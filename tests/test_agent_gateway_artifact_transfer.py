@@ -15,7 +15,6 @@ from agent_gateway.runtime.artifact_transfer import AgentArtifactTransferBroker
 
 def _artifact(data: bytes) -> AgentArtifactRef:
     return AgentArtifactRef(
-        artifact_kind="blob",
         media_type="application/octet-stream",
         schema_id=None,
         encoding="identity",
@@ -41,10 +40,8 @@ def _runtime(tmp_path: Path):
         artifact_access_mechanisms=("chunked_rpc", "local_path"),
         max_control_request_bytes=1024,
         max_control_response_bytes=1024,
-        max_inline_artifact_bytes=64,
         max_artifact_bytes=1024,
         max_artifact_chunk_bytes=4,
-        max_bundle_files=16,
         max_artifact_refs_per_operation=4,
         max_concurrent_uploads=2,
         max_concurrent_downloads=2,
@@ -135,7 +132,9 @@ def test_chunked_upload_download_and_ack_are_session_bound(tmp_path: Path) -> No
         store.close()
 
 
-def test_local_path_is_only_in_the_ephemeral_grant(tmp_path: Path) -> None:
+def test_local_path_is_read_only_and_only_in_the_ephemeral_grant(
+    tmp_path: Path,
+) -> None:
     data = b"local-path"
     store, broker = _runtime(tmp_path)
     try:
@@ -146,15 +145,26 @@ def test_local_path_is_only_in_the_ephemeral_grant(tmp_path: Path) -> None:
             artifact=_artifact(data),
             now=0.0,
         )
+        with pytest.raises(ValueError, match="uploads require"):
+            broker.issue_write_grant(
+                lease=lease,
+                mechanism="local_path",
+                now=1.0,
+            )
         grant = broker.issue_write_grant(
             lease=lease,
-            mechanism="local_path",
+            mechanism="chunked_rpc",
             now=1.0,
         )
-        path = Path(grant.to_wire()["locator"]["absolute_path"])
-        assert path.is_relative_to(store.root)
-        assert "absolute_path" not in grant.artifact.to_wire()
-        path.write_bytes(data)
+        for offset in range(0, len(data), 4):
+            broker.write_chunk(
+                grant_id=grant.grant_id,
+                client_id="rpent:local",
+                runtime_session_id="runtime:test",
+                offset=offset,
+                data=data[offset : offset + 4],
+                now=1.0 + offset,
+            )
         artifact, _ = broker.commit_write(
             grant_id=grant.grant_id,
             client_id="rpent:local",
@@ -168,7 +178,39 @@ def test_local_path_is_only_in_the_ephemeral_grant(tmp_path: Path) -> None:
             mechanism="local_path",
             now=3.0,
         )
-        assert Path(read.to_wire()["locator"]["absolute_path"]).read_bytes() == data
+        locator = read.to_wire()["locator"]
+        path = Path(locator["absolute_path"])
+        assert path.is_relative_to(store.root)
+        assert locator["read_only"] is True
+        assert "absolute_path" not in read.artifact.to_wire()
+        assert path.read_bytes() == data
+    finally:
+        store.close()
+
+
+def test_retried_write_grant_does_not_consume_another_concurrency_slot(
+    tmp_path: Path,
+) -> None:
+    store, broker = _runtime(tmp_path)
+    try:
+        lease = store.begin_upload(
+            client_id="rpent:local",
+            runtime_session_id="runtime:test",
+            idempotency_key="upload:retry",
+            artifact=_artifact(b"retry"),
+            now=0.0,
+        )
+        first = broker.issue_write_grant(
+            lease=lease,
+            mechanism="chunked_rpc",
+            now=1.0,
+        )
+        second = broker.issue_write_grant(
+            lease=store.upload(lease.upload_id),
+            mechanism="chunked_rpc",
+            now=2.0,
+        )
+        assert second == first
     finally:
         store.close()
 

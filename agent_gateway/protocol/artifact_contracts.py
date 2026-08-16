@@ -20,7 +20,6 @@ from ._contract_validation import (
     freeze_json_object,
     identifier,
     nonnegative_integer,
-    normalized_relative_path,
     optional_text,
     positive_integer,
     required_text,
@@ -32,9 +31,6 @@ from .version import AGENT_SKILL_PROTOCOL_VERSION_V2
 
 
 AGENT_ARTIFACT_REF_HASH_DOMAIN_V2 = "dexteleop.agent_skill.artifact_ref.v2"
-AGENT_ARTIFACT_BUNDLE_HASH_DOMAIN_V2 = (
-    "dexteleop.agent_skill.artifact_bundle_manifest.v2"
-)
 AGENT_ARTIFACT_BINDING_HASH_DOMAIN_V2 = (
     "dexteleop.agent_skill.artifact_binding.v2"
 )
@@ -48,15 +44,10 @@ AGENT_ARTIFACT_MATERIALIZATION_RECEIPT_HASH_DOMAIN_V2 = (
     "dexteleop.agent_skill.artifact_materialization_receipt.v2"
 )
 
-AGENT_ARTIFACT_KINDS_V2 = ("blob", "bundle_manifest")
 AGENT_ARTIFACT_ACCESS_DIRECTIONS_V2 = ("read", "write")
 AGENT_ARTIFACT_ACCESS_MECHANISMS_V2 = (
     "chunked_rpc",
     "local_path",
-    "shared_fs",
-    "unix_fd",
-    "https",
-    "object_store",
 )
 AGENT_ARTIFACT_TRANSFER_STATUSES_V2 = (
     "completed",
@@ -68,7 +59,6 @@ AGENT_ARTIFACT_TRANSFER_STATUSES_V2 = (
 class AgentArtifactRef:
     """Immutable, portable identity for one finite Artifact."""
 
-    artifact_kind: str
     media_type: str
     encoding: str
     compression: str
@@ -82,15 +72,6 @@ class AgentArtifactRef:
             raise ValueError(
                 f"Unsupported Agent Skill protocol: {self.protocol_version!r}."
             )
-        object.__setattr__(
-            self,
-            "artifact_kind",
-            enum_value(
-                self.artifact_kind,
-                field_name="artifact_kind",
-                allowed=AGENT_ARTIFACT_KINDS_V2,
-            ),
-        )
         for field_name in ("media_type", "encoding", "compression"):
             object.__setattr__(
                 self,
@@ -112,13 +93,6 @@ class AgentArtifactRef:
             "sha256",
             sha256_digest(self.sha256, field_name="sha256"),
         )
-        if self.artifact_kind == "bundle_manifest" and self.media_type != (
-            "application/vnd.dexteleop.agent-artifact-bundle+json"
-        ):
-            raise ValueError(
-                "bundle_manifest Artifacts require the canonical bundle media type."
-            )
-
     @property
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
@@ -133,7 +107,6 @@ class AgentArtifactRef:
     def to_wire(self, *, include_identity: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "protocol_version": self.protocol_version,
-            "artifact_kind": self.artifact_kind,
             "media_type": self.media_type,
             "schema_id": self.schema_id,
             "encoding": self.encoding,
@@ -151,7 +124,6 @@ class AgentArtifactRef:
         expected = {
             "protocol_version",
             "artifact_id",
-            "artifact_kind",
             "media_type",
             "schema_id",
             "encoding",
@@ -164,7 +136,6 @@ class AgentArtifactRef:
             raise ValueError("ArtifactRef fields must match the v2 contract exactly.")
         artifact = cls(
             protocol_version=payload["protocol_version"],
-            artifact_kind=payload["artifact_kind"],
             media_type=payload["media_type"],
             schema_id=payload["schema_id"],
             encoding=payload["encoding"],
@@ -177,98 +148,6 @@ class AgentArtifactRef:
         if payload["artifact_ref_hash"] != artifact.semantic_content_hash:
             raise ValueError("artifact_ref_hash does not match the descriptor.")
         return artifact
-
-
-@dataclass(frozen=True)
-class AgentArtifactBundleMember:
-    """One normalized member of a finite Artifact bundle."""
-
-    relative_path: str
-    byte_length: int
-    sha256: str
-    media_type: str | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "relative_path",
-            normalized_relative_path(
-                self.relative_path,
-                field_name="relative_path",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "byte_length",
-            nonnegative_integer(self.byte_length, field_name="byte_length"),
-        )
-        object.__setattr__(
-            self,
-            "sha256",
-            sha256_digest(self.sha256, field_name="sha256"),
-        )
-        object.__setattr__(
-            self,
-            "media_type",
-            optional_text(self.media_type, field_name="media_type"),
-        )
-
-    def to_wire(self) -> dict[str, Any]:
-        return {
-            "relative_path": self.relative_path,
-            "byte_length": self.byte_length,
-            "sha256": self.sha256,
-            "media_type": self.media_type,
-        }
-
-
-@dataclass(frozen=True)
-class AgentArtifactBundleManifest:
-    """Canonical, content-addressed inventory for a multi-file Artifact."""
-
-    members: tuple[AgentArtifactBundleMember, ...]
-    protocol_version: str = AGENT_SKILL_PROTOCOL_VERSION_V2
-
-    def __post_init__(self) -> None:
-        if self.protocol_version != AGENT_SKILL_PROTOCOL_VERSION_V2:
-            raise ValueError(
-                f"Unsupported Agent Skill protocol: {self.protocol_version!r}."
-            )
-        members = tuple(self.members)
-        if not members or any(
-            not isinstance(member, AgentArtifactBundleMember) for member in members
-        ):
-            raise ValueError("members must contain AgentArtifactBundleMember values.")
-        paths = tuple(member.relative_path for member in members)
-        if paths != tuple(sorted(paths)) or len(set(paths)) != len(paths):
-            raise ValueError("Bundle members must have unique, sorted paths.")
-        object.__setattr__(self, "members", members)
-
-    @property
-    def file_count(self) -> int:
-        return len(self.members)
-
-    @property
-    def total_bytes(self) -> int:
-        return sum(member.byte_length for member in self.members)
-
-    @property
-    def semantic_content_hash(self) -> str:
-        return canonical_content_hash(
-            self.to_wire(include_hash=False),
-            domain=AGENT_ARTIFACT_BUNDLE_HASH_DOMAIN_V2,
-        )
-
-    def to_wire(self, *, include_hash: bool = True) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "protocol_version": self.protocol_version,
-            "members": [member.to_wire() for member in self.members],
-            "file_count": self.file_count,
-            "total_bytes": self.total_bytes,
-        }
-        if include_hash:
-            payload["bundle_manifest_hash"] = self.semantic_content_hash
-        return payload
 
 
 @dataclass(frozen=True)
@@ -638,7 +517,6 @@ def agent_artifact_wire_schemas_v2() -> dict[str, dict[str, Any]]:
         "properties": {
             "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V2},
             "artifact_id": {"type": "string", "minLength": 1},
-            "artifact_kind": {"type": "string", "enum": list(AGENT_ARTIFACT_KINDS_V2)},
             "media_type": {"type": "string", "minLength": 1},
             "schema_id": nullable_string,
             "encoding": {"type": "string", "minLength": 1},
@@ -650,7 +528,6 @@ def agent_artifact_wire_schemas_v2() -> dict[str, dict[str, Any]]:
         "required": [
             "protocol_version",
             "artifact_id",
-            "artifact_kind",
             "media_type",
             "schema_id",
             "encoding",
@@ -677,40 +554,6 @@ def agent_artifact_wire_schemas_v2() -> dict[str, dict[str, Any]]:
             "production_receipt_ref",
             "artifact_binding_hash",
         ],
-    }
-    bundle_member = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "relative_path": {"type": "string", "minLength": 1},
-            "byte_length": {"type": "integer", "minimum": 0},
-            "sha256": digest,
-            "media_type": nullable_string,
-        },
-        "required": ["relative_path", "byte_length", "sha256", "media_type"],
-    }
-    bundle_manifest = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V2},
-            "members": {
-                "type": "array",
-                "minItems": 1,
-                "items": {"$ref": "#/$defs/AgentArtifactBundleMember"},
-            },
-            "file_count": {"type": "integer", "minimum": 1},
-            "total_bytes": {"type": "integer", "minimum": 0},
-            "bundle_manifest_hash": digest,
-        },
-        "required": [
-            "protocol_version",
-            "members",
-            "file_count",
-            "total_bytes",
-            "bundle_manifest_hash",
-        ],
-        "$defs": {"AgentArtifactBundleMember": bundle_member},
     }
     access_grant = {
         "type": "object",
@@ -825,7 +668,6 @@ def agent_artifact_wire_schemas_v2() -> dict[str, dict[str, Any]]:
             **artifact_binding,
             "$defs": {"AgentArtifactRef": artifact_ref},
         },
-        "agent_artifact_bundle_manifest": bundle_manifest,
         "agent_artifact_access_grant": access_grant,
         "agent_artifact_transfer_receipt": transfer_receipt,
         "agent_artifact_materialization_receipt": materialization_receipt,
@@ -835,11 +677,8 @@ def agent_artifact_wire_schemas_v2() -> dict[str, dict[str, Any]]:
 __all__ = [
     "AGENT_ARTIFACT_ACCESS_DIRECTIONS_V2",
     "AGENT_ARTIFACT_ACCESS_MECHANISMS_V2",
-    "AGENT_ARTIFACT_KINDS_V2",
     "AgentArtifactAccessGrant",
     "AgentArtifactBinding",
-    "AgentArtifactBundleManifest",
-    "AgentArtifactBundleMember",
     "AgentArtifactMaterializationReceipt",
     "AgentArtifactRef",
     "AgentArtifactTransferReceipt",

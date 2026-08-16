@@ -22,7 +22,6 @@ from agent_gateway.runtime.artifact_validation import (
 
 def _artifact(*, byte_length: int = 100) -> AgentArtifactRef:
     return AgentArtifactRef(
-        artifact_kind="blob",
         media_type="image/png",
         schema_id="depth.image.u16_mm.v1",
         encoding="png",
@@ -38,17 +37,12 @@ def _slot(*, direction: str) -> SkillArtifactSlotSpec:
         direction=direction,
         min_count=1,
         max_count=2,
-        allowed_artifact_kinds=("blob",),
         allowed_media_types=("image/png",),
         allowed_schema_ids=("depth.image.u16_mm.v1",),
         allowed_encodings=("png",),
         allowed_compressions=("deflate",),
         max_artifact_bytes=1000,
         max_total_bytes=1500,
-        inline_threshold_bytes=0,
-        retention_policy=(
-            "operation_bound" if direction == "input" else "handoff_bound"
-        ),
     )
 
 
@@ -73,10 +67,8 @@ def _capabilities() -> AgentGatewaySessionCapabilities:
         artifact_access_mechanisms=("chunked_rpc",),
         max_control_request_bytes=1000,
         max_control_response_bytes=1000,
-        max_inline_artifact_bytes=100,
         max_artifact_bytes=2000,
         max_artifact_chunk_bytes=100,
-        max_bundle_files=10,
         max_artifact_refs_per_operation=2,
         max_concurrent_uploads=1,
         max_concurrent_downloads=1,

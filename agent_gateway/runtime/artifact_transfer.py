@@ -178,7 +178,7 @@ class AgentArtifactTransferBroker:
                 "v2 read grants cover the complete Artifact; resume uses chunk offsets."
             )
         grant_id = f"grant:{uuid.uuid4().hex}"
-        chunk_uses = math.ceil(bounded / self.max_chunk_bytes) + 1
+        chunk_uses = max(1, math.ceil(bounded / self.max_chunk_bytes))
         locator: dict[str, Any]
         max_uses: int
         if selected == "local_path":
@@ -223,31 +223,25 @@ class AgentArtifactTransferBroker:
         if lease.runtime_session_id != self.session_capabilities.runtime_session_id:
             raise PermissionError("Upload session does not match capabilities.")
         selected = self._mechanism(mechanism)
-        if selected not in {"chunked_rpc", "local_path"}:
-            raise NotImplementedError(
-                f"Artifact mechanism is negotiated but not implemented: {selected}."
-            )
+        if selected != "chunked_rpc":
+            raise ValueError("Artifact uploads require the chunked_rpc mechanism.")
         issued, requested_expiry = self._ttl(now=now, ttl_sec=ttl_sec)
+        self.expire_grants(now=issued)
+        with self._lock:
+            for state in self._grants.values():
+                if (
+                    state.upload_id == lease.upload_id
+                    and state.grant.mechanism == selected
+                    and not state.completed
+                ):
+                    return state.grant
         expires = min(requested_expiry, lease.expires_at)
         if expires <= issued:
             raise ValueError("Upload lease expires before the access grant.")
         grant_id = f"grant:{uuid.uuid4().hex}"
         remaining = lease.artifact.byte_length - lease.received_bytes
         max_uses = math.ceil(remaining / self.max_chunk_bytes) + 1
-        if selected == "local_path":
-            path = self.store.managed_upload_path(
-                upload_id=lease.upload_id,
-                client_id=lease.client_id,
-                runtime_session_id=lease.runtime_session_id,
-            )
-            locator: dict[str, Any] = {
-                "absolute_path": str(path),
-                "mount_namespace": "gateway_host",
-                "server_owned_staging": True,
-            }
-            max_uses = 1
-        else:
-            locator = {"transfer_id": grant_id, "upload_id": lease.upload_id}
+        locator = {"transfer_id": grant_id, "upload_id": lease.upload_id}
         grant = AgentArtifactAccessGrant(
             grant_id=grant_id,
             artifact=lease.artifact,

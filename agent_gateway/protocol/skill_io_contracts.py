@@ -17,7 +17,6 @@ from ._contract_validation import (
     slot_identifier,
     unique_sorted_text,
 )
-from .artifact_contracts import AGENT_ARTIFACT_KINDS_V2
 from .version import AGENT_SKILL_PROTOCOL_VERSION_V2
 
 
@@ -26,15 +25,6 @@ AGENT_SKILL_IO_CONTRACT_HASH_DOMAIN_V2 = (
 )
 AGENT_SKILL_IO_CATALOG_HASH_DOMAIN_V2 = "dexteleop.agent_skill.io_catalog.v2"
 AGENT_SKILL_ARTIFACT_SLOT_DIRECTIONS_V2 = ("input", "output")
-AGENT_SKILL_ARTIFACT_RETENTION_POLICIES_V2 = (
-    "operation_bound",
-    "handoff_bound",
-)
-AGENT_SKILL_ARTIFACT_SENSITIVITY_CLASSES_V2 = (
-    "normal",
-    "sensitive",
-    "restricted",
-)
 
 _SKILL_ID_PATTERN = re.compile(
     r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
@@ -64,16 +54,12 @@ class SkillArtifactSlotSpec:
     direction: str
     min_count: int
     max_count: int
-    allowed_artifact_kinds: tuple[str, ...]
     allowed_media_types: tuple[str, ...]
     allowed_schema_ids: tuple[str, ...]
     allowed_encodings: tuple[str, ...]
     allowed_compressions: tuple[str, ...]
     max_artifact_bytes: int
     max_total_bytes: int
-    inline_threshold_bytes: int
-    retention_policy: str
-    sensitivity_class: str = "normal"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -96,15 +82,6 @@ class SkillArtifactSlotSpec:
             raise ValueError("min_count cannot exceed max_count.")
         object.__setattr__(self, "min_count", minimum)
         object.__setattr__(self, "max_count", maximum)
-        kinds = unique_sorted_text(
-            self.allowed_artifact_kinds,
-            field_name="allowed_artifact_kinds",
-            allow_empty=False,
-        )
-        unsupported = sorted(set(kinds) - set(AGENT_ARTIFACT_KINDS_V2))
-        if unsupported:
-            raise ValueError(f"Unsupported Artifact kinds: {unsupported}.")
-        object.__setattr__(self, "allowed_artifact_kinds", kinds)
         for field_name in (
             "allowed_media_types",
             "allowed_encodings",
@@ -141,38 +118,6 @@ class SkillArtifactSlotSpec:
             )
         object.__setattr__(self, "max_artifact_bytes", max_artifact)
         object.__setattr__(self, "max_total_bytes", max_total)
-        threshold = nonnegative_integer(
-            self.inline_threshold_bytes,
-            field_name="inline_threshold_bytes",
-        )
-        if threshold > max_artifact:
-            raise ValueError("inline_threshold_bytes cannot exceed max_artifact_bytes.")
-        object.__setattr__(self, "inline_threshold_bytes", threshold)
-        object.__setattr__(
-            self,
-            "retention_policy",
-            enum_value(
-                self.retention_policy,
-                field_name="retention_policy",
-                allowed=AGENT_SKILL_ARTIFACT_RETENTION_POLICIES_V2,
-            ),
-        )
-        expected_retention = (
-            "operation_bound" if self.direction == "input" else "handoff_bound"
-        )
-        if self.retention_policy != expected_retention:
-            raise ValueError(
-                f"{self.direction} slots require {expected_retention!r} retention."
-            )
-        object.__setattr__(
-            self,
-            "sensitivity_class",
-            enum_value(
-                self.sensitivity_class,
-                field_name="sensitivity_class",
-                allowed=AGENT_SKILL_ARTIFACT_SENSITIVITY_CLASSES_V2,
-            ),
-        )
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -180,16 +125,12 @@ class SkillArtifactSlotSpec:
             "direction": self.direction,
             "min_count": self.min_count,
             "max_count": self.max_count,
-            "allowed_artifact_kinds": list(self.allowed_artifact_kinds),
             "allowed_media_types": list(self.allowed_media_types),
             "allowed_schema_ids": list(self.allowed_schema_ids),
             "allowed_encodings": list(self.allowed_encodings),
             "allowed_compressions": list(self.allowed_compressions),
             "max_artifact_bytes": self.max_artifact_bytes,
             "max_total_bytes": self.max_total_bytes,
-            "inline_threshold_bytes": self.inline_threshold_bytes,
-            "retention_policy": self.retention_policy,
-            "sensitivity_class": self.sensitivity_class,
         }
 
 
@@ -447,12 +388,6 @@ def agent_skill_io_wire_schemas_v2() -> dict[str, dict[str, Any]]:
             },
             "min_count": {"type": "integer", "minimum": 0},
             "max_count": {"type": "integer", "minimum": 1},
-            "allowed_artifact_kinds": {
-                "type": "array",
-                "minItems": 1,
-                "uniqueItems": True,
-                "items": {"type": "string", "enum": list(AGENT_ARTIFACT_KINDS_V2)},
-            },
             "allowed_media_types": {
                 "type": "array",
                 "minItems": 1,
@@ -478,31 +413,18 @@ def agent_skill_io_wire_schemas_v2() -> dict[str, dict[str, Any]]:
             },
             "max_artifact_bytes": {"type": "integer", "minimum": 1},
             "max_total_bytes": {"type": "integer", "minimum": 1},
-            "inline_threshold_bytes": {"type": "integer", "minimum": 0},
-            "retention_policy": {
-                "type": "string",
-                "enum": list(AGENT_SKILL_ARTIFACT_RETENTION_POLICIES_V2),
-            },
-            "sensitivity_class": {
-                "type": "string",
-                "enum": list(AGENT_SKILL_ARTIFACT_SENSITIVITY_CLASSES_V2),
-            },
         },
         "required": [
             "slot_id",
             "direction",
             "min_count",
             "max_count",
-            "allowed_artifact_kinds",
             "allowed_media_types",
             "allowed_schema_ids",
             "allowed_encodings",
             "allowed_compressions",
             "max_artifact_bytes",
             "max_total_bytes",
-            "inline_threshold_bytes",
-            "retention_policy",
-            "sensitivity_class",
         ],
     }
     contract = {

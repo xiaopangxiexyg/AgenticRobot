@@ -20,8 +20,6 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from .artifact_contracts import (
     AGENT_ARTIFACT_ACCESS_GRANT_HASH_DOMAIN_V2,
     AGENT_ARTIFACT_BINDING_HASH_DOMAIN_V2,
-    AGENT_ARTIFACT_BUNDLE_HASH_DOMAIN_V2,
-    AGENT_ARTIFACT_KINDS_V2,
     AGENT_ARTIFACT_MATERIALIZATION_RECEIPT_HASH_DOMAIN_V2,
     AGENT_ARTIFACT_REF_HASH_DOMAIN_V2,
     AGENT_ARTIFACT_TRANSFER_RECEIPT_HASH_DOMAIN_V2,
@@ -1444,63 +1442,12 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
 
     nullable_string = _nullable({"type": "string", "minLength": 1})
     nullable_integer = _nullable({"type": "integer", "minimum": 0})
-    artifact_ref = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V2},
-            "artifact_id": {"type": "string", "minLength": 1},
-            "artifact_kind": {
-                "type": "string",
-                "enum": list(AGENT_ARTIFACT_KINDS_V2),
-            },
-            "media_type": {"type": "string", "minLength": 1},
-            "schema_id": nullable_string,
-            "encoding": {"type": "string", "minLength": 1},
-            "compression": {"type": "string", "minLength": 1},
-            "byte_length": {"type": "integer", "minimum": 0},
-            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "artifact_ref_hash": {
-                "type": "string",
-                "pattern": "^[0-9a-f]{64}$",
-            },
-        },
-        "required": [
-            "protocol_version",
-            "artifact_id",
-            "artifact_kind",
-            "media_type",
-            "schema_id",
-            "encoding",
-            "compression",
-            "byte_length",
-            "sha256",
-            "artifact_ref_hash",
-        ],
-    }
+    artifact_schemas = agent_artifact_wire_schemas_v2()
+    artifact_ref = artifact_schemas["agent_artifact_ref"]
     artifact_binding = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "slot_id": {
-                "type": "string",
-                "pattern": "^[a-z][a-z0-9_]{0,63}$",
-            },
-            "ordinal": {"type": "integer", "minimum": 0},
-            "artifact": {"$ref": "#/$defs/AgentArtifactRef"},
-            "production_receipt_ref": nullable_string,
-            "artifact_binding_hash": {
-                "type": "string",
-                "pattern": "^[0-9a-f]{64}$",
-            },
-        },
-        "required": [
-            "slot_id",
-            "ordinal",
-            "artifact",
-            "production_receipt_ref",
-            "artifact_binding_hash",
-        ],
+        key: value
+        for key, value in artifact_schemas["agent_artifact_binding"].items()
+        if key != "$defs"
     }
     authoritative_port_receipt_properties = {
         "receipt_id": {"type": "string", "minLength": 1},
@@ -1688,7 +1635,6 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
                 "items": {"$ref": "#/$defs/AgentSkillSchemaEntry"},
             },
             "skill_schema_catalog_hash": {"type": "string", "minLength": 1},
-            "skill_io_catalog_hash": {"type": "string", "minLength": 1},
         },
         required=(
             "protocol_version",
@@ -1696,7 +1642,6 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "catalog_version",
             "schema_entries",
             "skill_schema_catalog_hash",
-            "skill_io_catalog_hash",
         ),
         definitions={
             "AgentSkillSchemaEntry": schema_entry,
@@ -1944,6 +1889,7 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "execution_manifest_hash": {"type": "string", "minLength": 1},
             "skill_definition_catalog_hash": {"type": "string", "minLength": 1},
             "skill_schema_catalog_hash": {"type": "string", "minLength": 1},
+            "skill_io_catalog_hash": {"type": "string", "minLength": 1},
             "target_binding_id": {"type": "string", "minLength": 1},
             "target_kind": {
                 "type": "string",
@@ -1977,6 +1923,7 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "execution_manifest_hash",
             "skill_definition_catalog_hash",
             "skill_schema_catalog_hash",
+            "skill_io_catalog_hash",
             "target_binding_id",
             "target_kind",
             "current_mode",
@@ -2575,7 +2522,6 @@ def agent_skill_schema_snapshot_document() -> dict[str, Any]:
         ),
         "target_kinds": list(AGENT_SKILL_TARGET_KINDS_V1),
         "skill_kinds": list(AGENT_SKILL_KINDS_V1),
-        "artifact_kinds": list(AGENT_ARTIFACT_KINDS_V2),
         "gateway_event_kinds": list(AGENT_GATEWAY_EVENT_KINDS_V2),
         "task_outcomes": list(AGENT_SKILL_TASK_OUTCOMES_V1),
         "terminal_operation_statuses": list(
@@ -2619,7 +2565,6 @@ def agent_skill_schema_snapshot_document() -> dict[str, Any]:
         "request_authorization": AGENT_SKILL_REQUEST_AUTHORIZATION_HASH_DOMAIN_V2,
         "artifact_ref": AGENT_ARTIFACT_REF_HASH_DOMAIN_V2,
         "artifact_binding": AGENT_ARTIFACT_BINDING_HASH_DOMAIN_V2,
-        "artifact_bundle_manifest": AGENT_ARTIFACT_BUNDLE_HASH_DOMAIN_V2,
         "artifact_access_grant": AGENT_ARTIFACT_ACCESS_GRANT_HASH_DOMAIN_V2,
         "artifact_transfer_receipt": (
             AGENT_ARTIFACT_TRANSFER_RECEIPT_HASH_DOMAIN_V2

@@ -15,7 +15,7 @@ import pytest
 
 from agent_gateway.transport import unix_transport
 from agent_gateway.transport.unix_transport import (
-    AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
+    AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
     AgentGatewayUnixJsonServer,
     AgentGatewayUnixPeerClientMap,
     AgentGatewayUnixPeerCredentials,
@@ -373,7 +373,7 @@ def test_protocol_envelope_is_exact_and_method_allowlist_has_no_shutdown() -> No
     try:
         raw.connect(str(path))
         envelope = {
-            "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
+            "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
             "request_id": "request:forbidden",
             "method": "shutdown",
             "payload": None,

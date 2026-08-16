@@ -20,7 +20,6 @@ from agent_gateway.runtime.artifact_store import (
 
 def _artifact(data: bytes, *, media_type: str = "application/octet-stream"):
     return AgentArtifactRef(
-        artifact_kind="blob",
         media_type=media_type,
         schema_id=None,
         encoding="identity",

@@ -8,10 +8,15 @@ profile explicitly binds a Station application port.
 ## Ownership
 
 - `protocol/` owns versioned wire contracts, Skill/schema catalogs, Route and
-  deployment references, and transport-neutral serialization validation.
+  deployment references, generic Skill I/O/Artifact/Event contracts, the
+  reviewed Skill registration template, and transport-neutral serialization
+  validation. The only current public Skill protocol is
+  `dexteleop.agent_skill.v2`; do not create parallel v1/v2 Skill families.
 - `runtime/` owns authenticated-client admission, idempotency/reconciliation,
   bounded operation projection, exact Route-to-executor registration, and
-  cancellation/HOLD requests through injected lower ports.
+  cancellation/HOLD requests through injected lower ports. Its session-level
+  protocol runtime binds one manifest, I/O catalog, capability document,
+  replay journal, and optional transient Artifact store/data plane.
 - `transport/` authenticates and bounds connections, then delegates to one
   bound runtime facade. It does not reinterpret Skill or motion semantics.
 - `skills/` owns target-independent Skill definitions and payload/result
@@ -56,6 +61,40 @@ canonical robot authority, safety, IK, reference, dispatch, or dataset episode
 lifecycle. Admission, an operation terminal state, a disconnect ACK, or a
 transport response must not be presented as lower-confirmed HOLD evidence.
 
+## Generic Skill I/O and Artifact lifecycle
+
+Every advertised Skill has exactly one `SkillIOContract`, including Skills
+whose input and output Artifact slot lists are empty. New Skills should be
+assembled with `protocol.skill_registration.SkillRegistrationTemplate` so the
+Definition, strict schemas, I/O contract, and Routes fail closed over the same
+hashes. Hardware-information Skills use ordinary typed Artifact slots; do not
+add device- or depth-specific transport methods.
+
+Artifact identity is a finite immutable descriptor and content hash. A path,
+URL, file descriptor, or object-store key may appear only in a short-lived,
+authenticated access grant. `local_path` is valid only for a reviewed
+same-host trust boundary and is never a durable identity. The Gateway store is
+a recoverable transient handoff cache: stage and reserve quota, transfer,
+verify hash/length, atomically commit, bind to an operation, serve through an
+ephemeral grant, accept an upper-owned materialization receipt, then collect
+after pins/retention expire. It does not become the dataset, Experience, or
+Memory store.
+
+The current data plane implements only `chunked_rpc` and same-host
+`local_path`. Uploads always use `chunked_rpc`; `local_path` is a read-only
+grant over committed bytes. Do not advertise speculative transfer mechanisms
+or unenforced slot security/retention metadata. Multi-file results use multiple
+bindings or one explicitly encoded archive until a concrete consumer justifies
+another contract.
+
+Artifact transfer is capability-negotiated within v2. Inline-only sessions
+publish `artifact_transfer_enabled=false`; a profile that advertises Artifact
+slots must inject a matching store, broker, limits, and at least the bounded
+`chunked_rpc` fallback. Events are bounded at-least-once hints with monotonic
+session sequence numbers and explicit replay gaps. Operation query/catalog
+discovery remains authoritative after a gap; event payloads must never carry
+large Artifact bodies.
+
 ## Compatibility and verification
 
 Historic `control_station.agent_gateway`,
@@ -67,9 +106,11 @@ also a compatibility re-export. The former
 use the owning `agent_gateway.*` path; shims must not duplicate implementation,
 state, schemas, or resource ownership.
 
-Preserve public wire field names, schema/hash domains, Skill/Route/deployment
-identities, idempotency behavior, and fail-closed cancellation semantics during
-refactors. Validate the neutral core separately from each concrete profile,
+Preserve the single v2 public wire field names, schema/hash domains,
+Skill/Route/deployment identities, idempotency behavior, and fail-closed
+cancellation semantics during refactors. Upgrade the current protocol in
+place; do not retain a second public v1 transport or consumer mode. Validate
+the neutral core separately from each concrete profile,
 and do not infer simulator or real-hardware readiness from contract tests. An
 in-memory lower-owner loop proves wiring and fail-HOLD semantics only; it is not
 evidence that the production launcher supplies authoritative owner identities,

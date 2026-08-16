@@ -7,8 +7,6 @@ import pytest
 from agent_gateway.protocol.artifact_contracts import (
     AgentArtifactAccessGrant,
     AgentArtifactBinding,
-    AgentArtifactBundleManifest,
-    AgentArtifactBundleMember,
     AgentArtifactMaterializationReceipt,
     AgentArtifactRef,
     AgentArtifactTransferReceipt,
@@ -31,12 +29,10 @@ from agent_gateway.protocol.version import AGENT_SKILL_PROTOCOL_VERSION_V2
 
 
 _SHA_A = "a" * 64
-_SHA_B = "b" * 64
 
 
 def _artifact(*, sha256: str = _SHA_A) -> AgentArtifactRef:
     return AgentArtifactRef(
-        artifact_kind="blob",
         media_type="image/png",
         schema_id="depth.image.u16_mm.v1",
         encoding="png",
@@ -52,16 +48,12 @@ def _depth_slot() -> SkillArtifactSlotSpec:
         direction="output",
         min_count=1,
         max_count=1,
-        allowed_artifact_kinds=("blob",),
         allowed_media_types=("image/png",),
         allowed_schema_ids=("depth.image.u16_mm.v1",),
         allowed_encodings=("png",),
         allowed_compressions=("deflate",),
         max_artifact_bytes=8 * 1024 * 1024,
         max_total_bytes=8 * 1024 * 1024,
-        inline_threshold_bytes=0,
-        retention_policy="handoff_bound",
-        sensitivity_class="sensitive",
     )
 
 
@@ -84,10 +76,8 @@ def _capabilities() -> AgentGatewaySessionCapabilities:
         artifact_access_mechanisms=("chunked_rpc", "local_path"),
         max_control_request_bytes=256 * 1024,
         max_control_response_bytes=256 * 1024,
-        max_inline_artifact_bytes=64 * 1024,
         max_artifact_bytes=64 * 1024 * 1024,
         max_artifact_chunk_bytes=1024 * 1024,
-        max_bundle_files=256,
         max_artifact_refs_per_operation=16,
         max_concurrent_uploads=2,
         max_concurrent_downloads=4,
@@ -109,29 +99,6 @@ def test_artifact_ref_is_v2_content_identity_without_a_locator() -> None:
     forged["byte_length"] += 1
     with pytest.raises(ValueError, match="artifact_id does not match"):
         AgentArtifactRef.from_wire(forged)
-
-
-def test_bundle_manifest_rejects_path_escape_and_unsorted_members() -> None:
-    first = AgentArtifactBundleMember(
-        relative_path="frames/000001.png",
-        byte_length=100,
-        sha256=_SHA_A,
-        media_type="image/png",
-    )
-    second = AgentArtifactBundleMember(
-        relative_path="frames/000002.png",
-        byte_length=200,
-        sha256=_SHA_B,
-        media_type="image/png",
-    )
-    manifest = AgentArtifactBundleManifest(members=(first, second))
-    assert manifest.file_count == 2
-    assert manifest.total_bytes == 300
-
-    with pytest.raises(ValueError, match="normalized relative POSIX path"):
-        replace(first, relative_path="../outside.png")
-    with pytest.raises(ValueError, match="unique, sorted"):
-        AgentArtifactBundleManifest(members=(second, first))
 
 
 def test_location_is_short_lived_access_state_not_artifact_identity() -> None:
@@ -218,14 +185,12 @@ def test_every_skill_has_one_explicit_v2_io_contract() -> None:
         replace(catalog, io_contracts=(inline, depth))
 
 
-def test_artifact_slot_bounds_and_direction_own_retention_policy() -> None:
+def test_artifact_slot_bounds_are_finite() -> None:
     slot = _depth_slot()
-    with pytest.raises(ValueError, match="output slots require"):
-        replace(slot, retention_policy="operation_bound")
     with pytest.raises(ValueError, match="min_count cannot exceed"):
         replace(slot, min_count=2, max_count=1)
-    with pytest.raises(ValueError, match="inline_threshold_bytes"):
-        replace(slot, inline_threshold_bytes=slot.max_artifact_bytes + 1)
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        replace(slot, max_total_bytes=slot.max_artifact_bytes - 1)
 
 
 def test_capabilities_are_typed_and_require_a_bounded_fallback() -> None:
@@ -265,7 +230,6 @@ def test_capabilities_are_typed_and_require_a_bounded_fallback() -> None:
 
 def test_empty_artifact_has_a_zero_length_access_range() -> None:
     artifact = AgentArtifactRef(
-        artifact_kind="blob",
         media_type="application/octet-stream",
         schema_id=None,
         encoding="identity",

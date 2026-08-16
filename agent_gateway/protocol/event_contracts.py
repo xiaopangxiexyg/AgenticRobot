@@ -18,7 +18,10 @@ from ._contract_validation import (
     optional_text,
     thaw_json,
 )
-from .artifact_contracts import AgentArtifactBinding
+from .artifact_contracts import (
+    AgentArtifactBinding,
+    agent_artifact_wire_schemas_v2,
+)
 from .version import AGENT_SKILL_PROTOCOL_VERSION_V2
 
 
@@ -245,51 +248,12 @@ def agent_event_wire_schemas_v2() -> dict[str, dict[str, Any]]:
         ]
     }
     digest = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-    artifact_ref = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V2},
-            "artifact_id": {"type": "string", "minLength": 1},
-            "artifact_kind": {"type": "string", "enum": ["blob", "bundle_manifest"]},
-            "media_type": {"type": "string", "minLength": 1},
-            "schema_id": nullable_string,
-            "encoding": {"type": "string", "minLength": 1},
-            "compression": {"type": "string", "minLength": 1},
-            "byte_length": {"type": "integer", "minimum": 0},
-            "sha256": digest,
-            "artifact_ref_hash": digest,
-        },
-        "required": [
-            "protocol_version",
-            "artifact_id",
-            "artifact_kind",
-            "media_type",
-            "schema_id",
-            "encoding",
-            "compression",
-            "byte_length",
-            "sha256",
-            "artifact_ref_hash",
-        ],
-    }
+    artifact_schemas = agent_artifact_wire_schemas_v2()
+    artifact_ref = artifact_schemas["agent_artifact_ref"]
     artifact_binding = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "slot_id": {"type": "string", "minLength": 1},
-            "ordinal": {"type": "integer", "minimum": 0},
-            "artifact": {"$ref": "#/$defs/AgentArtifactRef"},
-            "production_receipt_ref": nullable_string,
-            "artifact_binding_hash": digest,
-        },
-        "required": [
-            "slot_id",
-            "ordinal",
-            "artifact",
-            "production_receipt_ref",
-            "artifact_binding_hash",
-        ],
+        key: value
+        for key, value in artifact_schemas["agent_artifact_binding"].items()
+        if key != "$defs"
     }
     event = {
         "type": "object",

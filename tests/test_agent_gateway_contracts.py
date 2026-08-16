@@ -362,6 +362,9 @@ def test_portable_schema_snapshot_is_route_based_and_strict() -> None:
     )
     assert "capability_manifest" not in document["schemas"]
     request_schema = document["schemas"]["skill_request"]
+    route_manifest_schema = document["schemas"]["skill_route_manifest"]
+    assert "skill_io_catalog_hash" in route_manifest_schema["properties"]
+    assert "skill_io_catalog_hash" in route_manifest_schema["required"]
     assert "route_hash" in request_schema["properties"]
     assert "raw_qpos" not in request_schema["properties"]
     assert "raw_pose" not in request_schema["properties"]

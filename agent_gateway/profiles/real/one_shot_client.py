@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from agent_gateway.transport.unix_transport import (
-    AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
+    AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
 )
 from agent_gateway.skills.motion.definition import (
     TCP_CARDINAL_STEP_SKILL_ID_V1,
@@ -71,7 +71,7 @@ class _Client:
         request_id = "operator-client:" + uuid.uuid4().hex
         encoded = json.dumps(
             {
-                "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
+                "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
                 "request_id": request_id,
                 "method": method,
                 "payload": payload,
@@ -203,6 +203,7 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             "requested_mode": "real_active",
             "requested_timeout_ms": int(args.operation_timeout_sec * 1000.0),
             "skill_execution_grant_id": None,
+            "input_artifact_bindings": [],
             "safety_profile_id": envelope["object_id"],
             "safety_profile_hash": envelope["content_hash"],
             "deployment_safety_envelope_id": envelope["object_id"],

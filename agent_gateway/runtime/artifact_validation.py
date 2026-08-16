@@ -18,8 +18,6 @@ def _validate_slot_artifact(
     binding: AgentArtifactBinding,
 ) -> None:
     artifact = binding.artifact
-    if artifact.artifact_kind not in slot.allowed_artifact_kinds:
-        raise ValueError(f"Artifact kind is not allowed for slot {slot.slot_id!r}.")
     if artifact.media_type not in slot.allowed_media_types:
         raise ValueError(f"Artifact media type is not allowed for slot {slot.slot_id!r}.")
     if slot.allowed_schema_ids and artifact.schema_id not in slot.allowed_schema_ids:

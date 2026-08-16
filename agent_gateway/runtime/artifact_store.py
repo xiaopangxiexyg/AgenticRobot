@@ -511,38 +511,6 @@ class RecoverableAgentArtifactStore:
             raise PermissionError("Artifact upload does not belong to this session.")
         return row
 
-    def managed_upload_path(
-        self,
-        *,
-        upload_id: str,
-        client_id: str,
-        runtime_session_id: str,
-    ) -> Path:
-        """Return the server-owned staging path to a trusted grant issuer."""
-
-        with self._lock:
-            self._ensure_open()
-            row = self._owned_upload_locked(
-                upload_id=upload_id,
-                client_id=client_id,
-                runtime_session_id=runtime_session_id,
-            )
-            if row["state"] != "staging" or row["staging_name"] is None:
-                raise ArtifactStoreConflictError(
-                    f"Upload has no writable staging path in state {row['state']!r}."
-                )
-            path = self._staging_path(row["staging_name"])
-            info = os.lstat(path)
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                raise ArtifactStoreIntegrityError(
-                    "Managed upload path is not a regular staging inode."
-                )
-            if info.st_size != row["received_bytes"]:
-                raise ArtifactStoreIntegrityError(
-                    "Managed upload inode size does not match committed progress."
-                )
-            return path
-
     def write_upload_chunk(
         self,
         *,

@@ -18,10 +18,6 @@
       "rearm",
       "rearm_v1"
     ],
-    "artifact_kinds": [
-      "blob",
-      "bundle_manifest"
-    ],
     "cancellation_policies": [
       "cancel_only",
       "hold_on_cancel",
@@ -168,7 +164,6 @@
     "aggregate_evaluation_receipt": "dexteleop.agent_skill.aggregate_evaluation_receipt.v1",
     "artifact_access_grant": "dexteleop.agent_skill.artifact_access_grant.v2",
     "artifact_binding": "dexteleop.agent_skill.artifact_binding.v2",
-    "artifact_bundle_manifest": "dexteleop.agent_skill.artifact_bundle_manifest.v2",
     "artifact_materialization_receipt": "dexteleop.agent_skill.artifact_materialization_receipt.v2",
     "artifact_ref": "dexteleop.agent_skill.artifact_ref.v2",
     "artifact_transfer_receipt": "dexteleop.agent_skill.artifact_transfer_receipt.v2",
@@ -206,7 +201,7 @@
     "max_json_depth": 16,
     "max_timeout_ms": 86400000
   },
-  "protocol_semantic_hash": "d60afaf025a3a388635952d78a15419a577bd06dcdaf7f7abe59c577abd65acf",
+  "protocol_semantic_hash": "3ea87b8f33698ca9f091e04b649e35266d986fbcefff3ae9c28fdd9544bed188",
   "protocol_version": "dexteleop.agent_skill.v2",
   "schema": "dexteleop_agent_skill_schema_snapshot_v2",
   "schemas": {
@@ -217,13 +212,6 @@
           "properties": {
             "artifact_id": {
               "minLength": 1,
-              "type": "string"
-            },
-            "artifact_kind": {
-              "enum": [
-                "blob",
-                "bundle_manifest"
-              ],
               "type": "string"
             },
             "artifact_ref_hash": {
@@ -268,7 +256,6 @@
           "required": [
             "protocol_version",
             "artifact_id",
-            "artifact_kind",
             "media_type",
             "schema_id",
             "encoding",
@@ -328,11 +315,7 @@
         "mechanism": {
           "enum": [
             "chunked_rpc",
-            "local_path",
-            "shared_fs",
-            "unix_fd",
-            "https",
-            "object_store"
+            "local_path"
           ],
           "type": "string"
         },
@@ -365,13 +348,6 @@
           "properties": {
             "artifact_id": {
               "minLength": 1,
-              "type": "string"
-            },
-            "artifact_kind": {
-              "enum": [
-                "blob",
-                "bundle_manifest"
-              ],
               "type": "string"
             },
             "artifact_ref_hash": {
@@ -416,7 +392,6 @@
           "required": [
             "protocol_version",
             "artifact_id",
-            "artifact_kind",
             "media_type",
             "schema_id",
             "encoding",
@@ -463,78 +438,6 @@
         "artifact",
         "production_receipt_ref",
         "artifact_binding_hash"
-      ],
-      "type": "object"
-    },
-    "agent_artifact_bundle_manifest": {
-      "$defs": {
-        "AgentArtifactBundleMember": {
-          "additionalProperties": false,
-          "properties": {
-            "byte_length": {
-              "minimum": 0,
-              "type": "integer"
-            },
-            "media_type": {
-              "anyOf": [
-                {
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "relative_path": {
-              "minLength": 1,
-              "type": "string"
-            },
-            "sha256": {
-              "pattern": "^[0-9a-f]{64}$",
-              "type": "string"
-            }
-          },
-          "required": [
-            "relative_path",
-            "byte_length",
-            "sha256",
-            "media_type"
-          ],
-          "type": "object"
-        }
-      },
-      "additionalProperties": false,
-      "properties": {
-        "bundle_manifest_hash": {
-          "pattern": "^[0-9a-f]{64}$",
-          "type": "string"
-        },
-        "file_count": {
-          "minimum": 1,
-          "type": "integer"
-        },
-        "members": {
-          "items": {
-            "$ref": "#/$defs/AgentArtifactBundleMember"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "protocol_version": {
-          "const": "dexteleop.agent_skill.v2"
-        },
-        "total_bytes": {
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "protocol_version",
-        "members",
-        "file_count",
-        "total_bytes",
-        "bundle_manifest_hash"
       ],
       "type": "object"
     },
@@ -597,13 +500,6 @@
           "minLength": 1,
           "type": "string"
         },
-        "artifact_kind": {
-          "enum": [
-            "blob",
-            "bundle_manifest"
-          ],
-          "type": "string"
-        },
         "artifact_ref_hash": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -646,7 +542,6 @@
       "required": [
         "protocol_version",
         "artifact_id",
-        "artifact_kind",
         "media_type",
         "schema_id",
         "encoding",
@@ -847,10 +742,6 @@
           },
           "type": "array"
         },
-        "skill_io_catalog_hash": {
-          "minLength": 1,
-          "type": "string"
-        },
         "skill_schema_catalog_hash": {
           "minLength": 1,
           "type": "string"
@@ -861,8 +752,7 @@
         "catalog_id",
         "catalog_version",
         "schema_entries",
-        "skill_schema_catalog_hash",
-        "skill_io_catalog_hash"
+        "skill_schema_catalog_hash"
       ],
       "type": "object"
     },
@@ -1137,7 +1027,7 @@
               ]
             },
             "slot_id": {
-              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
               "type": "string"
             }
           },
@@ -1155,13 +1045,6 @@
           "properties": {
             "artifact_id": {
               "minLength": 1,
-              "type": "string"
-            },
-            "artifact_kind": {
-              "enum": [
-                "blob",
-                "bundle_manifest"
-              ],
               "type": "string"
             },
             "artifact_ref_hash": {
@@ -1206,7 +1089,6 @@
           "required": [
             "protocol_version",
             "artifact_id",
-            "artifact_kind",
             "media_type",
             "schema_id",
             "encoding",
@@ -1345,7 +1227,7 @@
               ]
             },
             "slot_id": {
-              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
               "type": "string"
             }
           },
@@ -1363,13 +1245,6 @@
           "properties": {
             "artifact_id": {
               "minLength": 1,
-              "type": "string"
-            },
-            "artifact_kind": {
-              "enum": [
-                "blob",
-                "bundle_manifest"
-              ],
               "type": "string"
             },
             "artifact_ref_hash": {
@@ -1414,7 +1289,6 @@
           "required": [
             "protocol_version",
             "artifact_id",
-            "artifact_kind",
             "media_type",
             "schema_id",
             "encoding",
@@ -1580,11 +1454,7 @@
           "items": {
             "enum": [
               "chunked_rpc",
-              "local_path",
-              "shared_fs",
-              "unix_fd",
-              "https",
-              "object_store"
+              "local_path"
             ],
             "type": "string"
           },
@@ -1618,10 +1488,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "max_bundle_files": {
-          "minimum": 0,
-          "type": "integer"
-        },
         "max_concurrent_downloads": {
           "minimum": 0,
           "type": "integer"
@@ -1636,10 +1502,6 @@
         },
         "max_control_response_bytes": {
           "minimum": 1,
-          "type": "integer"
-        },
-        "max_inline_artifact_bytes": {
-          "minimum": 0,
           "type": "integer"
         },
         "protocol_version": {
@@ -1661,10 +1523,8 @@
         "artifact_access_mechanisms",
         "max_control_request_bytes",
         "max_control_response_bytes",
-        "max_inline_artifact_bytes",
         "max_artifact_bytes",
         "max_artifact_chunk_bytes",
-        "max_bundle_files",
         "max_artifact_refs_per_operation",
         "max_concurrent_uploads",
         "max_concurrent_downloads",
@@ -2736,18 +2596,6 @@
         "SkillArtifactSlotSpec": {
           "additionalProperties": false,
           "properties": {
-            "allowed_artifact_kinds": {
-              "items": {
-                "enum": [
-                  "blob",
-                  "bundle_manifest"
-                ],
-                "type": "string"
-              },
-              "minItems": 1,
-              "type": "array",
-              "uniqueItems": true
-            },
             "allowed_compressions": {
               "items": {
                 "minLength": 1,
@@ -2790,10 +2638,6 @@
               ],
               "type": "string"
             },
-            "inline_threshold_bytes": {
-              "minimum": 0,
-              "type": "integer"
-            },
             "max_artifact_bytes": {
               "minimum": 1,
               "type": "integer"
@@ -2810,21 +2654,6 @@
               "minimum": 0,
               "type": "integer"
             },
-            "retention_policy": {
-              "enum": [
-                "operation_bound",
-                "handoff_bound"
-              ],
-              "type": "string"
-            },
-            "sensitivity_class": {
-              "enum": [
-                "normal",
-                "sensitive",
-                "restricted"
-              ],
-              "type": "string"
-            },
             "slot_id": {
               "pattern": "^[a-z][a-z0-9_]{0,63}$",
               "type": "string"
@@ -2835,16 +2664,12 @@
             "direction",
             "min_count",
             "max_count",
-            "allowed_artifact_kinds",
             "allowed_media_types",
             "allowed_schema_ids",
             "allowed_encodings",
             "allowed_compressions",
             "max_artifact_bytes",
-            "max_total_bytes",
-            "inline_threshold_bytes",
-            "retention_policy",
-            "sensitivity_class"
+            "max_total_bytes"
           ],
           "type": "object"
         },
@@ -2853,18 +2678,6 @@
             "SkillArtifactSlotSpec": {
               "additionalProperties": false,
               "properties": {
-                "allowed_artifact_kinds": {
-                  "items": {
-                    "enum": [
-                      "blob",
-                      "bundle_manifest"
-                    ],
-                    "type": "string"
-                  },
-                  "minItems": 1,
-                  "type": "array",
-                  "uniqueItems": true
-                },
                 "allowed_compressions": {
                   "items": {
                     "minLength": 1,
@@ -2907,10 +2720,6 @@
                   ],
                   "type": "string"
                 },
-                "inline_threshold_bytes": {
-                  "minimum": 0,
-                  "type": "integer"
-                },
                 "max_artifact_bytes": {
                   "minimum": 1,
                   "type": "integer"
@@ -2927,21 +2736,6 @@
                   "minimum": 0,
                   "type": "integer"
                 },
-                "retention_policy": {
-                  "enum": [
-                    "operation_bound",
-                    "handoff_bound"
-                  ],
-                  "type": "string"
-                },
-                "sensitivity_class": {
-                  "enum": [
-                    "normal",
-                    "sensitive",
-                    "restricted"
-                  ],
-                  "type": "string"
-                },
                 "slot_id": {
                   "pattern": "^[a-z][a-z0-9_]{0,63}$",
                   "type": "string"
@@ -2952,16 +2746,12 @@
                 "direction",
                 "min_count",
                 "max_count",
-                "allowed_artifact_kinds",
                 "allowed_media_types",
                 "allowed_schema_ids",
                 "allowed_encodings",
                 "allowed_compressions",
                 "max_artifact_bytes",
-                "max_total_bytes",
-                "inline_threshold_bytes",
-                "retention_policy",
-                "sensitivity_class"
+                "max_total_bytes"
               ],
               "type": "object"
             }
@@ -3095,18 +2885,6 @@
         "SkillArtifactSlotSpec": {
           "additionalProperties": false,
           "properties": {
-            "allowed_artifact_kinds": {
-              "items": {
-                "enum": [
-                  "blob",
-                  "bundle_manifest"
-                ],
-                "type": "string"
-              },
-              "minItems": 1,
-              "type": "array",
-              "uniqueItems": true
-            },
             "allowed_compressions": {
               "items": {
                 "minLength": 1,
@@ -3149,10 +2927,6 @@
               ],
               "type": "string"
             },
-            "inline_threshold_bytes": {
-              "minimum": 0,
-              "type": "integer"
-            },
             "max_artifact_bytes": {
               "minimum": 1,
               "type": "integer"
@@ -3169,21 +2943,6 @@
               "minimum": 0,
               "type": "integer"
             },
-            "retention_policy": {
-              "enum": [
-                "operation_bound",
-                "handoff_bound"
-              ],
-              "type": "string"
-            },
-            "sensitivity_class": {
-              "enum": [
-                "normal",
-                "sensitive",
-                "restricted"
-              ],
-              "type": "string"
-            },
             "slot_id": {
               "pattern": "^[a-z][a-z0-9_]{0,63}$",
               "type": "string"
@@ -3194,16 +2953,12 @@
             "direction",
             "min_count",
             "max_count",
-            "allowed_artifact_kinds",
             "allowed_media_types",
             "allowed_schema_ids",
             "allowed_encodings",
             "allowed_compressions",
             "max_artifact_bytes",
-            "max_total_bytes",
-            "inline_threshold_bytes",
-            "retention_policy",
-            "sensitivity_class"
+            "max_total_bytes"
           ],
           "type": "object"
         }
@@ -3345,13 +3100,6 @@
               "minLength": 1,
               "type": "string"
             },
-            "artifact_kind": {
-              "enum": [
-                "blob",
-                "bundle_manifest"
-              ],
-              "type": "string"
-            },
             "artifact_ref_hash": {
               "pattern": "^[0-9a-f]{64}$",
               "type": "string"
@@ -3394,7 +3142,6 @@
           "required": [
             "protocol_version",
             "artifact_id",
-            "artifact_kind",
             "media_type",
             "schema_id",
             "encoding",
@@ -3640,13 +3387,6 @@
               "minLength": 1,
               "type": "string"
             },
-            "artifact_kind": {
-              "enum": [
-                "blob",
-                "bundle_manifest"
-              ],
-              "type": "string"
-            },
             "artifact_ref_hash": {
               "pattern": "^[0-9a-f]{64}$",
               "type": "string"
@@ -3689,7 +3429,6 @@
           "required": [
             "protocol_version",
             "artifact_id",
-            "artifact_kind",
             "media_type",
             "schema_id",
             "encoding",
@@ -4335,6 +4074,10 @@
           "minLength": 1,
           "type": "string"
         },
+        "skill_io_catalog_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
         "skill_routes": {
           "items": {
             "$ref": "#/$defs/SkillRouteManifestEntry"
@@ -4378,6 +4121,7 @@
         "execution_manifest_hash",
         "skill_definition_catalog_hash",
         "skill_schema_catalog_hash",
+        "skill_io_catalog_hash",
         "target_binding_id",
         "target_kind",
         "current_mode",
@@ -4389,6 +4133,6 @@
       "type": "object"
     }
   },
-  "snapshot_hash": "62051968520d5a18c564e163283aabb90bd029c2ff04bea06ca5a901af06eb35",
+  "snapshot_hash": "2754487bcb772495ed07117b537d7273aeddeaf96a0df109457d85454af62d08",
   "snapshot_hash_algorithm": "sha256_canonical_json_v1"
 }

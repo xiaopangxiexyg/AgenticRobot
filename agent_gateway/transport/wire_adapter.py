@@ -9,10 +9,22 @@ registered executor.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
 
+from ..protocol._contract_validation import (
+    finite_number as _finite_number,
+    nonnegative_integer as _nonnegative_integer,
+    positive_integer as _positive_integer,
+    required_text as _required,
+)
+from ..protocol.artifact_contracts import (
+    AgentArtifactMaterializationReceipt,
+    AgentArtifactRef,
+)
 from ..protocol.contracts import (
     AgentSkillRequest,
     agent_own_domain_hold_request_from_json,
@@ -20,7 +32,11 @@ from ..protocol.contracts import (
     agent_own_operation_query_from_json,
     agent_skill_request_from_json,
 )
-from ..protocol.skill_catalog import AgentSkillSchemaCatalog, SkillDefinitionCatalog
+from ..protocol.skill_catalog import (
+    AgentSkillSchemaCatalog,
+    SkillDefinitionCatalog,
+    validate_skill_route_catalog_closure,
+)
 from ..runtime.access_policy import SkillExecutionGrant
 from ..runtime.service import (
     AgentGatewayObservationOutcome,
@@ -29,20 +45,39 @@ from ..runtime.service import (
 )
 
 
-def _required(value: object, *, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be a non-empty string.")
-    if value != value.strip():
-        raise ValueError(f"{field_name} cannot contain surrounding whitespace.")
-    return value
-
-
 def _revision(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(
             "current_station_revision provider must return a non-negative integer."
         )
     return value
+
+
+def _exact_fields(payload: Mapping[str, Any], fields: set[str]) -> None:
+    if not isinstance(payload, Mapping) or set(payload) != fields:
+        raise ValueError(
+            "Gateway payload fields must match the method contract exactly."
+        )
+
+
+def _decode_base64(value: object) -> bytes:
+    if not isinstance(value, str) or not value:
+        raise ValueError("data_base64 must be a non-empty base64 string.")
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("data_base64 is not canonical base64.") from error
+
+
+def _upload_lease_to_wire(lease: Any) -> Mapping[str, Any]:
+    return {
+        "upload_id": lease.upload_id,
+        "artifact": lease.artifact.to_wire(),
+        "state": lease.state,
+        "received_bytes": lease.received_bytes,
+        "created_at": lease.created_at,
+        "expires_at": lease.expires_at,
+    }
 
 
 class BoundAgentGatewayWireAdapter:
@@ -124,6 +159,18 @@ class BoundAgentGatewayWireAdapter:
         self._operation_launcher = operation_launcher
         self._grant_resolver = grant_resolver
 
+        protocol_runtime = service.protocol_runtime
+        if protocol_runtime.io_catalog.semantic_content_hash != (
+            service.manifest.skill_io_catalog_hash
+        ):
+            raise ValueError("Skill I/O catalog does not match service manifest.")
+        validate_skill_route_catalog_closure(
+            definition_catalog=definition_catalog,
+            schema_catalog=schema_catalog,
+            route_manifest=service.manifest,
+            io_catalog=protocol_runtime.io_catalog,
+        )
+
     def _revision(self) -> int:
         return _revision(self._current_station_revision())
 
@@ -135,6 +182,19 @@ class BoundAgentGatewayWireAdapter:
                 "Payload client_id does not match authenticated connection."
             )
 
+    def _assert_session(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        fields: set[str],
+    ) -> None:
+        _exact_fields(payload, fields)
+        self._assert_client(payload)
+        if payload.get("runtime_session_id") != (
+            self.service.protocol_runtime.runtime_session_id
+        ):
+            raise PermissionError("Payload runtime_session_id does not match.")
+
     def get_skill_definition_catalog(self) -> Mapping[str, Any]:
         return self.definition_catalog.to_wire()
 
@@ -143,6 +203,240 @@ class BoundAgentGatewayWireAdapter:
 
     def get_skill_route_manifest(self) -> Mapping[str, Any]:
         return self.service.manifest.to_wire()
+
+    def get_skill_io_catalog(self) -> Mapping[str, Any]:
+        return self.service.protocol_runtime.io_catalog.to_wire()
+
+    def get_gateway_session_capabilities(self) -> Mapping[str, Any]:
+        return self.service.protocol_runtime.session_capabilities.to_wire()
+
+    def get_gateway_events(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_session(
+            payload,
+            fields={
+                "client_id",
+                "runtime_session_id",
+                "after_sequence",
+                "max_events",
+            },
+        )
+        batch = self.service.protocol_runtime.replay_events(
+            after_sequence=_nonnegative_integer(
+                payload["after_sequence"],
+                field_name="after_sequence",
+            ),
+            max_events=_positive_integer(
+                payload["max_events"],
+                field_name="max_events",
+            ),
+            operations=self.service.operation_store.operations(),
+        )
+        return batch.to_wire()
+
+    def begin_artifact_upload(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_session(
+            payload,
+            fields={
+                "client_id",
+                "runtime_session_id",
+                "idempotency_key",
+                "artifact",
+                "mechanism",
+                "ttl_sec",
+            },
+        )
+        store, broker = self.service.protocol_runtime.require_artifact_plane()
+        artifact = AgentArtifactRef.from_wire(payload["artifact"])
+        lease = store.begin_upload(
+            client_id=self.authenticated_client_id,
+            runtime_session_id=payload["runtime_session_id"],
+            idempotency_key=_required(
+                payload["idempotency_key"],
+                field_name="idempotency_key",
+            ),
+            artifact=artifact,
+            now=self.service.protocol_runtime.now(),
+        )
+        grant = None
+        if not lease.committed:
+            grant = broker.issue_write_grant(
+                lease=lease,
+                mechanism=_required(payload["mechanism"], field_name="mechanism"),
+                now=self.service.protocol_runtime.now(),
+                ttl_sec=_finite_number(payload["ttl_sec"], field_name="ttl_sec"),
+            )
+        return {
+            "upload": _upload_lease_to_wire(lease),
+            "access_grant": None if grant is None else grant.to_wire(),
+        }
+
+    def write_artifact_chunk(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_session(
+            payload,
+            fields={
+                "client_id",
+                "runtime_session_id",
+                "grant_id",
+                "offset",
+                "data_base64",
+            },
+        )
+        _store, broker = self.service.protocol_runtime.require_artifact_plane()
+        lease = broker.write_chunk(
+            grant_id=_required(payload["grant_id"], field_name="grant_id"),
+            client_id=self.authenticated_client_id,
+            runtime_session_id=payload["runtime_session_id"],
+            offset=_nonnegative_integer(payload["offset"], field_name="offset"),
+            data=_decode_base64(payload["data_base64"]),
+            now=self.service.protocol_runtime.now(),
+        )
+        return _upload_lease_to_wire(lease)
+
+    def commit_artifact_upload(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_session(
+            payload,
+            fields={"client_id", "runtime_session_id", "grant_id"},
+        )
+        _store, broker = self.service.protocol_runtime.require_artifact_plane()
+        artifact, receipt = broker.commit_write(
+            grant_id=_required(payload["grant_id"], field_name="grant_id"),
+            client_id=self.authenticated_client_id,
+            runtime_session_id=payload["runtime_session_id"],
+            now=self.service.protocol_runtime.now(),
+        )
+        return {"artifact": artifact.to_wire(), "receipt": receipt.to_wire()}
+
+    def begin_artifact_download(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_session(
+            payload,
+            fields={
+                "client_id",
+                "runtime_session_id",
+                "artifact_id",
+                "mechanism",
+                "ttl_sec",
+            },
+        )
+        _store, broker = self.service.protocol_runtime.require_artifact_plane()
+        grant = broker.issue_read_grant(
+            client_id=self.authenticated_client_id,
+            runtime_session_id=payload["runtime_session_id"],
+            artifact_id=_required(payload["artifact_id"], field_name="artifact_id"),
+            mechanism=_required(payload["mechanism"], field_name="mechanism"),
+            now=self.service.protocol_runtime.now(),
+            ttl_sec=_finite_number(payload["ttl_sec"], field_name="ttl_sec"),
+        )
+        return grant.to_wire()
+
+    def read_artifact_chunk(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_session(
+            payload,
+            fields={
+                "client_id",
+                "runtime_session_id",
+                "grant_id",
+                "offset",
+                "max_bytes",
+            },
+        )
+        _store, broker = self.service.protocol_runtime.require_artifact_plane()
+        offset = _nonnegative_integer(payload["offset"], field_name="offset")
+        data = broker.read_chunk(
+            grant_id=_required(payload["grant_id"], field_name="grant_id"),
+            client_id=self.authenticated_client_id,
+            runtime_session_id=payload["runtime_session_id"],
+            offset=offset,
+            max_bytes=_positive_integer(payload["max_bytes"], field_name="max_bytes"),
+            now=self.service.protocol_runtime.now(),
+        )
+        return {
+            "offset": offset,
+            "byte_length": len(data),
+            "data_base64": base64.b64encode(data).decode("ascii"),
+        }
+
+    def acknowledge_artifact_download(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_session(
+            payload,
+            fields={
+                "client_id",
+                "runtime_session_id",
+                "grant_id",
+                "transferred_bytes",
+                "verified_sha256",
+            },
+        )
+        _store, broker = self.service.protocol_runtime.require_artifact_plane()
+        receipt = broker.acknowledge_read(
+            grant_id=_required(payload["grant_id"], field_name="grant_id"),
+            client_id=self.authenticated_client_id,
+            runtime_session_id=payload["runtime_session_id"],
+            transferred_bytes=_nonnegative_integer(
+                payload["transferred_bytes"],
+                field_name="transferred_bytes",
+            ),
+            verified_sha256=_required(
+                payload["verified_sha256"],
+                field_name="verified_sha256",
+            ),
+            now=self.service.protocol_runtime.now(),
+        )
+        return receipt.to_wire()
+
+    def acknowledge_artifact_materialization(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_session(
+            payload,
+            fields={
+                "client_id",
+                "runtime_session_id",
+                "receipt_id",
+                "artifact_id",
+                "durable_store_id",
+                "durable_object_ref",
+                "materialized_at",
+                "verified_sha256",
+                "materialization_receipt_hash",
+            },
+        )
+        store, _broker = self.service.protocol_runtime.require_artifact_plane()
+        receipt = AgentArtifactMaterializationReceipt(
+            receipt_id=payload["receipt_id"],
+            artifact_id=payload["artifact_id"],
+            client_id=self.authenticated_client_id,
+            runtime_session_id=payload["runtime_session_id"],
+            durable_store_id=payload["durable_store_id"],
+            durable_object_ref=payload["durable_object_ref"],
+            materialized_at=payload["materialized_at"],
+            verified_sha256=payload["verified_sha256"],
+        )
+        if payload["materialization_receipt_hash"] != (receipt.semantic_content_hash):
+            raise ValueError("Materialization receipt hash does not match.")
+        store.record_materialization(receipt)
+        return receipt.to_wire()
 
     def get_observation_snapshot(self) -> Mapping[str, Any]:
         outcome = self._publish_observation()

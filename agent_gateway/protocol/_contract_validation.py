@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from pathlib import PurePosixPath
 import re
 from types import MappingProxyType
 from typing import Any
@@ -137,21 +136,6 @@ def unique_sorted_text(
     if len(set(normalized)) != len(normalized):
         raise ValueError(f"{field_name} must not contain duplicates.")
     return tuple(sorted(normalized))
-
-
-def normalized_relative_path(value: object, *, field_name: str) -> str:
-    normalized = required_text(value, field_name=field_name, maximum_length=1024)
-    if "\\" in normalized:
-        raise ValueError(f"{field_name} must use POSIX separators.")
-    path = PurePosixPath(normalized)
-    if (
-        path.is_absolute()
-        or ".." in path.parts
-        or path.as_posix() in {"", "."}
-        or path.as_posix() != normalized
-    ):
-        raise ValueError(f"{field_name} must be a normalized relative POSIX path.")
-    return normalized
 
 
 def freeze_json(value: Any, *, field_name: str, depth: int = 0) -> Any:

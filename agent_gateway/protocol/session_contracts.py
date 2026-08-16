@@ -99,10 +99,8 @@ class AgentGatewaySessionCapabilities:
     artifact_access_mechanisms: tuple[str, ...]
     max_control_request_bytes: int
     max_control_response_bytes: int
-    max_inline_artifact_bytes: int
     max_artifact_bytes: int
     max_artifact_chunk_bytes: int
-    max_bundle_files: int
     max_artifact_refs_per_operation: int
     max_concurrent_uploads: int
     max_concurrent_downloads: int
@@ -146,10 +144,8 @@ class AgentGatewaySessionCapabilities:
                 positive_integer(getattr(self, field_name), field_name=field_name),
             )
         artifact_limits = (
-            "max_inline_artifact_bytes",
             "max_artifact_bytes",
             "max_artifact_chunk_bytes",
-            "max_bundle_files",
             "max_artifact_refs_per_operation",
             "max_concurrent_uploads",
             "max_concurrent_downloads",
@@ -176,10 +172,6 @@ class AgentGatewaySessionCapabilities:
         elif mechanisms or any(getattr(self, name) != 0 for name in artifact_limits):
             raise ValueError(
                 "Artifact-disabled sessions require empty mechanisms and zero limits."
-            )
-        if self.max_inline_artifact_bytes > self.max_artifact_bytes:
-            raise ValueError(
-                "max_inline_artifact_bytes cannot exceed max_artifact_bytes."
             )
         if self.max_artifact_chunk_bytes > self.max_artifact_bytes:
             raise ValueError(
@@ -219,10 +211,8 @@ class AgentGatewaySessionCapabilities:
             artifact_access_mechanisms=(),
             max_control_request_bytes=max_control_request_bytes,
             max_control_response_bytes=max_control_response_bytes,
-            max_inline_artifact_bytes=0,
             max_artifact_bytes=0,
             max_artifact_chunk_bytes=0,
-            max_bundle_files=0,
             max_artifact_refs_per_operation=0,
             max_concurrent_uploads=0,
             max_concurrent_downloads=0,
@@ -241,10 +231,8 @@ class AgentGatewaySessionCapabilities:
             ),
             "max_control_request_bytes": self.max_control_request_bytes,
             "max_control_response_bytes": self.max_control_response_bytes,
-            "max_inline_artifact_bytes": self.max_inline_artifact_bytes,
             "max_artifact_bytes": self.max_artifact_bytes,
             "max_artifact_chunk_bytes": self.max_artifact_chunk_bytes,
-            "max_bundle_files": self.max_bundle_files,
             "max_artifact_refs_per_operation": (
                 self.max_artifact_refs_per_operation
             ),
@@ -299,10 +287,8 @@ def agent_session_wire_schemas_v2() -> dict[str, dict[str, Any]]:
             },
             "max_control_request_bytes": {"type": "integer", "minimum": 1},
             "max_control_response_bytes": {"type": "integer", "minimum": 1},
-            "max_inline_artifact_bytes": {"type": "integer", "minimum": 0},
             "max_artifact_bytes": {"type": "integer", "minimum": 0},
             "max_artifact_chunk_bytes": {"type": "integer", "minimum": 0},
-            "max_bundle_files": {"type": "integer", "minimum": 0},
             "max_artifact_refs_per_operation": {
                 "type": "integer",
                 "minimum": 0,
@@ -321,10 +307,8 @@ def agent_session_wire_schemas_v2() -> dict[str, dict[str, Any]]:
             "artifact_access_mechanisms",
             "max_control_request_bytes",
             "max_control_response_bytes",
-            "max_inline_artifact_bytes",
             "max_artifact_bytes",
             "max_artifact_chunk_bytes",
-            "max_bundle_files",
             "max_artifact_refs_per_operation",
             "max_concurrent_uploads",
             "max_concurrent_downloads",
