@@ -4,7 +4,11 @@ import numpy as np
 
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand
-from teleop_runtime.session import TeleopSession, TeleopSessionConfig
+from teleop_runtime.session import (
+    TeleopCommandOverride,
+    TeleopSession,
+    TeleopSessionConfig,
+)
 
 
 def _command(*, source: str, timestamp: float | None = None) -> TeleopCommand:
@@ -148,6 +152,34 @@ def test_override_uses_existing_filter_guard_admission_and_dispatch_path() -> No
     assert step.command.metadata["tcp_mode"] == "tool_tcp"
     assert step.command_dispatched is True
     assert len(rig.sent) == 1
+    assert rig.holds == []
+
+
+def test_claimed_commandless_override_inhibits_human_fallback() -> None:
+    rig = _Rig()
+    retargeter = _HumanRetargeter()
+    session = TeleopSession(
+        config=TeleopSessionConfig(
+            record_enabled=False,
+            allow_hardware_after_debug_pass=False,
+        ),
+        retargeters=[retargeter],
+        rig=rig,
+        command_override_provider=(
+            lambda observation, now: TeleopCommandOverride(command=None)
+        ),
+    )
+    try:
+        _arm(session)
+        step = session.run_step(now=2.5)
+    finally:
+        session.close()
+
+    assert retargeter.calls == 0
+    assert step.state == TeleopRunState.ARMED
+    assert step.command is None
+    assert step.command_dispatched is False
+    assert rig.sent == []
     assert rig.holds == []
 
 

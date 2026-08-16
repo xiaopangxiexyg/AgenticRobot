@@ -113,6 +113,23 @@ class SessionStepResult:
     home_recalibration_required: bool = False
 
 
+@dataclass(frozen=True)
+class TeleopCommandOverride:
+    """Explicitly claim one Session frame, with or without a command.
+
+    A bare ``None`` from ``command_override_provider`` means the provider is
+    inactive and the normal human path should run.  This wrapper with
+    ``command=None`` instead inhibits the frame without falling back to human
+    input, which closes activation/cancellation races for external owners.
+    """
+
+    command: TeleopCommand | None
+
+    def __post_init__(self) -> None:
+        if self.command is not None and not isinstance(self.command, TeleopCommand):
+            raise TypeError("TeleopCommandOverride.command must be TeleopCommand or None.")
+
+
 class TeleopSession:
     def __init__(
         self,
@@ -137,7 +154,8 @@ class TeleopSession:
         ]
         | None = None,
         command_override_provider: Callable[
-            [TeleopObservation, float], TeleopCommand | None
+            [TeleopObservation, float],
+            TeleopCommandOverride | TeleopCommand | None,
         ]
         | None = None,
         fault_filter: Callable[
@@ -1068,16 +1086,23 @@ class TeleopSession:
         observation = self._build_observation(channels, current_time)
         mark_phase("session.build_observation")
         command: TeleopCommand | None = None
+        command_override_claimed = False
         if self.command_override_provider is not None:
             self._current_human_command_emission = None
             try:
-                command = self.command_override_provider(
+                override = self.command_override_provider(
                     observation,
                     current_time,
                 )
+                if isinstance(override, TeleopCommandOverride):
+                    command_override_claimed = True
+                    command = override.command
+                else:
+                    command = override
                 if command is not None and not isinstance(command, TeleopCommand):
                     raise TypeError(
-                        "command_override_provider must return TeleopCommand or None."
+                        "command_override_provider must return TeleopCommandOverride, "
+                        "TeleopCommand, or None."
                     )
             except Exception as exc:  # noqa: BLE001 - external source must fail closed.
                 fault = self._reject_command_override_provider_error(
@@ -1096,6 +1121,17 @@ class TeleopSession:
                     faults=faults,
                 )
             mark_phase("session.command_override_provider")
+        if command_override_claimed and command is None:
+            mark_phase("session.command_override_inhibited")
+            return self._step_result(
+                timestamp=current_time,
+                state=self.state_machine.state,
+                control_hz=control_hz,
+                channels=channels,
+                raw_channels=raw_channels,
+                observation=observation,
+                faults=faults,
+            )
         if command is None:
             command = self._build_command(
                 observation,
