@@ -263,6 +263,12 @@ from .arm_backend_runtime import (
     resolve_arm_step_dt_max_scale,
     resolve_position_reference_and_command_hz as _resolve_position_reference_and_command_hz,
 )
+from .arm_safety_runtime import (
+    emergency_stop_deploy_arm_backends,
+    emergency_stop_position_deploy_on_keyboard_interrupt as _emergency_stop_position_deploy_on_keyboard_interrupt,
+    hold_deploy_arm_backends,
+    request_policy_inference_soft_hold,
+)
 from .arm_state_reader import ArmStateReader
 from .camera_runtime import (
     DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC,
@@ -336,7 +342,6 @@ from .impedance_force_guard import (
     ImpedanceForceGuardConfig,
     ImpedanceForceGuardFault,
     ImpedanceForceGuardMonitor,
-    bimanual_emergency_stop,
 )
 from .impedance_runtime import (
     enable_impedance_force_control_backends,
@@ -3394,91 +3399,20 @@ def resolve_effective_policy_hz(
     return float(action_hz), "action_hz"
 
 
-def hold_deploy_arm_backends(
-    arm_backends: Mapping[str, EffectorBackend],
-    *,
-    reason: str,
-) -> None:
-    """Request all configured real arm backends to hold before reporting errors."""
-
-    errors: list[str] = []
-    for side, backend in arm_backends.items():
-        try:
-            backend.hold_motion(str(reason))
-        except Exception as exc:  # noqa: BLE001 - attempt every active side.
-            errors.append(f"{side}: {type(exc).__name__}: {exc}")
-    if errors:
-        raise RuntimeError("deploy arm hold failed: " + "; ".join(errors))
-
-
-def request_policy_inference_soft_hold(
-    arm_backends: Mapping[str, EffectorBackend],
-    *,
-    reason: str,
-) -> dict[str, dict[str, object]]:
-    """Freeze measured arm state while synchronous policy inference is pending.
-
-    The hook is optional so position-only and non-RM65 backends retain their
-    existing semantics.  An implemented backend must fail closed when it
-    cannot produce a valid measured snapshot.
-    """
-
-    receipts: dict[str, dict[str, object]] = {}
-    for side, backend in arm_backends.items():
-        request = getattr(backend, "request_policy_inference_soft_hold", None)
-        if not callable(request):
-            receipts[str(side)] = {
-                "active": False,
-                "status": "unsupported",
-                "backend_type": type(backend).__name__,
-            }
-            continue
-        receipt = request(str(reason))
-        receipts[str(side)] = dict(receipt or {})
-    return receipts
-
-
-def emergency_stop_deploy_arm_backends(
-    arm_backends: Mapping[str, EffectorBackend],
-    *,
-    reason: str,
-) -> None:
-    """Request a concurrent, latched emergency stop on every active arm."""
-
-    errors = bimanual_emergency_stop(arm_backends, reason=str(reason))
-    if errors:
-        raise RuntimeError(
-            "deploy bimanual emergency stop was not acknowledged by all active arms: "
-            + "; ".join(f"{side}={detail}" for side, detail in sorted(errors.items()))
-        )
-
-
 def emergency_stop_position_deploy_on_keyboard_interrupt(
     args: argparse.Namespace,
     *,
     send_actions: bool,
     arm_backends: Mapping[str, EffectorBackend],
 ) -> bool:
-    """Request Arm_Stop for an active real-position deployment.
+    """Compatibility wrapper preserving the run_policy monkeypatch seam."""
 
-    Returns False for dry-run, arm-disabled, non-position, or backend-free
-    processes so Ctrl+C retains its ordinary resource-cleanup behavior there.
-    Any incomplete real-arm acknowledgement is intentionally propagated.
-    """
-
-    if not (
-        bool(send_actions)
-        and bool(getattr(args, "arms_enabled", False))
-        and normalize_rm65_arm_control_mode(getattr(args, "arm_control_mode", None))
-        == RM65_ARM_CONTROL_MODE_POSITION
-        and arm_backends
-    ):
-        return False
-    emergency_stop_deploy_arm_backends(
-        arm_backends,
-        reason="keyboard_interrupt",
+    return _emergency_stop_position_deploy_on_keyboard_interrupt(
+        args,
+        send_actions=send_actions,
+        arm_backends=arm_backends,
+        emergency_stop=emergency_stop_deploy_arm_backends,
     )
-    return True
 
 
 def build_hand_backends(
