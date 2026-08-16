@@ -114,8 +114,13 @@ def test_target_preparation_legacy_exports_are_identity_preserving() -> None:
     source = """
 import sim.mujoco.deploy as deploy
 from sim.mujoco.deploy import sim_hil_target
+from sim.mujoco.deploy import target_config
 from sim.mujoco.deploy import target_preparation
 
+assert (
+    target_preparation.MujocoSimHILTargetConfig
+    is target_config.MujocoSimHILTargetConfig
+)
 names = (
     "MujocoSimHILPreparedTarget",
     "MujocoSimHILTargetConfig",

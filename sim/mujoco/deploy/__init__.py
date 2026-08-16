@@ -48,9 +48,9 @@ from .sim_hil_target import (
     MujocoSimHILTarget,
     build_mujoco_sim_hil_target,
 )
+from .target_config import MujocoSimHILTargetConfig
 from .target_preparation import (
     MujocoSimHILPreparedTarget,
-    MujocoSimHILTargetConfig,
     prepare_mujoco_sim_hil_target,
 )
 from .target_measurement import (

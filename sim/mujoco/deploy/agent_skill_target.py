@@ -9,9 +9,9 @@ from typing import Any, Callable, Mapping
 from robot_motion.action import ExecutionObservationSink
 from robot_motion.coordinate_profiles import TargetFrameProfile, ToolFrameProfile
 
+from .target_config import MujocoSimHILTargetConfig
 from .target_preparation import (
     MujocoSimHILPreparedTarget,
-    MujocoSimHILTargetConfig,
     prepare_mujoco_sim_hil_target,
 )
 from .target_measurement import (

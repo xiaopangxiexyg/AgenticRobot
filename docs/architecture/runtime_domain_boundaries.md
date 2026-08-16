@@ -60,6 +60,9 @@ lower domains must not import application/profile layers
 - 两类 target 共用的 scene load/reset、actuation/timing profile 与 prepared-resource 生命周期由
   `sim.mujoco.deploy.target_preparation` 持有；`sim_hil_target` 和 `agent_skill_target` 都只在已准备资源上
   绑定各自 runtime，旧配置、prepared target 和 prepare 函数导出保持 identity 不变。
+- 两类 target 共用、但不执行资源生命周期的选择 contract 由 `sim.mujoco.deploy.target_config` 单独持有；
+  preparation 与两个 runtime factory 均依赖该配置，旧 `sim_hil_target`、`target_preparation` 和 package-root
+  配置导出仍指向同一类型。
 - deterministic async composition harness 已移到 `tests/support/mujoco_async_topology.py`，不再作为
   `sim.mujoco.deploy` 的运行时导出或发布内容。
 - `sim/mujoco/deploy/composition_binding.py` 现在集中构造可选 composition runtime、retention 和 trace
