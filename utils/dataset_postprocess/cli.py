@@ -28,6 +28,12 @@ from .camera_semantic_prepared_view import (
     plan_invalid_camera_prepared_view_quarantine,
     quarantine_invalid_camera_prepared_view,
 )
+from .camera_semantic_promotion import (
+    plan_camera_semantic_promotion,
+    plan_camera_semantic_promotion_rollback,
+    promote_camera_semantic_dataset,
+    rollback_camera_semantic_promotion,
+)
 from .causal_align import causal_align_dataset, plan_causal_align
 from .delete_episodes import delete_episodes, plan_episode_deletion
 from .fault_nan_tail import detect_fault_nan_tail
@@ -289,6 +295,42 @@ def _cmd_camera_semantic_quarantine_invalid_view(
             expected_plan_hash=str(args.expected_plan_hash or ""),
         )
     _print_json({**plan.to_dict(), "applied": bool(args.apply)})
+    return 0
+
+
+def _cmd_camera_semantic_promote(args: argparse.Namespace) -> int:
+    plan = plan_camera_semantic_promotion(
+        args.dataset_root,
+        args.corrected_root,
+        args.retirement_root,
+        args.registry,
+    )
+    if bool(args.apply):
+        result = promote_camera_semantic_dataset(
+            args.dataset_root,
+            args.corrected_root,
+            args.retirement_root,
+            args.registry,
+            expected_plan_hash=str(args.expected_plan_hash or ""),
+            confirm_no_active_readers=bool(args.confirm_no_active_readers),
+        )
+        _print_json(result)
+    else:
+        _print_json(plan.to_dict())
+    return 0
+
+
+def _cmd_camera_semantic_rollback_promotion(args: argparse.Namespace) -> int:
+    plan = plan_camera_semantic_promotion_rollback(args.transaction_path)
+    if bool(args.apply):
+        result = rollback_camera_semantic_promotion(
+            args.transaction_path,
+            expected_plan_hash=str(args.expected_plan_hash or ""),
+            confirm_no_active_readers=bool(args.confirm_no_active_readers),
+        )
+        _print_json(result)
+    else:
+        _print_json(plan.to_dict())
     return 0
 
 
@@ -759,6 +801,38 @@ def build_parser() -> argparse.ArgumentParser:
     camera_quarantine.add_argument("--apply", action="store_true")
     camera_quarantine.set_defaults(
         func=_cmd_camera_semantic_quarantine_invalid_view
+    )
+
+    camera_promote = subparsers.add_parser(
+        "camera-semantics-promote",
+        help=(
+            "Atomically retire a proven swapped full dataset and promote its "
+            "independent, self-contained canonical materialization."
+        ),
+    )
+    camera_promote.add_argument("dataset_root")
+    camera_promote.add_argument("--corrected-root", required=True)
+    camera_promote.add_argument("--retirement-root", required=True)
+    camera_promote.add_argument("--registry", required=True)
+    camera_promote.add_argument("--expected-plan-hash", default="")
+    camera_promote.add_argument(
+        "--confirm-no-active-readers", action="store_true"
+    )
+    camera_promote.add_argument("--apply", action="store_true")
+    camera_promote.set_defaults(func=_cmd_camera_semantic_promote)
+
+    camera_rollback = subparsers.add_parser(
+        "camera-semantics-rollback-promotion",
+        help="Atomically restore a completed camera-semantic promotion.",
+    )
+    camera_rollback.add_argument("transaction_path")
+    camera_rollback.add_argument("--expected-plan-hash", default="")
+    camera_rollback.add_argument(
+        "--confirm-no-active-readers", action="store_true"
+    )
+    camera_rollback.add_argument("--apply", action="store_true")
+    camera_rollback.set_defaults(
+        func=_cmd_camera_semantic_rollback_promotion
     )
 
     default_postprocess = subparsers.add_parser(

@@ -1,0 +1,556 @@
+"""Atomic promotion and rollback for complete camera-semantic datasets."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import fcntl
+import json
+import os
+from pathlib import Path
+from typing import Any, Mapping
+
+from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_interface.camera_semantics import (
+    CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH,
+    DatasetCameraSemanticResolver,
+    load_camera_role_binding,
+)
+from dataset_interface.validation import validate_v23_dataset
+
+from .camera_semantic_materialize import (
+    _episode_records,
+    _fsync_directory,
+    _source_inventory,
+    _validate_dataset_videos,
+    _write_json_fsync,
+)
+from .io import read_json
+from .modality_storage import modality_storage_status
+
+
+PROMOTION_PLAN_SCHEMA = "dexteleop.camera_semantic_promotion_plan.v1"
+PROMOTION_PLAN_DOMAIN = PROMOTION_PLAN_SCHEMA
+PROMOTION_TRANSACTION_SCHEMA = "dexteleop.camera_semantic_promotion_transaction.v1"
+PROMOTION_TRANSACTION_DOMAIN = PROMOTION_TRANSACTION_SCHEMA
+ROLLBACK_PLAN_SCHEMA = "dexteleop.camera_semantic_promotion_rollback_plan.v1"
+ROLLBACK_PLAN_DOMAIN = ROLLBACK_PLAN_SCHEMA
+
+
+class CameraSemanticPromotionError(RuntimeError):
+    """Raised when a corrected dataset cannot be promoted or rolled back safely."""
+
+
+def _root(path: str | Path, *, label: str) -> Path:
+    lexical = Path(path).expanduser()
+    if lexical.is_symlink():
+        raise CameraSemanticPromotionError(f"{label} must not be a symlink: {lexical}")
+    try:
+        resolved = lexical.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise CameraSemanticPromotionError(f"{label} is missing: {lexical}") from exc
+    if not resolved.is_dir():
+        raise CameraSemanticPromotionError(f"{label} is not a directory: {resolved}")
+    return resolved
+
+
+def _future_root(path: str | Path, *, label: str) -> Path:
+    lexical = Path(path).expanduser()
+    if lexical.is_symlink():
+        raise CameraSemanticPromotionError(f"{label} must not be a symlink: {lexical}")
+    return lexical.resolve(strict=False)
+
+
+def _existing_ancestor(path: Path) -> Path:
+    cursor = path
+    while not cursor.exists():
+        if cursor.parent == cursor:
+            raise CameraSemanticPromotionError(
+                f"Cannot resolve an existing filesystem ancestor for {path}"
+            )
+        cursor = cursor.parent
+    if cursor.is_symlink() or not cursor.is_dir():
+        raise CameraSemanticPromotionError(
+            f"Promotion ancestor is missing or unsafe: {cursor}"
+        )
+    return cursor.resolve()
+
+
+def _file_inodes(root: Path) -> set[tuple[int, int]]:
+    output: set[tuple[int, int]] = set()
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise CameraSemanticPromotionError(
+                f"Promotion refuses dataset symlinks: {path}"
+            )
+        if path.is_file():
+            metadata = path.stat()
+            output.add((int(metadata.st_dev), int(metadata.st_ino)))
+    return output
+
+
+def _episode_indices(root: Path) -> tuple[int, ...]:
+    return tuple(int(row["episode_index"]) for row in _episode_records(root))
+
+
+def _materialization_receipt(corrected: Path) -> Mapping[str, Any]:
+    path = corrected / CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH
+    if path.is_symlink() or not path.is_file():
+        raise CameraSemanticPromotionError(
+            f"Corrected dataset has no safe materialization receipt: {path}"
+        )
+    value = read_json(path)
+    if not isinstance(value, Mapping):
+        raise CameraSemanticPromotionError("Materialization receipt must be an object")
+    return value
+
+
+def _require_v23(root: Path, *, label: str) -> tuple[int, int, int]:
+    report = validate_v23_dataset(root)
+    if not report.ok:
+        raise CameraSemanticPromotionError(
+            f"{label} strict v2.3 validation failed: {report.errors[:5]}"
+        )
+    episodes = _episode_records(root)
+    video_count, decoded_frames = _validate_dataset_videos(root, episodes)
+    return int(report.frame_count), int(video_count), int(decoded_frames)
+
+
+def _require_modality_pair(source: Path, corrected: Path) -> tuple[str, str]:
+    source_status = modality_storage_status(source)
+    corrected_status = modality_storage_status(corrected)
+    for label, status in (("source", source_status), ("corrected", corrected_status)):
+        if str(status.get("status")) != "SELF_CONTAINED":
+            raise CameraSemanticPromotionError(
+                f"{label} tactile must be SELF_CONTAINED: {status}"
+            )
+        if bool(status.get("pending_transaction")):
+            raise CameraSemanticPromotionError(
+                f"{label} tactile has a pending storage transaction"
+            )
+        if not bool(status.get("tactile_read_eligible")):
+            raise CameraSemanticPromotionError(
+                f"{label} tactile is not reader eligible"
+            )
+    source_inventory = str(source_status.get("inventory_hash") or "")
+    corrected_inventory = str(corrected_status.get("inventory_hash") or "")
+    if not source_inventory or source_inventory != corrected_inventory:
+        raise CameraSemanticPromotionError(
+            "Source and corrected datasets do not bind the same tactile inventory"
+        )
+    return source_inventory, str(source_status.get("detachment_scope") or "")
+
+
+@dataclass(frozen=True)
+class CameraSemanticPromotionPlan:
+    source_root: str
+    corrected_root: str
+    retirement_root: str
+    retired_dataset_root: str
+    registry_path: str
+    binding_hash: str
+    materialization_receipt_hash: str
+    materialization_plan_hash: str
+    tactile_inventory_hash: str
+    source_inventory_hash: str
+    corrected_inventory_hash: str
+    source_root_device: int
+    source_root_inode: int
+    corrected_root_device: int
+    corrected_root_inode: int
+    source_file_count: int
+    corrected_file_count: int
+    source_hardlinked_file_count: int
+    corrected_hardlinked_file_count: int
+    shared_file_inode_count: int
+    episode_count: int
+    frame_count: int
+    source_video_count: int
+    corrected_video_count: int
+    source_decoded_video_frames: int
+    corrected_decoded_video_frames: int
+
+    @property
+    def plan_hash(self) -> str:
+        return canonical_content_hash(
+            self.to_dict(include_hash=False), domain=PROMOTION_PLAN_DOMAIN
+        )
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        payload = {"schema": PROMOTION_PLAN_SCHEMA, **asdict(self)}
+        if include_hash:
+            payload["plan_hash"] = self.plan_hash
+        return payload
+
+
+def plan_camera_semantic_promotion(
+    source_root: str | Path,
+    corrected_root: str | Path,
+    retirement_root: str | Path,
+    registry_path: str | Path,
+) -> CameraSemanticPromotionPlan:
+    source = _root(source_root, label="source_root")
+    corrected = _root(corrected_root, label="corrected_root")
+    retirement = _future_root(retirement_root, label="retirement_root")
+    registry = Path(registry_path).expanduser().resolve(strict=True)
+    if registry.is_symlink() or not registry.is_file():
+        raise CameraSemanticPromotionError(f"Registry is missing or unsafe: {registry}")
+    if source == corrected or source in corrected.parents or corrected in source.parents:
+        raise CameraSemanticPromotionError("Source and corrected roots must be disjoint")
+    if (
+        retirement == source
+        or retirement == corrected
+        or source in retirement.parents
+        or corrected in retirement.parents
+        or retirement in source.parents
+        or retirement in corrected.parents
+    ):
+        raise CameraSemanticPromotionError("Retirement root must be disjoint")
+
+    binding = load_camera_role_binding(registry)
+    receipt = _materialization_receipt(corrected)
+    # Resolver construction validates receipt schema/hash/completeness and the
+    # corrected output snapshot before any promotion can be planned.
+    corrected_resolver = DatasetCameraSemanticResolver(corrected, binding)
+    source_resolver = DatasetCameraSemanticResolver(source, binding)
+    source_indices = _episode_indices(source)
+    corrected_indices = _episode_indices(corrected)
+    if source_indices != corrected_indices:
+        raise CameraSemanticPromotionError("Source/corrected episode coverage differs")
+    declared_indices = tuple(sorted(int(value) for value in receipt.get("episode_indices", ())))
+    if source_indices != declared_indices:
+        raise CameraSemanticPromotionError("Materialization receipt episode coverage differs")
+    if Path(str(receipt.get("source_root") or "")).expanduser().resolve() != source:
+        raise CameraSemanticPromotionError("Materialization receipt points to another source")
+
+    declared_resolutions = {
+        int(item["episode_index"]): item
+        for item in receipt.get("source_resolutions", ())
+    }
+    for episode_index in source_indices:
+        source_resolution = source_resolver.resolution_for_episode(episode_index)
+        corrected_resolution = corrected_resolver.resolution_for_episode(episode_index)
+        if source_resolution.status != "swapped":
+            raise CameraSemanticPromotionError(
+                f"Source episode {episode_index} is not proven swapped"
+            )
+        if corrected_resolution.status != "identity":
+            raise CameraSemanticPromotionError(
+                f"Corrected episode {episode_index} is not canonical identity"
+            )
+        declared = declared_resolutions.get(episode_index)
+        if (
+            not isinstance(declared, Mapping)
+            or str(declared.get("resolution_hash") or "")
+            != source_resolution.semantic_content_hash
+        ):
+            raise CameraSemanticPromotionError(
+                f"Source episode {episode_index} differs from its materialization receipt"
+            )
+
+    source_frames, source_videos, source_decoded = _require_v23(
+        source, label="source"
+    )
+    corrected_frames, corrected_videos, corrected_decoded = _require_v23(
+        corrected, label="corrected"
+    )
+    if source_frames != corrected_frames:
+        raise CameraSemanticPromotionError("Source/corrected frame counts differ")
+    tactile_inventory, _ = _require_modality_pair(source, corrected)
+    source_files, source_inventory, _, source_hardlinks = _source_inventory(source)
+    corrected_files, corrected_inventory, _, corrected_hardlinks = _source_inventory(
+        corrected
+    )
+    shared_inodes = _file_inodes(source) & _file_inodes(corrected)
+    if source_hardlinks or corrected_hardlinks or shared_inodes:
+        raise CameraSemanticPromotionError(
+            "Promotion requires independent single-link trees: "
+            f"source_hardlinks={source_hardlinks} "
+            f"corrected_hardlinks={corrected_hardlinks} "
+            f"shared_inodes={len(shared_inodes)}"
+        )
+
+    source_stat = source.stat()
+    corrected_stat = corrected.stat()
+    ancestor = _existing_ancestor(retirement)
+    if len({int(source_stat.st_dev), int(corrected_stat.st_dev), int(ancestor.stat().st_dev)}) != 1:
+        raise CameraSemanticPromotionError(
+            "Promotion requires source, corrected, and retirement on one filesystem"
+        )
+    receipt_hash = str(receipt.get("receipt_hash") or "")
+    retired = retirement / f"{source.name}.swapped-{receipt_hash[:12]}"
+    if retired.exists() or retired.is_symlink():
+        raise CameraSemanticPromotionError(
+            f"Retirement destination already exists: {retired}"
+        )
+    return CameraSemanticPromotionPlan(
+        source_root=str(source),
+        corrected_root=str(corrected),
+        retirement_root=str(retirement),
+        retired_dataset_root=str(retired),
+        registry_path=str(registry),
+        binding_hash=binding.contract_hash,
+        materialization_receipt_hash=receipt_hash,
+        materialization_plan_hash=str(receipt.get("plan_hash") or ""),
+        tactile_inventory_hash=tactile_inventory,
+        source_inventory_hash=source_inventory,
+        corrected_inventory_hash=corrected_inventory,
+        source_root_device=int(source_stat.st_dev),
+        source_root_inode=int(source_stat.st_ino),
+        corrected_root_device=int(corrected_stat.st_dev),
+        corrected_root_inode=int(corrected_stat.st_ino),
+        source_file_count=len(source_files),
+        corrected_file_count=len(corrected_files),
+        source_hardlinked_file_count=source_hardlinks,
+        corrected_hardlinked_file_count=corrected_hardlinks,
+        shared_file_inode_count=len(shared_inodes),
+        episode_count=len(source_indices),
+        frame_count=source_frames,
+        source_video_count=source_videos,
+        corrected_video_count=corrected_videos,
+        source_decoded_video_frames=source_decoded,
+        corrected_decoded_video_frames=corrected_decoded,
+    )
+
+
+def _transaction_payload(plan: CameraSemanticPromotionPlan, *, state: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema": PROMOTION_TRANSACTION_SCHEMA,
+        "state": state,
+        "plan": plan.to_dict(),
+    }
+    payload["transaction_hash"] = canonical_content_hash(
+        payload, domain=PROMOTION_TRANSACTION_DOMAIN
+    )
+    return payload
+
+
+def _root_inode(path: Path) -> int | None:
+    try:
+        return int(path.stat().st_ino) if path.is_dir() and not path.is_symlink() else None
+    except FileNotFoundError:
+        return None
+
+
+def _rollback_failed_apply(plan: CameraSemanticPromotionPlan) -> None:
+    source = Path(plan.source_root)
+    corrected = Path(plan.corrected_root)
+    retired = Path(plan.retired_dataset_root)
+    source_inode = _root_inode(source)
+    corrected_inode = _root_inode(corrected)
+    retired_inode = _root_inode(retired)
+    if (
+        source_inode == plan.corrected_root_inode
+        and corrected_inode is None
+        and retired_inode == plan.source_root_inode
+    ):
+        os.replace(source, corrected)
+        os.replace(retired, source)
+    elif (
+        source_inode is None
+        and corrected_inode == plan.corrected_root_inode
+        and retired_inode == plan.source_root_inode
+    ):
+        os.replace(retired, source)
+
+
+def promote_camera_semantic_dataset(
+    source_root: str | Path,
+    corrected_root: str | Path,
+    retirement_root: str | Path,
+    registry_path: str | Path,
+    *,
+    expected_plan_hash: str,
+    confirm_no_active_readers: bool,
+) -> dict[str, Any]:
+    plan = plan_camera_semantic_promotion(
+        source_root, corrected_root, retirement_root, registry_path
+    )
+    if plan.plan_hash != str(expected_plan_hash):
+        raise CameraSemanticPromotionError("Promotion plan hash changed")
+    if not confirm_no_active_readers:
+        raise CameraSemanticPromotionError(
+            "Promotion requires explicit confirmation of no active readers"
+        )
+    retirement = Path(plan.retirement_root)
+    retirement.mkdir(parents=True, exist_ok=True)
+    transaction_dir = retirement / ".transactions"
+    transaction_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = retirement / ".promotion.lock"
+    transaction_path = transaction_dir / f"{plan.plan_hash}.json"
+    with lock_path.open("a+b") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CameraSemanticPromotionError("Another promotion is active") from exc
+        fresh = plan_camera_semantic_promotion(
+            source_root, corrected_root, retirement_root, registry_path
+        )
+        if fresh.plan_hash != plan.plan_hash:
+            raise CameraSemanticPromotionError("Promotion plan changed after locking")
+        if transaction_path.exists():
+            raise CameraSemanticPromotionError(
+                f"Promotion transaction already exists: {transaction_path}"
+            )
+        _write_json_fsync(transaction_path, _transaction_payload(plan, state="prepared"))
+        source = Path(plan.source_root)
+        corrected = Path(plan.corrected_root)
+        retired = Path(plan.retired_dataset_root)
+        try:
+            os.replace(source, retired)
+            _fsync_directory(source.parent)
+            _fsync_directory(retired.parent)
+            _write_json_fsync(
+                transaction_path, _transaction_payload(plan, state="source_retired")
+            )
+            os.replace(corrected, source)
+            _fsync_directory(corrected.parent)
+            _fsync_directory(source.parent)
+            if (
+                _root_inode(source) != plan.corrected_root_inode
+                or _root_inode(retired) != plan.source_root_inode
+            ):
+                raise CameraSemanticPromotionError("Post-promotion root inode mismatch")
+            completed = _transaction_payload(plan, state="completed")
+            _write_json_fsync(transaction_path, completed)
+            return {
+                **plan.to_dict(),
+                "applied": True,
+                "transaction_path": str(transaction_path),
+                "transaction_hash": completed["transaction_hash"],
+                "rollback_available": True,
+            }
+        except BaseException:
+            _rollback_failed_apply(plan)
+            _fsync_directory(source.parent)
+            _fsync_directory(corrected.parent)
+            _fsync_directory(retired.parent)
+            _write_json_fsync(
+                transaction_path, _transaction_payload(plan, state="rolled_back_after_failure")
+            )
+            raise
+
+
+@dataclass(frozen=True)
+class CameraSemanticPromotionRollbackPlan:
+    transaction_path: str
+    transaction_hash: str
+    canonical_root: str
+    corrected_work_root: str
+    retired_dataset_root: str
+    canonical_root_inode: int
+    retired_root_inode: int
+
+    @property
+    def plan_hash(self) -> str:
+        return canonical_content_hash(
+            self.to_dict(include_hash=False), domain=ROLLBACK_PLAN_DOMAIN
+        )
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        payload = {"schema": ROLLBACK_PLAN_SCHEMA, **asdict(self)}
+        if include_hash:
+            payload["plan_hash"] = self.plan_hash
+        return payload
+
+
+def plan_camera_semantic_promotion_rollback(
+    transaction_path: str | Path,
+) -> CameraSemanticPromotionRollbackPlan:
+    path = Path(transaction_path).expanduser().resolve(strict=True)
+    value = read_json(path)
+    if not isinstance(value, Mapping) or value.get("schema") != PROMOTION_TRANSACTION_SCHEMA:
+        raise CameraSemanticPromotionError("Unsupported promotion transaction")
+    claimed_hash = str(value.get("transaction_hash") or "")
+    hash_payload = dict(value)
+    hash_payload.pop("transaction_hash", None)
+    if claimed_hash != canonical_content_hash(
+        hash_payload, domain=PROMOTION_TRANSACTION_DOMAIN
+    ):
+        raise CameraSemanticPromotionError("Promotion transaction hash mismatch")
+    if value.get("state") != "completed":
+        raise CameraSemanticPromotionError("Only a completed promotion can be rolled back")
+    plan = value.get("plan")
+    if not isinstance(plan, Mapping):
+        raise CameraSemanticPromotionError("Promotion transaction has no plan")
+    canonical = Path(str(plan["source_root"]))
+    corrected = Path(str(plan["corrected_root"]))
+    retired = Path(str(plan["retired_dataset_root"]))
+    if corrected.exists() or corrected.is_symlink():
+        raise CameraSemanticPromotionError(
+            f"Corrected work root must remain absent before rollback: {corrected}"
+        )
+    if _root_inode(canonical) != int(plan["corrected_root_inode"]):
+        raise CameraSemanticPromotionError("Canonical root no longer matches promoted data")
+    if _root_inode(retired) != int(plan["source_root_inode"]):
+        raise CameraSemanticPromotionError("Retired root no longer matches original data")
+    return CameraSemanticPromotionRollbackPlan(
+        transaction_path=str(path),
+        transaction_hash=claimed_hash,
+        canonical_root=str(canonical),
+        corrected_work_root=str(corrected),
+        retired_dataset_root=str(retired),
+        canonical_root_inode=int(plan["corrected_root_inode"]),
+        retired_root_inode=int(plan["source_root_inode"]),
+    )
+
+
+def rollback_camera_semantic_promotion(
+    transaction_path: str | Path,
+    *,
+    expected_plan_hash: str,
+    confirm_no_active_readers: bool,
+) -> dict[str, Any]:
+    plan = plan_camera_semantic_promotion_rollback(transaction_path)
+    if plan.plan_hash != str(expected_plan_hash):
+        raise CameraSemanticPromotionError("Rollback plan hash changed")
+    if not confirm_no_active_readers:
+        raise CameraSemanticPromotionError(
+            "Rollback requires explicit confirmation of no active readers"
+        )
+    canonical = Path(plan.canonical_root)
+    corrected = Path(plan.corrected_work_root)
+    retired = Path(plan.retired_dataset_root)
+    transaction = Path(plan.transaction_path)
+    lock_path = transaction.parent.parent / ".promotion.lock"
+    with lock_path.open("a+b") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CameraSemanticPromotionError("Another promotion is active") from exc
+        fresh = plan_camera_semantic_promotion_rollback(transaction)
+        if fresh.plan_hash != plan.plan_hash:
+            raise CameraSemanticPromotionError("Rollback plan changed after locking")
+        os.replace(canonical, corrected)
+        try:
+            os.replace(retired, canonical)
+        except BaseException:
+            os.replace(corrected, canonical)
+            raise
+        _fsync_directory(canonical.parent)
+        _fsync_directory(corrected.parent)
+        _fsync_directory(retired.parent)
+        original = read_json(transaction)
+        rolled_back = dict(original)
+        rolled_back["state"] = "rolled_back"
+        rolled_back.pop("transaction_hash", None)
+        rolled_back["transaction_hash"] = canonical_content_hash(
+            rolled_back, domain=PROMOTION_TRANSACTION_DOMAIN
+        )
+        _write_json_fsync(transaction, rolled_back)
+        return {
+            **plan.to_dict(),
+            "applied": True,
+            "state": "rolled_back",
+            "transaction_hash": rolled_back["transaction_hash"],
+        }
+
+
+__all__ = [
+    "CameraSemanticPromotionError",
+    "CameraSemanticPromotionPlan",
+    "CameraSemanticPromotionRollbackPlan",
+    "plan_camera_semantic_promotion",
+    "plan_camera_semantic_promotion_rollback",
+    "promote_camera_semantic_dataset",
+    "rollback_camera_semantic_promotion",
+]
