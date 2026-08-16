@@ -191,7 +191,6 @@ from ..defaults import (
     DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
     DEFAULT_TELEOP_SAMPLE_HZ,
 )
-from ..execution_mode_contract import validate_dataset_arm_control_mode
 from ..hand_mapping import parse_tactile_regions
 from ..interfaces import EffectorBackend
 from ..log_utils import ChangeGate
@@ -362,6 +361,7 @@ from .position_stream_handoff import (
     position_source_tail_pending_before_synchronous_chunk_gap as _position_source_tail_pending_before_synchronous_chunk_gap,
 )
 from .replay import (
+    bind_debug_replay_arm_control_mode,
     debug_replay_execution_exhausted as _debug_replay_execution_exhausted,
     infer_replay_action_hz,
     load_dataset_replay_policy,
@@ -3616,17 +3616,13 @@ def _validate_debug_replay_arm_control_mode(
     policy: Any,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    contract = validate_dataset_arm_control_mode(
-        getattr(policy, "metadata", {}),
+    payload, warning = bind_debug_replay_arm_control_mode(
+        policy,
         selected_mode=args.arm_control_mode,
         hardware_output=bool(args.send_actions),
     )
-    payload = contract.to_dict()
-    metadata = getattr(policy, "metadata", None)
-    if isinstance(metadata, dict):
-        metadata["dataset_arm_control_mode_contract"] = dict(payload)
-    if contract.warning:
-        print(f"[ReplayMode] WARNING: {contract.warning}", flush=True)
+    if warning:
+        print(f"[ReplayMode] WARNING: {warning}", flush=True)
     return payload
 
 

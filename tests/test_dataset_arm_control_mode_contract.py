@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from teleop_runtime.deploy.replay import bind_debug_replay_arm_control_mode
 from teleop_runtime.deploy.run_policy import _validate_debug_replay_arm_control_mode
 from teleop_runtime.execution_mode_contract import (
     DatasetArmControlModeError,
@@ -125,3 +126,23 @@ def test_deploy_debug_replay_validates_before_backend_creation() -> None:
     args.arm_control_mode = "impedance"
     with pytest.raises(DatasetArmControlModeError, match="mismatch"):
         _validate_debug_replay_arm_control_mode(policy, args)
+
+
+def test_replay_owner_binds_receipt_and_application_prints_warning(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    policy = SimpleNamespace(metadata={})
+
+    payload, warning = bind_debug_replay_arm_control_mode(
+        policy,
+        selected_mode="position",
+        hardware_output=False,
+    )
+
+    assert warning
+    assert payload["recorded_mode"] is None
+    assert policy.metadata["dataset_arm_control_mode_contract"] == payload
+
+    args = SimpleNamespace(arm_control_mode="position", send_actions=False)
+    assert _validate_debug_replay_arm_control_mode(policy, args) == payload
+    assert capsys.readouterr().out == f"[ReplayMode] WARNING: {warning}\n"
