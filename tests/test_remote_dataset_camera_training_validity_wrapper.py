@@ -4,7 +4,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "codex_remote/remote_dataset_camera_training_validity.sh"
 
@@ -71,7 +70,13 @@ def test_wrapper_is_fixed_hash_bound_and_requires_reader_confirmation(
         str(prepared),
     ]
 
-    result = subprocess.run(base, env=env, capture_output=True, text=True)
+    result = subprocess.run(
+        base,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert result.returncode == 0, result.stderr
     assert _args(capture) == [
         "-u",
@@ -94,6 +99,7 @@ def test_wrapper_is_fixed_hash_bound_and_requires_reader_confirmation(
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode != 0
     assert "--confirm-no-active-readers" in result.stderr
@@ -109,6 +115,7 @@ def test_wrapper_is_fixed_hash_bound_and_requires_reader_confirmation(
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert _args(capture)[-3:] == [
@@ -122,6 +129,7 @@ def test_wrapper_is_fixed_hash_bound_and_requires_reader_confirmation(
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode != 0
     assert "passthrough" in result.stderr

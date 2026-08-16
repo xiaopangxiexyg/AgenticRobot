@@ -7,9 +7,10 @@ import hashlib
 import json
 import os
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_interface.camera_semantic_prepared_view import (
@@ -24,7 +25,6 @@ from .camera_semantic_prepared_view import (
     _source_dataset_identity,
 )
 from .io import read_json
-
 
 CAMERA_VIDEO_INTEGRITY_TRAINING_POLICY = (
     "exclude_entire_episode_if_any_required_video_is_invalid"
