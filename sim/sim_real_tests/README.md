@@ -40,13 +40,43 @@ Run the lightweight structure checks in any project environment:
 python -m pytest sim/sim_real_tests/tests/test_core_contracts.py -q
 ```
 
-Run the full Pinocchio/Pink collision and IK scenario in the project robot
-environment:
+The package-local suite uses the repository-wide pytest markers, but remains
+outside the default root `testpaths`. Activate the shared project environment
+once from the selected worktree root:
 
 ```bash
-conda run --name "${DEXTELEOP_ENV_NAME:-dexteleop310}" env PYTHONPATH=. \
-  python -m pytest sim/sim_real_tests/tests -q
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 ```
+
+Run its fast feedback tier while editing:
+
+```bash
+python -m pytest sim/sim_real_tests/tests -q -m "not slow_sim"
+```
+
+Run only the long physical closed-loop checks on the designated integration
+worktree:
+
+```bash
+python -m pytest sim/sim_real_tests/tests -q -m slow_sim
+```
+
+Run the complete Pinocchio/Pink/MuJoCo acceptance suite before integration:
+
+```bash
+python -m pytest sim/sim_real_tests/tests -q
+```
+
+`not slow_sim` is a development feedback selector, not a replacement for the
+complete suite. The slow marker is attached to exact closed-loop test
+functions; it does not reduce their sample counts, physical ticks, thresholds,
+or inclusion in the unfiltered command.
+
+Git does not populate ignored robot assets in a linked worktree. A worktree
+running this suite must expose the same reviewed, read-only asset tree at its
+own `assets/` path, for example through a local ignored directory symlink to the
+canonical checkout. Treat a missing asset as a preflight failure; do not copy
+assets into Git or change scenario semantics to make the test pass.
 
 The random stream is fixed by the JSON config. Increase `sample_count` for a
 longer offline soak test; do not replace deterministic CI coverage with an

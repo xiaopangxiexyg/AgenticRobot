@@ -22,6 +22,9 @@ from sim.sim_real_tests.mujoco.view_tcp_pose_absolute_workspace import (  # noqa
 from sim.mujoco.control.desk_tcp_position import DeskTcpPositionControl  # noqa: E402
 
 
+pytestmark = [pytest.mark.integration, pytest.mark.optional]
+
+
 class _FakeViewerHandle:
     def __init__(self, user_scene) -> None:
         self.user_scn = user_scene
@@ -143,6 +146,7 @@ def test_viewer_requires_explicit_candidate_selection() -> None:
         assert parser.parse_args(["--profile", profile_name]).profile == profile_name
 
 
+@pytest.mark.slow_sim
 def test_closed_loop_playback_contains_real_arm_motion() -> None:
     config = load_absolute_workspace_preview_config(DEFAULT_CONFIG_PATH)
     workspace = derive_absolute_workspace(config, "absolute_standard")

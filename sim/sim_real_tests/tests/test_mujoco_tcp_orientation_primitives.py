@@ -24,6 +24,9 @@ from sim.sim_real_tests.mujoco.view_tcp_orientation_primitives import (
 )
 
 
+pytestmark = [pytest.mark.integration, pytest.mark.optional]
+
+
 class _FakeViewerHandle:
     def __init__(self, user_scene) -> None:
         self.user_scn = user_scene
@@ -130,6 +133,7 @@ def test_visualizer_draws_three_headings_for_both_arms() -> None:
     assert "right_actual_tool_plus_z" in labels
 
 
+@pytest.mark.slow_sim
 def test_both_arms_execute_every_orientation_in_physical_mujoco_chain() -> None:
     result = run_level_tcp_orientation_primitives_active_closed_loop()
 

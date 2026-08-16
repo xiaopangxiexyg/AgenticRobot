@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from robot_motion.position_control.cartesian_admittance import (
     CartesianAdmittanceConfig,
@@ -307,6 +308,7 @@ def test_active_observer_and_shared_ik_close_in_one_solver_frame(
     ) <= 0.01
 
 
+@pytest.mark.slow_sim
 def test_dual_side_formal_active_closes_through_one_shared_ik_budget() -> None:
     initial_qpos = _initial_qpos()
     config_payload = {
@@ -533,6 +535,7 @@ def test_dual_side_formal_active_closes_through_one_shared_ik_budget() -> None:
         ) <= 0.05
 
 
+@pytest.mark.slow_sim
 def test_rotation_active_preserves_shared_ik_hold_and_single_step_budget(
 ) -> None:
     initial_qpos = _initial_qpos()

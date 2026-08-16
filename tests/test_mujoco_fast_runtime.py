@@ -344,6 +344,7 @@ def test_default_cube_lift_uses_measured_identified_gripper_state() -> None:
         env.close()
 
 
+@pytest.mark.slow_sim
 def test_vector_executor_is_deterministic_and_preserves_terminal_observation(
     tmp_path: Path,
 ) -> None:

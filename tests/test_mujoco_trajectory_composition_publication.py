@@ -488,6 +488,7 @@ def test_exact_trajectory_input_identity_cannot_be_silently_substituted() -> Non
         )
 
 
+@pytest.mark.slow_sim
 def test_locked_chunk_residual_enters_existing_mujoco_chain_once() -> None:
     target, composition, residual_profile, schema, observation_sink = (
         _build_running_fixture()
@@ -830,6 +831,7 @@ def test_locked_chunk_residual_enters_existing_mujoco_chain_once() -> None:
         composition.close()
 
 
+@pytest.mark.slow_sim
 def test_expired_residual_returns_no_action_without_new_proposal() -> None:
     target, composition, residual_profile, schema, _observation_sink = (
         _build_running_fixture()

@@ -402,6 +402,7 @@ class _VirtualAllocationPolicySource:
         }
 
 
+@pytest.mark.slow_sim
 def test_allocation_policy_only_start_does_not_open_human_devices(
     monkeypatch,
 ) -> None:
@@ -483,6 +484,7 @@ def test_allocation_policy_only_start_does_not_open_human_devices(
         (SIM_HIL_CONTROL_PROFILE_POLICY_HUMAN_ALLOCATION_SCHEME_B, True),
     ),
 )
+@pytest.mark.slow_sim
 def test_allocation_profiles_virtual_policy_and_human_run_button_operations(
     monkeypatch,
     profile_id: str,
