@@ -53,6 +53,11 @@ from teleop_runtime.deploy.run_policy import (
 from teleop_runtime.deploy.position_plan_cut import (
     DeploymentPositionPlanCutDetector,
 )
+from teleop_runtime.deploy.position_stream_handoff import (
+    defer_position_action_after_synchronous_prediction,
+    hold_active_position_stream_for_synchronous_chunk_gap,
+    position_source_tail_pending_before_synchronous_chunk_gap,
+)
 from teleop_runtime.deploy.dispatch import (
     POSITION_REFERENCE_DISPATCH_AUDIT_FULL,
     POSITION_REFERENCE_DISPATCH_AUDIT_POST,
@@ -86,6 +91,21 @@ def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
             return
         time.sleep(0.002)
     assert predicate(), "timed out waiting for background position executor"
+
+
+def test_run_policy_preserves_position_stream_handoff_exports() -> None:
+    assert (
+        _defer_position_action_after_synchronous_prediction
+        is defer_position_action_after_synchronous_prediction
+    )
+    assert (
+        _hold_active_position_stream_for_synchronous_chunk_gap
+        is hold_active_position_stream_for_synchronous_chunk_gap
+    )
+    assert (
+        _position_source_tail_pending_before_synchronous_chunk_gap
+        is position_source_tail_pending_before_synchronous_chunk_gap
+    )
 
 
 def test_synchronous_position_prediction_requires_next_observation_cut() -> None:
