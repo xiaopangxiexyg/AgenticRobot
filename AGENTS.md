@@ -140,6 +140,13 @@ Run the smallest relevant tests and report them. Use `git diff --check`; add
 targeted tests, `py_compile`, and entrypoint `--help` checks as appropriate.
 Hardware tests and remote runs require explicit scope.
 
+The repository-local `./lab` command currently exposes only the reviewed M1
+Task Workspace boundary documented in
+`docs/architecture/lab_m1_task_workspace.md`: Change/Task creation, multi-root
+open/inspect, and per-repository writer leases. It does not run tests, install
+environments, synchronize checkouts, contact remote hosts, allocate resources,
+or grant device authority.
+
 Only dependency, Python-version, package-discovery, or installation changes
 require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,
 `scripts/install_conda_env.sh`, or `README_ENV.md` as applicable. Source-only

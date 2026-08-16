@@ -5,6 +5,7 @@
 - [控制、数据与训练闭环图示](./dexteleop_architecture_visual_guide.md)
 - [实时 Action Chunk（RTC）图示](./dexteleop_rtc_visual_guide.md)
 - [数采、一般部署、混合控制与仿真的运行域边界](./runtime_domain_boundaries.md)
+- [`lab` M1：项目无关的多仓 Task Workspace](./lab_m1_task_workspace.md)
 
 ## 文档边界
 
