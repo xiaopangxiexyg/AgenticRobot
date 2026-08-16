@@ -1,0 +1,16 @@
+{
+  "environment_id": "agenticrobot-py310",
+  "import_modules": [
+    "lab_control"
+  ],
+  "python_major_minor": "3.10",
+  "repository": "AgenticRobot",
+  "resolver": {
+    "environment": "dexteleop310",
+    "kind": "conda"
+  },
+  "schema": "lab.environment.v1",
+  "source_roots": [
+    "."
+  ]
+}

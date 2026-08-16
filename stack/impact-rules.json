@@ -1,0 +1,30 @@
+{
+  "fallback_profiles": {},
+  "rules": [
+    {
+      "paths": {
+        "AgenticRobot": [
+          "lab",
+          "dev",
+          "lab_control/**",
+          "tests/test_lab_m1_workspace.py",
+          "tests/test_lab_m2_runs.py",
+          "tests/test_lab_writer_lease.py",
+          "integration/dev.json",
+          "integration/project.json",
+          "integration/environments/**",
+          "integration/profiles/lab-control-unit.json",
+          "stack/baseline.json",
+          "stack/impact-rules.json",
+          "docs/architecture/lab_m1_task_workspace.md",
+          "docs/architecture/lab_m2_local_runs.md"
+        ]
+      },
+      "profiles": [
+        "lab-control-unit"
+      ],
+      "rule_id": "lab-control"
+    }
+  ],
+  "schema": "lab.impact-rules.v1"
+}

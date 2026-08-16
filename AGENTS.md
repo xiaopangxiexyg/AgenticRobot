@@ -140,12 +140,13 @@ Run the smallest relevant tests and report them. Use `git diff --check`; add
 targeted tests, `py_compile`, and entrypoint `--help` checks as appropriate.
 Hardware tests and remote runs require explicit scope.
 
-The repository-local `./lab` command currently exposes only the reviewed M1
-Task Workspace boundary documented in
-`docs/architecture/lab_m1_task_workspace.md`: Change/Task creation, multi-root
-open/inspect, and per-repository writer leases. It does not run tests, install
-environments, synchronize checkouts, contact remote hosts, allocate resources,
-or grant device authority.
+The repository-local `./lab` command exposes the M1 Task Workspace boundary and
+the M2 local exact-clean Run boundary documented in
+`docs/architecture/lab_m1_task_workspace.md` and
+`docs/architecture/lab_m2_local_runs.md`. M2 only runs reviewed local R0/R1
+Profiles in detached snapshots; it does not create dirty snapshots, synchronize
+checkouts, contact remote hosts, allocate GPU/service/device resources, or grant
+device authority. `./dev` is the repository-local quick test/doctor adapter.
 
 Only dependency, Python-version, package-discovery, or installation changes
 require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,

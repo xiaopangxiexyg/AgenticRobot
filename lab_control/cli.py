@@ -9,6 +9,13 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from .environments import inspect_environments
+from .inspection import (
+    attach_run_comparison,
+    enrich_change_inspection,
+    enrich_task_inspection,
+)
+from .runs import CANDIDATE_EVIDENCE_TIER, DEVELOPMENT_EVIDENCE_TIER, RunManager
 from .workspace import LabError, TaskPlan, WorkspaceManager
 from .writer_lease import WriterLeaseManager
 
@@ -97,8 +104,15 @@ def _build_parser() -> argparse.ArgumentParser:
     writer_release.add_argument("--lease-id", required=True)
     writer_release.add_argument("--json", action="store_true")
 
-    open_parser = subcommands.add_parser("open", help="open a Task workspace")
-    open_parser.add_argument("task_id")
+    open_parser = subcommands.add_parser(
+        "open", help="open a Task workspace or an exact Run snapshot"
+    )
+    open_parser.add_argument("task_id", nargs="?")
+    open_parser.add_argument(
+        "--run",
+        dest="run_id",
+        help="open the detached multi-repository snapshot tested by a Run",
+    )
     open_parser.add_argument(
         "--print",
         dest="print_only",
@@ -115,7 +129,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="inspect a Task or Change without modifying it",
     )
     inspect.add_argument("identifier")
+    inspect.add_argument(
+        "--against-run",
+        dest="against_run_id",
+        help="compare a current Task with one exact recorded Run",
+    )
     inspect.add_argument("--json", action="store_true")
+
+    doctor = subcommands.add_parser(
+        "doctor",
+        help="verify repository environments and first-party import provenance",
+    )
+    doctor.add_argument(
+        "--environment",
+        action="append",
+        dest="environment_ids",
+        help="environment ID; repeatable, defaults to all local Profiles",
+    )
+    doctor.add_argument("--json", action="store_true")
+
+    for command_name, help_text in (
+        ("test", "run Development evidence on a clean detached snapshot"),
+        ("verify", "run Candidate evidence using a protected control plane"),
+    ):
+        command = subcommands.add_parser(command_name, help=help_text)
+        command.add_argument("task_id")
+        command.add_argument("profile_id", nargs="?")
+        command.add_argument(
+            "--recommended",
+            action="store_true",
+            help="run protected impact-rule recommendations",
+        )
+        command.add_argument("--json", action="store_true")
+
+    runs = subcommands.add_parser("runs", help="list recorded local Runs")
+    runs.add_argument("task_id", nargs="?")
+    runs.add_argument("--json", action="store_true")
     return parser
 
 
@@ -169,6 +218,37 @@ def _print_task(payload: dict[str, object]) -> None:
                 actor = lease.get("actor") if isinstance(lease, dict) else None
                 actor_suffix = f" ({actor})" if actor else ""
                 print(f"    writer: {writer.get('state')}{actor_suffix}")
+    readiness = payload.get("readiness")
+    if isinstance(readiness, dict):
+        print(f"Test readiness: {readiness.get('status')}")
+        recommended = readiness.get("recommended_profiles")
+        if isinstance(recommended, list):
+            print(
+                "Recommended Profiles: "
+                + (", ".join(str(item) for item in recommended) or "none")
+            )
+        profiles = readiness.get("profiles")
+        if isinstance(profiles, dict):
+            for profile_id, raw_profile in profiles.items():
+                if isinstance(raw_profile, dict):
+                    print(
+                        f"  {profile_id}: "
+                        f"{raw_profile.get('evidence_freshness')}"
+                    )
+    comparison = payload.get("against_run")
+    if isinstance(comparison, dict):
+        print(
+            f"Against Run: {comparison.get('run_id')} "
+            f"({comparison.get('classification')})"
+        )
+        repositories = comparison.get("repositories")
+        if isinstance(repositories, dict):
+            for name, raw_repository in repositories.items():
+                if isinstance(raw_repository, dict):
+                    print(
+                        f"  {name}: "
+                        f"{len(raw_repository.get('changed_paths', []))} changed paths"
+                    )
     print(f"Next action: {payload.get('next_action')}")
 
 
@@ -184,6 +264,17 @@ def _print_change(payload: dict[str, object]) -> None:
                     f"  {task_id}: {raw_task.get('development_host')} "
                     f"{raw_task.get('status')}"
                 )
+    readiness = payload.get("readiness")
+    if isinstance(readiness, dict):
+        print(f"Test readiness: {readiness.get('status')}")
+        recommended = readiness.get("recommended")
+        if isinstance(recommended, list):
+            for item in recommended:
+                if isinstance(item, dict):
+                    print(
+                        f"  recommended: {item.get('task_id')} / "
+                        f"{item.get('profile_id')}"
+                    )
     print(f"Next action: {payload.get('next_action')}")
 
 
@@ -219,6 +310,126 @@ def _print_writer(payload: dict[str, object]) -> None:
     print(f"Lease: {payload.get('lease_id')}")
 
 
+def _print_run(payload: dict[str, object]) -> None:
+    outcome = payload.get("outcome")
+    classification = (
+        outcome.get("classification") if isinstance(outcome, dict) else "UNKNOWN"
+    )
+    profile = payload.get("profile")
+    profile_id = profile.get("profile_id") if isinstance(profile, dict) else "?"
+    print(f"Run: {payload.get('run_id')}")
+    print(f"Task: {payload.get('task_id')}")
+    print(f"Profile: {profile_id}")
+    print(f"Evidence: {payload.get('evidence_tier')}")
+    print(f"Result: {classification}")
+    print(f"Snapshot: {payload.get('snapshot_id')}")
+
+
+def _print_run_list(payloads: list[dict[str, object]]) -> None:
+    if not payloads:
+        print("No Runs found.")
+        return
+    for payload in payloads:
+        outcome = payload.get("outcome")
+        classification = (
+            outcome.get("classification") if isinstance(outcome, dict) else "RUNNING"
+        )
+        profile = payload.get("profile")
+        profile_id = profile.get("profile_id") if isinstance(profile, dict) else "?"
+        print(
+            f"{payload.get('run_id')}  {payload.get('task_id')}  "
+            f"{profile_id}  {classification}"
+        )
+
+
+def _recommended_profiles(
+    manager: WorkspaceManager,
+    task_id: str,
+) -> list[str]:
+    inspection = enrich_task_inspection(manager, manager.inspect_task(task_id))
+    if inspection.get("status") != "ACTIVE":
+        raise LabError("recommended tests require an ACTIVE Task without drift")
+    repositories = inspection.get("repositories")
+    if not isinstance(repositories, dict):
+        raise LabError("Task inspection lacks repositories")
+    dirty = sorted(
+        name
+        for name, raw_repository in repositories.items()
+        if isinstance(raw_repository, dict) and raw_repository.get("dirty") is True
+    )
+    if dirty:
+        raise LabError(
+            "recommended clean tests require checkpointed repositories: "
+            + ", ".join(dirty)
+        )
+    readiness = inspection.get("readiness")
+    if not isinstance(readiness, dict) or readiness.get("status") != "READY":
+        errors = readiness.get("profile_errors") if isinstance(readiness, dict) else None
+        detail = (
+            "; ".join(str(error) for error in errors)
+            if isinstance(errors, list) and errors
+            else "required Profiles or baseline inputs are unavailable"
+        )
+        raise LabError(f"recommended test readiness requires attention: {detail}")
+    profiles = readiness.get("recommended_profiles")
+    if not isinstance(profiles, list) or not all(
+        isinstance(profile_id, str) for profile_id in profiles
+    ):
+        raise LabError("Task inspection has invalid recommended Profiles")
+    return list(profiles)
+
+
+def _run_recommended_profiles(
+    manager: WorkspaceManager,
+    task_id: str,
+    *,
+    evidence_tier: str,
+) -> dict[str, object]:
+    profile_ids = _recommended_profiles(manager, task_id)
+    run_manager = RunManager(manager)
+    run_manager.validate_evidence_tier(evidence_tier)
+    runs = [
+        run_manager.run_clean_profile(
+            task_id,
+            profile_id,
+            evidence_tier=evidence_tier,
+        )
+        for profile_id in profile_ids
+    ]
+    classifications = []
+    for run in runs:
+        outcome = run.get("outcome")
+        classifications.append(
+            outcome.get("classification") if isinstance(outcome, dict) else None
+        )
+    return {
+        "schema": "lab.recommended-test-batch.v1",
+        "task_id": task_id,
+        "evidence_tier": evidence_tier,
+        "profiles": profile_ids,
+        "runs": runs,
+        "all_passed": all(result == "PASSED" for result in classifications),
+        "no_tests_required": not profile_ids,
+    }
+
+
+def _print_recommended_batch(payload: dict[str, object]) -> None:
+    print(f"Task: {payload.get('task_id')}")
+    print(f"Evidence: {payload.get('evidence_tier')}")
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, list) or not profiles:
+        print("Recommended Profiles: none")
+        print("No tests required for the current Task diff.")
+        return
+    print("Recommended Profiles: " + ", ".join(str(item) for item in profiles))
+    runs = payload.get("runs")
+    if isinstance(runs, list):
+        for run in runs:
+            if isinstance(run, dict):
+                _print_run(run)
+    print(f"All passed: {str(payload.get('all_passed')).lower()}")
+
+
 def _emit(payload: dict[str, object], *, as_json: bool) -> None:
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -237,7 +448,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     print(f"Created Change {payload['change_id']}")
                 return 0
-            payload = manager.inspect_change(arguments.change_id)
+            payload = enrich_change_inspection(
+                manager,
+                manager.inspect_change(arguments.change_id),
+            )
             if arguments.json:
                 _emit(payload, as_json=True)
             else:
@@ -300,7 +514,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if arguments.command == "open":
-            workspace = manager.workspace_path(arguments.task_id)
+            if bool(arguments.task_id) == bool(arguments.run_id):
+                raise LabError("open requires exactly one Task ID or --run RUN_ID")
+            if arguments.run_id:
+                run = RunManager(manager).find_run(arguments.run_id)
+                workspace = Path(str(run.get("snapshot_workspace", "")))
+                if not workspace.is_file():
+                    raise LabError(f"Run snapshot workspace is missing: {workspace}")
+            else:
+                workspace = manager.workspace_path(arguments.task_id)
             if arguments.print_only:
                 print(workspace)
                 return 0
@@ -317,10 +539,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if arguments.command == "inspect":
             if manager.task_manifest_path(arguments.identifier).is_file():
-                payload = manager.inspect_task(arguments.identifier)
+                payload = enrich_task_inspection(
+                    manager,
+                    manager.inspect_task(arguments.identifier),
+                )
+                if arguments.against_run_id:
+                    payload = attach_run_comparison(
+                        payload,
+                        RunManager(manager).find_run(arguments.against_run_id),
+                    )
                 is_change = False
             else:
-                payload = manager.inspect_change(arguments.identifier)
+                if arguments.against_run_id:
+                    raise LabError("--against-run requires a Task, not a Change")
+                payload = enrich_change_inspection(
+                    manager,
+                    manager.inspect_change(arguments.identifier),
+                )
                 is_change = True
             if arguments.json:
                 _emit(payload, as_json=True)
@@ -328,6 +563,96 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print_change(payload)
             else:
                 _print_task(payload)
+            return 0
+
+        if arguments.command == "doctor":
+            environment_root = (
+                Path(manager.environ["LAB_ENVIRONMENT_PROFILE_ROOT"])
+                .expanduser()
+                .resolve()
+                if manager.environ.get("LAB_ENVIRONMENT_PROFILE_ROOT")
+                else manager.control_repository / "integration" / "environments"
+            )
+            environment_ids = arguments.environment_ids or sorted(
+                path.stem for path in environment_root.glob("*.json") if path.is_file()
+            )
+            if not environment_ids:
+                raise LabError(f"no environment Profiles found: {environment_root}")
+            payload = inspect_environments(
+                environment_root,
+                environment_ids,
+                repository_paths=manager.catalog,
+                environ=manager.environ,
+            )
+            if arguments.json:
+                _emit(payload, as_json=True)
+            else:
+                print(f"Status: {payload['status']}")
+                overlay = payload.get("source_overlay")
+                if isinstance(overlay, list):
+                    print("Source overlay:")
+                    for path in overlay:
+                        print(f"  {path}")
+                receipts = payload.get("environments")
+                if isinstance(receipts, dict):
+                    for environment_id, receipt in receipts.items():
+                        if isinstance(receipt, dict):
+                            print(
+                                f"{environment_id}: "
+                                f"{receipt.get('python_executable')} "
+                                f"Python {receipt.get('python_major_minor')}"
+                            )
+                errors = payload.get("errors")
+                if isinstance(errors, list):
+                    for error in errors:
+                        print(f"ERROR: {error}")
+            return 0 if payload.get("status") == "READY" else 1
+
+        if arguments.command in {"test", "verify"}:
+            if bool(arguments.profile_id) == bool(arguments.recommended):
+                raise LabError(
+                    f"{arguments.command} requires exactly one Profile ID or "
+                    "--recommended"
+                )
+            evidence_tier = (
+                CANDIDATE_EVIDENCE_TIER
+                if arguments.command == "verify"
+                else DEVELOPMENT_EVIDENCE_TIER
+            )
+            if arguments.recommended:
+                payload = _run_recommended_profiles(
+                    manager,
+                    arguments.task_id,
+                    evidence_tier=evidence_tier,
+                )
+                if arguments.json:
+                    _emit(payload, as_json=True)
+                else:
+                    _print_recommended_batch(payload)
+                return 0 if payload.get("all_passed") is True else 1
+            payload = RunManager(manager).run_clean_profile(
+                arguments.task_id,
+                arguments.profile_id,
+                evidence_tier=evidence_tier,
+            )
+            if arguments.json:
+                _emit(payload, as_json=True)
+            else:
+                _print_run(payload)
+            outcome = payload.get("outcome")
+            return (
+                0
+                if isinstance(outcome, dict)
+                and outcome.get("classification") == "PASSED"
+                else 1
+            )
+
+        if arguments.command == "runs":
+            payloads = RunManager(manager).list_runs(arguments.task_id)
+            if arguments.json:
+                print(json.dumps(payloads, indent=2, sort_keys=True))
+            else:
+                _print_run_list(payloads)
             return 0
     except LabError as exc:
         print(f"lab: error: {exc}", file=sys.stderr)
