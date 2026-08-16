@@ -1,4 +1,4 @@
-"""Launch the existing OpenPI server directly from a checkpoint directory.
+"""Launch the pinned or explicitly selected OpenPI server from a checkpoint.
 
 The OpenPI server currently selects its training config through a registry.
 This wrapper derives the registry entry from the checkpoint's authoritative
@@ -81,6 +81,39 @@ def _openpi_root_from_checkpoint(checkpoint_dir: Path) -> Path | None:
         if parent.name == "checkpoints":
             return parent.parent
     return None
+
+
+def _bundled_openpi_root() -> Path:
+    """Return AgenticRobot's pinned OpenPI submodule checkout location."""
+
+    return Path(__file__).resolve().parents[2] / "model" / "openpi"
+
+
+def _is_openpi_checkout(root: Path) -> bool:
+    return all(
+        (
+            (root / "src" / "openpi").is_dir(),
+            (root / "scripts" / "serve_dexteleop_policy.py").is_file(),
+            (root / "configs" / "dexteleop_policy_registry.json").is_file(),
+        )
+    )
+
+
+def _resolve_openpi_root(
+    checkpoint_dir: Path,
+    explicit_root: Path | None,
+) -> tuple[Path | None, str | None]:
+    """Resolve OpenPI without changing existing explicit/inferred precedence."""
+
+    if explicit_root is not None:
+        return explicit_root.expanduser().resolve(), "explicit"
+    inferred_root = _openpi_root_from_checkpoint(checkpoint_dir)
+    if inferred_root is not None and _is_openpi_checkout(inferred_root):
+        return inferred_root, "checkpoint"
+    bundled_root = _bundled_openpi_root()
+    if _is_openpi_checkout(bundled_root):
+        return bundled_root.resolve(), "bundled_submodule"
+    return None, None
 
 
 def _safe_filename(value: str) -> str:
@@ -257,7 +290,15 @@ def main(argv: list[str] | None = None) -> int:
             "--prepared-training-profile and the checkpoint receipt."
         ),
     )
-    parser.add_argument("--openpi-root", type=Path, default=None)
+    parser.add_argument(
+        "--openpi-root",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit OpenPI checkout. Otherwise infer it from a checkpoints/ "
+            "ancestor, then fall back to the initialized model/openpi submodule."
+        ),
+    )
     parser.add_argument("--config", default=None, help="Training config override.")
     parser.add_argument("--default-prompt", default=None)
     parser.add_argument("--action-horizon", type=int, default=50)
@@ -394,14 +435,16 @@ def main(argv: list[str] | None = None) -> int:
             "--prepared-training-profile so the adapter remains process-local."
         )
 
-    inferred_root = _openpi_root_from_checkpoint(checkpoint_dir)
-    openpi_root = (
-        args.openpi_root.expanduser().resolve()
-        if args.openpi_root is not None
-        else inferred_root
+    openpi_root, openpi_root_source = _resolve_openpi_root(
+        checkpoint_dir,
+        args.openpi_root,
     )
     if openpi_root is None:
-        parser.error("cannot infer OpenPI root; pass --openpi-root")
+        parser.error(
+            "cannot infer OpenPI root and the bundled OpenPI submodule is not "
+            "initialized; run 'git submodule update --init model/openpi' or "
+            "pass --openpi-root"
+        )
     if prepared_resolution is not None:
         profile_openpi_root = Path(
             str(prepared_resolution.profile["openpi_checkout"])
@@ -500,6 +543,8 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "model_id": model_id,
+                    "openpi_root": str(openpi_root),
+                    "openpi_root_source": openpi_root_source,
                     "command": command,
                     "environment": {"PYTHONPATH": runtime_pythonpath},
                     "excluded_cpu_ids": sorted(

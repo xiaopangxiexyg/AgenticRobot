@@ -11,6 +11,7 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 | 多人开发、worktree 与提交门禁 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
 | 安装环境、入口检查 | [`docs/setup/`](./docs/setup/README.md) |
 | 真机遥操、正式数采、replay、deploy | [`docs/real/`](./docs/real/README.md) |
+| OpenPI 固定源码与 server/client 接入 | [`deployments/openpi/`](./deployments/openpi/README.md) |
 | MuJoCo、VIVE sim teleop、dataset replay | [`docs/sim/`](./docs/sim/README.md) |
 | 设备枚举、USB、标定 | [`docs/hardware/`](./docs/hardware/README.md) |
 | 数据后处理、分析、测试、验收 | [`docs/data/`](./docs/data/README.md) |
@@ -44,7 +45,8 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 - `teleop_runtime/`：真实遥操、GUI/headless orchestration、来源绑定的采集适配和 policy deploy frontend。
 - `dataset_contracts/`、`dataset_interface/`：纯数据合约与数据适配。
 - `policy_learning/`：框架内 learner、loss、训练 batch adapter 与离线模型评估。
-- `model/`：本地策略权重、checkpoint 与运行 sidecar；不是 Python 源码包。
+- `model/`：本地策略权重、checkpoint、运行 sidecar，以及固定外部源码版本的
+  `model/openpi` Git submodule；不是 AgenticRobot Python 源码包。
 - `deployments/`：模型 client、协议和 artifact 集成。
 - `control_station/`：组合 human/replay/policy/dataset/sim/real target 的应用层。
 - `agent_gateway/`：上层框架中立的 Skill 协议、接入、operation runtime，以及具体 Gateway profile；不拥有底层 authority、安全、IK 或 dispatch。

@@ -2,6 +2,26 @@
 
 本目录连接 OpenPI 推理服务与 DexTeleop 真机部署运行时。OpenPI 仅负责模型加载和 websocket 推理；相机、机械臂、夹爪、初始化、限幅和力控均由 DexTeleop 负责。
 
+## 0. 固定的 OpenPI 源码边界
+
+AgenticRobot 将 OpenPI 固定为 `model/openpi` Git submodule。首次 clone 或切换到包含
+gitlink 的提交后，先初始化源码：
+
+```bash
+git submodule update --init model/openpi
+git -C model/openpi rev-parse HEAD
+```
+
+完整使用 OpenPI 上游示例时，可追加 `--recursive` 初始化其 `aloha`、`libero`
+submodule；当前 DexTeleop server/client 路径不依赖这两个示例仓库。OpenPI 继续使用
+自己的 Python/runtime 环境，AgenticRobot 不把它作为 `model.openpi` Python 包导入。
+
+`deployments.openpi.server` 按以下顺序选择源码 checkout：显式
+`--openpi-root`、checkpoint 的 `checkpoints/` 祖先、已初始化的
+`model/openpi`。因此已有外部 checkout 和 checkpoint 路径保持兼容；未能推导外部
+checkout 时才使用固定 submodule。prepared training profile 仍严格绑定其中记录的
+`openpi_checkout`，不会被 submodule fallback 静默替换。
+
 当前经过闭环 server/client 握手验证的模型是：
 
 | 项目 | 值 |

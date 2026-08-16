@@ -19,8 +19,12 @@ from deployments.openpi.client import real as openpi_real
 pytestmark = pytest.mark.integration
 
 
-def _write_checkpoint(root: Path) -> tuple[Path, PolicyArtifactContract]:
-    checkpoint = root / "checkpoints" / "test-policy" / "123"
+def _write_checkpoint(
+    root: Path,
+    *,
+    checkpoint_parent: str = "checkpoints",
+) -> tuple[Path, PolicyArtifactContract]:
+    checkpoint = root / checkpoint_parent / "test-policy" / "123"
     checkpoint.mkdir(parents=True)
     artifact = PolicyArtifactContract(
         policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
@@ -41,6 +45,20 @@ def _write_checkpoint(root: Path) -> tuple[Path, PolicyArtifactContract]:
         encoding="utf-8",
     )
     return checkpoint, artifact
+
+
+def _write_openpi_runtime_checkout(openpi_root: Path) -> None:
+    (openpi_root / "src/openpi").mkdir(parents=True)
+    (openpi_root / "scripts").mkdir()
+    (openpi_root / "scripts/serve_dexteleop_policy.py").write_text(
+        "# test fixture\n",
+        encoding="utf-8",
+    )
+    (openpi_root / "configs").mkdir()
+    (openpi_root / "configs/dexteleop_policy_registry.json").write_text(
+        json.dumps({"models": {}}),
+        encoding="utf-8",
+    )
 
 
 def test_client_checkpoint_dir_resolves_artifact_and_profile(tmp_path: Path) -> None:
@@ -115,6 +133,8 @@ def test_server_dry_run_builds_registry_from_artifact(
 
     report = json.loads(capsys.readouterr().out)
     assert report["model_id"] == artifact.model_id
+    assert report["openpi_root"] == str(openpi_root)
+    assert report["openpi_root_source"] == "explicit"
     assert report["environment"]["PYTHONPATH"].split(":")[0] == str(
         Path(openpi_server.__file__).resolve().parents[2]
     )
@@ -126,6 +146,83 @@ def test_server_dry_run_builds_registry_from_artifact(
     assert entry["checkpoint_dir"] == str(checkpoint)
     assert entry["action_dim"] == artifact.policy_io_layout.action_dim
     assert entry["camera_slots"] == ["base_0_rgb"]
+
+
+def test_server_dry_run_falls_back_to_bundled_openpi_submodule(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    checkpoint, artifact = _write_checkpoint(tmp_path / "external-model-store")
+    openpi_root = tmp_path / "agenticrobot" / "model" / "openpi"
+    _write_openpi_runtime_checkout(openpi_root)
+    monkeypatch.setattr(openpi_server, "_bundled_openpi_root", lambda: openpi_root)
+    monkeypatch.setattr(openpi_server.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    assert openpi_server.main(
+        [
+            "--checkpoint-dir",
+            str(checkpoint),
+            "--dry-run",
+        ]
+    ) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["model_id"] == artifact.model_id
+    assert report["openpi_root"] == str(openpi_root)
+    assert report["openpi_root_source"] == "bundled_submodule"
+    assert report["command"][1] == str(
+        openpi_root / "scripts/serve_dexteleop_policy.py"
+    )
+
+
+def test_bundled_openpi_root_matches_tracked_submodule_location() -> None:
+    project_root = Path(openpi_server.__file__).resolve().parents[2]
+
+    assert openpi_server._bundled_openpi_root() == project_root / "model/openpi"
+    gitmodules = (project_root / ".gitmodules").read_text(encoding="utf-8")
+    assert "[submodule \"model/openpi\"]" in gitmodules
+    assert "path = model/openpi" in gitmodules
+    assert "url = git@github.com:CYBER-QAQ/Openpi.git" in gitmodules
+
+
+def test_server_resolves_checkpoint_owned_openpi_before_submodule(
+    tmp_path: Path, monkeypatch
+) -> None:
+    openpi_root = tmp_path / "external-openpi"
+    _write_openpi_runtime_checkout(openpi_root)
+    checkpoint, _artifact = _write_checkpoint(openpi_root)
+    bundled_root = tmp_path / "agenticrobot" / "model" / "openpi"
+    _write_openpi_runtime_checkout(bundled_root)
+    monkeypatch.setattr(openpi_server, "_bundled_openpi_root", lambda: bundled_root)
+
+    resolved_root, source = openpi_server._resolve_openpi_root(checkpoint, None)
+
+    assert resolved_root == openpi_root
+    assert source == "checkpoint"
+
+
+def test_server_reports_uninitialized_bundled_openpi_submodule(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    checkpoint, _artifact = _write_checkpoint(tmp_path / "external-model-store")
+    empty_openpi_root = tmp_path / "agenticrobot" / "model" / "openpi"
+    empty_openpi_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        openpi_server,
+        "_bundled_openpi_root",
+        lambda: empty_openpi_root,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        openpi_server.main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--dry-run",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "git submodule update --init model/openpi" in capsys.readouterr().err
 
 
 def test_server_applies_process_cpu_exclusion_immediately_before_exec(
