@@ -6,6 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from collection_runtime.episode_curation import (
+    EpisodeCurationStore as CollectionRuntimeEpisodeCurationStore,
+    load_task_variant_profile as load_collection_runtime_task_variant_profile,
+)
 from dataset_contracts import (
     EpisodeCurationContractError,
     EpisodeCurationRecord,
@@ -14,7 +18,24 @@ from dataset_contracts import (
     annotation_episode_id,
 )
 from dataset_interface import DexTeleopDatasetIndex, EpisodeCurationReader, source_dataset_base_fingerprint
-from teleop_runtime.collection.episode_curation import EpisodeCurationSession, EpisodeCurationStore
+from teleop_runtime.collection.episode_curation import (
+    EpisodeCurationSession,
+    EpisodeCurationStore,
+    load_task_variant_profile,
+)
+
+
+def test_legacy_store_imports_are_object_identical_lower_owned_exports() -> None:
+    assert EpisodeCurationStore is CollectionRuntimeEpisodeCurationStore
+    assert (
+        load_task_variant_profile
+        is load_collection_runtime_task_variant_profile
+    )
+    assert EpisodeCurationStore.__module__ == "collection_runtime.episode_curation"
+    assert (
+        EpisodeCurationSession.__module__
+        == "teleop_runtime.collection.episode_curation"
+    )
 
 
 def _legacy_dataset(root: Path) -> None:

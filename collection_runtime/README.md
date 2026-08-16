@@ -20,6 +20,9 @@ Implemented here:
   buffer. The concrete writer decides when acceptance occurred; this runtime
   mechanism never infers it from enqueue success or counters;
 - immutable artifact publication and episode-maintenance mechanics;
+- default-off Plus episode-curation sidecar persistence bound to an immutable
+  source dataset.  The RM65/UMI application session and its operator/UI state
+  remain in `teleop_runtime`; the historical import path forwards the store;
 - fail-closed capture admission plus journaled, reversible quarantine of a
   provably abandoned final tail Episode. Unknown orphan artifacts still block
   append, while a unique unsealed `N+1` legacy artifact group is moved under
@@ -148,6 +151,7 @@ collection_runtime/
   async_writer.py
   dataset_episode_maintenance.py
   dataset_layout.py
+  episode_curation.py # application-neutral external curation sidecar store
   immutable_canonical_store.py
   process_quiescence.py # shared formal-collection process exclusion
   sample_acceptance.py # writer-neutral admission receipt + bounded retention

@@ -18,9 +18,10 @@ SuccessCallback = Callable[[Any], None]
 class RealTeleopPlusCurationRuntime:
     """Own the pending application request and its single writer thread.
 
-    ``EpisodeCurationSession`` remains the only persistence/identity owner.
-    This adapter only serializes one GUI request into one background call and
-    reports state changes through injected callbacks.
+    ``EpisodeCurationSession`` remains the application pending-state owner;
+    ``collection_runtime.episode_curation.EpisodeCurationStore`` owns the
+    persistent sidecar identity. This adapter only serializes one GUI request
+    into one background call and reports state changes through callbacks.
     """
 
     def __init__(self, session: EpisodeCurationSession) -> None:

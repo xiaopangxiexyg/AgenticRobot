@@ -232,6 +232,39 @@ def test_collection_frontend_does_not_absorb_deploy_or_composition() -> None:
     ) == {}
 
 
+def test_collection_runtime_remains_device_control_and_ui_neutral() -> None:
+    assert _violations(
+        REPO_ROOT / "collection_runtime",
+        {
+            "control_composition",
+            "control_station",
+            "deployments",
+            "hardware",
+            "sim",
+            "teleop_runtime",
+        },
+    ) == {}
+
+
+def test_collection_curation_store_has_one_lower_owner() -> None:
+    runtime_store = REPO_ROOT / "collection_runtime" / "episode_curation.py"
+    compatibility_session = (
+        REPO_ROOT / "teleop_runtime" / "collection" / "episode_curation.py"
+    )
+    lower_owned_symbols = {
+        "EpisodeCurationStore",
+        "load_task_variant_profile",
+    }
+
+    assert lower_owned_symbols <= _top_level_defined_names(runtime_store)
+    assert lower_owned_symbols.isdisjoint(
+        _top_level_defined_names(compatibility_session)
+    )
+    assert "EpisodeCurationSession" in _top_level_defined_names(
+        compatibility_session
+    )
+
+
 def test_general_real_deploy_does_not_absorb_composition_or_simulation() -> None:
     assert _violations(
         REPO_ROOT / "teleop_runtime" / "deploy",
