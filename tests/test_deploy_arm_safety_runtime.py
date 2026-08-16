@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from teleop_runtime.deploy import arm_safety_runtime, run_policy
+from teleop_runtime.deploy import arm_safety_runtime, impedance_force_guard, run_policy
 
 
 class _HoldBackend:
@@ -34,6 +34,13 @@ class _SoftHoldBackend:
 
 class _UnsupportedSoftHoldBackend:
     pass
+
+
+def test_impedance_force_guard_preserves_emergency_stop_compatibility_export() -> None:
+    assert (
+        impedance_force_guard.bimanual_emergency_stop
+        is arm_safety_runtime.bimanual_emergency_stop
+    )
 
 
 def test_deploy_hold_attempts_every_side_before_aggregating_errors() -> None:

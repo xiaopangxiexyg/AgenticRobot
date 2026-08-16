@@ -8,6 +8,7 @@ gates and fans one application request out to the configured arm backends.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from robot_motion.rm65 import (
@@ -16,7 +17,45 @@ from robot_motion.rm65 import (
 )
 
 from ..interfaces import EffectorBackend
-from .impedance_force_guard import bimanual_emergency_stop
+
+
+def bimanual_emergency_stop(
+    backends_by_side: Mapping[str, Any],
+    *,
+    reason: str,
+) -> dict[str, str]:
+    """Request Arm_Stop on every configured arm without serializing sides."""
+
+    del reason
+
+    def stop_one(side: str, backend: Any) -> tuple[str, str | None]:
+        try:
+            stop = getattr(backend, "emergency_stop", None)
+            if not callable(stop):
+                raise AttributeError("backend does not expose emergency_stop")
+            stop()
+        except Exception as exc:  # noqa: BLE001 - still stop the other side.
+            return side, f"{type(exc).__name__}: {exc}"
+        return side, None
+
+    items = [(str(side), backend) for side, backend in backends_by_side.items()]
+    if len(items) <= 1:
+        results = [stop_one(side, backend) for side, backend in items]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=len(items),
+            thread_name_prefix="rm65_deploy_bimanual_emergency_stop",
+        ) as executor:
+            futures = [
+                executor.submit(stop_one, side, backend)
+                for side, backend in items
+            ]
+            results = [future.result() for future in futures]
+    return {
+        side: detail
+        for side, detail in results
+        if detail is not None
+    }
 
 
 def hold_deploy_arm_backends(
@@ -108,6 +147,7 @@ def emergency_stop_position_deploy_on_keyboard_interrupt(
 
 
 __all__ = [
+    "bimanual_emergency_stop",
     "emergency_stop_deploy_arm_backends",
     "emergency_stop_position_deploy_on_keyboard_interrupt",
     "hold_deploy_arm_backends",
