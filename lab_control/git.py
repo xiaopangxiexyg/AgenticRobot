@@ -4,7 +4,7 @@ import os
 import subprocess
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 
@@ -170,7 +170,168 @@ def create_detached_worktree(
     target: Path,
     commit: str,
 ) -> None:
-    run_git(repository, ["worktree", "add", "--detach", str(target), commit])
+    run_git(
+        repository,
+        [
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.required=false",
+            "worktree",
+            "add",
+            "--detach",
+            str(target),
+            commit,
+        ],
+        environment={
+            "GIT_LFS_SKIP_SMUDGE": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
+    )
+
+
+def create_unfiltered_detached_worktree(
+    repository: Path,
+    *,
+    target: Path,
+    commit: str,
+    maximum_blob_bytes: int = 64 * 1024 * 1024,
+    maximum_total_bytes: int = 512 * 1024 * 1024,
+) -> None:
+    """Materialize exact Git blobs without checkout filters, hooks or network."""
+
+    resolved = resolve_commit(repository, commit)
+    if target.exists():
+        raise GitError(f"detached worktree target already exists: {target}")
+    environment = {
+        "GIT_LFS_SKIP_SMUDGE": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    run_git(
+        repository,
+        ["worktree", "add", "--no-checkout", "--detach", str(target), resolved],
+        environment=environment,
+    )
+    try:
+        run_git(target, ["read-tree", "--reset", resolved], environment=environment)
+        listing = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+                str(repository),
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                resolved,
+            ],
+            check=False,
+            capture_output=True,
+            env={**os.environ, **environment},
+        )
+        if listing.returncode != 0:
+            detail = listing.stderr.decode(errors="replace").strip()
+            raise GitError(f"cannot list exact tree in {repository}: {detail}")
+        total_bytes = 0
+        for record in listing.stdout.split(b"\0"):
+            if not record:
+                continue
+            metadata, separator, raw_path = record.partition(b"\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 3:
+                raise GitError(f"cannot parse exact tree entry in {repository}")
+            mode_bytes, object_type, oid_bytes = fields
+            try:
+                mode = mode_bytes.decode("ascii")
+                oid = oid_bytes.decode("ascii")
+                path_text = raw_path.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise GitError("exact tree contains a non-UTF-8 path") from exc
+            path = PurePosixPath(path_text)
+            if (
+                not path_text
+                or path_text.startswith(("/", "~"))
+                or "\\" in path_text
+                or any(part in {"", ".", "..", ".git"} for part in path.parts)
+            ):
+                raise GitError(f"exact tree contains an unsafe path: {path_text!r}")
+            destination = target.joinpath(*path.parts)
+            if mode == "160000" and object_type == b"commit":
+                destination.mkdir(parents=True, exist_ok=False)
+                continue
+            if object_type != b"blob" or mode not in {"100644", "100755", "120000"}:
+                raise GitError(
+                    f"unsupported exact tree entry: {mode} "
+                    f"{object_type.decode(errors='replace')} {path_text}"
+                )
+            size_result = run_git(repository, ["cat-file", "-s", oid])
+            try:
+                blob_size = int(size_result.stdout.strip())
+            except ValueError as exc:
+                raise GitError(f"invalid Git blob size for {path_text}") from exc
+            if blob_size > maximum_blob_bytes:
+                raise GitError(
+                    f"Git blob exceeds staging limit ({maximum_blob_bytes} bytes): "
+                    f"{path_text}"
+                )
+            total_bytes += blob_size
+            if total_bytes > maximum_total_bytes:
+                raise GitError(
+                    f"Git tree exceeds staging limit ({maximum_total_bytes} bytes)"
+                )
+            blob = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    str(repository),
+                    "cat-file",
+                    "blob",
+                    oid,
+                ],
+                check=False,
+                capture_output=True,
+                env={**os.environ, **environment},
+            )
+            if blob.returncode != 0 or len(blob.stdout) != blob_size:
+                raise GitError(f"cannot read exact Git blob for {path_text}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if mode == "120000":
+                try:
+                    link_target = blob.stdout.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise GitError(f"symlink target is not UTF-8: {path_text}") from exc
+                if not link_target or "\x00" in link_target or Path(link_target).is_absolute():
+                    raise GitError(f"exact tree contains an unsafe symlink: {path_text}")
+                resolved_link = (destination.parent / link_target).resolve(strict=False)
+                if not resolved_link.is_relative_to(target.resolve()):
+                    raise GitError(f"exact tree symlink escapes its slot: {path_text}")
+                os.symlink(link_target, destination)
+                continue
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(destination, flags, 0o755 if mode == "100755" else 0o644)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = -1
+                    stream.write(blob.stdout)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        if current_commit(target) != resolved or current_branch(target) is not None:
+            raise GitError(f"detached worktree identity mismatch: {target}")
+        if status_short(target):
+            raise GitError(f"unfiltered detached worktree is not clean: {target}")
+    except Exception:
+        try:
+            remove_worktree(repository, target)
+        except GitError:
+            pass
+        raise
 
 
 def status_short(repository: Path) -> tuple[str, ...]:

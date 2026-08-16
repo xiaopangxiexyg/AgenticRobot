@@ -15,6 +15,7 @@
 - [`lab` M3e：protected-main 合并检查](./lab_m3e_merge_gates.md)
 - [`lab` M3f：持久化 Run 请求协议](./lab_m3f_run_requests.md)
 - [`lab` M3g：受信 Runner 领取与 artifact 收据](./lab_m3g_runner_protocol.md)
+- [`lab` M3h：受认证 Request envelope 与 exact snapshot staging](./lab_m3h_transport_staging.md)
 
 ## 文档边界
 

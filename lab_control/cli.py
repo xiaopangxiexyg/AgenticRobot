@@ -26,6 +26,7 @@ from .project_maintenance import apply_guarded_project_checkout
 from .project_sync import fetch_project_sync, plan_project_sync
 from .run_requests import RunRequestManager
 from .runner_protocol import RunnerCoordinator
+from .runner_staging import ExactSnapshotStager
 from .runs import (
     CANDIDATE_EVIDENCE_TIER,
     DEVELOPMENT_EVIDENCE_TIER,
@@ -279,6 +280,14 @@ def _build_parser() -> argparse.ArgumentParser:
     runner_claim.add_argument("runner_id")
     runner_claim.add_argument("slot_id")
     runner_claim.add_argument("--json", action="store_true")
+    runner_stage = runner_commands.add_parser(
+        "stage",
+        help="materialize one claimed exact snapshot without network or execution",
+    )
+    runner_stage.add_argument("runner_id")
+    runner_stage.add_argument("request_id")
+    runner_stage.add_argument("--slot-root")
+    runner_stage.add_argument("--json", action="store_true")
     return parser
 
 
@@ -585,6 +594,17 @@ def _print_runner_claim(payload: dict[str, object] | None) -> None:
     print(f"Request: {payload.get('request_id')}")
     print(f"Runner: {payload.get('runner_id')}")
     print(f"Slot: {payload.get('slot_id')}")
+
+
+def _print_snapshot_stage(payload: dict[str, object]) -> None:
+    print(f"Request: {payload.get('request_id')}")
+    print(f"Runner: {payload.get('runner_id')}")
+    print(f"Slot: {payload.get('slot_id')}")
+    print(f"Snapshot: {payload.get('snapshot_id')}")
+    repositories = payload.get("repositories")
+    print(f"Repositories: {len(repositories) if isinstance(repositories, dict) else 0}")
+    print("Network access: false")
+    print("LFS smudge: false")
 
 
 def _runner_coordinator(manager: WorkspaceManager) -> RunnerCoordinator:
@@ -1107,6 +1127,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _emit(runner_payload, as_json=True)
                 else:
                     _print_runner_inspection(runner_payload)
+                return 0
+            if arguments.runner_command == "stage":
+                slot_root = (
+                    Path(arguments.slot_root).expanduser().resolve()
+                    if arguments.slot_root
+                    else Path(
+                        manager.environ.get(
+                            "LAB_RUNNER_SLOT_ROOT",
+                            manager.state_root / "runner-slots",
+                        )
+                    )
+                    .expanduser()
+                    .resolve()
+                )
+                staged = ExactSnapshotStager(
+                    coordinator,
+                    repository_catalog=manager.catalog,
+                    slot_root=slot_root,
+                ).stage(arguments.request_id, arguments.runner_id)
+                if arguments.json:
+                    _emit(staged, as_json=True)
+                else:
+                    _print_snapshot_stage(staged)
                 return 0
             claim = coordinator.claim_next(
                 arguments.runner_id, arguments.slot_id

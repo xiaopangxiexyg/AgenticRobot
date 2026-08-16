@@ -120,14 +120,14 @@ allocator、device gateway client 和 reviewed command adapter。被测试 paylo
 | M3a-c | fetch-only sync、维护门、父仓/gitlink 子仓协调 | 已实现，尚未部署 |
 | M3d-e | protected control-plane 外置安装与合并检查 | 已实现候选 |
 | M3f-g | durable Request、幂等状态机、Runner claim、artifact receipt | 已实现协议 |
-| M3h | transport envelope 与 exact clean snapshot staging | 下一切片 |
-| M4 | synthetic draft Git snapshot，仅 offline/sim/GPU-only | 待实现 |
+| M3h | transport envelope 与 exact clean snapshot staging | 已实现本地协议 |
+| M4 | synthetic draft Git snapshot，仅 offline/sim/GPU-only | 下一切片 |
 | M5 | 分布式 Profile、组合预留、ServiceReceipt | 待实现 |
 | M6 | 设备 observe、fixture/attempt/quarantine | 待实现 |
 | M7 | 设备 control、authority handoff、release evidence | 待实现 |
 | M8 | 确有需要时的远端 hosted development | 待实现 |
 
-M3h 先实现项目无关、无命令执行的协议：可移植 request envelope、完整性/重放校验，以及只从本机已有 Git objects
+M3h 已实现项目无关、无命令执行的协议：受认证 request envelope、完整性/重放校验，以及只从本机已有 Git objects
 物化 exact clean detached slot。它不连接真实远端、不下载大文件、不运行项目命令，也不授予 GPU/设备权限。
 
 ## 第二部分：当前项目的组合与双机拓扑

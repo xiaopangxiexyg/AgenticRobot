@@ -162,6 +162,11 @@ M3g adds trusted runner compatibility checks, cooperative slot claims, and
 content-addressed claim/artifact receipts. Its runner adapter still does not
 execute payload commands, transfer artifacts, contact remote hosts, or grant
 resource/device authority.
+M3h adds HMAC-authenticated, expiring Request envelopes and exact snapshot
+staging from Git objects already present on the runner. Staging must not fetch,
+run checkout filters/hooks, enable LFS smudge, execute project commands, or
+grant network/GPU/service/device authority. An incomplete slot is quarantined;
+never repair it with reset/clean or an implicit fetch.
 
 Use one active development branch per Task/repository. Record consecutive
 implementation milestones as commits, docs, tags, and Run evidence instead of

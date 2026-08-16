@@ -522,6 +522,13 @@ class RunnerCoordinator:
             raise LabError("runner claim hash mismatch")
         return claim, state, runner
 
+    def validated_claim(
+        self, request_id: str, runner_id: str
+    ) -> tuple[dict[str, object], dict[str, object], RunnerProfile]:
+        """Expose a revalidated claim to trusted runner adapters."""
+
+        return self._validated_claim(request_id, runner_id)
+
     def _validated_artifact_receipt(
         self,
         request_id: str,

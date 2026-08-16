@@ -19,7 +19,8 @@
       "tests/test_lab_control_install.py",
       "tests/test_lab_framework_boundary.py",
       "tests/test_lab_run_requests.py",
-      "tests/test_lab_runner_protocol.py"
+      "tests/test_lab_runner_protocol.py",
+      "tests/test_lab_m3h_transport_staging.py"
     ],
     "lab-m1": [
       "tests/test_lab_m1_workspace.py",
@@ -52,6 +53,9 @@
     ],
     "lab-m3g": [
       "tests/test_lab_runner_protocol.py"
+    ],
+    "lab-m3h": [
+      "tests/test_lab_m3h_transport_staging.py"
     ]
   }
 }
