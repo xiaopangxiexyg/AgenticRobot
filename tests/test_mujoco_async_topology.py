@@ -14,6 +14,7 @@ from robot_motion.action import (
 from sim.contracts import TimingSpec
 from sim.mujoco.adapters import MujocoPositionExecutionConfig, MujocoPositionExecutionRig
 from sim.mujoco.deploy import (
+    MujocoCompositionRuntimeConfig,
     MujocoDeployConfig,
     MujocoDeployRuntime,
 )
@@ -88,6 +89,7 @@ def build_runtime() -> tuple[MujocoDeployRuntime, FakeScene, ManualClock]:
             enable_composer_authority=True,
             decision_hz=30.0,
         ),
+        composition_runtime_config=MujocoCompositionRuntimeConfig(),
         clock=clock,
     )
     runtime.start()

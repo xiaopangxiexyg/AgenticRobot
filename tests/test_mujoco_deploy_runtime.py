@@ -179,6 +179,7 @@ def build_runtime(
     *,
     clock: ManualClock | None = None,
     domain: str = "mujoco-env-0",
+    composition_enabled: bool = False,
 ) -> tuple[MujocoDeployRuntime, FakeScene, ManualClock]:
     actual_clock = clock or ManualClock()
     scene = FakeScene()
@@ -200,13 +201,18 @@ def build_runtime(
             control_domain_id=domain,
             embodiment_instance_id=f"embodiment-{domain}",
         ),
+        composition_runtime_config=(
+            MujocoCompositionRuntimeConfig()
+            if composition_enabled
+            else None
+        ),
         clock=actual_clock,
     )
     return runtime, scene, actual_clock
 
 
 def test_composition_binding_preserves_runtime_compatibility_views() -> None:
-    runtime, _scene, _clock = build_runtime()
+    runtime, _scene, _clock = build_runtime(composition_enabled=True)
 
     assert runtime.composition_port is runtime._composition_binding
     assert runtime.policy_topology is runtime._composition_binding._topology
@@ -231,6 +237,32 @@ def test_composition_binding_preserves_runtime_compatibility_views() -> None:
         "step",
     ):
         assert not hasattr(runtime.composition_port, authority_operation)
+
+
+def test_general_runtime_does_not_allocate_optional_composition_state() -> None:
+    runtime, scene, _clock = build_runtime()
+
+    assert runtime.composition_runtime_config is None
+    assert runtime.composition_port is None
+    assert runtime.policy_topology is None
+    assert runtime.composition_strategy_control is None
+    assert runtime.composition_strategy is None
+    with pytest.raises(RuntimeError, match="Composition runtime is disabled"):
+        runtime.resolve_composition_context("not-admitted")
+    assert scene.physics_commands == []
+
+
+def test_composer_authority_requires_explicit_composition_runtime_config() -> None:
+    runtime, _scene, _clock = build_runtime()
+
+    with pytest.raises(
+        ValueError,
+        match="Composer authority requires an explicit",
+    ):
+        MujocoDeployRuntime(
+            runtime.rig,
+            replace(runtime.config, enable_composer_authority=True),
+        )
 
 
 def test_authoritative_runtime_can_adopt_one_transferred_owner_and_epoch_source() -> None:
@@ -1833,6 +1865,7 @@ def test_slow_context_fast_residual_composes_into_one_authoritative_sim_path() -
             embodiment_instance_id="slow-fast-sim-embodiment",
             enable_composer_authority=True,
         ),
+        composition_runtime_config=MujocoCompositionRuntimeConfig(),
         clock=clock,
     )
     runtime.start()
@@ -2232,7 +2265,8 @@ def test_information_plan_rejects_unrequested_context_before_retention() -> None
 
 def test_source_eligibility_is_default_off_and_opt_in_shadow_holds_no_motion() -> None:
     default_runtime, default_scene, _ = build_runtime(
-        domain="source-eligibility-default-off"
+        domain="source-eligibility-default-off",
+        composition_enabled=True,
     )
     default_runtime.start()
     default_runtime.activate_policy_node_producer("virtual-policy")
@@ -2415,6 +2449,7 @@ def test_multirate_topology_coalesces_40hz_inputs_at_the_30hz_arbiter() -> None:
             enable_composer_authority=True,
             decision_hz=30.0,
         ),
+        composition_runtime_config=MujocoCompositionRuntimeConfig(),
         clock=clock,
     )
     runtime.start()
