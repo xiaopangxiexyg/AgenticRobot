@@ -16,6 +16,10 @@
 - [`lab` M3f：持久化 Run 请求协议](./lab_m3f_run_requests.md)
 - [`lab` M3g：受信 Runner 领取与 artifact 收据](./lab_m3g_runner_protocol.md)
 - [`lab` M3h：受认证 Request envelope 与 exact snapshot staging](./lab_m3h_transport_staging.md)
+- [`lab` 执行边界：代码管理与系统命令的职责划分](./lab_execution_boundary.md)
+- [`lab` M4：synthetic draft Git snapshot](./lab_m4_draft_snapshots.md)
+- [`lab` M5：受信 staged system command execution](./lab_m5_command_execution.md)
+- [`lab` M6a：受认证 exact source/result package](./lab_m6_portable_transfer.md)
 
 ## 文档边界
 

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -25,6 +26,7 @@ from .inspection import (
 from .linked_sync import apply_linked_project_checkout, plan_linked_project_checkout
 from .project_maintenance import apply_guarded_project_checkout
 from .project_sync import fetch_project_sync, plan_project_sync
+from .result_transfer import ResultPackageBuilder, ResultPackageIngress
 from .run_requests import RunRequestManager
 from .runner_protocol import RunnerCoordinator
 from .runner_staging import ExactSnapshotStager
@@ -34,6 +36,7 @@ from .runs import (
     RunManager,
     control_plane_identity,
 )
+from .source_transfer import SourcePackageBuilder, SourcePackageIngress
 from .workspace import LabError, TaskPlan, WorkspaceManager
 from .writer_lease import WriterLeaseManager
 
@@ -52,6 +55,48 @@ def _repository_list(value: str) -> list[str]:
     if not repositories:
         raise argparse.ArgumentTypeError("repository list cannot be empty")
     return repositories
+
+
+def _transport_assignments(values: Sequence[str], *, label: str) -> dict[str, str]:
+    assignments: dict[str, str] = {}
+    for value in values:
+        if value.count("=") != 1:
+            raise LabError(f"{label} must use REPOSITORY=VALUE: {value!r}")
+        repository, assigned = value.split("=", 1)
+        if not repository or not assigned or repository in assignments:
+            raise LabError(f"invalid or duplicate {label}: {value!r}")
+        assignments[repository] = assigned
+    return assignments
+
+
+def _transport_key(path_value: str) -> bytes:
+    path = Path(path_value).expanduser()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise LabError(f"transport key file is missing or unsafe: {path}: {exc}") from exc
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise LabError(f"transport key path is not a regular file: {path}")
+        if stat.S_IMODE(status.st_mode) & 0o077:
+            raise LabError(
+                "transport key file must not be accessible by group or others"
+            )
+        if status.st_size > 4096:
+            raise LabError("transport key file exceeds 4096 bytes")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            secret = stream.read(4097)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(secret) < 32:
+        raise LabError("transport key file must contain at least 32 bytes")
+    return secret
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -310,6 +355,61 @@ def _build_parser() -> argparse.ArgumentParser:
     runner_execute.add_argument("--slot-root")
     runner_execute.add_argument("--command-root")
     runner_execute.add_argument("--json", action="store_true")
+
+    transfer = subcommands.add_parser(
+        "transfer",
+        help="build or ingest authenticated portable source/result packages",
+    )
+    transfer_commands = transfer.add_subparsers(
+        dest="transfer_command", required=True
+    )
+
+    def add_transport_identity(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--sender-id", required=True)
+        command.add_argument("--recipient-id", required=True)
+        command.add_argument("--key-id", required=True)
+        command.add_argument("--key-file", required=True)
+        command.add_argument("--json", action="store_true")
+
+    source_export = transfer_commands.add_parser(
+        "source-export",
+        help="build a bounded Git-object package for one queued request",
+    )
+    source_export.add_argument("request_id")
+    source_export.add_argument("destination")
+    source_export.add_argument(
+        "--base",
+        action="append",
+        default=[],
+        required=True,
+        metavar="REPOSITORY=RECEIVER_COMMIT",
+    )
+    source_export.add_argument("--ttl-seconds", type=int, default=3600)
+    add_transport_identity(source_export)
+
+    source_ingest = transfer_commands.add_parser(
+        "source-ingest",
+        help="authenticate source objects and submit their immutable request",
+    )
+    source_ingest.add_argument("package")
+    add_transport_identity(source_ingest)
+
+    result_export = transfer_commands.add_parser(
+        "result-export",
+        help="build a bounded package from one terminal runner request",
+    )
+    result_export.add_argument("request_id")
+    result_export.add_argument("destination")
+    result_export.add_argument("--slot-root")
+    add_transport_identity(result_export)
+
+    result_ingest = transfer_commands.add_parser(
+        "result-ingest",
+        help="authenticate and retain immutable returned runner evidence",
+    )
+    result_ingest.add_argument("package")
+    result_ingest.add_argument("--result-root")
+    add_transport_identity(result_ingest)
     return parser
 
 
@@ -636,6 +736,21 @@ def _print_command_execution(payload: dict[str, object]) -> None:
     print(f"Classification: {payload.get('classification')}")
     commands = payload.get("commands")
     print(f"Commands: {len(commands) if isinstance(commands, list) else 0}")
+
+
+def _print_transfer(payload: dict[str, object]) -> None:
+    package_id = payload.get("package_id")
+    if isinstance(package_id, str):
+        print(f"Package: {package_id}")
+        print(f"Request: {payload.get('request_id')}")
+        print(f"Sender: {payload.get('sender_id')}")
+        print(f"Recipient: {payload.get('recipient_id')}")
+        return
+    receipt = payload.get("receipt")
+    print(f"Request: {payload.get('request_id')}")
+    if isinstance(receipt, dict):
+        print(f"Package: {receipt.get('package_id')}")
+    print(f"Created: {str(payload.get('created')).lower()}")
 
 
 def _runner_slot_root(manager: WorkspaceManager, configured: str | None) -> Path:
@@ -1206,6 +1321,67 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Terminal: {str(request_payload.get('terminal')).lower()}")
             else:
                 _print_request_state(request_payload)
+            return 0
+
+        if arguments.command == "transfer":
+            store = RunRequestManager(manager).store
+            secret = _transport_key(arguments.key_file)
+            trusted = {arguments.sender_id: {arguments.key_id: secret}}
+            if arguments.transfer_command == "source-export":
+                payload = SourcePackageBuilder(
+                    repository_catalog=manager.catalog
+                ).build(
+                    store.load_request(arguments.request_id),
+                    Path(arguments.destination),
+                    base_commits=_transport_assignments(
+                        arguments.base, label="source receiver base"
+                    ),
+                    sender_id=arguments.sender_id,
+                    recipient_id=arguments.recipient_id,
+                    key_id=arguments.key_id,
+                    secret=secret,
+                    ttl_seconds=arguments.ttl_seconds,
+                )
+            elif arguments.transfer_command == "source-ingest":
+                payload = SourcePackageIngress(
+                    store,
+                    repository_catalog=manager.catalog,
+                    recipient_id=arguments.recipient_id,
+                    trusted_sender_keys=trusted,
+                ).ingest(Path(arguments.package))
+            elif arguments.transfer_command == "result-export":
+                payload = ResultPackageBuilder(
+                    store,
+                    slot_root=_runner_slot_root(manager, arguments.slot_root),
+                ).build(
+                    arguments.request_id,
+                    Path(arguments.destination),
+                    sender_id=arguments.sender_id,
+                    recipient_id=arguments.recipient_id,
+                    key_id=arguments.key_id,
+                    secret=secret,
+                )
+            else:
+                result_root = (
+                    Path(arguments.result_root)
+                    if arguments.result_root
+                    else Path(
+                        manager.environ.get(
+                            "LAB_TRANSFER_RESULT_ROOT",
+                            manager.state_root / "transferred-results",
+                        )
+                    )
+                ).expanduser().resolve()
+                payload = ResultPackageIngress(
+                    store,
+                    result_root=result_root,
+                    recipient_id=arguments.recipient_id,
+                    trusted_sender_keys=trusted,
+                ).ingest(Path(arguments.package))
+            if arguments.json:
+                _emit(payload, as_json=True)
+            else:
+                _print_transfer(payload)
             return 0
 
         if arguments.command == "runner":

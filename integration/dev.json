@@ -22,7 +22,9 @@
       "tests/test_lab_runner_protocol.py",
       "tests/test_lab_m3h_transport_staging.py",
       "tests/test_lab_m4_draft_snapshots.py",
-      "tests/test_lab_m5_command_execution.py"
+      "tests/test_lab_m5_command_execution.py",
+      "tests/test_lab_m6_source_transfer.py",
+      "tests/test_lab_m6_result_transfer.py"
     ],
     "lab-m1": [
       "tests/test_lab_m1_workspace.py",
@@ -64,6 +66,10 @@
     ],
     "lab-m5": [
       "tests/test_lab_m5_command_execution.py"
+    ],
+    "lab-m6": [
+      "tests/test_lab_m6_source_transfer.py",
+      "tests/test_lab_m6_result_transfer.py"
     ]
   }
 }

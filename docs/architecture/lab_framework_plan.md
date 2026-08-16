@@ -120,7 +120,8 @@ command adapter。被测试 payload 可包含仓库源码及 repo-local tests，
 | M3h | transport envelope 与 exact clean snapshot staging | 已实现本地协议 |
 | M4 | synthetic draft Git snapshot | 已实现本地协议 |
 | M5 | staged snapshot 的受信 command adapter、状态与日志 | 已实现本地协议 |
-| M6 | 已认证本地/远端 transport、Git object 传输与 artifact 回收 | 下一切片 |
+| M6a | 受认证 exact Git object package 与通用结果回收 | 已实现本地协议 |
+| M6b | host-local 复制 adapter、远端执行闭环与断线恢复 | 下一切片 |
 | M7 | 自动同步策略、evidence promotion 与保留/清理 | 待实现 |
 | M8 | 确有需要时的远端 hosted development | 待实现 |
 
@@ -206,5 +207,6 @@ task/AR-lab-framework-v2      M1 以后连续的框架集成线
 已被替代但需留档的早期项目专用 prototype 固定在 annotated tag
 `archive/lab-control-bootstrap-20260816`；它不是可继续开发或部署的框架分支。
 
-当前阶段仍不对旧远端混合运行目录做 reset/clean，也不部署候选控制面。下一阶段接入经过认证的本地/远端
-transport 与受限 Git object/artifact 传输；命令内部需要什么环境或外部能力继续不由 `lab` 解析。
+当前阶段仍不对旧远端混合运行目录做 reset/clean，也不部署候选控制面。M6a 已实现经过认证且有大小上限的 Git
+object/result package，但尚未自动复制到真实主机。下一阶段只增加 host-local transport adapter、远端执行状态跟踪与
+断线恢复；命令内部需要什么环境或外部能力继续不由 `lab` 解析。

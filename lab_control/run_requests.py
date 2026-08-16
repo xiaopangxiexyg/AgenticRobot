@@ -639,19 +639,32 @@ class RunRequestStore:
         return path.is_file() and not path.is_symlink()
 
     def latest_event(self, request_id: str) -> dict[str, object]:
+        return self.events(request_id)[-1]
+
+    def events(self, request_id: str) -> list[dict[str, object]]:
+        """Return the complete validated immutable event sequence."""
+
         state = self.load(request_id)
         history = state["history"]
         assert isinstance(history, list)
-        sequence = len(history) - 1
-        summary = history[sequence]
-        assert isinstance(summary, dict)
-        observed_state = str(summary["state"])
         request = self.load_request(request_id)
-        return self._validate_event(
-            _read_json(self._event_path(request_id, sequence, observed_state)),
-            request=request,
-            sequence=sequence,
-        )
+        events: list[dict[str, object]] = []
+        for sequence, summary in enumerate(history):
+            assert isinstance(summary, dict)
+            observed_state = str(summary["state"])
+            event = self._validate_event(
+                _read_json(self._event_path(request_id, sequence, observed_state)),
+                request=request,
+                sequence=sequence,
+            )
+            if (
+                event.get("state") != observed_state
+                or event.get("at") != summary.get("at")
+                or event.get("event_sha256") != summary.get("event_sha256")
+            ):
+                raise LabError("Run request event differs from state history")
+            events.append(event)
+        return events
 
     def _event(
         self,

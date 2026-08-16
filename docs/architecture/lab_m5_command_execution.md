@@ -100,7 +100,8 @@ AgenticRobot 与 `model/openpi` 的父仓/gitlink 一致性以及 RPent sibling 
 Command executor只看到通用 repository identity 和 staged path，不知道哪个仓库包含模型或其它运行实现。
 
 下一阶段 M6 接入 transport 时保持同一边界：本机传递 exact source 与 Request，远端执行相同 command adapter，再
-回传 execution/artifact receipt；不会新增项目资源调度 schema，也不会同步活动 worktree。
+回传 execution/artifact receipt；不会新增项目资源调度 schema，也不会同步活动 worktree。M6a 的可移植 package
+合同见 [`lab_m6_portable_transfer.md`](lab_m6_portable_transfer.md)。
 
 ## 验证
 
