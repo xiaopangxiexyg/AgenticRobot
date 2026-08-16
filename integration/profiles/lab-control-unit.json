@@ -1,0 +1,22 @@
+{
+  "commands": [
+    {
+      "argv": [
+        "{python}",
+        "dev",
+        "test",
+        "lab-control"
+      ],
+      "command_id": "lab-control-unit",
+      "environment_id": "agenticrobot-py310",
+      "repository": "AgenticRobot",
+      "timeout_seconds": 120
+    }
+  ],
+  "description": "AgenticRobot lab control-plane unit and temporary-Git integration tests.",
+  "execution": "local",
+  "profile_id": "lab-control-unit",
+  "requires_clean": true,
+  "risk_level": "R0",
+  "schema": "lab.profile.v1"
+}

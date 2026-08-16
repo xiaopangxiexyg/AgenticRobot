@@ -1,0 +1,45 @@
+{
+  "command_ids": [
+    "agenticrobot-openpi-gpu-preflight",
+    "agenticrobot-openpi-gpu-smoke"
+  ],
+  "description": "Clean AgenticRobot + openpi GPU-only preflight and smoke test; no device access.",
+  "execution": "remote-gpu",
+  "profile_id": "agenticrobot-openpi-gpu",
+  "repositories": [
+    "AgenticRobot",
+    "openpi"
+  ],
+  "required_capabilities": [
+    "gpu:cuda",
+    "openpi-runtime"
+  ],
+  "required_environments": [
+    "agenticrobot-py310",
+    "openpi-py311-cuda"
+  ],
+  "required_assets": [
+    "openpi-checkpoint",
+    "openpi-config",
+    "openpi-norm-stats"
+  ],
+  "requires_clean": true,
+  "resources": {
+    "device_access": false,
+    "downloads_permitted": false,
+    "gpu_count": 1,
+    "network_egress": "loopback-only"
+  },
+  "risk_level": "R1",
+  "schema": "lab.remote-profile.v1",
+  "service": {
+    "endpoint_scheme": "ws",
+    "environment_id": "openpi-py311-cuda",
+    "launch_command_id": "openpi-policy-service",
+    "launch_mode": "ephemeral",
+    "protocol": "openpi-policy-service.v1",
+    "repository": "openpi",
+    "service_name": "openpi-policy"
+  },
+  "target_host": "remote-gpu-hardware"
+}

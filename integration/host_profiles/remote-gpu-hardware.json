@@ -1,0 +1,75 @@
+{
+  "asset_roots": [
+    "/home/user/zc/openpi/assets",
+    "/home/user/zc/openpi/checkpoints",
+    "/home/user/zc/openpi/configs",
+    "/home/user/zc/robot-stack/data"
+  ],
+  "capabilities": [
+    "gpu:cuda",
+    "openpi-runtime"
+  ],
+  "control_plane_projectctl": "/home/user/zc/robot-stack/control-plane/current/projectctl",
+  "device_access": false,
+  "environments": {
+    "agenticrobot-py310": {
+      "import_modules": [
+        "lab_control"
+      ],
+      "path": "/home/user/zc/robot-stack/envs/agenticrobot-py310",
+      "python_major_minor": "3.10",
+      "repository": "AgenticRobot",
+      "source_roots": [
+        "."
+      ]
+    },
+    "openpi-py311-cuda": {
+      "import_modules": [
+        "openpi",
+        "openpi_client"
+      ],
+      "path": "/home/user/zc/robot-stack/envs/openpi-py311-cuda",
+      "python_major_minor": "3.11",
+      "repository": "openpi",
+      "source_roots": [
+        ".",
+        "src",
+        "packages/openpi-client/src"
+      ]
+    }
+  },
+  "host_id": "remote-gpu-hardware",
+  "hostname": "user-B650M-AORUS-PRO-AX",
+  "network_policy": {
+    "implicit_downloads": false,
+    "large_file_downloads": false,
+    "task_payload_egress": "loopback-only",
+    "trusted_prepare_egress": "explicit-only"
+  },
+  "repositories": {
+    "AgenticRobot": {
+      "canonical_identity": "CYBER-QAQ/AgenticRobot",
+      "path": "/home/user/zc/AgenticRobot"
+    },
+    "openpi": {
+      "canonical_identity": "CYBER-QAQ/Openpi",
+      "path": "/home/user/zc/robot-stack/dev/openpi"
+    }
+  },
+  "sandbox_backend": {
+    "allowed_gpu_devices": [
+      "/dev/nvidia0",
+      "/dev/nvidiactl",
+      "/dev/nvidia-uvm",
+      "/dev/nvidia-uvm-tools"
+    ],
+    "backend_id": "bubblewrap-v1",
+    "executable": "/usr/bin/bwrap",
+    "max_probe_age_seconds": 300
+  },
+  "schema": "lab.host-profile.v1",
+  "slot_root": "/home/user/zc/robot-stack/test-slots",
+  "slots": [
+    "gpu-slot-01"
+  ]
+}

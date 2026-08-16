@@ -1,0 +1,18 @@
+{
+  "environment_id": "openpi-source-py311",
+  "import_modules": [
+    "openpi",
+    "openpi_client"
+  ],
+  "python_major_minor": "3.11",
+  "repository": "openpi",
+  "resolver": {
+    "environment": "rpent",
+    "kind": "conda"
+  },
+  "schema": "lab.environment.v1",
+  "source_roots": [
+    "src",
+    "packages/openpi-client/src"
+  ]
+}

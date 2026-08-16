@@ -1,0 +1,36 @@
+{
+  "adapter_id": "openpi-dexteleop-policy-service-v1",
+  "argv_template": [
+    "{python}",
+    "-I",
+    "-c",
+    "import runpy,sys;script=sys.argv.pop(1);roots=[sys.argv.pop(1),sys.argv.pop(1)];sys.path[:0]=roots;sys.argv[0]=script;runpy.run_path(script,run_name='__main__')",
+    "{source:0}/scripts/serve_dexteleop_policy.py",
+    "{source:1}",
+    "{source:2}",
+    "--model",
+    "{workload_id}",
+    "--registry",
+    "{asset:openpi-config}",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "{port}",
+    "--checkpoint-dir",
+    "{asset:openpi-checkpoint}"
+  ],
+  "asset_projections": [
+    {
+      "destination_role": "openpi-checkpoint",
+      "relative_target": "assets/dual_rm65_dmgripper/norm_stats.json",
+      "source_role": "openpi-norm-stats"
+    }
+  ],
+  "environment": {},
+  "launch_command_id": "openpi-policy-service",
+  "schema": "lab.service-adapter.v1",
+  "supported_workload_ids": [
+    "dual_rm65_dmgripper_latest"
+  ],
+  "working_directory": "/workspace/source/0"
+}

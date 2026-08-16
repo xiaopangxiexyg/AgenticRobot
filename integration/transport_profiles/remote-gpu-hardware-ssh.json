@@ -1,0 +1,17 @@
+{
+  "host_key_fingerprints": [
+    "SHA256:GdVlBm+0B+VFEi72aeURSFc3yF2ih3MqJINOsDMjq/8"
+  ],
+  "kind": "ssh-stdio",
+  "remote_inbox_root": "/home/user/zc/robot-stack/runner-inbox",
+  "remote_projectctl": "/home/user/zc/robot-stack/control-plane/current/projectctl",
+  "remote_state_root": "/home/user/zc/robot-stack/runner-state",
+  "schema": "lab.transport-profile.v1",
+  "ssh_alias": "agenticrobot-remote-192-168-70-116",
+  "ssh_host": "192.168.70.116",
+  "ssh_port": 22,
+  "ssh_user": "user",
+  "status": "ACTIVE",
+  "target_host": "remote-gpu-hardware",
+  "transport_id": "remote-gpu-hardware-ssh"
+}

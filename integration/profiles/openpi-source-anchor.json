@@ -1,0 +1,21 @@
+{
+  "commands": [
+    {
+      "argv": [
+        "{python}",
+        "-c",
+        "from pathlib import Path; required = (Path('src/openpi/__init__.py'), Path('packages/openpi-client/src/openpi_client/__init__.py'), Path('.gitmodules')); missing = [str(path) for path in required if not path.is_file()]; assert not missing, missing; print('openpi source anchor ready')"
+      ],
+      "command_id": "openpi-source-anchor",
+      "environment_id": "openpi-source-py311",
+      "repository": "openpi",
+      "timeout_seconds": 60
+    }
+  ],
+  "description": "Dependency-free OpenPI source-anchor and import-provenance check; no GPU, model, dataset, or device access.",
+  "execution": "local",
+  "profile_id": "openpi-source-anchor",
+  "requires_clean": true,
+  "risk_level": "R0",
+  "schema": "lab.profile.v1"
+}

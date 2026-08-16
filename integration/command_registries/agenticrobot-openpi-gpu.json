@@ -1,0 +1,20 @@
+{
+  "commands": {
+    "agenticrobot-openpi-gpu-preflight": {
+      "adapter_id": "agenticrobot-openpi-gpu-preflight-v1",
+      "device_access": false,
+      "downloads_permitted": false,
+      "network_egress": "loopback-only",
+      "service_required": true
+    },
+    "agenticrobot-openpi-gpu-smoke": {
+      "adapter_id": "agenticrobot-openpi-gpu-smoke-v1",
+      "device_access": false,
+      "downloads_permitted": false,
+      "network_egress": "loopback-only",
+      "service_required": true
+    }
+  },
+  "registry_id": "agenticrobot-openpi-gpu-v1",
+  "schema": "lab.command-registry.v1"
+}

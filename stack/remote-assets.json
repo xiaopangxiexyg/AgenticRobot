@@ -1,0 +1,11 @@
+{
+  "assets": {},
+  "lock_id": "remote-assets-20260814-bootstrap",
+  "workload_id": null,
+  "schema": "lab.asset-lock.v1",
+  "unresolved": [
+    "openpi-checkpoint",
+    "openpi-config",
+    "openpi-norm-stats"
+  ]
+}

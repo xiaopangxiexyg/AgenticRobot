@@ -1,0 +1,45 @@
+{
+  "candidates": {
+    "dual_rm65_dmgripper_latest": {
+      "activation_ready": false,
+      "blockers": [
+        "content-manifest",
+        "explicit-selection"
+      ],
+      "content": {
+        "asset_role": "openpi-checkpoint",
+        "content_manifest_sha256": null,
+        "exists": true,
+        "relative_path": "checkpoints/dual_rm65_dmgripper/dual_rm65_dmgripper_lora_b2_lr5e-5_100k_20260706/99999"
+      },
+      "companion_assets": {
+        "openpi-config": {
+          "asset_id": "openpi-policy-registry-a212e8403",
+          "relative_path": "configs/dexteleop_policy_registry.json",
+          "sha256": "a212e8403ed60a627d7dcc4277196d794560dd079c16774d5e671a05174ac88a"
+        },
+        "openpi-norm-stats": {
+          "asset_id": "dual-rm65-dmgripper-norm-stats-38972e65",
+          "relative_path": "assets/dual_rm65_dmgripper/dual_rm65_dmgripper/norm_stats.json",
+          "sha256": "38972e65f80bed3a8ef2d0cbe91907a3c0bcf51e921a45004168dabd6f131e66"
+        }
+      },
+      "candidate_id": "dual_rm65_dmgripper_latest",
+      "selection_authorized": false
+    }
+  },
+  "host_id": "remote-gpu-hardware",
+  "observation_id": "openpi-assets-20260814",
+  "observed_at": "2026-08-14T13:44:20+08:00",
+  "registry": {
+    "asset_role": "openpi-config",
+    "relative_path": "configs/dexteleop_policy_registry.json",
+    "sha256": "a212e8403ed60a627d7dcc4277196d794560dd079c16774d5e671a05174ac88a"
+  },
+  "repository": {
+    "canonical_identity": "CYBER-QAQ/Openpi",
+    "commit": "0d2d7f4e5526cca5f65e17b34f17ca8adad17407",
+    "tree_oid": "2948ea44318a6197ad7b52f8274fd3473b333700"
+  },
+  "schema": "lab.asset-observations.v2"
+}

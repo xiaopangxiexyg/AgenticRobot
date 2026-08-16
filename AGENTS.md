@@ -62,9 +62,13 @@ is experimental.
   batch adapters, and offline model evaluation. It may depend on
   `dataset_contracts` and `dataset_interface`, but must not own robot-motion
   semantics, deployment, safety, authority, dispatch, or hardware resources.
-- `model/`: local policy weights, checkpoints, and runtime sidecars only. It is
-  not a Python package or a source-code owner; versioned artifact contracts and
-  integration remain under `deployments/`.
+- `model/`: local policy weights, checkpoints, runtime sidecars, and explicitly
+  pinned external source boundaries only. It is not a Python package or an
+  AgenticRobot source-code owner; versioned artifact contracts and integration
+  remain under `deployments/`. `model/openpi` is the independently owned OpenPI
+  Git submodule: its gitlink is the source-version boundary, it keeps its own
+  Python/runtime environment, and AgenticRobot code must not treat it as the
+  `model.openpi` package or vendor its generated/runtime assets.
 - `legacy/`: confirmed-archived code/docs only; production code must not import it.
 - `tests/`: verification, never runtime code. Root `todos/` is Git-ignored local planning state;
   tracked code, tests, and documentation must not import or link to it. Plans that require shared
@@ -135,6 +139,20 @@ owned state.
 Run the smallest relevant tests and report them. Use `git diff --check`; add
 targeted tests, `py_compile`, and entrypoint `--help` checks as appropriate.
 Hardware tests and remote runs require explicit scope.
+
+The repository-local `./dev` command is the stable development wrapper for
+implemented targets (`doctor`, `test lab-control`, and
+`test agent-gateway-contract`). Multi-repository Task workspaces and local clean
+Runs use `./lab`; its implemented boundary is documented in
+`docs/architecture/lab_task_workspace.md`. Neither command grants remote,
+GPU, simulator, service, or device authority merely by existing.
+`./lab doctor` validates protected repository-specific environment Profiles and
+first-party import provenance without creating a Task or starting tests.
+`./projectctl remote-request build|validate`, `./projectctl host-observe`, and
+`./projectctl remote-preflight` are currently M3 contract tools only. The host
+observer reads only the configured local host's Git/environment/receipt facts;
+the others emit or validate a GPU-only request/receipt. They do not submit,
+SSH, fetch, allocate a GPU, start a service, or access a device.
 
 Only dependency, Python-version, package-discovery, or installation changes
 require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,

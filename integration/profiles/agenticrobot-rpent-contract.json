@@ -1,0 +1,38 @@
+{
+  "commands": [
+    {
+      "argv": [
+        "{python}",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_control_station_agent_gateway_contracts.py",
+        "tests/test_control_station_agent_gateway_state_schemas.py"
+      ],
+      "command_id": "agenticrobot-agent-gateway-contract",
+      "environment_id": "agenticrobot-py310",
+      "repository": "AgenticRobot",
+      "timeout_seconds": 120
+    },
+    {
+      "argv": [
+        "{python}",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_repository_boundaries.py",
+        "integrations/dexteleop/tests/test_contract_snapshot.py"
+      ],
+      "command_id": "rpent-agent-gateway-boundary",
+      "environment_id": "rpent-py311",
+      "repository": "RPent",
+      "timeout_seconds": 120
+    }
+  ],
+  "description": "Clean AgenticRobot/RPent gateway and repository-boundary contract matrix in repository-specific environments.",
+  "execution": "local",
+  "profile_id": "agenticrobot-rpent-contract",
+  "requires_clean": true,
+  "risk_level": "R0",
+  "schema": "lab.profile.v1"
+}

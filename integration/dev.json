@@ -1,0 +1,44 @@
+{
+  "schema": "lab.dev-config.v1",
+  "python_major_minor": "3.10",
+  "import_modules": [
+    "lab_control",
+    "robot_motion",
+    "deployments"
+  ],
+  "test_targets": {
+    "agent-gateway-contract": [
+      "tests/test_control_station_agent_gateway_contracts.py",
+      "tests/test_control_station_agent_gateway_state_schemas.py"
+    ],
+    "lab-control": [
+      "tests/test_lab_task_workspace.py",
+      "tests/test_lab_remote_request.py",
+      "tests/test_lab_runtime_inventory.py",
+      "tests/test_lab_remote_preflight.py",
+      "tests/test_lab_draft_snapshot.py",
+      "tests/test_lab_clean_slot.py",
+      "tests/test_lab_asset_observation.py",
+      "tests/test_lab_asset_selection.py",
+      "tests/test_lab_command_registry.py",
+      "tests/test_lab_control_plane_package.py",
+      "tests/test_lab_maintenance.py",
+      "tests/test_lab_gpu_lease.py",
+      "tests/test_lab_resource_reservation.py",
+      "tests/test_lab_endpoint_lease.py",
+      "tests/test_lab_network_namespace.py",
+      "tests/test_lab_execution_sandbox.py",
+      "tests/test_lab_impact_rules.py",
+      "tests/test_lab_preparation_profile.py",
+      "tests/test_lab_project_independence.py",
+      "tests/test_lab_repository_links.py",
+      "tests/test_lab_project_sync.py",
+      "tests/test_lab_writer_lease.py",
+      "tests/test_lab_service_identity.py",
+      "tests/test_lab_remote_dispatch.py",
+      "tests/test_lab_source_anchor.py",
+      "tests/test_lab_stable_sync.py",
+      "tests/test_lab_trusted_fetch.py"
+    ]
+  }
+}

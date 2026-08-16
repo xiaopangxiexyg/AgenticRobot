@@ -1,0 +1,82 @@
+{
+  "fallback_profiles": {
+    "AgenticRobot": [
+      "agenticrobot-rpent-contract",
+      "lab-control-unit"
+    ],
+    "RPent": [
+      "agenticrobot-rpent-contract"
+    ],
+    "openpi": [
+      "openpi-source-anchor"
+    ]
+  },
+  "rules": [
+    {
+      "paths": {
+        "AgenticRobot": [
+          "lab_control/**",
+          "tests/test_lab_*.py",
+          "lab",
+          "projectctl",
+          "dev",
+          "integration/command_registries/**",
+          "integration/environments/**",
+          "integration/host_profiles/**",
+          "integration/preparation_profiles/**",
+          "integration/remote_profiles/**",
+          "integration/transport_profiles/**"
+        ]
+      },
+      "profiles": [
+        "lab-control-unit"
+      ],
+      "rule_id": "lab-control"
+    },
+    {
+      "paths": {
+        "AgenticRobot": [
+          "control_station/agent_gateway/**",
+          "tests/test_control_station_agent_gateway_*.py",
+          "integration/profiles/agenticrobot-rpent-contract.json"
+        ],
+        "RPent": [
+          "**"
+        ]
+      },
+      "profiles": [
+        "agenticrobot-rpent-contract"
+      ],
+      "rule_id": "agent-gateway-contract"
+    },
+    {
+      "paths": {
+        "AgenticRobot": [
+          "integration/profiles/openpi-source-anchor.json"
+        ],
+        "openpi": [
+          "**"
+        ]
+      },
+      "profiles": [
+        "openpi-source-anchor"
+      ],
+      "rule_id": "openpi-source"
+    },
+    {
+      "paths": {
+        "AgenticRobot": [
+          "stack/baseline.json",
+          "stack/impact-rules.json"
+        ]
+      },
+      "profiles": [
+        "agenticrobot-rpent-contract",
+        "lab-control-unit",
+        "openpi-source-anchor"
+      ],
+      "rule_id": "stack-composition"
+    }
+  ],
+  "schema": "lab.impact-rules.v1"
+}

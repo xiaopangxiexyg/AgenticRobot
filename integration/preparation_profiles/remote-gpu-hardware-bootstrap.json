@@ -1,0 +1,44 @@
+{
+  "allowed_target_roots": [
+    "/home/user/zc/robot-stack/dev",
+    "/home/user/zc/robot-stack/control-plane"
+  ],
+  "control_plane": {
+    "current_link": "/home/user/zc/robot-stack/control-plane/current",
+    "environment_id": "agenticrobot-py310",
+    "install_root": "/home/user/zc/robot-stack/control-plane",
+    "max_versions": 3,
+    "repository": "AgenticRobot"
+  },
+  "host_id": "remote-gpu-hardware",
+  "network_policy": {
+    "implicit_downloads": false,
+    "large_file_downloads": false,
+    "lfs_smudge": false,
+    "submodule_network_fetch": false,
+    "task_payload_egress": "loopback-only",
+    "trusted_prepare_egress": "explicit-only"
+  },
+  "profile_id": "remote-gpu-hardware-bootstrap",
+  "schema": "lab.preparation-profile.v1",
+  "source_anchors": {
+    "openpi": {
+      "canonical_identity": "CYBER-QAQ/Openpi",
+      "max_checkout_blob_bytes": 16777216,
+      "source_path": "/home/user/zc/openpi",
+      "submodule_sources": {
+        "third_party/aloha": "/home/user/zc/openpi/third_party/aloha",
+        "third_party/libero": "/home/user/zc/openpi/third_party/libero"
+      },
+      "target_path": "/home/user/zc/robot-stack/dev/openpi"
+    }
+  },
+  "stable_sync": {
+    "AgenticRobot": {
+      "branch": "main",
+      "canonical_identity": "CYBER-QAQ/AgenticRobot",
+      "path": "/home/user/zc/AgenticRobot",
+      "remote_ref": "refs/remotes/origin/main"
+    }
+  }
+}

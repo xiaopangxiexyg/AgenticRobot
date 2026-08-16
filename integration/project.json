@@ -1,0 +1,37 @@
+{
+  "control_repository": "AgenticRobot",
+  "default_development_host": "local-dev-control",
+  "project_id": "robot-stack",
+  "repositories": {
+    "AgenticRobot": {
+      "aliases": [
+        "main",
+        "agenticrobot"
+      ],
+      "checkout_mode": "stable_branch",
+      "default_path": ".",
+      "path_base": "control_repository",
+      "path_environment": "LAB_REPOSITORY_AGENTICROBOT",
+      "stable_branch": "main"
+    },
+    "RPent": {
+      "aliases": [
+        "rpent"
+      ],
+      "checkout_mode": "stable_branch",
+      "default_path": "RPent",
+      "path_base": "control_repository_parent",
+      "path_environment": "LAB_REPOSITORY_RPENT",
+      "stable_branch": "main"
+    },
+    "openpi": {
+      "aliases": [],
+      "checkout_mode": "pinned_gitlink",
+      "default_path": "model/openpi",
+      "path_base": "control_repository",
+      "path_environment": "LAB_REPOSITORY_OPENPI",
+      "stable_branch": "dexteleop/integration"
+    }
+  },
+  "schema": "lab.project.v3"
+}

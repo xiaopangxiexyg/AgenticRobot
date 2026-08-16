@@ -1,0 +1,17 @@
+{
+  "environment_id": "rpent-py311",
+  "import_modules": [
+    "rpent"
+  ],
+  "python_major_minor": "3.11",
+  "repository": "RPent",
+  "resolver": {
+    "environment": "rpent",
+    "kind": "conda"
+  },
+  "schema": "lab.environment.v1",
+  "source_roots": [
+    ".",
+    "integrations/dexteleop/src"
+  ]
+}
