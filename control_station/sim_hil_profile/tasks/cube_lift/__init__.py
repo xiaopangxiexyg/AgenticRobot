@@ -1,1 +1,1 @@
-"""CubeLift lifecycle, deployment, observation, and evaluation bindings."""
+"""Compatibility namespace for the MuJoCo CubeLift Skill deployment."""

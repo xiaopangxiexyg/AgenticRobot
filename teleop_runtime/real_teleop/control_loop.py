@@ -188,6 +188,61 @@ def _fresh_control_step_timestamp(
     return max(float(loop_started_at), float(clock()))
 
 
+def _publish_real_agent_motion_measured_cut(
+    components: object,
+    *,
+    hardware_state_by_side: Mapping[str, Mapping[str, object]],
+    preview_qpos_by_side: Mapping[str, object],
+    available_at: float,
+) -> object | None:
+    """Publish only fresh hardware qpos already read by this control frame."""
+
+    port = getattr(components, "agent_motion_port", None)
+    if port is None:
+        return None
+    active_sides = tuple(getattr(components, "active_sides", ()))
+    qpos_by_side = {
+        side: np.asarray(preview_qpos_by_side[side], dtype=float).reshape(6).copy()
+        for side in ("left", "right")
+    }
+    measured_timestamps: list[float] = []
+    evidence_refs: list[str] = []
+    for side in active_sides:
+        state = hardware_state_by_side.get(side, {})
+        measured_qpos = state.get("measured_qpos")
+        measurement_valid = bool(state.get("hardware_measurement_valid", False))
+        measurement_timestamp = state.get("hardware_measurement_timestamp")
+        measurement_sequence = state.get("hardware_measurement_sequence")
+        if measured_qpos is None:
+            measured_qpos = state.get("current_qpos")
+            measurement_valid = bool(state.get("measurement_valid", False))
+            measurement_timestamp = state.get("measurement_timestamp")
+            measurement_sequence = state.get("measurement_sequence")
+        if not measurement_valid or measured_qpos is None:
+            return None
+        try:
+            qpos = np.asarray(measured_qpos, dtype=float).reshape(6)
+            timestamp = float(measurement_timestamp)
+            sequence = int(measurement_sequence)
+        except (TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite(qpos)) or not np.isfinite(timestamp):
+            return None
+        qpos_by_side[side] = qpos.copy()
+        measured_timestamps.append(timestamp)
+        evidence_refs.append(
+            f"realteleop-hardware-qpos:{side}:{sequence}:{timestamp:.9f}"
+        )
+    if not measured_timestamps:
+        return None
+    return port.publish_measured_qpos_pair(
+        qpos_by_side=qpos_by_side,
+        measured_at=min(measured_timestamps),
+        available_at=max(float(available_at), max(measured_timestamps)),
+        source_evidence_refs=tuple(evidence_refs),
+    )
+
+
 class _LegacyFunctionProxy:
     __slots__ = ("_namespace", "_name")
 
@@ -736,6 +791,37 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     pending_progress_arm_transition: PendingProgressArmTransition | None = None
     progress_arm_entry_episode_hash = ""
     next_idle_tactile_compression_tick_at = 0.0
+    agent_motion_port = getattr(components, "agent_motion_port", None)
+    agent_motion_last_phase = (
+        None
+        if agent_motion_port is None
+        else agent_motion_port.snapshot().phase.value
+    )
+
+    def synchronize_agent_motion_owner_state(
+        snapshot: object,
+        *,
+        now: float,
+    ) -> None:
+        """Mirror a newly terminal lower Agent state into the normal UI Hold."""
+
+        nonlocal agent_motion_last_phase
+        phase = str(getattr(getattr(snapshot, "phase", None), "value", ""))
+        previous = agent_motion_last_phase
+        agent_motion_last_phase = phase
+        if phase not in {"held", "faulted"} or phase == previous:
+            return
+        reason = (
+            "agent_motion_owner_fault"
+            if phase == "faulted"
+            else "agent_motion_owner_hold"
+        )
+        _request_safety_hold_best_effort(
+            clutch_input,
+            reason=reason,
+            log=_log,
+            now=now,
+        )
 
     def reset_position_admittance_shadow(
         *,
@@ -2715,6 +2801,15 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             return False
 
         phase_recorder = loop_phase_timer.record if loop_phase_timer is not None else None
+        if agent_motion_port is not None:
+            agent_motion_snapshot = agent_motion_port.apply_owner_requests(
+                session=components.session,
+                now=loop_start,
+            )
+            synchronize_agent_motion_owner_state(
+                agent_motion_snapshot,
+                now=loop_start,
+            )
         try:
             step_result = components.session.run_step(
                 now=loop_start,
@@ -2759,6 +2854,15 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 continue
             raise
         mark_loop_phase("loop.session_run_step")
+        if agent_motion_port is not None:
+            agent_motion_snapshot = agent_motion_port.observe_session_step(
+                command=step_result.command,
+                command_dispatched=step_result.command_dispatched,
+            )
+            synchronize_agent_motion_owner_state(
+                agent_motion_snapshot,
+                now=loop_start,
+            )
         startup_continuity = (
             None
             if step_result.command is None
@@ -3352,6 +3456,34 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             components.right_state_backend,
             include_derived_pose=debug_derived_pose_requested,
         )
+        if agent_motion_port is not None:
+            try:
+                _publish_real_agent_motion_measured_cut(
+                    components,
+                    hardware_state_by_side={
+                        "left": left_hw_state,
+                        "right": right_hw_state,
+                    },
+                    preview_qpos_by_side={
+                        "left": _state_qpos(
+                            components.left_preview_backend,
+                            DEFAULT_LEFT_ARM_QPOS,
+                        ),
+                        "right": _state_qpos(
+                            components.right_preview_backend,
+                            DEFAULT_RIGHT_ARM_QPOS,
+                        ),
+                    },
+                    available_at=loop_start,
+                )
+            except Exception as exc:  # noqa: BLE001 - optional publication owns no control effect.
+                _log(
+                    "AgentMotion",
+                    "measured TCP publication rejected; active Agent operation "
+                    "will fail closed on freshness: "
+                    f"{type(exc).__name__}: {exc}",
+                    now=loop_start,
+                )
         if _update_init_arm_arrival_from_hardware(
             components,
             hardware_state_by_side={

@@ -1,1 +1,1 @@
-"""CubeLift task definition and concrete execution routes."""
+"""Compatibility namespace for Agent Gateway CubeLift Skill contracts."""

@@ -90,67 +90,15 @@ The CLI runner remains in the stable facade; none of these modules owns device
 workers, composition algorithms, canonical safety, IK, dispatch, or dataset
 persistence.
 
-### Agent Gateway semantic motion surface
+### Agent Gateway compatibility boundary
 
-The Gateway is an upper-framework-neutral Skill provider. Its wire requests do
-not contain an RPent Task, Program, Planner, Memory, Experience, or upper
-SkillAttempt object. RPent is the first reviewed consumer, not a required
-runtime dependency. Another upper framework may consume the same catalog and
-submit requests when its client identity is explicitly allowed, but it must
-preserve exact request identity, idempotency, reconciliation and lower-owned
-operation/HOLD truth. The Gateway does not adapt an upper framework's planner
-or task model and never exposes a controller bypass for compatibility.
-
-The default-off MuJoCo Agent Gateway profile publishes one shared lower motion
-domain with separate versioned Skills for absolute TCP targets and semantic
-cardinal steps. `motion.move_tcp_to_pose@1` accepts an exact lower target,
-whereas `motion.step_tcp_cardinal@1` accepts one of `forward`, `backward`,
-`left`, `right`, `up`, or `down`. The latter binds the existing pure
-`robot_motion` short-step catalog: exactly 3 cm along the reviewed target
-reference-frame axes with unchanged TCP orientation.
-
-The cardinal target is resolved from the measured TCP pose only when its Skill
-is activated. The Route schema pins the component, frame, tool, calibration,
-and primitive-catalog identities, but does not expose distance or an absolute
-target as caller-authored values. Both motion Routes share the existing
-authoritative application, safety/IK/reference/dispatch owner and domain-HOLD
-boundary; each has its own Route, evaluator, timeout and operation worker.
-
-The same semantic surface defines three fixed level-orientation Skills:
-`motion.set_tcp_level_forward@1`,
-`motion.set_tcp_level_forward_left_30@1`, and
-`motion.set_tcp_level_forward_right_30@1`. All three keep the selected arm's
-`tool_tcp` position fixed and set the gripper to a horizontal heading in the
-canonical desk plane. Their headings are fixed absolute values (0, +30, and
--30 degrees); they are not relative rotations, and repeated calls do not
-accumulate yaw. The reusable schema and lifecycle select `left_arm` or
-`right_arm` through `component_id` and emit an action only for that component.
-
-The current concrete no-model MuJoCo Agent Gateway launcher remains the
-pre-existing single-`right_arm` deployment and does not publish these three
-orientation Routes. Its `right_arm_base` frame lacks the canonical desk-axis
-binding required by the primitives, and its existing 15-degree safety profile
-does not admit every fixed 30-degree heading. Publishing a right-only Route or
-silently widening that profile would misrepresent the reusable contract. This
-is a deployment-binding limit, not a primitive limit: the lower primitive,
-generic request schema, and single-component lifecycle are arm-neutral and are
-tested with independently bound left- and right-arm action schemas. A future
-left-, right-, or dual-arm launcher must bind the canonical desk frame plus its
-own observation, safety-envelope, IK, and dispatch contracts before exposing
-an Active Route.
-
-The MuJoCo safety-envelope runtime keeps the independently reviewed `standard`
-profile unchanged and allowlisted only for its existing absolute-pose and
-cardinal-step Routes. Preview absolute/relative workspace JSON files are
-visual review inputs, not runtime safety profiles. Any future envelope for the
-fixed orientation Skills must be a separately reviewed lower profile bound to
-the exact desk-frame deployment; it must not be synthesized by scaling or
-widening `standard`.
-
-New primitive families should reuse the same Gateway catalog, admission and
-domain-HOLD path while retaining their own semantic Skill/schema when their
-initiation, effect, termination or evidence differs. Do not add a raw generic
-motion-command escape hatch or another safety/controller owner.
+Agent Gateway protocol/runtime/transport, Skill definitions, executors, and
+concrete MuJoCo deployments are owned by the top-level `agent_gateway` package.
+Control Station retains only its application ports and the historic
+`python -m control_station agent-gateway-mujoco` forwarding command. See
+[`agent_gateway/README.md`](../agent_gateway/README.md) for the canonical
+package layout, `python -m agent_gateway mujoco` entrypoint, published Skill
+surface, and lower-owned safety/HOLD boundary.
 
 The standalone `python -m control_station vive-deflection` application is a
 read-only VIVE input viewer. It opens one VIVE pose receiver and a loopback
@@ -988,17 +936,11 @@ capture, not a replacement for collection-runtime camera/tactile/native-stream
 writers. `--acceptance-gui` remains only a CLI compatibility alias for
 `--control-gui`.
 
-The Agent Gateway's visual path is pull-based and separate from its low-rate
-JSON state snapshot. A deployment can publish its complete current RGB source
-catalog and implement one bounded `capture_visual_snapshot` request. The
-request selects semantic roles plus hard count/dimension/byte limits; it does
-not grant the caller a streaming subscription or any motion/control authority.
-The MuJoCo Agent TCP-pose attachment currently publishes `main`, `wrist_left`,
-and `wrist_right`, renders requested frames under the existing scene/physics
-lock, and rejects a capture if the Station revision differs before or after
-the cut. Encoding and concrete camera IDs remain lower-owned. Other
-attachments, including real deployments, must bind their own producers to the
-same transport-neutral facade rather than importing the MuJoCo renderer.
+The top-level Agent Gateway owns the pull-based visual request contract and
+MuJoCo visual binding. Station only exposes the application revision and
+existing scene/physics cut used by that profile; the visual request grants no
+streaming or motion/control authority. See
+[`agent_gateway/README.md`](../agent_gateway/README.md#observation-and-visual-cuts).
 
 The Station loop follows the authoritative scheduler's exposed next deadline.
 If synchronous contributor work misses one or more upstream compose cuts,

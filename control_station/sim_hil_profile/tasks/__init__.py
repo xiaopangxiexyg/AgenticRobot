@@ -1,1 +1,1 @@
-"""Task-specific MuJoCo Sim-HIL application bindings."""
+"""Historic task-profile compatibility namespaces for Agent Gateway."""

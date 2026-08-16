@@ -36,6 +36,20 @@ is experimental.
   lower implementations or state. `control_station` may import active lower
   packages; lower packages must not import it.
   Migration exceptions must remain explicit in boundary tests or documentation.
+- `agent_gateway/`: upper-framework-neutral external Skill control plane. Its
+  core `protocol/`, `runtime/`, and `transport/` packages own versioned wire
+  contracts, authenticated attachment, request admission/reconciliation,
+  bounded operation projection, and exact executor registration. Target-
+  independent Skill definitions live under `skills/`; concrete application,
+  simulator, observation, executor, and deployment bindings live under
+  `profiles/`. The Gateway must not import or embed an upper planner, Task,
+  Program, Memory, Experience, or framework-specific adapter, and it owns no
+  canonical authority, safety, IK, reference, dispatch, or episode lifecycle.
+  Core packages must not import `control_station`, concrete simulation,
+  hardware, teleop, or model deployments. Concrete profiles may assemble
+  application leaves through typed ports. Historic `control_station` import
+  and CLI paths are forwarding compatibility shims only and must not regain
+  implementation or runtime state.
 - `robot_motion/`: shared motion semantics, Rig, Safety, Planner, position
   control, and runtime contracts; no vendor-device initialization or training.
 - `hardware/`: vendor SDKs and device backends; no dataset schema or learner.
@@ -73,8 +87,10 @@ is experimental.
 Shared code should depend toward `control_composition`, `robot_motion`, and pure
 data contracts. `control_composition` depends downward on `robot_motion`; the
 reverse dependency is forbidden. `sim` must not reverse-depend on
-`teleop_runtime`. `control_station` is an application leaf: dependencies point
-into it from no lower-level package.
+`teleop_runtime`. `control_station` and concrete `agent_gateway` profiles are
+application leaves; lower-level packages must not reverse-depend on either.
+The neutral Gateway core must remain independent of concrete application
+profiles.
 
 Ownership follows reusable domain semantics and resource lifecycles, not import
 legality or the current caller.

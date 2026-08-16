@@ -113,6 +113,23 @@ class SessionStepResult:
     home_recalibration_required: bool = False
 
 
+@dataclass(frozen=True)
+class TeleopCommandOverride:
+    """Explicitly claim one Session frame, with or without a command.
+
+    A bare ``None`` from ``command_override_provider`` means the provider is
+    inactive and the normal human path should run.  This wrapper with
+    ``command=None`` instead inhibits the frame without falling back to human
+    input, which closes activation/cancellation races for external owners.
+    """
+
+    command: TeleopCommand | None
+
+    def __post_init__(self) -> None:
+        if self.command is not None and not isinstance(self.command, TeleopCommand):
+            raise TypeError("TeleopCommandOverride.command must be TeleopCommand or None.")
+
+
 class TeleopSession:
     def __init__(
         self,
@@ -134,6 +151,11 @@ class TeleopSession:
         | None = None,
         command_dispatch_admission: Callable[
             [TeleopCommand, TeleopObservation, float], bool
+        ]
+        | None = None,
+        command_override_provider: Callable[
+            [TeleopObservation, float],
+            TeleopCommandOverride | TeleopCommand | None,
         ]
         | None = None,
         fault_filter: Callable[
@@ -159,6 +181,7 @@ class TeleopSession:
         self.command_filter = command_filter
         self.command_guard = command_guard
         self.command_dispatch_admission = command_dispatch_admission
+        self.command_override_provider = command_override_provider
         self.fault_filter = fault_filter
         self.human_command_observer = human_command_observer
         self.human_command_filter_observer = human_command_filter_observer
@@ -251,6 +274,37 @@ class TeleopSession:
         )
         held = self._hold_rig_motion(reason, context="command safety guard")
         self.fault(reason if held else f"{reason}; hold_motion failed")
+
+    def _reject_command_override_provider_error(
+        self,
+        error: BaseException,
+        *,
+        timestamp: float,
+    ) -> FaultEvent:
+        """Fail closed when an optional external command source cannot answer.
+
+        The provider is evaluated by the control-loop owner, never by an
+        external worker.  A provider failure therefore uses the same owned rig
+        HOLD seam as other pre-dispatch failures and cannot fall back to a
+        human command in the failing frame.
+        """
+
+        fault = FaultEvent(
+            code="command_override_provider_error",
+            message=(
+                "command override provider raised "
+                f"{type(error).__name__}: {error}"
+            ),
+            severity=FaultSeverity.ERROR,
+            timestamp=float(timestamp),
+            component="teleop_session",
+        )
+        if self.recorder is not None:
+            self.recorder.record_fault(fault)
+        reason = f"pre-dispatch command override failed: {fault.message}"
+        held = self._hold_rig_motion(reason, context="command override provider")
+        self.fault(reason if held else f"{reason}; hold_motion failed")
+        return fault
 
     def _step_result(self, **kwargs: Any) -> SessionStepResult:
         kwargs.setdefault(
@@ -1031,8 +1085,65 @@ class TeleopSession:
 
         observation = self._build_observation(channels, current_time)
         mark_phase("session.build_observation")
-        command = self._build_command(observation, phase_recorder=phase_recorder)
-        mark_phase("session.build_command")
+        command: TeleopCommand | None = None
+        command_override_claimed = False
+        if self.command_override_provider is not None:
+            self._current_human_command_emission = None
+            try:
+                override = self.command_override_provider(
+                    observation,
+                    current_time,
+                )
+                if isinstance(override, TeleopCommandOverride):
+                    command_override_claimed = True
+                    command = override.command
+                else:
+                    command = override
+                if command is not None and not isinstance(command, TeleopCommand):
+                    raise TypeError(
+                        "command_override_provider must return TeleopCommandOverride, "
+                        "TeleopCommand, or None."
+                    )
+            except Exception as exc:  # noqa: BLE001 - external source must fail closed.
+                fault = self._reject_command_override_provider_error(
+                    exc,
+                    timestamp=current_time,
+                )
+                faults.append(fault)
+                mark_phase("session.command_override_provider_fault")
+                return self._step_result(
+                    timestamp=current_time,
+                    state=self.state_machine.state,
+                    control_hz=control_hz,
+                    channels=channels,
+                    raw_channels=raw_channels,
+                    observation=observation,
+                    faults=faults,
+                )
+            mark_phase("session.command_override_provider")
+        if command_override_claimed and command is None:
+            mark_phase("session.command_override_inhibited")
+            return self._step_result(
+                timestamp=current_time,
+                state=self.state_machine.state,
+                control_hz=control_hz,
+                channels=channels,
+                raw_channels=raw_channels,
+                observation=observation,
+                faults=faults,
+            )
+        if command is None:
+            command = self._build_command(
+                observation,
+                phase_recorder=phase_recorder,
+            )
+            mark_phase("session.build_command")
+        else:
+            command = self._copy_command(command)
+            if command.timestamp is None:
+                command.timestamp = observation.timestamp
+            command.metadata.setdefault("tcp_mode", self.config.tcp_mode)
+            mark_phase("session.copy_override_command")
         if self.command_filter is not None:
             command = self.command_filter(command, observation, current_time)
             mark_phase("session.filter_command")

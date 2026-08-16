@@ -163,6 +163,7 @@ def build_mujoco_sim_hil_coordinate_profiles(
             semantic_parameters={
                 "frame_family": "target_station",
                 "source": "loaded_mujoco_scene_world",
+                "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
             },
         )
     ]

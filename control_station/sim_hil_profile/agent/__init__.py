@@ -1,1 +1,1 @@
-"""Reusable semantic Agent application bindings for concrete MuJoCo Sim-HIL."""
+"""Compatibility namespace for :mod:`agent_gateway.profiles.mujoco`."""

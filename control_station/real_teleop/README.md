@@ -45,10 +45,13 @@ to reject rooted-tree profiles until the branch workflow has its own gate.
 
 ## Attach-only Agent observation
 
-`agent_observation_gateway.py` defines the default-off real
-`state.read_tcp_pose` Route. It is a `real_observe`, `t0_read_only` Route and
-cannot start/connect a device, refresh hardware, dispatch a command, request
-owner HOLD, rearm, or home.
+The top-level
+`agent_gateway.profiles.real.observation_gateway` module defines the default-
+off real `state.read_tcp_pose` Route. The historic
+`control_station.real_teleop.agent_observation_gateway` path is a compatibility
+re-export only. The Route is `real_observe`, `t0_read_only` and cannot
+start/connect a device, refresh hardware, dispatch a command, request owner
+HOLD, rearm, or home.
 
 The Gateway core is embodiment-neutral. It imports no RM65 or other robot
 backend and contains no fixed arm/component name. A deployment supplies an
@@ -74,9 +77,10 @@ and buffer are no-I/O: neither calls a backend or changes the lower gate.
 Gateway close uses a local no-I/O receipt that explicitly proves neither motion
 nor HOLD; it is not a robot safety receipt.
 
-This package now provides the contract, owner-publication buffer, passive
-executor, Gateway service, and Unix server assembly. It deliberately does not
-register a CLI. Policy-deploy now exposes a separate programmatic default-off
+The top-level real Gateway profile now provides the contract, owner-publication
+buffer, passive executor, Gateway service, and Unix server assembly. It
+deliberately does not register a CLI. Policy-deploy now exposes a separate
+programmatic default-off
 `legacy_worker_binding`: one `LegacyControlDomainExecutionContext` owns its
 dispatch token/epochs plus lifecycle, execution gate, and owner-state revision,
 while `run_policy` submits typed transitions. The no-I/O publication port can
