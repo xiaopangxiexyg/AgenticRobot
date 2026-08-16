@@ -4,6 +4,7 @@ import argparse
 
 import pytest
 
+from teleop_runtime import cli_value_parsers as shared_cli_value_parsers
 from teleop_runtime.deploy import cli_value_parsers
 from teleop_runtime.deploy import run_policy
 
@@ -28,6 +29,14 @@ _MIGRATED_NAMES = (
 def test_run_policy_preserves_migrated_parser_symbols() -> None:
     for name in _MIGRATED_NAMES:
         assert getattr(run_policy, name) is getattr(cli_value_parsers, name)
+
+
+def test_generic_numeric_parsers_use_shared_implementations() -> None:
+    for name in ("_positive_float", "_non_negative_int", "_positive_int"):
+        assert getattr(cli_value_parsers, name) is getattr(
+            shared_cli_value_parsers,
+            name,
+        )
 
 
 @pytest.mark.parametrize(

@@ -12,34 +12,14 @@ import argparse
 
 from robot_motion.deploy.schema import ALL_SIDES
 
+from ..cli_value_parsers import _non_negative_int, _positive_float, _positive_int
 from ..dmtac_tactile_fields import normalize_dmtac_tactile_fields
-
-
-def _positive_float(text: str) -> float:
-    value = float(text)
-    if value <= 0.0:
-        raise argparse.ArgumentTypeError("value must be positive")
-    return value
 
 
 def _unit_interval_float(text: str) -> float:
     value = float(text)
     if not 0.0 < value <= 1.0:
         raise argparse.ArgumentTypeError("value must be in (0, 1]")
-    return value
-
-
-def _non_negative_int(text: str) -> int:
-    value = int(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError("value must be >= 0")
-    return value
-
-
-def _positive_int(text: str) -> int:
-    value = int(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("value must be positive")
     return value
 
 
