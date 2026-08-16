@@ -126,7 +126,7 @@ def build_cs2b_mujoco_replay_station_manifest(
             runtime.execution_capability.semantic_content_hash
         ),
         component_catalog_hash=runtime.catalog.semantic_content_hash,
-        selection_group_ids=runtime.core.config.active_selection_groups,
+        selection_group_ids=runtime.authoritative_port.profile.selection_group_ids,
         owner_registry_id=authoritative_owner_registry_id(runtime),
         authority_epoch_source_id=authoritative_authority_epoch_source_id(runtime),
         execution_epoch_source_id=authoritative_execution_epoch_source_id(runtime),
@@ -188,8 +188,8 @@ def build_cs2b_mujoco_replay_station_manifest(
                 ),
             ),
         ),
-        authority_policy_hash=runtime.core.config.authority_policy.semantic_content_hash,
-        decision_schedule_hash=runtime.core.config.decision_schedule.semantic_content_hash,
+        authority_policy_hash=runtime.authoritative_port.profile.authority_policy_hash,
+        decision_schedule_hash=runtime.authoritative_port.profile.decision_schedule_hash,
         trace_requirement_profile_id=trace_profile_id,
         capture_policy_id="capture_not_owned_by_cs2b_v1",
         allowed_intent_kinds=(
@@ -287,7 +287,7 @@ class MujocoReplayOnlyComposition:
             raise ValueError("CS-2b requires explicit MuJoCo replay authority.")
         if self.runtime.config.enable_composer_authority:
             raise ValueError("CS-2b forbids composer authority.")
-        if self.runtime.core.config.initial_control_mode != "replay":
+        if self.runtime.authoritative_port.profile.initial_control_mode != "replay":
             raise ValueError("CS-2b requires exact replay control mode.")
         if self.runtime.config.decision_hz > 60.0:
             raise ValueError("CS-2b ActionArbiter rate cannot exceed 60 Hz.")
@@ -362,11 +362,15 @@ class MujocoReplayOnlyComposition:
             raise ValueError("Replay observer/schedule start indices disagree.")
         if self.observer_binding.clock_domain_id != self.runtime.config.clock_domain_id:
             raise ValueError("Replay observer and MuJoCo runtime clock domains disagree.")
-        owner_snapshot = self.runtime.core.dispatch_owners.snapshot()
+        owner_snapshot = (
+            self.runtime.authoritative_port.capture_dispatch_owner_snapshot()
+        )
         token = owner_snapshot.current_token
         if token is None or token.owner_kind != "shared_arbitration_runtime":
             raise ValueError("MuJoCo target lacks shared authoritative owner token.")
-        execution_snapshot = self.runtime.core.execution_epochs.snapshot()
+        execution_snapshot = (
+            self.runtime.authoritative_port.capture_execution_epoch_snapshot()
+        )
         payload = {
             "manifest_hash": self.manifest.semantic_content_hash,
             "source_contract_hash": config.source_contract.semantic_content_hash,
@@ -385,10 +389,10 @@ class MujocoReplayOnlyComposition:
             ),
             "component_catalog_hash": self.runtime.catalog.semantic_content_hash,
             "authority_policy_hash": (
-                self.runtime.core.config.authority_policy.semantic_content_hash
+                self.runtime.authoritative_port.profile.authority_policy_hash
             ),
             "decision_schedule_hash": (
-                self.runtime.core.config.decision_schedule.semantic_content_hash
+                self.runtime.authoritative_port.profile.decision_schedule_hash
             ),
             "owner_token_id": token.token_id,
             "owner_token_hash": token.semantic_content_hash,
@@ -583,7 +587,9 @@ class ScopedMujocoReplayStationComposition:
     def authority_status_payload(self) -> dict[str, object]:
         state = self._station.state
         barrier = self.publication_barrier.snapshot()
-        receiver = self._data_plane.runtime.core.capture_receiver_state()
+        receiver = (
+            self._data_plane.runtime.authoritative_port.capture_receiver_state()
+        )
         source_state = state.source_state_by_slot[self.source_adapter.subject_id]
         active = bool(
             barrier.enabled

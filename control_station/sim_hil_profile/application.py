@@ -304,7 +304,7 @@ class MujocoSimHILApplication(
                 self.runtime.clock(),
                 name="passive_application_cut.captured_at",
             )
-            receiver = self.runtime.core.capture_receiver_state()
+            receiver = self.runtime.authoritative_port.capture_receiver_state()
             runtime_config = self.runtime.config
             if (
                 receiver.runtime_session_id != runtime_config.runtime_session_id
@@ -373,17 +373,11 @@ class MujocoSimHILApplication(
                 if self._closed or self._restart_required
                 else self.runtime.rig.capture_scene(scene_projector)
             )
-            coordinator = getattr(self.runtime.core, "coordinator", None)
-            capture_control_cut = getattr(coordinator, "capture_cut", None)
-            control_cut = (
-                None
-                if not callable(capture_control_cut)
-                else capture_control_cut(
-                    cutoff_at=_finite(
-                        self.runtime.clock(),
-                        name="passive_application_cut.cutoff_at",
-                    )
-                ).cut
+            control_cut = self.runtime.authoritative_port.capture_control_cut(
+                cutoff_at=_finite(
+                    self.runtime.clock(),
+                    name="passive_application_cut.cutoff_at",
+                )
             )
             if control_cut is not None and (
                 control_cut.runtime_session_id != runtime_config.runtime_session_id

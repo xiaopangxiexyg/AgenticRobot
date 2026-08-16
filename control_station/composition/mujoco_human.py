@@ -349,7 +349,7 @@ def build_cs2a1_mujoco_human_manifest(
             runtime.execution_capability.semantic_content_hash
         ),
         component_catalog_hash=runtime.catalog.semantic_content_hash,
-        selection_group_ids=runtime.core.config.active_selection_groups,
+        selection_group_ids=runtime.authoritative_port.profile.selection_group_ids,
         owner_registry_id=authoritative_owner_registry_id(runtime),
         authority_epoch_source_id=authoritative_authority_epoch_source_id(runtime),
         execution_epoch_source_id=authoritative_execution_epoch_source_id(runtime),
@@ -392,10 +392,10 @@ def build_cs2a1_mujoco_human_manifest(
             ),
         ),
         authority_policy_hash=(
-            runtime.core.config.authority_policy.semantic_content_hash
+            runtime.authoritative_port.profile.authority_policy_hash
         ),
         decision_schedule_hash=(
-            runtime.core.config.decision_schedule.semantic_content_hash
+            runtime.authoritative_port.profile.decision_schedule_hash
         ),
         trace_requirement_profile_id=trace_profile_id,
         capture_policy_id="capture_not_owned_by_cs2a1_v1",
@@ -691,7 +691,7 @@ class MujocoHumanOnlyComposition:
             raise ValueError("CS2a1 forbids replay authority.")
         if self.runtime.config.enable_composer_authority:
             raise ValueError("CS2a1 forbids composer authority.")
-        if self.runtime.core.config.initial_control_mode != "human":
+        if self.runtime.authoritative_port.profile.initial_control_mode != "human":
             raise ValueError("CS2a1 requires an explicit human control mode.")
         if self.runtime.config.decision_hz > 60.0:
             raise ValueError("CS2a1 ActionArbiter rate cannot exceed 60 Hz.")
@@ -712,11 +712,15 @@ class MujocoHumanOnlyComposition:
             ("right_arm", 6),
         ):
             raise ValueError("CS2a1 currently supports exact coupled bimanual q6 only.")
-        owner_snapshot = self.runtime.core.dispatch_owners.snapshot()
+        owner_snapshot = (
+            self.runtime.authoritative_port.capture_dispatch_owner_snapshot()
+        )
         token = owner_snapshot.current_token
         if token is None or token.owner_kind != "shared_arbitration_runtime":
             raise ValueError("MuJoCo target lacks the shared authoritative owner token.")
-        execution_snapshot = self.runtime.core.execution_epochs.snapshot()
+        execution_snapshot = (
+            self.runtime.authoritative_port.capture_execution_epoch_snapshot()
+        )
         payload = {
             "manifest_hash": self.manifest.semantic_content_hash,
             "source_adapter_contract_hash": self.adapter.contract_hash,
@@ -728,10 +732,10 @@ class MujocoHumanOnlyComposition:
             ),
             "component_catalog_hash": self.runtime.catalog.semantic_content_hash,
             "authority_policy_hash": (
-                self.runtime.core.config.authority_policy.semantic_content_hash
+                self.runtime.authoritative_port.profile.authority_policy_hash
             ),
             "decision_schedule_hash": (
-                self.runtime.core.config.decision_schedule.semantic_content_hash
+                self.runtime.authoritative_port.profile.decision_schedule_hash
             ),
             "owner_token_id": token.token_id,
             "owner_token_hash": token.semantic_content_hash,
@@ -779,13 +783,13 @@ class MujocoHumanOnlyComposition:
             occurred_at=float(self.runtime.clock()),
             clock_domain_id=self.runtime.config.clock_domain_id,
         )
-        self.runtime.core.record_external_facts(facts)
+        self.runtime.authoritative_port.record_external_facts(facts)
         receipt = None
         if (
             result.proposal_draft is not None
             and result.source_adapter_receipt.authoritative_eligible
         ):
-            receipt = self.runtime.core.admit_proposal(
+            receipt = self.runtime.authoritative_port.admit_proposal(
                 result.proposal_draft,
                 source_event_id=result.source_adapter_receipt.source_emission_id,
             )

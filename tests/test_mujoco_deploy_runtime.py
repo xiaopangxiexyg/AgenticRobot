@@ -239,6 +239,41 @@ def test_composition_binding_preserves_runtime_compatibility_views() -> None:
         assert not hasattr(runtime.composition_port, authority_operation)
 
 
+def test_authoritative_port_exposes_snapshots_without_mutable_owner_objects() -> None:
+    runtime, _scene, _clock = build_runtime()
+    port = runtime.authoritative_port
+
+    assert port.profile.initial_control_mode == runtime.core.config.initial_control_mode
+    assert port.profile.selection_group_ids == runtime.core.config.active_selection_groups
+    assert (
+        port.profile.authority_policy_hash
+        == runtime.core.config.authority_policy.semantic_content_hash
+    )
+    assert (
+        port.profile.decision_schedule_hash
+        == runtime.core.config.decision_schedule.semantic_content_hash
+    )
+    assert port.capture_receiver_state() == runtime.core.capture_receiver_state()
+    assert (
+        port.capture_execution_epoch_snapshot()
+        == runtime.core.execution_epochs.snapshot()
+    )
+    assert (
+        port.capture_dispatch_owner_snapshot()
+        == runtime.core.dispatch_owners.snapshot()
+    )
+    for mutable_owner in (
+        "core",
+        "coordinator",
+        "dispatch_owners",
+        "execution_epochs",
+        "producer_epochs",
+        "proposals",
+        "scheduler",
+    ):
+        assert not hasattr(port, mutable_owner)
+
+
 def test_general_runtime_does_not_allocate_optional_composition_state() -> None:
     runtime, scene, _clock = build_runtime()
 

@@ -222,7 +222,9 @@ class ScopedMujocoHumanStationComposition:
 
         state = self._station.state
         barrier = self.publication_barrier.snapshot()
-        receiver = self._data_plane.runtime.core.capture_receiver_state()
+        receiver = (
+            self._data_plane.runtime.authoritative_port.capture_receiver_state()
+        )
         source_state = state.source_state_by_slot[self.source_adapter.subject_id]
         active = bool(
             barrier.enabled

@@ -541,16 +541,12 @@ def _build_no_model_contract_bundle_fixture(
             representation_by_component={"right_arm": "cartesian_pose"},
             schema_hash_by_component={"right_arm": "pose-schema:fixture"},
         ),
-        core=SimpleNamespace(
-            config=SimpleNamespace(
-                active_selection_groups=("arms",),
-                authority_policy=SimpleNamespace(
-                    semantic_content_hash="authority-policy:fixture"
-                ),
-                decision_schedule=SimpleNamespace(
-                    semantic_content_hash="decision-schedule:fixture"
-                ),
-            )
+        authoritative_port=SimpleNamespace(
+            profile=SimpleNamespace(
+                selection_group_ids=("arms",),
+                authority_policy_hash="authority-policy:fixture",
+                decision_schedule_hash="decision-schedule:fixture",
+            ),
         ),
         clock=lambda: 10.0,
     )

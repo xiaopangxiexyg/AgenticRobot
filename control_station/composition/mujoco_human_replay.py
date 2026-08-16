@@ -256,7 +256,7 @@ def build_cs6a_human_replay_handoff_manifest(
             runtime.execution_capability.semantic_content_hash
         ),
         component_catalog_hash=runtime.catalog.semantic_content_hash,
-        selection_group_ids=runtime.core.config.active_selection_groups,
+        selection_group_ids=runtime.authoritative_port.profile.selection_group_ids,
         owner_registry_id=authoritative_owner_registry_id(runtime),
         authority_epoch_source_id=authoritative_authority_epoch_source_id(runtime),
         execution_epoch_source_id=authoritative_execution_epoch_source_id(runtime),
@@ -336,10 +336,10 @@ def build_cs6a_human_replay_handoff_manifest(
             ),
         ),
         authority_policy_hash=(
-            runtime.core.config.authority_policy.semantic_content_hash
+            runtime.authoritative_port.profile.authority_policy_hash
         ),
         decision_schedule_hash=(
-            runtime.core.config.decision_schedule.semantic_content_hash
+            runtime.authoritative_port.profile.decision_schedule_hash
         ),
         trace_requirement_profile_id=trace_profile_id,
         capture_policy_id=(
@@ -924,7 +924,7 @@ class MujocoHumanReplayHandoffComposition:
             raise ValueError(
                 "CS6a requires replay authority and forbids composer authority."
             )
-        if self.runtime.core.config.initial_control_mode != "hybrid":
+        if self.runtime.authoritative_port.profile.initial_control_mode != "hybrid":
             raise ValueError("CS6a requires explicit hybrid control mode.")
         if config.producer_id == config.replay_producer_id:
             raise ValueError("Human and replay producers must be distinct.")
@@ -934,7 +934,7 @@ class MujocoHumanReplayHandoffComposition:
         ):
             raise ValueError("Human and replay source slots must be distinct.")
         allowed = set(
-            self.runtime.core.config.authority_policy.takeover_allowed_producers
+            self.runtime.authoritative_port.profile.takeover_allowed_producers
         )
         expected_allowed = {config.producer_id, config.replay_producer_id}
         if allowed != expected_allowed:
@@ -1027,11 +1027,15 @@ class MujocoHumanReplayHandoffComposition:
             != config.clock_domain_id
         ):
             raise ValueError("Replay observer binding does not match the source/runtime.")
-        owner_snapshot = self.runtime.core.dispatch_owners.snapshot()
+        owner_snapshot = (
+            self.runtime.authoritative_port.capture_dispatch_owner_snapshot()
+        )
         token = owner_snapshot.current_token
         if token is None or token.owner_kind != "shared_arbitration_runtime":
             raise ValueError("MuJoCo target lacks the shared authoritative owner token.")
-        execution_snapshot = self.runtime.core.execution_epochs.snapshot()
+        execution_snapshot = (
+            self.runtime.authoritative_port.capture_execution_epoch_snapshot()
+        )
         payload = {
             "manifest_hash": self.manifest.semantic_content_hash,
             "human_adapter_contract_hash": self.human_adapter.contract_hash,
@@ -1048,7 +1052,7 @@ class MujocoHumanReplayHandoffComposition:
                 self.runtime.target_runtime_action_contract.semantic_content_hash
             ),
             "authority_policy_hash": (
-                self.runtime.core.config.authority_policy.semantic_content_hash
+                self.runtime.authoritative_port.profile.authority_policy_hash
             ),
             "owner_token_id": token.token_id,
             "execution_epoch_snapshot_hash": execution_snapshot.semantic_content_hash,
@@ -1128,12 +1132,12 @@ class MujocoHumanReplayHandoffComposition:
                 )
             release_event = None
             if previous_slot is not None:
-                release_event = self.runtime.core.admit_authority_event(
+                release_event = self.runtime.authoritative_port.admit_authority_event(
                     event_type="release",
                     selection_group_id="arms",
                     reason=f"cs6a_handoff_release:{normalized_reason}",
                 )
-            takeover_event = self.runtime.core.admit_authority_event(
+            takeover_event = self.runtime.authoritative_port.admit_authority_event(
                 event_type="takeover",
                 selection_group_id="arms",
                 owner_producer_id=target_producer,
@@ -1144,7 +1148,9 @@ class MujocoHumanReplayHandoffComposition:
                 reason=f"cs6a_handoff_ready:{normalized_reason}",
                 source_event_ids=(takeover_event.event_id,),
             )
-            execution_snapshot = self.runtime.core.execution_epochs.snapshot()
+            execution_snapshot = (
+                self.runtime.authoritative_port.capture_execution_epoch_snapshot()
+            )
             self._active_source_slot_id = target_slot
             self._activated_source_slot_ids.add(target_slot)
             payload = {
@@ -1218,11 +1224,15 @@ class MujocoHumanReplayHandoffComposition:
             sequence = self._handoff_sequence
             self._handoff_sequence += 1
             requested_at = float(self.runtime.clock())
-            execution_before = self.runtime.core.execution_epochs.snapshot()
-            owner_before = self.runtime.core.dispatch_owners.snapshot()
+            execution_before = (
+                self.runtime.authoritative_port.capture_execution_epoch_snapshot()
+            )
+            owner_before = (
+                self.runtime.authoritative_port.capture_dispatch_owner_snapshot()
+            )
             replay_producer = self.runtime.config.replay_producer_id
             human_producer = self.runtime.config.producer_id
-            replay_epoch = self.runtime.core.producer_epochs.current_epoch(
+            replay_epoch = self.runtime.authoritative_port.current_producer_epoch(
                 replay_producer
             )
             if replay_epoch is None:
@@ -1260,7 +1270,9 @@ class MujocoHumanReplayHandoffComposition:
                 force_cancellation=True,
             )
             hold_event = hold_outcome.event
-            execution_after = self.runtime.core.execution_epochs.snapshot()
+            execution_after = (
+                self.runtime.authoritative_port.capture_execution_epoch_snapshot()
+            )
             cancellation = hold_outcome.cancellation
             cancellation_receipt = hold_outcome.cancellation_receipt
             if cancellation is None or cancellation_receipt is None:
@@ -1287,13 +1299,13 @@ class MujocoHumanReplayHandoffComposition:
                 return state
 
             next_replay_epoch = replay_epoch + 1
-            activation = self.runtime.core.activate_producer(
+            activation = self.runtime.authoritative_port.activate_producer(
                 producer_id=replay_producer,
                 producer_epoch=next_replay_epoch,
                 reason=f"cs6b0_invalidate_replay:{normalized_reason}",
             )
             replay_invalidated = (
-                self.runtime.core.producer_epochs.current_epoch(replay_producer)
+                self.runtime.authoritative_port.current_producer_epoch(replay_producer)
                 == next_replay_epoch
             )
             state = apply_source_invalidation(
@@ -1313,7 +1325,7 @@ class MujocoHumanReplayHandoffComposition:
             if state.phase == "failed":
                 return state
 
-            release_event = self.runtime.core.admit_authority_event(
+            release_event = self.runtime.authoritative_port.admit_authority_event(
                 event_type="release",
                 selection_group_id="arms",
                 reason=f"cs6b0_release_replay:{normalized_reason}",
@@ -1332,7 +1344,7 @@ class MujocoHumanReplayHandoffComposition:
             )
             self._safe_human_takeover_state = state
 
-            takeover_event = self.runtime.core.admit_authority_event(
+            takeover_event = self.runtime.authoritative_port.admit_authority_event(
                 event_type="takeover",
                 selection_group_id="arms",
                 owner_producer_id=human_producer,
@@ -1415,9 +1427,9 @@ class MujocoHumanReplayHandoffComposition:
                     f"cs6b0-safety-preview:{state.request.request_id}:"
                     f"{adapter_receipt.source_emission_id}"
                 )
-                safety = self.runtime.core.shared_safety(
+                safety = self.runtime.authoritative_port.evaluate_canonical_safety(
                     preview.robot_action,
-                    safety_input_id,
+                    input_action_id=safety_input_id,
                 )
                 if safety.input_action_id != safety_input_id:
                     raise ValueError(
@@ -1710,7 +1722,7 @@ class MujocoHumanReplayHandoffComposition:
                     occurred_at=effective_from,
                     clock_domain_id=self.runtime.config.clock_domain_id,
                 )
-                self.runtime.core.record_external_facts(source_facts)
+                self.runtime.authoritative_port.record_external_facts(source_facts)
                 source_fact_hash_by_id = {
                     fact.fact_id: fact.semantic_content_hash
                     for fact in source_facts
@@ -1819,7 +1831,7 @@ class MujocoHumanReplayHandoffComposition:
                 )
             )
             result, receipt = admit_human_command_emission(
-                core=self.runtime.core,
+                core=self.runtime.authoritative_port,
                 adapter=self.human_adapter,
                 emission=emission,
                 effective_from=effective_from,
@@ -2052,7 +2064,7 @@ class MujocoHumanReplayHandoffComposition:
         if spec is None or snapshot is None:
             return
         proposal_snapshot = snapshot.proposal_snapshot
-        descriptor = self.runtime.core.coordinator.clock_domain
+        descriptor = self.runtime.authoritative_port.clock_domain
         cut = ControlCut(
             runtime_session_id=snapshot.runtime_session_id,
             control_domain_id=snapshot.control_domain_id,

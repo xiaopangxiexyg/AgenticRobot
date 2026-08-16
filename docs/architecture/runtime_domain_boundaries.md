@@ -70,6 +70,11 @@ lower domains must not import application/profile layers
   context/input/eligibility/dynamic-parameter admission 与 shadow evaluation。Control Station 已经由该 port
   调用这些能力；`policy_topology` / `composition_strategy_control` 分别保留为同一底层 topology/strategy
   对象的兼容视图。
+- `MujocoDeployRuntime.authoritative_port` 是 application-facing 的 target authority 边界：只暴露不可变
+  profile identity、receiver/gate/epoch/owner snapshot，以及显式 trace、proposal、producer、authority
+  admission 和 canonical-safety evaluation。它不暴露 coordinator、registry、scheduler、proposal buffer 或
+  dispatcher；Control Station 不再读取或传递 `MujocoDeployRuntime.core`，lower runtime 仍是 authority、
+  epoch、canonical safety 和 dispatch 的唯一状态所有者。
 - dynamic Sim-HIL strategy revision、alpha control 和其 retention factory 由
   `control_station.composition.mujoco_sim_hil` 构造；`sim.mujoco.deploy.sim_hil_target` 只接收 application
   提供的 callable，动态 contract 缺少该 binding 时在 target 资源构造前 fail-closed，不再在 sim 内重建

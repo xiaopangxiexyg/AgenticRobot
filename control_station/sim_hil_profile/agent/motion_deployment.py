@@ -771,7 +771,7 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
             runtime.execution_capability.semantic_content_hash
         ),
         component_catalog_hash=runtime.catalog.semantic_content_hash,
-        selection_group_ids=runtime.core.config.active_selection_groups,
+        selection_group_ids=runtime.authoritative_port.profile.selection_group_ids,
         owner_registry_id=authoritative_owner_registry_id(runtime),
         authority_epoch_source_id=authoritative_authority_epoch_source_id(runtime),
         execution_epoch_source_id=authoritative_execution_epoch_source_id(runtime),
@@ -842,8 +842,8 @@ def _build_station_manifests(application: Any) -> tuple[Any, Any]:
                 ),
             ),
         ),
-        authority_policy_hash=runtime.core.config.authority_policy.semantic_content_hash,
-        decision_schedule_hash=runtime.core.config.decision_schedule.semantic_content_hash,
+        authority_policy_hash=runtime.authoritative_port.profile.authority_policy_hash,
+        decision_schedule_hash=runtime.authoritative_port.profile.decision_schedule_hash,
         trace_requirement_profile_id=MUJOCO_AGENT_TCP_POSE_TRACE_PROFILE_ID_V1,
         capture_policy_id="agent_tcp_pose_lower_trace_owner_v1",
         allowed_intent_kinds=(
