@@ -9,6 +9,7 @@ choose a motion response; those semantics belong to
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from robot_motion.deploy.actions import NormalizedAction
 from robot_motion.deploy.runtime import PolicyActionEmission
@@ -255,7 +256,49 @@ class DeploymentPositionPlanCutDetector:
             raise RuntimeError("position plan-cut proposal is stale.")
 
 
+def prepare_position_plan_cut_for_action_step(
+    detector: DeploymentPositionPlanCutDetector,
+    action_step: Any,
+    *,
+    rtc_enabled: bool,
+    policy_node_id: str,
+    hold_generation: int,
+    detected_at: float,
+) -> DeploymentPositionPlanCutProposal:
+    """Build the mandatory typed cut from the owning source cursor.
+
+    RTC owns a committed timed emission.  The synchronous compatibility path
+    instead owns a shared queue cursor and its attached chunk metadata.  Its
+    optional passive emission must not become motion authority.
+    """
+
+    detector.observe_hold_generation(int(hold_generation))
+    if rtc_enabled:
+        emission = getattr(action_step, "emission", None)
+        if emission is None:
+            raise RuntimeError(
+                "RTC position action is missing its committed emission lineage; "
+                "motion submission is blocked before the executor."
+            )
+        return detector.prepare(
+            emission,
+            detected_at=detected_at,
+        )
+    raw_action = getattr(action_step, "raw_action", None)
+    if raw_action is None:
+        raise RuntimeError(
+            "Synchronous position action is missing its queue-owned source "
+            "lineage; motion submission is blocked before the executor."
+        )
+    return detector.prepare_synchronous_action(
+        raw_action,
+        policy_node_id=policy_node_id,
+        detected_at=detected_at,
+    )
+
+
 __all__ = [
     "DeploymentPositionPlanCutDetector",
     "DeploymentPositionPlanCutProposal",
+    "prepare_position_plan_cut_for_action_step",
 ]

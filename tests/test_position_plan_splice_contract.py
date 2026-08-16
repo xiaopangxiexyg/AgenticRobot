@@ -35,6 +35,7 @@ from robot_motion.position_control import (
 )
 from teleop_runtime.deploy.position_plan_cut import (
     DeploymentPositionPlanCutDetector,
+    prepare_position_plan_cut_for_action_step,
 )
 from teleop_runtime.deploy.run_policy import (
     _prepare_position_plan_cut_for_action_step,
@@ -65,6 +66,13 @@ def _cut(
         relation=relation,
         execution_gap=gap,
         detected_at=1.0,
+    )
+
+
+def test_run_policy_preserves_plan_cut_handoff_compatibility_export() -> None:
+    assert (
+        _prepare_position_plan_cut_for_action_step
+        is prepare_position_plan_cut_for_action_step
     )
 
 
