@@ -10,6 +10,7 @@ from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservati
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.real_teleop.agent_motion_port import (
     RealAgentMotionActivation,
+    RealAgentMotionMeasuredPoseCut,
     RealAgentMotionPhase,
     RealAgentMotionPort,
     RealAgentMotionPortConfig,
@@ -18,6 +19,9 @@ from teleop_runtime.real_teleop.agent_motion_runtime import (
     attach_real_agent_motion_port,
 )
 from teleop_runtime.real_teleop.components import RealTeleopComponents
+from teleop_runtime.real_teleop.control_loop import (
+    _publish_real_agent_motion_measured_cut,
+)
 from teleop_runtime.session import TeleopCommandOverride
 
 
@@ -72,6 +76,11 @@ class _TargetBuilder:
             )
         )
         return command
+
+    def tool_tcp_world_targets_for_qpos_pair(self, *, left_qpos, right_qpos):
+        left = _pose(x=float(np.asarray(left_qpos)[0]), y=0.20, z=0.30)
+        right = _pose(x=float(np.asarray(right_qpos)[0]), y=-0.20, z=0.30)
+        return {"left": left, "right": right}
 
 
 class _Session:
@@ -285,3 +294,99 @@ def test_attachment_composes_existing_admission_and_remains_explicit() -> None:
             attached,
             config=attached.agent_motion_port.config,
         )
+
+
+def test_control_thread_publishes_immutable_measured_pose_cut() -> None:
+    port = _port()
+    cut = port.publish_measured_pose(
+        pose_world_by_component={
+            "right-tool-tcp": _pose(x=0.30, y=-0.20, z=0.31),
+        },
+        measured_at=1.0,
+        available_at=1.01,
+        source_evidence_refs=("rm65-state-sample:right:42",),
+    )
+
+    assert isinstance(cut, RealAgentMotionMeasuredPoseCut)
+    assert cut.revision == 0
+    assert cut.pose_world_by_component["right-tool-tcp"].flags.writeable is False
+    assert cut.evidence_refs[0] == "rm65-state-sample:right:42"
+    assert cut.evidence_refs[1].startswith("real-agent-measured-pose:")
+    assert port.latest_measured_pose() is cut
+
+    with pytest.raises(ValueError, match="timestamp regressed"):
+        port.publish_measured_pose(
+            pose_world_by_component={
+                "right-tool-tcp": _pose(x=0.31, y=-0.20, z=0.31),
+            },
+            measured_at=0.9,
+            available_at=1.02,
+            source_evidence_refs=("rm65-state-sample:right:43",),
+        )
+
+
+def test_idle_domain_hold_is_applied_without_an_agent_operation() -> None:
+    port = _port()
+    session = _Session(TeleopRunState.ARMED)
+    requested = port.request_domain_hold(
+        reason="gateway close",
+        requested_at=1.0,
+    )
+    assert requested.phase == RealAgentMotionPhase.HOLD_REQUESTED
+    assert requested.operation_id is None
+
+    held = port.apply_owner_requests(session=session, now=1.01)
+
+    assert held.phase == RealAgentMotionPhase.HELD
+    assert held.operation_id is None
+    assert held.hold_succeeded is True
+    assert held.evidence_ref.startswith("real-agent-motion-port:")
+    assert session.holds == [
+        ("real Agent motion operation real-agent-domain-hold:1: gateway close", False)
+    ]
+
+
+def test_control_frame_publishes_only_existing_hardware_measurements() -> None:
+    port = _port()
+    components = SimpleNamespace(
+        agent_motion_port=port,
+        active_sides=("right",),
+    )
+    cut = _publish_real_agent_motion_measured_cut(
+        components,
+        hardware_state_by_side={
+            "left": {},
+            "right": {
+                "measured_qpos": np.array([0.42, 0, 0, 0, 0, 0], dtype=float),
+                "hardware_measurement_valid": True,
+                "hardware_measurement_timestamp": 2.0,
+                "hardware_measurement_sequence": 12,
+            },
+        },
+        preview_qpos_by_side={
+            "left": np.zeros(6, dtype=float),
+            "right": np.zeros(6, dtype=float),
+        },
+        available_at=2.01,
+    )
+
+    assert isinstance(cut, RealAgentMotionMeasuredPoseCut)
+    np.testing.assert_allclose(
+        cut.pose_world_by_component["right-tool-tcp"][:3, 3],
+        np.array([0.42, -0.20, 0.30]),
+    )
+    assert cut.source_evidence_refs == (
+        "realteleop-hardware-qpos:right:12:2.000000000",
+    )
+
+    missing = _publish_real_agent_motion_measured_cut(
+        components,
+        hardware_state_by_side={"left": {}, "right": {}},
+        preview_qpos_by_side={
+            "left": np.zeros(6, dtype=float),
+            "right": np.zeros(6, dtype=float),
+        },
+        available_at=2.02,
+    )
+    assert missing is None
+    assert port.latest_measured_pose() is cut

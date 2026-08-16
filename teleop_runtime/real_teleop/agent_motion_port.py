@@ -23,6 +23,7 @@ from robot_motion.rm65.dual_arm_target_solver import (
     BimanualPoseTargetSource,
 )
 from robot_motion.runtime import TeleopCommand, TeleopObservation
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.session import TeleopCommandOverride
 from teleop_runtime.transforms import validate_pose_matrix
@@ -191,6 +192,87 @@ class RealAgentMotionPortSnapshot:
     hold_succeeded: bool | None
     fault: str | None
 
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                **self.__dict__,
+                "phase": self.phase.value,
+            },
+            domain="dexteleop.real_agent_motion.port_snapshot.v1",
+        )
+
+    @property
+    def evidence_ref(self) -> str:
+        return "real-agent-motion-port:" + self.semantic_content_hash
+
+
+@dataclass(frozen=True)
+class RealAgentMotionMeasuredPoseCut:
+    """One immutable control-thread publication of measured tool-TCP poses."""
+
+    revision: int
+    measured_at: float
+    available_at: float
+    pose_world_by_component: Mapping[str, np.ndarray]
+    source_evidence_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int):
+            raise TypeError("revision must be an integer.")
+        if self.revision < 0:
+            raise ValueError("revision must be non-negative.")
+        measured_at = _finite(self.measured_at, field_name="measured_at")
+        available_at = _finite(self.available_at, field_name="available_at")
+        if available_at < measured_at:
+            raise ValueError("available_at cannot precede measured_at.")
+        poses = {
+            _required(component_id, field_name="component_id"): _immutable_pose(
+                pose,
+                field_name=f"pose_world_by_component.{component_id}",
+            )
+            for component_id, pose in dict(self.pose_world_by_component).items()
+        }
+        if not poses:
+            raise ValueError("pose_world_by_component must not be empty.")
+        refs = tuple(
+            sorted(
+                {
+                    _required(value, field_name="source_evidence_ref")
+                    for value in self.source_evidence_refs
+                }
+            )
+        )
+        if not refs:
+            raise ValueError("A measured pose cut requires source evidence.")
+        object.__setattr__(self, "measured_at", measured_at)
+        object.__setattr__(self, "available_at", available_at)
+        object.__setattr__(self, "pose_world_by_component", MappingProxyType(poses))
+        object.__setattr__(self, "source_evidence_refs", refs)
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "revision": self.revision,
+                "measured_at": self.measured_at,
+                "available_at": self.available_at,
+                "pose_world_by_component": {
+                    component_id: tuple(float(value) for value in pose.reshape(-1))
+                    for component_id, pose in self.pose_world_by_component.items()
+                },
+                "source_evidence_refs": self.source_evidence_refs,
+            },
+            domain="dexteleop.real_agent_motion.measured_pose_cut.v1",
+        )
+
+    @property
+    def evidence_refs(self) -> tuple[str, ...]:
+        return (
+            *self.source_evidence_refs,
+            "real-agent-measured-pose:" + self.semantic_content_hash,
+        )
+
 
 class RealAgentMotionTargetBuilder(Protocol):
     """Subset of the existing coupled retargeter used by this lower port."""
@@ -201,6 +283,13 @@ class RealAgentMotionTargetBuilder(Protocol):
         self,
         target: BimanualPoseTarget,
     ) -> TeleopCommand: ...
+
+    def tool_tcp_world_targets_for_qpos_pair(
+        self,
+        *,
+        left_qpos: np.ndarray,
+        right_qpos: np.ndarray,
+    ) -> dict[str, np.ndarray]: ...
 
 
 class RealAgentMotionOwnerSession(Protocol):
@@ -231,6 +320,8 @@ class RealAgentMotionPort:
         self._pending: RealAgentMotionActivation | None = None
         self._active: RealAgentMotionActivation | None = None
         self._last_operation: RealAgentMotionActivation | None = None
+        self._domain_hold_id: str | None = None
+        self._latest_measured_pose: RealAgentMotionMeasuredPoseCut | None = None
         self._activated_at: float | None = None
         self._last_command_at: float | None = None
         self._dispatch_count = 0
@@ -303,6 +394,7 @@ class RealAgentMotionPort:
             self._pending = activation
             self._active = None
             self._last_operation = activation
+            self._domain_hold_id = None
             self._phase = RealAgentMotionPhase.PENDING_ACTIVATION
             self._activated_at = None
             self._last_command_at = None
@@ -332,6 +424,7 @@ class RealAgentMotionPort:
             if self._phase not in {
                 RealAgentMotionPhase.PENDING_ACTIVATION,
                 RealAgentMotionPhase.ACTIVE,
+                RealAgentMotionPhase.FAULTED,
             }:
                 raise RuntimeError(
                     f"cannot request HOLD in phase {self._phase.value}."
@@ -341,6 +434,109 @@ class RealAgentMotionPort:
             self._hold_requested_at = normalized_requested_at
             self._advance_revision()
             return self._snapshot_locked()
+
+    def request_domain_hold(
+        self,
+        *,
+        reason: str,
+        requested_at: float,
+    ) -> RealAgentMotionPortSnapshot:
+        """Queue an owner HOLD even when no Agent operation is active."""
+
+        normalized_reason = _required(reason, field_name="reason")
+        normalized_requested_at = _finite(requested_at, field_name="requested_at")
+        with self._lock:
+            if (
+                self._phase == RealAgentMotionPhase.HELD
+                and self._hold_succeeded is True
+            ):
+                return self._snapshot_locked()
+            if self._phase not in {
+                RealAgentMotionPhase.INACTIVE,
+                RealAgentMotionPhase.FAULTED,
+            }:
+                raise RuntimeError(
+                    f"cannot request domain HOLD in phase {self._phase.value}."
+                )
+            self._pending = None
+            self._active = None
+            self._last_operation = None
+            self._domain_hold_id = f"real-agent-domain-hold:{self._revision + 1}"
+            self._phase = RealAgentMotionPhase.HOLD_REQUESTED
+            self._hold_reason = normalized_reason
+            self._hold_requested_at = normalized_requested_at
+            self._advance_revision()
+            return self._snapshot_locked()
+
+    def publish_measured_pose(
+        self,
+        *,
+        pose_world_by_component: Mapping[str, np.ndarray],
+        measured_at: float,
+        available_at: float,
+        source_evidence_refs: tuple[str, ...],
+    ) -> RealAgentMotionMeasuredPoseCut:
+        """Publish an already-measured FK cut; this performs no backend read."""
+
+        with self._lock:
+            next_revision = (
+                0
+                if self._latest_measured_pose is None
+                else self._latest_measured_pose.revision + 1
+            )
+            cut = RealAgentMotionMeasuredPoseCut(
+                revision=next_revision,
+                measured_at=measured_at,
+                available_at=available_at,
+                pose_world_by_component=pose_world_by_component,
+                source_evidence_refs=source_evidence_refs,
+            )
+            if set(cut.pose_world_by_component) != set(
+                self.config.component_id_by_side.values()
+            ):
+                raise ValueError(
+                    "Measured pose cut must exactly cover configured Agent components."
+                )
+            current = self._latest_measured_pose
+            if current is not None and cut.measured_at < current.measured_at:
+                raise ValueError("Measured pose timestamp regressed.")
+            if current is not None and cut.available_at < current.available_at:
+                raise ValueError("Measured pose availability regressed.")
+            self._latest_measured_pose = cut
+            self._advance_revision()
+            return cut
+
+    def publish_measured_qpos_pair(
+        self,
+        *,
+        qpos_by_side: Mapping[str, np.ndarray],
+        measured_at: float,
+        available_at: float,
+        source_evidence_refs: tuple[str, ...],
+    ) -> RealAgentMotionMeasuredPoseCut:
+        """Project an already-read joint cut through the existing FK owner."""
+
+        if set(qpos_by_side) != {"left", "right"}:
+            raise ValueError("qpos_by_side must exactly contain left and right.")
+        targets = self._target_builder.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=np.asarray(qpos_by_side["left"], dtype=float),
+            right_qpos=np.asarray(qpos_by_side["right"], dtype=float),
+        )
+        if set(targets) != {"left", "right"}:
+            raise RuntimeError("Tool-TCP FK must return exact left/right targets.")
+        return self.publish_measured_pose(
+            pose_world_by_component={
+                component_id: targets[side]
+                for side, component_id in self.config.component_id_by_side.items()
+            },
+            measured_at=measured_at,
+            available_at=available_at,
+            source_evidence_refs=source_evidence_refs,
+        )
+
+    def latest_measured_pose(self) -> RealAgentMotionMeasuredPoseCut | None:
+        with self._lock:
+            return self._latest_measured_pose
 
     def apply_owner_requests(
         self,
@@ -373,8 +569,11 @@ class RealAgentMotionPort:
                 return self._snapshot_locked()
             if self._phase == RealAgentMotionPhase.HOLD_REQUESTED:
                 operation = self._operation()
-                assert operation is not None
-                hold_operation_id = operation.operation_id
+                hold_operation_id = (
+                    operation.operation_id
+                    if operation is not None
+                    else self._domain_hold_id
+                )
                 hold_reason = self._hold_reason
                 self._phase = RealAgentMotionPhase.HOLD_APPLYING
                 self._advance_revision()
@@ -557,6 +756,7 @@ class RealAgentMotionPort:
 __all__ = [
     "RealAgentMotionActivation",
     "RealAgentMotionPhase",
+    "RealAgentMotionMeasuredPoseCut",
     "RealAgentMotionPort",
     "RealAgentMotionPortConfig",
     "RealAgentMotionPortSnapshot",
