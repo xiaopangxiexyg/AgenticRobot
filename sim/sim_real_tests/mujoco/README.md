@@ -57,3 +57,25 @@ conda run --name "${DEXTELEOP_ENV_NAME:-dexteleop310}" env PYTHONPATH=. \
   python -m pytest \
   sim/sim_real_tests/tests/test_mujoco_tcp_pose_envelope_closed_loop.py -q
 ```
+
+## Level TCP orientation primitives
+
+`tcp_orientation_primitives_closed_loop.py` executes three absolute level
+`robot_motion.primitives` orientations through the same 60 Hz coupled IK,
+120 Hz qcmd and 1000 Hz physics chain. In canonical desk axes, tool +Z is the
+gripper forward direction, tool +Y is gripper left and tool +X points down.
+The targets are centered forward, forward-left 30 degrees and forward-right
+30 degrees. These are fixed absolute headings in the horizontal desk plane,
+not relative orientation changes; repeated application does not accumulate
+rotation. All three preserve the input TCP translation exactly. The primitive
+catalog is shared by both arms, while the caller selects `left_arm` or
+`right_arm` for each operation.
+
+`view_tcp_orientation_primitives.py` runs the left arm through all three
+orientations before the right arm. Red, green and blue arrows show the three
+absolute tool +Z targets. Magenta and cyan show the realized left and right
+tool +Z directions, while yellow marks the active target.
+
+```bash
+python -m sim.sim_real_tests.mujoco.view_tcp_orientation_primitives
+```

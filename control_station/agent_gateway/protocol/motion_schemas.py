@@ -13,10 +13,12 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from .skill_catalog import (
     AgentSkillSchemaEntry,
+    SkillDefinition,
     SkillExecutionRoute,
     SkillParameterProfileRef,
     agent_skill_schema_document_hash,
@@ -24,6 +26,38 @@ from .skill_catalog import (
 
 TCP_POSE_TARGET_SKILL_ID_V1 = "motion.move_tcp_to_pose"
 TCP_CARDINAL_STEP_SKILL_ID_V1 = "motion.step_tcp_cardinal"
+TCP_LEVEL_FORWARD_SKILL_ID_V1 = "motion.set_tcp_level_forward"
+TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1 = "motion.set_tcp_level_forward_left_30"
+TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1 = "motion.set_tcp_level_forward_right_30"
+FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1 = (
+    TCP_LEVEL_FORWARD_SKILL_ID_V1,
+    TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
+    TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
+)
+FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1: Mapping[str, str] = (
+    MappingProxyType(
+        {
+            TCP_LEVEL_FORWARD_SKILL_ID_V1: (
+                "Keep the selected left or right arm tool_tcp position fixed "
+                "and set the gripper in the horizontal desk plane at the "
+                "fixed absolute forward heading (0 deg). This is not a "
+                "relative rotation; repeated calls do not accumulate yaw."
+            ),
+            TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1: (
+                "Keep the selected left or right arm tool_tcp position fixed "
+                "and set the gripper in the horizontal desk plane at the "
+                "fixed absolute forward-left 30 deg heading. This is not a "
+                "relative rotation; repeated calls do not accumulate yaw."
+            ),
+            TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1: (
+                "Keep the selected left or right arm tool_tcp position fixed "
+                "and set the gripper in the horizontal desk plane at the "
+                "fixed absolute forward-right 30 deg heading. This is not a "
+                "relative rotation; repeated calls do not accumulate yaw."
+            ),
+        }
+    )
+)
 REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1 = (
     "motion.replay_registered_tcp_pose_trajectory"
 )
@@ -33,6 +67,7 @@ INLINE_TCP_TRAJECTORY_SKILL_ID_V1 = (
 
 AGENT_MOTION_SCHEMA_KINDS_V1 = (
     "cardinal_tcp_step",
+    "fixed_level_tcp_orientation",
     "inline_tcp_pose_trajectory",
     "registered_tcp_pose_trajectory",
     "tcp_pose_target",
@@ -373,6 +408,138 @@ def cardinal_tcp_step_schema_entry_v1(
     )
 
 
+def fixed_level_tcp_orientation_schema_entry_v1(
+    *,
+    skill_id: str,
+    skill_definition_hash: str,
+    parameter_profile_id: str,
+    parameter_profile_hash: str,
+    allowed_component_ids: tuple[str, ...],
+    allowed_reference_frame_ids: tuple[str, ...],
+    reference_frame_spec_hash: str,
+    frame_graph_hash: str,
+    tool_config_hash: str,
+    calibration_hash: str,
+    primitive_hash: str,
+) -> AgentSkillSchemaEntry:
+    """Publish one fixed absolute level TCP heading.
+
+    The Skill identity fixes the reviewed heading.  A caller may select only
+    the controlled component and repeat immutable lineage facts; it cannot
+    provide an angle, a relative rotation, or an orientation increment.
+    """
+
+    selected_skill_id = _required(skill_id, field_name="skill_id")
+    if selected_skill_id not in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
+        raise ValueError("skill_id is not a fixed level TCP orientation Skill.")
+    components = _component_ids(allowed_component_ids)
+    frames = _component_ids(allowed_reference_frame_ids)
+    exact_hashes = {
+        "reference_frame_spec_hash": reference_frame_spec_hash,
+        "frame_graph_hash": frame_graph_hash,
+        "tool_config_hash": tool_config_hash,
+        "calibration_hash": calibration_hash,
+        "primitive_hash": primitive_hash,
+    }
+    parameter_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "component_id": {"type": "string", "enum": list(components)},
+            "reference_frame_id": {"type": "string", "enum": list(frames)},
+            "reference_frame_spec_hash": {
+                "const": _required(
+                    exact_hashes["reference_frame_spec_hash"],
+                    field_name="reference_frame_spec_hash",
+                )
+            },
+            "controlled_frame_id": {"const": "tool_tcp"},
+            "frame_graph_hash": {
+                "const": _required(
+                    exact_hashes["frame_graph_hash"],
+                    field_name="frame_graph_hash",
+                )
+            },
+            "tool_config_hash": {
+                "const": _required(
+                    exact_hashes["tool_config_hash"],
+                    field_name="tool_config_hash",
+                )
+            },
+            "calibration_hash": {
+                "const": _required(
+                    exact_hashes["calibration_hash"],
+                    field_name="calibration_hash",
+                )
+            },
+            "primitive_hash": {
+                "const": _required(
+                    exact_hashes["primitive_hash"],
+                    field_name="primitive_hash",
+                )
+            },
+        },
+        "required": [
+            "component_id",
+            "reference_frame_id",
+            "reference_frame_spec_hash",
+            "controlled_frame_id",
+            "frame_graph_hash",
+            "tool_config_hash",
+            "calibration_hash",
+            "primitive_hash",
+        ],
+    }
+    return _schema_entry(
+        skill_id=selected_skill_id,
+        skill_definition_hash=skill_definition_hash,
+        parameter_schema=parameter_schema,
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+    )
+
+
+def fixed_level_tcp_orientation_skill_definition_v1(
+    *,
+    skill_id: str,
+) -> SkillDefinition:
+    """Return one arm-selectable, fixed absolute orientation Skill definition.
+
+    The definition intentionally controls both arm component identities. One
+    invocation still selects exactly one component through the parameter
+    schema; it never couples or implicitly mirrors the two arms.
+    """
+
+    selected_skill_id = _required(skill_id, field_name="skill_id")
+    try:
+        summary = FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1[
+            selected_skill_id
+        ]
+    except KeyError as exc:
+        raise ValueError(
+            "skill_id is not a fixed level TCP orientation Skill."
+        ) from exc
+    return SkillDefinition(
+        skill_id=selected_skill_id,
+        skill_version="1",
+        skill_kind="motion",
+        summary=summary,
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=("left_arm", "right_arm"),
+        parameter_semantics_id=(
+            "tcp_fixed_absolute_horizontal_heading.no_relative_angle.v1"
+        ),
+        execution_result_semantics_id="component_action_execution.v1",
+        task_outcome_semantics_id="tcp_pose_arrival.v1",
+        entry_predicate_ids=(
+            "route_ready.v1",
+            "measured_start_pose_valid.v1",
+        ),
+        task_outcome_predicate_ids=("tcp_pose_within_tolerance.v1",),
+    )
+
+
 def registered_tcp_trajectory_schema_entry_v1(
     *,
     skill_definition_hash: str,
@@ -643,6 +810,26 @@ def validate_agent_motion_parameters_v1(
         if parameters.get("direction") not in directions:
             raise ValueError("Cardinal TCP step selects an unsupported direction.")
         return
+    if schema_kind == "fixed_level_tcp_orientation":
+        if parameters.get("component_id") not in components:
+            raise ValueError(
+                "Fixed level TCP orientation selects an unsupported component."
+            )
+        forbidden = {
+            "angle",
+            "angle_deg",
+            "delta_rotation",
+            "heading",
+            "rotation",
+            "yaw",
+            "yaw_deg",
+        } & set(parameters)
+        if forbidden:
+            raise ValueError(
+                "Fixed level TCP orientation cannot carry an angle or relative "
+                f"rotation: {sorted(forbidden)}."
+            )
+        return
     if schema_kind == "tcp_pose_target":
         _poses_by_component(
             parameters.get("pose_targets_by_component"),
@@ -749,12 +936,19 @@ def validate_agent_motion_route_schema_v1(
 __all__ = [
     "AGENT_MOTION_SCHEMA_KINDS_V1",
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
+    "FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1",
+    "FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1",
     "INLINE_TCP_TRAJECTORY_SKILL_ID_V1",
     "REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1",
     "TCP_CARDINAL_STEP_SKILL_ID_V1",
+    "TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1",
+    "TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1",
+    "TCP_LEVEL_FORWARD_SKILL_ID_V1",
     "TCP_POSE_TARGET_SKILL_ID_V1",
     "InlineTcpTrajectoryLimits",
     "cardinal_tcp_step_schema_entry_v1",
+    "fixed_level_tcp_orientation_schema_entry_v1",
+    "fixed_level_tcp_orientation_skill_definition_v1",
     "inline_tcp_trajectory_schema_entry_v1",
     "registered_tcp_trajectory_schema_entry_v1",
     "tcp_pose_target_schema_entry_v1",
