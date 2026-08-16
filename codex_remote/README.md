@@ -1080,6 +1080,7 @@ remote_view.sh
 remote_sync_check.sh
 remote_dataset_camera_semantics.sh
 remote_dataset_camera_quarantine.sh
+remote_dataset_tactile_storage.sh
 ```
 
 示例：
@@ -1102,6 +1103,10 @@ remote_dataset_camera_quarantine.sh
   --project '~/DexTeleop' --env dexteleop310 \
   --view-root /data/camera_semantic_prepared_views/bad_trial \
   --audit-root /data/camera_semantic_prepared_views/_invalid_audit
+./remote_dataset_tactile_storage.sh -H dex-remote \
+  --project '~/DexTeleop' --env dexteleop310 \
+  --detach-whole-prefix --dataset-root /data/source_dataset \
+  --cold-root /independent/cold/root --dry-run
 ```
 
 ### 实际同步和执行模型
@@ -1182,6 +1187,14 @@ remote_dataset_camera_quarantine.sh
   再生成包含目录清单的计划；只有携带完全一致的 `--expected-plan-hash`
   才会在同一文件系统内原子改名到审计目录。有效视图、符号链接、跨文件系统、
   已存在目标均会被拒绝；该入口不删除或覆盖任何数据。
+
+remote_dataset_tactile_storage.sh
+  是触觉模块可恢复拆装的专用 L3 非运动入口。它只允许只读 status、固定
+  `whole-prefix` detach 和按精确 inventory rehydrate，不开放 legacy hardlink
+  破窗参数或任意透传。apply 必须绑定同一次 proposal 的 `plan_hash`、
+  `dataset_fingerprint`，并显式确认没有采集、训练或其他 reader；rehydrate 还
+  必须绑定 64 位 `inventory_hash`。detach 先在独立文件系统完成冷副本验证和
+  restore drill，cold 副本在 rehydrate 后也不会被自动删除。
 ```
 
 示例安全流程：
