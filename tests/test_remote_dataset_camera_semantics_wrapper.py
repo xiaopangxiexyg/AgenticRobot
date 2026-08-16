@@ -136,6 +136,67 @@ def test_wrapper_apply_requires_and_forwards_exact_plan_hash(tmp_path: Path) -> 
     ]
 
 
+def test_wrapper_full_v23_dry_run_is_fixed_to_ordinary_materialization(
+    tmp_path: Path,
+) -> None:
+    env, capture = _fake_remote_environment(tmp_path)
+    command, source, output, registry = _base_command(tmp_path)
+    result = subprocess.run(
+        [*command, "--full-v23", "--dry-run"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "view_kind=full-v23" in result.stdout
+    assert _captured_python_args(capture) == [
+        "-u",
+        "-m",
+        "utils.dataset_postprocess",
+        "camera-semantics-materialize",
+        str(source),
+        "--output-root",
+        str(output),
+        "--registry",
+        str(registry),
+    ]
+
+
+def test_wrapper_full_v23_apply_forwards_exact_plan_hash(tmp_path: Path) -> None:
+    env, capture = _fake_remote_environment(tmp_path)
+    command, source, output, registry = _base_command(tmp_path)
+    plan_hash = "b" * 64
+    result = subprocess.run(
+        [
+            *command,
+            "--full-v23",
+            "--apply",
+            "--expected-plan-hash",
+            plan_hash,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _captured_python_args(capture) == [
+        "-u",
+        "-m",
+        "utils.dataset_postprocess",
+        "camera-semantics-materialize",
+        str(source),
+        "--output-root",
+        str(output),
+        "--registry",
+        str(registry),
+        "--expected-plan-hash",
+        plan_hash,
+        "--apply",
+    ]
+
+
 def test_wrapper_fails_closed_on_ambiguous_or_extensible_arguments(
     tmp_path: Path,
 ) -> None:

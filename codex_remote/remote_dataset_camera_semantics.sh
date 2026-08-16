@@ -15,6 +15,7 @@ REGISTRY_PATH=""
 MODE="dry-run"
 MODE_EXPLICIT=false
 EXPECTED_PLAN_HASH=""
+VIEW_KIND="camera-only"
 
 usage() {
   cat <<'EOF'
@@ -29,6 +30,13 @@ Usage:
   remote_dataset_camera_semantics.sh -H dex-remote \
     --project '~/DexTeleop' --env dexteleop310 \
     --source-root /data/source_dataset \
+    --output-root /data/camera_semantic_full/source_dataset \
+    --registry /path/to/frozen_camera_role_registry.json \
+    --full-v23 --dry-run
+
+  remote_dataset_camera_semantics.sh -H dex-remote \
+    --project '~/DexTeleop' --env dexteleop310 \
+    --source-root /data/source_dataset \
     --output-root /data/camera_semantic_prepared_views/source_dataset \
     --registry /path/to/frozen_camera_role_registry.json \
     --apply --expected-plan-hash SHA256
@@ -39,10 +47,12 @@ Options:
       --python PYTHON     Python executable after env activation. Default: python.
       --timeout SEC       Remote process timeout, 1..86400. Default: 900.
       --source-root DIR   Existing source dataset; the command treats it as read-only.
-      --output-root DIR   New prepared-view directory; existing outputs are refused.
+      --output-root DIR   New corrected-output directory; existing outputs are refused.
       --registry FILE     Frozen camera-role registry used by the correction plan.
+      --full-v23          Build an ordinary-loader full-v2.3 clone after verified
+                          tactile retirement. Default remains camera-only.
       --dry-run           Recompute and print the complete no-write plan (default).
-      --apply             Publish the new prepared view.
+      --apply             Publish the selected new corrected output.
       --expected-plan-hash SHA256
                           Required with --apply and rejected otherwise.
 
@@ -113,6 +123,11 @@ while [[ $# -gt 0 ]]; do
       EXPECTED_PLAN_HASH="$2"
       shift 2
       ;;
+    --full-v23)
+      [[ "$VIEW_KIND" == "camera-only" ]] || die "--full-v23 may be specified only once"
+      VIEW_KIND="full-v23"
+      shift
+      ;;
     --dry-run)
       [[ "$MODE_EXPLICIT" != "true" ]] || die "choose exactly one of --dry-run or --apply"
       MODE="dry-run"
@@ -161,7 +176,7 @@ print_wrapper_header "L3-dataset-non-motion" "$PROJECT" "$ENV_NAME"
 printf '[scope] source_read_only=%s\n' "$SOURCE_ROOT"
 printf '[scope] output_new_only=%s\n' "$OUTPUT_ROOT"
 printf '[scope] registry_read_only=%s\n' "$REGISTRY_PATH"
-printf '[mode] %s timeout_sec=%s\n' "$MODE" "$TIMEOUT_SEC"
+printf '[mode] %s view_kind=%s timeout_sec=%s\n' "$MODE" "$VIEW_KIND" "$TIMEOUT_SEC"
 
 remote_bash \
   "$PROJECT" \
@@ -172,7 +187,8 @@ remote_bash \
   "$OUTPUT_ROOT" \
   "$REGISTRY_PATH" \
   "$MODE" \
-  "$EXPECTED_PLAN_HASH" <<'REMOTE'
+  "$EXPECTED_PLAN_HASH" \
+  "$VIEW_KIND" <<'REMOTE'
 set -Eeuo pipefail
 
 project=$1
@@ -184,6 +200,7 @@ output_root=$6
 registry_path=$7
 mode=$8
 expected_plan_hash=$9
+view_kind=${10}
 
 resolve_remote_path() {
   local value="$1"
@@ -274,16 +291,23 @@ fi
 cd "$project"
 activate_env "$env_name"
 
+if [[ "$view_kind" == "full-v23" ]]; then
+  subcommand="camera-semantics-materialize"
+else
+  subcommand="camera-semantics-prepare-view"
+fi
+
 cmd=(
   "$python_bin" -u -m utils.dataset_postprocess
-  camera-semantics-prepare-view
+  "$subcommand"
   "$source_root"
   --output-root "$output_root"
   --registry "$registry_path"
 )
 if [[ "$mode" == "apply" ]]; then
   cmd+=(--expected-plan-hash "$expected_plan_hash" --apply)
-else
+elif [[ "$view_kind" == "camera-only" ]]; then
+  # Full-v2.3 materialization is already plan-only without --apply.
   cmd+=(--dry-run)
 fi
 
