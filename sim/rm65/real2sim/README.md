@@ -133,9 +133,8 @@ RM65-specific fidelity code and evidence live at the RM65 embodiment level:
 - `sim/rm65/real2sim/`: evidence contracts, fit source indexes, and manifests;
 - `sim/mujoco/actuation/executor.py`: thin MuJoCo actuator/measurement adapter.
 
-The compatibility package at `sim/real2sim/` re-exports the evidence contract
-only so concurrent callers do not break. New code should import
-`sim.rm65.real2sim` and `sim.rm65.actuation`.
+The former `sim.real2sim` compatibility package has been removed. Import the
+canonical `sim.rm65.real2sim` and `sim.rm65.actuation` packages directly.
 
 ## Sim-scoped execution plan
 

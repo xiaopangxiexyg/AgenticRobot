@@ -39,5 +39,5 @@ free motion only; fast preemption is provisional and contact/force behavior is
 not identified. The immutable stage artifact lives at
 `real2sim/artifacts/dmtac_gripper_position_20260722_v1.json`.
 
-`sim/real2sim` is retained only as a compatibility import shim. New RM65 code
-must use `sim.rm65.actuation` or `sim.rm65.real2sim`.
+The former top-level `sim.real2sim` compatibility package has been removed.
+RM65 code must use `sim.rm65.actuation` or `sim.rm65.real2sim` directly.

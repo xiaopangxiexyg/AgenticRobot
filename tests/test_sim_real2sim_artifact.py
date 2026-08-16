@@ -423,9 +423,3 @@ def test_historical_v1_baseline_preserves_failed_held_out_result() -> None:
 
     assert held_out.status == "failed"
     assert held_out.metrics["max_effective_delay_error_sec"] == 0.009
-
-
-def test_old_real2sim_import_path_is_a_compatibility_alias() -> None:
-    from sim.real2sim import Real2SimArtifactManifest as CompatibilityManifest
-
-    assert CompatibilityManifest is Real2SimArtifactManifest
