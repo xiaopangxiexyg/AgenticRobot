@@ -1,7 +1,7 @@
 # `lab` M3g：受信 Runner 领取与 artifact 收据
 
-状态：叠加在 M3f 上的 review candidate。本切片将持久 Request 接到一个项目无关的 runner 管理协议；它仍不
-执行测试载荷、不传输源码/artifact、不联系远端，也不分配 GPU、服务或设备权限。
+状态：`task/AR-lab-framework-v2` 中的 review candidate。本切片将持久 Request 接到一个项目无关的 runner
+管理协议；它仍不执行测试载荷、不传输源码/artifact、不联系远端，也不分配 GPU、服务或设备权限。
 
 ## 第一部分：一般项目的管理框架
 
@@ -123,12 +123,8 @@ integration/hosts/            # 后续机器局部 capability/asset 解析
 后两项仍只是规划，M3g 不定义其 schema。`model/openpi` 的 submodule gitlink 只作为普通 repository snapshot
 identity 进入 Request；runner 核心不理解其代码、模型或运行方式。
 
-当前叠加关系追加为：
-
-```text
-task/AR-lab-m3f-run-requests-v2
-  └── task/AR-lab-m3g-runner-protocol-v2
-```
+M3g 的实现边界固定在 commit `ecfa3c6c`；阶段分支已清理，当前连续交付线见
+[`lab_framework_plan.md`](./lab_framework_plan.md)。
 
 ## 验证
 

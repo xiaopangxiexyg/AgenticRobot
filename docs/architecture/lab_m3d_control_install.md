@@ -98,18 +98,10 @@ control plane 执行，新 Task payload 不参与。
 
 ## 第二部分：当前项目实例
 
-当前 `origin/main@fba0189b` 尚不包含 `lab` payload，所以在 M3d review branch 上实测 `control plan-install`
-会 fail closed，明确报告 protected payload 缺失。只有以下 stacked branches 依次合并并刷新 baseline 后才能 bootstrap：
-
-```text
-task/AR-openpi-submodule-v3
-  └── task/AR-lab-m1-workspace-v2
-        └── task/AR-lab-m2-local-runs-v2
-              └── task/AR-lab-m3a-stable-sync-v2
-                    └── task/AR-lab-m3b-maintenance-sync-v2
-                          └── task/AR-lab-m3c-gitlink-sync-v2
-                                └── task/AR-lab-m3d-control-install-v2
-```
+当前 `origin/main@fba0189b` 尚不包含 `lab` payload，所以在候选线上实测 `control plan-install` 会 fail closed，
+明确报告 protected payload 缺失。M3d 的实现边界固定在 commit `894997ed`；阶段分支已清理，整个候选进入
+protected `main` 并刷新 baseline 后才能 bootstrap。当前连续交付线见
+[`lab_framework_plan.md`](./lab_framework_plan.md)。
 
 外置 payload 只包含框架和项目组合配置；不包含 OpenPI 模型、checkpoint、CUDA 环境或 RPent/机器人运行时。
 远端 bootstrap 的目标也应位于新 clean management checkout 外，旧混合目录继续保留为 rollback 证据。

@@ -94,18 +94,11 @@ RPent (stable_branch, sibling, unlinked)
 `model/openpi` 必须等待多仓 gitlink transaction；远端旧的
 `user@192.168.70.116:/home/user/zc/AgenticRobot` 仍不允许 pull/reset/clean。
 
-此外，当前 stacked branches 尚未进入 protected `main`，所以本切片只作为 review candidate，不部署远端
+此外，当前候选尚未进入 protected `main`，所以本切片只作为 review candidate，不部署远端
 受信控制面，也不自动更新远端 checkout。
 
-评审顺序：
-
-```text
-task/AR-openpi-submodule-v3
-  └── task/AR-lab-m1-workspace-v2
-        └── task/AR-lab-m2-local-runs-v2
-              └── task/AR-lab-m3a-stable-sync-v2
-                    └── task/AR-lab-m3b-maintenance-sync-v2
-```
+M3b 的实现边界固定在 commit `1a701571`；阶段分支已清理，当前连续交付线见
+[`lab_framework_plan.md`](./lab_framework_plan.md)。
 
 ## 验证
 

@@ -137,19 +137,8 @@ AgenticRobot、RPent 与作为 `model/openpi` submodule 的 openpi 仍由 `integ
 `stack/baseline.json` 表达 repository/gitlink 关系。M3f 的请求生成器只读取解析后的通用 repository identity，
 因此同一机制也适用于完全不同的多仓项目。
 
-当前叠加关系为：
-
-```text
-task/AR-openpi-submodule-v3
-  └── task/AR-lab-m1-workspace-v2
-        └── task/AR-lab-m2-local-runs-v2
-              └── task/AR-lab-m3a-stable-sync-v2
-                    └── task/AR-lab-m3b-maintenance-sync-v2
-                          └── task/AR-lab-m3c-gitlink-sync-v2
-                                └── task/AR-lab-m3d-control-install-v2
-                                      └── task/AR-lab-m3e-merge-gates-v2
-                                            └── task/AR-lab-m3f-run-requests-v2
-```
+M3f 的实现边界固定在 commit `50293755`；阶段分支已清理，当前连续交付线见
+[`lab_framework_plan.md`](./lab_framework_plan.md)。
 
 ## 验证
 

@@ -163,6 +163,14 @@ content-addressed claim/artifact receipts. Its runner adapter still does not
 execute payload commands, transfer artifacts, contact remote hosts, or grant
 resource/device authority.
 
+Use one active development branch per Task/repository. Record consecutive
+implementation milestones as commits, docs, tags, and Run evidence instead of
+keeping a permanent stacked branch for every small slice. Create another branch
+only for an independent writer/Task, PR, or explicit handoff; delete superseded
+local and remote refs after preserving any required audit point with an
+annotated `archive/*` tag. The authoritative framework roadmap and current
+delivery line are documented in `docs/architecture/lab_framework_plan.md`.
+
 Only dependency, Python-version, package-discovery, or installation changes
 require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,
 `scripts/install_conda_env.sh`, or `README_ENV.md` as applicable. Source-only

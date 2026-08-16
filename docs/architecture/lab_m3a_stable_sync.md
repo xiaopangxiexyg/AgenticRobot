@@ -113,16 +113,9 @@ AgenticRobot exact tree
 M3a 不会对它执行 pull/reset/clean。后续应在新路径创建 clean management/staging clone，验证后再切换；
 旧目录保留为 rollback 证据。
 
-当前 stacked review 顺序：
-
-```text
-task/AR-openpi-submodule-v3
-  └── task/AR-lab-m1-workspace-v2
-        └── task/AR-lab-m2-local-runs-v2
-              └── task/AR-lab-m3a-stable-sync-v2
-```
-
-只有前层进入 protected `main` 并刷新 baseline 后，M3a 才能进入远端部署候选。
+M3a 的实现边界固定在 commit `4c62020e`；阶段分支已清理，当前连续交付线见
+[`lab_framework_plan.md`](./lab_framework_plan.md)。只有整个候选进入 protected `main` 并刷新 baseline 后，M3a 才能
+进入远端部署候选。
 
 ## 验证
 

@@ -111,19 +111,11 @@ RPent/main (独立 sibling)
 - M3c 不读取 checkpoint、模型配置、CUDA、数据或运行服务，gitlink target 是唯一源码联动事实。
 
 远端 `user@192.168.70.116:/home/user/zc/AgenticRobot` 目前仍未满足受保护 clean anchor 与独立 control-plane
-条件，不能直接运行 `apply-linked`。正确顺序仍是先合并 stacked candidates、刷新 protected baseline，再在新路径
+条件，不能直接运行 `apply-linked`。正确顺序仍是先合并候选、刷新 protected baseline，再在新路径
 准备 clean clone/submodule，最后将旧目录保留为 rollback 证据。
 
-评审顺序：
-
-```text
-task/AR-openpi-submodule-v3
-  └── task/AR-lab-m1-workspace-v2
-        └── task/AR-lab-m2-local-runs-v2
-              └── task/AR-lab-m3a-stable-sync-v2
-                    └── task/AR-lab-m3b-maintenance-sync-v2
-                          └── task/AR-lab-m3c-gitlink-sync-v2
-```
+M3c 的实现边界固定在 commit `76033197`；阶段分支已清理，当前连续交付线见
+[`lab_framework_plan.md`](./lab_framework_plan.md)。
 
 ## 验证
 

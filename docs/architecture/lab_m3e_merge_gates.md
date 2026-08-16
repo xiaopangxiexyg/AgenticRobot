@@ -39,18 +39,8 @@ workflow 对每个 PR 都产生结果，不使用 path filter；否则被设为 
 OpenPI 仍只是未 materialize 的 `model/openpi` gitlink；CI 不 clone 子仓，不下载模型、checkpoint、LFS、
 CUDA 环境或数据。
 
-当前堆叠顺序追加为：
-
-```text
-task/AR-openpi-submodule-v3
-  └── task/AR-lab-m1-workspace-v2
-        └── task/AR-lab-m2-local-runs-v2
-              └── task/AR-lab-m3a-stable-sync-v2
-                    └── task/AR-lab-m3b-maintenance-sync-v2
-                          └── task/AR-lab-m3c-gitlink-sync-v2
-                                └── task/AR-lab-m3d-control-install-v2
-                                      └── task/AR-lab-m3e-merge-gates-v2
-```
+M3e 的实现边界固定在 commit `67bb0b75`；阶段分支已清理，当前连续交付线见
+[`lab_framework_plan.md`](./lab_framework_plan.md)。
 
 workflow 成功只是 Candidate 合并检查，不是远端部署、GPU、设备或 Release evidence。仓库管理员仍需在
 GitHub branch protection 中把 `lab-control / verify` 设为 required check，并配置真实 CODEOWNERS；在未知
