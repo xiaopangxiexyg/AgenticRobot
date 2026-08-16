@@ -117,6 +117,7 @@ policy output (15 Hz)
   planner；sim/real 只在最后 qcmd sink 分叉。
 - `teleop_runtime/position_control/deploy_executor.py`: real-only 在线 60 Hz worker、chunk 编排、暂停/故障 hold 与 backend dispatch 边界。
 - `teleop_runtime/deploy/arm_state_reader.py`: deployment-facing arm 状态刷新节拍和 bounded causal snapshot history；backend 继续持有设备状态/FK，reader 不持有控制、安全或 dispatch。
+- `teleop_runtime/deploy/camera_runtime.py`: policy artifact 相机键绑定、部署侧 source 构造与启动准入适配；正式 RealSense 启动/重试和 freshness gate 继续复用 `teleop_runtime.real_teleop.camera_runtime`，本模块不另建相机生命周期所有者。
 - `teleop_runtime/deploy/dispatch.py`: 当前真机 launcher 的 `TeleopCommand` 到 arm/hand backend 分发；这是 real-specific 代码，不应迁到 `robot_motion`，sim launcher 应实现自己的 dispatcher。
 - `teleop_runtime/deploy/actions.py`: 仍保留旧 `ActionSafetyFilter.filter()` direct-command path 作为 legacy 封存入口；新代码应使用 `filter_normalized()`。
 

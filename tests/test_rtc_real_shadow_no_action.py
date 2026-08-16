@@ -20,6 +20,7 @@ from teleop_runtime.backends.hands.inspire_tac import (
     InspireTacHandBackend,
     InspireTacHandBackendConfig,
 )
+from teleop_runtime.deploy import camera_runtime as deploy_camera_runtime
 from teleop_runtime.deploy import run_policy
 from teleop_runtime.real_teleop import camera_runtime
 
@@ -345,11 +346,11 @@ def test_deploy_camera_reset_override_is_explicit_and_applies_to_each_config() -
     }
 
     with patch.object(
-        run_policy,
+        deploy_camera_runtime,
         "load_realsense_camera_config_map",
         return_value=configs,
     ), patch.object(
-        run_policy,
+        deploy_camera_runtime,
         "RealSenseRGBSource",
         side_effect=lambda config: config,
     ):
@@ -367,11 +368,11 @@ def test_deploy_camera_defaults_preserve_config_owned_reset_behavior() -> None:
     }
 
     with patch.object(
-        run_policy,
+        deploy_camera_runtime,
         "load_realsense_camera_config_map",
         return_value=configs,
     ), patch.object(
-        run_policy,
+        deploy_camera_runtime,
         "RealSenseRGBSource",
         side_effect=lambda config: config,
     ):
