@@ -288,6 +288,7 @@ export LAB_PROJECT_MANIFEST="$CONTROL_ROOT/current/payload/integration/project.j
 export LAB_BASELINE_LOCK="$CONTROL_ROOT/current/payload/stack/baseline.json"
 export LAB_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/profiles"
 export LAB_QUEUE_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/queue-profiles"
+export LAB_RUNNER_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/runners"
 export LAB_ENVIRONMENT_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/environments"
 export LAB_IMPACT_RULES="$CONTROL_ROOT/current/payload/stack/impact-rules.json"
 export LAB_CONTROL_PLANE_INSTALL_MANIFEST="$CONTROL_ROOT/current/install.json"

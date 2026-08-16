@@ -158,6 +158,10 @@ M3f adds only a transport-neutral, persistent clean-snapshot Run request queue:
 it can submit, inspect, watch, cancel, reserve, and record runner lifecycle
 transitions, but it does not contact a host, execute a Profile, allocate a GPU
 or device, or grant runtime authority.
+M3g adds trusted runner compatibility checks, cooperative slot claims, and
+content-addressed claim/artifact receipts. Its runner adapter still does not
+execute payload commands, transfer artifacts, contact remote hosts, or grant
+resource/device authority.
 
 Only dependency, Python-version, package-discovery, or installation changes
 require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,

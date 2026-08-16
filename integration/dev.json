@@ -18,7 +18,8 @@
       "tests/test_lab_linked_sync.py",
       "tests/test_lab_control_install.py",
       "tests/test_lab_framework_boundary.py",
-      "tests/test_lab_run_requests.py"
+      "tests/test_lab_run_requests.py",
+      "tests/test_lab_runner_protocol.py"
     ],
     "lab-m1": [
       "tests/test_lab_m1_workspace.py",
@@ -48,6 +49,9 @@
     ],
     "lab-m3f": [
       "tests/test_lab_run_requests.py"
+    ],
+    "lab-m3g": [
+      "tests/test_lab_runner_protocol.py"
     ]
   }
 }

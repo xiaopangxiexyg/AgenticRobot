@@ -49,7 +49,7 @@ wrapper 固定：
 
 - 安装时解析到的 Python executable；
 - 被管理 control repository 的 canonical path；
-- 当前 protected payload 内的 project/baseline、local/queued Profile、environment Profile 与 impact rules；
+- 当前 protected payload 内的 project/baseline、local/queued/runner Profile、environment Profile 与 impact rules；
 - `PYTHONDONTWRITEBYTECODE=1`。
 
 因此执行代码和授权配置来自同一个 protected commit，而仓库路径解析仍指向真实 stable checkout。

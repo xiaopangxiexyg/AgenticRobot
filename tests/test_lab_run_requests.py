@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -138,6 +139,7 @@ def test_detached_submission_is_portable_and_idempotent(
         "source_tree_oid",
         "source_dirty",
         "executor_sha256",
+        "install_manifest_sha256",
     }
     state = first["state"]
     assert isinstance(state, dict)
@@ -340,6 +342,7 @@ def test_repository_links_are_bound_without_project_specific_logic(
             "source_tree_oid": "7" * 40,
             "source_dirty": False,
             "executor_sha256": "8" * 64,
+            "install_manifest_sha256": None,
         },
     )
     assert request["snapshot"]["repository_links"][0]["commit"] == child_commit
@@ -348,6 +351,30 @@ def test_repository_links_are_bound_without_project_specific_logic(
     tampered["snapshot"]["repositories"]["Child"]["commit"] = "5" * 40
     with pytest.raises(LabError, match="differs from snapshot identities"):
         validate_run_request(tampered)
+
+
+def test_v2_reader_keeps_m3f_v1_requests_readable(
+    request_environment: tuple[WorkspaceManager, Path],
+) -> None:
+    manager, _ = request_environment
+    _create_task(manager, "T308B")
+    submission = RunRequestManager(manager).submit_clean_profile(
+        "T308B", "queued-check", evidence_tier="Development"
+    )
+    request = copy.deepcopy(submission["request"])
+    request["schema"] = "lab.run-request.v1"
+    del request["control_plane"]["install_manifest_sha256"]
+    content = {
+        key: value
+        for key, value in request.items()
+        if key not in {"request_id", "idempotency_key"}
+    }
+    encoded = json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+    idempotency_key = hashlib.sha256(encoded).hexdigest()
+    request["idempotency_key"] = idempotency_key
+    request["request_id"] = f"Q-{idempotency_key[:24]}"
+
+    assert validate_run_request(request) == request
 
 
 def test_cli_submits_statuses_and_cancels_without_execution(

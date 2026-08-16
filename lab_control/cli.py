@@ -25,7 +25,13 @@ from .linked_sync import apply_linked_project_checkout, plan_linked_project_chec
 from .project_maintenance import apply_guarded_project_checkout
 from .project_sync import fetch_project_sync, plan_project_sync
 from .run_requests import RunRequestManager
-from .runs import CANDIDATE_EVIDENCE_TIER, DEVELOPMENT_EVIDENCE_TIER, RunManager
+from .runner_protocol import RunnerCoordinator
+from .runs import (
+    CANDIDATE_EVIDENCE_TIER,
+    DEVELOPMENT_EVIDENCE_TIER,
+    RunManager,
+    control_plane_identity,
+)
 from .workspace import LabError, TaskPlan, WorkspaceManager
 from .writer_lease import WriterLeaseManager
 
@@ -259,6 +265,20 @@ def _build_parser() -> argparse.ArgumentParser:
     request_cancel.add_argument("--actor", required=True)
     request_cancel.add_argument("--reason", required=True)
     request_cancel.add_argument("--json", action="store_true")
+
+    runner = subcommands.add_parser(
+        "runner", help="inspect or claim requests through a trusted runner Profile"
+    )
+    runner_commands = runner.add_subparsers(
+        dest="runner_command", required=True
+    )
+    runner_inspect = runner_commands.add_parser("inspect")
+    runner_inspect.add_argument("runner_id")
+    runner_inspect.add_argument("--json", action="store_true")
+    runner_claim = runner_commands.add_parser("claim")
+    runner_claim.add_argument("runner_id")
+    runner_claim.add_argument("slot_id")
+    runner_claim.add_argument("--json", action="store_true")
     return parser
 
 
@@ -541,6 +561,56 @@ def _print_request_list(payloads: list[dict[str, object]]) -> None:
             f"{payload.get('profile_id')}  {payload.get('target_id')}  "
             f"{payload.get('state')}"
         )
+
+
+def _print_runner_inspection(payload: dict[str, object]) -> None:
+    runner = payload.get("runner")
+    runner_id = runner.get("runner_id") if isinstance(runner, dict) else "?"
+    print(f"Runner: {runner_id}")
+    print(f"Eligible: {payload.get('eligible_count')}")
+    pending = payload.get("pending")
+    if isinstance(pending, list):
+        for request in pending:
+            if not isinstance(request, dict):
+                continue
+            status = "ELIGIBLE" if request.get("eligible") is True else "REJECTED"
+            print(f"  {request.get('request_id')}  {status}")
+
+
+def _print_runner_claim(payload: dict[str, object] | None) -> None:
+    if payload is None:
+        print("No eligible queued Run request.")
+        return
+    print(f"Claim: {payload.get('claim_id')}")
+    print(f"Request: {payload.get('request_id')}")
+    print(f"Runner: {payload.get('runner_id')}")
+    print(f"Slot: {payload.get('slot_id')}")
+
+
+def _runner_coordinator(manager: WorkspaceManager) -> RunnerCoordinator:
+    requests = RunRequestManager(manager)
+    configured_runner_root = manager.environ.get("LAB_RUNNER_PROFILE_ROOT")
+    runner_root = (
+        Path(configured_runner_root).expanduser().resolve()
+        if configured_runner_root
+        else manager.control_repository / "integration" / "runners"
+    )
+    return RunnerCoordinator(
+        requests.store,
+        runner_profile_root=runner_root,
+        queue_profile_root=requests.profile_root,
+        control_plane=control_plane_identity(
+            manager.control_repository,
+            install_manifest_path=(
+                Path(configured_install_manifest)
+                if (
+                    configured_install_manifest
+                    := manager.environ.get("LAB_CONTROL_PLANE_INSTALL_MANIFEST")
+                )
+                else None
+            ),
+        ),
+    )
 
 
 def _recommended_profiles(
@@ -1027,6 +1097,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Terminal: {str(request_payload.get('terminal')).lower()}")
             else:
                 _print_request_state(request_payload)
+            return 0
+
+        if arguments.command == "runner":
+            coordinator = _runner_coordinator(manager)
+            if arguments.runner_command == "inspect":
+                runner_payload = coordinator.inspect(arguments.runner_id)
+                if arguments.json:
+                    _emit(runner_payload, as_json=True)
+                else:
+                    _print_runner_inspection(runner_payload)
+                return 0
+            claim = coordinator.claim_next(
+                arguments.runner_id, arguments.slot_id
+            )
+            if arguments.json:
+                print(json.dumps(claim, indent=2, sort_keys=True))
+            else:
+                _print_runner_claim(claim)
             return 0
 
         if arguments.command == "runs":

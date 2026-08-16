@@ -67,7 +67,7 @@ Queue Profile 只声明通用管理语义：
 请求只携带：
 
 - Task、Profile、target、risk、capability 和 evidence tier；
-- 提交请求的 control-plane version、commit/tree、dirty 状态和 executor hash；
+- 提交请求的 control-plane version、commit/tree、dirty 状态、executor hash，以及外置安装存在时的 manifest hash；
 - 每个 repository 的 commit、tree OID 和 submodule gitlink；
 - 父仓 gitlink 与独立子仓 commit 的一致性关系；
 - baseline ID/hash（存在时）。

@@ -28,7 +28,8 @@ from .workspace import (
     validate_task_id,
 )
 
-RUN_REQUEST_SCHEMA_ID = "lab.run-request.v1"
+LEGACY_RUN_REQUEST_SCHEMA_ID = "lab.run-request.v1"
+RUN_REQUEST_SCHEMA_ID = "lab.run-request.v2"
 REQUEST_STATE_SCHEMA_ID = "lab.run-request-state.v1"
 REQUEST_EVENT_SCHEMA_ID = "lab.run-request-event.v1"
 REQUEST_SUBMISSION_SCHEMA_ID = "lab.run-request-submission.v1"
@@ -196,7 +197,11 @@ def _portable_snapshot(
     }
 
 
-def _validated_control_plane(value: object) -> dict[str, object]:
+def validate_control_plane_identity(
+    value: object,
+    *,
+    require_install_manifest_identity: bool = True,
+) -> dict[str, object]:
     expected = {
         "version",
         "source_commit",
@@ -204,6 +209,8 @@ def _validated_control_plane(value: object) -> dict[str, object]:
         "source_dirty",
         "executor_sha256",
     }
+    if require_install_manifest_identity:
+        expected.add("install_manifest_sha256")
     if not isinstance(value, dict) or set(value) != expected:
         raise LabError("Run request control plane has an unexpected shape")
     version = value.get("version")
@@ -213,6 +220,17 @@ def _validated_control_plane(value: object) -> dict[str, object]:
     source_dirty = value.get("source_dirty")
     if not isinstance(source_dirty, bool):
         raise LabError("Run request control-plane dirty state is invalid")
+    install_manifest_sha256: str | None = None
+    if require_install_manifest_identity:
+        raw_install_manifest_sha256 = value.get("install_manifest_sha256")
+        install_manifest_sha256 = (
+            None
+            if raw_install_manifest_sha256 is None
+            else _validate_sha256(
+                raw_install_manifest_sha256,
+                label="control-plane install manifest SHA-256",
+            )
+        )
     normalized: dict[str, object] = {
         "version": version,
         "source_commit": _validate_oid(
@@ -226,6 +244,8 @@ def _validated_control_plane(value: object) -> dict[str, object]:
             value.get("executor_sha256"), label="control-plane executor SHA-256"
         ),
     }
+    if require_install_manifest_identity:
+        normalized["install_manifest_sha256"] = install_manifest_sha256
     if normalized != value:
         raise LabError("Run request control-plane identity is not canonical")
     return normalized
@@ -257,7 +277,7 @@ def build_run_request(
         "target_id": profile.target_id,
         "capabilities": list(profile.capabilities),
         "evidence_tier": evidence_tier,
-        "control_plane": _validated_control_plane(dict(control_plane)),
+        "control_plane": validate_control_plane_identity(dict(control_plane)),
     }
     idempotency_key = _sha256_json(content)
     request = {
@@ -283,14 +303,18 @@ def validate_run_request(payload: object) -> dict[str, object]:
     }
     if not isinstance(payload, dict) or set(payload) != expected:
         raise LabError("Run request has an unexpected shape")
-    if payload.get("schema") != RUN_REQUEST_SCHEMA_ID:
+    schema = payload.get("schema")
+    if schema not in {LEGACY_RUN_REQUEST_SCHEMA_ID, RUN_REQUEST_SCHEMA_ID}:
         raise LabError("unsupported Run request schema")
     validate_task_id(str(payload.get("task_id", "")))
     validate_task_id(str(payload.get("target_id", "")))
     evidence_tier = payload.get("evidence_tier")
     if evidence_tier not in {DEVELOPMENT_EVIDENCE_TIER, CANDIDATE_EVIDENCE_TIER}:
         raise LabError("Run request has an invalid evidence tier")
-    _validated_control_plane(payload.get("control_plane"))
+    validate_control_plane_identity(
+        payload.get("control_plane"),
+        require_install_manifest_identity=schema == RUN_REQUEST_SCHEMA_ID,
+    )
     raw_profile = payload.get("profile")
     if not isinstance(raw_profile, dict) or set(raw_profile) != {
         "profile_id",
@@ -460,6 +484,77 @@ class RunRequestStore:
         event_root = request_root / "events"
         if event_root.is_symlink():
             raise LabError(f"Run request event root must not be a symlink: {event_root}")
+        attachment_root = request_root / "attachments"
+        if attachment_root.is_symlink():
+            raise LabError(
+                f"Run request attachment root must not be a symlink: {attachment_root}"
+            )
+
+    def load_request(self, request_id: str) -> dict[str, object]:
+        self._validate_request_directories(request_id)
+        return validate_run_request(_read_json(self._request_path(request_id)))
+
+    def put_attachment(
+        self,
+        request_id: str,
+        attachment_id: str,
+        payload: Mapping[str, object],
+    ) -> tuple[dict[str, object], bool]:
+        validate_task_id(attachment_id)
+        with self._lock():
+            self.load(request_id)
+            attachment_root = self._request_root(request_id) / "attachments"
+            if attachment_root.is_symlink():
+                raise LabError(
+                    f"Run request attachment root must not be a symlink: {attachment_root}"
+                )
+            path = attachment_root / f"{attachment_id}.json"
+            document = dict(payload)
+            if len(_canonical_json(document)) > _MAX_STATE_BYTES:
+                raise LabError("Run request attachment exceeds its size limit")
+            if path.exists():
+                existing = _read_json(path)
+                if existing != document:
+                    raise LabError(
+                        f"Run request attachment collision: {request_id}/{attachment_id}"
+                    )
+                return existing, False
+            _write_new_json(path, document)
+            return document, True
+
+    def load_attachment(
+        self, request_id: str, attachment_id: str
+    ) -> dict[str, object]:
+        validate_task_id(attachment_id)
+        self.load(request_id)
+        return _read_json(
+            self._request_root(request_id) / "attachments" / f"{attachment_id}.json"
+        )
+
+    def has_attachment(self, request_id: str, attachment_id: str) -> bool:
+        validate_task_id(attachment_id)
+        self.load(request_id)
+        path = (
+            self._request_root(request_id)
+            / "attachments"
+            / f"{attachment_id}.json"
+        )
+        return path.is_file() and not path.is_symlink()
+
+    def latest_event(self, request_id: str) -> dict[str, object]:
+        state = self.load(request_id)
+        history = state["history"]
+        assert isinstance(history, list)
+        sequence = len(history) - 1
+        summary = history[sequence]
+        assert isinstance(summary, dict)
+        observed_state = str(summary["state"])
+        request = self.load_request(request_id)
+        return self._validate_event(
+            _read_json(self._event_path(request_id, sequence, observed_state)),
+            request=request,
+            sequence=sequence,
+        )
 
     def _event(
         self,
@@ -603,7 +698,7 @@ class RunRequestStore:
 
     def load(self, request_id: str) -> dict[str, object]:
         self._validate_request_directories(request_id)
-        request = validate_run_request(_read_json(self._request_path(request_id)))
+        request = self.load_request(request_id)
         state = _read_json(self._state_path(request_id))
         expected = {
             "schema",
@@ -968,7 +1063,17 @@ class RunRequestManager:
             profile=profile,
             evidence_tier=evidence_tier,
             control_plane=control_plane_identity(
-                self.workspace_manager.control_repository
+                self.workspace_manager.control_repository,
+                install_manifest_path=(
+                    Path(configured_install_manifest)
+                    if (
+                        configured_install_manifest
+                        := self.workspace_manager.environ.get(
+                            "LAB_CONTROL_PLANE_INSTALL_MANIFEST"
+                        )
+                    )
+                    else None
+                ),
             ),
         )
         state, created = self.store.submit(request)

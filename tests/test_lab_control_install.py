@@ -13,6 +13,7 @@ from lab_control.control_install import (
     install_control_plane,
     plan_control_plane_install,
 )
+from lab_control.runs import control_plane_identity
 from lab_control.workspace import LabError
 
 
@@ -142,6 +143,10 @@ def test_installs_only_protected_ref_outside_checkout_and_runs_wrapper(
         in wrapper
     )
     assert (
+        'LAB_RUNNER_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/runners"'
+        in wrapper
+    )
+    assert (
         'LAB_ENVIRONMENT_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/environments"'
         in wrapper
     )
@@ -149,6 +154,27 @@ def test_installs_only_protected_ref_outside_checkout_and_runs_wrapper(
     status = inspect_control_plane_install(install_root)
     assert status["status"] == "READY"
     assert status["current_commit"] == protected
+    (repository / "lab_control" / "__init__.py").write_text(
+        "VALUE = 999\n", encoding="utf-8"
+    )
+    with pytest.raises(LabError, match="outside its active payload"):
+        control_plane_identity(
+            repository,
+            install_manifest_path=install_root / "current" / "install.json",
+        )
+    installed_identity = control_plane_identity(
+        repository,
+        install_manifest_path=install_root / "current" / "install.json",
+        _executing_payload_root=install_root / "versions" / protected / "payload",
+    )
+    direct_identity = control_plane_identity(repository)
+    assert installed_identity["source_commit"] == protected
+    assert installed_identity["source_dirty"] is False
+    assert installed_identity["install_manifest_sha256"] == status["manifest"][
+        "manifest_sha256"
+    ]
+    assert installed_identity["executor_sha256"] != direct_identity["executor_sha256"]
+    assert direct_identity["source_dirty"] is True
 
     noop_plan = _plan(repository, install_root)
     assert noop_plan["action"] == "NOOP"

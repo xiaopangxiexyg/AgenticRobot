@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TextIO
 
 from . import git
+from .control_install import inspect_control_plane_install
 from .environments import (
     ResolvedEnvironment,
     load_environment_profile,
@@ -115,7 +116,80 @@ def control_plane_hash(control_repository: Path) -> str:
     return digest.hexdigest()
 
 
-def control_plane_identity(control_repository: Path) -> dict[str, object]:
+def _installed_control_plane_hash(manifest: Mapping[str, object]) -> str:
+    payload = manifest.get("payload")
+    if not isinstance(payload, dict):
+        raise LabError("installed control-plane manifest lacks payload identity")
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        raise LabError("installed control-plane manifest lacks file identities")
+    names = ["lab"] + sorted(
+        name
+        for name in files
+        if isinstance(name, str)
+        and name.startswith("lab_control/")
+        and name.endswith(".py")
+    )
+    digest = hashlib.sha256()
+    for name in names:
+        identity = files.get(name)
+        if not isinstance(identity, dict):
+            raise LabError(f"installed control-plane executor file is absent: {name}")
+        sha256 = identity.get("sha256")
+        if not isinstance(sha256, str) or len(sha256) != 64:
+            raise LabError(f"installed control-plane executor hash is invalid: {name}")
+        try:
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(bytes.fromhex(sha256))
+            digest.update(b"\0")
+        except ValueError as exc:
+            raise LabError(
+                f"installed control-plane executor hash is invalid: {name}"
+            ) from exc
+    return digest.hexdigest()
+
+
+def control_plane_identity(
+    control_repository: Path,
+    *,
+    install_manifest_path: Path | None = None,
+    _executing_payload_root: Path | None = None,
+) -> dict[str, object]:
+    if install_manifest_path is not None:
+        configured = install_manifest_path.expanduser()
+        if configured.name != "install.json" or configured.parent.name != "current":
+            raise LabError(
+                "installed control-plane manifest must use <install-root>/current/install.json"
+            )
+        install_root = configured.parent.parent.resolve()
+        status = inspect_control_plane_install(install_root)
+        manifest = status.get("manifest")
+        if status.get("status") != "READY" or not isinstance(manifest, dict):
+            raise LabError("installed control plane is not READY")
+        commit = manifest.get("commit")
+        version_root = install_root / "versions" / str(commit)
+        expected_manifest = version_root / "install.json"
+        if configured.resolve() != expected_manifest.resolve():
+            raise LabError("installed control-plane manifest is not the active version")
+        expected_payload_root = (version_root / "payload").resolve()
+        executing_payload_root = (
+            _executing_payload_root.resolve()
+            if _executing_payload_root is not None
+            else Path(__file__).resolve().parents[1]
+        )
+        if executing_payload_root != expected_payload_root:
+            raise LabError(
+                "installed control-plane identity was requested by code outside its active payload"
+            )
+        return {
+            "version": CONTROL_PLANE_VERSION,
+            "source_commit": commit,
+            "source_tree_oid": manifest.get("tree_oid"),
+            "source_dirty": False,
+            "executor_sha256": _installed_control_plane_hash(manifest),
+            "install_manifest_sha256": manifest.get("manifest_sha256"),
+        }
     commit = git.current_commit(control_repository)
     return {
         "version": CONTROL_PLANE_VERSION,
@@ -123,6 +197,7 @@ def control_plane_identity(control_repository: Path) -> dict[str, object]:
         "source_tree_oid": git.tree_oid(control_repository, commit),
         "source_dirty": bool(git.status_short(control_repository)),
         "executor_sha256": control_plane_hash(control_repository),
+        "install_manifest_sha256": None,
     }
 
 
@@ -465,7 +540,17 @@ class RunManager:
                 "python_major_minor": profile.python_major_minor,
             },
             "control_plane": control_plane_identity(
-                self.workspace_manager.control_repository
+                self.workspace_manager.control_repository,
+                install_manifest_path=(
+                    Path(configured_install_manifest)
+                    if (
+                        configured_install_manifest
+                        := self.workspace_manager.environ.get(
+                            "LAB_CONTROL_PLANE_INSTALL_MANIFEST"
+                        )
+                    )
+                    else None
+                ),
             ),
             "evidence_tier": evidence_tier,
             "baseline": snapshot_identity.get("baseline"),
