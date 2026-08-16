@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from collection_runtime.source_observation_history import (
+    SourceObservationHistoryBinding,
     SQLiteSourceObservationHistoryStore,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -73,7 +74,12 @@ MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1 = (
 
 @dataclass(frozen=True)
 class MujocoAgentTcpPoseHistoryStorageConfig:
-    """Explicit disk binding for the optional history Route; never auto-starts."""
+    """Disk catalog for exact source-bound history stores; never auto-starts.
+
+    A Gateway launch creates a new lower runtime/source binding.  The catalog
+    root is therefore partitioned by that immutable binding instead of opening
+    one mutable SQLite file across unrelated launches.
+    """
 
     root: Path
     profile: MujocoAgentTcpPoseHistoryProfile = field(
@@ -94,6 +100,14 @@ class MujocoAgentTcpPoseHistoryStorageConfig:
             or Path(self.filename).name != self.filename
         ):
             raise ValueError("history filename must be a non-empty basename.")
+
+    def store_root_for(
+        self,
+        binding: SourceObservationHistoryBinding,
+    ) -> Path:
+        if not isinstance(binding, SourceObservationHistoryBinding):
+            raise TypeError("history binding must be typed.")
+        return self.root / "source_bindings" / binding.semantic_content_hash
 
 
 def mujoco_agent_tcp_pose_execution_observation_plan_v1(
@@ -388,17 +402,17 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         history_profile=(None if history_storage is None else history_storage.profile),
     )
     history_store = None
-    if history_storage is not None:
-        source_binding = contract_bundle.history_source_binding
-        if source_binding is None:
-            raise RuntimeError("History contract lacks its source binding.")
-        history_store = SQLiteSourceObservationHistoryStore(
-            root=history_storage.root,
-            binding=source_binding,
-            limits=history_storage.profile.store_limits,
-            filename=history_storage.filename,
-        )
     try:
+        if history_storage is not None:
+            source_binding = contract_bundle.history_source_binding
+            if source_binding is None:
+                raise RuntimeError("History contract lacks its source binding.")
+            history_store = SQLiteSourceObservationHistoryStore(
+                root=history_storage.store_root_for(source_binding),
+                binding=source_binding,
+                limits=history_storage.profile.store_limits,
+                filename=history_storage.filename,
+            )
         return assemble_mujoco_agent_tcp_pose_gateway_session(
             application=application,
             contract_bundle=contract_bundle,
@@ -410,6 +424,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     except Exception:
         if history_store is not None:
             history_store.close()
+        application.close_after_hold()
         raise
 
 
