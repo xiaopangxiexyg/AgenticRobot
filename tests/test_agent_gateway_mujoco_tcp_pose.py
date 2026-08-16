@@ -9,6 +9,12 @@ from types import SimpleNamespace
 import pytest
 
 import agent_gateway.profiles.mujoco.motion_deployment as deployment
+import agent_gateway.profiles.mujoco.motion_skill as motion_skill
+from agent_gateway.profiles.motion_primitive_resolution import (
+    MotionPrimitiveTargetResolution,
+    resolve_level_tcp_orientation_primitive_target,
+    resolve_tcp_displacement_primitive_target,
+)
 from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
     AgentSkillOperation,
@@ -30,11 +36,15 @@ from agent_gateway.profiles.mujoco.motion_application import (
     MujocoAgentSkillMotionStep,
 )
 from agent_gateway.profiles.mujoco.motion_deployment import (
-    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1,
     MujocoAgentTcpPoseDeploymentBinding,
     MujocoAgentTcpPoseMotionProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
+)
+from agent_gateway.profiles.mujoco.motion_primitive_profiles import (
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
+    MujocoAgentTcpCardinalStepProfile,
+    MujocoAgentTcpFixedOrientationProfile,
 )
 from agent_gateway.profiles.mujoco.motion_factory import (
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,
@@ -49,8 +59,6 @@ from agent_gateway.profiles.mujoco.motion_gateway_session import (
 from agent_gateway.profiles.mujoco.motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
-    resolve_level_tcp_orientation_primitive_target,
-    resolve_tcp_displacement_primitive_target,
 )
 from robot_motion.coordinate_frames import (
     CoordinateFrameGraph,
@@ -65,6 +73,24 @@ from sim.mujoco.deploy import (
     MujocoSimHILTargetConfig,
     build_mujoco_pose_component_target_profile,
 )
+
+
+def test_motion_primitive_organization_preserves_legacy_profile_exports() -> None:
+    assert deployment.MujocoAgentTcpCardinalStepProfile is (
+        MujocoAgentTcpCardinalStepProfile
+    )
+    assert deployment.MujocoAgentTcpFixedOrientationProfile is (
+        MujocoAgentTcpFixedOrientationProfile
+    )
+    assert motion_skill.MujocoAgentTcpTargetResolution is (
+        MotionPrimitiveTargetResolution
+    )
+    assert motion_skill.resolve_tcp_displacement_primitive_target is (
+        resolve_tcp_displacement_primitive_target
+    )
+    assert motion_skill.resolve_level_tcp_orientation_primitive_target is (
+        resolve_level_tcp_orientation_primitive_target
+    )
 
 
 def _profile_and_schema(component_id: str = "right_arm"):

@@ -6,7 +6,6 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -21,6 +20,11 @@ from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationReceipt,
 )
 from agent_gateway.protocol.skill_catalog import SkillExecutionRoute
+from agent_gateway.profiles.motion_primitive_resolution import (
+    MotionPrimitiveTargetResolution as MujocoAgentTcpTargetResolution,
+    resolve_level_tcp_orientation_primitive_target,
+    resolve_tcp_displacement_primitive_target,
+)
 from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
@@ -29,15 +33,6 @@ from agent_gateway.runtime.station_operation_worker import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
-from robot_motion.coordinate_frames import CoordinateFrameGraph, CoordinateFrameSpec
-from robot_motion.primitives import (
-    LevelTCPOrientationPrimitive,
-    TCPPoseDisplacementPrimitive,
-)
-from robot_motion.relative_action import (
-    pose_matrix_to_xyzquat,
-    xyzquat_to_pose_matrix,
-)
 from robot_motion.target_safety import (
     TCPPoseEnvelopeLifecycleError,
     TCPPoseEnvelopeSafetyRuntime,
@@ -49,186 +44,6 @@ from .motion_deployment import (
     MujocoAgentTcpPoseDeploymentBinding,
     MujocoAgentTcpPoseMotionProfile,
 )
-
-
-@dataclass(frozen=True)
-class MujocoAgentTcpTargetResolution:
-    """One lower-derived absolute target and its immutable semantic evidence."""
-
-    target_pose: tuple[float, ...]
-    evidence_refs: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "target_pose",
-            _pose(self.target_pose, field_name="target_pose"),
-        )
-        refs = tuple(
-            sorted(
-                {
-                    _required(value, field_name="evidence_ref")
-                    for value in self.evidence_refs
-                }
-            )
-        )
-        if not refs:
-            raise ValueError("A derived TCP target requires semantic evidence.")
-        object.__setattr__(self, "evidence_refs", refs)
-
-
-def resolve_tcp_displacement_primitive_target(
-    *,
-    measured_pose: tuple[float, ...],
-    primitive: TCPPoseDisplacementPrimitive,
-    reference_frame_spec: CoordinateFrameSpec,
-    frame_graph: CoordinateFrameGraph | None = None,
-    measured_reference_frame_id: str | None = None,
-) -> MujocoAgentTcpTargetResolution:
-    """Resolve one pure primitive at the lower Skill activation boundary."""
-
-    if not isinstance(primitive, TCPPoseDisplacementPrimitive):
-        raise TypeError("primitive must be a TCP displacement primitive.")
-    if not isinstance(reference_frame_spec, CoordinateFrameSpec):
-        raise TypeError("reference_frame_spec must be typed.")
-    measured_matrix = xyzquat_to_pose_matrix(
-        measured_pose,
-        name="tcp_displacement_activation_pose",
-    )
-    anchor, execution_from_primitive, frame_evidence = _resolve_primitive_frames(
-        measured_pose=measured_matrix,
-        primitive_reference_frame_spec=reference_frame_spec,
-        frame_graph=frame_graph,
-        measured_reference_frame_id=measured_reference_frame_id,
-    )
-    target = primitive.apply(
-        anchor,
-        reference_frame_spec=reference_frame_spec,
-    )
-    execution_target = execution_from_primitive @ target.target_pose
-    return MujocoAgentTcpTargetResolution(
-        target_pose=tuple(
-            float(value)
-            for value in pose_matrix_to_xyzquat(
-                execution_target,
-                name="tcp_displacement_target_pose",
-            )
-        ),
-        evidence_refs=(
-            "tcp-displacement-primitive:" + primitive.semantic_content_hash,
-            "tcp-displacement-target:" + target.semantic_content_hash,
-            *frame_evidence,
-        ),
-    )
-
-
-def resolve_level_tcp_orientation_primitive_target(
-    *,
-    measured_pose: tuple[float, ...],
-    primitive: LevelTCPOrientationPrimitive,
-    reference_frame_spec: CoordinateFrameSpec,
-    frame_graph: CoordinateFrameGraph | None = None,
-    measured_reference_frame_id: str | None = None,
-) -> MujocoAgentTcpTargetResolution:
-    """Resolve one fixed absolute horizontal heading at activation.
-
-    The measured pose contributes translation only.  The primitive replaces
-    orientation with its profile-owned absolute heading, so calls never add a
-    relative yaw to the current TCP orientation.
-    """
-
-    if not isinstance(primitive, LevelTCPOrientationPrimitive):
-        raise TypeError("primitive must be a fixed level TCP orientation.")
-    if not isinstance(reference_frame_spec, CoordinateFrameSpec):
-        raise TypeError("reference_frame_spec must be typed.")
-    measured_matrix = xyzquat_to_pose_matrix(
-        measured_pose,
-        name="tcp_level_orientation_activation_pose",
-    )
-    anchor, execution_from_primitive, frame_evidence = _resolve_primitive_frames(
-        measured_pose=measured_matrix,
-        primitive_reference_frame_spec=reference_frame_spec,
-        frame_graph=frame_graph,
-        measured_reference_frame_id=measured_reference_frame_id,
-    )
-    target = primitive.apply(
-        anchor,
-        reference_frame_spec=reference_frame_spec,
-    )
-    execution_target = execution_from_primitive @ target.target_pose
-    return MujocoAgentTcpTargetResolution(
-        target_pose=tuple(
-            float(value)
-            for value in pose_matrix_to_xyzquat(
-                execution_target,
-                name="tcp_level_orientation_target_pose",
-            )
-        ),
-        evidence_refs=(
-            "tcp-level-orientation-primitive:" + primitive.semantic_content_hash,
-            "tcp-level-orientation-target:" + target.semantic_content_hash,
-            *frame_evidence,
-        ),
-    )
-
-
-def _resolve_primitive_frames(
-    *,
-    measured_pose: np.ndarray,
-    primitive_reference_frame_spec: CoordinateFrameSpec,
-    frame_graph: CoordinateFrameGraph | None,
-    measured_reference_frame_id: str | None,
-) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
-    """Move an execution-frame measurement into and back out of Skill axes.
-
-    MuJoCo executes arm targets in ``*_arm_base`` coordinates, while semantic
-    cardinal/orientation primitives are defined in the canonical station/desk
-    axes.  Keeping the two frames explicit prevents a rotated arm base from
-    silently changing ``forward`` or a fixed absolute heading.
-    """
-
-    primitive_frame_id = primitive_reference_frame_spec.frame_id
-    execution_frame_id = (
-        primitive_frame_id
-        if measured_reference_frame_id is None
-        else _required(
-            measured_reference_frame_id,
-            field_name="measured_reference_frame_id",
-        )
-    )
-    if execution_frame_id == primitive_frame_id:
-        return measured_pose, np.eye(4, dtype=np.float64), ()
-    if not isinstance(frame_graph, CoordinateFrameGraph):
-        raise TypeError(
-            "frame_graph is required when primitive and measured frames differ."
-        )
-    registered_spec = frame_graph.frame_by_id.get(primitive_frame_id)
-    if (
-        registered_spec is None
-        or registered_spec.semantic_content_hash
-        != primitive_reference_frame_spec.semantic_content_hash
-    ):
-        raise ValueError(
-            "primitive reference frame is not the exact frame-graph member."
-        )
-    primitive_from_execution = frame_graph.resolve(
-        execution_frame_id,
-        primitive_frame_id,
-    )
-    execution_from_primitive = frame_graph.resolve(
-        primitive_frame_id,
-        execution_frame_id,
-    )
-    return (
-        primitive_from_execution.matrix_target_source @ measured_pose,
-        execution_from_primitive.matrix_target_source,
-        (
-            "tcp-primitive-frame-resolution:"
-            + primitive_from_execution.semantic_content_hash,
-            "tcp-execution-frame-resolution:"
-            + execution_from_primitive.semantic_content_hash,
-        ),
-    )
 
 
 def _required(value: object, *, field_name: str) -> str:

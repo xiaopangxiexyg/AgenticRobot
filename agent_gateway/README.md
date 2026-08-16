@@ -31,6 +31,14 @@ not caller-authored Agent input.
   profile; it consumes immutable owner publications and performs no device or
   motion I/O.
 
+Shared activation-time application of reviewed TCP primitives lives in
+`profiles/motion_primitive_resolution.py`; it derives an absolute lower target
+from measured state and an exact frame graph but owns no safety, IK, authority,
+or dispatch. MuJoCo-specific 6+3 Route IDs and immutable parameter profiles live
+in `profiles/mujoco/motion_primitive_profiles.py`. The historic exports from
+`profiles/mujoco/motion_deployment.py` and `motion_skill.py` remain available so
+this organization-only split does not break consumers.
+
 The neutral `protocol/runtime/transport` core must not import
 `control_station`, concrete simulation, hardware, teleop, model deployments,
 or an upper Agent framework. A concrete profile may assemble a Control Station

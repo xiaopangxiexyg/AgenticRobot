@@ -37,15 +37,17 @@ from sim.mujoco.deploy import (
 
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
-    MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1,
-    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_POSE_MAX_TRANSLATION_DELTA_M_V1,
     MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1,
     MujocoAgentTcpPoseHistoryProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
+)
+from .motion_primitive_profiles import (
+    MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1,
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
 )
 from .motion_gateway_session import (
     MujocoAgentTcpPoseGatewaySession,

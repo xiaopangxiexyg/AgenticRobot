@@ -22,6 +22,12 @@ profile explicitly binds a Station application port.
 - `profiles/` owns concrete application and deployment bindings. A profile may
   import `control_station`, `sim`, deployment adapters, and lower motion APIs
   only to assemble one exact application leaf through typed ports.
+  `profiles/motion_primitive_resolution.py` is the shared pure activation-time
+  seam for applying a reviewed primitive to lower-measured state; target-
+  specific frame/profile identities remain in the concrete profile. MuJoCo's
+  reviewed 6+3 primitive identities and parameter profiles live in
+  `profiles/mujoco/motion_primitive_profiles.py`, separate from Route-manifest
+  construction and executor lifecycle.
 
 Semantic primitive axes and lower execution coordinates must remain explicit.
 When a Skill is defined in canonical Station/desk axes but the lower owner

@@ -16,6 +16,11 @@ from collection_runtime.source_observation_history import (
     SourceObservationHistoryRecorder,
     SQLiteSourceObservationHistoryStore,
 )
+from agent_gateway.profiles.motion_primitive_resolution import (
+    MotionPrimitiveTargetResolution,
+    resolve_level_tcp_orientation_primitive_target,
+    resolve_tcp_displacement_primitive_target,
+)
 from agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
 from agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
@@ -56,10 +61,7 @@ from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import MujocoAgentTcpPoseContractBundle
 from .motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
-    MujocoAgentTcpTargetResolution,
     mujoco_agent_skill_hold_evidence_from_transition,
-    resolve_level_tcp_orientation_primitive_target,
-    resolve_tcp_displacement_primitive_target,
 )
 from .observation import MujocoAgentObservationProducer
 from .observation_binding import (
@@ -427,7 +429,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
 
         def resolve_target(
             measured_pose: tuple[float, ...],
-        ) -> MujocoAgentTcpTargetResolution:
+        ) -> MotionPrimitiveTargetResolution:
             return resolve_tcp_displacement_primitive_target(
                 measured_pose=measured_pose,
                 primitive=primitive,
@@ -556,7 +558,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ):
             def resolve_target(
                 measured_pose: tuple[float, ...],
-            ) -> MujocoAgentTcpTargetResolution:
+            ) -> MotionPrimitiveTargetResolution:
                 return resolve_level_tcp_orientation_primitive_target(
                     measured_pose=measured_pose,
                     primitive=_profile.primitive,
