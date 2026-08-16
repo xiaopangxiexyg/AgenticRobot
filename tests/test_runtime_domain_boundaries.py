@@ -217,6 +217,50 @@ def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> N
     assert imported_symbols.isdisjoint(implementation_constructors)
 
 
+def test_mujoco_target_runtime_delegates_pure_promotion_policy() -> None:
+    target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
+    promotion_policy = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "composition_promotion.py"
+    )
+
+    assert "MujocoCompositionPromotionPolicy" in _called_names(target_runtime)
+    assert _absolute_import_roots(promotion_policy) == {
+        "__future__",
+        "dataclasses",
+        "robot_motion",
+    }
+
+    stateful_owner_operations = {
+        "admit_evaluated_composition",
+        "admit_proposal",
+        "run_decision",
+        "send_commands",
+    }
+    assert _attribute_names(promotion_policy).isdisjoint(
+        stateful_owner_operations
+    )
+    assert stateful_owner_operations & _attribute_names(target_runtime) == {
+        "admit_evaluated_composition",
+        "admit_proposal",
+        "run_decision",
+        "send_commands",
+    }
+    runtime_tree = ast.parse(
+        target_runtime.read_text(encoding="utf-8"),
+        filename=str(target_runtime),
+    )
+    assert any(
+        isinstance(node, ast.FunctionDef) and node.name == "step"
+        for node in ast.walk(runtime_tree)
+    )
+    policy_source = promotion_policy.read_text(encoding="utf-8")
+    runtime_source = target_runtime.read_text(encoding="utf-8")
+    assert "_next_composite_proposal_sequence" not in policy_source
+    assert "_composition_promotion_envelope_by_evaluation_id" not in policy_source
+    assert "_next_composite_proposal_sequence" in runtime_source
+    assert "_composition_promotion_envelope_by_evaluation_id" in runtime_source
+
+
 def test_control_station_uses_explicit_mujoco_composition_port() -> None:
     legacy_runtime_views = {
         "_topology",
