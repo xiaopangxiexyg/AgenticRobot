@@ -63,11 +63,16 @@ from robot_motion.deploy.observation import observation_faults
 from teleop_runtime.deploy.replay import (
     DatasetReplayPolicy,
     compare_v22_replay_absolute_relative_chunks,
+    debug_replay_execution_exhausted,
     load_dataset_replay_policy,
     resolve_replay_parquet_path,
+    skip_startup_replay_frames,
     v22_replay_rows_to_legacy_actions,
 )
-from teleop_runtime.deploy.run_policy import _debug_replay_execution_exhausted
+from teleop_runtime.deploy.run_policy import (
+    _debug_replay_execution_exhausted,
+    _skip_startup_replay_frames,
+)
 from teleop_runtime.deploy.policy import LoadedPolicy
 from teleop_runtime.deploy import run_policy
 from teleop_runtime.collection import run_collect
@@ -493,6 +498,23 @@ def test_finished_non_loop_replay_stops_prediction_only_after_queue_drains(tmp_p
 
     replay.loop = True
     assert not _debug_replay_execution_exhausted(policy, queued_actions=0)
+
+
+def test_run_policy_preserves_replay_lifecycle_exports(tmp_path) -> None:
+    assert _debug_replay_execution_exhausted is debug_replay_execution_exhausted
+    assert _skip_startup_replay_frames is skip_startup_replay_frames
+
+    replay = DatasetReplayPolicy(
+        actions=np.zeros((3, ACTION_DIM), dtype=np.float32),
+        source_path=tmp_path / "episode.parquet",
+        chunk_size=2,
+    )
+    policy = LoadedPolicy(policy=replay, name="dataset_replay:test")
+
+    assert _skip_startup_replay_frames(policy, count=2) == 2
+    assert replay.cursor == 2
+    assert replay.finished is False
+    assert _skip_startup_replay_frames(object()) == 0
 
 
 def test_v22_replay_binds_metadata_to_runtime_arm_only_selection(monkeypatch) -> None:

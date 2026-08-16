@@ -28,7 +28,19 @@ from teleop_runtime.deploy.run_policy import (
     validate_args,
 )
 from teleop_runtime.deploy.schema import ACTION_DIM
-from teleop_runtime.deploy.startup_init import StartupInitializer
+from teleop_runtime.deploy.startup_init import (
+    StartupInitializer,
+    finish_policy_qpos_init_reference_cut,
+    reset_startup_initializer,
+)
+
+
+def test_run_policy_preserves_startup_init_compatibility_exports() -> None:
+    assert (
+        _finish_policy_qpos_init_reference_cut
+        is finish_policy_qpos_init_reference_cut
+    )
+    assert _reset_startup_initializer is reset_startup_initializer
 
 
 def test_policy_qpos_init_completion_announcement_is_explicit() -> None:
