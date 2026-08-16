@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -199,6 +202,29 @@ def _violations(
     }
 
 
+def _loaded_control_composition_modules(module_name: str) -> set[str]:
+    script = """
+import importlib
+import json
+import sys
+
+importlib.import_module(sys.argv[1])
+print(json.dumps(sorted(
+    name
+    for name in sys.modules
+    if name == "control_composition" or name.startswith("control_composition.")
+)))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, module_name],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return set(json.loads(completed.stdout))
+
+
 def test_collection_frontend_does_not_absorb_deploy_or_composition() -> None:
     assert _violations(
         REPO_ROOT / "teleop_runtime" / "collection",
@@ -211,6 +237,27 @@ def test_general_real_deploy_does_not_absorb_composition_or_simulation() -> None
         REPO_ROOT / "teleop_runtime" / "deploy",
         {"collection_runtime", "control_composition", "control_station", "sim"},
     ) == {}
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    (
+        "teleop_runtime.deploy.run_policy",
+        "control_station.real_teleop_entrypoint",
+        "teleop_runtime.replay.web_gui",
+    ),
+)
+def test_direct_real_execution_modes_do_not_load_composition(
+    module_name: str,
+) -> None:
+    assert _loaded_control_composition_modules(module_name) == set()
+
+
+def test_explicit_mujoco_composition_binding_loads_composition() -> None:
+    loaded = _loaded_control_composition_modules(
+        "sim.mujoco.deploy.composition_binding"
+    )
+    assert "control_composition" in loaded
 
 
 def test_model_integrations_do_not_own_application_or_backend_runtime() -> None:

@@ -16,20 +16,6 @@ from dataset_contracts.replay import (
     replay_source_action_contract_payload,
     target_runtime_action_contract_payload,
 )
-from control_composition.composition import (
-    CompositionInputAdmissionReceipt,
-    CompositionInputRecord,
-    CompositionInputSnapshot,
-    CompositionEvaluation,
-    CompositionSpec,
-)
-from dataset_interface.composition_control_trace import (
-    project_composition_input as _project_composition_input,
-    project_composition_input_admission as _project_composition_input_admission,
-    project_composition_input_snapshot as _project_composition_input_snapshot,
-    project_composition_evaluation as _project_composition_evaluation,
-    project_composition_spec as _project_composition_spec,
-)
 from robot_motion.action.arbiter import ArbitrationResult
 from robot_motion.action.arbitration_input import ArbitrationInputSnapshot
 from robot_motion.action.authority import AuthorityEvent, AuthorityStateSnapshot
@@ -435,105 +421,6 @@ def project_replay_proposal_adapter_result(
         )
     )
     return tuple(facts)
-
-
-def project_composition_input_admission(
-    receipt: CompositionInputAdmissionReceipt,
-    *,
-    runtime_session_id: str,
-    control_domain_id: str,
-    embodiment_instance_id: str,
-    occurred_at: float,
-    clock_domain_id: str,
-) -> ControlTraceFact:
-    return _project_composition_input_admission(
-        AuthoritativeTraceContext(
-            runtime_session_id=runtime_session_id,
-            control_domain_id=control_domain_id,
-            embodiment_instance_id=embodiment_instance_id,
-            clock_domain_id=clock_domain_id,
-        ),
-        receipt,
-        occurred_at=occurred_at,
-    )
-
-
-def project_composition_spec(
-    spec: CompositionSpec,
-    *,
-    runtime_session_id: str,
-    control_domain_id: str,
-    embodiment_instance_id: str,
-    occurred_at: float,
-    clock_domain_id: str,
-) -> ControlTraceFact:
-    """Compatibility projection; implementation lives in the dataset adapter."""
-
-    return _project_composition_spec(
-        AuthoritativeTraceContext(
-            runtime_session_id=runtime_session_id,
-            control_domain_id=control_domain_id,
-            embodiment_instance_id=embodiment_instance_id,
-            clock_domain_id=clock_domain_id,
-        ),
-        spec,
-        occurred_at=occurred_at,
-    )
-
-
-def project_composition_input(
-    record: CompositionInputRecord,
-    *,
-    embodiment_instance_id: str,
-) -> ControlTraceFact:
-    return _project_composition_input(
-        AuthoritativeTraceContext(
-            runtime_session_id=record.runtime_session_id,
-            control_domain_id=record.control_domain_id,
-            embodiment_instance_id=embodiment_instance_id,
-            clock_domain_id=record.available_clock_domain_id,
-        ),
-        record,
-    )
-
-
-def project_composition_input_snapshot(
-    snapshot: CompositionInputSnapshot,
-    *,
-    runtime_session_id: str,
-    embodiment_instance_id: str,
-    clock_domain_id: str,
-) -> ControlTraceFact:
-    return _project_composition_input_snapshot(
-        AuthoritativeTraceContext(
-            runtime_session_id=runtime_session_id,
-            control_domain_id=snapshot.control_domain_id,
-            embodiment_instance_id=embodiment_instance_id,
-            clock_domain_id=clock_domain_id,
-        ),
-        snapshot,
-    )
-
-
-def project_composition_evaluation(
-    result: CompositionEvaluation,
-    *,
-    runtime_session_id: str,
-    control_domain_id: str,
-    embodiment_instance_id: str,
-    occurred_at: float,
-    clock_domain_id: str,
-) -> ControlTraceFact:
-    return _project_composition_evaluation(
-        AuthoritativeTraceContext(
-            runtime_session_id=runtime_session_id,
-            control_domain_id=control_domain_id,
-            embodiment_instance_id=embodiment_instance_id,
-            clock_domain_id=clock_domain_id,
-        ),
-        result,
-        occurred_at=occurred_at,
-    )
 
 
 def _human_component_mapping_payload(mapping: Any) -> dict[str, Any]:
@@ -1396,6 +1283,25 @@ def make_runtime_trace_terminal(
         clock_domain_id=coordinator.config.clock_domain_id,
         payload=payload,
     )
+
+
+_LAZY_COMPOSITION_PROJECTION_EXPORTS = {
+    "project_composition_input",
+    "project_composition_input_admission",
+    "project_composition_input_snapshot",
+    "project_composition_evaluation",
+    "project_composition_spec",
+}
+
+
+def __getattr__(name: str):
+    """Load composition projections only for explicit multi-source callers."""
+
+    if name in _LAZY_COMPOSITION_PROJECTION_EXPORTS:
+        from . import composition_projection
+
+        return getattr(composition_projection, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

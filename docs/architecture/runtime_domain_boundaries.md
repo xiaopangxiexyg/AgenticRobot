@@ -44,11 +44,29 @@ lower domains must not import application/profile layers
 任何跨域适配器都应能回答三个问题：输入由谁推进、最终 authority/dispatch 由谁拥有、资源由谁关闭。
 如果答案出现两个 owner，应先修正所有权，而不是增加同步队列或兼容状态。
 
+## 执行模式边界
+
+执行模式按同时参与控制决策的 source 数量划分，而不是按是否启用 GUI、trace 或被动 shadow 划分：
+
+| 执行模式 | source/入口 | 最终执行 owner | `control_composition` |
+| --- | --- | --- | --- |
+| 单源策略部署 | `teleop_runtime.deploy` | 既有 deploy safety/executor 与真实 backend | 不加载、不创建 |
+| 单源真人遥操 | canonical GUI/headless real-teleop frontend | 既有 real-teleop session、Rig 与真实 backend | 不加载、不创建 |
+| 单源 replay | `teleop_runtime.replay` | replay executor、`ReplayHardwareRig` 与真实 backend | 不加载、不创建 |
+| 单源 Agent-skill | 当前仅有 MuJoCo direct target；真机 target 暂缓 | target runtime 的 canonical safety、IK 与 dispatch | direct target 不加载、不创建 |
+| 多源组合 | 显式 Control Station composition/Sim-HIL profile | 同一个 target runtime；composition 只产生 candidate | profile 显式加载并创建 |
+
+被动 observer、ControlTrace、difference 或 shadow 不会因为记录了 source/output 事实就变成多源控制；
+它们不得获取 authority、dispatch token，也不得让默认单源入口 eager-load `control_composition`。当两个或更多
+source 同时参与动作选择、融合或 handoff 时，应用/profile 必须显式创建 composition runtime，并把结果提交给
+原 target 的唯一 safety/dispatch owner，不能另建执行环。
+
 ## 当前迁移状态
 
 - `deployments.openpi.client.real` 保留为历史命令兼容入口；实现由
   `teleop_runtime.deploy.openpi_application` 持有。前者不得重新加入参数解析、设备配置或运行循环。
-- `teleop_runtime.deploy` 的一般真实部署链当前不依赖 `control_composition` 或 `sim`。
+- `teleop_runtime.deploy`、canonical real-teleop frontend 和 `teleop_runtime.replay` 的默认单源入口当前不会
+  eager-load `control_composition`；显式 composition binding 仍按需加载。
 - `control_composition` 当前不依赖 collection、model/provider、sim、hardware、teleop 或 Control Station。
 - `sim` 当前不依赖真实 teleop、hardware、collection runtime、model provider 或 Control Station；OpenPI 与
   MuJoCo observation 的接线由 `control_station.sim_hil_profile.openpi_policy_source` 持有。
