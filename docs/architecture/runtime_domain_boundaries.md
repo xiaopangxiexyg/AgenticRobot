@@ -52,6 +52,8 @@ lower domains must not import application/profile layers
 - `control_composition` 当前不依赖 collection、model/provider、sim、hardware、teleop 或 Control Station。
 - `sim` 当前不依赖真实 teleop、hardware、collection runtime、model provider 或 Control Station；OpenPI 与
   MuJoCo observation 的接线由 `control_station.sim_hil_profile.openpi_policy_source` 持有。
+- no-model Agent-skill 模拟目标由 `sim.mujoco.deploy.agent_skill_target` 持有，不再与 composition-specific
+  Sim-HIL target 实现在同一文件；原 `sim_hil_target` symbol 保留为按需加载、对象 identity 不变的兼容出口。
 - deterministic async composition harness 已移到 `tests/support/mujoco_async_topology.py`，不再作为
   `sim.mujoco.deploy` 的运行时导出或发布内容。
 - `sim/mujoco/deploy/composition_binding.py` 现在集中构造可选 composition runtime、retention 和 trace

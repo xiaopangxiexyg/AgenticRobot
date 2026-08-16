@@ -334,6 +334,9 @@ def test_optional_composition_settings_are_not_general_target_config() -> None:
 
 def test_general_mujoco_target_does_not_opt_into_composition_runtime() -> None:
     sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
+    agent_target = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "agent_skill_target.py"
+    )
 
     sim_hil_runtime_keywords = _call_keyword_names_in_function(
         sim_target,
@@ -341,13 +344,17 @@ def test_general_mujoco_target_does_not_opt_into_composition_runtime() -> None:
         called_name="MujocoDeployRuntime",
     )
     agent_skill_runtime_keywords = _call_keyword_names_in_function(
-        sim_target,
+        agent_target,
         function_name="build_mujoco_agent_skill_motion_target",
         called_name="MujocoDeployRuntime",
     )
 
     assert "composition_runtime_config" in sim_hil_runtime_keywords
     assert "composition_runtime_config" not in agent_skill_runtime_keywords
+    assert "build_mujoco_agent_skill_motion_target" not in _called_names(
+        sim_target
+    )
+    assert "control_composition" not in _absolute_import_roots(agent_target)
 
 
 def test_general_mujoco_runtime_does_not_eagerly_import_composition() -> None:
