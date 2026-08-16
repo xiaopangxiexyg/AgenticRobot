@@ -62,12 +62,18 @@ class AgentArtifactTransferBroker:
             )
         self.store = store
         self.session_capabilities = session_capabilities
+        if not session_capabilities.artifact_transfer_enabled:
+            raise ValueError("Artifact broker requires an Artifact-enabled session.")
         self.max_chunk_bytes = positive_integer(
             max_chunk_bytes,
             field_name="max_chunk_bytes",
         )
         if self.max_chunk_bytes > store.max_chunk_bytes:
             raise ValueError("Broker chunk size cannot exceed the store chunk size.")
+        if self.max_chunk_bytes != session_capabilities.max_artifact_chunk_bytes:
+            raise ValueError(
+                "Broker chunk size does not match the session capability."
+            )
         if session_capabilities.artifact_store_quota_bytes != store.quota_bytes:
             raise ValueError("Session capability quota does not match the store.")
         if session_capabilities.max_artifact_bytes != store.max_artifact_bytes:

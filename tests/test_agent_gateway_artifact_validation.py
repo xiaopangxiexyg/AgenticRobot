@@ -69,11 +69,13 @@ def _contract(*, direction: str) -> SkillIOContract:
 def _capabilities() -> AgentGatewaySessionCapabilities:
     return AgentGatewaySessionCapabilities(
         runtime_session_id="runtime:test",
+        artifact_transfer_enabled=True,
         artifact_access_mechanisms=("chunked_rpc",),
         max_control_request_bytes=1000,
         max_control_response_bytes=1000,
         max_inline_artifact_bytes=100,
         max_artifact_bytes=2000,
+        max_artifact_chunk_bytes=100,
         max_bundle_files=10,
         max_artifact_refs_per_operation=2,
         max_concurrent_uploads=1,

@@ -80,11 +80,13 @@ def _io_contract(*, skill_id: str = "perception.capture_depth") -> SkillIOContra
 def _capabilities() -> AgentGatewaySessionCapabilities:
     return AgentGatewaySessionCapabilities(
         runtime_session_id="runtime:test",
+        artifact_transfer_enabled=True,
         artifact_access_mechanisms=("chunked_rpc", "local_path"),
         max_control_request_bytes=256 * 1024,
         max_control_response_bytes=256 * 1024,
         max_inline_artifact_bytes=64 * 1024,
         max_artifact_bytes=64 * 1024 * 1024,
+        max_artifact_chunk_bytes=1024 * 1024,
         max_bundle_files=256,
         max_artifact_refs_per_operation=16,
         max_concurrent_uploads=2,
@@ -243,6 +245,22 @@ def test_capabilities_are_typed_and_require_a_bounded_fallback() -> None:
         )
     with pytest.raises(ValueError, match="protocol event bound"):
         replace(capabilities, event_payload_max_bytes=65_537)
+    with pytest.raises(ValueError, match="chunk_bytes"):
+        replace(
+            capabilities,
+            max_artifact_chunk_bytes=capabilities.max_artifact_bytes + 1,
+        )
+
+    inline_only = AgentGatewaySessionCapabilities.control_plane_only(
+        runtime_session_id="runtime:inline",
+        max_control_request_bytes=1024,
+        max_control_response_bytes=2048,
+    )
+    assert not inline_only.artifact_transfer_enabled
+    assert inline_only.artifact_access_mechanisms == ()
+    assert inline_only.max_artifact_bytes == 0
+    with pytest.raises(ValueError, match="empty mechanisms and zero limits"):
+        replace(inline_only, max_artifact_bytes=1)
 
 
 def test_empty_artifact_has_a_zero_length_access_range() -> None:

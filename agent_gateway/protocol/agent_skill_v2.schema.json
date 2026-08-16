@@ -206,7 +206,7 @@
     "max_json_depth": 16,
     "max_timeout_ms": 86400000
   },
-  "protocol_semantic_hash": "403660fbacd55017507b1e3433ce06b320d74e0cc1629aaaed878536fc47c5c2",
+  "protocol_semantic_hash": "d60afaf025a3a388635952d78a15419a577bd06dcdaf7f7abe59c577abd65acf",
   "protocol_version": "dexteleop.agent_skill.v2",
   "schema": "dexteleop_agent_skill_schema_snapshot_v2",
   "schemas": {
@@ -1588,13 +1588,15 @@
             ],
             "type": "string"
           },
-          "minItems": 1,
           "type": "array",
           "uniqueItems": true
         },
         "artifact_store_quota_bytes": {
-          "minimum": 1,
+          "minimum": 0,
           "type": "integer"
+        },
+        "artifact_transfer_enabled": {
+          "type": "boolean"
         },
         "event_payload_max_bytes": {
           "minimum": 1,
@@ -1605,23 +1607,27 @@
           "type": "integer"
         },
         "max_artifact_bytes": {
-          "minimum": 1,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_artifact_chunk_bytes": {
+          "minimum": 0,
           "type": "integer"
         },
         "max_artifact_refs_per_operation": {
-          "minimum": 1,
+          "minimum": 0,
           "type": "integer"
         },
         "max_bundle_files": {
-          "minimum": 1,
+          "minimum": 0,
           "type": "integer"
         },
         "max_concurrent_downloads": {
-          "minimum": 1,
+          "minimum": 0,
           "type": "integer"
         },
         "max_concurrent_uploads": {
-          "minimum": 1,
+          "minimum": 0,
           "type": "integer"
         },
         "max_control_request_bytes": {
@@ -1633,7 +1639,7 @@
           "type": "integer"
         },
         "max_inline_artifact_bytes": {
-          "minimum": 1,
+          "minimum": 0,
           "type": "integer"
         },
         "protocol_version": {
@@ -1651,11 +1657,13 @@
       "required": [
         "protocol_version",
         "runtime_session_id",
+        "artifact_transfer_enabled",
         "artifact_access_mechanisms",
         "max_control_request_bytes",
         "max_control_response_bytes",
         "max_inline_artifact_bytes",
         "max_artifact_bytes",
+        "max_artifact_chunk_bytes",
         "max_bundle_files",
         "max_artifact_refs_per_operation",
         "max_concurrent_uploads",
@@ -4381,6 +4389,6 @@
       "type": "object"
     }
   },
-  "snapshot_hash": "bf624c313cdcf2f94836b0bedf631d2a2b9c19349d9a9333e09e7c77afd2e183",
+  "snapshot_hash": "62051968520d5a18c564e163283aabb90bd029c2ff04bea06ca5a901af06eb35",
   "snapshot_hash_algorithm": "sha256_canonical_json_v1"
 }

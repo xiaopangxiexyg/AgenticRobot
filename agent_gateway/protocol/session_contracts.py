@@ -10,6 +10,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from ._contract_validation import (
     enum_value,
     identifier,
+    nonnegative_integer,
     positive_integer,
     required_text,
     unique_sorted_text,
@@ -94,11 +95,13 @@ class AgentGatewaySessionCapabilities:
     """Typed, bounded capability document for one authenticated session."""
 
     runtime_session_id: str
+    artifact_transfer_enabled: bool
     artifact_access_mechanisms: tuple[str, ...]
     max_control_request_bytes: int
     max_control_response_bytes: int
     max_inline_artifact_bytes: int
     max_artifact_bytes: int
+    max_artifact_chunk_bytes: int
     max_bundle_files: int
     max_artifact_refs_per_operation: int
     max_concurrent_uploads: int
@@ -118,29 +121,22 @@ class AgentGatewaySessionCapabilities:
             "runtime_session_id",
             identifier(self.runtime_session_id, field_name="runtime_session_id"),
         )
+        if not isinstance(self.artifact_transfer_enabled, bool):
+            raise TypeError("artifact_transfer_enabled must be a boolean.")
         mechanisms = unique_sorted_text(
             self.artifact_access_mechanisms,
             field_name="artifact_access_mechanisms",
-            allow_empty=False,
+            allow_empty=True,
         )
         unsupported = sorted(
             set(mechanisms) - set(AGENT_ARTIFACT_ACCESS_MECHANISMS_V2)
         )
         if unsupported:
             raise ValueError(f"Unsupported Artifact mechanisms: {unsupported}.")
-        if "chunked_rpc" not in mechanisms:
-            raise ValueError("v2 sessions require chunked_rpc as the bounded fallback.")
         object.__setattr__(self, "artifact_access_mechanisms", mechanisms)
         for field_name in (
             "max_control_request_bytes",
             "max_control_response_bytes",
-            "max_inline_artifact_bytes",
-            "max_artifact_bytes",
-            "max_bundle_files",
-            "max_artifact_refs_per_operation",
-            "max_concurrent_uploads",
-            "max_concurrent_downloads",
-            "artifact_store_quota_bytes",
             "event_payload_max_bytes",
             "event_retention_count",
         ):
@@ -149,9 +145,45 @@ class AgentGatewaySessionCapabilities:
                 field_name,
                 positive_integer(getattr(self, field_name), field_name=field_name),
             )
+        artifact_limits = (
+            "max_inline_artifact_bytes",
+            "max_artifact_bytes",
+            "max_artifact_chunk_bytes",
+            "max_bundle_files",
+            "max_artifact_refs_per_operation",
+            "max_concurrent_uploads",
+            "max_concurrent_downloads",
+            "artifact_store_quota_bytes",
+        )
+        for field_name in artifact_limits:
+            object.__setattr__(
+                self,
+                field_name,
+                nonnegative_integer(
+                    getattr(self, field_name),
+                    field_name=field_name,
+                ),
+            )
+        if self.artifact_transfer_enabled:
+            if "chunked_rpc" not in mechanisms:
+                raise ValueError(
+                    "Artifact-enabled v2 sessions require chunked_rpc fallback."
+                )
+            if any(getattr(self, name) == 0 for name in artifact_limits):
+                raise ValueError(
+                    "Artifact-enabled v2 sessions require positive Artifact limits."
+                )
+        elif mechanisms or any(getattr(self, name) != 0 for name in artifact_limits):
+            raise ValueError(
+                "Artifact-disabled sessions require empty mechanisms and zero limits."
+            )
         if self.max_inline_artifact_bytes > self.max_artifact_bytes:
             raise ValueError(
                 "max_inline_artifact_bytes cannot exceed max_artifact_bytes."
+            )
+        if self.max_artifact_chunk_bytes > self.max_artifact_bytes:
+            raise ValueError(
+                "max_artifact_chunk_bytes cannot exceed max_artifact_bytes."
             )
         if self.max_artifact_bytes > self.artifact_store_quota_bytes:
             raise ValueError(
@@ -169,10 +201,41 @@ class AgentGatewaySessionCapabilities:
             domain=AGENT_GATEWAY_SESSION_CAPABILITIES_HASH_DOMAIN_V2,
         )
 
+    @classmethod
+    def control_plane_only(
+        cls,
+        *,
+        runtime_session_id: str,
+        max_control_request_bytes: int,
+        max_control_response_bytes: int,
+        event_payload_max_bytes: int = 65_536,
+        event_retention_count: int = 4096,
+    ) -> "AgentGatewaySessionCapabilities":
+        """Build a v2 session that currently publishes only inline Skills."""
+
+        return cls(
+            runtime_session_id=runtime_session_id,
+            artifact_transfer_enabled=False,
+            artifact_access_mechanisms=(),
+            max_control_request_bytes=max_control_request_bytes,
+            max_control_response_bytes=max_control_response_bytes,
+            max_inline_artifact_bytes=0,
+            max_artifact_bytes=0,
+            max_artifact_chunk_bytes=0,
+            max_bundle_files=0,
+            max_artifact_refs_per_operation=0,
+            max_concurrent_uploads=0,
+            max_concurrent_downloads=0,
+            artifact_store_quota_bytes=0,
+            event_payload_max_bytes=event_payload_max_bytes,
+            event_retention_count=event_retention_count,
+        )
+
     def to_wire(self, *, include_hash: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "protocol_version": self.protocol_version,
             "runtime_session_id": self.runtime_session_id,
+            "artifact_transfer_enabled": self.artifact_transfer_enabled,
             "artifact_access_mechanisms": list(
                 self.artifact_access_mechanisms
             ),
@@ -180,6 +243,7 @@ class AgentGatewaySessionCapabilities:
             "max_control_response_bytes": self.max_control_response_bytes,
             "max_inline_artifact_bytes": self.max_inline_artifact_bytes,
             "max_artifact_bytes": self.max_artifact_bytes,
+            "max_artifact_chunk_bytes": self.max_artifact_chunk_bytes,
             "max_bundle_files": self.max_bundle_files,
             "max_artifact_refs_per_operation": (
                 self.max_artifact_refs_per_operation
@@ -224,9 +288,9 @@ def agent_session_wire_schemas_v2() -> dict[str, dict[str, Any]]:
         "properties": {
             "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V2},
             "runtime_session_id": {"type": "string", "minLength": 1},
+            "artifact_transfer_enabled": {"type": "boolean"},
             "artifact_access_mechanisms": {
                 "type": "array",
-                "minItems": 1,
                 "uniqueItems": True,
                 "items": {
                     "type": "string",
@@ -235,16 +299,17 @@ def agent_session_wire_schemas_v2() -> dict[str, dict[str, Any]]:
             },
             "max_control_request_bytes": {"type": "integer", "minimum": 1},
             "max_control_response_bytes": {"type": "integer", "minimum": 1},
-            "max_inline_artifact_bytes": {"type": "integer", "minimum": 1},
-            "max_artifact_bytes": {"type": "integer", "minimum": 1},
-            "max_bundle_files": {"type": "integer", "minimum": 1},
+            "max_inline_artifact_bytes": {"type": "integer", "minimum": 0},
+            "max_artifact_bytes": {"type": "integer", "minimum": 0},
+            "max_artifact_chunk_bytes": {"type": "integer", "minimum": 0},
+            "max_bundle_files": {"type": "integer", "minimum": 0},
             "max_artifact_refs_per_operation": {
                 "type": "integer",
-                "minimum": 1,
+                "minimum": 0,
             },
-            "max_concurrent_uploads": {"type": "integer", "minimum": 1},
-            "max_concurrent_downloads": {"type": "integer", "minimum": 1},
-            "artifact_store_quota_bytes": {"type": "integer", "minimum": 1},
+            "max_concurrent_uploads": {"type": "integer", "minimum": 0},
+            "max_concurrent_downloads": {"type": "integer", "minimum": 0},
+            "artifact_store_quota_bytes": {"type": "integer", "minimum": 0},
             "event_payload_max_bytes": {"type": "integer", "minimum": 1},
             "event_retention_count": {"type": "integer", "minimum": 1},
             "session_capabilities_hash": digest,
@@ -252,11 +317,13 @@ def agent_session_wire_schemas_v2() -> dict[str, dict[str, Any]]:
         "required": [
             "protocol_version",
             "runtime_session_id",
+            "artifact_transfer_enabled",
             "artifact_access_mechanisms",
             "max_control_request_bytes",
             "max_control_response_bytes",
             "max_inline_artifact_bytes",
             "max_artifact_bytes",
+            "max_artifact_chunk_bytes",
             "max_bundle_files",
             "max_artifact_refs_per_operation",
             "max_concurrent_uploads",
