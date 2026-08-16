@@ -661,11 +661,6 @@ def plan_camera_semantic_prepared_view(
         for record in episodes
         if int(record["episode_index"]) not in excluded_episode_set
     )
-    if not selected_episodes:
-        raise CameraSemanticPreparedViewError(
-            "Every source episode failed video-integrity admission; "
-            "no train/test prepared view can be produced."
-        )
     included_episode_indices = tuple(
         sorted(int(record["episode_index"]) for record in selected_episodes)
     )
@@ -1082,6 +1077,7 @@ def materialize_camera_semantic_prepared_view(
                 plan=plan,
             ),
         )
+        projected_validity: dict[str, Any] = {}
         modality_validity_path = source / "meta/modality_validity.json"
         if modality_validity_path.is_file():
             modality_validity = read_json(modality_validity_path)
@@ -1093,6 +1089,28 @@ def materialize_camera_semantic_prepared_view(
                 modality_validity,
                 included_episode_indices=set(resolutions),
             )
+        if not resolutions:
+            projected_validity.setdefault(
+                "schema_version", "dexteleop.modality_validity.v1"
+            )
+            raw_training = projected_validity.get("training")
+            training = (
+                dict(raw_training)
+                if isinstance(raw_training, Mapping)
+                else {}
+            )
+            training.update(
+                {
+                    "valid": False,
+                    "reason": (
+                        "All source episodes were excluded because at least "
+                        "one required video failed integrity validation."
+                    ),
+                    "episodes": {},
+                }
+            )
+            projected_validity["training"] = training
+        if projected_validity:
             _write_json_fsync(
                 staging / "meta/modality_validity.json", projected_validity
             )

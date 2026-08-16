@@ -179,9 +179,9 @@ class CameraSemanticVideoIntegrityExclusionsV1:
             raise CameraSemanticPreparedViewContractError(
                 "source_dataset_name must be non-empty."
             )
-        if not included or included != tuple(sorted(set(included))):
+        if included != tuple(sorted(set(included))):
             raise CameraSemanticPreparedViewContractError(
-                "included_episode_indices must be a non-empty sorted unique sequence."
+                "included_episode_indices must be a sorted unique sequence."
             )
         if not excluded or excluded != tuple(sorted(set(excluded))):
             raise CameraSemanticPreparedViewContractError(
@@ -320,9 +320,9 @@ class CameraSemanticPreparedViewManifestV1:
                 "source_dataset_name must be non-empty."
             )
         episodes = tuple(int(value) for value in self.episode_indices)
-        if not episodes or episodes != tuple(sorted(set(episodes))):
+        if episodes != tuple(sorted(set(episodes))):
             raise CameraSemanticPreparedViewContractError(
-                "episode_indices must be a non-empty sorted unique sequence."
+                "episode_indices must be a sorted unique sequence."
             )
         files = tuple(self.files)
         excluded = tuple(int(value) for value in self.excluded_episode_indices)
@@ -339,6 +339,10 @@ class CameraSemanticPreparedViewManifestV1:
         if bool(excluded) != bool(exclusions_hash):
             raise CameraSemanticPreparedViewContractError(
                 "Excluded episodes require exactly one exclusions receipt hash."
+            )
+        if not episodes and not excluded:
+            raise CameraSemanticPreparedViewContractError(
+                "An empty prepared view must document excluded source episodes."
             )
         forbidden = tuple(
             path

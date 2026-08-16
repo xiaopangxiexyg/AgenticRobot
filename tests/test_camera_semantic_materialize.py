@@ -514,11 +514,45 @@ def test_plan_rejects_declared_source_video_frame_mismatch(
     assert not output.exists()
 
     _write_video(source_right_video, frame_count=1, color="blue")
-    with pytest.raises(
-        Exception, match="Every source episode failed video-integrity admission"
-    ):
-        plan_camera_semantic_prepared_view(source, output, registry)
-    assert not output.exists()
+    empty_plan = plan_camera_semantic_prepared_view(source, output, registry)
+    assert empty_plan.source_episode_count == 1
+    assert empty_plan.episode_count == 0
+    assert empty_plan.excluded_episode_indices == (0,)
+    result = materialize_camera_semantic_prepared_view(
+        source,
+        output,
+        registry,
+        expected_plan_hash=empty_plan.plan_hash,
+    )
+    assert result["validated_video_count"] == 0
+    empty_manifest = load_camera_semantic_prepared_view(
+        output, verify_payload_hashes=True
+    )
+    assert empty_manifest.episode_indices == ()
+    assert empty_manifest.excluded_episode_indices == (0,)
+    validity = json.loads(
+        (output / "meta/modality_validity.json").read_text(encoding="utf-8")
+    )
+    assert validity["training"]["valid"] is False
+
+    from deployments.openpi.corrected_train import _camera_audits
+
+    factory = type(
+        "Factory",
+        (),
+        {
+            "camera_slots": ("left_wrist_0_rgb", "right_wrist_0_rgb"),
+            "dataset_sources": (
+                type("Source", (), {"dataset_root": output})(),
+            ),
+        },
+    )()
+    with pytest.raises(ValueError, match="cannot enter training/testing"):
+        _camera_audits(
+            factory,
+            registry,
+            allow_camera_prepared_view=True,
+        )
     assert not list(
         tmp_path.glob(f".{output.name}.camera-semantic-stage-*")
     )
