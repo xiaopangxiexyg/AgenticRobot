@@ -154,6 +154,10 @@ remote-tracking refs, but it must not move stable checkouts, recurse into
 submodules, enable LFS smudge, or transfer Task/runtime content. Automatic
 checkout application remains unavailable until the runtime maintenance gate is
 implemented and deployed.
+M3f adds only a transport-neutral, persistent clean-snapshot Run request queue:
+it can submit, inspect, watch, cancel, reserve, and record runner lifecycle
+transitions, but it does not contact a host, execute a Profile, allocate a GPU
+or device, or grant runtime authority.
 
 Only dependency, Python-version, package-discovery, or installation changes
 require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,

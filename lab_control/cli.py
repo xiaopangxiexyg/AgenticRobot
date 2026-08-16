@@ -24,6 +24,7 @@ from .inspection import (
 from .linked_sync import apply_linked_project_checkout, plan_linked_project_checkout
 from .project_maintenance import apply_guarded_project_checkout
 from .project_sync import fetch_project_sync, plan_project_sync
+from .run_requests import RunRequestManager
 from .runs import CANDIDATE_EVIDENCE_TIER, DEVELOPMENT_EVIDENCE_TIER, RunManager
 from .workspace import LabError, TaskPlan, WorkspaceManager
 from .writer_lease import WriterLeaseManager
@@ -225,11 +226,39 @@ def _build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="run protected impact-rule recommendations",
         )
+        command.add_argument(
+            "--detach",
+            action="store_true",
+            help="submit a durable queued Run request without executing it here",
+        )
         command.add_argument("--json", action="store_true")
 
     runs = subcommands.add_parser("runs", help="list recorded local Runs")
     runs.add_argument("task_id", nargs="?")
     runs.add_argument("--json", action="store_true")
+
+    requests = subcommands.add_parser(
+        "requests", help="inspect or cancel durable queued Run requests"
+    )
+    request_commands = requests.add_subparsers(
+        dest="request_command", required=True
+    )
+    request_list = request_commands.add_parser("list")
+    request_list.add_argument("--task-id")
+    request_list.add_argument("--json", action="store_true")
+    request_status = request_commands.add_parser("status")
+    request_status.add_argument("request_id")
+    request_status.add_argument("--json", action="store_true")
+    request_watch = request_commands.add_parser("watch")
+    request_watch.add_argument("request_id")
+    request_watch.add_argument("--after-sequence", type=int, default=-1)
+    request_watch.add_argument("--timeout-seconds", type=float, default=30.0)
+    request_watch.add_argument("--json", action="store_true")
+    request_cancel = request_commands.add_parser("cancel")
+    request_cancel.add_argument("request_id")
+    request_cancel.add_argument("--actor", required=True)
+    request_cancel.add_argument("--reason", required=True)
+    request_cancel.add_argument("--json", action="store_true")
     return parser
 
 
@@ -480,6 +509,37 @@ def _print_run_list(payloads: list[dict[str, object]]) -> None:
         print(
             f"{payload.get('run_id')}  {payload.get('task_id')}  "
             f"{profile_id}  {classification}"
+        )
+
+
+def _print_request_state(payload: dict[str, object]) -> None:
+    print(f"Request: {payload.get('request_id')}")
+    print(f"Task: {payload.get('task_id')}")
+    print(f"Profile: {payload.get('profile_id')}")
+    print(f"Target: {payload.get('target_id')}")
+    print(f"State: {payload.get('state')}")
+    print(f"Slot: {payload.get('slot_id') or '-'}")
+    history = payload.get("history")
+    if isinstance(history, list):
+        print(f"Sequence: {len(history) - 1}")
+
+
+def _print_request_submission(payload: dict[str, object]) -> None:
+    state = payload.get("state")
+    if isinstance(state, dict):
+        _print_request_state(state)
+    print(f"Created: {str(payload.get('created')).lower()}")
+
+
+def _print_request_list(payloads: list[dict[str, object]]) -> None:
+    if not payloads:
+        print("No queued Run requests found.")
+        return
+    for payload in payloads:
+        print(
+            f"{payload.get('request_id')}  {payload.get('task_id')}  "
+            f"{payload.get('profile_id')}  {payload.get('target_id')}  "
+            f"{payload.get('state')}"
         )
 
 
@@ -891,6 +951,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if arguments.command == "verify"
                 else DEVELOPMENT_EVIDENCE_TIER
             )
+            if arguments.detach:
+                if arguments.recommended:
+                    raise LabError(
+                        "queued --detach currently requires one explicit queue Profile"
+                    )
+                payload = RunRequestManager(manager).submit_clean_profile(
+                    arguments.task_id,
+                    arguments.profile_id,
+                    evidence_tier=evidence_tier,
+                )
+                if arguments.json:
+                    _emit(payload, as_json=True)
+                else:
+                    _print_request_submission(payload)
+                return 0
             if arguments.recommended:
                 payload = _run_recommended_profiles(
                     manager,
@@ -918,6 +993,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 and outcome.get("classification") == "PASSED"
                 else 1
             )
+
+        if arguments.command == "requests":
+            store = RunRequestManager(manager).store
+            if arguments.request_command == "list":
+                payloads = store.list(arguments.task_id)
+                if arguments.json:
+                    print(json.dumps(payloads, indent=2, sort_keys=True))
+                else:
+                    _print_request_list(payloads)
+                return 0
+            if arguments.request_command == "status":
+                request_payload = store.load(arguments.request_id)
+            elif arguments.request_command == "watch":
+                request_payload = store.watch(
+                    arguments.request_id,
+                    after_sequence=arguments.after_sequence,
+                    timeout_seconds=arguments.timeout_seconds,
+                )
+            else:
+                request_payload = store.cancel(
+                    arguments.request_id,
+                    actor=arguments.actor,
+                    reason=arguments.reason,
+                )
+            if arguments.json:
+                _emit(request_payload, as_json=True)
+            elif arguments.request_command == "watch":
+                watched = request_payload.get("request")
+                if isinstance(watched, dict):
+                    _print_request_state(watched)
+                print(f"Changed: {str(request_payload.get('changed')).lower()}")
+                print(f"Terminal: {str(request_payload.get('terminal')).lower()}")
+            else:
+                _print_request_state(request_payload)
+            return 0
 
         if arguments.command == "runs":
             payloads = RunManager(manager).list_runs(arguments.task_id)

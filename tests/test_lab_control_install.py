@@ -135,6 +135,17 @@ def test_installs_only_protected_ref_outside_checkout_and_runs_wrapper(
     assert output["argv"] == ["probe"]
     assert output["control"] == str(repository)
     assert output["manifest"] == str(install_root / "current" / "install.json")
+    wrapper = (install_root / "bin" / "lab").read_text(encoding="utf-8")
+    assert 'LAB_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/profiles"' in wrapper
+    assert (
+        'LAB_QUEUE_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/queue-profiles"'
+        in wrapper
+    )
+    assert (
+        'LAB_ENVIRONMENT_PROFILE_ROOT="$CONTROL_ROOT/current/payload/integration/environments"'
+        in wrapper
+    )
+    assert 'LAB_IMPACT_RULES="$CONTROL_ROOT/current/payload/stack/impact-rules.json"' in wrapper
     status = inspect_control_plane_install(install_root)
     assert status["status"] == "READY"
     assert status["current_commit"] == protected

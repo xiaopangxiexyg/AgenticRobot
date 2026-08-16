@@ -12,6 +12,7 @@
 - [`lab` M3c：父仓与 gitlink 子仓协调更新](./lab_m3c_gitlink_sync.md)
 - [`lab` M3d：受保护控制面外置安装](./lab_m3d_control_install.md)
 - [`lab` M3e：protected-main 合并检查](./lab_m3e_merge_gates.md)
+- [`lab` M3f：持久化 Run 请求协议](./lab_m3f_run_requests.md)
 
 ## 文档边界
 

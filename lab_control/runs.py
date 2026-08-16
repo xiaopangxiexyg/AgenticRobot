@@ -98,7 +98,7 @@ def _run_id(snapshot_id: str) -> str:
     return f"R-{timestamp}-{snapshot_id[:8]}-{secrets.token_hex(2)}"
 
 
-def _control_plane_hash(control_repository: Path) -> str:
+def control_plane_hash(control_repository: Path) -> str:
     digest = hashlib.sha256()
     paths = [control_repository / "lab"] + sorted(
         (control_repository / "lab_control").glob("*.py")
@@ -113,6 +113,17 @@ def _control_plane_hash(control_repository: Path) -> str:
         )
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def control_plane_identity(control_repository: Path) -> dict[str, object]:
+    commit = git.current_commit(control_repository)
+    return {
+        "version": CONTROL_PLANE_VERSION,
+        "source_commit": commit,
+        "source_tree_oid": git.tree_oid(control_repository, commit),
+        "source_dirty": bool(git.status_short(control_repository)),
+        "executor_sha256": control_plane_hash(control_repository),
+    }
 
 
 def _isolated_payload_environment(run_root: Path) -> dict[str, str]:
@@ -436,13 +447,6 @@ class RunManager:
         run_root = self.runs_root / task_id / run_id
         run_root.mkdir(parents=True, exist_ok=False)
         run_manifest_path = run_root / "run.yaml"
-        control_commit = git.current_commit(self.workspace_manager.control_repository)
-        control_tree = git.tree_oid(
-            self.workspace_manager.control_repository, control_commit
-        )
-        control_dirty = bool(
-            git.status_short(self.workspace_manager.control_repository)
-        )
         run_manifest: dict[str, object] = {
             "schema": RUN_SCHEMA_ID,
             "run_id": run_id,
@@ -460,15 +464,9 @@ class RunManager:
                 "execution": profile.execution,
                 "python_major_minor": profile.python_major_minor,
             },
-            "control_plane": {
-                "version": CONTROL_PLANE_VERSION,
-                "source_commit": control_commit,
-                "source_tree_oid": control_tree,
-                "source_dirty": control_dirty,
-                "executor_sha256": _control_plane_hash(
-                    self.workspace_manager.control_repository
-                ),
-            },
+            "control_plane": control_plane_identity(
+                self.workspace_manager.control_repository
+            ),
             "evidence_tier": evidence_tier,
             "baseline": snapshot_identity.get("baseline"),
             "repository_links": snapshot_identity.get("repository_links", []),

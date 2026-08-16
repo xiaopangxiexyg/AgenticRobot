@@ -16,7 +16,9 @@
       "tests/test_lab_stable_maintenance.py",
       "tests/test_lab_project_maintenance.py",
       "tests/test_lab_linked_sync.py",
-      "tests/test_lab_control_install.py"
+      "tests/test_lab_control_install.py",
+      "tests/test_lab_framework_boundary.py",
+      "tests/test_lab_run_requests.py"
     ],
     "lab-m1": [
       "tests/test_lab_m1_workspace.py",
@@ -43,6 +45,9 @@
     ],
     "lab-m3e": [
       "tests/test_lab_framework_boundary.py"
+    ],
+    "lab-m3f": [
+      "tests/test_lab_run_requests.py"
     ]
   }
 }
