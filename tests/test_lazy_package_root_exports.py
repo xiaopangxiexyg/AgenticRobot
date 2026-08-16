@@ -65,3 +65,24 @@ assert "control_composition" in sys.modules
     result = _run_isolated_python(source)
 
     assert result.returncode == 0, result.stderr
+
+
+def test_agent_skill_target_legacy_path_is_identity_preserving() -> None:
+    source = """
+from sim.mujoco.deploy import sim_hil_target
+from sim.mujoco.deploy.agent_skill_target import (
+    MujocoAgentSkillMotionTarget,
+    build_mujoco_agent_skill_motion_target,
+)
+
+assert "MujocoAgentSkillMotionTarget" not in sim_hil_target.__dict__
+assert "build_mujoco_agent_skill_motion_target" not in sim_hil_target.__dict__
+assert sim_hil_target.MujocoAgentSkillMotionTarget is MujocoAgentSkillMotionTarget
+assert (
+    sim_hil_target.build_mujoco_agent_skill_motion_target
+    is build_mujoco_agent_skill_motion_target
+)
+"""
+    result = _run_isolated_python(source)
+
+    assert result.returncode == 0, result.stderr
