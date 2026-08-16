@@ -291,6 +291,7 @@ __all__ = [
     "build_default_mujoco_sim_hil_contracts",
     "build_mujoco_sim_hil_agent_skill_execution_manifest",
     "build_mujoco_sim_hil_agent_skill_station_manifest",
+    "build_mujoco_sim_hil_composition_runtime_config",
     "build_component_keyed_mujoco_sim_hil_contracts",
     "build_mujoco_sim_hil_policy_binding",
     "build_mujoco_sim_hil_strategy_control_factory",

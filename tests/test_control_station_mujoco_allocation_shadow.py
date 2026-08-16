@@ -82,6 +82,7 @@ from sim.mujoco.adapters import (
     MujocoPositionExecutionRig,
 )
 from sim.mujoco.deploy import (
+    MujocoCompositionRuntimeConfig,
     MujocoCoupledPoseToQposResolver,
     MujocoDeployConfig,
     MujocoDeployRuntime,
@@ -327,7 +328,9 @@ def _fixture(*, admit_context=None, enable_composer_authority: bool = False):
             clock_domain_id="control.monotonic",
             pose_frame_contract_hash="virtual-mujoco-pose-frame-contract",
             reference_activation_profile_id=SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
-            composition_information_plan=plan,
+        ),
+        composition_runtime_config=MujocoCompositionRuntimeConfig(
+            information_plan=plan,
         ),
         pose_resolver=MujocoCoupledPoseToQposResolver(
             RM65CanonicalIK(scene, ShadowPlanner())

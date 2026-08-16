@@ -51,6 +51,19 @@ def _attribute_names(path: Path) -> set[str]:
     }
 
 
+def _annotated_class_fields(path: Path, class_name: str) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {
+                field.target.id
+                for field in node.body
+                if isinstance(field, ast.AnnAssign)
+                and isinstance(field.target, ast.Name)
+            }
+    raise AssertionError(f"Class {class_name!r} not found in {path}.")
+
+
 def _legacy_mujoco_composition_calls(path: Path) -> set[str]:
     legacy_methods = {
         "capture_composition_context_snapshot",
@@ -225,6 +238,44 @@ def test_sim_hil_strategy_control_construction_is_application_owned() -> None:
     assert _called_names(sim_target).isdisjoint(strategy_control_constructors)
     assert strategy_control_constructors <= _called_names(station_composition)
     assert "build_mujoco_sim_hil_strategy_control_factory" in _called_names(
+        station_factory
+    )
+
+
+def test_optional_composition_settings_are_not_general_target_config() -> None:
+    target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
+    sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
+    composition_binding = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "composition_binding.py"
+    )
+    station_composition = (
+        REPO_ROOT / "control_station" / "composition" / "mujoco_sim_hil.py"
+    )
+    station_factory = (
+        REPO_ROOT / "control_station" / "sim_hil_profile" / "factory.py"
+    )
+
+    assert _annotated_class_fields(
+        target_runtime,
+        "MujocoDeployConfig",
+    ).isdisjoint(
+        {
+            "composition_information_plan",
+            "enable_composition_source_eligibility",
+        }
+    )
+    assert {
+        "enable_source_eligibility",
+        "information_plan",
+    } <= _annotated_class_fields(
+        composition_binding,
+        "MujocoCompositionRuntimeConfig",
+    )
+    assert "MujocoCompositionRuntimeConfig" not in _called_names(sim_target)
+    assert "MujocoCompositionRuntimeConfig" in _called_names(
+        station_composition
+    )
+    assert "build_mujoco_sim_hil_composition_runtime_config" in _called_names(
         station_factory
     )
 

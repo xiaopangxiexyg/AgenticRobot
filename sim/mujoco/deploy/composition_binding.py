@@ -48,6 +48,30 @@ from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
 
 
 @dataclass(frozen=True)
+class MujocoCompositionRuntimeConfig:
+    """Application-selected options for the optional composition binding.
+
+    Target cadence still determines the concrete retention window below.  This
+    config only declares whether source eligibility is part of the composition
+    cut and which backend-neutral information plan admission must enforce.
+    """
+
+    enable_source_eligibility: bool = False
+    information_plan: CompositionInformationPlan | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enable_source_eligibility, bool):
+            raise TypeError("enable_source_eligibility must be a bool.")
+        if self.information_plan is not None and not isinstance(
+            self.information_plan,
+            CompositionInformationPlan,
+        ):
+            raise TypeError(
+                "information_plan must be a CompositionInformationPlan or None."
+            )
+
+
+@dataclass(frozen=True)
 class MujocoCompositionRuntimeBinding:
     """Lifecycle-gated composition port over one authoritative MuJoCo target.
 
@@ -232,8 +256,7 @@ def build_mujoco_composition_runtime_binding(
     trace_sink: Callable[[tuple[ControlTraceFact, ...]], object],
     proposal_admitter: Callable[..., object],
     decision_hz: float,
-    enable_source_eligibility: bool,
-    information_plan: CompositionInformationPlan | None,
+    config: MujocoCompositionRuntimeConfig,
     composition_strategy: FormalCompositionStrategy | None,
     composition_strategy_control_factory: (
         Callable[
@@ -246,6 +269,9 @@ def build_mujoco_composition_runtime_binding(
     started: Callable[[], bool],
 ) -> MujocoCompositionRuntimeBinding:
     """Build the optional mixed-control adapter without target ownership."""
+
+    if not isinstance(config, MujocoCompositionRuntimeConfig):
+        raise TypeError("config must be a MujocoCompositionRuntimeConfig.")
 
     trace_emitter = CompositionControlTraceEmitter(
         trace_context=trace_context,
@@ -302,10 +328,10 @@ def build_mujoco_composition_runtime_binding(
                 max_effective_duration_sec=1.0,
                 max_late_arrival_sec=0.0,
             )
-            if enable_source_eligibility
+            if config.enable_source_eligibility
             else None
         ),
-        information_plan=information_plan,
+        information_plan=config.information_plan,
         composition_strategy=composition_strategy,
         strategy_control=strategy_control,
         clock=clock,
@@ -319,6 +345,7 @@ def build_mujoco_composition_runtime_binding(
 
 
 __all__ = [
+    "MujocoCompositionRuntimeConfig",
     "MujocoCompositionRuntimeBinding",
     "build_mujoco_composition_runtime_binding",
 ]

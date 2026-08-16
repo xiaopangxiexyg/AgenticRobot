@@ -10,7 +10,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 from dataset_contracts.control_trace import ControlTraceFact
 from control_composition.activation import CompositionActivationScope
-from control_composition.information import CompositionInformationPlan
 from control_composition.eligibility import (
     CompositionSourceEligibilityDraft,
     CompositionSourceEligibilitySpec,
@@ -127,7 +126,10 @@ from robot_motion.deploy import (
 )
 
 from ..adapters import MujocoPositionExecutionRig
-from .composition_binding import build_mujoco_composition_runtime_binding
+from .composition_binding import (
+    MujocoCompositionRuntimeConfig,
+    build_mujoco_composition_runtime_binding,
+)
 from .composition_promotion import MujocoCompositionPromotionPolicy
 from .measurement import (
     MujocoQposMeasurement,
@@ -357,13 +359,6 @@ class MujocoDeployConfig:
     # profile sets this false so raw contributor/policy proposals cannot race
     # the single composer proposal for actuator authority.
     enable_primary_policy_authority: bool = True
-    # Optional, additive declaration of context/difference information needed
-    # by the composer. It does not select dataset streams or change authority.
-    composition_information_plan: CompositionInformationPlan | None = None
-    # Explicitly opt-in source-liveness admission. Existing MuJoCo profiles
-    # keep their action-only behavior and hashes; the Sim-HIL composition
-    # consumes source state and actions on one causal cut.
-    enable_composition_source_eligibility: bool = False
     # Default-off formal gate for composer-owned compound motion.  The typed
     # profile binds exact composition semantics and an all-required scope; it
     # is intentionally independent from any model/checkpoint identity.
@@ -420,7 +415,6 @@ class MujocoDeployConfig:
             "enable_primary_policy_authority",
             "enable_composer_authority",
             "enable_replay_authority",
-            "enable_composition_source_eligibility",
             "enable_component_execution_handoff",
         ):
             if not isinstance(getattr(self, name), bool):
@@ -564,14 +558,6 @@ class MujocoDeployConfig:
             "compound_hand_action_specs_by_side",
             MappingProxyType(dict(sorted(hand_specs.items()))),
         )
-        if self.composition_information_plan is not None and not isinstance(
-            self.composition_information_plan,
-            CompositionInformationPlan,
-        ):
-            raise TypeError(
-                "composition_information_plan must be a "
-                "CompositionInformationPlan or None."
-            )
         if self.compound_composer_authority_profile is not None and not isinstance(
             self.compound_composer_authority_profile,
             ConservativeCompoundAuthorityProfile,
@@ -913,6 +899,7 @@ class MujocoDeployRuntime:
         trace_sink: Callable[[ControlTraceFact], None] | None = None,
         pose_resolver: MujocoCoupledPoseToQposResolver | None = None,
         shared_safety=None,
+        composition_runtime_config: MujocoCompositionRuntimeConfig | None = None,
         composition_strategy: FormalCompositionStrategy | None = None,
         composition_strategy_control_factory: (
             Callable[
@@ -937,6 +924,17 @@ class MujocoDeployRuntime:
     ) -> None:
         self.rig = rig
         self.config = config
+        if composition_runtime_config is None:
+            composition_runtime_config = MujocoCompositionRuntimeConfig()
+        elif not isinstance(
+            composition_runtime_config,
+            MujocoCompositionRuntimeConfig,
+        ):
+            raise TypeError(
+                "composition_runtime_config must be a "
+                "MujocoCompositionRuntimeConfig or None."
+            )
+        self.composition_runtime_config = composition_runtime_config
         self.clock = clock
         self.pose_resolver = pose_resolver
         self._pose_execution_enabled = pose_resolver is not None
@@ -1627,10 +1625,7 @@ class MujocoDeployRuntime:
             trace_sink=self.core.record_external_facts,
             proposal_admitter=self.core.admit_proposal,
             decision_hz=config.decision_hz,
-            enable_source_eligibility=(
-                config.enable_composition_source_eligibility
-            ),
-            information_plan=config.composition_information_plan,
+            config=self.composition_runtime_config,
             composition_strategy=composition_strategy,
             composition_strategy_control_factory=(
                 composition_strategy_control_factory

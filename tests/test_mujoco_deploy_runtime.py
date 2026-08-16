@@ -74,6 +74,7 @@ from sim.mujoco.adapters import (
     MujocoPositionExecutionRig,
 )
 from sim.mujoco.deploy import (
+    MujocoCompositionRuntimeConfig,
     MujocoDeployConfig,
     MujocoDeployRuntime,
     MujocoDirectComponentProposalSource,
@@ -2104,7 +2105,9 @@ def test_information_plan_rejects_unrequested_context_before_retention() -> None
             runtime_session_id="information-plan-session",
             control_domain_id="information-plan-domain",
             embodiment_instance_id="information-plan-embodiment",
-            composition_information_plan=plan,
+        ),
+        composition_runtime_config=MujocoCompositionRuntimeConfig(
+            information_plan=plan,
         ),
         clock=clock,
     )
@@ -2274,7 +2277,9 @@ def test_source_eligibility_is_default_off_and_opt_in_shadow_holds_no_motion() -
             runtime_session_id="source-eligibility-shadow-session",
             control_domain_id="source-eligibility-shadow-domain",
             embodiment_instance_id="source-eligibility-shadow-embodiment",
-            enable_composition_source_eligibility=True,
+        ),
+        composition_runtime_config=MujocoCompositionRuntimeConfig(
+            enable_source_eligibility=True,
         ),
         clock=clock,
     )
