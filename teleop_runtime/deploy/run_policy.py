@@ -339,6 +339,10 @@ from .impedance_force_guard import (
     ImpedanceForceGuardMonitor,
     bimanual_emergency_stop,
 )
+from .impedance_runtime import (
+    enable_impedance_force_control_backends,
+    warm_start_impedance_force_control_backends,
+)
 from .policy_qpos_init import (
     DeployPolicyQposInitController,
     DeployPolicyQposInitSettings,
@@ -3606,44 +3610,6 @@ def _send_legacy_deployment_action_commands(
         hand_backend = hand_backends.get(side)
         if hand_command is not None and hand_backend is not None:
             hand_backend.send_command(hand_command)
-
-
-def enable_impedance_force_control_backends(
-    arm_backends: Mapping[str, EffectorBackend],
-    *,
-    ready_timeout_sec: float = 1.0,
-) -> None:
-    for side, backend in arm_backends.items():
-        enable = getattr(backend, "enable_force_control", None)
-        if not callable(enable):
-            continue
-        enable()
-        wait_ready = getattr(backend, "wait_until_force_control_ready", None)
-        if callable(wait_ready):
-            wait_ready(timeout_sec=float(ready_timeout_sec))
-        print(f"[Deploy] {side} impedance force control enabled.", flush=True)
-
-
-def warm_start_impedance_force_control_backends(
-    arm_backends: Mapping[str, EffectorBackend],
-) -> tuple[str, ...]:
-    """Prepare impedance controllers without starting their periodic output loops.
-
-    The pose-impedance backend performs force-sensor setup and captures its
-    initial safe reference in ``warm_start_force_control``.  Starting the
-    40 Hz loop is deliberately a separate, explicit action: otherwise a
-    deployment which is still waiting for ``g`` would already issue hold
-    commands and continuously run IK.
-    """
-
-    warmed_sides: list[str] = []
-    for side, backend in arm_backends.items():
-        warm_start = getattr(backend, "warm_start_force_control", None)
-        if not callable(warm_start):
-            continue
-        warm_start()
-        warmed_sides.append(str(side))
-    return tuple(warmed_sides)
 
 
 def _validate_debug_replay_arm_control_mode(
