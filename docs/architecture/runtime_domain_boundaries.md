@@ -57,6 +57,9 @@ lower domains must not import application/profile layers
 - Agent-skill 与 composition Sim-HIL 共用的坐标身份、FK observation 和场景测量由
   `sim.mujoco.deploy.target_measurement` 持有；两个 target factory 只消费这些无状态 adapter，原
   `sim_hil_target` 与 package-root 导出保持同一对象的兼容视图。
+- 两类 target 共用的 scene load/reset、actuation/timing profile 与 prepared-resource 生命周期由
+  `sim.mujoco.deploy.target_preparation` 持有；`sim_hil_target` 和 `agent_skill_target` 都只在已准备资源上
+  绑定各自 runtime，旧配置、prepared target 和 prepare 函数导出保持 identity 不变。
 - deterministic async composition harness 已移到 `tests/support/mujoco_async_topology.py`，不再作为
   `sim.mujoco.deploy` 的运行时导出或发布内容。
 - `sim/mujoco/deploy/composition_binding.py` 现在集中构造可选 composition runtime、retention 和 trace

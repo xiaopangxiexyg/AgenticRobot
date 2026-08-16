@@ -35,7 +35,7 @@ from robot_motion.deploy.schema import pose_matrix_to_xyzquat
 from robot_motion.rm65 import endpoint_to_tool_transform, load_rm65_tool_profile
 
 if TYPE_CHECKING:
-    from .sim_hil_target import MujocoSimHILPreparedTarget
+    from .target_preparation import MujocoSimHILPreparedTarget
 
 
 def build_mujoco_sim_hil_pose_observation_projector(
@@ -44,9 +44,7 @@ def build_mujoco_sim_hil_pose_observation_projector(
 ) -> Any:
     """Bind the active component profile to private-MjData FK observation."""
 
-    # Keep the historical concrete type check while avoiding an import cycle:
-    # sim_hil_target re-exports this shared helper for compatibility.
-    from .sim_hil_target import MujocoSimHILPreparedTarget
+    from .target_preparation import MujocoSimHILPreparedTarget
 
     if not isinstance(prepared_target, MujocoSimHILPreparedTarget):
         raise TypeError(

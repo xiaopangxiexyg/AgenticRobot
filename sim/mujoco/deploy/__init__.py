@@ -45,10 +45,12 @@ from .pose_resolution import (
     build_mujoco_pose_qpos_execution_target,
 )
 from .sim_hil_target import (
-    MujocoSimHILPreparedTarget,
     MujocoSimHILTarget,
-    MujocoSimHILTargetConfig,
     build_mujoco_sim_hil_target,
+)
+from .target_preparation import (
+    MujocoSimHILPreparedTarget,
+    MujocoSimHILTargetConfig,
     prepare_mujoco_sim_hil_target,
 )
 from .target_measurement import (

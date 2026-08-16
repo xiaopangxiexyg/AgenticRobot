@@ -108,3 +108,24 @@ for name in names:
     result = _run_isolated_python(source)
 
     assert result.returncode == 0, result.stderr
+
+
+def test_target_preparation_legacy_exports_are_identity_preserving() -> None:
+    source = """
+import sim.mujoco.deploy as deploy
+from sim.mujoco.deploy import sim_hil_target
+from sim.mujoco.deploy import target_preparation
+
+names = (
+    "MujocoSimHILPreparedTarget",
+    "MujocoSimHILTargetConfig",
+    "prepare_mujoco_sim_hil_target",
+)
+for name in names:
+    owner_value = getattr(target_preparation, name)
+    assert getattr(sim_hil_target, name) is owner_value
+    assert getattr(deploy, name) is owner_value
+"""
+    result = _run_isolated_python(source)
+
+    assert result.returncode == 0, result.stderr

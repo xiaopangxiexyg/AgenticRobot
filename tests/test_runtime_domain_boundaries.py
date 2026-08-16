@@ -386,6 +386,25 @@ def test_mujoco_target_measurement_has_one_shared_owner() -> None:
     assert shared_symbols.isdisjoint(_top_level_defined_names(agent_target))
 
 
+def test_mujoco_target_preparation_has_one_shared_owner() -> None:
+    sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
+    agent_target = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "agent_skill_target.py"
+    )
+    target_preparation = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "target_preparation.py"
+    )
+    shared_symbols = {
+        "MujocoSimHILPreparedTarget",
+        "MujocoSimHILTargetConfig",
+        "prepare_mujoco_sim_hil_target",
+    }
+
+    assert shared_symbols <= _top_level_defined_names(target_preparation)
+    assert shared_symbols.isdisjoint(_top_level_defined_names(sim_target))
+    assert shared_symbols.isdisjoint(_top_level_defined_names(agent_target))
+
+
 def test_general_mujoco_runtime_does_not_eagerly_import_composition() -> None:
     target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
     composition_binding = (
