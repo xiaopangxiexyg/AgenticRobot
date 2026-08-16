@@ -14,9 +14,12 @@ from typing import Any
 
 from dataset_contracts.camera_semantic_prepared_view import (
     CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH,
+    CAMERA_SEMANTIC_VIDEO_INTEGRITY_EXCLUSIONS_RELATIVE_PATH,
     CameraSemanticPreparedViewContractError,
     CameraSemanticPreparedViewFileV1,
     CameraSemanticPreparedViewManifestV1,
+    CameraSemanticVideoIntegrityExclusionsV1,
+    CameraSemanticVideoIntegrityIssueV1,
 )
 from dataset_contracts.camera_semantics import (
     CAMERA_SEMANTIC_MATERIALIZATION_HASH_DOMAIN_V1,
@@ -58,7 +61,7 @@ from .camera_semantic_materialize import (
     _write_json_fsync,
     _write_jsonl_fsync,
 )
-from .io import read_json
+from .io import read_json, read_jsonl
 
 
 class CameraSemanticPreparedViewError(CameraSemanticMaterializationError):
@@ -212,6 +215,7 @@ def _selected_source_files(
                     label=f"episode {episode_index} {key}",
                 )
     files.discard(Path("meta/episodes.jsonl"))
+    files.discard(Path("meta/episodes_stats.jsonl"))
     files.discard(Path("meta/info.json"))
     files.discard(Path("meta/devices/realsense.json"))
     files.discard(Path(CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH))
@@ -228,6 +232,9 @@ def _selected_source_files(
                 f"Required prepared-view source metadata is missing: {path}"
             )
         files.add(required)
+    optional_episode_stats = Path("meta/episodes_stats.jsonl")
+    if (root / optional_episode_stats).is_file():
+        files.add(optional_episode_stats)
     return tuple(sorted(files))
 
 
@@ -433,6 +440,146 @@ def _validate_all_episode_videos(
     return video_count, decoded_frames
 
 
+def _video_integrity_issues(
+    root: Path,
+    episodes: tuple[Mapping[str, Any], ...],
+) -> tuple[CameraSemanticVideoIntegrityIssueV1, ...]:
+    """Audit every source video and return deterministic episode exclusions.
+
+    This is a read-only admission scan.  A failure quarantines the complete
+    episode from the camera-only view; it never authorizes a partial multi-view
+    episode and never changes the source dataset.
+    """
+
+    if shutil.which("ffprobe") is None or shutil.which("ffmpeg") is None:
+        raise CameraSemanticPreparedViewError(
+            "Safe video-integrity audit requires ffprobe and ffmpeg."
+        )
+    _parquet_module()
+    issues: list[CameraSemanticVideoIntegrityIssueV1] = []
+    for record in episodes:
+        episode_index = int(record["episode_index"])
+        try:
+            parquet = _safe_relative_path(
+                root,
+                record.get("parquet_path"),
+                label=f"episode {episode_index} parquet_path",
+            )
+        except CameraSemanticMaterializationError as exc:
+            issues.append(
+                CameraSemanticVideoIntegrityIssueV1(
+                    episode_index=episode_index,
+                    camera_key="*",
+                    relative_path="",
+                    reason="video_frame_index_contract_invalid",
+                    detail=str(exc),
+                )
+            )
+            continue
+        raw_videos = record.get("video_paths")
+        if not isinstance(raw_videos, Mapping) or not raw_videos:
+            issues.append(
+                CameraSemanticVideoIntegrityIssueV1(
+                    episode_index=episode_index,
+                    camera_key="*",
+                    relative_path="",
+                    reason="video_paths_missing",
+                    detail="Episode video_paths is missing or empty.",
+                )
+            )
+            continue
+        for raw_role, raw_path in sorted(raw_videos.items()):
+            role = str(raw_role).strip()
+            relative_text = str(raw_path or "").strip()
+            try:
+                relative = _safe_relative_path(
+                    root,
+                    raw_path,
+                    label=f"episode {episode_index} {role} video",
+                )
+            except CameraSemanticMaterializationError as exc:
+                issues.append(
+                    CameraSemanticVideoIntegrityIssueV1(
+                        episode_index=episode_index,
+                        camera_key=role or "*",
+                        relative_path="",
+                        reason="video_path_invalid",
+                        detail=(
+                            f"Unsafe or invalid video path {relative_text!r}: {exc}"
+                        ),
+                    )
+                )
+                continue
+            path = root / relative
+            if path.is_symlink() or not path.is_file():
+                issues.append(
+                    CameraSemanticVideoIntegrityIssueV1(
+                        episode_index=episode_index,
+                        camera_key=role or "*",
+                        relative_path=relative.as_posix(),
+                        reason="video_file_missing_or_unsafe",
+                        detail="Video payload is missing, not a regular file, or a symlink.",
+                    )
+                )
+                continue
+            try:
+                declared = _declared_video_frame_count(
+                    _index_values(root / parquet, role),
+                    label=f"episode={episode_index} role={role}",
+                )
+            except CameraSemanticMaterializationError as exc:
+                issues.append(
+                    CameraSemanticVideoIntegrityIssueV1(
+                        episode_index=episode_index,
+                        camera_key=role or "*",
+                        relative_path=relative.as_posix(),
+                        reason="video_frame_index_contract_invalid",
+                        detail=str(exc),
+                    )
+                )
+                continue
+            try:
+                decoded = _video_probe_frame_count(path)
+            except CameraSemanticMaterializationError as exc:
+                issues.append(
+                    CameraSemanticVideoIntegrityIssueV1(
+                        episode_index=episode_index,
+                        camera_key=role or "*",
+                        relative_path=relative.as_posix(),
+                        reason="video_probe_or_decode_failed",
+                        declared_frame_count=declared,
+                        detail=str(exc),
+                    )
+                )
+                continue
+            if decoded != declared:
+                issues.append(
+                    CameraSemanticVideoIntegrityIssueV1(
+                        episode_index=episode_index,
+                        camera_key=role or "*",
+                        relative_path=relative.as_posix(),
+                        reason="declared_decoded_frame_count_mismatch",
+                        declared_frame_count=declared,
+                        decoded_frame_count=decoded,
+                        detail=(
+                            "Parquet video-frame indices and the fully decoded "
+                            "payload report different frame counts."
+                        ),
+                    )
+                )
+    return tuple(
+        sorted(
+            issues,
+            key=lambda item: (
+                item.episode_index,
+                item.camera_key,
+                item.relative_path,
+                item.reason,
+            ),
+        )
+    )
+
+
 @dataclass(frozen=True)
 class CameraSemanticPreparedViewPlan:
     source_root: str
@@ -445,12 +592,18 @@ class CameraSemanticPreparedViewPlan:
     selected_file_count: int
     selected_byte_count: int
     selected_hardlinked_file_count: int
+    source_episode_count: int
     episode_count: int
+    video_count: int
     frame_count: int
     status_counts: Mapping[str, int]
     remapped_episode_count: int
     remapped_mismatched_row_count: int
     tactile_reference_episode_count: int
+    excluded_episode_count: int
+    excluded_episode_indices: tuple[int, ...]
+    video_integrity_issues: tuple[CameraSemanticVideoIntegrityIssueV1, ...]
+    video_integrity_exclusions_hash: str | None
 
     @property
     def plan_hash(self) -> str:
@@ -497,13 +650,45 @@ def plan_camera_semantic_prepared_view(
     files, inventory_hash, byte_count, hardlinked_count = _selected_inventory(
         source, episodes
     )
-    _validate_all_episode_videos(source, episodes)
+    source_identity = _source_dataset_identity(source)
+    video_integrity_issues = _video_integrity_issues(source, episodes)
+    excluded_episode_indices = tuple(
+        sorted({item.episode_index for item in video_integrity_issues})
+    )
+    excluded_episode_set = set(excluded_episode_indices)
+    selected_episodes = tuple(
+        record
+        for record in episodes
+        if int(record["episode_index"]) not in excluded_episode_set
+    )
+    if not selected_episodes:
+        raise CameraSemanticPreparedViewError(
+            "Every source episode failed video-integrity admission; "
+            "no train/test prepared view can be produced."
+        )
+    included_episode_indices = tuple(
+        sorted(int(record["episode_index"]) for record in selected_episodes)
+    )
+    exclusions = (
+        None
+        if not video_integrity_issues
+        else CameraSemanticVideoIntegrityExclusionsV1(
+            source_dataset_name=source.name,
+            source_dataset_identity_hash=source_identity,
+            selected_source_inventory_hash=inventory_hash,
+            source_episode_count=len(episodes),
+            included_episode_indices=included_episode_indices,
+            excluded_episode_indices=excluded_episode_indices,
+            issues=video_integrity_issues,
+        )
+    )
     status_counts: Counter[str] = Counter()
     frame_count = 0
     remapped_episodes = 0
     mismatch_rows = 0
     tactile_reference_episodes = 0
-    for record in episodes:
+    video_count = 0
+    for record in selected_episodes:
         episode_index = int(record["episode_index"])
         resolution = resolver.resolution_for_episode(episode_index)
         _resolution_maps(resolution)
@@ -516,28 +701,44 @@ def plan_camera_semantic_prepared_view(
         rows, mismatches = _frame_index_mismatch_count(
             source / parquet, resolution
         )
-        frame_count += rows
+        try:
+            frame_count += int(record["frame_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CameraSemanticPreparedViewError(
+                f"Episode {episode_index} has no integer frame_count."
+            ) from exc
         if resolution.status != "identity":
             remapped_episodes += 1
             mismatch_rows += mismatches
         tactile_reference_episodes += int(bool(record.get("tactile_paths")))
+        raw_videos = record.get("video_paths")
+        if isinstance(raw_videos, Mapping):
+            video_count += sum(bool(value) for value in raw_videos.values())
     return CameraSemanticPreparedViewPlan(
         source_root=str(source),
         output_root=str(output),
         registry_path=str(registry),
         source_dataset_name=source.name,
-        source_dataset_identity_hash=_source_dataset_identity(source),
+        source_dataset_identity_hash=source_identity,
         binding_hash=binding.contract_hash,
         selected_source_inventory_hash=inventory_hash,
         selected_file_count=len(files),
         selected_byte_count=byte_count,
         selected_hardlinked_file_count=hardlinked_count,
-        episode_count=len(episodes),
+        source_episode_count=len(episodes),
+        episode_count=len(selected_episodes),
+        video_count=video_count,
         frame_count=frame_count,
         status_counts=dict(sorted(status_counts.items())),
         remapped_episode_count=remapped_episodes,
         remapped_mismatched_row_count=mismatch_rows,
         tactile_reference_episode_count=tactile_reference_episodes,
+        excluded_episode_count=len(excluded_episode_indices),
+        excluded_episode_indices=excluded_episode_indices,
+        video_integrity_issues=video_integrity_issues,
+        video_integrity_exclusions_hash=(
+            None if exclusions is None else exclusions.receipt_hash
+        ),
     )
 
 
@@ -564,6 +765,30 @@ def _strip_tactile_episode_fields(record: Mapping[str, Any]) -> dict[str, Any]:
     return stripped
 
 
+def _project_modality_validity(
+    value: Mapping[str, Any],
+    *,
+    included_episode_indices: set[int],
+) -> dict[str, Any]:
+    projected = _strip_tactile_fields(value)
+    if not isinstance(projected, dict):  # pragma: no cover - type contract
+        raise CameraSemanticPreparedViewError(
+            "Prepared modality-validity projection must remain an object."
+        )
+    training = projected.get("training")
+    if isinstance(training, Mapping):
+        training_copy = dict(training)
+        raw_episodes = training_copy.get("episodes")
+        if isinstance(raw_episodes, Mapping):
+            training_copy["episodes"] = {
+                str(raw_index): raw_value
+                for raw_index, raw_value in raw_episodes.items()
+                if int(raw_index) in included_episode_indices
+            }
+        projected["training"] = training_copy
+    return projected
+
+
 def _prepared_info(
     info: Mapping[str, Any],
     *,
@@ -578,6 +803,15 @@ def _prepared_info(
         raise CameraSemanticPreparedViewError(
             "Prepared-view info projection must remain an object."
         )
+    for key in ("episode_count", "num_episodes", "total_episodes"):
+        if key in output:
+            output[key] = plan.episode_count
+    for key in ("frame_count", "num_frames", "total_frames"):
+        if key in output:
+            output[key] = plan.frame_count
+    for key in ("num_videos", "total_videos"):
+        if key in output:
+            output[key] = plan.video_count
     output["dexteleop_dataset_projection"] = {
         "schema": "dexteleop.camera_semantic_prepared_view_projection.v1",
         "manifest_path": CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH,
@@ -586,7 +820,22 @@ def _prepared_info(
         "full_v23_dataset": False,
         "requires_explicit_consumer_opt_in": True,
         "plan_hash": plan.plan_hash,
+        "source_episode_count": plan.source_episode_count,
+        "included_episode_count": plan.episode_count,
+        "excluded_episode_count": plan.excluded_episode_count,
     }
+    if plan.excluded_episode_indices:
+        output["dexteleop_dataset_projection"].update(
+            {
+                "excluded_episode_indices": list(plan.excluded_episode_indices),
+                "video_integrity_exclusions_path": (
+                    CAMERA_SEMANTIC_VIDEO_INTEGRITY_EXCLUSIONS_RELATIVE_PATH
+                ),
+                "video_integrity_exclusions_hash": (
+                    plan.video_integrity_exclusions_hash
+                ),
+            }
+        )
     return output
 
 
@@ -685,7 +934,17 @@ def materialize_camera_semantic_prepared_view(
     )
     binding = load_camera_role_binding(plan.registry_path)
     resolver = DatasetCameraSemanticResolver(source, binding)
-    episodes = _episode_records(source)
+    source_episodes = _episode_records(source)
+    excluded_episode_set = set(plan.excluded_episode_indices)
+    episodes = tuple(
+        record
+        for record in source_episodes
+        if int(record["episode_index"]) not in excluded_episode_set
+    )
+    if len(episodes) != plan.episode_count:
+        raise CameraSemanticPreparedViewError(
+            "Prepared-view selected episode count differs from the frozen plan."
+        )
     resolutions = {
         int(record["episode_index"]): resolver.resolution_for_episode(
             int(record["episode_index"])
@@ -703,6 +962,7 @@ def materialize_camera_semantic_prepared_view(
     }
     rewritten_inputs = {
         Path("meta/episodes.jsonl"),
+        Path("meta/episodes_stats.jsonl"),
         Path("meta/info.json"),
         Path("meta/modality_validity.json"),
         Path("meta/devices/realsense.json"),
@@ -775,6 +1035,32 @@ def materialize_camera_semantic_prepared_view(
         _write_jsonl_fsync(
             staging / "meta/episodes.jsonl", output_episode_tuple
         )
+        source_episode_stats = source / "meta/episodes_stats.jsonl"
+        if source_episode_stats.is_file():
+            selected_episode_indices = {
+                int(record["episode_index"]) for record in episodes
+            }
+            output_stats: list[dict[str, Any]] = []
+            for record in read_jsonl(source_episode_stats):
+                try:
+                    episode_index = int(record["episode_index"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise CameraSemanticPreparedViewError(
+                        "Source episodes_stats.jsonl has an invalid episode_index."
+                    ) from exc
+                if episode_index not in selected_episode_indices:
+                    continue
+                _, stored_to_canonical = _resolution_maps(
+                    resolutions[episode_index]
+                )
+                output_stats.append(
+                    _strip_tactile_episode_fields(
+                        _rewrite_episode_record(record, stored_to_canonical)
+                    )
+                )
+            _write_jsonl_fsync(
+                staging / "meta/episodes_stats.jsonl", tuple(output_stats)
+            )
 
         statuses = {resolution.status for resolution in resolutions.values()}
         info = read_json(source / "meta/info.json")
@@ -803,13 +1089,39 @@ def materialize_camera_semantic_prepared_view(
                 raise CameraSemanticPreparedViewError(
                     "Source meta/modality_validity.json is invalid."
                 )
-            projected_validity = _strip_tactile_fields(modality_validity)
-            if not isinstance(projected_validity, dict):
-                raise CameraSemanticPreparedViewError(
-                    "Prepared modality-validity projection must remain an object."
-                )
+            projected_validity = _project_modality_validity(
+                modality_validity,
+                included_episode_indices=set(resolutions),
+            )
             _write_json_fsync(
                 staging / "meta/modality_validity.json", projected_validity
+            )
+        video_integrity_exclusions = None
+        if plan.excluded_episode_indices:
+            video_integrity_exclusions = (
+                CameraSemanticVideoIntegrityExclusionsV1(
+                    source_dataset_name=plan.source_dataset_name,
+                    source_dataset_identity_hash=plan.source_dataset_identity_hash,
+                    selected_source_inventory_hash=(
+                        plan.selected_source_inventory_hash
+                    ),
+                    source_episode_count=plan.source_episode_count,
+                    included_episode_indices=tuple(sorted(resolutions)),
+                    excluded_episode_indices=plan.excluded_episode_indices,
+                    issues=plan.video_integrity_issues,
+                )
+            )
+            if (
+                video_integrity_exclusions.receipt_hash
+                != plan.video_integrity_exclusions_hash
+            ):
+                raise CameraSemanticPreparedViewError(
+                    "Video-integrity exclusions differ from the frozen plan."
+                )
+            _write_json_fsync(
+                staging
+                / CAMERA_SEMANTIC_VIDEO_INTEGRITY_EXCLUSIONS_RELATIVE_PATH,
+                video_integrity_exclusions.to_dict(),
             )
         output_snapshot = _camera_snapshot_from_binding(binding)
         _write_json_fsync(
@@ -869,6 +1181,12 @@ def materialize_camera_semantic_prepared_view(
             plan_hash=plan.plan_hash,
             episode_indices=tuple(sorted(resolutions)),
             files=files,
+            excluded_episode_indices=plan.excluded_episode_indices,
+            video_integrity_exclusions_hash=(
+                None
+                if video_integrity_exclusions is None
+                else video_integrity_exclusions.receipt_hash
+            ),
         )
         _write_json_fsync(
             staging / CAMERA_SEMANTIC_PREPARED_VIEW_RELATIVE_PATH,
@@ -877,7 +1195,9 @@ def materialize_camera_semantic_prepared_view(
         load_camera_semantic_prepared_view(
             staging, verify_payload_hashes=True
         )
-        _, final_inventory_hash, _, _ = _selected_inventory(source, episodes)
+        _, final_inventory_hash, _, _ = _selected_inventory(
+            source, source_episodes
+        )
         if final_inventory_hash != plan.selected_source_inventory_hash:
             raise CameraSemanticPreparedViewError(
                 "Selected source files changed during preparation; output was not published."
