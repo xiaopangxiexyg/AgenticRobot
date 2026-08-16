@@ -38,6 +38,7 @@ from sim.mujoco.deploy import (
     MujocoComponentActionRobotActionV1Materializer,
     MujocoRobotActionV1ComponentIngressAdapter,
     build_mujoco_component_execution_binding,
+    build_mujoco_policy_skill_motion_target,
     build_mujoco_pose_component_target_profile,
     build_mujoco_pose_qpos_component_target_profile,
     build_rm65_right_cube_lift_component_target_profile,
@@ -373,6 +374,14 @@ def test_native_profile_materializes_only_at_private_coupled_execution_edge() ->
         support_arm_sides=("left",),
         support_pose_contract_id="fixture.measured-left-pose.v1",
     )
+    policy_ingress = MujocoRobotActionV1ComponentIngressAdapter(
+        scene,
+        profile,
+        component_id_by_effector={
+            "right_arm": "right_arm",
+            "right_hand": "right_gripper",
+        },
+    )
     compatibility = materializer(
         native,
         timestamp=1.0,
@@ -381,6 +390,7 @@ def test_native_profile_materializes_only_at_private_coupled_execution_edge() ->
     binding = build_mujoco_component_execution_binding(
         profile,
         materializer,
+        policy_action_ingress=policy_ingress,
     )
 
     assert compatibility.action_space == BIMANUAL_EE_POSE_V1
@@ -405,6 +415,86 @@ def test_native_profile_materializes_only_at_private_coupled_execution_edge() ->
         "right_arm": "right_arm",
         "right_gripper": "right_hand",
     }
+    assert binding.policy_action_ingress_contract_hash == (
+        policy_ingress.semantic_content_hash
+    )
+    projected = binding.policy_action_ingress(source)
+    assert projected.component_coverage == (
+        "right_arm",
+        "right_gripper",
+    )
+
+
+def test_policy_ingress_must_exactly_invert_private_materializer_routing() -> None:
+    scene = _scene()
+    profile = build_rm65_right_cube_lift_component_target_profile(
+        scene,
+        SimpleNamespace(
+            controlled_side="right",
+            right_gripper_name="right_gripper",
+        ),
+    )
+    materializer = MujocoComponentActionRobotActionV1Materializer(
+        scene,
+        profile,
+        hand_action_spec_by_component={
+            "right_gripper": HandActionSpec.dmtac_gripper("right")
+        },
+        support_arm_pose_provider=lambda: {
+            "left": np.asarray(
+                [0.3, 0.2, 0.4, 0.0, 0.0, 0.0, 1.0],
+                dtype=np.float32,
+            )
+        },
+        support_arm_sides=("left",),
+        support_pose_contract_id="fixture.measured-left-pose.v1",
+    )
+    incomplete_ingress = MujocoRobotActionV1ComponentIngressAdapter(
+        scene,
+        profile,
+        component_id_by_effector={"right_arm": "right_arm"},
+    )
+
+    with pytest.raises(ValueError, match="invert the materializer"):
+        build_mujoco_component_execution_binding(
+            profile,
+            materializer,
+            policy_action_ingress=incomplete_ingress,
+        )
+
+
+def test_policy_skill_target_rejects_unbound_policy_ingress_before_prepare() -> None:
+    scene = _scene()
+    profile = build_mujoco_pose_component_target_profile(
+        scene,
+        profile_id="fixture.right-arm-policy-target",
+        arm_side_by_component={"right_arm": "right"},
+        arm_reference_frame_by_component={"right_arm": "right_arm_base"},
+        arm_controlled_frame_by_component={"right_arm": "tool_tcp"},
+    )
+    materializer = MujocoComponentActionRobotActionV1Materializer(
+        scene,
+        profile,
+        hand_action_spec_by_component={},
+        support_arm_pose_provider=lambda: {
+            "left": np.asarray(
+                [0.3, 0.2, 0.4, 0.0, 0.0, 0.0, 1.0],
+                dtype=np.float32,
+            )
+        },
+        support_arm_sides=("left",),
+        support_pose_contract_id="fixture.measured-left-pose.v1",
+    )
+    binding = build_mujoco_component_execution_binding(profile, materializer)
+
+    with pytest.raises(ValueError, match="target-owned policy ingress"):
+        build_mujoco_policy_skill_motion_target(
+            config=MujocoSimHILTargetConfig(
+                task_config_path=Path("does-not-need-to-exist.json"),
+                allow_scripted_task_reset=False,
+            ),
+            component_execution_binding=binding,
+        )
 
 
 def test_native_component_profile_reaches_one_atomic_mujoco_target() -> None:

@@ -570,6 +570,8 @@ class MujocoComponentActionRobotActionV1Materializer:
 def build_mujoco_component_execution_binding(
     profile: MujocoComponentTargetProfile,
     materializer: MujocoComponentActionRobotActionV1Materializer,
+    *,
+    policy_action_ingress: MujocoRobotActionV1ComponentIngressAdapter | None = None,
 ) -> Any:
     """Bind a native profile to the existing lower MuJoCo execution owner."""
 
@@ -587,6 +589,33 @@ def build_mujoco_component_execution_binding(
         != profile.action_schema.semantic_content_hash
     ):
         raise ValueError("Execution materializer binds another component profile.")
+    if policy_action_ingress is not None:
+        if not isinstance(
+            policy_action_ingress,
+            MujocoRobotActionV1ComponentIngressAdapter,
+        ):
+            raise TypeError(
+                "policy_action_ingress must be a "
+                "MujocoRobotActionV1ComponentIngressAdapter or None."
+            )
+        if (
+            policy_action_ingress.profile.action_schema.semantic_content_hash
+            != profile.action_schema.semantic_content_hash
+        ):
+            raise ValueError("Policy ingress binds another component profile.")
+        expected_ingress_map = {
+            effector: component_id
+            for component_id, effector in (
+                materializer.output_effector_by_component.items()
+            )
+        }
+        if dict(policy_action_ingress.component_id_by_effector) != (
+            expected_ingress_map
+        ):
+            raise ValueError(
+                "Policy ingress effector routing must invert the materializer "
+                "output routing exactly."
+            )
     from .runtime import MujocoComponentExecutionBinding
 
     catalog = ActionComponentCatalog(
@@ -618,6 +647,16 @@ def build_mujoco_component_execution_binding(
         ),
         support_only_output_effectors=(
             materializer.support_only_output_effectors
+        ),
+        policy_action_ingress=(
+            None
+            if policy_action_ingress is None
+            else policy_action_ingress.project
+        ),
+        policy_action_ingress_contract_hash=(
+            None
+            if policy_action_ingress is None
+            else policy_action_ingress.semantic_content_hash
         ),
     )
 

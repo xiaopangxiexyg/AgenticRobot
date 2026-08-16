@@ -187,6 +187,8 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/sim_hil_profile/agent/motion_application.py": ["sim"],
         "control_station/sim_hil_profile/agent/motion_factory.py": ["sim"],
         "control_station/sim_hil_profile/agent/observation.py": ["sim"],
+        "control_station/sim_hil_profile/agent/policy_application.py": ["sim"],
+        "control_station/sim_hil_profile/agent/policy_factory.py": ["sim"],
         "control_station/sim_hil_profile/tasks/cube_lift/deployment.py": ["sim"],
         "control_station/sim_hil_profile/factory.py": ["sim"],
         "control_station/sim_hil_profile/openpi_policy_source.py": ["sim"],

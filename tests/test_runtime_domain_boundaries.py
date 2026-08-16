@@ -346,6 +346,9 @@ def test_general_mujoco_target_does_not_opt_into_composition_runtime() -> None:
     agent_target = (
         REPO_ROOT / "sim" / "mujoco" / "deploy" / "agent_skill_target.py"
     )
+    policy_skill_target = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "policy_skill_target.py"
+    )
 
     sim_hil_runtime_keywords = _call_keyword_names_in_function(
         sim_target,
@@ -357,19 +360,55 @@ def test_general_mujoco_target_does_not_opt_into_composition_runtime() -> None:
         function_name="build_mujoco_agent_skill_motion_target",
         called_name="MujocoDeployRuntime",
     )
+    policy_skill_runtime_keywords = _call_keyword_names_in_function(
+        policy_skill_target,
+        function_name="build_mujoco_policy_skill_motion_target",
+        called_name="MujocoDeployRuntime",
+    )
 
     assert "composition_runtime_config" in sim_hil_runtime_keywords
     assert "composition_runtime_config" not in agent_skill_runtime_keywords
+    assert "composition_runtime_config" not in policy_skill_runtime_keywords
     assert "build_mujoco_agent_skill_motion_target" not in _called_names(
         sim_target
     )
     assert "control_composition" not in _absolute_import_roots(agent_target)
+    assert "control_composition" not in _absolute_import_roots(
+        policy_skill_target
+    )
+
+
+def test_policy_skill_assembly_depends_on_ports_not_openpi_or_composition() -> None:
+    policy_application = (
+        REPO_ROOT
+        / "control_station"
+        / "sim_hil_profile"
+        / "agent"
+        / "policy_application.py"
+    )
+    policy_factory = (
+        REPO_ROOT
+        / "control_station"
+        / "sim_hil_profile"
+        / "agent"
+        / "policy_factory.py"
+    )
+
+    assert _absolute_import_roots(policy_application).isdisjoint(
+        {"control_composition", "deployments"}
+    )
+    assert _absolute_import_roots(policy_factory).isdisjoint(
+        {"control_composition", "deployments"}
+    )
 
 
 def test_mujoco_target_measurement_has_one_shared_owner() -> None:
     sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
     agent_target = (
         REPO_ROOT / "sim" / "mujoco" / "deploy" / "agent_skill_target.py"
+    )
+    policy_skill_target = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "policy_skill_target.py"
     )
     target_measurement = (
         REPO_ROOT / "sim" / "mujoco" / "deploy" / "target_measurement.py"
@@ -384,12 +423,18 @@ def test_mujoco_target_measurement_has_one_shared_owner() -> None:
     assert shared_symbols <= _top_level_defined_names(target_measurement)
     assert shared_symbols.isdisjoint(_top_level_defined_names(sim_target))
     assert shared_symbols.isdisjoint(_top_level_defined_names(agent_target))
+    assert shared_symbols.isdisjoint(
+        _top_level_defined_names(policy_skill_target)
+    )
 
 
 def test_mujoco_target_preparation_has_one_shared_owner() -> None:
     sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
     agent_target = (
         REPO_ROOT / "sim" / "mujoco" / "deploy" / "agent_skill_target.py"
+    )
+    policy_skill_target = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "policy_skill_target.py"
     )
     target_preparation = (
         REPO_ROOT / "sim" / "mujoco" / "deploy" / "target_preparation.py"
@@ -402,6 +447,9 @@ def test_mujoco_target_preparation_has_one_shared_owner() -> None:
     assert shared_symbols <= _top_level_defined_names(target_preparation)
     assert shared_symbols.isdisjoint(_top_level_defined_names(sim_target))
     assert shared_symbols.isdisjoint(_top_level_defined_names(agent_target))
+    assert shared_symbols.isdisjoint(
+        _top_level_defined_names(policy_skill_target)
+    )
 
 
 def test_mujoco_target_config_has_one_shared_owner() -> None:
@@ -411,6 +459,7 @@ def test_mujoco_target_config_has_one_shared_owner() -> None:
         deploy_root / "target_preparation.py",
         deploy_root / "sim_hil_target.py",
         deploy_root / "agent_skill_target.py",
+        deploy_root / "policy_skill_target.py",
     )
 
     assert "MujocoSimHILTargetConfig" in _top_level_defined_names(target_config)
