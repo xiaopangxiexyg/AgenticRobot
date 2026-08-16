@@ -92,12 +92,9 @@ from robot_motion.deploy.runtime import (
     resolve_action_queue_policy,
 )
 from robot_motion.deploy.schema import (
-    ACTION_ARM_POSE_SLICES,
     ACTION_DIM,
-    ACTION_HAND_SLICES,
     ALL_SIDES,
     DEPLOY_ACTION_VECTOR_ACTION_SPACE,
-    pose_matrix_to_xyzquat,
     to_serializable,
 )
 from robot_motion.deploy.session_contract import (
@@ -286,15 +283,31 @@ from .debug_payload import (
     DEPLOY_DEBUG_PAYLOAD_MODES,
     _DEBUG_EFFECTOR_METADATA_KEYS,
     _DEBUG_LAST_COMMAND_METADATA_KEYS,
+    _debug_action_summary,
+    _debug_action_vector,
+    _debug_arm_joint_targets,
     _debug_args_payload,
+    _debug_arm_state_summary,
+    _debug_backend_arm_states,
     _debug_backend_dispatch_by_effector_summary,
     _debug_backend_group_health_summary,
+    _debug_backend_limits,
     _debug_background_streaming_summary,
     _debug_compact_value,
+    _debug_command_arm_pose_by_side,
+    _debug_command_summary,
+    _debug_hand_by_side_from_vector,
     _debug_metadata_summary,
+    _debug_pose_by_side_from_vector,
+    _debug_pose_delta,
+    _debug_pose_delta_by_side,
     _debug_position_executor_event_summary,
+    _debug_quat_delta_deg,
     _debug_redact,
     _debug_remote_policy_summary,
+    _debug_state_pose_by_side,
+    _debug_vector,
+    _debug_xyzquat,
 )
 from .dispatch import (
     POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES,
@@ -461,367 +474,6 @@ class LoopRate:
             self.hz = instant if self.hz <= 0.0 else 0.2 * instant + 0.8 * self.hz
         self._last = float(now)
         return float(self.hz)
-
-
-def _debug_vector(
-    value: Any,
-    *,
-    length: int | None = None,
-    require_finite: bool = True,
-) -> np.ndarray | None:
-    if value is None:
-        return None
-    try:
-        vector = np.asarray(value, dtype=float).reshape(-1)
-    except (TypeError, ValueError):
-        return None
-    if length is not None and vector.shape != (int(length),):
-        return None
-    if require_finite and not np.all(np.isfinite(vector)):
-        return None
-    return vector.astype(np.float32, copy=True)
-
-
-def _debug_xyzquat(value: Any) -> np.ndarray | None:
-    if value is None:
-        return None
-    try:
-        array = np.asarray(value, dtype=float)
-    except (TypeError, ValueError):
-        return None
-    if array.shape == (4, 4):
-        pose = pose_matrix_to_xyzquat(array)
-        return None if pose is None else pose.astype(np.float32, copy=True)
-    vector = _debug_vector(array, length=7)
-    if vector is None:
-        return None
-    quat = np.asarray(vector[3:7], dtype=float)
-    norm = float(np.linalg.norm(quat))
-    if norm <= 1e-12:
-        return None
-    vector = vector.astype(np.float32, copy=True)
-    vector[3:7] = (quat / norm).astype(np.float32)
-    return vector
-
-
-def _debug_action_vector(action: Any) -> np.ndarray | None:
-    vector = getattr(action, "vector", action)
-    return _debug_vector(vector, length=ACTION_DIM, require_finite=False)
-
-
-def _debug_pose_by_side_from_vector(
-    vector: np.ndarray | None,
-    active_sides: tuple[str, ...],
-) -> dict[str, np.ndarray]:
-    if vector is None:
-        return {}
-    poses: dict[str, np.ndarray] = {}
-    for side in active_sides:
-        target_slice = ACTION_ARM_POSE_SLICES[side]
-        pose = _debug_xyzquat(vector[target_slice])
-        if pose is not None:
-            poses[side] = pose
-    return poses
-
-
-def _debug_hand_by_side_from_vector(
-    vector: np.ndarray | None,
-    active_sides: tuple[str, ...],
-) -> dict[str, np.ndarray]:
-    if vector is None:
-        return {}
-    hands: dict[str, np.ndarray] = {}
-    for side in active_sides:
-        target_slice = ACTION_HAND_SLICES[side]
-        target = _debug_vector(vector[target_slice])
-        if target is not None:
-            hands[side] = target
-    return hands
-
-
-def _debug_arm_joint_targets(
-    action: Any, active_sides: tuple[str, ...]
-) -> dict[str, np.ndarray]:
-    targets = getattr(action, "arm_joint_targets", {}) or {}
-    if not isinstance(targets, Mapping):
-        return {}
-    resolved: dict[str, np.ndarray] = {}
-    for side in active_sides:
-        target = _debug_vector(targets.get(side), length=6)
-        if target is not None:
-            resolved[side] = target
-    return resolved
-
-
-def _debug_action_summary(
-    action: Any,
-    active_sides: tuple[str, ...],
-    *,
-    full_payload: bool = False,
-) -> dict[str, Any] | None:
-    vector = _debug_action_vector(action)
-    if vector is None:
-        return None
-    metadata = getattr(action, "metadata", {})
-    return {
-        "source": (
-            str(metadata.get("source", "")) if isinstance(metadata, Mapping) else ""
-        ),
-        "metadata": _debug_metadata_summary(
-            metadata,
-            full_payload=full_payload,
-        ),
-        "vector": vector,
-        "arm_pose_by_side": _debug_pose_by_side_from_vector(vector, active_sides),
-        "arm_joint_targets_by_side": _debug_arm_joint_targets(action, active_sides),
-        "hand_by_side": _debug_hand_by_side_from_vector(vector, active_sides),
-    }
-
-
-def _debug_quat_delta_deg(reference: np.ndarray, candidate: np.ndarray) -> float | None:
-    ref_quat = np.asarray(reference[3:7], dtype=float)
-    candidate_quat = np.asarray(candidate[3:7], dtype=float)
-    ref_norm = float(np.linalg.norm(ref_quat))
-    candidate_norm = float(np.linalg.norm(candidate_quat))
-    if ref_norm <= 1e-12 or candidate_norm <= 1e-12:
-        return None
-    ref_quat = ref_quat / ref_norm
-    candidate_quat = candidate_quat / candidate_norm
-    dot = float(np.clip(abs(np.dot(ref_quat, candidate_quat)), -1.0, 1.0))
-    return float(np.degrees(2.0 * np.arccos(dot)))
-
-
-def _debug_pose_delta(reference: Any, candidate: Any) -> dict[str, Any] | None:
-    ref_pose = _debug_xyzquat(reference)
-    candidate_pose = _debug_xyzquat(candidate)
-    if ref_pose is None or candidate_pose is None:
-        return None
-    xyz_delta = np.asarray(candidate_pose[:3] - ref_pose[:3], dtype=np.float32)
-    return {
-        "xyz_delta_m": xyz_delta,
-        "xyz_norm_m": float(np.linalg.norm(xyz_delta)),
-        "rot_delta_deg": _debug_quat_delta_deg(ref_pose, candidate_pose),
-    }
-
-
-def _debug_pose_delta_by_side(
-    reference_by_side: Mapping[str, Any],
-    candidate_by_side: Mapping[str, Any],
-) -> dict[str, Any]:
-    deltas: dict[str, Any] = {}
-    for side in ALL_SIDES:
-        if side not in reference_by_side or side not in candidate_by_side:
-            continue
-        delta = _debug_pose_delta(reference_by_side[side], candidate_by_side[side])
-        if delta is not None:
-            deltas[side] = delta
-    return deltas
-
-
-def _debug_command_arm_pose_by_side(
-    command: Any, active_sides: tuple[str, ...]
-) -> dict[str, np.ndarray]:
-    if command is None:
-        return {}
-    commands = getattr(command, "commands", {}) or {}
-    poses: dict[str, np.ndarray] = {}
-    for side in active_sides:
-        effector_command = commands.get(f"{side}_arm")
-        if (
-            effector_command is None
-            or getattr(effector_command, "command_type", "") != "cartesian_pose"
-        ):
-            continue
-        metadata = getattr(effector_command, "metadata", {}) or {}
-        pose = None
-        if isinstance(metadata, Mapping):
-            pose = _debug_xyzquat(metadata.get("target_xyzquat"))
-            if pose is None:
-                pose = _debug_xyzquat(metadata.get("target_pose_base"))
-        if pose is None:
-            pose = _debug_xyzquat(getattr(effector_command, "value", None))
-        if pose is not None:
-            poses[side] = pose
-    return poses
-
-
-def _debug_command_summary(
-    command: Any,
-    active_sides: tuple[str, ...],
-    *,
-    full_payload: bool = False,
-) -> dict[str, Any] | None:
-    if command is None:
-        return None
-    commands = getattr(command, "commands", {}) or {}
-    command_payload: dict[str, Any] = {}
-    for effector_name, effector_command in commands.items():
-        metadata = getattr(effector_command, "metadata", {}) or {}
-        item: dict[str, Any] = {
-            "command_type": getattr(effector_command, "command_type", ""),
-            "side": getattr(effector_command, "side", None),
-            "frame_name": getattr(effector_command, "frame_name", None),
-            "value": getattr(effector_command, "value", None),
-            "metadata": _debug_metadata_summary(
-                metadata,
-                full_payload=full_payload,
-                selected_keys=(
-                    None if full_payload else _DEBUG_EFFECTOR_METADATA_KEYS
-                ),
-            ),
-        }
-        if item["command_type"] == "cartesian_pose":
-            item["target_xyzquat"] = _debug_xyzquat(
-                item["metadata"].get("target_xyzquat")
-                if isinstance(item["metadata"], Mapping)
-                else None
-            )
-            if item["target_xyzquat"] is None:
-                item["target_xyzquat"] = _debug_xyzquat(
-                    getattr(effector_command, "value", None)
-                )
-        command_payload[str(effector_name)] = item
-    return {
-        "timestamp": getattr(command, "timestamp", None),
-        "metadata": _debug_metadata_summary(
-            getattr(command, "metadata", {}) or {},
-            full_payload=full_payload,
-        ),
-        "commands": command_payload,
-        "arm_pose_by_side": _debug_command_arm_pose_by_side(command, active_sides),
-    }
-
-
-def _debug_arm_state_summary(
-    states: Mapping[str, Mapping[str, Any]] | None,
-    *,
-    full_payload: bool = False,
-) -> dict[str, Any]:
-    if not states:
-        return {}
-    keys = (
-        "current_qpos",
-        "current_tcp_pose",
-        "hardware_qpos",
-        "last_target_qpos",
-        "last_command",
-        "last_command_timestamp",
-        "hardware_pose_6d",
-        "hardware_refresh_time",
-        "hardware_read_phase_timing",
-        "hardware_result_code",
-        "hardware_result_text",
-        "hardware_arm_err",
-        "hardware_sys_err",
-        "send_result_code",
-        "send_result_text",
-        "emergency_stopped",
-        "effective_control_dt_sec",
-        "effective_step_scale",
-        "ik_metadata",
-        "singularity_metadata",
-        "tcp_pose_source",
-        "state_error",
-        "pose_error",
-        "active_tool_name",
-        "configured_tcp_enabled",
-        "tool_tcp_source",
-        "tool_tcp_endpoint_delta_m",
-        "tool_tcp_endpoint_delta_deg",
-    )
-    payload: dict[str, Any] = {}
-    for side, state in states.items():
-        side_payload = {key: state.get(key) for key in keys if key in state}
-        if not full_payload:
-            last_command = side_payload.get("last_command")
-            if isinstance(last_command, Mapping):
-                last_command_payload = dict(last_command)
-                last_command_payload["metadata"] = _debug_metadata_summary(
-                    last_command.get("metadata", {}),
-                    full_payload=False,
-                    selected_keys=_DEBUG_LAST_COMMAND_METADATA_KEYS,
-                )
-                last_command_payload.pop("execution_work_item", None)
-                side_payload["last_command"] = last_command_payload
-            for key in ("ik_metadata", "singularity_metadata"):
-                if key in side_payload:
-                    side_payload[key] = _debug_compact_value(
-                        side_payload[key],
-                        max_items=32,
-                    )
-        pose = _debug_xyzquat(side_payload.get("current_tcp_pose"))
-        if pose is not None:
-            side_payload["current_tcp_xyzquat"] = pose
-        payload[str(side)] = side_payload
-    return payload
-
-
-def _debug_state_pose_by_side(
-    states: Mapping[str, Mapping[str, Any]] | None
-) -> dict[str, np.ndarray]:
-    poses: dict[str, np.ndarray] = {}
-    if not states:
-        return poses
-    for side, state in states.items():
-        pose = _debug_xyzquat(state.get("current_tcp_pose"))
-        if pose is not None:
-            poses[str(side)] = pose
-    return poses
-
-
-def _debug_backend_arm_states(
-    backends: Mapping[str, EffectorBackend]
-) -> dict[str, dict[str, Any]]:
-    states: dict[str, dict[str, Any]] = {}
-    for side, backend in backends.items():
-        try:
-            states[side] = dict(backend.get_state())
-        except Exception as exc:  # noqa: BLE001
-            states[side] = {"state_error": f"{type(exc).__name__}: {exc}"}
-    return states
-
-
-def _debug_backend_limits(
-    backends: Mapping[str, EffectorBackend],
-    *,
-    now: float,
-) -> dict[str, Any]:
-    limits: dict[str, Any] = {}
-    for side, backend in backends.items():
-        get_effective_step = getattr(backend, "get_effective_max_joint_step", None)
-        try:
-            effective_step = (
-                get_effective_step(now=now) if callable(get_effective_step) else None
-            )
-        except Exception as exc:  # noqa: BLE001
-            effective_step = None
-            error = f"{type(exc).__name__}: {exc}"
-        else:
-            error = ""
-        config = backend.config
-        limits[side] = {
-            "control_dt_sec": float(config.control_dt),
-            "max_angvel_rad_s": tuple(float(value) for value in config.max_angvel),
-            "effective_max_joint_step_rad": effective_step,
-            "background_streaming_enabled": bool(
-                getattr(config, "background_streaming_enabled", False)
-            ),
-            "background_streaming_hz": (
-                None
-                if getattr(config, "background_streaming_hz", None) is None
-                else float(config.background_streaming_hz)
-            ),
-            "background_streaming_target_admission_mode": getattr(
-                config,
-                "background_streaming_target_admission_mode",
-                None,
-            ),
-            "canfd_follow": getattr(config, "canfd_follow", None),
-            "observation_only": bool(getattr(config, "observation_only", False)),
-            "send_commands": getattr(config, "send_commands", None),
-            "error": error,
-        }
-    return limits
 
 
 def canonical_deployment_debug_root(*, now: float | None = None) -> Path:
