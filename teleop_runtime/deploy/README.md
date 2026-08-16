@@ -120,6 +120,7 @@ policy output (15 Hz)
 - `teleop_runtime/deploy/arm_state_reader.py`: deployment-facing arm 状态刷新节拍和 bounded causal snapshot history；backend 继续持有设备状态/FK，reader 不持有控制、安全或 dispatch。
 - `teleop_runtime/deploy/camera_runtime.py`: policy artifact 相机键绑定、部署侧 source 构造与启动准入适配；正式 RealSense 启动/重试和 freshness gate 继续复用 `teleop_runtime.real_teleop.camera_runtime`，本模块不另建相机生命周期所有者。
 - `teleop_runtime/deploy/debug_payload.py`: deployment JSONL 的纯脱敏、裁剪和摘要投影；只生成被动观测 payload，不持有 logger、控制状态、设备或 dispatch。
+- `teleop_runtime/deploy/debug_logger.py`: deployment debug artifact 路径和 JSONL writer 生命周期；通过只读 execution view 记录既有执行事实，不拥有控制、authority、safety 或 dispatch。
 - `teleop_runtime/deploy/dispatch.py`: 当前真机 launcher 的 `TeleopCommand` 到 arm/hand backend 分发；这是 real-specific 代码，不应迁到 `robot_motion`，sim launcher 应实现自己的 dispatcher。
 - `teleop_runtime/deploy/actions.py`: 仍保留旧 `ActionSafetyFilter.filter()` direct-command path 作为 legacy 封存入口；新代码应使用 `filter_normalized()`。
 
