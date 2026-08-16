@@ -376,6 +376,7 @@ def build_mujoco_sim_hil_target(
         str, ComponentActionSchema
     ]
     | None = None,
+    composition_strategy_control_factory: Callable[..., Any] | None = None,
     prepared_target: MujocoSimHILPreparedTarget | None = None,
     component_execution_binding: Any | None = None,
     execution_observation_sink: ExecutionObservationSink | None = None,
@@ -390,8 +391,25 @@ def build_mujoco_sim_hil_target(
 
     if not isinstance(config, MujocoSimHILTargetConfig):
         raise TypeError("config must be a MujocoSimHILTargetConfig.")
-    if not hasattr(contracts, "authority_profile") or not hasattr(contracts, "strategy"):
+    if not hasattr(contracts, "authority_profile") or not hasattr(
+        contracts,
+        "strategy",
+    ):
         raise TypeError("contracts must expose authority_profile and strategy.")
+    if composition_strategy_control_factory is not None and not callable(
+        composition_strategy_control_factory
+    ):
+        raise TypeError(
+            "composition_strategy_control_factory must be callable or None."
+        )
+    if (
+        getattr(contracts, "dynamic_parameter_contract", None) is not None
+        and composition_strategy_control_factory is None
+    ):
+        raise ValueError(
+            "Dynamic composition contracts require an application-supplied "
+            "composition_strategy_control_factory."
+        )
     hand_specs = {
         str(side): (
             spec
@@ -416,12 +434,6 @@ def build_mujoco_sim_hil_target(
         RM65_POSITION_TARGET_POSE_SMOOTHING_V1,
         build_bimanual_pose_smoother,
     )
-    from control_composition.composition import (
-        FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
-        CompositionStrategyControl,
-        build_initial_strategy_revision,
-    )
-    from control_composition.retention import TimeWindowRetentionSpec
     from sim.mujoco.adapters import (
         MujocoPositionExecutionConfig,
         MujocoPositionExecutionRig,
@@ -520,61 +532,6 @@ def build_mujoco_sim_hil_target(
             collision_constraints_enabled=config.collision_stop_enabled,
         ),
     )
-    strategy_control_factory = None
-    dynamic_contract = getattr(
-        contracts,
-        "dynamic_parameter_contract",
-        None,
-    )
-    if dynamic_contract is not None:
-        initial_alpha = dict(contracts.initial_alpha_by_component)
-
-        def strategy_control_factory(
-            coordinator,
-            producer_epochs,
-            available_at,
-        ):
-            initial_revision = build_initial_strategy_revision(
-                runtime_session_id=config.runtime_session_id,
-                control_domain_id=config.control_domain_id,
-                strategy_instance_id=(
-                    f"{contracts.strategy_spec.strategy_id}:control"
-                ),
-                request_id=(
-                    f"{contracts.strategy_spec.strategy_id}:initial"
-                ),
-                strategy_mode=(
-                    FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1
-                ),
-                composition_spec=contracts.composition_spec,
-                strategy_spec=contracts.strategy_spec,
-                component_rule_set=contracts.component_rule_set,
-                dynamic_parameter_contract=dynamic_contract,
-                initial_alpha_by_component=initial_alpha,
-                available_at=float(available_at),
-                available_clock_domain_id=config.clock_domain_id,
-            )
-            return CompositionStrategyControl(
-                runtime_session_id=config.runtime_session_id,
-                control_domain_id=config.control_domain_id,
-                strategy_instance_id=initial_revision.strategy_instance_id,
-                coordinator=coordinator,
-                producer_epochs=producer_epochs,
-                retention_spec=TimeWindowRetentionSpec(
-                    spec_id=(
-                        "mujoco-sim-hil-strategy-control-window-v1"
-                    ),
-                    history_window_sec=2.0,
-                    max_future_lead_sec=1.0,
-                    max_effective_duration_sec=1.0,
-                    max_late_arrival_sec=0.0,
-                ),
-                supported_strategy_modes=(
-                    FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
-                ),
-                initial_revision=initial_revision,
-            )
-
     source_support_horizon_sec = max(
         0.25,
         1.0 / compose_target_hz,
@@ -632,7 +589,9 @@ def build_mujoco_sim_hil_target(
         ),
         shared_safety=shared_safety,
         composition_strategy=contracts.strategy,
-        composition_strategy_control_factory=strategy_control_factory,
+        composition_strategy_control_factory=(
+            composition_strategy_control_factory
+        ),
         composition_input_action_schema_by_role=(
             composition_input_action_schema_by_role
         ),

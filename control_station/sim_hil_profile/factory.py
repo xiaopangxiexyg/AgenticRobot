@@ -359,6 +359,7 @@ def build_application_graph(
         MujocoSimHILProfileConfig,
         build_component_keyed_mujoco_sim_hil_contracts,
         build_mujoco_sim_hil_policy_binding,
+        build_mujoco_sim_hil_strategy_control_factory,
         build_scoped_mujoco_sim_hil_composition,
     )
     from control_composition.observability import SourceDifferenceSpec
@@ -501,6 +502,9 @@ def build_application_graph(
                 "human": action_schema,
                 "policy": action_schema,
             }
+        ),
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(contracts)
         ),
     )
     runtime_rig_holder["rig"] = target.runtime.rig

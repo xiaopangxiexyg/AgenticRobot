@@ -207,6 +207,28 @@ def test_optional_sim_deploy_integrations_do_not_spread_into_simulation_core() -
     ) == {}
 
 
+def test_sim_hil_strategy_control_construction_is_application_owned() -> None:
+    sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
+    station_composition = (
+        REPO_ROOT / "control_station" / "composition" / "mujoco_sim_hil.py"
+    )
+    station_factory = (
+        REPO_ROOT / "control_station" / "sim_hil_profile" / "factory.py"
+    )
+    strategy_control_constructors = {
+        "CompositionStrategyControl",
+        "TimeWindowRetentionSpec",
+        "build_initial_strategy_revision",
+    }
+
+    assert "control_composition" not in _absolute_import_roots(sim_target)
+    assert _called_names(sim_target).isdisjoint(strategy_control_constructors)
+    assert strategy_control_constructors <= _called_names(station_composition)
+    assert "build_mujoco_sim_hil_strategy_control_factory" in _called_names(
+        station_factory
+    )
+
+
 def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> None:
     target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
     composition_binding = (

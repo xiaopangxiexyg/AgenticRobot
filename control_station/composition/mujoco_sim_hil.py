@@ -31,21 +31,25 @@ from control_composition.eligibility import (
 )
 from control_composition.composition import (
     FORMAL_COMPONENT_STRATEGY_ALGEBRA_V2,
+    FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
     CompositionAuthorityDisposition,
     CompositionAuthorityGateSpec,
     CompositionDynamicParameterContract,
     CompositionDynamicParameterDraft,
     CompositionInputAdmissionReceipt,
     CompositionSpec,
+    CompositionStrategyControl,
     ComponentCompositionRuleSet,
     FormalComponentCompositionStrategyV2,
     FormalCompositionStrategySpec,
     PoseComponentCompositionRule,
     QposComponentCompositionRule,
+    build_initial_strategy_revision,
     build_composition_input_draft,
     decide_composition_authority_disposition,
     hand_action_spec_semantic_hash,
 )
+from control_composition.retention import TimeWindowRetentionSpec
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.control_trace import ControlTraceFact
 from dataset_interface.composition_control_trace import (
@@ -70,7 +74,11 @@ from robot_motion.deploy import (
     PolicyActionEmission,
     project_policy_action_emission,
 )
-from robot_motion.runtime.control_admission import ControlCut
+from robot_motion.runtime.control_admission import (
+    ControlAdmissionCoordinator,
+    ControlCut,
+)
+from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
 from sim.mujoco.deploy import MujocoDeployRuntime
 from teleop_runtime.action.human_proposal import (
     HumanCommandEmission,
@@ -352,6 +360,77 @@ class MujocoSimHILContracts:
                 domain=MUJOCO_SIM_HIL_CONTRACT_HASH_DOMAIN_V1,
             ),
         )
+
+
+MujocoSimHILStrategyControlFactory = Callable[
+    [ControlAdmissionCoordinator, ProducerEpochRegistry, float],
+    CompositionStrategyControl,
+]
+
+
+def build_mujoco_sim_hil_strategy_control_factory(
+    contracts: object,
+) -> MujocoSimHILStrategyControlFactory | None:
+    """Bind application-owned hot composition control for one target runtime.
+
+    Static composition profiles return ``None``.  Dynamic profiles close over
+    their already-validated application contracts; runtime identity and clock
+    facts are read from the target-owned admission coordinator at construction
+    time.  The simulator therefore receives a factory without selecting or
+    reconstructing composition semantics.
+    """
+
+    dynamic_contract = getattr(contracts, "dynamic_parameter_contract", None)
+    if dynamic_contract is None:
+        return None
+    initial_alpha = dict(getattr(contracts, "initial_alpha_by_component"))
+    composition_spec = getattr(contracts, "composition_spec")
+    strategy_spec = getattr(contracts, "strategy_spec")
+    component_rule_set = getattr(contracts, "component_rule_set")
+
+    def build_strategy_control(
+        coordinator: ControlAdmissionCoordinator,
+        producer_epochs: ProducerEpochRegistry,
+        available_at: float,
+    ) -> CompositionStrategyControl:
+        runtime_session_id = coordinator.clock_domain.runtime_session_id
+        control_domain_id = coordinator.control_domain_id
+        clock_domain_id = coordinator.clock_domain.clock_domain_id
+        strategy_instance_id = f"{strategy_spec.strategy_id}:control"
+        initial_revision = build_initial_strategy_revision(
+            runtime_session_id=runtime_session_id,
+            control_domain_id=control_domain_id,
+            strategy_instance_id=strategy_instance_id,
+            request_id=f"{strategy_spec.strategy_id}:initial",
+            strategy_mode=FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
+            composition_spec=composition_spec,
+            strategy_spec=strategy_spec,
+            component_rule_set=component_rule_set,
+            dynamic_parameter_contract=dynamic_contract,
+            initial_alpha_by_component=initial_alpha,
+            available_at=float(available_at),
+            available_clock_domain_id=clock_domain_id,
+        )
+        return CompositionStrategyControl(
+            runtime_session_id=runtime_session_id,
+            control_domain_id=control_domain_id,
+            strategy_instance_id=strategy_instance_id,
+            coordinator=coordinator,
+            producer_epochs=producer_epochs,
+            retention_spec=TimeWindowRetentionSpec(
+                spec_id="mujoco-sim-hil-strategy-control-window-v1",
+                history_window_sec=2.0,
+                max_future_lead_sec=1.0,
+                max_effective_duration_sec=1.0,
+                max_late_arrival_sec=0.0,
+            ),
+            supported_strategy_modes=(
+                FORMAL_COMPONENT_STRATEGY_MODE_WEIGHTED_V1,
+            ),
+            initial_revision=initial_revision,
+        )
+
+    return build_strategy_control
 
 
 def build_component_keyed_mujoco_sim_hil_contracts(
@@ -3248,5 +3327,6 @@ __all__ = [
     "build_mujoco_sim_hil_agent_skill_execution_manifest",
     "build_mujoco_sim_hil_agent_skill_station_manifest",
     "build_mujoco_sim_hil_policy_binding",
+    "build_mujoco_sim_hil_strategy_control_factory",
     "build_scoped_mujoco_sim_hil_composition",
 ]

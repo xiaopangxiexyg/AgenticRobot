@@ -29,6 +29,7 @@ from control_station.composition import (
     MujocoTrajectoryPublicationProfile,
     MujocoTrajectoryPublicationRequest,
     build_mujoco_sim_hil_policy_binding,
+    build_mujoco_sim_hil_strategy_control_factory,
     build_scoped_mujoco_sim_hil_composition,
 )
 from control_station.composition.mujoco_policy_human_residual import (
@@ -359,6 +360,11 @@ def _build_running_fixture():
     target = build_mujoco_sim_hil_target(
         config=target_config,
         contracts=residual_profile.sim_hil_contracts,
+        composition_strategy_control_factory=(
+            build_mujoco_sim_hil_strategy_control_factory(
+                residual_profile.sim_hil_contracts
+            )
+        ),
         hand_specs_by_side={"right": HandActionSpec.dmtac_gripper("right")},
         prepared_target=prepared,
         component_execution_binding=execution_binding,
