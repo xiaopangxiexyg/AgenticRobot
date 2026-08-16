@@ -66,6 +66,9 @@ lower domains must not import application/profile layers
 - information plan 与 source-eligibility enablement 已从一般 `MujocoDeployConfig` 移到可选
   `MujocoCompositionRuntimeConfig`。Control Station 根据已选 contracts 显式构造该配置，Sim-HIL target 只校验
   binding 完整性并转交；具体 retention window 仍由 MuJoCo composition binding 按 target cadence 实现。
+  未提供该配置的一般 MuJoCo/Agent-skill runtime 不创建 composition topology、retention 或 trace emitter；
+  兼容属性为 `None`，误用 composition 兼容方法时显式失败。启用 composer authority 或注入 strategy/schema
+  时必须同时显式提供该配置。
 - proposal promotion 的 target catalog/group/schema 与期限策略已收敛到
   `sim.mujoco.deploy.composition_promotion`；它是无状态 target policy，不做 admission、序号推进、authority、
   safety 或 dispatch。proposal 幂等缓存、admission、target state、canonical safety 和 dispatch 继续只由

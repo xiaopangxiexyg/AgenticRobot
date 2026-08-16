@@ -64,6 +64,47 @@ def _annotated_class_fields(path: Path, class_name: str) -> set[str]:
     raise AssertionError(f"Class {class_name!r} not found in {path}.")
 
 
+def _call_keyword_names_in_function(
+    path: Path,
+    *,
+    function_name: str,
+    called_name: str,
+) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == function_name
+        ),
+        None,
+    )
+    if function is None:
+        raise AssertionError(f"Function {function_name!r} not found in {path}.")
+    calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and (
+            (
+                isinstance(node.func, ast.Name)
+                and node.func.id == called_name
+            )
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == called_name
+            )
+        )
+    ]
+    if len(calls) != 1:
+        raise AssertionError(
+            f"Expected one {called_name!r} call in {function_name!r}; "
+            f"found {len(calls)}."
+        )
+    return {keyword.arg for keyword in calls[0].keywords if keyword.arg is not None}
+
+
 def _legacy_mujoco_composition_calls(path: Path) -> set[str]:
     legacy_methods = {
         "capture_composition_context_snapshot",
@@ -278,6 +319,24 @@ def test_optional_composition_settings_are_not_general_target_config() -> None:
     assert "build_mujoco_sim_hil_composition_runtime_config" in _called_names(
         station_factory
     )
+
+
+def test_general_mujoco_target_does_not_opt_into_composition_runtime() -> None:
+    sim_target = REPO_ROOT / "sim" / "mujoco" / "deploy" / "sim_hil_target.py"
+
+    sim_hil_runtime_keywords = _call_keyword_names_in_function(
+        sim_target,
+        function_name="build_mujoco_sim_hil_target",
+        called_name="MujocoDeployRuntime",
+    )
+    agent_skill_runtime_keywords = _call_keyword_names_in_function(
+        sim_target,
+        function_name="build_mujoco_agent_skill_motion_target",
+        called_name="MujocoDeployRuntime",
+    )
+
+    assert "composition_runtime_config" in sim_hil_runtime_keywords
+    assert "composition_runtime_config" not in agent_skill_runtime_keywords
 
 
 def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> None:

@@ -49,6 +49,7 @@ from sim.mujoco.adapters import (
     MujocoPositionExecutionRig,
 )
 from sim.mujoco.deploy import (
+    MujocoCompositionRuntimeConfig,
     MujocoCoupledPoseToQposResolver,
     MujocoDeployConfig,
     MujocoDeployRuntime,
@@ -274,6 +275,7 @@ def _runtime(
             anchor=anchor,
             profile=safety_profile,
         ),
+        composition_runtime_config=MujocoCompositionRuntimeConfig(),
         composition_strategy=strategy,
         clock=clock,
     )
