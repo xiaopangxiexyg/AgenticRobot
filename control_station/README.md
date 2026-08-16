@@ -107,12 +107,36 @@ target as caller-authored values. Both motion Routes share the existing
 authoritative application, safety/IK/reference/dispatch owner and domain-HOLD
 boundary; each has its own Route, evaluator, timeout and operation worker.
 
-The first formal MuJoCo safety-envelope runtime intentionally publishes only
-the independently reviewed `standard` profile, and its Route allowlist covers
-both motion Skills. Preview absolute/relative workspace JSON files are visual
-review inputs, not runtime safety profiles. `strict` or `relaxed` may be added
-later as separate reviewed lower profiles without changing the Skill schema;
-they must not be synthesized by scaling `standard`.
+The same semantic surface defines three fixed level-orientation Skills:
+`motion.set_tcp_level_forward@1`,
+`motion.set_tcp_level_forward_left_30@1`, and
+`motion.set_tcp_level_forward_right_30@1`. All three keep the selected arm's
+`tool_tcp` position fixed and set the gripper to a horizontal heading in the
+canonical desk plane. Their headings are fixed absolute values (0, +30, and
+-30 degrees); they are not relative rotations, and repeated calls do not
+accumulate yaw. The reusable schema and lifecycle select `left_arm` or
+`right_arm` through `component_id` and emit an action only for that component.
+
+The current concrete no-model MuJoCo Agent Gateway launcher remains the
+pre-existing single-`right_arm` deployment and does not publish these three
+orientation Routes. Its `right_arm_base` frame lacks the canonical desk-axis
+binding required by the primitives, and its existing 15-degree safety profile
+does not admit every fixed 30-degree heading. Publishing a right-only Route or
+silently widening that profile would misrepresent the reusable contract. This
+is a deployment-binding limit, not a primitive limit: the lower primitive,
+generic request schema, and single-component lifecycle are arm-neutral and are
+tested with independently bound left- and right-arm action schemas. A future
+left-, right-, or dual-arm launcher must bind the canonical desk frame plus its
+own observation, safety-envelope, IK, and dispatch contracts before exposing
+an Active Route.
+
+The MuJoCo safety-envelope runtime keeps the independently reviewed `standard`
+profile unchanged and allowlisted only for its existing absolute-pose and
+cardinal-step Routes. Preview absolute/relative workspace JSON files are
+visual review inputs, not runtime safety profiles. Any future envelope for the
+fixed orientation Skills must be a separately reviewed lower profile bound to
+the exact desk-frame deployment; it must not be synthesized by scaling or
+widening `standard`.
 
 New primitive families should reuse the same Gateway catalog, admission and
 domain-HOLD path while retaining their own semantic Skill/schema when their

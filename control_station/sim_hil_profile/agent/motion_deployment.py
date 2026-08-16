@@ -160,6 +160,7 @@ class MujocoAgentTcpPoseMotionProfile:
     frame_graph_hash: str
     tool_config_hash: str
     calibration_hash: str
+    component_id: str = "right_arm"
     workspace_bounds: tuple[float, float, float, float, float, float] = (
         MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1
     )
@@ -182,12 +183,15 @@ class MujocoAgentTcpPoseMotionProfile:
             "frame_graph_hash",
             "tool_config_hash",
             "calibration_hash",
+            "component_id",
         ):
             object.__setattr__(
                 self,
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
+        if self.component_id not in {"left_arm", "right_arm"}:
+            raise ValueError("component_id must be left_arm or right_arm.")
         bounds = tuple(
             _finite(value, field_name="workspace_bounds item")
             for value in self.workspace_bounds
@@ -223,7 +227,7 @@ class MujocoAgentTcpPoseMotionProfile:
         return canonical_content_hash(
             {
                 "profile_id": MUJOCO_AGENT_TCP_POSE_PARAMETER_PROFILE_ID_V1,
-                "component_ids": ("right_arm",),
+                "component_ids": (self.component_id,),
                 "controlled_frame_id": "tool_tcp",
                 "reference_frame_id": self.reference_frame_id,
                 "reference_frame_spec_hash": self.reference_frame_spec_hash,
@@ -274,8 +278,8 @@ class MujocoAgentTcpCardinalStepProfile:
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
-        if self.component_id != "right_arm":
-            raise ValueError("The first MuJoCo cardinal-step profile binds right_arm.")
+        if self.component_id not in {"left_arm", "right_arm"}:
+            raise ValueError("Cardinal-step component must be left_arm or right_arm.")
         primitives = tuple(self.primitives)
         if any(
             not isinstance(item, TCPPoseDisplacementPrimitive)
@@ -448,6 +452,7 @@ class MujocoAgentTcpPoseDeploymentBinding:
     trace_requirement_profile_id: str
     executor_id: str
     explicit_exclusions: tuple[str, ...]
+    component_id: str = "right_arm"
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...] = ()
 
     def __post_init__(self) -> None:
@@ -477,12 +482,15 @@ class MujocoAgentTcpPoseDeploymentBinding:
             "calibration_hash",
             "trace_requirement_profile_id",
             "executor_id",
+            "component_id",
         ):
             object.__setattr__(
                 self,
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
+        if self.component_id not in {"left_arm", "right_arm"}:
+            raise ValueError("component_id must be left_arm or right_arm.")
         exclusions = tuple(sorted(set(self.explicit_exclusions)))
         if not exclusions or any(not str(item).strip() for item in exclusions):
             raise ValueError("explicit_exclusions must contain non-empty values.")
@@ -506,12 +514,12 @@ class MujocoAgentTcpPoseDeploymentBinding:
                 **{
                     field_name: getattr(self, field_name)
                     for field_name in self.__dataclass_fields__
-                    if field_name != "safety_envelope_refs"
+                    if field_name not in {"component_id", "safety_envelope_refs"}
                 },
                 "safety_envelope_refs": tuple(
                     item.to_wire() for item in self.safety_envelope_refs
                 ),
-                "controlled_component_ids": ("right_arm",),
+                "controlled_component_ids": (self.component_id,),
                 "controlled_frame_id": "tool_tcp",
                 "target_kind": "sim",
                 "source_kind": "agent_skill",
@@ -673,8 +681,15 @@ class MujocoAgentTcpPoseContractBundle:
         if cardinal_step_entry.deployment_binding.deployment_binding_hash != (
             self.cardinal_step_deployment_binding.semantic_content_hash
         ):
+            raise ValueError("Cardinal-step Route uses another deployment binding.")
+        if self.deployment_binding.component_id != self.motion_profile.component_id:
+            raise ValueError("Motion deployment and profile component mismatch.")
+        if (
+            self.cardinal_step_deployment_binding.component_id
+            != self.cardinal_step_profile.component_id
+        ):
             raise ValueError(
-                "Cardinal-step Route uses another deployment binding."
+                "Cardinal-step deployment and profile component mismatch."
             )
         if motion_entry.evaluation_plan_hash != (
             self.evaluation_plan.semantic_content_hash

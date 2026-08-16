@@ -30,7 +30,10 @@ from control_station.agent_gateway.runtime.station_operation_worker import (
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action import ComponentAction
 from robot_motion.coordinate_frames import CoordinateFrameSpec
-from robot_motion.primitives import TCPPoseDisplacementPrimitive
+from robot_motion.primitives import (
+    LevelTCPOrientationPrimitive,
+    TCPPoseDisplacementPrimitive,
+)
 from robot_motion.relative_action import (
     pose_matrix_to_xyzquat,
     xyzquat_to_pose_matrix,
@@ -100,6 +103,45 @@ def resolve_tcp_displacement_primitive_target(
         evidence_refs=(
             "tcp-displacement-primitive:" + primitive.semantic_content_hash,
             "tcp-displacement-target:" + target.semantic_content_hash,
+        ),
+    )
+
+
+def resolve_level_tcp_orientation_primitive_target(
+    *,
+    measured_pose: tuple[float, ...],
+    primitive: LevelTCPOrientationPrimitive,
+    reference_frame_spec: CoordinateFrameSpec,
+) -> MujocoAgentTcpTargetResolution:
+    """Resolve one fixed absolute horizontal heading at activation.
+
+    The measured pose contributes translation only.  The primitive replaces
+    orientation with its profile-owned absolute heading, so calls never add a
+    relative yaw to the current TCP orientation.
+    """
+
+    if not isinstance(primitive, LevelTCPOrientationPrimitive):
+        raise TypeError("primitive must be a fixed level TCP orientation.")
+    if not isinstance(reference_frame_spec, CoordinateFrameSpec):
+        raise TypeError("reference_frame_spec must be typed.")
+    target = primitive.apply(
+        xyzquat_to_pose_matrix(
+            measured_pose,
+            name="tcp_level_orientation_activation_pose",
+        ),
+        reference_frame_spec=reference_frame_spec,
+    )
+    return MujocoAgentTcpTargetResolution(
+        target_pose=tuple(
+            float(value)
+            for value in pose_matrix_to_xyzquat(
+                target.target_pose,
+                name="tcp_level_orientation_target_pose",
+            )
+        ),
+        evidence_refs=(
+            "tcp-level-orientation-primitive:" + primitive.semantic_content_hash,
+            "tcp-level-orientation-target:" + target.semantic_content_hash,
         ),
     )
 
@@ -259,10 +301,39 @@ class MujocoAgentTcpPoseSkillLifecycle:
         if target_resolver is not None and not callable(target_resolver):
             raise TypeError("target_resolver must be callable or None.")
         poses = parameters.get("pose_targets_by_component")
-        if target_resolver is None and (
-            not isinstance(poses, Mapping) or set(poses) != {"right_arm"}
-        ):
-            raise ValueError("TCP pose lifecycle requires exactly right_arm.")
+        if target_resolver is None:
+            if not isinstance(poses, Mapping) or len(poses) != 1:
+                raise ValueError(
+                    "TCP pose lifecycle requires exactly one arm component."
+                )
+            component_id = str(next(iter(poses)))
+        else:
+            requested_component = parameters.get("component_id")
+            if requested_component is None and isinstance(poses, Mapping) and len(
+                poses
+            ) == 1:
+                requested_component = next(iter(poses))
+            component_id = _required(
+                requested_component,
+                field_name="component_id",
+            )
+        if component_id not in {"left_arm", "right_arm"}:
+            raise ValueError(
+                "TCP pose lifecycle component_id must be left_arm or right_arm."
+            )
+        if component_id not in application.runtime.action_schema.component_ids:
+            raise ValueError(
+                "TCP pose lifecycle component is absent from the runtime schema."
+            )
+        if motion_profile.component_id != component_id:
+            raise ValueError(
+                "TCP pose lifecycle component does not match the motion profile."
+            )
+        if deployment_binding.component_id != component_id:
+            raise ValueError(
+                "TCP pose lifecycle component does not match the deployment "
+                "binding."
+            )
         exact = {
             "reference_frame_id": motion_profile.reference_frame_id,
             "reference_frame_spec_hash": motion_profile.reference_frame_spec_hash,
@@ -281,6 +352,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self.deployment_binding = deployment_binding
         self.evaluation_plan = evaluation_plan
         self.motion_profile = motion_profile
+        self.component_id = component_id
         self.request = request
         self.operation = operation
         self._target_resolver = target_resolver
@@ -288,8 +360,8 @@ class MujocoAgentTcpPoseSkillLifecycle:
             None
             if target_resolver is not None
             else _pose(
-                poses["right_arm"],
-                field_name="pose_targets_by_component.right_arm",
+                poses[component_id],
+                field_name=f"pose_targets_by_component.{component_id}",
             )
         )
         self.action: ComponentAction | None = (
@@ -298,7 +370,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
             else ComponentAction(
                 action_schema=application.runtime.action_schema,
                 values_by_component={
-                    "right_arm": np.asarray(self.target_pose, dtype=np.float32),
+                    component_id: np.asarray(self.target_pose, dtype=np.float32),
                 },
             )
         )
@@ -351,9 +423,14 @@ class MujocoAgentTcpPoseSkillLifecycle:
 
     def _capture_pose(self) -> tuple[float, ...]:
         values = self.application.capture_tcp_pose_by_component()
-        if set(values) != {"right_arm"}:
-            raise RuntimeError("Measured TCP pose scope is incomplete.")
-        return _pose(values["right_arm"], field_name="measured.right_arm")
+        if self.component_id not in values:
+            raise RuntimeError(
+                "Measured TCP pose does not include the selected arm component."
+            )
+        return _pose(
+            values[self.component_id],
+            field_name=f"measured.{self.component_id}",
+        )
 
     def activate(
         self,
@@ -381,7 +458,10 @@ class MujocoAgentTcpPoseSkillLifecycle:
             self.action = ComponentAction(
                 action_schema=self.application.runtime.action_schema,
                 values_by_component={
-                    "right_arm": np.asarray(self.target_pose, dtype=np.float32),
+                    self.component_id: np.asarray(
+                        self.target_pose,
+                        dtype=np.float32,
+                    ),
                 },
             )
             with self._lock:
@@ -690,7 +770,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
                 "runtime_session_id": request.runtime_session_id,
                 "control_domain_id": self.deployment_binding.control_domain_id,
                 "operation_id": operation.operation_id,
-                "component_id": "right_arm",
+                "component_id": self.component_id,
                 "pose_xyz_quat_xyzw": final_pose,
                 "measured_at": measured_at,
                 "reference_frame_id": self.motion_profile.reference_frame_id,
@@ -808,5 +888,6 @@ __all__ = [
     "MujocoAgentTcpPoseSkillLifecycle",
     "MujocoAgentTcpTargetResolution",
     "mujoco_agent_skill_hold_evidence_from_transition",
+    "resolve_level_tcp_orientation_primitive_target",
     "resolve_tcp_displacement_primitive_target",
 ]
