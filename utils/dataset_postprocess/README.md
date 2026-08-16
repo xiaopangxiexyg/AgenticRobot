@@ -62,6 +62,41 @@ manifest hash/大小变化、未知热端文件或不同 artifact graph 都会 f
 `tactile_paths`、inventory 和 receipt，且发布前重新得到完全相同的 detach audit。因此应先完成并
 验证触觉迁出，再物化相机语义；不要把 NAS/cold root 传给相机工具。
 
+完整物化输出在按同一 inventory 放回触觉、通过严格 v2.3 校验和全视频解码后，可用
+`camera-semantics-promote` 原子接替原 canonical 路径。晋升只接受同文件系统上相互独立、无
+共享 inode 的两个完整数据集：原路径必须被证明为 `swapped`，新路径必须被证明为
+`identity`，两侧触觉 inventory 必须完全相同且都可独立读取。原数据不会删除，而是移动到
+显式 retirement 目录；事务文件记录两侧目录 inode、物化 receipt、计划 hash 和回滚位置：
+
+```bash
+python -m utils.dataset_postprocess camera-semantics-promote \
+  CANONICAL_SWAPPED_ROOT \
+  --corrected-root CORRECTED_FULL_ROOT \
+  --retirement-root RETIREMENT_ROOT \
+  --registry robot_motion/configs/rm65_camera_registry.json
+
+python -m utils.dataset_postprocess camera-semantics-promote \
+  CANONICAL_SWAPPED_ROOT \
+  --corrected-root CORRECTED_FULL_ROOT \
+  --retirement-root RETIREMENT_ROOT \
+  --registry robot_motion/configs/rm65_camera_registry.json \
+  --apply \
+  --expected-plan-hash PLAN_HASH \
+  --confirm-no-active-readers
+```
+
+晋升后应分别复核 canonical 的严格 v2.3、相机 `identity`、触觉 reader eligibility，并先 dry-run
+回滚计划。需要恢复旧数据时只使用事务文件，不手工改名：
+
+```bash
+python -m utils.dataset_postprocess camera-semantics-rollback-promotion \
+  RETIREMENT_ROOT/.transactions/PROMOTION_PLAN_HASH.json
+```
+
+回滚 apply 同样要求冻结的计划 hash 和 `--confirm-no-active-readers`。晋升和回滚都拒绝已有
+目标、符号链接、目录 inode 漂移、活跃触觉事务及跨文件系统操作；它们不删除 cold copy、旧
+数据或纠正数据。
+
 如果输出只用于数值 + RGB/depth/mask 训练，不需要成为可独立恢复全部模态的完整 v2.3 数据集，
 可显式使用默认关闭的 `camera-semantics-prepare-view`。它只选择 episode Parquet、相机 artifact
 和训练所需的小型 metadata，不遍历 `tactile/`，也不读取、校验或复制触觉 inventory/payload：

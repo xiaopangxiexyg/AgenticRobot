@@ -1080,6 +1080,7 @@ remote_view.sh
 remote_sync_check.sh
 remote_dataset_camera_semantics.sh
 remote_dataset_camera_quarantine.sh
+remote_dataset_camera_promotion.sh
 remote_dataset_tactile_storage.sh
 ```
 
@@ -1103,6 +1104,12 @@ remote_dataset_tactile_storage.sh
   --project '~/DexTeleop' --env dexteleop310 \
   --view-root /data/camera_semantic_prepared_views/bad_trial \
   --audit-root /data/camera_semantic_prepared_views/_invalid_audit
+./remote_dataset_camera_promotion.sh -H dex-remote \
+  --project '~/DexTeleop' --env dexteleop310 --promote \
+  --dataset-root /data/canonical_swapped \
+  --corrected-root /data/corrected_full \
+  --retirement-root /data/retired_swapped \
+  --registry /data/frozen_camera_role_registry.json --dry-run
 ./remote_dataset_tactile_storage.sh -H dex-remote \
   --project '~/DexTeleop' --env dexteleop310 \
   --detach-whole-prefix --dataset-root /data/source_dataset \
@@ -1187,6 +1194,12 @@ remote_dataset_camera_quarantine.sh
   再生成包含目录清单的计划；只有携带完全一致的 `--expected-plan-hash`
   才会在同一文件系统内原子改名到审计目录。有效视图、符号链接、跨文件系统、
   已存在目标均会被拒绝；该入口不删除或覆盖任何数据。
+
+remote_dataset_camera_promotion.sh
+  是完整相机纠正数据接替 canonical 路径的固定 L3 事务入口。它只接受经过严格
+  v2.3、全视频解码、相机 swapped→identity、同触觉 inventory、独立 inode 和同文件系统证明
+  的晋升，旧目录会保留在 retirement root。apply 必须绑定 plan hash 并确认无 reader；回滚只
+  接受已发布事务文件和新的冻结 plan hash。它不提供删除、覆盖或任意参数透传。
 
 remote_dataset_tactile_storage.sh
   是触觉模块可恢复拆装的专用 L3 非运动入口。它只允许只读 status、固定
