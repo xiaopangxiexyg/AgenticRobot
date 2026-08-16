@@ -53,7 +53,6 @@ junit*.xml
 test-results/
 playwright-report/
 .agents
-/AGENTS.md
 .realtime_sync_ssh.exclude
 logs/
 # Canonical local runtime outputs; versioned configs remain package-owned.
