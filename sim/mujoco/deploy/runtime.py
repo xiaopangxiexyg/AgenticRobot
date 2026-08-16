@@ -9,9 +9,6 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 from dataset_contracts.control_trace import ControlTraceFact
-from dataset_interface.composition_control_trace import (
-    CompositionControlTraceEmitter,
-)
 from control_composition.activation import CompositionActivationScope
 from control_composition.information import CompositionInformationPlan
 from control_composition.eligibility import (
@@ -32,11 +29,7 @@ from control_composition.residual_anchor_lifecycle import (
     ResidualAnchorLifecycleDraft,
     ResidualAnchorLifecycleSpec,
 )
-from control_composition.retention import TimeWindowRetentionSpec
-from control_composition.runtime import (
-    CompositeProposalSubmission,
-    ControlCompositionRuntime,
-)
+from control_composition.runtime import CompositeProposalSubmission
 from dataset_contracts.replay import (
     REPLAY_EXECUTION_MODE_SIM_AUTHORITY,
     TargetRuntimeActionContract,
@@ -134,6 +127,7 @@ from robot_motion.deploy import (
 )
 
 from ..adapters import MujocoPositionExecutionRig
+from .composition_binding import build_mujoco_composition_runtime_binding
 from .measurement import (
     MujocoQposMeasurement,
     build_mujoco_backend_measurement,
@@ -1612,32 +1606,7 @@ class MujocoDeployRuntime:
                     rig,
                     **receiver_args,
                 )
-        self._composition_trace_emitter = CompositionControlTraceEmitter(
-            trace_context=self.core.trace_context,
-            trace_sink=self.core.record_external_facts,
-        )
-        composition_strategy_control = None
-        if composition_strategy_control_factory is not None:
-            if composition_strategy is None:
-                raise ValueError(
-                    "A composition strategy control factory requires a "
-                    "formal composition strategy."
-                )
-            composition_strategy_control = composition_strategy_control_factory(
-                self.core.coordinator,
-                self.core.producer_epochs,
-                float(clock()),
-            )
-            if not isinstance(
-                composition_strategy_control,
-                CompositionStrategyControl,
-            ):
-                raise TypeError(
-                    "composition_strategy_control_factory must return "
-                    "CompositionStrategyControl."
-                )
-        self.composition_strategy_control = composition_strategy_control
-        self.policy_topology = ControlCompositionRuntime(
+        self._composition_binding = build_mujoco_composition_runtime_binding(
             runtime_session_id=config.runtime_session_id,
             control_domain_id=config.control_domain_id,
             embodiment_instance_id=config.embodiment_instance_id,
@@ -1645,38 +1614,27 @@ class MujocoDeployRuntime:
             producer_epochs=self.core.producer_epochs,
             action_schema=self.action_schema,
             input_action_schema_by_role=(composition_input_action_schema_by_role),
-            event_emitter=self._composition_trace_emitter,
+            trace_context=self.core.trace_context,
+            trace_sink=self.core.record_external_facts,
             proposal_admitter=self.core.admit_proposal,
-            context_retention_spec=TimeWindowRetentionSpec(
-                spec_id="mujoco-composition-context-latest-v1",
-                history_window_sec=max(0.02, 1.0 / config.decision_hz),
-                max_future_lead_sec=1.0,
-                max_effective_duration_sec=1.0,
-                max_late_arrival_sec=0.0,
-            ),
-            composition_input_retention_spec=TimeWindowRetentionSpec(
-                spec_id="mujoco-composition-input-latest-v1",
-                history_window_sec=max(0.02, 1.0 / config.decision_hz),
-                max_future_lead_sec=1.0,
-                max_effective_duration_sec=1.0,
-                max_late_arrival_sec=0.0,
-            ),
-            source_eligibility_retention_spec=(
-                TimeWindowRetentionSpec(
-                    spec_id="mujoco-composition-source-eligibility-latest-v1",
-                    history_window_sec=max(0.02, 1.0 / config.decision_hz),
-                    max_future_lead_sec=1.0,
-                    max_effective_duration_sec=1.0,
-                    max_late_arrival_sec=0.0,
-                )
-                if config.enable_composition_source_eligibility
-                else None
+            decision_hz=config.decision_hz,
+            enable_source_eligibility=(
+                config.enable_composition_source_eligibility
             ),
             information_plan=config.composition_information_plan,
             composition_strategy=composition_strategy,
-            strategy_control=composition_strategy_control,
+            composition_strategy_control_factory=(
+                composition_strategy_control_factory
+            ),
             clock=clock,
         )
+        self._composition_trace_emitter = (
+            self._composition_binding.trace_emitter
+        )
+        self.composition_strategy_control = (
+            self._composition_binding.strategy_control
+        )
+        self.policy_topology = self._composition_binding.topology
         self._started = False
         self._latest_target_execution_step: AuthoritativeControlStep | None = None
         self._last_dispatch_context: (

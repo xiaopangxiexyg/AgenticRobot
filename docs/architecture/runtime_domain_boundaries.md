@@ -54,9 +54,13 @@ lower domains must not import application/profile layers
   MuJoCo observation 的接线由 `control_station.sim_hil_profile.openpi_policy_source` 持有。
 - deterministic async composition harness 已移到 `tests/support/mujoco_async_topology.py`，不再作为
   `sim.mujoco.deploy` 的运行时导出或发布内容。
-- `sim/mujoco/deploy` 仍同时包含一般 sim target 与可选 composition 接线。这是下一阶段需要拆出的已知边界
-  债务；现阶段门禁只允许该依赖停留在此 integration 子目录，禁止扩散到 sim contracts、task、physics、
-  actuation 和基础 runtime。
+- `sim/mujoco/deploy/composition_binding.py` 现在集中构造可选 composition runtime、retention 和 trace
+  projection；`MujocoDeployRuntime` 保留原有公开属性作为兼容视图，并继续唯一拥有 target state、canonical
+  safety 和 dispatch。composition 依赖只允许停留在此 integration 子目录，禁止扩散到 sim contracts、
+  task、physics、actuation 和基础 runtime。
+- `MujocoDeployRuntime` 的 composition 提交/评估兼容方法与相关配置仍是后续边界债务。迁移这些调用面前，
+  必须先建立窄 port 并保持现有 policy/replay/direct-component/composition 行为等价，不能把 authority、
+  safety 或 dispatch 一并移入 composition binding。
 - `control_station/composition` 仍是 compatibility-scoped 的应用装配区。迁移时只保留 source/target/profile
   绑定，可复用控制语义回到 `control_composition`，MuJoCo 事实与执行回到 `sim`。
 

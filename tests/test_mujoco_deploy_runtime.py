@@ -204,6 +204,20 @@ def build_runtime(
     return runtime, scene, actual_clock
 
 
+def test_composition_binding_preserves_runtime_compatibility_views() -> None:
+    runtime, _scene, _clock = build_runtime()
+
+    assert runtime.policy_topology is runtime._composition_binding.topology
+    assert (
+        runtime.composition_strategy_control
+        is runtime._composition_binding.strategy_control
+    )
+    assert (
+        runtime._composition_trace_emitter
+        is runtime._composition_binding.trace_emitter
+    )
+
+
 def test_authoritative_runtime_can_adopt_one_transferred_owner_and_epoch_source() -> None:
     runtime, _scene, clock = build_runtime()
     config = runtime.core.config

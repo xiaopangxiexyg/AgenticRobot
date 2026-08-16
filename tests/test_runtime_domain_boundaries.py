@@ -31,6 +31,19 @@ def _absolute_import_roots(path: Path) -> set[str]:
     return roots
 
 
+def _called_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            names.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            names.add(node.func.attr)
+    return names
+
+
 def _violations(
     root: Path,
     forbidden_roots: set[str],
@@ -140,3 +153,31 @@ def test_optional_sim_deploy_integrations_do_not_spread_into_simulation_core() -
         {"control_composition"},
         excluded=integration_files,
     ) == {}
+
+
+def test_mujoco_target_runtime_delegates_composition_runtime_construction() -> None:
+    target_runtime = REPO_ROOT / "sim" / "mujoco" / "deploy" / "runtime.py"
+    composition_binding = (
+        REPO_ROOT / "sim" / "mujoco" / "deploy" / "composition_binding.py"
+    )
+    implementation_constructors = {
+        "CompositionControlTraceEmitter",
+        "ControlCompositionRuntime",
+        "TimeWindowRetentionSpec",
+    }
+
+    assert _called_names(target_runtime).isdisjoint(implementation_constructors)
+    assert implementation_constructors <= _called_names(composition_binding)
+
+    runtime_tree = ast.parse(
+        target_runtime.read_text(encoding="utf-8"),
+        filename=str(target_runtime),
+    )
+    imported_symbols = {
+        alias.name
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert "build_mujoco_composition_runtime_binding" in imported_symbols
+    assert imported_symbols.isdisjoint(implementation_constructors)
