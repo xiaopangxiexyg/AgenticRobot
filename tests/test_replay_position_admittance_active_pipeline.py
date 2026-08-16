@@ -265,6 +265,7 @@ def _write_raw_wrench_log(
     return path
 
 
+@pytest.mark.slow_sim
 def test_raw_wrench_active_pipeline_exercises_shared_ik(
     tmp_path: Path,
 ) -> None:
@@ -293,6 +294,7 @@ def test_raw_wrench_active_pipeline_exercises_shared_ik(
         assert rollout["opposite_final_qpos_delta_deg"] < 0.01
 
 
+@pytest.mark.slow_sim
 def test_sub_hold_wrench_is_not_promoted_as_active_ik_coverage(
     tmp_path: Path,
 ) -> None:
@@ -318,6 +320,7 @@ def test_sub_hold_wrench_is_not_promoted_as_active_ik_coverage(
         assert coverage["detail"]["active_qref_motion_ticks"] == 0
 
 
+@pytest.mark.slow_sim
 def test_normal_shadow_envelope_is_replayed_under_cautious_active_caps(
     tmp_path: Path,
 ) -> None:
@@ -344,6 +347,7 @@ def test_normal_shadow_envelope_is_replayed_under_cautious_active_caps(
         assert rollout["offset_norm_m"]["max"] <= 0.002 + 1e-9
 
 
+@pytest.mark.slow_sim
 @pytest.mark.parametrize(
     (
         "active_envelope",
@@ -524,6 +528,7 @@ def test_mujoco_replay_execution_config_v2_changes_only_source_latch() -> None:
     ) == v1
 
 
+@pytest.mark.slow_sim
 def test_raw_wrench_active_pipeline_runs_through_physical_mujoco(
     tmp_path: Path,
 ) -> None:
@@ -561,6 +566,7 @@ def test_raw_wrench_active_pipeline_runs_through_physical_mujoco(
     assert comparison["selected_measured_translation_m"]["max"] > 0.0
 
 
+@pytest.mark.slow_sim
 def test_right_combined_formal_active_runs_through_physical_mujoco(
     tmp_path: Path,
 ) -> None:
@@ -612,6 +618,7 @@ def test_right_combined_formal_active_runs_through_physical_mujoco(
     assert comparison["selected_measured_rotation_deg"]["max"] > 0.0
 
 
+@pytest.mark.slow_sim
 @pytest.mark.parametrize(
     (
         "envelope_name",
@@ -690,6 +697,7 @@ def test_larger_envelope_mujoco_abrupt_release_retains_frozen_catchup_gate(
     )
 
 
+@pytest.mark.slow_sim
 def test_half_normal_mujoco_endpoint_guard_holds_before_larger_qref_dispatch(
     tmp_path: Path,
 ) -> None:

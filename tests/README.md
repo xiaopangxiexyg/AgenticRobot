@@ -31,6 +31,7 @@ From the repository root:
 
 ```bash
 python -m pytest --collect-only -q
+python -m pytest -q -m "unit and not optional and not hardware and not slow_sim"
 python -m pytest -q -m "unit and not optional and not hardware"
 python -m pytest -q -m "contract and not optional and not hardware"
 python -m pytest -q -m "integration and not optional and not hardware"
@@ -45,6 +46,10 @@ audited.  Do not treat a successful default run as coverage of those suites.
 
 - `unit`: deterministic in-process behavior.  This is the transitional default
   for modules not yet listed in `tests/conftest.py`.
+- `slow_sim`: an orthogonal cost marker for long-running deterministic
+  simulation, IK replay, or physical closed-loop verification.  It remains in
+  the complete `unit`/`integration` gates and is excluded only by an explicit
+  fast selector.
 - `integration`: multi-component, filesystem, worker, writer, or loopback
   behavior.
 - `contract`: an orthogonal public schema, dependency-boundary, action, or data
@@ -60,6 +65,11 @@ The filename sets in `tests/conftest.py` are a transitional compatibility
 mechanism that preserves current pytest node IDs.  New tests should carry the
 most precise marker possible; unclassified tests must not silently grow into
 multi-component or optional-dependency tests.
+
+Use the `not slow_sim` selector for local edit feedback only.  Marker changes
+must not reduce the complete merge or pre-push gate, and a slow test may move
+to this tier only when an equivalent behavior is still executed by the full
+suite.
 
 ## Finding and adding tests
 

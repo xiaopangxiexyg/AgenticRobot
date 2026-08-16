@@ -252,7 +252,11 @@ PY
 # 共享开发基座门禁：环境、锁、源码解析和核心包边界，不连接硬件。
 bash scripts/verify_dev_base.sh
 
-# 修改后最快的默认回归层：纯进程内单元测试。
+# 日常快速反馈：保留普通单元测试，显式排除已审查的长时仿真/IK 闭环。
+PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python -m pytest -m 'unit and not optional and not slow_sim' -q
+
+# 完整单元回归：合并、提交和推送前仍需执行，不排除 slow_sim。
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   python -m pytest -m 'unit and not optional' -q
 
@@ -265,9 +269,10 @@ PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   python -m pytest -q
 ```
 
-测试按 `unit`、`contract`、`integration`、`optional` 和 `hardware` marker 分层；mocked 硬件行为仍
-属于 `unit`/`integration`，`hardware` 仅留给未来必须连接真实设备的测试。`pyarrow` 是正式 parquet
-数据写盘和 integration 测试的依赖，完整环境会安装它。
+测试按 `unit`、`contract`、`integration`、`optional`、`slow_sim` 和 `hardware` marker 分层；
+`slow_sim` 是与执行层正交的耗时标记，仅用于显式快速选择，完整单元/集成门禁仍会执行它。
+mocked 硬件行为仍属于 `unit`/`integration`，`hardware` 仅留给未来必须连接真实设备的测试。
+`pyarrow` 是正式 parquet 数据写盘和 integration 测试的依赖，完整环境会安装它。
 
 基础数值栈和双臂 IK：
 
