@@ -17,7 +17,6 @@ from runtime_artifact_resolution import (
 )
 from scripts import runtime_artifact_migration as migration
 
-
 pytestmark = pytest.mark.integration
 
 

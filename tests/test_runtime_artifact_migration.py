@@ -8,7 +8,6 @@ import pytest
 
 from scripts import runtime_artifact_migration as migration
 
-
 pytestmark = pytest.mark.integration
 
 

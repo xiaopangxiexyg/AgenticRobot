@@ -9,7 +9,6 @@ import pytest
 import runtime_artifact_migration as archive
 from scripts import runtime_artifact_archive as archive_cli
 
-
 pytestmark = pytest.mark.integration
 
 
