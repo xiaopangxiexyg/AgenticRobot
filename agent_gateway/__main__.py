@@ -16,6 +16,10 @@ def main(argv: list[str] | None = None) -> int:
         from .profiles.real.gateway_cli import main as real_rm65_main
 
         return int(real_rm65_main(values[1:]))
+    if values and values[0] == "allocate-unix-endpoint":
+        from .transport.endpoint_cli import main as endpoint_main
+
+        return int(endpoint_main(values[1:]))
 
     parser = argparse.ArgumentParser(
         prog="python -m agent_gateway",
@@ -24,8 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "profile",
         nargs="?",
-        choices=("mujoco", "real-rm65"),
-        help="concrete Gateway deployment profile to run",
+        choices=("mujoco", "real-rm65", "allocate-unix-endpoint"),
+        help="Gateway deployment profile or transport utility",
     )
     if not values:
         parser.print_help()

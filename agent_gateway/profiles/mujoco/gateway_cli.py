@@ -21,6 +21,10 @@ from typing import Any
 from project_paths import repo_root
 from sim.mujoco.deploy import MujocoSimHILTargetConfig
 
+from agent_gateway.transport.unix_transport import (
+    validate_agent_gateway_unix_server_preflight,
+)
+
 from .motion_factory import (
     MujocoAgentArtifactStorageConfig,
     MujocoAgentTcpPoseHistoryStorageConfig,
@@ -43,7 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "absolute Unix socket path; its real, non-world-writable parent "
-            "must already exist and an existing endpoint is never replaced"
+            "must already exist, the encoded path must fit Linux's 107-byte "
+            "limit, and an existing endpoint is never replaced"
         ),
     )
     parser.add_argument(
@@ -233,6 +238,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--client-uid must be non-negative")
     if args.max_retained_operations <= 0:
         parser.error("--max-retained-operations must be positive")
+    try:
+        validate_agent_gateway_unix_server_preflight(
+            socket_path=socket_path,
+            peer_idle_timeout_sec=args.peer_idle_timeout_sec,
+        )
+    except (FileExistsError, TypeError, ValueError) as error:
+        parser.error(f"--socket-path preflight failed: {error}")
     runtime_session_id = _resolved_runtime_session_id(args.runtime_session_id)
     history_storage = None
     if args.history_root is not None:

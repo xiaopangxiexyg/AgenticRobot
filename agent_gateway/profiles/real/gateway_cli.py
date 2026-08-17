@@ -12,6 +12,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from agent_gateway.transport.unix_transport import (
+    validate_agent_gateway_unix_server_preflight,
+)
 from robot_motion.rm65 import RM65_BIMANUAL_POSITION_V1_NAME
 from teleop_runtime.skill_deploy import (
     ExclusiveRM65SkillDeploymentProfile,
@@ -39,7 +42,15 @@ def build_parser() -> argparse.ArgumentParser:
             "trusted profile resolves and the exact confirmation is present."
         ),
     )
-    parser.add_argument("--socket-path", type=Path, required=True)
+    parser.add_argument(
+        "--socket-path",
+        type=Path,
+        required=True,
+        help=(
+            "absolute Unix socket path in an existing private real directory; "
+            "the encoded path must fit Linux's 107-byte limit"
+        ),
+    )
     parser.add_argument("--calibration-profile", type=Path, required=True)
     parser.add_argument("--arm-ip-assignment", type=Path, required=True)
     parser.add_argument("--left-tool-profile", type=Path, required=True)
@@ -257,6 +268,13 @@ def main(argv: list[str] | None = None) -> int:
             "--camera-config, --camera-registry, and --artifact-root must be "
             "provided together"
         )
+    try:
+        validate_agent_gateway_unix_server_preflight(
+            socket_path=socket_path,
+            peer_idle_timeout_sec=args.peer_idle_timeout_sec,
+        )
+    except (FileExistsError, TypeError, ValueError) as error:
+        parser.error(f"--socket-path preflight failed: {error}")
     files = {
         "calibration_profile": _absolute_existing_file(
             parser,

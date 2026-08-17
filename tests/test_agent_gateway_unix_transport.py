@@ -164,6 +164,20 @@ def test_peer_map_is_one_to_one_and_rejects_unconfigured_uid() -> None:
         )
 
 
+def test_server_preflight_reports_encoded_path_budget_without_relocation() -> None:
+    overlong = "/" + "a" * 108
+
+    with pytest.raises(ValueError) as captured:
+        unix_transport.validate_agent_gateway_unix_server_preflight(
+            socket_path=overlong,
+        )
+
+    message = str(captured.value)
+    assert "uses 109 encoded bytes" in message
+    assert "at most 107" in message
+    assert "will not relocate it automatically" in message
+
+
 def test_server_refuses_existing_endpoint_and_unlinks_only_its_own_socket(
     short_unix_socket_path_factory,
 ) -> None:

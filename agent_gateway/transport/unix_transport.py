@@ -209,9 +209,14 @@ def validate_agent_gateway_unix_server_preflight(
         raise ValueError("socket_path must be a non-empty absolute path.")
     if "\x00" in path:
         raise ValueError("Abstract or NUL-containing Unix paths are forbidden.")
-    if len(os.fsencode(path)) > MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES:
+    path_bytes = len(os.fsencode(path))
+    if path_bytes > MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES:
         raise ValueError(
-            "socket_path exceeds the Linux Unix-socket 107-byte limit."
+            "socket_path uses "
+            f"{path_bytes} encoded bytes; Linux permits at most "
+            f"{MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES}. Choose a shorter "
+            "explicit endpoint path; the Gateway will not relocate it "
+            "automatically."
         )
     parent = os.path.dirname(path)
     try:

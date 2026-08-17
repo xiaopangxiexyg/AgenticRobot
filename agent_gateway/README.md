@@ -122,11 +122,29 @@ read execution.
 The canonical MuJoCo entrypoint is:
 
 ```bash
+DEXTELEOP_GATEWAY_SOCKET="$(
+  python -m agent_gateway allocate-unix-endpoint
+)"
+
 python -m agent_gateway mujoco \
-  --socket-path /absolute/private/gateway.sock \
+  --socket-path "${DEXTELEOP_GATEWAY_SOCKET}" \
   --task-config /absolute/task_config.json \
   --artifact-root /absolute/private/artifact_cache
 ```
+
+`allocate-unix-endpoint` creates a unique mode-0700 directory under
+`<DexTeleop>/temp/ag/` and prints its absent `g.sock` pathname. This separates
+the bounded transport namespace from longer history, Artifact, Experience and
+log paths. Use `--format json` when the allocation metadata should be retained
+alongside a run record.
+
+The allocated endpoint remains explicit: pass the exact returned path to both
+the lower Gateway and RPent; neither side discovers or silently relocates it.
+Linux limits pathname-based Unix sockets to 107 encoded bytes. Both MuJoCo and
+real launchers retain a final validation before constructing a simulator,
+device, or lower owner, and the server repeats it immediately before bind. An
+advanced caller may pass `--root`, but is then responsible for choosing a root
+that leaves enough pathname budget.
 
 `--artifact-root` is optional and default-off. Supplying a real,
 non-world-writable directory enables the read-only

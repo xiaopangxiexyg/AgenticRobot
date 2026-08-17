@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_gateway.profiles.mujoco import gateway_cli
 from agent_gateway.profiles.mujoco.gateway_cli import (
     _absolute_managed_directory,
     _resolved_runtime_session_id,
@@ -124,3 +125,39 @@ def test_artifact_root_preflight_rejects_symlink_and_world_writable(tmp_path) ->
             managed,
             flag="--artifact-root",
         )
+
+
+def test_cli_rejects_overlong_socket_before_simulator_assembly(
+    monkeypatch,
+    capsys,
+) -> None:
+    assembled = False
+
+    def should_not_assemble(**_kwargs):
+        nonlocal assembled
+        assembled = True
+        raise AssertionError("socket preflight must precede simulator assembly")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "build_mujoco_agent_tcp_pose_gateway_session",
+        should_not_assemble,
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main(
+            [
+                "--socket-path",
+                "/" + "a" * 108,
+                "--task-config",
+                str(gateway_cli.repo_root() / "pyproject.toml"),
+            ]
+        )
+
+    assert captured.value.code == 2
+    assert assembled is False
+    error = capsys.readouterr().err
+    assert "--socket-path preflight failed" in error
+    assert "uses 109 encoded bytes" in error
+    assert "will not relocate it automatically" in error
+    assert "Traceback" not in error

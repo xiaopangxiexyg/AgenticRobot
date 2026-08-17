@@ -50,15 +50,23 @@ identity；只有受控复现时才显式传入 `--runtime-session-id`。历史�
 
 ```bash
 export RPENT_ROOT=/absolute/path/to/RPent
-mkdir -p "${RPENT_ROOT}/temp/runtime/sim_gateway"
-chmod 700 "${RPENT_ROOT}/temp/runtime/sim_gateway"
+export DEXTELEOP_GATEWAY_SOCKET="$(
+  python -m agent_gateway allocate-unix-endpoint
+)"
 
 python -m agent_gateway mujoco \
-  --socket-path "${RPENT_ROOT}/temp/runtime/sim_gateway/gateway.sock" \
+  --socket-path "${DEXTELEOP_GATEWAY_SOCKET}" \
   --task-config "${PWD}/sim/configs/tasks/rm65_right_cube_reach_fixed_pose_xyz_proprio_v1.json" \
   --client-id rpent.dexteleop \
   --history-root "${RPENT_ROOT}/temp/runtime/sim_gateway/history"
 ```
+
+`allocate-unix-endpoint` 会在 DexTeleop 的 `temp/ag/` 下创建唯一、私有且长度受控的
+endpoint 目录；history、Artifact 和 Experience 仍可位于较长的项目
+`temp/runtime/` 目录。将返回值原样交给 Gateway 和 RPent，不需要操作者手工计算
+Linux 的 107 encoded-byte 限制，也不会静默迁移到 `/tmp` 或符号链接目录。
+MuJoCo 与 real launcher 都会在构造仿真、设备或 lower owner 前执行同一 preflight，
+并在 bind 前再次检查竞态。
 
 历史命令 `python -m control_station agent-gateway-mujoco ...` 仅保留为薄兼容转发；
 Gateway 实现、Skill 定义和 MuJoCo executor 均由顶层 `agent_gateway` 包持有。
