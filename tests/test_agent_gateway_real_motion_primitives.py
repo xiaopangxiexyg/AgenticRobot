@@ -186,3 +186,8 @@ def test_convergence_profile_is_content_addressed() -> None:
     first = RealAgentPrimitiveConvergenceProfile()
     second = RealAgentPrimitiveConvergenceProfile(stable_measurement_count=4)
     assert first.semantic_content_hash != second.semantic_content_hash
+
+
+def test_convergence_profile_requires_positive_hold_confirmation_timeout() -> None:
+    with pytest.raises(ValueError, match="hold_confirmation_timeout_sec"):
+        RealAgentPrimitiveConvergenceProfile(hold_confirmation_timeout_sec=0.0)

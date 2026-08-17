@@ -283,3 +283,55 @@ def test_real_lifecycle_resolves_dispatches_converges_and_confirms_hold() -> Non
     assert port.snapshot().phase == RealAgentMotionPhase.HELD
     assert port.snapshot().dispatch_count >= 3
     assert len(owner.holds) == 1
+
+
+def test_real_lifecycle_confirms_hold_after_operation_deadline() -> None:
+    """HOLD proof gets a lower-control grace window after motion expiry."""
+
+    bundle, port, _builder = _runtime_fixture()
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _request_and_operation(bundle, clock=clock)
+    port.publish_measured_pose(
+        pose_world_by_component={"right_arm": np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:deadline-hold",),
+    )
+
+    def lower_cycle_sleep(duration: float) -> None:
+        clock.value += duration
+        port.apply_owner_requests(session=owner, now=clock())
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.cardinal_profile,
+        request=request,
+        operation=operation,
+        clock=clock,
+        sleep=lower_cycle_sleep,
+    )
+
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    assert activation.succeeded is True
+    assert port.snapshot().phase == RealAgentMotionPhase.ACTIVE
+
+    # The operation's motion budget is already exhausted when HOLD is asked
+    # for.  The lower control loop still needs one cycle to apply the request.
+    clock.value = operation.deadline_at
+    hold = lifecycle.request_hold(
+        operation=operation,
+        reason="real_primitive_deadline_exceeded",
+    )
+
+    assert hold.succeeded is True
+    assert hold.lower_hold_confirmed is True
+    assert port.snapshot().phase == RealAgentMotionPhase.HELD
+    assert len(owner.holds) == 1
