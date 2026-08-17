@@ -20,6 +20,11 @@ from .rm65_ports import (
     RM65SkillTargetBuilder,
     build_exclusive_rm65_skill_position_force_guard,
 )
+from .rm65_profile import (
+    ExclusiveRM65SkillDeploymentProfile,
+    ResolvedExclusiveRM65SkillDeploymentProfile,
+    resolve_exclusive_rm65_skill_deployment_profile,
+)
 from .rm65_target_safety import (
     ExclusiveRM65SkillStartupSafetyBinder,
     ExclusiveRM65SkillStartupSafetyReceipt,
@@ -60,6 +65,9 @@ __all__ = [
     "RM65SkillPositionForceGuard",
     "RM65SkillTargetBuilder",
     "build_exclusive_rm65_skill_position_force_guard",
+    "ExclusiveRM65SkillDeploymentProfile",
+    "ResolvedExclusiveRM65SkillDeploymentProfile",
+    "resolve_exclusive_rm65_skill_deployment_profile",
     "ExclusiveRM65SkillStartupSafetyReceipt",
     "ExclusiveRM65SkillStartupSafetyBinder",
     "ExclusiveRM65SkillTargetSafetyRuntime",
