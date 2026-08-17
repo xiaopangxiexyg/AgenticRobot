@@ -133,6 +133,14 @@ def _parallel_gripper_from_joints(
 
 def _infer_gripper_specs(mujoco, model) -> dict[str, GripperSpec]:
     specs: dict[str, GripperSpec] = {}
+    cad_joint_suffixes = (
+        "l_1_joint",
+        "l_3_joint",
+        "r_1_joint",
+        "r_3_joint",
+        "l_2_joint",
+        "r_2_joint",
+    )
     candidates = (
         (
             "eg2_4b2",
@@ -164,17 +172,23 @@ def _infer_gripper_specs(mujoco, model) -> dict[str, GripperSpec]:
         ),
         (
             "eg2_4b2_cad",
-            (
-                "eg2_4b2_cad_l_1_joint",
-                "eg2_4b2_cad_l_3_joint",
-                "eg2_4b2_cad_r_1_joint",
-                "eg2_4b2_cad_r_3_joint",
-                "eg2_4b2_cad_l_2_joint",
-                "eg2_4b2_cad_r_2_joint",
-            ),
+            tuple(f"eg2_4b2_cad_{suffix}" for suffix in cad_joint_suffixes),
             "gripper",
             "right",
             False,
+        ),
+        *(
+            (
+                f"{side}_eg2_4b2_cad",
+                tuple(
+                    f"{side}_eg2_4b2_cad_{suffix}"
+                    for suffix in cad_joint_suffixes
+                ),
+                f"{side}_gripper",
+                side,
+                False,
+            )
+            for side in ("left", "right")
         ),
     )
     for name, joint_names, effector_name, side, open_at_upper in candidates:
