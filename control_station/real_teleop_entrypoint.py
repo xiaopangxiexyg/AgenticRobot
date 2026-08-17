@@ -121,12 +121,12 @@ from teleop_runtime.collection.diagnostics import (
     format_phase_timings,
     should_report_debug_frozen,
 )
-from teleop_runtime.collection.async_writer import AsyncWriterConfig, AsyncWriterPool
+from collection_runtime.async_writer import AsyncWriterConfig, AsyncWriterPool
 from teleop_runtime.collection.arm_state_polling import ArmHardwareStatePoller, ArmHardwareStatePollerConfig
 from teleop_runtime.collection.hand_state_polling import HandStateHistoryPoller, HandStateHistoryPollerConfig
 from teleop_runtime.collection.camera_preview import CameraPreviewConfig, CameraPreviewer
 from teleop_runtime.collection.build_collect_components import CollectorComponents
-from teleop_runtime.collection.dataset_episode_maintenance import (
+from collection_runtime.dataset_episode_maintenance import (
     EpisodeDeleteResult,
     delete_episode_and_compact,
 )

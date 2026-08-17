@@ -217,3 +217,12 @@ def test_umi_recorder_uses_canonical_collection_runtime_owners() -> None:
     modules = _absolute_import_modules(path)
     assert "collection_runtime.async_writer" in modules
     assert "collection_runtime.dataset_episode_maintenance" in modules
+
+
+def test_control_station_real_teleop_entrypoint_uses_canonical_collection_runtime_owners() -> None:
+    path = REPO_ROOT / "control_station" / "real_teleop_entrypoint.py"
+    modules = _absolute_import_modules(path)
+    assert "collection_runtime.async_writer" in modules
+    assert "collection_runtime.dataset_episode_maintenance" in modules
+    assert "teleop_runtime.collection.async_writer" not in modules
+    assert "teleop_runtime.collection.dataset_episode_maintenance" not in modules

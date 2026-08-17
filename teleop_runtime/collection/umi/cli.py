@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Sequence
 
 from dataset_contracts.v25p_native_storage import V25P_NATIVE_STORAGE_LAYOUTS_V1
+from dataset_interface.policy_io_layout import load_policy_io_layout
 from project_paths import DEFAULT_FORMAL_COLLECTION_ROOT
 
-from ..policy_io import load_policy_io_layout
 from .calibration import UmiCalibrationSet
 from .config import UmiCollectionConfig, load_umi_collection_config
 from .topology import CAMERA_KEYS, SIDES

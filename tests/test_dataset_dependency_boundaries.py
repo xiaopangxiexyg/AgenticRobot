@@ -175,6 +175,41 @@ def test_legacy_random_background_paths_reexport_dataset_owned_objects() -> None
     assert LegacyMaskReader is CanonicalMaskReader
 
 
+def test_collection_policy_io_layout_loader_reexports_dataset_interface_owner() -> None:
+    path = REPO_ROOT / "teleop_runtime" / "collection" / "policy_io.py"
+    tree = _parsed_tree(path)
+    executable_nodes = [
+        node
+        for node in tree.body
+        if not (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+    ]
+    assert executable_nodes
+    assert all(isinstance(node, ast.ImportFrom) for node in executable_nodes)
+    assert {
+        node.module for node in executable_nodes if isinstance(node, ast.ImportFrom)
+    } == {"dataset_interface.policy_io_layout"}
+
+    from dataset_interface.policy_io_layout import load_policy_io_layout as canonical
+    from teleop_runtime.collection.policy_io import load_policy_io_layout as compatibility
+
+    assert compatibility is canonical
+
+
+def test_policy_io_layout_loader_callers_use_dataset_interface_owner() -> None:
+    for relative_path in (
+        "control_station/umi_application.py",
+        "teleop_runtime/collection/policy_io_runtime.py",
+        "teleop_runtime/collection/umi/cli.py",
+    ):
+        modules = _imported_modules(REPO_ROOT / relative_path)
+        assert "dataset_interface.policy_io_layout" in modules
+        assert "teleop_runtime.collection.policy_io" not in modules
+
+
 def test_shared_manifest_does_not_embed_an_offline_implementation_path() -> None:
     payload = mask_manifest_payload(
         camera_key="left_wrist",

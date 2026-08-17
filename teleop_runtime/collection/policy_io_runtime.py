@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from dataset_contracts.v22 import EndEffectorSpec, PolicyIOLayout
+from dataset_interface.policy_io_layout import load_policy_io_layout
 
 from ..backends.grippers import DMTacGripperBackend, GRIPPER_ACTION_MAX
 from ..backends.hands import InspireTacHandBackend
 from ..retargeters import JointsToDexHandRetargeter, ScalarToGripperRetargeter
-from .policy_io import load_policy_io_layout
 
 
 AUTO_POLICY_IO_LAYOUT = "auto"
