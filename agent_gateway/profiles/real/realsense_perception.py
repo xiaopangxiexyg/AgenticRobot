@@ -1,0 +1,823 @@
+"""RealSense resource and passive capture boundary for the real Gateway."""
+
+from __future__ import annotations
+
+import io
+import math
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Protocol
+
+import numpy as np
+from PIL import Image
+
+from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.perception_artifacts import (
+    DEPTH_FRAME_COMPRESSION_V1,
+    DEPTH_FRAME_ENCODING_V1,
+    DEPTH_FRAME_MEDIA_TYPE_V1,
+    DEPTH_FRAME_SCHEMA_ID_V1,
+    RGB_FRAME_MEDIA_TYPE_V1,
+)
+from robot_motion.relative_action import pose_matrix_to_xyzquat
+from teleop_runtime.cameras import load_camera_registry
+from teleop_runtime.sources.camera import (
+    REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+    RealSenseRGBSource,
+    load_realsense_camera_config_map,
+)
+
+from .perception_deployment import RealPerceptionCaptureProfile
+
+_ROLE_BY_SOURCE_ID = {
+    "front": "main",
+    "left_wrist": "wrist_left",
+    "right_wrist": "wrist_right",
+}
+_CAMERA_START_STAGGER_SEC = 0.5
+_CAMERA_DEFERRED_RETRY_COOLDOWN_SEC = 1.0
+_CAMERA_ADMISSION_TIMEOUT_SEC = 3.0
+_CAMERA_ADMISSION_INTERVAL_SEC = 0.2
+_CAMERA_ADMISSION_FRESH_AGE_SEC = 0.2
+_CAMERA_ADMISSION_CONSECUTIVE_FRAMES = 3
+
+
+class _LifecycleResource(Protocol):
+    def start(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class _CloseResource(Protocol):
+    def close(self) -> None: ...
+
+
+def real_camera_role_for_source(source_id: str) -> str:
+    source = _required_text(source_id, field_name="source_id")
+    return _ROLE_BY_SOURCE_ID.get(source, f"auxiliary_{source}")
+
+
+def _required_text(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{field_name} must be a non-empty trimmed string.")
+    return value
+
+
+def _finite_timestamp(value: object, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be numeric.")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError(f"{field_name} must be finite.")
+    return normalized
+
+
+def _pose_matrix(value: object, *, field_name: str) -> np.ndarray:
+    matrix = np.asarray(value, dtype=float)
+    if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"{field_name} must be a finite 4x4 transform.")
+    if not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9, rtol=0.0):
+        raise ValueError(f"{field_name} has an invalid homogeneous row.")
+    rotation = matrix[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0.0):
+        raise ValueError(f"{field_name} rotation is not orthonormal.")
+    if not math.isclose(float(np.linalg.det(rotation)), 1.0, abs_tol=1e-6):
+        raise ValueError(f"{field_name} rotation is not right-handed.")
+    return matrix.copy()
+
+
+@dataclass(frozen=True)
+class EncodedRealRgbFrame:
+    source_id: str
+    role: str
+    width: int
+    height: int
+    data: bytes
+    media_type: str = RGB_FRAME_MEDIA_TYPE_V1
+
+
+@dataclass(frozen=True)
+class RealRgbCapture:
+    captured_at: float
+    station_revision: int
+    frames: tuple[EncodedRealRgbFrame, ...]
+
+
+@dataclass(frozen=True)
+class EncodedRealDepthFrame:
+    source_id: str
+    role: str
+    captured_at: float
+    width: int
+    height: int
+    camera_pose_world_xyz_quat_xyzw: tuple[float, ...]
+    intrinsics: Mapping[str, float | int]
+    data: bytes
+    media_type: str = DEPTH_FRAME_MEDIA_TYPE_V1
+    schema_id: str = DEPTH_FRAME_SCHEMA_ID_V1
+    encoding: str = DEPTH_FRAME_ENCODING_V1
+    compression: str = DEPTH_FRAME_COMPRESSION_V1
+
+
+@dataclass(frozen=True)
+class RealPerceptionSourceBinding:
+    """Preflighted camera inventory and trusted static depth poses."""
+
+    camera_sources: Mapping[str, object]
+    world_from_depth_camera_by_source: Mapping[str, np.ndarray]
+    semantic_content_hash: str
+
+    def __post_init__(self) -> None:
+        sources = dict(self.camera_sources)
+        if not sources:
+            raise ValueError("Real perception source binding must not be empty.")
+        for source_id, source in sources.items():
+            _required_text(source_id, field_name="camera_sources key")
+            if getattr(source, "config", None) is None:
+                raise TypeError(f"camera source {source_id!r} has no config.")
+        depth_sources = {
+            source_id
+            for source_id, source in sources.items()
+            if bool(source.config.enable_depth)
+        }
+        if set(self.world_from_depth_camera_by_source) != depth_sources:
+            raise ValueError(
+                "Every enabled depth source requires exactly one trusted pose."
+            )
+        poses = {}
+        for source_id, value in self.world_from_depth_camera_by_source.items():
+            matrix = _pose_matrix(
+                value,
+                field_name=f"world_from_depth_camera_by_source.{source_id}",
+            )
+            matrix.setflags(write=False)
+            poses[source_id] = matrix
+        object.__setattr__(self, "camera_sources", MappingProxyType(sources))
+        object.__setattr__(
+            self,
+            "world_from_depth_camera_by_source",
+            MappingProxyType(poses),
+        )
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            _required_text(
+                self.semantic_content_hash,
+                field_name="semantic_content_hash",
+            ),
+        )
+
+
+def build_real_perception_source_binding(
+    *,
+    camera_config_path: str | Path,
+    camera_registry_path: str | Path,
+    scene_world_from_arm_base_by_side: Mapping[str, np.ndarray],
+) -> RealPerceptionSourceBinding:
+    """Prepare sources and static depth geometry without opening hardware."""
+
+    configs = load_realsense_camera_config_map(camera_config_path)
+    if not configs:
+        raise ValueError("Real perception camera config must not be empty.")
+    for camera_key, config in configs.items():
+        config.keep_last = max(4, int(config.keep_last))
+        config.startup_warmup_policy = REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+        config.require_complete_frameset = True
+        config.restart_on_incomplete_frameset = True
+        config.restart_max_attempts_without_complete_frame = max(
+            3,
+            int(config.restart_max_attempts_without_complete_frame),
+        )
+        config.startup_hardware_reset_on_failure = False
+        if config.startup_hardware_reset:
+            raise ValueError(
+                f"camera {camera_key!r} cannot request a startup hardware reset."
+            )
+    registry = load_camera_registry(camera_registry_path)
+    registry_cameras = registry["cameras"]
+    world_from_base = {
+        side: _pose_matrix(
+            scene_world_from_arm_base_by_side[side],
+            field_name=f"scene_world_from_arm_base_by_side.{side}",
+        )
+        for side in ("left", "right")
+    }
+    static_depth_poses: dict[str, np.ndarray] = {}
+    binding_cameras = []
+    for camera_key, config in configs.items():
+        spec = registry_cameras.get(camera_key)
+        if not isinstance(spec, Mapping):
+            raise ValueError(f"camera {camera_key!r} is absent from the registry.")
+        if str(spec.get("serial")) != str(config.serial):
+            raise ValueError(f"camera {camera_key!r} serial differs from the registry.")
+        profile = spec.get("profile")
+        if not isinstance(profile, Mapping) or any(
+            int(profile.get(field_name, -1)) != int(getattr(config, field_name))
+            for field_name in ("width", "height", "fps")
+        ):
+            raise ValueError(f"camera {camera_key!r} profile differs from the registry.")
+        pose_payload = None
+        if config.enable_depth:
+            frames = (spec.get("extrinsics") or {}).get("frames")
+            candidates = tuple(
+                value
+                for value in (frames.values() if isinstance(frames, Mapping) else ())
+                if isinstance(value, Mapping) and "T_camera_to_parent" in value
+            )
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"depth camera {camera_key!r} requires exactly one trusted "
+                    "static T_camera_to_parent binding."
+                )
+            frame = candidates[0]
+            parent = str(frame.get("parent_frame") or "")
+            side_by_parent = {
+                "left_arm_base_link": "left",
+                "right_arm_base_link": "right",
+            }
+            if parent not in side_by_parent:
+                raise ValueError(
+                    f"depth camera {camera_key!r} parent is not a fixed arm base."
+                )
+            parent_from_camera = _pose_matrix(
+                frame["T_camera_to_parent"],
+                field_name=f"camera_registry.{camera_key}.T_camera_to_parent",
+            )
+            world_from_camera = world_from_base[side_by_parent[parent]] @ parent_from_camera
+            static_depth_poses[camera_key] = _pose_matrix(
+                world_from_camera,
+                field_name=f"world_from_depth_camera.{camera_key}",
+            )
+            pose_payload = static_depth_poses[camera_key].tolist()
+        binding_cameras.append(
+            {
+                "source_id": camera_key,
+                "role": real_camera_role_for_source(camera_key),
+                "config": config.to_dict(),
+                "registry_serial": str(spec["serial"]),
+                "world_from_depth_camera": pose_payload,
+            }
+        )
+    binding_hash = canonical_content_hash(
+        {
+            "camera_registry_schema": registry["schema_version"],
+            "cameras": binding_cameras,
+            "pose_semantics": "world_from_camera_optical_frame",
+        },
+        domain="dexteleop.real_realsense_perception_source_binding.v1",
+    )
+    return RealPerceptionSourceBinding(
+        camera_sources={key: RealSenseRGBSource(config) for key, config in configs.items()},
+        world_from_depth_camera_by_source=static_depth_poses,
+        semantic_content_hash=binding_hash,
+    )
+
+
+class ExclusiveRealPerceptionResources:
+    """One transaction over cameras and the existing lower RM65 resources."""
+
+    def __init__(
+        self,
+        *,
+        lower: _LifecycleResource,
+        camera_sources: Mapping[str, object],
+        artifact_store: _CloseResource | None = None,
+        start_cameras: Callable[[Mapping[str, Any]], None] | None = None,
+        admit_cameras: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> None:
+        if not callable(getattr(lower, "start", None)) or not callable(
+            getattr(lower, "close", None)
+        ):
+            raise TypeError("lower must expose start and close.")
+        if not camera_sources:
+            raise ValueError("camera_sources must not be empty.")
+        if artifact_store is not None and not callable(
+            getattr(artifact_store, "close", None)
+        ):
+            raise TypeError("artifact_store must expose close.")
+        start_cameras = start_realsense_sources if start_cameras is None else start_cameras
+        admit_cameras = admit_realsense_sources if admit_cameras is None else admit_cameras
+        if not callable(start_cameras) or not callable(admit_cameras):
+            raise TypeError("camera lifecycle callbacks must be callable.")
+        self.lower = lower
+        self.camera_sources = dict(camera_sources)
+        self.artifact_store = artifact_store
+        self._start_cameras = start_cameras
+        self._admit_cameras = admit_cameras
+        self._lock = threading.Lock()
+        self._started = False
+        self._closed = False
+
+    def start(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("closed real perception resources cannot restart.")
+            if self._started:
+                return
+        cameras_attempted = False
+        lower_attempted = False
+        try:
+            cameras_attempted = True
+            self._start_cameras(self.camera_sources)
+            self._admit_cameras(self.camera_sources)
+            lower_attempted = True
+            self.lower.start()
+        except Exception:
+            if lower_attempted:
+                try:
+                    self.lower.close()
+                except Exception:
+                    pass
+            if cameras_attempted:
+                self._close_cameras()
+            if self.artifact_store is not None:
+                try:
+                    self.artifact_store.close()
+                except Exception:
+                    pass
+            with self._lock:
+                self._closed = True
+            raise
+        with self._lock:
+            self._started = True
+
+    def _close_cameras(self) -> list[str]:
+        errors = []
+        for camera_key, source in reversed(tuple(self.camera_sources.items())):
+            try:
+                source.close()
+            except Exception as exc:  # noqa: BLE001 - close the remaining cameras.
+                errors.append(f"camera[{camera_key}]:{type(exc).__name__}:{exc}")
+        return errors
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        errors = []
+        try:
+            self.lower.close()
+        except Exception as exc:  # noqa: BLE001 - cameras still must close.
+            errors.append(f"lower:{type(exc).__name__}:{exc}")
+        errors.extend(self._close_cameras())
+        if self.artifact_store is not None:
+            try:
+                self.artifact_store.close()
+            except Exception as exc:  # noqa: BLE001 - complete resource close.
+                errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
+        if errors:
+            raise RuntimeError("real perception resource close failed: " + "; ".join(errors))
+
+
+def start_realsense_sources(camera_sources: Mapping[str, Any]) -> None:
+    """Start cameras serially, with one deferred bounded-first-frame retry."""
+
+    ranked = []
+    for index, (camera_key, source) in enumerate(camera_sources.items()):
+        metadata = getattr(source.config, "metadata", {})
+        priority = (
+            metadata.get("startup_priority", index)
+            if isinstance(metadata, Mapping)
+            else index
+        )
+        try:
+            priority = float(priority)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"camera {camera_key!r} startup_priority must be numeric."
+            ) from exc
+        ranked.append((priority, index, camera_key, source))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    failures = {}
+    for position, (_priority, _index, camera_key, source) in enumerate(ranked):
+        try:
+            source.start()
+        except Exception as exc:  # noqa: BLE001 - finish the serial first pass.
+            failures[camera_key] = exc
+        if position + 1 < len(ranked):
+            time.sleep(_CAMERA_START_STAGGER_SEC)
+    retry_keys = tuple(
+        camera_key
+        for _priority, _index, camera_key, source in ranked
+        if camera_key in failures
+        and getattr(source.config, "startup_warmup_policy", None)
+        == REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+        and "startup_warmup_failed:policy=bounded_first_frame"
+        in str(failures[camera_key]).lower()
+    )
+    if retry_keys:
+        time.sleep(_CAMERA_DEFERRED_RETRY_COOLDOWN_SEC)
+        for camera_key in retry_keys:
+            source = camera_sources[camera_key]
+            try:
+                source.close()
+                source.start()
+            except Exception as exc:  # noqa: BLE001 - report every failed camera.
+                failures[camera_key] = exc
+            else:
+                failures.pop(camera_key, None)
+    if failures:
+        detail = "; ".join(
+            f"{camera_key}={type(error).__name__}:{error}"
+            for camera_key, error in sorted(failures.items())
+        )
+        raise RuntimeError("RealSense serial startup failed: " + detail)
+
+
+def admit_realsense_sources(camera_sources: Mapping[str, Any]) -> None:
+    """Require several new, fresh frames from every source before arm startup."""
+
+    deadline = time.time() + _CAMERA_ADMISSION_TIMEOUT_SEC
+    previous = {key: None for key in camera_sources}
+    streaks = {key: 0 for key in camera_sources}
+    while True:
+        now = time.time()
+        for camera_key, source in camera_sources.items():
+            info = source.device_info()
+            count = info.get("frame_count")
+            age = info.get("last_frame_age_sec")
+            fresh = bool(
+                isinstance(count, int)
+                and not isinstance(count, bool)
+                and count > 0
+                and (previous[camera_key] is None or count > previous[camera_key])
+                and isinstance(age, (int, float))
+                and not isinstance(age, bool)
+                and 0.0 <= float(age) <= _CAMERA_ADMISSION_FRESH_AGE_SEC
+                and info.get("running") is True
+                and info.get("lifecycle_state") == "running"
+                and info.get("worker_alive") is True
+            )
+            streaks[camera_key] = streaks[camera_key] + 1 if fresh else 0
+            previous[camera_key] = count
+        if all(value >= _CAMERA_ADMISSION_CONSECUTIVE_FRAMES for value in streaks.values()):
+            return
+        if now >= deadline:
+            raise RuntimeError(f"RealSense startup freshness admission failed: {streaks}")
+        time.sleep(min(_CAMERA_ADMISSION_INTERVAL_SEC, deadline - now))
+
+
+class RealSenseAgentPerceptionProvider:
+    """Read already-published frames; never starts devices or touches control."""
+
+    def __init__(
+        self,
+        *,
+        source_binding: RealPerceptionSourceBinding,
+        current_station_revision: Callable[[], int],
+        max_frame_age_ms: int = 200,
+        max_inter_camera_skew_ms: int = 100,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if not isinstance(source_binding, RealPerceptionSourceBinding):
+            raise TypeError("source_binding must be typed.")
+        if not callable(current_station_revision) or not callable(clock):
+            raise TypeError("revision and clock providers must be callable.")
+        for field_name, value in (
+            ("max_frame_age_ms", max_frame_age_ms),
+            ("max_inter_camera_skew_ms", max_inter_camera_skew_ms),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer.")
+        self.source_binding = source_binding
+        self._current_station_revision = current_station_revision
+        self.max_frame_age_ms = max_frame_age_ms
+        self.max_inter_camera_skew_ms = max_inter_camera_skew_ms
+        self._clock = clock
+        self._profile: RealPerceptionCaptureProfile | None = None
+
+    def rgb_source_catalog(self) -> tuple[Mapping[str, object], ...]:
+        return tuple(
+            {
+                "source_id": source_id,
+                "role": real_camera_role_for_source(source_id),
+                "native_width": int(source.config.width),
+                "native_height": int(source.config.height),
+            }
+            for source_id, source in self.source_binding.camera_sources.items()
+        )
+
+    def depth_source_catalog(self) -> tuple[Mapping[str, object], ...]:
+        return tuple(
+            {
+                "source_id": source_id,
+                "role": real_camera_role_for_source(source_id),
+                "native_width": int(
+                    source.config.width
+                    if source.config.align_depth_to_color
+                    else source.config.depth_width
+                ),
+                "native_height": int(
+                    source.config.height
+                    if source.config.align_depth_to_color
+                    else source.config.depth_height
+                ),
+            }
+            for source_id, source in self.source_binding.camera_sources.items()
+            if source.config.enable_depth
+        )
+
+    def bind_profile(self, profile: RealPerceptionCaptureProfile) -> None:
+        rgb_sources = tuple(
+            sorted(
+                (
+                    (
+                        item["source_id"],
+                        item["role"],
+                        item["native_width"],
+                        item["native_height"],
+                    )
+                    for item in self.rgb_source_catalog()
+                ),
+                key=lambda item: item[1],
+            )
+        )
+        if tuple(profile.rgb_sources) != rgb_sources:
+            raise ValueError("Real RGB provider does not match the registered profile.")
+        if tuple(profile.depth_sources) != tuple(
+            sorted(
+                (
+                    (
+                        item["source_id"],
+                        item["role"],
+                        item["native_width"],
+                        item["native_height"],
+                    )
+                    for item in self.depth_source_catalog()
+                ),
+                key=lambda item: item[1],
+            )
+        ):
+            raise ValueError("Real depth provider does not match the registered profile.")
+        if profile.source_binding_hash != self.source_binding.semantic_content_hash:
+            raise ValueError("Real perception source binding hash changed.")
+        self._profile = profile
+
+    @staticmethod
+    def _expected_revision(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("expected_station_revision must be non-negative.")
+        return value
+
+    def _frame(self, source_id: str, *, now: float):
+        source = self.source_binding.camera_sources[source_id]
+        frame = source.get_latest_frame()
+        if frame is None:
+            raise RuntimeError(f"real_perception_frame_unavailable:{source_id}")
+        source_at = _finite_timestamp(
+            frame.source_timestamp,
+            field_name=f"{source_id}.source_timestamp",
+        )
+        available_at = _finite_timestamp(
+            frame.available_timestamp,
+            field_name=f"{source_id}.available_timestamp",
+        )
+        if source_at > now or available_at > now:
+            raise RuntimeError(f"real_perception_frame_from_future:{source_id}")
+        if available_at < source_at:
+            raise RuntimeError(f"real_perception_frame_clock_order_invalid:{source_id}")
+        if (now - source_at) * 1000.0 > self.max_frame_age_ms:
+            raise RuntimeError(f"real_perception_frame_stale:{source_id}")
+        info = source.device_info()
+        if (
+            info.get("running") is not True
+            or info.get("lifecycle_state") != "running"
+            or info.get("worker_alive") is not True
+        ):
+            raise RuntimeError(f"real_perception_source_not_running:{source_id}")
+        serial = info.get("serial_number")
+        if serial is None or str(serial) != str(source.config.serial):
+            raise RuntimeError(f"real_perception_serial_mismatch:{source_id}")
+        metadata = frame.metadata
+        if not isinstance(metadata, Mapping):
+            raise RuntimeError(f"real_perception_frame_identity_missing:{source_id}")
+        if (
+            metadata.get("camera_key") != source_id
+            or str(metadata.get("serial")) != str(source.config.serial)
+        ):
+            raise RuntimeError(f"real_perception_frame_identity_mismatch:{source_id}")
+        generation = info.get("generation")
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or metadata.get("source_generation") != generation
+        ):
+            raise RuntimeError(f"real_perception_frame_generation_mismatch:{source_id}")
+        return frame, source_at, info
+
+    def capture_rgb(
+        self,
+        parameters: Mapping[str, Any],
+        *,
+        expected_station_revision: int,
+    ) -> RealRgbCapture:
+        profile = self._profile
+        if profile is None:
+            raise RuntimeError("real_perception_provider_not_bound")
+        fields = {"selected_roles", "width", "height", "max_total_bytes"}
+        if not isinstance(parameters, Mapping) or set(parameters) != fields:
+            raise ValueError("RGB capture parameters must use the exact schema fields.")
+        expected_station_revision = self._expected_revision(
+            expected_station_revision
+        )
+        roles_raw = parameters.get("selected_roles")
+        if isinstance(roles_raw, (str, bytes)) or not isinstance(roles_raw, Sequence):
+            raise TypeError("selected_roles must be an array.")
+        roles = tuple(_required_text(value, field_name="selected_roles[]") for value in roles_raw)
+        if not roles or len(roles) > 8 or len(set(roles)) != len(roles):
+            raise ValueError("selected_roles must contain one to eight unique roles.")
+        width = parameters["width"]
+        height = parameters["height"]
+        max_total_bytes = parameters["max_total_bytes"]
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (
+            width,
+            height,
+            max_total_bytes,
+        )) or not (
+            1 <= width <= 1920
+            and 1 <= height <= 1080
+            and 1 <= max_total_bytes <= profile.max_artifact_bytes
+        ):
+            raise ValueError("RGB capture dimensions or byte bound are invalid.")
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("rgb_capture_station_revision_mismatch")
+        source_by_role = {
+            real_camera_role_for_source(source_id): (source_id, source)
+            for source_id, source in self.source_binding.camera_sources.items()
+        }
+        now = _finite_timestamp(self._clock(), field_name="capture clock")
+        frames = []
+        source_timestamps = []
+        total_bytes = 0
+        for role in roles:
+            if role not in source_by_role:
+                raise ValueError(f"RGB role {role!r} is not registered.")
+            source_id, source = source_by_role[role]
+            frame, source_at, _info = self._frame(source_id, now=now)
+            image = np.asarray(frame.image)
+            expected_shape = (int(source.config.height), int(source.config.width), 3)
+            if image.shape != expected_shape or image.dtype != np.uint8:
+                raise RuntimeError(f"real_rgb_frame_contract_mismatch:{source_id}")
+            if source.config.color_space == "bgr":
+                image = image[..., ::-1]
+            encoded = _encode_rgb_jpeg(image, width=width, height=height)
+            total_bytes += len(encoded)
+            if total_bytes > max_total_bytes:
+                raise RuntimeError("rgb_capture_artifact_limit_exceeded")
+            frames.append(
+                EncodedRealRgbFrame(
+                    source_id=source_id,
+                    role=role,
+                    width=width,
+                    height=height,
+                    data=encoded,
+                )
+            )
+            source_timestamps.append(source_at)
+        skew_ms = (max(source_timestamps) - min(source_timestamps)) * 1000.0
+        if skew_ms > self.max_inter_camera_skew_ms:
+            raise RuntimeError("rgb_capture_inter_camera_skew_exceeded")
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("rgb_capture_station_revision_changed")
+        return RealRgbCapture(
+            captured_at=max(source_timestamps),
+            station_revision=expected_station_revision,
+            frames=tuple(frames),
+        )
+
+    def capture_depth(
+        self,
+        *,
+        role: str,
+        expected_station_revision: int,
+    ) -> EncodedRealDepthFrame:
+        profile = self._profile
+        if profile is None:
+            raise RuntimeError("real_perception_provider_not_bound")
+        expected_station_revision = self._expected_revision(
+            expected_station_revision
+        )
+        selected_role = _required_text(role, field_name="role")
+        source_by_role = {
+            real_camera_role_for_source(source_id): (source_id, source)
+            for source_id, source in self.source_binding.camera_sources.items()
+            if source.config.enable_depth
+        }
+        if selected_role not in source_by_role:
+            raise ValueError("Depth role is not registered.")
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("depth_capture_station_revision_mismatch")
+        source_id, source = source_by_role[selected_role]
+        now = _finite_timestamp(self._clock(), field_name="capture clock")
+        frame, source_at, info = self._frame(source_id, now=now)
+        depth = np.asarray(frame.depth_image)
+        metadata = frame.depth_metadata
+        if depth.ndim != 2 or depth.dtype != np.uint16:
+            raise RuntimeError(f"real_depth_frame_contract_mismatch:{source_id}")
+        if (int(depth.shape[1]), int(depth.shape[0])) != (
+            profile.depth_dimensions_by_role[selected_role]
+        ):
+            raise RuntimeError(f"real_depth_dimensions_changed:{source_id}")
+        scale = metadata.get("depth_scale_m_per_unit")
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+            raise RuntimeError(f"real_depth_scale_unavailable:{source_id}")
+        scale = float(scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise RuntimeError(f"real_depth_scale_invalid:{source_id}")
+        expected_alignment = "color" if source.config.align_depth_to_color else "none"
+        if metadata.get("aligned_to") != expected_alignment:
+            raise RuntimeError(f"real_depth_alignment_changed:{source_id}")
+        aligned = expected_alignment == "color"
+        intrinsics_raw = info.get("intrinsics" if aligned else "depth_intrinsics")
+        intrinsics = _depth_intrinsics(intrinsics_raw, depth.shape)
+        output = io.BytesIO()
+        np.save(output, np.asarray(depth, dtype=np.float32) * scale, allow_pickle=False)
+        world_from_camera = self.source_binding.world_from_depth_camera_by_source[
+            source_id
+        ]
+        pose = tuple(
+            float(value)
+            for value in pose_matrix_to_xyzquat(
+                world_from_camera,
+                name=f"real_depth_camera_pose.{source_id}",
+            )
+        )
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("depth_capture_station_revision_changed")
+        data = output.getvalue()
+        if len(data) > profile.max_artifact_bytes:
+            raise RuntimeError("depth_capture_artifact_limit_exceeded")
+        return EncodedRealDepthFrame(
+            source_id=source_id,
+            role=selected_role,
+            captured_at=source_at,
+            width=int(depth.shape[1]),
+            height=int(depth.shape[0]),
+            camera_pose_world_xyz_quat_xyzw=pose,
+            intrinsics=intrinsics,
+            data=data,
+        )
+
+
+def _encode_rgb_jpeg(image: np.ndarray, *, width: int, height: int) -> bytes:
+    if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
+        raise RuntimeError("Real RGB source did not return uint8 HWC RGB.")
+    resampling = getattr(Image, "Resampling", Image).BILINEAR
+    resized = Image.fromarray(np.ascontiguousarray(image), mode="RGB").resize(
+        (width, height),
+        resample=resampling,
+    )
+    output = io.BytesIO()
+    resized.save(output, format="JPEG", quality=85, optimize=True)
+    return output.getvalue()
+
+
+def _depth_intrinsics(
+    payload: object,
+    shape: tuple[int, ...],
+) -> Mapping[str, float | int]:
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("real_depth_intrinsics_unavailable")
+    if len(shape) != 2:
+        raise RuntimeError("real_depth_shape_invalid")
+    width, height = int(shape[1]), int(shape[0])
+    values = {
+        "width": int(payload.get("width", 0)),
+        "height": int(payload.get("height", 0)),
+        "fx": float(payload.get("fx", 0.0)),
+        "fy": float(payload.get("fy", 0.0)),
+        "cx": float(payload.get("cx", payload.get("ppx", -1.0))),
+        "cy": float(payload.get("cy", payload.get("ppy", -1.0))),
+    }
+    if (
+        (values["width"], values["height"]) != (width, height)
+        or not all(math.isfinite(float(value)) for value in values.values())
+        or values["fx"] <= 0.0
+        or values["fy"] <= 0.0
+        or values["cx"] < 0.0
+        or values["cy"] < 0.0
+    ):
+        raise RuntimeError("real_depth_intrinsics_invalid")
+    values["fovy_deg"] = math.degrees(
+        2.0 * math.atan(height / (2.0 * float(values["fy"])))
+    )
+    return values
+
+
+__all__ = [
+    "EncodedRealDepthFrame",
+    "EncodedRealRgbFrame",
+    "ExclusiveRealPerceptionResources",
+    "RealPerceptionSourceBinding",
+    "RealRgbCapture",
+    "RealSenseAgentPerceptionProvider",
+    "build_real_perception_source_binding",
+    "admit_realsense_sources",
+    "real_camera_role_for_source",
+    "start_realsense_sources",
+]

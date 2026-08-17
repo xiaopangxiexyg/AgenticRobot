@@ -17,6 +17,9 @@ from agent_gateway.profiles.real.rm65_composition import (
 from agent_gateway.profiles.real.one_shot_authorization import (
     REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
 )
+from agent_gateway.profiles.real.realsense_perception import (
+    ExclusiveRealPerceptionResources,
+)
 from teleop_runtime.configs import build_annotated_dual_rm65_calibration
 from teleop_runtime.interfaces import EffectorBackend
 from teleop_runtime.skill_deploy import rm65_profile as profile_module
@@ -185,6 +188,81 @@ def test_composition_binds_existing_gateway_to_one_lower_graph_without_start(
     assert all(backend.starts == 0 for backend in lower.arm_backends.values())
     assert guard.starts == 0
     assert not socket_path.exists()
+
+
+def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_start(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lower, guard = _lower(monkeypatch)
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower,
+        socket_path=REPO_ROOT / "temp/test-real-rm65-perception.sock",
+        authorized_side="right",
+        authorized_action="forward",
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test",
+        client_uid=1000,
+        runtime_session_id="real-rm65:perception-test",
+        control_domain_id="exclusive-real-skill:perception-test",
+        embodiment_instance_id="dual-rm65:perception-test",
+        camera_config_path=(
+            REPO_ROOT
+            / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
+        ),
+        camera_registry_path=(
+            REPO_ROOT / "robot_motion/configs/rm65_camera_registry.json"
+        ),
+        artifact_root=tmp_path,
+    )
+    session = composition.deployment.gateway_session
+    try:
+        assert isinstance(composition.resources, ExclusiveRealPerceptionResources)
+        assert composition.application.resources is composition.resources
+        assert composition.perception_capture is not None
+        assert composition.perception_capture.profile.rgb_roles == (
+            "main",
+            "wrist_left",
+            "wrist_right",
+        )
+        assert composition.perception_capture.profile.depth_roles == ("main",)
+        assert session.service.protocol_runtime.session_capabilities.artifact_transfer_enabled
+        assert session.rgb_executor is not None
+        assert session.depth_executor is not None
+        assert len(session.contract_bundle.route_manifest.skill_routes) == 6
+        effects = {
+            entry.route.skill_id: entry.route.control_effect_class
+            for entry in session.contract_bundle.route_manifest.skill_routes
+        }
+        assert effects["perception.capture_rgb"] == "read_only"
+        assert effects["perception.capture_depth"] == "read_only"
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+        assert guard.starts == 0
+        assert all(
+            source.device_info()["running"] is False
+            for source in composition.perception_source_binding.camera_sources.values()
+        )
+    finally:
+        assert session.artifact_store is not None
+        session.artifact_store.close()
+
+
+def test_composition_requires_complete_perception_attachment(monkeypatch, tmp_path) -> None:
+    lower, _guard = _lower(monkeypatch)
+    with pytest.raises(ValueError, match="provided together"):
+        assemble_exclusive_rm65_agent_primitive_composition(
+            lower=lower,
+            socket_path=REPO_ROOT / "temp/test-real-rm65-perception.sock",
+            authorized_side="right",
+            authorized_action="forward",
+            confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+            client_id="rpent:test",
+            client_uid=1000,
+            runtime_session_id="real-rm65:perception-test",
+            control_domain_id="exclusive-real-skill:perception-test",
+            embodiment_instance_id="dual-rm65:perception-test",
+            artifact_root=tmp_path,
+        )
 
 
 def test_composition_rejects_envelope_for_another_side(monkeypatch) -> None:

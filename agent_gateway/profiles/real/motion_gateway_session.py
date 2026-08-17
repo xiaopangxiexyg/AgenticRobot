@@ -9,6 +9,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from agent_gateway.protocol.contracts import AgentObservationSnapshot, AgentSkillRequest
+from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
+from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.runtime.access_policy import (
     AgentSkillAccessPolicy,
     SkillExecutionGrant,
@@ -17,10 +19,22 @@ from agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
     SkillExecutorRegistry,
 )
+from agent_gateway.runtime.artifact_producer import (
+    artifact_ref_for_bytes,
+    commit_artifact_bytes,
+)
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.runtime.artifact_transfer import AgentArtifactTransferBroker
+from agent_gateway.runtime.event_journal import BoundedAgentGatewayEventJournal
 from agent_gateway.runtime.operation_port import AgentGatewayAuthoritativePortReceipt
 from agent_gateway.runtime.operation_store import (
     BoundedInMemoryAgentSkillOperationStore,
 )
+from agent_gateway.runtime.passive_read_executor import (
+    PassiveReadResult,
+    PassiveReadSkillExecutor,
+)
+from agent_gateway.runtime.protocol_runtime import AgentGatewayProtocolRuntime
 from agent_gateway.runtime.reusable_station_executor import (
     ReusableStationAgentSkillOperationExecutor,
 )
@@ -37,6 +51,11 @@ from agent_gateway.transport.unix_transport import (
     AgentGatewayUnixPeerClientMap,
 )
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
+from agent_gateway.skills.perception.schemas import (
+    RGB_FRAME_COMPRESSION_V1,
+    RGB_FRAME_ENCODING_V1,
+    RGB_FRAME_SCHEMA_ID_V1,
+)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import pose_matrix_to_xyzquat
 from teleop_runtime.skill_deploy.motion_port import (
@@ -49,6 +68,11 @@ from .motion_primitive_profiles import (
 )
 from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
 from .observation_gateway import RealControlOwnerState
+from .perception_deployment import (
+    REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
+    REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
+)
+from .realsense_perception import RealSenseAgentPerceptionProvider
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -288,12 +312,29 @@ class RealAgentPrimitiveGatewaySession:
     port: RealAgentMotionPort
     observation_producer: RealAgentPrimitiveObservationProducer
     executors_by_skill_id: Mapping[str, ReusableStationAgentSkillOperationExecutor]
+    perception_provider: RealSenseAgentPerceptionProvider | None
+    rgb_executor: PassiveReadSkillExecutor | None
+    depth_executor: PassiveReadSkillExecutor | None
+    artifact_store: RecoverableAgentArtifactStore | None
+    owns_artifact_store: bool
     service: AgentGatewayService
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
         default=None,
         init=False,
     )
+    _artifact_store_closed: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        enabled = self.contract_bundle.perception_capture is not None
+        if enabled != (self.perception_provider is not None):
+            raise ValueError("Real perception registration and provider disagree.")
+        if enabled != (self.artifact_store is not None):
+            raise ValueError("Real perception requires an exact Artifact store.")
+        if enabled != (self.rgb_executor is not None and self.depth_executor is not None):
+            raise ValueError("Real perception requires both passive executors.")
+        if self.owns_artifact_store and self.artifact_store is None:
+            raise ValueError("Owned Artifact store must be present.")
 
     def wire_adapter(
         self,
@@ -367,6 +408,14 @@ class RealAgentPrimitiveGatewaySession:
                     )
                 )
             outcome = self._close_outcome
+            perception_settled = all(
+                executor is None or executor.wait_all(timeout_sec=5.0)
+                for executor in (self.rgb_executor, self.depth_executor)
+            )
+            if not perception_settled:
+                raise RuntimeError(
+                    "Passive real perception did not quiesce before Gateway close."
+                )
             receipt = outcome.port_receipt
             if (
                 outcome.accepted
@@ -381,6 +430,13 @@ class RealAgentPrimitiveGatewaySession:
                     )
                     if executor_receipt.succeeded and executor_receipt.proves_motion_or_hold:
                         executor.close_after_hold(hold_receipt=executor_receipt)
+            if (
+                self.owns_artifact_store
+                and self.artifact_store is not None
+                and not self._artifact_store_closed
+            ):
+                self.artifact_store.close()
+                self._artifact_store_closed = True
             return outcome
 
 
@@ -391,10 +447,13 @@ def assemble_real_agent_primitive_gateway_session(
     owner_state_provider: Callable[[], RealControlOwnerState],
     allowed_client_ids: tuple[str, ...],
     max_retained_operations: int = 16,
+    perception_provider: RealSenseAgentPerceptionProvider | None = None,
+    artifact_store: RecoverableAgentArtifactStore | None = None,
+    owns_artifact_store: bool = False,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RealAgentPrimitiveGatewaySession:
-    """Assemble four exact Route executors without starting a server or robot."""
+    """Assemble motion and optional passive Routes without starting resources."""
 
     if not isinstance(contract_bundle, RealAgentPrimitiveContractBundle):
         raise TypeError("contract_bundle must be typed.")
@@ -414,12 +473,30 @@ def assemble_real_agent_primitive_gateway_session(
         max_retained_operations, int
     ) or max_retained_operations <= 0:
         raise ValueError("max_retained_operations must be positive.")
+    if not isinstance(owns_artifact_store, bool):
+        raise TypeError("owns_artifact_store must be boolean.")
+    perception_enabled = contract_bundle.perception_capture is not None
+    if perception_enabled != isinstance(
+        perception_provider,
+        RealSenseAgentPerceptionProvider,
+    ):
+        raise ValueError("Real perception registration requires its exact provider.")
+    if perception_enabled != isinstance(
+        artifact_store,
+        RecoverableAgentArtifactStore,
+    ):
+        raise ValueError("Real perception registration requires its Artifact store.")
+    if owns_artifact_store and artifact_store is None:
+        raise ValueError("Owned Artifact store must be injected.")
     producer = RealAgentPrimitiveObservationProducer(
         contract_bundle=contract_bundle,
         port=port,
         owner_state_provider=owner_state_provider,
         clock=clock,
     )
+    if perception_provider is not None:
+        assert contract_bundle.perception_capture is not None
+        perception_provider.bind_profile(contract_bundle.perception_capture.profile)
 
     def domain_hold(*, operation, reason):
         del operation
@@ -432,7 +509,12 @@ def assemble_real_agent_primitive_gateway_session(
 
     executors: dict[str, ReusableStationAgentSkillOperationExecutor] = {}
     execution_port_by_route_hash = {}
-    for entry in contract_bundle.route_manifest.skill_routes:
+    motion_entries = tuple(
+        entry
+        for entry in contract_bundle.route_manifest.skill_routes
+        if entry.route.control_effect_class == "motion"
+    )
+    for entry in motion_entries:
         route = entry.route
         binding = contract_bundle.binding_for_skill(route.skill_id)
         if route.skill_id == "motion.step_tcp_cardinal":
@@ -489,6 +571,170 @@ def assemble_real_agent_primitive_gateway_session(
         )
         executors[route.skill_id] = executor
         execution_port_by_route_hash[route.semantic_content_hash] = executor
+    rgb_executor = None
+    depth_executor = None
+    if perception_provider is not None and artifact_store is not None:
+        registration = contract_bundle.perception_capture
+        assert registration is not None
+        rgb_route = registration.rgb.routes[0]
+        depth_route = registration.depth.routes[0]
+
+        def read_rgb(request, operation) -> PassiveReadResult:
+            capture = perception_provider.capture_rgb(
+                request.parameters,
+                expected_station_revision=request.expected_station_revision,
+            )
+            bindings = []
+            frame_metadata = []
+            total_bytes = 0
+            for ordinal, frame in enumerate(capture.frames):
+                artifact = artifact_ref_for_bytes(
+                    frame.data,
+                    media_type=frame.media_type,
+                    schema_id=RGB_FRAME_SCHEMA_ID_V1,
+                    encoding=RGB_FRAME_ENCODING_V1,
+                    compression=RGB_FRAME_COMPRESSION_V1,
+                )
+                committed = commit_artifact_bytes(
+                    store=artifact_store,
+                    data=frame.data,
+                    artifact=artifact,
+                    producer_id="agent_gateway.provider.real_realsense_rgb",
+                    runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                    idempotency_key=f"rgb-output:{operation.operation_id}:{ordinal}",
+                    now=capture.captured_at,
+                )
+                total_bytes += committed.byte_length
+                metadata = {
+                    "ordinal": ordinal,
+                    "source_id": frame.source_id,
+                    "role": frame.role,
+                    "media_type": committed.media_type,
+                    "width": frame.width,
+                    "height": frame.height,
+                    "media_content_hash": committed.sha256,
+                }
+                frame_metadata.append(metadata)
+                bindings.append(
+                    AgentArtifactBinding(
+                        slot_id=REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
+                        ordinal=ordinal,
+                        artifact=committed,
+                        production_receipt_ref=(
+                            f"real-rgb-frame:{operation.operation_id}:{ordinal}:"
+                            + committed.sha256
+                        ),
+                    )
+                )
+            identity = canonical_content_hash(
+                {
+                    "operation_id": operation.operation_id,
+                    "request_hash": request.semantic_content_hash,
+                    "station_revision": capture.station_revision,
+                    "captured_at": capture.captured_at,
+                    "frames": frame_metadata,
+                },
+                domain="dexteleop.agent_skill.real_rgb_capture_receipt.v1",
+            )
+            return PassiveReadResult(
+                execution_result={
+                    "snapshot_id": "rgb-snapshot:" + identity,
+                    "station_revision": capture.station_revision,
+                    "captured_at": capture.captured_at,
+                    "frames": frame_metadata,
+                    "total_bytes": total_bytes,
+                },
+                evidence_refs=("real-rgb-capture:" + identity,),
+                output_artifact_bindings=tuple(bindings),
+                reason_code="passive_rgb_capture_completed",
+            )
+
+        def read_depth(request, operation) -> PassiveReadResult:
+            frame = perception_provider.capture_depth(
+                role=str(request.parameters["role"]),
+                expected_station_revision=request.expected_station_revision,
+            )
+            artifact = artifact_ref_for_bytes(
+                frame.data,
+                media_type=frame.media_type,
+                schema_id=frame.schema_id,
+                encoding=frame.encoding,
+                compression=frame.compression,
+            )
+            committed = commit_artifact_bytes(
+                store=artifact_store,
+                data=frame.data,
+                artifact=artifact,
+                producer_id="agent_gateway.provider.real_realsense_depth",
+                runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                idempotency_key="depth-output:" + operation.operation_id,
+                now=frame.captured_at,
+            )
+            result = {
+                "source_id": frame.source_id,
+                "role": frame.role,
+                "captured_at": frame.captured_at,
+                "width": frame.width,
+                "height": frame.height,
+                "depth_unit": "meter",
+                "invalid_depth_value": 0.0,
+                "camera_pose_world_xyz_quat_xyzw": list(
+                    frame.camera_pose_world_xyz_quat_xyzw
+                ),
+                "intrinsics": dict(frame.intrinsics),
+            }
+            identity = canonical_content_hash(
+                {
+                    "operation_id": operation.operation_id,
+                    "request_hash": request.semantic_content_hash,
+                    "result": result,
+                    "artifact_ref_hash": committed.semantic_content_hash,
+                },
+                domain="dexteleop.agent_skill.real_depth_capture_receipt.v1",
+            )
+            evidence_ref = "real-depth-capture:" + identity
+            return PassiveReadResult(
+                execution_result=result,
+                evidence_refs=(evidence_ref,),
+                output_artifact_bindings=(
+                    AgentArtifactBinding(
+                        slot_id=REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
+                        ordinal=0,
+                        artifact=committed,
+                        production_receipt_ref=evidence_ref,
+                    ),
+                ),
+                reason_code="passive_depth_capture_completed",
+            )
+
+        rgb_executor = PassiveReadSkillExecutor(
+            port_id=(
+                "agent-gateway:real-passive-rgb:"
+                + contract_bundle.attachment.runtime_session_id
+            ),
+            executor_id=registration.rgb_binding.executor_id,
+            read=read_rgb,
+            current_station_revision=lambda: producer.current_station_revision,
+            clock=clock,
+            max_retained_operations=max_retained_operations,
+        )
+        depth_executor = PassiveReadSkillExecutor(
+            port_id=(
+                "agent-gateway:real-passive-depth:"
+                + contract_bundle.attachment.runtime_session_id
+            ),
+            executor_id=registration.depth_binding.executor_id,
+            read=read_depth,
+            current_station_revision=lambda: producer.current_station_revision,
+            clock=clock,
+            max_retained_operations=max_retained_operations,
+        )
+        execution_port_by_route_hash.update(
+            {
+                rgb_route.semantic_content_hash: rgb_executor,
+                depth_route.semantic_content_hash: depth_executor,
+            }
+        )
     registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -517,6 +763,45 @@ def assemble_real_agent_primitive_gateway_session(
         max_grant_invocations=1,
     )
     domain_executor = executors["motion.step_tcp_cardinal"]
+    if artifact_store is None:
+        protocol_runtime = AgentGatewayProtocolRuntime.control_plane_only(
+            manifest=contract_bundle.route_manifest,
+            clock=clock,
+        )
+    else:
+        capabilities = AgentGatewaySessionCapabilities(
+            runtime_session_id=contract_bundle.attachment.runtime_session_id,
+            artifact_transfer_enabled=True,
+            artifact_access_mechanisms=("chunked_rpc", "local_path"),
+            max_control_request_bytes=2 * 1024 * 1024,
+            max_control_response_bytes=2 * 1024 * 1024,
+            max_artifact_bytes=artifact_store.max_artifact_bytes,
+            max_artifact_chunk_bytes=artifact_store.max_chunk_bytes,
+            max_artifact_refs_per_operation=8,
+            max_concurrent_uploads=8,
+            max_concurrent_downloads=8,
+            artifact_store_quota_bytes=artifact_store.quota_bytes,
+            event_payload_max_bytes=65_536,
+            event_retention_count=4096,
+        )
+        broker = AgentArtifactTransferBroker(
+            store=artifact_store,
+            session_capabilities=capabilities,
+            max_chunk_bytes=artifact_store.max_chunk_bytes,
+        )
+        protocol_runtime = AgentGatewayProtocolRuntime(
+            manifest=contract_bundle.route_manifest,
+            io_catalog=contract_bundle.io_catalog,
+            session_capabilities=capabilities,
+            event_journal=BoundedAgentGatewayEventJournal(
+                runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                max_events=capabilities.event_retention_count,
+                event_payload_max_bytes=capabilities.event_payload_max_bytes,
+            ),
+            artifact_store=artifact_store,
+            artifact_transfer_broker=broker,
+            clock=clock,
+        )
     service = AgentGatewayService(
         manifest=contract_bundle.route_manifest,
         access_policy=access_policy,
@@ -530,6 +815,7 @@ def assemble_real_agent_primitive_gateway_session(
                 for entry in contract_bundle.route_manifest.skill_routes
             },
         ),
+        protocol_runtime=protocol_runtime,
         clock=clock,
         clock_domain_id=contract_bundle.attachment.clock_domain_id,
     )
@@ -538,6 +824,11 @@ def assemble_real_agent_primitive_gateway_session(
         port=port,
         observation_producer=producer,
         executors_by_skill_id=executors,
+        perception_provider=perception_provider,
+        rgb_executor=rgb_executor,
+        depth_executor=depth_executor,
+        artifact_store=artifact_store,
+        owns_artifact_store=owns_artifact_store,
         service=service,
     )
 

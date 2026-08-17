@@ -22,7 +22,7 @@ from ...interfaces import ObservationSource
 from ...recording import _to_serializable
 from ...registry import register_source
 from ...schemas import ObservationChannel
-from ...collection.video_frame import NearestFrameBuffer, VideoFrame
+from ...video_frame import NearestFrameBuffer, VideoFrame
 
 
 REALSENSE_STARTUP_WARMUP_LEGACY = "legacy"
@@ -1315,6 +1315,7 @@ class RealSenseRGBSource(ObservationSource):
                         "color_format": self.config.color_format,
                         "source_clock": "receiver_wall_time",
                         "available_clock": "local_wall_time",
+                        "source_generation": generation,
                         "camera_timestamp_sec": frame_timestamp_sec,
                         "timestamp_domain": timestamp_domain,
                         "sensor_timestamp_ms": sensor_timestamp_ms,
