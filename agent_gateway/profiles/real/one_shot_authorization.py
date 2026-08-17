@@ -38,17 +38,21 @@ _FIXED_SKILL_ID_BY_ACTION = {
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
 }
+_ACTION_BY_FIXED_SKILL_ID = {
+    skill_id: action for action, skill_id in _FIXED_SKILL_ID_BY_ACTION.items()
+}
 
 
 class RealAgentPrimitiveOneShotAuthorization:
-    """Issue at most one request-bound Grant for one operator-approved action."""
+    """Issue at most one request-bound Grant from an approved action set."""
 
     def __init__(
         self,
         *,
         gateway_session: RealAgentPrimitiveGatewaySession,
         side: str,
-        action: str,
+        action: str | None = None,
+        authorized_actions: tuple[str, ...] | None = None,
         client_id: str,
         confirmation_token: str,
         grant_lifetime_sec: float = 5.0,
@@ -57,12 +61,24 @@ class RealAgentPrimitiveOneShotAuthorization:
         if not isinstance(gateway_session, RealAgentPrimitiveGatewaySession):
             raise TypeError("gateway_session must be typed.")
         normalized_side = str(side).strip()
-        normalized_action = str(action).strip()
+        if authorized_actions is None:
+            if action is None:
+                raise ValueError("action or authorized_actions is required.")
+            requested_actions = (action,)
+        else:
+            if action is not None:
+                raise ValueError("action and authorized_actions are mutually exclusive.")
+            requested_actions = tuple(authorized_actions)
+        normalized_actions = tuple(
+            sorted({str(item).strip() for item in requested_actions})
+        )
         normalized_client_id = str(client_id).strip()
         if normalized_side not in {"left", "right"}:
             raise ValueError("side must be left or right.")
-        if normalized_action not in REAL_AGENT_PRIMITIVE_ACTIONS:
-            raise ValueError("action is not a reviewed real primitive.")
+        if not normalized_actions or any(
+            item not in REAL_AGENT_PRIMITIVE_ACTIONS for item in normalized_actions
+        ):
+            raise ValueError("authorized_actions contains an unreviewed primitive.")
         if not normalized_client_id:
             raise ValueError("client_id must be non-empty.")
         if str(confirmation_token) != REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN:
@@ -74,7 +90,8 @@ class RealAgentPrimitiveOneShotAuthorization:
             raise TypeError("clock must be callable.")
         self.gateway_session = gateway_session
         self.side = normalized_side
-        self.action = normalized_action
+        self.authorized_actions = normalized_actions
+        self.action = normalized_actions[0] if len(normalized_actions) == 1 else None
         self.client_id = normalized_client_id
         self.grant_lifetime_sec = lifetime
         self._clock = clock
@@ -83,6 +100,8 @@ class RealAgentPrimitiveOneShotAuthorization:
 
     @property
     def expected_skill_id(self) -> str:
+        if self.action is None:
+            raise RuntimeError("expected_skill_id is undefined for an action set.")
         return _FIXED_SKILL_ID_BY_ACTION.get(
             self.action,
             "motion.step_tcp_cardinal",
@@ -101,13 +120,16 @@ class RealAgentPrimitiveOneShotAuthorization:
 
         if request.client_id != self.client_id:
             return None
-        if request.skill_id != self.expected_skill_id:
+        requested_action = (
+            request.parameters.get("direction")
+            if request.skill_id == "motion.step_tcp_cardinal"
+            else _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id)
+        )
+        if requested_action not in self.authorized_actions:
             return None
         if request.parameters.get("component_id") != f"{self.side}_arm":
             return None
-        if self.expected_skill_id == "motion.step_tcp_cardinal" and (
-            request.parameters.get("direction") != self.action
-        ):
+        if requested_action not in REAL_AGENT_PRIMITIVE_ACTIONS:
             return None
         with self._lock:
             if self._grant_issued:
@@ -129,7 +151,7 @@ class RealAgentPrimitiveOneShotAuthorization:
                     + canonical_content_hash(
                         {
                             "side": self.side,
-                            "action": self.action,
+                            "authorized_actions": self.authorized_actions,
                             "client_id": self.client_id,
                             "confirmation": REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
                         },

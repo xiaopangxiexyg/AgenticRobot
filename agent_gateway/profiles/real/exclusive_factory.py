@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
 from robot_motion.coordinate_frames import CoordinateFrameGraph
 from robot_motion.runtime import TeleopCommand, TeleopObservation
 from teleop_runtime.skill_deploy.control_runtime import (
@@ -130,7 +131,11 @@ def assemble_exclusive_real_agent_primitive_deployment(
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     perception_provider_factory: (
-        Callable[[RealAgentMotionPort], RealSenseAgentPerceptionProvider] | None
+        Callable[
+            [RealAgentMotionPort, Callable[[], int]],
+            RealSenseAgentPerceptionProvider,
+        ]
+        | None
     ) = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
@@ -154,10 +159,14 @@ def assemble_exclusive_real_agent_primitive_deployment(
         target_builder=target_builder,
         owner_identity=_owner_identity(observation_attachment),
     )
+    revision_tracker = AgentStationRevisionTracker()
     perception_provider = (
         None
         if perception_provider_factory is None
-        else perception_provider_factory(port)
+        else perception_provider_factory(
+            port,
+            lambda: revision_tracker.current_revision,
+        )
     )
     control_runtime = ExclusiveRealSkillControlRuntime(
         motion_port=port,
@@ -177,6 +186,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         perception_provider=perception_provider,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
+        revision_tracker=revision_tracker,
         clock=clock,
         sleep=sleep,
     )
@@ -199,7 +209,11 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
     perception_provider_factory: (
-        Callable[[RealAgentMotionPort], RealSenseAgentPerceptionProvider] | None
+        Callable[
+            [RealAgentMotionPort, Callable[[], int]],
+            RealSenseAgentPerceptionProvider,
+        ]
+        | None
     ) = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
