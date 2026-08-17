@@ -11,7 +11,7 @@ import pytest
 
 from agent_gateway.protocol.contracts import (
     AGENT_CONTROL_REASON_CODES_V1,
-    AGENT_SKILL_PROTOCOL_VERSION_V1,
+    AGENT_SKILL_PROTOCOL_VERSION_V2,
     AgentObservationSnapshot,
     AgentOwnDomainHoldRequest,
     AgentOwnOperationCancelRequest,
@@ -36,7 +36,7 @@ _SCHEMA_PATH = (
     Path(__file__).resolve().parents[1]
     / "agent_gateway"
     / "protocol"
-    / "agent_skill_v1.schema.json"
+    / "agent_skill_v2.schema.json"
 )
 
 
@@ -146,6 +146,7 @@ def _request_payload(
         "observation_snapshot_id": "snapshot:test:7",
         "requested_mode": manifest.current_mode,
         "requested_timeout_ms": 500,
+        "input_artifact_bindings": [],
     }
 
 
@@ -160,7 +161,7 @@ def test_manifest_is_order_stable_and_hashes_exact_route_bindings() -> None:
     assert first.skill_routes == second.skill_routes
     assert first.semantic_content_hash == second.semantic_content_hash
     assert first.to_wire()["route_manifest_hash"] == first.semantic_content_hash
-    assert first.protocol_version == AGENT_SKILL_PROTOCOL_VERSION_V1
+    assert first.protocol_version == AGENT_SKILL_PROTOCOL_VERSION_V2
 
 
 def test_skill_request_identity_is_upper_framework_neutral() -> None:
@@ -341,7 +342,7 @@ def test_operation_separates_running_from_terminal_success() -> None:
 
 def test_portable_schema_snapshot_is_route_based_and_strict() -> None:
     document = agent_skill_schema_snapshot_document()
-    assert document["protocol_version"] == AGENT_SKILL_PROTOCOL_VERSION_V1
+    assert document["protocol_version"] == AGENT_SKILL_PROTOCOL_VERSION_V2
     assert len(document["snapshot_hash"]) == 64
     assert len(document["protocol_semantic_hash"]) == 64
     for schema in document["schemas"].values():
@@ -361,6 +362,9 @@ def test_portable_schema_snapshot_is_route_based_and_strict() -> None:
     )
     assert "capability_manifest" not in document["schemas"]
     request_schema = document["schemas"]["skill_request"]
+    route_manifest_schema = document["schemas"]["skill_route_manifest"]
+    assert "skill_io_catalog_hash" in route_manifest_schema["properties"]
+    assert "skill_io_catalog_hash" in route_manifest_schema["required"]
     assert "route_hash" in request_schema["properties"]
     assert "raw_qpos" not in request_schema["properties"]
     assert "raw_pose" not in request_schema["properties"]

@@ -17,6 +17,21 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from .artifact_contracts import (
+    AGENT_ARTIFACT_ACCESS_GRANT_HASH_DOMAIN_V2,
+    AGENT_ARTIFACT_BINDING_HASH_DOMAIN_V2,
+    AGENT_ARTIFACT_MATERIALIZATION_RECEIPT_HASH_DOMAIN_V2,
+    AGENT_ARTIFACT_REF_HASH_DOMAIN_V2,
+    AGENT_ARTIFACT_TRANSFER_RECEIPT_HASH_DOMAIN_V2,
+    AgentArtifactBinding,
+    agent_artifact_wire_schemas_v2,
+)
+from .event_contracts import (
+    AGENT_GATEWAY_EVENT_BATCH_HASH_DOMAIN_V2,
+    AGENT_GATEWAY_EVENT_HASH_DOMAIN_V2,
+    AGENT_GATEWAY_EVENT_KINDS_V2,
+    agent_event_wire_schemas_v2,
+)
 from .evaluation_contracts import (
     AGENT_SKILL_AGGREGATE_EVALUATION_RECEIPT_HASH_DOMAIN_V1,
     AGENT_SKILL_AGGREGATE_VERDICTS_V1,
@@ -34,25 +49,35 @@ from .evaluation_contracts import (
 from .skill_catalog import (
     AGENT_SKILL_CONTROL_EFFECT_CLASSES_V1,
     AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_POLICIES_V1,
-    AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V1,
-    AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V1,
-    AGENT_SKILL_DEFINITION_HASH_DOMAIN_V1,
-    AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V1,
+    AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V2,
+    AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V2,
+    AGENT_SKILL_DEFINITION_HASH_DOMAIN_V2,
+    AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V2,
     AGENT_SKILL_INTENDED_TARGET_KINDS_V1,
     AGENT_SKILL_KINDS_V1,
-    AGENT_SKILL_ROUTE_HASH_DOMAIN_V1,
-    AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V1,
-    AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V1,
-    AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V1,
-    AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V1,
-    AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V1,
+    AGENT_SKILL_ROUTE_HASH_DOMAIN_V2,
+    AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V2,
+    AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V2,
+    AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V2,
+    AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V2,
+    AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V2,
     validate_route_id,
     validate_skill_id,
     validate_version,
 )
+from .skill_io_contracts import (
+    AGENT_SKILL_IO_CATALOG_HASH_DOMAIN_V2,
+    AGENT_SKILL_IO_CONTRACT_HASH_DOMAIN_V2,
+    agent_skill_io_wire_schemas_v2,
+)
+from .session_contracts import (
+    AGENT_GATEWAY_SESSION_CAPABILITIES_HASH_DOMAIN_V2,
+    AGENT_SKILL_RESOURCE_CLAIM_HASH_DOMAIN_V2,
+    agent_session_wire_schemas_v2,
+)
+from .version import AGENT_SKILL_PROTOCOL_VERSION_V2
 
-AGENT_SKILL_PROTOCOL_VERSION_V1 = "dexteleop.agent_skill.v1"
-AGENT_SKILL_SCHEMA_SNAPSHOT_V1 = "dexteleop_agent_skill_schema_snapshot_v1"
+AGENT_SKILL_SCHEMA_SNAPSHOT_V2 = "dexteleop_agent_skill_schema_snapshot_v2"
 
 AGENT_SKILL_TARGET_KINDS_V1 = ("null", "real", "sim")
 AGENT_SKILL_MODES_V1 = (
@@ -137,14 +162,14 @@ AMBIGUOUS_LIFECYCLE_SKILL_IDS_V1 = (
 MAX_AGENT_SKILL_TIMEOUT_MS_V1 = 86_400_000
 MAX_AGENT_SKILL_JSON_DEPTH_V1 = 16
 
-AGENT_SKILL_REQUEST_HASH_DOMAIN_V1 = "dexteleop.agent_skill.request.v1"
-AGENT_SKILL_REQUEST_AUTHORIZATION_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.request_authorization.v1"
+AGENT_SKILL_REQUEST_HASH_DOMAIN_V2 = "dexteleop.agent_skill.request.v2"
+AGENT_SKILL_REQUEST_AUTHORIZATION_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.request_authorization.v2"
 )
 AGENT_SKILL_OBSERVATION_SNAPSHOT_HASH_DOMAIN_V1 = (
     "dexteleop.agent_skill.observation_snapshot.v1"
 )
-AGENT_SKILL_OPERATION_HASH_DOMAIN_V1 = "dexteleop.agent_skill.operation.v1"
+AGENT_SKILL_OPERATION_HASH_DOMAIN_V2 = "dexteleop.agent_skill.operation.v2"
 AGENT_SKILL_EXECUTION_GRANT_HASH_DOMAIN_V1 = (
     "dexteleop.agent_skill.execution_grant.v1"
 )
@@ -154,8 +179,8 @@ AGENT_SKILL_ACCESS_POLICY_HASH_DOMAIN_V1 = (
 AGENT_SKILL_ACCESS_DECISION_HASH_DOMAIN_V1 = (
     "dexteleop.agent_skill.access_decision.v1"
 )
-AGENT_SKILL_PROTOCOL_SCHEMA_HASH_DOMAIN_V1 = (
-    "dexteleop.agent_skill.protocol_schema.v1"
+AGENT_SKILL_PROTOCOL_SCHEMA_HASH_DOMAIN_V2 = (
+    "dexteleop.agent_skill.protocol_schema.v2"
 )
 AGENT_OWN_OPERATION_QUERY_HASH_DOMAIN_V1 = (
     "dexteleop.agent_control.own_operation_query.v1"
@@ -358,6 +383,31 @@ def _nullable(schema: Mapping[str, Any]) -> dict[str, Any]:
     return {"anyOf": [dict(schema), {"type": "null"}]}
 
 
+def _artifact_bindings(
+    values: object,
+    *,
+    field_name: str,
+    allow_production_receipts: bool,
+) -> tuple[AgentArtifactBinding, ...]:
+    if not isinstance(values, (tuple, list)):
+        raise TypeError(f"{field_name} must be a tuple or list.")
+    bindings = tuple(values)
+    if any(not isinstance(item, AgentArtifactBinding) for item in bindings):
+        raise TypeError(f"{field_name} must contain AgentArtifactBinding values.")
+    keys = tuple((item.slot_id, item.ordinal) for item in bindings)
+    if keys != tuple(sorted(keys)) or len(set(keys)) != len(keys):
+        raise ValueError(
+            f"{field_name} must be uniquely sorted by slot_id and ordinal."
+        )
+    if not allow_production_receipts and any(
+        item.production_receipt_ref is not None for item in bindings
+    ):
+        raise ValueError(
+            "Input Artifact bindings cannot contain production_receipt_ref."
+        )
+    return bindings
+
+
 @dataclass(frozen=True)
 class AgentSkillRequest:
     """Strict client request for one advertised server-side skill."""
@@ -388,6 +438,7 @@ class AgentSkillRequest:
     deployment_safety_envelope_id: str | None = None
     deployment_safety_envelope_hash: str | None = None
     safety_constraint_set_hash: str | None = None
+    input_artifact_bindings: tuple[AgentArtifactBinding, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -493,6 +544,15 @@ class AgentSkillRequest:
             )
         for field_name, value in normalized_safety.items():
             object.__setattr__(self, field_name, value)
+        object.__setattr__(
+            self,
+            "input_artifact_bindings",
+            _artifact_bindings(
+                self.input_artifact_bindings,
+                field_name="input_artifact_bindings",
+                allow_production_receipts=False,
+            ),
+        )
 
     @property
     def has_safety_profile_selection(self) -> bool:
@@ -502,7 +562,7 @@ class AgentSkillRequest:
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             self.to_wire(),
-            domain=AGENT_SKILL_REQUEST_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_REQUEST_HASH_DOMAIN_V2,
         )
 
     @property
@@ -513,7 +573,7 @@ class AgentSkillRequest:
         payload.pop("skill_execution_grant_id")
         return canonical_content_hash(
             payload,
-            domain=AGENT_SKILL_REQUEST_AUTHORIZATION_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_REQUEST_AUTHORIZATION_HASH_DOMAIN_V2,
         )
 
     def to_wire(self) -> dict[str, Any]:
@@ -539,6 +599,9 @@ class AgentSkillRequest:
             "requested_mode": self.requested_mode,
             "requested_timeout_ms": self.requested_timeout_ms,
             "skill_execution_grant_id": self.skill_execution_grant_id,
+            "input_artifact_bindings": [
+                binding.to_wire() for binding in self.input_artifact_bindings
+            ],
         }
         if self.has_safety_profile_selection:
             payload.update(
@@ -587,6 +650,7 @@ _SKILL_REQUEST_FIELDS = frozenset(
         "deployment_safety_envelope_id",
         "deployment_safety_envelope_hash",
         "safety_constraint_set_hash",
+        "input_artifact_bindings",
     }
 )
 _REQUIRED_SKILL_REQUEST_FIELDS = _SKILL_REQUEST_FIELDS - {
@@ -642,6 +706,10 @@ def agent_skill_request_from_json(payload: Mapping[str, Any]) -> AgentSkillReque
             "deployment_safety_envelope_hash"
         ),
         safety_constraint_set_hash=payload.get("safety_constraint_set_hash"),
+        input_artifact_bindings=tuple(
+            AgentArtifactBinding.from_wire(item)
+            for item in payload["input_artifact_bindings"]
+        ),
     )
 
 
@@ -1089,6 +1157,7 @@ class AgentSkillOperation:
     progress_summary: Mapping[str, Any] = field(default_factory=dict)
     execution_result: Mapping[str, Any] | None = None
     task_evaluation: Mapping[str, Any] | None = None
+    output_artifact_bindings: tuple[AgentArtifactBinding, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -1198,6 +1267,19 @@ class AgentSkillOperation:
                     field_name,
                     _freeze_json_object(value, field_name=field_name),
                 )
+        object.__setattr__(
+            self,
+            "output_artifact_bindings",
+            _artifact_bindings(
+                self.output_artifact_bindings,
+                field_name="output_artifact_bindings",
+                allow_production_receipts=True,
+            ),
+        )
+        if self.output_artifact_bindings and self.execution_outcome != "completed":
+            raise ValueError(
+                "Output Artifact bindings require execution_outcome='completed'."
+            )
 
         if self.status in {
             "received",
@@ -1307,7 +1389,7 @@ class AgentSkillOperation:
     def semantic_content_hash(self) -> str:
         return canonical_content_hash(
             self.to_wire(include_hash=False),
-            domain=AGENT_SKILL_OPERATION_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_OPERATION_HASH_DOMAIN_V2,
         )
 
     def to_wire(self, *, include_hash: bool = True) -> dict[str, Any]:
@@ -1345,6 +1427,9 @@ class AgentSkillOperation:
                 if self.task_evaluation is None
                 else _thaw_json(self.task_evaluation)
             ),
+            "output_artifact_bindings": [
+                binding.to_wire() for binding in self.output_artifact_bindings
+            ],
         }
         if include_hash:
             payload["operation_hash"] = self.semantic_content_hash
@@ -1357,6 +1442,13 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
 
     nullable_string = _nullable({"type": "string", "minLength": 1})
     nullable_integer = _nullable({"type": "integer", "minimum": 0})
+    artifact_schemas = agent_artifact_wire_schemas_v2()
+    artifact_ref = artifact_schemas["agent_artifact_ref"]
+    artifact_binding = {
+        key: value
+        for key, value in artifact_schemas["agent_artifact_binding"].items()
+        if key != "$defs"
+    }
     authoritative_port_receipt_properties = {
         "receipt_id": {"type": "string", "minLength": 1},
         "port_id": {"type": "string", "minLength": 1},
@@ -1469,9 +1561,9 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         ],
     }
     definition_catalog = _json_schema_object(
-        schema_id="urn:dexteleop:agent-skill:definition-catalog:v1",
+        schema_id="urn:dexteleop:agent-skill:definition-catalog:v2",
         properties={
-            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V1},
+            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V2},
             "catalog_id": {"type": "string", "minLength": 1},
             "catalog_version": {"type": "string", "pattern": r"^[1-9][0-9]*$"},
             "skill_definitions": {
@@ -1533,9 +1625,9 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         ],
     }
     schema_catalog = _json_schema_object(
-        schema_id="urn:dexteleop:agent-skill:schema-catalog:v1",
+        schema_id="urn:dexteleop:agent-skill:schema-catalog:v2",
         properties={
-            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V1},
+            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V2},
             "catalog_id": {"type": "string", "minLength": 1},
             "catalog_version": {"type": "string", "pattern": r"^[1-9][0-9]*$"},
             "schema_entries": {
@@ -1604,8 +1696,19 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
                 "type": "string",
                 "enum": list(AGENT_SKILL_CANCELLATION_POLICIES_V1),
             },
-            "max_concurrent_operations": {"const": 1},
+            "max_concurrent_operations": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 64,
+            },
             "requires_task_evaluation": {"type": "boolean"},
+            "skill_io_contract_hash": {"type": "string", "minLength": 1},
+            "resource_claims": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": True,
+                "items": {"$ref": "#/$defs/SkillResourceClaim"},
+            },
             "route_hash": {"type": "string", "minLength": 1},
         },
         "required": [
@@ -1630,7 +1733,31 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "cancellation_policy",
             "max_concurrent_operations",
             "requires_task_evaluation",
+            "skill_io_contract_hash",
+            "resource_claims",
             "route_hash",
+        ],
+    }
+    resource_claim = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "resource_id": {"type": "string", "minLength": 1},
+            "access_mode": {
+                "type": "string",
+                "enum": ["shared_read", "shared_write", "exclusive"],
+            },
+            "units": {"type": "integer", "minimum": 1},
+            "resource_claim_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+        },
+        "required": [
+            "resource_id",
+            "access_mode",
+            "units",
+            "resource_claim_hash",
         ],
     }
     cross_target_deployment_review = {
@@ -1753,15 +1880,16 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         ],
     }
     route_manifest = _json_schema_object(
-        schema_id="urn:dexteleop:agent-skill:route-manifest:v1",
+        schema_id="urn:dexteleop:agent-skill:route-manifest:v2",
         properties={
-            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V1},
+            "protocol_version": {"const": AGENT_SKILL_PROTOCOL_VERSION_V2},
             "runtime_session_id": {"type": "string", "minLength": 1},
             "control_domain_id": {"type": "string", "minLength": 1},
             "station_manifest_hash": {"type": "string", "minLength": 1},
             "execution_manifest_hash": {"type": "string", "minLength": 1},
             "skill_definition_catalog_hash": {"type": "string", "minLength": 1},
             "skill_schema_catalog_hash": {"type": "string", "minLength": 1},
+            "skill_io_catalog_hash": {"type": "string", "minLength": 1},
             "target_binding_id": {"type": "string", "minLength": 1},
             "target_kind": {
                 "type": "string",
@@ -1795,6 +1923,7 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "execution_manifest_hash",
             "skill_definition_catalog_hash",
             "skill_schema_catalog_hash",
+            "skill_io_catalog_hash",
             "target_binding_id",
             "target_kind",
             "current_mode",
@@ -1806,13 +1935,14 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         definitions={
             "SkillParameterProfileRef": profile_ref,
             "SkillExecutionRoute": route,
+            "SkillResourceClaim": resource_claim,
             "CrossTargetDeploymentReviewRef": cross_target_deployment_review,
             "SkillDeploymentBindingRef": binding,
             "SkillRouteManifestEntry": route_entry,
         },
     )
     request = _json_schema_object(
-        schema_id="urn:dexteleop:agent-skill:request:v1",
+        schema_id="urn:dexteleop:agent-skill:request:v2",
         properties={
             "client_id": {"type": "string", "minLength": 1},
             "request_id": {"type": "string", "minLength": 1},
@@ -1842,6 +1972,11 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
                 "maximum": MAX_AGENT_SKILL_TIMEOUT_MS_V1,
             },
             "skill_execution_grant_id": nullable_string,
+            "input_artifact_bindings": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {"$ref": "#/$defs/AgentArtifactBinding"},
+            },
             "safety_profile_id": {"type": "string", "minLength": 1},
             "safety_profile_hash": {"type": "string", "minLength": 1},
             "deployment_safety_envelope_id": {
@@ -1858,6 +1993,10 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             },
         },
         required=tuple(sorted(_REQUIRED_SKILL_REQUEST_FIELDS)),
+        definitions={
+            "AgentArtifactRef": artifact_ref,
+            "AgentArtifactBinding": artifact_binding,
+        },
     )
     own_operation_query = _json_schema_object(
         schema_id="urn:dexteleop:agent-control:own-operation-query:v1",
@@ -1967,7 +2106,7 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         ),
     )
     operation = _json_schema_object(
-        schema_id="urn:dexteleop:agent-skill:operation:v1",
+        schema_id="urn:dexteleop:agent-skill:operation:v2",
         properties={
             "operation_id": {"type": "string", "minLength": 1},
             "request_hash": {"type": "string", "minLength": 1},
@@ -2013,6 +2152,11 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "progress_summary": {"type": "object"},
             "execution_result": _nullable({"type": "object"}),
             "task_evaluation": _nullable({"type": "object"}),
+            "output_artifact_bindings": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {"$ref": "#/$defs/AgentArtifactBinding"},
+            },
             "operation_hash": {"type": "string", "minLength": 1},
         },
         required=(
@@ -2037,8 +2181,13 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
             "progress_summary",
             "execution_result",
             "task_evaluation",
+            "output_artifact_bindings",
             "operation_hash",
         ),
+        definitions={
+            "AgentArtifactRef": artifact_ref,
+            "AgentArtifactBinding": artifact_binding,
+        },
     )
     control_plane_response = _json_schema_object(
         schema_id="urn:dexteleop:agent-control:response:v1",
@@ -2305,7 +2454,7 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         properties=aggregate_properties,
         required=tuple(aggregate_properties),
     )
-    return {
+    schemas = {
         "skill_definition_catalog": definition_catalog,
         "agent_skill_schema_catalog": schema_catalog,
         "skill_route_manifest": route_manifest,
@@ -2322,6 +2471,11 @@ def _agent_skill_route_wire_schemas() -> dict[str, Any]:
         "skill_evaluation_receipt": evaluation_receipt,
         "skill_aggregate_evaluation_receipt": aggregate_evaluation_receipt,
     }
+    schemas.update(agent_artifact_wire_schemas_v2())
+    schemas.update(agent_skill_io_wire_schemas_v2())
+    schemas.update(agent_session_wire_schemas_v2())
+    schemas.update(agent_event_wire_schemas_v2())
+    return schemas
 
 
 def agent_skill_schema_snapshot_document() -> dict[str, Any]:
@@ -2368,6 +2522,7 @@ def agent_skill_schema_snapshot_document() -> dict[str, Any]:
         ),
         "target_kinds": list(AGENT_SKILL_TARGET_KINDS_V1),
         "skill_kinds": list(AGENT_SKILL_KINDS_V1),
+        "gateway_event_kinds": list(AGENT_GATEWAY_EVENT_KINDS_V2),
         "task_outcomes": list(AGENT_SKILL_TASK_OUTCOMES_V1),
         "terminal_operation_statuses": list(
             AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1
@@ -2379,13 +2534,13 @@ def agent_skill_schema_snapshot_document() -> dict[str, Any]:
         "aggregate_evaluation_receipt": (
             AGENT_SKILL_AGGREGATE_EVALUATION_RECEIPT_HASH_DOMAIN_V1
         ),
-        "definition": AGENT_SKILL_DEFINITION_HASH_DOMAIN_V1,
-        "definition_catalog": AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V1,
+        "definition": AGENT_SKILL_DEFINITION_HASH_DOMAIN_V2,
+        "definition_catalog": AGENT_SKILL_DEFINITION_CATALOG_HASH_DOMAIN_V2,
         "cross_target_deployment_review_ref": (
-            AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V1
+            AGENT_SKILL_CROSS_TARGET_DEPLOYMENT_REVIEW_REF_HASH_DOMAIN_V2
         ),
         "deployment_binding_ref": (
-            AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V1
+            AGENT_SKILL_DEPLOYMENT_BINDING_REF_HASH_DOMAIN_V2
         ),
         "execution_grant": AGENT_SKILL_EXECUTION_GRANT_HASH_DOMAIN_V1,
         "evaluation_plan": AGENT_SKILL_EVALUATION_PLAN_HASH_DOMAIN_V1,
@@ -2404,22 +2559,39 @@ def agent_skill_schema_snapshot_document() -> dict[str, Any]:
         "authoritative_port_receipt": (
             AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_HASH_DOMAIN_V1
         ),
-        "operation": AGENT_SKILL_OPERATION_HASH_DOMAIN_V1,
-        "protocol_schema": AGENT_SKILL_PROTOCOL_SCHEMA_HASH_DOMAIN_V1,
-        "request": AGENT_SKILL_REQUEST_HASH_DOMAIN_V1,
-        "request_authorization": AGENT_SKILL_REQUEST_AUTHORIZATION_HASH_DOMAIN_V1,
-        "route": AGENT_SKILL_ROUTE_HASH_DOMAIN_V1,
-        "route_manifest": AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V1,
-        "route_manifest_entry": (
-            AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V1
+        "operation": AGENT_SKILL_OPERATION_HASH_DOMAIN_V2,
+        "protocol_schema": AGENT_SKILL_PROTOCOL_SCHEMA_HASH_DOMAIN_V2,
+        "request": AGENT_SKILL_REQUEST_HASH_DOMAIN_V2,
+        "request_authorization": AGENT_SKILL_REQUEST_AUTHORIZATION_HASH_DOMAIN_V2,
+        "artifact_ref": AGENT_ARTIFACT_REF_HASH_DOMAIN_V2,
+        "artifact_binding": AGENT_ARTIFACT_BINDING_HASH_DOMAIN_V2,
+        "artifact_access_grant": AGENT_ARTIFACT_ACCESS_GRANT_HASH_DOMAIN_V2,
+        "artifact_transfer_receipt": (
+            AGENT_ARTIFACT_TRANSFER_RECEIPT_HASH_DOMAIN_V2
         ),
-        "schema_catalog": AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V1,
-        "schema_document": AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V1,
-        "schema_entry": AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V1,
+        "artifact_materialization_receipt": (
+            AGENT_ARTIFACT_MATERIALIZATION_RECEIPT_HASH_DOMAIN_V2
+        ),
+        "gateway_event": AGENT_GATEWAY_EVENT_HASH_DOMAIN_V2,
+        "gateway_event_batch": AGENT_GATEWAY_EVENT_BATCH_HASH_DOMAIN_V2,
+        "session_capabilities": (
+            AGENT_GATEWAY_SESSION_CAPABILITIES_HASH_DOMAIN_V2
+        ),
+        "resource_claim": AGENT_SKILL_RESOURCE_CLAIM_HASH_DOMAIN_V2,
+        "route": AGENT_SKILL_ROUTE_HASH_DOMAIN_V2,
+        "route_manifest": AGENT_SKILL_ROUTE_MANIFEST_HASH_DOMAIN_V2,
+        "route_manifest_entry": (
+            AGENT_SKILL_ROUTE_MANIFEST_ENTRY_HASH_DOMAIN_V2
+        ),
+        "schema_catalog": AGENT_SKILL_SCHEMA_CATALOG_HASH_DOMAIN_V2,
+        "skill_io_catalog": AGENT_SKILL_IO_CATALOG_HASH_DOMAIN_V2,
+        "skill_io_contract": AGENT_SKILL_IO_CONTRACT_HASH_DOMAIN_V2,
+        "schema_document": AGENT_SKILL_SCHEMA_DOCUMENT_HASH_DOMAIN_V2,
+        "schema_entry": AGENT_SKILL_SCHEMA_ENTRY_HASH_DOMAIN_V2,
     }
     schemas = _agent_skill_route_wire_schemas()
     protocol_surface = {
-        "protocol_version": AGENT_SKILL_PROTOCOL_VERSION_V1,
+        "protocol_version": AGENT_SKILL_PROTOCOL_VERSION_V2,
         "enums": enums,
         "hash_domains": hash_domains,
         "limits": {
@@ -2429,11 +2601,11 @@ def agent_skill_schema_snapshot_document() -> dict[str, Any]:
         "schemas": schemas,
     }
     document = {
-        "schema": AGENT_SKILL_SCHEMA_SNAPSHOT_V1,
+        "schema": AGENT_SKILL_SCHEMA_SNAPSHOT_V2,
         **protocol_surface,
         "protocol_semantic_hash": canonical_content_hash(
             protocol_surface,
-            domain=AGENT_SKILL_PROTOCOL_SCHEMA_HASH_DOMAIN_V1,
+            domain=AGENT_SKILL_PROTOCOL_SCHEMA_HASH_DOMAIN_V2,
         ),
         "snapshot_hash_algorithm": "sha256_canonical_json_v1",
     }
@@ -2480,8 +2652,8 @@ __all__ = [
     "AGENT_SKILL_INTENDED_TARGET_KINDS_V1",
     "AGENT_SKILL_OPERATION_STATUSES_V1",
     "AGENT_SKILL_PRIVILEGE_TIERS_V1",
-    "AGENT_SKILL_PROTOCOL_VERSION_V1",
-    "AGENT_SKILL_SCHEMA_SNAPSHOT_V1",
+    "AGENT_SKILL_PROTOCOL_VERSION_V2",
+    "AGENT_SKILL_SCHEMA_SNAPSHOT_V2",
     "AGENT_SKILL_TARGET_KINDS_V1",
     "AGENT_SKILL_TASK_OUTCOMES_V1",
     "AGENT_SKILL_TERMINAL_OPERATION_STATUSES_V1",

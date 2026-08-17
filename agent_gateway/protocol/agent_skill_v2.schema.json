@@ -1,0 +1,4138 @@
+{
+  "enums": {
+    "agent_control_reason_codes": [
+      "agent_anomaly_detected",
+      "agent_replan_requested",
+      "agent_requested_pause",
+      "agent_task_aborted",
+      "agent_uncertain_state"
+    ],
+    "aggregate_evaluation_verdicts": [
+      "failed",
+      "inconclusive",
+      "succeeded"
+    ],
+    "ambiguous_lifecycle_skill_ids": [
+      "home",
+      "home_v1",
+      "rearm",
+      "rearm_v1"
+    ],
+    "cancellation_policies": [
+      "cancel_only",
+      "hold_on_cancel",
+      "hold_on_cancel_disconnect_or_timeout",
+      "hold_on_disconnect_or_timeout"
+    ],
+    "control_effect_classes": [
+      "lifecycle",
+      "motion",
+      "read_only"
+    ],
+    "cross_target_deployment_policies": [
+      "forbidden",
+      "not_applicable",
+      "review_required"
+    ],
+    "disagreement_policies": [
+      "aggregation_policy",
+      "inconclusive",
+      "veto"
+    ],
+    "evaluation_statuses": [
+      "completed",
+      "not_requested",
+      "pending",
+      "timed_out"
+    ],
+    "evaluation_verdicts": [
+      "error",
+      "failed",
+      "inconclusive",
+      "succeeded"
+    ],
+    "evaluator_failure_policies": [
+      "mark_error",
+      "omit",
+      "veto"
+    ],
+    "evaluator_kinds": [
+      "environment",
+      "external",
+      "operator",
+      "policy_self",
+      "rule_based"
+    ],
+    "evaluator_locations": [
+      "external_service",
+      "gateway_worker",
+      "lower_runtime",
+      "operator_console",
+      "policy_runtime"
+    ],
+    "evaluator_roles": [
+      "advisory",
+      "contributing",
+      "required",
+      "veto"
+    ],
+    "execution_outcomes": [
+      "cancelled",
+      "completed",
+      "failed",
+      "pending",
+      "timed_out"
+    ],
+    "gateway_event_kinds": [
+      "artifact_ready",
+      "capabilities_changed",
+      "manifest_changed",
+      "operation_progress",
+      "operation_terminal",
+      "operation_updated",
+      "session_closing"
+    ],
+    "intended_target_kinds": [
+      "real",
+      "sim",
+      "target_agnostic"
+    ],
+    "missing_evidence_policies": [
+      "fail",
+      "inconclusive"
+    ],
+    "modes": [
+      "dry_run",
+      "real_active",
+      "real_observe",
+      "sim_active"
+    ],
+    "operation_statuses": [
+      "received",
+      "validated",
+      "preflighted",
+      "awaiting_operator_confirmation",
+      "admitted",
+      "activated",
+      "running",
+      "awaiting_evaluation",
+      "completed",
+      "failed",
+      "cancelled",
+      "timed_out"
+    ],
+    "privilege_tiers": [
+      "t0_read_only",
+      "t1_sim_or_no_motion",
+      "t2_real_motion",
+      "t3_lifecycle"
+    ],
+    "privileged_lifecycle_skill_ids": [
+      "lifecycle.capture_runtime_home",
+      "lifecycle.move_to_registered_home",
+      "lifecycle.rearm_safety_latch",
+      "lifecycle.resume_after_hold"
+    ],
+    "skill_kinds": [
+      "inspection",
+      "lifecycle",
+      "motion",
+      "policy_task"
+    ],
+    "target_kinds": [
+      "null",
+      "real",
+      "sim"
+    ],
+    "task_outcomes": [
+      "failed",
+      "inconclusive",
+      "not_assessed",
+      "pending",
+      "succeeded"
+    ],
+    "terminal_operation_statuses": [
+      "cancelled",
+      "completed",
+      "failed",
+      "timed_out"
+    ]
+  },
+  "hash_domains": {
+    "access_decision": "dexteleop.agent_skill.access_decision.v1",
+    "access_policy": "dexteleop.agent_skill.access_policy.v1",
+    "aggregate_evaluation_receipt": "dexteleop.agent_skill.aggregate_evaluation_receipt.v1",
+    "artifact_access_grant": "dexteleop.agent_skill.artifact_access_grant.v2",
+    "artifact_binding": "dexteleop.agent_skill.artifact_binding.v2",
+    "artifact_materialization_receipt": "dexteleop.agent_skill.artifact_materialization_receipt.v2",
+    "artifact_ref": "dexteleop.agent_skill.artifact_ref.v2",
+    "artifact_transfer_receipt": "dexteleop.agent_skill.artifact_transfer_receipt.v2",
+    "authoritative_port_receipt": "dexteleop.agent_gateway.authoritative_port_receipt.v1",
+    "cross_target_deployment_review_ref": "dexteleop.agent_skill.cross_target_deployment_review_ref.v2",
+    "definition": "dexteleop.agent_skill.definition.v2",
+    "definition_catalog": "dexteleop.agent_skill.definition_catalog.v2",
+    "deployment_binding_ref": "dexteleop.agent_skill.deployment_binding_ref.v2",
+    "evaluation_plan": "dexteleop.agent_skill.evaluation_plan.v1",
+    "evaluation_receipt": "dexteleop.agent_skill.evaluation_receipt.v1",
+    "evaluator_spec": "dexteleop.agent_skill.evaluator_spec.v1",
+    "execution_grant": "dexteleop.agent_skill.execution_grant.v1",
+    "gateway_event": "dexteleop.agent_gateway.event.v2",
+    "gateway_event_batch": "dexteleop.agent_gateway.event_batch.v2",
+    "observation_snapshot": "dexteleop.agent_skill.observation_snapshot.v1",
+    "operation": "dexteleop.agent_skill.operation.v2",
+    "own_domain_hold_request": "dexteleop.agent_control.own_domain_hold_request.v1",
+    "own_operation_cancel_request": "dexteleop.agent_control.own_operation_cancel_request.v1",
+    "own_operation_query": "dexteleop.agent_control.own_operation_query.v1",
+    "protocol_schema": "dexteleop.agent_skill.protocol_schema.v2",
+    "request": "dexteleop.agent_skill.request.v2",
+    "request_authorization": "dexteleop.agent_skill.request_authorization.v2",
+    "resource_claim": "dexteleop.agent_skill.resource_claim.v2",
+    "route": "dexteleop.agent_skill.route.v2",
+    "route_manifest": "dexteleop.agent_skill.route_manifest.v2",
+    "route_manifest_entry": "dexteleop.agent_skill.route_manifest_entry.v2",
+    "schema_catalog": "dexteleop.agent_skill.schema_catalog.v2",
+    "schema_document": "dexteleop.agent_skill.schema_document.v2",
+    "schema_entry": "dexteleop.agent_skill.schema_entry.v2",
+    "session_capabilities": "dexteleop.agent_gateway.session_capabilities.v2",
+    "skill_io_catalog": "dexteleop.agent_skill.io_catalog.v2",
+    "skill_io_contract": "dexteleop.agent_skill.io_contract.v2"
+  },
+  "limits": {
+    "max_json_depth": 16,
+    "max_timeout_ms": 86400000
+  },
+  "protocol_semantic_hash": "3ea87b8f33698ca9f091e04b649e35266d986fbcefff3ae9c28fdd9544bed188",
+  "protocol_version": "dexteleop.agent_skill.v2",
+  "schema": "dexteleop_agent_skill_schema_snapshot_v2",
+  "schemas": {
+    "agent_artifact_access_grant": {
+      "$defs": {
+        "AgentArtifactRef": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "artifact_ref_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "byte_length": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "compression": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "encoding": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "media_type": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "dexteleop.agent_skill.v2"
+            },
+            "schema_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "artifact_id",
+            "media_type",
+            "schema_id",
+            "encoding",
+            "compression",
+            "byte_length",
+            "sha256",
+            "artifact_ref_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "access_grant_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "artifact": {
+          "$ref": "#/$defs/AgentArtifactRef"
+        },
+        "byte_offset": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "direction": {
+          "enum": [
+            "read",
+            "write"
+          ],
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "number"
+        },
+        "grant_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "issued_at": {
+          "type": "number"
+        },
+        "locator": {
+          "type": "object"
+        },
+        "max_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_uses": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mechanism": {
+          "enum": [
+            "chunked_rpc",
+            "local_path"
+          ],
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "grant_id",
+        "artifact",
+        "direction",
+        "mechanism",
+        "client_id",
+        "runtime_session_id",
+        "issued_at",
+        "expires_at",
+        "max_uses",
+        "locator",
+        "byte_offset",
+        "max_bytes",
+        "access_grant_hash"
+      ],
+      "type": "object"
+    },
+    "agent_artifact_binding": {
+      "$defs": {
+        "AgentArtifactRef": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "artifact_ref_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "byte_length": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "compression": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "encoding": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "media_type": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "dexteleop.agent_skill.v2"
+            },
+            "schema_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "artifact_id",
+            "media_type",
+            "schema_id",
+            "encoding",
+            "compression",
+            "byte_length",
+            "sha256",
+            "artifact_ref_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/AgentArtifactRef"
+        },
+        "artifact_binding_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "production_receipt_ref": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slot_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "slot_id",
+        "ordinal",
+        "artifact",
+        "production_receipt_ref",
+        "artifact_binding_hash"
+      ],
+      "type": "object"
+    },
+    "agent_artifact_materialization_receipt": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "durable_object_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "durable_store_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "materialization_receipt_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "materialized_at": {
+          "type": "number"
+        },
+        "receipt_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "verified_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "receipt_id",
+        "artifact_id",
+        "client_id",
+        "runtime_session_id",
+        "durable_store_id",
+        "durable_object_ref",
+        "materialized_at",
+        "verified_sha256",
+        "materialization_receipt_hash"
+      ],
+      "type": "object"
+    },
+    "agent_artifact_ref": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "artifact_ref_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "byte_length": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "compression": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "encoding": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "media_type": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "schema_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "artifact_id",
+        "media_type",
+        "schema_id",
+        "encoding",
+        "compression",
+        "byte_length",
+        "sha256",
+        "artifact_ref_hash"
+      ],
+      "type": "object"
+    },
+    "agent_artifact_transfer_receipt": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "completed_at": {
+          "type": "number"
+        },
+        "direction": {
+          "enum": [
+            "read",
+            "write"
+          ],
+          "type": "string"
+        },
+        "grant_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason_code": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "receipt_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "transfer_receipt_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "transferred_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verified_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "receipt_id",
+        "grant_id",
+        "artifact_id",
+        "client_id",
+        "runtime_session_id",
+        "direction",
+        "status",
+        "transferred_bytes",
+        "verified_sha256",
+        "completed_at",
+        "reason_code",
+        "transfer_receipt_hash"
+      ],
+      "type": "object"
+    },
+    "agent_skill_schema_catalog": {
+      "$defs": {
+        "AgentSkillSchemaEntry": {
+          "additionalProperties": false,
+          "properties": {
+            "execution_result_schema": {
+              "type": "object"
+            },
+            "execution_result_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "parameter_profiles": {
+              "items": {
+                "$ref": "#/$defs/SkillParameterProfileRef"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "parameter_schema": {
+              "type": "object"
+            },
+            "parameter_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_definition_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_id": {
+              "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+              "type": "string"
+            },
+            "skill_schema_entry_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_version": {
+              "pattern": "^[1-9][0-9]*$",
+              "type": "string"
+            },
+            "task_evaluation_schema": {
+              "type": "object"
+            },
+            "task_evaluation_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "skill_id",
+            "skill_version",
+            "skill_definition_hash",
+            "parameter_schema",
+            "parameter_schema_hash",
+            "execution_result_schema",
+            "execution_result_schema_hash",
+            "task_evaluation_schema",
+            "task_evaluation_schema_hash",
+            "parameter_profiles",
+            "skill_schema_entry_hash"
+          ],
+          "type": "object"
+        },
+        "SkillParameterProfileRef": {
+          "additionalProperties": false,
+          "properties": {
+            "parameter_profile_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "parameter_profile_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "parameter_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "parameter_profile_id",
+            "parameter_profile_hash",
+            "parameter_schema_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "urn:dexteleop:agent-skill:schema-catalog:v2",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "catalog_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "catalog_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "schema_entries": {
+          "items": {
+            "$ref": "#/$defs/AgentSkillSchemaEntry"
+          },
+          "type": "array"
+        },
+        "skill_schema_catalog_hash": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "catalog_id",
+        "catalog_version",
+        "schema_entries",
+        "skill_schema_catalog_hash"
+      ],
+      "type": "object"
+    },
+    "authoritative_port_receipt": {
+      "$id": "urn:dexteleop:agent-gateway:authoritative-port-receipt:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "authoritative_lower_receipt": {
+          "const": true
+        },
+        "call_sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "completed_at": {
+          "type": "number"
+        },
+        "evidence_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "evidence_scope": {
+          "const": "authoritative_lower_reference"
+        },
+        "lower_operation_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation_kind": {
+          "enum": [
+            "activate",
+            "cancel",
+            "hold"
+          ],
+          "type": "string"
+        },
+        "port_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "proves_motion_or_hold": {
+          "type": "boolean"
+        },
+        "receipt_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "receipt_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "succeeded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "receipt_id",
+        "port_id",
+        "operation_kind",
+        "operation_id",
+        "succeeded",
+        "status",
+        "completed_at",
+        "call_sequence",
+        "lower_operation_id",
+        "evidence_refs",
+        "evidence_scope",
+        "authoritative_lower_receipt",
+        "proves_motion_or_hold",
+        "receipt_hash"
+      ],
+      "type": "object"
+    },
+    "control_plane_response": {
+      "$defs": {
+        "authoritative_port_receipt": {
+          "additionalProperties": false,
+          "properties": {
+            "authoritative_lower_receipt": {
+              "const": true
+            },
+            "call_sequence": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "completed_at": {
+              "type": "number"
+            },
+            "evidence_refs": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "evidence_scope": {
+              "const": "authoritative_lower_reference"
+            },
+            "lower_operation_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "operation_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "operation_kind": {
+              "enum": [
+                "activate",
+                "cancel",
+                "hold"
+              ],
+              "type": "string"
+            },
+            "port_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "proves_motion_or_hold": {
+              "type": "boolean"
+            },
+            "receipt_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "receipt_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "status": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "succeeded": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "receipt_id",
+            "port_id",
+            "operation_kind",
+            "operation_id",
+            "succeeded",
+            "status",
+            "completed_at",
+            "call_sequence",
+            "lower_operation_id",
+            "evidence_refs",
+            "evidence_scope",
+            "authoritative_lower_receipt",
+            "proves_motion_or_hold",
+            "receipt_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "urn:dexteleop:agent-control:response:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "idempotent_replay": {
+          "type": "boolean"
+        },
+        "operation": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "port_receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/authoritative_port_receipt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_code": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_hash": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "accepted",
+        "reason_code",
+        "request_hash",
+        "idempotent_replay",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "gateway_event": {
+      "$defs": {
+        "AgentArtifactBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/AgentArtifactRef"
+            },
+            "artifact_binding_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "ordinal": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "production_receipt_ref": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "slot_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slot_id",
+            "ordinal",
+            "artifact",
+            "production_receipt_ref",
+            "artifact_binding_hash"
+          ],
+          "type": "object"
+        },
+        "AgentArtifactRef": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "artifact_ref_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "byte_length": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "compression": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "encoding": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "media_type": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "dexteleop.agent_skill.v2"
+            },
+            "schema_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "artifact_id",
+            "media_type",
+            "schema_id",
+            "encoding",
+            "compression",
+            "byte_length",
+            "sha256",
+            "artifact_ref_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "artifact_binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentArtifactBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "emitted_at": {
+          "type": "number"
+        },
+        "event_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "event_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "event_kind": {
+          "enum": [
+            "artifact_ready",
+            "capabilities_changed",
+            "manifest_changed",
+            "operation_progress",
+            "operation_terminal",
+            "operation_updated",
+            "session_closing"
+          ],
+          "type": "string"
+        },
+        "operation_hash": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload": {
+          "type": "object"
+        },
+        "payload_schema_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "runtime_session_id",
+        "sequence",
+        "event_kind",
+        "emitted_at",
+        "operation_id",
+        "operation_hash",
+        "artifact_binding",
+        "payload_schema_id",
+        "payload",
+        "event_id",
+        "event_hash"
+      ],
+      "type": "object"
+    },
+    "gateway_event_batch": {
+      "$defs": {
+        "AgentArtifactBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/AgentArtifactRef"
+            },
+            "artifact_binding_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "ordinal": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "production_receipt_ref": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "slot_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slot_id",
+            "ordinal",
+            "artifact",
+            "production_receipt_ref",
+            "artifact_binding_hash"
+          ],
+          "type": "object"
+        },
+        "AgentArtifactRef": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "artifact_ref_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "byte_length": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "compression": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "encoding": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "media_type": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "dexteleop.agent_skill.v2"
+            },
+            "schema_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "artifact_id",
+            "media_type",
+            "schema_id",
+            "encoding",
+            "compression",
+            "byte_length",
+            "sha256",
+            "artifact_ref_hash"
+          ],
+          "type": "object"
+        },
+        "AgentGatewayEvent": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_binding": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AgentArtifactBinding"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "emitted_at": {
+              "type": "number"
+            },
+            "event_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "event_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "event_kind": {
+              "enum": [
+                "artifact_ready",
+                "capabilities_changed",
+                "manifest_changed",
+                "operation_progress",
+                "operation_terminal",
+                "operation_updated",
+                "session_closing"
+              ],
+              "type": "string"
+            },
+            "operation_hash": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "operation_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "payload": {
+              "type": "object"
+            },
+            "payload_schema_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "protocol_version": {
+              "const": "dexteleop.agent_skill.v2"
+            },
+            "runtime_session_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sequence": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "runtime_session_id",
+            "sequence",
+            "event_kind",
+            "emitted_at",
+            "operation_id",
+            "operation_hash",
+            "artifact_binding",
+            "payload_schema_id",
+            "payload",
+            "event_id",
+            "event_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "event_batch_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/AgentGatewayEvent"
+          },
+          "type": "array"
+        },
+        "gap_detected": {
+          "type": "boolean"
+        },
+        "latest_sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "oldest_available_sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "requested_after_sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "runtime_session_id",
+        "requested_after_sequence",
+        "oldest_available_sequence",
+        "latest_sequence",
+        "gap_detected",
+        "events",
+        "event_batch_hash"
+      ],
+      "type": "object"
+    },
+    "gateway_session_capabilities": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_access_mechanisms": {
+          "items": {
+            "enum": [
+              "chunked_rpc",
+              "local_path"
+            ],
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "artifact_store_quota_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "artifact_transfer_enabled": {
+          "type": "boolean"
+        },
+        "event_payload_max_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "event_retention_count": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_artifact_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_artifact_chunk_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_artifact_refs_per_operation": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_concurrent_downloads": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_concurrent_uploads": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_control_request_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_control_response_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "session_capabilities_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "runtime_session_id",
+        "artifact_transfer_enabled",
+        "artifact_access_mechanisms",
+        "max_control_request_bytes",
+        "max_control_response_bytes",
+        "max_artifact_bytes",
+        "max_artifact_chunk_bytes",
+        "max_artifact_refs_per_operation",
+        "max_concurrent_uploads",
+        "max_concurrent_downloads",
+        "artifact_store_quota_bytes",
+        "event_payload_max_bytes",
+        "event_retention_count",
+        "session_capabilities_hash"
+      ],
+      "type": "object"
+    },
+    "observation_snapshot": {
+      "$id": "urn:dexteleop:agent-skill:observation-snapshot:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "active_operation_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "authority_epoch": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "available_at": {
+          "type": "number"
+        },
+        "calibration_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "captured_at": {
+          "type": "number"
+        },
+        "clock_domain_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "dispatch_owner_generation": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "execution_epoch": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "execution_gate": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "execution_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "fault_class": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fault_rearmable": {
+          "type": "boolean"
+        },
+        "frame_graph_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "lifecycle_state": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "measurement_freshness_ms": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "measurement_summary": {
+          "type": "object"
+        },
+        "measurement_valid": {
+          "type": "boolean"
+        },
+        "producer_epoch": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_route_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "snapshot_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "snapshot_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_binding_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "station_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target_binding_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tool_config_hash": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "runtime_session_id",
+        "skill_route_manifest_hash",
+        "station_revision",
+        "captured_at",
+        "available_at",
+        "clock_domain_id",
+        "authority_epoch",
+        "execution_epoch",
+        "dispatch_owner_generation",
+        "lifecycle_state",
+        "execution_gate",
+        "active_operation_id",
+        "source_binding_id",
+        "producer_epoch",
+        "target_binding_id",
+        "execution_manifest_hash",
+        "frame_graph_hash",
+        "tool_config_hash",
+        "calibration_hash",
+        "measurement_summary",
+        "measurement_freshness_ms",
+        "measurement_valid",
+        "fault_class",
+        "fault_rearmable",
+        "snapshot_hash"
+      ],
+      "type": "object"
+    },
+    "own_domain_hold_request": {
+      "$id": "urn:dexteleop:agent-control:own-domain-hold:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "control_domain_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "control_request_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_station_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "idempotency_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "observation_snapshot_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason_code": {
+          "enum": [
+            "agent_anomaly_detected",
+            "agent_replan_requested",
+            "agent_requested_pause",
+            "agent_task_aborted",
+            "agent_uncertain_state"
+          ],
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_route_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "target_binding_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "control_domain_id",
+        "control_request_id",
+        "expected_station_revision",
+        "idempotency_key",
+        "observation_snapshot_id",
+        "reason_code",
+        "runtime_session_id",
+        "skill_route_manifest_hash",
+        "target_binding_id"
+      ],
+      "type": "object"
+    },
+    "own_operation_cancel_request": {
+      "$id": "urn:dexteleop:agent-control:own-operation-cancel:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "control_request_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_station_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "idempotency_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "observation_snapshot_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason_code": {
+          "enum": [
+            "agent_anomaly_detected",
+            "agent_replan_requested",
+            "agent_requested_pause",
+            "agent_task_aborted",
+            "agent_uncertain_state"
+          ],
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_route_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "control_request_id",
+        "expected_station_revision",
+        "idempotency_key",
+        "observation_snapshot_id",
+        "operation_id",
+        "reason_code",
+        "runtime_session_id",
+        "skill_route_manifest_hash"
+      ],
+      "type": "object"
+    },
+    "own_operation_query": {
+      "$id": "urn:dexteleop:agent-control:own-operation-query:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "query_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_route_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "operation_id",
+        "query_id",
+        "runtime_session_id",
+        "skill_route_manifest_hash"
+      ],
+      "type": "object"
+    },
+    "skill_aggregate_evaluation_receipt": {
+      "$id": "urn:dexteleop:agent-skill:aggregate-evaluation-receipt:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "aggregate_evaluation_receipt_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "aggregation_policy_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "aggregation_policy_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "consumed_evaluation_receipt_hashes": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "evaluation_plan_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "generated_at": {
+          "type": "number"
+        },
+        "ignored_evaluation_receipt_hashes": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "missing_evaluator_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "operation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason_codes": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "request_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "verdict": {
+          "enum": [
+            "failed",
+            "inconclusive",
+            "succeeded"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "request_hash",
+        "evaluation_plan_hash",
+        "aggregation_policy_id",
+        "aggregation_policy_hash",
+        "consumed_evaluation_receipt_hashes",
+        "ignored_evaluation_receipt_hashes",
+        "missing_evaluator_ids",
+        "verdict",
+        "reason_codes",
+        "generated_at",
+        "aggregate_evaluation_receipt_hash"
+      ],
+      "type": "object"
+    },
+    "skill_definition_catalog": {
+      "$defs": {
+        "SkillDefinition": {
+          "additionalProperties": false,
+          "properties": {
+            "controlled_component_ids": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "cross_target_deployment_policy": {
+              "enum": [
+                "forbidden",
+                "not_applicable",
+                "review_required"
+              ],
+              "type": "string"
+            },
+            "entry_predicate_ids": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "execution_result_semantics_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "intended_target_kind": {
+              "enum": [
+                "real",
+                "sim",
+                "target_agnostic"
+              ],
+              "type": "string"
+            },
+            "parameter_semantics_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_definition_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_id": {
+              "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+              "type": "string"
+            },
+            "skill_kind": {
+              "enum": [
+                "inspection",
+                "lifecycle",
+                "motion",
+                "policy_task"
+              ],
+              "type": "string"
+            },
+            "skill_version": {
+              "pattern": "^[1-9][0-9]*$",
+              "type": "string"
+            },
+            "summary": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "task_outcome_predicate_ids": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "task_outcome_semantics_id": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "skill_id",
+            "skill_version",
+            "skill_kind",
+            "summary",
+            "intended_target_kind",
+            "cross_target_deployment_policy",
+            "controlled_component_ids",
+            "parameter_semantics_id",
+            "execution_result_semantics_id",
+            "task_outcome_semantics_id",
+            "entry_predicate_ids",
+            "task_outcome_predicate_ids",
+            "skill_definition_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "urn:dexteleop:agent-skill:definition-catalog:v2",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "catalog_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "catalog_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "skill_definition_catalog_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_definitions": {
+          "items": {
+            "$ref": "#/$defs/SkillDefinition"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "catalog_id",
+        "catalog_version",
+        "skill_definitions",
+        "skill_definition_catalog_hash"
+      ],
+      "type": "object"
+    },
+    "skill_evaluation_plan": {
+      "$defs": {
+        "SkillEvaluatorSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "configuration_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "deadline_ms": {
+              "maximum": 86400000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "evaluator_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "evaluator_id": {
+              "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+              "type": "string"
+            },
+            "evaluator_kind": {
+              "enum": [
+                "environment",
+                "external",
+                "operator",
+                "policy_self",
+                "rule_based"
+              ],
+              "type": "string"
+            },
+            "evaluator_version": {
+              "pattern": "^[1-9][0-9]*$",
+              "type": "string"
+            },
+            "evidence_domain_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "execution_location": {
+              "enum": [
+                "external_service",
+                "gateway_worker",
+                "lower_runtime",
+                "operator_console",
+                "policy_runtime"
+              ],
+              "type": "string"
+            },
+            "failure_policy": {
+              "enum": [
+                "mark_error",
+                "omit",
+                "veto"
+              ],
+              "type": "string"
+            },
+            "input_evidence_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "output_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "enum": [
+                "advisory",
+                "contributing",
+                "required",
+                "veto"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "evaluator_id",
+            "evaluator_version",
+            "evaluator_kind",
+            "input_evidence_schema_hash",
+            "output_schema_hash",
+            "role",
+            "execution_location",
+            "deadline_ms",
+            "failure_policy",
+            "evidence_domain_id",
+            "configuration_hash",
+            "evaluator_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "urn:dexteleop:agent-skill:evaluation-plan:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "aggregation_policy_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "aggregation_policy_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "deployment_binding_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "disagreement_policy": {
+          "enum": [
+            "aggregation_policy",
+            "inconclusive",
+            "veto"
+          ],
+          "type": "string"
+        },
+        "evaluation_plan_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "evaluation_plan_id": {
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "type": "string"
+        },
+        "evaluation_plan_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "evaluator_specs": {
+          "items": {
+            "$ref": "#/$defs/SkillEvaluatorSpec"
+          },
+          "type": "array"
+        },
+        "missing_evidence_policy": {
+          "enum": [
+            "fail",
+            "inconclusive"
+          ],
+          "type": "string"
+        },
+        "required_evaluation_deadline_ms": {
+          "maximum": 86400000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "route_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_definition_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "task_outcome_schema_hash": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "evaluation_plan_id",
+        "evaluation_plan_version",
+        "skill_definition_hash",
+        "route_hash",
+        "deployment_binding_hash",
+        "evaluator_specs",
+        "aggregation_policy_id",
+        "aggregation_policy_hash",
+        "required_evaluation_deadline_ms",
+        "missing_evidence_policy",
+        "disagreement_policy",
+        "task_outcome_schema_hash",
+        "evaluation_plan_hash"
+      ],
+      "type": "object"
+    },
+    "skill_evaluation_receipt": {
+      "$id": "urn:dexteleop:agent-skill:evaluation-receipt:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confidence_semantics_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deployment_binding_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "evaluated_at": {
+          "type": "number"
+        },
+        "evaluated_cut_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "evaluation_plan_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "evaluation_receipt_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "evaluator_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "evaluator_id": {
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "type": "string"
+        },
+        "evaluator_kind": {
+          "enum": [
+            "environment",
+            "external",
+            "operator",
+            "policy_self",
+            "rule_based"
+          ],
+          "type": "string"
+        },
+        "evaluator_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "evidence_domain_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "input_evidence_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason_codes": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "request_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "route_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "route_id": {
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "type": "string"
+        },
+        "route_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "score": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "score_schema_hash": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skill_definition_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_id": {
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "type": "string"
+        },
+        "skill_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "verdict": {
+          "enum": [
+            "error",
+            "failed",
+            "inconclusive",
+            "succeeded"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "request_hash",
+        "skill_id",
+        "skill_version",
+        "skill_definition_hash",
+        "route_id",
+        "route_version",
+        "route_hash",
+        "deployment_binding_hash",
+        "evaluation_plan_hash",
+        "evaluator_id",
+        "evaluator_version",
+        "evaluator_hash",
+        "evaluator_kind",
+        "evidence_domain_id",
+        "input_evidence_hash",
+        "evaluated_cut_id",
+        "evaluated_at",
+        "verdict",
+        "reason_codes",
+        "evidence_refs",
+        "score",
+        "score_schema_hash",
+        "confidence",
+        "confidence_semantics_id",
+        "evaluation_receipt_hash"
+      ],
+      "type": "object"
+    },
+    "skill_execution_grant": {
+      "$id": "urn:dexteleop:agent-skill:execution-grant:v1",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "allowed_mode": {
+          "enum": [
+            "dry_run",
+            "real_active",
+            "real_observe",
+            "sim_active"
+          ],
+          "type": "string"
+        },
+        "authorized_request_hash": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "control_domain_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "control_effect_class": {
+          "enum": [
+            "lifecycle",
+            "motion",
+            "read_only"
+          ],
+          "type": "string"
+        },
+        "deployment_binding_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "number"
+        },
+        "grant_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "grant_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "issued_at": {
+          "type": "number"
+        },
+        "max_invocations": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "may_move_robot": {
+          "type": "boolean"
+        },
+        "operator_authorization_receipt_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parameter_profile_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parameter_profile_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "route_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "route_id": {
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "type": "string"
+        },
+        "route_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_definition_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_id": {
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "type": "string"
+        },
+        "skill_route_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "target_binding_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "grant_id",
+        "operator_authorization_receipt_id",
+        "client_id",
+        "runtime_session_id",
+        "skill_route_manifest_hash",
+        "control_domain_id",
+        "target_binding_id",
+        "skill_id",
+        "skill_version",
+        "skill_definition_hash",
+        "route_id",
+        "route_version",
+        "route_hash",
+        "deployment_binding_hash",
+        "parameter_profile_id",
+        "parameter_profile_hash",
+        "authorized_request_hash",
+        "allowed_mode",
+        "control_effect_class",
+        "may_move_robot",
+        "max_invocations",
+        "issued_at",
+        "expires_at",
+        "grant_hash"
+      ],
+      "type": "object"
+    },
+    "skill_io_catalog": {
+      "$defs": {
+        "SkillArtifactSlotSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_compressions": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "allowed_encodings": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "allowed_media_types": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "allowed_schema_ids": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "direction": {
+              "enum": [
+                "input",
+                "output"
+              ],
+              "type": "string"
+            },
+            "max_artifact_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_count": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_total_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "min_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "slot_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slot_id",
+            "direction",
+            "min_count",
+            "max_count",
+            "allowed_media_types",
+            "allowed_schema_ids",
+            "allowed_encodings",
+            "allowed_compressions",
+            "max_artifact_bytes",
+            "max_total_bytes"
+          ],
+          "type": "object"
+        },
+        "SkillIOContract": {
+          "$defs": {
+            "SkillArtifactSlotSpec": {
+              "additionalProperties": false,
+              "properties": {
+                "allowed_compressions": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "allowed_encodings": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "allowed_media_types": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "allowed_schema_ids": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "direction": {
+                  "enum": [
+                    "input",
+                    "output"
+                  ],
+                  "type": "string"
+                },
+                "max_artifact_bytes": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "max_count": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "max_total_bytes": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "min_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "slot_id": {
+                  "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "slot_id",
+                "direction",
+                "min_count",
+                "max_count",
+                "allowed_media_types",
+                "allowed_schema_ids",
+                "allowed_encodings",
+                "allowed_compressions",
+                "max_artifact_bytes",
+                "max_total_bytes"
+              ],
+              "type": "object"
+            }
+          },
+          "additionalProperties": false,
+          "properties": {
+            "execution_result_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "input_artifact_slots": {
+              "items": {
+                "$ref": "#/$defs/SkillArtifactSlotSpec"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "max_inline_parameter_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_inline_result_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_progress_summary_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "output_artifact_slots": {
+              "items": {
+                "$ref": "#/$defs/SkillArtifactSlotSpec"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "parameter_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "progress_schema_hash": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "protocol_version": {
+              "const": "dexteleop.agent_skill.v2"
+            },
+            "skill_definition_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_io_contract_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "skill_version": {
+              "pattern": "^[1-9][0-9]*$",
+              "type": "string"
+            },
+            "task_evaluation_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "skill_id",
+            "skill_version",
+            "skill_definition_hash",
+            "parameter_schema_hash",
+            "execution_result_schema_hash",
+            "task_evaluation_schema_hash",
+            "progress_schema_hash",
+            "max_inline_parameter_bytes",
+            "max_inline_result_bytes",
+            "max_progress_summary_bytes",
+            "input_artifact_slots",
+            "output_artifact_slots",
+            "skill_io_contract_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "catalog_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "catalog_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "io_contracts": {
+          "items": {
+            "$ref": "#/$defs/SkillIOContract"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "skill_io_catalog_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "catalog_id",
+        "catalog_version",
+        "io_contracts",
+        "skill_io_catalog_hash"
+      ],
+      "type": "object"
+    },
+    "skill_io_contract": {
+      "$defs": {
+        "SkillArtifactSlotSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_compressions": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "allowed_encodings": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "allowed_media_types": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "allowed_schema_ids": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "direction": {
+              "enum": [
+                "input",
+                "output"
+              ],
+              "type": "string"
+            },
+            "max_artifact_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_count": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_total_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "min_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "slot_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slot_id",
+            "direction",
+            "min_count",
+            "max_count",
+            "allowed_media_types",
+            "allowed_schema_ids",
+            "allowed_encodings",
+            "allowed_compressions",
+            "max_artifact_bytes",
+            "max_total_bytes"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "execution_result_schema_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "input_artifact_slots": {
+          "items": {
+            "$ref": "#/$defs/SkillArtifactSlotSpec"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "max_inline_parameter_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_inline_result_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_progress_summary_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "output_artifact_slots": {
+          "items": {
+            "$ref": "#/$defs/SkillArtifactSlotSpec"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "parameter_schema_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "progress_schema_hash": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "skill_definition_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_io_contract_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "skill_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "task_evaluation_schema_hash": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "skill_id",
+        "skill_version",
+        "skill_definition_hash",
+        "parameter_schema_hash",
+        "execution_result_schema_hash",
+        "task_evaluation_schema_hash",
+        "progress_schema_hash",
+        "max_inline_parameter_bytes",
+        "max_inline_result_bytes",
+        "max_progress_summary_bytes",
+        "input_artifact_slots",
+        "output_artifact_slots",
+        "skill_io_contract_hash"
+      ],
+      "type": "object"
+    },
+    "skill_operation": {
+      "$defs": {
+        "AgentArtifactBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/AgentArtifactRef"
+            },
+            "artifact_binding_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "ordinal": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "production_receipt_ref": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "slot_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slot_id",
+            "ordinal",
+            "artifact",
+            "production_receipt_ref",
+            "artifact_binding_hash"
+          ],
+          "type": "object"
+        },
+        "AgentArtifactRef": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "artifact_ref_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "byte_length": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "compression": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "encoding": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "media_type": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "dexteleop.agent_skill.v2"
+            },
+            "schema_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "artifact_id",
+            "media_type",
+            "schema_id",
+            "encoding",
+            "compression",
+            "byte_length",
+            "sha256",
+            "artifact_ref_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "urn:dexteleop:agent-skill:operation:v2",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "aggregate_evaluation_receipt_ref": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current_station_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deadline_at": {
+          "type": "number"
+        },
+        "evaluation_status": {
+          "enum": [
+            "completed",
+            "not_requested",
+            "pending",
+            "timed_out"
+          ],
+          "type": "string"
+        },
+        "evaluator_receipt_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "execution_outcome": {
+          "enum": [
+            "cancelled",
+            "completed",
+            "failed",
+            "pending",
+            "timed_out"
+          ],
+          "type": "string"
+        },
+        "execution_receipt_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "execution_result": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lower_operation_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "output_artifact_bindings": {
+          "items": {
+            "$ref": "#/$defs/AgentArtifactBinding"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "progress_summary": {
+          "type": "object"
+        },
+        "reason_code": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "started_at": {
+          "type": "number"
+        },
+        "station_revision_at_admission": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "received",
+            "validated",
+            "preflighted",
+            "awaiting_operator_confirmation",
+            "admitted",
+            "activated",
+            "running",
+            "awaiting_evaluation",
+            "completed",
+            "failed",
+            "cancelled",
+            "timed_out"
+          ],
+          "type": "string"
+        },
+        "task_evaluation": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_outcome": {
+          "enum": [
+            "failed",
+            "inconclusive",
+            "not_assessed",
+            "pending",
+            "succeeded"
+          ],
+          "type": "string"
+        },
+        "terminal": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "operation_id",
+        "request_hash",
+        "runtime_session_id",
+        "status",
+        "reason_code",
+        "terminal",
+        "execution_outcome",
+        "evaluation_status",
+        "task_outcome",
+        "station_revision_at_admission",
+        "current_station_revision",
+        "started_at",
+        "updated_at",
+        "deadline_at",
+        "lower_operation_id",
+        "execution_receipt_refs",
+        "evaluator_receipt_refs",
+        "aggregate_evaluation_receipt_ref",
+        "progress_summary",
+        "execution_result",
+        "task_evaluation",
+        "output_artifact_bindings",
+        "operation_hash"
+      ],
+      "type": "object"
+    },
+    "skill_request": {
+      "$defs": {
+        "AgentArtifactBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/AgentArtifactRef"
+            },
+            "artifact_binding_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "ordinal": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "production_receipt_ref": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "slot_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slot_id",
+            "ordinal",
+            "artifact",
+            "production_receipt_ref",
+            "artifact_binding_hash"
+          ],
+          "type": "object"
+        },
+        "AgentArtifactRef": {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "artifact_ref_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "byte_length": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "compression": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "encoding": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "media_type": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "protocol_version": {
+              "const": "dexteleop.agent_skill.v2"
+            },
+            "schema_id": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "artifact_id",
+            "media_type",
+            "schema_id",
+            "encoding",
+            "compression",
+            "byte_length",
+            "sha256",
+            "artifact_ref_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "urn:dexteleop:agent-skill:request:v2",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "client_sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deployment_binding_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "deployment_safety_envelope_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "deployment_safety_envelope_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_station_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "idempotency_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "input_artifact_bindings": {
+          "items": {
+            "$ref": "#/$defs/AgentArtifactBinding"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "observation_snapshot_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parameter_profile_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parameter_profile_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parameters": {
+          "type": "object"
+        },
+        "request_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requested_mode": {
+          "enum": [
+            "dry_run",
+            "real_active",
+            "real_observe",
+            "sim_active"
+          ],
+          "type": "string"
+        },
+        "requested_timeout_ms": {
+          "maximum": 86400000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "route_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "route_id": {
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "type": "string"
+        },
+        "route_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "safety_constraint_set_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "safety_profile_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "safety_profile_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_definition_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_execution_grant_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skill_id": {
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+          "type": "string"
+        },
+        "skill_route_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_version": {
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "client_sequence",
+        "deployment_binding_hash",
+        "expected_station_revision",
+        "idempotency_key",
+        "input_artifact_bindings",
+        "observation_snapshot_id",
+        "parameter_profile_hash",
+        "parameter_profile_id",
+        "parameters",
+        "request_id",
+        "requested_mode",
+        "requested_timeout_ms",
+        "route_hash",
+        "route_id",
+        "route_version",
+        "runtime_session_id",
+        "skill_definition_hash",
+        "skill_id",
+        "skill_route_manifest_hash",
+        "skill_version"
+      ],
+      "type": "object"
+    },
+    "skill_resource_claim": {
+      "additionalProperties": false,
+      "properties": {
+        "access_mode": {
+          "enum": [
+            "shared_read",
+            "shared_write",
+            "exclusive"
+          ],
+          "type": "string"
+        },
+        "resource_claim_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "resource_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "units": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "resource_id",
+        "access_mode",
+        "units",
+        "resource_claim_hash"
+      ],
+      "type": "object"
+    },
+    "skill_route_manifest": {
+      "$defs": {
+        "CrossTargetDeploymentReviewRef": {
+          "additionalProperties": false,
+          "properties": {
+            "approval_receipt_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "compatibility_assessment_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "cross_target_deployment_review_ref_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "deployed_target_kind": {
+              "enum": [
+                "real",
+                "sim"
+              ],
+              "type": "string"
+            },
+            "intended_target_kind": {
+              "enum": [
+                "real",
+                "sim"
+              ],
+              "type": "string"
+            },
+            "review_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "route_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_definition_hash": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "review_id",
+            "skill_definition_hash",
+            "route_hash",
+            "intended_target_kind",
+            "deployed_target_kind",
+            "compatibility_assessment_hash",
+            "approval_receipt_hash",
+            "cross_target_deployment_review_ref_hash"
+          ],
+          "type": "object"
+        },
+        "SkillDeploymentBindingRef": {
+          "additionalProperties": false,
+          "properties": {
+            "cross_target_deployment_review": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/CrossTargetDeploymentReviewRef"
+                }
+              ]
+            },
+            "deployment_binding_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "deployment_binding_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "deployment_binding_ref_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "execution_manifest_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "safety_envelope_refs": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "allowed_route_ids": {
+                    "items": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "constraint_set_hash": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "content_hash": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "object_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "schema": {
+                    "const": "dexteleop.deployment_safety_envelope.v1"
+                  }
+                },
+                "required": [
+                  "object_id",
+                  "schema",
+                  "content_hash",
+                  "constraint_set_hash",
+                  "allowed_route_ids"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "target_binding_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "target_kind": {
+              "enum": [
+                "null",
+                "real",
+                "sim"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "deployment_binding_id",
+            "deployment_binding_hash",
+            "target_binding_id",
+            "target_kind",
+            "execution_manifest_hash",
+            "cross_target_deployment_review",
+            "deployment_binding_ref_hash"
+          ],
+          "type": "object"
+        },
+        "SkillExecutionRoute": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_parameter_profiles": {
+              "items": {
+                "$ref": "#/$defs/SkillParameterProfileRef"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "cancellation_policy": {
+              "enum": [
+                "cancel_only",
+                "hold_on_cancel",
+                "hold_on_cancel_disconnect_or_timeout",
+                "hold_on_disconnect_or_timeout"
+              ],
+              "type": "string"
+            },
+            "control_effect_class": {
+              "enum": [
+                "lifecycle",
+                "motion",
+                "read_only"
+              ],
+              "type": "string"
+            },
+            "execution_result_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "max_concurrent_operations": {
+              "maximum": 64,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_operation_duration_ms": {
+              "maximum": 86400000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "may_move_robot": {
+              "type": "boolean"
+            },
+            "may_open_publication": {
+              "type": "boolean"
+            },
+            "parameter_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "privilege_tier": {
+              "enum": [
+                "t0_read_only",
+                "t1_sim_or_no_motion",
+                "t2_real_motion",
+                "t3_lifecycle"
+              ],
+              "type": "string"
+            },
+            "requires_deadman": {
+              "type": "boolean"
+            },
+            "requires_operator_confirmation": {
+              "type": "boolean"
+            },
+            "requires_task_evaluation": {
+              "type": "boolean"
+            },
+            "resource_claims": {
+              "items": {
+                "$ref": "#/$defs/SkillResourceClaim"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "route_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "route_id": {
+              "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+              "type": "string"
+            },
+            "route_version": {
+              "pattern": "^[1-9][0-9]*$",
+              "type": "string"
+            },
+            "skill_definition_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_id": {
+              "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+              "type": "string"
+            },
+            "skill_io_contract_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "skill_version": {
+              "pattern": "^[1-9][0-9]*$",
+              "type": "string"
+            },
+            "supported_modes": {
+              "items": {
+                "enum": [
+                  "dry_run",
+                  "real_active",
+                  "real_observe",
+                  "sim_active"
+                ],
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "target_kind": {
+              "enum": [
+                "null",
+                "real",
+                "sim"
+              ],
+              "type": "string"
+            },
+            "task_evaluation_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "skill_id",
+            "skill_version",
+            "skill_definition_hash",
+            "route_id",
+            "route_version",
+            "parameter_schema_hash",
+            "execution_result_schema_hash",
+            "task_evaluation_schema_hash",
+            "allowed_parameter_profiles",
+            "control_effect_class",
+            "privilege_tier",
+            "supported_modes",
+            "target_kind",
+            "may_move_robot",
+            "may_open_publication",
+            "requires_operator_confirmation",
+            "requires_deadman",
+            "max_operation_duration_ms",
+            "cancellation_policy",
+            "max_concurrent_operations",
+            "requires_task_evaluation",
+            "skill_io_contract_hash",
+            "resource_claims",
+            "route_hash"
+          ],
+          "type": "object"
+        },
+        "SkillParameterProfileRef": {
+          "additionalProperties": false,
+          "properties": {
+            "parameter_profile_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "parameter_profile_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "parameter_schema_hash": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "parameter_profile_id",
+            "parameter_profile_hash",
+            "parameter_schema_hash"
+          ],
+          "type": "object"
+        },
+        "SkillResourceClaim": {
+          "additionalProperties": false,
+          "properties": {
+            "access_mode": {
+              "enum": [
+                "shared_read",
+                "shared_write",
+                "exclusive"
+              ],
+              "type": "string"
+            },
+            "resource_claim_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "resource_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "units": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "resource_id",
+            "access_mode",
+            "units",
+            "resource_claim_hash"
+          ],
+          "type": "object"
+        },
+        "SkillRouteManifestEntry": {
+          "additionalProperties": false,
+          "properties": {
+            "availability_hash": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "deployment_binding": {
+              "$ref": "#/$defs/SkillDeploymentBindingRef"
+            },
+            "evaluation_plan_hash": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "route": {
+              "$ref": "#/$defs/SkillExecutionRoute"
+            },
+            "route_manifest_entry_hash": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "route",
+            "deployment_binding",
+            "evaluation_plan_hash",
+            "availability_hash",
+            "route_manifest_entry_hash"
+          ],
+          "type": "object"
+        }
+      },
+      "$id": "urn:dexteleop:agent-skill:route-manifest:v2",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "control_domain_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "current_mode": {
+          "enum": [
+            "dry_run",
+            "real_active",
+            "real_observe",
+            "sim_active"
+          ],
+          "type": "string"
+        },
+        "execution_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "explicit_exclusions": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "protocol_version": {
+          "const": "dexteleop.agent_skill.v2"
+        },
+        "route_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runtime_session_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_definition_catalog_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_io_catalog_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "skill_routes": {
+          "items": {
+            "$ref": "#/$defs/SkillRouteManifestEntry"
+          },
+          "type": "array"
+        },
+        "skill_schema_catalog_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "station_manifest_hash": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "supported_transport_features": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "target_binding_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "target_kind": {
+          "enum": [
+            "null",
+            "real",
+            "sim"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "runtime_session_id",
+        "control_domain_id",
+        "station_manifest_hash",
+        "execution_manifest_hash",
+        "skill_definition_catalog_hash",
+        "skill_schema_catalog_hash",
+        "skill_io_catalog_hash",
+        "target_binding_id",
+        "target_kind",
+        "current_mode",
+        "supported_transport_features",
+        "skill_routes",
+        "explicit_exclusions",
+        "route_manifest_hash"
+      ],
+      "type": "object"
+    }
+  },
+  "snapshot_hash": "2754487bcb772495ed07117b537d7273aeddeaf96a0df109457d85454af62d08",
+  "snapshot_hash_algorithm": "sha256_canonical_json_v1"
+}

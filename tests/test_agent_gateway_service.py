@@ -373,6 +373,32 @@ def _submit(service, manifest, capability, *, now: float = 10.0):
     )
 
 
+def test_default_v2_protocol_runtime_publishes_inline_io_and_replay_events() -> None:
+    service, _port, _clock, manifest, capability = _service()
+    runtime = service.protocol_runtime
+    assert not runtime.session_capabilities.artifact_transfer_enabled
+    assert runtime.io_catalog.semantic_content_hash == manifest.skill_io_catalog_hash
+    assert not runtime.io_catalog.contract(
+        capability.skill_id,
+        capability.skill_version,
+    ).output_artifact_slots
+
+    admitted = _submit(service, manifest, capability)
+    assert admitted.accepted and admitted.operation is not None
+    first = runtime.replay_events(
+        after_sequence=0,
+        max_events=16,
+        operations=service.operation_store.operations(),
+    )
+    assert [event.event_kind for event in first.events] == ["operation_updated"]
+    replay = runtime.replay_events(
+        after_sequence=first.latest_sequence,
+        max_events=16,
+        operations=service.operation_store.operations(),
+    )
+    assert replay.events == ()
+
+
 def _own_operation_query(
     manifest: SkillRouteManifest,
     operation_id: str,
@@ -1475,6 +1501,7 @@ def _two_route_manifest() -> tuple[
         skill_id="inspection.tcp_pose",
         skill_definition_hash="definition:inspection.tcp_pose:v1",
         route_id="null.fixture.tcp_pose_reader",
+        skill_io_contract_hash=None,
     )
     single = _manifest(first)
     second_entry = SkillRouteManifestEntry(
@@ -1491,6 +1518,7 @@ def _two_route_manifest() -> tuple[
         replace(
             single,
             skill_routes=(single.skill_routes[0], second_entry),
+            skill_io_catalog_hash=None,
         ),
         first,
         second,

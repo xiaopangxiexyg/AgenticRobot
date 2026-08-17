@@ -16,6 +16,7 @@ from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from ..protocol.artifact_contracts import AgentArtifactBinding
 from ..protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from .access_policy import SkillAccessDecision
 
@@ -364,6 +365,7 @@ class BoundedInMemoryAgentSkillOperationStore:
         execution_receipt_refs: tuple[str, ...] = (),
         progress_summary: Mapping[str, Any] | None = None,
         execution_result: Mapping[str, Any] | None = None,
+        output_artifact_bindings: tuple[AgentArtifactBinding, ...] = (),
     ) -> OperationStoreOutcome:
         """CAS one worker projection; reserved safety control always wins."""
 
@@ -458,6 +460,15 @@ class BoundedInMemoryAgentSkillOperationStore:
                     "nonterminal_result_forbidden",
                     current,
                 )
+            if output_artifact_bindings and normalized_status not in {
+                "awaiting_evaluation",
+                "completed",
+            }:
+                return OperationStoreOutcome(
+                    False,
+                    "nonterminal_artifact_output_forbidden",
+                    current,
+                )
 
             next_operation = replace(
                 current,
@@ -499,6 +510,7 @@ class BoundedInMemoryAgentSkillOperationStore:
                     else progress_summary
                 ),
                 execution_result=execution_result,
+                output_artifact_bindings=output_artifact_bindings,
             )
             self._replace_operation_locked(next_operation)
             return OperationStoreOutcome(

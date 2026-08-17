@@ -255,7 +255,7 @@ def test_fixed_level_orientation_definitions_select_either_arm_absolutely() -> N
         assert "do not accumulate yaw" in summary
 
 
-def test_motion_skill_definition_hashes_survive_the_package_migration() -> None:
+def test_motion_skill_definition_hashes_match_protocol_v2_domains() -> None:
     definitions = (
         tcp_pose_target_skill_definition_v1(
             controlled_component_ids=("right_arm",),
@@ -274,19 +274,19 @@ def test_motion_skill_definition_hashes_survive_the_package_migration() -> None:
         for definition in definitions
     } == {
         "motion.move_tcp_to_pose": (
-            "bbd59b2858b986b695d9a1e47bd057b37be875dc018286050cb9c6d37a19663c"
+            "595e9c6f4c34cc1629e5a973268cd91b1c9490d8b8064a662c437465b0f7930c"
         ),
         "motion.step_tcp_cardinal": (
-            "c6e28fbde6b016a48d7510debf1465d90b6073f5160bd3885f852ab0811bba89"
+            "28c5d8cd1315785b4287fad3fe2e926cf17cc1650ebd0f99cee6451113550249"
         ),
         "motion.set_tcp_level_forward": (
-            "6e263d603c35da25f11f6ff6cfd0d5a2896e542d04a4bded262fd1bd648de351"
+            "f4cf378efdaa11ed45128b3ae7a1ba06b8f24fdfd8b8b5714ef34a213e00a954"
         ),
         "motion.set_tcp_level_forward_left_30": (
-            "a1faeff5337562453b64301284a8ba3500b8bf76d822eadaaac28f4c13acba34"
+            "54fbe9dee506a8f380620a86289d170219ac8dff1b9c58d66ca58d51834d9b9b"
         ),
         "motion.set_tcp_level_forward_right_30": (
-            "0d8852424cf94bf5e1b75caedc642be037c2a0393d7137ba9e0a6566cb8133a5"
+            "2e5b056963c9361136e4e954033bc607e4598cd69190e2d1dc07bd819417a964"
         ),
     }
 

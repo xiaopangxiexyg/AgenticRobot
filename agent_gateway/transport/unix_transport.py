@@ -27,13 +27,16 @@ from typing import Any
 
 from .wire_adapter import BoundAgentGatewayWireAdapter
 
-AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1 = "dexteleop.agent_gateway.unix_json.v1"
-AGENT_GATEWAY_UNIX_JSON_METHODS_V1 = frozenset(
+AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2 = "dexteleop.agent_gateway.unix_json.v2"
+AGENT_GATEWAY_UNIX_JSON_METHODS_V2 = frozenset(
     {
         "healthz",
         "get_skill_definition_catalog",
         "get_agent_skill_schema_catalog",
         "get_skill_route_manifest",
+        "get_skill_io_catalog",
+        "get_gateway_session_capabilities",
+        "get_gateway_events",
         "get_observation_snapshot",
         "get_visual_source_catalog",
         "capture_visual_snapshot",
@@ -41,6 +44,13 @@ AGENT_GATEWAY_UNIX_JSON_METHODS_V1 = frozenset(
         "get_own_operation",
         "cancel_own_operation",
         "request_hold_own_domain",
+        "begin_artifact_upload",
+        "write_artifact_chunk",
+        "commit_artifact_upload",
+        "begin_artifact_download",
+        "read_artifact_chunk",
+        "acknowledge_artifact_download",
+        "acknowledge_artifact_materialization",
     }
 )
 
@@ -57,10 +67,14 @@ _NO_PAYLOAD_METHODS = frozenset(
         "get_skill_definition_catalog",
         "get_agent_skill_schema_catalog",
         "get_skill_route_manifest",
+        "get_skill_io_catalog",
+        "get_gateway_session_capabilities",
         "get_observation_snapshot",
         "get_visual_source_catalog",
     }
 )
+
+
 class AgentGatewayUnixProtocolError(RuntimeError):
     """A bounded protocol violation safe to project without a traceback."""
 
@@ -86,9 +100,7 @@ class AgentGatewayUnixPeerCredentials:
         for field_name in ("pid", "uid", "gid"):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(
-                    f"{field_name} must be a non-negative integer."
-                )
+                raise ValueError(f"{field_name} must be a non-negative integer.")
 
 
 @dataclass(frozen=True)
@@ -161,9 +173,7 @@ def _frame_limit(value: object) -> int:
         or not isinstance(value, int)
         or not 1024 <= value <= MAX_AGENT_GATEWAY_UNIX_FRAME_BYTES
     ):
-        raise ValueError(
-            "max_frame_bytes must be an integer in [1024, 16777216]."
-        )
+        raise ValueError("max_frame_bytes must be an integer in [1024, 16777216].")
     return value
 
 
@@ -288,7 +298,7 @@ def _validate_request(payload: Mapping[str, Any]) -> _ValidatedRequest:
             "request fields must be exactly protocol/request_id/method/payload",
             request_id=request_id,
         )
-    if payload["protocol"] != AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1:
+    if payload["protocol"] != AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2:
         raise AgentGatewayUnixProtocolError(
             "protocol_mismatch",
             "request protocol is not supported",
@@ -301,7 +311,7 @@ def _validate_request(payload: Mapping[str, Any]) -> _ValidatedRequest:
         )
     method_value = payload["method"]
     if not isinstance(method_value, str) or method_value not in (
-        AGENT_GATEWAY_UNIX_JSON_METHODS_V1
+        AGENT_GATEWAY_UNIX_JSON_METHODS_V2
     ):
         raise AgentGatewayUnixProtocolError(
             "method_not_allowed",
@@ -346,7 +356,7 @@ def _peer_credentials(sock: socket.socket) -> AgentGatewayUnixPeerCredentials:
 
 def _success_response(request_id: str, result: object) -> Mapping[str, Any]:
     return {
-        "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
+        "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
         "request_id": request_id,
         "ok": True,
         "result": result,
@@ -360,7 +370,7 @@ def _error_response(
     message: str,
 ) -> Mapping[str, Any]:
     return {
-        "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
+        "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
         "request_id": request_id,
         "ok": False,
         "error": {
@@ -513,7 +523,9 @@ class AgentGatewayUnixJsonServer(
         try:
             parent_stat = os.lstat(parent)
         except OSError as error:
-            raise ValueError("Unix socket parent directory must already exist.") from error
+            raise ValueError(
+                "Unix socket parent directory must already exist."
+            ) from error
         if not stat.S_ISDIR(parent_stat.st_mode):
             raise ValueError(
                 "Unix socket parent must be a real directory, not a symlink."
@@ -619,6 +631,26 @@ class AgentGatewayUnixJsonServer(
                 raise ValueError(
                     "facade_factory returned a differently bound client identity."
                 )
+            service = getattr(facade, "service", None)
+            protocol_runtime = getattr(service, "protocol_runtime", None)
+            if protocol_runtime is not None:
+                capabilities = protocol_runtime.session_capabilities
+                if (
+                    capabilities.max_control_request_bytes != self.max_frame_bytes
+                    or capabilities.max_control_response_bytes != self.max_frame_bytes
+                ):
+                    raise ValueError(
+                        "Session control bounds must match the Unix frame bound."
+                    )
+                if capabilities.artifact_transfer_enabled:
+                    encoded_chunk_bound = (
+                        4 * ((capabilities.max_artifact_chunk_bytes + 2) // 3) + 65_536
+                    )
+                    if encoded_chunk_bound > self.max_frame_bytes:
+                        raise ValueError(
+                            "Artifact chunk plus base64/control overhead exceeds "
+                            "the Unix frame bound."
+                        )
             return client_id, peer, facade
         except BaseException:
             with self._connection_lock:
@@ -637,7 +669,7 @@ class AgentGatewayUnixJsonServer(
             if request.method == "healthz":
                 result: object = {
                     "status": "ok",
-                    "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1,
+                    "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
                     "authenticated_client_id": client_id,
                     "max_frame_bytes": self.max_frame_bytes,
                     "peer_idle_timeout_sec": self.peer_idle_timeout_sec,
@@ -648,6 +680,12 @@ class AgentGatewayUnixJsonServer(
                 result = facade.get_agent_skill_schema_catalog()
             elif request.method == "get_skill_route_manifest":
                 result = facade.get_skill_route_manifest()
+            elif request.method == "get_skill_io_catalog":
+                result = facade.get_skill_io_catalog()
+            elif request.method == "get_gateway_session_capabilities":
+                result = facade.get_gateway_session_capabilities()
+            elif request.method == "get_gateway_events":
+                result = facade.get_gateway_events(request.payload or {})
             elif request.method == "get_observation_snapshot":
                 result = facade.get_observation_snapshot()
             elif request.method == "get_visual_source_catalog":
@@ -662,6 +700,22 @@ class AgentGatewayUnixJsonServer(
                 result = facade.cancel_own_operation(request.payload or {})
             elif request.method == "request_hold_own_domain":
                 result = facade.request_hold_own_domain(request.payload or {})
+            elif request.method == "begin_artifact_upload":
+                result = facade.begin_artifact_upload(request.payload or {})
+            elif request.method == "write_artifact_chunk":
+                result = facade.write_artifact_chunk(request.payload or {})
+            elif request.method == "commit_artifact_upload":
+                result = facade.commit_artifact_upload(request.payload or {})
+            elif request.method == "begin_artifact_download":
+                result = facade.begin_artifact_download(request.payload or {})
+            elif request.method == "read_artifact_chunk":
+                result = facade.read_artifact_chunk(request.payload or {})
+            elif request.method == "acknowledge_artifact_download":
+                result = facade.acknowledge_artifact_download(request.payload or {})
+            elif request.method == "acknowledge_artifact_materialization":
+                result = facade.acknowledge_artifact_materialization(
+                    request.payload or {}
+                )
             else:  # pragma: no cover - closed by _validate_request.
                 raise AgentGatewayUnixProtocolError(
                     "method_not_allowed",
@@ -746,8 +800,7 @@ class AgentGatewayUnixJsonServer(
             return
         if (
             stat.S_ISSOCK(endpoint.st_mode)
-            and (endpoint.st_dev, endpoint.st_ino)
-            == self._bound_endpoint_identity
+            and (endpoint.st_dev, endpoint.st_ino) == self._bound_endpoint_identity
         ):
             os.unlink(self.socket_path)
 
@@ -774,8 +827,8 @@ class AgentGatewayUnixJsonServer(
 
 
 __all__ = [
-    "AGENT_GATEWAY_UNIX_JSON_METHODS_V1",
-    "AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V1",
+    "AGENT_GATEWAY_UNIX_JSON_METHODS_V2",
+    "AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2",
     "DEFAULT_AGENT_GATEWAY_UNIX_MAX_FRAME_BYTES",
     "DEFAULT_AGENT_GATEWAY_UNIX_PEER_IDLE_TIMEOUT_SEC",
     "MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES",

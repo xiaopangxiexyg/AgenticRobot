@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ..protocol.artifact_contracts import AgentArtifactBinding
 from ..protocol.contracts import (
     AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,
     AgentObservationSnapshot,
@@ -48,6 +49,8 @@ from .operation_store import (
     OperationStoreOutcome,
 )
 from .payload_validation import AgentSkillPayloadValidatorRegistry
+from .artifact_validation import validate_skill_artifact_bindings
+from .protocol_runtime import AgentGatewayProtocolRuntime
 
 
 def _required_text(value: object, *, field_name: str) -> str:
@@ -148,6 +151,7 @@ class AgentGatewayService:
         domain_control_port: AgentDomainControlPort | None = None,
         payload_validators: AgentSkillPayloadValidatorRegistry | None = None,
         operation_store: BoundedInMemoryAgentSkillOperationStore | None = None,
+        protocol_runtime: AgentGatewayProtocolRuntime | None = None,
         clock: Callable[[], float] = time.monotonic,
         clock_domain_id: str = "agent-gateway-monotonic",
     ) -> None:
@@ -225,6 +229,17 @@ class AgentGatewayService:
             clock_domain_id,
             field_name="clock_domain_id",
         )
+        if protocol_runtime is None:
+            protocol_runtime = AgentGatewayProtocolRuntime.control_plane_only(
+                manifest=manifest,
+                clock=clock,
+            )
+        elif not isinstance(protocol_runtime, AgentGatewayProtocolRuntime):
+            raise TypeError(
+                "protocol_runtime must be AgentGatewayProtocolRuntime or None."
+            )
+        elif protocol_runtime.manifest != manifest:
+            raise ValueError("protocol_runtime manifest does not match service.")
 
         self.manifest = manifest
         self.access_policy = access_policy
@@ -241,6 +256,7 @@ class AgentGatewayService:
         self._domain_no_io = domain_no_io
         self.payload_validators = payload_validators
         self.operation_store = operation_store
+        self.protocol_runtime = protocol_runtime
         self._clock = clock
         self.clock_domain_id = normalized_clock_domain
         self._admission_lock = threading.RLock()
@@ -717,12 +733,25 @@ class AgentGatewayService:
                     reason_code="observation_measurement_invalid",
                     access_decision=decision,
                 )
+            try:
+                self.protocol_runtime.validate_and_pin_request_inputs(
+                    request=request,
+                    now=timestamp,
+                )
+            except (KeyError, PermissionError, RuntimeError, TypeError, ValueError):
+                return AgentGatewaySubmission(
+                    accepted=False,
+                    reason_code="input_artifact_bindings_rejected",
+                    access_decision=decision,
+                )
             store_outcome = self.operation_store.admit(
                 request=request,
                 access_decision=decision,
                 current_station_revision=revision,
                 admitted_at=timestamp,
             )
+            if not store_outcome.accepted:
+                self.protocol_runtime.release_request_input_pins(request)
             if (
                 store_outcome.accepted
                 and not store_outcome.idempotent_replay
@@ -883,6 +912,7 @@ class AgentGatewayService:
         current_station_revision: int,
         execution_result: Mapping[str, Any] | None = None,
         execution_receipt_refs: tuple[str, ...] = (),
+        output_artifact_bindings: tuple[AgentArtifactBinding, ...] = (),
         now: float | None = None,
     ) -> AgentGatewayOperationOutcome:
         """CAS an already-produced worker result onto the live projection."""
@@ -913,6 +943,31 @@ class AgentGatewayService:
             request.route_id,
             request.route_version,
         ).route
+        io_contract = self.protocol_runtime.io_catalog.contract(
+            request.skill_id,
+            request.skill_version,
+        )
+        try:
+            validate_skill_artifact_bindings(
+                io_contract=io_contract,
+                direction="output",
+                bindings=output_artifact_bindings,
+                session_capabilities=self.protocol_runtime.session_capabilities,
+            )
+            if output_artifact_bindings:
+                store, _broker = self.protocol_runtime.require_artifact_plane()
+                for binding in output_artifact_bindings:
+                    record = store.artifact(binding.artifact.artifact_id)
+                    if not record.available or record.artifact != binding.artifact:
+                        raise ValueError(
+                            "Output Artifact is unavailable or does not match."
+                        )
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            return AgentGatewayOperationOutcome(
+                False,
+                "output_artifact_bindings_rejected",
+                self.operation_store.get(normalized_id),
+            )
         if execution_result is not None and self.payload_validators is not None:
             try:
                 self.payload_validators.validate_execution_result(
@@ -941,6 +996,7 @@ class AgentGatewayService:
             execution_receipt_refs=execution_receipt_refs,
             progress_summary={"phase": next_status},
             execution_result=execution_result,
+            output_artifact_bindings=output_artifact_bindings,
         )
         return AgentGatewayOperationOutcome(
             projection.accepted,
@@ -1688,6 +1744,7 @@ class NoIoAgentGatewayService(AgentGatewayService):
         operation_port: NoIoAgentSkillOperationPort,
         payload_validators: AgentSkillPayloadValidatorRegistry | None = None,
         operation_store: BoundedInMemoryAgentSkillOperationStore | None = None,
+        protocol_runtime: AgentGatewayProtocolRuntime | None = None,
         clock: Callable[[], float] = time.monotonic,
         clock_domain_id: str = "agent-gateway-monotonic",
     ) -> None:
@@ -1699,6 +1756,7 @@ class NoIoAgentGatewayService(AgentGatewayService):
             operation_port=operation_port,
             payload_validators=payload_validators,
             operation_store=operation_store,
+            protocol_runtime=protocol_runtime,
             clock=clock,
             clock_domain_id=clock_domain_id,
         )
