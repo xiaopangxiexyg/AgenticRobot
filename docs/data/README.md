@@ -5,7 +5,9 @@
 [长程任务细粒度阶段标注](../real/LONG_HORIZON_STAGE_ANNOTATION.md)。向其他人说明或交付实际
 数据集时，先阅读 [v2.5-p2 数据格式](./v25p2/README.md)，再使用
 [数据集内容与交付说明](./v25p2/DATASET_CONTENT_AND_HANDOFF.md)。
-数据集整体迁移、备份或将旧路径替换为软链接前，必须先阅读其中的
+当前 RealmanDMTAC 根目录、正式采集默认位置和 2026-08-06 迁移边界见
+[数据根与 hardlink 警告](./v25p2/REALMANDMTAC_DATASET_ROOT_NOTICE.md)。
+数据集整体迁移、备份或将旧路径替换为软链接前，必须先阅读该警告和交付说明中的
 “数据集迁移、hardlink 与软链接”章节；不同路径可能共享同一 inode，不得将路径副本
 默认视为独立备份。
 以下命令均不连接真实执行器。

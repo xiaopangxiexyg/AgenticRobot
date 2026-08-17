@@ -70,3 +70,11 @@ bash scripts/verify_dev_base.sh
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 python -m pytest -m 'unit and not optional' -q
 ```
+
+## 5. 兼容与开发工具说明
+
+- [`ENVIRONMENT.md`](./ENVIRONMENT.md) 只保留旧链接兼容；新增环境说明应更新本页或仓库根
+  [`README_ENV.md`](../../README_ENV.md)，不要再建立第三份安装步骤。
+- [`CODEX_BEINGBEYOND_REMOTE.md`](./CODEX_BEINGBEYOND_REMOTE.md) 是特定远端开发工具和
+  provider 的运维说明，不定义 DexTeleop 的 Python 依赖、运行环境或部署合同。使用其中命令时仍应遵守
+  密钥不入仓库、远端目标显式选择和只读优先的边界。
