@@ -206,6 +206,13 @@ safety, persisted data, or expected behavior.
 - After unexpected real motion, freeze that Active path and preserve its exact
   command, configuration, logs, and process evidence. Diagnose read-only and do
   not tune or retry until both the cause and the missing safety gate are closed.
+- Real Agent motion has an explicit frame boundary: public Skill/observation
+  poses are `tool_tcp`, while the RM65 coupled solver consumes its configured
+  solver endpoint frame. The current DMTAC profiles commonly have about
+  `0.14m` of TCP offset, but the selected tool profile is authoritative. Never
+  pass a TCP pose directly to `BimanualPoseTarget`/IK or recreate the tool
+  transform above the lower target owner; require the canonical lower conversion
+  and fail closed when it is unavailable.
 - Use `AGENT_TEMP_NOTE:` only for active collaboration and remove obsolete notes.
 
 ## Verification and environment metadata

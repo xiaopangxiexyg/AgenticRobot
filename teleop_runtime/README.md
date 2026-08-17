@@ -89,6 +89,16 @@ arm pose7 的正式语义是 `T_arm_base_tool_tcp`：
   偏差超过 `90deg` 时会打印显式 warning。
 - RM65 后端内部会把 `tool_tcp` 转到 SDK/IK 需要的 hand_base 或 arm_link6 frame；这些内部 frame 不应作为模型 action 语义。
 - `arm_endpoint` / `hand_base` 仅保留为兼容和调试 frame。
+- 真机 Agent Skill 还必须遵守同一条边界：Skill/activation 的绝对目标和观测是
+  `tool_tcp` 语义，而 `BimanualPoseTarget.target_pose_by_side` 是 coupled solver 的
+  `solver_world_endpoint` 语义。当前 RM65 DMTAC 工具 profile 通常带有约 `0.14m` 的
+  TCP--solver endpoint 平移（实际值必须从选中的 tool profile 读取，不能硬编码）。
+  不得把 TCP pose 直接塞进 `BimanualPoseTarget` 或 IK；必须由下层唯一 target owner 的
+  `solver_world_target_from_tool_tcp_world_target()` 完成一次转换。该转换不能由 Agent、
+  Gateway、Skill 或上层重复实现。
+- 任何新增或修改的 Agent motion path 都必须用非零 TCP offset fixture 验证：有效目标的
+  source/audit 值仍保持 TCP，交给 solver 的 target 才能是 solver endpoint；缺少转换
+  owner 时应 fail closed，而不是默认 identity。
 - 数据集和部署 metadata 会写 `arm_action_specs_by_side`、
   `arm_controlled_frame_by_side` 和 `arm_reference_frame_by_side`；下游代码应按这些
   spec 解释 arm pose，不要凭维度猜测 pose 控制的是 TCP 还是内部 frame。

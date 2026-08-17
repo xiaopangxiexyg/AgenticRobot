@@ -287,6 +287,32 @@ its Active final pre-IK TCP envelope. Ordinary RealTeleop invocations do not
 advertise or start the Gateway, and the repository's offline tests are not
 real-hardware validation.
 
+### Real Skill target-frame invariant
+
+The real Skill API is TCP-based, but the RM65 coupled solver is endpoint-frame
+based. `RealAgentMotionActivation.target_pose_world`, measured cuts, and the
+source value recorded in `BimanualPoseTargetSource` are tool-TCP poses in the
+selected execution/world frame. In contrast,
+`BimanualPoseTarget.target_pose_by_side` is consumed as a solver-world endpoint
+target. Current DMTAC tool profiles commonly introduce roughly `0.14m` of
+translation between those frames; the selected profile, not this number, is
+the authority.
+
+The only valid path is:
+
+```text
+Skill TCP target
+  -> lower target owner's solver_world_target_from_tool_tcp_world_target()
+  -> BimanualPoseTarget solver endpoint
+  -> TCP envelope / IK / dispatch
+```
+
+Never pass a TCP pose directly to `BimanualPoseTarget` or duplicate the tool
+transform in Gateway/Agent code. A target owner without the conversion method
+must be rejected, and tests for this path must use a non-zero offset so an
+identity fake cannot hide a frame regression. The canonical action/frame
+background is maintained in [`teleop_runtime/README.md`](../teleop_runtime/README.md#action-contract-说明).
+
 Target-independent CubeLift semantics live in `skills/cube_lift`. The MuJoCo
 Route, deployment, lifecycle executor, observation binding, evidence, and
 terminal evaluator live in `profiles/mujoco/skills/cube_lift`. This keeps task
