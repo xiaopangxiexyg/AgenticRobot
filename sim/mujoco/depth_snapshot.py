@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from agent_gateway.skills.perception.schemas import (
+from dataset_contracts.perception_artifacts import (
     DEPTH_FRAME_COMPRESSION_V1,
     DEPTH_FRAME_ENCODING_V1,
     DEPTH_FRAME_MEDIA_TYPE_V1,

@@ -13,6 +13,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from control_station.sim_hil_profile.application import (
+    MujocoSimHILPassiveApplicationCut,
+)
 from robot_motion.action import ComponentAction
 from robot_motion.deploy.schema import pose_matrix_to_xyzquat
 from robot_motion.target_safety import (
@@ -29,14 +32,7 @@ from sim.mujoco.depth_snapshot import (
     EncodedMujocoDepthFrame,
     MujocoDepthSnapshotSource,
 )
-from sim.mujoco.rgb_snapshot import (
-    EncodedMujocoRgbFrame,
-    MujocoRgbSnapshotSource,
-)
-
-from control_station.sim_hil_profile.application import (
-    MujocoSimHILPassiveApplicationCut,
-)
+from sim.mujoco.rgb_snapshot import EncodedMujocoRgbSnapshot, MujocoRgbSnapshotSource
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -131,6 +127,7 @@ class MujocoAgentSkillMotionApplication:
         self._active_operation_id: str | None = None
         self._visual_snapshot_source = MujocoRgbSnapshotSource(
             capture_scene=self._capture_visual_scene,
+            clock=self.runtime.clock,
         )
         self._depth_snapshot_source = MujocoDepthSnapshotSource(
             capture_scene=self._capture_visual_scene,
@@ -375,16 +372,16 @@ class MujocoAgentSkillMotionApplication:
 
         return self._visual_snapshot_source.source_catalog()
 
-    def capture_visual_jpeg_frames(
+    def capture_visual_jpeg_snapshot(
         self,
         *,
         source_ids: tuple[str, ...],
         width: int,
         height: int,
-    ) -> Mapping[str, EncodedMujocoRgbFrame]:
-        """Capture validated JPEG frames through the lower MuJoCo source."""
+    ) -> EncodedMujocoRgbSnapshot:
+        """Capture one timestamped RGB scene cut through the lower source."""
 
-        return self._visual_snapshot_source.capture_jpeg_frames(
+        return self._visual_snapshot_source.capture_jpeg_snapshot(
             source_ids=source_ids,
             width=width,
             height=height,
@@ -533,7 +530,7 @@ class MujocoAgentSkillMotionApplication:
         for source in snapshot_sources:
             try:
                 source.close()
-            except Exception as exc:  # pragma: no cover - backend cleanup
+            except Exception as exc:  # noqa: BLE001  # pragma: no cover - backend cleanup
                 if first_error is None:
                     first_error = exc
         if first_error is not None:

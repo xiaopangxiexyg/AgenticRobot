@@ -29,7 +29,8 @@ not caller-authored Agent input.
   deployment.
 - `profiles/`: exact application/deployment bindings and executors. The current
   `profiles/mujoco` package owns the no-model TCP-pose Gateway application and
-  its motion, observation, visual snapshot, policy-Skill, and CubeLift bindings.
+  its motion, observation, perception Artifact, policy-Skill, and CubeLift
+  bindings.
   `profiles/real` owns the default-off, attach-only real TCP-pose observation
   profile and the 6+3 primitive application. Gateway workers submit immutable
   requests to one lower RealTeleop port; they perform no device I/O, IK, safety
@@ -67,13 +68,12 @@ event replay and generic operations to begin/upload/commit an Artifact,
 begin/read/acknowledge a download, and acknowledge an upper-owned durable
 materialization.
 
-There is no depth-image method in the protocol. A Skill such as “capture a
-specific view's latest depth” declares parameters for the requested view, an
-output Artifact slot with media/schema/size constraints, and a normal executor
-binding. The same machinery supports point clouds, logs, calibration artifacts,
-or other finite Skill input/output without changing transport semantics. Multi-file
-results use multiple bindings or one explicitly encoded archive; v2 does not add a
-second bundle abstraction.
+There is no RGB- or depth-image method in the protocol. A capture Skill declares
+its selection parameters, output Artifact slots with media/schema/size
+constraints, and a normal executor binding. The same machinery supports point
+clouds, logs, calibration artifacts, or other finite Skill input/output without
+changing transport semantics. Multi-file results use multiple bindings or one
+explicitly encoded archive; v2 does not add a second bundle abstraction.
 
 Large bodies never enter an operation or event payload. `AgentArtifactRef` is
 the portable content identity; filesystem paths and other locators exist only
@@ -128,10 +128,12 @@ python -m agent_gateway mujoco \
 ```
 
 `--artifact-root` is optional and default-off. Supplying a real,
-non-world-writable directory enables `perception.capture_depth`, which returns
-native-resolution float32 metric depth through a normal output Artifact slot.
-The inline result contains view/capture/intrinsic metadata; the Artifact body
-is an `application/x-npy` array with invalid depth represented as `0.0`.
+non-world-writable directory enables the read-only
+`perception.capture_depth` and `perception.capture_rgb` Skills. Depth returns
+native-resolution float32 metric data; RGB returns one role-selected JPEG per
+output Artifact ordinal from a single scene cut. Inline results contain only
+bounded metadata and content hashes. Pixel arrays never enter the control
+frame.
 
 `python -m control_station agent-gateway-mujoco ...` remains a compatibility
 forwarder. It creates no Gateway implementation or runtime state inside
@@ -207,13 +209,14 @@ concrete Gateway profile.
 
 ## Observation and visual cuts
 
-Low-rate state observations and pull-based visual captures are separate. A
-deployment publishes its complete current RGB source catalog and implements one
-bounded capture request; the request grants no streaming or motion authority.
-The MuJoCo profile currently publishes `main`, `wrist_left`, and `wrist_right`,
-renders under the existing scene/physics lock, and rejects a cut if the bound
-Station revision changes across capture. Other profiles bind their own producer
-to the same transport-neutral facade and do not import the MuJoCo renderer.
+Low-rate state observations and pull-based visual captures are separate. RGB is
+not a dedicated transport method: `perception.capture_rgb` is an ordinary
+`inspection` Skill with a `read_only`, `t0_read_only` Route and generic output
+Artifacts. Its deployment profile publishes the trusted semantic roles; the
+MuJoCo binding maps `main`, `wrist_left`, and `wrist_right` to current cameras,
+renders one scene cut under the existing scene/physics lock, and rejects a cut
+if its Station revision changes. Other profiles may bind their own producer to
+the same Definition/schema/I/O contract without importing the MuJoCo renderer.
 
 ## Compatibility
 

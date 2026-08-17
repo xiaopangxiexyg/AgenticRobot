@@ -11,11 +11,40 @@ import numpy as np
 import pytest
 
 import agent_gateway.profiles.mujoco.motion_deployment as deployment
-import agent_gateway.profiles.mujoco.motion_skill as motion_skill
 from agent_gateway.profiles.motion_primitive_resolution import (
     MotionPrimitiveTargetResolution,
     resolve_level_tcp_orientation_primitive_target,
     resolve_tcp_displacement_primitive_target,
+)
+from agent_gateway.profiles.mujoco import motion_skill
+from agent_gateway.profiles.mujoco.motion_application import (
+    MujocoAgentSkillMotionApplication,
+    MujocoAgentSkillMotionStep,
+)
+from agent_gateway.profiles.mujoco.motion_deployment import (
+    MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1,
+    MujocoAgentTcpPoseDeploymentBinding,
+    MujocoAgentTcpPoseMotionProfile,
+    build_mujoco_agent_tcp_pose_contract_bundle,
+)
+from agent_gateway.profiles.mujoco.motion_factory import (
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,
+    MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1,
+    _build_standard_tcp_pose_envelope_runtime,
+    mujoco_agent_tcp_pose_execution_observation_plan_v1,
+    validate_mujoco_agent_tcp_pose_target_config,
+)
+from agent_gateway.profiles.mujoco.motion_gateway_session import (
+    assemble_mujoco_agent_tcp_pose_gateway_session,
+)
+from agent_gateway.profiles.mujoco.motion_primitive_profiles import (
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
+    MujocoAgentTcpCardinalStepProfile,
+    MujocoAgentTcpFixedOrientationProfile,
+)
+from agent_gateway.profiles.mujoco.motion_skill import (
+    MujocoAgentTcpPoseSkillLifecycle,
+    mujoco_agent_skill_hold_evidence_from_transition,
 )
 from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
@@ -30,40 +59,14 @@ from agent_gateway.protocol.skill_catalog import (
     SkillExecutionRoute,
     SkillParameterProfileRef,
 )
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.skills.motion.definition import (
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
-from agent_gateway.profiles.mujoco.motion_application import (
-    MujocoAgentSkillMotionApplication,
-    MujocoAgentSkillMotionStep,
+from agent_gateway.skills.perception.definition import (
+    CAPTURE_DEPTH_SKILL_ID_V1,
+    CAPTURE_RGB_SKILL_ID_V1,
 )
-from agent_gateway.profiles.mujoco.motion_deployment import (
-    MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1,
-    MujocoAgentTcpPoseDeploymentBinding,
-    MujocoAgentTcpPoseMotionProfile,
-    build_mujoco_agent_tcp_pose_contract_bundle,
-)
-from agent_gateway.profiles.mujoco.motion_primitive_profiles import (
-    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
-    MujocoAgentTcpCardinalStepProfile,
-    MujocoAgentTcpFixedOrientationProfile,
-)
-from agent_gateway.profiles.mujoco.motion_factory import (
-    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1,
-    MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1,
-    _build_standard_tcp_pose_envelope_runtime,
-    mujoco_agent_tcp_pose_execution_observation_plan_v1,
-    validate_mujoco_agent_tcp_pose_target_config,
-)
-from agent_gateway.profiles.mujoco.motion_gateway_session import (
-    assemble_mujoco_agent_tcp_pose_gateway_session,
-)
-from agent_gateway.profiles.mujoco.motion_skill import (
-    MujocoAgentTcpPoseSkillLifecycle,
-    mujoco_agent_skill_hold_evidence_from_transition,
-)
-from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
-from agent_gateway.skills.perception.definition import CAPTURE_DEPTH_SKILL_ID_V1
 from robot_motion.coordinate_frames import (
     CoordinateFrameGraph,
     CoordinateFrameSpec,
@@ -78,6 +81,10 @@ from sim.mujoco.deploy import (
     build_mujoco_pose_component_target_profile,
 )
 from sim.mujoco.depth_snapshot import EncodedMujocoDepthFrame
+from sim.mujoco.rgb_snapshot import (
+    EncodedMujocoRgbFrame,
+    EncodedMujocoRgbSnapshot,
+)
 
 
 def test_motion_primitive_organization_preserves_legacy_profile_exports() -> None:
@@ -855,7 +862,7 @@ def test_graph_factory_rejects_non_dedicated_target_config_before_scene_load() -
 def _build_no_model_contract_bundle_fixture(
     monkeypatch,
     *,
-    enable_depth_capture: bool = False,
+    enable_artifact_perception: bool = False,
 ):
     _profile, action_schema = _profile_and_schema()
     observation_plan = SimpleNamespace(
@@ -970,13 +977,14 @@ def _build_no_model_contract_bundle_fixture(
     application.depth_source_catalog = lambda: (
         {"view_id": "front", "native_width": 2, "native_height": 2},
     )
-    application.tcp_pose_envelope_runtime = (
-        _build_standard_tcp_pose_envelope_runtime(
-            prepared=application,
-            target_config=SimpleNamespace(
-                clock_domain_id=runtime.config.clock_domain_id,
-            ),
-        )
+    application.visual_source_catalog = lambda: (
+        {"source_id": "front", "native_width": 640, "native_height": 480},
+    )
+    application.tcp_pose_envelope_runtime = _build_standard_tcp_pose_envelope_runtime(
+        prepared=application,
+        target_config=SimpleNamespace(
+            clock_domain_id=runtime.config.clock_domain_id,
+        ),
     )
     captured_manifest_args = {}
 
@@ -1007,7 +1015,7 @@ def _build_no_model_contract_bundle_fixture(
 
     bundle = build_mujoco_agent_tcp_pose_contract_bundle(
         application=application,
-        enable_depth_capture=enable_depth_capture,
+        enable_artifact_perception=enable_artifact_perception,
     )
     return application, runtime, direct, bundle, captured_manifest_args
 
@@ -1208,7 +1216,7 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     application, _runtime, _direct, bundle, _captured_manifest_args = (
         _build_no_model_contract_bundle_fixture(
             monkeypatch,
-            enable_depth_capture=True,
+            enable_artifact_perception=True,
         )
     )
     depth_entry = bundle.route_manifest.route(CAPTURE_DEPTH_SKILL_ID_V1, "1")
@@ -1256,6 +1264,21 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
             },
         )
     )
+    rgb_bytes = b"bounded-rgb-jpeg"
+    motion_application.capture_visual_jpeg_snapshot = lambda **_kwargs: (
+        EncodedMujocoRgbSnapshot(
+            captured_at=10.0,
+            frames={
+                "front": EncodedMujocoRgbFrame(
+                    source_id="front",
+                    width=32,
+                    height=24,
+                    media_type="image/jpeg",
+                    data=rgb_bytes,
+                )
+            },
+        )
+    )
     artifact_store = RecoverableAgentArtifactStore(
         root=tmp_path / "artifacts",
         quota_bytes=32 * 1024 * 1024,
@@ -1275,6 +1298,7 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
         for item in session.service.executor_registry.bindings
     }
     assert route_to_port[CAPTURE_DEPTH_SKILL_ID_V1] is session.depth_executor
+    assert route_to_port[CAPTURE_RGB_SKILL_ID_V1] is session.rgb_executor
     assert session.depth_executor is not session.motion_executor
     assert session.service.domain_control_port is session.motion_executor
     capabilities = session.service.protocol_runtime.session_capabilities
@@ -1378,6 +1402,69 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     assert tuple(
         receipt.operation_kind for receipt in session.depth_executor.port_receipts
     ) == ("activate",)
+    assert session.motion_executor.workers == ()
+
+    rgb_entry = bundle.route_manifest.route(CAPTURE_RGB_SKILL_ID_V1, "1")
+    rgb_route = rgb_entry.route
+    rgb_binding = rgb_entry.deployment_binding
+    rgb_request = AgentSkillRequest(
+        client_id="rpent:fixture",
+        request_id="request:rgb:1",
+        idempotency_key="idempotency:rgb:1",
+        client_sequence=2,
+        runtime_session_id=bundle.route_manifest.runtime_session_id,
+        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+        expected_station_revision=0,
+        skill_id=rgb_route.skill_id,
+        skill_version=rgb_route.skill_version,
+        skill_definition_hash=rgb_route.skill_definition_hash,
+        route_id=rgb_route.route_id,
+        route_version=rgb_route.route_version,
+        route_hash=rgb_route.semantic_content_hash,
+        deployment_binding_hash=rgb_binding.deployment_binding_hash,
+        parameter_profile_id=(
+            rgb_route.allowed_parameter_profiles[0].parameter_profile_id
+        ),
+        parameter_profile_hash=(
+            rgb_route.allowed_parameter_profiles[0].parameter_profile_hash
+        ),
+        parameters={
+            "selected_roles": ["main"],
+            "width": 32,
+            "height": 24,
+            "max_total_bytes": 1024,
+        },
+        observation_snapshot_id=snapshot.snapshot_id,
+        requested_mode="sim_active",
+        requested_timeout_ms=1_000,
+    )
+    rgb_admitted = session.service.submit_request(
+        request=rgb_request,
+        current_station_revision=0,
+        now=10.0,
+    )
+    assert rgb_admitted.accepted and rgb_admitted.operation is not None
+    assert session.service.launch_operation(
+        rgb_admitted.operation.operation_id
+    ).accepted
+    assert session.rgb_executor is not None
+    assert session.rgb_executor.wait(
+        rgb_admitted.operation.operation_id,
+        timeout_sec=1.0,
+    )
+    rgb_completed = session.service.operation_store.get(
+        rgb_admitted.operation.operation_id
+    )
+    assert rgb_completed is not None and rgb_completed.status == "completed"
+    assert rgb_completed.execution_result["station_revision"] == 0
+    assert rgb_completed.execution_result["frames"][0]["role"] == "main"
+    assert len(rgb_completed.output_artifact_bindings) == 1
+    rgb_output = rgb_completed.output_artifact_bindings[0]
+    assert rgb_output.ordinal == 0
+    assert (
+        artifact_store.managed_read_path(rgb_output.artifact.artifact_id).read_bytes()
+        == rgb_bytes
+    )
     assert session.motion_executor.workers == ()
 
     session.close()

@@ -46,14 +46,14 @@ from .motion_deployment import (
     MujocoAgentTcpPoseHistoryProfile,
     build_mujoco_agent_tcp_pose_contract_bundle,
 )
+from .motion_gateway_session import (
+    MujocoAgentTcpPoseGatewaySession,
+    assemble_mujoco_agent_tcp_pose_gateway_session,
+)
 from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
-)
-from .motion_gateway_session import (
-    MujocoAgentTcpPoseGatewaySession,
-    assemble_mujoco_agent_tcp_pose_gateway_session,
 )
 
 MUJOCO_AGENT_TCP_POSE_CALIBRATION_HASH_DOMAIN_V1 = (
@@ -453,7 +453,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             history_profile=(
                 None if history_storage is None else history_storage.profile
             ),
-            enable_depth_capture=artifact_storage is not None,
+            enable_artifact_perception=artifact_storage is not None,
         )
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding

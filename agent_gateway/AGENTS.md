@@ -67,8 +67,9 @@ Every advertised Skill has exactly one `SkillIOContract`, including Skills
 whose input and output Artifact slot lists are empty. New Skills should be
 assembled with `protocol.skill_registration.SkillRegistrationTemplate` so the
 Definition, strict schemas, I/O contract, and Routes fail closed over the same
-hashes. Hardware-information Skills use ordinary typed Artifact slots; do not
-add device- or depth-specific transport methods.
+hashes. Hardware-information Skills, including RGB and depth capture, use
+ordinary typed Artifact slots; do not add device- or modality-specific
+transport methods.
 
 Treat control effect as a cross-layer invariant. `inspection` Definitions bind
 only `read_only` Routes, and those Routes remain `t0_read_only`, `cancel_only`,

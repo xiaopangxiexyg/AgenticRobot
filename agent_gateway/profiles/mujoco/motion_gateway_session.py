@@ -12,10 +12,6 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
-from collection_runtime.source_observation_history import (
-    SourceObservationHistoryRecorder,
-    SQLiteSourceObservationHistoryStore,
-)
 from agent_gateway.profiles.motion_primitive_resolution import (
     MotionPrimitiveTargetResolution,
     resolve_level_tcp_orientation_primitive_target,
@@ -59,13 +55,25 @@ from agent_gateway.runtime.station_operation_worker import (
 from agent_gateway.skills.motion.definition import (
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
-from agent_gateway.skills.perception.definition import CAPTURE_DEPTH_SKILL_ID_V1
+from agent_gateway.skills.perception.definition import (
+    CAPTURE_DEPTH_SKILL_ID_V1,
+    CAPTURE_RGB_SKILL_ID_V1,
+)
+from agent_gateway.skills.perception.schemas import (
+    RGB_FRAME_COMPRESSION_V1,
+    RGB_FRAME_ENCODING_V1,
+    RGB_FRAME_SCHEMA_ID_V1,
+)
 from agent_gateway.transport.unix_transport import (
     AgentGatewayUnixJsonServer,
     AgentGatewayUnixPeerClientMap,
 )
 from agent_gateway.transport.wire_adapter import (
     BoundAgentGatewayWireAdapter,
+)
+from collection_runtime.source_observation_history import (
+    SourceObservationHistoryRecorder,
+    SQLiteSourceObservationHistoryStore,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
@@ -80,8 +88,9 @@ from .observation import MujocoAgentObservationProducer
 from .observation_binding import (
     build_mujoco_agent_motion_observation_source_binding,
 )
+from .rgb_deployment import MUJOCO_CAPTURE_RGB_OUTPUT_SLOT_ID_V1
 from .tcp_pose_history import MujocoAgentTcpPoseHistoryProvider
-from .visual_observation import MujocoAgentVisualSnapshotProvider
+from .visual_observation import MujocoAgentRgbCaptureProvider
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -105,7 +114,7 @@ class MujocoAgentTcpPoseGatewaySession:
     application: MujocoAgentSkillMotionApplication
     contract_bundle: MujocoAgentTcpPoseContractBundle
     observation_producer: MujocoAgentObservationProducer
-    visual_snapshot_provider: MujocoAgentVisualSnapshotProvider
+    rgb_capture_provider: MujocoAgentRgbCaptureProvider
     motion_executor: ReusableStationAgentSkillOperationExecutor
     cardinal_step_executor: ReusableStationAgentSkillOperationExecutor
     fixed_orientation_executors: Mapping[
@@ -113,6 +122,7 @@ class MujocoAgentTcpPoseGatewaySession:
     ]
     state_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor | None
+    rgb_executor: PassiveReadSkillExecutor | None
     history_provider: MujocoAgentTcpPoseHistoryProvider | None
     history_executor: PassiveReadSkillExecutor | None
     history_recorder: SourceObservationHistoryRecorder | None
@@ -164,6 +174,10 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError(
                 "Depth executor and Artifact store must be enabled together."
             )
+        if (self.rgb_executor is None) != (self.artifact_store is None):
+            raise ValueError(
+                "RGB executor and Artifact store must be enabled together."
+            )
 
     def wire_adapter(
         self,
@@ -181,8 +195,6 @@ class MujocoAgentTcpPoseGatewaySession:
             current_station_revision=lambda: (
                 self.observation_producer.current_station_revision
             ),
-            visual_source_catalog=self.visual_snapshot_provider.source_catalog,
-            capture_visual_snapshot=self.visual_snapshot_provider.capture,
             operation_launcher=self.service.launch_operation,
         )
 
@@ -288,12 +300,13 @@ class MujocoAgentTcpPoseGatewaySession:
                         self.observation_producer.current_station_revision
                     )
                 )
-            depth_settled = self.depth_executor is None or self.depth_executor.wait_all(
-                timeout_sec=5.0
+            perception_settled = all(
+                executor is None or executor.wait_all(timeout_sec=5.0)
+                for executor in (self.depth_executor, self.rgb_executor)
             )
-            if not depth_settled:
+            if not perception_settled:
                 raise RuntimeError(
-                    "Passive depth capture did not quiesce before Gateway close."
+                    "Passive perception capture did not quiesce before Gateway close."
                 )
             self._finish_lower_close(self._close_outcome)
             if (
@@ -348,13 +361,15 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         and source_observation_history_store is None
     ):
         raise ValueError("Owned planning history store must be injected.")
-    depth_enabled = contract_bundle.depth_capture is not None
-    if depth_enabled and not isinstance(
+    perception_enabled = contract_bundle.depth_capture is not None
+    if perception_enabled != (contract_bundle.rgb_capture is not None):
+        raise ValueError("RGB and depth Artifact Skills must be enabled together.")
+    if perception_enabled and not isinstance(
         artifact_store,
         RecoverableAgentArtifactStore,
     ):
-        raise ValueError("Enabled depth capture requires an exact Artifact store.")
-    if not depth_enabled and artifact_store is not None:
+        raise ValueError("Enabled perception capture requires an exact Artifact store.")
+    if not perception_enabled and artifact_store is not None:
         raise ValueError("Artifact store cannot be bound without an Artifact Skill.")
     if owns_artifact_store and artifact_store is None:
         raise ValueError("Owned Artifact store must be injected.")
@@ -434,7 +449,12 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     )
     depth_entry = (
         contract_bundle.route_manifest.route(CAPTURE_DEPTH_SKILL_ID_V1, "1")
-        if depth_enabled
+        if perception_enabled
+        else None
+    )
+    rgb_entry = (
+        contract_bundle.route_manifest.route(CAPTURE_RGB_SKILL_ID_V1, "1")
+        if perception_enabled
         else None
     )
     observation_producer = MujocoAgentObservationProducer(
@@ -445,11 +465,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             contract_bundle=contract_bundle,
         ),
     )
-    visual_snapshot_provider = MujocoAgentVisualSnapshotProvider(
+    rgb_capture_provider = MujocoAgentRgbCaptureProvider(
         application=application,
-        current_station_revision=lambda: (
-            observation_producer.current_station_revision
-        ),
+        current_station_revision=lambda: observation_producer.current_station_revision,
     )
     history_provider = (
         MujocoAgentTcpPoseHistoryProvider(
@@ -784,6 +802,94 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             clock=runtime_clock,
             max_retained_operations=retention,
         )
+    rgb_executor = None
+    if rgb_entry is not None and artifact_store is not None:
+        rgb_registration = contract_bundle.rgb_capture
+        if rgb_registration is None:
+            raise RuntimeError("RGB Route lost its registration.")
+
+        def read_rgb(request, operation) -> PassiveReadResult:
+            capture = rgb_capture_provider.capture(
+                request.parameters,
+                expected_station_revision=request.expected_station_revision,
+            )
+            bindings = []
+            frame_metadata = []
+            total_bytes = 0
+            for ordinal, (source_id, role, frame) in enumerate(capture.frames):
+                artifact = artifact_ref_for_bytes(
+                    frame.data,
+                    media_type=frame.media_type,
+                    schema_id=RGB_FRAME_SCHEMA_ID_V1,
+                    encoding=RGB_FRAME_ENCODING_V1,
+                    compression=RGB_FRAME_COMPRESSION_V1,
+                )
+                committed = commit_artifact_bytes(
+                    store=artifact_store,
+                    data=frame.data,
+                    artifact=artifact,
+                    producer_id="agent_gateway.provider.mujoco_rgb",
+                    runtime_session_id=binding.runtime_session_id,
+                    idempotency_key=(f"rgb-output:{operation.operation_id}:{ordinal}"),
+                    now=capture.captured_at,
+                )
+                total_bytes += committed.byte_length
+                frame_metadata.append(
+                    {
+                        "ordinal": ordinal,
+                        "source_id": source_id,
+                        "role": role,
+                        "media_type": committed.media_type,
+                        "width": frame.width,
+                        "height": frame.height,
+                        "media_content_hash": committed.sha256,
+                    }
+                )
+                bindings.append(
+                    AgentArtifactBinding(
+                        slot_id=MUJOCO_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
+                        ordinal=ordinal,
+                        artifact=committed,
+                        production_receipt_ref=(
+                            f"mujoco-rgb-frame:{operation.operation_id}:{ordinal}:"
+                            + committed.sha256
+                        ),
+                    )
+                )
+            result_identity = canonical_content_hash(
+                {
+                    "operation_id": operation.operation_id,
+                    "request_hash": request.semantic_content_hash,
+                    "station_revision": capture.station_revision,
+                    "captured_at": capture.captured_at,
+                    "frames": frame_metadata,
+                },
+                domain="dexteleop.agent_skill.mujoco_rgb_capture_receipt.v1",
+            )
+            result = {
+                "snapshot_id": "rgb-snapshot:" + result_identity,
+                "station_revision": capture.station_revision,
+                "captured_at": capture.captured_at,
+                "frames": frame_metadata,
+                "total_bytes": total_bytes,
+            }
+            return PassiveReadResult(
+                execution_result=result,
+                evidence_refs=("mujoco-rgb-capture:" + result_identity,),
+                output_artifact_bindings=tuple(bindings),
+                reason_code="passive_rgb_capture_completed",
+            )
+
+        rgb_executor = PassiveReadSkillExecutor(
+            port_id=("agent-gateway:passive-rgb-capture:" + binding.runtime_session_id),
+            executor_id=rgb_registration.deployment_binding.executor_id,
+            read=read_rgb,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+            clock=runtime_clock,
+            max_retained_operations=retention,
+        )
     history_executor = None
     if history_provider is not None:
         history_binding = contract_bundle.history_deployment_binding
@@ -833,6 +939,10 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     if depth_entry is not None and depth_executor is not None:
         execution_port_by_route_hash[depth_entry.route.semantic_content_hash] = (
             depth_executor
+        )
+    if rgb_entry is not None and rgb_executor is not None:
+        execution_port_by_route_hash[rgb_entry.route.semantic_content_hash] = (
+            rgb_executor
         )
     executor_registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
@@ -934,12 +1044,13 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         application=application,
         contract_bundle=contract_bundle,
         observation_producer=observation_producer,
-        visual_snapshot_provider=visual_snapshot_provider,
+        rgb_capture_provider=rgb_capture_provider,
         motion_executor=motion_executor,
         cardinal_step_executor=cardinal_step_executor,
         fixed_orientation_executors=fixed_orientation_executors,
         state_executor=state_executor,
         depth_executor=depth_executor,
+        rgb_executor=rgb_executor,
         history_provider=history_provider,
         history_executor=history_executor,
         history_recorder=history_recorder,
