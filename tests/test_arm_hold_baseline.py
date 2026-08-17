@@ -13,7 +13,7 @@ from dataset_contracts.arm_hold_history import (
     ARM_HOLD_RESOLVED_CONTEXT_PROVENANCE_V1,
     ArmHoldHistorySequenceContext,
 )
-from policy_learning.arm_hold import (
+from experiments.policy_learning.arm_hold import (
     ArmHoldBaseline,
     ArmHoldBaselineConfig,
     ArmHoldLossConfig,

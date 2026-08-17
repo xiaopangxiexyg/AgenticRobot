@@ -512,7 +512,7 @@ model-RTC
   robot_motion         在线 timeline、old-plan overlap、canonical conditioning bundle、epoch/plan identity
   deployments.client   injected codec编排、model-space input、protocol envelope/receipt
   deployments.<model>  artifact-bound codec、模型字段、sampler 与 transport
-  policy_learning/     learner、loss 与训练实现
+  experiments/policy_learning/  非正式 learner、loss 与离线实验实现
 ```
 
 model-RTC 是跨层 feature，不由单一 package 完整拥有，也不新增顶级 `rtc/`

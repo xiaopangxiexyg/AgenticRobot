@@ -1,4 +1,4 @@
-"""Small independent arm-hold learner and its single canonical loss.
+"""Experimental arm-hold learner and its single canonical loss.
 
 This is intentionally not an OpenPI adapter.  It provides a cheap reference
 model for validating input/label plumbing before the same frozen dataset view

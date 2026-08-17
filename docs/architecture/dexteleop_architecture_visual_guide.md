@@ -32,7 +32,10 @@ flowchart TB
         CC["control_composition<br/>multi-source causal composition"]
         SIM["sim<br/>scene / task / physics / sim target"]
         HW["hardware<br/>vendor/device backends"]
-        PL["policy_learning<br/>offline learner/loss/eval"]
+    end
+
+    subgraph Offline["非生产离线叶子"]
+        PL["experiments.policy_learning<br/>hypothesis / learner / eval"]
     end
 
     subgraph Shared["共享语义与纯数据"]
@@ -63,7 +66,7 @@ flowchart TB
 箭头表示允许的依赖/装配方向，不表示每个应用必须加载全部模块。application/profile 可以
 组合多个 lower domain；lower domain 不得反向导入应用叶子。
 
-## 2. 六个主要开发边界
+## 2. 五个运行边界与非生产实验叶子
 
 | 边界 | 领域 owner | 应用装配 | 不应吸收 |
 |---|---|---|---|
@@ -71,11 +74,13 @@ flowchart TB
 | 一般策略部署 | `robot_motion.deploy`、`deployments` | `teleop_runtime.deploy` 绑定 observation、backend 与唯一 dispatch | composition session、sim runtime、dataset writer |
 | 混合遥操/策略部署 | `control_composition` | `control_station.composition` 与显式 Sim-HIL/profile 绑定 Human/Policy/Replay 与 target | model worker、source cursor、canonical safety、dispatch、episode commit |
 | 模拟环境 | `sim.contracts`、`sim.rm65`、`sim.mujoco` | sim CLI 或 Control Station sim profile | real device 初始化、真机 `teleop_runtime`、训练 loop |
-| 离线学习 | `policy_learning` + data interfaces | training/eval commands；产出 versioned artifact | robot authority、safety、dispatch、hardware resource |
+| 离线学习实验 | `experiments.policy_learning` + data interfaces | 非正式 training/eval commands；产出本地 artifact | production dependency、robot authority、safety、dispatch、hardware resource |
 | 外部 Agent Skill | `agent_gateway.protocol/runtime/transport` 与 target-neutral `skills` | `agent_gateway.profiles` 绑定 concrete application/executor | 上层 Planner/Task/Memory、canonical safety/IK/dispatch、episode owner |
 
 `control_station` 与 concrete `agent_gateway.profiles` 都是应用叶子。二者可以装配 lower
 能力，但不能把自己的状态或 framework 语义下沉到 reusable domain。
+`experiments.policy_learning` 不属于运行分层；它只消费数据接口并生成本地实验产物，
+production package 不得反向依赖它。
 
 ## 3. 数采链
 
@@ -213,13 +218,14 @@ flowchart LR
 flowchart LR
     Capture["committed capture"] --> Contract["dataset_contracts"]
     Contract --> View["dataset_interface training view"]
-    View --> Learn["policy_learning"]
+    View --> Learn["experiments.policy_learning"]
     Learn --> Artifact["model/ checkpoint + sidecar"]
     Artifact --> Deploy["deployments artifact integration"]
     Deploy --> Runtime["teleop_runtime.deploy"]
 ```
 
-- `policy_learning` 只拥有 learner、loss、training batch adapter 和 offline evaluation；
+- `experiments.policy_learning` 只拥有非正式 learner、loss、training command 和 offline evaluation；
+- production package 不得导入 `experiments`；可复用逻辑必须提升到正式 owner；
 - robot action schema 来自 shared contracts，训练代码不重定义 motion/safety；
 - `model/` 保存权重、checkpoint、runtime sidecar 和明确 pin 的外部 source boundary，不是
   Python package；

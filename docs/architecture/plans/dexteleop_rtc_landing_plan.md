@@ -90,7 +90,7 @@ runtime 与 model adapter 只能有一处执行 delay crop。producer-local over
 | OpenPI artifact-bound codec、metadata、transport adapter | `deployments.openpi.client` |
 | continuation schema/training semantics | `dataset_contracts` |
 | offline continuation projection/training view | `dataset_interface` |
-| learner、loss、sampling/training implementation | `policy_learning` 或独立模型工程 |
+| 非正式 learner、loss、training experiment | `experiments/policy_learning` 或独立模型工程 |
 | target safety、IK、reference、dispatch | target runtime / `robot_motion`，不属于 RTC |
 
 `teleop_runtime.deploy.rtc_frontend` 是 `robot_motion.deploy.rtc_runtime` 的 import-compatible re-export，不拥有

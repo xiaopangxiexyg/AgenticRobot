@@ -9,4 +9,5 @@ The directory contents are ignored by Git except for this README and the
 tracked `model/openpi` Git submodule. OpenPI remains independently owned and
 uses its own Python/runtime environment; its gitlink pins only the external
 source version. Versioned artifact contracts and integration code belong under
-`deployments/`; reusable learner source belongs under `policy_learning/`.
+`deployments/`; non-canonical learner experiments belong under
+`experiments/policy_learning/`.

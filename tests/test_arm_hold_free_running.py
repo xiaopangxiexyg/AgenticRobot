@@ -13,7 +13,7 @@ from dataset_interface.arm_hold_windows import (
     ArmHoldWindowLocation,
     ArmHoldWindowSample,
 )
-from policy_learning.arm_hold import (
+from experiments.policy_learning.arm_hold import (
     arm_hold_free_running_evaluation,
     arm_hold_offset_zero_evaluation,
 )

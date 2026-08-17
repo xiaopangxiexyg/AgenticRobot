@@ -1,4 +1,4 @@
-"""Lightweight policy-learning baselines and evaluation helpers."""
+"""Experimental arm-hold baselines and offline evaluation helpers."""
 
 from .baseline import (
     ARM_HOLD_DWELL_BUCKET_THRESHOLDS,

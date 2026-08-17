@@ -3,11 +3,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from policy_learning.arm_hold import (
+from experiments.policy_learning.arm_hold import (
     arm_hold_chunk_sequence_evaluation,
     arm_hold_fixed_lead_sequence_evaluation,
 )
-from policy_learning.arm_hold.sequence_evaluation import _match_events
+from experiments.policy_learning.arm_hold.sequence_evaluation import _match_events
 
 
 def _case(

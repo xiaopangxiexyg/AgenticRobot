@@ -30,7 +30,7 @@ as evidence for independent `00` or `11` behavior.
 `dataset_interface.arm_hold_sampling` owns deterministic Episode-local window
 batch order and optional exposure repetition. Learner definitions, tensor
 collation, losses, and prediction evaluation remain in
-`policy_learning.arm_hold`.
+`experiments.policy_learning.arm_hold`.
 
 ## Control-composition projection boundary
 
