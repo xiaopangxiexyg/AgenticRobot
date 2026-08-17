@@ -21,6 +21,9 @@ from teleop_runtime.skill_deploy.control_runtime import (
     RealSkillMotionObservationCut,
     RealSkillMotionTargetSynchronizer,
 )
+from teleop_runtime.skill_deploy.rm65_ports import (
+    ExclusiveRM65SkillDeployPorts,
+)
 from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionOwnerIdentity,
     RealAgentMotionPort,
@@ -165,7 +168,51 @@ def assemble_exclusive_real_agent_primitive_deployment(
     )
 
 
+def assemble_exclusive_rm65_agent_primitive_deployment(
+    *,
+    target_builder: RealAgentMotionTargetBuilder,
+    rm65_ports: ExclusiveRM65SkillDeployPorts,
+    port_config: RealAgentMotionPortConfig,
+    observation_attachment: RealTcpPoseObserveAttachmentSpec,
+    frame_graph: CoordinateFrameGraph,
+    primitive_reference_frame_id: str,
+    safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
+    allowed_client_ids: tuple[str, ...],
+    convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    max_retained_operations: int = 16,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> ExclusiveRealAgentPrimitiveDeployment:
+    """Bind all real effects to one exact independent RM65 port owner."""
+
+    if not isinstance(rm65_ports, ExclusiveRM65SkillDeployPorts):
+        raise TypeError("rm65_ports must be typed.")
+    if rm65_ports.target_builder is not target_builder:
+        raise ValueError(
+            "RM65 ports and Gateway deployment must share one target builder."
+        )
+    return assemble_exclusive_real_agent_primitive_deployment(
+        target_builder=target_builder,
+        port_config=port_config,
+        observation_attachment=observation_attachment,
+        frame_graph=frame_graph,
+        primitive_reference_frame_id=primitive_reference_frame_id,
+        safety_envelope_refs=safety_envelope_refs,
+        allowed_client_ids=allowed_client_ids,
+        observation_provider=rm65_ports.observe,
+        synchronize_target_builder=rm65_ports.synchronize_target_builder,
+        command_admission=rm65_ports.admit_command,
+        command_dispatch=rm65_ports.dispatch,
+        hold_controller=rm65_ports.hold,
+        convergence_profile=convergence_profile,
+        max_retained_operations=max_retained_operations,
+        clock=clock,
+        sleep=sleep,
+    )
+
+
 __all__ = [
     "ExclusiveRealAgentPrimitiveDeployment",
+    "assemble_exclusive_rm65_agent_primitive_deployment",
     "assemble_exclusive_real_agent_primitive_deployment",
 ]

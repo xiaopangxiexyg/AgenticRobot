@@ -18,7 +18,10 @@ import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.runtime import TeleopCommand, TeleopObservation
-from teleop_runtime.deploy.arm_safety_runtime import hold_deploy_arm_backends
+from teleop_runtime.deploy.arm_safety_runtime import (
+    emergency_stop_deploy_arm_backends,
+    hold_deploy_arm_backends,
+)
 from teleop_runtime.deploy.arm_state_reader import ArmStateReader
 from teleop_runtime.deploy.dispatch import (
     POSITION_REFERENCE_DISPATCH_AUDIT_POST,
@@ -27,6 +30,11 @@ from teleop_runtime.deploy.dispatch import (
     require_arm_backends_ready_for_position_dispatch,
 )
 from teleop_runtime.interfaces import EffectorBackend
+from teleop_runtime.position_force_guard import (
+    PositionForceGuardConfig,
+    PositionForceGuardFault,
+    PositionForceGuardMonitor,
+)
 
 from .control_runtime import (
     RealSkillMotionDispatchReceipt,
@@ -46,6 +54,24 @@ class RM65SkillTargetBuilder(Protocol):
         right_qpos: np.ndarray,
         reset_tracking: bool = True,
     ) -> None: ...
+
+
+class RM65SkillPositionForceGuard(Protocol):
+    """Lower force guard required by the formal real-position profile."""
+
+    @property
+    def motion_ready(self) -> bool: ...
+
+    @property
+    def fault(self) -> object | None: ...
+
+    def start(
+        self,
+        *,
+        arm_stale_watchdog: bool = True,
+    ) -> Mapping[str, object]: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -87,6 +113,42 @@ def _bounded_backend_state(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_exclusive_rm65_skill_position_force_guard(
+    *,
+    arm_backends: Mapping[str, EffectorBackend],
+    config: PositionForceGuardConfig | None = None,
+) -> PositionForceGuardMonitor:
+    """Build the shared latched guard without importing a RealTeleop host."""
+
+    backends = dict(arm_backends)
+    if set(backends) != {"left", "right"}:
+        raise ValueError(
+            "exclusive RM65 Skill force guard requires exact left/right backends."
+        )
+    readers: dict[str, Callable[[], Mapping[str, Any]]] = {}
+    for side, backend in backends.items():
+        reader = getattr(backend, "read_force_data", None)
+        if not callable(reader):
+            raise TypeError(
+                f"{side} RM65 Skill backend does not expose read_force_data."
+            )
+        readers[side] = reader
+
+    def emergency_stop(fault: PositionForceGuardFault) -> None:
+        emergency_stop_deploy_arm_backends(
+            backends,
+            reason=(
+                f"position_force_guard:{fault.reason}:{fault.side or 'all'}"
+            ),
+        )
+
+    return PositionForceGuardMonitor(
+        readers_by_side=readers,
+        emergency_stop=emergency_stop,
+        config=config,
+    )
+
+
 class ExclusiveRM65SkillDeployPorts:
     """Typed production callbacks over one exact dual-RM65 backend inventory."""
 
@@ -95,6 +157,7 @@ class ExclusiveRM65SkillDeployPorts:
         *,
         arm_backends: Mapping[str, EffectorBackend],
         target_builder: RM65SkillTargetBuilder,
+        position_force_guard: RM65SkillPositionForceGuard,
         profile: ExclusiveRM65SkillPortProfile | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -109,8 +172,16 @@ class ExclusiveRM65SkillDeployPorts:
             )
         if not callable(clock):
             raise TypeError("clock must be callable.")
+        for name in ("start", "close"):
+            if not callable(getattr(position_force_guard, name, None)):
+                raise TypeError(f"position_force_guard must expose {name}.")
+        if not hasattr(position_force_guard, "motion_ready"):
+            raise TypeError("position_force_guard must expose motion_ready.")
+        if not hasattr(position_force_guard, "fault"):
+            raise TypeError("position_force_guard must expose fault.")
         self.arm_backends = backends
         self.target_builder = target_builder
+        self.position_force_guard = position_force_guard
         self.profile = profile or ExclusiveRM65SkillPortProfile()
         self.clock = clock
         self.arm_state_reader = ArmStateReader(
@@ -120,10 +191,112 @@ class ExclusiveRM65SkillDeployPorts:
         )
         self._sync_lock = threading.Lock()
         self._target_builder_synchronized = False
+        self._resource_lock = threading.Lock()
+        self._resources_started = False
+        self._resources_closed = False
+        self._force_guard_started = False
+
+    @property
+    def resources_started(self) -> bool:
+        with self._resource_lock:
+            return self._resources_started
+
+    def start(self) -> None:
+        """Start both lower backends and reject any partial inventory."""
+
+        with self._resource_lock:
+            if self._resources_closed:
+                raise RuntimeError("closed RM65 Skill resources cannot restart.")
+            if self._resources_started:
+                return
+        started: list[EffectorBackend] = []
+        try:
+            for side in ("left", "right"):
+                backend = self.arm_backends[side]
+                backend.start()
+                started.append(backend)
+                if not backend.is_ready():
+                    raise RuntimeError(f"{side} RM65 backend is not ready.")
+            require_arm_backends_ready_for_position_dispatch(
+                self.arm_backends,
+                require_background_target=False,
+                stage="exclusive_real_skill_resource_start",
+                required_sides=("left", "right"),
+            )
+            self.position_force_guard.start(arm_stale_watchdog=True)
+            self._force_guard_started = True
+            self._require_force_guard_motion_ready()
+        except Exception:
+            try:
+                hold_deploy_arm_backends(
+                    self.arm_backends,
+                    reason="exclusive real Skill resource startup rollback",
+                )
+            except Exception:
+                pass
+            if self._force_guard_started:
+                try:
+                    self.position_force_guard.close()
+                except Exception:
+                    pass
+                self._force_guard_started = False
+            for backend in reversed(started):
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+            with self._resource_lock:
+                self._resources_closed = True
+            raise
+        with self._resource_lock:
+            self._resources_started = True
+
+    def close(self) -> None:
+        """HOLD before closing both lower resources; always attempt both sides."""
+
+        with self._resource_lock:
+            if self._resources_closed:
+                return
+        hold_receipt = self.hold("exclusive real Skill resource shutdown")
+        errors: list[str] = []
+        if not hold_receipt.succeeded:
+            errors.append("lower HOLD was not confirmed")
+        if self._force_guard_started:
+            try:
+                self.position_force_guard.close()
+            except Exception as exc:  # noqa: BLE001 - still close both arms.
+                errors.append(f"force_guard: {type(exc).__name__}: {exc}")
+            self._force_guard_started = False
+        for side in ("right", "left"):
+            try:
+                self.arm_backends[side].close()
+            except Exception as exc:  # noqa: BLE001 - close the other side too.
+                errors.append(f"{side}: {type(exc).__name__}: {exc}")
+        with self._resource_lock:
+            self._resources_closed = True
+            self._resources_started = False
+        if errors:
+            raise RuntimeError(
+                "exclusive RM65 Skill resource close failed: " + "; ".join(errors)
+            )
+
+    def _require_force_guard_motion_ready(self) -> None:
+        fault = self.position_force_guard.fault
+        if fault is not None:
+            reason = getattr(fault, "reason", type(fault).__name__)
+            raise RuntimeError(
+                f"RM65 Skill position force guard is faulted: {reason}."
+            )
+        if not bool(self.position_force_guard.motion_ready):
+            raise RuntimeError(
+                "RM65 Skill position force guard is not motion-ready."
+            )
 
     def observe(self) -> RealSkillMotionObservationCut:
         """Read one fresh dual hardware cut; command/preview qpos is forbidden."""
 
+        if not self.resources_started:
+            raise RuntimeError("exclusive RM65 Skill resources are not started.")
         requested_at = float(self.clock())
         states = self.arm_state_reader.snapshot(requested_at)
         available_at = max(requested_at, float(self.clock()))
@@ -211,6 +384,9 @@ class ExclusiveRM65SkillDeployPorts:
         """Require exact coupled joint targets and a ready lower inventory."""
 
         del observation, now
+        if not self.resources_started:
+            raise RuntimeError("exclusive RM65 Skill resources are not started.")
+        self._require_force_guard_motion_ready()
         if set(command.commands) != {"left_arm", "right_arm"}:
             return False
         if not isinstance(
@@ -242,6 +418,11 @@ class ExclusiveRM65SkillDeployPorts:
         """Dispatch through the existing checked real position-reference path."""
 
         try:
+            if not self.resources_started:
+                raise RuntimeError(
+                    "exclusive RM65 Skill resources are not started."
+                )
+            self._require_force_guard_motion_ready()
             batch = dispatch_position_reference_command(
                 command,
                 arm_backends=self.arm_backends,
@@ -313,5 +494,7 @@ class ExclusiveRM65SkillDeployPorts:
 __all__ = [
     "ExclusiveRM65SkillDeployPorts",
     "ExclusiveRM65SkillPortProfile",
+    "RM65SkillPositionForceGuard",
     "RM65SkillTargetBuilder",
+    "build_exclusive_rm65_skill_position_force_guard",
 ]

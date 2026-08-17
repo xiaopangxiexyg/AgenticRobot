@@ -204,7 +204,7 @@ from ..position_control import (
     build_position_collision_planner_from_started_backends,
     resolve_real_arm_execution_config,
 )
-from ..real_teleop.position_force_guard import (
+from ..position_force_guard import (
     POSITION_FORCE_SOURCES,
     PositionForceGuardFault,
     PositionForceGuardMonitor,

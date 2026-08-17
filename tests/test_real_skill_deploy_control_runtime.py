@@ -4,9 +4,11 @@ import importlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
 from teleop_runtime.skill_deploy import (
@@ -204,6 +206,119 @@ def test_failed_dispatch_fails_closed_through_same_hold_owner() -> None:
     assert holds == [
         "real Agent motion operation operation:test: lower_dispatch_failed"
     ]
+
+
+def test_fail_closed_does_not_require_another_observation() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    holds: list[str] = []
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=lambda: (_ for _ in ()).throw(
+            RuntimeError("camera-independent arm read failed")
+        ),
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: RealSkillMotionDispatchReceipt(
+            succeeded=True,
+            evidence_refs=("unused-dispatch:test",),
+        ),
+        hold_controller=lambda reason: (
+            holds.append(reason)
+            or RealSkillMotionHoldReceipt(
+                succeeded=True,
+                evidence_refs=("rm65-hold-after-read-failure:test",),
+            )
+        ),
+        clock=lambda: 2.0,
+    )
+    runtime.start()
+    port.submit_activation(_activation())
+
+    with pytest.raises(RuntimeError, match="arm read failed"):
+        runtime.step(now=2.0)
+    receipt = runtime.fail_closed("control_cycle_failed", now=2.0)
+
+    assert receipt.succeeded is True
+    assert runtime.lifecycle == RealSkillControlLifecycle.HOLD
+    assert port.snapshot().phase == RealAgentMotionPhase.HELD
+    assert holds == [
+        "real Agent motion operation operation:test: control_cycle_failed"
+    ]
+
+
+def test_fail_closed_is_a_dispatch_barrier_for_an_inflight_cycle() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    admission_entered = threading.Event()
+    release_admission = threading.Event()
+    hold_called = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    def lower_admission(command, observation, now):
+        del command, observation, now
+        order.append("admission")
+        admission_entered.set()
+        assert release_admission.wait(timeout=1.0)
+        return True
+
+    def dispatch(command):
+        del command
+        order.append("dispatch")
+        return RealSkillMotionDispatchReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-dispatch:barrier",),
+        )
+
+    def hold(reason):
+        del reason
+        order.append("hold")
+        hold_called.set()
+        return RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-hold:barrier",),
+        )
+
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=_observation_cut,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lower_admission,
+        command_dispatch=dispatch,
+        hold_controller=hold,
+    )
+    runtime.start()
+    port.submit_activation(_activation())
+
+    def run_step() -> None:
+        try:
+            runtime.step(now=2.0)
+        except BaseException as exc:  # noqa: BLE001 - assert thread outcome.
+            errors.append(exc)
+
+    def run_hold() -> None:
+        try:
+            runtime.fail_closed("shutdown", now=2.1)
+        except BaseException as exc:  # noqa: BLE001 - assert thread outcome.
+            errors.append(exc)
+
+    step_thread = threading.Thread(target=run_step)
+    hold_thread = threading.Thread(target=run_hold)
+    step_thread.start()
+    assert admission_entered.wait(timeout=1.0)
+    hold_thread.start()
+
+    assert not hold_called.wait(timeout=0.05)
+    release_admission.set()
+    step_thread.join(timeout=1.0)
+    hold_thread.join(timeout=1.0)
+
+    assert not step_thread.is_alive()
+    assert not hold_thread.is_alive()
+    assert errors == []
+    assert order == ["admission", "dispatch", "hold"]
+    assert runtime.lifecycle == RealSkillControlLifecycle.HOLD
 
 
 def test_realteleop_motion_port_path_is_object_identical_compatibility_export() -> None:

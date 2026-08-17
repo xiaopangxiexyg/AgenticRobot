@@ -11,6 +11,7 @@ pytestmark = pytest.mark.integration
 
 from teleop_runtime.backends.arms.rm65 import RM65ArmBackend, RM65ArmBackendConfig
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime import position_force_guard as canonical_position_force_guard
 from teleop_runtime.real_teleop import control_loop
 from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
 from teleop_runtime.real_teleop.position_force_guard import (
@@ -20,6 +21,17 @@ from teleop_runtime.real_teleop.position_force_guard import (
     PositionForceGuardTripped,
     position_force_guard_config,
 )
+
+
+def test_realteleop_force_guard_path_is_object_identical_compatibility() -> None:
+    assert (
+        PositionForceGuardMonitor
+        is canonical_position_force_guard.PositionForceGuardMonitor
+    )
+    assert (
+        PositionForceGuardConfig
+        is canonical_position_force_guard.PositionForceGuardConfig
+    )
 
 
 def _payload(*, force_x: float = 0.0, torque_x: float = 0.0):

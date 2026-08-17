@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
 from agent_gateway.profiles.real.exclusive_factory import (
     assemble_exclusive_real_agent_primitive_deployment,
+)
+from agent_gateway.profiles.real.exclusive_application import (
+    ExclusiveRealSkillApplication,
+    ExclusiveRealSkillApplicationConfig,
+    ExclusiveRealSkillApplicationState,
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
@@ -146,6 +153,74 @@ def _observation_cut() -> RealSkillMotionObservationCut:
     )
 
 
+def _fresh_observation_cut() -> RealSkillMotionObservationCut:
+    now = time.time()
+    return RealSkillMotionObservationCut(
+        observation=TeleopObservation(timestamp=now),
+        qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
+        measured_at=now - 0.001,
+        available_at=now,
+        evidence_refs=(f"hardware-qpos-cut:{now:.9f}",),
+    )
+
+
+class _Resources:
+    def __init__(self) -> None:
+        self.starts = 0
+        self.closes = 0
+
+    def start(self) -> None:
+        self.starts += 1
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+class _Server:
+    def __init__(self) -> None:
+        self.shutdown_event = threading.Event()
+        self.closed = 0
+
+    def serve_forever(self, poll_interval=0.5) -> None:
+        self.shutdown_event.wait(timeout=max(1.0, 4.0 * poll_interval))
+
+    def shutdown(self) -> None:
+        self.shutdown_event.set()
+
+    def server_close(self) -> None:
+        self.closed += 1
+
+
+def _deployment(*, observation_provider, hold_reasons):
+    frame_graph, station_frame, attachment, config, envelope = _assembly_inputs()
+    target_builder = _TargetBuilder()
+    return assemble_exclusive_real_agent_primitive_deployment(
+        target_builder=target_builder,
+        port_config=config,
+        observation_attachment=attachment,
+        frame_graph=frame_graph,
+        primitive_reference_frame_id=station_frame.frame_id,
+        safety_envelope_refs=(envelope,),
+        allowed_client_ids=("rpent:test",),
+        observation_provider=observation_provider,
+        synchronize_target_builder=target_builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: RealSkillMotionDispatchReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-dispatch:test",),
+        ),
+        hold_controller=lambda reason: (
+            hold_reasons.append(reason)
+            or RealSkillMotionHoldReceipt(
+                succeeded=True,
+                evidence_refs=("rm65-hold:test",),
+            )
+        ),
+        clock=time.time,
+        sleep=time.sleep,
+    )
+
+
 def test_factory_assembles_one_gateway_and_independent_lower_owner() -> None:
     frame_graph, station_frame, attachment, config, envelope = _assembly_inputs()
     target_builder = _TargetBuilder()
@@ -194,6 +269,7 @@ def test_exclusive_factory_import_has_no_realteleop_or_composition_dependency() 
 import json
 import sys
 import agent_gateway.profiles.real.exclusive_factory
+import agent_gateway.profiles.real.exclusive_application
 print(json.dumps(sorted(
     name for name in sys.modules
     if name == 'control_composition'
@@ -211,3 +287,70 @@ print(json.dumps(sorted(
     )
 
     assert json.loads(completed.stdout) == []
+
+
+def test_application_owns_control_loop_and_holds_before_resource_close() -> None:
+    holds: list[str] = []
+    resources = _Resources()
+    server = _Server()
+    deployment = _deployment(
+        observation_provider=_fresh_observation_cut,
+        hold_reasons=holds,
+    )
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment,
+        resources=resources,
+        server_factory=lambda: server,
+        config=ExclusiveRealSkillApplicationConfig(control_hz=100.0),
+    )
+
+    application.start()
+    time.sleep(0.03)
+    application.close()
+
+    assert application.state == ExclusiveRealSkillApplicationState.CLOSED
+    assert resources.starts == 1
+    assert resources.closes == 1
+    assert server.closed == 1
+    assert holds
+    assert deployment.control_runtime.last_hold_receipt is not None
+    assert deployment.control_runtime.last_hold_receipt.succeeded is True
+
+
+def test_application_control_fault_reaches_hold_without_another_read() -> None:
+    calls = 0
+
+    def fail_after_initial_cut():
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("dual RM65 state read failed")
+        return _fresh_observation_cut()
+
+    holds: list[str] = []
+    resources = _Resources()
+    deployment = _deployment(
+        observation_provider=fail_after_initial_cut,
+        hold_reasons=holds,
+    )
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment,
+        resources=resources,
+        server_factory=_Server,
+        config=ExclusiveRealSkillApplicationConfig(control_hz=100.0),
+    )
+
+    application.start()
+    deadline = time.monotonic() + 1.0
+    while (
+        application.state != ExclusiveRealSkillApplicationState.FAULT
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
+
+    assert application.state == ExclusiveRealSkillApplicationState.FAULT
+    assert isinstance(application.control_fault, RuntimeError)
+    assert holds
+    assert deployment.control_runtime.last_hold_receipt is not None
+    assert deployment.control_runtime.last_hold_receipt.succeeded is True
+    application.close()

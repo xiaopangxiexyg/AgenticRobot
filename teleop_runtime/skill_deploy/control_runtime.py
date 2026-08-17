@@ -204,6 +204,10 @@ class ExclusiveRealSkillControlRuntime:
         self._hold_controller = hold_controller
         self._clock = clock
         self._lock = threading.Lock()
+        # Serialize an entire lower control cut against fail-closed/HOLD.  A
+        # lifecycle flag alone is insufficient: a step that has already
+        # passed admission could otherwise dispatch after a concurrent HOLD.
+        self._cycle_lock = threading.Lock()
         self._lifecycle = RealSkillControlLifecycle.CREATED
         self._last_hold_receipt: RealSkillMotionHoldReceipt | None = None
 
@@ -249,6 +253,10 @@ class ExclusiveRealSkillControlRuntime:
         return receipt.succeeded
 
     def step(self, *, now: float | None = None) -> RealSkillControlStep:
+        with self._cycle_lock:
+            return self._step(now=now)
+
+    def _step(self, *, now: float | None = None) -> RealSkillControlStep:
         current_time = _finite(
             self._clock() if now is None else now,
             field_name="now",
@@ -354,38 +362,79 @@ class ExclusiveRealSkillControlRuntime:
             dispatch_evidence_refs=receipt.evidence_refs,
         )
 
-    def close(self, *, reason: str = "exclusive_skill_runtime_shutdown") -> None:
+    def fail_closed(
+        self,
+        reason: str,
+        *,
+        now: float | None = None,
+    ) -> RealSkillMotionHoldReceipt:
+        """Reach lower-confirmed HOLD without requiring another observation."""
+
+        with self._cycle_lock:
+            return self._fail_closed(reason, now=now)
+
+    def _fail_closed(
+        self,
+        reason: str,
+        *,
+        now: float | None = None,
+    ) -> RealSkillMotionHoldReceipt:
+
+        current_time = _finite(
+            self._clock() if now is None else now,
+            field_name="now",
+        )
         if self.lifecycle == RealSkillControlLifecycle.CLOSED:
-            return
-        now = _finite(self._clock(), field_name="clock")
+            raise RuntimeError("closed exclusive Skill runtime cannot request HOLD.")
         snapshot = self.motion_port.snapshot()
+        receipt = self.last_hold_receipt
+        if (
+            snapshot.phase == RealAgentMotionPhase.HELD
+            and snapshot.hold_succeeded is True
+            and receipt is not None
+            and receipt.succeeded
+        ):
+            return receipt
+        normalized_reason = _required(reason, field_name="hold_reason")
         if snapshot.phase not in {
             RealAgentMotionPhase.HOLD_REQUESTED,
             RealAgentMotionPhase.HOLD_APPLYING,
-            RealAgentMotionPhase.HELD,
         }:
             if snapshot.operation_id is None:
-                self.motion_port.request_domain_hold(reason=reason, requested_at=now)
+                self.motion_port.request_domain_hold(
+                    reason=normalized_reason,
+                    requested_at=current_time,
+                )
             else:
                 self.motion_port.request_hold(
                     operation_id=snapshot.operation_id,
-                    reason=reason,
-                    requested_at=now,
+                    reason=normalized_reason,
+                    requested_at=current_time,
                 )
         snapshot = self.motion_port.apply_control_owner_requests(
             owner=self,
-            now=now,
+            now=current_time,
+        )
+        self.motion_port.publish_control_owner_state(
+            owner=self,
+            captured_at=current_time,
         )
         receipt = self.last_hold_receipt
         if (
             snapshot.phase != RealAgentMotionPhase.HELD
-            or not snapshot.hold_succeeded
+            or snapshot.hold_succeeded is not True
             or receipt is None
             or not receipt.succeeded
         ):
             raise RuntimeError(
-                "exclusive Skill runtime shutdown lacks lower-confirmed HOLD."
+                "exclusive Skill runtime failed to reach lower-confirmed HOLD."
             )
+        return receipt
+
+    def close(self, *, reason: str = "exclusive_skill_runtime_shutdown") -> None:
+        if self.lifecycle == RealSkillControlLifecycle.CLOSED:
+            return
+        self.fail_closed(reason)
         with self._lock:
             self._lifecycle = RealSkillControlLifecycle.CLOSED
 

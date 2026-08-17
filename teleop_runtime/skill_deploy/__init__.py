@@ -16,7 +16,9 @@ from .motion_port import (
 from .rm65_ports import (
     ExclusiveRM65SkillDeployPorts,
     ExclusiveRM65SkillPortProfile,
+    RM65SkillPositionForceGuard,
     RM65SkillTargetBuilder,
+    build_exclusive_rm65_skill_position_force_guard,
 )
 from .control_runtime import (
     ExclusiveRealSkillControlRuntime,
@@ -49,5 +51,7 @@ __all__ = [
     "RealSkillMotionTargetSynchronizer",
     "ExclusiveRM65SkillDeployPorts",
     "ExclusiveRM65SkillPortProfile",
+    "RM65SkillPositionForceGuard",
     "RM65SkillTargetBuilder",
+    "build_exclusive_rm65_skill_position_force_guard",
 ]
