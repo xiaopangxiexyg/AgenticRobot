@@ -19,6 +19,22 @@
 当前 deploy、human teleop 和 replay 的默认模式各自直达既有 target owner；只有显式多源 profile 才加载
 `control_composition`。被动 trace/shadow 不改变这个分类。
 
+## 文档类型与查找顺序
+
+同一主题可能同时有入口、合同、计划和证据。它们承担不同职责，不应只按文件更新时间判断哪个更权威：
+
+| 类型 | 位置 | 如何使用 |
+|---|---|---|
+| 运行入口 | 各领域 `README.md` | 查找当前可复制命令、前置条件和风险等级 |
+| 专题说明 | 领域目录中的专题 Markdown | 查找当前参数、数据语义、安全边界和验收方法 |
+| 架构与接口合同 | [`architecture/`](./architecture/README.md) | 查找当前模块边界、依赖方向和已实现接口；不替代代码与测试 |
+| 共享实施计划 | [`architecture/plans/`](./architecture/plans/README.md)、[`real/plans/`](./real/plans/README.md) | 查找仍未闭合的批次、门禁和回退条件；其中“已完成”通常只描述某个子批次 |
+| 报告与 evidence receipt | 各领域 `reports/`、`evidence/` | 读取带日期和范围的历史结果；只证明收据明确覆盖的环境与边界 |
+| 历史材料 | [`legacy/`](./legacy/README.md) | 追溯已被替代的命令和结论，不作为当前操作入口 |
+
+遇到冲突时，先核对当前代码、测试和 [`AGENTS.md`](../AGENTS.md)，再看领域入口与专题合同；
+计划、报告和历史收据不能反向扩大当前实现或授权范围。
+
 ## 使用方式
 
 1. 先进入对应领域的 `README.md` 复制当前命令。

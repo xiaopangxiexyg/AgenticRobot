@@ -7,3 +7,4 @@
 | 报告 | 内容 |
 |---|---|
 | [0727 Pose→QPOS](./POSE_LIFT_EXPERIMENTS_0727.md) | Pose replay/deploy 方案、离线门禁、版本结论和源码哈希 |
+| [2026-08-06 RM65 原生力位透传探针](./RM65_NATIVE_FORCE_POSITION_PROBE_20260806.md) | 控制器能力边界、隔离真机验证结果、已排除路线和后续约束 |

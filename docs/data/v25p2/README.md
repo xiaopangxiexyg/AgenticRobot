@@ -13,6 +13,11 @@
 `2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage` 为实例，说明模态、字段、
 标注状态、磁盘体量、训练准入和对外交付清单。
 
+涉及 RealmanDMTAC 根目录、正式采集默认位置、历史兼容软链接或任何可能写穿 hardlink
+的迁移/变换时，先阅读
+[数据根与 hardlink 警告](./REALMANDMTAC_DATASET_ROOT_NOTICE.md)。该警告记录的是具体存储
+边界与迁移收据；本页继续负责 v2.5-p2 的格式和语义。
+
 ## 1. 一句话理解
 
 当前真机 v2.5-p2 不是用新格式替换 v2.3 主表，而是：
