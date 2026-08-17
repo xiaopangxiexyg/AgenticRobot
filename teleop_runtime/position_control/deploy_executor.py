@@ -779,6 +779,13 @@ class PositionDeployExecutor:
         self._hold_retry_required = False
         self._hold_callback_thread_id: int | None = None
         self._missed_reference_ticks = 0
+        self._reference_timing_observation_count = 0
+        self._reference_tick_skip_event_count = 0
+        self._last_reference_timing: dict[str, Any] | None = None
+        self._max_reference_start_late_ms = 0.0
+        self._max_reference_emit_elapsed_ms = 0.0
+        self._max_reference_emit_cpu_elapsed_ms = 0.0
+        self._max_reference_non_cpu_wall_ms = 0.0
         self._reference_worker_affinity_receipt: dict[str, Any] | None = None
         self._reference_worker_affinity_error: str | None = None
         self._last_reference_metadata: dict[str, Any] | None = None
@@ -2173,6 +2180,29 @@ class PositionDeployExecutor:
                 "last_hold_error": self._last_hold_error,
                 "hold_retry_required": bool(self._hold_retry_required),
                 "missed_reference_ticks": int(self._missed_reference_ticks),
+                "reference_timing_observation_count": int(
+                    self._reference_timing_observation_count
+                ),
+                "reference_tick_skip_event_count": int(
+                    self._reference_tick_skip_event_count
+                ),
+                "last_reference_timing": (
+                    None
+                    if self._last_reference_timing is None
+                    else dict(self._last_reference_timing)
+                ),
+                "max_reference_start_late_ms": float(
+                    self._max_reference_start_late_ms
+                ),
+                "max_reference_emit_elapsed_ms": float(
+                    self._max_reference_emit_elapsed_ms
+                ),
+                "max_reference_emit_cpu_elapsed_ms": float(
+                    self._max_reference_emit_cpu_elapsed_ms
+                ),
+                "max_reference_non_cpu_wall_ms": float(
+                    self._max_reference_non_cpu_wall_ms
+                ),
                 "max_reference_tick_skip_burst": (
                     self.config.max_reference_tick_skip_burst
                 ),
@@ -2973,6 +3003,23 @@ class PositionDeployExecutor:
                     if not self._active:
                         continue
                     following = next_tick + self.config.reference_period_sec
+                    start_late_ms = max(
+                        0.0,
+                        emit_started - next_tick,
+                    ) * 1000.0
+                    emit_elapsed_ms = max(
+                        0.0,
+                        after - emit_started,
+                    ) * 1000.0
+                    non_cpu_wall_ms = max(
+                        0.0,
+                        emit_elapsed_ms - emit_cpu_elapsed_ms,
+                    )
+                    following_late_ms = max(
+                        0.0,
+                        after - following,
+                    ) * 1000.0
+                    skipped = 0
                     if after > following + _TIME_EPSILON_SEC:
                         skipped = (
                             int(
@@ -2984,23 +3031,67 @@ class PositionDeployExecutor:
                         )
                         following += skipped * self.config.reference_period_sec
                         self._missed_reference_ticks += skipped
+                    reference_period_ms = (
+                        self.config.reference_period_sec * 1000.0
+                    )
+                    if emit_cpu_elapsed_ms >= reference_period_ms:
+                        timing_classification = "thread_cpu_overrun"
+                    elif non_cpu_wall_ms >= reference_period_ms:
+                        timing_classification = "non_cpu_wall_stall"
+                    elif start_late_ms >= reference_period_ms:
+                        timing_classification = "start_late"
+                    elif skipped:
+                        timing_classification = "combined_minor_overrun"
+                    else:
+                        timing_classification = "on_time"
+                    timing_metadata = {
+                        "reference_hz": float(self.config.reference_hz),
+                        "reference_period_ms": float(reference_period_ms),
+                        "scheduled_timestamp": float(next_tick),
+                        "emit_started_timestamp": float(emit_started),
+                        "emit_completed_timestamp": float(after),
+                        "start_late_ms": float(start_late_ms),
+                        "emit_elapsed_ms": float(emit_elapsed_ms),
+                        "emit_cpu_elapsed_ms": float(emit_cpu_elapsed_ms),
+                        "non_cpu_wall_ms": float(non_cpu_wall_ms),
+                        "following_late_ms": float(following_late_ms),
+                        "skipped_ticks": int(skipped),
+                        "submission_drain_count": int(drained_submissions),
+                        "submission_drain_elapsed_ms": float(
+                            max(0.0, drain_completed - drain_started) * 1000.0
+                        ),
+                        "queue_depth_after_drain": int(queue_depth_after_drain),
+                        "classification": timing_classification,
+                    }
+                    self._reference_timing_observation_count += 1
+                    self._last_reference_timing = dict(timing_metadata)
+                    self._max_reference_start_late_ms = max(
+                        self._max_reference_start_late_ms,
+                        start_late_ms,
+                    )
+                    self._max_reference_emit_elapsed_ms = max(
+                        self._max_reference_emit_elapsed_ms,
+                        emit_elapsed_ms,
+                    )
+                    self._max_reference_emit_cpu_elapsed_ms = max(
+                        self._max_reference_emit_cpu_elapsed_ms,
+                        emit_cpu_elapsed_ms,
+                    )
+                    self._max_reference_non_cpu_wall_ms = max(
+                        self._max_reference_non_cpu_wall_ms,
+                        non_cpu_wall_ms,
+                    )
+                    if skipped:
+                        self._reference_tick_skip_event_count += 1
+                        self._append_debug_event_locked(
+                            "reference_timing_overrun",
+                            timing_metadata,
+                        )
                         max_skip_burst = self.config.max_reference_tick_skip_burst
                         if (
                             max_skip_burst is not None
                             and skipped > max_skip_burst
                         ):
-                            start_late_ms = max(
-                                0.0,
-                                emit_started - next_tick,
-                            ) * 1000.0
-                            emit_elapsed_ms = max(
-                                0.0,
-                                after - emit_started,
-                            ) * 1000.0
-                            following_late_ms = max(
-                                0.0,
-                                after - (next_tick + self.config.reference_period_sec),
-                            ) * 1000.0
                             last_reference_metadata = dict(
                                 self._last_reference_metadata or {}
                             )
