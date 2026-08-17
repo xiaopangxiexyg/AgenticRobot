@@ -9,6 +9,9 @@ import pytest
 from scripts import runtime_artifact_migration as migration
 
 
+pytestmark = pytest.mark.integration
+
+
 def _paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     source = tmp_path / "source" / "diagnostic-run"
     target_parent = tmp_path / "canonical"
