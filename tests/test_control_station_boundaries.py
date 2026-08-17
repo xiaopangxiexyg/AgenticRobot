@@ -237,6 +237,7 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
         "agent_gateway/profiles/mujoco/policy_application.py": ["sim"],
         "agent_gateway/profiles/mujoco/policy_factory.py": ["sim"],
         "agent_gateway/profiles/mujoco/skills/cube_lift/deployment.py": ["sim"],
+        "agent_gateway/profiles/mujoco/visual_observation.py": ["sim"],
     }
 
 

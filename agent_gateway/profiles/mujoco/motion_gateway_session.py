@@ -12,16 +12,21 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
-from collection_runtime.source_observation_history import (
-    SourceObservationHistoryRecorder,
-    SQLiteSourceObservationHistoryStore,
-)
 from agent_gateway.profiles.motion_primitive_resolution import (
     MotionPrimitiveTargetResolution,
     resolve_level_tcp_orientation_primitive_target,
     resolve_tcp_displacement_primitive_target,
 )
+from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
+from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.runtime.access_policy import AgentSkillAccessPolicy
+from agent_gateway.runtime.artifact_producer import (
+    artifact_ref_for_bytes,
+    commit_artifact_bytes,
+)
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.runtime.artifact_transfer import AgentArtifactTransferBroker
+from agent_gateway.runtime.event_journal import BoundedAgentGatewayEventJournal
 from agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
     SkillExecutorRegistry,
@@ -36,6 +41,7 @@ from agent_gateway.runtime.passive_read_executor import (
     PassiveReadResult,
     PassiveReadSkillExecutor,
 )
+from agent_gateway.runtime.protocol_runtime import AgentGatewayProtocolRuntime
 from agent_gateway.runtime.reusable_station_executor import (
     ReusableStationAgentSkillOperationExecutor,
 )
@@ -49,6 +55,15 @@ from agent_gateway.runtime.station_operation_worker import (
 from agent_gateway.skills.motion.definition import (
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
+from agent_gateway.skills.perception.definition import (
+    CAPTURE_DEPTH_SKILL_ID_V1,
+    CAPTURE_RGB_SKILL_ID_V1,
+)
+from agent_gateway.skills.perception.schemas import (
+    RGB_FRAME_COMPRESSION_V1,
+    RGB_FRAME_ENCODING_V1,
+    RGB_FRAME_SCHEMA_ID_V1,
+)
 from agent_gateway.transport.unix_transport import (
     AgentGatewayUnixJsonServer,
     AgentGatewayUnixPeerClientMap,
@@ -56,7 +71,13 @@ from agent_gateway.transport.unix_transport import (
 from agent_gateway.transport.wire_adapter import (
     BoundAgentGatewayWireAdapter,
 )
+from collection_runtime.source_observation_history import (
+    SourceObservationHistoryRecorder,
+    SQLiteSourceObservationHistoryStore,
+)
+from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from .depth_deployment import MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import MujocoAgentTcpPoseContractBundle
 from .motion_skill import (
@@ -67,8 +88,9 @@ from .observation import MujocoAgentObservationProducer
 from .observation_binding import (
     build_mujoco_agent_motion_observation_source_binding,
 )
+from .rgb_deployment import MUJOCO_CAPTURE_RGB_OUTPUT_SLOT_ID_V1
 from .tcp_pose_history import MujocoAgentTcpPoseHistoryProvider
-from .visual_observation import MujocoAgentVisualSnapshotProvider
+from .visual_observation import MujocoAgentRgbCaptureProvider
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -92,18 +114,22 @@ class MujocoAgentTcpPoseGatewaySession:
     application: MujocoAgentSkillMotionApplication
     contract_bundle: MujocoAgentTcpPoseContractBundle
     observation_producer: MujocoAgentObservationProducer
-    visual_snapshot_provider: MujocoAgentVisualSnapshotProvider
+    rgb_capture_provider: MujocoAgentRgbCaptureProvider
     motion_executor: ReusableStationAgentSkillOperationExecutor
     cardinal_step_executor: ReusableStationAgentSkillOperationExecutor
     fixed_orientation_executors: Mapping[
         str, ReusableStationAgentSkillOperationExecutor
     ]
     state_executor: PassiveReadSkillExecutor
+    depth_executor: PassiveReadSkillExecutor | None
+    rgb_executor: PassiveReadSkillExecutor | None
     history_provider: MujocoAgentTcpPoseHistoryProvider | None
     history_executor: PassiveReadSkillExecutor | None
     history_recorder: SourceObservationHistoryRecorder | None
     source_observation_history_store: SQLiteSourceObservationHistoryStore | None
     owns_source_observation_history_store: bool
+    artifact_store: RecoverableAgentArtifactStore | None
+    owns_artifact_store: bool
     service: AgentGatewayService
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -120,6 +146,11 @@ class MujocoAgentTcpPoseGatewaySession:
         init=False,
         repr=False,
     )
+    _artifact_store_closed: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if set(self.fixed_orientation_executors) != set(
@@ -130,11 +161,23 @@ class MujocoAgentTcpPoseGatewaySession:
             )
         if not isinstance(self.owns_source_observation_history_store, bool):
             raise TypeError("owns_source_observation_history_store must be boolean.")
+        if not isinstance(self.owns_artifact_store, bool):
+            raise TypeError("owns_artifact_store must be boolean.")
         if (
             self.owns_source_observation_history_store
             and self.source_observation_history_store is None
         ):
             raise ValueError("Owned planning history store must be present.")
+        if self.owns_artifact_store and self.artifact_store is None:
+            raise ValueError("Owned Artifact store must be present.")
+        if (self.depth_executor is None) != (self.artifact_store is None):
+            raise ValueError(
+                "Depth executor and Artifact store must be enabled together."
+            )
+        if (self.rgb_executor is None) != (self.artifact_store is None):
+            raise ValueError(
+                "RGB executor and Artifact store must be enabled together."
+            )
 
     def wire_adapter(
         self,
@@ -152,8 +195,6 @@ class MujocoAgentTcpPoseGatewaySession:
             current_station_revision=lambda: (
                 self.observation_producer.current_station_revision
             ),
-            visual_source_catalog=self.visual_snapshot_provider.source_catalog,
-            capture_visual_snapshot=self.visual_snapshot_provider.capture,
             operation_launcher=self.service.launch_operation,
         )
 
@@ -259,6 +300,14 @@ class MujocoAgentTcpPoseGatewaySession:
                         self.observation_producer.current_station_revision
                     )
                 )
+            perception_settled = all(
+                executor is None or executor.wait_all(timeout_sec=5.0)
+                for executor in (self.depth_executor, self.rgb_executor)
+            )
+            if not perception_settled:
+                raise RuntimeError(
+                    "Passive perception capture did not quiesce before Gateway close."
+                )
             self._finish_lower_close(self._close_outcome)
             if (
                 self.owns_source_observation_history_store
@@ -267,6 +316,13 @@ class MujocoAgentTcpPoseGatewaySession:
             ):
                 self.source_observation_history_store.close()
                 self._source_observation_history_store_closed = True
+            if (
+                self.owns_artifact_store
+                and self.artifact_store is not None
+                and not self._artifact_store_closed
+            ):
+                self.artifact_store.close()
+                self._artifact_store_closed = True
             return self._close_outcome
 
 
@@ -279,6 +335,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     clock: Callable[[], float] | None = None,
     source_observation_history_store: SQLiteSourceObservationHistoryStore | None = None,
     owns_source_observation_history_store: bool = False,
+    artifact_store: RecoverableAgentArtifactStore | None = None,
+    owns_artifact_store: bool = False,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Wire exact Routes without starting the application or history recorder."""
 
@@ -288,6 +346,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         raise TypeError("contract_bundle must be typed.")
     if not isinstance(owns_source_observation_history_store, bool):
         raise TypeError("owns_source_observation_history_store must be boolean.")
+    if not isinstance(owns_artifact_store, bool):
+        raise TypeError("owns_artifact_store must be boolean.")
     history_enabled = contract_bundle.history_profile is not None
     if history_enabled and not isinstance(
         source_observation_history_store,
@@ -301,6 +361,18 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         and source_observation_history_store is None
     ):
         raise ValueError("Owned planning history store must be injected.")
+    perception_enabled = contract_bundle.depth_capture is not None
+    if perception_enabled != (contract_bundle.rgb_capture is not None):
+        raise ValueError("RGB and depth Artifact Skills must be enabled together.")
+    if perception_enabled and not isinstance(
+        artifact_store,
+        RecoverableAgentArtifactStore,
+    ):
+        raise ValueError("Enabled perception capture requires an exact Artifact store.")
+    if not perception_enabled and artifact_store is not None:
+        raise ValueError("Artifact store cannot be bound without an Artifact Skill.")
+    if owns_artifact_store and artifact_store is None:
+        raise ValueError("Owned Artifact store must be injected.")
     clients = tuple(
         _required(value, field_name="allowed_client_ids item")
         for value in allowed_client_ids
@@ -375,6 +447,16 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         if history_enabled
         else None
     )
+    depth_entry = (
+        contract_bundle.route_manifest.route(CAPTURE_DEPTH_SKILL_ID_V1, "1")
+        if perception_enabled
+        else None
+    )
+    rgb_entry = (
+        contract_bundle.route_manifest.route(CAPTURE_RGB_SKILL_ID_V1, "1")
+        if perception_enabled
+        else None
+    )
     observation_producer = MujocoAgentObservationProducer(
         application=application,
         contract_bundle=contract_bundle,
@@ -383,11 +465,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             contract_bundle=contract_bundle,
         ),
     )
-    visual_snapshot_provider = MujocoAgentVisualSnapshotProvider(
+    rgb_capture_provider = MujocoAgentRgbCaptureProvider(
         application=application,
-        current_station_revision=lambda: (
-            observation_producer.current_station_revision
-        ),
+        current_station_revision=lambda: observation_producer.current_station_revision,
     )
     history_provider = (
         MujocoAgentTcpPoseHistoryProvider(
@@ -649,6 +729,173 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         clock=runtime_clock,
         max_retained_operations=retention,
     )
+    depth_executor = None
+    if depth_entry is not None and artifact_store is not None:
+        depth_registration = contract_bundle.depth_capture
+        if depth_registration is None:
+            raise RuntimeError("Depth Route lost its registration.")
+
+        def read_depth(request, operation) -> PassiveReadResult:
+            role = str(request.parameters["role"])
+            try:
+                source_id = depth_registration.profile.source_id_by_role[role]
+            except KeyError as exc:
+                raise ValueError("Depth role is not bound to a source.") from exc
+            frame = application.capture_depth_npy_frame(
+                view_id=source_id,
+            )
+            artifact = artifact_ref_for_bytes(
+                frame.data,
+                media_type=frame.media_type,
+                schema_id=frame.schema_id,
+                encoding=frame.encoding,
+                compression=frame.compression,
+            )
+            committed = commit_artifact_bytes(
+                store=artifact_store,
+                data=frame.data,
+                artifact=artifact,
+                producer_id="agent_gateway.provider.mujoco_depth",
+                runtime_session_id=binding.runtime_session_id,
+                idempotency_key="depth-output:" + operation.operation_id,
+                now=frame.captured_at,
+            )
+            result = {
+                "source_id": frame.view_id,
+                "role": role,
+                "captured_at": frame.captured_at,
+                "width": frame.width,
+                "height": frame.height,
+                "depth_unit": "meter",
+                "invalid_depth_value": 0.0,
+                "camera_pose_world_xyz_quat_xyzw": list(
+                    frame.camera_pose_world_xyz_quat_xyzw
+                ),
+                "intrinsics": dict(frame.intrinsics),
+            }
+            capture_ref = "mujoco-depth-capture:" + canonical_content_hash(
+                {
+                    "operation_id": operation.operation_id,
+                    "request_hash": request.semantic_content_hash,
+                    "result": result,
+                    "artifact_ref_hash": committed.semantic_content_hash,
+                },
+                domain="dexteleop.agent_skill.mujoco_depth_capture_receipt.v1",
+            )
+            return PassiveReadResult(
+                execution_result=result,
+                evidence_refs=(capture_ref,),
+                output_artifact_bindings=(
+                    AgentArtifactBinding(
+                        slot_id=MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
+                        ordinal=0,
+                        artifact=committed,
+                        production_receipt_ref=capture_ref,
+                    ),
+                ),
+                reason_code="passive_depth_capture_completed",
+            )
+
+        depth_executor = PassiveReadSkillExecutor(
+            port_id=(
+                "agent-gateway:passive-depth-capture:" + binding.runtime_session_id
+            ),
+            executor_id=depth_registration.deployment_binding.executor_id,
+            read=read_depth,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+            clock=runtime_clock,
+            max_retained_operations=retention,
+        )
+    rgb_executor = None
+    if rgb_entry is not None and artifact_store is not None:
+        rgb_registration = contract_bundle.rgb_capture
+        if rgb_registration is None:
+            raise RuntimeError("RGB Route lost its registration.")
+
+        def read_rgb(request, operation) -> PassiveReadResult:
+            capture = rgb_capture_provider.capture(
+                request.parameters,
+                expected_station_revision=request.expected_station_revision,
+            )
+            bindings = []
+            frame_metadata = []
+            total_bytes = 0
+            for ordinal, (source_id, role, frame) in enumerate(capture.frames):
+                artifact = artifact_ref_for_bytes(
+                    frame.data,
+                    media_type=frame.media_type,
+                    schema_id=RGB_FRAME_SCHEMA_ID_V1,
+                    encoding=RGB_FRAME_ENCODING_V1,
+                    compression=RGB_FRAME_COMPRESSION_V1,
+                )
+                committed = commit_artifact_bytes(
+                    store=artifact_store,
+                    data=frame.data,
+                    artifact=artifact,
+                    producer_id="agent_gateway.provider.mujoco_rgb",
+                    runtime_session_id=binding.runtime_session_id,
+                    idempotency_key=(f"rgb-output:{operation.operation_id}:{ordinal}"),
+                    now=capture.captured_at,
+                )
+                total_bytes += committed.byte_length
+                frame_metadata.append(
+                    {
+                        "ordinal": ordinal,
+                        "source_id": source_id,
+                        "role": role,
+                        "media_type": committed.media_type,
+                        "width": frame.width,
+                        "height": frame.height,
+                        "media_content_hash": committed.sha256,
+                    }
+                )
+                bindings.append(
+                    AgentArtifactBinding(
+                        slot_id=MUJOCO_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
+                        ordinal=ordinal,
+                        artifact=committed,
+                        production_receipt_ref=(
+                            f"mujoco-rgb-frame:{operation.operation_id}:{ordinal}:"
+                            + committed.sha256
+                        ),
+                    )
+                )
+            result_identity = canonical_content_hash(
+                {
+                    "operation_id": operation.operation_id,
+                    "request_hash": request.semantic_content_hash,
+                    "station_revision": capture.station_revision,
+                    "captured_at": capture.captured_at,
+                    "frames": frame_metadata,
+                },
+                domain="dexteleop.agent_skill.mujoco_rgb_capture_receipt.v1",
+            )
+            result = {
+                "snapshot_id": "rgb-snapshot:" + result_identity,
+                "station_revision": capture.station_revision,
+                "captured_at": capture.captured_at,
+                "frames": frame_metadata,
+                "total_bytes": total_bytes,
+            }
+            return PassiveReadResult(
+                execution_result=result,
+                evidence_refs=("mujoco-rgb-capture:" + result_identity,),
+                output_artifact_bindings=tuple(bindings),
+                reason_code="passive_rgb_capture_completed",
+            )
+
+        rgb_executor = PassiveReadSkillExecutor(
+            port_id=("agent-gateway:passive-rgb-capture:" + binding.runtime_session_id),
+            executor_id=rgb_registration.deployment_binding.executor_id,
+            read=read_rgb,
+            current_station_revision=lambda: (
+                observation_producer.current_station_revision
+            ),
+            clock=runtime_clock,
+            max_retained_operations=retention,
+        )
     history_executor = None
     if history_provider is not None:
         history_binding = contract_bundle.history_deployment_binding
@@ -695,6 +942,14 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         execution_port_by_route_hash[history_entry.route.semantic_content_hash] = (
             history_executor
         )
+    if depth_entry is not None and depth_executor is not None:
+        execution_port_by_route_hash[depth_entry.route.semantic_content_hash] = (
+            depth_executor
+        )
+    if rgb_entry is not None and rgb_executor is not None:
+        execution_port_by_route_hash[rgb_entry.route.semantic_content_hash] = (
+            rgb_executor
+        )
     executor_registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -713,28 +968,54 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         allowed_client_ids=clients,
         allowed_modes=(contract_bundle.route_manifest.current_mode,),
         max_request_timeout_ms=max(
-            motion_route.max_operation_duration_ms,
-            cardinal_step_route.max_operation_duration_ms,
-            *(
-                entry.route.max_operation_duration_ms
-                for entry in fixed_orientation_entry_by_skill_id.values()
-            ),
+            entry.route.max_operation_duration_ms
+            for entry in contract_bundle.route_manifest.skill_routes
         ),
         max_grant_lifetime_sec=30.0,
     )
     admissions_by_route_hash = {
-        motion_route.semantic_content_hash: retention,
-        cardinal_step_route.semantic_content_hash: retention,
-        state_entry.route.semantic_content_hash: retention,
+        entry.route.semantic_content_hash: retention
+        for entry in contract_bundle.route_manifest.skill_routes
     }
-    admissions_by_route_hash.update(
-        {
-            entry.route.semantic_content_hash: retention
-            for entry in fixed_orientation_entry_by_skill_id.values()
-        }
-    )
-    if history_entry is not None:
-        admissions_by_route_hash[history_entry.route.semantic_content_hash] = retention
+    if artifact_store is None:
+        protocol_runtime = AgentGatewayProtocolRuntime.control_plane_only(
+            manifest=contract_bundle.route_manifest,
+            clock=runtime_clock,
+        )
+    else:
+        session_capabilities = AgentGatewaySessionCapabilities(
+            runtime_session_id=binding.runtime_session_id,
+            artifact_transfer_enabled=True,
+            artifact_access_mechanisms=("chunked_rpc", "local_path"),
+            max_control_request_bytes=2 * 1024 * 1024,
+            max_control_response_bytes=2 * 1024 * 1024,
+            max_artifact_bytes=artifact_store.max_artifact_bytes,
+            max_artifact_chunk_bytes=artifact_store.max_chunk_bytes,
+            max_artifact_refs_per_operation=8,
+            max_concurrent_uploads=8,
+            max_concurrent_downloads=8,
+            artifact_store_quota_bytes=artifact_store.quota_bytes,
+            event_payload_max_bytes=65_536,
+            event_retention_count=4096,
+        )
+        artifact_broker = AgentArtifactTransferBroker(
+            store=artifact_store,
+            session_capabilities=session_capabilities,
+            max_chunk_bytes=artifact_store.max_chunk_bytes,
+        )
+        protocol_runtime = AgentGatewayProtocolRuntime(
+            manifest=contract_bundle.route_manifest,
+            io_catalog=contract_bundle.io_catalog,
+            session_capabilities=session_capabilities,
+            event_journal=BoundedAgentGatewayEventJournal(
+                runtime_session_id=binding.runtime_session_id,
+                max_events=session_capabilities.event_retention_count,
+                event_payload_max_bytes=(session_capabilities.event_payload_max_bytes),
+            ),
+            artifact_store=artifact_store,
+            artifact_transfer_broker=artifact_broker,
+            clock=runtime_clock,
+        )
     service = AgentGatewayService(
         manifest=contract_bundle.route_manifest,
         access_policy=access_policy,
@@ -745,6 +1026,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             max_retained_operations=retention,
             max_admissions_by_route_hash=admissions_by_route_hash,
         ),
+        protocol_runtime=protocol_runtime,
         clock=runtime_clock,
         clock_domain_id=_required(
             runtime.config.clock_domain_id,
@@ -768,16 +1050,20 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         application=application,
         contract_bundle=contract_bundle,
         observation_producer=observation_producer,
-        visual_snapshot_provider=visual_snapshot_provider,
+        rgb_capture_provider=rgb_capture_provider,
         motion_executor=motion_executor,
         cardinal_step_executor=cardinal_step_executor,
         fixed_orientation_executors=fixed_orientation_executors,
         state_executor=state_executor,
+        depth_executor=depth_executor,
+        rgb_executor=rgb_executor,
         history_provider=history_provider,
         history_executor=history_executor,
         history_recorder=history_recorder,
         source_observation_history_store=source_observation_history_store,
         owns_source_observation_history_store=owns_source_observation_history_store,
+        artifact_store=artifact_store,
+        owns_artifact_store=owns_artifact_store,
         service=service,
     )
 

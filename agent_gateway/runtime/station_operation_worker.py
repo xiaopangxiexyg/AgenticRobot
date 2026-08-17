@@ -414,6 +414,7 @@ class BoundedStationAgentSkillOperationWorker:
     """One thread and one immutable lifecycle; no queue and no reuse."""
 
     no_io = False
+    control_effect_class = "motion"
 
     def __init__(
         self,

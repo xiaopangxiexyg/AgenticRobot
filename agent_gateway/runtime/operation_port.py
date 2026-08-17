@@ -311,6 +311,7 @@ class AgentSkillExecutionPort(Protocol):
 
     port_id: str
     no_io: bool
+    control_effect_class: str | None
 
     def activate(
         self,
@@ -359,6 +360,7 @@ class NoIoAgentSkillOperationPort(AgentSkillOperationPort, Protocol):
 
 class _NoIoPortBase:
     no_io = True
+    control_effect_class = None
 
     def __init__(
         self,

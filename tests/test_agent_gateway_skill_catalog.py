@@ -403,6 +403,43 @@ def test_route_has_one_effect_class_and_no_agent_visible_lower_permit() -> None:
         replace(route, may_move_robot=False)
 
 
+def test_read_only_route_cannot_select_effectful_tier_or_hold_cancellation() -> None:
+    definition, schema_entry, _, _ = _catalogs()
+    motion_route = _route(definition, schema_entry)
+    read_only = replace(
+        motion_route,
+        control_effect_class="read_only",
+        privilege_tier="t0_read_only",
+        may_move_robot=False,
+        cancellation_policy="cancel_only",
+    )
+
+    with pytest.raises(ValueError, match="t0_read_only and cancel_only"):
+        replace(read_only, privilege_tier="t1_sim_or_no_motion")
+    with pytest.raises(ValueError, match="t0_read_only and cancel_only"):
+        replace(read_only, cancellation_policy="hold_on_cancel")
+
+
+def test_catalog_closure_rejects_definition_route_effect_mismatch() -> None:
+    definition, schema_entry, definitions, schemas = _catalogs()
+    motion_route = _route(definition, schema_entry)
+    read_only = replace(
+        motion_route,
+        control_effect_class="read_only",
+        privilege_tier="t0_read_only",
+        may_move_robot=False,
+        cancellation_policy="cancel_only",
+    )
+    manifest = _manifest(read_only, definitions, schemas)
+
+    with pytest.raises(ValueError, match="motion.*control effect 'motion'"):
+        validate_skill_route_catalog_closure(
+            definition_catalog=definitions,
+            schema_catalog=schemas,
+            route_manifest=manifest,
+        )
+
+
 def test_frozen_lifecycle_routes_reject_ambiguous_or_wrong_effects() -> None:
     definition = replace(
         _definition(),

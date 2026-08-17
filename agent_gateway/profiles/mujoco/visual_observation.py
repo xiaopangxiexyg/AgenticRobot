@@ -1,27 +1,26 @@
-"""On-demand RGB snapshot provider for the MuJoCo Agent Gateway."""
+"""MuJoCo RGB role selection below the generic Skill/Artifact protocol."""
 
 from __future__ import annotations
 
-import base64
-import hashlib
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
-from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.perception_artifacts import RGB_FRAME_MEDIA_TYPE_V1
+from sim.mujoco.rgb_snapshot import EncodedMujocoRgbFrame
 
 from .motion_application import MujocoAgentSkillMotionApplication
 
-MUJOCO_AGENT_VISUAL_CATALOG_SCHEMA_V1 = (
-    "dexteleop.agent_visual_source_catalog.v1"
-)
-MUJOCO_AGENT_VISUAL_SNAPSHOT_SCHEMA_V1 = "dexteleop.agent_visual_snapshot.v1"
-MUJOCO_AGENT_VISUAL_FRAME_SCHEMA_V1 = "dexteleop.agent_visual_frame.v1"
-_VISUAL_SNAPSHOT_HASH_DOMAIN_V1 = "dexteleop.agent_visual_snapshot.v1"
 _ROLE_BY_SOURCE_ID = {
     "front": "main",
     "left_wrist": "wrist_left",
     "right_wrist": "wrist_right",
 }
+
+
+def mujoco_rgb_role_for_source(source_id: str) -> str:
+    source = _required_text(source_id, field_name="source_id")
+    return _ROLE_BY_SOURCE_ID.get(source, f"auxiliary_{source}")
 
 
 def _required_text(value: object, *, field_name: str) -> str:
@@ -40,8 +39,15 @@ def _positive_int(value: object, *, field_name: str, maximum: int) -> int:
     return value
 
 
-class MujocoAgentVisualSnapshotProvider:
-    """Expose all live RGB sources while honoring a bounded semantic selection."""
+@dataclass(frozen=True)
+class MujocoAgentRgbCapture:
+    captured_at: float
+    station_revision: int
+    frames: tuple[tuple[str, str, EncodedMujocoRgbFrame], ...]
+
+
+class MujocoAgentRgbCaptureProvider:
+    """Resolve trusted roles and capture one bounded, revision-stable scene cut."""
 
     def __init__(
         self,
@@ -56,149 +62,99 @@ class MujocoAgentVisualSnapshotProvider:
         self._application = application
         self._current_station_revision = current_station_revision
 
-    def source_catalog(self) -> Mapping[str, object]:
-        sources = self._catalog_sources()
-        return {
-            "schema": MUJOCO_AGENT_VISUAL_CATALOG_SCHEMA_V1,
-            "sources": sources,
-            "supported_media_types": ["image/jpeg"],
-            "max_images_per_snapshot": 8,
-            "max_width": 1920,
-            "max_height": 1080,
-        }
+    def source_catalog(self) -> tuple[Mapping[str, object], ...]:
+        sources = []
+        for source in self._application.visual_source_catalog():
+            source_id = str(source["source_id"])
+            role = mujoco_rgb_role_for_source(source_id)
+            sources.append({**dict(source), "role": role})
+        return tuple(sources)
 
-    def capture(self, request: Mapping[str, Any]) -> Mapping[str, object]:
-        if not isinstance(request, Mapping):
-            raise TypeError("visual snapshot request must be an object.")
-        expected_fields = {
-            "client_id",
-            "request_id",
-            "selected_roles",
-            "max_images",
-            "width",
-            "height",
-            "max_total_bytes",
-            "expected_station_revision",
-        }
-        if set(request) != expected_fields:
-            raise ValueError(
-                "visual snapshot request fields must be exactly "
-                f"{sorted(expected_fields)}."
-            )
-        request_id = _required_text(request["request_id"], field_name="request_id")
-        roles_raw = request["selected_roles"]
-        if isinstance(roles_raw, (str, bytes)) or not isinstance(roles_raw, Sequence):
+    def capture(
+        self,
+        parameters: Mapping[str, Any],
+        *,
+        expected_station_revision: int,
+    ) -> MujocoAgentRgbCapture:
+        parameter_fields = {"selected_roles", "width", "height", "max_total_bytes"}
+        if not isinstance(parameters, Mapping) or set(parameters) != parameter_fields:
+            raise ValueError("RGB capture parameters must use the exact schema fields.")
+        if (
+            isinstance(expected_station_revision, bool)
+            or not isinstance(expected_station_revision, int)
+            or expected_station_revision < 0
+        ):
+            raise ValueError("expected_station_revision must be non-negative.")
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("rgb_capture_station_revision_mismatch")
+        roles_raw = parameters.get("selected_roles")
+        if isinstance(roles_raw, (str, bytes)) or not isinstance(
+            roles_raw,
+            Sequence,
+        ):
             raise TypeError("selected_roles must be an array.")
         roles = tuple(
             _required_text(value, field_name="selected_roles[]") for value in roles_raw
         )
-        if not roles or len(set(roles)) != len(roles):
-            raise ValueError("selected_roles must be non-empty and unique.")
-        max_images = _positive_int(
-            request["max_images"], field_name="max_images", maximum=8
+        if not roles or len(roles) > 8 or len(set(roles)) != len(roles):
+            raise ValueError("selected_roles must contain one to eight unique roles.")
+        width = _positive_int(
+            parameters.get("width"),
+            field_name="width",
+            maximum=1920,
         )
-        if len(roles) > max_images:
-            raise ValueError("selected_roles exceeds max_images.")
-        width = _positive_int(request["width"], field_name="width", maximum=1920)
-        height = _positive_int(request["height"], field_name="height", maximum=1080)
+        height = _positive_int(
+            parameters.get("height"),
+            field_name="height",
+            maximum=1080,
+        )
         max_total_bytes = _positive_int(
-            request["max_total_bytes"],
+            parameters.get("max_total_bytes"),
             field_name="max_total_bytes",
             maximum=16 * 1024 * 1024,
         )
-        expected_revision = request["expected_station_revision"]
-        if (
-            isinstance(expected_revision, bool)
-            or not isinstance(expected_revision, int)
-            or expected_revision < 0
-        ):
-            raise ValueError("expected_station_revision must be non-negative.")
-        if self._current_station_revision() != expected_revision:
-            raise RuntimeError("visual_snapshot_station_revision_mismatch")
-
-        catalog = self._catalog_sources()
-        selected = []
+        catalog = self.source_catalog()
+        selected: list[Mapping[str, object]] = []
         for role in roles:
             matches = [source for source in catalog if source["role"] == role]
             if len(matches) != 1:
                 raise ValueError(
-                    f"visual role {role!r} does not resolve to exactly one source."
+                    f"RGB role {role!r} does not resolve to exactly one source."
                 )
             selected.append(matches[0])
         source_ids = tuple(str(source["source_id"]) for source in selected)
-        encoded_frames = self._application.capture_visual_jpeg_frames(
+        snapshot = self._application.capture_visual_jpeg_snapshot(
             source_ids=source_ids,
             width=width,
             height=height,
         )
-        if self._current_station_revision() != expected_revision:
-            raise RuntimeError("visual_snapshot_station_revision_changed")
-
-        frames: list[dict[str, object]] = []
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("rgb_capture_station_revision_changed")
+        captured: list[tuple[str, str, EncodedMujocoRgbFrame]] = []
         total_bytes = 0
         for source in selected:
             source_id = str(source["source_id"])
-            encoded_frame = encoded_frames[source_id]
+            frame = snapshot.frames[source_id]
             if (
-                encoded_frame.source_id != source_id
-                or encoded_frame.width != width
-                or encoded_frame.height != height
-                or encoded_frame.media_type != "image/jpeg"
+                frame.source_id != source_id
+                or frame.width != width
+                or frame.height != height
+                or frame.media_type != RGB_FRAME_MEDIA_TYPE_V1
             ):
-                raise RuntimeError("visual_snapshot_frame_contract_mismatch")
-            encoded = encoded_frame.data
-            total_bytes += len(encoded)
+                raise RuntimeError("rgb_capture_frame_contract_mismatch")
+            total_bytes += len(frame.data)
             if total_bytes > max_total_bytes:
-                raise RuntimeError("visual_snapshot_payload_limit_exceeded")
-            media_hash = hashlib.sha256(encoded).hexdigest()
-            frames.append(
-                {
-                    "schema": MUJOCO_AGENT_VISUAL_FRAME_SCHEMA_V1,
-                    "frame_id": f"visual-frame:{media_hash}",
-                    "source_id": source_id,
-                    "role": source["role"],
-                    "media_type": encoded_frame.media_type,
-                    "width": width,
-                    "height": height,
-                    "media_content_hash": media_hash,
-                    "data_base64": base64.b64encode(encoded).decode("ascii"),
-                }
-            )
-        identity = canonical_content_hash(
-            {
-                "request_id": request_id,
-                "station_revision": expected_revision,
-                "frames": [
-                    {
-                        key: value
-                        for key, value in frame.items()
-                        if key != "data_base64"
-                    }
-                    for frame in frames
-                ],
-            },
-            domain=_VISUAL_SNAPSHOT_HASH_DOMAIN_V1,
+                raise RuntimeError("rgb_capture_artifact_limit_exceeded")
+            captured.append((source_id, str(source["role"]), frame))
+        return MujocoAgentRgbCapture(
+            captured_at=snapshot.captured_at,
+            station_revision=expected_station_revision,
+            frames=tuple(captured),
         )
-        return {
-            "schema": MUJOCO_AGENT_VISUAL_SNAPSHOT_SCHEMA_V1,
-            "snapshot_id": f"visual-snapshot:{identity}",
-            "request_id": request_id,
-            "station_revision": expected_revision,
-            "frames": frames,
-            "total_bytes": total_bytes,
-        }
 
-    def _catalog_sources(self) -> list[dict[str, object]]:
-        sources = []
-        for source in self._application.visual_source_catalog():
-            source_id = str(source["source_id"])
-            role = _ROLE_BY_SOURCE_ID.get(source_id, f"auxiliary_{source_id}")
-            sources.append({**dict(source), "role": role})
-        return sources
 
 __all__ = [
-    "MUJOCO_AGENT_VISUAL_CATALOG_SCHEMA_V1",
-    "MUJOCO_AGENT_VISUAL_FRAME_SCHEMA_V1",
-    "MUJOCO_AGENT_VISUAL_SNAPSHOT_SCHEMA_V1",
-    "MujocoAgentVisualSnapshotProvider",
+    "MujocoAgentRgbCapture",
+    "MujocoAgentRgbCaptureProvider",
+    "mujoco_rgb_role_for_source",
 ]
