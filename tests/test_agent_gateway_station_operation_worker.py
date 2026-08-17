@@ -60,6 +60,7 @@ class _FakeStationLifecycle:
         block_activation: bool = False,
         block_run: bool = False,
         activation_error: bool = False,
+        run_error: bool = False,
         invalid_result: bool = False,
         evaluation: StationLifecycleEvaluationCompletion | None = None,
     ) -> None:
@@ -72,6 +73,7 @@ class _FakeStationLifecycle:
         if not block_run:
             self.run_release.set()
         self.activation_error = activation_error
+        self.run_error = run_error
         self.invalid_result = invalid_result
         self.evaluation = evaluation
         self.calls: list[str] = []
@@ -112,6 +114,8 @@ class _FakeStationLifecycle:
         while not self.run_release.wait(timeout=0.01):
             if cancel_requested():
                 break
+        if self.run_error:
+            raise RuntimeError("injected execution failure")
         if cancel_requested():
             return StationLifecycleExecutionCompletion(
                 succeeded=False,
@@ -460,6 +464,28 @@ def test_activation_exception_records_lower_hold_before_terminal_failure() -> No
     assert not activation_receipt.succeeded
     assert activation_receipt.proves_motion_or_hold
     assert lifecycle.calls == ["activate", "hold", "close"]
+
+
+def test_worker_exception_publishes_bounded_phase_diagnostic_after_hold() -> None:
+    lifecycle = _FakeStationLifecycle(run_error=True)
+    service, worker, admitted = _setup(lifecycle)
+    assert worker.launch(service=service, operation_id=admitted.operation_id).accepted
+    assert worker.wait(timeout_sec=1.0)
+
+    failed = service.get_operation(admitted.operation_id)
+    assert failed.status == "failed"
+    assert failed.reason_code == "station_operation_worker_exception_after_hold"
+    assert failed.execution_result is None
+    assert failed.progress_summary == {
+        "phase": "failed",
+        "worker_error": {
+            "phase": "lifecycle_run",
+            "error_type": "RuntimeError",
+            "message": "injected execution failure",
+        },
+    }
+    assert worker.last_error == "RuntimeError:injected execution failure"
+    assert lifecycle.calls == ["activate", "run", "hold", "close"]
 
 
 def test_worker_can_commit_embedded_required_evaluation_after_execution() -> None:

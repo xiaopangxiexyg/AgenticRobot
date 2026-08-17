@@ -913,9 +913,15 @@ class AgentGatewayService:
         execution_result: Mapping[str, Any] | None = None,
         execution_receipt_refs: tuple[str, ...] = (),
         output_artifact_bindings: tuple[AgentArtifactBinding, ...] = (),
+        progress_summary: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> AgentGatewayOperationOutcome:
-        """CAS an already-produced worker result onto the live projection."""
+        """CAS an already-produced worker result onto the live projection.
+
+        ``progress_summary`` is an additive, bounded diagnostic seam for a
+        worker that has already failed closed.  It does not authorize motion
+        or alter the terminal status selected by ``succeeded``.
+        """
 
         normalized_id = _required_text(operation_id, field_name="operation_id")
         expected_hash = _required_text(
@@ -994,7 +1000,11 @@ class AgentGatewayService:
             current_station_revision=revision,
             updated_at=timestamp,
             execution_receipt_refs=execution_receipt_refs,
-            progress_summary={"phase": next_status},
+            progress_summary=(
+                {"phase": next_status}
+                if progress_summary is None
+                else progress_summary
+            ),
             execution_result=execution_result,
             output_artifact_bindings=output_artifact_bindings,
         )

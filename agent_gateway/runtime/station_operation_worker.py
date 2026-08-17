@@ -415,6 +415,7 @@ class BoundedStationAgentSkillOperationWorker:
 
     no_io = False
     control_effect_class = "motion"
+    _WORKER_ERROR_MESSAGE_MAX_CHARS = 256
 
     def __init__(
         self,
@@ -901,6 +902,7 @@ class BoundedStationAgentSkillOperationWorker:
         request: AgentSkillRequest,
         admitted: AgentSkillOperation,
     ) -> None:
+        worker_phase = "activation"
         try:
             activation = service.activate_operation(
                 operation_id=admitted.operation_id,
@@ -916,6 +918,7 @@ class BoundedStationAgentSkillOperationWorker:
             ):
                 return
             self._set_state("running")
+            worker_phase = "lifecycle_run"
             completion = self.lifecycle.run(
                 request=request,
                 operation=running,
@@ -923,10 +926,12 @@ class BoundedStationAgentSkillOperationWorker:
             )
             if not isinstance(completion, StationLifecycleExecutionCompletion):
                 raise TypeError("Lifecycle returned invalid execution completion.")
+            worker_phase = "timeout_reconciliation"
             if self._expire_if_due(service=service, operation=running) is not None:
                 return
             receipt_refs = completion.execution_receipt_refs
             if not completion.terminal_hold_confirmed:
+                worker_phase = "terminal_hold_completion"
                 hold_receipt = self.request_hold(
                     operation=running,
                     reason="execution_completed_without_terminal_hold",
@@ -941,6 +946,7 @@ class BoundedStationAgentSkillOperationWorker:
                         execution_receipt_refs=receipt_refs,
                         terminal_hold_confirmed=False,
                     )
+            worker_phase = "execution_result_commit"
             outcome = service.complete_operation(
                 operation_id=running.operation_id,
                 expected_operation_hash=running.semantic_content_hash,
@@ -955,6 +961,7 @@ class BoundedStationAgentSkillOperationWorker:
                 and getattr(outcome, "reason_code", None)
                 == "execution_result_payload_rejected"
             ):
+                worker_phase = "execution_result_rejection_fallback"
                 hold_receipt = self.request_hold(
                     operation=running,
                     reason="execution_result_payload_rejected",
@@ -979,6 +986,7 @@ class BoundedStationAgentSkillOperationWorker:
                 and projected.status == "awaiting_evaluation"
                 and completion.evaluation is not None
             ):
+                worker_phase = "evaluation_commit"
                 evaluation = completion.evaluation
                 evaluation_outcome = service.complete_evaluation(
                     operation_id=projected.operation_id,
@@ -1024,6 +1032,10 @@ class BoundedStationAgentSkillOperationWorker:
                     ),
                     current_station_revision=self._revision(),
                     execution_receipt_refs=(hold_receipt.receipt_id,),
+                    progress_summary=self._worker_error_progress(
+                        error,
+                        phase=worker_phase,
+                    ),
                 )
                 with self._condition:
                     self._last_completion_outcome = outcome
@@ -1039,6 +1051,27 @@ class BoundedStationAgentSkillOperationWorker:
         with self._condition:
             if self._last_error is None:
                 self._last_error = detail
+
+    @classmethod
+    def _worker_error_progress(
+        cls,
+        error: BaseException,
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        """Return bounded, non-authoritative diagnostics for terminal output."""
+
+        message = str(error)
+        if len(message) > cls._WORKER_ERROR_MESSAGE_MAX_CHARS:
+            message = message[: cls._WORKER_ERROR_MESSAGE_MAX_CHARS - 1] + "…"
+        return {
+            "phase": "failed",
+            "worker_error": {
+                "phase": phase,
+                "error_type": type(error).__name__,
+                "message": message,
+            },
+        }
 
     def close_after_hold(
         self,
