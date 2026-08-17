@@ -52,7 +52,7 @@ from robot_motion.primitives import (
     cardinal_tcp_short_step,
     level_tcp_orientation,
 )
-from teleop_runtime.real_teleop.agent_motion_port import RealAgentMotionPortConfig
+from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
 

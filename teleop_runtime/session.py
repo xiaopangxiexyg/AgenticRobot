@@ -8,6 +8,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .action.schema import ActionRecord
 from .action.human_proposal import HumanCommandEmission, HumanLegacyCommandObservation
 from .calibration import TeleopCalibration
+from .command_override import TeleopCommandOverride
 from .diagnostics import FaultEvent, FaultSeverity, RateTracker, TeleopRunState, TeleopStateMachine
 from .interfaces import ObservationSource, Retargeter, Rig
 from .recording import RecordingConfig, SessionRecorder
@@ -111,23 +112,6 @@ class SessionStepResult:
     tracker_loss_duration_sec: float = 0.0
     tracker_loss_channels: tuple[str, ...] = ()
     home_recalibration_required: bool = False
-
-
-@dataclass(frozen=True)
-class TeleopCommandOverride:
-    """Explicitly claim one Session frame, with or without a command.
-
-    A bare ``None`` from ``command_override_provider`` means the provider is
-    inactive and the normal human path should run.  This wrapper with
-    ``command=None`` instead inhibits the frame without falling back to human
-    input, which closes activation/cancellation races for external owners.
-    """
-
-    command: TeleopCommand | None
-
-    def __post_init__(self) -> None:
-        if self.command is not None and not isinstance(self.command, TeleopCommand):
-            raise TypeError("TeleopCommandOverride.command must be TeleopCommand or None.")
 
 
 class TeleopSession:

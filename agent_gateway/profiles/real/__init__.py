@@ -1,1 +1,1 @@
-"""Attach-only real observation profiles for Agent Gateway."""
+"""Default-off real observation and Skill deployment profiles."""

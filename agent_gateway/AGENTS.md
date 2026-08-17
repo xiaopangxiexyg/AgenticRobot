@@ -34,8 +34,12 @@ profile explicitly binds a Station application port.
   `profiles/mujoco/motion_primitive_profiles.py`, separate from Route-manifest
   construction and executor lifecycle. The real 6+3 application follows the
   same split under `profiles/real/motion_primitive_*`; its factory is
-  attach-only and must share exactly one lower `RealAgentMotionPort` with the
-  returned RealTeleop component aggregate.
+  assembled with exactly one lower `RealAgentMotionPort`. The preferred real
+  Skill deployment factory shares that port with an independent exclusive
+  lower owner under `teleop_runtime.skill_deploy`; it must not construct or
+  import RealTeleop, VIVE, collection, GUI, or `control_composition`. The
+  historic RealTeleop attachment remains a compatibility path, not the owner
+  of new real Skill deployment architecture.
 
 Semantic primitive axes and lower execution coordinates must remain explicit.
 When a Skill is defined in canonical Station/desk axes but the lower owner
@@ -49,12 +53,15 @@ envelope.
 Real motion remains default-off. The exact profile must require a one-use,
 request-bound operator Grant, a fresh lower-measured pose cut, a RUNNING/READY
 lower owner cut, and terminal lower-confirmed HOLD. Do not reinterpret the
-existing foot switches as an Agent deadman lease. The lower RealTeleop control
-thread alone may apply activation/HOLD requests, construct commands through the
-existing coupled target solver, publish already-read measured qpos/FK cuts, and
-pass commands through the existing filter, guard, admission, rig dispatch, and
-HOLD boundaries. A caller must continue with the component aggregate returned
-by the attach factory; the original aggregate is not attached.
+existing foot switches as an Agent deadman lease. In the preferred deployment,
+the independent Skill control owner alone may apply activation/HOLD requests,
+construct commands through the lower coupled target solver, publish already-read
+measured qpos/FK cuts, and pass commands through the lower filter, guard,
+admission, dispatch, and HOLD boundaries. It must reuse those lower owners
+through typed application ports rather than copying them into the Gateway. On
+the compatibility attachment only, the existing RealTeleop control thread
+retains those effects and the caller must use the replacement component
+aggregate returned by the attach factory.
 
 The Gateway never owns an upper planner, RPent Task/Program/Memory/Experience,
 canonical robot authority, safety, IK, reference, dispatch, or dataset episode
