@@ -3,6 +3,11 @@
 > 本页说明模块接口和局部示例。正式真机遥操/数采的组合命令统一从
 > [`docs/real/README.md`](../docs/real/README.md) 复制。
 
+> **SAPIEN 路线状态**：`run_vive_sapien_virtual.py`、SAPIEN renderer 以及本文仍保留的
+> 相关命令只用于复现历史调试流程，不再属于当前遥操、仿真或发布路线。不要为它们新增
+> 功能或调用方，也不要把其结果作为当前验证证据。正式真机遥操/数采使用上面的 canonical
+> 文档；新的虚拟验证和可视化优先使用 MuJoCo、Web UI 或 backend-neutral 工具。
+
 `teleop_runtime` 是新的通用遥操作运行时骨架。当前版本已经能把下面两条链路接到统一接口里：
 
 - `VIVE tracker -> pose_to_arm -> RM65`
@@ -339,7 +344,7 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
   --load-profile teleop_records/calibration_profiles/your_profile.json
 ```
 
-2. 直接进入虚拟跑法，复用 profile，再做一次 runtime home calibration：
+2. 历史虚拟跑法（冻结保留），复用 profile，再做一次 runtime home calibration：
 
 ```bash
 python -m teleop_runtime.debug.run_vive_sapien_virtual \
@@ -376,7 +381,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 简单验证 `absolute`
 - 非完整标定场景下的 home-only 调试
 
-它仍然有价值，但它不替代完整标定流程。
+它只为旧实验和诊断流程复现而保留，不再是新开发或正式验收入口，也不替代完整标定流程。
 
 ## 基站、tracker、机器人变化时该怎么处理
 
@@ -778,7 +783,8 @@ debug trajectory 不会在正式 dataset 采集中默认重复保存；仅在 `-
 - `teleop_records/<timestamp>/trajectories/episode_000001/frames.jsonl`
 - `teleop_records/<timestamp>/trajectories/episode_000001/events.jsonl`
 
-推荐的 replay 验收顺序：
+历史 replay 流程如下；其中 `run_recorded_episode_replay` 的 SAPIEN virtual 模式只用于旧流程
+复现，不再作为当前推荐验收证据：
 
 1. 录一段 episode
 2. `python -m teleop_runtime.debug.validate_recorded_episode /path/to/episode_000001`
@@ -810,11 +816,10 @@ debug trajectory 不会在正式 dataset 采集中默认重复保存；仅在 `-
 
 1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py --hz 300`
 2. 跑 `run_vive_rm65_calibration_debug.py` 完成 `LINK_CHECK -> virtual desk -> wrist offset -> save profile`
-3. 启动 `run_vive_sapien_virtual.py`，读取 profile，并在当前真机/虚拟起始姿态上做 session `home capture`
-4. 用 `control_mode="absolute"` 做虚拟验收，确认前/左/上和双臂相对关系
-5. 启动 `run_vive_rm65_real_teleop.py` 接入真机，统一按 `tool_tcp` action 执行
-6. 正式采集时再打开 `--gui`、相机和需要的 hand/gripper backend
+3. 不再把 `run_vive_sapien_virtual.py` 作为新流程门禁；离线/虚拟验证按 canonical MuJoCo、
+   contract 或 backend-neutral 工具执行，并明确其证据边界
+4. 启动 `run_vive_rm65_real_teleop.py` 接入真机，统一按 `tool_tcp` action 执行
+5. 正式采集时再打开 `--gui`、相机和需要的 hand/gripper backend
 
-如果下一步继续开发，建议优先补：
-
-- SAPIEN workspace / TCP 调试可视化
+如果下一步继续开发，不再扩展 SAPIEN workspace / TCP 可视化；新的调试呈现应进入 MuJoCo、
+Web UI 或 backend-neutral observer，并保持不复制控制、安全或 dispatch 状态。

@@ -15,6 +15,9 @@
 注意：本文档是历史实施蓝图，不代表当前 frame 语义。当前已落地实现以
 `tool_tcp` 作为 action 主 frame；`rm_eef` 会归一为 `tool_tcp`，`hand_base` /
 `arm_endpoint` 仅作为兼容、调试或后端内部 frame。
+本文把 SAPIEN 写为优先 3D 调试后端的段落同样属于历史方案，已被当前决策取代：SAPIEN
+只冻结保留旧 preview，不再新增功能或调用方；新的仿真/可视化工作使用 MuJoCo、Web UI
+或 backend-neutral observer。
 
 ## 0. 本轮已确认的设计决策
 

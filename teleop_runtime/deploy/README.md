@@ -312,7 +312,8 @@ IK recovery rollback/chunk-id 变化影响，并分别检查：
 
 - `robot_motion`：`RobotAction` schema/spec、vector adapter、canonical deploy preparation、value-level safety、时间戳 motion resampling。
 - `teleop_runtime`：CLI、键盘、相机/触觉、真机 backend、在线因果 worker、`dispatch.py`、fixed-init 真机执行。
-- `sim`：MuJoCo/Sapien 等仿真专属 scene/controller/dispatcher；复用 `robot_motion` 的 action/resampling/schedule。
+- `sim`：当前由 MuJoCo 拥有仿真专属 scene/controller/dispatcher，并复用 `robot_motion` 的
+  action/resampling/schedule；SAPIEN 仅是冻结保留的历史 preview，不属于部署路线。
 
 部署频率与 action chunk 执行：
 

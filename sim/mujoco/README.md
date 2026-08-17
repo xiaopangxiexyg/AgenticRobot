@@ -3,11 +3,12 @@
 > 本页维护 MuJoCo 模块参数和局部示例。当前 canonical 仿真命令统一从
 > [`docs/sim/README.md`](../../docs/sim/README.md) 复制。
 
-MuJoCo is the canonical task-physics backend for this project. SAPIEN remains
-the teleop/debug preview. Cross-domain action, observation, timing, and scene
-semantics are versioned in `sim/contracts/`, with the first physical profile at
-`sim/configs/rm65_bimanual_physics_v1.json`. See `sim/README.md` for ownership
-and current limitations.
+MuJoCo is the canonical task-physics backend for this project. SAPIEN references
+describe a frozen retained legacy preview only; they are not a current backend,
+development target, or validation source. Cross-domain action, observation,
+timing, and scene semantics are versioned in `sim/contracts/`, with the first
+physical profile at `sim/configs/rm65_bimanual_physics_v1.json`. See
+`sim/README.md` for ownership and current limitations.
 
 This package provides a reusable MuJoCo layer for DexTeleop real2sim checks.
 The first implementation is intentionally position-controlled only: no force

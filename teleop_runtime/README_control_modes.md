@@ -1,17 +1,22 @@
 # VIVE 到 RM65 的相对控制与绝对控制说明
 
+> **入口状态**：`run_vive_sapien_virtual.py` 是冻结保留的历史调试入口，不再是当前虚拟
+> 验收或新开发路径。本文继续用它说明既有 control-mode 语义，但不得据此新增 SAPIEN
+> 依赖、功能或验证结论；当前真实入口仍以 `run_vive_rm65_real_teleop.py` 为准。
+
 本文档说明当前仓库里已经落地的 arm teleop 控制模式。当前 active 主路径是 `absolute`；`delta_clutch` 章节仅保留历史说明，已经硬封存：
 
 - `absolute`：绝对控制
 - `delta_clutch`：已硬封存的历史相对控制实现
 
 这里讨论的是 `VIVE -> PoseToArmRetargeter -> RM65` 这条链路，**不包含** `q6 -> hand/gripper` 手部链路。
-当前真正可运行的调试入口是：
+本文涉及的保留/当前入口是：
 
 - [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)
 - [teleop_runtime/debug/run_vive_rm65_real_teleop.py](./debug/run_vive_rm65_real_teleop.py)
 
-前者使用真实 VIVE 输入，但默认只驱动 SAPIEN 中的双 RM65 虚拟模型；后者接入 RM65 真机。
+前者是冻结历史入口，使用真实 VIVE 输入但默认只驱动 SAPIEN 中的双 RM65 虚拟模型；
+后者是当前真实入口并接入 RM65 真机。
 
 ## 1. 先说结论
 

@@ -700,11 +700,15 @@ python -m utils.dataset_postprocess validate-v23 /path/to/dataset
 命令成功返回 `0`；任何 contract/hash、causal timestamp、pose 副本、计数或外置文件错误
 均返回 `1` 并输出 JSON 诊断，不会修改原数据。
 
-## 10. SAPIEN 数据集回放
+## 10. 历史兼容工具：SAPIEN 回放（冻结）
 
-采集完成后，可以用 [replay_dataset_sapien.py](replay_dataset_sapien.py) 读取 dataset root + episode，并在 SAPIEN 中按 parquet 里的关节序列复刻动作，同时逐帧打印左右手 tactile sum。
+这里不存在独立的“SAPIEN 数据集”格式。[replay_dataset_sapien.py](replay_dataset_sapien.py)
+读取的是普通 LeRobot 风格 dataset root、episode parquet、视频和触觉字段；SAPIEN 只用于历史
+关节状态预览。该入口为旧实验复现冻结保留，不属于当前数采、仿真或发布路线，不再新增功能、
+调用方或验证结论。新的数据验收使用第 9 节的 canonical validator；新的仿真回放使用 MuJoCo
+或 backend-neutral 工具。
 
-推荐命令：
+历史复现命令：
 
 ```bash
 python -m teleop_runtime.collection.replay_dataset_sapien \
@@ -852,7 +856,7 @@ collector 启动后会打印按键输入来源：
 - [realsense.json](../configs/devices/realsense.json)
   已提供默认单相机配置
 - [replay_dataset_sapien.py](replay_dataset_sapien.py)
-  已支持读取 LeRobot 风格采集 dataset，并用 SAPIEN 复刻双臂双手动作，同时打印触觉总和
+  冻结保留的历史预览入口；读取普通 LeRobot 风格 dataset，不是当前开发或发布能力
 
 当前还没有完全闭环验证的部分是：
 
@@ -874,7 +878,8 @@ collector 启动后会打印按键输入来源：
 5. writer discard 检查：
    - 已验证 active episode 丢弃后，下一次 `start_episode()` 会复用未保存的 episode index
 6. dataset replay 检查：
-   - 已验证 `replay_dataset_sapien.py --skip-renderer` 可以读取 `demo_bimanual_no_camera` 的 parquet 并打印触觉总和
+   - 历史上已验证 `replay_dataset_sapien.py --skip-renderer` 可以读取
+     `demo_bimanual_no_camera` 的 parquet 并打印触觉总和；该结果不代表 SAPIEN 路线仍受支持
 
 这些检查只覆盖：
 
