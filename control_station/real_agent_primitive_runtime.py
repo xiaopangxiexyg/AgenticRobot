@@ -19,16 +19,11 @@ from agent_gateway.profiles.real.motion_primitive_profiles import (
 from agent_gateway.profiles.real.observation_gateway import (
     RealTcpPoseObserveAttachmentSpec,
 )
-from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
-from agent_gateway.runtime.access_policy import (
-    SkillExecutionGrant,
-    issue_skill_execution_grant,
-)
-from agent_gateway.skills.motion.definition import (
-    TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
-    TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
-    TCP_LEVEL_FORWARD_SKILL_ID_V1,
+from agent_gateway.profiles.real.one_shot_authorization import (
+    REAL_AGENT_PRIMITIVE_ACTIONS,
+    REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+    RealAgentPrimitiveOneShotAuthorization,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.coordinate_frames import CoordinateFrameGraph, CoordinateFrameSpec
@@ -39,23 +34,6 @@ from teleop_runtime.real_teleop.agent_motion_port import (
 )
 from teleop_runtime.real_teleop.components import RealTeleopComponents
 
-REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN = "AUTHORIZE_ONE_REAL_TCP_PRIMITIVE"
-REAL_AGENT_PRIMITIVE_ACTIONS = (
-    "forward",
-    "backward",
-    "left",
-    "right",
-    "up",
-    "down",
-    "level_forward",
-    "level_forward_left_30",
-    "level_forward_right_30",
-)
-_FIXED_SKILL_ID_BY_ACTION = {
-    "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
-    "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
-    "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
-}
 _ALL_REAL_PRIMITIVE_ROUTE_IDS = (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
     *tuple(REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()),
@@ -256,8 +234,7 @@ class RealAgentPrimitiveSkillOnlyExtension:
         self._attachment: RealAgentPrimitiveRealTeleopAttachment | None = None
         self._server: object | None = None
         self._server_thread: threading.Thread | None = None
-        self._grant_lock = threading.Lock()
-        self._grant_issued = False
+        self._authorization: RealAgentPrimitiveOneShotAuthorization | None = None
         self._started = False
 
     def attach_components(
@@ -398,69 +375,22 @@ class RealAgentPrimitiveSkillOnlyExtension:
         )
         return self._attachment.components
 
-    def _grant_resolver(
-        self,
-        request: AgentSkillRequest,
-    ) -> SkillExecutionGrant | None:
-        attachment = self._require_attachment()
-        expected_skill_id = _FIXED_SKILL_ID_BY_ACTION.get(
-            self.action,
-            "motion.step_tcp_cardinal",
-        )
-        if request.client_id != self.client_id or request.skill_id != expected_skill_id:
-            return None
-        if request.parameters.get("component_id") != f"{self.side}_arm":
-            return None
-        if expected_skill_id == "motion.step_tcp_cardinal" and (
-            request.parameters.get("direction") != self.action
-        ):
-            return None
-        with self._grant_lock:
-            if self._grant_issued:
-                return None
-            now = time.time()
-            route = attachment.gateway_session.contract_bundle.route_manifest.route(
-                request.skill_id,
-                request.skill_version,
-                request.route_id,
-                request.route_version,
-            ).route
-            grant = issue_skill_execution_grant(
-                access_policy=attachment.gateway_session.service.access_policy,
-                manifest=attachment.gateway_session.contract_bundle.route_manifest,
-                route=route,
-                request=request,
-                operator_authorization_receipt_id=(
-                    "real-agent-primitive-cli-confirmation:"
-                    + canonical_content_hash(
-                        {
-                            "side": self.side,
-                            "action": self.action,
-                            "client_id": self.client_id,
-                            "confirmation": REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
-                        },
-                        domain="dexteleop.real_agent_motion.operator_confirmation.v1",
-                    )
-                ),
-                client_id=self.client_id,
-                parameter_profile_id=request.parameter_profile_id,
-                parameter_profile_hash=request.parameter_profile_hash,
-                max_invocations=1,
-                issued_at=now,
-                expires_at=now + 5.0,
-            )
-            self._grant_issued = True
-            return grant
-
     def start(self, *, components: RealTeleopComponents) -> None:
         attachment = self._require_attachment()
         if components is not attachment.components:
             raise RuntimeError("RealTeleop did not retain the attached components.")
+        authorization = RealAgentPrimitiveOneShotAuthorization(
+            gateway_session=attachment.gateway_session,
+            side=self.side,
+            action=self.action,
+            client_id=self.client_id,
+            confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        )
         server = attachment.gateway_session.build_unix_json_server(
             socket_path=self.socket_path,
             client_id_by_uid={self.client_uid: self.client_id},
             peer_idle_timeout_sec=30.0,
-            grant_resolver=self._grant_resolver,
+            grant_resolver=authorization.grant_resolver,
         )
         thread = threading.Thread(
             target=server.serve_forever,
@@ -470,6 +400,7 @@ class RealAgentPrimitiveSkillOnlyExtension:
         thread.start()
         self._server = server
         self._server_thread = thread
+        self._authorization = authorization
         self._started = True
         print(
             "[AgentPrimitive] Skill-only READY boundary installed; "

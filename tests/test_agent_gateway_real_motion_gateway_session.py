@@ -21,6 +21,10 @@ from agent_gateway.profiles.real.observation_gateway import (
     RealControlOwnerState,
     RealTcpPoseObserveAttachmentSpec,
 )
+from agent_gateway.profiles.real.one_shot_authorization import (
+    REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+    RealAgentPrimitiveOneShotAuthorization,
+)
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.runtime.access_policy import issue_skill_execution_grant
@@ -388,6 +392,81 @@ def test_real_gateway_refuses_a_port_from_another_execution_binding() -> None:
             port=mismatched,
             owner_state_provider=lambda: _owner_state(bundle, captured_at=10.0),
             allowed_client_ids=(CLIENT_ID,),
+        )
+
+
+def test_one_shot_authorization_issues_exactly_one_bound_grant() -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    owner_state = _owner_state(bundle, captured_at=clock())
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:authorization",),
+    )
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: owner_state,
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+    snapshot = gateway.observation_producer.capture_and_publish(
+        gateway.service,
+    ).snapshot
+    assert snapshot is not None
+    request = _request(
+        bundle,
+        snapshot,
+        skill_id="motion.step_tcp_cardinal",
+        direction="forward",
+    )
+    authorization = RealAgentPrimitiveOneShotAuthorization(
+        gateway_session=gateway,
+        side="right",
+        action="forward",
+        client_id=CLIENT_ID,
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        clock=clock,
+    )
+
+    mismatched = replace(
+        request,
+        parameters={**request.parameters, "direction": "backward"},
+    )
+    assert authorization.grant_resolver(mismatched) is None
+    grant = authorization.grant_resolver(request)
+
+    assert grant is not None
+    assert grant.client_id == CLIENT_ID
+    assert grant.max_invocations == 1
+    assert authorization.grant_issued is True
+    assert authorization.grant_resolver(request) is None
+
+
+def test_one_shot_authorization_requires_exact_operator_confirmation() -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(
+            bundle,
+            captured_at=clock(),
+        ),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+
+    with pytest.raises(ValueError, match="confirmation token"):
+        RealAgentPrimitiveOneShotAuthorization(
+            gateway_session=gateway,
+            side="right",
+            action="forward",
+            client_id=CLIENT_ID,
+            confirmation_token="not-authorized",
+            clock=clock,
         )
 
 
