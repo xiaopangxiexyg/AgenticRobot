@@ -345,7 +345,7 @@ def _shared_port_hold_evidence(
     reason: str,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
-    timeout_sec: float = 2.0,
+    timeout_sec: float,
 ) -> StationLifecycleControlEvidence:
     now = float(clock())
     snapshot = port.snapshot()
@@ -614,6 +614,9 @@ def assemble_real_agent_primitive_gateway_session(
             reason=reason,
             clock=clock,
             sleep=sleep,
+            timeout_sec=(
+                contract_bundle.convergence_profile.hold_confirmation_timeout_sec
+            ),
         )
 
     executors: dict[str, ReusableStationAgentSkillOperationExecutor] = {}

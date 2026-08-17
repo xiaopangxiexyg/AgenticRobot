@@ -364,7 +364,14 @@ class RealAgentPrimitiveSkillLifecycle:
                 reason=normalized_reason,
                 requested_at=float(self.clock()),
             )
-        while float(self.clock()) < self.operation.deadline_at:
+        # The operation deadline bounds motion execution, not the lower
+        # control-plane proof that the requested HOLD has been applied.  Once
+        # the deadline has elapsed, the control owner still needs a bounded
+        # grace window to run its next cycle and produce HELD evidence.
+        hold_deadline = float(self.clock()) + (
+            self.contract_bundle.convergence_profile.hold_confirmation_timeout_sec
+        )
+        while float(self.clock()) < hold_deadline:
             snapshot = self.port.snapshot()
             if snapshot.phase == RealAgentMotionPhase.HELD:
                 return self._control_evidence_from_snapshot(

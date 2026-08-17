@@ -130,12 +130,14 @@ class RealAgentPrimitiveConvergenceProfile:
     stable_measurement_count: int = 3
     max_measurement_age_ms: int = 200
     poll_interval_sec: float = 0.01
+    hold_confirmation_timeout_sec: float = 2.0
 
     def __post_init__(self) -> None:
         for field_name in (
             "translation_tolerance_m",
             "rotation_tolerance_rad",
             "poll_interval_sec",
+            "hold_confirmation_timeout_sec",
         ):
             value = float(getattr(self, field_name))
             if not math.isfinite(value) or not value > 0.0:
