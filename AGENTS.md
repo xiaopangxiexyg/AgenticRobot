@@ -214,6 +214,19 @@ Run the smallest relevant tests and report them. Use `git diff --check`; add
 targeted tests, `py_compile`, and entrypoint `--help` checks as appropriate.
 Hardware tests and remote runs require explicit scope.
 
+Run repository tests through `bash scripts/run_pytest.sh ...`. The wrapper
+selects the supported `dexteleop310` Python 3.10 environment, verifies the
+required `osqp` test dependency, disables ambient pytest plugins, and allocates
+a process-unique short `--basetemp` under `/tmp`. Do not run DexTeleop tests
+with the RPent Python environment and do not place pytest `--basetemp` inside a
+worktree.
+
+AF_UNIX tests must request the shared `short_unix_socket_path_factory` fixture;
+never derive a live socket endpoint from `tmp_path`, the repository path, or a
+worktree-local `temp/` directory. Production endpoints must continue to reject
+overlong paths rather than silently relocating them. The `/tmp` exception is
+test-only and does not change runtime artifact placement.
+
 Only dependency, Python-version, package-discovery, or installation changes
 require updates to `pyproject.toml`, `environment.yml`, `uv.lock`,
 `scripts/install_conda_env.sh`, or `README_ENV.md` as applicable. Source-only

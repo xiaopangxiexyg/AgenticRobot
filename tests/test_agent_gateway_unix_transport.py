@@ -7,7 +7,6 @@ import stat
 import struct
 import threading
 import time
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,19 +90,6 @@ class _FakeBoundFacade(BoundAgentGatewayWireAdapter):
             )
 
 
-def _transport_root() -> Path:
-    root = Path(__file__).resolve().parents[1] / "temp" / "u"
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(root, 0o700)
-    return root
-
-
-def _socket_path(label: str) -> Path:
-    return _transport_root() / (
-        f"{label[:4]}-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
-    )
-
-
 def _wait_for(predicate, *, timeout_sec: float = 2.0) -> None:
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -178,8 +164,10 @@ def test_peer_map_is_one_to_one_and_rejects_unconfigured_uid() -> None:
         )
 
 
-def test_server_refuses_existing_endpoint_and_unlinks_only_its_own_socket() -> None:
-    path = _socket_path("ownership")
+def test_server_refuses_existing_endpoint_and_unlinks_only_its_own_socket(
+    short_unix_socket_path_factory,
+) -> None:
+    path = short_unix_socket_path_factory("ownership")
     path.touch()
     try:
         with pytest.raises(FileExistsError, match="Refusing to replace"):
@@ -205,8 +193,9 @@ def test_server_refuses_existing_endpoint_and_unlinks_only_its_own_socket() -> N
 
 def test_server_cleans_its_bound_inode_when_permission_setup_fails(
     monkeypatch,
+    short_unix_socket_path_factory,
 ) -> None:
-    path = _socket_path("chmod")
+    path = short_unix_socket_path_factory("chmod")
 
     def reject_chmod(*_args, **_kwargs):
         raise PermissionError("injected chmod failure")
@@ -226,7 +215,9 @@ def test_server_cleans_its_bound_inode_when_permission_setup_fails(
 
 @pytest.mark.integration
 @pytest.mark.optional
-def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity() -> None:
+def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity(
+    short_unix_socket_path_factory,
+) -> None:
     transport_module = pytest.importorskip(
         "rpent_dexteleop.gateway.unix_transport",
         reason="paired RPent integration wheel is not installed",
@@ -236,7 +227,7 @@ def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity()
     )
     UnixDexTeleopGatewayClient = transport_module.UnixDexTeleopGatewayClient
 
-    path = _socket_path("live-client")
+    path = short_unix_socket_path_factory("live-client")
     facade = _FakeBoundFacade("rpent:local")
     server, thread, close_calls = _start_server(
         path=path,
@@ -297,8 +288,10 @@ def test_live_rpent_client_authenticates_heartbeats_and_binds_payload_identity()
     assert len(close_calls) == 1
 
 
-def test_idle_or_oversized_authenticated_peer_disconnects_fail_closed() -> None:
-    path = _socket_path("idle")
+def test_idle_or_oversized_authenticated_peer_disconnects_fail_closed(
+    short_unix_socket_path_factory,
+) -> None:
+    path = short_unix_socket_path_factory("idle")
     facade = _FakeBoundFacade("rpent:local")
     server, thread, _ = _start_server(
         path=path,
@@ -318,7 +311,7 @@ def test_idle_or_oversized_authenticated_peer_disconnects_fail_closed() -> None:
         raw.close()
         _stop_server(server, thread)
 
-    path = _socket_path("oversized")
+    path = short_unix_socket_path_factory("oversized")
     facade = _FakeBoundFacade("rpent:local")
     server, thread, _ = _start_server(
         path=path,
@@ -338,7 +331,9 @@ def test_idle_or_oversized_authenticated_peer_disconnects_fail_closed() -> None:
         _stop_server(server, thread)
 
 
-def test_protocol_envelope_is_exact_and_method_allowlist_has_no_shutdown() -> None:
+def test_protocol_envelope_is_exact_and_method_allowlist_has_no_shutdown(
+    short_unix_socket_path_factory,
+) -> None:
     assert "shutdown" not in {
         "healthz",
         "get_skill_definition_catalog",
@@ -350,7 +345,7 @@ def test_protocol_envelope_is_exact_and_method_allowlist_has_no_shutdown() -> No
         "cancel_own_operation",
         "request_hold_own_domain",
     }
-    path = _socket_path("allowlist")
+    path = short_unix_socket_path_factory("allowlist")
     facade = _FakeBoundFacade("rpent:local")
     server, thread, _ = _start_server(path=path, facade=facade)
     raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

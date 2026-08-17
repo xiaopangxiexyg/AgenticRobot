@@ -18,10 +18,17 @@ handling happens after collection.
 
 from __future__ import annotations
 
+import os
+import shutil
 import socket
+import tempfile
+import uuid
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+
+_LINUX_UNIX_SOCKET_PATH_LIMIT_BYTES = 107
 
 OPTIONAL_MODULES = frozenset(
     {
@@ -138,6 +145,36 @@ def require_udp_loopback() -> None:
             sock.close()
     except OSError as exc:
         pytest.skip(f"loopback UDP is unavailable in this environment: {exc}")
+
+
+@pytest.fixture
+def short_unix_socket_path_factory() -> Iterator[Callable[[str], Path]]:
+    """Allocate private AF_UNIX endpoints independently of checkout length."""
+
+    root = Path(
+        tempfile.mkdtemp(
+            prefix=f"dt-u-{os.getpid()}-",
+            dir="/tmp",
+        )
+    )
+    os.chmod(root, 0o700)
+
+    def allocate(label: str) -> Path:
+        safe_label = "".join(
+            character if character.isalnum() else "-" for character in label
+        ).strip("-")
+        path = root / f"{safe_label[:8] or 'socket'}-{uuid.uuid4().hex[:8]}.sock"
+        if len(os.fsencode(path)) > _LINUX_UNIX_SOCKET_PATH_LIMIT_BYTES:
+            raise AssertionError(
+                "short AF_UNIX test path unexpectedly exceeds 107 bytes: "
+                f"{path}"
+            )
+        return path
+
+    try:
+        yield allocate
+    finally:
+        shutil.rmtree(root)
 
 
 def pytest_collection_modifyitems(

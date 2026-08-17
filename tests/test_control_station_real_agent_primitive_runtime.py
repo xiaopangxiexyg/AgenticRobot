@@ -204,10 +204,10 @@ def test_skill_only_extension_attaches_one_exclusive_lower_owner() -> None:
 
 
 def test_skill_only_extension_shutdown_confirms_hold_before_session_close(
-    tmp_path,
+    short_unix_socket_path_factory,
 ) -> None:
     components = _components()
-    socket_path = tmp_path / "primitive.sock"
+    socket_path = short_unix_socket_path_factory("primitive")
     extension = RealAgentPrimitiveSkillOnlyExtension(_args(str(socket_path)))
     attached = extension.attach_components(components)
 

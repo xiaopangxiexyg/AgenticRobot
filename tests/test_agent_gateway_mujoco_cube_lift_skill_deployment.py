@@ -3,13 +3,25 @@ from __future__ import annotations
 import os
 import threading
 import time
-import uuid
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from agent_gateway.profiles.mujoco.observation import (
+    MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1,
+)
+from agent_gateway.profiles.mujoco.skills.cube_lift import deployment
+from agent_gateway.profiles.mujoco.skills.cube_lift.deployment import (
+    build_mujoco_cube_lift_agent_skill_contract_bundle,
+    cube_lift_terminal_evaluator_config_from_task,
+)
+from agent_gateway.profiles.mujoco.skills.cube_lift.gateway_session import (
+    assemble_mujoco_cube_lift_agent_gateway_session,
+)
+from agent_gateway.profiles.mujoco.skills.cube_lift.observation_binding import (
+    MujocoCubeLiftAgentObservationProducer,
+)
 from agent_gateway.protocol.contracts import (
     AgentOwnOperationQuery,
     AgentSkillRequest,
@@ -38,23 +50,9 @@ from agent_gateway.transport.wire_adapter import (
     BoundAgentGatewayWireAdapter,
 )
 from control_station.composition.mujoco_sim_hil import MujocoSimHILComposition
-from agent_gateway.profiles.mujoco.observation import (
-    MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1,
-)
 from control_station.sim_hil_profile.application import (
     MujocoSimHILApplication,
     MujocoSimHILPassiveApplicationCut,
-)
-from agent_gateway.profiles.mujoco.skills.cube_lift import deployment
-from agent_gateway.profiles.mujoco.skills.cube_lift.deployment import (
-    build_mujoco_cube_lift_agent_skill_contract_bundle,
-    cube_lift_terminal_evaluator_config_from_task,
-)
-from agent_gateway.profiles.mujoco.skills.cube_lift.gateway_session import (
-    assemble_mujoco_cube_lift_agent_gateway_session,
-)
-from agent_gateway.profiles.mujoco.skills.cube_lift.observation_binding import (
-    MujocoCubeLiftAgentObservationProducer,
 )
 from robot_motion.action import BIMANUAL_EE_POSE_V1
 from robot_motion.runtime.control_admission import ControlCut
@@ -651,6 +649,7 @@ def test_exact_bundle_wire_facade_admits_rpent_request_without_transport(
 @pytest.mark.optional
 def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
     monkeypatch,
+    short_unix_socket_path_factory,
 ) -> None:
     toolkit_module = pytest.importorskip(
         "rpent_dexteleop.toolkit",
@@ -722,12 +721,7 @@ def test_live_rpent_toolkit_uses_authenticated_uds_disconnect_control_path(
             current_station_revision=lambda: producer.current_station_revision,
         )
 
-    socket_root = Path(__file__).resolve().parents[1] / "temp" / "u"
-    socket_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(socket_root, 0o700)
-    socket_path = socket_root / (
-        f"b3-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
-    )
+    socket_path = short_unix_socket_path_factory("b3")
     server = AgentGatewayUnixJsonServer(
         socket_path=socket_path,
         peer_client_map=AgentGatewayUnixPeerClientMap(

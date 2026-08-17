@@ -254,19 +254,19 @@ bash scripts/verify_dev_base.sh
 
 # 日常快速反馈：保留普通单元测试，显式排除已审查的长时仿真/IK 闭环。
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  python -m pytest -m 'unit and not optional and not slow_sim' -q
+  bash scripts/run_pytest.sh -m 'unit and not optional and not slow_sim' -q
 
 # 完整单元回归：合并、提交和推送前仍需执行，不排除 slow_sim。
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  python -m pytest -m 'unit and not optional' -q
+  bash scripts/run_pytest.sh -m 'unit and not optional' -q
 
 # 不含可选软件栈的完整回归。
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  python -m pytest -m 'not optional' -q
+  bash scripts/run_pytest.sh -m 'not optional' -q
 
 # 完整环境中的全部测试。
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  python -m pytest -q
+  bash scripts/run_pytest.sh -q
 ```
 
 测试按 `unit`、`contract`、`integration`、`optional`、`slow_sim` 和 `hardware` marker 分层；
