@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -26,17 +28,43 @@ class ArmStateReader:
         *,
         refresh_hz: float,
         compute_tcp_pose: bool = True,
+        clock: Any = time.time,
     ):
         self.backends = dict(backends)
         self.refresh_hz = float(refresh_hz)
         self.compute_tcp_pose = bool(compute_tcp_pose)
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self.clock = clock
         self._last_refresh_at = {side: 0.0 for side in self.backends}
         self._history_by_side = {
-            side: CausalSnapshotHistory(maxlen=256, name=f"deploy:arm:{side}")
+            side: CausalSnapshotHistory(
+                maxlen=256,
+                name=f"deploy:arm:{side}",
+                clock=self.clock,
+            )
             for side in self.backends
         }
 
-    def snapshot(self, now: float) -> dict[str, dict[str, Any]]:
+    def snapshot(
+        self,
+        now: float,
+        *,
+        cut_after_refresh: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Refresh and select arm state at an explicit causal cut.
+
+        The default preserves the historical/replay contract: ``now`` is the
+        fixed cut, so a read completed after that cut is deliberately not
+        visible.  ``cut_after_refresh`` is for an explicit live, on-demand
+        observation (for example a startup Skill admission): it captures one
+        shared cut after all requested refreshes and selects the newly
+        published state without weakening historical queries.
+        """
+
+        requested_at = float(now)
+        if not math.isfinite(requested_at):
+            raise ValueError("now must be finite")
         states: dict[str, dict[str, Any]] = {}
         refresh_period = 0.0 if self.refresh_hz <= 0.0 else 1.0 / self.refresh_hz
         for side, backend in self.backends.items():
@@ -125,11 +153,20 @@ class ArmStateReader:
                 source_timestamp=source_timestamp,
                 available_timestamp=None,
             )
-            selected = self._history_by_side[side].latest_at_or_before(float(now))
+
+        cutoff = (
+            max(requested_at, float(self.clock()))
+            if cut_after_refresh
+            else requested_at
+        )
+        if not math.isfinite(cutoff):
+            raise ValueError("causal snapshot cutoff must be finite")
+        for side in self.backends:
+            selected = self._history_by_side[side].latest_at_or_before(cutoff)
             if selected is None:
                 states[side] = {
                     "causal_snapshot_missing": True,
-                    "causal_snapshot_cutoff_timestamp": float(now),
+                    "causal_snapshot_cutoff_timestamp": cutoff,
                     "causal_snapshot_contract": (
                         "source_timestamp<=T0_and_available_timestamp<=T0"
                     ),
@@ -145,7 +182,7 @@ class ArmStateReader:
                             selection.available_timestamp
                         ),
                         "causal_snapshot_age_sec": selection.age_sec,
-                        "causal_snapshot_cutoff_timestamp": float(now),
+                        "causal_snapshot_cutoff_timestamp": cutoff,
                         "causal_snapshot_contract": (
                             "source_timestamp<=T0_and_available_timestamp<=T0"
                         ),

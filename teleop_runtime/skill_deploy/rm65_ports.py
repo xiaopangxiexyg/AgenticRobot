@@ -188,6 +188,7 @@ class ExclusiveRM65SkillDeployPorts:
             backends,
             refresh_hz=self.profile.state_refresh_hz,
             compute_tcp_pose=True,
+            clock=clock,
         )
         self._sync_lock = threading.Lock()
         self._target_builder_synchronized = False
@@ -309,7 +310,14 @@ class ExclusiveRM65SkillDeployPorts:
         if not self.resources_started:
             raise RuntimeError("exclusive RM65 Skill resources are not started.")
         requested_at = float(self.clock())
-        states = self.arm_state_reader.snapshot(requested_at)
+        # This is an explicit live observation request, not a historical
+        # replay cut.  The reader refreshes first and then captures one shared
+        # post-refresh causal cut so a just-measured hardware state is not
+        # rejected merely because the SDK call took time.
+        states = self.arm_state_reader.snapshot(
+            requested_at,
+            cut_after_refresh=True,
+        )
         available_at = max(requested_at, float(self.clock()))
         qpos_by_side: dict[str, np.ndarray] = {}
         measured_at_by_side: dict[str, float] = {}
@@ -318,6 +326,11 @@ class ExclusiveRM65SkillDeployPorts:
             state = states.get(side)
             if not isinstance(state, Mapping):
                 raise RuntimeError(f"{side} RM65 hardware state is missing.")
+            if state.get("causal_snapshot_missing") is True:
+                raise RuntimeError(
+                    f"{side} RM65 hardware qpos cut is causally unavailable "
+                    f"at {state.get('causal_snapshot_cutoff_timestamp')!r}."
+                )
             try:
                 qpos = np.asarray(state.get("hardware_qpos"), dtype=float).reshape(6)
                 measured_at = float(state.get("hardware_measurement_timestamp"))

@@ -624,3 +624,34 @@ def test_arm_state_reader_does_not_publish_actual_tcp_pose_after_failed_read() -
 
     assert state["actual_tcp_pose"] is None
     assert state["actual_tcp_pose_source"] is None
+
+
+def test_arm_state_reader_post_refresh_cut_is_live_only() -> None:
+    def build_reader():
+        clock_value = [100.0]
+        backend = _MeasuredDeployArmBackend()
+
+        def refresh_state_from_hardware():
+            clock_value[0] = 100.1
+            backend.measurement_timestamp = clock_value[0]
+            return backend.get_state()
+
+        backend.refresh_state_from_hardware = refresh_state_from_hardware
+        return (
+            ArmStateReader(
+                {"right": backend},
+                refresh_hz=30.0,
+                clock=lambda: clock_value[0],
+            ),
+            clock_value,
+        )
+
+    historical_reader, _ = build_reader()
+    historical = historical_reader.snapshot(100.0)["right"]
+    assert historical["causal_snapshot_missing"] is True
+
+    live_reader, _ = build_reader()
+    live = live_reader.snapshot(100.0, cut_after_refresh=True)["right"]
+    assert live["causal_snapshot_missing"] is False
+    assert live["causal_snapshot_cutoff_timestamp"] == pytest.approx(100.1)
+    assert live["hardware_measurement_timestamp"] == pytest.approx(100.1)

@@ -177,9 +177,7 @@ def _ports(
     age_sec: float = 0.01,
     force_guard_ready: bool = True,
 ):
-    # ArmStateReader publishes availability when get_state returns. Keep the
-    # requested causal cut just after that bounded in-process publication.
-    now = time.time() + 0.05
+    now = time.time()
     events: list[str] = []
     backends = {
         side: _Backend(
