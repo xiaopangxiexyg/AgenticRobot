@@ -28,7 +28,7 @@ from robot_motion.runtime import TeleopCommand, TeleopObservation
 from teleop_runtime.command_override import TeleopCommandOverride
 from teleop_runtime.transforms import validate_pose_matrix
 
-_COMMAND_METADATA_KEY = "real_agent_motion_operation"
+REAL_AGENT_MOTION_COMMAND_METADATA_KEY = "real_agent_motion_operation"
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -956,7 +956,7 @@ class RealAgentMotionPort:
                     source_by_side=source_by_side,
                 )
             )
-            command.metadata[_COMMAND_METADATA_KEY] = {
+            command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = {
                 "operation_id": activation.operation_id,
                 "request_id": activation.request_id,
                 "component_id": activation.component_id,
@@ -1003,7 +1003,9 @@ class RealAgentMotionPort:
         """Deny a stale Agent command if HOLD/cancellation won the race."""
 
         del observation, now
-        operation_metadata = command.metadata.get(_COMMAND_METADATA_KEY)
+        operation_metadata = command.metadata.get(
+            REAL_AGENT_MOTION_COMMAND_METADATA_KEY
+        )
         if not isinstance(operation_metadata, Mapping):
             return True
         operation_id = str(operation_metadata.get("operation_id", ""))
@@ -1024,7 +1026,9 @@ class RealAgentMotionPort:
 
         if command is None:
             return self.snapshot()
-        operation_metadata = command.metadata.get(_COMMAND_METADATA_KEY)
+        operation_metadata = command.metadata.get(
+            REAL_AGENT_MOTION_COMMAND_METADATA_KEY
+        )
         if not isinstance(operation_metadata, Mapping):
             return self.snapshot()
         operation_id = str(operation_metadata.get("operation_id", ""))
@@ -1040,6 +1044,7 @@ class RealAgentMotionPort:
 
 
 __all__ = [
+    "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
     "RealAgentMotionActivation",
     "RealAgentMotionMeasuredPoseCut",
     "RealAgentMotionOwnerCut",

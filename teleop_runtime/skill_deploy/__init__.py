@@ -1,6 +1,7 @@
 """Exclusive real Skill deployment runtime, independent of RealTeleop."""
 
 from .motion_port import (
+    REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
     RealAgentMotionActivation,
     RealAgentMotionMeasuredPoseCut,
     RealAgentMotionOwnerCut,
@@ -11,6 +12,11 @@ from .motion_port import (
     RealAgentMotionPortSnapshot,
     RealAgentMotionTargetBuilder,
     RealSkillMotionControlOwner,
+)
+from .rm65_ports import (
+    ExclusiveRM65SkillDeployPorts,
+    ExclusiveRM65SkillPortProfile,
+    RM65SkillTargetBuilder,
 )
 from .control_runtime import (
     ExclusiveRealSkillControlRuntime,
@@ -23,6 +29,7 @@ from .control_runtime import (
 )
 
 __all__ = [
+    "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
     "RealAgentMotionActivation",
     "RealAgentMotionMeasuredPoseCut",
     "RealAgentMotionOwnerCut",
@@ -40,4 +47,7 @@ __all__ = [
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
     "RealSkillMotionTargetSynchronizer",
+    "ExclusiveRM65SkillDeployPorts",
+    "ExclusiveRM65SkillPortProfile",
+    "RM65SkillTargetBuilder",
 ]
