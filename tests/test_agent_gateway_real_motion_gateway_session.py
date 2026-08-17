@@ -262,6 +262,39 @@ def _request(bundle, snapshot, *, skill_id: str, direction: str | None):
     )
 
 
+def _read_request(bundle, snapshot) -> AgentSkillRequest:
+    entry = bundle.route_manifest.route("state.read_tcp_pose", "1")
+    route = entry.route
+    profile = route.allowed_parameter_profiles[0]
+    return AgentSkillRequest(
+        client_id=CLIENT_ID,
+        request_id="request:state.read_tcp_pose:1",
+        idempotency_key="idempotency:state.read_tcp_pose:1",
+        client_sequence=1,
+        runtime_session_id=bundle.route_manifest.runtime_session_id,
+        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+        expected_station_revision=snapshot.station_revision,
+        skill_id=route.skill_id,
+        skill_version=route.skill_version,
+        skill_definition_hash=route.skill_definition_hash,
+        route_id=route.route_id,
+        route_version=route.route_version,
+        route_hash=route.semantic_content_hash,
+        deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+        parameter_profile_id=profile.parameter_profile_id,
+        parameter_profile_hash=profile.parameter_profile_hash,
+        parameters={
+            "component_ids": list(bundle.attachment.component_ids),
+            "reference_frame_id": bundle.attachment.reference_frame_id,
+            "controlled_frame_id": "tool_tcp",
+            "max_measurement_age_ms": bundle.attachment.max_measurement_age_ms,
+        },
+        observation_snapshot_id=snapshot.snapshot_id,
+        requested_mode="real_active",
+        requested_timeout_ms=1_000,
+    )
+
+
 PRIMITIVE_CASES = (
     *tuple(
         ("motion.step_tcp_cardinal", direction)
@@ -272,6 +305,61 @@ PRIMITIVE_CASES = (
         for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
     ),
 )
+
+
+def test_real_gateway_reads_tcp_pose_without_consuming_motion_grant() -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:read-only",),
+    )
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+    authorization = RealAgentPrimitiveOneShotAuthorization(
+        gateway_session=gateway,
+        side="right",
+        action="forward",
+        client_id=CLIENT_ID,
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        clock=clock,
+    )
+    snapshot = gateway.observation_producer.capture_and_publish(
+        gateway.service
+    ).snapshot
+    assert snapshot is not None
+    submission = gateway.service.submit_request(
+        request=_read_request(bundle, snapshot),
+        current_station_revision=port.snapshot().revision,
+        now=clock(),
+    )
+    assert submission.accepted
+    assert submission.operation is not None
+    launch = gateway.service.launch_operation(submission.operation.operation_id)
+    assert launch.accepted
+    assert gateway.state_executor.wait_all(timeout_sec=1.0)
+    operation = gateway.service.get_operation(submission.operation.operation_id)
+    assert operation is not None
+    assert operation.status == "completed"
+    assert operation.execution_result["component_ids"] == (COMPONENT_ID,)
+    assert operation.execution_result["pose_by_component"][COMPONENT_ID] == (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
+    assert authorization.grant_issued is False
+    assert port.snapshot().dispatch_count == 0
 
 
 @pytest.mark.parametrize(("skill_id", "direction"), PRIMITIVE_CASES)

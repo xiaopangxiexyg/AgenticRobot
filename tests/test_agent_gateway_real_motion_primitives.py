@@ -104,16 +104,24 @@ def _bundle():
     )
 
 
-def test_real_bundle_exposes_six_plus_three_through_four_t2_routes() -> None:
+def test_real_bundle_exposes_read_plus_six_plus_three_motion_primitives() -> None:
     bundle = _bundle()
 
-    assert len(bundle.route_manifest.skill_routes) == 4
+    assert len(bundle.route_manifest.skill_routes) == 5
     assert len(bundle.cardinal_profile.primitives) == 6
     assert {item.skill_id for item in bundle.orientation_profiles} == set(
         FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
     )
+    read = bundle.route_manifest.route("state.read_tcp_pose", "1")
+    assert read.route.privilege_tier == "t0_read_only"
+    assert read.route.control_effect_class == "read_only"
+    assert read.route.supported_modes == ("real_active",)
+    assert read.route.requires_operator_confirmation is False
+    assert read.route.may_move_robot is False
     for entry in bundle.route_manifest.skill_routes:
         route = entry.route
+        if route.control_effect_class == "read_only":
+            continue
         assert route.privilege_tier == "t2_real_motion"
         assert route.supported_modes == ("real_active",)
         assert route.requires_operator_confirmation is True

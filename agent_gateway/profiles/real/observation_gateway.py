@@ -440,11 +440,21 @@ def _payload_validators(
 
 def build_real_tcp_pose_observe_contract_bundle(
     attachment: RealTcpPoseObserveAttachmentSpec,
+    *,
+    current_mode: str = "real_observe",
 ) -> RealTcpPoseObserveContractBundle:
-    """Build one exact real-observe Route without touching a device."""
+    """Build one exact passive Route without touching a device.
+
+    ``real_observe`` remains the standalone attach-only deployment.  The same
+    read-only Skill may also be registered inside an exclusive ``real_active``
+    application so an upper Program can obtain explicit before/after evidence
+    without creating another state or control owner.
+    """
 
     if not isinstance(attachment, RealTcpPoseObserveAttachmentSpec):
         raise TypeError("attachment must be typed.")
+    if current_mode not in {"real_active", "real_observe"}:
+        raise ValueError("current_mode must be real_active or real_observe.")
     definition = tcp_pose_state_definition_v1(
         controlled_component_ids=attachment.component_ids
     )
@@ -480,7 +490,7 @@ def build_real_tcp_pose_observe_contract_bundle(
         allowed_parameter_profiles=schema.parameter_profiles,
         control_effect_class="read_only",
         privilege_tier="t0_read_only",
-        supported_modes=("real_observe",),
+        supported_modes=(current_mode,),
         target_kind="real",
         may_move_robot=False,
         may_open_publication=False,
@@ -523,7 +533,7 @@ def build_real_tcp_pose_observe_contract_bundle(
         skill_schema_catalog_hash=schemas.semantic_content_hash,
         target_binding_id=attachment.target_binding_id,
         target_kind="real",
-        current_mode="real_observe",
+        current_mode=current_mode,
         supported_transport_features=(
             "idempotency_v1",
             "own_operation_cancel_v1",

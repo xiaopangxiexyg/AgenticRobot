@@ -58,7 +58,11 @@ from robot_motion.primitives import (
 )
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
-from .observation_gateway import RealTcpPoseObserveAttachmentSpec
+from .observation_gateway import (
+    RealTcpPoseObserveAttachmentSpec,
+    RealTcpPoseObserveContractBundle,
+    build_real_tcp_pose_observe_contract_bundle,
+)
 from .perception_deployment import RealPerceptionCaptureRegistration
 
 REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1 = (
@@ -418,6 +422,7 @@ class RealAgentPrimitiveContractBundle:
     payload_validators: AgentSkillPayloadValidatorRegistry
     frame_graph: CoordinateFrameGraph
     attachment: RealTcpPoseObserveAttachmentSpec
+    tcp_pose_observe: RealTcpPoseObserveContractBundle
     perception_capture: RealPerceptionCaptureRegistration | None = None
 
     def __post_init__(self) -> None:
@@ -438,7 +443,9 @@ class RealAgentPrimitiveContractBundle:
             )
         if self.route_manifest.skill_io_catalog_hash != self.io_catalog.semantic_content_hash:
             raise ValueError("Real primitive bundle I/O catalog mismatch.")
-        expected_route_count = 4 + (2 if self.perception_capture is not None else 0)
+        if self.tcp_pose_observe.attachment != self.attachment:
+            raise ValueError("Real primitive and TCP-pose attachments disagree.")
+        expected_route_count = 5 + (2 if self.perception_capture is not None else 0)
         if len(self.route_manifest.skill_routes) != expected_route_count:
             raise ValueError("Real perception registration and manifest disagree.")
 
@@ -637,6 +644,10 @@ def build_real_agent_primitive_contract_bundle(
             "Primitive reference frame must declare the canonical Station axis contract."
         )
     convergence = convergence_profile or RealAgentPrimitiveConvergenceProfile()
+    tcp_pose_observe = build_real_tcp_pose_observe_contract_bundle(
+        attachment,
+        current_mode="real_active",
+    )
     cardinal_profile = RealAgentTcpCardinalStepProfile(
         component_id=component_id,
         side=side,
@@ -848,10 +859,14 @@ def build_real_agent_primitive_contract_bundle(
         if perception_capture is None
         else (perception_capture.rgb, perception_capture.depth)
     )
+    tcp_pose_definition = tcp_pose_observe.definition_catalog.skill_definitions[0]
+    tcp_pose_schema = tcp_pose_observe.schema_catalog.schema_entries[0]
+    tcp_pose_entry = tcp_pose_observe.route_manifest.skill_routes[0]
     definitions = SkillDefinitionCatalog(
         catalog_id="dexteleop.agent_skill_definitions.real_motion_primitives",
         catalog_version="1",
         skill_definitions=(
+            tcp_pose_definition,
             cardinal_definition,
             *orientation_definitions,
             *(item.definition for item in perception_registrations),
@@ -861,12 +876,14 @@ def build_real_agent_primitive_contract_bundle(
         catalog_id="dexteleop.agent_skill_schemas.real_motion_primitives",
         catalog_version="1",
         schema_entries=(
+            tcp_pose_schema,
             cardinal_schema,
             *orientation_schemas,
             *(item.schema_entry for item in perception_registrations),
         ),
     )
-    route_items = [
+    route_items = [tcp_pose_entry]
+    route_items.extend(
         SkillRouteManifestEntry(
             route=route,
             deployment_binding=(
@@ -887,7 +904,7 @@ def build_real_agent_primitive_contract_bundle(
             ),
         )
         for route in all_routes
-    ]
+    )
     if perception_capture is not None:
         for registration, deployment_binding in (
             (perception_capture.rgb, perception_capture.rgb_binding),
@@ -970,6 +987,9 @@ def build_real_agent_primitive_contract_bundle(
             + attachment.runtime_session_id
         ),
         validators=(
+            tcp_pose_observe.payload_validators.validator_for(
+                tcp_pose_entry.route
+            ),
             _payload_validator(route=cardinal_route, profile=cardinal_profile),
             *tuple(
                 _payload_validator(route=route, profile=profile)
@@ -998,6 +1018,7 @@ def build_real_agent_primitive_contract_bundle(
         payload_validators=validators,
         frame_graph=frame_graph,
         attachment=attachment,
+        tcp_pose_observe=tcp_pose_observe,
         perception_capture=perception_capture,
     )
 

@@ -151,11 +151,11 @@ class RealAgentPrimitiveObservationProducer:
         if config.component_id_by_side.get(profile.side) != profile.component_id:
             raise ValueError("Real motion port component/side binding mismatch.")
 
-    def capture_snapshot(
+    def _capture_snapshot_with_read_evidence(
         self,
         *,
         active_operation_id: str | None,
-    ) -> AgentObservationSnapshot:
+    ) -> tuple[AgentObservationSnapshot, str, tuple[str, ...], float]:
         now = float(self.clock())
         owner = self._owner_state()
         cut = self.port.latest_measured_pose()
@@ -195,7 +195,7 @@ class RealAgentPrimitiveObservationProducer:
             },
             domain="dexteleop.real_agent_motion.observation_snapshot_id.v1",
         )
-        return AgentObservationSnapshot(
+        snapshot = AgentObservationSnapshot(
             snapshot_id="real-agent-motion-observation:" + snapshot_hash,
             runtime_session_id=attachment.runtime_session_id,
             skill_route_manifest_hash=(
@@ -228,6 +228,108 @@ class RealAgentPrimitiveObservationProducer:
             },
             measurement_freshness_ms=age_ms,
             measurement_valid=True,
+        )
+        return (
+            snapshot,
+            cut.semantic_content_hash,
+            tuple(sorted((*owner.evidence_refs, *cut.evidence_refs))),
+            now,
+        )
+
+    def capture_snapshot(
+        self,
+        *,
+        active_operation_id: str | None,
+    ) -> AgentObservationSnapshot:
+        snapshot, _, _, _ = self._capture_snapshot_with_read_evidence(
+            active_operation_id=active_operation_id,
+        )
+        return snapshot
+
+    def read_tcp_pose(
+        self,
+        *,
+        active_operation_id: str,
+        parameters: Mapping[str, object],
+    ) -> PassiveReadResult:
+        route = self.contract_bundle.route_manifest.route(
+            "state.read_tcp_pose",
+            "1",
+        ).route
+        self.contract_bundle.payload_validators.validate_parameters(
+            route=route,
+            payload=parameters,
+        )
+        snapshot, source_measurement_hash, evidence_refs, cutoff_at = (
+            self._capture_snapshot_with_read_evidence(
+                active_operation_id=active_operation_id,
+            )
+        )
+        attachment = self.contract_bundle.attachment
+        requested_components = tuple(sorted(parameters["component_ids"]))
+        all_poses = snapshot.measurement_summary[
+            "pose_xyz_quat_xyzw_by_component"
+        ]
+        poses = {
+            component_id: list(all_poses[component_id])
+            for component_id in requested_components
+        }
+        measurement_observation_hash = canonical_content_hash(
+            {
+                "attachment_hash": attachment.semantic_content_hash,
+                "source_measurement_hash": source_measurement_hash,
+                "poses": poses,
+            },
+            domain="dexteleop.real_agent_motion.tcp_pose_measurement_observation.v1",
+        )
+        observation_cut_hash = canonical_content_hash(
+            {
+                "snapshot_id": snapshot.snapshot_id,
+                "source_measurement_hash": source_measurement_hash,
+                "cutoff_at": cutoff_at,
+                "active_operation_id": active_operation_id,
+            },
+            domain="dexteleop.real_agent_motion.tcp_pose_read_cut.v1",
+        )
+        result = {
+            "observation_cut_id": "real-agent-motion-cut:" + observation_cut_hash,
+            "observation_cut_hash": observation_cut_hash,
+            "cutoff_at": cutoff_at,
+            "cutoff_clock_domain_id": attachment.clock_domain_id,
+            "component_ids": list(requested_components),
+            "reference_frame_id": attachment.reference_frame_id,
+            "reference_frame_spec_hash": attachment.reference_frame_spec_hash,
+            "controlled_frame_id": "tool_tcp",
+            "frame_graph_hash": attachment.frame_graph_hash,
+            "tool_config_hash": attachment.tool_config_hash,
+            "calibration_hash": attachment.calibration_hash,
+            "measurement_id": "real-agent-measured-pose:" + source_measurement_hash,
+            "measurement_observation_hash": measurement_observation_hash,
+            "source_measurement_hash": source_measurement_hash,
+            "measured_at": snapshot.captured_at,
+            "available_at": snapshot.available_at,
+            "clock_domain_id": attachment.clock_domain_id,
+            "pose_by_component": poses,
+            "pose_schema_hash_by_component": {
+                component_id: attachment.pose_schema_hash
+                for component_id in requested_components
+            },
+            "representation_by_component": {
+                component_id: "cartesian_pose"
+                for component_id in requested_components
+            },
+            "observation_binding_id": attachment.observation_binding_id,
+            "observation_plan_hash": attachment.observation_plan_hash,
+        }
+        self.contract_bundle.payload_validators.validate_execution_result(
+            route=route,
+            payload=result,
+            request_parameters=parameters,
+        )
+        return PassiveReadResult(
+            execution_result=result,
+            evidence_refs=evidence_refs,
+            reason_code="passive_real_tcp_pose_read_completed",
         )
 
     def capture_and_publish(self, service: AgentGatewayService):
@@ -312,6 +414,7 @@ class RealAgentPrimitiveGatewaySession:
     port: RealAgentMotionPort
     observation_producer: RealAgentPrimitiveObservationProducer
     executors_by_skill_id: Mapping[str, ReusableStationAgentSkillOperationExecutor]
+    state_executor: PassiveReadSkillExecutor
     perception_provider: RealSenseAgentPerceptionProvider | None
     rgb_executor: PassiveReadSkillExecutor | None
     depth_executor: PassiveReadSkillExecutor | None
@@ -335,6 +438,8 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError("Real perception requires both passive executors.")
         if self.owns_artifact_store and self.artifact_store is None:
             raise ValueError("Owned Artifact store must be present.")
+        if not isinstance(self.state_executor, PassiveReadSkillExecutor):
+            raise TypeError("Real TCP-pose state executor must be passive.")
 
     def wire_adapter(
         self,
@@ -408,13 +513,17 @@ class RealAgentPrimitiveGatewaySession:
                     )
                 )
             outcome = self._close_outcome
-            perception_settled = all(
+            passive_reads_settled = all(
                 executor is None or executor.wait_all(timeout_sec=5.0)
-                for executor in (self.rgb_executor, self.depth_executor)
+                for executor in (
+                    self.state_executor,
+                    self.rgb_executor,
+                    self.depth_executor,
+                )
             )
-            if not perception_settled:
+            if not passive_reads_settled:
                 raise RuntimeError(
-                    "Passive real perception did not quiesce before Gateway close."
+                    "Passive real reads did not quiesce before Gateway close."
                 )
             receipt = outcome.port_receipt
             if (
@@ -509,6 +618,27 @@ def assemble_real_agent_primitive_gateway_session(
 
     executors: dict[str, ReusableStationAgentSkillOperationExecutor] = {}
     execution_port_by_route_hash = {}
+    state_entry = contract_bundle.route_manifest.route(
+        "state.read_tcp_pose",
+        "1",
+    )
+    state_executor = PassiveReadSkillExecutor(
+        port_id=(
+            "agent-gateway:real-passive-tcp-pose:"
+            + contract_bundle.route_manifest.runtime_session_id
+        ),
+        executor_id=contract_bundle.tcp_pose_observe.deployment_binding.executor_id,
+        read=lambda request, operation: producer.read_tcp_pose(
+            active_operation_id=operation.operation_id,
+            parameters=request.parameters,
+        ),
+        current_station_revision=lambda: producer.current_station_revision,
+        clock=clock,
+        max_retained_operations=max_retained_operations,
+    )
+    execution_port_by_route_hash[
+        state_entry.route.semantic_content_hash
+    ] = state_executor
     motion_entries = tuple(
         entry
         for entry in contract_bundle.route_manifest.skill_routes
@@ -824,6 +954,7 @@ def assemble_real_agent_primitive_gateway_session(
         port=port,
         observation_producer=producer,
         executors_by_skill_id=executors,
+        state_executor=state_executor,
         perception_provider=perception_provider,
         rgb_executor=rgb_executor,
         depth_executor=depth_executor,
