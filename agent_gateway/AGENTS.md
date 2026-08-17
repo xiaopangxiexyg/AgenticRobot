@@ -63,6 +63,18 @@ Each motion Route must pin exactly one compatible lower safety envelope; a
 larger fixed-orientation range must not silently widen the generic/cardinal
 envelope.
 
+Concrete real profiles must also distinguish the public controlled frame from
+the solver endpoint frame. In the current RM65/DMTAC binding, public Skill
+observations and activation targets are `tool_tcp`, while
+`BimanualPoseTarget.target_pose_by_side` is consumed by the coupled solver as a
+solver-world endpoint. The tool profile is authoritative; current DMTAC
+profiles commonly have roughly `0.14m` of translation but that value must not
+be hard-coded. The lower target owner must perform the one canonical
+`solver_world_target_from_tool_tcp_world_target()` conversion, and a missing
+conversion capability must fail closed. Gateway/Agent code must not duplicate
+this tool geometry. The concrete frame details and non-zero-offset test rule
+are documented in `agent_gateway/README.md` and `teleop_runtime/README.md`.
+
 Real motion remains default-off. The exact profile must require a one-use,
 request-bound operator Grant, a fresh lower-measured pose cut, a RUNNING/READY
 lower owner cut, and terminal lower-confirmed HOLD. Do not reinterpret the
