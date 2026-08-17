@@ -55,8 +55,9 @@ def _activation(*, expires_at: float = 2.0) -> RealAgentMotionActivation:
 
 
 class _TargetBuilder:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, tcp_offset_m: float = 0.0) -> None:
         self.fail = fail
+        self.tcp_offset_m = float(tcp_offset_m)
         self.targets = []
 
     def current_tool_tcp_world_targets(self):
@@ -64,6 +65,18 @@ class _TargetBuilder:
             "left": _pose(x=0.25, y=0.20, z=0.30),
             "right": _pose(x=0.25, y=-0.20, z=0.30),
         }
+
+    def solver_world_target_from_tool_tcp_world_target(
+        self,
+        *,
+        side,
+        tool_tcp_world_target,
+    ):
+        del side
+        tool_tcp = np.asarray(tool_tcp_world_target, dtype=float)
+        tool_tcp_from_solver = np.eye(4, dtype=float)
+        tool_tcp_from_solver[2, 3] = self.tcp_offset_m
+        return tool_tcp @ np.linalg.inv(tool_tcp_from_solver)
 
     def build_command_for_target_pair(self, target):
         self.targets.append(target)
@@ -127,6 +140,11 @@ def _components_for_attachment(
     return RealTeleopComponents(**values)
 
 
+def test_port_rejects_target_builder_without_tcp_solver_conversion() -> None:
+    with pytest.raises(TypeError, match="tool-TCP-to-solver-world"):
+        _port(object())
+
+
 def test_owner_activation_builds_through_coupled_target_solver() -> None:
     builder = _TargetBuilder()
     port = _port(builder)
@@ -171,6 +189,48 @@ def test_owner_activation_builds_through_coupled_target_solver() -> None:
     )
     assert observed.dispatch_count == 1
     assert observed.last_command_at == 1.2
+
+
+def test_owner_activation_converts_tcp_target_before_solver_boundary() -> None:
+    builder = _TargetBuilder(tcp_offset_m=0.14)
+    port = _port(builder)
+    pending = port.submit_activation(_activation())
+    assert pending.phase == RealAgentMotionPhase.PENDING_ACTIVATION
+    port.apply_owner_requests(
+        session=_Session(TeleopRunState.ARMED),
+        now=1.1,
+    )
+
+    command = port.command_for_observation(
+        TeleopObservation(timestamp=1.2),
+        1.2,
+    )
+    assert isinstance(command, TeleopCommand)
+    assert len(builder.targets) == 1
+    target = builder.targets[0]
+
+    expected_solver_target = _activation().target_pose_world.copy()
+    expected_solver_target[2, 3] -= 0.14
+    expected_inactive_solver_target = _pose(x=0.25, y=0.20, z=0.30)
+    expected_inactive_solver_target[2, 3] -= 0.14
+    np.testing.assert_allclose(
+        target.target_pose_by_side["left"],
+        expected_inactive_solver_target,
+    )
+    np.testing.assert_allclose(
+        target.target_pose_by_side["right"],
+        expected_solver_target,
+    )
+    np.testing.assert_allclose(
+        target.source_by_side["right"].value,
+        _activation().target_pose_world,
+    )
+    assert target.source_by_side["right"].metadata["controlled_frame_id"] == (
+        "tool_tcp"
+    )
+    assert target.source_by_side["right"].metadata[
+        "solver_target_pose_semantics"
+    ] == "solver_world_endpoint"
 
 
 def test_hold_request_wins_admission_race_and_is_applied_by_owner() -> None:

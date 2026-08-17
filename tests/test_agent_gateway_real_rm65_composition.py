@@ -80,6 +80,14 @@ class _TargetBuilder:
     ):
         return np.asarray(solver_world_target, dtype=float).copy()
 
+    def solver_world_target_from_tool_tcp_world_target(
+        self,
+        *,
+        side,
+        tool_tcp_world_target,
+    ):
+        return np.asarray(tool_tcp_world_target, dtype=float).copy()
+
     def tool_tcp_world_targets_for_qpos_pair(self, **kwargs):
         raise AssertionError("default-off composition must not read state")
 
