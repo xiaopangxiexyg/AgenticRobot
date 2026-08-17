@@ -38,8 +38,9 @@ receive no additional control-plane traffic or newer JSON fields.
 
 ## Start a calibrated pair
 
-The current local collector, real-teleop, calibration-debug, SAPIEN-debug,
-and common `VivePoseSource` builder paths listen on UDP 10001 by default.
+The current local collector, real-teleop, calibration-debug, retained legacy
+SAPIEN-debug, and common `VivePoseSource` builder paths listen on UDP 10001 by
+default.
 The default is non-blocking (`auto` behavior): an old sender continues to
 work and channel metadata reports `clock_sync_status=unavailable`. Use
 `--vive-clock-sync-required` when a recording must not begin until a mapping

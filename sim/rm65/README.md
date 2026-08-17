@@ -4,6 +4,11 @@
 RM65 embodiment. It is deliberately above any one physics engine and must not
 import `teleop_runtime` or initialize real hardware.
 
+`sapien_renderer.py` is an explicit frozen exception retained for historical
+debug-preview reproduction. It is not part of the current RM65 simulation
+route, must not receive new callers or features, and must not be used as
+real2sim, task-physics, release-readiness, or validation evidence.
+
 ```text
 sim/rm65/
   actuation/
@@ -14,7 +19,7 @@ sim/rm65/
     artifact.py       # evidence/claim/validation contract
     gripper_position_fit.py  # offline DM-Tac free-motion position fit
     artifacts/        # content-addressed fit indexes and manifests
-  sapien_renderer.py  # operator/debug preview adapter
+  sapien_renderer.py  # frozen retained legacy preview only
 
 sim/mujoco/actuation/
   executor.py         # writes RM65 core targets to MuJoCo and reads measured qpos

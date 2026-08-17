@@ -7,14 +7,14 @@
 单独安装到 `.venv-annotation`，供不连接真机的异机标注使用。
 
 快速路径：只做后期标注看第 2 节；完整环境首次安装看第 1、3 节；验证主环境看第 5 节；
-Isaac Gym 单独看第 6 节；MuJoCo/SAPIEN 看第 7 节；只有设备权限问题才进入第 8 节。项目运行命令不在本文维护，完成
+Isaac Gym 单独看第 6 节；MuJoCo 和冻结保留的 SAPIEN 兼容依赖看第 7 节；只有设备权限问题才进入第 8 节。项目运行命令不在本文维护，完成
 环境后回到 [运行文档索引](./docs/README.md)。
 
 ## 1. 环境边界与唯一来源
 
 | 环境 | 用途 | 是否属于主环境 |
 | --- | --- | --- |
-| `dexteleop310` / Python 3.10 | 项目代码、测试、数据集、MuJoCo/SAPIEN、OpenPI client、真机硬件 | 是 |
+| `dexteleop310` / Python 3.10 | 项目代码、测试、数据集、MuJoCo、冻结的 SAPIEN 历史兼容、OpenPI client、真机硬件 | 是 |
 | `.venv-annotation` / Python 3.10 | 封存 Episode 的细粒度阶段标注；无设备、控制、仿真和训练能力 | 否，独立轻量环境 |
 | `isaacgym38` / Python 3.8 | Isaac Gym Preview 4 real2sim 检查 | 否，因上游 Python 限制独立 |
 | OpenPI server / GPU | 模型加载和 JAX/CUDA 推理服务 | 否，使用 OpenPI 自己的 `uv` 环境 |
@@ -196,7 +196,7 @@ bash scripts/install_conda_env.sh --env-name "$DEXTELEOP_ENV_NAME"
 | `test` | pytest | 是 |
 | `dataset` | Pandas、PyArrow、Pillow | 是 |
 | `annotation` | 独立标注所需的 NumPy、SciPy、OSQP、PyArrow | 是；也可单独安装 |
-| `sim` | MuJoCo、Gymnasium、SAPIEN | 是 |
+| `sim` | MuJoCo、Gymnasium，以及冻结保留入口所需的 SAPIEN 兼容依赖 | 是 |
 | `model` | PyTorch 2.10、临时 PPO 训练与 checkpoint 推理 | 是 |
 | `openpi` | DexTeleop OpenPI websocket/msgpack client | 是 |
 | `vla_scratch` | 直接运行 vla-scratch 原生 ZMQ client 所需的 `pyzmq`；不包含模型/server | 是 |
@@ -443,10 +443,12 @@ export DEXTELEOP_REAL2SIM_URDF="${DEXTELEOP_ROOT:?set DEXTELEOP_ROOT}/assets/rm6
 - 左右 `arm_link6` 末端挂载的法兰、D405、`left_camera_rgb` / `right_camera_rgb`
 - 左右 gripper 几何
 
-## 7. MuJoCo / SAPIEN 验证
+## 7. MuJoCo 验证与冻结保留的 SAPIEN 兼容依赖
 
-MuJoCo 和 SAPIEN 已由完整主环境安装。官方 Python binding 包内已经包含 MuJoCo library，不需要另行
-下载 MuJoCo 二进制，也不要在主环境中再执行一套不受项目元数据约束的 `pip install`。
+MuJoCo 是当前 canonical 仿真路线。完整安装脚本使用 `--all-extras`，因此仍会安装冻结历史入口
+所需的 SAPIEN；这只是为了让保留代码可导入和复现旧诊断，不表示 SAPIEN 仍是当前仿真、验证或
+发布能力，也不应为它新增功能或调用方。官方 Python binding 包内已经包含 MuJoCo library，不需要
+另行下载 MuJoCo 二进制，也不要在主环境中再执行一套不受项目元数据约束的 `pip install`。
 
 ```bash
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"

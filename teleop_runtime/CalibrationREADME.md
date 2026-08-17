@@ -1,5 +1,10 @@
 # Calibration README
 
+> **SAPIEN 状态**：本文保留的 SAPIEN frame preview 和
+> `run_vive_sapien_virtual.py` 命令只用于复现历史标定诊断，不再是当前开发、验收或发布
+> 路线。新的标定呈现应使用 Web UI、MuJoCo 或 backend-neutral observer；不要为历史入口
+> 新增功能或调用方。下面未改写的命令仅说明保留代码原有行为。
+
 这份文档只说明**当前已经落地的** VIVE -> RM65 标定调试流程。  
 它对应的入口是：
 

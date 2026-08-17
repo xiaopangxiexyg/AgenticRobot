@@ -3,14 +3,18 @@
 > 本页说明仿真架构和模块边界。当前可直接运行的仿真命令统一从
 > [`docs/sim/README.md`](../docs/sim/README.md) 复制。
 
+> **SAPIEN 状态（冻结保留）**：SAPIEN 已不属于当前仿真、real2sim、验证或发布路线。
+> 现有 renderer 和历史调试入口暂时保留，以复现旧的 tracker/operator preview；它们不再
+> 接受新功能、新调用方或新的验证结论。后续任务物理、数据回放和可视化工作统一优先落到
+> MuJoCo 或 backend-neutral 工具。保留源码不表示 SAPIEN 仍是受支持框架能力。
+
 ## Backend roles
 
 - **MuJoCo is the canonical task-physics backend** for real2sim, task scenes,
   contact, system identification, policy rollout, and later sim2real checks.
-- **SAPIEN remains a teleop/debug preview**; its RM65 renderer lives in
-  `sim/rm65`, while entrypoints remain in `teleop_runtime`. It is useful for
-  tracker mapping and operator visualization, but it is not the canonical
-  task-physics source of truth.
+- **SAPIEN is a frozen retained legacy preview**. Its RM65 renderer remains in
+  `sim/rm65` only for old diagnostic reproduction; it is not a current backend,
+  a release target, or a source of new task-physics/validation evidence.
 - MuJoCo `replay/` keeps an explicit kinematic diagnostic profile. It may set
   qpos directly for camera/geometry checks and must not be reported as a
   dynamic manipulation rollout.
@@ -35,7 +39,7 @@ sim/
   rm65/                       # engine-independent RM65 embodiment behavior/evidence
     actuation/                # causal qcmd -> actuator-target profile and core
     real2sim/                 # fit indexes, manifests and fidelity contracts
-    sapien_renderer.py        # SAPIEN operator/debug preview adapter
+    sapien_renderer.py        # frozen retained legacy preview; no new callers/features
   mujoco/
     actuation/                # thin MuJoCo bindings for RM65/DM-Tac actuators
     deploy/                   # shared-control observation/action/backend binding; no teleop_runtime dependency
