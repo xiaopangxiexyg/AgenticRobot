@@ -127,3 +127,5 @@ dry-run，再显式应用。
 - 实验命令通过验收后再提升；旧说明迁入 `legacy/`，保留替代关系。
 - 真机遥操参数数组只在 [`docs/real/teleop_args.sh`](./real/teleop_args.sh)维护。
 - 带日期、数据来源和源码哈希的评估结果放入所属领域的 `reports/`，不与当前运行入口并列。
+- 新增、移动或删除文档后运行 `python scripts/check_docs_navigation.py`；检查器只验证
+  repository-local 链接、顶层入口可达性、evidence 索引和 `todos/` 边界，不访问外部链接或执行文档命令。
