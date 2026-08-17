@@ -4,6 +4,10 @@
 VIVE + Q6/angle-trigger 输入经过 component-keyed composition 后，只驱动 MuJoCo。
 它不会构造真实 RM65 backend，也不会改变既有 teleop、replay、deploy 或 RTC 路径。
 后文仍保留历史 `CS-6b1f` replay→human takeover 说明，并明确标为历史 profile。
+当前 ownership、四类公开 Sim-HIL profile 与未完成 trajectory/real gate 见
+[HITL 当前边界](../architecture/plans/hitl_chunk_relative_migration_plan.md)；原 R0-R4、
+R3.1a-c 的完整设计与实施记录见
+[HITL 历史台账](../architecture/reports/hitl_chunk_relative_ledger_20260807.md)。
 
 ## 0. 架构边界：五个正交平面
 

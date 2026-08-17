@@ -34,9 +34,11 @@ consumer needs them.
   transport, and downstream authority gates. The original RTC-0 to RTC-7 and
   R-R/MRTC ledger is preserved under
   [`../reports/`](../reports/rtc_landing_ledger_20260725.md).
-- [HITL chunk-relative migration](hitl_chunk_relative_migration_plan.md):
-  relative HITL session, handback, coordinator, device binding, and durable
-  evidence boundaries.
+- [HITL and chunk-relative control](hitl_chunk_relative_migration_plan.md):
+  current exclusive/continuous Sim-HIL profiles, application/composition/
+  trajectory ownership, strict GUI subset, real-binding limits, and remaining
+  handback gates. The original R0 to R4 and R3.1a-c ledger is preserved under
+  [`../reports/`](../reports/hitl_chunk_relative_ledger_20260807.md).
 
 ## Structure-remediation ledger
 
