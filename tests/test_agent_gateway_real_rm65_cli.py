@@ -70,6 +70,39 @@ def test_cli_rejects_confirmation_before_profile_or_hardware_resolution(
     assert called is False
 
 
+def test_cli_accepts_a_list_of_reviewed_actions_for_temporary_testing() -> None:
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN)
+    action_index = argv.index("--authorized-action")
+    del argv[action_index : action_index + 2]
+    argv.extend(
+        [
+            "--authorized-actions",
+            "forward",
+            "backward",
+            "left",
+            "right",
+            "up",
+            "down",
+            "level_forward",
+            "level_forward_left_30",
+            "level_forward_right_30",
+        ]
+    )
+    parsed = gateway_cli.build_parser().parse_args(argv)
+    assert parsed.authorized_action is None
+    assert tuple(parsed.authorized_actions) == (
+        "forward",
+        "backward",
+        "left",
+        "right",
+        "up",
+        "down",
+        "level_forward",
+        "level_forward_left_30",
+        "level_forward_right_30",
+    )
+
+
 def test_cli_rejects_partial_perception_attachment_before_profile_resolution(
     monkeypatch,
 ) -> None:

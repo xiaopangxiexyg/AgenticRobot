@@ -42,6 +42,7 @@ from agent_gateway.runtime.service import (
     AgentGatewayOperationOutcome,
     AgentGatewayService,
 )
+from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
 from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleControlEvidence,
     StationOperationWorkerBinding,
@@ -92,6 +93,7 @@ class RealAgentPrimitiveObservationProducer:
         contract_bundle: RealAgentPrimitiveContractBundle,
         port: RealAgentMotionPort,
         owner_state_provider: Callable[[], RealControlOwnerState],
+        revision_tracker: AgentStationRevisionTracker | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not isinstance(contract_bundle, RealAgentPrimitiveContractBundle):
@@ -103,12 +105,62 @@ class RealAgentPrimitiveObservationProducer:
         self.contract_bundle = contract_bundle
         self.port = port
         self.owner_state_provider = owner_state_provider
+        self.revision_tracker = (
+            AgentStationRevisionTracker()
+            if revision_tracker is None
+            else revision_tracker
+        )
+        if not isinstance(self.revision_tracker, AgentStationRevisionTracker):
+            raise TypeError("revision_tracker must be an AgentStationRevisionTracker.")
         self.clock = clock
         self._validate_port_binding()
 
     @property
     def current_station_revision(self) -> int:
-        return self.port.snapshot().revision
+        return self._observe_control_state()
+
+    def _control_fingerprint(self) -> dict[str, object]:
+        """Return only state that can change admission semantics.
+
+        The lower port revision also advances for every measured/control cycle
+        and for dispatch bookkeeping. Those are fresh measurement facts, not
+        optimistic-concurrency changes to the station control state.
+        """
+
+        attachment = self.contract_bundle.attachment
+        port_snapshot = self.port.snapshot()
+        owner_cut = self.port.latest_owner_state()
+        fingerprint: dict[str, object] = {
+            "runtime_session_id": attachment.runtime_session_id,
+            "control_domain_id": attachment.control_domain_id,
+            "target_binding_id": attachment.target_binding_id,
+            "execution_manifest_hash": attachment.execution_manifest_hash,
+            "phase": port_snapshot.phase.value,
+            "operation_id": port_snapshot.operation_id,
+            "request_id": port_snapshot.request_id,
+            "activation_grant_id": port_snapshot.activation_grant_id,
+            "hold_reason": port_snapshot.hold_reason,
+            "hold_succeeded": port_snapshot.hold_succeeded,
+            "fault": port_snapshot.fault,
+        }
+        if owner_cut is not None:
+            fingerprint.update(
+                {
+                    "owner_token_id": owner_cut.owner_token_id,
+                    "owner_kind": owner_cut.owner_kind,
+                    "owner_generation": owner_cut.owner_generation,
+                    "authority_epoch": owner_cut.authority_epoch,
+                    "execution_epoch": owner_cut.execution_epoch,
+                    "lifecycle_state": owner_cut.lifecycle_state,
+                    "execution_gate": owner_cut.execution_gate,
+                }
+            )
+        return fingerprint
+
+    def _observe_control_state(self) -> int:
+        return self.revision_tracker.observe(
+            self._control_fingerprint()
+        ).station_revision
 
     def _owner_state(self) -> RealControlOwnerState:
         owner = self.owner_state_provider()
@@ -184,7 +236,7 @@ class RealAgentPrimitiveObservationProducer:
             ]
             for component_id, pose in cut.pose_world_by_component.items()
         }
-        station_revision = self.current_station_revision
+        station_revision = self._observe_control_state()
         snapshot_hash = canonical_content_hash(
             {
                 "manifest_hash": self.contract_bundle.route_manifest.semantic_content_hash,
@@ -559,6 +611,7 @@ def assemble_real_agent_primitive_gateway_session(
     perception_provider: RealSenseAgentPerceptionProvider | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
+    revision_tracker: AgentStationRevisionTracker | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RealAgentPrimitiveGatewaySession:
@@ -601,6 +654,7 @@ def assemble_real_agent_primitive_gateway_session(
         contract_bundle=contract_bundle,
         port=port,
         owner_state_provider=owner_state_provider,
+        revision_tracker=revision_tracker,
         clock=clock,
     )
     if perception_provider is not None:
