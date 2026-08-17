@@ -2423,6 +2423,11 @@ def test_reference_deadline_burst_faults_instead_of_catching_up() -> None:
         ]
         assert timing_events
         assert timing_events[-1]["skipped_ticks"] > 1
+        assert timing_events[-1]["reference_worker_ident"] > 0
+        assert timing_events[-1]["reference_worker_native_id"] > 0
+        assert timing_events[-1]["phase_timing_ms"][
+            "arm_dispatch_callback"
+        ] >= 50.0
         assert timing_events[-1]["classification"] in {
             "thread_cpu_overrun",
             "non_cpu_wall_stall",

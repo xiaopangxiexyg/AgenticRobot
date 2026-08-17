@@ -3044,9 +3044,48 @@ class PositionDeployExecutor:
                         timing_classification = "combined_minor_overrun"
                     else:
                         timing_classification = "on_time"
+                    last_reference_metadata = dict(
+                        self._last_reference_metadata or {}
+                    )
+                    phase_timing_ms = {
+                        output_key: float(value)
+                        for output_key, metadata_key in {
+                            "collision_frame_total": (
+                                "position_collision_frame_total_ms"
+                            ),
+                            "collision_selection": (
+                                "position_collision_selection_ms"
+                            ),
+                            "collision_horizon": (
+                                "position_collision_horizon_plan_ms"
+                            ),
+                            "collision_validation": (
+                                "position_collision_validation_ms"
+                            ),
+                            "collision_endpoint_fk": (
+                                "position_collision_endpoint_fk_ms"
+                            ),
+                            "collision_shadow": (
+                                "position_collision_shadow_metadata_ms"
+                            ),
+                            "collision_precompute_submit": (
+                                "position_collision_precompute_submit_ms"
+                            ),
+                            "arm_dispatch_callback": (
+                                "position_arm_dispatch_callback_ms"
+                            ),
+                        }.items()
+                        if (value := last_reference_metadata.get(metadata_key))
+                        is not None
+                    }
                     timing_metadata = {
                         "reference_hz": float(self.config.reference_hz),
                         "reference_period_ms": float(reference_period_ms),
+                        "reference_sequence": last_reference_metadata.get(
+                            "position_reference_sequence"
+                        ),
+                        "reference_worker_ident": threading.get_ident(),
+                        "reference_worker_native_id": threading.get_native_id(),
                         "scheduled_timestamp": float(next_tick),
                         "emit_started_timestamp": float(emit_started),
                         "emit_completed_timestamp": float(after),
@@ -3062,6 +3101,7 @@ class PositionDeployExecutor:
                         ),
                         "queue_depth_after_drain": int(queue_depth_after_drain),
                         "classification": timing_classification,
+                        "phase_timing_ms": phase_timing_ms,
                     }
                     self._reference_timing_observation_count += 1
                     self._last_reference_timing = dict(timing_metadata)
@@ -3092,9 +3132,6 @@ class PositionDeployExecutor:
                             max_skip_burst is not None
                             and skipped > max_skip_burst
                         ):
-                            last_reference_metadata = dict(
-                                self._last_reference_metadata or {}
-                            )
                             planner_frame_total_ms = last_reference_metadata.get(
                                 "position_collision_frame_total_ms"
                             )
