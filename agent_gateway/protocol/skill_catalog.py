@@ -954,6 +954,13 @@ class SkillExecutionRoute:
             self.may_move_robot or self.may_open_publication
         ):
             raise ValueError("Read-only Routes cannot move or open publication.")
+        if effect == "read_only" and (
+            tier != "t0_read_only" or self.cancellation_policy != "cancel_only"
+        ):
+            raise ValueError(
+                "Read-only Routes must use t0_read_only and cancel_only so "
+                "Skill cancellation cannot invoke downstream HOLD/control."
+            )
         if effect == "motion" and not self.may_move_robot:
             raise ValueError("Motion Routes must declare may_move_robot=true.")
         if tier == "t0_read_only" and (
@@ -1670,6 +1677,10 @@ def validate_skill_route_catalog_closure(
             raise ValueError("Route references an unknown Skill definition.") from error
         if route.skill_definition_hash != definition.semantic_content_hash:
             raise ValueError("Route Skill definition hash mismatch.")
+        validate_skill_definition_route_effect(
+            definition=definition,
+            route=route,
+        )
         review = advertised.deployment_binding.cross_target_deployment_review
         intended_target = definition.intended_target_kind
         deployed_target = route.target_kind
@@ -1754,6 +1765,30 @@ def validate_skill_route_catalog_closure(
                 )
 
 
+def validate_skill_definition_route_effect(
+    *,
+    definition: SkillDefinition,
+    route: SkillExecutionRoute,
+) -> None:
+    """Close semantic Skill kind over its only permitted control effect."""
+
+    if not isinstance(definition, SkillDefinition):
+        raise TypeError("definition must be a SkillDefinition.")
+    if not isinstance(route, SkillExecutionRoute):
+        raise TypeError("route must be a SkillExecutionRoute.")
+    expected_effect = {
+        "inspection": "read_only",
+        "lifecycle": "lifecycle",
+        "motion": "motion",
+        "policy_task": "motion",
+    }[definition.skill_kind]
+    if route.control_effect_class != expected_effect:
+        raise ValueError(
+            f"Skill kind {definition.skill_kind!r} requires Route control "
+            f"effect {expected_effect!r}."
+        )
+
+
 __all__ = [
     "AGENT_SKILL_CANCELLATION_POLICIES_V1",
     "AGENT_SKILL_CONTROL_EFFECT_CLASSES_V1",
@@ -1793,6 +1828,7 @@ __all__ = [
     "agent_skill_schema_document_hash",
     "validate_route_id",
     "validate_skill_id",
+    "validate_skill_definition_route_effect",
     "validate_skill_route_catalog_closure",
     "validate_version",
 ]

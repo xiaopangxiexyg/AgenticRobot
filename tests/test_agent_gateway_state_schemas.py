@@ -273,9 +273,5 @@ def test_state_route_must_remain_t0_read_only_without_task_evaluation() -> None:
     route = _route(entry)
     validate_agent_state_route_schema_v1(route=route, schema_entry=entry)
 
-    hold_on_cancel = replace(route, cancellation_policy="hold_on_cancel")
-    with pytest.raises(ValueError, match="strictly T0 read-only"):
-        validate_agent_state_route_schema_v1(
-            route=hold_on_cancel,
-            schema_entry=entry,
-        )
+    with pytest.raises(ValueError, match="t0_read_only and cancel_only"):
+        replace(route, cancellation_policy="hold_on_cancel")

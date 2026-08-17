@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -164,6 +165,21 @@ def test_registration_builder_canonicalizes_input_order() -> None:
         expected
     )
     assert tuple(item.skill_id for item in catalogs.io_catalog.io_contracts) == expected
+
+
+def test_registration_rejects_inspection_route_with_control_effects() -> None:
+    registration = _registration()[0]
+    route = registration.routes[0]
+    effectful = replace(
+        route,
+        control_effect_class="motion",
+        privilege_tier="t1_sim_or_no_motion",
+        may_move_robot=True,
+        cancellation_policy="hold_on_disconnect_or_timeout",
+    )
+
+    with pytest.raises(ValueError, match="inspection.*read_only"):
+        replace(registration, routes=(effectful,))
 
 
 def _artifact_runtime(tmp_path: Path):

@@ -58,6 +58,20 @@ class SkillExecutorBinding:
         no_io = getattr(self.execution_port, "no_io", None)
         if not isinstance(no_io, bool):
             raise TypeError("execution_port must declare boolean no_io.")
+        execution_effect = getattr(
+            self.execution_port,
+            "control_effect_class",
+            None,
+        )
+        if not no_io and execution_effect != self.control_effect_class:
+            raise ValueError(
+                "Authoritative execution port control_effect_class does not "
+                "match its Route."
+            )
+        if no_io and execution_effect not in {None, self.control_effect_class}:
+            raise ValueError(
+                "No-I/O execution port control_effect_class contradicts its Route."
+            )
         _required(
             getattr(self.execution_port, "port_id", None),
             field_name="execution_port.port_id",

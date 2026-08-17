@@ -79,6 +79,7 @@ class ReusableStationAgentSkillOperationExecutor:
     """
 
     no_io = False
+    control_effect_class = "motion"
 
     def __init__(
         self,
