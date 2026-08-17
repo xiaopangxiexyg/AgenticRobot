@@ -383,9 +383,22 @@ class RealAgentMotionMeasuredPoseCut:
 
 
 class RealAgentMotionTargetBuilder(Protocol):
-    """Subset of the existing coupled retargeter used by this lower port."""
+    """Subset of the existing coupled retargeter used by this lower port.
+
+    The public observation/Skill contract is tool-TCP based, while the
+    coupled RM65 solver consumes its configured endpoint frame.  Keeping this
+    conversion on the injected lower target owner prevents the mailbox from
+    duplicating tool geometry or silently treating a TCP pose as a flange pose.
+    """
 
     def current_tool_tcp_world_targets(self) -> dict[str, np.ndarray]: ...
+
+    def solver_world_target_from_tool_tcp_world_target(
+        self,
+        *,
+        side: str,
+        tool_tcp_world_target: np.ndarray,
+    ) -> np.ndarray: ...
 
     def build_command_for_target_pair(
         self,
@@ -451,6 +464,17 @@ class RealAgentMotionPort:
     ) -> None:
         self.config = config
         self._target_builder = target_builder
+        if not callable(
+            getattr(
+                target_builder,
+                "solver_world_target_from_tool_tcp_world_target",
+                None,
+            )
+        ):
+            raise TypeError(
+                "target_builder must expose the exact tool-TCP-to-solver-world "
+                "target conversion."
+            )
         if owner_identity is not None and not isinstance(
             owner_identity,
             RealAgentMotionOwnerIdentity,
@@ -917,23 +941,55 @@ class RealAgentMotionPort:
             assert self._active is not None
             activation = self._active
         try:
-            current_targets = self._target_builder.current_tool_tcp_world_targets()
-            if set(current_targets) != {"left", "right"}:
+            current_tool_tcp_targets = (
+                self._target_builder.current_tool_tcp_world_targets()
+            )
+            if set(current_tool_tcp_targets) != {"left", "right"}:
                 raise RuntimeError(
                     "coupled target builder must publish current left/right tool TCP targets."
                 )
-            target_pose_by_side = {
+            current_tool_tcp_targets = {
                 side: _immutable_pose(
-                    current_targets[side],
+                    current_tool_tcp_targets[side],
                     field_name=f"current_tool_tcp_world_targets.{side}",
                 )
                 for side in ("left", "right")
             }
-            target_pose_by_side[activation.side] = activation.target_pose_world
+            # ``BimanualPoseTarget`` is consumed by the coupled solver and its
+            # pose values are solver-world endpoint poses.  The Agent Skill and
+            # measured cuts remain tool-TCP poses; convert both the inactive
+            # hold anchors and the active target at this single lower boundary.
+            target_pose_by_side = {
+                side: _immutable_pose(
+                    self._target_builder.solver_world_target_from_tool_tcp_world_target(
+                        side=side,
+                        tool_tcp_world_target=current_tool_tcp_targets[side],
+                    ),
+                    field_name=(
+                        "solver_world_target_from_tool_tcp_world_target."
+                        + side
+                    ),
+                )
+                for side in ("left", "right")
+            }
+            activation_tool_tcp_target = _immutable_pose(
+                activation.target_pose_world,
+                field_name="activation.target_tool_tcp_world",
+            )
+            target_pose_by_side[activation.side] = _immutable_pose(
+                self._target_builder.solver_world_target_from_tool_tcp_world_target(
+                    side=activation.side,
+                    tool_tcp_world_target=activation_tool_tcp_target,
+                ),
+                field_name=(
+                    "solver_world_target_from_tool_tcp_world_target."
+                    + activation.side
+                ),
+            )
             source_by_side = {"left": None, "right": None}
             source_by_side[activation.side] = BimanualPoseTargetSource(
                 command_type="tcp_pose",
-                value=activation.target_pose_world,
+                value=activation_tool_tcp_target,
                 frame_name=self.config.execution_frame_id,
                 metadata={
                     "operation_id": activation.operation_id,
@@ -945,6 +1001,9 @@ class RealAgentMotionPort:
                     "activation_grant_hash": activation.activation_grant_hash,
                     "measured_state_revision": activation.measured_state_revision,
                     "measured_state_hash": activation.measured_state_hash,
+                    "controlled_frame_id": "tool_tcp",
+                    "target_pose_semantics": "tool_tcp_world",
+                    "solver_target_pose_semantics": "solver_world_endpoint",
                 },
             )
             command = self._target_builder.build_command_for_target_pair(

@@ -60,6 +60,15 @@ class _TargetBuilder:
     def current_tool_tcp_world_targets(self):
         return {"left": np.eye(4), "right": np.eye(4)}
 
+    def solver_world_target_from_tool_tcp_world_target(
+        self,
+        *,
+        side,
+        tool_tcp_world_target,
+    ):
+        del side
+        return np.asarray(tool_tcp_world_target, dtype=float).copy()
+
     def build_command_for_target_pair(self, target):
         command = TeleopCommand(timestamp=target.timestamp)
         command.add_command(
