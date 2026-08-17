@@ -5,6 +5,7 @@
 - [控制、数据与训练闭环图示](./dexteleop_architecture_visual_guide.md)
 - [实时 Action Chunk（RTC）图示](./dexteleop_rtc_visual_guide.md)
 - [单源直通、多源组合及数采/部署/仿真的运行域边界](./runtime_domain_boundaries.md)
+- [Embodiment runtime provider 当前接口合同](./embodiment_runtime_provider_contract.md)
 
 其中运行域边界页区分 deploy、human teleop、replay 的默认单源直通模式与显式多源
 `control_composition` profile。它只记录当前代码、import contract 和入口解析已经建立的边界；
@@ -20,6 +21,9 @@
   [control-core landing](plans/dexteleop_control_core_landing_plan.md)、
   [RTC landing](plans/dexteleop_rtc_landing_plan.md) 和
   [Control Station](plans/dexteleop_control_station_plan.md)。
+- [`plans/`](plans/README.md) 是仍含未闭合工作或门禁的共享计划索引；
+  [`evidence/`](evidence/README.md) 是按批次冻结的历史收据索引。计划中的阶段状态与
+  evidence 的验证范围不能相互替代。
 - [`evidence/`](evidence/) 中 evidence JSON 内出现的旧 `todos/evidence/` 路径和哈希是历史收据的
   一部分；迁移版本控制位置时不回写这些记录。
 
