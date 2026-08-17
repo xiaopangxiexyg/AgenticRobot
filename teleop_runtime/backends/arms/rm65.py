@@ -133,6 +133,7 @@ _SERIALIZED_QPOS_INIT_TARGET_SOURCES = frozenset(
         "replay_qpos_init_final_hold",
     }
 )
+_SERIALIZED_POLICY_TARGET_SOURCES = frozenset({"openpi_v22_policy"})
 _SINGULARITY_LABELS = {
     0: "normal",
     -1: "shoulder_singularity",
@@ -446,8 +447,9 @@ class RM65ArmBackendConfig:
     background_streaming_target_max_age_sec: float = 0.25
     background_streaming_shutdown_timeout_sec: float = 1.0
     # Keep the backend-wide default compatible for teleop/replay callers.
-    # Policy deployment explicitly selects latest_nonblocking so a slow SDK
-    # call cannot make 60 Hz reference admission wait on the 120 Hz worker.
+    # Policy deployment selects latest_nonblocking; sources whose planner
+    # continuity would be broken by in-flight supersession are narrowed back
+    # to serialized admission inside send_command.
     background_streaming_target_admission_mode: str = (
         RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
     )
@@ -3674,6 +3676,25 @@ class RM65ArmBackend(EffectorBackend):
                 )
                 target_admission_fallback_reason = (
                     "qpos_init_requires_serialized_velocity_continuity"
+                )
+            elif (
+                target_admission_mode
+                == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+                and command_source in _SERIALIZED_POLICY_TARGET_SOURCES
+            ):
+                # The OpenPI reference loop publishes at 60 Hz while this
+                # worker streams the acceleration-limited trajectory at
+                # 120 Hz.  Superseding an SDK call already in flight forces
+                # the conservative completion rebase to restart from zero
+                # velocity.  Serialize only this policy source so each new
+                # reference is admitted after the physical application order
+                # is known; teleop and other latest-target callers retain the
+                # non-blocking admission contract.
+                effective_target_admission_mode = (
+                    RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+                )
+                target_admission_fallback_reason = (
+                    "openpi_policy_requires_serialized_velocity_continuity"
                 )
             elif (
                 target_admission_mode

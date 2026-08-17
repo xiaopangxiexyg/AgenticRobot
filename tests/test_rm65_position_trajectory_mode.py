@@ -284,6 +284,46 @@ def test_qpos_init_serializes_target_admission_for_velocity_continuity(
     assert timing["send_lock_wait_ms"] >= 20.0
 
 
+def test_openpi_policy_serializes_target_admission_for_velocity_continuity() -> None:
+    backend, _arm = _backend(
+        target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    )
+    completed = threading.Event()
+    receipts = []
+    errors: list[BaseException] = []
+
+    def admit_target() -> None:
+        try:
+            receipts.append(
+                backend.send_command(
+                    _command(0.05, source="openpi_v22_policy")
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    with backend._send_lock:
+        thread = threading.Thread(target=admit_target, daemon=True)
+        thread.start()
+        assert not completed.wait(0.03)
+    assert completed.wait(0.25)
+    thread.join(timeout=0.25)
+
+    assert not errors
+    assert len(receipts) == 1
+    timing = receipts[0].metadata["target_admission_timing"]
+    assert timing["requested_mode"] == (
+        RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+    )
+    assert timing["mode"] == RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
+    assert timing["fallback_reason"] == (
+        "openpi_policy_requires_serialized_velocity_continuity"
+    )
+    assert timing["send_lock_wait_ms"] >= 20.0
+
+
 def test_synchronous_target_admission_remains_explicit_rollback() -> None:
     backend, _arm = _backend(
         target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,

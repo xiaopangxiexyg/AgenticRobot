@@ -2390,6 +2390,7 @@ def test_reference_deadline_burst_faults_instead_of_catching_up() -> None:
             command_hz=120.0,
             stale_after_sec=0.5,
             max_reference_tick_skip_burst=1,
+            debug_events_enabled=True,
         ),
         canonical_pipeline=_pipeline(("left",)),
         dispatch_callback=overrun_dispatch,
@@ -2408,7 +2409,31 @@ def test_reference_deadline_burst_faults_instead_of_catching_up() -> None:
         assert snapshot["fault_stage"] == "reference_worker"
         assert snapshot["fault_type"] == "TimeoutError"
         assert snapshot["missed_reference_ticks"] > 1
+        assert snapshot["reference_timing_observation_count"] >= 1
+        assert snapshot["reference_tick_skip_event_count"] >= 1
+        assert snapshot["last_reference_timing"]["skipped_ticks"] > 1
+        assert snapshot["max_reference_emit_elapsed_ms"] >= 50.0
+        assert snapshot["max_reference_emit_cpu_elapsed_ms"] >= 0.0
+        assert snapshot["max_reference_non_cpu_wall_ms"] >= 0.0
         assert snapshot["max_reference_tick_skip_burst"] == 1
+        timing_events = [
+            event
+            for event in executor.drain_debug_events()
+            if event["event"] == "reference_timing_overrun"
+        ]
+        assert timing_events
+        assert timing_events[-1]["skipped_ticks"] > 1
+        assert timing_events[-1]["reference_worker_ident"] > 0
+        assert timing_events[-1]["reference_worker_native_id"] > 0
+        assert timing_events[-1]["phase_timing_ms"][
+            "arm_dispatch_callback"
+        ] >= 50.0
+        assert timing_events[-1]["classification"] in {
+            "thread_cpu_overrun",
+            "non_cpu_wall_stall",
+            "start_late",
+            "combined_minor_overrun",
+        }
         with pytest.raises(
             PositionDeployExecutorFault,
             match="deadline burst exceeded",
@@ -2418,6 +2443,45 @@ def test_reference_deadline_burst_faults_instead_of_catching_up() -> None:
         assert "emit_cpu_elapsed_ms=" in message
         assert "planner_frame_total_ms=" in message
         assert "planner_precompute_submit_ms=" in message
+    finally:
+        executor.close()
+
+
+def test_allowed_reference_tick_skip_is_observable_before_fault_threshold() -> None:
+    def single_tick_overrun(_command: TeleopCommand) -> None:
+        time.sleep(0.025)
+
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=0.5,
+            max_reference_tick_skip_burst=100,
+            debug_events_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left",)),
+        dispatch_callback=single_tick_overrun,
+    )
+    executor.start()
+    try:
+        executor.submit(
+            _filtered_pose("left", _pose(0.16)),
+            _observation(),
+            "allowed-deadline-overrun",
+        )
+        _wait_until(lambda: executor.snapshot()["missed_reference_ticks"] >= 1)
+        snapshot = executor.snapshot()
+        assert snapshot["fault_latched"] is False
+        assert snapshot["reference_tick_skip_event_count"] >= 1
+        assert snapshot["last_reference_timing"]["skipped_ticks"] >= 1
+        timing_events = [
+            event
+            for event in executor.drain_debug_events()
+            if event["event"] == "reference_timing_overrun"
+        ]
+        assert timing_events
+        assert timing_events[-1]["emit_elapsed_ms"] >= 20.0
     finally:
         executor.close()
 
