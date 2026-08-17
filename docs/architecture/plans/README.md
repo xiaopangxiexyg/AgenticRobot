@@ -29,8 +29,11 @@ consumer needs them.
   control-plane ownership, strict GUI/browser subset, source/target profile
   debt, and remaining boundary migrations. Its completed CS-0 to CS-6 ledger
   is preserved under [`../reports/`](../reports/control_station_implementation_ledger_20260724.md).
-- [RTC landing](dexteleop_rtc_landing_plan.md): action-chunk producer,
-  transport, admission, target handoff, and real-observation gates.
+- [RTC landing](dexteleop_rtc_landing_plan.md): current raw/model RTC producer
+  ownership, timing/representation invariants, default-off profiles, re-arm,
+  transport, and downstream authority gates. The original RTC-0 to RTC-7 and
+  R-R/MRTC ledger is preserved under
+  [`../reports/`](../reports/rtc_landing_ledger_20260725.md).
 - [HITL chunk-relative migration](hitl_chunk_relative_migration_plan.md):
   relative HITL session, handback, coordinator, device binding, and durable
   evidence boundaries.

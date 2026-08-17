@@ -6,6 +6,7 @@
 - [P0 结构治理历史实施台账（2026-08-04～08-07）](./p0_structure_remediation_20260803.md)
 - [Control Station 历史实施台账（更新至 2026-07-24）](./control_station_implementation_ledger_20260724.md)
 - [Control Core 历史落地台账（更新至 2026-07-22）](./control_core_landing_ledger_20260722.md)
+- [RTC 历史落地台账（原审计日期 2026-07-25）](./rtc_landing_ledger_20260725.md)
 
 当前架构边界和剩余工作分别由 [`../README.md`](../README.md) 与
 [`../plans/README.md`](../plans/README.md) 索引。
