@@ -10,6 +10,9 @@ import runtime_artifact_migration as archive
 from scripts import runtime_artifact_archive as archive_cli
 
 
+pytestmark = pytest.mark.integration
+
+
 def _source(root: Path, name: str, payload: bytes = b"artifact\n") -> Path:
     source = root / name
     source.mkdir(parents=True)

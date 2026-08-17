@@ -18,6 +18,9 @@ from runtime_artifact_resolution import (
 from scripts import runtime_artifact_migration as migration
 
 
+pytestmark = pytest.mark.integration
+
+
 def _write(path: Path, text: str = "valid") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
