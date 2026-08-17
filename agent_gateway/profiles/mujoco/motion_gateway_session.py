@@ -736,8 +736,13 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             raise RuntimeError("Depth Route lost its registration.")
 
         def read_depth(request, operation) -> PassiveReadResult:
+            role = str(request.parameters["role"])
+            try:
+                source_id = depth_registration.profile.source_id_by_role[role]
+            except KeyError as exc:
+                raise ValueError("Depth role is not bound to a source.") from exc
             frame = application.capture_depth_npy_frame(
-                view_id=str(request.parameters["view_id"]),
+                view_id=source_id,
             )
             artifact = artifact_ref_for_bytes(
                 frame.data,
@@ -756,7 +761,8 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                 now=frame.captured_at,
             )
             result = {
-                "view_id": frame.view_id,
+                "source_id": frame.view_id,
+                "role": role,
                 "captured_at": frame.captured_at,
                 "width": frame.width,
                 "height": frame.height,

@@ -34,7 +34,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 
 MUJOCO_CAPTURE_DEPTH_ROUTE_ID_V1 = "sim.mujoco.perception.capture_depth"
 MUJOCO_CAPTURE_DEPTH_EXECUTOR_ID_V1 = "control-station.mujoco-passive-depth-capture.v1"
-MUJOCO_CAPTURE_DEPTH_PARAMETER_PROFILE_ID_V1 = "mujoco-registered-native-depth-views-v1"
+MUJOCO_CAPTURE_DEPTH_PARAMETER_PROFILE_ID_V1 = "mujoco-semantic-depth-roles-v1"
 MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1 = "depth_frame"
 MUJOCO_CAPTURE_DEPTH_MAX_ARTIFACT_BYTES_V1 = 16 * 1024 * 1024
 
@@ -47,9 +47,9 @@ def _required(value: object, *, field_name: str) -> str:
 
 @dataclass(frozen=True)
 class MujocoDepthCaptureProfile:
-    """Exact registered view catalog and finite output bound."""
+    """Exact semantic-role catalog, lower source bindings and output bound."""
 
-    dimensions_by_view: tuple[tuple[str, int, int], ...]
+    sources: tuple[tuple[str, str, int, int], ...]
     max_artifact_bytes: int = MUJOCO_CAPTURE_DEPTH_MAX_ARTIFACT_BYTES_V1
     profile_id: str = MUJOCO_CAPTURE_DEPTH_PARAMETER_PROFILE_ID_V1
 
@@ -60,9 +60,10 @@ class MujocoDepthCaptureProfile:
             or self.max_artifact_bytes <= 0
         ):
             raise ValueError("max_artifact_bytes must be positive.")
-        normalized: list[tuple[str, int, int]] = []
-        for view_id, width, height in self.dimensions_by_view:
-            view = _required(view_id, field_name="view_id")
+        normalized: list[tuple[str, str, int, int]] = []
+        for source_id, role, width, height in self.sources:
+            source = _required(source_id, field_name="source_id")
+            semantic_role = _required(role, field_name="role")
             if (
                 isinstance(width, bool)
                 or not isinstance(width, int)
@@ -74,11 +75,13 @@ class MujocoDepthCaptureProfile:
                 raise ValueError("Depth view dimensions must be positive integers.")
             if width * height * 4 + 1024 > self.max_artifact_bytes:
                 raise ValueError("Depth view exceeds the profile Artifact bound.")
-            normalized.append((view, width, height))
+            normalized.append((source, semantic_role, width, height))
         normalized.sort()
         if not normalized or len({item[0] for item in normalized}) != len(normalized):
-            raise ValueError("Depth profile requires unique registered views.")
-        object.__setattr__(self, "dimensions_by_view", tuple(normalized))
+            raise ValueError("Depth profile requires unique registered sources.")
+        if len({item[1] for item in normalized}) != len(normalized):
+            raise ValueError("Depth profile requires unique semantic roles.")
+        object.__setattr__(self, "sources", tuple(normalized))
         object.__setattr__(
             self,
             "profile_id",
@@ -86,14 +89,20 @@ class MujocoDepthCaptureProfile:
         )
 
     @property
-    def view_ids(self) -> tuple[str, ...]:
-        return tuple(item[0] for item in self.dimensions_by_view)
+    def roles(self) -> tuple[str, ...]:
+        return tuple(item[1] for item in self.sources)
 
     @property
-    def dimensions(self) -> Mapping[str, tuple[int, int]]:
+    def source_id_by_role(self) -> Mapping[str, str]:
         return {
-            view_id: (width, height)
-            for view_id, width, height in self.dimensions_by_view
+            role: source_id for source_id, role, _width, _height in self.sources
+        }
+
+    @property
+    def dimensions_by_role(self) -> Mapping[str, tuple[int, int]]:
+        return {
+            role: (width, height)
+            for _source_id, role, width, height in self.sources
         }
 
     @property
@@ -101,7 +110,7 @@ class MujocoDepthCaptureProfile:
         return canonical_content_hash(
             {
                 "profile_id": self.profile_id,
-                "dimensions_by_view": self.dimensions_by_view,
+                "sources": self.sources,
                 "max_artifact_bytes": self.max_artifact_bytes,
                 "depth_unit": "meter",
                 "invalid_depth_value": 0.0,
@@ -182,28 +191,30 @@ def build_mujoco_depth_capture_registration(
     station_manifest_hash: str,
     execution_manifest_hash: str,
 ) -> MujocoDepthCaptureRegistration:
-    dimensions: list[tuple[str, int, int]] = []
+    sources: list[tuple[str, str, int, int]] = []
     for item in source_catalog:
         if not isinstance(item, Mapping) or set(item) != {
-            "view_id",
+            "source_id",
+            "role",
             "native_width",
             "native_height",
         }:
             raise ValueError("Depth source catalog entry has unexpected fields.")
-        dimensions.append(
+        sources.append(
             (
-                item["view_id"],
+                item["source_id"],
+                item["role"],
                 item["native_width"],
                 item["native_height"],
             )
         )
-    profile = MujocoDepthCaptureProfile(dimensions_by_view=tuple(dimensions))
+    profile = MujocoDepthCaptureProfile(sources=tuple(sources))
     definition = capture_depth_skill_definition_v1()
     schema_entry = capture_depth_schema_entry_v1(
         skill_definition_hash=definition.semantic_content_hash,
         parameter_profile_id=profile.profile_id,
         parameter_profile_hash=profile.semantic_content_hash,
-        allowed_view_ids=profile.view_ids,
+        allowed_roles=profile.roles,
     )
     io_contract = SkillIOContract(
         skill_id=definition.skill_id,
@@ -272,13 +283,14 @@ def build_mujoco_depth_capture_registration(
     def validate_parameters(payload: Mapping[str, Any]) -> None:
         validate_capture_depth_parameters_v1(
             payload,
-            allowed_view_ids=profile.view_ids,
+            allowed_roles=profile.roles,
         )
 
     def validate_result(payload: Mapping[str, Any]) -> None:
         validate_capture_depth_result_v1(
             payload,
-            dimensions_by_view=profile.dimensions,
+            source_id_by_role=profile.source_id_by_role,
+            dimensions_by_role=profile.dimensions_by_role,
         )
 
     validator = AgentSkillPayloadValidatorSet(

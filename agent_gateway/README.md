@@ -130,10 +130,11 @@ python -m agent_gateway mujoco \
 `--artifact-root` is optional and default-off. Supplying a real,
 non-world-writable directory enables the read-only
 `perception.capture_depth` and `perception.capture_rgb` Skills. Depth returns
-native-resolution float32 metric data; RGB returns one role-selected JPEG per
-output Artifact ordinal from a single scene cut. Inline results contain only
-bounded metadata and content hashes. Pixel arrays never enter the control
-frame.
+role-selected native-resolution float32 metric data; RGB returns one
+role-selected JPEG per output Artifact ordinal from a single scene cut. The
+trusted MuJoCo profile maps semantic roles to lower camera sources. Inline
+results contain only bounded metadata and content hashes. Pixel arrays never
+enter the control frame.
 
 `python -m control_station agent-gateway-mujoco ...` remains a compatibility
 forwarder. It creates no Gateway implementation or runtime state inside

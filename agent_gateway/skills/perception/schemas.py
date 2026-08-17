@@ -25,7 +25,7 @@ from dataset_contracts.perception_artifacts import (
 from .definition import CAPTURE_DEPTH_SKILL_ID_V1, CAPTURE_RGB_SKILL_ID_V1
 
 
-def _view_ids(values: tuple[str, ...]) -> tuple[str, ...]:
+def _semantic_roles(values: tuple[str, ...]) -> tuple[str, ...]:
     normalized = tuple(values)
     if (
         not normalized
@@ -35,7 +35,7 @@ def _view_ids(values: tuple[str, ...]) -> tuple[str, ...]:
         )
         or len(set(normalized)) != len(normalized)
     ):
-        raise ValueError("allowed_view_ids must contain unique non-empty strings.")
+        raise ValueError("allowed_roles must contain unique non-empty strings.")
     return tuple(sorted(normalized))
 
 
@@ -70,24 +70,25 @@ def capture_depth_schema_entry_v1(
     skill_definition_hash: str,
     parameter_profile_id: str,
     parameter_profile_hash: str,
-    allowed_view_ids: tuple[str, ...],
+    allowed_roles: tuple[str, ...],
 ) -> AgentSkillSchemaEntry:
-    """Build the exact schema triple for one deployment view catalog."""
+    """Build the exact schema triple for one deployment role catalog."""
 
-    views = _view_ids(allowed_view_ids)
+    roles = _semantic_roles(allowed_roles)
     parameter_schema = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "view_id": {"type": "string", "enum": list(views)},
+            "role": {"type": "string", "enum": list(roles)},
         },
-        "required": ["view_id"],
+        "required": ["role"],
     }
     execution_result_schema = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "view_id": {"type": "string", "enum": list(views)},
+            "source_id": {"type": "string", "minLength": 1},
+            "role": {"type": "string", "enum": list(roles)},
             "captured_at": {"type": "number"},
             "width": {"type": "integer", "minimum": 1},
             "height": {"type": "integer", "minimum": 1},
@@ -97,7 +98,8 @@ def capture_depth_schema_entry_v1(
             "intrinsics": _intrinsics_schema(),
         },
         "required": [
-            "view_id",
+            "source_id",
+            "role",
             "captured_at",
             "width",
             "height",
@@ -135,22 +137,24 @@ def capture_depth_schema_entry_v1(
 def validate_capture_depth_parameters_v1(
     payload: Mapping[str, Any],
     *,
-    allowed_view_ids: tuple[str, ...],
+    allowed_roles: tuple[str, ...],
 ) -> None:
-    views = _view_ids(allowed_view_ids)
-    if not isinstance(payload, Mapping) or set(payload) != {"view_id"}:
-        raise ValueError("Depth capture parameters require exactly view_id.")
-    if payload["view_id"] not in views:
-        raise ValueError("Depth capture view_id is not registered.")
+    roles = _semantic_roles(allowed_roles)
+    if not isinstance(payload, Mapping) or set(payload) != {"role"}:
+        raise ValueError("Depth capture parameters require exactly role.")
+    if payload["role"] not in roles:
+        raise ValueError("Depth capture role is not registered.")
 
 
 def validate_capture_depth_result_v1(
     payload: Mapping[str, Any],
     *,
-    dimensions_by_view: Mapping[str, tuple[int, int]],
+    source_id_by_role: Mapping[str, str],
+    dimensions_by_role: Mapping[str, tuple[int, int]],
 ) -> None:
     fields = {
-        "view_id",
+        "source_id",
+        "role",
         "captured_at",
         "width",
         "height",
@@ -161,11 +165,14 @@ def validate_capture_depth_result_v1(
     }
     if not isinstance(payload, Mapping) or set(payload) != fields:
         raise ValueError("Depth capture result fields do not match the schema.")
-    view_id = payload["view_id"]
+    role = payload["role"]
     try:
-        expected_width, expected_height = dimensions_by_view[view_id]
+        source_id = source_id_by_role[role]
+        expected_width, expected_height = dimensions_by_role[role]
     except (KeyError, TypeError) as exc:
-        raise ValueError("Depth capture result uses an unknown view.") from exc
+        raise ValueError("Depth capture result uses an unknown role.") from exc
+    if payload["source_id"] != source_id:
+        raise ValueError("Depth capture source differs from its registered role.")
     if any(
         isinstance(payload[field_name], bool)
         or not isinstance(payload[field_name], int)
@@ -177,7 +184,7 @@ def validate_capture_depth_result_v1(
         expected_width,
         expected_height,
     ):
-        raise ValueError("Depth capture dimensions do not match the view profile.")
+        raise ValueError("Depth capture dimensions do not match the role profile.")
     invalid_depth = payload["invalid_depth_value"]
     if (
         payload["depth_unit"] != "meter"
@@ -240,8 +247,8 @@ def validate_capture_depth_result_for_parameters_v1(
     parameters: Mapping[str, Any],
     result: Mapping[str, Any],
 ) -> None:
-    if parameters.get("view_id") != result.get("view_id"):
-        raise ValueError("Depth result view_id differs from the request.")
+    if parameters.get("role") != result.get("role"):
+        raise ValueError("Depth result role differs from the request.")
 
 
 def validate_no_task_evaluation_v1(payload: Mapping[str, Any]) -> None:
@@ -259,7 +266,7 @@ def capture_rgb_schema_entry_v1(
 ) -> AgentSkillSchemaEntry:
     """Build the exact RGB schema triple for one deployment role catalog."""
 
-    roles = _view_ids(allowed_roles)
+    roles = _semantic_roles(allowed_roles)
     parameter_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -368,7 +375,7 @@ def validate_capture_rgb_parameters_v1(
     if not isinstance(payload, Mapping) or set(payload) != fields:
         raise ValueError("RGB capture parameter fields do not match the schema.")
     roles = payload["selected_roles"]
-    allowed = frozenset(_view_ids(allowed_roles))
+    allowed = frozenset(_semantic_roles(allowed_roles))
     if (
         not isinstance(roles, (list, tuple))
         or not 1 <= len(roles) <= min(8, len(allowed))

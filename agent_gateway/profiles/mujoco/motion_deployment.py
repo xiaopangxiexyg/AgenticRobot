@@ -1582,7 +1582,15 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     )
     depth_capture = (
         build_mujoco_depth_capture_registration(
-            source_catalog=application.depth_source_catalog(),
+            source_catalog=tuple(
+                {
+                    "source_id": source["view_id"],
+                    "role": mujoco_rgb_role_for_source(source["view_id"]),
+                    "native_width": source["native_width"],
+                    "native_height": source["native_height"],
+                }
+                for source in application.depth_source_catalog()
+            ),
             runtime_session_id=exact["runtime_session_id"],
             control_domain_id=exact["control_domain_id"],
             target_binding_id=target_binding.binding_id,

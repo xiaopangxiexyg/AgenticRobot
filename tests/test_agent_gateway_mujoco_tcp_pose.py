@@ -1361,7 +1361,7 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
         parameter_profile_hash=(
             depth_route.allowed_parameter_profiles[0].parameter_profile_hash
         ),
-        parameters={"view_id": "front"},
+        parameters={"role": "main"},
         observation_snapshot_id=snapshot.snapshot_id,
         requested_mode="sim_active",
         requested_timeout_ms=1_000,
@@ -1380,7 +1380,8 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     )
     completed = session.service.operation_store.get(admitted.operation.operation_id)
     assert completed is not None and completed.status == "completed"
-    assert completed.execution_result["view_id"] == "front"
+    assert completed.execution_result["role"] == "main"
+    assert completed.execution_result["source_id"] == "front"
     assert len(completed.output_artifact_bindings) == 1
     output_binding = completed.output_artifact_bindings[0]
     assert (
