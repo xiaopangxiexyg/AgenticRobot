@@ -30,6 +30,7 @@ def _route(
     deadman: bool = False,
     effect: str = "lifecycle",
     timeout_ms: int = 2_000,
+    cancellation_policy: str = "hold_on_disconnect_or_timeout",
 ) -> SkillExecutionRoute:
     parameter_schema_hash = f"params:{skill_id}:v1"
     return SkillExecutionRoute(
@@ -57,7 +58,7 @@ def _route(
         requires_operator_confirmation=confirmation,
         requires_deadman=deadman,
         max_operation_duration_ms=timeout_ms,
-        cancellation_policy="hold_on_disconnect_or_timeout",
+        cancellation_policy=cancellation_policy,
     )
 
 
@@ -68,6 +69,7 @@ def _read_only_route() -> SkillExecutionRoute:
         confirmation=False,
         effect="read_only",
         timeout_ms=1_000,
+        cancellation_policy="cancel_only",
     )
 
 

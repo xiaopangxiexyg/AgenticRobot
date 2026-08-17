@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import signal
+import stat
 import threading
 import uuid
 from pathlib import Path
@@ -21,6 +22,7 @@ from project_paths import repo_root
 from sim.mujoco.deploy import MujocoSimHILTargetConfig
 
 from .motion_factory import (
+    MujocoAgentArtifactStorageConfig,
     MujocoAgentTcpPoseHistoryStorageConfig,
     build_mujoco_agent_tcp_pose_gateway_session,
     mujoco_agent_tcp_pose_execution_observation_plan_v1,
@@ -75,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="lower-owned control-domain identity published in the manifest",
     )
     parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        help=(
+            "optional absolute existing non-world-writable directory for the "
+            "persistent Agent Artifact CAS; providing it enables the passive "
+            "depth-capture Skill"
+        ),
+    )
+    parser.add_argument(
         "--history-root",
         type=Path,
         help=(
@@ -127,6 +138,24 @@ def _absolute_path(parser: argparse.ArgumentParser, value: Path, *, flag: str) -
     return Path(os.path.abspath(expanded))
 
 
+def _absolute_managed_directory(
+    parser: argparse.ArgumentParser,
+    value: Path,
+    *,
+    flag: str,
+) -> Path:
+    path = _absolute_path(parser, value, flag=flag)
+    try:
+        info = os.lstat(path)
+    except OSError:
+        parser.error(f"{flag} is not an existing directory: {path}")
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        parser.error(f"{flag} must be a real directory, not a symlink: {path}")
+    if info.st_mode & stat.S_IWOTH:
+        parser.error(f"{flag} cannot be world-writable: {path}")
+    return path
+
+
 def _resolved_runtime_session_id(explicit: str | None) -> str:
     if explicit is not None:
         return explicit
@@ -135,6 +164,7 @@ def _resolved_runtime_session_id(explicit: str | None) -> str:
 
 def _ready_payload(*, session: Any, socket_path: Path, client_id: str) -> dict[str, Any]:
     manifest = session.contract_bundle.route_manifest
+    capabilities = session.service.protocol_runtime.session_capabilities
     return {
         "event": "gateway_ready",
         "socket_path": str(socket_path),
@@ -145,6 +175,8 @@ def _ready_payload(*, session: Any, socket_path: Path, client_id: str) -> dict[s
         "control_domain_id": manifest.control_domain_id,
         "target_binding_id": manifest.target_binding_id,
         "route_manifest_hash": manifest.semantic_content_hash,
+        "artifact_transfer_enabled": capabilities.artifact_transfer_enabled,
+        "artifact_access_mechanisms": list(capabilities.artifact_access_mechanisms),
         "station_manifest_hash": manifest.station_manifest_hash,
         "execution_manifest_hash": manifest.execution_manifest_hash,
         "routes": [
@@ -208,6 +240,14 @@ def main(argv: list[str] | None = None) -> int:
             root=_absolute_path(parser, args.history_root, flag="--history-root"),
             filename=args.history_filename,
         )
+    artifact_storage = None
+    if args.artifact_root is not None:
+        artifact_root = _absolute_managed_directory(
+            parser,
+            args.artifact_root,
+            flag="--artifact-root",
+        )
+        artifact_storage = MujocoAgentArtifactStorageConfig(root=artifact_root)
 
     # Task configs may contain repository-relative calibration/profile paths.
     # This dedicated process owns its working directory, so normalize it once
@@ -230,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
         allowed_client_ids=(args.client_id,),
         max_retained_operations=args.max_retained_operations,
         history_storage=history_storage,
+        artifact_storage=artifact_storage,
     )
     server = session.build_unix_json_server(
         socket_path=str(socket_path),

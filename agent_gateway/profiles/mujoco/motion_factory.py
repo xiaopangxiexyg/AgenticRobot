@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from collection_runtime.source_observation_history import (
     SourceObservationHistoryBinding,
     SQLiteSourceObservationHistoryStore,
@@ -70,6 +71,47 @@ MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1 = (
 MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ENVELOPE_ID_V1 = (
     "mujoco.agent_tcp_pose.safety.fixed_orientation.v1"
 )
+
+
+@dataclass(frozen=True)
+class MujocoAgentArtifactStorageConfig:
+    """Explicit persistent CAS root and finite session-local limits."""
+
+    root: Path
+    quota_bytes: int = 512 * 1024 * 1024
+    max_artifact_bytes: int = 16 * 1024 * 1024
+    max_chunk_bytes: int = 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, Path):
+            raise TypeError("Artifact root must be pathlib.Path.")
+        if not self.root.is_absolute():
+            raise ValueError("Artifact root must be an explicit absolute path.")
+        for field_name in (
+            "quota_bytes",
+            "max_artifact_bytes",
+            "max_chunk_bytes",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer.")
+        if self.max_artifact_bytes > self.quota_bytes:
+            raise ValueError("max_artifact_bytes cannot exceed quota_bytes.")
+        if self.max_chunk_bytes > self.max_artifact_bytes:
+            raise ValueError("max_chunk_bytes cannot exceed max_artifact_bytes.")
+
+    def store_root_for(self, runtime_session_id: str) -> Path:
+        if (
+            not isinstance(runtime_session_id, str)
+            or not runtime_session_id
+            or runtime_session_id != runtime_session_id.strip()
+        ):
+            raise ValueError("runtime_session_id must be a non-empty trimmed string.")
+        partition = canonical_content_hash(
+            {"runtime_session_id": runtime_session_id},
+            domain="dexteleop.agent_gateway.artifact_store_partition.v1",
+        )
+        return self.root / partition
 
 
 @dataclass(frozen=True)
@@ -296,6 +338,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     max_retained_operations: int = 16,
     trace_sink: Callable[[Any], None] | None = None,
     history_storage: MujocoAgentTcpPoseHistoryStorageConfig | None = None,
+    artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
 ) -> MujocoAgentTcpPoseGatewaySession:
     """Build the exact default-off graph; do not start, record, or serve it."""
 
@@ -304,6 +347,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         MujocoAgentTcpPoseHistoryStorageConfig,
     ):
         raise TypeError("history_storage must be typed or None.")
+    if artifact_storage is not None and not isinstance(
+        artifact_storage,
+        MujocoAgentArtifactStorageConfig,
+    ):
+        raise TypeError("artifact_storage must be typed or None.")
     validate_mujoco_agent_tcp_pose_target_config(target_config)
     prepared = prepare_mujoco_sim_hil_target(target_config)
     component_profile = build_mujoco_pose_component_target_profile(
@@ -397,12 +445,16 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         target=target,
         calibration_hash=_calibration_hash(target),
     )
-    contract_bundle = build_mujoco_agent_tcp_pose_contract_bundle(
-        application=application,
-        history_profile=(None if history_storage is None else history_storage.profile),
-    )
     history_store = None
+    artifact_store = None
     try:
+        contract_bundle = build_mujoco_agent_tcp_pose_contract_bundle(
+            application=application,
+            history_profile=(
+                None if history_storage is None else history_storage.profile
+            ),
+            enable_depth_capture=artifact_storage is not None,
+        )
         if history_storage is not None:
             source_binding = contract_bundle.history_source_binding
             if source_binding is None:
@@ -413,6 +465,15 @@ def build_mujoco_agent_tcp_pose_gateway_session(
                 limits=history_storage.profile.store_limits,
                 filename=history_storage.filename,
             )
+        if artifact_storage is not None:
+            artifact_store = RecoverableAgentArtifactStore(
+                root=artifact_storage.store_root_for(
+                    contract_bundle.route_manifest.runtime_session_id
+                ),
+                quota_bytes=artifact_storage.quota_bytes,
+                max_artifact_bytes=artifact_storage.max_artifact_bytes,
+                max_chunk_bytes=artifact_storage.max_chunk_bytes,
+            )
         return assemble_mujoco_agent_tcp_pose_gateway_session(
             application=application,
             contract_bundle=contract_bundle,
@@ -420,10 +481,14 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             max_retained_operations=max_retained_operations,
             source_observation_history_store=history_store,
             owns_source_observation_history_store=history_store is not None,
+            artifact_store=artifact_store,
+            owns_artifact_store=artifact_store is not None,
         )
     except Exception:
         if history_store is not None:
             history_store.close()
+        if artifact_store is not None:
+            artifact_store.close()
         application.close_after_hold()
         raise
 
@@ -434,6 +499,7 @@ __all__ = [
     "MUJOCO_AGENT_TCP_POSE_COMPONENT_PROFILE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_OBSERVATION_PLAN_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_STANDARD_ENVELOPE_ID_V1",
+    "MujocoAgentArtifactStorageConfig",
     "MujocoAgentTcpPoseHistoryStorageConfig",
     "build_mujoco_agent_tcp_pose_gateway_session",
     "mujoco_agent_tcp_pose_execution_observation_plan_v1",

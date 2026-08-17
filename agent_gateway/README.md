@@ -107,6 +107,15 @@ discovery catalogs. Concrete deployment bindings, device acquisition, camera
 ownership, safety, and executors remain in `profiles/`; they are deliberately
 not hidden inside the template.
 
+Control effect is a closed contract, not a naming convention. An `inspection`
+Definition can only use a `read_only` Route; that Route must be
+`t0_read_only`, use `cancel_only`, advertise no robot motion or publication
+opening, and bind an executor that declares the same effect class. Motion and
+policy-task Definitions use motion Routes, while lifecycle Definitions use
+lifecycle Routes. Neutral no-I/O test/dry-run ports cannot prove either read or
+control execution. The control-domain HOLD port remains separate from passive
+read execution.
+
 ## Entrypoints
 
 The canonical MuJoCo entrypoint is:
@@ -114,8 +123,15 @@ The canonical MuJoCo entrypoint is:
 ```bash
 python -m agent_gateway mujoco \
   --socket-path /absolute/private/gateway.sock \
-  --task-config /absolute/task_config.json
+  --task-config /absolute/task_config.json \
+  --artifact-root /absolute/private/artifact_cache
 ```
+
+`--artifact-root` is optional and default-off. Supplying a real,
+non-world-writable directory enables `perception.capture_depth`, which returns
+native-resolution float32 metric depth through a normal output Artifact slot.
+The inline result contains view/capture/intrinsic metadata; the Artifact body
+is an `application/x-npy` array with invalid depth represented as `0.0`.
 
 `python -m control_station agent-gateway-mujoco ...` remains a compatibility
 forwarder. It creates no Gateway implementation or runtime state inside

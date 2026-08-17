@@ -70,6 +70,16 @@ Definition, strict schemas, I/O contract, and Routes fail closed over the same
 hashes. Hardware-information Skills use ordinary typed Artifact slots; do not
 add device- or depth-specific transport methods.
 
+Treat control effect as a cross-layer invariant. `inspection` Definitions bind
+only `read_only` Routes, and those Routes remain `t0_read_only`, `cancel_only`,
+non-motion, and non-publication-opening. Bind them to a read-only executor,
+never to a motion/lifecycle executor or the domain HOLD port. Motion and
+policy-task Definitions bind motion Routes; lifecycle Definitions bind
+lifecycle Routes. Neutral no-I/O ports are test/dry-run projections and prove
+neither read nor control execution. A shutdown-level domain HOLD is Gateway
+lifecycle behavior, not evidence that a passive Skill is allowed to control
+downstream state.
+
 Artifact identity is a finite immutable descriptor and content hash. A path,
 URL, file descriptor, or object-store key may appear only in a short-lived,
 authenticated access grant. `local_path` is valid only for a reviewed

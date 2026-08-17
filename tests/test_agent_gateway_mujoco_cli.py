@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import argparse
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from agent_gateway.profiles.mujoco.gateway_cli import (
+    _absolute_managed_directory,
     _resolved_runtime_session_id,
     _stopped_payload,
     build_parser,
@@ -74,6 +77,7 @@ def test_runtime_session_identity_is_unique_by_default_and_overridable() -> None
     ]
 
     assert parser.parse_args(common).runtime_session_id is None
+    assert parser.parse_args(common).artifact_root is None
     assert (
         parser.parse_args(
             [*common, "--runtime-session-id", "runtime:operator-selected"]
@@ -89,3 +93,34 @@ def test_runtime_session_identity_is_unique_by_default_and_overridable() -> None
         _resolved_runtime_session_id("runtime:operator-selected")
         == "runtime:operator-selected"
     )
+
+
+def test_artifact_root_preflight_rejects_symlink_and_world_writable(tmp_path) -> None:
+    parser = argparse.ArgumentParser()
+    managed = tmp_path / "managed"
+    managed.mkdir(mode=0o700)
+    assert (
+        _absolute_managed_directory(
+            parser,
+            managed,
+            flag="--artifact-root",
+        )
+        == managed
+    )
+
+    link = tmp_path / "managed-link"
+    link.symlink_to(managed, target_is_directory=True)
+    with pytest.raises(SystemExit):
+        _absolute_managed_directory(
+            parser,
+            link,
+            flag="--artifact-root",
+        )
+
+    os.chmod(managed, 0o707)
+    with pytest.raises(SystemExit):
+        _absolute_managed_directory(
+            parser,
+            managed,
+            flag="--artifact-root",
+        )

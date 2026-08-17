@@ -18,6 +18,7 @@ from typing import Any, Protocol
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from ..protocol.artifact_contracts import AgentArtifactBinding
 from ..protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from .operation_port import AgentGatewayAuthoritativePortReceipt
 
@@ -64,6 +65,7 @@ class PassiveReadResult:
 
     execution_result: Mapping[str, Any]
     evidence_refs: tuple[str, ...]
+    output_artifact_bindings: tuple[AgentArtifactBinding, ...] = ()
     reason_code: str = "passive_read_completed"
 
     def __post_init__(self) -> None:
@@ -71,6 +73,12 @@ class PassiveReadResult:
             raise TypeError("execution_result must be a mapping.")
         object.__setattr__(self, "execution_result", dict(self.execution_result))
         object.__setattr__(self, "evidence_refs", _evidence_refs(self.evidence_refs))
+        bindings = tuple(self.output_artifact_bindings)
+        if any(not isinstance(item, AgentArtifactBinding) for item in bindings):
+            raise TypeError(
+                "output_artifact_bindings must contain AgentArtifactBinding values."
+            )
+        object.__setattr__(self, "output_artifact_bindings", bindings)
         object.__setattr__(
             self,
             "reason_code",
@@ -180,6 +188,7 @@ class PassiveReadSkillExecutor:
     """Reusable thread-per-operation executor for sequential passive reads."""
 
     no_io = False
+    control_effect_class = "read_only"
 
     def __init__(
         self,
@@ -305,6 +314,23 @@ class PassiveReadSkillExecutor:
             return False
         thread.join(timeout=timeout_sec)
         return not thread.is_alive()
+
+    def wait_all(self, *, timeout_sec: float | None = None) -> bool:
+        """Wait for a stable snapshot of launched reads without holding locks."""
+
+        if timeout_sec is not None:
+            timeout_sec = _finite(timeout_sec, field_name="timeout_sec")
+            if timeout_sec < 0.0:
+                raise ValueError("timeout_sec cannot be negative.")
+        with self._lock:
+            threads = tuple(self._threads.values())
+        deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
+        for thread in threads:
+            remaining = None
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+        return all(not thread.is_alive() for thread in threads)
 
     def activate(
         self,
@@ -444,17 +470,23 @@ class PassiveReadSkillExecutor:
                 current_station_revision=self._revision(),
                 execution_result=result.execution_result,
                 execution_receipt_refs=(execution_receipt.receipt_id,),
+                output_artifact_bindings=result.output_artifact_bindings,
             )
-            if (
-                not bool(getattr(outcome, "accepted", False))
-                and getattr(outcome, "reason_code", None)
-                == "execution_result_payload_rejected"
-            ):
+            rejection_reason = getattr(outcome, "reason_code", None)
+            rejected_result = rejection_reason in {
+                "execution_result_payload_rejected",
+                "output_artifact_bindings_rejected",
+            }
+            if not bool(getattr(outcome, "accepted", False)) and rejected_result:
                 outcome = service.complete_operation(
                     operation_id=running.operation_id,
                     expected_operation_hash=running.semantic_content_hash,
                     succeeded=False,
-                    reason_code="passive_read_result_rejected",
+                    reason_code=(
+                        "passive_read_output_artifacts_rejected"
+                        if rejection_reason == "output_artifact_bindings_rejected"
+                        else "passive_read_result_rejected"
+                    ),
                     current_station_revision=self._revision(),
                     execution_receipt_refs=(execution_receipt.receipt_id,),
                 )

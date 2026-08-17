@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import math
 import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import agent_gateway.profiles.mujoco.motion_deployment as deployment
@@ -60,6 +62,8 @@ from agent_gateway.profiles.mujoco.motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
 )
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.skills.perception.definition import CAPTURE_DEPTH_SKILL_ID_V1
 from robot_motion.coordinate_frames import (
     CoordinateFrameGraph,
     CoordinateFrameSpec,
@@ -73,6 +77,7 @@ from sim.mujoco.deploy import (
     MujocoSimHILTargetConfig,
     build_mujoco_pose_component_target_profile,
 )
+from sim.mujoco.depth_snapshot import EncodedMujocoDepthFrame
 
 
 def test_motion_primitive_organization_preserves_legacy_profile_exports() -> None:
@@ -849,6 +854,8 @@ def test_graph_factory_rejects_non_dedicated_target_config_before_scene_load() -
 
 def _build_no_model_contract_bundle_fixture(
     monkeypatch,
+    *,
+    enable_depth_capture: bool = False,
 ):
     _profile, action_schema = _profile_and_schema()
     observation_plan = SimpleNamespace(
@@ -960,6 +967,9 @@ def _build_no_model_contract_bundle_fixture(
             },
         ),
     )
+    application.depth_source_catalog = lambda: (
+        {"view_id": "front", "native_width": 2, "native_height": 2},
+    )
     application.tcp_pose_envelope_runtime = (
         _build_standard_tcp_pose_envelope_runtime(
             prepared=application,
@@ -996,7 +1006,8 @@ def _build_no_model_contract_bundle_fixture(
     )
 
     bundle = build_mujoco_agent_tcp_pose_contract_bundle(
-        application=application
+        application=application,
+        enable_depth_capture=enable_depth_capture,
     )
     return application, runtime, direct, bundle, captured_manifest_args
 
@@ -1188,6 +1199,189 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "station_hold_not_confirmed_no_active_operation"
     )
     assert motion_application.closed
+
+
+def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    application, _runtime, _direct, bundle, _captured_manifest_args = (
+        _build_no_model_contract_bundle_fixture(
+            monkeypatch,
+            enable_depth_capture=True,
+        )
+    )
+    depth_entry = bundle.route_manifest.route(CAPTURE_DEPTH_SKILL_ID_V1, "1")
+    assert depth_entry.route.control_effect_class == "read_only"
+    assert depth_entry.route.privilege_tier == "t0_read_only"
+    assert not depth_entry.route.may_move_robot
+    assert not depth_entry.route.may_open_publication
+    assert bundle.depth_capture is not None
+    depth_payload = io.BytesIO()
+    np.save(
+        depth_payload,
+        np.asarray([[1.0, 2.0], [3.0, 0.0]], dtype=np.float32),
+        allow_pickle=False,
+    )
+    depth_bytes = depth_payload.getvalue()
+
+    motion_application = object.__new__(MujocoAgentSkillMotionApplication)
+    motion_application.__dict__.update(application.__dict__)
+    motion_application._lock = threading.RLock()
+    motion_application._started = False
+    motion_application._held = False
+    motion_application._closed = False
+    motion_application._active_operation_id = None
+    motion_application.capture_passive_application_cut = lambda **_kwargs: None
+    motion_application.capture_depth_npy_frame = lambda **_kwargs: (
+        EncodedMujocoDepthFrame(
+            view_id="front",
+            captured_at=10.0,
+            width=2,
+            height=2,
+            media_type="application/x-npy",
+            schema_id="dexteleop.perception.depth_image_meters.v1",
+            encoding="npy.float32.c_order.v1",
+            compression="none",
+            data=depth_bytes,
+            camera_pose_world_xyz_quat_xyzw=(0, 0, 1, 0, 0, 0, 1),
+            intrinsics={
+                "width": 2,
+                "height": 2,
+                "fx": 1.0,
+                "fy": 1.0,
+                "cx": 1.0,
+                "cy": 1.0,
+                "fovy_deg": 90.0,
+            },
+        )
+    )
+    artifact_store = RecoverableAgentArtifactStore(
+        root=tmp_path / "artifacts",
+        quota_bytes=32 * 1024 * 1024,
+        max_artifact_bytes=16 * 1024 * 1024,
+        max_chunk_bytes=1024 * 1024,
+    )
+    session = assemble_mujoco_agent_tcp_pose_gateway_session(
+        application=motion_application,
+        contract_bundle=bundle,
+        allowed_client_ids=("rpent:fixture",),
+        max_retained_operations=3,
+        artifact_store=artifact_store,
+        owns_artifact_store=True,
+    )
+    route_to_port = {
+        item.skill_id: item.execution_port
+        for item in session.service.executor_registry.bindings
+    }
+    assert route_to_port[CAPTURE_DEPTH_SKILL_ID_V1] is session.depth_executor
+    assert session.depth_executor is not session.motion_executor
+    assert session.service.domain_control_port is session.motion_executor
+    capabilities = session.service.protocol_runtime.session_capabilities
+    assert capabilities.artifact_transfer_enabled
+    assert capabilities.artifact_access_mechanisms == (
+        "chunked_rpc",
+        "local_path",
+    )
+    assert bundle.route_manifest.skill_io_catalog_hash == (
+        bundle.io_catalog.semantic_content_hash
+    )
+
+    source_slot = bundle.station_manifest.source_slots[0]
+    snapshot = AgentObservationSnapshot(
+        snapshot_id="agent-observation:depth-fixture",
+        runtime_session_id=bundle.route_manifest.runtime_session_id,
+        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+        station_revision=0,
+        captured_at=10.0,
+        available_at=10.0,
+        clock_domain_id=application.runtime.config.clock_domain_id,
+        authority_epoch=0,
+        execution_epoch=0,
+        dispatch_owner_generation=1,
+        lifecycle_state="configured",
+        execution_gate="not_started",
+        active_operation_id=None,
+        source_binding_id=source_slot.source_slot_id,
+        producer_epoch=application.runtime.config.direct_component_proposal_source.producer_epoch,
+        target_binding_id=bundle.route_manifest.target_binding_id,
+        execution_manifest_hash=bundle.route_manifest.execution_manifest_hash,
+        frame_graph_hash=bundle.deployment_binding.frame_graph_hash,
+        tool_config_hash=bundle.deployment_binding.tool_config_hash,
+        calibration_hash=bundle.deployment_binding.calibration_hash,
+        measurement_summary={"right_arm_tcp_pose_available": True},
+        measurement_freshness_ms=0,
+        measurement_valid=True,
+    )
+    assert session.service.publish_observation(snapshot=snapshot, now=10.0).accepted
+    depth_route = depth_entry.route
+    depth_binding = depth_entry.deployment_binding
+    request = AgentSkillRequest(
+        client_id="rpent:fixture",
+        request_id="request:depth:1",
+        idempotency_key="idempotency:depth:1",
+        client_sequence=1,
+        runtime_session_id=bundle.route_manifest.runtime_session_id,
+        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+        expected_station_revision=0,
+        skill_id=depth_route.skill_id,
+        skill_version=depth_route.skill_version,
+        skill_definition_hash=depth_route.skill_definition_hash,
+        route_id=depth_route.route_id,
+        route_version=depth_route.route_version,
+        route_hash=depth_route.semantic_content_hash,
+        deployment_binding_hash=depth_binding.deployment_binding_hash,
+        parameter_profile_id=(
+            depth_route.allowed_parameter_profiles[0].parameter_profile_id
+        ),
+        parameter_profile_hash=(
+            depth_route.allowed_parameter_profiles[0].parameter_profile_hash
+        ),
+        parameters={"view_id": "front"},
+        observation_snapshot_id=snapshot.snapshot_id,
+        requested_mode="sim_active",
+        requested_timeout_ms=1_000,
+    )
+    admitted = session.service.submit_request(
+        request=request,
+        current_station_revision=0,
+        now=10.0,
+    )
+    assert admitted.accepted and admitted.operation is not None
+    assert session.service.launch_operation(admitted.operation.operation_id).accepted
+    assert session.depth_executor is not None
+    assert session.depth_executor.wait(
+        admitted.operation.operation_id,
+        timeout_sec=1.0,
+    )
+    completed = session.service.operation_store.get(admitted.operation.operation_id)
+    assert completed is not None and completed.status == "completed"
+    assert completed.execution_result["view_id"] == "front"
+    assert len(completed.output_artifact_bindings) == 1
+    output_binding = completed.output_artifact_bindings[0]
+    assert (
+        artifact_store.managed_read_path(
+            output_binding.artifact.artifact_id
+        ).read_bytes()
+        == depth_bytes
+    )
+    events = session.service.protocol_runtime.replay_events(
+        after_sequence=0,
+        max_events=16,
+        operations=(completed,),
+    ).events
+    artifact_events = tuple(
+        event for event in events if event.event_kind == "artifact_ready"
+    )
+    assert len(artifact_events) == 1
+    assert artifact_events[0].artifact_binding == output_binding
+    assert tuple(
+        receipt.operation_kind for receipt in session.depth_executor.port_receipts
+    ) == ("activate",)
+    assert session.motion_executor.workers == ()
+
+    session.close()
+    assert session._artifact_store_closed
 
 
 @pytest.mark.integration

@@ -25,6 +25,10 @@ from sim.mujoco.deploy.agent_skill_target import MujocoAgentSkillMotionTarget
 from sim.mujoco.deploy.target_measurement import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
 )
+from sim.mujoco.depth_snapshot import (
+    EncodedMujocoDepthFrame,
+    MujocoDepthSnapshotSource,
+)
 from sim.mujoco.rgb_snapshot import (
     EncodedMujocoRgbFrame,
     MujocoRgbSnapshotSource,
@@ -127,6 +131,10 @@ class MujocoAgentSkillMotionApplication:
         self._active_operation_id: str | None = None
         self._visual_snapshot_source = MujocoRgbSnapshotSource(
             capture_scene=self._capture_visual_scene,
+        )
+        self._depth_snapshot_source = MujocoDepthSnapshotSource(
+            capture_scene=self._capture_visual_scene,
+            clock=self.runtime.clock,
         )
 
     @property
@@ -382,6 +390,20 @@ class MujocoAgentSkillMotionApplication:
             height=height,
         )
 
+    def depth_source_catalog(self) -> tuple[Mapping[str, object], ...]:
+        """Describe deployment-registered native depth views."""
+
+        return self._depth_snapshot_source.source_catalog()
+
+    def capture_depth_npy_frame(
+        self,
+        *,
+        view_id: str,
+    ) -> EncodedMujocoDepthFrame:
+        """Capture one passive native-resolution metric depth Artifact."""
+
+        return self._depth_snapshot_source.capture_npy_frame(view_id=view_id)
+
     def _capture_visual_scene(self, capture: Callable[[Any], Any]) -> Any:
         """Keep renderer access serialized with motion and lifecycle changes."""
 
@@ -487,7 +509,7 @@ class MujocoAgentSkillMotionApplication:
             )
 
     def close_after_hold(self) -> None:
-        visual_source: MujocoRgbSnapshotSource | None = None
+        snapshot_sources: tuple[object, ...] = ()
         with self._lock:
             if self._closed:
                 return
@@ -495,13 +517,27 @@ class MujocoAgentSkillMotionApplication:
                 raise RuntimeError("Closing a started motion application requires HOLD.")
             if self._started:
                 self.runtime.close()
-            visual_source = getattr(self, "_visual_snapshot_source", None)
+            snapshot_sources = tuple(
+                source
+                for source in (
+                    getattr(self, "_visual_snapshot_source", None),
+                    getattr(self, "_depth_snapshot_source", None),
+                )
+                if source is not None
+            )
             self._closed = True
             self._active_operation_id = None
         # Do not invert the source-lock -> application-lock order used during
         # capture.  Once _closed is visible, no new scene capture can begin.
-        if visual_source is not None:
-            visual_source.close()
+        first_error: Exception | None = None
+        for source in snapshot_sources:
+            try:
+                source.close()
+            except Exception as exc:  # pragma: no cover - backend cleanup
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 __all__ = [
