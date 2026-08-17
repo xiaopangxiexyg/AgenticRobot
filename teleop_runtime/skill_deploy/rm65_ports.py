@@ -195,11 +195,16 @@ class ExclusiveRM65SkillDeployPorts:
         self._resources_started = False
         self._resources_closed = False
         self._force_guard_started = False
+        self._startup_hold_receipt: RealSkillMotionHoldReceipt | None = None
 
     @property
     def resources_started(self) -> bool:
         with self._resource_lock:
             return self._resources_started
+
+    @property
+    def startup_hold_receipt(self) -> RealSkillMotionHoldReceipt | None:
+        return self._startup_hold_receipt
 
     def start(self) -> None:
         """Start both lower backends and reject any partial inventory."""
@@ -223,6 +228,12 @@ class ExclusiveRM65SkillDeployPorts:
                 stage="exclusive_real_skill_resource_start",
                 required_sides=("left", "right"),
             )
+            startup_hold = self.hold("exclusive real Skill startup fence")
+            if not startup_hold.succeeded:
+                raise RuntimeError(
+                    "exclusive RM65 Skill startup HOLD was not confirmed."
+                )
+            self._startup_hold_receipt = startup_hold
             self.position_force_guard.start(arm_stale_watchdog=True)
             self._force_guard_started = True
             self._require_force_guard_motion_ready()

@@ -266,7 +266,11 @@ def test_rm65_ports_use_checked_dispatch_and_lower_hold() -> None:
     assert all(len(backend.sent) == 1 for backend in backends.values())
     assert hold.succeeded is True
     assert hold.evidence_refs[0].startswith("rm65-skill-hold:")
-    assert all(backend.holds == ["skill complete"] for backend in backends.values())
+    assert all(
+        backend.holds
+        == ["exclusive real Skill startup fence", "skill complete"]
+        for backend in backends.values()
+    )
     assert all(backend.target_active is False for backend in backends.values())
 
 
@@ -277,19 +281,27 @@ def test_rm65_ports_own_start_and_hold_before_close() -> None:
     ports.close()
 
     assert ports.resources_started is False
+    assert ports.startup_hold_receipt is not None
+    assert ports.startup_hold_receipt.succeeded is True
     assert all(backend.starts == 1 for backend in backends.values())
     assert ports.position_force_guard.starts == 1
     assert ports.position_force_guard.closes == 1
     assert all(
-        backend.holds == ["exclusive real Skill resource shutdown"]
+        backend.holds
+        == [
+            "exclusive real Skill startup fence",
+            "exclusive real Skill resource shutdown",
+        ]
         for backend in backends.values()
     )
     assert all(backend.closes == 1 for backend in backends.values())
     events = ports.position_force_guard.events
-    assert max(
-        events.index("backend_hold:left"),
-        events.index("backend_hold:right"),
-    ) < events.index("force_guard_close")
+    hold_indices = [
+        index
+        for index, event in enumerate(events)
+        if event in {"backend_hold:left", "backend_hold:right"}
+    ]
+    assert max(hold_indices) < events.index("force_guard_close")
     assert events.index("force_guard_close") < min(
         events.index("backend_close:left"),
         events.index("backend_close:right"),

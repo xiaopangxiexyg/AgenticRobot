@@ -158,9 +158,12 @@ server teardown, and the strict relative-envelope files. They establish wiring
 and fail-HOLD behavior, not safe physical motion; the first real run remains an
 operator-supervised 3 cm single-arm test.
 
-The reviewed test envelope files are
-`configs/agent_primitive_left_relative_tight_v1.json` and
-`configs/agent_primitive_right_relative_tight_v1.json`. Each binds the runtime
+The canonical shared profiles live at
+`teleop_runtime/configs/skill_deploy/agent_primitive_left_relative_tight_v1.json`
+and
+`teleop_runtime/configs/skill_deploy/agent_primitive_right_relative_tight_v1.json`.
+The files under this package's `configs/` directory are compatibility mirrors
+checked for semantic equality by tests. Each profile binds the runtime
 Home TCP as the anchor, allows ±10 cm in canonical desk axes, and limits total
 rotation from that anchor to 45 degrees. The runtime brings both arms online so
 the coupled collision and final pre-IK safety owners remain authoritative, but

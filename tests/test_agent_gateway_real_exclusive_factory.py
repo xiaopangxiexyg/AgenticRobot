@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from agent_gateway.profiles.real.exclusive_factory import (
     assemble_exclusive_real_agent_primitive_deployment,
@@ -300,6 +301,7 @@ def test_application_owns_control_loop_and_holds_before_resource_close() -> None
     application = ExclusiveRealSkillApplication(
         deployment=deployment,
         resources=resources,
+        startup_admission=lambda: {"startup": "admitted"},
         server_factory=lambda: server,
         config=ExclusiveRealSkillApplicationConfig(control_hz=100.0),
     )
@@ -311,6 +313,7 @@ def test_application_owns_control_loop_and_holds_before_resource_close() -> None
     assert application.state == ExclusiveRealSkillApplicationState.CLOSED
     assert resources.starts == 1
     assert resources.closes == 1
+    assert application.startup_admission_receipt == {"startup": "admitted"}
     assert server.closed == 1
     assert holds
     assert deployment.control_runtime.last_hold_receipt is not None
@@ -336,6 +339,7 @@ def test_application_control_fault_reaches_hold_without_another_read() -> None:
     application = ExclusiveRealSkillApplication(
         deployment=deployment,
         resources=resources,
+        startup_admission=lambda: {"startup": "admitted"},
         server_factory=_Server,
         config=ExclusiveRealSkillApplicationConfig(control_hz=100.0),
     )
@@ -354,3 +358,39 @@ def test_application_control_fault_reaches_hold_without_another_read() -> None:
     assert deployment.control_runtime.last_hold_receipt is not None
     assert deployment.control_runtime.last_hold_receipt.succeeded is True
     application.close()
+
+
+def test_application_fails_closed_before_server_when_startup_admission_fails() -> None:
+    holds: list[str] = []
+    resources = _Resources()
+    server_built = False
+    deployment = _deployment(
+        observation_provider=_fresh_observation_cut,
+        hold_reasons=holds,
+    )
+
+    def reject_startup():
+        raise RuntimeError("target safety anchor unavailable")
+
+    def build_server():
+        nonlocal server_built
+        server_built = True
+        return _Server()
+
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment,
+        resources=resources,
+        startup_admission=reject_startup,
+        server_factory=build_server,
+    )
+
+    with pytest.raises(RuntimeError, match="target safety anchor unavailable"):
+        application.start()
+
+    assert application.state == ExclusiveRealSkillApplicationState.FAULT
+    assert application.startup_admission_receipt is None
+    assert server_built is False
+    assert resources.starts == 1
+    assert resources.closes == 1
+    assert len(holds) == 1
+    assert "exclusive_skill_application_start_failed" in holds[0]

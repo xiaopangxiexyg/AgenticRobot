@@ -31,6 +31,12 @@ class ExclusiveRealSkillServer(Protocol):
     def server_close(self) -> None: ...
 
 
+class ExclusiveRealSkillStartupAdmission(Protocol):
+    """Trusted lower startup gate invoked before transport is exposed."""
+
+    def __call__(self) -> object: ...
+
+
 class ExclusiveRealSkillApplicationState(str, Enum):
     CREATED = "created"
     RUNNING = "running"
@@ -64,6 +70,7 @@ class ExclusiveRealSkillApplication:
         *,
         deployment: ExclusiveRealAgentPrimitiveDeployment,
         resources: ExclusiveRealSkillResources,
+        startup_admission: ExclusiveRealSkillStartupAdmission,
         server_factory: Callable[[], ExclusiveRealSkillServer],
         config: ExclusiveRealSkillApplicationConfig | None = None,
     ) -> None:
@@ -72,12 +79,14 @@ class ExclusiveRealSkillApplication:
         for name, value in (
             ("resources.start", getattr(resources, "start", None)),
             ("resources.close", getattr(resources, "close", None)),
+            ("startup_admission", startup_admission),
             ("server_factory", server_factory),
         ):
             if not callable(value):
                 raise TypeError(f"{name} must be callable.")
         self.deployment = deployment
         self.resources = resources
+        self.startup_admission = startup_admission
         self.server_factory = server_factory
         self.config = config or ExclusiveRealSkillApplicationConfig()
         self._lock = threading.RLock()
@@ -87,6 +96,7 @@ class ExclusiveRealSkillApplication:
         self._control_stop = threading.Event()
         self._serving = threading.Event()
         self._control_fault: BaseException | None = None
+        self._startup_admission_receipt: object | None = None
 
     @property
     def state(self) -> ExclusiveRealSkillApplicationState:
@@ -98,8 +108,13 @@ class ExclusiveRealSkillApplication:
         with self._lock:
             return self._control_fault
 
+    @property
+    def startup_admission_receipt(self) -> object | None:
+        with self._lock:
+            return self._startup_admission_receipt
+
     def start(self) -> None:
-        """Open resources before exposing transport and publish one fresh cut."""
+        """Pass lower startup admission before publishing or exposing transport."""
 
         with self._lock:
             if self._state != ExclusiveRealSkillApplicationState.CREATED:
@@ -112,6 +127,13 @@ class ExclusiveRealSkillApplication:
             resources_started = True
             self.deployment.control_runtime.start()
             runtime_started = True
+            startup_receipt = self.startup_admission()
+            if startup_receipt is None:
+                raise RuntimeError(
+                    "exclusive real Skill startup admission returned no receipt."
+                )
+            with self._lock:
+                self._startup_admission_receipt = startup_receipt
             self.deployment.control_runtime.step()
             server = self.server_factory()
             for name in ("serve_forever", "shutdown", "server_close"):
@@ -251,4 +273,5 @@ __all__ = [
     "ExclusiveRealSkillApplicationState",
     "ExclusiveRealSkillResources",
     "ExclusiveRealSkillServer",
+    "ExclusiveRealSkillStartupAdmission",
 ]
