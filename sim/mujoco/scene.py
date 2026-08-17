@@ -69,7 +69,15 @@ def _body_exists(mujoco, model, name: str) -> bool:
 
 
 def _infer_arm_spec(mujoco, model, side: str) -> ArmSpec | None:
-    prefix_candidates = (f"{side}_arm_joint", "arm_joint", "joint")
+    # The legacy single-arm RM65 URDF convention is unqualified
+    # ``arm_joint1..6``/``arm_link6`` and is used by the right-side entrypoint.
+    # Do not probe that same physical chain for both sides: doing so creates
+    # duplicate qpos addresses before --mode can select the active side.
+    prefix_candidates = [f"{side}_arm_joint"]
+    body_candidates = [f"{side}_arm_link6", f"{side}_link6"]
+    if side == "right":
+        prefix_candidates.extend(("arm_joint", "joint"))
+        body_candidates.append("arm_link6")
     joint_names: tuple[str, ...] | None = None
     for prefix in prefix_candidates:
         candidate = tuple(f"{prefix}{index}" for index in range(1, 7))
@@ -78,7 +86,6 @@ def _infer_arm_spec(mujoco, model, side: str) -> ArmSpec | None:
             break
     if joint_names is None:
         return None
-    body_candidates = (f"{side}_arm_link6", "arm_link6", f"{side}_link6")
     controlled_body = next(
         (name for name in body_candidates if _body_exists(mujoco, model, name)),
         "",
@@ -101,21 +108,24 @@ def _parallel_gripper_from_joints(
     joint_names: tuple[str, ...],
     effector_name: str = "gripper",
     side: str | None = None,
+    open_at_upper: bool = True,
 ) -> GripperSpec | None:
     if not all(_joint_exists(mujoco, model, joint_name) for joint_name in joint_names):
         return None
     ranges = [_joint_range(mujoco, model, joint_name) for joint_name in joint_names]
     if any(item is None for item in ranges):
         return None
-    # The local gripper URDF convention is viewer-friendly: q=upper is open and
-    # q=lower is closed. Keeping this per spec lets future modules override it.
     lower = tuple(float(item[0]) for item in ranges if item is not None)
     upper = tuple(float(item[1]) for item in ranges if item is not None)
+    if open_at_upper:
+        open_qpos, closed_qpos = upper, lower
+    else:
+        open_qpos, closed_qpos = lower, upper
     return GripperSpec(
         name=name,
         joint_names=joint_names,
-        open_qpos=upper,
-        closed_qpos=lower,
+        open_qpos=open_qpos,
+        closed_qpos=closed_qpos,
         effector_name=effector_name,
         side=side,
     )
@@ -129,27 +139,45 @@ def _infer_gripper_specs(mujoco, model) -> dict[str, GripperSpec]:
             ("eg2_4b2_left_finger_joint", "eg2_4b2_right_finger_joint"),
             "gripper",
             None,
+            True,
         ),
         (
             "parallel_gripper",
             ("left_finger_joint", "right_finger_joint"),
             "gripper",
             None,
+            True,
         ),
         (
             "left_gripper",
             ("left_gripper_left_finger_joint", "left_gripper_right_finger_joint"),
             "left_hand",
             "left",
+            True,
         ),
         (
             "right_gripper",
             ("right_gripper_left_finger_joint", "right_gripper_right_finger_joint"),
             "right_hand",
             "right",
+            True,
+        ),
+        (
+            "eg2_4b2_cad",
+            (
+                "eg2_4b2_cad_l_1_joint",
+                "eg2_4b2_cad_l_3_joint",
+                "eg2_4b2_cad_r_1_joint",
+                "eg2_4b2_cad_r_3_joint",
+                "eg2_4b2_cad_l_2_joint",
+                "eg2_4b2_cad_r_2_joint",
+            ),
+            "gripper",
+            "right",
+            False,
         ),
     )
-    for name, joint_names, effector_name, side in candidates:
+    for name, joint_names, effector_name, side, open_at_upper in candidates:
         spec = _parallel_gripper_from_joints(
             mujoco,
             model,
@@ -157,6 +185,7 @@ def _infer_gripper_specs(mujoco, model) -> dict[str, GripperSpec]:
             joint_names=joint_names,
             effector_name=effector_name,
             side=side,
+            open_at_upper=open_at_upper,
         )
         if spec is not None:
             specs[spec.name] = spec

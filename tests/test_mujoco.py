@@ -20,6 +20,9 @@ from teleop_runtime.schemas import EffectorCommand
 URDF = Path(
     "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 )
+CAD_SINGLE_ARM_URDF = Path(
+    "assets/rm65_inspire_gripper_v3/rm65_arm_wrist_camera_4b2_cad_with_legacy_housing.urdf"
+)
 
 
 def test_canonical_mujoco_package_replaces_legacy_namespace() -> None:
@@ -316,6 +319,27 @@ def test_mujoco_scene_loads_arms_and_cameras() -> None:
     assert set(scene.arm_specs) == {"left", "right"}
     assert set(scene.camera_names) == {"front", "left_wrist", "right_wrist"}
     assert scene.get_arm_qpos("right").shape == (6,)
+
+
+@pytest.mark.optional
+def test_mujoco_scene_loads_single_arm_cad_gripper() -> None:
+    pytest.importorskip("mujoco")
+    if not CAD_SINGLE_ARM_URDF.exists():
+        pytest.skip(f"optional CAD asset is unavailable: {CAD_SINGLE_ARM_URDF}")
+
+    scene = MujocoScene.from_urdf(CAD_SINGLE_ARM_URDF, camera_names=())
+
+    assert set(scene.arm_specs) == {"right"}
+    assert set(scene.gripper_specs) == {"eg2_4b2_cad"}
+    spec = scene.gripper_specs["eg2_4b2_cad"]
+    assert spec.side == "right"
+    assert spec.open_qpos == pytest.approx((0.0,) * 6)
+    assert spec.closed_qpos == pytest.approx((0.864,) * 6)
+
+    scene.set_gripper_close("eg2_4b2_cad", 1.0)
+    assert scene.get_gripper_qpos("eg2_4b2_cad").tolist() == pytest.approx([0.864] * 6)
+    scene.set_gripper_close("eg2_4b2_cad", 0.0)
+    assert scene.get_gripper_qpos("eg2_4b2_cad").tolist() == pytest.approx([0.0] * 6)
 
 
 def test_gripper_spec_maps_normalized_close_to_joint_qpos() -> None:
