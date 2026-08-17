@@ -63,7 +63,7 @@ one target runtime / one dispatch owner
 | schema/hash/validation | `dataset_contracts` |
 | projection/reader/training view | `dataset_interface` |
 | live collection lifecycle/persistence mechanics | `collection_runtime` |
-| learner/loss/offline evaluation | `policy_learning` |
+| 非正式 learner/loss/offline evaluation | `experiments/policy_learning` |
 | GUI/profile coordination | `control_station` application leaf |
 
 共享代码依赖向 `robot_motion`、`control_composition` 和纯数据 contract 收敛；下层 owner 不得反向导入
@@ -164,7 +164,7 @@ runtime event
 - 用精确 allowlist 阻止 RM65、left/right、q6/q16 和固定 shape 假设向 generic core 扩散；
 - 新本体先定义 component/action/frame/capability contract，再增加 profile-specific adapter；
 - 保留旧 v1 facade 和 artifact consumer，只有经调用审计、迁移说明和 parity 后才能删除；
-- learner 源码归 `policy_learning`，model artifact 归 `model/`，二者都不拥有 motion semantics。
+- 非正式 learner 源码归 `experiments/policy_learning`，model artifact 归 `model/`；生产模块不得导入实验源码，二者都不拥有 motion semantics。
 
 ### CC-5：production authority adoption（独立安全批次）
 

@@ -1,10 +1,9 @@
-# Policy learning
+# Policy-learning compatibility path
 
-`policy_learning/` owns framework-local learner definitions, losses, training
-batch adapters, and offline model evaluation. It may consume
-`dataset_contracts` and `dataset_interface`, but it does not own dataset
-schemas, robot-motion semantics, policy deployment, safety, authority, or
-dispatch.
+The canonical non-production learner and offline evaluation source now lives
+under `experiments/policy_learning/`. This top-level package temporarily keeps
+object-identical `policy_learning.arm_hold` imports available while concurrent
+callers move to `experiments.policy_learning.arm_hold`.
 
 Framework-specific integration remains under its owning deployment package,
 for example `deployments/openpi/training/`. Runtime weight files and exported

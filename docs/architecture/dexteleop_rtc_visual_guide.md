@@ -93,7 +93,7 @@ flowchart TD
     C["deployments.client<br/>model-neutral capability/transport"]
     D["deployments.openpi.client<br/>artifact-bound codec/adapter"]
     E["dataset_contracts / dataset_interface<br/>continuation schema + offline view"]
-    F["policy_learning or model repo<br/>learner + loss + sampling"]
+    F["experiments.policy_learning or model repo<br/>non-canonical learner + loss"]
     G["robot_motion target runtime<br/>safety + IK + reference + dispatch"]
 
     B --> A

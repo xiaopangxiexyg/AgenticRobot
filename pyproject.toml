@@ -87,6 +87,7 @@ include = [
     "dataset_contracts*",
     "dataset_interface*",
     "deployments*",
+    "experiments*",
     "hardware*",
     "policy_learning*",
     "robot_motion*",

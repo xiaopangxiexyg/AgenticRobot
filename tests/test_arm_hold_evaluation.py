@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from policy_learning.arm_hold import arm_hold_window_evaluation
+from experiments.policy_learning.arm_hold import arm_hold_window_evaluation
 
 
 def _perfect_case() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

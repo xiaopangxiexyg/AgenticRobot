@@ -39,7 +39,7 @@ def test_model_directory_is_artifact_only() -> None:
     ) == []
 
 
-def test_policy_learning_does_not_depend_on_runtime_or_motion_owners() -> None:
+def test_experimental_policy_learning_has_a_narrow_dependency_surface() -> None:
     forbidden = {
         "collection_runtime",
         "control_composition",
@@ -54,32 +54,87 @@ def test_policy_learning_does_not_depend_on_runtime_or_motion_owners() -> None:
         str(path.relative_to(REPO_ROOT)): sorted(
             _absolute_import_roots(path) & forbidden
         )
-        for path in sorted((REPO_ROOT / "policy_learning").rglob("*.py"))
+        for path in sorted(
+            (REPO_ROOT / "experiments" / "policy_learning").rglob("*.py")
+        )
         if _absolute_import_roots(path) & forbidden
     }
 
     assert violations == {}
 
 
-def test_lower_owners_do_not_import_policy_learning() -> None:
-    lower_owners = (
+def test_production_owners_do_not_import_experiments() -> None:
+    production_owners = (
+        "agent_gateway",
         "collection_runtime",
         "control_composition",
+        "control_station",
         "dataset_contracts",
         "dataset_interface",
+        "deployments",
         "hardware",
         "robot_motion",
         "sim",
+        "teleop_runtime",
     )
     violations = {
         str(path.relative_to(REPO_ROOT)): sorted(
             root
             for root in _absolute_import_roots(path)
-            if root == "policy_learning"
+            if root == "experiments"
         )
-        for owner in lower_owners
+        for owner in production_owners
         for path in sorted((REPO_ROOT / owner).rglob("*.py"))
-        if "policy_learning" in _absolute_import_roots(path)
+        if "experiments" in _absolute_import_roots(path)
     }
 
     assert violations == {}
+
+
+def test_policy_learning_compatibility_exports_are_object_identical() -> None:
+    from experiments.policy_learning import arm_hold as canonical
+    from policy_learning import arm_hold as compatibility
+
+    assert compatibility.__all__ == canonical.__all__
+    for name in canonical.__all__:
+        assert getattr(compatibility, name) is getattr(canonical, name)
+
+
+def test_policy_learning_compatibility_package_has_no_implementation() -> None:
+    compatibility_root = REPO_ROOT / "policy_learning"
+
+    assert sorted(
+        path.relative_to(compatibility_root)
+        for path in compatibility_root.rglob("*.py")
+    ) == [Path("__init__.py"), Path("arm_hold/__init__.py")]
+
+
+def test_experiments_are_discoverable_without_becoming_a_core_dependency() -> None:
+    project = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert '    "experiments*",' in project
+    assert '    "policy_learning*",' in project
+
+
+def test_arm_hold_compatibility_launchers_stay_thin() -> None:
+    launchers = (
+        "probe_arm_hold_front_state_batch_benchmark.py",
+        "probe_arm_hold_one_episode_overfit.py",
+        "probe_arm_hold_state_only_train_validation.py",
+    )
+
+    for name in launchers:
+        path = REPO_ROOT / "scripts" / "probes" / name
+        source = path.read_text(encoding="utf-8")
+        assert len(source.splitlines()) <= 18
+        assert "from experiments.policy_learning.arm_hold.commands" in source
+
+
+def test_experiments_do_not_add_catch_all_modules() -> None:
+    forbidden_names = {"common.py", "helpers.py", "misc.py", "utils.py"}
+
+    assert {
+        path.relative_to(REPO_ROOT)
+        for path in (REPO_ROOT / "experiments").rglob("*.py")
+        if path.name in forbidden_names
+    } == set()

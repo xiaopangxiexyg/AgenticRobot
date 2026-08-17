@@ -72,10 +72,14 @@ is experimental.
   validation interfaces. It may depend on `dataset_contracts` and pure domain
   contracts, but must not become a device/control runtime or authoritative
   episode owner, and must not import `control_station`.
-- `policy_learning/`: framework-local learner definitions, losses, training
-  batch adapters, and offline model evaluation. It may depend on
-  `dataset_contracts` and `dataset_interface`, but must not own robot-motion
-  semantics, deployment, safety, authority, dispatch, or hardware resources.
+- `experiments/`: versioned, reproducible, non-canonical hypothesis
+  implementations and offline evaluation. It may consume canonical public
+  contracts, but production packages must not import it. It owns no canonical
+  schema, persistent data semantics, artifact integration, authority, safety,
+  dispatch, resource lifecycle, or production entrypoint. Reusable logic is
+  promoted to its production owner rather than imported from this tree.
+- `policy_learning/`: temporary forwarding compatibility only; it must not
+  regain implementation, state, commands, or artifacts.
 - `model/`: local policy weights, checkpoints, runtime sidecars, and explicitly
   pinned external source boundaries only. It is not a Python package or an
   AgenticRobot source-code owner; versioned artifact contracts and integration

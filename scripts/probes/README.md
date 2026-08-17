@@ -14,3 +14,7 @@ dataset, deployment, simulation, or hardware safety rules before execution.
 They are not canonical teleoperation, collection, replay, or deployment
 entrypoints.  Those remain documented under `docs/` and in the repository root
 `README.md`.
+
+Experiment-specific learner, loss, training, and evaluation implementations
+belong under `experiments/`. A launcher kept here for compatibility must stay
+thin and delegate to that owner.

@@ -1,1 +1,1 @@
-"""Framework-local policy learners, losses, and offline evaluation."""
+"""Temporary compatibility namespace for ``experiments.policy_learning``."""
