@@ -122,27 +122,47 @@ python -m agent_gateway mujoco \
 forwarder. It creates no Gateway implementation or runtime state inside
 `control_station`.
 
+The dedicated independent RM65 Skill entrypoint is:
+
+```bash
+python -m agent_gateway real-rm65 \
+  --socket-path /absolute/private/gateway.sock \
+  --calibration-profile /absolute/station_calibration.json \
+  --arm-ip-assignment /absolute/rm65_arm_ips.json \
+  --left-tool-profile /absolute/left_tool.json \
+  --right-tool-profile /absolute/right_tool.json \
+  --envelope-profile /absolute/right_skill_envelope.json \
+  --authorized-side right \
+  --authorized-action forward \
+  --confirm AUTHORIZE_ONE_REAL_TCP_PRIMITIVE
+```
+
+The CLI is a concrete lower deployment leaf, not an Agent API. All files and
+the selected side/action are trusted operator inputs. The process exposes no
+transport until both RM65 backends have started, lower HOLD is confirmed, a
+fresh measured dual-arm cut has seeded the coupled solver, and the Active
+pre-IK envelope has been anchored. The exact confirmation authorizes at most
+one matching request; it does not bypass per-request Gateway admission.
+
 The MuJoCo launcher starts no RPent planner and connects no real device. Its
 socket parent must already exist, resolve to a real non-world-writable
 directory, and contain no existing endpoint at the selected path.
 
-The Gateway package does not yet provide a fully configured real-device CLI.
-The preferred programmatic path calls
-`assemble_exclusive_real_agent_primitive_deployment`, binds its callbacks to
-`ExclusiveRM65SkillDeployPorts`, and runs it under
-`ExclusiveRealSkillApplication`. This application owns the sole lower control
-  thread, opens the Gateway transport only after resources and a fresh measured
-  cut are ready, and orders shutdown as Gateway fence -> future-cycle fence ->
-  lower-confirmed HOLD -> control-thread join -> resource close. None of those modules imports or
-constructs RealTeleop, VIVE, collection, GUI, or `control_composition`.
+The real CLI resolves an `ExclusiveRM65SkillDeploymentProfile`, constructs the
+single lower graph through `assemble_exclusive_rm65_skill_lower`, and binds it
+to the existing Skill/Gateway contracts through
+`assemble_exclusive_rm65_agent_primitive_composition`. It reuses the shared
+RM65 backend, coupled solver, force guard, target-envelope, one-use Grant, and
+Unix transport implementations without importing or constructing RealTeleop,
+VIVE, collection, GUI, or `control_composition`. The application owns the sole
+lower control thread and orders shutdown as Gateway fence -> future-cycle
+fence -> lower-confirmed HOLD -> control-thread join -> resource close.
 
-A trusted composition root must still provide the exact RM65 backends, coupled
-target solver, identities, frame graph, safety-envelope references, and socket
-policy. Constructing that production profile and its dedicated CLI is the
-remaining launcher work; the offline application tests are not hardware
-evidence. `attach_real_agent_primitive_gateway` and the RealTeleop
-`--agent-primitive-skill-only` option remain compatibility paths while that
-migration completes. `one_shot_client` is only an authenticated one-request
+The current evidence is offline construction and lifecycle validation, not
+real-hardware proof. `attach_real_agent_primitive_gateway` and the RealTeleop
+`--agent-primitive-skill-only` option remain compatibility paths; the
+independent launcher is the preferred path. `one_shot_client` is only an
+authenticated one-request
 Unix client and never initializes or dispatches hardware itself.
 
 ## Skill and execution boundary

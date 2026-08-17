@@ -12,7 +12,9 @@ import numpy as np
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.rm65 import (
     RM65_BIMANUAL_POSITION_V1_NAME,
+    build_rm65_dual_arm_scene_profile,
     load_rm65_tool_profile,
+    load_world_from_arm_base_transforms,
     resolve_rm65_bimanual_position_profile,
     tool_tcp_pose_flange_m_rad,
 )
@@ -99,6 +101,7 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
     arm_ip_by_side: Mapping[str, str]
     tool_profile_by_side: Mapping[str, Mapping[str, object]]
     tool_tcp_pose_flange_m_rad_by_side: Mapping[str, np.ndarray]
+    scene_world_from_arm_base_by_side: Mapping[str, np.ndarray]
     envelope_file_spec: TCPPoseEnvelopeFileSpec
     position_profile: RM65BimanualPositionProfile
     collision_scene_profile: str
@@ -120,11 +123,18 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
                 self.tool_tcp_pose_flange_m_rad_by_side
             ).items()
         }
+        scene_mounts = {
+            side: np.asarray(value, dtype=float).reshape(4, 4).copy()
+            for side, value in dict(
+                self.scene_world_from_arm_base_by_side
+            ).items()
+        }
         for name, values in (
             ("arm_ip_by_side", ips),
             ("tool_profile_by_side", tools),
             ("tool_profile_path_by_side", tool_paths),
             ("tool_tcp_pose_flange_m_rad_by_side", tcp),
+            ("scene_world_from_arm_base_by_side", scene_mounts),
         ):
             if set(values) != set(_SIDES):
                 raise ValueError(f"{name} must contain exactly left and right.")
@@ -132,6 +142,8 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
             raise ValueError("both RM65 arm IP assignments must be non-empty.")
         if any(not np.all(np.isfinite(value)) for value in tcp.values()):
             raise ValueError("tool TCP poses must contain finite values.")
+        if any(not np.all(np.isfinite(value)) for value in scene_mounts.values()):
+            raise ValueError("scene arm mounts must contain finite values.")
         object.__setattr__(self, "arm_ip_by_side", MappingProxyType(ips))
         object.__setattr__(self, "tool_profile_by_side", MappingProxyType(tools))
         object.__setattr__(
@@ -143,6 +155,11 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
             self,
             "tool_tcp_pose_flange_m_rad_by_side",
             MappingProxyType(tcp),
+        )
+        object.__setattr__(
+            self,
+            "scene_world_from_arm_base_by_side",
+            MappingProxyType(scene_mounts),
         )
 
 
@@ -173,11 +190,25 @@ def resolve_exclusive_rm65_skill_deployment_profile(
         for side in _SIDES
     }
     calibration = TeleopCalibration.load_json(calibration_path)
+    scene_profile = build_rm65_dual_arm_scene_profile(
+        profile.collision_scene_profile
+    )
+    scene_mounts = load_world_from_arm_base_transforms(scene_profile)
     for side in _SIDES:
         arm = calibration.get_arm_for_side(side)
         transform = np.asarray(arm.T_D_B, dtype=float)
         if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
             raise ValueError(f"calibration side {side!r} has no finite T_D_B.")
+        if not np.allclose(
+            transform,
+            scene_mounts[side],
+            rtol=0.0,
+            atol=1e-9,
+        ):
+            raise ValueError(
+                f"calibration side {side!r} T_D_B does not match the fixed "
+                f"arm mount in collision scene {scene_profile.name!r}."
+            )
     assignment = load_assignment(arm_ip_assignment_path)
     arm_ips = arm_ips_for_sides(assignment, sides=_SIDES)
     if set(arm_ips) != set(_SIDES):
@@ -221,6 +252,9 @@ def resolve_exclusive_rm65_skill_deployment_profile(
             },
             "position_profile": position_profile.to_metadata(),
             "collision_scene_profile": profile.collision_scene_profile,
+            "scene_world_from_arm_base_by_side": {
+                side: scene_mounts[side].tolist() for side in _SIDES
+            },
         },
         domain="dexteleop.real_skill.rm65_deployment_profile.v1",
     )
@@ -233,6 +267,7 @@ def resolve_exclusive_rm65_skill_deployment_profile(
         arm_ip_by_side=arm_ips,
         tool_profile_by_side=tool_profiles,
         tool_tcp_pose_flange_m_rad_by_side=tcp_by_side,
+        scene_world_from_arm_base_by_side=scene_mounts,
         envelope_file_spec=envelope_spec,
         position_profile=position_profile,
         collision_scene_profile=profile.collision_scene_profile,

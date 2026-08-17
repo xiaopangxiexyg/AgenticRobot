@@ -198,8 +198,20 @@ class ExclusiveRealSkillApplication:
             deadline += period
             self._control_stop.wait(max(0.0, deadline - time.monotonic()))
 
-    def serve_forever(self) -> None:
-        """Run the sole Gateway server until shutdown or a lower control fault."""
+    def serve_forever(
+        self,
+        *,
+        ready_callback: Callable[[], None] | None = None,
+    ) -> None:
+        """Run the sole Gateway server until shutdown or a lower control fault.
+
+        The callback is a process-host seam: it runs only after lower startup
+        admission and server construction, immediately before transport
+        serving.  It grants no motion or shutdown authority.
+        """
+
+        if ready_callback is not None and not callable(ready_callback):
+            raise TypeError("ready_callback must be callable or None.")
 
         self.start()
         with self._lock:
@@ -207,6 +219,8 @@ class ExclusiveRealSkillApplication:
         assert server is not None
         self._serving.set()
         try:
+            if ready_callback is not None:
+                ready_callback()
             server.serve_forever(
                 poll_interval=self.config.server_poll_interval_sec,
             )
@@ -218,6 +232,17 @@ class ExclusiveRealSkillApplication:
             raise RuntimeError(
                 "exclusive real Skill control loop failed."
             ) from fault
+
+    def request_shutdown(self) -> bool:
+        """Ask the owned transport loop to stop; normal close still owns HOLD."""
+
+        with self._lock:
+            server = self._server
+            serving = self._serving.is_set()
+        if server is None or not serving:
+            return False
+        server.shutdown()
+        return True
 
     def close(self) -> None:
         """Fence Gateway and future cycles, then HOLD and close resources."""

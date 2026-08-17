@@ -384,7 +384,7 @@ class RealAgentPrimitiveDeploymentBinding:
                 ),
                 "target_kind": "real",
                 "controlled_frame_id": "tool_tcp",
-                "source_kind": "agent_skill_via_existing_realteleop_owner",
+                "source_kind": "agent_skill_via_lower_owned_motion_port",
             },
             domain="dexteleop.agent_skill.real_tcp_primitive_deployment.v1",
         )

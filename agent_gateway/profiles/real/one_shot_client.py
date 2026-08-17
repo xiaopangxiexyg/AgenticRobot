@@ -158,7 +158,7 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         if snapshot["lifecycle_state"] != "running" or (
             snapshot["execution_gate"] != "ready"
         ):
-            raise RuntimeError("Lower RealTeleop owner is not RUNNING/READY.")
+            raise RuntimeError("Lower real Skill owner is not RUNNING/READY.")
         parameters = _parameters(
             action=args.action,
             skill_id=skill_id,

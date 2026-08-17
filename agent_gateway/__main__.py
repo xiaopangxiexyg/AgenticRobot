@@ -12,6 +12,10 @@ def main(argv: list[str] | None = None) -> int:
         from .profiles.mujoco.gateway_cli import main as mujoco_main
 
         return int(mujoco_main(values[1:]))
+    if values and values[0] == "real-rm65":
+        from .profiles.real.gateway_cli import main as real_rm65_main
+
+        return int(real_rm65_main(values[1:]))
 
     parser = argparse.ArgumentParser(
         prog="python -m agent_gateway",
@@ -20,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "profile",
         nargs="?",
-        choices=("mujoco",),
+        choices=("mujoco", "real-rm65"),
         help="concrete Gateway deployment profile to run",
     )
     if not values:

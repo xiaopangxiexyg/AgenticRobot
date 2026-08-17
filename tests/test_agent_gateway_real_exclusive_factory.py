@@ -394,3 +394,36 @@ def test_application_fails_closed_before_server_when_startup_admission_fails() -
     assert resources.closes == 1
     assert len(holds) == 1
     assert "exclusive_skill_application_start_failed" in holds[0]
+
+
+def test_application_ready_hook_and_shutdown_request_preserve_close_owner() -> None:
+    holds: list[str] = []
+    resources = _Resources()
+    server = _Server()
+    deployment = _deployment(
+        observation_provider=_fresh_observation_cut,
+        hold_reasons=holds,
+    )
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment,
+        resources=resources,
+        startup_admission=lambda: {"startup": "admitted"},
+        server_factory=lambda: server,
+        config=ExclusiveRealSkillApplicationConfig(control_hz=100.0),
+    )
+    ready = threading.Event()
+    thread = threading.Thread(
+        target=lambda: application.serve_forever(ready_callback=ready.set),
+    )
+
+    thread.start()
+    assert ready.wait(timeout=1.0)
+    assert application.request_shutdown() is True
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert application.state == ExclusiveRealSkillApplicationState.CLOSED
+    assert deployment.control_runtime.last_hold_receipt is not None
+    assert deployment.control_runtime.last_hold_receipt.succeeded is True
+    assert resources.closes == 1
+    assert holds

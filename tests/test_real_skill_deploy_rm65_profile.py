@@ -78,6 +78,14 @@ def test_profile_resolves_existing_shared_inputs_without_device_construction(
     )
     assert resolved.envelope_file_spec.profile_id.endswith("left-relative-tight-v1")
     assert resolved.position_profile.name == "rm65_bimanual_position_v1"
+    assert set(resolved.scene_world_from_arm_base_by_side) == {"left", "right"}
+    for side in ("left", "right"):
+        np.testing.assert_allclose(
+            resolved.calibration.get_arm_for_side(side).T_D_B,
+            resolved.scene_world_from_arm_base_by_side[side],
+            rtol=0.0,
+            atol=1e-9,
+        )
     assert len(resolved.semantic_content_hash) == 64
 
 
@@ -133,6 +141,21 @@ print(json.dumps(sorted(
     )
 
     assert json.loads(completed.stdout) == []
+
+
+def test_profile_rejects_calibration_that_disagrees_with_collision_scene(
+    monkeypatch,
+) -> None:
+    calibration = build_annotated_dual_rm65_calibration()
+    calibration.get_arm_for_side("right").T_D_B[1, 3] += 0.01
+    monkeypatch.setattr(
+        profile_module.TeleopCalibration,
+        "load_json",
+        lambda path: calibration,
+    )
+
+    with pytest.raises(ValueError, match="does not match the fixed arm mount"):
+        resolve_exclusive_rm65_skill_deployment_profile(_profile())
 
 
 def test_legacy_rm65_ip_module_is_the_canonical_module_object() -> None:
