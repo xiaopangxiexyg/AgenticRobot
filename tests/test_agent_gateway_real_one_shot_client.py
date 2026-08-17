@@ -34,10 +34,12 @@ class _FakeClient:
                             "route_id": "real.rm65.agent_skill_tcp_cardinal_step",
                             "route_version": "1",
                             "route_hash": "route:test",
+                            "parameter_schema_hash": "parameter-schema-hash:test",
                             "allowed_parameter_profiles": [
                                 {
                                     "parameter_profile_id": "profile:test",
                                     "parameter_profile_hash": "profile-hash:test",
+                                    "parameter_schema_hash": "parameter-schema-hash:test",
                                 }
                             ],
                         },
@@ -56,6 +58,53 @@ class _FakeClient:
                         },
                     }
                 ],
+                "skill_schema_catalog_hash": "schema-catalog:test",
+            }
+        if method == "get_agent_skill_schema_catalog":
+            return {
+                "skill_schema_catalog_hash": "schema-catalog:test",
+                "schema_entries": [
+                    {
+                        "skill_id": "motion.step_tcp_cardinal",
+                        "skill_version": "1",
+                        "parameter_schema_hash": "parameter-schema-hash:test",
+                        "parameter_schema": {
+                            "properties": {
+                                "component_id": {"enum": ["left_arm"]},
+                                "direction": {
+                                    "enum": [
+                                        "forward",
+                                        "backward",
+                                        "left",
+                                        "right",
+                                        "up",
+                                        "down",
+                                    ]
+                                },
+                                "reference_frame_id": {
+                                    "enum": ["canonical_station"]
+                                },
+                                "reference_frame_spec_hash": {
+                                    "const": "station-frame:test"
+                                },
+                                "controlled_frame_id": {"const": "tool_tcp"},
+                                "frame_graph_hash": {"const": "frame-graph:test"},
+                                "tool_config_hash": {"const": "tool-config:test"},
+                                "calibration_hash": {"const": "calibration:test"},
+                                "primitive_catalog_hash": {
+                                    "const": "primitive-catalog:test"
+                                },
+                            }
+                        },
+                        "parameter_profiles": [
+                            {
+                                "parameter_profile_id": "profile:test",
+                                "parameter_profile_hash": "profile-hash:test",
+                                "parameter_schema_hash": "parameter-schema-hash:test",
+                            }
+                        ],
+                    }
+                ],
             }
         if method == "get_observation_snapshot":
             return {
@@ -68,8 +117,6 @@ class _FakeClient:
                 "calibration_hash": "calibration:test",
                 "measurement_summary": {
                     "pose_xyz_quat_xyzw_by_component": {"left_arm": [0] * 7},
-                    "reference_frame_id": "dual_arm_solver_world",
-                    "reference_frame_spec_hash": "frame-spec:test",
                 },
             }
         if method == "submit_skill_request":
@@ -115,7 +162,17 @@ def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch) -> None:
     assert client.closed is True
     assert [method for method, _ in client.calls] == [
         "get_skill_route_manifest",
+        "get_agent_skill_schema_catalog",
         "get_observation_snapshot",
         "submit_skill_request",
         "get_own_operation",
     ]
+    request = next(
+        payload
+        for method, payload in client.calls
+        if method == "submit_skill_request"
+    )
+    assert request["parameters"]["reference_frame_id"] == "canonical_station"
+    assert request["parameters"]["reference_frame_spec_hash"] == (
+        "station-frame:test"
+    )
