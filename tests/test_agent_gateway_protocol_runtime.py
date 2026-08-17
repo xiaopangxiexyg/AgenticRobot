@@ -4,6 +4,8 @@ import base64
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from agent_gateway.protocol.artifact_contracts import (
     AgentArtifactMaterializationReceipt,
     AgentArtifactRef,
@@ -231,6 +233,7 @@ def _artifact_runtime(tmp_path: Path):
         event_journal=BoundedAgentGatewayEventJournal(
             runtime_session_id=manifest.runtime_session_id,
             max_events=16,
+            event_payload_max_bytes=1024,
         ),
         artifact_store=store,
         artifact_transfer_broker=broker,
@@ -257,6 +260,27 @@ def _artifact_runtime(tmp_path: Path):
         current_station_revision=lambda: 0,
     )
     return adapter, store
+
+
+def test_protocol_runtime_rejects_event_journal_payload_bound_mismatch(
+    tmp_path: Path,
+) -> None:
+    adapter, _store = _artifact_runtime(tmp_path)
+    runtime = adapter.service.protocol_runtime
+
+    with pytest.raises(ValueError, match="Event payload bound"):
+        AgentGatewayProtocolRuntime(
+            manifest=runtime.manifest,
+            io_catalog=runtime.io_catalog,
+            session_capabilities=runtime.session_capabilities,
+            event_journal=BoundedAgentGatewayEventJournal(
+                runtime_session_id=runtime.runtime_session_id,
+                max_events=runtime.session_capabilities.event_retention_count,
+                event_payload_max_bytes=512,
+            ),
+            artifact_store=runtime.artifact_store,
+            artifact_transfer_broker=runtime.artifact_transfer_broker,
+        )
 
 
 def test_registration_template_builds_three_closed_catalogs() -> None:

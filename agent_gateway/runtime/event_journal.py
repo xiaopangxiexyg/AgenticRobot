@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from collections.abc import Mapping
-import threading
 from typing import Any
 
 from agent_gateway.protocol._contract_validation import (
+    canonical_json_size,
     finite_number,
     identifier,
     nonnegative_integer,
@@ -15,6 +16,7 @@ from agent_gateway.protocol._contract_validation import (
 )
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.protocol.event_contracts import (
+    MAX_AGENT_GATEWAY_EVENT_PAYLOAD_BYTES_V2,
     AgentGatewayEvent,
     AgentGatewayEventBatch,
 )
@@ -27,12 +29,29 @@ class BoundedAgentGatewayEventJournal:
     reconcile through the authoritative Operation/catalog query surface.
     """
 
-    def __init__(self, *, runtime_session_id: str, max_events: int = 4096) -> None:
+    def __init__(
+        self,
+        *,
+        runtime_session_id: str,
+        max_events: int = 4096,
+        event_payload_max_bytes: int = MAX_AGENT_GATEWAY_EVENT_PAYLOAD_BYTES_V2,
+    ) -> None:
         self.runtime_session_id = identifier(
             runtime_session_id,
             field_name="runtime_session_id",
         )
         self.max_events = positive_integer(max_events, field_name="max_events")
+        self.event_payload_max_bytes = positive_integer(
+            event_payload_max_bytes,
+            field_name="event_payload_max_bytes",
+        )
+        if (
+            self.event_payload_max_bytes
+            > MAX_AGENT_GATEWAY_EVENT_PAYLOAD_BYTES_V2
+        ):
+            raise ValueError(
+                "event_payload_max_bytes exceeds the protocol event bound."
+            )
         self._lock = threading.RLock()
         self._events: deque[AgentGatewayEvent] = deque(maxlen=self.max_events)
         self._latest_sequence = 0
@@ -73,6 +92,10 @@ class BoundedAgentGatewayEventJournal:
                 payload_schema_id=payload_schema_id,
                 payload=payload,
             )
+            if canonical_json_size(event.payload, field_name="payload") > (
+                self.event_payload_max_bytes
+            ):
+                raise ValueError("Event payload exceeds the session event bound.")
             self._events.append(event)
             self._latest_sequence = event.sequence
             return event
