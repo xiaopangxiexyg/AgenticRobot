@@ -57,3 +57,45 @@ def test_empty_journal_has_a_non_gap_cursor_zero_snapshot() -> None:
     assert not batch.events
     with pytest.raises(ValueError, match="latest_sequence"):
         journal.replay(after_sequence=1, max_events=1)
+
+
+def test_journal_rejects_payload_above_session_bound_without_advancing() -> None:
+    journal = BoundedAgentGatewayEventJournal(
+        runtime_session_id="runtime:test",
+        max_events=4,
+        event_payload_max_bytes=16,
+    )
+
+    with pytest.raises(ValueError, match="session event bound"):
+        journal.append(
+            event_kind="capabilities_changed",
+            emitted_at=1.0,
+            payload={"detail": "x" * 16},
+        )
+
+    assert journal.latest_sequence == 0
+    assert not journal.replay(after_sequence=0, max_events=4).events
+
+
+def test_journal_accepts_payload_at_exact_utf8_session_bound() -> None:
+    journal = BoundedAgentGatewayEventJournal(
+        runtime_session_id="runtime:test",
+        max_events=4,
+        event_payload_max_bytes=14,
+    )
+
+    event = journal.append(
+        event_kind="capabilities_changed",
+        emitted_at=1.0,
+        payload={"value": "é"},
+    )
+
+    assert event.sequence == 1
+
+
+def test_journal_rejects_payload_bound_above_protocol_limit() -> None:
+    with pytest.raises(ValueError, match="protocol event bound"):
+        BoundedAgentGatewayEventJournal(
+            runtime_session_id="runtime:test",
+            event_payload_max_bytes=65_537,
+        )

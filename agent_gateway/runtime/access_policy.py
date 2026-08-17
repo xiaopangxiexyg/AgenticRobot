@@ -271,7 +271,7 @@ class AgentSkillAccessPolicy:
         )
         if missing_required:
             raise ValueError(
-                "Agent skill protocol v1 cannot disable grants for tiers: "
+                "Agent Skill protocol v2 cannot disable grants for tiers: "
                 f"{missing_required}."
             )
         object.__setattr__(self, "grant_required_tiers", grant_tiers)

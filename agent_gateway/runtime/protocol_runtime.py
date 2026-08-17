@@ -63,6 +63,13 @@ class AgentGatewayProtocolRuntime:
             raise ValueError("Event journal does not match the manifest session.")
         if event_journal.max_events != session_capabilities.event_retention_count:
             raise ValueError("Event retention does not match session capabilities.")
+        if (
+            event_journal.event_payload_max_bytes
+            != session_capabilities.event_payload_max_bytes
+        ):
+            raise ValueError(
+                "Event payload bound does not match session capabilities."
+            )
         if manifest.skill_io_catalog_hash != io_catalog.semantic_content_hash:
             raise ValueError("Skill I/O catalog does not match the manifest.")
 
@@ -139,7 +146,7 @@ class AgentGatewayProtocolRuntime:
         event_payload_max_bytes: int = 65_536,
         event_retention_count: int = 4096,
         clock: Callable[[], float] = time.monotonic,
-    ) -> "AgentGatewayProtocolRuntime":
+    ) -> AgentGatewayProtocolRuntime:
         """Create the default v2 profile for Skills with inline JSON only."""
 
         if not isinstance(manifest, SkillRouteManifest):
@@ -161,6 +168,7 @@ class AgentGatewayProtocolRuntime:
             event_journal=BoundedAgentGatewayEventJournal(
                 runtime_session_id=manifest.runtime_session_id,
                 max_events=event_retention_count,
+                event_payload_max_bytes=event_payload_max_bytes,
             ),
             clock=clock,
         )
