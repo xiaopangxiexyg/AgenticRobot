@@ -8,13 +8,17 @@ compression does not extend the physics-owner critical section.
 from __future__ import annotations
 
 import io
+import math
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from PIL import Image
+
+from dataset_contracts.perception_artifacts import RGB_FRAME_MEDIA_TYPE_V1
 
 from .scene import MujocoCameraRenderer
 
@@ -30,6 +34,14 @@ class EncodedMujocoRgbFrame:
     data: bytes
 
 
+@dataclass(frozen=True)
+class EncodedMujocoRgbSnapshot:
+    """Frames from one scene cut plus its lower runtime timestamp."""
+
+    captured_at: float
+    frames: Mapping[str, EncodedMujocoRgbFrame]
+
+
 class MujocoRgbSnapshotSource:
     """Own bounded renderer resources for on-demand MuJoCo RGB snapshots."""
 
@@ -37,11 +49,14 @@ class MujocoRgbSnapshotSource:
         self,
         *,
         capture_scene: Callable[[Callable[[Any], Any]], Any],
+        clock: Callable[[], float] = time.monotonic,
         renderer_factory: Callable[..., Any] = MujocoCameraRenderer,
         max_renderer_dimensions: int = 4,
     ) -> None:
         if not callable(capture_scene):
             raise TypeError("capture_scene must be callable.")
+        if not callable(clock):
+            raise TypeError("clock must be callable.")
         if not callable(renderer_factory):
             raise TypeError("renderer_factory must be callable.")
         if (
@@ -51,6 +66,7 @@ class MujocoRgbSnapshotSource:
         ):
             raise ValueError("max_renderer_dimensions must be a positive integer.")
         self._capture_scene = capture_scene
+        self._clock = clock
         self._renderer_factory = renderer_factory
         self._max_renderer_dimensions = max_renderer_dimensions
         self._renderers: dict[tuple[int, int], Any] = {}
@@ -75,18 +91,18 @@ class MujocoRgbSnapshotSource:
             self._ensure_open()
             return self._capture_scene(capture)
 
-    def capture_jpeg_frames(
+    def capture_jpeg_snapshot(
         self,
         *,
         source_ids: tuple[str, ...],
         width: int,
         height: int,
-    ) -> Mapping[str, EncodedMujocoRgbFrame]:
+    ) -> EncodedMujocoRgbSnapshot:
         """Render one scene cut and encode it after releasing the capture lock."""
 
         _validate_request(source_ids=source_ids, width=width, height=height)
 
-        def render(scene: Any) -> Mapping[str, Any]:
+        def render(scene: Any) -> tuple[Mapping[str, Any], float]:
             available = frozenset(scene.camera_names)
             missing = tuple(name for name in source_ids if name not in available)
             if missing:
@@ -102,14 +118,16 @@ class MujocoRgbSnapshotSource:
                     height=height,
                 )
                 self._renderers[key] = renderer
-            return renderer.render_all(source_ids)
+            return renderer.render_all(source_ids), float(self._clock())
 
         with self._lock:
             self._ensure_open()
-            rendered = self._capture_scene(render)
+            rendered, captured_at = self._capture_scene(render)
 
         if not isinstance(rendered, Mapping):
-            raise RuntimeError("MuJoCo renderer did not return a frame mapping.")
+            raise TypeError("MuJoCo renderer did not return a frame mapping.")
+        if not math.isfinite(captured_at):
+            raise RuntimeError("MuJoCo RGB capture clock is non-finite.")
         encoded: dict[str, EncodedMujocoRgbFrame] = {}
         for source_id in source_ids:
             if source_id not in rendered:
@@ -121,10 +139,13 @@ class MujocoRgbSnapshotSource:
                 source_id=source_id,
                 width=width,
                 height=height,
-                media_type="image/jpeg",
+                media_type=RGB_FRAME_MEDIA_TYPE_V1,
                 data=data,
             )
-        return encoded
+        return EncodedMujocoRgbSnapshot(
+            captured_at=captured_at,
+            frames=encoded,
+        )
 
     def close(self) -> None:
         """Close every cached renderer. Repeated calls are harmless."""
@@ -139,7 +160,7 @@ class MujocoRgbSnapshotSource:
         for renderer in renderers:
             try:
                 renderer.close()
-            except Exception as exc:  # pragma: no cover - backend-specific cleanup
+            except Exception as exc:  # noqa: BLE001  # pragma: no cover - backend-specific cleanup
                 if first_error is None:
                     first_error = exc
         if first_error is not None:
@@ -189,5 +210,6 @@ def _encode_jpeg(image: object) -> bytes:
 
 __all__ = [
     "EncodedMujocoRgbFrame",
+    "EncodedMujocoRgbSnapshot",
     "MujocoRgbSnapshotSource",
 ]

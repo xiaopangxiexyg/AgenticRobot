@@ -29,7 +29,8 @@ not caller-authored Agent input.
   deployment.
 - `profiles/`: exact application/deployment bindings and executors. The current
   `profiles/mujoco` package owns the no-model TCP-pose Gateway application and
-  its motion, observation, visual snapshot, policy-Skill, and CubeLift bindings.
+  its motion, observation, perception Artifact, policy-Skill, and CubeLift
+  bindings.
   `profiles/real` owns the default-off, attach-only real TCP-pose observation
   profile and the 6+3 primitive application. Gateway workers submit immutable
   requests to one lower RealTeleop port; they perform no device I/O, IK, safety
@@ -67,13 +68,12 @@ event replay and generic operations to begin/upload/commit an Artifact,
 begin/read/acknowledge a download, and acknowledge an upper-owned durable
 materialization.
 
-There is no depth-image method in the protocol. A Skill such as “capture a
-specific view's latest depth” declares parameters for the requested view, an
-output Artifact slot with media/schema/size constraints, and a normal executor
-binding. The same machinery supports point clouds, logs, calibration artifacts,
-or other finite Skill input/output without changing transport semantics. Multi-file
-results use multiple bindings or one explicitly encoded archive; v2 does not add a
-second bundle abstraction.
+There is no RGB- or depth-image method in the protocol. A capture Skill declares
+its selection parameters, output Artifact slots with media/schema/size
+constraints, and a normal executor binding. The same machinery supports point
+clouds, logs, calibration artifacts, or other finite Skill input/output without
+changing transport semantics. Multi-file results use multiple bindings or one
+explicitly encoded archive; v2 does not add a second bundle abstraction.
 
 Large bodies never enter an operation or event payload. `AgentArtifactRef` is
 the portable content identity; filesystem paths and other locators exist only
@@ -107,6 +107,15 @@ discovery catalogs. Concrete deployment bindings, device acquisition, camera
 ownership, safety, and executors remain in `profiles/`; they are deliberately
 not hidden inside the template.
 
+Control effect is a closed contract, not a naming convention. An `inspection`
+Definition can only use a `read_only` Route; that Route must be
+`t0_read_only`, use `cancel_only`, advertise no robot motion or publication
+opening, and bind an executor that declares the same effect class. Motion and
+policy-task Definitions use motion Routes, while lifecycle Definitions use
+lifecycle Routes. Neutral no-I/O test/dry-run ports cannot prove either read or
+control execution. The control-domain HOLD port remains separate from passive
+read execution.
+
 ## Entrypoints
 
 The canonical MuJoCo entrypoint is:
@@ -114,8 +123,17 @@ The canonical MuJoCo entrypoint is:
 ```bash
 python -m agent_gateway mujoco \
   --socket-path /absolute/private/gateway.sock \
-  --task-config /absolute/task_config.json
+  --task-config /absolute/task_config.json \
+  --artifact-root /absolute/private/artifact_cache
 ```
+
+`--artifact-root` is optional and default-off. Supplying a real,
+non-world-writable directory enables the read-only
+`perception.capture_depth` and `perception.capture_rgb` Skills. Depth returns
+native-resolution float32 metric data; RGB returns one role-selected JPEG per
+output Artifact ordinal from a single scene cut. Inline results contain only
+bounded metadata and content hashes. Pixel arrays never enter the control
+frame.
 
 `python -m control_station agent-gateway-mujoco ...` remains a compatibility
 forwarder. It creates no Gateway implementation or runtime state inside
@@ -191,13 +209,14 @@ concrete Gateway profile.
 
 ## Observation and visual cuts
 
-Low-rate state observations and pull-based visual captures are separate. A
-deployment publishes its complete current RGB source catalog and implements one
-bounded capture request; the request grants no streaming or motion authority.
-The MuJoCo profile currently publishes `main`, `wrist_left`, and `wrist_right`,
-renders under the existing scene/physics lock, and rejects a cut if the bound
-Station revision changes across capture. Other profiles bind their own producer
-to the same transport-neutral facade and do not import the MuJoCo renderer.
+Low-rate state observations and pull-based visual captures are separate. RGB is
+not a dedicated transport method: `perception.capture_rgb` is an ordinary
+`inspection` Skill with a `read_only`, `t0_read_only` Route and generic output
+Artifacts. Its deployment profile publishes the trusted semantic roles; the
+MuJoCo binding maps `main`, `wrist_left`, and `wrist_right` to current cameras,
+renders one scene cut under the existing scene/physics lock, and rejects a cut
+if its Station revision changes. Other profiles may bind their own producer to
+the same Definition/schema/I/O contract without importing the MuJoCo renderer.
 
 ## Compatibility
 

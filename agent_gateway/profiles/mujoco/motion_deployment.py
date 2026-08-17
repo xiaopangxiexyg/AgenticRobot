@@ -26,6 +26,10 @@ from agent_gateway.protocol.skill_catalog import (
     SkillRouteManifestEntry,
     validate_skill_route_catalog_closure,
 )
+from agent_gateway.protocol.skill_io_contracts import (
+    SkillIOCatalog,
+    inline_only_skill_io_contract,
+)
 from agent_gateway.protocol.state_schemas import (
     TcpPoseHistoryLimits,
     tcp_pose_history_state_definition_v1,
@@ -35,6 +39,10 @@ from agent_gateway.protocol.state_schemas import (
     validate_agent_state_parameters_v1,
     validate_agent_state_result_v1,
     validate_agent_state_route_schema_v1,
+)
+from agent_gateway.runtime.payload_validation import (
+    AgentSkillPayloadValidatorRegistry,
+    AgentSkillPayloadValidatorSet,
 )
 from agent_gateway.skills.motion.definition import (
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
@@ -48,10 +56,6 @@ from agent_gateway.skills.motion.schemas import (
     tcp_pose_target_schema_entry_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
-)
-from agent_gateway.runtime.payload_validation import (
-    AgentSkillPayloadValidatorRegistry,
-    AgentSkillPayloadValidatorSet,
 )
 from control_station.contracts import (
     ControlStationRunManifest,
@@ -71,6 +75,10 @@ from robot_motion.action import (
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.primitives import level_tcp_orientation
 
+from .depth_deployment import (
+    MujocoDepthCaptureRegistration,
+    build_mujoco_depth_capture_registration,
+)
 from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
     MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1,
@@ -87,7 +95,12 @@ from .motion_primitive_profiles import (
     MujocoAgentTcpCardinalStepProfile,
     MujocoAgentTcpFixedOrientationProfile,
 )
+from .rgb_deployment import (
+    MujocoRgbCaptureRegistration,
+    build_mujoco_rgb_capture_registration,
+)
 from .state_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
+from .visual_observation import mujoco_rgb_role_for_source
 
 MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1 = "sim.mujoco.rm65.agent_skill_tcp_pose"
 MUJOCO_AGENT_TCP_POSE_EXECUTOR_ID_V1 = (
@@ -581,6 +594,7 @@ class MujocoAgentTcpFixedOrientationContract:
 class MujocoAgentTcpPoseContractBundle:
     definition_catalog: SkillDefinitionCatalog
     schema_catalog: AgentSkillSchemaCatalog
+    io_catalog: SkillIOCatalog
     route_manifest: SkillRouteManifest
     deployment_binding: MujocoAgentTcpPoseDeploymentBinding
     cardinal_step_deployment_binding: MujocoAgentTcpPoseDeploymentBinding
@@ -595,6 +609,8 @@ class MujocoAgentTcpPoseContractBundle:
     payload_validators: AgentSkillPayloadValidatorRegistry
     station_manifest: ControlStationRunManifest
     execution_manifest: Any
+    depth_capture: MujocoDepthCaptureRegistration | None = None
+    rgb_capture: MujocoRgbCaptureRegistration | None = None
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None
     history_source_binding: SourceObservationHistoryBinding | None = None
     history_deployment_binding: (
@@ -606,6 +622,7 @@ class MujocoAgentTcpPoseContractBundle:
             definition_catalog=self.definition_catalog,
             schema_catalog=self.schema_catalog,
             route_manifest=self.route_manifest,
+            io_catalog=self.io_catalog,
         )
         motion_entry = self.route_manifest.route(
             "motion.move_tcp_to_pose",
@@ -616,6 +633,30 @@ class MujocoAgentTcpPoseContractBundle:
             "1",
         )
         state_entry = self.route_manifest.route("state.read_tcp_pose", "1")
+        depth_capture = self.depth_capture
+        if depth_capture is not None:
+            if not isinstance(depth_capture, MujocoDepthCaptureRegistration):
+                raise TypeError("depth_capture must be a typed registration.")
+            depth_entry = self.route_manifest.route(
+                depth_capture.registration.definition.skill_id,
+                depth_capture.registration.definition.skill_version,
+            )
+            if depth_entry.deployment_binding.deployment_binding_hash != (
+                depth_capture.deployment_binding.semantic_content_hash
+            ):
+                raise ValueError("Depth Route uses another deployment binding.")
+        rgb_capture = self.rgb_capture
+        if rgb_capture is not None:
+            if not isinstance(rgb_capture, MujocoRgbCaptureRegistration):
+                raise TypeError("rgb_capture must be a typed registration.")
+            rgb_entry = self.route_manifest.route(
+                rgb_capture.registration.definition.skill_id,
+                rgb_capture.registration.definition.skill_version,
+            )
+            if rgb_entry.deployment_binding.deployment_binding_hash != (
+                rgb_capture.deployment_binding.semantic_content_hash
+            ):
+                raise ValueError("RGB Route uses another deployment binding.")
         if motion_entry.deployment_binding.deployment_binding_hash != (
             self.deployment_binding.semantic_content_hash
         ):
@@ -1502,6 +1543,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     *,
     application: Any,
     history_profile: MujocoAgentTcpPoseHistoryProfile | None = None,
+    enable_artifact_perception: bool = False,
 ) -> MujocoAgentTcpPoseContractBundle:
     """Project one already-constructed no-model application without starting it."""
 
@@ -1510,6 +1552,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         MujocoAgentTcpPoseHistoryProfile,
     ):
         raise TypeError("history_profile must be typed or None.")
+    if not isinstance(enable_artifact_perception, bool):
+        raise TypeError("enable_artifact_perception must be boolean.")
     exact = _exact_application(application)
     station, execution = _build_station_manifests(application)
     runtime = application.runtime
@@ -1535,6 +1579,36 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         frame_graph_hash=profile.frame_graph_hash,
         tool_config_hash=profile.tool_config_hash,
         calibration_hash=profile.calibration_hash,
+    )
+    depth_capture = (
+        build_mujoco_depth_capture_registration(
+            source_catalog=application.depth_source_catalog(),
+            runtime_session_id=exact["runtime_session_id"],
+            control_domain_id=exact["control_domain_id"],
+            target_binding_id=target_binding.binding_id,
+            station_manifest_hash=station.semantic_content_hash,
+            execution_manifest_hash=execution.semantic_content_hash,
+        )
+        if enable_artifact_perception
+        else None
+    )
+    rgb_capture = (
+        build_mujoco_rgb_capture_registration(
+            source_catalog=tuple(
+                {
+                    **dict(source),
+                    "role": mujoco_rgb_role_for_source(source["source_id"]),
+                }
+                for source in application.visual_source_catalog()
+            ),
+            runtime_session_id=exact["runtime_session_id"],
+            control_domain_id=exact["control_domain_id"],
+            target_binding_id=target_binding.binding_id,
+            station_manifest_hash=station.semantic_content_hash,
+            execution_manifest_hash=execution.semantic_content_hash,
+        )
+        if enable_artifact_perception
+        else None
     )
     if any(
         item.distance_m > profile.max_translation_delta_m
@@ -2270,6 +2344,12 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     if history_definition is not None and history_schema is not None:
         definition_items.append(history_definition)
         schema_items.append(history_schema)
+    if depth_capture is not None:
+        definition_items.append(depth_capture.registration.definition)
+        schema_items.append(depth_capture.registration.schema_entry)
+    if rgb_capture is not None:
+        definition_items.append(rgb_capture.registration.definition)
+        schema_items.append(rgb_capture.registration.schema_entry)
     definitions = SkillDefinitionCatalog(
         catalog_id="dexteleop.agent_skill_definitions.agent_tcp_pose_session",
         catalog_version="1",
@@ -2380,6 +2460,63 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 availability_hash=history_availability,
             )
         )
+    if depth_capture is not None:
+        depth_route = depth_capture.registration.routes[0]
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=depth_route,
+                deployment_binding=depth_capture.deployment_binding.to_ref(),
+                evaluation_plan_hash=None,
+                availability_hash=depth_capture.availability_hash,
+            )
+        )
+    if rgb_capture is not None:
+        rgb_route = rgb_capture.registration.routes[0]
+        route_items.append(
+            SkillRouteManifestEntry(
+                route=rgb_route,
+                deployment_binding=rgb_capture.deployment_binding.to_ref(),
+                evaluation_plan_hash=None,
+                availability_hash=rgb_capture.availability_hash,
+            )
+        )
+    io_contract_by_skill = {}
+    for item in route_items:
+        route_item = item.route
+        key = (route_item.skill_id, route_item.skill_version)
+        artifact_contracts = tuple(
+            registration.registration.io_contract
+            for registration in (depth_capture, rgb_capture)
+            if registration is not None
+            and key
+            == (
+                registration.registration.definition.skill_id,
+                registration.registration.definition.skill_version,
+            )
+        )
+        contract = (
+            artifact_contracts[0]
+            if artifact_contracts
+            else inline_only_skill_io_contract(
+                skill_id=route_item.skill_id,
+                skill_version=route_item.skill_version,
+                skill_definition_hash=route_item.skill_definition_hash,
+                parameter_schema_hash=route_item.parameter_schema_hash,
+                execution_result_schema_hash=(route_item.execution_result_schema_hash),
+                task_evaluation_schema_hash=(route_item.task_evaluation_schema_hash),
+            )
+        )
+        previous = io_contract_by_skill.get(key)
+        if previous is not None and previous != contract:
+            raise ValueError("Routes for one Skill disagree on the I/O contract.")
+        io_contract_by_skill[key] = contract
+    io_catalog = SkillIOCatalog(
+        catalog_id="dexteleop.agent_skill_io",
+        catalog_version="1",
+        io_contracts=tuple(
+            io_contract_by_skill[key] for key in sorted(io_contract_by_skill)
+        ),
+    )
     manifest = SkillRouteManifest(
         runtime_session_id=exact["runtime_session_id"],
         control_domain_id=exact["control_domain_id"],
@@ -2387,6 +2524,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         execution_manifest_hash=execution.semantic_content_hash,
         skill_definition_catalog_hash=definitions.semantic_content_hash,
         skill_schema_catalog_hash=schemas.semantic_content_hash,
+        skill_io_catalog_hash=io_catalog.semantic_content_hash,
         target_binding_id=target_binding.binding_id,
         target_kind="sim",
         current_mode="sim_active",
@@ -2457,6 +2595,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 source_binding=history_source_binding,
             )
         )
+    if depth_capture is not None:
+        validator_items.append(depth_capture.payload_validator)
+    if rgb_capture is not None:
+        validator_items.append(rgb_capture.payload_validator)
     validators = AgentSkillPayloadValidatorRegistry(
         registry_id=(
             "dexteleop.agent_skill_payload_validators.agent_tcp_pose_session:"
@@ -2467,6 +2609,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     return MujocoAgentTcpPoseContractBundle(
         definition_catalog=definitions,
         schema_catalog=schemas,
+        io_catalog=io_catalog,
         route_manifest=manifest,
         deployment_binding=binding,
         cardinal_step_deployment_binding=cardinal_step_binding,
@@ -2479,6 +2622,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         payload_validators=validators,
         station_manifest=station,
         execution_manifest=execution,
+        depth_capture=depth_capture,
+        rgb_capture=rgb_capture,
         history_profile=history_profile,
         history_source_binding=history_source_binding,
         history_deployment_binding=history_binding,

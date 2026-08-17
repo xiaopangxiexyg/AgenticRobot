@@ -6,6 +6,10 @@ from dataclasses import replace
 
 import pytest
 
+from agent_gateway.protocol.artifact_contracts import (
+    AgentArtifactBinding,
+    AgentArtifactRef,
+)
 from agent_gateway.protocol.contracts import (
     AGENT_GATEWAY_AUTHORITATIVE_PORT_RECEIPT_FEATURE_V1,
     AgentObservationSnapshot,
@@ -69,8 +73,14 @@ class _AuthoritativeStationPort:
     no_io = False
     port_id = "agent-gateway:authoritative-station-test"
 
-    def __init__(self, clock: _ManualClock) -> None:
+    def __init__(
+        self,
+        clock: _ManualClock,
+        *,
+        control_effect_class: str = "read_only",
+    ) -> None:
         self.clock = clock
+        self.control_effect_class = control_effect_class
         self.calls: list[str] = []
 
     def _receipt(
@@ -119,7 +129,6 @@ class _AuthoritativeStationPort:
 
 def _capability(
     *,
-    cancellation_policy: str = "cancel_only",
     requires_task_evaluation: bool = False,
 ) -> SkillExecutionRoute:
     return SkillExecutionRoute(
@@ -147,8 +156,22 @@ def _capability(
         requires_operator_confirmation=False,
         requires_deadman=False,
         max_operation_duration_ms=1_000,
-        cancellation_policy=cancellation_policy,
+        cancellation_policy="cancel_only",
         requires_task_evaluation=requires_task_evaluation,
+    )
+
+
+def _motion_capability(*, cancellation_policy: str) -> SkillExecutionRoute:
+    return replace(
+        _capability(),
+        skill_id="motion.station_control_fixture",
+        skill_definition_hash="definition:motion.station_control_fixture:v1",
+        route_id="null.fixture.station_controller",
+        control_effect_class="motion",
+        privilege_tier="t1_sim_or_no_motion",
+        may_move_robot=True,
+        cancellation_policy=cancellation_policy,
+        skill_io_contract_hash=None,
     )
 
 
@@ -341,9 +364,10 @@ def _service(
     allowed_client_ids: tuple[str, ...] = ("rpent:b2a",),
 ):
     clock = _ManualClock()
-    capability = _capability(
-        cancellation_policy=cancellation_policy,
-        requires_task_evaluation=requires_task_evaluation,
+    capability = (
+        _capability(requires_task_evaluation=requires_task_evaluation)
+        if cancellation_policy == "cancel_only"
+        else _motion_capability(cancellation_policy=cancellation_policy)
     )
     manifest = _manifest(capability)
     if port is None:
@@ -581,11 +605,14 @@ def test_fake_worker_activation_and_completion_remain_distinct_states() -> None:
 
 def test_generic_service_accepts_authoritative_start_and_hold_receipts() -> None:
     clock = _ManualClock()
-    capability = _capability(
+    capability = _motion_capability(
         cancellation_policy="hold_on_cancel_disconnect_or_timeout"
     )
     manifest = _manifest(capability)
-    port = _AuthoritativeStationPort(clock)
+    port = _AuthoritativeStationPort(
+        clock,
+        control_effect_class="motion",
+    )
     service = AgentGatewayService(
         manifest=manifest,
         access_policy=_policy(),
@@ -632,12 +659,15 @@ def test_authoritative_control_receipt_projection_is_feature_gated(
     advertise_receipt: bool,
 ) -> None:
     clock = _ManualClock()
-    capability = _capability(cancellation_policy="hold_on_cancel")
+    capability = _motion_capability(cancellation_policy="hold_on_cancel")
     manifest = _manifest(
         capability,
         authoritative_receipt_feature=advertise_receipt,
     )
-    port = _AuthoritativeStationPort(clock)
+    port = _AuthoritativeStationPort(
+        clock,
+        control_effect_class="motion",
+    )
     service = AgentGatewayService(
         manifest=manifest,
         access_policy=_policy(),
@@ -1549,6 +1579,21 @@ def test_executor_registry_requires_exactly_one_executor_per_route() -> None:
         )
 
 
+def test_executor_registry_rejects_effectful_port_for_read_only_route() -> None:
+    manifest = _manifest(_capability())
+    port = _AuthoritativeStationPort(
+        _ManualClock(),
+        control_effect_class="motion",
+    )
+
+    with pytest.raises(ValueError, match="control_effect_class"):
+        SkillExecutorBinding.from_manifest_entry(
+            manifest=manifest,
+            entry=manifest.skill_routes[0],
+            execution_port=port,
+        )
+
+
 def test_service_activates_and_cancels_through_exact_route_executor() -> None:
     manifest, first, second = _two_route_manifest()
     first_port = DeterministicNoIoAgentSkillOperationPort(
@@ -1690,6 +1735,175 @@ def test_passive_read_executor_is_reusable_and_never_requests_hold() -> None:
         not receipt.proves_motion_or_hold
         for receipt in executor.port_receipts
     )
+    assert executor.wait_all(timeout_sec=0.0)
+
+
+@pytest.mark.parametrize(
+    ("control_path", "expected_status"),
+    (
+        ("cancel", "cancelled"),
+        ("disconnect", "cancelled"),
+        ("timeout", "timed_out"),
+    ),
+)
+def test_read_only_passive_control_paths_never_request_domain_hold(
+    control_path: str,
+    expected_status: str,
+) -> None:
+    clock = _ManualClock()
+    capability = _capability()
+    manifest = _manifest(capability)
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    def read(_request, operation) -> PassiveReadResult:
+        read_started.set()
+        assert release_read.wait(timeout=1.0)
+        return PassiveReadResult(
+            execution_result={"operation_id": operation.operation_id},
+            evidence_refs=(f"passive-cut:{operation.operation_id}",),
+        )
+
+    executor = PassiveReadSkillExecutor(
+        port_id="passive-reader:control-isolation",
+        executor_id="passive-reader-executor:control-isolation",
+        read=read,
+        current_station_revision=lambda: 4,
+        clock=clock,
+    )
+    domain_port = _AuthoritativeStationPort(clock)
+    service = AgentGatewayService(
+        manifest=manifest,
+        access_policy=_policy(),
+        executor_registry=SkillExecutorRegistry.bind_all_routes_to_port(
+            manifest=manifest,
+            execution_port=executor,
+        ),
+        domain_control_port=domain_port,
+        payload_validators=_payload_validators(capability),
+        operation_store=BoundedInMemoryAgentSkillOperationStore(
+            max_retained_operations=4
+        ),
+        clock=clock,
+    )
+    assert service.publish_observation(
+        snapshot=_snapshot(manifest),
+        now=10.0,
+    ).accepted
+    admitted = service.submit_request(
+        request=_request(manifest, capability),
+        current_station_revision=4,
+        now=10.0,
+    )
+    assert admitted.accepted and admitted.operation is not None
+    operation_id = admitted.operation.operation_id
+    assert service.launch_operation(operation_id).accepted
+    assert read_started.wait(timeout=1.0)
+
+    if control_path == "cancel":
+        outcome = service.cancel_operation(
+            operation_id=operation_id,
+            reason="fixture_cancel",
+            current_station_revision=4,
+            now=10.1,
+        )
+    elif control_path == "disconnect":
+        outcome = service.handle_client_disconnect(
+            client_id="rpent:b2a",
+            reason="fixture_disconnect",
+            current_station_revision=4,
+            now=10.1,
+        )
+    else:
+        clock.set(11.0)
+        outcome = service.expire_due_operation(
+            current_station_revision=4,
+            now=11.0,
+        )
+
+    assert outcome.accepted
+    assert outcome.operation is not None
+    assert outcome.operation.status == expected_status
+    assert domain_port.calls == []
+    assert tuple(item.operation_kind for item in executor.port_receipts) == (
+        "activate",
+        "cancel",
+    )
+    assert all(
+        not receipt.proves_motion_or_hold for receipt in executor.port_receipts
+    )
+
+    release_read.set()
+    assert executor.wait(operation_id, timeout_sec=1.0)
+    assert service.operation_store.get(operation_id).status == expected_status
+
+
+def test_passive_read_executor_fails_closed_when_output_artifact_is_rejected() -> None:
+    clock = _ManualClock()
+    capability = _capability()
+    manifest = _manifest(capability)
+    artifact = AgentArtifactRef(
+        media_type="application/octet-stream",
+        schema_id=None,
+        encoding="raw",
+        compression="none",
+        byte_length=1,
+        sha256="0" * 64,
+    )
+
+    def read(_request, operation) -> PassiveReadResult:
+        return PassiveReadResult(
+            execution_result={"operation_id": operation.operation_id},
+            evidence_refs=(f"passive-cut:{operation.operation_id}",),
+            output_artifact_bindings=(
+                AgentArtifactBinding(
+                    slot_id="output",
+                    ordinal=0,
+                    artifact=artifact,
+                ),
+            ),
+        )
+
+    executor = PassiveReadSkillExecutor(
+        port_id="passive-reader:artifact-rejection",
+        executor_id="passive-reader-executor:artifact-rejection",
+        read=read,
+        current_station_revision=lambda: 4,
+        clock=clock,
+    )
+    domain_port = _AuthoritativeStationPort(clock)
+    service = AgentGatewayService(
+        manifest=manifest,
+        access_policy=_policy(),
+        executor_registry=SkillExecutorRegistry.bind_all_routes_to_port(
+            manifest=manifest,
+            execution_port=executor,
+        ),
+        domain_control_port=domain_port,
+        payload_validators=_payload_validators(capability),
+        operation_store=BoundedInMemoryAgentSkillOperationStore(
+            max_retained_operations=4
+        ),
+        clock=clock,
+    )
+    assert service.publish_observation(
+        snapshot=_snapshot(manifest),
+        now=10.0,
+    ).accepted
+    admitted = service.submit_request(
+        request=_request(manifest, capability),
+        current_station_revision=4,
+        now=10.0,
+    )
+    assert admitted.accepted and admitted.operation is not None
+    operation_id = admitted.operation.operation_id
+    assert service.launch_operation(operation_id).accepted
+    assert executor.wait(operation_id, timeout_sec=1.0)
+    failed = service.operation_store.get(operation_id)
+    assert failed is not None and failed.status == "failed"
+    assert failed.reason_code == "passive_read_output_artifacts_rejected"
+    assert failed.output_artifact_bindings == ()
+    assert domain_port.calls == []
 
 
 def test_domain_hold_during_passive_read_never_binds_read_to_motion_port() -> None:
@@ -1742,6 +1956,7 @@ def test_domain_hold_during_passive_read_never_binds_read_to_motion_port() -> No
     operation_id = admitted.operation.operation_id
     assert service.launch_operation(operation_id).accepted
     assert read_started.wait(timeout=1.0)
+    assert not executor.wait_all(timeout_sec=0.01)
 
     held = service.request_hold(
         reason="fixture_domain_hold",
@@ -1759,5 +1974,6 @@ def test_domain_hold_during_passive_read_never_binds_read_to_motion_port() -> No
 
     release_read.set()
     assert executor.wait(operation_id, timeout_sec=1.0)
+    assert executor.wait_all(timeout_sec=0.0)
     terminal = service.operation_store.get(operation_id)
     assert terminal is not None and terminal.status == "cancelled"

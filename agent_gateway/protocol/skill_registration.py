@@ -11,6 +11,7 @@ from .skill_catalog import (
     SkillDefinition,
     SkillDefinitionCatalog,
     SkillExecutionRoute,
+    validate_skill_definition_route_effect,
 )
 from .skill_io_contracts import SkillIOCatalog, SkillIOContract
 
@@ -70,6 +71,10 @@ class SkillRegistrationTemplate:
         if io_hashes != expected_hashes[:4]:
             raise ValueError("Skill I/O contract does not bind definition/schemas.")
         for route in routes:
+            validate_skill_definition_route_effect(
+                definition=self.definition,
+                route=route,
+            )
             route_hashes = (
                 route.skill_definition_hash,
                 route.parameter_schema_hash,
