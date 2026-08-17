@@ -11,6 +11,7 @@ import time
 from typing import Callable
 
 from dataset_contracts.v25p_native_storage import V25P_RECORD_CJSON_LAYOUT_V1
+from dataset_interface.policy_io_layout import load_policy_io_layout
 from robot_motion.runtime.lifecycle import run_best_effort_cleanup
 
 from .umi.application_policy import (
@@ -19,7 +20,6 @@ from .umi.application_policy import (
 from .web.calibration_web_ui import CalibrationWebUi
 from .web.startup_progress import GuiStartupProgress
 from teleop_runtime.collection.operator_labels import OperatorLabelStateMachine
-from teleop_runtime.collection.policy_io import load_policy_io_layout
 from teleop_runtime.collection.umi.angle_trigger_calibration import (
     ensure_default_command_input_from_gui,
 )

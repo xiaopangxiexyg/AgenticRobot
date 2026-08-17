@@ -171,6 +171,9 @@ def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None
         {"dataset_interface"},
     ) == {
         "control_station/real_teleop_entrypoint.py": ["dataset_interface"],
+        # Concrete UMI application leaf loads the dataset/model layout contract;
+        # device derivation and collection lifecycle remain lower-owned.
+        "control_station/umi_application.py": ["dataset_interface"],
         "control_station/composition/mujoco_pose_composer.py": ["dataset_interface"],
         "control_station/composition/mujoco_sim_hil.py": ["dataset_interface"],
         "control_station/control_trace.py": ["dataset_interface"],
