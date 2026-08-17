@@ -20,6 +20,12 @@ from .rm65_ports import (
     RM65SkillTargetBuilder,
     build_exclusive_rm65_skill_position_force_guard,
 )
+from .rm65_lower_assembly import (
+    ExclusiveRM65SkillLowerAssembly,
+    RM65SkillBackendFactory,
+    RM65SkillTargetBuilderFactory,
+    assemble_exclusive_rm65_skill_lower,
+)
 from .rm65_profile import (
     ExclusiveRM65SkillDeploymentProfile,
     ResolvedExclusiveRM65SkillDeploymentProfile,
@@ -61,10 +67,14 @@ __all__ = [
     "RealSkillMotionObservationCut",
     "RealSkillMotionTargetSynchronizer",
     "ExclusiveRM65SkillDeployPorts",
+    "ExclusiveRM65SkillLowerAssembly",
     "ExclusiveRM65SkillPortProfile",
     "RM65SkillPositionForceGuard",
+    "RM65SkillBackendFactory",
+    "RM65SkillTargetBuilderFactory",
     "RM65SkillTargetBuilder",
     "build_exclusive_rm65_skill_position_force_guard",
+    "assemble_exclusive_rm65_skill_lower",
     "ExclusiveRM65SkillDeploymentProfile",
     "ResolvedExclusiveRM65SkillDeploymentProfile",
     "resolve_exclusive_rm65_skill_deployment_profile",

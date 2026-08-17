@@ -23,8 +23,6 @@ from robot_motion.rm65.dual_arm_target_solver import (
     _DualArmCandidate,
     _DualArmEvaluatedCandidate,
 )
-from robot_motion.runtime import TeleopCommand
-
 from ..registry import register_retargeter
 from .pose_to_arm import PoseToArmRetargeter, PoseToArmRetargeterConfig
 
@@ -78,22 +76,6 @@ class DualArmCollisionAwareRetargeter(_SharedDualArmCollisionAwareRetargeter):
             ik_solver_builder=build_rm65_dual_arm_collision_ik_solver,
             scene_profile_builder=build_rm65_dual_arm_scene_profile,
         )
-
-    def build_command_for_target_pair(
-        self,
-        target: BimanualPoseTarget,
-    ) -> TeleopCommand:
-        """Build one runtime command through the shared coupled target solver.
-
-        ``robot_motion`` intentionally exposes a pure ``BimanualIKResult`` at
-        its public direct-target boundary.  This teleop adapter is the owner of
-        the runtime command container, so external target sources can reuse the
-        same coupled IK and pre-IK safety path without reaching into the
-        solver's private command conversion helper.
-        """
-
-        return self._command_from_bimanual_result(self.solve_target_pair(target))
-
 
 # Tests and legacy diagnostics monkeypatch the module-level clock and construct
 # candidate values directly. Keep those aliases pointed at the shared module
