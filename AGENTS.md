@@ -78,8 +78,6 @@ is experimental.
   schema, persistent data semantics, artifact integration, authority, safety,
   dispatch, resource lifecycle, or production entrypoint. Reusable logic is
   promoted to its production owner rather than imported from this tree.
-- `policy_learning/`: temporary forwarding compatibility only; it must not
-  regain implementation, state, commands, or artifacts.
 - `model/`: local policy weights, checkpoints, runtime sidecars, and explicitly
   pinned external source boundaries only. It is not a Python package or an
   AgenticRobot source-code owner; versioned artifact contracts and integration

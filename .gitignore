@@ -112,7 +112,7 @@ hardware/VIVE/VIVE_sender.zip
 *.safetensors
 *.mp4
 
-# Local policy model artifacts; source code belongs in policy_learning/.
+# Local policy model artifacts; experiment source belongs in experiments/.
 /model/*
 !/model/README.md
 !/model/openpi

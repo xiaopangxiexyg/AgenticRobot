@@ -89,7 +89,6 @@ include = [
     "deployments*",
     "experiments*",
     "hardware*",
-    "policy_learning*",
     "robot_motion*",
     "sim*",
     "teleop_runtime*",

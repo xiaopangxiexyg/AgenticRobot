@@ -62,7 +62,6 @@ source 同时参与选择、融合或 handoff 时，应用/profile 才显式创�
 - `teleop_runtime/`：真实遥操、GUI/headless orchestration、来源绑定的采集适配、replay 和 policy deploy frontend。
 - `dataset_contracts/`、`dataset_interface/`：纯数据合约与数据适配。
 - `experiments/`：非正式、可复现的算法假设、baseline、训练命令与离线评估；生产包不得反向依赖。
-- `policy_learning/`：迁移期旧导入转发，不再拥有 learner 实现。
 - `model/`：本地策略权重、checkpoint、运行 sidecar，以及固定外部源码版本的
   `model/openpi` Git submodule；不是 AgenticRobot Python 源码包。
 - `deployments/`：模型 client、协议和 artifact 集成。

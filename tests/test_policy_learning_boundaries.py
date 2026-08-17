@@ -91,29 +91,15 @@ def test_production_owners_do_not_import_experiments() -> None:
     assert violations == {}
 
 
-def test_policy_learning_compatibility_exports_are_object_identical() -> None:
-    from experiments.policy_learning import arm_hold as canonical
-    from policy_learning import arm_hold as compatibility
-
-    assert compatibility.__all__ == canonical.__all__
-    for name in canonical.__all__:
-        assert getattr(compatibility, name) is getattr(canonical, name)
-
-
-def test_policy_learning_compatibility_package_has_no_implementation() -> None:
-    compatibility_root = REPO_ROOT / "policy_learning"
-
-    assert sorted(
-        path.relative_to(compatibility_root)
-        for path in compatibility_root.rglob("*.py")
-    ) == [Path("__init__.py"), Path("arm_hold/__init__.py")]
+def test_top_level_policy_learning_package_is_removed() -> None:
+    assert not (REPO_ROOT / "policy_learning").exists()
 
 
 def test_experiments_are_discoverable_without_becoming_a_core_dependency() -> None:
     project = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert '    "experiments*",' in project
-    assert '    "policy_learning*",' in project
+    assert '    "policy_learning*",' not in project
 
 
 def test_arm_hold_compatibility_launchers_stay_thin() -> None:

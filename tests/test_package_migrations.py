@@ -49,6 +49,12 @@ def _python_source_files(package_dir: Path) -> tuple[Path, ...]:
             ".".join(("utils", "wrist_cam_" + "fix_mask")),
             REPO_ROOT / "utils" / ("wrist_cam_" + "fix_mask"),
         ),
+        (
+            "experiments.policy_learning",
+            REPO_ROOT / "experiments" / "policy_learning",
+            "policy_learning",
+            REPO_ROOT / "policy_learning",
+        ),
     ),
 )
 def test_only_canonical_package_remains(
