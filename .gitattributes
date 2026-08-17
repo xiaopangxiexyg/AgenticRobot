@@ -1,0 +1,3 @@
+# Preserve the authorized upstream-derived VIVE wrapper byte-for-byte. Its
+# legacy mixed line endings and trailing whitespace are vendor-owned.
+hardware/VIVE/triad_openvr/triad_openvr.py -text -whitespace

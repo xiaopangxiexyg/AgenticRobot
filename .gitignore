@@ -86,7 +86,11 @@ BaselineVLA_deployment/Outputs
 BaselineVLA_deployment/Datasets/post_fix_realrobot_data/outputs
 BaselineVLA_deployment/ServerClientDeploy/Pi
 
-hardware/VIVE/triad_openvr
+# Keep the portable OpenVR wrapper in the parent repository. The nested
+# upstream checkout, local device configuration, demos, and caches stay local.
+hardware/VIVE/triad_openvr/*
+!hardware/VIVE/triad_openvr/__init__.py
+!hardware/VIVE/triad_openvr/triad_openvr.py
 hardware/VIVE/VIVE_sender/
 hardware/VIVE/VIVE_sender.zip
 *.egg-info/
