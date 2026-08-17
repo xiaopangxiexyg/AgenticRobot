@@ -2,7 +2,7 @@
 
 这里集中维护跨模块架构、RTC 可视化说明和需要团队共享的实施计划：
 
-- [控制、数据与训练闭环图示](./dexteleop_architecture_visual_guide.md)
+- [当前模块与运行域图示](./dexteleop_architecture_visual_guide.md)
 - [实时 Action Chunk（RTC）图示](./dexteleop_rtc_visual_guide.md)
 - [单源直通、多源组合及数采/部署/仿真的运行域边界](./runtime_domain_boundaries.md)
 - [Embodiment runtime provider 当前接口合同](./embodiment_runtime_provider_contract.md)

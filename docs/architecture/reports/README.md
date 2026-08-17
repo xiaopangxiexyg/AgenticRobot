@@ -9,6 +9,7 @@
 - [RTC 历史落地台账（原审计日期 2026-07-25）](./rtc_landing_ledger_20260725.md)
 - [HITL 与 chunk-relative 历史实施台账（更新至 2026-08-07）](./hitl_chunk_relative_ledger_20260807.md)
 - [RTC 历史实现与规划图示（更新至 2026-07-25）](./rtc_visual_guide_20260725.md)
+- [控制、数据与训练历史闭环图示（更新至 2026-07-25）](./architecture_visual_guide_20260725.md)
 
 当前架构边界和剩余工作分别由 [`../README.md`](../README.md) 与
 [`../plans/README.md`](../plans/README.md) 索引。
