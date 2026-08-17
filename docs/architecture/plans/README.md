@@ -34,7 +34,8 @@ consumer needs them.
 ## Structure-remediation ledger
 
 - [P0 structure remediation](dexteleop_p0_structure_remediation_plan_20260803.md):
-  completed structural slices plus the still-applicable follow-up conditions.
-  It remains here while those conditions are referenced; it is not a current
-  worktree snapshot and must be revalidated against the present branch before
-  starting a new batch.
+  current gates for the remaining UMI compatibility audit, RealTeleop resource-
+  lifecycle decomposition, and RM65 solver work. The 2026-08-04 to 2026-08-07
+  implementation ledger is preserved under
+  [`../reports/`](../reports/p0_structure_remediation_20260803.md); neither file
+  replaces a fresh audit of the branch that will receive a new batch.

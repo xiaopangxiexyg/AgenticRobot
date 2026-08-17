@@ -1,7 +1,11 @@
 # 远端 Codex 使用 BeingBeyond Provider
 
+> 文档类型：特定远端开发工具运维说明。本文不定义 DexTeleop 的 Conda/Python 依赖、
+> policy deployment、远端硬件控制或项目运行合同。示例中的 host、shell、provider 名称和
+> endpoint 均需在目标机器重新确认；密钥不得写入仓库、命令历史、日志或聊天。
+
 本文说明在 VS Code Remote 主机上使用 BeingBeyond provider 和其专用 API key 的标准配置、
-验证闭环与故障分支。示例目标是 `dex-remote`，远端用户使用 zsh。
+验证闭环与故障分支。`dex-remote` 和 zsh 是原始排障现场的示例，不是所有开发机器的默认值。
 
 ## 1. 正确配置逻辑
 
