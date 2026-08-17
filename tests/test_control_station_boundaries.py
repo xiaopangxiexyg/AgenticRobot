@@ -267,12 +267,13 @@ def test_station_numerical_source_debt_is_explicit_and_cannot_spread() -> None:
     }
 
 
-def test_gateway_numerical_dependency_is_confined_to_motion_executor() -> None:
+def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> None:
     assert _violations(
         _python_files(GATEWAY_ROOT),
         {"numpy", "scipy"},
     ) == {
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
+        "agent_gateway/profiles/real/realsense_perception.py": ["numpy"],
     }
 
 

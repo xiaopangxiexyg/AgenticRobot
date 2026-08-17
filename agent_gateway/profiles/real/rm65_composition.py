@@ -13,8 +13,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
-
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
@@ -61,7 +59,6 @@ from .realsense_perception import (
     RealSenseAgentPerceptionProvider,
     build_real_perception_source_binding,
 )
-
 
 RM65_SKILL_EXECUTION_FRAME_ID_V1 = "dual_arm_solver_world"
 RM65_SKILL_STATION_FRAME_ID_V1 = "canonical_station"
@@ -272,7 +269,12 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 transform_version="1",
                 source_frame_id=execution_frame.frame_id,
                 target_frame_id=station_frame.frame_id,
-                matrix_target_source=np.eye(4),
+                matrix_target_source=(
+                    (1.0, 0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
                 semantic_parameters={
                     "basis": "reviewed_scene_world_is_canonical_station",
                     "collision_scene_profile": profile.collision_scene_profile,
