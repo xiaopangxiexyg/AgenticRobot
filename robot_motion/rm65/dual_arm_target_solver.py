@@ -311,6 +311,7 @@ class BimanualPoseTarget:
     timestamp: float | None
     target_pose_by_side: Mapping[str, np.ndarray]
     active_sides: tuple[str, ...] = ("left", "right")
+    hard_hold_inactive_sides: bool = False
     world_to_base_by_side: Mapping[str, np.ndarray | None] = field(
         default_factory=lambda: {"left": None, "right": None}
     )
@@ -338,6 +339,8 @@ class BimanualPoseTarget:
         active_sides = tuple(str(side).strip().lower() for side in self.active_sides)
         if len(set(active_sides)) != len(active_sides) or not set(active_sides) <= expected:
             raise ValueError("active_sides must be a unique subset of ('left', 'right').")
+        if type(self.hard_hold_inactive_sides) is not bool:
+            raise TypeError("hard_hold_inactive_sides must be bool.")
         world_to_base: dict[str, np.ndarray | None] = {}
         sources: dict[str, BimanualPoseTargetSource | None] = {}
         skipped: dict[str, str | None] = {}
@@ -2180,6 +2183,9 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         if isinstance(solve_input, BimanualPoseTarget):
             if targets is not None:
                 raise ValueError("targets override is only valid for DualArmTargetContext.")
+            direct_target_active_sides: frozenset[str] | None = frozenset(
+                solve_input.active_sides
+            ) if solve_input.hard_hold_inactive_sides else None
             timestamp = solve_input.timestamp
             left_input_target = solve_input.target_pose_by_side["left"]
             right_input_target = solve_input.target_pose_by_side["right"]
@@ -2197,10 +2203,34 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             right_source_value = None if right_source is None else right_source.value
             left_source_metadata = {} if left_source is None else left_source.metadata
             right_source_metadata = {} if right_source is None else right_source.metadata
+            if direct_target_active_sides is not None:
+                # The explicit hard-hold flag turns ``active_sides`` into an
+                # authority boundary for Agent direct targets. Feed inactive
+                # sides into the existing fixed-side candidate logic, then
+                # enforce an exact joint hold again at the final admitted-q
+                # boundary below. Ordinary direct-target callers retain their
+                # existing behavior when the flag is disabled.
+                direct_source_metadata = {
+                    "left": dict(left_source_metadata),
+                    "right": dict(right_source_metadata),
+                }
+                for inactive_side in {"left", "right"} - set(
+                    direct_target_active_sides
+                ):
+                    direct_source_metadata[inactive_side].update(
+                        {
+                            "fix_arm_frozen": True,
+                            "fix_arm_fixed_side": inactive_side,
+                            "direct_target_inactive_side_hold": True,
+                        }
+                    )
+                left_source_metadata = direct_source_metadata["left"]
+                right_source_metadata = direct_source_metadata["right"]
             left_input_skipped = solve_input.input_skipped_by_side["left"]
             right_input_skipped = solve_input.input_skipped_by_side["right"]
             target_smoothing_metadata = solve_input.target_smoothing_metadata
         else:
+            direct_target_active_sides = None
             timestamp = solve_input.timestamp
             left_input_target = (
                 solve_input.left_target if targets is None else targets["left"]
@@ -2784,6 +2814,87 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 )
                 status = "boundary_active" if near_boundary else "tracking"
                 fallback_reason = None
+        direct_target_inactive_hold_metadata: dict[str, object] = {
+            "enabled": direct_target_active_sides is not None,
+            "active_sides": (
+                None
+                if direct_target_active_sides is None
+                else sorted(direct_target_active_sides)
+            ),
+            "held_sides": [],
+            "applied": False,
+            "collision_rechecked": False,
+            "collision_fallback": False,
+        }
+        direct_target_inactive_hold_changed = False
+        if direct_target_active_sides is not None:
+            held_sides = tuple(
+                side
+                for side in ("left", "right")
+                if side not in direct_target_active_sides
+            )
+            direct_target_inactive_hold_metadata["held_sides"] = list(held_sides)
+            if held_sides:
+                reference_left, reference_right = self._split_solution(pre_solve_q)
+                candidate_left, candidate_right = self._split_solution(active_q)
+                held_q = self._embed_arm_qpos(
+                    current_full_q=active_q,
+                    left_qpos=(
+                        reference_left if "left" in held_sides else candidate_left
+                    ),
+                    right_qpos=(
+                        reference_right if "right" in held_sides else candidate_right
+                    ),
+                )
+                direct_target_inactive_hold_changed = not np.allclose(
+                    held_q,
+                    active_q,
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+                direct_target_inactive_hold_metadata["applied"] = bool(
+                    direct_target_inactive_hold_changed
+                )
+                if direct_target_inactive_hold_changed:
+                    min_distance_m = self._profiled_min_collision_distance(
+                        held_q,
+                        profile,
+                        phase="direct_target_inactive_side_hold",
+                    )
+                    direct_target_inactive_hold_metadata[
+                        "collision_rechecked"
+                    ] = True
+                    direct_target_inactive_hold_metadata[
+                        "collision_distance_m"
+                    ] = min_distance_m
+                    hold_fallback_reason = self._fallback_reason_for_distance(
+                        min_distance_m
+                    )
+                    if hold_fallback_reason is not None:
+                        # Never relax the authorization boundary to rescue a
+                        # colliding selected-side step: hold both arms instead.
+                        active_q = pre_solve_q.copy()
+                        status = "hold_last_safe"
+                        fallback_reason = (
+                            "direct_target_inactive_side_hold:"
+                            + str(hold_fallback_reason)
+                        )
+                        direct_target_inactive_hold_metadata[
+                            "collision_fallback"
+                        ] = True
+                    else:
+                        active_q = held_q
+                        near_boundary = (
+                            min_distance_m is not None
+                            and min_distance_m
+                            <= float(self.config.collision_min_distance_m)
+                            + float(self.config.collision_distance_epsilon_m)
+                        )
+                        status = "boundary_active" if near_boundary else "tracking"
+                        fallback_reason = None
+                    left_qpos, right_qpos = self._split_solution(active_q)
+                    self.ik_solver.set_configuration_q(active_q)
+                    self._last_safe_full_q = active_q.copy()
         q5_candidate_metadata = candidate_selection_metadata.get(
             "singularity_aware_wrist_q5_candidate_stabilization"
         )
@@ -2831,6 +2942,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         if (
             output_qpos_smoothing.get("enabled", False)
             or final_canonicalization_changed
+            or direct_target_inactive_hold_changed
             or bool(
                 isinstance(output_qpos_smoothing.get("wrist_q5_escape"), Mapping)
                 and output_qpos_smoothing["wrist_q5_escape"].get("applied", False)
@@ -3062,6 +3174,10 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 "target_activity": dict(target_activity_metadata),
             }
         )
+        if direct_target_active_sides is not None:
+            output_metadata["direct_target_inactive_side_hold"] = dict(
+                direct_target_inactive_hold_metadata
+            )
         left_metadata = {
             "controller": self.name,
             "scene_profile": self.profile.name,

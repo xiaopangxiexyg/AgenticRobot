@@ -28,9 +28,19 @@ def _validate_attachment(
         raise RuntimeError(
             "Real Agent motion requires the existing coupled dual-arm target solver."
         )
-    if set(config.active_sides) != set(components.active_sides):
+    port_sides = set(config.active_sides)
+    runtime_sides = set(components.active_sides)
+    exact_authority = port_sides == runtime_sides
+    exclusive_coupled_subset = bool(
+        config.exclusive_command_claim
+        and runtime_sides == {"left", "right"}
+        and port_sides < runtime_sides
+    )
+    if not (exact_authority or exclusive_coupled_subset):
         raise ValueError(
-            "Agent motion active_sides must exactly match RealTeleop authority."
+            "Agent motion active_sides must exactly match RealTeleop authority, "
+            "except that an exclusive coupled dual-arm runtime may authorize "
+            "one command side while hard-holding the other."
         )
     session = components.session
     if session.command_override_provider is not None:

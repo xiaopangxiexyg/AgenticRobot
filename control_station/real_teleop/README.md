@@ -128,7 +128,9 @@ advertise any Agent motion Route.
 
 The existing RealTeleop control thread remains the sole effect owner. It applies
 queued activation/HOLD requests, builds the selected absolute tool-TCP target
-through the existing coupled retargeter, and sends the result through the
+through the existing coupled retargeter, exact-holds the unauthorized arm at
+the final admitted-q boundary, rechecks the resulting coupled collision state,
+and sends the result through the
 Session's existing command filter, pre-dispatch guard, admission, Rig dispatch,
 recorder, and `hold_hardware()` paths. After the normal hardware-state reads,
 the same control frame may publish those already-read joint values through the
@@ -160,5 +162,6 @@ The reviewed test envelope files are
 `configs/agent_primitive_left_relative_tight_v1.json` and
 `configs/agent_primitive_right_relative_tight_v1.json`. Each binds the runtime
 Home TCP as the anchor, allows ±10 cm in canonical desk axes, and limits total
-rotation from that anchor to 45 degrees. They are separate because a single-arm
-runtime refuses profile entries for inactive sides.
+rotation from that anchor to 45 degrees. The runtime brings both arms online so
+the coupled collision and final pre-IK safety owners remain authoritative, but
+the selected profile and one-use grant authorize only one arm to move.

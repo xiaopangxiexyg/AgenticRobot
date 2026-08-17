@@ -17,7 +17,9 @@ from teleop_runtime.real_teleop.agent_motion_port import (
     RealAgentMotionPortConfig,
 )
 from teleop_runtime.real_teleop.agent_motion_runtime import (
+    attach_prepared_real_agent_motion_port,
     attach_real_agent_motion_port,
+    build_real_agent_motion_port,
 )
 from teleop_runtime.real_teleop.components import RealTeleopComponents
 from teleop_runtime.real_teleop.control_loop import (
@@ -111,6 +113,7 @@ def _components_for_attachment(
     *,
     session: object,
     target_builder: object,
+    active_sides: tuple[str, ...] = ("right",),
 ) -> RealTeleopComponents:
     values = {}
     for item in fields(RealTeleopComponents):
@@ -118,7 +121,7 @@ def _components_for_attachment(
             values[item.name] = None
     values.update(
         session=session,
-        active_sides=("right",),
+        active_sides=active_sides,
         dual_arm_retargeter=target_builder,
     )
     return RealTeleopComponents(**values)
@@ -148,6 +151,7 @@ def test_owner_activation_builds_through_coupled_target_solver() -> None:
     assert len(builder.targets) == 1
     target = builder.targets[0]
     assert target.active_sides == ("right",)
+    assert target.hard_hold_inactive_sides is True
     np.testing.assert_allclose(
         target.target_pose_by_side["left"],
         _pose(x=0.25, y=0.20, z=0.30),
@@ -294,6 +298,71 @@ def test_attachment_composes_existing_admission_and_remains_explicit() -> None:
         attach_real_agent_motion_port(
             attached,
             config=attached.agent_motion_port.config,
+        )
+
+
+def test_exclusive_single_side_port_can_own_coupled_dual_arm_runtime() -> None:
+    session = SimpleNamespace(
+        command_override_provider=None,
+        command_dispatch_admission=None,
+    )
+    target_builder = _TargetBuilder()
+    components = _components_for_attachment(
+        session=session,
+        target_builder=target_builder,
+        active_sides=("left", "right"),
+    )
+    config = RealAgentMotionPortConfig(
+        active_sides=("right",),
+        component_id_by_side={"right": "right-tool-tcp"},
+        execution_frame_id="dual-arm-solver-world",
+        execution_frame_spec_hash="solver-world-spec-hash-1",
+        exclusive_command_claim=True,
+    )
+
+    port = build_real_agent_motion_port(
+        components,
+        config=config,
+        owner_identity=RealAgentMotionOwnerIdentity(
+            runtime_session_id="real-session:test",
+            control_domain_id="real-domain:test",
+            embodiment_instance_id="rm65:test",
+            target_binding_id="tool-tcp:test",
+            execution_manifest_hash="execution-manifest:test",
+            backend_inventory_hash="backend-inventory:test",
+            clock_domain_id="wall-clock:test",
+        ),
+    )
+    attached = attach_prepared_real_agent_motion_port(components, port=port)
+
+    assert attached.agent_motion_port is not None
+    assert attached.agent_motion_port.config.active_sides == ("right",)
+    assert isinstance(
+        session.command_override_provider(TeleopObservation(timestamp=1.0), 1.0),
+        TeleopCommandOverride,
+    )
+
+
+def test_nonexclusive_single_side_port_cannot_claim_dual_arm_runtime() -> None:
+    components = _components_for_attachment(
+        session=SimpleNamespace(
+            command_override_provider=None,
+            command_dispatch_admission=None,
+        ),
+        target_builder=_TargetBuilder(),
+        active_sides=("left", "right"),
+    )
+
+    with pytest.raises(ValueError, match="exclusive coupled dual-arm"):
+        attach_real_agent_motion_port(
+            components,
+            config=RealAgentMotionPortConfig(
+                active_sides=("right",),
+                component_id_by_side={"right": "right-tool-tcp"},
+                execution_frame_id="dual-arm-solver-world",
+                execution_frame_spec_hash="solver-world-spec-hash-1",
+                exclusive_command_claim=False,
+            ),
         )
 
 

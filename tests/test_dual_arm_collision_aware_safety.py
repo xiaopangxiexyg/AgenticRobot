@@ -1564,6 +1564,96 @@ def test_pure_bimanual_solve_returns_atomic_result_and_facade_round_trips() -> N
         np.testing.assert_allclose(effector.value, side_result.command_value)
 
 
+def test_direct_bimanual_target_hard_holds_inactive_side_at_final_q_boundary() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    initial_q = solver.current_q.copy()
+    candidate = initial_q.copy()
+    candidate[0] -= 0.04
+    candidate[6] -= 0.06
+    solver.solve = lambda *, targets: candidate.copy()  # type: ignore[attr-defined]
+    current_targets = retargeter.current_world_targets()
+    left_target = current_targets["left"].copy()
+    left_target[0, 3] += 0.10
+    target = BimanualPoseTarget(
+        timestamp=2.0,
+        target_pose_by_side={
+            "left": left_target,
+            "right": current_targets["right"],
+        },
+        active_sides=("left",),
+        hard_hold_inactive_sides=True,
+        source_by_side={
+            "left": BimanualPoseTargetSource(
+                command_type="tcp_pose",
+                value=left_target,
+                frame_name="dual_arm_solver_world",
+                metadata={},
+            ),
+            "right": None,
+        },
+    )
+
+    result = retargeter.solve_target_pair(target)
+
+    assert result.qpos_by_side()["left"][0] < initial_q[0]
+    np.testing.assert_allclose(result.qpos_by_side()["right"], initial_q[6:12])
+    assert result.metadata["target_activity"]["right"]["fixed_by_authority"] is True
+    hold = result.metadata["direct_target_inactive_side_hold"]
+    assert hold["active_sides"] == ["left"]
+    assert hold["held_sides"] == ["right"]
+    assert hold["applied"] is True
+    assert hold["collision_rechecked"] is True
+    assert hold["collision_fallback"] is False
+
+
+def test_direct_bimanual_target_holds_both_when_exact_inactive_hold_collides() -> None:
+    solver = _FakeDualArmSolver()
+    retargeter = _retargeter(solver)
+    initial_q = solver.current_q.copy()
+    candidate = initial_q.copy()
+    candidate[0] -= 0.04
+    candidate[6] -= 0.06
+    solver.solve = lambda *, targets: candidate.copy()  # type: ignore[attr-defined]
+    retargeter._profiled_min_collision_distance = (  # type: ignore[method-assign]
+        lambda qpos, profile, *, phase: (
+            0.0 if phase == "direct_target_inactive_side_hold" else 1.0
+        )
+    )
+    current_targets = retargeter.current_world_targets()
+    left_target = current_targets["left"].copy()
+    left_target[0, 3] += 0.10
+    target = BimanualPoseTarget(
+        timestamp=2.0,
+        target_pose_by_side={
+            "left": left_target,
+            "right": current_targets["right"],
+        },
+        active_sides=("left",),
+        hard_hold_inactive_sides=True,
+        source_by_side={
+            "left": BimanualPoseTargetSource(
+                command_type="tcp_pose",
+                value=left_target,
+                frame_name="dual_arm_solver_world",
+                metadata={},
+            ),
+            "right": None,
+        },
+    )
+
+    result = retargeter.solve_target_pair(target)
+
+    np.testing.assert_allclose(result.qpos_by_side()["left"], initial_q[:6])
+    np.testing.assert_allclose(result.qpos_by_side()["right"], initial_q[6:12])
+    assert result.status == "hold_last_safe"
+    assert result.fallback_reason is not None
+    assert result.fallback_reason.startswith("direct_target_inactive_side_hold:")
+    hold = result.metadata["direct_target_inactive_side_hold"]
+    assert hold["collision_rechecked"] is True
+    assert hold["collision_fallback"] is True
+
+
 def test_bimanual_contract_facade_has_explicit_compatibility_rollback() -> None:
     solver = _FakeDualArmSolver()
     retargeter = DualArmCollisionAwareRetargeter(

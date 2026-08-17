@@ -126,11 +126,11 @@ def validate_real_agent_primitive_arguments(
         parser.error("--agent-primitive-authorized-side is required")
     if getattr(args, "agent_primitive_authorized_action", None) is None:
         parser.error("--agent-primitive-authorized-action is required")
-    authorized_side = str(args.agent_primitive_authorized_side)
-    if tuple(getattr(args, "active_sides", ())) != (authorized_side,):
+    if set(getattr(args, "active_sides", ())) != {"left", "right"}:
         parser.error(
-            "Skill-only primitive requires --active-sides to exactly match "
-            "--agent-primitive-authorized-side"
+            "Skill-only primitive requires --active-sides both: the existing "
+            "coupled collision solver and final pre-IK TCP safety owner must "
+            "observe both arms even though only the authorized side may move"
         )
     if not bool(getattr(args, "tcp_pose_envelope_active", False)):
         parser.error(
@@ -210,19 +210,23 @@ def _actual_binding_hashes(
         },
         domain="dexteleop.real_agent_motion.execution_manifest.v1",
     )
-    active_backend = (
-        components.left_command_backend
-        if side == "left"
-        else components.right_command_backend
-    )
+    command_backend_by_side = {
+        "left": components.left_command_backend,
+        "right": components.right_command_backend,
+    }
     backend_inventory_hash = canonical_content_hash(
         {
-            "side": side,
-            "command_backend_type": (
-                None
-                if active_backend is None
-                else f"{type(active_backend).__module__}.{type(active_backend).__qualname__}"
-            ),
+            "authorized_side": side,
+            "runtime_active_sides": list(components.active_sides),
+            "command_backend_type_by_side": {
+                backend_side: (
+                    None
+                    if backend is None
+                    else f"{type(backend).__module__}.{type(backend).__qualname__}"
+                )
+                for backend_side, backend in command_backend_by_side.items()
+            },
+            "inactive_side_policy": "exact_q_hold_then_coupled_collision_recheck",
             "target_builder_type": (
                 f"{type(components.dual_arm_retargeter).__module__}."
                 f"{type(components.dual_arm_retargeter).__qualname__}"
@@ -260,10 +264,10 @@ class RealAgentPrimitiveSkillOnlyExtension:
         self,
         components: RealTeleopComponents,
     ) -> RealTeleopComponents:
-        if tuple(components.active_sides) != (self.side,):
+        if set(components.active_sides) != {"left", "right"}:
             raise RuntimeError(
-                "Skill-only primitive requires RealTeleop --active-sides to "
-                f"be exactly {self.side!r}."
+                "Skill-only primitive requires RealTeleop --active-sides both "
+                "for the coupled collision and final pre-IK safety owner."
             )
         if not components.collision_guard_requested or (
             components.dual_arm_retargeter is None

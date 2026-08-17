@@ -92,7 +92,7 @@ def _components() -> RealTeleopComponents:
     )
     values.update(
         session=session,
-        active_sides=("left",),
+        active_sides=("left", "right"),
         dual_arm_retargeter=target_builder,
         collision_guard_requested=True,
     )
@@ -120,7 +120,7 @@ def _validation_args(socket_path: str) -> Namespace:
         agent_primitive_socket_path=socket_path,
         agent_primitive_authorized_side="left",
         agent_primitive_authorized_action="up",
-        active_sides=("left",),
+        active_sides=("left", "right"),
         tcp_pose_envelope_active=True,
         tcp_pose_envelope_profile="left-relative-tight.json",
         disable_dual_arm_collision_avoidance=False,
@@ -146,7 +146,7 @@ def test_skill_only_argument_contract_accepts_reviewed_configuration(
 @pytest.mark.parametrize(
     ("field_name", "invalid_value"),
     (
-        ("active_sides", ("left", "right")),
+        ("active_sides", ("left",)),
         ("disable_dual_arm_collision_avoidance", True),
         ("position_force_guard", False),
         ("position_admittance_active", True),
