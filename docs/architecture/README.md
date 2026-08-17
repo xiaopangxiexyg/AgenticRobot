@@ -2,7 +2,7 @@
 
 这里集中维护跨模块架构、RTC 可视化说明和需要团队共享的实施计划：
 
-- [控制、数据与训练闭环图示](./dexteleop_architecture_visual_guide.md)
+- [当前模块与运行域图示](./dexteleop_architecture_visual_guide.md)
 - [实时 Action Chunk（RTC）图示](./dexteleop_rtc_visual_guide.md)
 - [单源直通、多源组合及数采/部署/仿真的运行域边界](./runtime_domain_boundaries.md)
 - [Embodiment runtime provider 当前接口合同](./embodiment_runtime_provider_contract.md)
@@ -22,8 +22,9 @@
   [RTC landing](plans/dexteleop_rtc_landing_plan.md) 和
   [Control Station](plans/dexteleop_control_station_plan.md)。
 - [`plans/`](plans/README.md) 是仍含未闭合工作或门禁的共享计划索引；
-  [`evidence/`](evidence/README.md) 是按批次冻结的历史收据索引。计划中的阶段状态与
-  evidence 的验证范围不能相互替代。
+  [`reports/`](reports/README.md) 保存带日期的审计和已完成实施台账；
+  [`evidence/`](evidence/README.md) 是按批次冻结的历史收据索引。计划、报告和 evidence
+  的状态与验证范围不能相互替代。
 - [`evidence/`](evidence/) 中 evidence JSON 内出现的旧 `todos/evidence/` 路径和哈希是历史收据的
   一部分；迁移版本控制位置时不回写这些记录。
 
