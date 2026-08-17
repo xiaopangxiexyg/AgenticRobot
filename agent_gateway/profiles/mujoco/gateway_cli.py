@@ -15,6 +15,7 @@ import signal
 import stat
 import threading
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +121,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run MuJoCo stepping without realtime pacing (simulation only)",
     )
+    parser.add_argument(
+        "--viewer",
+        action="store_true",
+        help=(
+            "open the lower-owned passive MuJoCo viewer; the default remains "
+            "headless and a later viewer loss degrades to headless execution"
+        ),
+    )
     return parser
 
 
@@ -167,7 +176,13 @@ def _resolved_runtime_session_id(explicit: str | None) -> str:
     return "dexteleop-agent-mujoco-tcp-pose:" + uuid.uuid4().hex
 
 
-def _ready_payload(*, session: Any, socket_path: Path, client_id: str) -> dict[str, Any]:
+def _ready_payload(
+    *,
+    session: Any,
+    socket_path: Path,
+    client_id: str,
+    viewer: Any | None = None,
+) -> dict[str, Any]:
     manifest = session.contract_bundle.route_manifest
     capabilities = session.service.protocol_runtime.session_capabilities
     return {
@@ -184,6 +199,11 @@ def _ready_payload(*, session: Any, socket_path: Path, client_id: str) -> dict[s
         "artifact_access_mechanisms": list(capabilities.artifact_access_mechanisms),
         "station_manifest_hash": manifest.station_manifest_hash,
         "execution_manifest_hash": manifest.execution_manifest_hash,
+        "viewer": (
+            {"enabled": False, "state": "disabled", "running": False}
+            if viewer is None
+            else dict(viewer.status())
+        ),
         "routes": [
             {
                 "skill_id": entry.route.skill_id,
@@ -197,7 +217,13 @@ def _ready_payload(*, session: Any, socket_path: Path, client_id: str) -> dict[s
     }
 
 
-def _stopped_payload(*, server: Any, session: Any) -> dict[str, Any]:
+def _stopped_payload(
+    *,
+    server: Any,
+    session: Any,
+    stop_reason: str | None = None,
+    viewer_status: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     outcome = server.gateway_close_outcome
     receipt = None if outcome is None else outcome.port_receipt
     lower_hold_proved = bool(
@@ -209,6 +235,12 @@ def _stopped_payload(*, server: Any, session: Any) -> dict[str, Any]:
     safe_shutdown = not motion_ever_activated or lower_hold_proved
     return {
         "event": "gateway_stopped",
+        "stop_reason": stop_reason or "server_loop_ended",
+        "viewer": (
+            {"enabled": False, "state": "disabled", "running": False}
+            if viewer_status is None
+            else dict(viewer_status)
+        ),
         "gateway_close_error": (
             None
             if server.gateway_close_error is None
@@ -284,6 +316,14 @@ def main(argv: list[str] | None = None) -> int:
         history_storage=history_storage,
         artifact_storage=artifact_storage,
     )
+    viewer = None
+    if args.viewer:
+        from sim.mujoco.viewer import MujocoPassiveViewerSession
+
+        viewer = MujocoPassiveViewerSession(
+            session.application.scene,
+            sync_callback=session.application.runtime.rig.sync_viewer,
+        )
     server = session.build_unix_json_server(
         socket_path=str(socket_path),
         client_id_by_uid={args.client_uid: args.client_id},
@@ -292,15 +332,20 @@ def main(argv: list[str] | None = None) -> int:
     stop_requested = threading.Event()
     server_error: list[BaseException] = []
     stopped_payload: dict[str, Any] | None = None
+    stop_reason: str | None = None
 
     def serve() -> None:
+        nonlocal stop_reason
         try:
             server.serve_forever(poll_interval=0.1)
         except BaseException as error:  # noqa: BLE001 - surfaced to main.
             server_error.append(error)
+            stop_reason = "server_fault"
             stop_requested.set()
 
-    def request_stop(_signum: int, _frame: Any) -> None:
+    def request_stop(signum: int, _frame: Any) -> None:
+        nonlocal stop_reason
+        stop_reason = f"signal:{signal.Signals(signum).name}"
         stop_requested.set()
 
     previous_handlers = {
@@ -315,10 +360,16 @@ def main(argv: list[str] | None = None) -> int:
         daemon=True,
     )
     server_thread_started = False
+    viewer_sync_enabled = viewer is not None
     try:
         # Construction is deliberately default-off.  This explicit lower-owned
         # boundary starts MuJoCo and proves HOLD before any client can observe a
         # ready endpoint or before history capture touches the runtime.
+        # The passive viewer must open first: its native window and the realtime
+        # physics worker share MjModel/MjData, and concurrent startup has caused
+        # native GLFW/GLX crashes on some systems.
+        if viewer is not None:
+            viewer.start()
         session.application.start_observation_ready()
         if session.history_recorder is not None:
             session.history_recorder.capture_once()
@@ -331,12 +382,28 @@ def main(argv: list[str] | None = None) -> int:
                     session=session,
                     socket_path=socket_path,
                     client_id=args.client_id,
+                    viewer=viewer,
                 ),
                 sort_keys=True,
             ),
             flush=True,
         )
         while server_thread.is_alive() and not stop_requested.wait(0.25):
+            if viewer_sync_enabled and viewer is not None and not viewer.sync():
+                viewer_state = str(viewer.status().get("state") or "unknown")
+                if viewer_state in {"closed_by_user", "faulted"}:
+                    viewer_sync_enabled = False
+                    print(
+                        json.dumps(
+                            {
+                                "event": "viewer_unavailable",
+                                "gateway_continues_headless": True,
+                                "viewer": dict(viewer.status()),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
             if (
                 session.history_recorder is not None
                 and session.history_recorder.last_error is not None
@@ -354,8 +421,17 @@ def main(argv: list[str] | None = None) -> int:
             server_thread.join(timeout=2.0)
         for signum, previous in previous_handlers.items():
             signal.signal(signum, previous)
-        stopped_payload = _stopped_payload(server=server, session=session)
+        stopped_payload = _stopped_payload(
+            server=server,
+            session=session,
+            stop_reason=stop_reason,
+            viewer_status=None if viewer is None else viewer.status(),
+        )
         print(json.dumps(stopped_payload, sort_keys=True), flush=True)
+        if viewer is not None:
+            # Gateway close above joins/fences the lower runtime first; only
+            # then may the native viewer release the shared MjData.
+            viewer.close()
     if server.gateway_close_error is not None:
         raise RuntimeError("Agent Gateway close failed") from server.gateway_close_error
     if stopped_payload is None or not stopped_payload["safe_shutdown"]:

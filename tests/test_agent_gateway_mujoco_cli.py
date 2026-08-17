@@ -45,6 +45,12 @@ def test_never_activated_gateway_closes_safely_without_hold_claim() -> None:
     assert payload["safe_shutdown"] is True
     assert payload["safe_shutdown_basis"] == "motion_never_activated"
     assert payload["lower_hold_proved"] is False
+    assert payload["stop_reason"] == "server_loop_ended"
+    assert payload["viewer"] == {
+        "enabled": False,
+        "state": "disabled",
+        "running": False,
+    }
 
 
 def test_activated_gateway_requires_lower_hold_proof() -> None:
@@ -68,6 +74,24 @@ def test_activated_gateway_requires_lower_hold_proof() -> None:
     assert proved["safe_shutdown_basis"] == "lower_hold_proved"
 
 
+def test_stopped_payload_preserves_bounded_viewer_exit_reason() -> None:
+    payload = _stopped_payload(
+        server=_server(),
+        session=_session(started=False),
+        stop_reason="viewer:faulted",
+        viewer_status={
+            "enabled": True,
+            "state": "faulted",
+            "running": False,
+            "last_error": "RuntimeError:sync failed",
+        },
+    )
+
+    assert payload["stop_reason"] == "viewer:faulted"
+    assert payload["viewer"]["state"] == "faulted"
+    assert payload["viewer"]["last_error"] == "RuntimeError:sync failed"
+
+
 def test_runtime_session_identity_is_unique_by_default_and_overridable() -> None:
     parser = build_parser()
     common = [
@@ -79,6 +103,8 @@ def test_runtime_session_identity_is_unique_by_default_and_overridable() -> None
 
     assert parser.parse_args(common).runtime_session_id is None
     assert parser.parse_args(common).artifact_root is None
+    assert parser.parse_args(common).viewer is False
+    assert parser.parse_args([*common, "--viewer"]).viewer is True
     assert (
         parser.parse_args(
             [*common, "--runtime-session-id", "runtime:operator-selected"]
