@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import ast
-import io
-import tokenize
 from configparser import ConfigParser
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -115,34 +115,65 @@ def _string_mentions_legacy_root(value: str) -> bool:
     return "logs" in normalized.split("/")
 
 
-def _source_mentions_legacy_root(path: Path) -> bool:
-    tokens = tokenize.generate_tokens(
-        io.StringIO(path.read_text(encoding="utf-8")).readline
+@dataclass(frozen=True)
+class _ArtifactReferenceSummary:
+    mentions_legacy_root: bool
+    logs_literal_scopes: frozenset[str | None]
+
+
+_IDENTIFIER_FIELDS = frozenset(
+    {"arg", "asname", "attr", "id", "module", "name", "names", "rest"}
+)
+
+
+@lru_cache(maxsize=None)
+def _artifact_reference_summary(path: Path) -> _ArtifactReferenceSummary:
+    """Scan one source once for both runtime-artifact boundary assertions."""
+
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    has_raw_legacy_identifier = "teleop_records_root" in source
+    has_raw_teleop_records = "teleop_records" in source
+    source_lines = tuple(
+        line.encode("utf-8") for line in source.splitlines(keepends=True)
     )
-    for token in tokens:
-        if token.type == tokenize.NAME and token.string == "teleop_records_root":
-            return True
-        if token.type != tokenize.STRING:
-            continue
-        if "teleop_records" in token.string:
-            return True
-        try:
-            value = ast.literal_eval(token.string)
-        except (SyntaxError, ValueError):
-            continue
-        if isinstance(value, str) and _string_mentions_legacy_root(value):
-            return True
-    return False
 
-
-def _literal_component_scopes(path: Path, component: str) -> set[str | None]:
-    """Return function scopes containing one exact string path component."""
-
-    scopes: set[str | None] = set()
+    def raw_source_segment(node: ast.AST) -> str:
+        if node.end_lineno is None or node.end_col_offset is None:
+            return ""
+        start = node.lineno - 1
+        end = node.end_lineno - 1
+        if start == end:
+            segment = source_lines[start][node.col_offset : node.end_col_offset]
+        else:
+            segment = b"".join(
+                (
+                    source_lines[start][node.col_offset :],
+                    *source_lines[start + 1 : end],
+                    source_lines[end][: node.end_col_offset],
+                )
+            )
+        return segment.decode("utf-8")
 
     class Visitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.function_stack: list[str] = []
+            self.mentions_legacy_root = False
+            self.logs_literal_scopes: set[str | None] = set()
+
+        def generic_visit(self, node: ast.AST) -> None:
+            if has_raw_legacy_identifier:
+                for field_name, value in ast.iter_fields(node):
+                    if field_name not in _IDENTIFIER_FIELDS:
+                        continue
+                    values = value if isinstance(value, list) else (value,)
+                    if any(
+                        isinstance(item, str)
+                        and "teleop_records_root" in item.split(".")
+                        for item in values
+                    ):
+                        self.mentions_legacy_root = True
+            super().generic_visit(node)
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
             self.function_stack.append(node.name)
@@ -158,18 +189,38 @@ def _literal_component_scopes(path: Path, component: str) -> set[str | None]:
             self.function_stack.pop()
 
         def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802
-            if node.value == component:
-                scopes.add(self.function_stack[-1] if self.function_stack else None)
+            value = node.value
+            if not isinstance(value, str):
+                return
+            if (
+                (
+                    has_raw_teleop_records
+                    and "teleop_records" in raw_source_segment(node)
+                )
+                or (
+                    ("logs" in value or "teleop_records" in value)
+                    and _string_mentions_legacy_root(value)
+                )
+            ):
+                self.mentions_legacy_root = True
+            if value == "logs":
+                self.logs_literal_scopes.add(
+                    self.function_stack[-1] if self.function_stack else None
+                )
 
-    Visitor().visit(ast.parse(path.read_text(encoding="utf-8")))
-    return scopes
+    visitor = Visitor()
+    visitor.visit(tree)
+    return _ArtifactReferenceSummary(
+        mentions_legacy_root=visitor.mentions_legacy_root,
+        logs_literal_scopes=frozenset(visitor.logs_literal_scopes),
+    )
 
 
 def test_legacy_artifact_root_reference_budget_does_not_grow() -> None:
     observed = {
         path.relative_to(REPO_ROOT).as_posix()
         for path in _iter_production_sources()
-        if _source_mentions_legacy_root(path)
+        if _artifact_reference_summary(path).mentions_legacy_root
     }
     unexpected = observed - LEGACY_ARTIFACT_ROOT_ALLOWLIST
 
@@ -184,7 +235,7 @@ def test_project_logs_literal_is_confined_to_archived_reader_roots() -> None:
     observed = {
         (path.relative_to(REPO_ROOT).as_posix(), scope)
         for path in _iter_production_sources()
-        for scope in _literal_component_scopes(path, "logs")
+        for scope in _artifact_reference_summary(path).logs_literal_scopes
     }
 
     assert observed == {
