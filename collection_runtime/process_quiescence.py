@@ -31,15 +31,30 @@ def is_formal_collection_argv(argv: Iterable[str]) -> bool:
     contains a collection command. Wrappers such as ``conda run`` and
     ``taskset`` remain covered because they preserve the separate ``-m`` and
     module-name arguments; their Python child is covered independently too.
+
+    The real-teleop entrypoint is not a collection process when it explicitly
+    disables both formal collection and compatibility episode recording.  Both
+    negative flags are required so maintenance remains fail-closed for partial
+    or ambiguous command lines.
     """
 
     tokens = tuple(str(token) for token in argv)
-    return any(
-        token == "-m"
+    modules = tuple(
+        tokens[index + 1]
+        for index, token in enumerate(tokens)
+        if token == "-m"
         and index + 1 < len(tokens)
         and tokens[index + 1] in FORMAL_COLLECTION_ENTRY_MODULES
-        for index, token in enumerate(tokens)
     )
+    if not modules:
+        return False
+    if (
+        modules == ("teleop_runtime.debug.run_vive_rm65_real_teleop",)
+        and "--no-collection" in tokens
+        and "--no-episode-recording" in tokens
+    ):
+        return False
+    return True
 
 
 def active_formal_collection_processes() -> tuple[str, ...]:

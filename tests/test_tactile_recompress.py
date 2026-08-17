@@ -59,6 +59,32 @@ class TactileRecompressTest(unittest.TestCase):
             )
         )
 
+    def test_collection_process_detection_ignores_explicit_no_write_teleop(self) -> None:
+        base = (
+            "python",
+            "-m",
+            "teleop_runtime.debug.run_vive_rm65_real_teleop",
+            "--gui",
+        )
+        self.assertFalse(
+            is_formal_collection_argv(
+                (*base, "--no-collection", "--no-episode-recording")
+            )
+        )
+        self.assertTrue(is_formal_collection_argv((*base, "--no-collection")))
+        self.assertTrue(is_formal_collection_argv((*base, "--no-episode-recording")))
+        self.assertTrue(
+            is_formal_collection_argv(
+                (
+                    *base,
+                    "--no-collection",
+                    "--no-episode-recording",
+                    "-m",
+                    "teleop_runtime.collection",
+                )
+            )
+        )
+
     def test_collection_process_detection_ignores_embedded_command_text(self) -> None:
         command = "python -m teleop_runtime.collection umi"
         self.assertFalse(is_formal_collection_argv(("bash", "-c", command)))
