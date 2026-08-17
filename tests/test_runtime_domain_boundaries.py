@@ -265,6 +265,22 @@ def test_collection_curation_store_has_one_lower_owner() -> None:
     )
 
 
+def test_collection_pose_storage_has_one_data_interface_owner() -> None:
+    data_owner = REPO_ROOT / "dataset_interface" / "collection_pose_storage.py"
+    compatibility_module = (
+        REPO_ROOT / "teleop_runtime" / "collection" / "pose_storage.py"
+    )
+    data_owned_symbols = {
+        "bind_collection_row_pose_storage",
+        "validate_v23_collection_row_actual_tcp",
+    }
+
+    assert data_owned_symbols <= _top_level_defined_names(data_owner)
+    assert data_owned_symbols.isdisjoint(
+        _top_level_defined_names(compatibility_module)
+    )
+
+
 def test_general_real_deploy_does_not_absorb_composition_or_simulation() -> None:
     assert _violations(
         REPO_ROOT / "teleop_runtime" / "deploy",
