@@ -23,8 +23,10 @@ consumer needs them.
 
 - [Control-core landing](dexteleop_control_core_landing_plan.md): shared
   control-core batches, maturity levels, authority gates, and validation ledger.
-- [Control Station](dexteleop_control_station_plan.md): application control
-  plane, source/target bindings, and remaining station integration batches.
+- [Control Station](dexteleop_control_station_plan.md): current application
+  control-plane ownership, strict GUI/browser subset, source/target profile
+  debt, and remaining boundary migrations. Its completed CS-0 to CS-6 ledger
+  is preserved under [`../reports/`](../reports/control_station_implementation_ledger_20260724.md).
 - [RTC landing](dexteleop_rtc_landing_plan.md): action-chunk producer,
   transport, admission, target handoff, and real-observation gates.
 - [HITL chunk-relative migration](hitl_chunk_relative_migration_plan.md):

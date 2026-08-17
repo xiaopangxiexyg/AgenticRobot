@@ -4,6 +4,7 @@
 不定义当前代码，不重新打开已完成批次，也不授权硬件操作、真实运动、数据变换或部署。
 
 - [P0 结构治理历史实施台账（2026-08-04～08-07）](./p0_structure_remediation_20260803.md)
+- [Control Station 历史实施台账（更新至 2026-07-24）](./control_station_implementation_ledger_20260724.md)
 
 当前架构边界和剩余工作分别由 [`../README.md`](../README.md) 与
 [`../plans/README.md`](../plans/README.md) 索引。
