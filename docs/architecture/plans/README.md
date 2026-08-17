@@ -21,8 +21,10 @@ consumer needs them.
 
 ## Active landing ledgers
 
-- [Control-core landing](dexteleop_control_core_landing_plan.md): shared
-  control-core batches, maturity levels, authority gates, and validation ledger.
+- [Control-core landing](dexteleop_control_core_landing_plan.md): current direct
+  versus composed execution boundary, shared-core ownership, maturity terms,
+  and remaining structure/authority gates. The original M0 to M8 batch ledger
+  is preserved under [`../reports/`](../reports/control_core_landing_ledger_20260722.md).
 - [Control Station](dexteleop_control_station_plan.md): current application
   control-plane ownership, strict GUI/browser subset, source/target profile
   debt, and remaining boundary migrations. Its completed CS-0 to CS-6 ledger
