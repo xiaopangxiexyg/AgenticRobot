@@ -21,11 +21,6 @@ from agent_gateway.skills.motion.definition import (
 from agent_gateway.transport.unix_transport import (
     AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
 )
-from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.primitives import (
-    CARDINAL_TCP_SHORT_STEP_PRIMITIVES,
-    level_tcp_orientation,
-)
 
 from .motion_primitive_profiles import (
     REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
@@ -106,38 +101,142 @@ def _route_entry(manifest: Mapping[str, Any], *, skill_id: str) -> Mapping[str, 
     return matches[0]
 
 
+def _schema_entry_for_route(
+    *,
+    manifest: Mapping[str, Any],
+    schema_catalog: Mapping[str, Any],
+    route: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if not isinstance(schema_catalog, Mapping):
+        raise TypeError("Gateway returned an invalid Skill schema catalog.")
+    if schema_catalog.get("skill_schema_catalog_hash") != manifest.get(
+        "skill_schema_catalog_hash"
+    ):
+        raise RuntimeError("Skill schema catalog does not match the Route manifest.")
+    entries = schema_catalog.get("schema_entries")
+    if not isinstance(entries, (tuple, list)):
+        raise TypeError("Skill schema catalog has no schema_entries list.")
+    matches = tuple(
+        item
+        for item in entries
+        if isinstance(item, Mapping)
+        and item.get("skill_id") == route.get("skill_id")
+        and item.get("skill_version") == route.get("skill_version")
+    )
+    if len(matches) != 1:
+        raise RuntimeError("Gateway schema catalog has no unique matching Skill.")
+    entry = matches[0]
+    if entry.get("parameter_schema_hash") != route.get("parameter_schema_hash"):
+        raise RuntimeError("Skill schema parameter hash does not match the Route.")
+    route_profiles = route.get("allowed_parameter_profiles")
+    schema_profiles = entry.get("parameter_profiles")
+    if not isinstance(route_profiles, (tuple, list)) or not isinstance(
+        schema_profiles, (tuple, list)
+    ):
+        raise TypeError("Route/schema parameter profiles are malformed.")
+    schema_profile_keys = {
+        (item.get("parameter_profile_id"), item.get("parameter_profile_hash"))
+        for item in schema_profiles
+        if isinstance(item, Mapping)
+    }
+    if any(
+        not isinstance(item, Mapping)
+        or (
+            item.get("parameter_profile_id"),
+            item.get("parameter_profile_hash"),
+        )
+        not in schema_profile_keys
+        for item in route_profiles
+    ):
+        raise RuntimeError("Route parameter profile is absent from its schema.")
+    return entry
+
+
+def _schema_properties(schema_entry: Mapping[str, Any]) -> Mapping[str, Any]:
+    schema = schema_entry.get("parameter_schema")
+    if not isinstance(schema, Mapping):
+        raise TypeError("Skill schema entry has no parameter_schema object.")
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        raise TypeError("Skill parameter schema has no properties object.")
+    return properties
+
+
+def _schema_const(
+    properties: Mapping[str, Any],
+    field_name: str,
+) -> Any:
+    field = properties.get(field_name)
+    if not isinstance(field, Mapping) or "const" not in field:
+        raise RuntimeError(
+            f"Skill parameter schema has no trusted const for {field_name}."
+        )
+    return field["const"]
+
+
+def _schema_enum(
+    properties: Mapping[str, Any],
+    field_name: str,
+) -> tuple[Any, ...]:
+    field = properties.get(field_name)
+    values = None if not isinstance(field, Mapping) else field.get("enum")
+    if not isinstance(values, (tuple, list)) or not values:
+        raise RuntimeError(
+            f"Skill parameter schema has no trusted enum for {field_name}."
+        )
+    return tuple(values)
+
+
 def _parameters(
     *,
     action: str,
     skill_id: str,
+    side: str,
     snapshot: Mapping[str, Any],
+    schema_entry: Mapping[str, Any],
 ) -> dict[str, Any]:
     summary = snapshot["measurement_summary"]
     components = tuple(summary["pose_xyz_quat_xyzw_by_component"])
-    if len(components) != 1:
-        raise RuntimeError("Real primitive observation must contain one component.")
+    expected_component = f"{side}_arm"
+    if components != (expected_component,):
+        raise RuntimeError(
+            "Real primitive observation does not exactly match the selected side."
+        )
+    properties = _schema_properties(schema_entry)
+    if expected_component not in _schema_enum(properties, "component_id"):
+        raise RuntimeError("Selected side is not allowed by the Skill schema.")
+    if skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1 and action not in _schema_enum(
+        properties, "direction"
+    ):
+        raise RuntimeError("Requested cardinal action is not allowed by the Skill schema.")
+    reference_frames = _schema_enum(properties, "reference_frame_id")
+    if len(reference_frames) != 1:
+        raise RuntimeError("Real primitive schema must bind one reference frame.")
     payload = {
-        "component_id": components[0],
-        "reference_frame_id": summary["reference_frame_id"],
-        "reference_frame_spec_hash": summary["reference_frame_spec_hash"],
-        "controlled_frame_id": "tool_tcp",
-        "frame_graph_hash": snapshot["frame_graph_hash"],
-        "tool_config_hash": snapshot["tool_config_hash"],
-        "calibration_hash": snapshot["calibration_hash"],
+        "component_id": expected_component,
+        "reference_frame_id": reference_frames[0],
+        "reference_frame_spec_hash": _schema_const(
+            properties, "reference_frame_spec_hash"
+        ),
+        "controlled_frame_id": _schema_const(properties, "controlled_frame_id"),
+        "frame_graph_hash": _schema_const(properties, "frame_graph_hash"),
+        "tool_config_hash": _schema_const(properties, "tool_config_hash"),
+        "calibration_hash": _schema_const(properties, "calibration_hash"),
     }
+    for field_name in ("frame_graph_hash", "tool_config_hash", "calibration_hash"):
+        if payload[field_name] != snapshot.get(field_name):
+            raise RuntimeError(
+                f"Skill schema {field_name} disagrees with the observation snapshot."
+            )
     if skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1:
         payload["direction"] = action
-        payload["primitive_catalog_hash"] = canonical_content_hash(
-            tuple(item.to_payload() for item in CARDINAL_TCP_SHORT_STEP_PRIMITIVES),
-            domain="dexteleop.robot_motion.tcp_displacement_catalog.v1",
+        payload["primitive_catalog_hash"] = _schema_const(
+            properties, "primitive_catalog_hash"
         )
     else:
-        heading = REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1[
-            skill_id
-        ]
-        payload["primitive_hash"] = level_tcp_orientation(
-            heading
-        ).semantic_content_hash
+        if skill_id not in REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1:
+            raise RuntimeError("Unsupported fixed-orientation real primitive Skill.")
+        payload["primitive_hash"] = _schema_const(properties, "primitive_hash")
     return payload
 
 
@@ -154,6 +253,14 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
     )
     try:
         manifest = client.call("get_skill_route_manifest", None)
+        entry = _route_entry(manifest, skill_id=skill_id)
+        route = entry["route"]
+        schema_catalog = client.call("get_agent_skill_schema_catalog", None)
+        schema_entry = _schema_entry_for_route(
+            manifest=manifest,
+            schema_catalog=schema_catalog,
+            route=route,
+        )
         snapshot = client.call("get_observation_snapshot", None)
         if snapshot["lifecycle_state"] != "running" or (
             snapshot["execution_gate"] != "ready"
@@ -162,14 +269,14 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         parameters = _parameters(
             action=args.action,
             skill_id=skill_id,
+            side=args.side,
             snapshot=snapshot,
+            schema_entry=schema_entry,
         )
         if parameters["component_id"] != expected_component:
             raise RuntimeError(
                 "Server component does not match the operator-selected side."
             )
-        entry = _route_entry(manifest, skill_id=skill_id)
-        route = entry["route"]
         binding = entry["deployment_binding"]
         profiles = tuple(route["allowed_parameter_profiles"])
         if len(profiles) != 1:
