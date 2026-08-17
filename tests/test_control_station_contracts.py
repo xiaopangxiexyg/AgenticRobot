@@ -43,6 +43,12 @@ from dataset_interface.composition_control_trace import (
 from control_station.targets.authoritative import (
     authoritative_authority_epoch_source_id,
 )
+from tests.support.repository_imports import (
+    absolute_import_roots as _absolute_import_roots,
+)
+from tests.support.repository_imports import (
+    python_files as _python_files,
+)
 
 
 def _source_slot(
@@ -1303,24 +1309,15 @@ def test_lower_level_packages_do_not_reverse_depend_on_control_station() -> None
         "sim",
         "hardware",
     )
-    violations: list[str] = []
-    for package_name in lower_package_roots:
-        for path in sorted((repository_root / package_name).rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            for node in ast.walk(tree):
-                imported_names: tuple[str, ...] = ()
-                if isinstance(node, ast.Import):
-                    imported_names = tuple(alias.name for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                    imported_names = (node.module,)
-                if any(
-                    name == "control_station" or name.startswith("control_station.")
-                    for name in imported_names
-                ):
-                    violations.append(f"{path.relative_to(repository_root)}:{node.lineno}")
+    violations = {
+        path.relative_to(repository_root).as_posix()
+        for package_name in lower_package_roots
+        for path in _python_files(repository_root / package_name)
+        if "control_station" in _absolute_import_roots(path)
+    }
     # Historic command shims only. Browser state and pure input policy already
     # live in Control Station; no lower API facade may be added to this list.
-    assert sorted({item.rsplit(":", 1)[0] for item in violations}) == [
+    assert sorted(violations) == [
         "teleop_runtime/collection/umi/app.py",
         "teleop_runtime/debug/run_vive_rm65_calibration_debug.py",
         "teleop_runtime/debug/run_vive_rm65_real_teleop.py",
