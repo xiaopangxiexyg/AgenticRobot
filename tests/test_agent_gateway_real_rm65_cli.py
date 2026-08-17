@@ -66,6 +66,38 @@ def test_cli_rejects_confirmation_before_profile_or_hardware_resolution(
     assert called is False
 
 
+def test_cli_rejects_partial_perception_attachment_before_profile_resolution(
+    monkeypatch,
+) -> None:
+    called = False
+
+    def should_not_resolve(profile):
+        nonlocal called
+        called = True
+        raise AssertionError("partial perception flags must fail first")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        should_not_resolve,
+    )
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN)
+    argv.extend(
+        [
+            "--camera-config",
+            str(
+                REPO_ROOT
+                / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
+            ),
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        gateway_cli.main(argv)
+
+    assert called is False
+
+
 def test_cli_assembles_then_reports_ready_and_lower_hold(monkeypatch, capsys) -> None:
     resolved = SimpleNamespace(semantic_content_hash="a" * 64)
     lower = object()

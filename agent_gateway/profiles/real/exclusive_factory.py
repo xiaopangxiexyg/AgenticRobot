@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from robot_motion.coordinate_frames import CoordinateFrameGraph
 from robot_motion.runtime import TeleopCommand, TeleopObservation
 from teleop_runtime.skill_deploy.control_runtime import (
@@ -43,6 +44,8 @@ from .observation_gateway import (
     RealControlOwnerState,
     RealTcpPoseObserveAttachmentSpec,
 )
+from .perception_deployment import RealPerceptionCaptureRegistration
+from .realsense_perception import RealSenseAgentPerceptionProvider
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,12 @@ def assemble_exclusive_real_agent_primitive_deployment(
     command_dispatch: Callable[[TeleopCommand], RealSkillMotionDispatchReceipt],
     hold_controller: Callable[[str], RealSkillMotionHoldReceipt],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    perception_capture: RealPerceptionCaptureRegistration | None = None,
+    perception_provider_factory: (
+        Callable[[RealAgentMotionPort], RealSenseAgentPerceptionProvider] | None
+    ) = None,
+    artifact_store: RecoverableAgentArtifactStore | None = None,
+    owns_artifact_store: bool = False,
     max_retained_operations: int = 16,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
@@ -138,11 +147,17 @@ def assemble_exclusive_real_agent_primitive_deployment(
         primitive_reference_frame_id=primitive_reference_frame_id,
         safety_envelope_refs=safety_envelope_refs,
         convergence_profile=convergence_profile,
+        perception_capture=perception_capture,
     )
     port = RealAgentMotionPort(
         config=port_config,
         target_builder=target_builder,
         owner_identity=_owner_identity(observation_attachment),
+    )
+    perception_provider = (
+        None
+        if perception_provider_factory is None
+        else perception_provider_factory(port)
     )
     control_runtime = ExclusiveRealSkillControlRuntime(
         motion_port=port,
@@ -159,6 +174,9 @@ def assemble_exclusive_real_agent_primitive_deployment(
         owner_state_provider=lambda: _owner_state(port),
         allowed_client_ids=allowed_client_ids,
         max_retained_operations=max_retained_operations,
+        perception_provider=perception_provider,
+        artifact_store=artifact_store,
+        owns_artifact_store=owns_artifact_store,
         clock=clock,
         sleep=sleep,
     )
@@ -179,6 +197,12 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
     allowed_client_ids: tuple[str, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    perception_capture: RealPerceptionCaptureRegistration | None = None,
+    perception_provider_factory: (
+        Callable[[RealAgentMotionPort], RealSenseAgentPerceptionProvider] | None
+    ) = None,
+    artifact_store: RecoverableAgentArtifactStore | None = None,
+    owns_artifact_store: bool = False,
     max_retained_operations: int = 16,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
@@ -205,6 +229,10 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         command_dispatch=rm65_ports.dispatch,
         hold_controller=rm65_ports.hold,
         convergence_profile=convergence_profile,
+        perception_capture=perception_capture,
+        perception_provider_factory=perception_provider_factory,
+        artifact_store=artifact_store,
+        owns_artifact_store=owns_artifact_store,
         max_retained_operations=max_retained_operations,
         clock=clock,
         sleep=sleep,

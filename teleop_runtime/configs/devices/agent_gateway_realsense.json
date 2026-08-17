@@ -1,0 +1,57 @@
+{
+  "front": {
+    "serial": "213222079798",
+    "width": 640,
+    "height": 480,
+    "fps": 15,
+    "color_format": "bgr8",
+    "color_space": "rgb",
+    "keep_last": 4,
+    "enable_depth": true,
+    "depth_width": 640,
+    "depth_height": 480,
+    "depth_fps": 15,
+    "align_depth_to_color": true,
+    "startup_hardware_reset": false,
+    "startup_hardware_reset_on_failure": false,
+    "metadata": {
+      "mount": "single_front",
+      "startup_priority": 0,
+      "deployment": "agent_gateway_read_only_perception"
+    }
+  },
+  "left_wrist": {
+    "serial": "260522278055",
+    "width": 640,
+    "height": 480,
+    "fps": 15,
+    "color_format": "bgr8",
+    "color_space": "rgb",
+    "keep_last": 4,
+    "enable_depth": false,
+    "startup_hardware_reset": false,
+    "startup_hardware_reset_on_failure": false,
+    "metadata": {
+      "mount": "single_left_wrist",
+      "startup_priority": 20,
+      "deployment": "agent_gateway_read_only_perception"
+    }
+  },
+  "right_wrist": {
+    "serial": "261122273924",
+    "width": 640,
+    "height": 480,
+    "fps": 15,
+    "color_format": "bgr8",
+    "color_space": "rgb",
+    "keep_last": 4,
+    "enable_depth": false,
+    "startup_hardware_reset": false,
+    "startup_hardware_reset_on_failure": false,
+    "metadata": {
+      "mount": "single_right_wrist",
+      "startup_priority": 10,
+      "deployment": "agent_gateway_read_only_perception"
+    }
+  }
+}

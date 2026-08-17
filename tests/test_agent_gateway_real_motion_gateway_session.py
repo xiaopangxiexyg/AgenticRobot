@@ -21,6 +21,13 @@ from agent_gateway.profiles.real.observation_gateway import (
     RealControlOwnerState,
     RealTcpPoseObserveAttachmentSpec,
 )
+from agent_gateway.profiles.real.perception_deployment import (
+    build_real_perception_capture_registration,
+)
+from agent_gateway.profiles.real.realsense_perception import (
+    RealPerceptionSourceBinding,
+    RealSenseAgentPerceptionProvider,
+)
 from agent_gateway.profiles.real.one_shot_authorization import (
     REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
     RealAgentPrimitiveOneShotAuthorization,
@@ -28,6 +35,7 @@ from agent_gateway.profiles.real.one_shot_authorization import (
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.runtime.access_policy import issue_skill_execution_grant
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.skills.motion.definition import (
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
@@ -47,6 +55,7 @@ from teleop_runtime.real_teleop.agent_motion_port import (
     RealAgentMotionPortConfig,
 )
 from teleop_runtime.real_teleop.components import RealTeleopComponents
+from teleop_runtime.video_frame import VideoFrame
 
 CLIENT_ID = "rpent-real-motion-test"
 COMPONENT_ID = "right_arm"
@@ -596,3 +605,221 @@ def test_wire_adapter_atomically_binds_one_use_grant_to_exact_request() -> None:
     operation = result["operation"]
     assert operation is not None
     assert operation["status"] == "admitted"
+
+
+def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) -> None:
+    base_bundle, port, _target_builder = _runtime_fixture()
+    clock = _Clock()
+
+    class _RgbSource:
+        config = SimpleNamespace(
+            width=4,
+            height=3,
+            depth_width=4,
+            depth_height=3,
+            align_depth_to_color=True,
+            enable_depth=True,
+            color_space="rgb",
+            serial="rgb-test-serial",
+        )
+
+        def get_latest_frame(self):
+            return VideoFrame(
+                image=np.full((3, 4, 3), 127, dtype=np.uint8),
+                source_timestamp=clock(),
+                receive_timestamp=clock(),
+                available_timestamp=clock(),
+                metadata={
+                    "camera_key": "front",
+                    "serial": self.config.serial,
+                    "source_generation": 1,
+                },
+                depth_image=np.zeros((3, 4), dtype=np.uint16),
+                depth_metadata={
+                    "aligned_to": "color",
+                    "depth_scale_m_per_unit": 0.001,
+                },
+            )
+
+        def device_info(self):
+            return {
+                "running": True,
+                "lifecycle_state": "running",
+                "serial_number": self.config.serial,
+                "generation": 1,
+                "worker_alive": True,
+                "intrinsics": {
+                    "width": 4,
+                    "height": 3,
+                    "fx": 4.0,
+                    "fy": 3.0,
+                    "ppx": 2.0,
+                    "ppy": 1.5,
+                },
+            }
+
+    source_binding = RealPerceptionSourceBinding(
+        camera_sources={"front": _RgbSource()},
+        world_from_depth_camera_by_source={"front": np.eye(4)},
+        semantic_content_hash="real-rgb-source-binding:test",
+    )
+    catalog_provider = RealSenseAgentPerceptionProvider(
+        source_binding=source_binding,
+        current_station_revision=lambda: port.snapshot().revision,
+        clock=clock,
+    )
+    perception = build_real_perception_capture_registration(
+        rgb_source_catalog=catalog_provider.rgb_source_catalog(),
+        depth_source_catalog=catalog_provider.depth_source_catalog(),
+        runtime_session_id=base_bundle.attachment.runtime_session_id,
+        control_domain_id=base_bundle.attachment.control_domain_id,
+        target_binding_id=base_bundle.attachment.target_binding_id,
+        station_manifest_hash=base_bundle.attachment.station_manifest_hash,
+        execution_manifest_hash=base_bundle.attachment.execution_manifest_hash,
+        source_binding_hash=source_binding.semantic_content_hash,
+    )
+    envelope = SkillDeploymentSafetyEnvelopeRef(
+        object_id="real-envelope:perception-test",
+        schema="dexteleop.deployment_safety_envelope.v1",
+        content_hash="real-envelope-hash:perception-test",
+        constraint_set_hash="real-constraint-hash:perception-test",
+        allowed_route_ids=tuple(
+            entry.route.route_id for entry in base_bundle.route_manifest.skill_routes
+        ),
+    )
+    bundle = build_real_agent_primitive_contract_bundle(
+        attachment=base_bundle.attachment,
+        port_config=port.config,
+        frame_graph=base_bundle.frame_graph,
+        primitive_reference_frame_id="canonical_station",
+        safety_envelope_refs=(envelope,),
+        perception_capture=perception,
+    )
+    provider = RealSenseAgentPerceptionProvider(
+        source_binding=source_binding,
+        current_station_revision=lambda: port.snapshot().revision,
+        clock=clock,
+    )
+    store = RecoverableAgentArtifactStore(
+        root=tmp_path / "artifacts",
+        quota_bytes=32 * 1024 * 1024,
+        max_artifact_bytes=16 * 1024 * 1024,
+        max_chunk_bytes=1024 * 1024,
+    )
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:perception",),
+    )
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
+        allowed_client_ids=(CLIENT_ID,),
+        perception_provider=provider,
+        artifact_store=store,
+        clock=clock,
+    )
+    observation = gateway.observation_producer.capture_and_publish(gateway.service)
+    assert observation.accepted and observation.snapshot is not None
+    entry = bundle.route_manifest.route("perception.capture_rgb", "1")
+    route = entry.route
+    parameter_profile = route.allowed_parameter_profiles[0]
+    request = AgentSkillRequest(
+        client_id=CLIENT_ID,
+        request_id="request:real-rgb",
+        idempotency_key="idempotency:real-rgb",
+        client_sequence=1,
+        runtime_session_id=bundle.route_manifest.runtime_session_id,
+        skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+        expected_station_revision=observation.snapshot.station_revision,
+        skill_id=route.skill_id,
+        skill_version=route.skill_version,
+        skill_definition_hash=route.skill_definition_hash,
+        route_id=route.route_id,
+        route_version=route.route_version,
+        route_hash=route.semantic_content_hash,
+        deployment_binding_hash=entry.deployment_binding.deployment_binding_hash,
+        parameter_profile_id=parameter_profile.parameter_profile_id,
+        parameter_profile_hash=parameter_profile.parameter_profile_hash,
+        parameters={
+            "selected_roles": ["main"],
+            "width": 2,
+            "height": 2,
+            "max_total_bytes": 100_000,
+        },
+        observation_snapshot_id=observation.snapshot.snapshot_id,
+        requested_mode="real_active",
+        requested_timeout_ms=3_000,
+    )
+    try:
+        submitted = gateway.service.submit_request(
+            request=request,
+            current_station_revision=port.snapshot().revision,
+            now=clock(),
+        )
+        assert submitted.accepted and submitted.operation is not None
+        launched = gateway.service.launch_operation(submitted.operation.operation_id)
+        assert launched.accepted
+        assert gateway.rgb_executor is not None
+        assert gateway.rgb_executor.wait_all(timeout_sec=1.0)
+        operation = gateway.service.get_operation(submitted.operation.operation_id)
+        assert operation is not None and operation.status == "completed"
+        assert len(operation.output_artifact_bindings) == 1
+        artifact = operation.output_artifact_bindings[0].artifact
+        assert store.managed_read_path(artifact.artifact_id).read_bytes()[:2] == b"\xff\xd8"
+
+        depth_entry = bundle.route_manifest.route("perception.capture_depth", "1")
+        depth_route = depth_entry.route
+        depth_profile = depth_route.allowed_parameter_profiles[0]
+        depth_request = AgentSkillRequest(
+            client_id=CLIENT_ID,
+            request_id="request:real-depth",
+            idempotency_key="idempotency:real-depth",
+            client_sequence=2,
+            runtime_session_id=bundle.route_manifest.runtime_session_id,
+            skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
+            expected_station_revision=observation.snapshot.station_revision,
+            skill_id=depth_route.skill_id,
+            skill_version=depth_route.skill_version,
+            skill_definition_hash=depth_route.skill_definition_hash,
+            route_id=depth_route.route_id,
+            route_version=depth_route.route_version,
+            route_hash=depth_route.semantic_content_hash,
+            deployment_binding_hash=(
+                depth_entry.deployment_binding.deployment_binding_hash
+            ),
+            parameter_profile_id=depth_profile.parameter_profile_id,
+            parameter_profile_hash=depth_profile.parameter_profile_hash,
+            parameters={"role": "main"},
+            observation_snapshot_id=observation.snapshot.snapshot_id,
+            requested_mode="real_active",
+            requested_timeout_ms=3_000,
+        )
+        depth_submitted = gateway.service.submit_request(
+            request=depth_request,
+            current_station_revision=port.snapshot().revision,
+            now=clock(),
+        )
+        assert depth_submitted.accepted and depth_submitted.operation is not None
+        depth_launched = gateway.service.launch_operation(
+            depth_submitted.operation.operation_id
+        )
+        assert depth_launched.accepted
+        assert gateway.depth_executor is not None
+        assert gateway.depth_executor.wait_all(timeout_sec=1.0)
+        depth_operation = gateway.service.get_operation(
+            depth_submitted.operation.operation_id
+        )
+        assert depth_operation is not None and depth_operation.status == "completed"
+        depth_artifact = depth_operation.output_artifact_bindings[0].artifact
+        depth_array = np.load(
+            store.managed_read_path(depth_artifact.artifact_id),
+            allow_pickle=False,
+        )
+        assert depth_array.dtype == np.float32
+        assert depth_array.shape == (3, 4)
+        assert port.snapshot().dispatch_count == 0
+    finally:
+        store.close()

@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import signal
+import stat
 import threading
 import uuid
 from pathlib import Path
@@ -44,6 +45,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--left-tool-profile", type=Path, required=True)
     parser.add_argument("--right-tool-profile", type=Path, required=True)
     parser.add_argument("--envelope-profile", type=Path, required=True)
+    parser.add_argument(
+        "--camera-config",
+        type=Path,
+        help="absolute RealSense config; requires --camera-registry and --artifact-root",
+    )
+    parser.add_argument(
+        "--camera-registry",
+        type=Path,
+        help="absolute trusted camera registry used for serials and depth geometry",
+    )
+    parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        help="absolute existing non-world-writable directory for the v2 Artifact CAS",
+    )
     parser.add_argument(
         "--position-profile",
         default=RM65_BIMANUAL_POSITION_V1_NAME,
@@ -106,6 +122,27 @@ def _absolute_socket_path(
     return Path(os.path.abspath(expanded))
 
 
+def _absolute_managed_directory(
+    parser: argparse.ArgumentParser,
+    value: Path,
+    *,
+    flag: str,
+) -> Path:
+    expanded = value.expanduser()
+    if not expanded.is_absolute():
+        parser.error(f"{flag} must be an absolute path")
+    path = Path(os.path.abspath(expanded))
+    try:
+        info = os.lstat(path)
+    except OSError:
+        parser.error(f"{flag} is not an existing directory: {path}")
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        parser.error(f"{flag} must be a real directory, not a symlink: {path}")
+    if info.st_mode & stat.S_IWOTH:
+        parser.error(f"{flag} cannot be world-writable: {path}")
+    return path
+
+
 def _runtime_session_id(explicit: str | None) -> str:
     if explicit is not None:
         return explicit
@@ -116,6 +153,13 @@ def _ready_payload(
     composition: ExclusiveRM65AgentPrimitiveComposition,
 ) -> dict[str, Any]:
     manifest = composition.deployment.gateway_session.contract_bundle.route_manifest
+    session = composition.deployment.gateway_session
+    capabilities = getattr(
+        getattr(getattr(session, "service", None), "protocol_runtime", None),
+        "session_capabilities",
+        None,
+    )
+    perception_capture = getattr(composition, "perception_capture", None)
     return {
         "event": "gateway_ready",
         "socket_path": str(composition.socket_path),
@@ -126,12 +170,29 @@ def _ready_payload(
         "control_domain_id": manifest.control_domain_id,
         "target_binding_id": manifest.target_binding_id,
         "route_manifest_hash": manifest.semantic_content_hash,
+        "artifact_transfer_enabled": bool(
+            capabilities is not None and capabilities.artifact_transfer_enabled
+        ),
+        "artifact_access_mechanisms": (
+            []
+            if capabilities is None
+            else list(capabilities.artifact_access_mechanisms)
+        ),
         "station_manifest_hash": manifest.station_manifest_hash,
         "execution_manifest_hash": manifest.execution_manifest_hash,
         "deployment_profile_hash": composition.lower.profile.semantic_content_hash,
         "authorized_side": composition.authorized_side,
         "authorized_action": composition.authorized_action,
         "authorization_scope": "one_matching_skill_request",
+        "perception": (
+            None
+            if perception_capture is None
+            else {
+                "rgb_roles": list(perception_capture.profile.rgb_roles),
+                "depth_roles": list(perception_capture.profile.depth_roles),
+                "control_effect_class": "read_only",
+            }
+        ),
         "routes": [
             {
                 "skill_id": entry.route.skill_id,
@@ -187,6 +248,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--grant-lifetime-sec must be in (0, 30]")
 
     socket_path = _absolute_socket_path(parser, args.socket_path)
+    perception_supplied = tuple(
+        value is not None
+        for value in (args.camera_config, args.camera_registry, args.artifact_root)
+    )
+    if any(perception_supplied) and not all(perception_supplied):
+        parser.error(
+            "--camera-config, --camera-registry, and --artifact-root must be "
+            "provided together"
+        )
     files = {
         "calibration_profile": _absolute_existing_file(
             parser,
@@ -228,6 +298,29 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     lower = assemble_exclusive_rm65_skill_lower(profile=resolved)
+    camera_config = (
+        None
+        if args.camera_config is None
+        else _absolute_existing_file(parser, args.camera_config, flag="--camera-config")
+    )
+    camera_registry = (
+        None
+        if args.camera_registry is None
+        else _absolute_existing_file(
+            parser,
+            args.camera_registry,
+            flag="--camera-registry",
+        )
+    )
+    artifact_root = (
+        None
+        if args.artifact_root is None
+        else _absolute_managed_directory(
+            parser,
+            args.artifact_root,
+            flag="--artifact-root",
+        )
+    )
     embodiment_instance_id = (
         args.embodiment_instance_id
         if args.embodiment_instance_id is not None
@@ -247,6 +340,9 @@ def main(argv: list[str] | None = None) -> int:
         max_retained_operations=args.max_retained_operations,
         peer_idle_timeout_sec=args.peer_idle_timeout_sec,
         grant_lifetime_sec=args.grant_lifetime_sec,
+        camera_config_path=camera_config,
+        camera_registry_path=camera_registry,
+        artifact_root=artifact_root,
     )
 
     ready = threading.Event()

@@ -18,6 +18,7 @@ import numpy as np
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.transport.unix_transport import (
     validate_agent_gateway_unix_server_preflight,
 )
@@ -48,6 +49,17 @@ from .motion_primitive_profiles import (
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
 from .one_shot_authorization import (
     RealAgentPrimitiveOneShotAuthorization,
+)
+from .perception_deployment import (
+    REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
+    RealPerceptionCaptureRegistration,
+    build_real_perception_capture_registration,
+)
+from .realsense_perception import (
+    ExclusiveRealPerceptionResources,
+    RealPerceptionSourceBinding,
+    RealSenseAgentPerceptionProvider,
+    build_real_perception_source_binding,
 )
 
 
@@ -103,6 +115,9 @@ class ExclusiveRM65AgentPrimitiveComposition:
     deployment: ExclusiveRealAgentPrimitiveDeployment
     authorization: RealAgentPrimitiveOneShotAuthorization
     application: ExclusiveRealSkillApplication
+    resources: object
+    perception_source_binding: RealPerceptionSourceBinding | None
+    perception_capture: RealPerceptionCaptureRegistration | None
     socket_path: Path
     authorized_side: str
     authorized_action: str
@@ -118,8 +133,13 @@ class ExclusiveRM65AgentPrimitiveComposition:
             raise ValueError("application must own the exact composed deployment.")
         if self.authorization.gateway_session is not self.deployment.gateway_session:
             raise ValueError("authorization must bind the exact Gateway session.")
-        if self.application.resources is not self.lower.ports:
-            raise ValueError("application must own the exact lower resources.")
+        if self.application.resources is not self.resources:
+            raise ValueError("application must own the exact composed resources.")
+        if self.perception_capture is None:
+            if self.resources is not self.lower.ports:
+                raise ValueError("motion-only composition must own lower resources.")
+        elif not isinstance(self.resources, ExclusiveRealPerceptionResources):
+            raise ValueError("perception composition requires aggregate resources.")
         if self.application.startup_admission is not self.lower.startup_admission:
             raise ValueError("application must use the exact lower startup gate.")
 
@@ -139,6 +159,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     max_retained_operations: int = 16,
     peer_idle_timeout_sec: float = 10.0,
     grant_lifetime_sec: float = 5.0,
+    camera_config_path: str | Path | None = None,
+    camera_registry_path: str | Path | None = None,
+    artifact_root: str | Path | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> ExclusiveRM65AgentPrimitiveComposition:
@@ -166,6 +189,17 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     endpoint = Path(endpoint_value)
     if not callable(clock) or not callable(sleep):
         raise TypeError("clock and sleep must be callable.")
+    perception_values = (
+        camera_config_path,
+        camera_registry_path,
+        artifact_root,
+    )
+    perception_enabled = all(value is not None for value in perception_values)
+    if perception_enabled != any(value is not None for value in perception_values):
+        raise ValueError(
+            "camera_config_path, camera_registry_path, and artifact_root must be "
+            "provided together."
+        )
 
     envelope_profile = lower.target_safety.envelope_profile
     side_envelope = envelope_profile.side_config_by_side.get(side)
@@ -379,19 +413,89 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         constraint_set_hash=constraint_set_hash,
         allowed_route_ids=_route_ids(),
     )
-    deployment = assemble_exclusive_rm65_agent_primitive_deployment(
-        target_builder=lower.target_builder,
-        rm65_ports=lower.ports,
-        port_config=port_config,
-        observation_attachment=attachment,
-        frame_graph=frame_graph,
-        primitive_reference_frame_id=station_frame.frame_id,
-        safety_envelope_refs=(envelope_ref,),
-        allowed_client_ids=(client,),
-        max_retained_operations=max_retained_operations,
-        clock=clock,
-        sleep=sleep,
-    )
+    perception_source_binding = None
+    perception_capture = None
+    artifact_store = None
+    provider_factory = None
+    resources: object = lower.ports
+    if perception_enabled:
+        assert camera_config_path is not None
+        assert camera_registry_path is not None
+        assert artifact_root is not None
+        root = Path(artifact_root)
+        if not root.is_absolute():
+            raise ValueError("artifact_root must be an absolute path.")
+        perception_source_binding = build_real_perception_source_binding(
+            camera_config_path=camera_config_path,
+            camera_registry_path=camera_registry_path,
+            scene_world_from_arm_base_by_side=(
+                lower.profile.scene_world_from_arm_base_by_side
+            ),
+        )
+        catalog_provider = RealSenseAgentPerceptionProvider(
+            source_binding=perception_source_binding,
+            current_station_revision=lambda: 0,
+        )
+        perception_capture = build_real_perception_capture_registration(
+            rgb_source_catalog=catalog_provider.rgb_source_catalog(),
+            depth_source_catalog=catalog_provider.depth_source_catalog(),
+            runtime_session_id=runtime_id,
+            control_domain_id=domain_id,
+            target_binding_id=target_binding_id,
+            station_manifest_hash=station_manifest_hash,
+            execution_manifest_hash=execution_manifest_hash,
+            source_binding_hash=perception_source_binding.semantic_content_hash,
+        )
+        partition = _hash(
+            {"runtime_session_id": runtime_id},
+            domain="dexteleop.agent_gateway.artifact_store_partition.v1",
+        )
+        artifact_store = RecoverableAgentArtifactStore(
+            root=root / partition,
+            quota_bytes=512 * 1024 * 1024,
+            max_artifact_bytes=REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
+            max_chunk_bytes=1024 * 1024,
+        )
+
+        def provider_factory(port):
+            assert perception_source_binding is not None
+            return RealSenseAgentPerceptionProvider(
+                source_binding=perception_source_binding,
+                current_station_revision=lambda: port.snapshot().revision,
+                max_frame_age_ms=perception_capture.profile.max_frame_age_ms,
+                max_inter_camera_skew_ms=(
+                    perception_capture.profile.max_inter_camera_skew_ms
+                ),
+                clock=clock,
+            )
+
+        resources = ExclusiveRealPerceptionResources(
+            lower=lower.ports,
+            camera_sources=perception_source_binding.camera_sources,
+            artifact_store=artifact_store,
+        )
+    try:
+        deployment = assemble_exclusive_rm65_agent_primitive_deployment(
+            target_builder=lower.target_builder,
+            rm65_ports=lower.ports,
+            port_config=port_config,
+            observation_attachment=attachment,
+            frame_graph=frame_graph,
+            primitive_reference_frame_id=station_frame.frame_id,
+            safety_envelope_refs=(envelope_ref,),
+            allowed_client_ids=(client,),
+            perception_capture=perception_capture,
+            perception_provider_factory=provider_factory,
+            artifact_store=artifact_store,
+            owns_artifact_store=artifact_store is not None,
+            max_retained_operations=max_retained_operations,
+            clock=clock,
+            sleep=sleep,
+        )
+    except Exception:
+        if artifact_store is not None:
+            artifact_store.close()
+        raise
     authorization = RealAgentPrimitiveOneShotAuthorization(
         gateway_session=deployment.gateway_session,
         side=side,
@@ -412,7 +516,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
 
     application = ExclusiveRealSkillApplication(
         deployment=deployment,
-        resources=lower.ports,
+        resources=resources,
         startup_admission=lower.startup_admission,
         server_factory=server_factory,
         config=ExclusiveRealSkillApplicationConfig(
@@ -428,6 +532,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         deployment=deployment,
         authorization=authorization,
         application=application,
+        resources=resources,
+        perception_source_binding=perception_source_binding,
+        perception_capture=perception_capture,
         socket_path=endpoint,
         authorized_side=side,
         authorized_action=authorization.action,

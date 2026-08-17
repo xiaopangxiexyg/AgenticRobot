@@ -156,12 +156,55 @@ python -m agent_gateway real-rm65 \
   --confirm AUTHORIZE_ONE_REAL_TCP_PRIMITIVE
 ```
 
+Real RGB/Depth support is opt-in on that same v2 session:
+
+```bash
+python -m agent_gateway real-rm65 \
+  --socket-path /absolute/private/gateway.sock \
+  --calibration-profile /absolute/station_calibration.json \
+  --arm-ip-assignment /absolute/rm65_arm_ips.json \
+  --left-tool-profile /absolute/left_tool.json \
+  --right-tool-profile /absolute/right_tool.json \
+  --envelope-profile /absolute/right_skill_envelope.json \
+  --camera-config /absolute/DexTeleop/teleop_runtime/configs/devices/agent_gateway_realsense.json \
+  --camera-registry /absolute/DexTeleop/robot_motion/configs/rm65_camera_registry.json \
+  --artifact-root /absolute/private/artifact_cache \
+  --authorized-side right \
+  --authorized-action forward \
+  --confirm AUTHORIZE_ONE_REAL_TCP_PRIMITIVE
+```
+
+The three perception flags are all-or-none. The checked-in deployment profile
+publishes RGB for `main`, `wrist_left`, and `wrist_right`, but publishes depth
+only for `main`. The front camera has a reviewed static camera-to-arm-base
+transform; wrist depth is deliberately unavailable because those cameras move
+with link 6 and the current registry does not provide the activation-time
+joint/FK pose needed by the depth result contract. Hardware reset is disabled.
+
+Both capture Routes are `inspection` / `read_only` / `t0_read_only`: invoking
+them needs no motion Grant and cannot call command admission, dispatch, or
+HOLD. RGB is JPEG; depth is native-resolution float32 metric NPY with aligned
+color intrinsics and the trusted world pose. Payload bytes are committed to
+the same generic transient Artifact CAS and retrieved through `chunked_rpc` or
+a reviewed same-host `local_path` grant.
+
+This is currently a combined real application, not a camera-only diagnostic
+launcher. Starting it acquires and admits all configured cameras, then starts
+the exclusive dual-RM65 lower owner before publishing the socket; consequently
+the existing one-use motion confirmation and real-hardware safety preflight
+remain mandatory even when an upper client intends to invoke only passive
+Skills. A capture invocation itself has no downstream control effect. Live
+camera or robot execution is not established by the repository's offline
+tests.
+
 The CLI is a concrete lower deployment leaf, not an Agent API. All files and
 the selected side/action are trusted operator inputs. The process exposes no
-transport until both RM65 backends have started, lower HOLD is confirmed, a
-fresh measured dual-arm cut has seeded the coupled solver, and the Active
-pre-IK envelope has been anchored. The exact confirmation authorizes at most
-one matching request; it does not bypass per-request Gateway admission.
+transport until optional cameras have passed consecutive-frame freshness
+admission, both RM65 backends have started, lower HOLD is confirmed, a fresh
+measured dual-arm cut has seeded the coupled solver, and the Active pre-IK
+envelope has been anchored. The exact confirmation authorizes at most one
+matching motion request; it does not bypass per-request Gateway admission and
+is not consumed by a passive capture.
 
 The MuJoCo launcher starts no RPent planner and connects no real device. Its
 socket parent must already exist, resolve to a real non-world-writable
@@ -242,6 +285,10 @@ MuJoCo binding maps `main`, `wrist_left`, and `wrist_right` to current cameras,
 renders one scene cut under the existing scene/physics lock, and rejects a cut
 if its Station revision changes. Other profiles may bind their own producer to
 the same Definition/schema/I/O contract without importing the MuJoCo renderer.
+The real binding maps the same roles to an exclusive RealSense inventory,
+rejects stale, cross-generation, serial-mismatched, or revision-racing frames,
+and commits encoded output through the generic Artifact lifecycle. Device
+lifecycle remains outside the passive executor.
 
 ## Compatibility
 

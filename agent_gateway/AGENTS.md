@@ -41,6 +41,19 @@ profile explicitly binds a Station application port.
   historic RealTeleop attachment remains a compatibility path, not the owner
   of new real Skill deployment architecture.
 
+The optional real perception binding reuses the existing
+`perception.capture_rgb` and `perception.capture_depth` contracts. It owns one
+reviewed RealSense inventory and one transient Artifact store as application
+resources; an executor may only read an already-published immutable frame. It
+must never start, reset, restart, or close a device from a Skill invocation,
+and it must never call the motion port, command admission, dispatch, or HOLD.
+Resource startup belongs to the application transaction before the socket is
+published. A live frame must match the configured source key, hardware serial,
+source generation, freshness bound, and Station revision. Depth additionally
+requires a numeric trusted camera-to-world pose for that exact role; a moving
+wrist camera cannot reuse a static arm-base pose and remains unavailable until
+an activation-time joint/FK binding is implemented and reviewed.
+
 Semantic primitive axes and lower execution coordinates must remain explicit.
 When a Skill is defined in canonical Station/desk axes but the lower owner
 executes in an arm-base frame, the concrete profile must bind an exact typed

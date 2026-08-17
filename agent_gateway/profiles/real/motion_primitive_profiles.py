@@ -23,6 +23,10 @@ from agent_gateway.protocol.skill_catalog import (
     SkillRouteManifestEntry,
     validate_skill_route_catalog_closure,
 )
+from agent_gateway.protocol.skill_io_contracts import (
+    SkillIOCatalog,
+    inline_only_skill_io_contract,
+)
 from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorRegistry,
     AgentSkillPayloadValidatorSet,
@@ -55,6 +59,7 @@ from robot_motion.primitives import (
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
+from .perception_deployment import RealPerceptionCaptureRegistration
 
 REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1 = (
     "real.rm65.agent_skill_tcp_cardinal_step"
@@ -405,6 +410,7 @@ class RealAgentPrimitiveContractBundle:
     definition_catalog: SkillDefinitionCatalog
     schema_catalog: AgentSkillSchemaCatalog
     route_manifest: SkillRouteManifest
+    io_catalog: SkillIOCatalog
     cardinal_profile: RealAgentTcpCardinalStepProfile
     orientation_profiles: tuple[RealAgentTcpFixedOrientationProfile, ...]
     deployment_bindings: tuple[RealAgentPrimitiveDeploymentBinding, ...]
@@ -412,12 +418,14 @@ class RealAgentPrimitiveContractBundle:
     payload_validators: AgentSkillPayloadValidatorRegistry
     frame_graph: CoordinateFrameGraph
     attachment: RealTcpPoseObserveAttachmentSpec
+    perception_capture: RealPerceptionCaptureRegistration | None = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
             definition_catalog=self.definition_catalog,
             schema_catalog=self.schema_catalog,
             route_manifest=self.route_manifest,
+            io_catalog=self.io_catalog,
         )
         self.payload_validators.validate_manifest(self.route_manifest)
         if (
@@ -428,6 +436,11 @@ class RealAgentPrimitiveContractBundle:
                 "Real primitive bundle requires one cardinal and three "
                 "orientation bindings."
             )
+        if self.route_manifest.skill_io_catalog_hash != self.io_catalog.semantic_content_hash:
+            raise ValueError("Real primitive bundle I/O catalog mismatch.")
+        expected_route_count = 4 + (2 if self.perception_capture is not None else 0)
+        if len(self.route_manifest.skill_routes) != expected_route_count:
+            raise ValueError("Real perception registration and manifest disagree.")
 
     def binding_for_skill(self, skill_id: str) -> RealAgentPrimitiveDeploymentBinding:
         route = self.route_manifest.route(skill_id, "1").route
@@ -574,8 +587,9 @@ def build_real_agent_primitive_contract_bundle(
     primitive_reference_frame_id: str,
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
+    perception_capture: RealPerceptionCaptureRegistration | None = None,
 ) -> RealAgentPrimitiveContractBundle:
-    """Build exact T2 Routes; all runtime effects remain unattached."""
+    """Build exact motion and optional passive Routes without runtime effects."""
 
     if not isinstance(attachment, RealTcpPoseObserveAttachmentSpec):
         raise TypeError("attachment must be typed.")
@@ -829,15 +843,97 @@ def build_real_agent_primitive_contract_bundle(
         for route in all_routes
     )
     binding_by_route_hash = {item.route_hash: item for item in bindings}
+    perception_registrations = (
+        ()
+        if perception_capture is None
+        else (perception_capture.rgb, perception_capture.depth)
+    )
     definitions = SkillDefinitionCatalog(
         catalog_id="dexteleop.agent_skill_definitions.real_motion_primitives",
         catalog_version="1",
-        skill_definitions=(cardinal_definition, *orientation_definitions),
+        skill_definitions=(
+            cardinal_definition,
+            *orientation_definitions,
+            *(item.definition for item in perception_registrations),
+        ),
     )
     schemas = AgentSkillSchemaCatalog(
         catalog_id="dexteleop.agent_skill_schemas.real_motion_primitives",
         catalog_version="1",
-        schema_entries=(cardinal_schema, *orientation_schemas),
+        schema_entries=(
+            cardinal_schema,
+            *orientation_schemas,
+            *(item.schema_entry for item in perception_registrations),
+        ),
+    )
+    route_items = [
+        SkillRouteManifestEntry(
+            route=route,
+            deployment_binding=(
+                binding_by_route_hash[route.semantic_content_hash].to_ref()
+            ),
+            evaluation_plan_hash=None,
+            availability_hash=canonical_content_hash(
+                {
+                    "status": "default_off_requires_exclusive_real_skill_owner",
+                    "route_hash": route.semantic_content_hash,
+                    "deployment_binding_hash": (
+                        binding_by_route_hash[
+                            route.semantic_content_hash
+                        ].semantic_content_hash
+                    ),
+                },
+                domain="dexteleop.agent_skill.real_primitive_availability.v1",
+            ),
+        )
+        for route in all_routes
+    ]
+    if perception_capture is not None:
+        for registration, deployment_binding in (
+            (perception_capture.rgb, perception_capture.rgb_binding),
+            (perception_capture.depth, perception_capture.depth_binding),
+        ):
+            perception_route = registration.routes[0]
+            route_items.append(
+                SkillRouteManifestEntry(
+                    route=perception_route,
+                    deployment_binding=deployment_binding.to_ref(),
+                    evaluation_plan_hash=None,
+                    availability_hash=(
+                        perception_capture.availability_hash_by_route_hash[
+                            perception_route.semantic_content_hash
+                        ]
+                    ),
+                )
+            )
+    artifact_contract_by_skill = {
+        (item.definition.skill_id, item.definition.skill_version): item.io_contract
+        for item in perception_registrations
+    }
+    io_catalog = SkillIOCatalog(
+        catalog_id="dexteleop.agent_skill_io",
+        catalog_version="1",
+        io_contracts=tuple(
+            artifact_contract_by_skill.get(
+                (item.route.skill_id, item.route.skill_version),
+                inline_only_skill_io_contract(
+                    skill_id=item.route.skill_id,
+                    skill_version=item.route.skill_version,
+                    skill_definition_hash=item.route.skill_definition_hash,
+                    parameter_schema_hash=item.route.parameter_schema_hash,
+                    execution_result_schema_hash=(
+                        item.route.execution_result_schema_hash
+                    ),
+                    task_evaluation_schema_hash=(
+                        item.route.task_evaluation_schema_hash
+                    ),
+                ),
+            )
+            for item in sorted(
+                route_items,
+                key=lambda entry: (entry.route.skill_id, entry.route.skill_version),
+            )
+        ),
     )
     manifest = SkillRouteManifest(
         runtime_session_id=attachment.runtime_session_id,
@@ -846,6 +942,7 @@ def build_real_agent_primitive_contract_bundle(
         execution_manifest_hash=attachment.execution_manifest_hash,
         skill_definition_catalog_hash=definitions.semantic_content_hash,
         skill_schema_catalog_hash=schemas.semantic_content_hash,
+        skill_io_catalog_hash=io_catalog.semantic_content_hash,
         target_binding_id=attachment.target_binding_id,
         target_kind="real",
         current_mode="real_active",
@@ -857,28 +954,7 @@ def build_real_agent_primitive_contract_bundle(
             "own_operation_status_v1",
             "safety_profile_selection_v1",
         ),
-        skill_routes=tuple(
-            SkillRouteManifestEntry(
-                route=route,
-                deployment_binding=(
-                    binding_by_route_hash[route.semantic_content_hash].to_ref()
-                ),
-                evaluation_plan_hash=None,
-                availability_hash=canonical_content_hash(
-                    {
-                        "status": "default_off_requires_realteleop_owner_attachment",
-                        "route_hash": route.semantic_content_hash,
-                        "deployment_binding_hash": (
-                            binding_by_route_hash[
-                                route.semantic_content_hash
-                            ].semantic_content_hash
-                        ),
-                    },
-                    domain="dexteleop.agent_skill.real_primitive_availability.v1",
-                ),
-            )
-            for route in all_routes
-        ),
+        skill_routes=tuple(route_items),
         explicit_exclusions=(
             "agent_estop",
             "agent_rearm",
@@ -903,12 +979,18 @@ def build_real_agent_primitive_contract_bundle(
                     strict=True,
                 )
             ),
+            *(
+                ()
+                if perception_capture is None
+                else perception_capture.payload_validators
+            ),
         ),
     )
     return RealAgentPrimitiveContractBundle(
         definition_catalog=definitions,
         schema_catalog=schemas,
         route_manifest=manifest,
+        io_catalog=io_catalog,
         cardinal_profile=cardinal_profile,
         orientation_profiles=orientation_profiles,
         deployment_bindings=bindings,
@@ -916,6 +998,7 @@ def build_real_agent_primitive_contract_bundle(
         payload_validators=validators,
         frame_graph=frame_graph,
         attachment=attachment,
+        perception_capture=perception_capture,
     )
 
 
