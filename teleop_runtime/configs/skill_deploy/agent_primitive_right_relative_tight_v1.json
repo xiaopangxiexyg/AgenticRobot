@@ -1,0 +1,14 @@
+{
+  "schema_version": "teleop_runtime.tcp_pose_envelope.v1",
+  "profile_id": "agent-primitive-right-relative-tight-v1",
+  "sides": {
+    "right": {
+      "relative_bounds": {
+        "min_xyz_m": [-0.1, -0.1, -0.1],
+        "max_xyz_m": [0.1, 0.1, 0.1]
+      },
+      "relative_axes": "canonical_axes",
+      "max_total_rotation_deg": 45.0
+    }
+  }
+}

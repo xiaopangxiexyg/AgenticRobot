@@ -143,6 +143,7 @@ from .ik_tuning import (
     load_ik_tuning_config,
     pose_delta_metrics,
     preferred_wrist_flip_candidate,
+    with_rm65_position_ik_objective,
     weighted_joint_distance_score,
 )
 from .scene_profiles import (
@@ -408,4 +409,5 @@ __all__ = [
     "validate_qpos_by_side",
     "validate_qpos_within_absolute_limits",
     "weighted_joint_distance_score",
+    "with_rm65_position_ik_objective",
 ]

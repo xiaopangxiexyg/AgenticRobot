@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,43 @@ class RM65IKTuningConfig:
                 f"Available modes: {sorted(self.objective_modes)}"
             )
         return self.objective_modes[self.ik_objective_mode]
+
+
+def with_rm65_position_ik_objective(
+    tuning: RM65IKTuningConfig,
+    *,
+    position_weight: float,
+    orientation_weight: float,
+    mode_name: str = "position_runtime_override",
+) -> RM65IKTuningConfig:
+    """Bind a versioned position objective without an application dependency."""
+
+    if not isinstance(tuning, RM65IKTuningConfig):
+        raise TypeError("tuning must be RM65IKTuningConfig.")
+    position = float(position_weight)
+    orientation = float(orientation_weight)
+    name = str(mode_name).strip()
+    if (
+        not math.isfinite(position)
+        or position < 0.0
+        or not math.isfinite(orientation)
+        or orientation < 0.0
+    ):
+        raise ValueError("IK objective weights must be finite and non-negative.")
+    if not name:
+        raise ValueError("mode_name must be non-empty.")
+    objective_modes = dict(tuning.objective_modes)
+    objective_modes[name] = IKObjectiveWeights(
+        single_arm_position_weight=position,
+        single_arm_orientation_weight=orientation,
+        dual_arm_position_cost=position,
+        dual_arm_orientation_cost=orientation,
+    )
+    return replace(
+        tuning,
+        ik_objective_mode=name,
+        objective_modes=objective_modes,
+    )
 
 
 def default_ik_tuning_json_path() -> Path:

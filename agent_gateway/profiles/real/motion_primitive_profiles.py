@@ -52,7 +52,7 @@ from robot_motion.primitives import (
     cardinal_tcp_short_step,
     level_tcp_orientation,
 )
-from teleop_runtime.real_teleop.agent_motion_port import RealAgentMotionPortConfig
+from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
 
@@ -384,7 +384,7 @@ class RealAgentPrimitiveDeploymentBinding:
                 ),
                 "target_kind": "real",
                 "controlled_frame_id": "tool_tcp",
-                "source_kind": "agent_skill_via_existing_realteleop_owner",
+                "source_kind": "agent_skill_via_lower_owned_motion_port",
             },
             domain="dexteleop.agent_skill.real_tcp_primitive_deployment.v1",
         )

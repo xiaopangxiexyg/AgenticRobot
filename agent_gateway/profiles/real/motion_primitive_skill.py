@@ -22,7 +22,7 @@ from robot_motion.relative_action import (
     pose_matrix_to_xyzquat,
     xyzquat_to_pose_matrix,
 )
-from teleop_runtime.real_teleop.agent_motion_port import (
+from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionActivation,
     RealAgentMotionPhase,
     RealAgentMotionPort,

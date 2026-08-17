@@ -191,6 +191,49 @@ def _socket_mode(value: object) -> int:
     return value
 
 
+def validate_agent_gateway_unix_server_preflight(
+    *,
+    socket_path: str | os.PathLike[str],
+    peer_idle_timeout_sec: float = (
+        DEFAULT_AGENT_GATEWAY_UNIX_PEER_IDLE_TIMEOUT_SEC
+    ),
+) -> tuple[str, float]:
+    """Validate the side-effect-free endpoint facts needed before startup.
+
+    The server repeats this check immediately before binding, so this function
+    is a fail-fast configuration preflight rather than a reservation claim.
+    """
+
+    path = os.fspath(socket_path)
+    if not isinstance(path, str) or not path or not os.path.isabs(path):
+        raise ValueError("socket_path must be a non-empty absolute path.")
+    if "\x00" in path:
+        raise ValueError("Abstract or NUL-containing Unix paths are forbidden.")
+    if len(os.fsencode(path)) > MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES:
+        raise ValueError(
+            "socket_path exceeds the Linux Unix-socket 107-byte limit."
+        )
+    parent = os.path.dirname(path)
+    try:
+        parent_stat = os.lstat(parent)
+    except OSError as error:
+        raise ValueError(
+            "Unix socket parent directory must already exist."
+        ) from error
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        raise ValueError(
+            "Unix socket parent must be a real directory, not a symlink."
+        )
+    if parent_stat.st_mode & stat.S_IWOTH:
+        raise ValueError("Unix socket parent directory cannot be world-writable.")
+    if os.path.lexists(path):
+        raise FileExistsError(
+            "Refusing to replace an existing Unix socket path; remove only "
+            "the verified stale endpoint explicitly."
+        )
+    return path, _peer_idle_timeout(peer_idle_timeout_sec)
+
+
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
@@ -494,15 +537,10 @@ class AgentGatewayUnixJsonServer(
         ),
         max_disconnect_events: int = 64,
     ) -> None:
-        path = os.fspath(socket_path)
-        if not isinstance(path, str) or not path or not os.path.isabs(path):
-            raise ValueError("socket_path must be a non-empty absolute path.")
-        if "\x00" in path:
-            raise ValueError("Abstract or NUL-containing Unix paths are forbidden.")
-        if len(os.fsencode(path)) > MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES:
-            raise ValueError(
-                "socket_path exceeds the Linux Unix-socket 107-byte limit."
-            )
+        path, peer_idle_timeout = validate_agent_gateway_unix_server_preflight(
+            socket_path=socket_path,
+            peer_idle_timeout_sec=peer_idle_timeout_sec,
+        )
         if not isinstance(peer_client_map, AgentGatewayUnixPeerClientMap):
             raise TypeError("peer_client_map must be AgentGatewayUnixPeerClientMap.")
         if not callable(facade_factory):
@@ -516,29 +554,10 @@ class AgentGatewayUnixJsonServer(
         ):
             raise ValueError("max_disconnect_events must be in [1, 4096].")
 
-        parent = os.path.dirname(path)
-        try:
-            parent_stat = os.lstat(parent)
-        except OSError as error:
-            raise ValueError(
-                "Unix socket parent directory must already exist."
-            ) from error
-        if not stat.S_ISDIR(parent_stat.st_mode):
-            raise ValueError(
-                "Unix socket parent must be a real directory, not a symlink."
-            )
-        if parent_stat.st_mode & stat.S_IWOTH:
-            raise ValueError("Unix socket parent directory cannot be world-writable.")
-        if os.path.lexists(path):
-            raise FileExistsError(
-                "Refusing to replace an existing Unix socket path; remove only "
-                "the verified stale endpoint explicitly."
-            )
-
         self.socket_path = path
         self.socket_mode = _socket_mode(socket_mode)
         self.max_frame_bytes = _frame_limit(max_frame_bytes)
-        self.peer_idle_timeout_sec = _peer_idle_timeout(peer_idle_timeout_sec)
+        self.peer_idle_timeout_sec = peer_idle_timeout
         self.peer_client_map = peer_client_map
         self._facade_factory = facade_factory
         self._close_gateway = close_gateway
@@ -830,4 +849,5 @@ __all__ = [
     "AgentGatewayUnixPeerClientMap",
     "AgentGatewayUnixPeerCredentials",
     "AgentGatewayUnixProtocolError",
+    "validate_agent_gateway_unix_server_preflight",
 ]

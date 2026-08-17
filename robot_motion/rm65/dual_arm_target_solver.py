@@ -2120,6 +2120,20 @@ class DualArmCollisionAwareRetargeter(Retargeter):
         assert isinstance(result, BimanualIKResult)
         return result
 
+    def build_command_for_target_pair(
+        self,
+        target: BimanualPoseTarget,
+    ) -> TeleopCommand:
+        """Build a runtime command from one direct coupled target.
+
+        The target solver remains the only IK/collision owner.  This public
+        conversion is shared by non-operator sources so they do not need to
+        depend on a RealTeleop retargeter adapter or reach into a private
+        command-conversion helper.
+        """
+
+        return self._command_from_bimanual_result(self.solve_target_pair(target))
+
     def _command_from_bimanual_result(
         self,
         result: BimanualIKResult,

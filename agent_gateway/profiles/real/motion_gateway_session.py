@@ -39,7 +39,7 @@ from agent_gateway.transport.unix_transport import (
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import pose_matrix_to_xyzquat
-from teleop_runtime.real_teleop.agent_motion_port import (
+from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPhase,
     RealAgentMotionPort,
 )

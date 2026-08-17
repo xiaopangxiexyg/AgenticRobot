@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 
-from robot_motion.rm65.ik_tuning import IKObjectiveWeights, RM65IKTuningConfig
+from robot_motion.rm65.ik_tuning import (
+    RM65IKTuningConfig,
+    with_rm65_position_ik_objective,
+)
 from robot_motion.profiles import IKSafetyProfile, load_ik_safety_profiles
 
 from ..sources.pose.vive_motion import TrackerMotionIntentConfig
@@ -55,18 +58,11 @@ def _position_ik_tuning_for_args(
     if arm_control_mode != "position" or orientation_weight is None:
         return tuning
     weight = float(orientation_weight)
-    mode_name = "position_runtime_override"
-    objective_modes = dict(tuning.objective_modes)
-    objective_modes[mode_name] = IKObjectiveWeights(
-        single_arm_position_weight=1.0,
-        single_arm_orientation_weight=weight,
-        dual_arm_position_cost=1.0,
-        dual_arm_orientation_cost=weight,
-    )
-    return replace(
+    return with_rm65_position_ik_objective(
         tuning,
-        ik_objective_mode=mode_name,
-        objective_modes=objective_modes,
+        position_weight=1.0,
+        orientation_weight=weight,
+        mode_name="position_runtime_override",
     )
 
 

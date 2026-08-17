@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from robot_motion.coordinate_frames import CoordinateFrameGraph
-from teleop_runtime.real_teleop.agent_motion_port import (
+from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionOwnerIdentity,
     RealAgentMotionPortConfig,
 )

@@ -115,6 +115,14 @@ RM65_BACKGROUND_TARGET_ADMISSION_CHOICES = (
     RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK,
     RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
 )
+
+# Shared lower execution defaults for position reference sources.  Deployment
+# frontends may keep compatibility aliases, but a non-policy Skill process must
+# not import a policy-deployment composition module merely to bind the same
+# reviewed RM65 backend timing behavior.
+RM65_POSITION_SEND_DT_ALPHA = 0.25
+RM65_POSITION_SEND_DT_MAX_SCALE = 3.0
+RM65_POSITION_SEND_DT_STALL_RESET_SEC = 0.25
 HAND_BASE_POSE_FLANGE_M_RAD = (0.0, 0.0, 0.009, 0.0, 0.0, 0.0)
 _SINGULARITY_WARNING_INTERVAL_SEC = 1.0
 DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN = 0.2
