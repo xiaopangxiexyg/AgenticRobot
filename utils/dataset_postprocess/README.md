@@ -62,12 +62,13 @@ manifest hash/大小变化、未知热端文件或不同 artifact graph 都会 f
 `tactile_paths`、inventory 和 receipt，且发布前重新得到完全相同的 detach audit。因此应先完成并
 验证触觉迁出，再物化相机语义；不要把 NAS/cold root 传给相机工具。
 
-完整物化输出在按同一 inventory 放回触觉、通过严格 v2.3 校验和全视频解码后，可用
+完整物化输出在通过严格 v2.3 core 校验和全视频解码后，可用
 `camera-semantics-promote` 原子接替原 canonical 路径。晋升只接受同文件系统上相互独立、无
 共享 inode 的两个数据集：原路径必须被证明为 `swapped`，新路径必须被证明为 `identity`，
-两侧触觉 inventory 必须完全相同。空间充足时两侧都可为 `SELF_CONTAINED`；批量维护时推荐让
-旧源保持带完整 retirement evidence 的 `DETACHED_VERIFIED`，只把纠正输出恢复为
-`SELF_CONTAINED`，从而在热盘始终最多保存一份触觉。原数据不会删除，而是移动到显式
+两侧触觉 inventory 必须完全相同。允许的触觉状态组合只有：热→热、冷→热，以及同 inventory、
+同 detachment scope 且双方都有生产级 retirement evidence 的冷→冷。热→冷会被严格拒绝，
+避免晋升操作无意中移除仍在热端的触觉。批量维护推荐使用冷→冷：相机物化继承 inventory 与
+retirement receipts，晋升和回滚都不读取、复制或恢复 NAS/cold payload。原数据不会删除，而是移动到显式
 retirement 目录；事务文件记录两侧目录 inode、核心文件 guard、物化 receipt、计划 hash 和
 回滚位置：
 

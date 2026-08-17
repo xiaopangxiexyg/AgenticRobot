@@ -419,32 +419,52 @@ def _require_modality_pair(
         raise CameraSemanticPromotionError(
             f"source tactile must be SELF_CONTAINED or DETACHED_VERIFIED: {source_status}"
         )
-    if corrected_state != SELF_CONTAINED:
+    if corrected_state not in {SELF_CONTAINED, DETACHED_VERIFIED}:
         raise CameraSemanticPromotionError(
-            f"corrected tactile must be SELF_CONTAINED: {corrected_status}"
+            "corrected tactile must be SELF_CONTAINED or DETACHED_VERIFIED: "
+            f"{corrected_status}"
+        )
+    if source_state == SELF_CONTAINED and corrected_state == DETACHED_VERIFIED:
+        raise CameraSemanticPromotionError(
+            "Promotion refuses to replace self-contained tactile with a detached "
+            "corrected dataset"
         )
     for label, status in (("source", source_status), ("corrected", corrected_status)):
         if bool(status.get("pending_transaction")):
             raise CameraSemanticPromotionError(
                 f"{label} tactile has a pending storage transaction"
             )
-    if source_state == DETACHED_VERIFIED and not bool(
-        source_status.get("production_detached_verified")
-    ):
-        raise CameraSemanticPromotionError(
-            "source tactile detach lacks production retirement evidence"
-        )
-    if not bool(corrected_status.get("tactile_read_eligible")):
-        raise CameraSemanticPromotionError(
-            "corrected tactile is not reader eligible"
-        )
-    if source_state == SELF_CONTAINED and not bool(
-        source_status.get("tactile_read_eligible")
-    ):
-        raise CameraSemanticPromotionError(
-            "self-contained source tactile is not reader eligible"
-        )
     source_scope = str(source_status.get("detachment_scope") or "")
+    corrected_scope = str(corrected_status.get("detachment_scope") or "")
+    for label, state, status, scope in (
+        ("source", source_state, source_status, source_scope),
+        ("corrected", corrected_state, corrected_status, corrected_scope),
+    ):
+        if state == DETACHED_VERIFIED:
+            if not bool(status.get("production_detached_verified")):
+                raise CameraSemanticPromotionError(
+                    f"{label} tactile detach lacks production retirement evidence"
+                )
+            if bool(status.get("tactile_read_eligible")):
+                raise CameraSemanticPromotionError(
+                    f"{label} detached tactile is unexpectedly reader eligible"
+                )
+            if not scope:
+                raise CameraSemanticPromotionError(
+                    f"{label} tactile detach has no verified scope"
+                )
+        elif not bool(status.get("tactile_read_eligible")):
+            raise CameraSemanticPromotionError(
+                f"self-contained {label} tactile is not reader eligible"
+            )
+    if (
+        source_state == DETACHED_VERIFIED
+        and corrected_state == DETACHED_VERIFIED
+        and source_scope != corrected_scope
+    ):
+        raise CameraSemanticPromotionError(
+            "Source and corrected datasets use different tactile detachment scopes"
+        )
     source_inventory = str(source_status.get("inventory_hash") or "")
     corrected_inventory = str(corrected_status.get("inventory_hash") or "")
     if not source_inventory or source_inventory != corrected_inventory:
@@ -857,6 +877,7 @@ def promote_camera_semantic_dataset(
                 "rollback_available": True,
                 "rollback_requires_canonical_detach": bool(
                     plan.source_tactile_status == DETACHED_VERIFIED
+                    and plan.corrected_tactile_status != DETACHED_VERIFIED
                 ),
             }
         except BaseException:

@@ -48,9 +48,11 @@ Apply requires:
   ... --apply --expected-plan-hash SHA256 --confirm-no-active-readers
 
 Safety: fixed L3 non-motion dataset transaction. Promotion is admitted only
-for independent, self-contained roots where the old dataset is proven swapped
-and the materialized dataset is identity. Strict v2.3 is the default. The
-explicit legacy option requires an exact format-preserving camera transform and
+for independent roots where the old dataset is proven swapped and the
+materialized dataset is identity. Tactile may remain verified-detached on both
+roots when the inventory and detachment scope match; the tool never reads or
+restores cold payloads. Strict v2.3 is the default. The explicit legacy option
+requires an exact format-preserving camera transform and
 does not claim or upgrade the dataset to v2.3. Promotion atomically retains the
 old root under retirement; rollback is a separate hash-bound operation. No
 deletion, overwrite, schema migration, device, or arbitrary passthrough is
