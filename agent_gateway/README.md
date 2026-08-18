@@ -226,6 +226,16 @@ read without capturing a frame. This grouping matches current lower admission
 granularity and does not claim independent per-camera leases that the lower
 runtime does not provide.
 
+The MuJoCo TCP-pose profile publishes one readable/drivable
+`simulation.runtime` resource. Motion, TCP state/history, and optional RGB/depth
+capture all share the same scene and runtime owner, so the profile does not
+invent independent simulated arm or camera leases. Before the lower runtime is
+started the resource is `free` and `unavailable`; after observation-ready
+startup it remains `occupied` through READY and lower-confirmed HOLD until the
+application closes. Health is derived from the existing execution-gate state
+without stepping physics or rendering a frame, and active Skill execution is
+still reported separately through the operation projection.
+
 The dedicated independent RM65 Skill entrypoint is:
 
 ```bash

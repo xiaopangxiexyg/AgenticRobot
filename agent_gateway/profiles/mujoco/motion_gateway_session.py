@@ -31,6 +31,10 @@ from agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
     SkillExecutorRegistry,
 )
+from agent_gateway.runtime.hardware_view_provider import (
+    HardwareResourceBinding,
+    HardwareViewProvider,
+)
 from agent_gateway.runtime.operation_port import (
     AgentGatewayAuthoritativePortReceipt,
 )
@@ -134,6 +138,7 @@ class MujocoAgentTcpPoseGatewaySession:
     owns_source_observation_history_store: bool
     artifact_store: RecoverableAgentArtifactStore | None
     owns_artifact_store: bool
+    hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -188,6 +193,8 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError(
                 "RGB executor and Artifact store must be enabled together."
             )
+        if not isinstance(self.hardware_view_provider, HardwareViewProvider):
+            raise TypeError("MuJoCo hardware view provider must be typed.")
 
     def wire_adapter(
         self,
@@ -206,6 +213,7 @@ class MujocoAgentTcpPoseGatewaySession:
                 self.observation_producer.current_station_revision
             ),
             operation_launcher=self.service.launch_operation,
+            hardware_view_provider=self.hardware_view_provider,
         )
 
     def wait(self, *, timeout_sec: float | None = None) -> bool:
@@ -338,6 +346,62 @@ class MujocoAgentTcpPoseGatewaySession:
                 self.artifact_store.close()
                 self._artifact_store_closed = True
             return self._close_outcome
+
+
+def _mujoco_runtime_health(
+    application: MujocoAgentSkillMotionApplication,
+) -> str:
+    """Project cached lower lifecycle/gate state without stepping or rendering."""
+
+    if application.closed or not application.started:
+        return "unavailable"
+    gate = application.runtime.capture_execution_gate_snapshot(
+        now=float(application.runtime.clock())
+    )
+    status = str(getattr(gate, "status", ""))
+    if status == "fault":
+        return "fault"
+    if status in {"hold", "ready"}:
+        return "ready"
+    return "unavailable"
+
+
+def _mujoco_runtime_control_claimed(
+    application: MujocoAgentSkillMotionApplication,
+) -> bool:
+    """The application claim spans READY/HOLD and ends only after close."""
+
+    return application.started and not application.closed
+
+
+def _mujoco_hardware_view_provider(
+    *,
+    application: MujocoAgentSkillMotionApplication,
+    contract_bundle: MujocoAgentTcpPoseContractBundle,
+    operation_store: BoundedInMemoryAgentSkillOperationStore,
+) -> HardwareViewProvider:
+    """Map the single MuJoCo scene owner to its semantic Skill surface."""
+
+    route_hashes = tuple(
+        entry.route.semantic_content_hash
+        for entry in contract_bundle.route_manifest.skill_routes
+        if entry.route.control_effect_class in {"read_only", "motion"}
+    )
+    return HardwareViewProvider(
+        manifest=contract_bundle.route_manifest,
+        operation_store=operation_store,
+        bindings=(
+            HardwareResourceBinding(
+                resource_id="simulation.runtime",
+                resource_kind="simulation_runtime",
+                route_hashes=route_hashes,
+                health_provider=lambda: _mujoco_runtime_health(application),
+                control_claimed_provider=lambda: (
+                    _mujoco_runtime_control_claimed(application)
+                ),
+            ),
+        ),
+    )
 
 
 def assemble_mujoco_agent_tcp_pose_gateway_session(
@@ -1147,6 +1211,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             field_name="runtime clock_domain_id",
         ),
     )
+    hardware_view_provider = _mujoco_hardware_view_provider(
+        application=application,
+        contract_bundle=contract_bundle,
+        operation_store=service.operation_store,
+    )
     history_recorder = (
         SourceObservationHistoryRecorder(
             store=source_observation_history_store,
@@ -1179,6 +1248,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         owns_source_observation_history_store=owns_source_observation_history_store,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
+        hardware_view_provider=hardware_view_provider,
         service=service,
     )
 

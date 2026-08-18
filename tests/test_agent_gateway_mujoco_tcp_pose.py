@@ -1359,6 +1359,40 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert route_to_port["state.read_tcp_pose"] is session.state_executor
     assert not motion_application.started
 
+    adapter = session.wire_adapter(authenticated_client_id="rpent:fixture")
+    resources = adapter.get_hardware_resource_views()
+    assert resources["enabled"] is True
+    assert [item["resource_id"] for item in resources["resources"]] == [
+        "simulation.runtime"
+    ]
+    simulation = resources["resources"][0]
+    assert simulation["resource_kind"] == "simulation_runtime"
+    assert simulation["properties"] == {"readable": True, "drivable": True}
+    assert {item["skill_id"] for item in simulation["read_skill_refs"]} == {
+        "state.read_tcp_pose"
+    }
+    assert "motion.step_tcp_forward" in {
+        item["skill_id"] for item in simulation["drive_skill_refs"]
+    }
+    configured = adapter.get_hardware_status_views()["resources"][0]
+    assert configured["occupancy"] == "free"
+    assert configured["health"] == "unavailable"
+    assert configured["reason_code"] == "lower_control_claim_free"
+    assert configured["active_operation_id"] is None
+
+    motion_application.runtime.capture_execution_gate_snapshot = (
+        lambda **_kwargs: SimpleNamespace(status="hold")
+    )
+    motion_application._started = True
+    motion_application._held = True
+    held = adapter.get_hardware_status_views()["resources"][0]
+    assert held["occupancy"] == "occupied"
+    assert held["health"] == "ready"
+    assert held["reason_code"] == "lower_control_claim_occupied"
+    assert held["active_operation_id"] is None
+    motion_application._started = False
+    motion_application._held = False
+
     close_outcome = session.close()
     assert not close_outcome.accepted
     assert close_outcome.reason_code == (
@@ -1459,6 +1493,19 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     assert route_to_port[CAPTURE_RGB_SKILL_ID_V1] is session.rgb_executor
     assert session.depth_executor is not session.motion_executor
     assert session.service.domain_control_port is session.motion_executor
+    hardware_resources = session.wire_adapter(
+        authenticated_client_id="rpent:fixture"
+    ).get_hardware_resource_views()["resources"]
+    assert [item["resource_id"] for item in hardware_resources] == [
+        "simulation.runtime"
+    ]
+    assert {
+        item["skill_id"] for item in hardware_resources[0]["read_skill_refs"]
+    } == {
+        "perception.capture_depth",
+        "perception.capture_rgb",
+        "state.read_tcp_pose",
+    }
     capabilities = session.service.protocol_runtime.session_capabilities
     assert capabilities.artifact_transfer_enabled
     assert capabilities.artifact_access_mechanisms == (
