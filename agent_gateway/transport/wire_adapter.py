@@ -38,6 +38,7 @@ from ..protocol.skill_catalog import (
     validate_skill_route_catalog_closure,
 )
 from ..runtime.access_policy import SkillExecutionGrant
+from ..runtime.hardware_view_provider import HardwareViewProvider
 from ..runtime.service import (
     AgentGatewayObservationOutcome,
     AgentGatewayOperationOutcome,
@@ -96,6 +97,7 @@ class BoundAgentGatewayWireAdapter:
         grant_resolver: (
             Callable[[AgentSkillRequest], SkillExecutionGrant | None] | None
         ) = None,
+        hardware_view_provider: HardwareViewProvider | None = None,
     ) -> None:
         client_id = _required(
             authenticated_client_id,
@@ -115,6 +117,13 @@ class BoundAgentGatewayWireAdapter:
             raise TypeError("operation_launcher must be callable or None.")
         if grant_resolver is not None and not callable(grant_resolver):
             raise TypeError("grant_resolver must be callable or None.")
+        if hardware_view_provider is not None and not isinstance(
+            hardware_view_provider,
+            HardwareViewProvider,
+        ):
+            raise TypeError(
+                "hardware_view_provider must be a HardwareViewProvider or None."
+            )
         if service.executor_registry.has_authoritative_execution and (
             operation_launcher is None
         ):
@@ -142,6 +151,7 @@ class BoundAgentGatewayWireAdapter:
         self._current_station_revision = current_station_revision
         self._operation_launcher = operation_launcher
         self._grant_resolver = grant_resolver
+        self._hardware_view_provider = hardware_view_provider
 
         protocol_runtime = service.protocol_runtime
         if protocol_runtime.io_catalog.semantic_content_hash != (
@@ -157,6 +167,30 @@ class BoundAgentGatewayWireAdapter:
 
     def _revision(self) -> int:
         return _revision(self._current_station_revision())
+
+    def _require_strict_read_only_route(self, request: AgentSkillRequest) -> None:
+        try:
+            route = self.service.manifest.route(
+                request.skill_id,
+                request.skill_version,
+                request.route_id,
+                request.route_version,
+            ).route
+        except (KeyError, TypeError, ValueError) as error:
+            raise PermissionError(
+                "Remote read-only access requires an advertised strictly "
+                "read-only Skill Route."
+            ) from error
+        if not (
+            route.control_effect_class == "read_only"
+            and route.privilege_tier == "t0_read_only"
+            and not route.may_move_robot
+            and not route.may_open_publication
+            and route.cancellation_policy == "cancel_only"
+        ):
+            raise PermissionError(
+                "Remote read-only access rejects motion and lifecycle Skill Routes."
+            )
 
     def _assert_client(self, payload: Mapping[str, Any]) -> None:
         if not isinstance(payload, Mapping):
@@ -193,6 +227,33 @@ class BoundAgentGatewayWireAdapter:
 
     def get_gateway_session_capabilities(self) -> Mapping[str, Any]:
         return self.service.protocol_runtime.session_capabilities.to_wire()
+
+    def get_hardware_resource_views(self) -> Mapping[str, Any]:
+        provider = self._hardware_view_provider
+        resources = () if provider is None else provider.resource_views()
+        return {
+            "schema_version": "dexteleop.hardware_resource_views.v1",
+            "runtime_session_id": self.service.manifest.runtime_session_id,
+            "target_kind": self.service.manifest.target_kind,
+            "enabled": provider is not None,
+            "resources": [item.to_wire() for item in resources],
+        }
+
+    def get_hardware_status_views(self) -> Mapping[str, Any]:
+        revision = self._revision()
+        provider = self._hardware_view_provider
+        resources = (
+            ()
+            if provider is None
+            else provider.status_views(station_revision=revision)
+        )
+        return {
+            "schema_version": "dexteleop.hardware_status_views.v1",
+            "runtime_session_id": self.service.manifest.runtime_session_id,
+            "station_revision": revision,
+            "enabled": provider is not None,
+            "resources": [item.to_wire() for item in resources],
+        }
 
     def get_gateway_events(
         self,
@@ -436,13 +497,33 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        return self._submit_skill_request(payload, read_only_only=False)
+
+    def submit_read_only_skill_request(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Submit only a Route whose immutable contract is strictly read-only."""
+
+        return self._submit_skill_request(payload, read_only_only=True)
+
+    def _submit_skill_request(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        read_only_only: bool,
+    ) -> Mapping[str, Any]:
         self._assert_client(payload)
         request = agent_skill_request_from_json(payload)
-        grant = (
-            None
-            if self._grant_resolver is None
-            else self._grant_resolver(request)
-        )
+        if read_only_only:
+            self._require_strict_read_only_route(request)
+            grant = None
+        else:
+            grant = (
+                None
+                if self._grant_resolver is None
+                else self._grant_resolver(request)
+            )
         if grant is not None and not isinstance(grant, SkillExecutionGrant):
             raise TypeError("grant_resolver returned an invalid grant.")
         if grant is not None and request.skill_execution_grant_id is None:
@@ -493,6 +574,24 @@ class BoundAgentGatewayWireAdapter:
     ) -> Mapping[str, Any]:
         self._assert_client(payload)
         request = agent_own_operation_cancel_request_from_json(payload)
+        return self.service.cancel_own_operation(
+            request=request,
+            current_station_revision=self._revision(),
+        ).to_wire()
+
+    def cancel_own_read_only_operation(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._assert_client(payload)
+        request = agent_own_operation_cancel_request_from_json(payload)
+        operation_request = self.service.operation_store.request_for_operation(
+            request.operation_id
+        )
+        if operation_request is not None:
+            if operation_request.client_id != self.authenticated_client_id:
+                raise PermissionError("Operation belongs to another client.")
+            self._require_strict_read_only_route(operation_request)
         return self.service.cancel_own_operation(
             request=request,
             current_station_revision=self._revision(),

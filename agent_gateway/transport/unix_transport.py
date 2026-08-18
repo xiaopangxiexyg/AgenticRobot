@@ -36,11 +36,15 @@ AGENT_GATEWAY_UNIX_JSON_METHODS_V2 = frozenset(
         "get_skill_route_manifest",
         "get_skill_io_catalog",
         "get_gateway_session_capabilities",
+        "get_hardware_resource_views",
+        "get_hardware_status_views",
         "get_gateway_events",
         "get_observation_snapshot",
         "submit_skill_request",
+        "submit_read_only_skill_request",
         "get_own_operation",
         "cancel_own_operation",
+        "cancel_own_read_only_operation",
         "request_hold_own_domain",
         "begin_artifact_upload",
         "write_artifact_chunk",
@@ -67,6 +71,8 @@ _NO_PAYLOAD_METHODS = frozenset(
         "get_skill_route_manifest",
         "get_skill_io_catalog",
         "get_gateway_session_capabilities",
+        "get_hardware_resource_views",
+        "get_hardware_status_views",
         "get_observation_snapshot",
     }
 )
@@ -705,16 +711,28 @@ class AgentGatewayUnixJsonServer(
                 result = facade.get_skill_io_catalog()
             elif request.method == "get_gateway_session_capabilities":
                 result = facade.get_gateway_session_capabilities()
+            elif request.method == "get_hardware_resource_views":
+                result = facade.get_hardware_resource_views()
+            elif request.method == "get_hardware_status_views":
+                result = facade.get_hardware_status_views()
             elif request.method == "get_gateway_events":
                 result = facade.get_gateway_events(request.payload or {})
             elif request.method == "get_observation_snapshot":
                 result = facade.get_observation_snapshot()
             elif request.method == "submit_skill_request":
                 result = facade.submit_skill_request(request.payload or {})
+            elif request.method == "submit_read_only_skill_request":
+                result = facade.submit_read_only_skill_request(
+                    request.payload or {}
+                )
             elif request.method == "get_own_operation":
                 result = facade.get_own_operation(request.payload or {})
             elif request.method == "cancel_own_operation":
                 result = facade.cancel_own_operation(request.payload or {})
+            elif request.method == "cancel_own_read_only_operation":
+                result = facade.cancel_own_read_only_operation(
+                    request.payload or {}
+                )
             elif request.method == "request_hold_own_domain":
                 result = facade.request_hold_own_domain(request.payload or {})
             elif request.method == "begin_artifact_upload":

@@ -20,6 +20,10 @@ def main(argv: list[str] | None = None) -> int:
         from .transport.endpoint_cli import main as endpoint_main
 
         return int(endpoint_main(values[1:]))
+    if values and values[0] == "ssh-readonly-proxy":
+        from .transport.ssh_readonly_proxy import main as proxy_main
+
+        return int(proxy_main(values[1:]))
 
     parser = argparse.ArgumentParser(
         prog="python -m agent_gateway",
@@ -28,7 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "profile",
         nargs="?",
-        choices=("mujoco", "real-rm65", "allocate-unix-endpoint"),
+        choices=(
+            "mujoco",
+            "real-rm65",
+            "allocate-unix-endpoint",
+            "ssh-readonly-proxy",
+        ),
         help="Gateway deployment profile or transport utility",
     )
     if not values:

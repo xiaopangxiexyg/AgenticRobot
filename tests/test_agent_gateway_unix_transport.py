@@ -44,6 +44,14 @@ class _FakeBoundFacade(BoundAgentGatewayWireAdapter):
         self.requests.append(("get_skill_route_manifest", None))
         return {"manifest": "routes"}
 
+    def get_hardware_resource_views(self):
+        self.requests.append(("get_hardware_resource_views", None))
+        return {"resources": []}
+
+    def get_hardware_status_views(self):
+        self.requests.append(("get_hardware_status_views", None))
+        return {"statuses": []}
+
     def get_observation_snapshot(self):
         self.requests.append(("get_observation_snapshot", None))
         return {"snapshot": "current"}
@@ -58,6 +66,16 @@ class _FakeBoundFacade(BoundAgentGatewayWireAdapter):
             "operation": None,
         }
 
+    def submit_read_only_skill_request(self, payload):
+        self._assert_client(payload)
+        self.requests.append(("submit_read_only_skill_request", dict(payload)))
+        return {
+            "accepted": True,
+            "reason_code": "fake_read_only_admitted",
+            "idempotent_replay": False,
+            "operation": None,
+        }
+
     def get_own_operation(self, payload):
         self._assert_client(payload)
         self.requests.append(("get_own_operation", dict(payload)))
@@ -67,6 +85,11 @@ class _FakeBoundFacade(BoundAgentGatewayWireAdapter):
         self._assert_client(payload)
         self.requests.append(("cancel_own_operation", dict(payload)))
         return {"accepted": False, "reason_code": "fake_not_found"}
+
+    def cancel_own_read_only_operation(self, payload):
+        self._assert_client(payload)
+        self.requests.append(("cancel_own_read_only_operation", dict(payload)))
+        return {"accepted": False, "reason_code": "fake_read_only_not_found"}
 
     def request_hold_own_domain(self, payload):
         self._assert_client(payload)
@@ -107,6 +130,19 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
             raise AssertionError("socket closed before the complete test frame")
         chunks.extend(chunk)
     return bytes(chunks)
+
+
+def _raw_call(sock: socket.socket, *, request_id: str, method: str, payload):
+    envelope = {
+        "protocol": AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
+        "request_id": request_id,
+        "method": method,
+        "payload": payload,
+    }
+    body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    sock.sendall(_PREFIX.pack(len(body)) + body)
+    (size,) = _PREFIX.unpack(_recv_exact(sock, _PREFIX.size))
+    return json.loads(_recv_exact(sock, size))
 
 
 def _start_server(
@@ -380,6 +416,42 @@ def test_protocol_envelope_is_exact_and_method_allowlist_has_no_shutdown(
         assert response["error"]["code"] == "method_not_allowed"
         assert "traceback" not in response
         _wait_for(lambda: len(server.disconnect_events) == 1)
+    finally:
+        raw.close()
+        _stop_server(server, thread)
+
+
+def test_hardware_views_and_read_only_submission_are_additive_methods(
+    short_unix_socket_path_factory,
+) -> None:
+    path = short_unix_socket_path_factory("hardware-ro")
+    facade = _FakeBoundFacade("rpent:local")
+    server, thread, _ = _start_server(path=path, facade=facade)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw.settimeout(1.0)
+    try:
+        raw.connect(str(path))
+        resources = _raw_call(
+            raw,
+            request_id="request:hardware-resources",
+            method="get_hardware_resource_views",
+            payload=None,
+        )
+        statuses = _raw_call(
+            raw,
+            request_id="request:hardware-statuses",
+            method="get_hardware_status_views",
+            payload=None,
+        )
+        submitted = _raw_call(
+            raw,
+            request_id="request:readonly-submit",
+            method="submit_read_only_skill_request",
+            payload={"client_id": "rpent:local"},
+        )
+        assert resources["result"] == {"resources": []}
+        assert statuses["result"] == {"statuses": []}
+        assert submitted["result"]["reason_code"] == "fake_read_only_admitted"
     finally:
         raw.close()
         _stop_server(server, thread)

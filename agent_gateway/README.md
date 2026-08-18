@@ -159,6 +159,47 @@ enter the control frame.
 forwarder. It creates no Gateway implementation or runtime state inside
 `control_station`.
 
+### Read-only SSH attachment
+
+`ssh-readonly-proxy` is a small forced-command bridge to an already-running
+host-local Unix Gateway. It does not start hardware, create another Gateway,
+or own a device. Its fixed method allowlist permits discovery, bounded status,
+strictly read-only Skill submission, own-operation query, read-only cancel, and
+Artifact downloads. Generic Skill submission, lifecycle, HOLD, Artifact upload,
+and all motion routes are absent from the allowlist. The Gateway independently checks
+that `submit_read_only_skill_request` resolves to a `t0_read_only`,
+`cancel_only`, non-motion Route before admission.
+
+The server-side command is:
+
+```bash
+python -m agent_gateway ssh-readonly-proxy \
+  --socket-path /absolute/private/gateway.sock
+```
+
+Deploy it through a dedicated SSH account or key-specific forced command; do
+not grant that identity an interactive shell or membership that can reach a
+full-control Gateway endpoint. The SSH identity maps to the Unix UID accepted
+by the Gateway, while payload `client_id` remains non-authoritative. The proxy
+uses the existing length-prefixed `dexteleop.agent_gateway.unix_json.v2`
+frames, so a client does not need a second hardware protocol. Remote Artifact
+access is limited to `chunked_rpc` bytes exposed by an own-operation response
+on the same SSH connection; arbitrary cache IDs and host-local paths are denied.
+
+Two additive discovery calls expose a profile-owned, redacted view:
+
+- `get_hardware_resource_views`: `readable`/`drivable` capability plus exact
+  semantic Skill references;
+- `get_hardware_status_views`: binary `free`/`occupied` occupancy, separate
+  health, and an optional active operation projection.
+
+These views are not a registry or lease system. Concrete profiles bind stable
+resource IDs to existing Route hashes and the existing lower-owner occupancy
+and health reads; the runtime adds its current operation projection. A status
+read failure is reported fail-closed as unavailable and occupied. If a profile
+provides no binding, discovery returns `enabled=false` and an empty list rather
+than guessing hardware identity.
+
 The dedicated independent RM65 Skill entrypoint is:
 
 ```bash
