@@ -676,6 +676,231 @@ def test_tcp_pose_lifecycle_dispatches_through_lower_and_finishes_under_hold() -
     assert calls["release"] == [operation.operation_id]
 
 
+@pytest.mark.parametrize(
+    "transient_kind",
+    ("publication_miss", "target_support_expired"),
+)
+def test_tcp_pose_lifecycle_retries_same_reference_after_bounded_no_action(
+    transient_kind: str,
+) -> None:
+    motion_profile, action_schema = _profile_and_schema()
+    route, binding, evaluation_plan = _contracts(motion_profile)
+    target_pose = (0.40, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    start_pose = (0.38, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    request, operation = _request_and_operation(
+        route,
+        binding,
+        motion_profile,
+        target_pose,
+    )
+    application, calls = _fake_application(
+        action_schema,
+        start_pose=start_pose,
+        target_pose=target_pose,
+    )
+    original_submit = application.submit_and_step
+    attempts = 0
+
+    def submit_with_one_publication_miss(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            calls["submit"].append(kwargs)
+            if transient_kind == "target_support_expired":
+                return MujocoAgentSkillMotionStep(
+                    proposal_admission=SimpleNamespace(
+                        accepted=True,
+                        rejection_code=None,
+                        proposal_id="proposal:target-support-expired",
+                        semantic_content_hash=(
+                            "proposal-admission:target-support-expired"
+                        ),
+                    ),
+                    authoritative_step=SimpleNamespace(
+                        status=(
+                            "target_support_expired_before_submission_"
+                            "keep_existing"
+                        ),
+                        decision=SimpleNamespace(decision_id="decision:fixture"),
+                        publication_attempt=SimpleNamespace(accepted=True),
+                        directive=SimpleNamespace(
+                            global_status="normal",
+                            directive_by_selection_group={
+                                "arms": SimpleNamespace(
+                                    directive="publish_selected"
+                                )
+                            },
+                        ),
+                        action_adaptation=SimpleNamespace(
+                            receipt=SimpleNamespace(accepted=True)
+                        ),
+                        target_execution_request=None,
+                        target_submission_receipt=None,
+                        target_dispatch_result=None,
+                        target_completion_receipt=None,
+                        cancellation=None,
+                        safety_result=None,
+                        resolution_failure=None,
+                        dispatch_validation=None,
+                        dispatch_receipts=None,
+                        trace_facts=(
+                            SimpleNamespace(fact_id="support-expired:fixture"),
+                        ),
+                    ),
+                )
+            return MujocoAgentSkillMotionStep(
+                proposal_admission=SimpleNamespace(
+                    accepted=True,
+                    rejection_code=None,
+                    proposal_id="proposal:transient",
+                    semantic_content_hash="proposal-admission:transient",
+                ),
+                authoritative_step=SimpleNamespace(
+                    status="execution_kept_existing",
+                    decision=None,
+                    publication_attempt=SimpleNamespace(
+                        accepted=False,
+                        rejection_reason="publication_deadline_missed:no_action",
+                        required_fallback="no_action",
+                    ),
+                    directive=SimpleNamespace(
+                        global_status="normal",
+                        directive_by_selection_group={
+                            "arms": SimpleNamespace(
+                                directive="keep_existing_until_expiry"
+                            )
+                        },
+                    ),
+                    cancellation=None,
+                    safety_result=None,
+                    resolution_failure=None,
+                    dispatch_receipts=None,
+                    trace_facts=(
+                        SimpleNamespace(fact_id="publication-miss:fixture"),
+                    ),
+                    target_execution_request=None,
+                ),
+            )
+        return original_submit(**kwargs)
+
+    application.submit_and_step = submit_with_one_publication_miss
+    lifecycle = MujocoAgentTcpPoseSkillLifecycle(
+        application=application,
+        route=route,
+        deployment_binding=binding,
+        evaluation_plan=evaluation_plan,
+        motion_profile=motion_profile,
+        request=request,
+        operation=operation,
+        clock=lambda: 12.0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    ).succeeded
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert completion.succeeded
+    assert len(calls["submit"]) == 2
+    first = calls["submit"][0]["action"].value("right_arm").values
+    second = calls["submit"][1]["action"].value("right_arm").values
+    assert second == pytest.approx(first)
+    assert ":target-attempt:0:reference:0" in calls["submit"][0]["source_event_id"]
+    assert ":target-attempt:1:reference:0" in calls["submit"][1]["source_event_id"]
+
+
+def test_tcp_pose_lifecycle_fails_closed_on_unclassified_keep_existing() -> None:
+    motion_profile, action_schema = _profile_and_schema()
+    route, binding, evaluation_plan = _contracts(motion_profile)
+    target_pose = (0.40, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    start_pose = (0.38, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    request, operation = _request_and_operation(
+        route,
+        binding,
+        motion_profile,
+        target_pose,
+    )
+    application, calls = _fake_application(
+        action_schema,
+        start_pose=start_pose,
+        target_pose=target_pose,
+    )
+
+    def submit_unclassified(**kwargs):
+        calls["submit"].append(kwargs)
+        return MujocoAgentSkillMotionStep(
+            proposal_admission=SimpleNamespace(
+                accepted=True,
+                rejection_code=None,
+                proposal_id="proposal:bad-keep-existing",
+                semantic_content_hash="proposal-admission:bad-keep-existing",
+            ),
+            authoritative_step=SimpleNamespace(
+                status="execution_kept_existing",
+                decision=None,
+                publication_attempt=SimpleNamespace(
+                    accepted=False,
+                    rejection_reason="candidate_authorization_rejected",
+                    required_fallback="no_action",
+                ),
+                directive=SimpleNamespace(
+                    global_status="normal",
+                    directive_by_selection_group={
+                        "arms": SimpleNamespace(
+                            directive="keep_existing_until_expiry"
+                        )
+                    },
+                ),
+                cancellation=None,
+                safety_result=None,
+                resolution_failure=None,
+                dispatch_receipts=None,
+                trace_facts=(),
+                target_execution_request=None,
+            ),
+        )
+
+    application.submit_and_step = submit_unclassified
+    lifecycle = MujocoAgentTcpPoseSkillLifecycle(
+        application=application,
+        route=route,
+        deployment_binding=binding,
+        evaluation_plan=evaluation_plan,
+        motion_profile=motion_profile,
+        request=request,
+        operation=operation,
+        clock=lambda: 12.0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    ).succeeded
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert not completion.succeeded
+    assert completion.reason_code == "tcp_pose_authoritative_step_failed"
+    assert calls["hold"] == [
+        {
+            "reason": "tcp_pose_authoritative_step_failed",
+            "operation_id": operation.operation_id,
+        }
+    ]
+
+
 def test_lifecycle_resolves_cardinal_target_at_lower_activation_boundary() -> None:
     motion_profile, action_schema = _profile_and_schema()
     route, binding, evaluation_plan = _contracts(motion_profile)

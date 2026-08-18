@@ -109,6 +109,92 @@ def _slerp_quaternion_xyzw(
     return tuple(float(value) for value in normalized)
 
 
+_RETRYABLE_PUBLICATION_NO_ACTION_REASONS = frozenset(
+    {
+        "coalesced_before_publication",
+        "publication_deadline_missed:no_action",
+        "target_late:no_action",
+    }
+)
+
+
+def _authoritative_step_keeps_existing_for_retry(authoritative: Any) -> bool:
+    """Recognize bounded, non-faulting no-action timing dispositions.
+
+    The authoritative runtime may reject a late/coalesced publication while
+    explicitly keeping the previously dispatched segment alive.  That is not
+    proof that the newly submitted reference executed, so callers must retry
+    the same reference.  Every other non-dispatch status remains fail-closed.
+    """
+
+    status = getattr(authoritative, "status", None)
+    if status == "target_support_expired_before_submission_keep_existing":
+        publication = getattr(authoritative, "publication_attempt", None)
+        directive = getattr(authoritative, "directive", None)
+        directives = getattr(directive, "directive_by_selection_group", None)
+        adaptation = getattr(authoritative, "action_adaptation", None)
+        return bool(
+            getattr(authoritative, "decision", None) is not None
+            and publication is not None
+            and bool(getattr(publication, "accepted", False))
+            and getattr(directive, "global_status", None) == "normal"
+            and isinstance(directives, Mapping)
+            and directives
+            and all(
+                getattr(item, "directive", None) == "publish_selected"
+                for item in directives.values()
+            )
+            and adaptation is not None
+            and bool(
+                getattr(
+                    getattr(adaptation, "receipt", None),
+                    "accepted",
+                    False,
+                )
+            )
+            and getattr(authoritative, "target_execution_request", None) is None
+            and getattr(authoritative, "target_submission_receipt", None) is None
+            and getattr(authoritative, "target_dispatch_result", None) is None
+            and getattr(authoritative, "target_completion_receipt", None) is None
+            and getattr(authoritative, "cancellation", None) is None
+            and getattr(authoritative, "safety_result", None) is None
+            and getattr(authoritative, "resolution_failure", None) is None
+            and getattr(authoritative, "dispatch_validation", None) is None
+            and getattr(authoritative, "dispatch_receipts", None) is None
+        )
+    if status != "execution_kept_existing":
+        return False
+    if getattr(authoritative, "decision", None) is not None:
+        return False
+    publication = getattr(authoritative, "publication_attempt", None)
+    if (
+        publication is None
+        or bool(getattr(publication, "accepted", True))
+        or getattr(publication, "required_fallback", None) != "no_action"
+        or getattr(publication, "rejection_reason", None)
+        not in _RETRYABLE_PUBLICATION_NO_ACTION_REASONS
+    ):
+        return False
+    directive = getattr(authoritative, "directive", None)
+    directives = getattr(directive, "directive_by_selection_group", None)
+    if (
+        getattr(directive, "global_status", None) != "normal"
+        or not isinstance(directives, Mapping)
+        or not directives
+        or any(
+            getattr(item, "directive", None) != "keep_existing_until_expiry"
+            for item in directives.values()
+        )
+    ):
+        return False
+    return bool(
+        getattr(authoritative, "cancellation", None) is None
+        and getattr(authoritative, "safety_result", None) is None
+        and getattr(authoritative, "resolution_failure", None) is None
+        and getattr(authoritative, "dispatch_receipts", None) is None
+    )
+
+
 def mujoco_agent_skill_hold_evidence_from_transition(
     transition: Any | None,
     *,
@@ -757,17 +843,21 @@ class MujocoAgentTcpPoseSkillLifecycle:
 
         if self.action is None:
             raise RuntimeError("TCP pose lifecycle has no resolved action.")
-        for cycle in range(self.motion_profile.max_control_cycles):
+        reference_cycle = 0
+        for control_attempt in range(self.motion_profile.max_control_cycles):
             if bool(cancel_requested()):
                 hold = self._hold(reason="tcp_pose_operation_cancelled")
                 return self._failure(
                     reason_code="tcp_pose_operation_cancelled_after_hold",
                     hold=hold,
                 )
-            event_id = f"{operation.operation_id}:target-cycle:{cycle}"
+            event_id = (
+                f"{operation.operation_id}:target-attempt:{control_attempt}:"
+                f"reference:{reference_cycle}"
+            )
             step = self.application.submit_and_step(
                 operation_id=operation.operation_id,
-                action=self._reference_action_for_cycle(cycle),
+                action=self._reference_action_for_cycle(reference_cycle),
                 source_event_id=event_id,
                 # The Agent snapshot is a Gateway application cut, not a
                 # lower ObservationCutRecord. Keep it as context lineage and
@@ -789,7 +879,15 @@ class MujocoAgentTcpPoseSkillLifecycle:
                     hold=hold,
                 )
             authoritative = step.authoritative_step
-            if authoritative is None or authoritative.status != "dispatched":
+            if authoritative is None:
+                hold = self._hold(reason="tcp_pose_authoritative_step_failed")
+                return self._failure(
+                    reason_code="tcp_pose_authoritative_step_failed",
+                    hold=hold,
+                )
+            if authoritative.status == "dispatched":
+                reference_cycle += 1
+            elif not _authoritative_step_keeps_existing_for_retry(authoritative):
                 hold = self._hold(reason="tcp_pose_authoritative_step_failed")
                 return self._failure(
                     reason_code="tcp_pose_authoritative_step_failed",
