@@ -8,7 +8,6 @@ from typing import Any
 
 from dataset_contracts.progress_detail_annotations import (
     DetailStageAnnotationBundleV1,
-    DetailStageAnnotationSetBindingV1,
     validate_detail_stage_annotation_set,
 )
 from dataset_contracts.progress_stage_annotations import StageAnnotationBundleV1
