@@ -19,12 +19,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from project_paths import repo_root
-from sim.mujoco.deploy import MujocoSimHILTargetConfig
-
 from agent_gateway.transport.unix_transport import (
     validate_agent_gateway_unix_server_preflight,
 )
+from project_paths import repo_root
+from sim.mujoco.deploy import MujocoSimHILTargetConfig
 
 from .motion_factory import (
     MujocoAgentArtifactStorageConfig,
@@ -261,6 +260,21 @@ def _stopped_payload(
     }
 
 
+def _close_viewer_for_stopped_payload(
+    viewer: Any | None,
+) -> tuple[dict[str, Any] | None, BaseException | None]:
+    """Close an optional viewer and retain its truthful final bounded status."""
+
+    if viewer is None:
+        return None, None
+    close_error = None
+    try:
+        viewer.close()
+    except BaseException as error:  # noqa: BLE001 - re-raised after reporting.
+        close_error = error
+    return dict(viewer.status()), close_error
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -332,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
     stop_requested = threading.Event()
     server_error: list[BaseException] = []
     stopped_payload: dict[str, Any] | None = None
+    viewer_close_error: BaseException | None = None
     stop_reason: str | None = None
 
     def serve() -> None:
@@ -421,17 +436,19 @@ def main(argv: list[str] | None = None) -> int:
             server_thread.join(timeout=2.0)
         for signum, previous in previous_handlers.items():
             signal.signal(signum, previous)
+        # Gateway close above joins/fences the lower runtime first.  Release the
+        # native viewer next so gateway_stopped describes its final state rather
+        # than a pre-teardown snapshot that still claims it is running.
+        viewer_status, viewer_close_error = _close_viewer_for_stopped_payload(viewer)
         stopped_payload = _stopped_payload(
             server=server,
             session=session,
             stop_reason=stop_reason,
-            viewer_status=None if viewer is None else viewer.status(),
+            viewer_status=viewer_status,
         )
         print(json.dumps(stopped_payload, sort_keys=True), flush=True)
-        if viewer is not None:
-            # Gateway close above joins/fences the lower runtime first; only
-            # then may the native viewer release the shared MjData.
-            viewer.close()
+    if viewer_close_error is not None:
+        raise RuntimeError("MuJoCo viewer close failed") from viewer_close_error
     if server.gateway_close_error is not None:
         raise RuntimeError("Agent Gateway close failed") from server.gateway_close_error
     if stopped_payload is None or not stopped_payload["safe_shutdown"]:
