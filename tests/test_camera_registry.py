@@ -30,24 +30,34 @@ class CameraRegistryTest(unittest.TestCase):
         placements = front_frames["head_camera_frame"]["placements"]
         expected_dual_arm_urdf = (
             "assets/rm65_inspire_gripper_v3/"
+            "rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf"
+        )
+        legacy_dual_arm_urdf = (
+            "assets/rm65_inspire_gripper_v3/"
             "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
         )
         self.assertEqual(placements[0]["frame"], "head_camera_frame")
         self.assertEqual(
-            [placement["urdf"] for placement in placements],
-            [expected_dual_arm_urdf],
+            {placement["urdf"] for placement in placements},
+            {legacy_dual_arm_urdf, expected_dual_arm_urdf},
         )
 
         left_frames = registry["cameras"]["left_wrist"]["extrinsics"]["frames"]
         self.assertIn("left_camera_rgb", left_frames)
         left_wrist_placements = left_frames["left_camera_rgb"]["placements"]
-        self.assertEqual(len(left_wrist_placements), 1)
-        self.assertEqual(left_wrist_placements[0]["urdf"], expected_dual_arm_urdf)
+        self.assertEqual(len(left_wrist_placements), 2)
+        self.assertIn(
+            expected_dual_arm_urdf,
+            {placement["urdf"] for placement in left_wrist_placements},
+        )
 
         right_frames = registry["cameras"]["right_wrist"]["extrinsics"]["frames"]
         right_wrist_placements = right_frames["right_camera_rgb"]["placements"]
-        self.assertEqual(len(right_wrist_placements), 1)
-        self.assertEqual(right_wrist_placements[0]["urdf"], expected_dual_arm_urdf)
+        self.assertEqual(len(right_wrist_placements), 2)
+        self.assertIn(
+            expected_dual_arm_urdf,
+            {placement["urdf"] for placement in right_wrist_placements},
+        )
 
     def test_canonical_camera_configs_exist_without_root_cameras_package(self) -> None:
         project_root = Path(__file__).resolve().parents[1]

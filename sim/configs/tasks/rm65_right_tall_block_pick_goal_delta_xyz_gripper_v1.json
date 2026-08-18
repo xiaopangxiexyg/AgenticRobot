@@ -1,7 +1,7 @@
 {
   "extends": "sim/configs/tasks/rm65_right_cube_pick_goal_delta_xyz_gripper_v3.json",
   "name": "rm65_right_tall_block_pick_goal_delta_xyz_gripper_v1",
-  "base_contract_path": "sim/configs/rm65_bimanual_tall_block_physics_v1.json",
+  "base_contract_path": "sim/configs/rm65_bimanual_tall_block_physics_legacy_v1.json",
   "base_contract_sha256": "e4ec03e73be6e2cc8cee35c5786a098be81778db4bef593ccc039572058f8a3f",
   "object_size_m": [0.03, 0.03, 0.05]
 }

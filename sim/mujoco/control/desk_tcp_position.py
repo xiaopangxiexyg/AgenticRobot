@@ -42,7 +42,7 @@ from robot_motion.rm65.position_collision import load_world_from_arm_base_transf
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from sim.contracts import SimulationContract, TimingSpec
 from ..actuation import (
-    identified_bimanual_dmtac_gripper_profile,
+    cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
 )
 from ..adapters import MujocoPositionExecutionConfig, MujocoPositionExecutionRig
@@ -64,7 +64,7 @@ DEFAULT_TOOL_PROFILE_BY_SIDE = {
 DEFAULT_INSPIRE_V3_DUAL_ARM_URDF = (
     _REPO_ROOT
     / "assets/rm65_inspire_gripper_v3/"
-    "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+    "rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf"
 )
 # MuJoCo-safe dual-arm reset used by the collision-enabled task scenes.  The
 # historical visualizer fallback has right J4=3.10 rad, outside this URDF's
@@ -293,7 +293,11 @@ class DeskTcpPositionControl:
         )
         contract = replace(base_contract, timing=timing)
         arm_profile = rm65_bimanual_udp_feedback_profile()
-        gripper_profile = identified_bimanual_dmtac_gripper_profile()
+        # The canonical desk scene now embeds the official six-joint CAD
+        # mechanism.  Keep the identified two-joint proxy profile available
+        # for explicit legacy URDF callers, but bind this default chain to the
+        # matching CAD actuator layout.
+        gripper_profile = cad_bimanual_dmtac_gripper_profile()
         scene = MujocoScene.from_contract(
             contract,
             position_actuation_profile=arm_profile,

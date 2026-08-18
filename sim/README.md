@@ -82,6 +82,13 @@ the v3 RM65 URDF, collision profile, gravity, ground, and a minimal freejoint
 debug cube. Values that still require dedicated real 120 Hz identification are
 marked as pending rather than presented as identified truth.
 
+This canonical profile uses the additive EG2-4B2 CAD gripper with the retained
+legacy black housing. Historical CubeLift task files that still depend on the
+two-joint finger-body contract point explicitly to
+`rm65_bimanual_physics_legacy_v1.json` (and its tall-block counterpart); those
+compatibility contracts preserve the old task geometry and are not the default
+simulation scene.
+
 Generate/inspect its MJCF without advancing physics:
 
 ```bash
@@ -95,7 +102,7 @@ Legacy kinematic inspection remains explicit:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --control qpos \
   --no-render
 ```

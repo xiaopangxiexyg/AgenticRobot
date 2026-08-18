@@ -43,7 +43,7 @@ from robot_motion.rm65.position_profile import (
 )
 from sim.contracts import SimulationContract
 from sim.mujoco.actuation import (
-    identified_bimanual_dmtac_gripper_profile,
+    cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
 )
 from sim.mujoco.adapters import (
@@ -897,7 +897,7 @@ def _physical_rollout(
     )
     contract = replace(base_contract, timing=timing)
     arm_profile = rm65_bimanual_udp_feedback_profile()
-    gripper_profile = identified_bimanual_dmtac_gripper_profile()
+    gripper_profile = cad_bimanual_dmtac_gripper_profile()
     scene = MujocoScene.from_contract(
         contract,
         position_actuation_profile=arm_profile,

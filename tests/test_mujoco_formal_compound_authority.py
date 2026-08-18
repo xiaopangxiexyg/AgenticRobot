@@ -41,7 +41,7 @@ from robot_motion.position_control import PositionKeyframeSafetyConfig
 from robot_motion.runtime import CommandDispatchReceipt
 from sim.contracts import SimulationContract, TimingSpec
 from sim.mujoco.actuation import (
-    identified_bimanual_dmtac_gripper_profile,
+    cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
 )
 from sim.mujoco.adapters import (
@@ -194,7 +194,7 @@ def _runtime(
     clock = ManualClock()
     contract = SimulationContract.load(CONTRACT_PATH)
     arm_profile = rm65_bimanual_udp_feedback_profile()
-    gripper_profile = identified_bimanual_dmtac_gripper_profile()
+    gripper_profile = cad_bimanual_dmtac_gripper_profile()
     scene = MujocoScene.from_contract(
         contract,
         position_actuation_profile=arm_profile,

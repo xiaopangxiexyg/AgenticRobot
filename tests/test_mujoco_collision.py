@@ -109,6 +109,18 @@ def test_collision_group_allow_matrix_and_masks_are_symmetric() -> None:
     assert collision_filter.masks_for_group(OBJECT_GROUP) == (8, 15)
 
 
+def test_official_4b2_cad_links_use_the_gripper_contact_group() -> None:
+    collision_filter = CollisionFilter()
+
+    for link_name in (
+        "left_eg2_4b2_cad_l_1",
+        "left_eg2_4b2_cad_ee_link_2",
+        "right_eg2_4b2_cad_r_1",
+    ):
+        assert collision_filter.group_for_urdf_link(link_name) == GRIPPER_GROUP
+    assert collision_filter.group_for_urdf_link("left_arm_link3") == ROBOT_GROUP
+
+
 @pytest.mark.integration
 def test_parent_child_and_explicit_deny_pairs_compile_to_contact_excludes(
     tmp_path: Path,

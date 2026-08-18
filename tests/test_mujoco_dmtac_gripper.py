@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -37,6 +38,7 @@ from robot_motion.runtime import (
 from sim.contracts import SimulationContract, TimingSpec
 from sim.mujoco.actuation import (
     MujocoDmtacGripperExecutor,
+    cad_bimanual_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
 )
@@ -53,6 +55,10 @@ from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 
 
 CONTRACT_PATH = "sim/configs/rm65_bimanual_physics_v1.json"
+LEGACY_URDF_PATH = (
+    "assets/rm65_inspire_gripper_v3/"
+    "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+)
 
 
 def _timing() -> TimingSpec:
@@ -69,8 +75,31 @@ def _timing() -> TimingSpec:
 
 def _scene():
     contract = SimulationContract.load(CONTRACT_PATH)
+    # These tests freeze the identified two-joint proxy actuator trace.  Keep
+    # that compatibility path explicit now that the canonical contract uses
+    # the additive six-joint CAD gripper.
+    contract = replace(
+        contract,
+        scene=replace(
+            contract.scene,
+            urdf_path=LEGACY_URDF_PATH,
+            collision=replace(contract.scene.collision, excluded_body_pairs=()),
+        ),
+    )
     arm_profile = rm65_bimanual_udp_feedback_profile()
     gripper_profile = identified_bimanual_dmtac_gripper_profile()
+    scene = MujocoScene.from_contract(
+        contract,
+        position_actuation_profile=arm_profile,
+        gripper_actuation_profile=gripper_profile,
+    )
+    return scene, arm_profile, gripper_profile
+
+
+def _cad_scene():
+    contract = SimulationContract.load(CONTRACT_PATH)
+    arm_profile = rm65_bimanual_udp_feedback_profile()
+    gripper_profile = cad_bimanual_dmtac_gripper_profile()
     scene = MujocoScene.from_contract(
         contract,
         position_actuation_profile=arm_profile,
@@ -110,6 +139,60 @@ def test_identified_dmtac_profile_freezes_bilateral_stage_semantics() -> None:
     assert profile.contact_tuning.friction is None
     assert profile.contact_tuning.solref is None
     assert profile.contact_tuning.solimp is None
+
+
+def test_cad_dmtac_profile_preserves_official_six_joint_open_close_semantics() -> None:
+    profile = cad_bimanual_dmtac_gripper_profile()
+
+    assert profile.name == "dmtac_bimanual_position_eg2_4b2_cad_20260818.v1"
+    for name, side in (
+        ("left_eg2_4b2_cad", "left"),
+        ("right_eg2_4b2_cad", "right"),
+    ):
+        assert profile.side_by_gripper[name] == side
+        assert len(profile.joint_names_by_gripper[name]) == 6
+        assert profile.open_qpos_by_gripper[name] == (0.0,) * 6
+        assert profile.closed_qpos_by_gripper[name] == (0.864,) * 6
+        assert profile.qpos_from_close(name, 0.0) == (0.0,) * 6
+        assert profile.qpos_from_close(name, 1.0) == (0.864,) * 6
+        assert profile.master_joint_by_gripper[name].endswith("_r_1_joint")
+        assert len(profile.equality_joint_pairs(name)) == 5
+        assert all(
+            master == profile.master_joint_by_gripper[name]
+            for master, _mimic in profile.equality_joint_pairs(name)
+        )
+
+
+@pytest.mark.slow_sim
+def test_cad_dmtac_scene_compiles_six_actuators_and_explicit_mimic_constraints() -> None:
+    pytest.importorskip("mujoco")
+    scene, _arm_profile, profile = _cad_scene()
+
+    assert set(scene.gripper_specs) == {
+        "left_eg2_4b2_cad",
+        "right_eg2_4b2_cad",
+    }
+    assert scene.model.nu == 24
+    assert scene.model.neq == 10
+    for name, joint_names in profile.joint_names_by_gripper.items():
+        assert all(
+            scene.mujoco.mj_name2id(
+                scene.model,
+                scene.mujoco.mjtObj.mjOBJ_ACTUATOR,
+                profile.actuator_name(name, index),
+            )
+            >= 0
+            for index in range(len(joint_names))
+        )
+        assert all(
+            scene.mujoco.mj_name2id(
+                scene.model,
+                scene.mujoco.mjtObj.mjOBJ_EQUALITY,
+                profile.equality_name(name, index),
+            )
+            >= 0
+            for index in range(len(profile.equality_joint_pairs(name)))
+        )
 
 
 @pytest.mark.slow_sim

@@ -16,7 +16,12 @@ def add_gripper_position_actuators(
     mujoco_root: ET.Element,
     profile: GripperActuationProfile,
 ) -> None:
-    """Add symmetric finger constraints and independent force-limited servos."""
+    """Add mimic-linked finger constraints and force-limited servos.
+
+    The first configured joint is the master.  This makes CAD URDF mimic
+    semantics explicit in generated MJCF because the local URDF parser keeps
+    joint limits and axes but intentionally does not import ``<mimic>`` tags.
+    """
 
     joints = {
         str(element.attrib["name"]): element
@@ -36,17 +41,20 @@ def add_gripper_position_actuators(
             raise KeyError(
                 f"Gripper profile {gripper_name!r} references unknown joints {missing}."
             )
-        ET.SubElement(
-            equality,
-            "joint",
-            {
-                "name": profile.equality_name(gripper_name),
-                "joint1": joint_names[0],
-                "joint2": joint_names[1],
-                "polycoef": "0 1 0 0 0",
-                "solref": "0.005 1",
-            },
-        )
+        for relation_index, (master_joint, mimic_joint) in enumerate(
+            profile.equality_joint_pairs(gripper_name)
+        ):
+            ET.SubElement(
+                equality,
+                "joint",
+                {
+                    "name": profile.equality_name(gripper_name, relation_index),
+                    "joint1": master_joint,
+                    "joint2": mimic_joint,
+                    "polycoef": "0 1 0 0 0",
+                    "solref": "0.005 1",
+                },
+            )
         for index, joint_name in enumerate(joint_names):
             joints[joint_name].attrib.update(
                 {
