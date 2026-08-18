@@ -28,7 +28,7 @@ class HardwareResourceBinding:
     resource_kind: str
     route_hashes: tuple[str, ...]
     health_provider: Callable[[], str]
-    occupied_provider: Callable[[], bool]
+    control_claimed_provider: Callable[[], bool]
     occupies_on_read: bool = False
 
     def __post_init__(self) -> None:
@@ -53,8 +53,8 @@ class HardwareResourceBinding:
         )
         if not callable(self.health_provider):
             raise TypeError("health_provider must be callable.")
-        if not callable(self.occupied_provider):
-            raise TypeError("occupied_provider must be callable.")
+        if not callable(self.control_claimed_provider):
+            raise TypeError("control_claimed_provider must be callable.")
         if not isinstance(self.occupies_on_read, bool):
             raise TypeError("occupies_on_read must be a boolean.")
 
@@ -152,9 +152,11 @@ class HardwareViewProvider:
                     field_name="hardware health",
                     allowed=HARDWARE_HEALTH_STATES_V1,
                 )
-                lower_occupied = binding.occupied_provider()
-                if not isinstance(lower_occupied, bool):
-                    raise TypeError("occupied_provider must return a boolean.")
+                lower_control_claimed = binding.control_claimed_provider()
+                if not isinstance(lower_control_claimed, bool):
+                    raise TypeError(
+                        "control_claimed_provider must return a boolean."
+                    )
             except Exception:  # noqa: BLE001 - public view fails closed.
                 views.append(
                     HardwareStatusView(
@@ -184,27 +186,27 @@ class HardwareViewProvider:
                 views.append(
                     HardwareStatusView(
                         binding.resource_id,
-                        "occupied" if lower_occupied else "free",
+                        "occupied" if lower_control_claimed else "free",
                         health,
                         station_revision,
                         (
-                            "lower_resource_occupied"
-                            if lower_occupied
-                            else "no_active_bound_operation"
+                            "lower_control_claim_occupied"
+                            if lower_control_claimed
+                            else "lower_control_claim_free"
                         ),
                     )
                 )
                 continue
 
             occupies = (
-                lower_occupied
+                lower_control_claimed
                 or route.control_effect_class != "read_only"
                 or binding.occupies_on_read
             )
-            if lower_occupied:
-                reason_code = "lower_resource_occupied"
+            if lower_control_claimed:
+                reason_code = "lower_control_claim_occupied"
             elif occupies:
-                reason_code = "active_exclusive_operation"
+                reason_code = "active_operation_reservation"
             else:
                 reason_code = "active_shared_read_operation"
             views.append(

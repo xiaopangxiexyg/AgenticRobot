@@ -176,8 +176,8 @@ host-local Unix Gateway. It does not start hardware, create another Gateway,
 or own a device. Its fixed method allowlist permits discovery, bounded status,
 strictly read-only Skill submission, own-operation query, read-only cancel, and
 Artifact downloads. Generic Skill submission, lifecycle, HOLD, Artifact upload,
-and all motion routes are absent from the allowlist. The Gateway independently checks
-that `submit_read_only_skill_request` resolves to a `t0_read_only`,
+and all motion routes are absent from the allowlist. The Gateway independently
+checks that `submit_read_only_skill_request` resolves to a `t0_read_only`,
 `cancel_only`, non-motion Route before admission.
 
 The server-side command is:
@@ -204,11 +204,16 @@ Two additive discovery calls expose a profile-owned, redacted view:
   health, and an optional active operation projection.
 
 These views are not a registry or lease system. Concrete profiles bind stable
-resource IDs to existing Route hashes and the existing lower-owner occupancy
-and health reads; the runtime adds its current operation projection. A status
-read failure is reported fail-closed as unavailable and occupied. If a profile
-provides no binding, discovery returns `enabled=false` and an empty list rather
-than guessing hardware identity.
+resource IDs to existing Route hashes and lower-owned control-claim and health
+reads; the runtime adds its current operation projection. `occupied` means that
+an exclusive lower control/resource claim or an active exclusive operation is
+present. It does not mean that a Skill is currently moving the robot. READY,
+idle, and lower-confirmed HOLD do not release a claim and therefore never imply
+`free`; the optional `active_operation_id` reports execution activity
+separately. A status read failure is reported fail-closed as unavailable and
+occupied. If a profile provides no binding, discovery returns `enabled=false`
+and an empty list rather than guessing hardware identity. Gateway admission,
+not this advisory view, remains authoritative for whether a Skill may start.
 
 The dedicated independent RM65 Skill entrypoint is:
 
