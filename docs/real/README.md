@@ -169,6 +169,47 @@ rc=$?
 printf '[DexTeleop] command exited with status=%s\n' "$rc"
 ```
 
+#### 1.3.1 固定的 60 Hz 阻抗数采 + 四阶段标注 + 五踏板命令
+
+正式 writing 数采使用仓库内固定 launcher
+[`run_formal_60hz_writing_collection.sh`](../../scripts/run_formal_60hz_writing_collection.sh)。
+它只组合现有、已准入的参数数组和 canonical RealTeleop 入口，不维护第二份控制参数。
+默认 dataset task name 是拼写正确的 `4_stage_writing_detail`；在线 Progress profile
+固定为 `dmtac_rm65_bimanual_position_writing_four_stage_progress`。采集时封存的 coarse
+stage profile 会在后标注程序中自动匹配 writing detail overlay，因此不要把
+`.stages_detailed.json` 作为采集端基础 stage profile 传入。
+
+先在终端 1 启动五踏板转发服务：
+
+```bash
+cd /path/to/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+bash scripts/run_formal_60hz_writing_collection.sh foot-pad
+```
+
+再在终端 2 启动正式数采；触觉目录通过参数显式选择：
+
+```bash
+cd /path/to/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+bash scripts/run_formal_60hz_writing_collection.sh collect \
+  --tactile-bundle-root /absolute/path/to/DexTeleopTactile
+```
+
+触觉根目录必须预先存在、不能是符号链接，并且必须与 dataset root 位于不同文件系统。
+launcher 默认保留 200 GiB 空闲空间，可用 `--tactile-min-free-gb` 显式调整。dataset 根目录
+和 task name 也可以分别用 `--dataset-root`、`--task-name` 覆盖；等价的环境变量是
+`TACTILE_BUNDLE_ROOT`、`TACTILE_BUNDLE_MIN_FREE_GB`、`DATASET_BASE` 和
+`COLLECTION_TASK_NAME`。正式启动前可在任一命令末尾追加 `--dry-run`，只打印完整解析结果，
+不会连接踏板、机械臂、相机、夹爪或触觉设备。
+
+该 collect 命令固定展开
+`POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_DAMPED_ADMITTANCE_ARGS`，即 15 Hz
+操作输入、60 Hz IK/qref、120 Hz qcmd，以及双臂平移/旋转 bounded force-admittance
+overlay；同时启用 Progress GUI、external tactile、artifact integrity 和空闲期无损压缩。
+五踏板 1/2 继续使用单臂 Fix 语义，3/4/5 分别为 Advance、Failure、Undo；踏板服务必须
+与数采进程分终端运行。
+
 当前 `POSITION_FORMAL_V1_ARGS` 已内置稳定的 single-step 奇异保护（guard=12°、
 q5 回滞 release=6°），因此上面的正式命令就是稳定版命令，不需要另加实验数组。
 如需逐项回退，显式追加对应参数即可；完整旧链路回退使用
