@@ -98,7 +98,10 @@ class GripperActuationProfile:
 
     The profile keeps transport, target motion, servo, and pad-contact
     parameters separate so later hardware identification can replace each
-    layer without changing the Q6/action contract.
+    layer without changing the normalized close/action contract.  A gripper
+    may expose more than two mechanical joints: the first configured joint is
+    the master and the remaining joints are explicitly constrained to mimic it
+    when the MJCF is assembled.
     """
 
     name: str
@@ -124,6 +127,7 @@ class GripperActuationProfile:
     calibration_status: str = "dataset_coarse_delay_temporary_servo"
     evidence: str = ""
     position_response_profile: DmtacPositionActuationProfile | None = None
+    master_joint_by_gripper: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
@@ -136,23 +140,32 @@ class GripperActuationProfile:
         opens: dict[str, tuple[float, ...]] = {}
         closes: dict[str, tuple[float, ...]] = {}
         delays: dict[str, float] = {}
+        masters: dict[str, str] = {}
+        configured_masters = self.master_joint_by_gripper or {}
         for gripper, raw_names in self.joint_names_by_gripper.items():
             gripper_name = str(gripper).strip()
             joint_names = tuple(str(item).strip() for item in raw_names)
-            if not gripper_name or len(joint_names) != 2 or not all(joint_names):
-                raise ValueError("each gripper must define exactly two finger joints.")
+            if not gripper_name or not joint_names or not all(joint_names):
+                raise ValueError("each gripper must define at least one finger joint.")
             side = str(self.side_by_gripper.get(gripper_name, "")).strip()
             if side not in {"left", "right"}:
                 raise ValueError(f"{gripper_name} must map to side left or right.")
+            master_joint = str(
+                configured_masters.get(gripper_name, joint_names[0])
+            ).strip()
+            if master_joint not in joint_names:
+                raise ValueError(
+                    f"{gripper_name} master joint {master_joint!r} is not configured."
+                )
             open_qpos = _finite_tuple(
                 self.open_qpos_by_gripper[gripper_name],
                 name=f"{gripper_name}.open_qpos",
-                length=2,
+                length=len(joint_names),
             )
             closed_qpos = _finite_tuple(
                 self.closed_qpos_by_gripper[gripper_name],
                 name=f"{gripper_name}.closed_qpos",
-                length=2,
+                length=len(joint_names),
             )
             if all(math.isclose(a, b, abs_tol=1e-12) for a, b in zip(open_qpos, closed_qpos)):
                 raise ValueError(f"{gripper_name} open and closed qpos must differ.")
@@ -164,6 +177,7 @@ class GripperActuationProfile:
             opens[gripper_name] = open_qpos
             closes[gripper_name] = closed_qpos
             delays[gripper_name] = delay
+            masters[gripper_name] = master_joint
         if not joints or len(set(sides.values())) != len(sides):
             raise ValueError("profile must define at most one gripper per side.")
         for field_name in (
@@ -196,6 +210,7 @@ class GripperActuationProfile:
         object.__setattr__(self, "side_by_gripper", MappingProxyType(sides))
         object.__setattr__(self, "open_qpos_by_gripper", MappingProxyType(opens))
         object.__setattr__(self, "closed_qpos_by_gripper", MappingProxyType(closes))
+        object.__setattr__(self, "master_joint_by_gripper", MappingProxyType(masters))
         object.__setattr__(
             self,
             "command_to_actuator_delay_sec_by_gripper",
@@ -228,8 +243,24 @@ class GripperActuationProfile:
     def actuator_name(self, gripper_name: str, joint_index: int) -> str:
         return f"{self.actuator_prefix}_{gripper_name}_finger{int(joint_index) + 1}"
 
-    def equality_name(self, gripper_name: str) -> str:
-        return f"{self.actuator_prefix}_{gripper_name}_symmetric"
+    def equality_name(self, gripper_name: str, relation_index: int = 0) -> str:
+        index = int(relation_index)
+        if index < 0:
+            raise ValueError("relation_index must be non-negative.")
+        suffix = "" if index == 0 else f"_mimic{index + 1}"
+        return f"{self.actuator_prefix}_{gripper_name}_symmetric{suffix}"
+
+    def equality_joint_pairs(
+        self, gripper_name: str
+    ) -> tuple[tuple[str, str], ...]:
+        """Return explicit master-to-mimic joint relations for one gripper."""
+
+        gripper = str(gripper_name)
+        joint_names = self.joint_names_by_gripper[gripper]
+        if len(joint_names) < 2:
+            return ()
+        master = self.master_joint_by_gripper[gripper]
+        return tuple((master, joint_name) for joint_name in joint_names if joint_name != master)
 
     def gripper_for_side(self, side: str) -> str:
         matches = [name for name, value in self.side_by_gripper.items() if value == str(side)]
@@ -285,7 +316,7 @@ class GripperActuationProfile:
             },
         )
 
-    def qpos_from_close(self, gripper_name: str, close: float) -> tuple[float, float]:
+    def qpos_from_close(self, gripper_name: str, close: float) -> tuple[float, ...]:
         value = min(1.0, max(0.0, float(close)))
         return tuple(
             opened + value * (closed - opened)
@@ -296,7 +327,7 @@ class GripperActuationProfile:
         )  # type: ignore[return-value]
 
     def to_metadata(self) -> dict[str, object]:
-        return {
+        metadata = {
             "name": self.name,
             "joint_names_by_gripper": {
                 name: list(joints) for name, joints in self.joint_names_by_gripper.items()
@@ -326,6 +357,12 @@ class GripperActuationProfile:
                 else self.position_response_profile.to_metadata()
             ),
         }
+        if any(
+            self.master_joint_by_gripper[name] != joints[0]
+            for name, joints in self.joint_names_by_gripper.items()
+        ):
+            metadata["master_joint_by_gripper"] = dict(self.master_joint_by_gripper)
+        return metadata
 
 
 def identified_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
@@ -385,6 +422,62 @@ def identified_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     )
 
 
+def cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
+    """Normalized actuator profile for the additive EG2-4B2 CAD mechanism.
+
+    The official CAD export exposes six revolute joints per side.  Its first
+    joint is the master at ``q=0`` open and ``q=0.864`` closed; the other five
+    joints carry the same normalized target and are constrained as explicit
+    MJCF mimic relations because the local URDF converter does not rely on
+    URDF ``<mimic>`` tags.
+    """
+
+    base = identified_bimanual_dmtac_gripper_profile()
+    names = ("left_eg2_4b2_cad", "right_eg2_4b2_cad")
+    joint_suffixes = (
+        "l_1_joint",
+        "l_3_joint",
+        "r_1_joint",
+        "r_3_joint",
+        "l_2_joint",
+        "r_2_joint",
+    )
+    return replace(
+        base,
+        name="dmtac_bimanual_position_eg2_4b2_cad_20260818.v1",
+        joint_names_by_gripper={
+            name: tuple(f"{name}_{suffix}" for suffix in joint_suffixes)
+            for name in names
+        },
+        side_by_gripper={
+            "left_eg2_4b2_cad": "left",
+            "right_eg2_4b2_cad": "right",
+        },
+        open_qpos_by_gripper={name: (0.0,) * 6 for name in names},
+        closed_qpos_by_gripper={name: (0.864,) * 6 for name in names},
+        master_joint_by_gripper={
+            name: f"{name}_r_1_joint" for name in names
+        },
+        command_to_actuator_delay_sec_by_gripper={
+            name: base.command_to_actuator_delay_sec_by_gripper[
+                "left_gripper" if side == "left" else "right_gripper"
+            ]
+            for name, side in (
+                ("left_eg2_4b2_cad", "left"),
+                ("right_eg2_4b2_cad", "right"),
+            )
+        },
+        calibration_status=(
+            "official_eg2_4b2_cad_normalized_mimic_kinematics_provisional"
+        ),
+        evidence=(
+            "additive SolidWorks EG2-4B2 CAD export; r_1_joint is the master, "
+            "all five remaining moving joints mimic it with multiplier=1; "
+            "q=0 is open and q=0.864 is closed."
+        ),
+    )
+
+
 def temporary_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     """Compatibility alias for the current identified bimanual V1 profile."""
 
@@ -420,6 +513,7 @@ def cube_lift_contact_dmtac_gripper_profile() -> GripperActuationProfile:
 __all__ = [
     "GripperActuationProfile",
     "GripperContactTuning",
+    "cad_bimanual_dmtac_gripper_profile",
     "cube_lift_contact_dmtac_gripper_profile",
     "identified_bimanual_dmtac_gripper_profile",
     "temporary_bimanual_dmtac_gripper_profile",

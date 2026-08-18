@@ -292,7 +292,7 @@ For example, compile the latest v3 dual-arm MJCF for inspection:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --dump-mjcf-only \
   --mjcf-out /tmp/rm65_v3_colored.xml
 ```
@@ -436,7 +436,7 @@ Compile the explicit URDF and list arms/cameras:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --dump-mjcf-only \
   --mjcf-out sim/outputs/rm65_dual_arm_wrist_cameras_v3_head_camera.xml
 ```
@@ -445,7 +445,7 @@ Right-arm qpos check without rendering:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode right \
   --control qpos \
   --right-qpos 0 0 0 0 0 0 \
@@ -456,7 +456,7 @@ Interactive MuJoCo GUI viewer:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode right \
   --control qpos \
   --right-qpos 0 0 0 0 0 0 \
@@ -469,7 +469,7 @@ check:
 
 ```bash
 python -m sim.mujoco.run_control \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode right \
   --control qpos \
   --right-qpos 0 0 0 0 0 0 \
@@ -591,7 +591,7 @@ LeRobot-style dataset with the explicit `.runner` entrypoint:
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode dual \
   --qpos-source auto \
   --no-render
@@ -653,7 +653,7 @@ Right-arm-only replay keeps the left arm fixed at the first recorded frame:
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode right \
   --qpos-source auto \
   --no-render
@@ -665,7 +665,7 @@ Open the MuJoCo GUI while replaying:
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode dual \
   --viewer \
   --no-render
@@ -678,7 +678,7 @@ the viewer open after loading the selected frame and highlights proxy boxes:
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-04_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode dual \
   --qpos-source auto \
   --start-frame 75 \
@@ -702,7 +702,7 @@ export MUJOCO_GL=egl
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode dual \
   --record \
   --record-dir sim/outputs
@@ -716,7 +716,7 @@ export MUJOCO_GL=egl
 python -m sim.mujoco.replay.runner \
   --dataset-root datasets/2026-07-03_vive_rm65_real_teleop \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode dual \
   --qpos-source auto \
   --export-dataset datasets/2026-07-03_mujoco_replay
@@ -761,7 +761,7 @@ export MUJOCO_GL=egl
 python -m sim.mujoco.replay.runner \
   --dataset-root <real_dataset_root> \
   --episode 0 \
-  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --urdf assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf \
   --mode dual \
   --qpos-source auto \
   --require-gripper-replay \

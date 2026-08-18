@@ -86,7 +86,16 @@ class CollisionFilter:
         name = str(link_name).lower()
         if name == "table" or "camera_pole" in name or "head_camera" in name:
             return ENVIRONMENT_GROUP
-        if "gripper" in name or "finger" in name or "contact_frame" in name:
+        # The official EG2-4B2 CAD export uses l_*/r_* link names rather than
+        # the proxy's explicit "finger" names.  Keep those links in the
+        # gripper contact group so the CAD model preserves the same collision
+        # semantics as the older parallel-gripper scene.
+        if (
+            "gripper" in name
+            or "finger" in name
+            or "contact_frame" in name
+            or "eg2_4b2_cad" in name
+        ):
             return GRIPPER_GROUP
         return ROBOT_GROUP
 

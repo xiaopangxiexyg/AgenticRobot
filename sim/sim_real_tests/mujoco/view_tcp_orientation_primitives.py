@@ -14,7 +14,7 @@ import numpy as np
 
 from sim.contracts import SimulationContract
 from sim.mujoco.actuation import (
-    identified_bimanual_dmtac_gripper_profile,
+    cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
 )
 from sim.mujoco.control.desk_tcp_position import (
@@ -55,7 +55,7 @@ def _build_playback_scene() -> MujocoScene:
     return MujocoScene.from_contract(
         contract,
         position_actuation_profile=rm65_bimanual_udp_feedback_profile(),
-        gripper_actuation_profile=identified_bimanual_dmtac_gripper_profile(),
+        gripper_actuation_profile=cad_bimanual_dmtac_gripper_profile(),
     )
 
 

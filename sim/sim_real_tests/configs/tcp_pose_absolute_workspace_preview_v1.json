@@ -1,7 +1,7 @@
 {
   "schema_version": "sim_real_tests.tcp_pose_absolute_workspace_preview.v1",
   "role": "visual_review_only_not_a_runtime_safety_profile",
-  "urdf_path": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf",
+  "urdf_path": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf",
   "reference_frame_link": "workspace_near_boundary_frame",
   "table_link": "table",
   "camera_pole_link": "camera_pole",

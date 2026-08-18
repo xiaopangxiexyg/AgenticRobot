@@ -2,7 +2,7 @@
   "schema_version": "dexteleop.sim.mujoco.cube_lift_task.v2",
   "name": "rm65_right_cube_lift_rl_normal_contact_curriculum_v2",
   "policy_class": "normal",
-  "base_contract_path": "sim/configs/rm65_bimanual_physics_v1.json",
+  "base_contract_path": "sim/configs/rm65_bimanual_physics_legacy_v1.json",
   "base_contract_sha256": "c3d4703b460905d130e59885661a7b037585b98e898ab9fdd59b01457aa5eae5",
   "execution_mode": "actuated_position_servo",
   "robot_dynamics": "mujoco_position_actuator",

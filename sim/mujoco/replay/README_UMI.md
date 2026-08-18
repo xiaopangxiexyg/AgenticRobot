@@ -38,8 +38,8 @@ are already the FK pose of accepted qref, so replay uses qref smoothing alpha
 `1.0` and does not repeat collection-side inactive or adaptive `0.14 -> 0.45`
 shaping. Use `--position-control-profile legacy` only for rollback comparison.
 
-The physical MuJoCo scene remains the complete
-`rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf`.
+The physical MuJoCo scene remains the complete additive CAD-gripper model
+`rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf`.
 Coupled IK directly reuses the real-position-teleoperation default
 `dual_arm_hand_proxy_open` collision scene from `robot_motion`, including its
 checked 12 collision pairs. The proxy URDF is only the online collision/IK

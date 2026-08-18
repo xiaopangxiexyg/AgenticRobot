@@ -128,7 +128,9 @@ def test_rm65_physics_profile_has_one_urdf_table_and_no_initial_contact() -> Non
     assert len(root.findall(".//geom[@name='table_collision_0']")) == 1
     assert root.find(".//geom[@name='table_collision_0']").attrib["contype"] == "1"
     assert root.find(".//geom[@name='left_arm_link3_collision_0']").attrib["contype"] == "2"
-    assert root.find(".//geom[@name='left_gripper_left_finger_collision_0']").attrib[
+    assert root.find(
+        ".//geom[@name='left_eg2_4b2_cad_l_1_collision_0']"
+    ).attrib[
         "contype"
     ] == "4"
     assert root.find(".//geom[@name='debug_cube_collision']").attrib["contype"] == "8"
@@ -148,3 +150,10 @@ def test_rm65_physics_profile_has_one_urdf_table_and_no_initial_contact() -> Non
     assert scene.conversion.scene_profile_name == contract.scene.profile_name
     assert scene.model.opt.timestep == pytest.approx(contract.timing.physics_timestep_sec)
     assert set(scene.camera_names) == set(contract.observation.image_keys)
+    assert set(scene.gripper_specs) == {
+        "left_eg2_4b2_cad",
+        "right_eg2_4b2_cad",
+    }
+    for spec in scene.gripper_specs.values():
+        assert spec.open_qpos == pytest.approx((0.0,) * 6)
+        assert spec.closed_qpos == pytest.approx((0.864,) * 6)

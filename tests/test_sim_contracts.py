@@ -7,9 +7,21 @@ import pytest
 from robot_motion.deploy.schema import ACTION_DIM, OBSERVATION_STATE_DIM
 from robot_motion.position_control import PositionControlRates
 from sim.contracts import SceneSpec, SimulationContract
+from sim.contracts.scene import DEFAULT_RM65_PHYSICS_URDF
 
 
 CONTRACT = Path("sim/configs/rm65_bimanual_physics_v1.json")
+
+
+def test_default_scene_uses_additive_4b2_cad_gripper_urdf() -> None:
+    expected = (
+        "assets/rm65_inspire_gripper_v3/"
+        "rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf"
+    )
+
+    assert DEFAULT_RM65_PHYSICS_URDF == expected
+    assert SceneSpec().urdf_path == expected
+    assert SimulationContract.load(CONTRACT).scene.urdf_path == expected
 
 
 def test_versioned_simulation_contract_pins_existing_project_contracts() -> None:
