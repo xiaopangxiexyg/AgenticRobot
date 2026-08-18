@@ -117,6 +117,16 @@ lifecycle Routes. Neutral no-I/O test/dry-run ports cannot prove either read or
 control execution. The control-domain HOLD port remains separate from passive
 read execution.
 
+Safety-envelope selection is a motion-admission concern. A Route may publish a
+finite set of compatible reviewed envelopes, but every admitted operation pins
+one exact envelope ID, content hash, and constraint-set hash. If exactly one
+compatible envelope exists, omission retains the single-envelope compatibility
+default. If more than one exists and the session advertises
+`safety_profile_selection_v1`, omission fails closed with
+`safety_profile_selection_required`; the Gateway never guesses a tier from
+ordering or names. Passive read and lifecycle Routes do not acquire a motion
+envelope through this mechanism.
+
 ## Entrypoints
 
 The canonical MuJoCo entrypoint is:

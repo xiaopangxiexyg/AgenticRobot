@@ -65,9 +65,11 @@ When a Skill is defined in canonical Station/desk axes but the lower owner
 executes in an arm-base frame, the concrete profile must bind an exact typed
 frame graph and transform the measured anchor and resolved target across that
 graph. Do not attach a canonical axis contract to a rotated arm-base frame.
-Each motion Route must pin exactly one compatible lower safety envelope; a
-larger fixed-orientation range must not silently widen the generic/cardinal
-envelope.
+Each admitted motion operation must pin exactly one compatible lower safety
+envelope. A motion Route may publish a finite reviewed set, but when more than
+one member is compatible the request must select one exact member before
+admission; omission is not permission to choose implicitly. A larger
+fixed-orientation range must not silently widen the generic/cardinal envelope.
 
 Concrete real profiles must also distinguish the public controlled frame from
 the solver endpoint frame. In the current RM65/DMTAC binding, public Skill

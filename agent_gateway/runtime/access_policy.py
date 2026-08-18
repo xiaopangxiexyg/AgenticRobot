@@ -621,6 +621,21 @@ def assess_skill_request_access(
             "safety_profile_selection_not_supported",
             route_entry=route_entry,
         )
+    route_safety_envelopes = tuple(
+        item
+        for item in binding.safety_envelope_refs
+        if request.route_id in item.allowed_route_ids
+    )
+    if (
+        route.control_effect_class == "motion"
+        and safety_selection_supported
+        and len(route_safety_envelopes) > 1
+        and not request.has_safety_profile_selection
+    ):
+        return reject(
+            "safety_profile_selection_required",
+            route_entry=route_entry,
+        )
     if request.has_safety_profile_selection:
         matching_envelopes = tuple(
             item

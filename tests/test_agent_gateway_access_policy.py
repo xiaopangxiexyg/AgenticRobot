@@ -183,6 +183,7 @@ def _grant(
 def _sim_motion_surface(
     *,
     with_selection_feature: bool,
+    multiple_envelopes: bool = False,
 ) -> tuple[SkillExecutionRoute, SkillRouteManifest]:
     route = SkillExecutionRoute(
         skill_id="motion.move_tcp_to_pose",
@@ -211,8 +212,9 @@ def _sim_motion_surface(
         max_operation_duration_ms=2_000,
         cancellation_policy="hold_on_disconnect_or_timeout",
     )
-    refs = (
-        (
+    refs = ()
+    if with_selection_feature:
+        refs = (
             SkillDeploymentSafetyEnvelopeRef(
                 object_id="sim.tcp.standard@1",
                 schema="dexteleop.deployment_safety_envelope.v1",
@@ -221,9 +223,16 @@ def _sim_motion_surface(
                 allowed_route_ids=(route.route_id,),
             ),
         )
-        if with_selection_feature
-        else ()
-    )
+        if multiple_envelopes:
+            refs += (
+                SkillDeploymentSafetyEnvelopeRef(
+                    object_id="sim.tcp.strict@1",
+                    schema="dexteleop.deployment_safety_envelope.v1",
+                    content_hash="envelope-hash:strict",
+                    constraint_set_hash="constraints:strict",
+                    allowed_route_ids=(route.route_id,),
+                ),
+            )
     manifest = SkillRouteManifest(
         runtime_session_id="runtime:sim-motion-test",
         control_domain_id="domain:right-arm",
@@ -518,6 +527,15 @@ def test_real_motion_grant_still_only_yields_application_access() -> None:
 
 def test_sim_motion_accepts_only_an_exact_published_safety_envelope() -> None:
     route, manifest = _sim_motion_surface(with_selection_feature=True)
+    single_envelope_default = assess_skill_request_access(
+        policy=_policy(mode="sim_active"),
+        manifest=manifest,
+        request=_request(manifest, route),
+        current_station_revision=4,
+        now=12.0,
+    )
+    assert single_envelope_default.accepted
+
     selected = replace(
         _request(manifest, route),
         safety_profile_id="safety.standard@1",
@@ -547,6 +565,40 @@ def test_sim_motion_accepts_only_an_exact_published_safety_envelope() -> None:
     )
     assert not rejected.accepted
     assert rejected.reason_code == "deployment_safety_envelope_not_allowed"
+
+
+def test_multi_envelope_motion_requires_an_explicit_selection_at_admission() -> None:
+    route, manifest = _sim_motion_surface(
+        with_selection_feature=True,
+        multiple_envelopes=True,
+    )
+    missing = assess_skill_request_access(
+        policy=_policy(mode="sim_active"),
+        manifest=manifest,
+        request=_request(manifest, route),
+        current_station_revision=4,
+        now=12.0,
+    )
+
+    assert not missing.accepted
+    assert missing.reason_code == "safety_profile_selection_required"
+
+    selected = replace(
+        _request(manifest, route),
+        safety_profile_id="safety.strict@1",
+        safety_profile_hash="safety-profile-hash:strict",
+        deployment_safety_envelope_id="sim.tcp.strict@1",
+        deployment_safety_envelope_hash="envelope-hash:strict",
+        safety_constraint_set_hash="constraints:strict",
+    )
+    accepted = assess_skill_request_access(
+        policy=_policy(mode="sim_active"),
+        manifest=manifest,
+        request=selected,
+        current_station_revision=4,
+        now=12.0,
+    )
+    assert accepted.accepted
 
 
 def test_compatibility_manifest_rejects_unadvertised_safety_selection() -> None:
