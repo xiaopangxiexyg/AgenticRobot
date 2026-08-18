@@ -9,7 +9,7 @@ configuration is rejected instead of being silently repurposed.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,7 @@ from sim.mujoco.deploy import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
     prepare_mujoco_sim_hil_target,
 )
+from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
 
 from .motion_application import MujocoAgentSkillMotionApplication
 from .motion_deployment import (
@@ -356,6 +357,11 @@ def build_mujoco_agent_tcp_pose_gateway_session(
         MujocoAgentArtifactStorageConfig,
     ):
         raise TypeError("artifact_storage must be typed or None.")
+    if target_config.station_pose_contract_path is None:
+        target_config = replace(
+            target_config,
+            station_pose_contract_path=DEFAULT_STATION_POSE_CONTRACT_PATH,
+        )
     validate_mujoco_agent_tcp_pose_target_config(target_config)
     prepared = prepare_mujoco_sim_hil_target(target_config)
     component_profile = build_mujoco_pose_component_target_profile(

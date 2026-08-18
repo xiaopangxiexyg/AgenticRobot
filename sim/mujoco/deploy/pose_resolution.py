@@ -54,7 +54,7 @@ from robot_motion.action.safety_anchor import safety_anchor_action_hash
 from robot_motion.rm65.constants import TOOL_TCP_FRAME
 from robot_motion.runtime import TeleopCommand
 
-from ..ik import IKResult, PoseTarget, RM65CanonicalIK
+from ..ik import IKResult, PoseTarget, RM65CanonicalIK, RM65RetargeterIK
 
 
 POSE_TO_QPOS_RESOLUTION_HASH_DOMAIN_V1 = (
@@ -76,6 +76,26 @@ POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1 = canonical_content_hash(
         "output_action_space": "bimanual_qpos_v1",
         "source_side_transform": "forbidden",
         "solver": "robot_motion.rm65.position_collision",
+    },
+    domain="dexteleop.mujoco.pose_to_qpos_resolver_contract.v1",
+)
+
+RETARGETER_POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1 = (
+    "mujoco-rm65-dual-arm-retargeter-arm-base-pose-to-qpos-v1"
+)
+RETARGETER_POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1 = canonical_content_hash(
+    {
+        "contract_id": RETARGETER_POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1,
+        "input_action_space": BIMANUAL_EE_POSE_V1,
+        "required_components": ("left_arm", "right_arm"),
+        "reference_frame_by_side": {
+            "left": "left_arm_base",
+            "right": "right_arm_base",
+        },
+        "controlled_frame": TOOL_TCP_FRAME,
+        "output_action_space": "bimanual_qpos_v1",
+        "source_side_transform": "forbidden",
+        "solver": "robot_motion.rm65.dual_arm_collision_aware",
     },
     domain="dexteleop.mujoco.pose_to_qpos_resolver_contract.v1",
 )
@@ -189,14 +209,17 @@ class MujocoCoupledPoseToQposResolver:
 
     def __init__(
         self,
-        ik: RM65CanonicalIK,
+        ik: RM65CanonicalIK | RM65RetargeterIK,
         *,
         pose_transformer: CanonicalDeskToRuntimePoseTransformer | None = None,
         target_pose_smoother: BimanualPoseSmoother | None = None,
         pose_target_safety_filter: Callable[[RobotAction], RobotAction] | None = None,
+        support_only_arm_sides: tuple[str, ...] = (),
     ) -> None:
-        if not isinstance(ik, RM65CanonicalIK):
-            raise TypeError("ik must be RM65CanonicalIK.")
+        if not isinstance(ik, (RM65CanonicalIK, RM65RetargeterIK)):
+            raise TypeError(
+                "ik must be RM65CanonicalIK or RM65RetargeterIK."
+            )
         self.ik = ik
         self.pose_transformer = pose_transformer
         if target_pose_smoother is not None and not isinstance(
@@ -227,6 +250,21 @@ class MujocoCoupledPoseToQposResolver:
                 "pose_target_safety_filter requires filter_contract_hash."
             )
         self.pose_target_safety_filter = pose_target_safety_filter
+        support_sides = tuple(
+            str(side).strip().lower() for side in support_only_arm_sides
+        )
+        if (
+            len(support_sides) != len(set(support_sides))
+            or set(support_sides) - {"left", "right"}
+            or set(support_sides) == {"left", "right"}
+        ):
+            raise ValueError(
+                "support_only_arm_sides must be a unique proper arm-side subset."
+            )
+        self.support_only_arm_sides = support_sides
+        self.active_arm_sides = tuple(
+            side for side in ("left", "right") if side not in support_sides
+        )
         transform_hash = (
             None
             if pose_transformer is None
@@ -235,15 +273,22 @@ class MujocoCoupledPoseToQposResolver:
         collision_constraints_enabled = bool(
             getattr(self.ik.planner, "collision_pair_count", 0) > 0
         )
-        base_contract_id = (
-            POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1
-            if collision_constraints_enabled
-            else "mujoco-rm65-coupled-arm-base-pose-to-qpos-no-collision-v1"
-        )
-        base_contract_hash = (
-            POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1
-            if collision_constraints_enabled
-            else canonical_content_hash(
+        retargeter_backend = isinstance(self.ik, RM65RetargeterIK)
+        if retargeter_backend:
+            if not collision_constraints_enabled:
+                raise ValueError(
+                    "RM65RetargeterIK requires an auditable collision profile."
+                )
+            base_contract_id = RETARGETER_POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1
+            base_contract_hash = RETARGETER_POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1
+        elif collision_constraints_enabled:
+            base_contract_id = POSE_TO_QPOS_RESOLVER_CONTRACT_ID_V1
+            base_contract_hash = POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1
+        else:
+            base_contract_id = (
+                "mujoco-rm65-coupled-arm-base-pose-to-qpos-no-collision-v1"
+            )
+            base_contract_hash = canonical_content_hash(
                 {
                     "base_resolver_contract_hash": (
                         POSE_TO_QPOS_RESOLVER_CONTRACT_HASH_V1
@@ -255,19 +300,22 @@ class MujocoCoupledPoseToQposResolver:
                     "dexteleop.mujoco.pose_to_qpos_no_collision_resolver.v1"
                 ),
             )
-        )
-        transformed_contract_id = (
-            base_contract_id
-            if transform_hash is None
-            else (
-                "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-v1"
-                if collision_constraints_enabled
-                else (
-                    "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-"
-                    "no-collision-v1"
-                )
+        if transform_hash is None:
+            transformed_contract_id = base_contract_id
+        elif retargeter_backend:
+            transformed_contract_id = (
+                "mujoco-rm65-dual-arm-retargeter-canonical-desk-"
+                "pose-to-qpos-v1"
             )
-        )
+        elif collision_constraints_enabled:
+            transformed_contract_id = (
+                "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-v1"
+            )
+        else:
+            transformed_contract_id = (
+                "mujoco-rm65-coupled-canonical-desk-pose-to-qpos-"
+                "no-collision-v1"
+            )
         transformed_contract_hash = (
             base_contract_hash
             if transform_hash is None
@@ -325,6 +373,23 @@ class MujocoCoupledPoseToQposResolver:
                 ),
             )
         )
+        if self.support_only_arm_sides:
+            self.resolver_contract_id = (
+                f"{self.resolver_contract_id}+inactive-support-hold-v1"
+            )
+            self.resolver_contract_hash = canonical_content_hash(
+                {
+                    "base_resolver_contract_hash": self.resolver_contract_hash,
+                    "active_arm_sides": self.active_arm_sides,
+                    "support_only_arm_sides": self.support_only_arm_sides,
+                    "support_semantics": (
+                        "measured_pose_for_coupled_context_then_exact_qpos_hold"
+                    ),
+                },
+                domain=(
+                    "dexteleop.mujoco.pose_to_qpos_support_arm_hold_resolver.v1"
+                ),
+            )
         self._command_resolver = RobotActionResolver()
         self._lock = threading.RLock()
         self._resolution_by_id: dict[str, MujocoPoseToQposResolution] = {}
@@ -394,7 +459,7 @@ class MujocoCoupledPoseToQposResolver:
             )
             for side in ("left", "right")
         }
-        result = self.ik.solve(targets)
+        result = self.ik.solve(targets, active_sides=self.active_arm_sides)
         if not result.success or result.hold:
             metadata = dict(result.metadata or {})
             failure = dict(metadata.get("failure") or {})

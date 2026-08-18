@@ -11,11 +11,23 @@ from robot_motion.action import ExecutionObservationPlan
 from robot_motion.position_control import POSITION_15_60_120_PROFILE
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_STATION_POSE_CONTRACT_PATH = (
+    _REPO_ROOT
+    / "robot_motion/configs/pose_frames/"
+    "rm65_dual_arm_workspace_near_boundary_v1_collection_desk_absolute.json"
+)
+
+
 @dataclass(frozen=True)
 class MujocoSimHILTargetConfig:
     """Target-side selection shared by Station MuJoCo target profiles."""
 
     task_config_path: Path
+    # Optional canonical station binding. Existing policy/human Sim-HIL
+    # profiles preserve their historical scene-world frame when omitted;
+    # semantic motion Skills select the reviewed station contract explicitly.
+    station_pose_contract_path: Path | None = None
     realtime_worker: bool = True
     runtime_session_id: str = "control-station-sim-hil-ppo-session"
     control_domain_id: str = "mujoco-sim-hil"
@@ -50,6 +62,12 @@ class MujocoSimHILTargetConfig:
             "task_config_path",
             Path(self.task_config_path).expanduser(),
         )
+        if self.station_pose_contract_path is not None:
+            object.__setattr__(
+                self,
+                "station_pose_contract_path",
+                Path(self.station_pose_contract_path).expanduser(),
+            )
         for name in (
             "runtime_session_id",
             "control_domain_id",
@@ -102,4 +120,7 @@ class MujocoSimHILTargetConfig:
         object.__setattr__(self, "exposed_pose_sides", sides)
 
 
-__all__ = ["MujocoSimHILTargetConfig"]
+__all__ = [
+    "DEFAULT_STATION_POSE_CONTRACT_PATH",
+    "MujocoSimHILTargetConfig",
+]

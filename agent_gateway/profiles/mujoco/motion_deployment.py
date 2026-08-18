@@ -91,6 +91,7 @@ from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
+    MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_REFERENCE_STEP_RAD_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_TRANSLATION_DELTA_M_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1,
@@ -1628,6 +1629,18 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     target_binding = station.execution_binding
     physics_hz = float(application.task_config.physics_hz)
     decision_hz = float(runtime.config.decision_hz)
+    coupled_ik = getattr(
+        getattr(runtime, "pose_resolver", None),
+        "ik",
+        None,
+    )
+    orientation_reference_hz = float(
+        getattr(
+            coupled_ik,
+            "reference_hz",
+            decision_hz,
+        )
+    )
     profile = MujocoAgentTcpPoseMotionProfile(
         reference_frame_id=exact["reference_frame_id"],
         reference_frame_spec_hash=exact["reference_frame_spec_hash"],
@@ -1859,7 +1872,17 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         max_rotation_delta_rad=(
             MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1
         ),
-        physics_ticks_per_control_cycle=profile.physics_ticks_per_control_cycle,
+        max_control_cycles=(
+            math.ceil(
+                MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1
+                / MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_REFERENCE_STEP_RAD_V1
+            )
+            + round(2.0 * orientation_reference_hz)
+        ),
+        physics_ticks_per_control_cycle=max(
+            1,
+            round(physics_hz / orientation_reference_hz),
+        ),
     )
     orientation_profiles: list[MujocoAgentTcpFixedOrientationProfile] = []
     orientation_definitions: list[Any] = []
@@ -1933,7 +1956,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             may_open_publication=False,
             requires_operator_confirmation=False,
             requires_deadman=False,
-            max_operation_duration_ms=10_000,
+            max_operation_duration_ms=30_000,
             cancellation_policy="hold_on_cancel_disconnect_or_timeout",
             requires_task_evaluation=True,
         )
