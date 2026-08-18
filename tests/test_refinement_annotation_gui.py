@@ -218,6 +218,9 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "/api/reflow-failed-stage/" in app_source
         assert "function renderCaptureEndStepEditor" in app_source
         assert "function annotationAttempts" in app_source
+        assert "详细标注完成" in app_source
+        assert "detail_annotation_complete" in app_source
+        assert ".badge.detail-complete" in style_source
         assert "/api/reflow-capture-end-step/" in app_source
         assert "function timelineCoverageGaps" in app_source
         assert "function occurrenceReferenceIssues" in app_source
@@ -1016,6 +1019,12 @@ def test_detail_overlay_is_optional_until_explicitly_sealed(
             coarse_report["detail_annotation"]["resolution_level"]
             == "COARSE_FALLBACK"
         )
+        coarse_summary = application.episode_annotation_summaries(
+            (episode_uuid,)
+        )
+        assert coarse_summary["summaries"][0][
+            "detail_annotation_complete"
+        ] is False
 
         detail = application.episode_detail(episode_uuid)
         detail_draft = json.loads(json.dumps(detail["draft"]))
@@ -1060,6 +1069,12 @@ def test_detail_overlay_is_optional_until_explicitly_sealed(
             "DETAIL_COMPLETE"
         )
         assert reopened["detail_annotation"]["draft_state"] == "SEALED"
+        complete_summary = application.episode_annotation_summaries(
+            (episode_uuid,)
+        )
+        assert complete_summary["summaries"][0][
+            "detail_annotation_complete"
+        ] is True
     finally:
         application.close()
 

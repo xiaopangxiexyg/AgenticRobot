@@ -106,6 +106,7 @@ _DRAFT_SCHEMA = "dexteleop.stage_annotation_draft.local.v1"
 _DETAIL_DRAFT_SCHEMA = "dexteleop.detail_stage_annotation_draft.local.v1"
 _SAMPLE_AXIS_CACHE_LIMIT = 16
 _ANNOTATION_SET_CACHE_LIMIT = 16
+_DETAIL_ANNOTATION_STATUS_CACHE_LIMIT = 64
 _RETRYABLE_STAGE_STORE_ERRNOS = frozenset(
     value
     for value in (
@@ -217,6 +218,10 @@ class RefinementAnnotationApplication:
             str,
             tuple[object, ...],
         ] = {}
+        self._detail_annotation_status_cache: OrderedDict[
+            str,
+            tuple[tuple[object, ...], bool],
+        ] = OrderedDict()
         self._episode_list_revision = 0
         self._sample_axis_cache: OrderedDict[
             str,
@@ -251,6 +256,7 @@ class RefinementAnnotationApplication:
                 self._annotation_sets_cache.clear()
                 self._annotation_summary_cache.clear()
                 self._annotation_root_fingerprints.clear()
+                self._detail_annotation_status_cache.clear()
                 self._sample_axis_cache.clear()
                 self._detail_profile_cache.clear()
 
@@ -298,6 +304,7 @@ class RefinementAnnotationApplication:
                     self._annotation_sets_cache,
                     self._annotation_summary_cache,
                     self._annotation_root_fingerprints,
+                    self._detail_annotation_status_cache,
                     self._sample_axis_cache,
                 ):
                     for episode_uuid in tuple(cache):
@@ -593,6 +600,10 @@ class RefinementAnnotationApplication:
                                 episode_uuid,
                                 None,
                             )
+                            self._detail_annotation_status_cache.pop(
+                                episode_uuid,
+                                None,
+                            )
                     summary = self._episode_summary(
                         item,
                         load_annotations=True,
@@ -621,6 +632,9 @@ class RefinementAnnotationApplication:
                     ],
                     "whole_episode_abnormal_reason": summary[
                         "whole_episode_abnormal_reason"
+                    ],
+                    "detail_annotation_complete": summary[
+                        "detail_annotation_complete"
                     ],
                     "annotation_summary_loaded": True,
                 }
@@ -807,6 +821,97 @@ class RefinementAnnotationApplication:
             / DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT
             / item.episode_uuid
         )
+
+    def _detail_annotation_root_fingerprint(
+        self,
+        item: ProgressAnnotationWorkItem,
+    ) -> tuple[object, ...]:
+        root = self._detail_annotation_root(item)
+        try:
+            value = root.stat()
+        except FileNotFoundError:
+            return ("missing",)
+        except OSError as exc:
+            return ("error", type(exc).__name__, getattr(exc, "errno", None))
+        return (
+            "directory",
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    def _detail_annotation_is_complete(
+        self,
+        item: ProgressAnnotationWorkItem,
+        annotation_sets: Sequence[LoadedStageAnnotationSet],
+    ) -> bool:
+        """Return whether the current coarse base has a valid detail set.
+
+        The sidebar status is intentionally derived from the same binding
+        rules as the Episode editor.  A detail set for an older coarse base,
+        or a profile target absent from this Episode, must not produce a
+        completion badge.
+        """
+
+        if not annotation_sets:
+            return False
+        selection, _ = self._detail_profile_selection(item)
+        if selection is None:
+            return False
+        target = selection.target_progress_step_id
+        if not selection.stage_profile.stages_for_step(target):
+            return False
+        base_annotation_set = annotation_sets[-1]
+        if not any(
+            occurrence.progress_step_id == target
+            for occurrence in base_annotation_set.bundle.occurrences
+        ):
+            return False
+        root_fingerprint = self._detail_annotation_root_fingerprint(item)
+        cache_key = (
+            root_fingerprint,
+            base_annotation_set.binding.annotation_set_id,
+            base_annotation_set.manifest.semantic_content_hash,
+            selection.stage_profile.semantic_content_hash,
+            target,
+        )
+        with self._lock:
+            cached = self._detail_annotation_status_cache.get(
+                item.episode_uuid
+            )
+            if cached is not None and cached[0] == cache_key:
+                self._detail_annotation_status_cache.move_to_end(
+                    item.episode_uuid
+                )
+                return cached[1]
+
+        try:
+            detail_annotation_set, _ = self._current_detail_annotation_set(
+                item,
+                base_annotation_set,
+                selection,
+            )
+            complete = detail_annotation_set is not None
+        except (OSError, TypeError, ValueError):
+            # Detail is an optional overlay.  A transient or malformed
+            # optional artifact must not hide the valid coarse summary.
+            complete = False
+        with self._lock:
+            self._detail_annotation_status_cache[item.episode_uuid] = (
+                cache_key,
+                complete,
+            )
+            self._detail_annotation_status_cache.move_to_end(
+                item.episode_uuid
+            )
+            while (
+                len(self._detail_annotation_status_cache)
+                > _DETAIL_ANNOTATION_STATUS_CACHE_LIMIT
+            ):
+                self._detail_annotation_status_cache.popitem(last=False)
+        return complete
 
     def _current_detail_annotation_set(
         self,
@@ -1437,6 +1542,10 @@ class RefinementAnnotationApplication:
                         self._annotation_sets_cache.pop(normalized, None)
                         self._annotation_summary_cache.pop(normalized, None)
                         self._annotation_root_fingerprints.pop(normalized, None)
+                        self._detail_annotation_status_cache.pop(
+                            normalized,
+                            None,
+                        )
                     try:
                         detail = self._episode_detail_owned(normalized)
                     except Exception:
@@ -1446,6 +1555,10 @@ class RefinementAnnotationApplication:
                             self._annotation_sets_cache.pop(normalized, None)
                             self._annotation_summary_cache.pop(normalized, None)
                             self._annotation_root_fingerprints.pop(
+                                normalized,
+                                None,
+                            )
+                            self._detail_annotation_status_cache.pop(
                                 normalized,
                                 None,
                             )
@@ -1468,6 +1581,10 @@ class RefinementAnnotationApplication:
                         self._annotation_sets_cache.pop(normalized, None)
                         self._annotation_summary_cache.pop(normalized, None)
                         self._annotation_root_fingerprints.pop(normalized, None)
+                        self._detail_annotation_status_cache.pop(
+                            normalized,
+                            None,
+                        )
                         self._sample_axis_cache.pop(normalized, None)
                 try:
                     self.workspace.release_episode(episode_uuid=normalized)
@@ -1768,6 +1885,10 @@ class RefinementAnnotationApplication:
                 detail_draft=detail_draft,
                 reason=detail_reason,
             ),
+            "detail_annotation_complete": (
+                detail_payload_selection is not None
+                and detail_annotation_set is not None
+            ),
             "attempts": [
                 {
                     "attempt_id": attempt.attempt_id,
@@ -1845,10 +1966,19 @@ class RefinementAnnotationApplication:
             annotation_summary = self._annotation_summary_cache.get(
                 item.episode_uuid
             )
+        annotation_sets: tuple[LoadedStageAnnotationSet, ...] | None = None
         if annotation_summary is None and load_annotations:
             annotation_sets = self._sealed_annotation_sets(item)
             annotation_summary = self._summarize_annotation_sets(
                 annotation_sets
+            )
+        detail_annotation_complete: bool | None = None
+        if load_annotations and annotation_summary is not None:
+            if annotation_sets is None:
+                annotation_sets = self._sealed_annotation_sets(item)
+            detail_annotation_complete = self._detail_annotation_is_complete(
+                item,
+                annotation_sets,
             )
         if annotation_summary is None:
             set_count = item.annotation_set_count
@@ -1880,6 +2010,7 @@ class RefinementAnnotationApplication:
             "whole_episode_abnormal_reason": (
                 whole_episode_abnormal_reason
             ),
+            "detail_annotation_complete": detail_annotation_complete,
             "annotation_summary_loaded": annotation_summary is not None,
         }
 
@@ -2660,6 +2791,8 @@ class RefinementAnnotationApplication:
             bundle=detail_bundle,
             manifest=report.manifest,
         )
+        with self._lock:
+            self._detail_annotation_status_cache.pop(episode_uuid, None)
         self._mark_item_has_draft(episode_uuid)
         self._report_operation_progress(
             progress_callback,
@@ -2847,6 +2980,7 @@ class RefinementAnnotationApplication:
             self._annotation_sets_cache.pop(episode_uuid, None)
             self._annotation_summary_cache.pop(episode_uuid, None)
             self._annotation_root_fingerprints.pop(episode_uuid, None)
+            self._detail_annotation_status_cache.pop(episode_uuid, None)
         self._mark_item_annotation_committed(episode_uuid)
         self._report_operation_progress(
             progress_callback,

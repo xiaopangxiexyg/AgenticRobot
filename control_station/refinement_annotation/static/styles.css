@@ -384,6 +384,7 @@ h3 { margin-bottom: 7px; font-size: 15px; }
 .collapsed-episode-status.abnormal { color: #ff9ca3; }
 .collapsed-episode-status.review { color: #ffd18b; }
 .collapsed-episode-status.review-complete { color: #8fe4bf; }
+.collapsed-episode-status.detail-complete { color: #9edcff; }
 .panel-note, .hint, .tool-card p, .commit-panel p {
   color: var(--muted);
   font-size: 12px;
@@ -419,6 +420,7 @@ h3 { margin-bottom: 7px; font-size: 15px; }
 .badge.review { background: #593a16; color: #ffd18b; }
 .badge.abnormal { background: #682a31; color: #ffd5d8; }
 .badge.review-complete { background: #173f35; color: #8fe4bf; }
+.badge.detail-complete { background: #1d3e52; color: #9edcff; }
 .badge.loading { background: #26323b; color: #9ba8b0; }
 .badge.summary-error { background: #5c2730; color: #ffccd0; }
 .editor { min-width: 0; }
