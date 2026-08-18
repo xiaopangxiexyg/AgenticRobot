@@ -91,6 +91,32 @@ def target_frame_binding_hash_from_calibration(
     """Hash the exact transforms used to express coupled targets in world."""
 
     normalized = _normalized_sides(sides)
+    world_from_base_by_side: dict[str, np.ndarray] = {}
+    for side in normalized:
+        try:
+            arm = calibration.get_arm_for_side(side)
+        except Exception as exc:  # noqa: BLE001 - convert to one binding failure.
+            raise ValueError(f"calibration is missing side {side!r}") from exc
+        world_from_base_by_side[side] = _pose(
+            getattr(arm, "T_D_B", None),
+            name=f"calibration.{side}.T_D_B",
+        )
+    return target_frame_binding_hash_from_transforms(
+        target_world_from_base_by_side=world_from_base_by_side,
+        sides=normalized,
+        reference_frame_by_side=reference_frame_by_side,
+    )
+
+
+def target_frame_binding_hash_from_transforms(
+    *,
+    target_world_from_base_by_side: Mapping[str, Any],
+    sides: Sequence[str],
+    reference_frame_by_side: Mapping[str, str],
+) -> str:
+    """Hash an explicit, lower-owned base-to-target-world frame binding."""
+
+    normalized = _normalized_sides(sides)
     payload: dict[str, object] = {
         "controlled_frame_id": TCP_CONTROLLED_FRAME_ID,
         "reference_frame_by_side": {},
@@ -106,12 +132,14 @@ def target_frame_binding_hash_from_calibration(
             name=f"reference_frame_by_side.{side}",
         )
         try:
-            arm = calibration.get_arm_for_side(side)
-        except Exception as exc:  # noqa: BLE001 - convert to one binding failure.
-            raise ValueError(f"calibration is missing side {side!r}") from exc
+            raw_transform = target_world_from_base_by_side[side]
+        except KeyError as exc:
+            raise ValueError(
+                f"target frame binding is missing side {side!r}"
+            ) from exc
         transform = _pose(
-            getattr(arm, "T_D_B", None),
-            name=f"calibration.{side}.T_D_B",
+            raw_transform,
+            name=f"target_world_from_base_by_side.{side}",
         )
         references[side] = frame
         transforms[side] = transform.tolist()
@@ -215,6 +243,66 @@ class TCPPoseEnvelopeFileSpec:
             self,
             "side_config_by_side",
             MappingProxyType(dict(sorted(configs.items()))),
+        )
+
+
+@dataclass(frozen=True)
+class TCPPoseEnvelopeTargetFrameBinding:
+    """Immutable lower-owned geometry used by a TCP envelope runtime."""
+
+    reference_frame_by_side: Mapping[str, str]
+    target_world_from_base_by_side: Mapping[str, np.ndarray]
+
+    def __post_init__(self) -> None:
+        references: dict[str, str] = {}
+        for raw_side, frame in dict(self.reference_frame_by_side).items():
+            side = str(raw_side).strip().lower()
+            if side not in {"left", "right"} or str(raw_side) != side:
+                raise ValueError(
+                    "target frame binding side keys must be exact 'left' or 'right'"
+                )
+            references[side] = _required_text(
+                frame,
+                name=f"reference_frame_by_side.{side}",
+            )
+        transforms: dict[str, np.ndarray] = {}
+        for raw_side, transform in dict(
+            self.target_world_from_base_by_side
+        ).items():
+            side = str(raw_side).strip().lower()
+            if side not in {"left", "right"} or str(raw_side) != side:
+                raise ValueError(
+                    "target frame binding side keys must be exact 'left' or 'right'"
+                )
+            transforms[side] = _pose(
+                transform,
+                name=f"target_world_from_base_by_side.{side}",
+            )
+        if not references or set(references) != set(transforms):
+            raise ValueError(
+                "reference_frame_by_side and target_world_from_base_by_side "
+                "must contain the same non-empty side set"
+            )
+        frozen_transforms: dict[str, np.ndarray] = {}
+        for side, transform in transforms.items():
+            transform.setflags(write=False)
+            frozen_transforms[side] = transform
+        object.__setattr__(
+            self,
+            "reference_frame_by_side",
+            MappingProxyType(dict(sorted(references.items()))),
+        )
+        object.__setattr__(
+            self,
+            "target_world_from_base_by_side",
+            MappingProxyType(dict(sorted(frozen_transforms.items()))),
+        )
+
+    def semantic_hash(self, *, sides: Sequence[str]) -> str:
+        return target_frame_binding_hash_from_transforms(
+            target_world_from_base_by_side=self.target_world_from_base_by_side,
+            sides=sides,
+            reference_frame_by_side=self.reference_frame_by_side,
         )
 
 
@@ -369,6 +457,40 @@ def load_tcp_pose_envelope_profile(
     )
 
 
+def load_tcp_pose_envelope_profile_from_target_frame_binding(
+    path: str | Path,
+    *,
+    target_frame_binding: TCPPoseEnvelopeTargetFrameBinding,
+    retargeter: Any,
+    active_sides: Sequence[str],
+) -> TCPPoseEnvelopeProfile:
+    """Load a deploy envelope from explicit Station geometry, not teleop state."""
+
+    if not isinstance(target_frame_binding, TCPPoseEnvelopeTargetFrameBinding):
+        raise TypeError("target_frame_binding must be typed")
+    spec = load_tcp_pose_envelope_file_spec(path, active_sides=active_sides)
+    configs = dict(spec.side_config_by_side)
+    references = {
+        side: target_frame_binding.reference_frame_by_side[side]
+        for side in configs
+    }
+    enabled_sides = tuple(
+        side for side, config in configs.items() if config.enabled
+    )
+    return TCPPoseEnvelopeProfile(
+        profile_id=spec.profile_id,
+        target_frame_binding_hash=target_frame_binding.semantic_hash(
+            sides=enabled_sides
+        ),
+        tool_frame_binding_hash_by_side=tool_frame_binding_hashes_from_retargeter(
+            retargeter,
+            sides=tuple(configs),
+        ),
+        reference_frame_by_side=references,
+        side_config_by_side=configs,
+    )
+
+
 def capture_tcp_pose_envelope_anchor(
     *,
     anchor_id: str,
@@ -493,16 +615,27 @@ class TCPPoseEnvelopeTargetFilter:
         *,
         retargeter: Any,
         profile: TCPPoseEnvelopeProfile,
-        calibration: Any,
+        calibration: Any | None = None,
+        target_frame_binding: TCPPoseEnvelopeTargetFrameBinding | None = None,
         execution_epoch: int,
         anchor_receipt: TCPPoseEnvelopeAnchorReceipt | None,
         apply_to_target: bool = False,
     ) -> None:
         if not isinstance(profile, TCPPoseEnvelopeProfile):
             raise TypeError("profile must be TCPPoseEnvelopeProfile")
+        if (calibration is None) == (target_frame_binding is None):
+            raise ValueError(
+                "provide exactly one of calibration or target_frame_binding"
+            )
+        if target_frame_binding is not None and not isinstance(
+            target_frame_binding,
+            TCPPoseEnvelopeTargetFrameBinding,
+        ):
+            raise TypeError("target_frame_binding must be typed")
         self.retargeter = retargeter
         self.profile = profile
         self.calibration = calibration
+        self.target_frame_binding = target_frame_binding
         self.apply_to_target = bool(apply_to_target)
         self._tool_frame_binding_hash_by_side = (
             tool_frame_binding_hashes_from_retargeter(
@@ -535,6 +668,29 @@ class TCPPoseEnvelopeTargetFilter:
     def anchor_receipt(self) -> TCPPoseEnvelopeAnchorReceipt | None:
         with self._lock:
             return self._anchor_receipt
+
+    def _current_target_frame_binding_hash(self) -> str:
+        if self.target_frame_binding is not None:
+            return self.target_frame_binding.semantic_hash(
+                sides=self.profile.enabled_sides
+            )
+        return target_frame_binding_hash_from_calibration(
+            self.calibration,
+            sides=self.profile.enabled_sides,
+            reference_frame_by_side=self.profile.reference_frame_by_side,
+        )
+
+    def _target_world_from_base(self, side: str) -> np.ndarray:
+        if self.target_frame_binding is not None:
+            return _pose(
+                self.target_frame_binding.target_world_from_base_by_side[side],
+                name=f"target_frame_binding.target_world_from_base_by_side.{side}",
+            )
+        arm = self.calibration.get_arm_for_side(side)
+        return _pose(
+            getattr(arm, "T_D_B", None),
+            name=f"calibration.{side}.T_D_B",
+        )
 
     def rebind(
         self,
@@ -579,6 +735,10 @@ class TCPPoseEnvelopeTargetFilter:
     ) -> TCPPoseEnvelopeAnchorReceipt | None:
         """Rebind after runtime Home without reading qpos or invoking FK."""
 
+        if self.calibration is None:
+            raise TCPPoseEnvelopeRuntimeError(
+                "this envelope is not bound to a teleop calibration"
+            )
         previous = self.anchor_receipt
         anchor = (
             None
@@ -648,11 +808,7 @@ class TCPPoseEnvelopeTargetFilter:
             execution_epoch = int(self._execution_epoch)
             anchor_receipt = self._anchor_receipt
         try:
-            target_hash = target_frame_binding_hash_from_calibration(
-                self.calibration,
-                sides=self.profile.enabled_sides,
-                reference_frame_by_side=self.profile.reference_frame_by_side,
-            )
+            target_hash = self._current_target_frame_binding_hash()
             tool_targets = self._tool_targets(effective_targets)
             projection = project_tcp_pose_envelope(
                 tool_targets,
@@ -712,8 +868,8 @@ class TCPPoseEnvelopeTargetFilter:
         """Project one native-impedance composed TCP without IK or FK.
 
         Native RM65 impedance workers operate independently in each arm base.
-        The canonical envelope remains expressed in the calibrated desk frame,
-        so this adapter performs only the fixed base/desk transform around the
+        The envelope remains expressed in its bound target-world frame, so this
+        adapter performs only the fixed base/target-world transform around the
         same pure projector used by position control.
         """
 
@@ -730,20 +886,12 @@ class TCPPoseEnvelopeTargetFilter:
             execution_epoch = int(self._execution_epoch)
             anchor_receipt = self._anchor_receipt
         try:
-            arm = self.calibration.get_arm_for_side(normalized_side)
-            desk_from_base = _pose(
-                getattr(arm, "T_D_B", None),
-                name=f"calibration.{normalized_side}.T_D_B",
-            )
-            target_hash = target_frame_binding_hash_from_calibration(
-                self.calibration,
-                sides=self.profile.enabled_sides,
-                reference_frame_by_side=self.profile.reference_frame_by_side,
-            )
-            raw_desk_pose = desk_from_base @ raw_base_pose
+            target_world_from_base = self._target_world_from_base(normalized_side)
+            target_hash = self._current_target_frame_binding_hash()
+            raw_target_world_pose = target_world_from_base @ raw_base_pose
             projection = project_tcp_pose_envelope_side(
                 normalized_side,
-                raw_desk_pose,
+                raw_target_world_pose,
                 profile=self.profile,
                 target_frame_binding_hash=target_hash,
                 tool_frame_binding_hash_by_side=(
@@ -754,11 +902,11 @@ class TCPPoseEnvelopeTargetFilter:
                 execution_epoch=execution_epoch,
                 anchor_receipt=anchor_receipt,
             )
-            effective_desk_pose = projection.effective_tcp_pose_by_side[
+            effective_target_world_pose = projection.effective_tcp_pose_by_side[
                 normalized_side
             ]
             effective_base_pose = _pose(
-                np.linalg.inv(desk_from_base) @ effective_desk_pose,
+                np.linalg.inv(target_world_from_base) @ effective_target_world_pose,
                 name=f"effective_arm_base_tool_tcp.{normalized_side}",
             )
         except Exception as exc:  # noqa: BLE001 - Shadow records; Active fails closed.
@@ -852,7 +1000,8 @@ def install_tcp_pose_envelope_filter(
     *,
     retargeter: Any,
     profile: TCPPoseEnvelopeProfile,
-    calibration: Any,
+    calibration: Any | None = None,
+    target_frame_binding: TCPPoseEnvelopeTargetFrameBinding | None = None,
     execution_epoch: int,
     anchor_receipt: TCPPoseEnvelopeAnchorReceipt | None,
     apply_to_target: bool = False,
@@ -869,6 +1018,7 @@ def install_tcp_pose_envelope_filter(
         retargeter=retargeter,
         profile=profile,
         calibration=calibration,
+        target_frame_binding=target_frame_binding,
         execution_epoch=execution_epoch,
         anchor_receipt=anchor_receipt,
         apply_to_target=apply_to_target,
@@ -884,11 +1034,14 @@ __all__ = [
     "TCPPoseEnvelopeFileSpec",
     "TCPPoseEnvelopeFilterSnapshot",
     "TCPPoseEnvelopeRuntimeError",
+    "TCPPoseEnvelopeTargetFrameBinding",
     "TCPPoseEnvelopeTargetFilter",
     "capture_tcp_pose_envelope_anchor",
     "install_tcp_pose_envelope_filter",
     "load_tcp_pose_envelope_file_spec",
     "load_tcp_pose_envelope_profile",
+    "load_tcp_pose_envelope_profile_from_target_frame_binding",
     "target_frame_binding_hash_from_calibration",
+    "target_frame_binding_hash_from_transforms",
     "tool_frame_binding_hashes_from_retargeter",
 ]

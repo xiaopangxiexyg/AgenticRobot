@@ -15,12 +15,15 @@ from .tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeFileSpec,
     TCPPoseEnvelopeFilterSnapshot,
     TCPPoseEnvelopeRuntimeError,
+    TCPPoseEnvelopeTargetFrameBinding,
     TCPPoseEnvelopeTargetFilter,
     capture_tcp_pose_envelope_anchor,
     install_tcp_pose_envelope_filter,
     load_tcp_pose_envelope_file_spec,
     load_tcp_pose_envelope_profile,
+    load_tcp_pose_envelope_profile_from_target_frame_binding,
     target_frame_binding_hash_from_calibration,
+    target_frame_binding_hash_from_transforms,
     tool_frame_binding_hashes_from_retargeter,
 )
 
@@ -35,6 +38,7 @@ __all__ = [
     "TCPPoseEnvelopeFileSpec",
     "TCPPoseEnvelopeFilterSnapshot",
     "TCPPoseEnvelopeRuntimeError",
+    "TCPPoseEnvelopeTargetFrameBinding",
     "TCPPoseEnvelopeTargetFilter",
     "capture_tcp_pose_envelope_anchor",
     "deploy_target_frame_binding_hash",
@@ -42,6 +46,8 @@ __all__ = [
     "install_tcp_pose_envelope_filter",
     "load_tcp_pose_envelope_file_spec",
     "load_tcp_pose_envelope_profile",
+    "load_tcp_pose_envelope_profile_from_target_frame_binding",
     "target_frame_binding_hash_from_calibration",
+    "target_frame_binding_hash_from_transforms",
     "tool_frame_binding_hashes_from_retargeter",
 ]

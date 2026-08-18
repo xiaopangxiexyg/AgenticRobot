@@ -51,7 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
             "the encoded path must fit Linux's 107-byte limit"
         ),
     )
-    parser.add_argument("--calibration-profile", type=Path, required=True)
     parser.add_argument("--arm-ip-assignment", type=Path, required=True)
     parser.add_argument("--left-tool-profile", type=Path, required=True)
     parser.add_argument("--right-tool-profile", type=Path, required=True)
@@ -301,11 +300,6 @@ def main(argv: list[str] | None = None) -> int:
     except (FileExistsError, TypeError, ValueError) as error:
         parser.error(f"--socket-path preflight failed: {error}")
     files = {
-        "calibration_profile": _absolute_existing_file(
-            parser,
-            args.calibration_profile,
-            flag="--calibration-profile",
-        ),
         "arm_ip_assignment": _absolute_existing_file(
             parser,
             args.arm_ip_assignment,
@@ -329,7 +323,6 @@ def main(argv: list[str] | None = None) -> int:
     }
     resolved = resolve_exclusive_rm65_skill_deployment_profile(
         ExclusiveRM65SkillDeploymentProfile(
-            calibration_path=files["calibration_profile"],
             arm_ip_assignment_path=files["arm_ip_assignment"],
             tool_profile_path_by_side={
                 "left": files["left_tool_profile"],

@@ -54,6 +54,12 @@ requires a numeric trusted camera-to-world pose for that exact role; a moving
 wrist camera cannot reuse a static arm-base pose and remains unavailable until
 an activation-time joint/FK binding is implemented and reviewed.
 
+Independent real Skill Station geometry comes from the selected lower
+collision-scene URDF fixed-joint chain. Do not require, load, or reinterpret a
+Vive/teleoperation `TeleopCalibration` as arm-base, camera-world, envelope, or
+Station authority. Camera registry extrinsics remain camera-to-parent facts;
+fresh lower state plus FK owns moving-link poses and runtime envelope anchors.
+
 Semantic primitive axes and lower execution coordinates must remain explicit.
 When a Skill is defined in canonical Station/desk axes but the lower owner
 executes in an arm-base frame, the concrete profile must bind an exact typed

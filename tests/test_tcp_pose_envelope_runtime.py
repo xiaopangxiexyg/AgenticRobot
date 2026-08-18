@@ -15,6 +15,7 @@ from robot_motion.target_safety.tcp_pose_envelope import (
 from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     TCP_POSE_ENVELOPE_FILE_SCHEMA_V1,
     TCPPoseEnvelopeRuntimeError,
+    TCPPoseEnvelopeTargetFrameBinding,
     TCPPoseEnvelopeTargetFilter,
     capture_tcp_pose_envelope_anchor,
     install_tcp_pose_envelope_filter,
@@ -340,6 +341,35 @@ def test_active_projects_native_impedance_composed_tcp_in_arm_base() -> None:
     metadata = observer.command_metadata()
     assert metadata["modified_sides"] == ["left"]
     assert metadata["side_adjustments"]["left"]["translation_adjustment_m"] == pytest.approx(0.2)
+
+
+def test_explicit_target_frame_binding_matches_legacy_projection_and_is_immutable() -> None:
+    calibration, retargeter, profile = _fixture()
+    binding = TCPPoseEnvelopeTargetFrameBinding(
+        reference_frame_by_side=profile.reference_frame_by_side,
+        target_world_from_base_by_side=calibration.transforms,
+    )
+    observer = TCPPoseEnvelopeTargetFilter(
+        retargeter=retargeter,
+        profile=profile,
+        target_frame_binding=binding,
+        execution_epoch=7,
+        anchor_receipt=_anchor(calibration, profile),
+        apply_to_target=True,
+    )
+
+    result = observer.project_arm_base_tool_tcp(
+        "left",
+        _pose((0.5, 0.0, 0.3)),
+    )
+
+    np.testing.assert_allclose(result[:3, 3], (0.3, 0.0, 0.3), atol=1e-12)
+    assert binding.semantic_hash(sides=("left", "right")) == (
+        profile.target_frame_binding_hash
+    )
+    assert not binding.target_world_from_base_by_side["left"].flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        binding.target_world_from_base_by_side["left"][0, 3] = 99.0
 
 
 def test_shadow_native_impedance_projection_returns_base_pose_bit_exact() -> None:
