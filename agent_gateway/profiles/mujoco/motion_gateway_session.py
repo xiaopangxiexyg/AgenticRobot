@@ -9,7 +9,7 @@ the same lower runtime, dispatch owner and domain-HOLD boundary.
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 
 from agent_gateway.profiles.motion_primitive_resolution import (
@@ -200,6 +200,7 @@ class MujocoAgentTcpPoseGatewaySession:
         self,
         *,
         authenticated_client_id: str,
+        read_only_access: bool = False,
     ) -> BoundAgentGatewayWireAdapter:
         return BoundAgentGatewayWireAdapter(
             authenticated_client_id=authenticated_client_id,
@@ -214,6 +215,7 @@ class MujocoAgentTcpPoseGatewaySession:
             ),
             operation_launcher=self.service.launch_operation,
             hardware_view_provider=self.hardware_view_provider,
+            read_only_access=read_only_access,
         )
 
     def wait(self, *, timeout_sec: float | None = None) -> bool:
@@ -234,6 +236,7 @@ class MujocoAgentTcpPoseGatewaySession:
         socket_mode: int = 0o600,
         max_frame_bytes: int = 2 * 1024 * 1024,
         peer_idle_timeout_sec: float = 10.0,
+        read_only_client_ids: Collection[str] = (),
     ) -> AgentGatewayUnixJsonServer:
         """Bind the local endpoint without starting its serve loop."""
 
@@ -244,11 +247,15 @@ class MujocoAgentTcpPoseGatewaySession:
             raise ValueError(
                 "Unix peer client map must exactly cover the session access policy."
             )
+        read_only_clients = frozenset(read_only_client_ids)
+        if not read_only_clients <= frozenset(peer_map.client_id_by_uid.values()):
+            raise ValueError("Read-only clients must exist in the Unix peer map.")
         return AgentGatewayUnixJsonServer(
             socket_path=socket_path,
             peer_client_map=peer_map,
             facade_factory=lambda client_id: self.wire_adapter(
-                authenticated_client_id=client_id
+                authenticated_client_id=client_id,
+                read_only_access=client_id in read_only_clients,
             ),
             close_gateway=self.close,
             socket_mode=socket_mode,

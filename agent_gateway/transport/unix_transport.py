@@ -245,6 +245,36 @@ def validate_agent_gateway_unix_server_preflight(
     return path, _peer_idle_timeout(peer_idle_timeout_sec)
 
 
+def validate_agent_gateway_unix_group_parent(
+    *,
+    socket_path: str | os.PathLike[str],
+) -> int:
+    """Require a setgid, group-searchable parent for a mode-0660 socket."""
+
+    path, _ = validate_agent_gateway_unix_server_preflight(socket_path=socket_path)
+    parent = os.path.dirname(path)
+    try:
+        parent_stat = os.lstat(parent)
+    except FileNotFoundError as error:
+        raise ValueError(
+            "A group-shared Gateway socket parent must already exist."
+        ) from error
+    if not stat.S_ISDIR(parent_stat.st_mode) or stat.S_ISLNK(parent_stat.st_mode):
+        raise ValueError(
+            "A group-shared Gateway socket parent must be a real directory."
+        )
+    if not (
+        parent_stat.st_mode & stat.S_ISGID
+        and parent_stat.st_mode & stat.S_IRGRP
+        and parent_stat.st_mode & stat.S_IXGRP
+    ):
+        raise ValueError(
+            "A group-shared Gateway socket parent must be setgid and "
+            "group-readable/searchable."
+        )
+    return parent_stat.st_gid
+
+
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
@@ -567,6 +597,8 @@ class AgentGatewayUnixJsonServer(
 
         self.socket_path = path
         self.socket_mode = _socket_mode(socket_mode)
+        if self.socket_mode == 0o660:
+            validate_agent_gateway_unix_group_parent(socket_path=path)
         self.max_frame_bytes = _frame_limit(max_frame_bytes)
         self.peer_idle_timeout_sec = peer_idle_timeout
         self.peer_client_map = peer_client_map
@@ -872,5 +904,6 @@ __all__ = [
     "AgentGatewayUnixPeerClientMap",
     "AgentGatewayUnixPeerCredentials",
     "AgentGatewayUnixProtocolError",
+    "validate_agent_gateway_unix_group_parent",
     "validate_agent_gateway_unix_server_preflight",
 ]

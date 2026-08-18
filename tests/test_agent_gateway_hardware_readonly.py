@@ -326,6 +326,43 @@ def test_read_only_submission_is_server_enforced_before_admission() -> None:
     assert len(adapter.service.requests) == 1
 
 
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "get_gateway_events",
+        "begin_artifact_upload",
+        "write_artifact_chunk",
+        "commit_artifact_upload",
+        "acknowledge_artifact_materialization",
+        "submit_skill_request",
+        "cancel_own_operation",
+        "request_hold_own_domain",
+    ),
+)
+def test_read_only_authenticated_client_cannot_use_privileged_methods(
+    method_name: str,
+) -> None:
+    read = _route(effect="read_only")
+    manifest = _manifest(read)
+    adapter = _submission_adapter(manifest)
+    adapter.read_only_access = True
+
+    with pytest.raises(PermissionError, match="read-only authenticated client"):
+        getattr(adapter, method_name)({})
+
+
+def test_read_only_authenticated_client_can_still_submit_strict_read_route() -> None:
+    read = _route(effect="read_only")
+    manifest = _manifest(read)
+    adapter = _submission_adapter(manifest)
+    adapter.read_only_access = True
+
+    accepted = adapter.submit_read_only_skill_request(
+        _request_payload(manifest, read)
+    )
+    assert accepted["accepted"] is True
+
+
 def _encoded_request(method: str, payload=None) -> bytes:
     body = json.dumps(
         {

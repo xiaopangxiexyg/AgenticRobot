@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 
 from agent_gateway.protocol.contracts import AgentObservationSnapshot, AgentSkillRequest
@@ -511,6 +511,7 @@ class RealAgentPrimitiveGatewaySession:
         grant_resolver: (
             Callable[[AgentSkillRequest], SkillExecutionGrant | None] | None
         ) = None,
+        read_only_access: bool = False,
     ) -> BoundAgentGatewayWireAdapter:
         return BoundAgentGatewayWireAdapter(
             authenticated_client_id=authenticated_client_id,
@@ -526,6 +527,7 @@ class RealAgentPrimitiveGatewaySession:
             operation_launcher=self.service.launch_operation,
             grant_resolver=grant_resolver,
             hardware_view_provider=self.hardware_view_provider,
+            read_only_access=read_only_access,
         )
 
     def build_unix_json_server(
@@ -539,18 +541,23 @@ class RealAgentPrimitiveGatewaySession:
         grant_resolver: (
             Callable[[AgentSkillRequest], SkillExecutionGrant | None] | None
         ) = None,
+        read_only_client_ids: Collection[str] = (),
     ) -> AgentGatewayUnixJsonServer:
         peer_map = AgentGatewayUnixPeerClientMap(client_id_by_uid)
         if set(peer_map.client_id_by_uid.values()) != set(
             self.service.access_policy.allowed_client_ids
         ):
             raise ValueError("Unix peer map must exactly cover allowed clients.")
+        read_only_clients = frozenset(read_only_client_ids)
+        if not read_only_clients <= frozenset(peer_map.client_id_by_uid.values()):
+            raise ValueError("Read-only clients must exist in the Unix peer map.")
         return AgentGatewayUnixJsonServer(
             socket_path=socket_path,
             peer_client_map=peer_map,
             facade_factory=lambda client_id: self.wire_adapter(
                 authenticated_client_id=client_id,
                 grant_resolver=grant_resolver,
+                read_only_access=client_id in read_only_clients,
             ),
             close_gateway=self.close,
             socket_mode=socket_mode,

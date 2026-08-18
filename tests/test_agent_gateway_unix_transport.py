@@ -151,6 +151,7 @@ def _start_server(
     facade: _FakeBoundFacade,
     peer_idle_timeout_sec: float = 1.0,
     max_frame_bytes: int = 2 * 1024 * 1024,
+    socket_mode: int = 0o600,
 ):
     close_calls: list[object] = []
 
@@ -172,6 +173,7 @@ def _start_server(
         close_gateway=close_gateway,
         peer_idle_timeout_sec=peer_idle_timeout_sec,
         max_frame_bytes=max_frame_bytes,
+        socket_mode=socket_mode,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -238,6 +240,26 @@ def test_server_refuses_existing_endpoint_and_unlinks_only_its_own_socket(
     assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
     _stop_server(server, thread)
     assert not path.exists()
+    assert len(close_calls) == 1
+
+
+def test_group_shared_server_requires_setgid_parent_and_inherits_group(
+    short_unix_socket_path_factory,
+) -> None:
+    path = short_unix_socket_path_factory("group")
+    facade = _FakeBoundFacade("rpent:local")
+    with pytest.raises(ValueError, match="must be setgid"):
+        _start_server(path=path, facade=facade, socket_mode=0o660)
+
+    os.chmod(path.parent, 0o2750)
+    server, thread, close_calls = _start_server(
+        path=path,
+        facade=facade,
+        socket_mode=0o660,
+    )
+    assert stat.S_IMODE(os.lstat(path).st_mode) == 0o660
+    assert os.lstat(path).st_gid == os.lstat(path.parent).st_gid
+    _stop_server(server, thread)
     assert len(close_calls) == 1
 
 

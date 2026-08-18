@@ -102,6 +102,25 @@ def test_cli_accepts_a_list_of_reviewed_actions_for_temporary_testing() -> None:
     assert not hasattr(parsed, "calibration_profile")
 
 
+def test_cli_accepts_distinct_repeatable_ssh_read_only_identities() -> None:
+    parsed = gateway_cli.build_parser().parse_args(
+        [
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN),
+            "--ssh-read-only-client",
+            "rpent.remote.alice",
+            "1101",
+            "--ssh-read-only-client",
+            "rpent.remote.bob",
+            "1102",
+        ]
+    )
+
+    assert parsed.ssh_read_only_client == [
+        ["rpent.remote.alice", "1101"],
+        ["rpent.remote.bob", "1102"],
+    ]
+
+
 def test_cli_rejects_partial_perception_attachment_before_profile_resolution(
     monkeypatch,
 ) -> None:
@@ -224,6 +243,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     )
     runtime = SimpleNamespace(motion_port=motion_port, last_hold_receipt=hold)
     socket_path = short_unix_socket_path_factory("real-cli")
+    socket_path.parent.chmod(0o2750)
     composition = SimpleNamespace(
         socket_path=socket_path,
         client_id="rpent.dexteleop",
@@ -260,12 +280,18 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         assemble,
     )
 
-    assert gateway_cli.main(
-        _argv(
-            confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
-            socket_path=socket_path,
-        )
-    ) == 0
+    argv = _argv(
+        confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        socket_path=socket_path,
+    )
+    argv.extend(
+        [
+            "--ssh-read-only-client",
+            "rpent.remote.alice",
+            "1101",
+        ]
+    )
+    assert gateway_cli.main(argv) == 0
 
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [event["event"] for event in events] == [
@@ -277,3 +303,6 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert captured["lower"] is lower
     assert captured["authorized_side"] == "right"
     assert captured["authorized_action"] == "forward"
+    assert captured["ssh_read_only_client_id_by_uid"] == {
+        1101: "rpent.remote.alice"
+    }

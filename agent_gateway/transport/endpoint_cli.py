@@ -34,6 +34,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="path",
         help="stdout representation (default: path for shell assignment)",
     )
+    parser.add_argument(
+        "--group-access",
+        action="store_true",
+        help=(
+            "allocate a mode-2750 session directory below a pre-created "
+            "setgid root for the Gateway's dedicated read-only access group"
+        ),
+    )
     return parser
 
 
@@ -42,7 +50,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = repo_root() / "temp" / "ag" if args.root is None else args.root
     try:
-        allocation = allocate_agent_gateway_unix_endpoint(endpoint_root=root)
+        allocation = allocate_agent_gateway_unix_endpoint(
+            endpoint_root=root,
+            endpoint_dir_mode=0o2750 if args.group_access else 0o700,
+        )
     except (OSError, TypeError, ValueError) as error:
         parser.error(f"cannot allocate Unix endpoint: {error}")
 
