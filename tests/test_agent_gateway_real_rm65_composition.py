@@ -181,7 +181,7 @@ def test_composition_binds_existing_gateway_to_one_lower_graph_without_start(
         RM65_SKILL_EXECUTION_FRAME_ID_V1
     )
     assert RM65_SKILL_STATION_FRAME_ID_V1 in composition.frame_graph.frame_by_id
-    assert len(composition.safety_envelope_ref.allowed_route_ids) == 4
+    assert len(composition.safety_envelope_ref.allowed_route_ids) == 10
     assert composition.authorization.grant_issued is False
     assert composition.application.config.control_hz == (
         lower.profile.position_profile.rates.reference_hz
@@ -230,7 +230,7 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         assert session.service.protocol_runtime.session_capabilities.artifact_transfer_enabled
         assert session.rgb_executor is not None
         assert session.depth_executor is not None
-        assert len(session.contract_bundle.route_manifest.skill_routes) == 7
+        assert len(session.contract_bundle.route_manifest.skill_routes) == 13
         effects = {
             entry.route.skill_id: entry.route.control_effect_class
             for entry in session.contract_bundle.route_manifest.skill_routes

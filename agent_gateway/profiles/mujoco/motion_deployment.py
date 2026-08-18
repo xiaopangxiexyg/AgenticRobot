@@ -45,13 +45,17 @@ from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorSet,
 )
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     cardinal_tcp_step_skill_definition_v1,
+    fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
     tcp_pose_target_skill_definition_v1,
 )
 from agent_gateway.skills.motion.schemas import (
     cardinal_tcp_step_schema_entry_v1,
+    fixed_cardinal_tcp_step_schema_entry_v1,
     fixed_level_tcp_orientation_schema_entry_v1,
     tcp_pose_target_schema_entry_v1,
     validate_agent_motion_parameters_v1,
@@ -83,6 +87,8 @@ from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
     MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1,
     MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1,
+    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1,
@@ -570,6 +576,29 @@ class MujocoPassiveTcpPoseHistoryDeploymentBinding:
 
 
 @dataclass(frozen=True)
+class MujocoAgentTcpFixedCardinalStepContract:
+    skill_id: str
+    direction: str
+    deployment_binding: MujocoAgentTcpPoseDeploymentBinding
+    evaluation_plan: SkillEvaluationPlan
+
+    def __post_init__(self) -> None:
+        if self.skill_id not in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
+            raise ValueError("skill_id is not a fixed cardinal TCP-step Skill.")
+        if FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[self.skill_id] != (
+            self.direction
+        ):
+            raise ValueError("Fixed cardinal Skill and direction disagree.")
+        if not isinstance(
+            self.deployment_binding,
+            MujocoAgentTcpPoseDeploymentBinding,
+        ):
+            raise TypeError("deployment_binding must be typed.")
+        if not isinstance(self.evaluation_plan, SkillEvaluationPlan):
+            raise TypeError("evaluation_plan must be typed.")
+
+
+@dataclass(frozen=True)
 class MujocoAgentTcpFixedOrientationContract:
     profile: MujocoAgentTcpFixedOrientationProfile
     motion_profile: MujocoAgentTcpPoseMotionProfile
@@ -603,6 +632,9 @@ class MujocoAgentTcpPoseContractBundle:
     cardinal_step_profile: MujocoAgentTcpCardinalStepProfile
     evaluation_plan: SkillEvaluationPlan
     cardinal_step_evaluation_plan: SkillEvaluationPlan
+    fixed_cardinal_step_contracts: tuple[
+        MujocoAgentTcpFixedCardinalStepContract, ...
+    ]
     fixed_orientation_contracts: tuple[
         MujocoAgentTcpFixedOrientationContract, ...
     ]
@@ -692,6 +724,29 @@ class MujocoAgentTcpPoseContractBundle:
             raise ValueError(
                 "Cardinal-step execution frame and motion profile disagree."
             )
+        fixed_cardinal_contracts = tuple(self.fixed_cardinal_step_contracts)
+        if {
+            item.skill_id for item in fixed_cardinal_contracts
+        } != set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) or len(
+            fixed_cardinal_contracts
+        ) != len(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1):
+            raise ValueError(
+                "Bundle requires exactly six fixed cardinal-step contracts."
+            )
+        for item in fixed_cardinal_contracts:
+            entry = self.route_manifest.route(item.skill_id, "1")
+            if entry.deployment_binding.deployment_binding_hash != (
+                item.deployment_binding.semantic_content_hash
+            ):
+                raise ValueError(
+                    "Fixed cardinal-step Route uses another deployment binding."
+                )
+            if entry.evaluation_plan_hash != (
+                item.evaluation_plan.semantic_content_hash
+            ):
+                raise ValueError(
+                    "Fixed cardinal-step Route uses another evaluation plan."
+                )
         orientation_contracts = tuple(self.fixed_orientation_contracts)
         if len(orientation_contracts) != len(
             FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
@@ -1146,7 +1201,17 @@ def _cardinal_step_validators(
     *,
     route: SkillExecutionRoute,
     profile: MujocoAgentTcpCardinalStepProfile,
+    allowed_directions: tuple[str, ...] | None = None,
 ) -> AgentSkillPayloadValidatorSet:
+    directions = (
+        tuple(item.direction.value for item in profile.primitives)
+        if allowed_directions is None
+        else tuple(allowed_directions)
+    )
+    if not directions or set(directions) - {
+        item.direction.value for item in profile.primitives
+    }:
+        raise ValueError("Cardinal validator directions are outside the profile.")
     parameter_fields = {
         "component_id",
         "direction",
@@ -1168,9 +1233,7 @@ def _cardinal_step_validators(
             schema_kind="cardinal_tcp_step",
             parameters=payload,
             allowed_component_ids=(profile.component_id,),
-            allowed_cardinal_directions=tuple(
-                item.direction.value for item in profile.primitives
-            ),
+            allowed_cardinal_directions=directions,
         )
         exact = {
             "component_id": profile.component_id,
@@ -1227,6 +1290,11 @@ def _cardinal_step_validators(
         validator_id=(
             "payload-validator:mujoco-agent-tcp-cardinal-step:"
             + profile.semantic_content_hash
+            + (
+                ""
+                if allowed_directions is None
+                else ":" + route.skill_id
+            )
         ),
         skill_id=route.skill_id,
         skill_version=route.skill_version,
@@ -1714,6 +1782,70 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         route=cardinal_step_route,
         schema_entry=cardinal_step_schema,
     )
+    fixed_cardinal_definitions: list[Any] = []
+    fixed_cardinal_schemas: list[Any] = []
+    fixed_cardinal_routes: list[SkillExecutionRoute] = []
+    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
+        fixed_definition = fixed_cardinal_tcp_step_skill_definition_v1(
+            skill_id=skill_id,
+            controlled_component_ids=("right_arm",),
+        )
+        fixed_schema = fixed_cardinal_tcp_step_schema_entry_v1(
+            skill_id=skill_id,
+            skill_definition_hash=fixed_definition.semantic_content_hash,
+            parameter_profile_id=(
+                MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1
+            ),
+            parameter_profile_hash=cardinal_step_profile.semantic_content_hash,
+            allowed_component_ids=("right_arm",),
+            allowed_reference_frame_ids=(
+                cardinal_step_profile.reference_frame_id,
+            ),
+            reference_frame_spec_hash=(
+                cardinal_step_profile.reference_frame_spec_hash
+            ),
+            frame_graph_hash=profile.frame_graph_hash,
+            tool_config_hash=profile.tool_config_hash,
+            calibration_hash=profile.calibration_hash,
+            primitive_catalog_hash=cardinal_step_profile.primitive_catalog_hash,
+        )
+        fixed_route = SkillExecutionRoute(
+            skill_id=fixed_definition.skill_id,
+            skill_version=fixed_definition.skill_version,
+            skill_definition_hash=fixed_definition.semantic_content_hash,
+            route_id=(
+                MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[
+                    skill_id
+                ]
+            ),
+            route_version="1",
+            parameter_schema_hash=fixed_schema.parameter_schema_hash,
+            execution_result_schema_hash=(
+                fixed_schema.execution_result_schema_hash
+            ),
+            task_evaluation_schema_hash=(
+                fixed_schema.task_evaluation_schema_hash
+            ),
+            allowed_parameter_profiles=fixed_schema.parameter_profiles,
+            control_effect_class="motion",
+            privilege_tier="t1_sim_or_no_motion",
+            supported_modes=("sim_active",),
+            target_kind="sim",
+            may_move_robot=True,
+            may_open_publication=False,
+            requires_operator_confirmation=False,
+            requires_deadman=False,
+            max_operation_duration_ms=10_000,
+            cancellation_policy="hold_on_cancel_disconnect_or_timeout",
+            requires_task_evaluation=True,
+        )
+        validate_agent_motion_route_schema_v1(
+            route=fixed_route,
+            schema_entry=fixed_schema,
+        )
+        fixed_cardinal_definitions.append(fixed_definition)
+        fixed_cardinal_schemas.append(fixed_schema)
+        fixed_cardinal_routes.append(fixed_route)
     orientation_motion_profile = MujocoAgentTcpPoseMotionProfile(
         reference_frame_id=profile.reference_frame_id,
         reference_frame_spec_hash=profile.reference_frame_spec_hash,
@@ -2001,6 +2133,118 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             cardinal_step_schema.task_evaluation_schema_hash
         ),
     )
+    fixed_cardinal_contracts: list[
+        MujocoAgentTcpFixedCardinalStepContract
+    ] = []
+    for fixed_definition, fixed_schema, fixed_route in zip(
+        fixed_cardinal_definitions,
+        fixed_cardinal_schemas,
+        fixed_cardinal_routes,
+        strict=True,
+    ):
+        skill_id = fixed_definition.skill_id
+        direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[skill_id]
+        fixed_binding = MujocoAgentTcpPoseDeploymentBinding(
+            deployment_binding_id=(
+                "sim.mujoco.agent_tcp_fixed_cardinal_step:"
+                + skill_id
+                + ":"
+                + exact["runtime_session_id"]
+            ),
+            deployment_binding_version="1",
+            route_hash=fixed_route.semantic_content_hash,
+            runtime_session_id=exact["runtime_session_id"],
+            control_domain_id=exact["control_domain_id"],
+            target_binding_id=target_binding.binding_id,
+            station_manifest_hash=station.semantic_content_hash,
+            execution_manifest_hash=execution.semantic_content_hash,
+            execution_domain_binding_hash=target_binding.semantic_content_hash,
+            target_runtime_action_contract_hash=(
+                target_binding.target_runtime_action_contract_hash
+            ),
+            component_target_capability_hash=(
+                runtime.component_target_capability.semantic_content_hash
+            ),
+            action_schema_hash=runtime.action_schema.semantic_content_hash,
+            observation_binding_id=exact["observation_binding_id"],
+            observation_binding_hash=exact["observation_binding_hash"],
+            observation_plan_hash=exact["observation_plan_hash"],
+            observation_capability_hash=exact["observation_capability_hash"],
+            pose_schema_hash=exact["pose_schema_hash"],
+            motion_profile_hash=profile.semantic_content_hash,
+            reference_frame_id=cardinal_step_profile.reference_frame_id,
+            reference_frame_spec_hash=(
+                cardinal_step_profile.reference_frame_spec_hash
+            ),
+            frame_graph_hash=profile.frame_graph_hash,
+            tool_config_hash=profile.tool_config_hash,
+            calibration_hash=profile.calibration_hash,
+            trace_requirement_profile_id=station.trace_requirement_profile_id,
+            executor_id=(
+                MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1[
+                    skill_id
+                ]
+            ),
+            explicit_exclusions=(
+                "agent_authored_direction",
+                "agent_authored_distance",
+                "hand_control",
+                "hardware_backend",
+                "model_inference",
+                "second_dispatch_owner",
+                "trajectory_streaming",
+                "upper_target_derivation",
+            ),
+            safety_envelope_refs=safety_envelope_refs_for_route(
+                fixed_route.route_id
+            ),
+        )
+        fixed_evaluator = SkillEvaluatorSpec(
+            evaluator_id=f"motion.tcp_fixed_{direction}_step_arrival_rule",
+            evaluator_version="1",
+            evaluator_kind="rule_based",
+            input_evidence_schema_hash=evaluator_input_hash,
+            output_schema_hash=fixed_schema.task_evaluation_schema_hash,
+            role="required",
+            execution_location="gateway_worker",
+            deadline_ms=1_000,
+            failure_policy="veto",
+            evidence_domain_id=exact["control_domain_id"],
+            configuration_hash=canonical_content_hash(
+                {
+                    "motion_profile_hash": profile.semantic_content_hash,
+                    "cardinal_step_profile_hash": (
+                        cardinal_step_profile.semantic_content_hash
+                    ),
+                    "direction": direction,
+                },
+                domain=(
+                    "dexteleop.agent_skill.tcp_fixed_cardinal_step_evaluator.v1"
+                ),
+            ),
+        )
+        fixed_evaluation_plan = SkillEvaluationPlan(
+            evaluation_plan_id=fixed_evaluator.evaluator_id,
+            evaluation_plan_version="1",
+            skill_definition_hash=fixed_definition.semantic_content_hash,
+            route_hash=fixed_route.semantic_content_hash,
+            deployment_binding_hash=fixed_binding.semantic_content_hash,
+            evaluator_specs=(fixed_evaluator,),
+            aggregation_policy_id="motion.single_required_rule.v1",
+            aggregation_policy_hash=aggregation_hash,
+            required_evaluation_deadline_ms=1_000,
+            missing_evidence_policy="fail",
+            disagreement_policy="aggregation_policy",
+            task_outcome_schema_hash=fixed_schema.task_evaluation_schema_hash,
+        )
+        fixed_cardinal_contracts.append(
+            MujocoAgentTcpFixedCardinalStepContract(
+                skill_id=skill_id,
+                direction=direction,
+                deployment_binding=fixed_binding,
+                evaluation_plan=fixed_evaluation_plan,
+            )
+        )
     orientation_contracts: list[MujocoAgentTcpFixedOrientationContract] = []
     for orientation_profile, orientation_definition, orientation_schema, orientation_route in zip(
         orientation_profiles,
@@ -2340,12 +2584,14 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     definition_items = [
         definition,
         cardinal_step_definition,
+        *fixed_cardinal_definitions,
         *orientation_definitions,
         state_definition,
     ]
     schema_items = [
         schema_entry,
         cardinal_step_schema,
+        *fixed_cardinal_schemas,
         *orientation_schemas,
         state_schema,
     ]
@@ -2422,6 +2668,38 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             availability_hash=state_availability,
         ),
     ]
+    for fixed_route, fixed_contract in zip(
+        fixed_cardinal_routes,
+        fixed_cardinal_contracts,
+        strict=True,
+    ):
+        route_items.insert(
+            -1,
+            SkillRouteManifestEntry(
+                route=fixed_route,
+                deployment_binding=fixed_contract.deployment_binding.to_ref(),
+                evaluation_plan_hash=(
+                    fixed_contract.evaluation_plan.semantic_content_hash
+                ),
+                availability_hash=canonical_content_hash(
+                    {
+                        "status": "configured_requires_activation_preflight",
+                        "route_hash": fixed_route.semantic_content_hash,
+                        "deployment_binding_hash": (
+                            fixed_contract.deployment_binding.semantic_content_hash
+                        ),
+                        "cardinal_step_profile_hash": (
+                            cardinal_step_profile.semantic_content_hash
+                        ),
+                        "fixed_direction": fixed_contract.direction,
+                    },
+                    domain=(
+                        "dexteleop.agent_skill."
+                        "mujoco_tcp_fixed_cardinal_step_availability.v1"
+                    ),
+                ),
+            ),
+        )
     for orientation_route, orientation_contract in zip(
         orientation_routes,
         orientation_contracts,
@@ -2578,6 +2856,18 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         ),
     ]
     validator_items[2:2] = [
+        _cardinal_step_validators(
+            route=fixed_route,
+            profile=cardinal_step_profile,
+            allowed_directions=(fixed_contract.direction,),
+        )
+        for fixed_route, fixed_contract in zip(
+            fixed_cardinal_routes,
+            fixed_cardinal_contracts,
+            strict=True,
+        )
+    ]
+    validator_items[2:2] = [
         _fixed_orientation_validators(
             route=orientation_route,
             profile=orientation_contract.profile,
@@ -2626,6 +2916,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         cardinal_step_profile=cardinal_step_profile,
         evaluation_plan=evaluation_plan,
         cardinal_step_evaluation_plan=cardinal_step_evaluation_plan,
+        fixed_cardinal_step_contracts=tuple(fixed_cardinal_contracts),
         fixed_orientation_contracts=tuple(orientation_contracts),
         payload_validators=validators,
         station_manifest=station,
@@ -2642,6 +2933,9 @@ __all__ = [
     "MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1",
     "MUJOCO_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1",
     "MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1",
+    "MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_DIRECTION_BY_SKILL_ID_V1",
+    "MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1",
+    "MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1",
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1",
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1",
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1",
@@ -2667,6 +2961,7 @@ __all__ = [
     "MUJOCO_AGENT_TCP_POSE_STATE_ROUTE_ID_V1",
     "MUJOCO_AGENT_TCP_POSE_WORKSPACE_BOUNDS_V1",
     "MujocoAgentTcpCardinalStepProfile",
+    "MujocoAgentTcpFixedCardinalStepContract",
     "MujocoAgentTcpFixedOrientationContract",
     "MujocoAgentTcpFixedOrientationProfile",
     "MujocoAgentTcpPoseContractBundle",

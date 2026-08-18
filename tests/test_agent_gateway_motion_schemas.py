@@ -7,6 +7,8 @@ import pytest
 from agent_gateway.protocol.skill_catalog import SkillExecutionRoute
 from agent_gateway.skills.motion.definition import (
     CARDINAL_TCP_STEP_DIRECTIONS_V1,
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
     REGISTERED_TCP_TRAJECTORY_SKILL_ID_V1,
@@ -14,12 +16,14 @@ from agent_gateway.skills.motion.definition import (
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_POSE_TARGET_SKILL_ID_V1,
     cardinal_tcp_step_skill_definition_v1,
+    fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
     tcp_pose_target_skill_definition_v1,
 )
 from agent_gateway.skills.motion.schemas import (
     InlineTcpTrajectoryLimits,
     cardinal_tcp_step_schema_entry_v1,
+    fixed_cardinal_tcp_step_schema_entry_v1,
     fixed_level_tcp_orientation_schema_entry_v1,
     inline_tcp_trajectory_schema_entry_v1,
     registered_tcp_trajectory_schema_entry_v1,
@@ -177,6 +181,43 @@ def test_cardinal_tcp_step_exposes_direction_but_pins_lower_profile_facts() -> N
             schema_kind="cardinal_tcp_step",
             parameters={**parameters, "direction": "diagonal"},
             allowed_component_ids=("right_arm",),
+        )
+
+
+def test_fixed_cardinal_tcp_step_pins_direction_in_skill_identity_and_schema() -> None:
+    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
+        direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[skill_id]
+        definition = fixed_cardinal_tcp_step_skill_definition_v1(
+            skill_id=skill_id,
+            controlled_component_ids=("right_arm",),
+        )
+        entry = fixed_cardinal_tcp_step_schema_entry_v1(
+            skill_id=skill_id,
+            skill_definition_hash=definition.semantic_content_hash,
+            parameter_profile_id=f"right-arm-fixed-{direction}-step-v1",
+            parameter_profile_hash=f"profile:fixed-{direction}",
+            allowed_component_ids=("right_arm",),
+            allowed_reference_frame_ids=("station_base",),
+            reference_frame_spec_hash="frame-spec:station-base",
+            frame_graph_hash="frame-graph:fixture",
+            tool_config_hash="tool-config:fixture",
+            calibration_hash="calibration:fixture",
+            primitive_catalog_hash="primitive-catalog:fixture",
+        )
+
+        assert definition.parameter_semantics_id.endswith(
+            f".{direction}.no_distance.v1"
+        )
+        assert entry.skill_id == skill_id
+        assert entry.parameter_schema["properties"]["direction"]["enum"] == (
+            direction,
+        )
+        assert "distance_m" not in entry.parameter_schema["properties"]
+
+    with pytest.raises(ValueError, match="not a fixed cardinal"):
+        fixed_cardinal_tcp_step_skill_definition_v1(
+            skill_id=TCP_CARDINAL_STEP_SKILL_ID_V1,
+            controlled_component_ids=("right_arm",),
         )
 
 

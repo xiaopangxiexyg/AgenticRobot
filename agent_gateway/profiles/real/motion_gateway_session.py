@@ -57,6 +57,9 @@ from agent_gateway.skills.perception.schemas import (
     RGB_FRAME_ENCODING_V1,
     RGB_FRAME_SCHEMA_ID_V1,
 )
+from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
+)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import pose_matrix_to_xyzquat
 from teleop_runtime.skill_deploy.motion_port import (
@@ -705,7 +708,9 @@ def assemble_real_agent_primitive_gateway_session(
     for entry in motion_entries:
         route = entry.route
         binding = contract_bundle.binding_for_skill(route.skill_id)
-        if route.skill_id == "motion.step_tcp_cardinal":
+        if route.skill_id == "motion.step_tcp_cardinal" or (
+            route.skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+        ):
             profile = contract_bundle.cardinal_profile
         else:
             profile = contract_bundle.orientation_profile(route.skill_id)

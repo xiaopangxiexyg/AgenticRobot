@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
     TCP_CARDINAL_STEP_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
@@ -29,12 +31,7 @@ from .motion_primitive_profiles import (
 _PREFIX = struct.Struct(">I")
 _CONFIRM_TOKEN = "EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE"
 _ACTION_TO_SKILL_ID = {
-    "forward": TCP_CARDINAL_STEP_SKILL_ID_V1,
-    "backward": TCP_CARDINAL_STEP_SKILL_ID_V1,
-    "left": TCP_CARDINAL_STEP_SKILL_ID_V1,
-    "right": TCP_CARDINAL_STEP_SKILL_ID_V1,
-    "up": TCP_CARDINAL_STEP_SKILL_ID_V1,
-    "down": TCP_CARDINAL_STEP_SKILL_ID_V1,
+    **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
     "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
@@ -205,9 +202,13 @@ def _parameters(
     properties = _schema_properties(schema_entry)
     if expected_component not in _schema_enum(properties, "component_id"):
         raise RuntimeError("Selected side is not allowed by the Skill schema.")
-    if skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1 and action not in _schema_enum(
-        properties, "direction"
-    ):
+    fixed_cardinal_direction = (
+        FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(skill_id)
+    )
+    if (
+        skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1
+        or fixed_cardinal_direction is not None
+    ) and action not in _schema_enum(properties, "direction"):
         raise RuntimeError("Requested cardinal action is not allowed by the Skill schema.")
     reference_frames = _schema_enum(properties, "reference_frame_id")
     if len(reference_frames) != 1:
@@ -228,7 +229,10 @@ def _parameters(
             raise RuntimeError(
                 f"Skill schema {field_name} disagrees with the observation snapshot."
             )
-    if skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1:
+    if (
+        skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1
+        or fixed_cardinal_direction is not None
+    ):
         payload["direction"] = action
         payload["primitive_catalog_hash"] = _schema_const(
             properties, "primitive_catalog_hash"

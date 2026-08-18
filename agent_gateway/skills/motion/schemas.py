@@ -23,6 +23,8 @@ from agent_gateway.protocol.skill_catalog import (
 )
 from agent_gateway.skills.motion.definition import (
     CARDINAL_TCP_STEP_DIRECTIONS_V1,
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1,
     INLINE_TCP_TRAJECTORY_SKILL_ID_V1,
@@ -282,6 +284,7 @@ def cardinal_tcp_step_schema_entry_v1(
     calibration_hash: str,
     primitive_catalog_hash: str,
     allowed_directions: tuple[str, ...] = CARDINAL_TCP_STEP_DIRECTIONS_V1,
+    skill_id: str = TCP_CARDINAL_STEP_SKILL_ID_V1,
 ) -> AgentSkillSchemaEntry:
     """Publish one bounded semantic step over a lower-owned primitive catalog.
 
@@ -291,6 +294,11 @@ def cardinal_tcp_step_schema_entry_v1(
     Distance, target derivation, safety, IK and dispatch remain lower-owned.
     """
 
+    selected_skill_id = _required(skill_id, field_name="skill_id")
+    if selected_skill_id != TCP_CARDINAL_STEP_SKILL_ID_V1 and (
+        selected_skill_id not in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+    ):
+        raise ValueError("skill_id is not a cardinal TCP-step Skill.")
     components = _component_ids(allowed_component_ids)
     frames = _component_ids(allowed_reference_frame_ids)
     directions = tuple(
@@ -361,11 +369,52 @@ def cardinal_tcp_step_schema_entry_v1(
         ],
     }
     return _schema_entry(
-        skill_id=TCP_CARDINAL_STEP_SKILL_ID_V1,
+        skill_id=selected_skill_id,
         skill_definition_hash=skill_definition_hash,
         parameter_schema=parameter_schema,
         parameter_profile_id=parameter_profile_id,
         parameter_profile_hash=parameter_profile_hash,
+    )
+
+
+def fixed_cardinal_tcp_step_schema_entry_v1(
+    *,
+    skill_id: str,
+    skill_definition_hash: str,
+    parameter_profile_id: str,
+    parameter_profile_hash: str,
+    allowed_component_ids: tuple[str, ...],
+    allowed_reference_frame_ids: tuple[str, ...],
+    reference_frame_spec_hash: str,
+    frame_graph_hash: str,
+    tool_config_hash: str,
+    calibration_hash: str,
+    primitive_catalog_hash: str,
+) -> AgentSkillSchemaEntry:
+    """Publish one direction-fixed TCP step over the shared primitive catalog."""
+
+    selected_skill_id = _required(skill_id, field_name="skill_id")
+    try:
+        direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
+            selected_skill_id
+        ]
+    except KeyError as exc:
+        raise ValueError(
+            "skill_id is not a fixed cardinal TCP-step Skill."
+        ) from exc
+    return cardinal_tcp_step_schema_entry_v1(
+        skill_id=selected_skill_id,
+        skill_definition_hash=skill_definition_hash,
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+        allowed_component_ids=allowed_component_ids,
+        allowed_reference_frame_ids=allowed_reference_frame_ids,
+        reference_frame_spec_hash=reference_frame_spec_hash,
+        frame_graph_hash=frame_graph_hash,
+        tool_config_hash=tool_config_hash,
+        calibration_hash=calibration_hash,
+        primitive_catalog_hash=primitive_catalog_hash,
+        allowed_directions=(direction,),
     )
 
 
@@ -856,6 +905,7 @@ def validate_agent_motion_route_schema_v1(
 __all__ = [
     "AGENT_MOTION_SCHEMA_KINDS_V1",
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
+    "FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1",
     "INLINE_TCP_TRAJECTORY_SKILL_ID_V1",
@@ -867,6 +917,7 @@ __all__ = [
     "TCP_POSE_TARGET_SKILL_ID_V1",
     "InlineTcpTrajectoryLimits",
     "cardinal_tcp_step_schema_entry_v1",
+    "fixed_cardinal_tcp_step_schema_entry_v1",
     "fixed_level_tcp_orientation_schema_entry_v1",
     "fixed_level_tcp_orientation_skill_definition_v1",
     "inline_tcp_trajectory_schema_entry_v1",

@@ -38,6 +38,7 @@ from agent_gateway.profiles.mujoco.motion_gateway_session import (
     assemble_mujoco_agent_tcp_pose_gateway_session,
 )
 from agent_gateway.profiles.mujoco.motion_primitive_profiles import (
+    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     MujocoAgentTcpCardinalStepProfile,
     MujocoAgentTcpFixedOrientationProfile,
@@ -61,6 +62,8 @@ from agent_gateway.protocol.skill_catalog import (
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from agent_gateway.skills.perception.definition import (
@@ -1092,6 +1095,7 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         entry.route.skill_id for entry in bundle.route_manifest.skill_routes
     }
     assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= published_skill_ids
+    assert set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) <= published_skill_ids
     assert "distance_m" not in bundle.schema_catalog.entry(
         "motion.step_tcp_cardinal",
         "1",
@@ -1112,6 +1116,34 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         route=cardinal_step_entry.route,
         payload=cardinal_parameters,
     )
+    for fixed_contract in bundle.fixed_cardinal_step_contracts:
+        fixed_route = bundle.route_manifest.route(
+            fixed_contract.skill_id,
+            "1",
+        ).route
+        assert fixed_route.route_id == (
+            MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[
+                fixed_contract.skill_id
+            ]
+        )
+        assert fixed_contract.direction == (
+            FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
+                fixed_contract.skill_id
+            ]
+        )
+        fixed_parameters = {
+            **cardinal_parameters,
+            "direction": fixed_contract.direction,
+        }
+        bundle.payload_validators.validate_parameters(
+            route=fixed_route,
+            payload=fixed_parameters,
+        )
+        with pytest.raises(ValueError, match="unsupported direction"):
+            bundle.payload_validators.validate_parameters(
+                route=fixed_route,
+                payload={**fixed_parameters, "direction": "diagonal"},
+            )
     for orientation_contract in bundle.fixed_orientation_contracts:
         orientation_profile = orientation_contract.profile
         orientation_route = bundle.route_manifest.route(
@@ -1193,6 +1225,11 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
     assert route_to_port["motion.step_tcp_cardinal"] is (
         session.cardinal_step_executor
     )
+    assert set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1) <= set(route_to_port)
+    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
+        assert route_to_port[skill_id] is session.fixed_cardinal_step_executors[
+            skill_id
+        ]
     assert set(FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1) <= set(route_to_port)
     for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1:
         assert route_to_port[skill_id] is session.fixed_orientation_executors[

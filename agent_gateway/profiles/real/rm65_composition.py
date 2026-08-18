@@ -43,6 +43,7 @@ from .exclusive_factory import (
 )
 from .motion_primitive_profiles import (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
 )
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
@@ -96,6 +97,7 @@ def _route_ids() -> tuple[str, ...]:
         sorted(
             {
                 REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+                *REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values(),
                 *REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values(),
             }
         )

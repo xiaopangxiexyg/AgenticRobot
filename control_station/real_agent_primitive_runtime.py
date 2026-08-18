@@ -14,6 +14,7 @@ from agent_gateway.profiles.real.motion_factory import (
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
 )
 from agent_gateway.profiles.real.observation_gateway import (
@@ -36,6 +37,7 @@ from teleop_runtime.real_teleop.components import RealTeleopComponents
 
 _ALL_REAL_PRIMITIVE_ROUTE_IDS = (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    *tuple(REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values()),
     *tuple(REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values()),
 )
 

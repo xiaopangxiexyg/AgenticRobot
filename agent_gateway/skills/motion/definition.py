@@ -14,6 +14,12 @@ from agent_gateway.protocol.skill_catalog import SkillDefinition
 
 TCP_POSE_TARGET_SKILL_ID_V1 = "motion.move_tcp_to_pose"
 TCP_CARDINAL_STEP_SKILL_ID_V1 = "motion.step_tcp_cardinal"
+TCP_STEP_FORWARD_SKILL_ID_V1 = "motion.step_tcp_forward"
+TCP_STEP_BACKWARD_SKILL_ID_V1 = "motion.step_tcp_backward"
+TCP_STEP_LEFT_SKILL_ID_V1 = "motion.step_tcp_left"
+TCP_STEP_RIGHT_SKILL_ID_V1 = "motion.step_tcp_right"
+TCP_STEP_UP_SKILL_ID_V1 = "motion.step_tcp_up"
+TCP_STEP_DOWN_SKILL_ID_V1 = "motion.step_tcp_down"
 TCP_LEVEL_FORWARD_SKILL_ID_V1 = "motion.set_tcp_level_forward"
 TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1 = "motion.set_tcp_level_forward_left_30"
 TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1 = "motion.set_tcp_level_forward_right_30"
@@ -29,6 +35,33 @@ CARDINAL_TCP_STEP_DIRECTIONS_V1 = (
     "right",
     "up",
     "down",
+)
+
+FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1: Mapping[str, str] = (
+    MappingProxyType(
+        {
+            "forward": TCP_STEP_FORWARD_SKILL_ID_V1,
+            "backward": TCP_STEP_BACKWARD_SKILL_ID_V1,
+            "left": TCP_STEP_LEFT_SKILL_ID_V1,
+            "right": TCP_STEP_RIGHT_SKILL_ID_V1,
+            "up": TCP_STEP_UP_SKILL_ID_V1,
+            "down": TCP_STEP_DOWN_SKILL_ID_V1,
+        }
+    )
+)
+FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1: Mapping[str, str] = (
+    MappingProxyType(
+        {
+            skill_id: direction
+            for direction, skill_id in (
+                FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1.items()
+            )
+        }
+    )
+)
+FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1 = tuple(
+    FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1[direction]
+    for direction in CARDINAL_TCP_STEP_DIRECTIONS_V1
 )
 
 FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1 = (
@@ -140,6 +173,44 @@ def cardinal_tcp_step_skill_definition_v1(
     )
 
 
+def fixed_cardinal_tcp_step_skill_definition_v1(
+    *,
+    skill_id: str,
+    controlled_component_ids: tuple[str, ...],
+) -> SkillDefinition:
+    """Return one fixed-direction bounded TCP-step Skill definition."""
+
+    selected_skill_id = _required(skill_id, field_name="skill_id")
+    try:
+        direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
+            selected_skill_id
+        ]
+    except KeyError as exc:
+        raise ValueError(
+            "skill_id is not a fixed cardinal TCP-step Skill."
+        ) from exc
+    return SkillDefinition(
+        skill_id=selected_skill_id,
+        skill_version="1",
+        skill_kind="motion",
+        summary=(
+            "Move one tool_tcp by the reviewed lower 3 cm short-step "
+            f"primitive in the fixed semantic {direction} direction. The "
+            "caller cannot select another direction or distance."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=_component_ids(controlled_component_ids),
+        parameter_semantics_id=(
+            f"tcp_fixed_cardinal_short_step.{direction}.no_distance.v1"
+        ),
+        execution_result_semantics_id="component_action_execution.v1",
+        task_outcome_semantics_id="tcp_pose_arrival.v1",
+        entry_predicate_ids=("route_ready.v1", "measured_start_pose_valid.v1"),
+        task_outcome_predicate_ids=("tcp_pose_within_tolerance.v1",),
+    )
+
+
 def fixed_level_tcp_orientation_skill_definition_v1(
     *,
     skill_id: str,
@@ -175,6 +246,9 @@ def fixed_level_tcp_orientation_skill_definition_v1(
 
 __all__ = [
     "CARDINAL_TCP_STEP_DIRECTIONS_V1",
+    "FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1",
+    "FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1",
+    "FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1",
     "FIXED_LEVEL_TCP_ORIENTATION_SKILL_SUMMARY_BY_ID_V1",
     "INLINE_TCP_TRAJECTORY_SKILL_ID_V1",
@@ -184,7 +258,14 @@ __all__ = [
     "TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1",
     "TCP_LEVEL_FORWARD_SKILL_ID_V1",
     "TCP_POSE_TARGET_SKILL_ID_V1",
+    "TCP_STEP_BACKWARD_SKILL_ID_V1",
+    "TCP_STEP_DOWN_SKILL_ID_V1",
+    "TCP_STEP_FORWARD_SKILL_ID_V1",
+    "TCP_STEP_LEFT_SKILL_ID_V1",
+    "TCP_STEP_RIGHT_SKILL_ID_V1",
+    "TCP_STEP_UP_SKILL_ID_V1",
     "cardinal_tcp_step_skill_definition_v1",
+    "fixed_cardinal_tcp_step_skill_definition_v1",
     "fixed_level_tcp_orientation_skill_definition_v1",
     "tcp_pose_target_skill_definition_v1",
 ]

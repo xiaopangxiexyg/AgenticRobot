@@ -28,10 +28,10 @@ class _FakeClient:
                 "skill_routes": [
                     {
                         "route": {
-                            "skill_id": "motion.step_tcp_cardinal",
+                            "skill_id": "motion.step_tcp_forward",
                             "skill_version": "1",
                             "skill_definition_hash": "skill-definition:test",
-                            "route_id": "real.rm65.agent_skill_tcp_cardinal_step",
+                            "route_id": "real.rm65.agent_skill_step_tcp_forward",
                             "route_version": "1",
                             "route_hash": "route:test",
                             "parameter_schema_hash": "parameter-schema-hash:test",
@@ -51,7 +51,7 @@ class _FakeClient:
                                     "content_hash": "envelope-hash:test",
                                     "constraint_set_hash": "constraint-hash:test",
                                     "allowed_route_ids": [
-                                        "real.rm65.agent_skill_tcp_cardinal_step"
+                                        "real.rm65.agent_skill_step_tcp_forward"
                                     ],
                                 }
                             ],
@@ -65,21 +65,14 @@ class _FakeClient:
                 "skill_schema_catalog_hash": "schema-catalog:test",
                 "schema_entries": [
                     {
-                        "skill_id": "motion.step_tcp_cardinal",
+                        "skill_id": "motion.step_tcp_forward",
                         "skill_version": "1",
                         "parameter_schema_hash": "parameter-schema-hash:test",
                         "parameter_schema": {
                             "properties": {
                                 "component_id": {"enum": ["left_arm"]},
                                 "direction": {
-                                    "enum": [
-                                        "forward",
-                                        "backward",
-                                        "left",
-                                        "right",
-                                        "up",
-                                        "down",
-                                    ]
+                                    "enum": ["forward"]
                                 },
                                 "reference_frame_id": {
                                     "enum": ["canonical_station"]

@@ -53,6 +53,7 @@ from agent_gateway.runtime.station_operation_worker import (
     StationOperationWorkerBinding,
 )
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from agent_gateway.skills.perception.definition import (
@@ -117,6 +118,9 @@ class MujocoAgentTcpPoseGatewaySession:
     rgb_capture_provider: MujocoAgentRgbCaptureProvider
     motion_executor: ReusableStationAgentSkillOperationExecutor
     cardinal_step_executor: ReusableStationAgentSkillOperationExecutor
+    fixed_cardinal_step_executors: Mapping[
+        str, ReusableStationAgentSkillOperationExecutor
+    ]
     fixed_orientation_executors: Mapping[
         str, ReusableStationAgentSkillOperationExecutor
     ]
@@ -153,6 +157,12 @@ class MujocoAgentTcpPoseGatewaySession:
     )
 
     def __post_init__(self) -> None:
+        if set(self.fixed_cardinal_step_executors) != set(
+            FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+        ):
+            raise ValueError(
+                "fixed_cardinal_step_executors must exactly cover six Skills."
+            )
         if set(self.fixed_orientation_executors) != set(
             FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
         ):
@@ -282,6 +292,10 @@ class MujocoAgentTcpPoseGatewaySession:
         return (
             self.motion_executor,
             self.cardinal_step_executor,
+            *tuple(
+                self.fixed_cardinal_step_executors[skill_id]
+                for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+            ),
             *tuple(
                 self.fixed_orientation_executors[skill_id]
                 for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
@@ -427,6 +441,14 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         "1",
     )
     cardinal_step_route = cardinal_step_entry.route
+    fixed_cardinal_entry_by_skill_id = {
+        skill_id: contract_bundle.route_manifest.route(skill_id, "1")
+        for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+    }
+    fixed_cardinal_contract_by_skill_id = {
+        item.skill_id: item
+        for item in contract_bundle.fixed_cardinal_step_contracts
+    }
     fixed_orientation_entry_by_skill_id = {
         skill_id: contract_bundle.route_manifest.route(skill_id, "1")
         for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
@@ -499,12 +521,23 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         contract_bundle.cardinal_step_profile.reference_frame_id
     ]
 
-    def cardinal_step_lifecycle_factory(*, request, operation):
+    def build_cardinal_step_lifecycle(
+        *,
+        request,
+        operation,
+        route,
+        deployment_binding,
+        evaluation_plan,
+        fixed_direction: str | None = None,
+    ):
         parameters = request.parameters
         if not isinstance(parameters, Mapping):
             raise TypeError("Cardinal-step parameters must be an object.")
+        requested_direction = str(parameters.get("direction"))
+        if fixed_direction is not None and requested_direction != fixed_direction:
+            raise ValueError("Fixed cardinal-step direction changed in request.")
         primitive = contract_bundle.cardinal_step_profile.primitive(
-            str(parameters.get("direction"))
+            requested_direction
         )
 
         def resolve_target(
@@ -522,13 +555,9 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
 
         return MujocoAgentTcpPoseSkillLifecycle(
             application=application,
-            route=cardinal_step_route,
-            deployment_binding=(
-                contract_bundle.cardinal_step_deployment_binding
-            ),
-            evaluation_plan=(
-                contract_bundle.cardinal_step_evaluation_plan
-            ),
+            route=route,
+            deployment_binding=deployment_binding,
+            evaluation_plan=evaluation_plan,
             motion_profile=contract_bundle.motion_profile,
             request=request,
             operation=operation,
@@ -552,6 +581,19 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                 ),
             },
             clock=runtime_clock,
+        )
+
+    def cardinal_step_lifecycle_factory(*, request, operation):
+        return build_cardinal_step_lifecycle(
+            request=request,
+            operation=operation,
+            route=cardinal_step_route,
+            deployment_binding=(
+                contract_bundle.cardinal_step_deployment_binding
+            ),
+            evaluation_plan=(
+                contract_bundle.cardinal_step_evaluation_plan
+            ),
         )
 
     def domain_hold(*, operation, reason):
@@ -615,6 +657,64 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ),
         clock=runtime_clock,
     )
+    fixed_cardinal_step_executors: dict[
+        str, ReusableStationAgentSkillOperationExecutor
+    ] = {}
+    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
+        fixed_entry = fixed_cardinal_entry_by_skill_id[skill_id]
+        fixed_route = fixed_entry.route
+        fixed_contract = fixed_cardinal_contract_by_skill_id[skill_id]
+
+        def fixed_cardinal_lifecycle_factory(
+            *,
+            request,
+            operation,
+            _route=fixed_route,
+            _contract=fixed_contract,
+        ):
+            return build_cardinal_step_lifecycle(
+                request=request,
+                operation=operation,
+                route=_route,
+                deployment_binding=_contract.deployment_binding,
+                evaluation_plan=_contract.evaluation_plan,
+                fixed_direction=_contract.direction,
+            )
+
+        fixed_binding = fixed_contract.deployment_binding
+        fixed_cardinal_step_executors[skill_id] = (
+            ReusableStationAgentSkillOperationExecutor(
+                port_id=(
+                    "agent-gateway:fixed-cardinal-step-worker:"
+                    + skill_id
+                    + ":"
+                    + fixed_binding.runtime_session_id
+                ),
+                binding=StationOperationWorkerBinding(
+                    worker_id=(
+                        "agent-tcp-fixed-cardinal-step-worker:"
+                        + skill_id
+                        + ":"
+                        + fixed_binding.runtime_session_id
+                    ),
+                    executor_id=fixed_binding.executor_id,
+                    runtime_session_id=fixed_binding.runtime_session_id,
+                    skill_id=fixed_route.skill_id,
+                    skill_version=fixed_route.skill_version,
+                    route_id=fixed_route.route_id,
+                    route_version=fixed_route.route_version,
+                    deployment_binding_hash=(
+                        fixed_binding.semantic_content_hash
+                    ),
+                ),
+                lifecycle_factory=fixed_cardinal_lifecycle_factory,
+                domain_hold=domain_hold,
+                current_station_revision=lambda: (
+                    observation_producer.current_station_revision
+                ),
+                clock=runtime_clock,
+            )
+        )
     fixed_orientation_executors: dict[
         str, ReusableStationAgentSkillOperationExecutor
     ] = {}
@@ -932,6 +1032,14 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     }
     execution_port_by_route_hash.update(
         {
+            fixed_cardinal_entry_by_skill_id[
+                skill_id
+            ].route.semantic_content_hash: fixed_cardinal_step_executors[skill_id]
+            for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+        }
+    )
+    execution_port_by_route_hash.update(
+        {
             fixed_orientation_entry_by_skill_id[
                 skill_id
             ].route.semantic_content_hash: fixed_orientation_executors[skill_id]
@@ -1053,6 +1161,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         rgb_capture_provider=rgb_capture_provider,
         motion_executor=motion_executor,
         cardinal_step_executor=cardinal_step_executor,
+        fixed_cardinal_step_executors=fixed_cardinal_step_executors,
         fixed_orientation_executors=fixed_orientation_executors,
         state_executor=state_executor,
         depth_executor=depth_executor,
