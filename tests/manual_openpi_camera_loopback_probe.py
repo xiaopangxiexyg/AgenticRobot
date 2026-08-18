@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -19,6 +20,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from deployments.client.rtc_transport import RtcTransportDeadlineSpec
 from deployments.openpi.client.observation_adapter import (
@@ -32,7 +37,7 @@ from deployments.openpi.client.transport import (
 )
 from robot_motion.deploy.observation import DeploymentObservation
 from robot_motion.deploy.schema import OBSERVATION_STATE_DIM
-from teleop_runtime.deploy.run_policy import run_camera_startup_self_check
+from teleop_runtime.deploy.camera_runtime import run_camera_startup_self_check
 from teleop_runtime.real_teleop.camera_runtime import (
     _close_camera_sources,
     _start_camera_sources_best_effort,

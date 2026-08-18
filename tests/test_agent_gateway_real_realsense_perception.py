@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from agent_gateway.profiles.real import realsense_perception
+
 from agent_gateway.profiles.real.perception_deployment import (
     REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
     REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
@@ -422,46 +424,17 @@ def test_resource_transaction_closes_partial_lower_start() -> None:
     assert source.closes == 1
 
 
-def test_camera_startup_retries_bounded_first_frame_after_serial_pass(
+def test_gateway_camera_startup_delegates_to_formal_teleop_lifecycle(
     monkeypatch,
 ) -> None:
-    events = []
-
-    class _StartupSource:
-        def __init__(self, key, priority, *, fail_once=False):
-            self.key = key
-            self.fail_once = fail_once
-            self.attempts = 0
-            self.config = SimpleNamespace(
-                metadata={"startup_priority": priority},
-                startup_warmup_policy="bounded_first_frame",
-            )
-
-        def start(self):
-            self.attempts += 1
-            events.append(f"start:{self.key}:{self.attempts}")
-            if self.fail_once and self.attempts == 1:
-                raise RuntimeError(
-                    "startup_warmup_failed:policy=bounded_first_frame:no_frames"
-                )
-
-        def close(self):
-            events.append(f"close:{self.key}")
-
-    front = _StartupSource("front", 0, fail_once=True)
-    wrist = _StartupSource("wrist", 10)
+    sources = {"front": object()}
+    calls = []
     monkeypatch.setattr(
-        "agent_gateway.profiles.real.realsense_perception.time.sleep",
-        lambda seconds: events.append(f"sleep:{seconds}"),
+        realsense_perception,
+        "_formal_start_camera_sources",
+        lambda values: calls.append(values),
     )
 
-    start_realsense_sources({"wrist": wrist, "front": front})
+    start_realsense_sources(sources)
 
-    assert events == [
-        "start:front:1",
-        "sleep:0.5",
-        "start:wrist:1",
-        "sleep:1.0",
-        "close:front",
-        "start:front:2",
-    ]
+    assert calls == [sources]
