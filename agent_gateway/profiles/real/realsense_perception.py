@@ -38,12 +38,6 @@ _ROLE_BY_SOURCE_ID = {
     "left_wrist": "wrist_left",
     "right_wrist": "wrist_right",
 }
-_CAMERA_START_STAGGER_SEC = 0.5
-_CAMERA_DEFERRED_RETRY_COOLDOWN_SEC = 1.0
-_CAMERA_ADMISSION_TIMEOUT_SEC = 3.0
-_CAMERA_ADMISSION_INTERVAL_SEC = 0.2
-_CAMERA_ADMISSION_FRESH_AGE_SEC = 0.2
-_CAMERA_ADMISSION_CONSECUTIVE_FRAMES = 3
 
 
 class _LifecycleResource(Protocol):
@@ -54,6 +48,40 @@ class _LifecycleResource(Protocol):
 
 class _CloseResource(Protocol):
     def close(self) -> None: ...
+
+
+def _apply_formal_camera_startup_defaults(configs: Mapping[str, Any]) -> None:
+    # Keep the optional perception attachment out of motion-only Gateway
+    # imports. The actual lifecycle remains solely owned by teleop_runtime.
+    from teleop_runtime.real_teleop.camera_runtime import (
+        apply_real_teleop_camera_startup_defaults,
+    )
+
+    apply_real_teleop_camera_startup_defaults(
+        configs,
+        color_format="bgr8",
+        warmup_policy=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+    )
+
+
+def _formal_start_camera_sources(camera_sources: Mapping[str, Any]) -> None:
+    from teleop_runtime.deploy.camera_runtime import start_camera_sources
+
+    start_camera_sources(camera_sources)
+
+
+def _formal_camera_startup_self_check(
+    camera_sources: Mapping[str, Any],
+) -> None:
+    from teleop_runtime.deploy.camera_runtime import run_camera_startup_self_check
+
+    run_camera_startup_self_check(camera_sources)
+
+
+def _formal_close_camera_sources(camera_sources: Mapping[str, Any]) -> None:
+    from teleop_runtime.deploy.camera_runtime import close_camera_sources
+
+    close_camera_sources(camera_sources)
 
 
 def real_camera_role_for_source(source_id: str) -> str:
@@ -184,19 +212,13 @@ def build_real_perception_source_binding(
     if not configs:
         raise ValueError("Real perception camera config must not be empty.")
     for camera_key, config in configs.items():
-        config.keep_last = max(4, int(config.keep_last))
-        config.startup_warmup_policy = REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
-        config.require_complete_frameset = True
-        config.restart_on_incomplete_frameset = True
-        config.restart_max_attempts_without_complete_frame = max(
-            3,
-            int(config.restart_max_attempts_without_complete_frame),
-        )
-        config.startup_hardware_reset_on_failure = False
         if config.startup_hardware_reset:
             raise ValueError(
                 f"camera {camera_key!r} cannot request a startup hardware reset."
             )
+    _apply_formal_camera_startup_defaults(configs)
+    for config in configs.values():
+        config.keep_last = max(4, int(config.keep_last))
     registry = load_camera_registry(camera_registry_path)
     registry_cameras = registry["cameras"]
     world_from_base = {
@@ -346,13 +368,11 @@ class ExclusiveRealPerceptionResources:
             self._started = True
 
     def _close_cameras(self) -> list[str]:
-        errors = []
-        for camera_key, source in reversed(tuple(self.camera_sources.items())):
-            try:
-                source.close()
-            except Exception as exc:  # noqa: BLE001 - close the remaining cameras.
-                errors.append(f"camera[{camera_key}]:{type(exc).__name__}:{exc}")
-        return errors
+        try:
+            _formal_close_camera_sources(self.camera_sources)
+        except Exception as exc:  # noqa: BLE001 - formal cleanup already tried all cameras.
+            return [f"cameras:{type(exc).__name__}:{exc}"]
+        return []
 
     def close(self) -> None:
         with self._lock:
@@ -375,91 +395,15 @@ class ExclusiveRealPerceptionResources:
 
 
 def start_realsense_sources(camera_sources: Mapping[str, Any]) -> None:
-    """Start cameras serially, with one deferred bounded-first-frame retry."""
+    """Compatibility name delegating to formal real-teleop startup."""
 
-    ranked = []
-    for index, (camera_key, source) in enumerate(camera_sources.items()):
-        metadata = getattr(source.config, "metadata", {})
-        priority = (
-            metadata.get("startup_priority", index)
-            if isinstance(metadata, Mapping)
-            else index
-        )
-        try:
-            priority = float(priority)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"camera {camera_key!r} startup_priority must be numeric."
-            ) from exc
-        ranked.append((priority, index, camera_key, source))
-    ranked.sort(key=lambda item: (item[0], item[1]))
-    failures = {}
-    for position, (_priority, _index, camera_key, source) in enumerate(ranked):
-        try:
-            source.start()
-        except Exception as exc:  # noqa: BLE001 - finish the serial first pass.
-            failures[camera_key] = exc
-        if position + 1 < len(ranked):
-            time.sleep(_CAMERA_START_STAGGER_SEC)
-    retry_keys = tuple(
-        camera_key
-        for _priority, _index, camera_key, source in ranked
-        if camera_key in failures
-        and getattr(source.config, "startup_warmup_policy", None)
-        == REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
-        and "startup_warmup_failed:policy=bounded_first_frame"
-        in str(failures[camera_key]).lower()
-    )
-    if retry_keys:
-        time.sleep(_CAMERA_DEFERRED_RETRY_COOLDOWN_SEC)
-        for camera_key in retry_keys:
-            source = camera_sources[camera_key]
-            try:
-                source.close()
-                source.start()
-            except Exception as exc:  # noqa: BLE001 - report every failed camera.
-                failures[camera_key] = exc
-            else:
-                failures.pop(camera_key, None)
-    if failures:
-        detail = "; ".join(
-            f"{camera_key}={type(error).__name__}:{error}"
-            for camera_key, error in sorted(failures.items())
-        )
-        raise RuntimeError("RealSense serial startup failed: " + detail)
+    _formal_start_camera_sources(camera_sources)
 
 
 def admit_realsense_sources(camera_sources: Mapping[str, Any]) -> None:
-    """Require several new, fresh frames from every source before arm startup."""
+    """Compatibility name delegating to formal real-teleop admission."""
 
-    deadline = time.time() + _CAMERA_ADMISSION_TIMEOUT_SEC
-    previous = {key: None for key in camera_sources}
-    streaks = {key: 0 for key in camera_sources}
-    while True:
-        now = time.time()
-        for camera_key, source in camera_sources.items():
-            info = source.device_info()
-            count = info.get("frame_count")
-            age = info.get("last_frame_age_sec")
-            fresh = bool(
-                isinstance(count, int)
-                and not isinstance(count, bool)
-                and count > 0
-                and (previous[camera_key] is None or count > previous[camera_key])
-                and isinstance(age, (int, float))
-                and not isinstance(age, bool)
-                and 0.0 <= float(age) <= _CAMERA_ADMISSION_FRESH_AGE_SEC
-                and info.get("running") is True
-                and info.get("lifecycle_state") == "running"
-                and info.get("worker_alive") is True
-            )
-            streaks[camera_key] = streaks[camera_key] + 1 if fresh else 0
-            previous[camera_key] = count
-        if all(value >= _CAMERA_ADMISSION_CONSECUTIVE_FRAMES for value in streaks.values()):
-            return
-        if now >= deadline:
-            raise RuntimeError(f"RealSense startup freshness admission failed: {streaks}")
-        time.sleep(min(_CAMERA_ADMISSION_INTERVAL_SEC, deadline - now))
+    _formal_camera_startup_self_check(camera_sources)
 
 
 class RealSenseAgentPerceptionProvider:

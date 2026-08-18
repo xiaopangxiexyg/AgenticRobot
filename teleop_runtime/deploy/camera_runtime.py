@@ -20,6 +20,9 @@ from ..real_teleop.camera_runtime import (
     apply_real_teleop_camera_startup_defaults,
 )
 from ..real_teleop.camera_runtime import (
+    _close_camera_sources as _close_real_teleop_camera_sources,
+)
+from ..real_teleop.camera_runtime import (
     _start_camera_sources_best_effort as _start_real_teleop_camera_sources_best_effort,
 )
 from ..real_teleop.status_payloads import _build_camera_status
@@ -226,6 +229,14 @@ def start_camera_sources(
         )
 
 
+def close_camera_sources(
+    camera_sources: Mapping[str, RealSenseRGBSource],
+) -> None:
+    """Use the formal real-teleop reverse-order camera shutdown lifecycle."""
+
+    _close_real_teleop_camera_sources(camera_sources)
+
+
 def run_camera_startup_self_check(
     camera_sources: Mapping[str, RealSenseRGBSource],
     *,
@@ -293,6 +304,7 @@ __all__ = [
     "DEFAULT_DEPLOYMENT_CAMERA_KEEP_LAST",
     "REAL_TELEOP_CAMERA_START_STAGGER_SEC",
     "build_camera_sources",
+    "close_camera_sources",
     "resolve_policy_camera_input_keys",
     "run_camera_startup_self_check",
     "select_preview_camera_sources",
