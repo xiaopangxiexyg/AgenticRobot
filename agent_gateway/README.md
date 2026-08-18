@@ -215,6 +215,17 @@ occupied. If a profile provides no binding, discovery returns `enabled=false`
 and an empty list rather than guessing hardware identity. Gateway admission,
 not this advisory view, remains authoritative for whether a Skill may start.
 
+The exclusive real primitive profile publishes its existing arm `component_id`
+as one readable/drivable `robot_arm` ownership unit. Its occupancy comes from
+the lower `RealAgentMotionOwnerCut`, including READY and HOLD, while health uses
+only cached lower state and freshness. When real RGB/depth capture is enabled,
+the profile additionally publishes one shared, read-only
+`perception.cameras` bundle. A running lower camera worker projects the bundle
+as occupied even when no capture Skill is active; camera lifecycle health is
+read without capturing a frame. This grouping matches current lower admission
+granularity and does not claim independent per-camera leases that the lower
+runtime does not provide.
+
 The dedicated independent RM65 Skill entrypoint is:
 
 ```bash
