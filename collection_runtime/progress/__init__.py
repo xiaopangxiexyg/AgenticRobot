@@ -51,6 +51,11 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     'StageAnnotationStoreError': ('.stage_annotation_store', 'StageAnnotationStoreError'),
     'commit_stage_annotation_set': ('.stage_annotation_store', 'commit_stage_annotation_set'),
     'load_stage_annotation_set': ('.stage_annotation_store', 'load_stage_annotation_set'),
+    'DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT': ('.detail_stage_annotation_store', 'DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT'),
+    'DetailStageAnnotationCommitReport': ('.detail_stage_annotation_store', 'DetailStageAnnotationCommitReport'),
+    'DetailStageAnnotationStoreError': ('.detail_stage_annotation_store', 'DetailStageAnnotationStoreError'),
+    'commit_detail_stage_annotation_set': ('.detail_stage_annotation_store', 'commit_detail_stage_annotation_set'),
+    'load_detail_stage_annotation_set': ('.detail_stage_annotation_store', 'load_detail_stage_annotation_set'),
 }
 
 __all__ = [
@@ -93,10 +98,15 @@ __all__ = [
     'reduce_progress_fact',
     'replay_progress_facts',
     'commit_stage_annotation_set',
+    'DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT',
+    'DetailStageAnnotationCommitReport',
+    'DetailStageAnnotationStoreError',
+    'commit_detail_stage_annotation_set',
     'failure_trigger_capture_path',
     'failure_trigger_capture_root',
     'load_failure_trigger_capture_records',
     'load_stage_annotation_set',
+    'load_detail_stage_annotation_set',
     'record_failure_trigger_capture',
 ]
 
