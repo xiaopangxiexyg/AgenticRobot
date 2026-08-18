@@ -192,6 +192,7 @@ class RealAgentPrimitiveObservationProducer:
                 "owner_state_hash": owner.semantic_content_hash,
                 "measured_cut_hash": cut.semantic_content_hash,
                 "active_operation_id": active_operation_id,
+                "measurement_freshness_ms": age_ms,
             },
             domain="dexteleop.real_agent_motion.observation_snapshot_id.v1",
         )

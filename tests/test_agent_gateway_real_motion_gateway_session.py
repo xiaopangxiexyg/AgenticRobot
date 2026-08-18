@@ -371,6 +371,42 @@ def test_real_gateway_reads_tcp_pose_without_consuming_motion_grant() -> None:
     assert port.snapshot().dispatch_count == 0
 
 
+def test_republishing_one_measured_cut_uses_freshness_in_snapshot_identity() -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    owner_state = _owner_state(bundle, captured_at=clock())
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:stable",),
+    )
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: owner_state,
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+
+    first = gateway.observation_producer.capture_and_publish(gateway.service)
+    assert first.accepted and first.snapshot is not None
+    clock.value += 0.010
+    second = gateway.observation_producer.capture_and_publish(gateway.service)
+
+    assert second.accepted and second.snapshot is not None
+    assert second.snapshot.snapshot_id != first.snapshot.snapshot_id
+    assert (
+        second.snapshot.measurement_summary["measured_state_hash"]
+        == first.snapshot.measurement_summary["measured_state_hash"]
+    )
+    assert second.snapshot.station_revision == first.snapshot.station_revision
+    assert (
+        second.snapshot.measurement_freshness_ms
+        > first.snapshot.measurement_freshness_ms
+    )
+
+
 @pytest.mark.parametrize(("skill_id", "direction"), PRIMITIVE_CASES)
 def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
     skill_id: str,
