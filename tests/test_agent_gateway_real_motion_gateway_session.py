@@ -54,6 +54,7 @@ from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.real_teleop.agent_motion_port import (
+    RealAgentMotionOwnerIdentity,
     RealAgentMotionPhase,
     RealAgentMotionPort,
     RealAgentMotionPortConfig,
@@ -121,7 +122,7 @@ class _OwnerSession:
         return True
 
 
-def _runtime_fixture():
+def _runtime_fixture(*, exclusive_owner: bool = False):
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
         frame_id="canonical_station",
@@ -169,6 +170,7 @@ def _runtime_fixture():
         component_id_by_side={"right": COMPONENT_ID},
         execution_frame_id=execution_frame.frame_id,
         execution_frame_spec_hash=execution_frame.semantic_content_hash,
+        exclusive_command_claim=exclusive_owner,
     )
     route_ids = (
         REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
@@ -196,10 +198,27 @@ def _runtime_fixture():
         safety_envelope_refs=(envelope,),
     )
     target_builder = _TargetBuilder()
+    owner_identity = (
+        RealAgentMotionOwnerIdentity(
+            runtime_session_id=attachment.runtime_session_id,
+            control_domain_id=attachment.control_domain_id,
+            embodiment_instance_id=attachment.embodiment_instance_id,
+            target_binding_id=attachment.target_binding_id,
+            execution_manifest_hash=attachment.execution_manifest_hash,
+            backend_inventory_hash=attachment.backend_inventory_hash,
+            clock_domain_id=attachment.clock_domain_id,
+        )
+        if exclusive_owner
+        else None
+    )
     port = RealAgentMotionPort(
         config=port_config,
         target_builder=target_builder,
+        owner_identity=owner_identity,
     )
+    if exclusive_owner:
+        port.confirm_exclusive_attachment()
+        port.publish_owner_state(session=_OwnerSession(), captured_at=10.0)
     return bundle, port, target_builder
 
 
@@ -334,6 +353,56 @@ PRIMITIVE_CASES = (
         for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
     ),
 )
+
+
+def test_real_wire_adapter_projects_lower_owned_arm_resource_while_idle() -> None:
+    bundle, port, _ = _runtime_fixture(exclusive_owner=True)
+    clock = _Clock()
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+
+    adapter = gateway.wire_adapter(authenticated_client_id=CLIENT_ID)
+    resources = adapter.get_hardware_resource_views()
+    assert resources["enabled"] is True
+    assert [item["resource_id"] for item in resources["resources"]] == [
+        COMPONENT_ID
+    ]
+    arm = resources["resources"][0]
+    assert arm["resource_kind"] == "robot_arm"
+    assert arm["properties"] == {"readable": True, "drivable": True}
+    assert {item["skill_id"] for item in arm["read_skill_refs"]} == {
+        "state.read_tcp_pose"
+    }
+    assert "motion.step_tcp_forward" in {
+        item["skill_id"] for item in arm["drive_skill_refs"]
+    }
+
+    statuses = adapter.get_hardware_status_views()
+    assert statuses["enabled"] is True
+    assert statuses["station_revision"] >= 0
+    assert statuses["resources"] == [
+        {
+            "schema_version": "dexteleop.hardware_status_view.v1",
+            "resource_id": COMPONENT_ID,
+            "occupancy": "occupied",
+            "health": "ready",
+            "station_revision": statuses["station_revision"],
+            "reason_code": "lower_control_claim_occupied",
+            "active_operation_id": None,
+            "active_skill_ref": None,
+        }
+    ]
+
+    clock.value += 1.0
+    stale = adapter.get_hardware_status_views()["resources"][0]
+    assert stale["occupancy"] == "occupied"
+    assert stale["health"] == "unavailable"
+    assert stale["reason_code"] == "lower_control_claim_occupied"
 
 
 def test_real_gateway_reads_tcp_pose_without_consuming_motion_grant() -> None:
@@ -932,6 +1001,34 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         artifact_store=store,
         clock=clock,
     )
+    adapter = gateway.wire_adapter(authenticated_client_id=CLIENT_ID)
+    resources = adapter.get_hardware_resource_views()["resources"]
+    assert [item["resource_id"] for item in resources] == [
+        "perception.cameras",
+        COMPONENT_ID,
+    ]
+    perception_resource = resources[0]
+    assert perception_resource["resource_kind"] == "camera_bundle"
+    assert perception_resource["properties"] == {
+        "readable": True,
+        "drivable": False,
+    }
+    assert {item["skill_id"] for item in perception_resource["read_skill_refs"]} == {
+        "perception.capture_depth",
+        "perception.capture_rgb",
+    }
+    statuses = {
+        item["resource_id"]: item
+        for item in adapter.get_hardware_status_views()["resources"]
+    }
+    assert statuses["perception.cameras"]["occupancy"] == "occupied"
+    assert statuses["perception.cameras"]["health"] == "ready"
+    assert statuses["perception.cameras"]["reason_code"] == (
+        "lower_control_claim_occupied"
+    )
+    assert statuses["perception.cameras"]["active_operation_id"] is None
+    assert statuses[COMPONENT_ID]["occupancy"] == "occupied"
+    assert statuses[COMPONENT_ID]["health"] == "unavailable"
     observation = gateway.observation_producer.capture_and_publish(gateway.service)
     assert observation.accepted and observation.snapshot is not None
     entry = bundle.route_manifest.route("perception.capture_rgb", "1")

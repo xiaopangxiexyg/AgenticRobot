@@ -215,6 +215,27 @@ occupied. If a profile provides no binding, discovery returns `enabled=false`
 and an empty list rather than guessing hardware identity. Gateway admission,
 not this advisory view, remains authoritative for whether a Skill may start.
 
+The exclusive real primitive profile publishes its existing arm `component_id`
+as one readable/drivable `robot_arm` ownership unit. Its occupancy comes from
+the lower `RealAgentMotionOwnerCut`, including READY and HOLD, while health uses
+only cached lower state and freshness. When real RGB/depth capture is enabled,
+the profile additionally publishes one shared, read-only
+`perception.cameras` bundle. A running lower camera worker projects the bundle
+as occupied even when no capture Skill is active; camera lifecycle health is
+read without capturing a frame. This grouping matches current lower admission
+granularity and does not claim independent per-camera leases that the lower
+runtime does not provide.
+
+The MuJoCo TCP-pose profile publishes one readable/drivable
+`simulation.runtime` resource. Motion, TCP state/history, and optional RGB/depth
+capture all share the same scene and runtime owner, so the profile does not
+invent independent simulated arm or camera leases. Before the lower runtime is
+started the resource is `free` and `unavailable`; after observation-ready
+startup it remains `occupied` through READY and lower-confirmed HOLD until the
+application closes. Health is derived from the existing execution-gate state
+without stepping physics or rendering a frame, and active Skill execution is
+still reported separately through the operation projection.
+
 The dedicated independent RM65 Skill entrypoint is:
 
 ```bash

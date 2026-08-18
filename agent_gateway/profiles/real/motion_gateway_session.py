@@ -26,6 +26,10 @@ from agent_gateway.runtime.artifact_producer import (
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.runtime.artifact_transfer import AgentArtifactTransferBroker
 from agent_gateway.runtime.event_journal import BoundedAgentGatewayEventJournal
+from agent_gateway.runtime.hardware_view_provider import (
+    HardwareResourceBinding,
+    HardwareViewProvider,
+)
 from agent_gateway.runtime.operation_port import AgentGatewayAuthoritativePortReceipt
 from agent_gateway.runtime.operation_store import (
     BoundedInMemoryAgentSkillOperationStore,
@@ -476,6 +480,7 @@ class RealAgentPrimitiveGatewaySession:
     depth_executor: PassiveReadSkillExecutor | None
     artifact_store: RecoverableAgentArtifactStore | None
     owns_artifact_store: bool
+    hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _close_outcome: AgentGatewayOperationOutcome | None = field(
@@ -496,6 +501,8 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError("Owned Artifact store must be present.")
         if not isinstance(self.state_executor, PassiveReadSkillExecutor):
             raise TypeError("Real TCP-pose state executor must be passive.")
+        if not isinstance(self.hardware_view_provider, HardwareViewProvider):
+            raise TypeError("Real hardware view provider must be typed.")
 
     def wire_adapter(
         self,
@@ -518,6 +525,7 @@ class RealAgentPrimitiveGatewaySession:
             ),
             operation_launcher=self.service.launch_operation,
             grant_resolver=grant_resolver,
+            hardware_view_provider=self.hardware_view_provider,
         )
 
     def build_unix_json_server(
@@ -603,6 +611,147 @@ class RealAgentPrimitiveGatewaySession:
                 self.artifact_store.close()
                 self._artifact_store_closed = True
             return outcome
+
+
+def _real_motion_resource_health(
+    *,
+    port: RealAgentMotionPort,
+    clock: Callable[[], float],
+    maximum_owner_age_ms: int,
+) -> str:
+    """Project cached lower state only; never refresh or command hardware."""
+
+    snapshot = port.snapshot()
+    if snapshot.phase == RealAgentMotionPhase.FAULTED or snapshot.fault is not None:
+        return "fault"
+    owner = port.latest_owner_state()
+    if owner is None:
+        return "unavailable"
+    if owner.lifecycle_state == "fault":
+        return "fault"
+    age_ms = (float(clock()) - owner.captured_at) * 1_000.0
+    if age_ms < 0.0 or age_ms > maximum_owner_age_ms:
+        return "unavailable"
+    return "ready"
+
+
+def _real_motion_control_claimed(port: RealAgentMotionPort) -> bool:
+    """Read the lower exclusive owner cut without inferring from READY/HOLD."""
+
+    owner = port.latest_owner_state()
+    if owner is None:
+        raise RuntimeError("No lower real motion owner cut is available.")
+    if owner.owner_kind != "exclusive_real_skill_motion_port":
+        raise RuntimeError("Lower real motion owner kind is not exclusive.")
+    return True
+
+
+def _real_perception_feed_health(
+    provider: RealSenseAgentPerceptionProvider,
+) -> str:
+    """Project cached camera lifecycle state without capturing a frame."""
+
+    infos = []
+    for source in provider.source_binding.camera_sources.values():
+        device_info = getattr(source, "device_info", None)
+        if not callable(device_info):
+            return "unavailable"
+        info = device_info()
+        if not isinstance(info, Mapping):
+            return "unavailable"
+        infos.append(info)
+    if any(str(item.get("lifecycle_state", "")).lower() == "fault" for item in infos):
+        return "fault"
+    if all(
+        item.get("running") is True
+        and item.get("worker_alive") is True
+        and item.get("lifecycle_state") == "running"
+        for item in infos
+    ):
+        return "ready"
+    return "unavailable"
+
+
+def _real_perception_control_claimed(
+    provider: RealSenseAgentPerceptionProvider,
+) -> bool:
+    """A running lower camera worker proves that its device is claimed."""
+
+    running = []
+    for source in provider.source_binding.camera_sources.values():
+        device_info = getattr(source, "device_info", None)
+        if not callable(device_info):
+            raise RuntimeError("Real perception source has no status provider.")
+        info = device_info()
+        if not isinstance(info, Mapping) or not isinstance(
+            info.get("running"), bool
+        ):
+            raise RuntimeError("Real perception source status is unavailable.")
+        running.append(info["running"])
+    return any(running)
+
+
+def _real_hardware_view_provider(
+    *,
+    contract_bundle: RealAgentPrimitiveContractBundle,
+    port: RealAgentMotionPort,
+    perception_provider: RealSenseAgentPerceptionProvider | None,
+    operation_store: BoundedInMemoryAgentSkillOperationStore,
+    clock: Callable[[], float],
+) -> HardwareViewProvider:
+    """Bind profile-owned ownership units to existing semantic Routes."""
+
+    component_id = contract_bundle.cardinal_profile.component_id
+    arm_route_hashes = []
+    perception_route_hashes = []
+    for entry in contract_bundle.route_manifest.skill_routes:
+        route = entry.route
+        definition = contract_bundle.definition_catalog.definition(
+            route.skill_id,
+            route.skill_version,
+        )
+        if component_id in definition.controlled_component_ids:
+            arm_route_hashes.append(route.semantic_content_hash)
+        elif route.control_effect_class == "read_only" and route.skill_id.startswith(
+            "perception."
+        ):
+            perception_route_hashes.append(route.semantic_content_hash)
+    bindings = [
+        HardwareResourceBinding(
+            resource_id=component_id,
+            resource_kind="robot_arm",
+            route_hashes=tuple(arm_route_hashes),
+            health_provider=lambda: _real_motion_resource_health(
+                port=port,
+                clock=clock,
+                maximum_owner_age_ms=(
+                    contract_bundle.attachment.max_measurement_age_ms
+                ),
+            ),
+            control_claimed_provider=lambda: _real_motion_control_claimed(port),
+        )
+    ]
+    if perception_provider is not None:
+        if not perception_route_hashes:
+            raise ValueError("Real perception provider has no read-only Routes.")
+        bindings.append(
+            HardwareResourceBinding(
+                resource_id="perception.cameras",
+                resource_kind="camera_bundle",
+                route_hashes=tuple(perception_route_hashes),
+                health_provider=lambda: _real_perception_feed_health(
+                    perception_provider
+                ),
+                control_claimed_provider=lambda: (
+                    _real_perception_control_claimed(perception_provider)
+                ),
+            )
+        )
+    return HardwareViewProvider(
+        manifest=contract_bundle.route_manifest,
+        operation_store=operation_store,
+        bindings=tuple(bindings),
+    )
 
 
 def assemble_real_agent_primitive_gateway_session(
@@ -1012,6 +1161,13 @@ def assemble_real_agent_primitive_gateway_session(
         clock=clock,
         clock_domain_id=contract_bundle.attachment.clock_domain_id,
     )
+    hardware_view_provider = _real_hardware_view_provider(
+        contract_bundle=contract_bundle,
+        port=port,
+        perception_provider=perception_provider,
+        operation_store=service.operation_store,
+        clock=clock,
+    )
     return RealAgentPrimitiveGatewaySession(
         contract_bundle=contract_bundle,
         port=port,
@@ -1023,6 +1179,7 @@ def assemble_real_agent_primitive_gateway_session(
         depth_executor=depth_executor,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
+        hardware_view_provider=hardware_view_provider,
         service=service,
     )
 
