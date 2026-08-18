@@ -72,11 +72,22 @@ complete suite. The slow marker is attached to exact closed-loop test
 functions; it does not reduce their sample counts, physical ticks, thresholds,
 or inclusion in the unfiltered command.
 
-Git does not populate ignored robot assets in a linked worktree. A worktree
-running this suite must expose the same reviewed, read-only asset tree at its
-own `assets/` path, for example through a local ignored directory symlink to the
-canonical checkout. Treat a missing asset as a preflight failure; do not copy
-assets into Git or change scenario semantics to make the test pass.
+Git does not populate ignored robot assets in a linked worktree. Configure the
+clone-shared development asset store once and use the standard worktree claim
+tool documented in [`CONTRIBUTING.md`](../../CONTRIBUTING.md). For a worktree
+created before that tool, run:
+
+```bash
+python scripts/dev_asset_store.py link-worktree --worktree "$PWD"
+python scripts/dev_environment_doctor.py --require-development-assets
+```
+
+The ignored `assets` symlink is a compatibility mapping, not proof that the
+target filesystem is read-only. Do not edit the canonical store through it.
+Treat a missing or mismatched asset as a preflight failure; do not copy assets
+into Git or change scenario semantics to make the test pass. Runtime asset
+identity and semantic hashes remain owned by the TargetRuntime contract rather
+than this development-path mechanism.
 
 The random stream is fixed by the JSON config. Increase `sample_count` for a
 longer offline soak test; do not replace deterministic CI coverage with an

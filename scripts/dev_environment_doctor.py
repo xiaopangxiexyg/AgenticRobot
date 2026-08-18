@@ -26,6 +26,7 @@ from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_FILE = REPO_ROOT / "pyproject.toml"
+ASSET_STORE_TOOL = REPO_ROOT / "scripts" / "dev_asset_store.py"
 
 
 @dataclass(frozen=True)
@@ -234,6 +235,31 @@ def _git_metadata() -> dict[str, object]:
         "commit": head.stdout.strip() if head.returncode == 0 else None,
         "dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
     }
+
+
+def _development_asset_status() -> dict[str, object]:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ASSET_STORE_TOOL),
+            "--repo-root",
+            str(REPO_ROOT),
+            "status",
+            "--json",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
+        raise RuntimeError(f"asset-store status was not valid JSON: {detail}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("asset-store status was not a JSON object")
+    return payload
 
 
 def _append_package_findings(
@@ -460,6 +486,38 @@ def collect_findings(args: argparse.Namespace) -> tuple[list[Finding], dict[str,
     else:
         findings.append(Finding("WARN", "lock.check", "skipped by request"))
 
+    asset_status: dict[str, object] = {}
+    try:
+        asset_status = _development_asset_status()
+    except RuntimeError as exc:
+        level = "FAIL" if args.require_development_assets else "WARN"
+        findings.append(Finding(level, "assets.development_store", str(exc)))
+    else:
+        if asset_status.get("available") is True:
+            findings.append(
+                Finding(
+                    "PASS",
+                    "assets.development_store",
+                    f"required development bundles are available at {asset_status['root']} "
+                    f"via {asset_status['source']}",
+                )
+            )
+        else:
+            level = "FAIL" if args.require_development_assets else "WARN"
+            error = asset_status.get("error")
+            missing_bundles = [
+                item.get("bundle_id")
+                for item in asset_status.get("bundles", [])
+                if isinstance(item, dict)
+                and item.get("required_by_default") is True
+                and item.get("available") is not True
+            ]
+            detail = str(error) if error else (
+                "required development bundles are unavailable: "
+                + ", ".join(str(item) for item in missing_bundles)
+            )
+            findings.append(Finding(level, "assets.development_store", detail))
+
     configured_sdk = args.vendor_sdk_root or os.environ.get(
         "DEXTELEOP_DMTAC_SDK_ROOT"
     ) or str(REPO_ROOT / config.vendor_sdk)
@@ -487,6 +545,7 @@ def collect_findings(args: argparse.Namespace) -> tuple[list[Finding], dict[str,
         "prefix": sys.prefix,
         "fingerprints": fingerprints,
         "git": _git_metadata(),
+        "development_assets": asset_status,
     }
     return findings, metadata_result
 
@@ -519,6 +578,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vendor-sdk-root",
         help="override the DM-Tac SDK checkout path",
+    )
+    parser.add_argument(
+        "--require-development-assets",
+        action="store_true",
+        help="fail unless the configured development asset store has all default bundles",
     )
     return parser
 

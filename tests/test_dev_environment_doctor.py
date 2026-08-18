@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -78,6 +79,7 @@ def test_doctor_cli_is_machine_readable_and_does_not_require_hardware() -> None:
     assert findings["repo.cwd"]["level"] == "PASS"
     assert findings["source.root_resolution"]["level"] == "PASS"
     assert findings["vendor_sdk"]["level"] in {"PASS", "WARN"}
+    assert findings["assets.development_store"]["level"] in {"PASS", "WARN"}
 
 
 def test_doctor_rejects_execution_outside_the_worktree_root(tmp_path: Path) -> None:
@@ -99,3 +101,31 @@ def test_doctor_rejects_execution_outside_the_worktree_root(tmp_path: Path) -> N
     payload = json.loads(completed.stdout)
     findings = {item["key"]: item for item in payload["findings"]}
     assert findings["repo.cwd"]["level"] == "FAIL"
+
+
+def test_doctor_strict_asset_gate_rejects_missing_configured_root(
+    tmp_path: Path,
+) -> None:
+    environment = os.environ.copy()
+    environment["DEXTELEOP_ASSET_ROOT"] = str(tmp_path / "missing-assets")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(DOCTOR_PATH),
+            "--json",
+            "--skip-lock-check",
+            "--skip-dependency-check",
+            "--require-development-assets",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    payload = json.loads(completed.stdout)
+    findings = {item["key"]: item for item in payload["findings"]}
+    assert findings["assets.development_store"]["level"] == "FAIL"
+    assert "not a directory" in findings["assets.development_store"]["detail"]
