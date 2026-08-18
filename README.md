@@ -4,6 +4,11 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 和 dataset contracts。运行命令按领域统一维护在 [`docs/`](./docs/README.md)，不要从历史
 实验报告或日志中拼接参数。
 
+# 下载并解压assets: https://disk.pku.edu.cn/link/AAFC87022DDDD74051882C5F926A1DD540
+文件名：assets.zip
+有效期限：2026-09-17 12:16
+提取码：rDpF
+
 ## 从这里开始
 
 | 目标 | 当前入口 |
