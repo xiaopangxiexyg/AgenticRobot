@@ -25,8 +25,6 @@ def _argv(*, confirmation: str, socket_path: Path | None = None) -> list[str]:
             if socket_path is None
             else socket_path
         ),
-        "--calibration-profile",
-        existing,
         "--arm-ip-assignment",
         existing,
         "--left-tool-profile",
@@ -101,6 +99,7 @@ def test_cli_accepts_a_list_of_reviewed_actions_for_temporary_testing() -> None:
         "level_forward_left_30",
         "level_forward_right_30",
     )
+    assert not hasattr(parsed, "calibration_profile")
 
 
 def test_cli_rejects_partial_perception_attachment_before_profile_resolution(

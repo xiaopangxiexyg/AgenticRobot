@@ -14,7 +14,6 @@ from robot_motion.rm65 import (
     load_ik_tuning_config,
     with_rm65_position_ik_objective,
 )
-from teleop_runtime.configs import build_annotated_dual_rm65_calibration
 from teleop_runtime.interfaces import EffectorBackend
 from teleop_runtime.skill_deploy import rm65_profile as profile_module
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
@@ -31,7 +30,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _profile() -> ExclusiveRM65SkillDeploymentProfile:
     return ExclusiveRM65SkillDeploymentProfile(
-        calibration_path=REPO_ROOT / "pyproject.toml",
         arm_ip_assignment_path=REPO_ROOT / "README.md",
         tool_profile_path_by_side={
             "left": (
@@ -54,11 +52,6 @@ def _profile() -> ExclusiveRM65SkillDeploymentProfile:
 
 
 def _resolved(monkeypatch):
-    monkeypatch.setattr(
-        profile_module.TeleopCalibration,
-        "load_json",
-        lambda path: build_annotated_dual_rm65_calibration(),
-    )
     monkeypatch.setattr(
         profile_module,
         "load_assignment",
@@ -194,6 +187,12 @@ def test_lower_assembly_reuses_one_profile_and_starts_no_resources(
     assert assembly.position_force_guard is force_guard
     assert assembly.ports.target_builder is target_builder
     assert assembly.target_safety.target_builder is target_builder
+    assert assembly.target_safety.target_frame_binding is (
+        assembly.target_safety.envelope_filter.target_frame_binding
+    )
+    assert set(
+        assembly.target_safety.target_frame_binding.target_world_from_base_by_side
+    ) == {"left", "right"}
     assert assembly.startup_admission.ports is assembly.ports
     assert assembly.startup_admission.target_safety is assembly.target_safety
     assert guard_inputs == [assembly.arm_backends]

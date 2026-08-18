@@ -272,7 +272,10 @@ def assemble_exclusive_rm65_skill_lower(
     )
     target_safety = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
         target_builder=target_builder,
-        calibration=profile.calibration,
+        station_world_from_arm_base_by_side=(
+            profile.scene_world_from_arm_base_by_side
+        ),
+        station_world_frame_id=profile.station_world_frame_id,
         envelope_profile_path=profile.envelope_profile_path,
     )
     startup_admission = ExclusiveRM65SkillStartupSafetyBinder(

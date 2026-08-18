@@ -19,7 +19,6 @@ from robot_motion.rm65 import (
     tool_tcp_pose_flange_m_rad,
 )
 from robot_motion.rm65.position_profile import RM65BimanualPositionProfile
-from teleop_runtime.calibration import TeleopCalibration
 from teleop_runtime.hardware_config.rm65_arm_ips import (
     arm_ips_for_sides,
     load_assignment,
@@ -31,6 +30,7 @@ from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
 
 
 _SIDES = ("left", "right")
+RM65_SKILL_SCENE_WORLD_FRAME_ID_V1 = "dual_arm_solver_world"
 
 
 def _absolute_file(value: str | Path, *, field_name: str) -> Path:
@@ -47,7 +47,6 @@ def _absolute_file(value: str | Path, *, field_name: str) -> Path:
 class ExclusiveRM65SkillDeploymentProfile:
     """Operator-selected facts; none are accepted from an Agent request."""
 
-    calibration_path: Path
     arm_ip_assignment_path: Path
     tool_profile_path_by_side: Mapping[str, Path]
     envelope_profile_path: Path
@@ -69,7 +68,6 @@ class ExclusiveRM65SkillDeploymentProfile:
             raise ValueError(
                 "position_profile_name and collision_scene_profile must be non-empty."
             )
-        object.__setattr__(self, "calibration_path", Path(self.calibration_path))
         object.__setattr__(
             self,
             "arm_ip_assignment_path",
@@ -93,23 +91,20 @@ class ExclusiveRM65SkillDeploymentProfile:
 class ResolvedExclusiveRM65SkillDeploymentProfile:
     """Exact local inputs used to construct one independent real process."""
 
-    calibration_path: Path
     arm_ip_assignment_path: Path
     tool_profile_path_by_side: Mapping[str, Path]
     envelope_profile_path: Path
-    calibration: TeleopCalibration
     arm_ip_by_side: Mapping[str, str]
     tool_profile_by_side: Mapping[str, Mapping[str, object]]
     tool_tcp_pose_flange_m_rad_by_side: Mapping[str, np.ndarray]
     scene_world_from_arm_base_by_side: Mapping[str, np.ndarray]
+    station_world_frame_id: str
     envelope_file_spec: TCPPoseEnvelopeFileSpec
     position_profile: RM65BimanualPositionProfile
     collision_scene_profile: str
     semantic_content_hash: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.calibration, TeleopCalibration):
-            raise TypeError("calibration must be TeleopCalibration.")
         if not isinstance(self.envelope_file_spec, TCPPoseEnvelopeFileSpec):
             raise TypeError("envelope_file_spec must be typed.")
         if not isinstance(self.position_profile, RM65BimanualPositionProfile):
@@ -144,6 +139,11 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
             raise ValueError("tool TCP poses must contain finite values.")
         if any(not np.all(np.isfinite(value)) for value in scene_mounts.values()):
             raise ValueError("scene arm mounts must contain finite values.")
+        for value in (*tcp.values(), *scene_mounts.values()):
+            value.setflags(write=False)
+        station_world_frame_id = str(self.station_world_frame_id).strip()
+        if not station_world_frame_id:
+            raise ValueError("station_world_frame_id must be non-empty.")
         object.__setattr__(self, "arm_ip_by_side", MappingProxyType(ips))
         object.__setattr__(self, "tool_profile_by_side", MappingProxyType(tools))
         object.__setattr__(
@@ -161,6 +161,11 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
             "scene_world_from_arm_base_by_side",
             MappingProxyType(scene_mounts),
         )
+        object.__setattr__(
+            self,
+            "station_world_frame_id",
+            station_world_frame_id,
+        )
 
 
 def resolve_exclusive_rm65_skill_deployment_profile(
@@ -170,10 +175,6 @@ def resolve_exclusive_rm65_skill_deployment_profile(
 
     if not isinstance(profile, ExclusiveRM65SkillDeploymentProfile):
         raise TypeError("profile must be ExclusiveRM65SkillDeploymentProfile.")
-    calibration_path = _absolute_file(
-        profile.calibration_path,
-        field_name="calibration_path",
-    )
     arm_ip_assignment_path = _absolute_file(
         profile.arm_ip_assignment_path,
         field_name="arm_ip_assignment_path",
@@ -189,26 +190,10 @@ def resolve_exclusive_rm65_skill_deployment_profile(
         )
         for side in _SIDES
     }
-    calibration = TeleopCalibration.load_json(calibration_path)
     scene_profile = build_rm65_dual_arm_scene_profile(
         profile.collision_scene_profile
     )
     scene_mounts = load_world_from_arm_base_transforms(scene_profile)
-    for side in _SIDES:
-        arm = calibration.get_arm_for_side(side)
-        transform = np.asarray(arm.T_D_B, dtype=float)
-        if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
-            raise ValueError(f"calibration side {side!r} has no finite T_D_B.")
-        if not np.allclose(
-            transform,
-            scene_mounts[side],
-            rtol=0.0,
-            atol=1e-9,
-        ):
-            raise ValueError(
-                f"calibration side {side!r} T_D_B does not match the fixed "
-                f"arm mount in collision scene {scene_profile.name!r}."
-            )
     assignment = load_assignment(arm_ip_assignment_path)
     arm_ips = arm_ips_for_sides(assignment, sides=_SIDES)
     if set(arm_ips) != set(_SIDES):
@@ -230,7 +215,6 @@ def resolve_exclusive_rm65_skill_deployment_profile(
     )
     semantic_hash = canonical_content_hash(
         {
-            "calibration": calibration.to_dict(),
             "arm_ip_by_side": arm_ips,
             "tool_profile_by_side": {
                 side: {
@@ -252,22 +236,25 @@ def resolve_exclusive_rm65_skill_deployment_profile(
             },
             "position_profile": position_profile.to_metadata(),
             "collision_scene_profile": profile.collision_scene_profile,
-            "scene_world_from_arm_base_by_side": {
-                side: scene_mounts[side].tolist() for side in _SIDES
+            "station_geometry": {
+                "source": "collision_scene_urdf_fixed_joint_chain",
+                "world_frame_id": RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
+                "world_from_arm_base_by_side": {
+                    side: scene_mounts[side].tolist() for side in _SIDES
+                },
             },
         },
-        domain="dexteleop.real_skill.rm65_deployment_profile.v1",
+        domain="dexteleop.real_skill.rm65_deployment_profile.v2",
     )
     return ResolvedExclusiveRM65SkillDeploymentProfile(
-        calibration_path=calibration_path,
         arm_ip_assignment_path=arm_ip_assignment_path,
         tool_profile_path_by_side=tool_paths,
         envelope_profile_path=envelope_profile_path,
-        calibration=calibration,
         arm_ip_by_side=arm_ips,
         tool_profile_by_side=tool_profiles,
         tool_tcp_pose_flange_m_rad_by_side=tcp_by_side,
         scene_world_from_arm_base_by_side=scene_mounts,
+        station_world_frame_id=RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
         envelope_file_spec=envelope_spec,
         position_profile=position_profile,
         collision_scene_profile=profile.collision_scene_profile,
@@ -277,6 +264,7 @@ def resolve_exclusive_rm65_skill_deployment_profile(
 
 __all__ = [
     "ExclusiveRM65SkillDeploymentProfile",
+    "RM65_SKILL_SCENE_WORLD_FRAME_ID_V1",
     "ResolvedExclusiveRM65SkillDeploymentProfile",
     "resolve_exclusive_rm65_skill_deployment_profile",
 ]

@@ -28,6 +28,7 @@ from .rm65_lower_assembly import (
 )
 from .rm65_profile import (
     ExclusiveRM65SkillDeploymentProfile,
+    RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
     ResolvedExclusiveRM65SkillDeploymentProfile,
     resolve_exclusive_rm65_skill_deployment_profile,
 )
@@ -76,6 +77,7 @@ __all__ = [
     "build_exclusive_rm65_skill_position_force_guard",
     "assemble_exclusive_rm65_skill_lower",
     "ExclusiveRM65SkillDeploymentProfile",
+    "RM65_SKILL_SCENE_WORLD_FRAME_ID_V1",
     "ResolvedExclusiveRM65SkillDeploymentProfile",
     "resolve_exclusive_rm65_skill_deployment_profile",
     "ExclusiveRM65SkillStartupSafetyReceipt",

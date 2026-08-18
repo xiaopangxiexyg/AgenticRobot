@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 
 from robot_motion.runtime import TeleopObservation
-from teleop_runtime.configs import build_annotated_dual_rm65_calibration
 from teleop_runtime.skill_deploy import (
     ExclusiveRM65SkillStartupSafetyBinder,
     ExclusiveRM65SkillTargetSafetyRuntime,
@@ -109,10 +108,15 @@ def _cut() -> RealSkillMotionObservationCut:
 
 
 def _runtime(builder: _TargetBuilder):
-    calibration = build_annotated_dual_rm65_calibration()
+    world_from_base = {
+        "left": np.eye(4, dtype=float),
+        "right": np.eye(4, dtype=float),
+    }
+    world_from_base["right"][1, 3] = 0.525
     runtime = ExclusiveRM65SkillTargetSafetyRuntime.from_profile_path(
         target_builder=builder,
-        calibration=calibration,
+        station_world_from_arm_base_by_side=world_from_base,
+        station_world_frame_id="dual_arm_solver_world",
         envelope_profile_path=(
             CANONICAL_PROFILE_DIR
             / "agent_primitive_left_relative_tight_v1.json"
@@ -120,12 +124,12 @@ def _runtime(builder: _TargetBuilder):
         execution_epoch=7,
         clock_domain_id="exclusive-real-skill-test-clock",
     )
-    return runtime, calibration
+    return runtime
 
 
 def test_startup_binder_requires_hold_then_binds_fresh_active_anchor() -> None:
     builder = _TargetBuilder()
-    runtime, calibration = _runtime(builder)
+    runtime = _runtime(builder)
     ports = _Ports(
         target_builder=builder,
         cut=_cut(),
@@ -154,8 +158,7 @@ def test_startup_binder_requires_hold_then_binds_fresh_active_anchor() -> None:
         == receipt.anchor_receipt_hash
     )
     np.testing.assert_allclose(
-        calibration.get_arm_for_side("left")
-        .home_pose_for_tcp_mode("tool_tcp")[:3, 3],
+        runtime.envelope_filter.anchor_receipt.tcp_pose_by_side["left"][:3, 3],
         np.array([0.1, 0.0, 0.0]),
     )
     assert ports.observations == 1
@@ -169,7 +172,7 @@ def test_startup_binder_requires_hold_then_binds_fresh_active_anchor() -> None:
 
 def test_startup_binder_rejects_unconfirmed_hold_without_observing() -> None:
     builder = _TargetBuilder()
-    runtime, _ = _runtime(builder)
+    runtime = _runtime(builder)
     ports = _Ports(
         target_builder=builder,
         cut=_cut(),

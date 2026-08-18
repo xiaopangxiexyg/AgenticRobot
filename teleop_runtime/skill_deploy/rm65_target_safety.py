@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -13,13 +13,14 @@ import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.target_safety.tcp_pose_envelope import (
+    TCPPoseEnvelopeAnchorReceipt,
     TCPPoseEnvelopeProfile,
 )
-from teleop_runtime.calibration import TeleopCalibration
 from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
+    TCPPoseEnvelopeTargetFrameBinding,
     TCPPoseEnvelopeTargetFilter,
     install_tcp_pose_envelope_filter,
-    load_tcp_pose_envelope_profile,
+    load_tcp_pose_envelope_profile_from_target_frame_binding,
 )
 
 from .control_runtime import (
@@ -60,14 +61,17 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
         self,
         *,
         target_builder: RM65SkillTargetSafetyBuilder,
-        calibration: TeleopCalibration,
+        target_frame_binding: TCPPoseEnvelopeTargetFrameBinding,
         envelope_profile: TCPPoseEnvelopeProfile,
         envelope_filter: TCPPoseEnvelopeTargetFilter,
         execution_epoch: int = 1,
         clock_domain_id: str = "python-time-time-wall-clock",
     ) -> None:
-        if not isinstance(calibration, TeleopCalibration):
-            raise TypeError("calibration must be TeleopCalibration.")
+        if not isinstance(
+            target_frame_binding,
+            TCPPoseEnvelopeTargetFrameBinding,
+        ):
+            raise TypeError("target_frame_binding must be typed.")
         if not isinstance(envelope_profile, TCPPoseEnvelopeProfile):
             raise TypeError("envelope_profile must be typed.")
         if not isinstance(envelope_filter, TCPPoseEnvelopeTargetFilter):
@@ -76,6 +80,10 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
             raise ValueError("target builder and envelope filter must be identical.")
         if envelope_filter.profile is not envelope_profile:
             raise ValueError("envelope filter must use the exact selected profile.")
+        if envelope_filter.target_frame_binding is not target_frame_binding:
+            raise ValueError(
+                "envelope filter must use the exact selected target frame binding."
+            )
         if not envelope_filter.apply_to_target:
             raise ValueError("independent real Skill envelope must be Active.")
         epoch = int(execution_epoch)
@@ -85,7 +93,7 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
         if not clock_id:
             raise ValueError("clock_domain_id must be non-empty.")
         self.target_builder = target_builder
-        self.calibration = calibration
+        self.target_frame_binding = target_frame_binding
         self.envelope_profile = envelope_profile
         self.envelope_filter = envelope_filter
         self.execution_epoch = epoch
@@ -101,30 +109,37 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
         cls,
         *,
         target_builder: RM65SkillTargetSafetyBuilder,
-        calibration: TeleopCalibration,
+        station_world_from_arm_base_by_side: Mapping[str, np.ndarray],
+        station_world_frame_id: str,
         envelope_profile_path: str | Path,
         execution_epoch: int = 1,
         clock_domain_id: str = "python-time-time-wall-clock",
     ) -> ExclusiveRM65SkillTargetSafetyRuntime:
-        """Reuse the canonical envelope loader and final pre-IK filter."""
+        """Bind the final pre-IK envelope to lower-owned Station geometry."""
 
-        profile = load_tcp_pose_envelope_profile(
+        target_frame_binding = TCPPoseEnvelopeTargetFrameBinding(
+            reference_frame_by_side={
+                side: station_world_frame_id for side in ("left", "right")
+            },
+            target_world_from_base_by_side=station_world_from_arm_base_by_side,
+        )
+        profile = load_tcp_pose_envelope_profile_from_target_frame_binding(
             envelope_profile_path,
-            calibration=calibration,
+            target_frame_binding=target_frame_binding,
             retargeter=target_builder,
             active_sides=("left", "right"),
         )
         filter_owner = install_tcp_pose_envelope_filter(
             retargeter=target_builder,
             profile=profile,
-            calibration=calibration,
+            target_frame_binding=target_frame_binding,
             execution_epoch=int(execution_epoch),
             anchor_receipt=None,
             apply_to_target=True,
         )
         return cls(
             target_builder=target_builder,
-            calibration=calibration,
+            target_frame_binding=target_frame_binding,
             envelope_profile=profile,
             envelope_filter=filter_owner,
             execution_epoch=execution_epoch,
@@ -161,19 +176,23 @@ class ExclusiveRM65SkillTargetSafetyRuntime:
         required_sides = tuple(self.envelope_profile.anchor_required_sides)
         if not set(required_sides).issubset(tool_targets):
             raise RuntimeError("target builder omitted a required TCP anchor side.")
-        for side in required_sides:
-            self.calibration.capture_home_pose(
-                f"{side}_arm",
-                tool_targets[side],
-                tcp_mode="tool_tcp",
+        anchor = (
+            None
+            if not required_sides
+            else TCPPoseEnvelopeAnchorReceipt.capture(
+                anchor_id=f"exclusive_skill_startup:{self.execution_epoch}",
+                profile=self.envelope_profile,
+                execution_epoch=self.execution_epoch,
+                clock_domain_id=self.clock_domain_id,
+                tcp_pose_by_side={
+                    side: tool_targets[side] for side in required_sides
+                },
+                captured_at_by_side={side: timestamp for side in required_sides},
             )
-            self.calibration.capture_home_qpos(f"{side}_arm", qpos[side])
-        anchor = self.envelope_filter.rebind_from_calibration_home(
+        )
+        self.envelope_filter.rebind(
             execution_epoch=self.execution_epoch,
-            captured_at=timestamp,
-            captured_sides=required_sides,
-            anchor_id=f"exclusive_skill_startup:{self.execution_epoch}",
-            clock_domain_id=self.clock_domain_id,
+            anchor_receipt=anchor,
         )
         anchor_hash = None if anchor is None else anchor.semantic_content_hash
         payload = {

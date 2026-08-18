@@ -164,7 +164,6 @@ The dedicated independent RM65 Skill entrypoint is:
 ```bash
 python -m agent_gateway real-rm65 \
   --socket-path /absolute/private/gateway.sock \
-  --calibration-profile /absolute/station_calibration.json \
   --arm-ip-assignment /absolute/rm65_arm_ips.json \
   --left-tool-profile /absolute/left_tool.json \
   --right-tool-profile /absolute/right_tool.json \
@@ -179,7 +178,6 @@ Real RGB/Depth support is opt-in on that same v2 session:
 ```bash
 python -m agent_gateway real-rm65 \
   --socket-path /absolute/private/gateway.sock \
-  --calibration-profile /absolute/station_calibration.json \
   --arm-ip-assignment /absolute/rm65_arm_ips.json \
   --left-tool-profile /absolute/left_tool.json \
   --right-tool-profile /absolute/right_tool.json \
@@ -205,6 +203,14 @@ HOLD. RGB is JPEG; depth is native-resolution float32 metric NPY with aligned
 color intrinsics and the trusted world pose. Payload bytes are committed to
 the same generic transient Artifact CAS and retrieved through `chunked_rpc` or
 a reviewed same-host `local_path` grant.
+
+The selected `--collision-scene-profile` is the single source of Station
+geometry for this independent Skill process. Its scene URDF fixed-joint chain
+defines both arm bases in `dual_arm_solver_world`; the camera registry then
+defines each fixed camera relative to its parent link. A Vive/teleoperation
+`TeleopCalibration` is neither loaded nor accepted by this entrypoint. Runtime
+TCP-envelope anchors come from the fresh lower-measured qpos/FK cut after the
+startup HOLD, not from a teleoperation Home record.
 
 This is currently a combined real application, not a camera-only diagnostic
 launcher. Starting it acquires and admits all configured cameras, then starts

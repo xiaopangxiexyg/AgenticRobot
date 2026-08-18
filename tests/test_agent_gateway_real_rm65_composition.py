@@ -20,7 +20,6 @@ from agent_gateway.profiles.real.one_shot_authorization import (
 from agent_gateway.profiles.real.realsense_perception import (
     ExclusiveRealPerceptionResources,
 )
-from teleop_runtime.configs import build_annotated_dual_rm65_calibration
 from teleop_runtime.interfaces import EffectorBackend
 from teleop_runtime.skill_deploy import rm65_profile as profile_module
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
@@ -109,11 +108,6 @@ class _ForceGuard:
 
 def _lower(monkeypatch, *, envelope_side: str = "right"):
     monkeypatch.setattr(
-        profile_module.TeleopCalibration,
-        "load_json",
-        lambda path: build_annotated_dual_rm65_calibration(),
-    )
-    monkeypatch.setattr(
         profile_module,
         "load_assignment",
         lambda path: {
@@ -125,7 +119,6 @@ def _lower(monkeypatch, *, envelope_side: str = "right"):
     )
     profile = resolve_exclusive_rm65_skill_deployment_profile(
         ExclusiveRM65SkillDeploymentProfile(
-            calibration_path=REPO_ROOT / "pyproject.toml",
             arm_ip_assignment_path=REPO_ROOT / "README.md",
             tool_profile_path_by_side={
                 "left": (
@@ -250,6 +243,26 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         assert all(
             source.device_info()["running"] is False
             for source in composition.perception_source_binding.camera_sources.values()
+        )
+
+        registry = json.loads(
+            (
+                REPO_ROOT / "robot_motion/configs/rm65_camera_registry.json"
+            ).read_text(encoding="utf-8")
+        )
+        parent_from_camera = np.asarray(
+            registry["cameras"]["front"]["extrinsics"]["frames"]
+            ["head_camera_frame"]["T_camera_to_parent"],
+            dtype=float,
+        )
+        expected_world_from_camera = (
+            lower.profile.scene_world_from_arm_base_by_side["left"]
+            @ parent_from_camera
+        )
+        np.testing.assert_allclose(
+            composition.perception_source_binding
+            .world_from_depth_camera_by_source["front"],
+            expected_world_from_camera,
         )
     finally:
         assert session.artifact_store is not None

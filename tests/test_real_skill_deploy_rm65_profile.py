@@ -9,10 +9,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from teleop_runtime.configs import build_annotated_dual_rm65_calibration
 from teleop_runtime.skill_deploy import rm65_profile as profile_module
 from teleop_runtime.skill_deploy.rm65_profile import (
     ExclusiveRM65SkillDeploymentProfile,
+    RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
     resolve_exclusive_rm65_skill_deployment_profile,
 )
 
@@ -22,7 +22,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _profile() -> ExclusiveRM65SkillDeploymentProfile:
     return ExclusiveRM65SkillDeploymentProfile(
-        calibration_path=REPO_ROOT / "pyproject.toml",
         arm_ip_assignment_path=REPO_ROOT / "README.md",
         tool_profile_path_by_side={
             "left": (
@@ -45,12 +44,6 @@ def _profile() -> ExclusiveRM65SkillDeploymentProfile:
 def test_profile_resolves_existing_shared_inputs_without_device_construction(
     monkeypatch,
 ) -> None:
-    calibration = build_annotated_dual_rm65_calibration()
-    monkeypatch.setattr(
-        profile_module.TeleopCalibration,
-        "load_json",
-        lambda path: calibration,
-    )
     monkeypatch.setattr(
         profile_module,
         "load_assignment",
@@ -64,7 +57,6 @@ def test_profile_resolves_existing_shared_inputs_without_device_construction(
 
     resolved = resolve_exclusive_rm65_skill_deployment_profile(_profile())
 
-    assert resolved.calibration is calibration
     assert set(resolved.arm_ip_by_side) == {"left", "right"}
     assert set(resolved.tool_profile_by_side) == {"left", "right"}
     assert set(resolved.tool_tcp_pose_flange_m_rad_by_side) == {
@@ -79,32 +71,28 @@ def test_profile_resolves_existing_shared_inputs_without_device_construction(
     assert resolved.envelope_file_spec.profile_id.endswith("left-relative-tight-v1")
     assert resolved.position_profile.name == "rm65_bimanual_position_v1"
     assert set(resolved.scene_world_from_arm_base_by_side) == {"left", "right"}
-    for side in ("left", "right"):
-        np.testing.assert_allclose(
-            resolved.calibration.get_arm_for_side(side).T_D_B,
-            resolved.scene_world_from_arm_base_by_side[side],
-            rtol=0.0,
-            atol=1e-9,
-        )
+    assert resolved.station_world_frame_id == RM65_SKILL_SCENE_WORLD_FRAME_ID_V1
+    assert all(
+        not value.flags.writeable
+        for value in resolved.scene_world_from_arm_base_by_side.values()
+    )
+    assert all(
+        not value.flags.writeable
+        for value in resolved.tool_tcp_pose_flange_m_rad_by_side.values()
+    )
     assert len(resolved.semantic_content_hash) == 64
 
 
 def test_profile_requires_absolute_files_and_both_arm_ips(monkeypatch) -> None:
     profile = _profile()
     relative = ExclusiveRM65SkillDeploymentProfile(
-        calibration_path=Path("relative-calibration.json"),
-        arm_ip_assignment_path=profile.arm_ip_assignment_path,
+        arm_ip_assignment_path=Path("relative-arm-ips.json"),
         tool_profile_path_by_side=profile.tool_profile_path_by_side,
         envelope_profile_path=profile.envelope_profile_path,
     )
-    with pytest.raises(ValueError, match="calibration_path must be an absolute"):
+    with pytest.raises(ValueError, match="arm_ip_assignment_path must be an absolute"):
         resolve_exclusive_rm65_skill_deployment_profile(relative)
 
-    monkeypatch.setattr(
-        profile_module.TeleopCalibration,
-        "load_json",
-        lambda path: build_annotated_dual_rm65_calibration(),
-    )
     monkeypatch.setattr(
         profile_module,
         "load_assignment",
@@ -143,19 +131,38 @@ print(json.dumps(sorted(
     assert json.loads(completed.stdout) == []
 
 
-def test_profile_rejects_calibration_that_disagrees_with_collision_scene(
+def test_profile_uses_collision_scene_geometry_without_teleop_calibration(
     monkeypatch,
 ) -> None:
-    calibration = build_annotated_dual_rm65_calibration()
-    calibration.get_arm_for_side("right").T_D_B[1, 3] += 0.01
+    expected = {
+        "left": np.eye(4, dtype=float),
+        "right": np.eye(4, dtype=float),
+    }
+    expected["right"][1, 3] = 0.525
     monkeypatch.setattr(
-        profile_module.TeleopCalibration,
-        "load_json",
-        lambda path: calibration,
+        profile_module,
+        "load_world_from_arm_base_transforms",
+        lambda scene_profile: expected,
+    )
+    monkeypatch.setattr(
+        profile_module,
+        "load_assignment",
+        lambda path: {
+            "assignments": {
+                "left": {"arm_ip": "192.0.2.10"},
+                "right": {"arm_ip": "192.0.2.11"},
+            }
+        },
     )
 
-    with pytest.raises(ValueError, match="does not match the fixed arm mount"):
-        resolve_exclusive_rm65_skill_deployment_profile(_profile())
+    resolved = resolve_exclusive_rm65_skill_deployment_profile(_profile())
+
+    assert not hasattr(profile_module, "TeleopCalibration")
+    for side in ("left", "right"):
+        np.testing.assert_allclose(
+            resolved.scene_world_from_arm_base_by_side[side],
+            expected[side],
+        )
 
 
 def test_legacy_rm65_ip_module_is_the_canonical_module_object() -> None:

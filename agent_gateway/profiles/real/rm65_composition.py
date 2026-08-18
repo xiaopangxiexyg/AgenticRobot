@@ -29,6 +29,7 @@ from robot_motion.coordinate_frames import (
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from teleop_runtime.skill_deploy import (
     ExclusiveRM65SkillLowerAssembly,
+    RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
     RealAgentMotionPortConfig,
 )
 
@@ -61,7 +62,7 @@ from .realsense_perception import (
     build_real_perception_source_binding,
 )
 
-RM65_SKILL_EXECUTION_FRAME_ID_V1 = "dual_arm_solver_world"
+RM65_SKILL_EXECUTION_FRAME_ID_V1 = RM65_SKILL_SCENE_WORLD_FRAME_ID_V1
 RM65_SKILL_STATION_FRAME_ID_V1 = "canonical_station"
 RM65_SKILL_CLOCK_DOMAIN_ID_V1 = "python-time-time-wall-clock"
 
@@ -224,10 +225,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         )
 
     profile = lower.profile
-    calibration_hash = _hash(
-        profile.calibration.to_dict(),
-        domain="dexteleop.real_skill.rm65_calibration.v1",
-    )
+    if profile.station_world_frame_id != RM65_SKILL_EXECUTION_FRAME_ID_V1:
+        raise ValueError(
+            "lower Station world frame does not match the real Skill execution frame"
+        )
     tool_config_hash = _hash(
         {
             "profiles": _public_tool_profiles(lower),
@@ -258,6 +259,15 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             for name in ("left", "right")
         },
         domain="dexteleop.real_skill.rm65_scene_mounts.v1",
+    )
+    station_geometry_hash = _hash(
+        {
+            "source": "collision_scene_urdf_fixed_joint_chain",
+            "world_frame_id": profile.station_world_frame_id,
+            "collision_scene_profile": profile.collision_scene_profile,
+            "scene_mount_hash": scene_mount_hash,
+        },
+        domain="dexteleop.real_skill.rm65_station_geometry.v1",
     )
 
     execution_frame = CoordinateFrameSpec(
@@ -304,6 +314,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         {
             "frame_graph_hash": frame_graph.semantic_content_hash,
             "scene_mount_hash": scene_mount_hash,
+            "station_geometry_hash": station_geometry_hash,
             "deployment_profile_hash": profile.semantic_content_hash,
         },
         domain="dexteleop.real_skill.rm65_station_manifest.v1",
@@ -366,7 +377,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "observation_plan_hash": observation_plan_hash,
             "observation_capability_hash": observation_capability_hash,
             "tool_config_hash": tool_config_hash,
-            "calibration_hash": calibration_hash,
+            "station_geometry_hash": station_geometry_hash,
         },
         domain="dexteleop.real_skill.rm65_observation_binding.v1",
     )
@@ -404,7 +415,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         reference_frame_spec_hash=execution_frame.semantic_content_hash,
         frame_graph_hash=frame_graph.semantic_content_hash,
         tool_config_hash=tool_config_hash,
-        calibration_hash=calibration_hash,
+        # ``calibration_hash`` is a v2 wire compatibility field. Independent
+        # Skill deployment binds it to lower-owned Station geometry; it never
+        # hashes or loads a TeleopCalibration.
+        calibration_hash=station_geometry_hash,
         clock_domain_id=RM65_SKILL_CLOCK_DOMAIN_ID_V1,
         producer_epoch=1,
         max_measurement_age_ms=maximum_age_ms,
