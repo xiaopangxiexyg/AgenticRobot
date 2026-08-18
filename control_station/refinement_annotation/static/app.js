@@ -441,14 +441,16 @@ function updateEpisodeNavigation() {
   if (selected?.whole_episode_abnormal) labels.push("整条异常");
   if (selected?.review_state === "PENDING") labels.push("待复核");
   else if (selected?.review_state === "COMPLETED") labels.push("已复核");
+  if (selected?.detail_annotation_complete === true) labels.push("详细完成");
   status.textContent = labels.join(" / ") || "—";
   status.className = [
     "collapsed-episode-status",
     selected?.whole_episode_abnormal ? "abnormal" : "",
     selected?.review_state === "PENDING" ? "review" : "",
     selected?.review_state === "COMPLETED" ? "review-complete" : "",
+    selected?.detail_annotation_complete === true ? "detail-complete" : "",
   ].filter(Boolean).join(" ");
-  status.title = labels.join("；") || "当前 Episode 无整条异常或复核状态";
+  status.title = labels.join("；") || "当前 Episode 无整条异常、复核或详细标注状态";
   for (const id of ["previous-episode", "previous-episode-collapsed"]) {
     $(id).disabled = !hasSelection || index <= 0;
   }
@@ -2392,6 +2394,11 @@ function renderEpisodeList() {
         ),
       );
     }
+    if (item.detail_annotation_complete === true) {
+      badges.appendChild(
+        element("span", "badge detail-complete", "详细标注完成"),
+      );
+    }
     if (item.annotation_summary_error) {
       const badge = element("span", "badge summary-error", "状态读取失败");
       badge.title = item.annotation_summary_error;
@@ -2504,6 +2511,10 @@ async function selectEpisode(episodeUuid) {
         whole_episode_abnormal: payload.episode.whole_episode_abnormal,
         whole_episode_abnormal_reason:
           payload.episode.whole_episode_abnormal_reason,
+        detail_annotation_complete:
+          payload.episode.detail_annotation_complete === true
+          || payload.episode.detail_annotation?.resolution_level
+            === "DETAIL_COMPLETE",
         annotation_summary_loaded: true,
         annotation_summary_error: null,
       };
@@ -3753,8 +3764,23 @@ async function publishDetailAnnotations() {
   if (report.detail_annotation) {
     state.detail.detail_annotation = report.detail_annotation;
   }
+  state.detail.detail_annotation_complete =
+    report.detail_annotation?.resolution_level === "DETAIL_COMPLETE";
+  const episodeIndex = state.episodes.findIndex(
+    (value) => value.episode_uuid === state.detail.episode_uuid,
+  );
+  if (episodeIndex >= 0) {
+    state.episodes[episodeIndex] = {
+      ...state.episodes[episodeIndex],
+      detail_annotation_complete: state.detail.detail_annotation_complete,
+      annotation_summary_loaded: true,
+      annotation_summary_error: null,
+    };
+    episodeSummaryRefreshedAt.set(state.detail.episode_uuid, Date.now());
+  }
   setSavedDraftSnapshot(state.draft);
   renderTimeline();
+  renderEpisodeList();
   await loadEpisodes();
   return report;
 }
@@ -3807,6 +3833,8 @@ async function publishCurrentAnnotations() {
   if (report.detail_annotation) {
     state.detail.detail_annotation = report.detail_annotation;
   }
+  state.detail.detail_annotation_complete =
+    report.detail_annotation?.resolution_level === "DETAIL_COMPLETE";
   setSavedDraftSnapshot(state.draft);
   state.sealedReeditBaseline = null;
   state.sealedReeditSourceId = null;
@@ -3855,11 +3883,13 @@ async function publishCurrentAnnotations() {
       whole_episode_abnormal: state.detail.whole_episode_abnormal,
       whole_episode_abnormal_reason:
         state.detail.whole_episode_abnormal_reason,
+      detail_annotation_complete: state.detail.detail_annotation_complete,
       annotation_summary_loaded: true,
       annotation_summary_error: null,
     };
     episodeSummaryRefreshedAt.set(state.detail.episode_uuid, Date.now());
   }
+  renderEpisodeList();
   state.detail.draft_persistence_state = "SEALED_SNAPSHOT";
   state.detail.draft_requires_seal = false;
   renderSealedReeditControls();
