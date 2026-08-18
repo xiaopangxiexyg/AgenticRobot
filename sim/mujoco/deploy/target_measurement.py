@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from dataset_contracts.pose_frames import load_pose_frame_contract
 from project_paths import resolve_path
 from robot_motion.action import (
     BIMANUAL_EE_POSE_V1,
@@ -154,17 +155,41 @@ def build_mujoco_sim_hil_coordinate_profiles(
     task_config: Any,
     *,
     active_sides: tuple[str, ...] = ("left", "right"),
+    station_pose_contract_path: str | Path | None = None,
 ) -> tuple[TargetFrameProfile, ToolFrameProfile]:
     """Derive immutable target/tool identities from the loaded MuJoCo scene."""
 
     canonical_frame_id = "mujoco_sim_hil/station"
+    station_contract = (
+        None
+        if station_pose_contract_path is None
+        else load_pose_frame_contract(station_pose_contract_path)
+    )
+    if station_contract is not None:
+        if station_contract.pose_storage_frame != "desk_absolute":
+            raise ValueError(
+                "MuJoCo station pose contract must store desk_absolute poses."
+            )
+        if station_contract.canonical_absolute_frame != "desk":
+            raise ValueError(
+                "MuJoCo station pose contract canonical frame must be desk."
+            )
     frames = [
         CoordinateFrameSpec(
             canonical_frame_id,
             semantic_parameters={
                 "frame_family": "target_station",
-                "source": "loaded_mujoco_scene_world",
+                "source": (
+                    "loaded_mujoco_scene_world"
+                    if station_contract is None
+                    else "reviewed_station_pose_contract"
+                ),
                 "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+                **(
+                    {}
+                    if station_contract is None
+                    else {"pose_contract_hash": station_contract.contract_hash}
+                ),
             },
         )
     ]
@@ -191,15 +216,33 @@ def build_mujoco_sim_hil_coordinate_profiles(
                 },
             )
         )
+        station_from_base = (
+            scene.body_pose(body_name)
+            if station_contract is None
+            else station_contract.source.effective_raw_to_canonical_desk_transform(
+                side
+            )
+        )
         transforms.append(
             RigidFrameTransformSpec(
                 transform_id=f"mujoco-scene:{reference_frame_id}-to-station",
                 source_frame_id=reference_frame_id,
                 target_frame_id=canonical_frame_id,
-                matrix_target_source=scene.body_pose(body_name),
+                matrix_target_source=station_from_base,
                 semantic_parameters={
-                    "source": "loaded_scene_body_pose",
+                    "source": (
+                        "loaded_scene_body_pose"
+                        if station_contract is None
+                        else "reviewed_station_pose_contract"
+                    ),
                     "scene_body_name": body_name,
+                    **(
+                        {}
+                        if station_contract is None
+                        else {
+                            "pose_contract_hash": station_contract.contract_hash
+                        }
+                    ),
                 },
             )
         )
@@ -227,7 +270,18 @@ def build_mujoco_sim_hil_coordinate_profiles(
         reference_frame_by_component=reference_by_component,
         semantic_parameters={
             "backend": "mujoco",
-            "derivation": "loaded_scene_body_pose",
+            "derivation": (
+                "loaded_scene_body_pose"
+                if station_contract is None
+                else "reviewed_station_pose_contract"
+            ),
+            **(
+                {}
+                if station_contract is None
+                else {
+                    "station_pose_contract_hash": station_contract.contract_hash
+                }
+            ),
             "canonical_target_frame_contract_id": (
                 STATION_RETARGET_FRAME_CONTRACT_V1
             ),

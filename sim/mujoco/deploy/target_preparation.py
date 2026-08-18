@@ -213,6 +213,7 @@ def prepare_mujoco_sim_hil_target(
         build_mujoco_sim_hil_coordinate_profiles(
             scene,
             task_config,
+            station_pose_contract_path=config.station_pose_contract_path,
             active_sides=config.exposed_pose_sides,
         )
     )

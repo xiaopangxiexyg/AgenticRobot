@@ -78,6 +78,37 @@ def _pose_error(
     return translation, rotation
 
 
+def _slerp_quaternion_xyzw(
+    start: tuple[float, ...],
+    target: tuple[float, ...],
+    fraction: float,
+) -> tuple[float, float, float, float]:
+    """Interpolate the shortest normalized quaternion arc without SciPy."""
+
+    first = np.asarray(start, dtype=np.float64)
+    second = np.asarray(target, dtype=np.float64)
+    dot = float(np.dot(first, second))
+    if dot < 0.0:
+        second = -second
+        dot = -dot
+    dot = min(1.0, max(-1.0, dot))
+    blend = min(1.0, max(0.0, float(fraction)))
+    if dot > 0.9995:
+        result = first + blend * (second - first)
+    else:
+        angle = math.acos(dot)
+        sine = math.sin(angle)
+        result = (
+            math.sin((1.0 - blend) * angle) / sine * first
+            + math.sin(blend * angle) / sine * second
+        )
+    norm = float(np.linalg.norm(result))
+    if not math.isfinite(norm) or norm <= 0.0:
+        raise RuntimeError("Interpolated TCP quaternion is invalid.")
+    normalized = result / norm
+    return tuple(float(value) for value in normalized)
+
+
 def mujoco_agent_skill_hold_evidence_from_transition(
     transition: Any | None,
     *,
@@ -145,6 +176,8 @@ class MujocoAgentTcpPoseSkillLifecycle:
         target_resolver: (
             Callable[[tuple[float, ...]], MujocoAgentTcpTargetResolution] | None
         ) = None,
+        max_reference_rotation_step_rad: float | None = None,
+        max_measured_translation_excursion_m: float | None = None,
         parameter_lineage: Mapping[str, str] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -201,6 +234,20 @@ class MujocoAgentTcpPoseSkillLifecycle:
             raise TypeError("request.parameters must be a mapping.")
         if target_resolver is not None and not callable(target_resolver):
             raise TypeError("target_resolver must be callable or None.")
+        for field_name, value in (
+            (
+                "max_reference_rotation_step_rad",
+                max_reference_rotation_step_rad,
+            ),
+            (
+                "max_measured_translation_excursion_m",
+                max_measured_translation_excursion_m,
+            ),
+        ):
+            if value is not None and (
+                not math.isfinite(float(value)) or float(value) <= 0.0
+            ):
+                raise ValueError(f"{field_name} must be finite and positive.")
         lineage = (
             {
                 "reference_frame_id": motion_profile.reference_frame_id,
@@ -275,6 +322,16 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self.request = request
         self.operation = operation
         self._target_resolver = target_resolver
+        self._max_reference_rotation_step_rad = (
+            None
+            if max_reference_rotation_step_rad is None
+            else float(max_reference_rotation_step_rad)
+        )
+        self._max_measured_translation_excursion_m = (
+            None
+            if max_measured_translation_excursion_m is None
+            else float(max_measured_translation_excursion_m)
+        )
         self.parameter_lineage = lineage
         self.target_pose: tuple[float, ...] | None = (
             None
@@ -318,6 +375,47 @@ class MujocoAgentTcpPoseSkillLifecycle:
         self._first_step_refs: tuple[str, ...] = ()
         self._latest_step_refs: tuple[str, ...] = ()
         self._activation_measured_pose: tuple[float, ...] | None = None
+
+    def _reference_action_for_cycle(self, cycle: int) -> ComponentAction:
+        if self.action is None or self.target_pose is None:
+            raise RuntimeError("TCP pose lifecycle has no resolved action.")
+        step = self._max_reference_rotation_step_rad
+        start = self._activation_measured_pose
+        if step is None or start is None:
+            return self.action
+        _translation, total_rotation = _pose_error(start, self.target_pose)
+        sample_count = max(1, int(math.ceil(total_rotation / step)))
+        fraction = min(
+            1.0,
+            float(cycle + 1) / float(sample_count),
+        )
+        reference_pose = (
+            *self.target_pose[:3],
+            *_slerp_quaternion_xyzw(
+                start[3:],
+                self.target_pose[3:],
+                fraction,
+            ),
+        )
+        return ComponentAction(
+            action_schema=self.application.runtime.action_schema,
+            values_by_component={
+                self.component_id: np.asarray(reference_pose, dtype=np.float32),
+            },
+        )
+
+    def _measured_translation_excursion_exceeded(
+        self,
+        measured: tuple[float, ...],
+    ) -> bool:
+        limit = self._max_measured_translation_excursion_m
+        start = self._activation_measured_pose
+        if limit is None or start is None:
+            return False
+        excursion = math.sqrt(
+            sum((first - second) ** 2 for first, second in zip(measured[:3], start[:3]))
+        )
+        return bool(excursion > limit)
 
     def _validate_call(
         self,
@@ -669,7 +767,7 @@ class MujocoAgentTcpPoseSkillLifecycle:
             event_id = f"{operation.operation_id}:target-cycle:{cycle}"
             step = self.application.submit_and_step(
                 operation_id=operation.operation_id,
-                action=self.action,
+                action=self._reference_action_for_cycle(cycle),
                 source_event_id=event_id,
                 # The Agent snapshot is a Gateway application cut, not a
                 # lower ObservationCutRecord. Keep it as context lineage and
@@ -698,6 +796,16 @@ class MujocoAgentTcpPoseSkillLifecycle:
                     hold=hold,
                 )
             measured = self._capture_pose()
+            if self._measured_translation_excursion_exceeded(measured):
+                hold = self._hold(
+                    reason="tcp_pose_measured_translation_excursion_exceeded"
+                )
+                return self._failure(
+                    reason_code=(
+                        "tcp_pose_measured_translation_excursion_exceeded"
+                    ),
+                    hold=hold,
+                )
             stable = stable + 1 if self._within_terminal_tolerance(measured) else 0
             if stable >= self.motion_profile.stable_measurement_count:
                 hold = self._hold(reason="tcp_pose_terminal_candidate_reached")

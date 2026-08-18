@@ -85,7 +85,19 @@ def build_mujoco_agent_skill_motion_target(
         apply_canonical_keyframe_safety,
     )
     from robot_motion.position_control import PositionKeyframeSafetyConfig
-    from robot_motion.rm65 import RM65PositionCollisionPlannerConfig
+    from robot_motion.rm65 import (
+        DEFAULT_COLLISION_SCENE,
+        DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+        DualArmCollisionAwareRetargeter,
+        DualArmCollisionAwareRetargeterConfig,
+        RM65_BIMANUAL_POSITION_V1,
+        RM65PositionCollisionPlannerConfig,
+        load_ik_tuning_config,
+        load_rm65_tool_profile,
+        load_world_from_arm_base_transforms,
+        tool_tcp_pose_flange_m_rad,
+        with_rm65_position_ik_objective,
+    )
     from robot_motion.target_safety import (
         RobotActionTCPPoseEnvelopeFilter,
         TCPPoseEnvelopeSafetyRuntime,
@@ -94,7 +106,7 @@ def build_mujoco_agent_skill_motion_target(
         MujocoPositionExecutionConfig,
         MujocoPositionExecutionRig,
     )
-    from sim.mujoco.ik import RM65CanonicalIK
+    from sim.mujoco.ik import RM65CanonicalIK, RM65RetargeterIK
 
     from .pose_resolution import MujocoCoupledPoseToQposResolver
     from .runtime import (
@@ -137,19 +149,125 @@ def build_mujoco_agent_skill_motion_target(
             profile=safety_profile,
         )
 
-    ik = RM65CanonicalIK.from_tool_profiles(
-        prepared.scene,
-        {
-            "left": prepared.task_config.left_tool_profile_path,
-            "right": prepared.task_config.right_tool_profile_path,
-        },
-        planner_config=RM65PositionCollisionPlannerConfig(
-            reference_hz=prepared.compose_target_hz,
-            solve_time_budget_ms=(
-                1000.0 / float(prepared.position_profile.rates.ik_hz)
-            ),
-        ),
+    ik_profile = RM65_BIMANUAL_POSITION_V1.ik_execution
+    sim_collision_clearance_m = float(
+        prepared.scene.scene_spec.collision.safety_minimum_clearance_m
     )
+    ik_tuning = with_rm65_position_ik_objective(
+        load_ik_tuning_config(),
+        position_weight=ik_profile.position_weight,
+        orientation_weight=ik_profile.orientation_weight,
+        mode_name="mujoco_agent_skill_position_v1",
+    )
+    if config.collision_stop_enabled:
+        initial_qpos = {
+            side: prepared.scene.get_arm_qpos(side).copy()
+            for side in ("left", "right")
+        }
+        retargeter = DualArmCollisionAwareRetargeter(
+            DualArmCollisionAwareRetargeterConfig(
+                scene_profile=DEFAULT_COLLISION_SCENE,
+                solver_frequency=prepared.position_profile.rates.ik_hz,
+                damping=ik_profile.damping,
+                solve_time_budget_ms=(
+                    1000.0 / float(prepared.position_profile.rates.ik_hz)
+                ),
+                solve_min_iterations=ik_profile.solve_min_iterations,
+                solve_max_iterations=ik_profile.solve_max_iterations,
+                solve_adaptive_iterations_enabled=ik_profile.adaptive_iterations,
+                solve_iteration_reserve_ms=ik_profile.iteration_reserve_ms,
+                candidate_certification_reserve_ms=(
+                    ik_profile.candidate_certification_reserve_ms
+                ),
+                ik_tuning=ik_tuning,
+                bimanual_result_contract_enabled=True,
+                enforce_realistic_joint_step=True,
+                left_initial_qpos=initial_qpos["left"],
+                right_initial_qpos=initial_qpos["right"],
+                left_tool_tcp_pose_flange_m_rad=tool_tcp_pose_flange_m_rad(
+                    load_rm65_tool_profile(
+                        prepared.task_config.left_tool_profile_path,
+                        side="left",
+                    )
+                ),
+                right_tool_tcp_pose_flange_m_rad=tool_tcp_pose_flange_m_rad(
+                    load_rm65_tool_profile(
+                        prepared.task_config.right_tool_profile_path,
+                        side="right",
+                    )
+                ),
+                joint_velocity_limit_profile=(
+                    ik_profile.joint_velocity_limit_profile
+                ),
+                output_qpos_smoothing_alpha=1.0,
+                output_qpos_smoothing_adaptive_enabled=False,
+                output_qpos_smoothing_fast_alpha=1.0,
+                inactive_side_hold_enabled=False,
+                inactive_side_hold_execution_cap_enabled=False,
+                inactive_side_hold_execution_release_enabled=False,
+                prefer_non_wrist_singular_branch=(
+                    ik_profile.prefer_non_wrist_singular_branch
+                ),
+                prefer_non_elbow_singular_branch=(
+                    ik_profile.prefer_non_elbow_singular_branch
+                ),
+                prefer_non_shoulder_singular_branch=(
+                    ik_profile.prefer_non_shoulder_singular_branch
+                ),
+                local_step_candidate_clip_scale=(
+                    ik_profile.local_step_candidate_clip_scale
+                ),
+                collision_min_distance_m=sim_collision_clearance_m,
+                collision_distance_epsilon_m=min(
+                    DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+                    sim_collision_clearance_m,
+                ),
+            )
+        )
+        ik = RM65RetargeterIK(
+            prepared.scene,
+            retargeter,
+            world_from_arm_base_by_side=(
+                load_world_from_arm_base_transforms(retargeter.profile)
+            ),
+            admitted_qpos_source=rig.accepted_qcmd_by_side,
+        )
+    else:
+        # The retargeter deliberately refuses to claim a no-collision
+        # contract. Preserve the existing explicit diagnostic mode through
+        # the canonical planner instead of weakening the production adapter.
+        ik = RM65CanonicalIK.from_tool_profiles(
+            prepared.scene,
+            {
+                "left": prepared.task_config.left_tool_profile_path,
+                "right": prepared.task_config.right_tool_profile_path,
+            },
+            planner_config=RM65PositionCollisionPlannerConfig(
+                # Component proposals are admitted at the 15 Hz compose
+                # cadence, but the coupled planner owns the profile's 60 Hz
+                # IK reference stage. Its joint-step envelope is defined at
+                # that IK cadence; binding it to compose_target_hz would
+                # silently permit a four-times larger per-reference step.
+                reference_hz=prepared.position_profile.rates.ik_hz,
+                solve_time_budget_ms=(
+                    1000.0 / float(prepared.position_profile.rates.ik_hz)
+                ),
+                collision_min_distance_m=sim_collision_clearance_m,
+                collision_distance_epsilon_m=min(
+                    DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+                    sim_collision_clearance_m,
+                ),
+                collision_constraints_enabled=False,
+                damping=ik_profile.damping,
+                solve_min_iterations=ik_profile.solve_min_iterations,
+                solve_max_iterations=ik_profile.solve_max_iterations,
+                solve_adaptive_iterations_enabled=(
+                    ik_profile.adaptive_iterations
+                ),
+                solve_iteration_reserve_ms=ik_profile.iteration_reserve_ms,
+                ik_tuning=ik_tuning,
+            ),
+        )
     support_horizon_sec = max(0.25, 1.0 / prepared.compose_target_hz)
     pose_target_safety_filter = None
     if tcp_pose_envelope_runtime is not None:
@@ -195,6 +313,10 @@ def build_mujoco_agent_skill_motion_target(
         pose_resolver=MujocoCoupledPoseToQposResolver(
             ik,
             pose_target_safety_filter=pose_target_safety_filter,
+            support_only_arm_sides=tuple(
+                effector.removesuffix("_arm")
+                for effector in component_execution_binding.support_only_output_effectors
+            ),
         ),
         shared_safety=shared_safety,
         component_execution_binding=component_execution_binding,

@@ -95,6 +95,8 @@ MUJOCO_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1 = {
 }
 MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1 = math.pi
 MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_TRANSLATION_DELTA_M_V1 = 1e-6
+MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_REFERENCE_STEP_RAD_V1 = math.radians(0.25)
+MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_MEASURED_TRANSLATION_EXCURSION_M_V1 = 0.015
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -216,6 +218,12 @@ class MujocoAgentTcpFixedOrientationProfile:
     tool_config_hash: str
     calibration_hash: str
     primitive: LevelTCPOrientationPrimitive
+    max_reference_rotation_step_rad: float = (
+        MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_REFERENCE_STEP_RAD_V1
+    )
+    max_measured_translation_excursion_m: float = (
+        MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_MEASURED_TRANSLATION_EXCURSION_M_V1
+    )
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -249,6 +257,14 @@ class MujocoAgentTcpFixedOrientationProfile:
         )
         if self.primitive.heading.value != expected_heading:
             raise ValueError("Skill ID and fixed-orientation primitive disagree.")
+        for field_name in (
+            "max_reference_rotation_step_rad",
+            "max_measured_translation_excursion_m",
+        ):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{field_name} must be finite and positive.")
+            object.__setattr__(self, field_name, value)
 
     @property
     def parameter_profile_id(self) -> str:
@@ -276,6 +292,12 @@ class MujocoAgentTcpFixedOrientationProfile:
                 "primitive": self.primitive.to_payload(),
                 "anchor_semantics": "lower_measured_pose_at_skill_activation",
                 "target_semantics": "absolute_heading_preserve_translation",
+                "max_reference_rotation_step_rad": (
+                    self.max_reference_rotation_step_rad
+                ),
+                "max_measured_translation_excursion_m": (
+                    self.max_measured_translation_excursion_m
+                ),
             },
             domain=(
                 "dexteleop.agent_skill.mujoco_tcp_fixed_orientation_profile.v1"
@@ -293,6 +315,8 @@ __all__ = [
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1",
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1",
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1",
+    "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_REFERENCE_STEP_RAD_V1",
+    "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_MEASURED_TRANSLATION_EXCURSION_M_V1",
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_TRANSLATION_DELTA_M_V1",
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1",
     "MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1",

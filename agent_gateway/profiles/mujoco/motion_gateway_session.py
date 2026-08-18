@@ -758,6 +758,12 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                 request=request,
                 operation=operation,
                 target_resolver=resolve_target,
+                max_reference_rotation_step_rad=(
+                    _profile.max_reference_rotation_step_rad
+                ),
+                max_measured_translation_excursion_m=(
+                    _profile.max_measured_translation_excursion_m
+                ),
                 parameter_lineage={
                     "reference_frame_id": _profile.reference_frame_id,
                     "reference_frame_spec_hash": (

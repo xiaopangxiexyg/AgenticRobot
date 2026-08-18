@@ -828,6 +828,127 @@ def test_lifecycle_resolves_fixed_level_orientation_for_either_arm(
     assert calls["hold"]
 
 
+def test_fixed_orientation_lifecycle_slerps_large_rotation_references() -> None:
+    motion_profile, action_schema = _profile_and_schema()
+    motion_profile = replace(motion_profile, max_rotation_delta_rad=math.pi)
+    route, binding, evaluation_plan = _contracts(motion_profile)
+    start_pose = (0.38, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    target_pose = (0.38, -0.10, 0.50, 0.0, 0.0, 1.0, 0.0)
+    request, operation = _request_and_operation(
+        route,
+        binding,
+        motion_profile,
+        target_pose,
+    )
+    application, calls = _fake_application(
+        action_schema,
+        start_pose=start_pose,
+        target_pose=target_pose,
+    )
+    lifecycle = MujocoAgentTcpPoseSkillLifecycle(
+        application=application,
+        route=route,
+        deployment_binding=binding,
+        evaluation_plan=evaluation_plan,
+        motion_profile=motion_profile,
+        request=request,
+        operation=operation,
+        target_resolver=lambda _measured: MotionPrimitiveTargetResolution(
+            target_pose=target_pose,
+            evidence_refs=("orientation-target:fixture",),
+        ),
+        max_reference_rotation_step_rad=math.radians(30.0),
+        max_measured_translation_excursion_m=0.015,
+        clock=lambda: 12.0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    ).succeeded
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert completion.succeeded
+    submitted = [
+        call["action"].value("right_arm").values
+        for call in calls["submit"]
+    ]
+    assert len(submitted) == 2
+    assert submitted[0][:3] == pytest.approx(start_pose[:3])
+    assert submitted[1][:3] == pytest.approx(start_pose[:3])
+    assert submitted[0][3:] == pytest.approx(
+        (0.0, 0.0, math.sin(math.radians(15.0)), math.cos(math.radians(15.0)))
+    )
+    assert submitted[1][3:] == pytest.approx(
+        (0.0, 0.0, math.sin(math.radians(30.0)), math.cos(math.radians(30.0)))
+    )
+
+
+def test_fixed_orientation_lifecycle_holds_on_measured_translation_excursion() -> None:
+    motion_profile, action_schema = _profile_and_schema()
+    motion_profile = replace(motion_profile, max_rotation_delta_rad=math.pi)
+    route, binding, evaluation_plan = _contracts(motion_profile)
+    start_pose = (0.38, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    target_pose = (0.38, -0.10, 0.50, 0.0, 0.0, 1.0, 0.0)
+    drifted_pose = (0.40, -0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    request, operation = _request_and_operation(
+        route,
+        binding,
+        motion_profile,
+        target_pose,
+    )
+    application, calls = _fake_application(
+        action_schema,
+        start_pose=start_pose,
+        target_pose=drifted_pose,
+    )
+    lifecycle = MujocoAgentTcpPoseSkillLifecycle(
+        application=application,
+        route=route,
+        deployment_binding=binding,
+        evaluation_plan=evaluation_plan,
+        motion_profile=motion_profile,
+        request=request,
+        operation=operation,
+        target_resolver=lambda _measured: MotionPrimitiveTargetResolution(
+            target_pose=target_pose,
+            evidence_refs=("orientation-target:fixture",),
+        ),
+        max_reference_rotation_step_rad=math.radians(30.0),
+        max_measured_translation_excursion_m=0.015,
+        clock=lambda: 12.0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    ).succeeded
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert not completion.succeeded
+    assert completion.reason_code == (
+        "tcp_pose_measured_translation_excursion_exceeded"
+    )
+    assert calls["hold"] == [
+        {
+            "reason": "tcp_pose_measured_translation_excursion_exceeded",
+            "operation_id": operation.operation_id,
+        }
+    ]
+
+
 def test_hold_evidence_never_claims_unstarted_runtime_is_held() -> None:
     evidence = mujoco_agent_skill_hold_evidence_from_transition(
         None,

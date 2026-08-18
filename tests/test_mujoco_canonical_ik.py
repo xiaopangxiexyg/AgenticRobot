@@ -7,14 +7,20 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from robot_motion.rm65 import RM65SingleArmIKConfig, build_rm65_single_arm_ik_solver
+from robot_motion.rm65 import (
+    BimanualIKResult,
+    BimanualIKSideResult,
+    DualArmCollisionAwareRetargeter,
+    RM65SingleArmIKConfig,
+    build_rm65_single_arm_ik_solver,
+)
 from robot_motion.rm65.constants import ARM_ENDPOINT_FRAME, TOOL_TCP_FRAME
 from robot_motion.runtime import EffectorCommand
 from sim.contracts import SimulationContract
 from sim.mujoco.backend import MuJoCoArmBackend, MuJoCoArmBackendConfig
 from sim.mujoco.config import ArmSpec
 from sim.mujoco.controllers import PoseIKController
-from sim.mujoco.ik import PoseTarget, RM65CanonicalIK
+from sim.mujoco.ik import PoseTarget, RM65CanonicalIK, RM65RetargeterIK
 
 
 class _FakeScene:
@@ -179,6 +185,91 @@ def test_canonical_group_call_rejects_mixed_controlled_frames() -> None:
                 "right": PoseTarget("right", np.eye(4), ARM_ENDPOINT_FRAME),
             }
         )
+
+
+def test_retargeter_ik_uses_admitted_pair_and_hard_holds_support_arm() -> None:
+    scene = _FakeScene()
+    retargeter = object.__new__(DualArmCollisionAwareRetargeter)
+    retargeter.profile = SimpleNamespace(collision_pairs=(("left", "right"),))
+    retargeter.config = SimpleNamespace(solver_frequency=60.0)
+    reset_pairs: list[tuple[np.ndarray, np.ndarray, bool]] = []
+    targets = []
+
+    def set_current_qpos_pair(*, left_qpos, right_qpos, reset_tracking=True):
+        reset_pairs.append(
+            (
+                np.asarray(left_qpos, dtype=float).copy(),
+                np.asarray(right_qpos, dtype=float).copy(),
+                bool(reset_tracking),
+            )
+        )
+
+    retargeter.set_current_qpos_pair = set_current_qpos_pair
+    retargeter.check_qpos_pair_collision = lambda **_kwargs: SimpleNamespace(
+        safe=True,
+        min_distance_m=0.25,
+    )
+    retargeter.solver_world_target_from_tool_tcp_world_target = (
+        lambda *, side, tool_tcp_world_target: np.asarray(
+            tool_tcp_world_target,
+            dtype=float,
+        ).copy()
+    )
+
+    def solve_target_pair(target):
+        targets.append(target)
+        return BimanualIKResult(
+            timestamp=None,
+            status="tracking",
+            fallback_reason=None,
+            side_results={
+                side: BimanualIKSideResult(
+                    side=side,
+                    qpos=np.full(6, 0.2 if side == "left" else -0.2),
+                    raw_qpos=None,
+                    solver_pose_world=target.target_pose_by_side[side],
+                    tool_tcp_pose_world=target.target_pose_by_side[side],
+                    command_type="joint_vector",
+                    command_value=np.zeros(6),
+                    command_frame_name=None,
+                )
+                for side in ("left", "right")
+            },
+            metadata={"ik_solve_iterations": 1},
+        )
+
+    retargeter.solve_target_pair = solve_target_pair
+    admitted = {
+        "left": np.full(6, 0.4),
+        "right": np.full(6, -0.4),
+    }
+    ik = RM65RetargeterIK(
+        scene,
+        retargeter,
+        world_from_arm_base_by_side={
+            "left": np.eye(4),
+            "right": np.eye(4),
+        },
+        admitted_qpos_source=lambda: admitted,
+    )
+
+    result = ik.solve(
+        {
+            side: PoseTarget(side, np.eye(4), TOOL_TCP_FRAME)
+            for side in ("left", "right")
+        },
+        active_sides=("right",),
+    )
+
+    assert result.success is True
+    assert result.solver == "robot_motion.rm65.dual_arm_collision_aware"
+    assert len(reset_pairs) == 2
+    np.testing.assert_allclose(reset_pairs[-1][0], admitted["left"])
+    np.testing.assert_allclose(reset_pairs[-1][1], admitted["right"])
+    assert reset_pairs[-1][2] is False
+    assert len(targets) == 1
+    assert targets[0].active_sides == ("right",)
+    assert targets[0].hard_hold_inactive_sides is True
 
 
 def test_canonical_ik_refuses_to_guess_missing_tool_profile() -> None:

@@ -11,11 +11,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from robot_motion.rm65 import (
+    BimanualPoseTarget,
+    DualArmCollisionAwareRetargeter,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
     canonical_rm65_controlled_frame,
@@ -151,6 +153,12 @@ class RM65CanonicalIK:
             }
         )
 
+    @property
+    def reference_hz(self) -> float:
+        """Return the physical cadence assumed by the planner step limits."""
+
+        return float(self.planner.config.reference_hz)
+
     def reset_from_qpos(
         self,
         qpos_by_side: Mapping[str, Any],
@@ -170,7 +178,12 @@ class RM65CanonicalIK:
             }
         )
 
-    def solve(self, targets: Mapping[str, PoseTarget]) -> IKResult:
+    def solve(
+        self,
+        targets: Mapping[str, PoseTarget],
+        *,
+        active_sides: tuple[str, ...] | None = None,
+    ) -> IKResult:
         """Plan one coupled reference without changing the MuJoCo scene."""
 
         if not targets:
@@ -190,6 +203,17 @@ class RM65CanonicalIK:
                     f"Pose target key {side!r} does not match target.side={target.side!r}."
                 )
             normalized[normalized_side] = target
+        selected_sides = (
+            tuple(normalized)
+            if active_sides is None
+            else tuple(str(side).strip().lower() for side in active_sides)
+        )
+        if (
+            not selected_sides
+            or len(selected_sides) != len(set(selected_sides))
+            or set(selected_sides) - set(normalized)
+        ):
+            raise ValueError("active_sides must be a non-empty target subset.")
         controlled_frames = {target.controlled_frame for target in normalized.values()}
         if len(controlled_frames) != 1:
             raise ValueError(
@@ -198,7 +222,7 @@ class RM65CanonicalIK:
         controlled_frame = next(iter(controlled_frames))
 
         plan = self.planner.plan_pose_reference(
-            {side: target.pose for side, target in normalized.items()},
+            {side: normalized[side].pose for side in selected_sides},
             target_reference_frame="arm_base",
             target_controlled_frame=controlled_frame,
             source="mujoco_canonical_pose_reference",
@@ -247,4 +271,192 @@ class RM65CanonicalIK:
         )
 
 
-__all__ = ["IKResult", "PoseTarget", "RM65CanonicalIK"]
+class RM65RetargeterIK:
+    """Adapt the validated coupled position retargeter to the MuJoCo resolver.
+
+    This adapter changes only the pose-to-qpos implementation.  The enclosing
+    deploy runtime remains the sole safety, arbitration, reference-generation
+    and dispatch owner.
+    """
+
+    def __init__(
+        self,
+        scene: MujocoScene,
+        retargeter: DualArmCollisionAwareRetargeter,
+        *,
+        world_from_arm_base_by_side: Mapping[str, Any],
+        admitted_qpos_source: Callable[[], Mapping[str, Any]],
+    ) -> None:
+        if not isinstance(retargeter, DualArmCollisionAwareRetargeter):
+            raise TypeError("retargeter must be DualArmCollisionAwareRetargeter.")
+        transforms = {
+            str(side).strip().lower(): np.asarray(value, dtype=float).reshape(4, 4)
+            for side, value in world_from_arm_base_by_side.items()
+        }
+        if set(transforms) != {"left", "right"} or not all(
+            np.all(np.isfinite(value)) for value in transforms.values()
+        ):
+            raise ValueError(
+                "world_from_arm_base_by_side must contain finite left/right poses."
+            )
+        self.scene = scene
+        self.retargeter = retargeter
+        if not callable(admitted_qpos_source):
+            raise TypeError("admitted_qpos_source must be callable.")
+        self.admitted_qpos_source = admitted_qpos_source
+        self.world_from_arm_base_by_side = transforms
+        # The generic resolver inspects this small planner surface when it
+        # publishes collision ownership.  It is an adapter identity, not a
+        # second planner or dispatch owner.
+        self.planner = self
+        self.reset_from_scene()
+
+    @property
+    def collision_pair_count(self) -> int:
+        return len(tuple(self.retargeter.profile.collision_pairs))
+
+    @property
+    def reference_hz(self) -> float:
+        """Return the physical cadence assumed by the retargeter step limits."""
+
+        return float(self.retargeter.config.solver_frequency)
+
+    def reset_from_scene(self) -> Mapping[str, Any]:
+        return self.reset_from_qpos(
+            {
+                side: self.scene.get_arm_qpos(side).copy()
+                for side in ("left", "right")
+            }
+        )
+
+    def reset_from_qpos(
+        self,
+        qpos_by_side: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        normalized = {
+            side: np.asarray(qpos_by_side[side], dtype=float).reshape(6).copy()
+            for side in ("left", "right")
+        }
+        self.retargeter.set_current_qpos_pair(
+            left_qpos=normalized["left"],
+            right_qpos=normalized["right"],
+        )
+        collision = self.retargeter.check_qpos_pair_collision(
+            left_qpos=normalized["left"],
+            right_qpos=normalized["right"],
+        )
+        if not collision.safe:
+            raise ValueError(
+                "retargeter initial qpos is not certifiably collision-safe."
+            )
+        return {
+            "initialized": True,
+            "qpos_sides": ("left", "right"),
+            "collision_pair_count": self.collision_pair_count,
+            "collision_distance_m": collision.min_distance_m,
+            "reference_hz": float(self.retargeter.config.solver_frequency),
+            "temporal_smoothing_applied": False,
+        }
+
+    def solve(
+        self,
+        targets: Mapping[str, PoseTarget],
+        *,
+        active_sides: tuple[str, ...] | None = None,
+    ) -> IKResult:
+        if set(targets) != {"left", "right"}:
+            raise ValueError(
+                "Retargeter IK requires the complete measured-support bimanual target."
+            )
+        controlled_frames = {
+            target.controlled_frame for target in targets.values()
+        }
+        if controlled_frames != {TOOL_TCP_FRAME}:
+            raise ValueError("Retargeter IK requires tool_tcp targets.")
+        selected_sides = (
+            ("left", "right")
+            if active_sides is None
+            else tuple(str(side).strip().lower() for side in active_sides)
+        )
+        if (
+            not selected_sides
+            or len(selected_sides) != len(set(selected_sides))
+            or set(selected_sides) - {"left", "right"}
+        ):
+            raise ValueError("active_sides must be a non-empty arm-side subset.")
+        admitted = self.admitted_qpos_source()
+        admitted_qpos = {
+            side: np.asarray(admitted[side], dtype=float).reshape(6).copy()
+            for side in ("left", "right")
+        }
+        self.retargeter.set_current_qpos_pair(
+            left_qpos=admitted_qpos["left"],
+            right_qpos=admitted_qpos["right"],
+            reset_tracking=False,
+        )
+        tool_world = {
+            side: self.world_from_arm_base_by_side[side]
+            @ np.asarray(targets[side].pose, dtype=float)
+            for side in ("left", "right")
+        }
+        solver_world = {
+            side: self.retargeter.solver_world_target_from_tool_tcp_world_target(
+                side=side,
+                tool_tcp_world_target=tool_world[side],
+            )
+            for side in ("left", "right")
+        }
+        result = self.retargeter.solve_target_pair(
+            BimanualPoseTarget(
+                timestamp=None,
+                target_pose_by_side=solver_world,
+                active_sides=selected_sides,
+                hard_hold_inactive_sides=True,
+                world_to_base_by_side={
+                    side: np.linalg.inv(self.world_from_arm_base_by_side[side])
+                    for side in ("left", "right")
+                },
+            )
+        )
+        success = result.status in {"tracking", "boundary_active"}
+        position_error_m: dict[str, float] = {}
+        orientation_error_rad: dict[str, float] = {}
+        for side in ("left", "right"):
+            realized = result.side_results[side].tool_tcp_pose_world
+            position_error_m[side] = float(
+                np.linalg.norm(tool_world[side][:3, 3] - realized[:3, 3])
+            )
+            orientation_error_rad[side] = float(
+                np.linalg.norm(
+                    rotation_error_world(realized[:3, :3], tool_world[side][:3, :3])
+                )
+            )
+        metadata = _plain_metadata(result.metadata)
+        metadata["side_result_metadata"] = {
+            side: _plain_metadata(result.side_results[side].metadata)
+            for side in ("left", "right")
+        }
+        return IKResult(
+            success=success,
+            iterations=int(metadata.get("ik_solve_iterations", 1)),
+            qpos_by_side={
+                side: [
+                    float(value)
+                    for value in result.side_results[side].qpos.reshape(6)
+                ]
+                for side in ("left", "right")
+            },
+            position_error_m=position_error_m,
+            orientation_error_rad=orientation_error_rad,
+            controlled_frame_by_side={
+                side: TOOL_TCP_FRAME for side in ("left", "right")
+            },
+            message=str(result.fallback_reason or result.status),
+            status=str(result.status),
+            hold=not success,
+            metadata=metadata,
+            solver="robot_motion.rm65.dual_arm_collision_aware",
+        )
+
+
+__all__ = ["IKResult", "PoseTarget", "RM65CanonicalIK", "RM65RetargeterIK"]
