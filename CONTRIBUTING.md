@@ -6,17 +6,48 @@ worktree 根目录运行。
 
 ## 1. 开始任务前认领 worktree
 
-开始修改前先确认当前 worktree 和并行状态，再为任务建立独立分支及目录：
+开始修改前先确认当前 worktree 和并行状态。首次在一个 clone 上开发时，把解压后的共享
+`assets/` 根目录记录一次（这是机器本地 Git 配置，不进入提交）：
 
 ```bash
 git worktree list
 git status --short --branch
-git worktree add -b task/<task-name> /absolute/path/to/worktree <baseline>
+export DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets
+python scripts/dev_asset_store.py configure \
+  --asset-root "$DEXTELEOP_ASSET_ROOT"
+```
+
+以后统一通过认领工具创建 worktree；它会在创建分支前验证资产，写入所有权描述，并在新
+worktree 中建立被 Git 忽略的 `assets` 兼容链接：
+
+```bash
+python scripts/claim_worktree.py \
+  --branch task/<owner>/<task-name>-<YYYYMMDD> \
+  --path /absolute/path/to/worktree \
+  --base <baseline> \
+  --owner <owner> \
+  --write-scope '<planned files or packages>' \
+  --semantic-scope '<public contract or semantics affected>' \
+  --validation '<planned offline validation>'
 ```
 
 向协作者说明 worktree 绝对路径、分支、baseline commit 和计划修改的目录。一个任务只在已
 认领的 worktree 中修改；不要在主 worktree 临时改完后再搬运，也不要 reset、clean 或 stash
 其他人的未提交工作。需要修改共享热点文件时，先缩小文件范围并确认没有重叠认领。
+
+`claim_worktree.py` 不会覆盖已有目录、已有分支或已有 `assets` 路径；初始化后半段失败时也
+不会擅自删除已经建立的 worktree。用下面的只读命令诊断当前绑定，或为早期手工创建的
+worktree 补齐链接：
+
+```bash
+python scripts/dev_asset_store.py status
+python scripts/dev_asset_store.py link-worktree --worktree /absolute/path/to/worktree
+```
+
+共享链接是路径兼容层，不是文件系统只读证明。普通开发不得修改共享资产；需要编辑或生成
+资产时，应另行认领明确的可写资产工作区并完成 provenance/hash 评审，不能通过任一 worktree
+的 `assets` 链接直接改 canonical store。Runtime 的资产身份与 hash 仍由 TargetRuntime 合同
+负责，开发机 Git 配置和绝对路径不得进入 Skill、profile 或提交。
 
 个人任务列表和临时推演可以放在根目录 `todos/`，该目录不进入 Git。需要跨 worktree 评审或
 被正式文档引用的计划应放入实际 owner 的 `docs/**/plans/`，可复用脚本则放入 `scripts/`
@@ -36,6 +67,10 @@ python scripts/dev_environment_doctor.py
 editable 方式绑定到某个 worktree；每个终端必须先 `cd` 到自己认领的 worktree 根目录再运行
 `python -m ...` 或测试。诊断器若发现旧 editable 映射会给出警告，但仍会验证根目录运行时
 是否确实解析到当前 worktree；重新运行安装脚本会移除该旧映射。
+
+诊断器默认把开发资产缺失报告为 `WARN`，因为纯数据或文档任务不一定需要 RM65 模型。要运行
+RM65 仿真、IK 或相关验收时使用 `python scripts/dev_environment_doctor.py
+--require-development-assets`，缺失或错绑会在启动前 fail closed。
 
 厂商 DM-Tac SDK 不随 linked worktree 复制。需要硬件开发时，把共享 SDK 放在仓库之外并设置：
 
