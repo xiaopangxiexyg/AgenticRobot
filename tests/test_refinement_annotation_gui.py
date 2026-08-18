@@ -1064,6 +1064,63 @@ def test_detail_overlay_is_optional_until_explicitly_sealed(
         application.close()
 
 
+def test_detail_overlay_without_target_step_falls_back_after_three_coarse_seals(
+    tmp_path: Path,
+) -> None:
+    episode_uuid = _finalized_manual_stop_dataset(
+        tmp_path,
+        advance_to_second_step=False,
+    )
+    detail_profile_root = tmp_path / "detail-profiles"
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+        detail_profile_root=detail_profile_root,
+    )
+    try:
+        detail = application.episode_detail(episode_uuid)
+        for _ in range(3):
+            application.commit(episode_uuid, detail["draft"])
+            detail = application.episode_detail(episode_uuid)
+
+        item = application._item(episode_uuid)
+        progress_profile = item.progress.profile
+        detail_stage_profile = TaskStageProfileV1(
+            profile_id="annotation-fixture-detail-missing-target",
+            profile_version="1",
+            task_progress_profile_hash=progress_profile.semantic_content_hash,
+            stages=(
+                ProgressStageDefinitionV1("a", "a1", "A1", "阶段 A1", 1),
+                ProgressStageDefinitionV1("a", "a2", "A2", "阶段 A2", 2),
+                ProgressStageDefinitionV1("b", "b1", "B1", "阶段 B1", 1),
+                ProgressStageDefinitionV1("b", "b2", "B2", "阶段 B2", 2),
+                ProgressStageDefinitionV1("c", "c1", "C1", "阶段 C1", 1),
+            ),
+        )
+        detail_profile_root.mkdir()
+        (detail_profile_root / "fixture.progress_detailed.json").write_text(
+            json.dumps(progress_profile.to_payload(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (detail_profile_root / "fixture.stages_detailed.json").write_text(
+            json.dumps(detail_stage_profile.to_payload(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        reopened = application.episode_detail(episode_uuid)
+        assert reopened["annotation_set_count"] == 3
+        assert reopened["detail_annotation"]["available"] is False
+        assert reopened["detail_annotation"]["resolution_level"] == (
+            "COARSE_FALLBACK"
+        )
+        assert "没有覆盖详细 profile 的目标子任务" in (
+            reopened["detail_annotation"]["reason"]
+        )
+        assert reopened["draft"]["detail_overlay"] is None
+    finally:
+        application.close()
+
+
 def test_draft_navigation_state_distinguishes_bootstrap_legacy_and_sealed(
     tmp_path: Path,
 ) -> None:

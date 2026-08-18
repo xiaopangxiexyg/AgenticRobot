@@ -1628,46 +1628,69 @@ class RefinementAnnotationApplication:
         detail_annotation_set: LoadedDetailStageAnnotationSet | None = None
         detail_reason = detail_profile_reason
         detail_draft: dict[str, Any] | None = None
+        detail_payload_selection = detail_selection
         if detail_selection is not None and latest_annotation_set is not None:
-            detail_annotation_set, detail_load_reason = (
-                self._current_detail_annotation_set(
-                    item,
-                    latest_annotation_set,
-                    detail_selection,
+            target_progress_step_id = detail_selection.target_progress_step_id
+            target_has_stages = bool(
+                detail_selection.stage_profile.stages_for_step(
+                    target_progress_step_id
                 )
             )
-            if detail_load_reason is not None:
-                detail_reason = detail_load_reason
-            stored_detail = draft.get("detail_overlay")
-            if isinstance(stored_detail, Mapping):
-                try:
-                    detail_draft = self._normalize_detail_draft(
+            target_has_occurrences = any(
+                occurrence.progress_step_id == target_progress_step_id
+                for occurrence in latest_annotation_set.bundle.occurrences
+            )
+            if not target_has_stages or not target_has_occurrences:
+                # A detail profile may match the dataset while this Episode
+                # ended before its target Step was recorded.  Detail is an
+                # additive overlay, so it must not make the valid coarse
+                # annotation impossible to reopen.
+                detail_reason = (
+                    "当前粗粒度封存没有覆盖详细 profile 的目标子任务；"
+                    "继续使用粗粒度标注。"
+                )
+                detail_payload_selection = None
+                draft = {**draft, "detail_overlay": None}
+            else:
+                detail_annotation_set, detail_load_reason = (
+                    self._current_detail_annotation_set(
                         item,
-                        stored_detail,
                         base_annotation_set=latest_annotation_set,
                         selection=detail_selection,
                     )
-                except RefinementAnnotationApplicationError:
-                    # A draft bound to an older coarse version must not be
-                    # carried forward.  The base annotation remains intact.
-                    detail_draft = None
-            if detail_draft is None:
-                if detail_annotation_set is not None:
-                    detail_draft = self._detail_draft_from_annotation_set(
-                        item,
-                        detail_annotation_set,
-                        draft_revision=int(draft.get("draft_revision", 0)),
-                    )
-                else:
-                    detail_draft = self._bootstrap_detail_draft(
-                        item,
-                        latest_annotation_set,
-                        detail_selection,
-                    )
-            draft = {
-                **draft,
-                "detail_overlay": detail_draft,
-            }
+                )
+                if detail_load_reason is not None:
+                    detail_reason = detail_load_reason
+                stored_detail = draft.get("detail_overlay")
+                if isinstance(stored_detail, Mapping):
+                    try:
+                        detail_draft = self._normalize_detail_draft(
+                            item,
+                            stored_detail,
+                            base_annotation_set=latest_annotation_set,
+                            selection=detail_selection,
+                        )
+                    except RefinementAnnotationApplicationError:
+                        # A draft bound to an older coarse version must not be
+                        # carried forward.  The base annotation remains intact.
+                        detail_draft = None
+                if detail_draft is None:
+                    if detail_annotation_set is not None:
+                        detail_draft = self._detail_draft_from_annotation_set(
+                            item,
+                            detail_annotation_set,
+                            draft_revision=int(draft.get("draft_revision", 0)),
+                        )
+                    else:
+                        detail_draft = self._bootstrap_detail_draft(
+                            item,
+                            latest_annotation_set,
+                            detail_selection,
+                        )
+                draft = {
+                    **draft,
+                    "detail_overlay": detail_draft,
+                }
         else:
             # No sealed coarse source means there is nothing safe to bind an
             # additive overlay to.  Existing coarse bootstrap behavior stays
@@ -1740,7 +1763,7 @@ class RefinementAnnotationApplication:
             "detail_annotation": self._detail_payload(
                 item,
                 base_annotation_set=latest_annotation_set,
-                selection=detail_selection,
+                selection=detail_payload_selection,
                 detail_annotation_set=detail_annotation_set,
                 detail_draft=detail_draft,
                 reason=detail_reason,
