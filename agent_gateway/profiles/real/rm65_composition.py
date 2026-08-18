@@ -46,6 +46,7 @@ from .motion_primitive_profiles import (
 )
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
 from .one_shot_authorization import (
+    REAL_AGENT_PRIMITIVE_ACTIONS,
     RealAgentPrimitiveOneShotAuthorization,
 )
 from .perception_deployment import (
@@ -117,7 +118,8 @@ class ExclusiveRM65AgentPrimitiveComposition:
     perception_capture: RealPerceptionCaptureRegistration | None
     socket_path: Path
     authorized_side: str
-    authorized_action: str
+    authorized_action: str | None
+    authorized_actions: tuple[str, ...]
     client_id: str
     client_uid: int
 
@@ -146,10 +148,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     lower: ExclusiveRM65SkillLowerAssembly,
     socket_path: str | Path,
     authorized_side: str,
-    authorized_action: str,
+    authorized_action: str | None,
     confirmation_token: str,
     client_id: str,
     client_uid: int,
+    authorized_actions: tuple[str, ...] | None = None,
     runtime_session_id: str,
     control_domain_id: str,
     embodiment_instance_id: str,
@@ -169,6 +172,21 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     side = str(authorized_side).strip().lower()
     if side not in {"left", "right"}:
         raise ValueError("authorized_side must be left or right.")
+    if authorized_actions is None:
+        if authorized_action is None:
+            raise ValueError("authorized_action or authorized_actions is required.")
+        requested_actions = (authorized_action,)
+    else:
+        if authorized_action is not None:
+            raise ValueError(
+                "authorized_action and authorized_actions are mutually exclusive."
+            )
+        requested_actions = tuple(authorized_actions)
+    normalized_actions = tuple(sorted({str(item).strip() for item in requested_actions}))
+    if not normalized_actions or any(
+        item not in REAL_AGENT_PRIMITIVE_ACTIONS for item in normalized_actions
+    ):
+        raise ValueError("authorized_actions contains an unreviewed primitive.")
     client = _required(client_id, field_name="client_id")
     runtime_id = _required(runtime_session_id, field_name="runtime_session_id")
     domain_id = _required(control_domain_id, field_name="control_domain_id")
@@ -459,11 +477,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             max_chunk_bytes=1024 * 1024,
         )
 
-        def provider_factory(port):
+        def provider_factory(port, current_station_revision):
             assert perception_source_binding is not None
             return RealSenseAgentPerceptionProvider(
                 source_binding=perception_source_binding,
-                current_station_revision=lambda: port.snapshot().revision,
+                current_station_revision=current_station_revision,
                 max_frame_age_ms=perception_capture.profile.max_frame_age_ms,
                 max_inter_camera_skew_ms=(
                     perception_capture.profile.max_inter_camera_skew_ms
@@ -501,7 +519,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     authorization = RealAgentPrimitiveOneShotAuthorization(
         gateway_session=deployment.gateway_session,
         side=side,
-        action=authorized_action,
+        authorized_actions=normalized_actions,
         client_id=client,
         confirmation_token=confirmation_token,
         grant_lifetime_sec=grant_lifetime_sec,
@@ -540,6 +558,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         socket_path=endpoint,
         authorized_side=side,
         authorized_action=authorization.action,
+        authorized_actions=authorization.authorized_actions,
         client_id=client,
         client_uid=uid,
     )

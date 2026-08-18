@@ -85,7 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--authorized-action",
         choices=REAL_AGENT_PRIMITIVE_ACTIONS,
-        required=True,
+        help="one reviewed primitive action (compatibility form)",
+    )
+    parser.add_argument(
+        "--authorized-actions",
+        choices=REAL_AGENT_PRIMITIVE_ACTIONS,
+        nargs="+",
+        help=(
+            "one or more reviewed primitive actions allowed for this temporary "
+            "test profile"
+        ),
     )
     parser.add_argument(
         "--confirm",
@@ -171,6 +180,13 @@ def _ready_payload(
         None,
     )
     perception_capture = getattr(composition, "perception_capture", None)
+    authorized_actions = tuple(
+        getattr(
+            composition,
+            "authorized_actions",
+            (composition.authorized_action,),
+        )
+    )
     return {
         "event": "gateway_ready",
         "socket_path": str(composition.socket_path),
@@ -194,7 +210,12 @@ def _ready_payload(
         "deployment_profile_hash": composition.lower.profile.semantic_content_hash,
         "authorized_side": composition.authorized_side,
         "authorized_action": composition.authorized_action,
-        "authorization_scope": "one_matching_skill_request",
+        "authorized_actions": list(authorized_actions),
+        "authorization_scope": (
+            "one_matching_skill_request"
+            if len(authorized_actions) == 1
+            else "one_request_from_listed_primitive_actions"
+        ),
         "perception": (
             None
             if perception_capture is None
@@ -248,6 +269,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--confirm must exactly equal "
             + REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN
+        )
+    if (args.authorized_action is None) == (args.authorized_actions is None):
+        parser.error(
+            "provide exactly one of --authorized-action or --authorized-actions"
         )
     if args.client_uid < 0:
         parser.error("--client-uid must be non-negative")
@@ -349,6 +374,11 @@ def main(argv: list[str] | None = None) -> int:
         socket_path=socket_path,
         authorized_side=args.authorized_side,
         authorized_action=args.authorized_action,
+        authorized_actions=(
+            None
+            if args.authorized_actions is None
+            else tuple(args.authorized_actions)
+        ),
         confirmation_token=args.confirm,
         client_id=args.client_id,
         client_uid=args.client_uid,

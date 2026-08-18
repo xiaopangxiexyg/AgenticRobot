@@ -344,9 +344,22 @@ def test_real_gateway_reads_tcp_pose_without_consuming_motion_grant() -> None:
         gateway.service
     ).snapshot
     assert snapshot is not None
+    raw_revision_before_refresh = port.snapshot().revision
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:read-only-refresh",),
+    )
+    assert port.snapshot().revision > raw_revision_before_refresh
+    assert gateway.observation_producer.current_station_revision == (
+        snapshot.station_revision
+    )
     submission = gateway.service.submit_request(
         request=_read_request(bundle, snapshot),
-        current_station_revision=port.snapshot().revision,
+        current_station_revision=(
+            gateway.observation_producer.current_station_revision
+        ),
         now=clock(),
     )
     assert submission.accepted
@@ -432,7 +445,9 @@ def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
     )
     rejected = gateway.service.submit_request(
         request=pre_grant_request,
-        current_station_revision=port.snapshot().revision,
+        current_station_revision=(
+            gateway.observation_producer.current_station_revision
+        ),
         now=clock(),
     )
     assert rejected.accepted is False
@@ -460,7 +475,9 @@ def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
     )
     submission = gateway.service.submit_request(
         request=request,
-        current_station_revision=port.snapshot().revision,
+        current_station_revision=(
+            gateway.observation_producer.current_station_revision
+        ),
         grant=grant,
         now=clock(),
     )
@@ -574,6 +591,46 @@ def test_one_shot_authorization_requires_exact_operator_confirmation() -> None:
             confirmation_token="not-authorized",
             clock=clock,
         )
+
+
+def test_one_shot_authorization_accepts_one_request_from_listed_actions() -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:action-set",),
+    )
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+    snapshot = gateway.observation_producer.capture_and_publish(
+        gateway.service,
+    ).snapshot
+    assert snapshot is not None
+    request = _request(
+        bundle,
+        snapshot,
+        skill_id="motion.step_tcp_cardinal",
+        direction="backward",
+    )
+    authorization = RealAgentPrimitiveOneShotAuthorization(
+        gateway_session=gateway,
+        side="right",
+        authorized_actions=("forward", "backward"),
+        client_id=CLIENT_ID,
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        clock=clock,
+    )
+    grant = authorization.grant_resolver(request)
+    assert grant is not None
+    assert authorization.action is None
+    assert authorization.authorized_actions == ("backward", "forward")
 
 
 def test_real_factory_attaches_gateway_and_realteleop_to_one_lower_port() -> None:
@@ -762,7 +819,7 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
     )
     catalog_provider = RealSenseAgentPerceptionProvider(
         source_binding=source_binding,
-        current_station_revision=lambda: port.snapshot().revision,
+        current_station_revision=lambda: 0,
         clock=clock,
     )
     perception = build_real_perception_capture_registration(
@@ -794,7 +851,7 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
     )
     provider = RealSenseAgentPerceptionProvider(
         source_binding=source_binding,
-        current_station_revision=lambda: port.snapshot().revision,
+        current_station_revision=lambda: 0,
         clock=clock,
     )
     store = RecoverableAgentArtifactStore(
@@ -853,7 +910,9 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
     try:
         submitted = gateway.service.submit_request(
             request=request,
-            current_station_revision=port.snapshot().revision,
+            current_station_revision=(
+                gateway.observation_producer.current_station_revision
+            ),
             now=clock(),
         )
         assert submitted.accepted and submitted.operation is not None
@@ -896,7 +955,9 @@ def test_real_rgb_and_depth_routes_run_passively_and_commit_artifacts(tmp_path) 
         )
         depth_submitted = gateway.service.submit_request(
             request=depth_request,
-            current_station_revision=port.snapshot().revision,
+            current_station_revision=(
+                gateway.observation_producer.current_station_revision
+            ),
             now=clock(),
         )
         assert depth_submitted.accepted and depth_submitted.operation is not None
