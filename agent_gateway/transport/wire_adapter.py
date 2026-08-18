@@ -98,6 +98,7 @@ class BoundAgentGatewayWireAdapter:
             Callable[[AgentSkillRequest], SkillExecutionGrant | None] | None
         ) = None,
         hardware_view_provider: HardwareViewProvider | None = None,
+        read_only_access: bool = False,
     ) -> None:
         client_id = _required(
             authenticated_client_id,
@@ -124,6 +125,8 @@ class BoundAgentGatewayWireAdapter:
             raise TypeError(
                 "hardware_view_provider must be a HardwareViewProvider or None."
             )
+        if not isinstance(read_only_access, bool):
+            raise TypeError("read_only_access must be a boolean.")
         if service.executor_registry.has_authoritative_execution and (
             operation_launcher is None
         ):
@@ -152,6 +155,7 @@ class BoundAgentGatewayWireAdapter:
         self._operation_launcher = operation_launcher
         self._grant_resolver = grant_resolver
         self._hardware_view_provider = hardware_view_provider
+        self.read_only_access = read_only_access
 
         protocol_runtime = service.protocol_runtime
         if protocol_runtime.io_catalog.semantic_content_hash != (
@@ -198,6 +202,12 @@ class BoundAgentGatewayWireAdapter:
         if payload.get("client_id") != self.authenticated_client_id:
             raise PermissionError(
                 "Payload client_id does not match authenticated connection."
+            )
+
+    def _require_full_access(self, method: str) -> None:
+        if self.read_only_access:
+            raise PermissionError(
+                f"{method} is unavailable to a read-only authenticated client."
             )
 
     def _assert_session(
@@ -259,6 +269,7 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._require_full_access("get_gateway_events")
         self._assert_session(
             payload,
             fields={
@@ -285,6 +296,7 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._require_full_access("begin_artifact_upload")
         self._assert_session(
             payload,
             fields={
@@ -325,6 +337,7 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._require_full_access("write_artifact_chunk")
         self._assert_session(
             payload,
             fields={
@@ -350,6 +363,7 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._require_full_access("commit_artifact_upload")
         self._assert_session(
             payload,
             fields={"client_id", "runtime_session_id", "grant_id"},
@@ -453,6 +467,7 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._require_full_access("acknowledge_artifact_materialization")
         self._assert_session(
             payload,
             fields={
@@ -497,6 +512,7 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._require_full_access("submit_skill_request")
         return self._submit_skill_request(payload, read_only_only=False)
 
     def submit_read_only_skill_request(
@@ -572,6 +588,7 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._require_full_access("cancel_own_operation")
         self._assert_client(payload)
         request = agent_own_operation_cancel_request_from_json(payload)
         return self.service.cancel_own_operation(
@@ -601,6 +618,7 @@ class BoundAgentGatewayWireAdapter:
         self,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        self._require_full_access("request_hold_own_domain")
         self._assert_client(payload)
         request = agent_own_domain_hold_request_from_json(payload)
         return self.service.request_hold_own_domain(

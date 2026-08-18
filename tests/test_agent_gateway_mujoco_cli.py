@@ -180,6 +180,28 @@ def test_runtime_session_identity_is_unique_by_default_and_overridable() -> None
     )
 
 
+def test_cli_accepts_distinct_repeatable_ssh_read_only_identities() -> None:
+    parsed = build_parser().parse_args(
+        [
+            "--socket-path",
+            "/absolute/gateway.sock",
+            "--task-config",
+            "/absolute/task.json",
+            "--ssh-read-only-client",
+            "rpent.remote.alice",
+            "1101",
+            "--ssh-read-only-client",
+            "rpent.remote.bob",
+            "1102",
+        ]
+    )
+
+    assert parsed.ssh_read_only_client == [
+        ["rpent.remote.alice", "1101"],
+        ["rpent.remote.bob", "1102"],
+    ]
+
+
 def test_artifact_root_preflight_rejects_symlink_and_world_writable(tmp_path) -> None:
     parser = argparse.ArgumentParser()
     managed = tmp_path / "managed"

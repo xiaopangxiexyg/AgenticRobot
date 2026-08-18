@@ -46,6 +46,11 @@ def _preflight_without_af_unix_path_binding(monkeypatch) -> None:
             float(peer_idle_timeout_sec),
         ),
     )
+    monkeypatch.setattr(
+        composition_module,
+        "validate_agent_gateway_unix_group_parent",
+        lambda *, socket_path: 1000,
+    )
 
 
 class _Backend(EffectorBackend):
@@ -164,6 +169,10 @@ def test_composition_binds_existing_gateway_to_one_lower_graph_without_start(
         confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
         client_id="rpent:test",
         client_uid=1000,
+        ssh_read_only_client_id_by_uid={
+            1101: "rpent.remote.alice",
+            1102: "rpent.remote.bob",
+        },
         runtime_session_id="real-rm65:test",
         control_domain_id="exclusive-real-skill:test",
         embodiment_instance_id="dual-rm65:test",
@@ -183,6 +192,14 @@ def test_composition_binds_existing_gateway_to_one_lower_graph_without_start(
     assert RM65_SKILL_STATION_FRAME_ID_V1 in composition.frame_graph.frame_by_id
     assert len(composition.safety_envelope_ref.allowed_route_ids) == 10
     assert composition.authorization.grant_issued is False
+    assert composition.read_only_client_ids == (
+        "rpent.remote.alice",
+        "rpent.remote.bob",
+    )
+    assert composition.socket_mode == 0o660
+    assert (
+        composition.deployment.gateway_session.service.access_policy.allowed_client_ids
+    ) == ("rpent.remote.alice", "rpent.remote.bob", "rpent:test")
     assert composition.application.config.control_hz == (
         lower.profile.position_profile.rates.reference_hz
     )

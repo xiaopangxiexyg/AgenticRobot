@@ -29,6 +29,8 @@ class AgentGatewayUnixEndpointAllocation:
     endpoint_dir: Path
     socket_path: Path
     encoded_path_bytes: int
+    endpoint_dir_mode: int
+    endpoint_gid: int
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -38,12 +40,15 @@ class AgentGatewayUnixEndpointAllocation:
             "socket_path": str(self.socket_path),
             "encoded_path_bytes": self.encoded_path_bytes,
             "max_path_bytes": MAX_AGENT_GATEWAY_UNIX_SOCKET_PATH_BYTES,
+            "endpoint_dir_mode": format(self.endpoint_dir_mode, "04o"),
+            "endpoint_gid": self.endpoint_gid,
         }
 
 
 def allocate_agent_gateway_unix_endpoint(
     *,
     endpoint_root: str | os.PathLike[str],
+    endpoint_dir_mode: int = 0o700,
 ) -> AgentGatewayUnixEndpointAllocation:
     """Create a private unique directory and return its absent socket path.
 
@@ -52,18 +57,38 @@ def allocate_agent_gateway_unix_endpoint(
     repeats its normal validation immediately before bind.
     """
 
+    if isinstance(endpoint_dir_mode, bool) or endpoint_dir_mode not in {
+        0o700,
+        0o2750,
+    }:
+        raise ValueError("endpoint_dir_mode must be exactly 0o700 or 0o2750.")
+    group_access = endpoint_dir_mode == 0o2750
     root = Path(os.path.abspath(os.fspath(endpoint_root)))
     if not root.is_absolute():  # pragma: no cover - abspath is defensive.
         raise ValueError("endpoint_root must resolve to an absolute path.")
+    if group_access and not root.exists():
+        raise ValueError(
+            "A group-access endpoint_root must be pre-created as a setgid "
+            "directory owned by the dedicated access group."
+        )
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root_stat = os.lstat(root)
     if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
         raise ValueError("endpoint_root must be a real directory, not a symlink.")
     if root_stat.st_mode & stat.S_IWOTH:
         raise ValueError("endpoint_root cannot be world-writable.")
+    if group_access and not (
+        root_stat.st_mode & stat.S_ISGID
+        and root_stat.st_mode & stat.S_IRGRP
+        and root_stat.st_mode & stat.S_IXGRP
+    ):
+        raise ValueError(
+            "A group-access endpoint_root must be setgid and group-readable/"
+            "searchable."
+        )
 
     endpoint_dir = Path(tempfile.mkdtemp(prefix="g-", dir=root))
-    os.chmod(endpoint_dir, 0o700)
+    os.chmod(endpoint_dir, endpoint_dir_mode)
     socket_path = endpoint_dir / "g.sock"
     try:
         validated_path, _ = validate_agent_gateway_unix_server_preflight(
@@ -80,4 +105,6 @@ def allocate_agent_gateway_unix_endpoint(
         endpoint_dir=endpoint_dir,
         socket_path=Path(validated_path),
         encoded_path_bytes=len(os.fsencode(validated_path)),
+        endpoint_dir_mode=endpoint_dir_mode,
+        endpoint_gid=os.lstat(endpoint_dir).st_gid,
     )

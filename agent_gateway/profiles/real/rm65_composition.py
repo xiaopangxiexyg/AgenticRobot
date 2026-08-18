@@ -9,7 +9,7 @@ socket, thread, or motion authority.  RealTeleop, VIVE, collection, GUI, and
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +17,11 @@ from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.transport.client_bindings import (
+    compile_agent_gateway_unix_client_bindings,
+)
 from agent_gateway.transport.unix_transport import (
+    validate_agent_gateway_unix_group_parent,
     validate_agent_gateway_unix_server_preflight,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -125,6 +129,8 @@ class ExclusiveRM65AgentPrimitiveComposition:
     authorized_actions: tuple[str, ...]
     client_id: str
     client_uid: int
+    read_only_client_ids: tuple[str, ...]
+    socket_mode: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.lower, ExclusiveRM65SkillLowerAssembly):
@@ -155,6 +161,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     confirmation_token: str,
     client_id: str,
     client_uid: int,
+    ssh_read_only_client_id_by_uid: Mapping[int, str] | None = None,
     authorized_actions: tuple[str, ...] | None = None,
     runtime_session_id: str,
     control_domain_id: str,
@@ -200,6 +207,22 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     uid = int(client_uid)
     if isinstance(client_uid, bool) or uid < 0:
         raise ValueError("client_uid must be a non-negative integer.")
+    if ssh_read_only_client_id_by_uid is None:
+        read_only_pairs: tuple[tuple[str, int], ...] = ()
+    elif isinstance(ssh_read_only_client_id_by_uid, Mapping):
+        read_only_pairs = tuple(
+            (client_id, read_only_uid)
+            for read_only_uid, client_id in ssh_read_only_client_id_by_uid.items()
+        )
+    else:
+        raise TypeError("ssh_read_only_client_id_by_uid must be a mapping or None.")
+    client_bindings = compile_agent_gateway_unix_client_bindings(
+        primary_client_id=client,
+        primary_client_uid=uid,
+        ssh_read_only_clients=read_only_pairs,
+    )
+    if client_bindings.read_only_client_ids:
+        validate_agent_gateway_unix_group_parent(socket_path=socket_path)
     endpoint_value, peer_timeout = validate_agent_gateway_unix_server_preflight(
         socket_path=socket_path,
         peer_idle_timeout_sec=peer_idle_timeout_sec,
@@ -519,7 +542,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             frame_graph=frame_graph,
             primitive_reference_frame_id=station_frame.frame_id,
             safety_envelope_refs=(envelope_ref,),
-            allowed_client_ids=(client,),
+            allowed_client_ids=client_bindings.allowed_client_ids,
             perception_capture=perception_capture,
             perception_provider_factory=provider_factory,
             artifact_store=artifact_store,
@@ -545,7 +568,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     def server_factory():
         return deployment.gateway_session.build_unix_json_server(
             socket_path=str(endpoint),
-            client_id_by_uid={uid: client},
+            client_id_by_uid=client_bindings.client_id_by_uid,
+            read_only_client_ids=client_bindings.read_only_client_ids,
+            socket_mode=client_bindings.socket_mode,
             peer_idle_timeout_sec=peer_timeout,
             grant_resolver=authorization.grant_resolver,
         )
@@ -577,6 +602,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         authorized_actions=authorization.authorized_actions,
         client_id=client,
         client_uid=uid,
+        read_only_client_ids=tuple(sorted(client_bindings.read_only_client_ids)),
+        socket_mode=client_bindings.socket_mode,
     )
 
 

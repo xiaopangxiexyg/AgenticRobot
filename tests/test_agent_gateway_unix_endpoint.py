@@ -28,7 +28,39 @@ def test_allocator_returns_unique_private_absent_endpoints_within_budget(
         assert allocation.socket_path.name == "g.sock"
         assert not os.path.lexists(allocation.socket_path)
         assert stat.S_IMODE(os.lstat(allocation.endpoint_dir).st_mode) == 0o700
+        assert allocation.endpoint_dir_mode == 0o700
         assert allocation.encoded_path_bytes <= 107
+
+
+def test_allocator_group_access_requires_and_inherits_a_setgid_root(
+    short_unix_socket_path_factory,
+) -> None:
+    parent = short_unix_socket_path_factory("root").parent
+    missing = parent / "missing-shared"
+    with pytest.raises(ValueError, match="must be pre-created"):
+        allocate_agent_gateway_unix_endpoint(
+            endpoint_root=missing,
+            endpoint_dir_mode=0o2750,
+        )
+
+    shared = parent / "shared"
+    shared.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="must be setgid"):
+        allocate_agent_gateway_unix_endpoint(
+            endpoint_root=shared,
+            endpoint_dir_mode=0o2750,
+        )
+
+    os.chmod(shared, 0o2750)
+    allocation = allocate_agent_gateway_unix_endpoint(
+        endpoint_root=shared,
+        endpoint_dir_mode=0o2750,
+    )
+    endpoint_stat = os.lstat(allocation.endpoint_dir)
+    assert stat.S_IMODE(endpoint_stat.st_mode) == 0o2750
+    assert endpoint_stat.st_gid == os.lstat(shared).st_gid
+    assert allocation.endpoint_dir_mode == 0o2750
+    assert allocation.endpoint_gid == endpoint_stat.st_gid
 
 
 def test_allocator_rejects_symlink_or_world_writable_root(
@@ -66,6 +98,29 @@ def test_endpoint_cli_supports_shell_path_and_auditable_json(
     assert payload["event"] == "agent_gateway_unix_endpoint_allocated"
     assert payload["socket_path"].endswith("/g.sock")
     assert payload["encoded_path_bytes"] <= payload["max_path_bytes"] == 107
+    assert payload["endpoint_dir_mode"] == "0700"
+
+
+def test_endpoint_cli_allocates_group_access_below_setgid_root(
+    short_unix_socket_path_factory,
+    capsys,
+) -> None:
+    root = short_unix_socket_path_factory("root").parent / "shared"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o2750)
+
+    assert endpoint_cli.main(
+        [
+            "--root",
+            str(root),
+            "--group-access",
+            "--format",
+            "json",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["endpoint_dir_mode"] == "2750"
+    assert stat.S_IMODE(os.lstat(payload["endpoint_dir"]).st_mode) == 0o2750
 
 
 def test_package_dispatches_endpoint_allocation_utility(

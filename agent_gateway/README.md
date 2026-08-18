@@ -187,14 +187,63 @@ python -m agent_gateway ssh-readonly-proxy \
   --socket-path /absolute/private/gateway.sock
 ```
 
-Deploy it through a dedicated SSH account or key-specific forced command; do
-not grant that identity an interactive shell or membership that can reach a
-full-control Gateway endpoint. The SSH identity maps to the Unix UID accepted
-by the Gateway, while payload `client_id` remains non-authoritative. The proxy
-uses the existing length-prefixed `dexteleop.agent_gateway.unix_json.v2`
-frames, so a client does not need a second hardware protocol. Remote Artifact
-access is limited to `chunked_rpc` bytes exposed by an own-operation response
-on the same SSH connection; arbitrary cache IDs and host-local paths are denied.
+Deploy it through a dedicated no-shell SSH account and a key-specific forced
+command. Each concurrently attaching developer needs one distinct Unix UID and
+one distinct Gateway `client_id`; do not multiplex several developers through
+one account or reuse the primary trusted client's identity. Add every remote
+identity explicitly when starting the existing Gateway:
+
+```bash
+python -m agent_gateway mujoco \
+  --socket-path "${DEXTELEOP_GATEWAY_SOCKET}" \
+  --task-config /absolute/task_config.json \
+  --client-id rpent.dexteleop \
+  --client-uid "$(id -u)" \
+  --ssh-read-only-client rpent.remote.alice 1101 \
+  --ssh-read-only-client rpent.remote.bob 1102
+```
+
+`real-rm65` accepts the same repeatable option. With no additional identity,
+the endpoint stays mode `0600`. Adding one or more read-only identities changes
+only the endpoint mode to `0660`; the Gateway process and the no-shell accounts
+must therefore share one dedicated local group. Allocate a traversable session
+directory below a pre-created setgid root owned by that group:
+
+```bash
+install -d -o gateway-user -g dexteleop-agent-ro -m 2750 \
+  /run/dexteleop-agent-gateway
+
+DEXTELEOP_GATEWAY_SOCKET="$(
+  python -m agent_gateway allocate-unix-endpoint \
+    --root /run/dexteleop-agent-gateway \
+    --group-access
+)"
+```
+
+The allocated session directory is mode `2750`, so the socket inherits the
+dedicated group; group users may traverse it but cannot unlink the socket. The
+launcher does not change account/group
+membership or ownership and does not run `chgrp`. Account and group setup stays
+an explicit host-administration step.
+
+The primary `--client-id` remains the only identity eligible for the real
+profile's reviewed one-shot motion grant. Additional identities are marked
+read-only in the Gateway itself: generic submission, lifecycle, HOLD, event
+replay, Artifact upload, and materialization acknowledgement are rejected even
+if a caller bypasses the proxy. Strict read-only Skills, bounded status,
+own-operation reads/cancel, and own-operation Artifact downloads remain
+available. This keeps remote access read-only without introducing a second
+Gateway, broker, lease service, or hardware owner.
+
+The SSH identity maps to the Unix UID accepted by the Gateway, while payload
+`client_id` remains non-authoritative. The proxy uses the existing
+length-prefixed `dexteleop.agent_gateway.unix_json.v2` frames, so a client does
+not need a second hardware protocol. Remote Artifact access is limited to
+`chunked_rpc` bytes exposed by an own-operation response on the same SSH
+connection; arbitrary cache IDs and host-local paths are denied. If another
+operation or lower resource claim occupies the device, the normal Gateway
+admission/status result is returned; remote access does not queue, preempt, or
+acquire a separate lease.
 
 Two additive discovery calls expose a profile-owned, redacted view:
 

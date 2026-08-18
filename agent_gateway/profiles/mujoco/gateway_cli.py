@@ -19,7 +19,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from agent_gateway.transport.client_bindings import (
+    compile_agent_gateway_unix_client_bindings,
+)
 from agent_gateway.transport.unix_transport import (
+    validate_agent_gateway_unix_group_parent,
     validate_agent_gateway_unix_server_preflight,
 )
 from project_paths import repo_root
@@ -67,6 +71,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=os.getuid(),
         help="local Unix peer UID authorized for --client-id (default: current UID)",
+    )
+    parser.add_argument(
+        "--ssh-read-only-client",
+        action="append",
+        nargs=2,
+        default=[],
+        metavar=("CLIENT_ID", "UID"),
+        help=(
+            "additional distinct client identity and Unix UID restricted by the "
+            "Gateway to the SSH read-only method/Route surface; may be repeated"
+        ),
     )
     parser.add_argument(
         "--runtime-session-id",
@@ -181,6 +196,8 @@ def _ready_payload(
     socket_path: Path,
     client_id: str,
     viewer: Any | None = None,
+    read_only_client_ids: tuple[str, ...] = (),
+    socket_mode: int = 0o600,
 ) -> dict[str, Any]:
     manifest = session.contract_bundle.route_manifest
     capabilities = session.service.protocol_runtime.session_capabilities
@@ -188,6 +205,8 @@ def _ready_payload(
         "event": "gateway_ready",
         "socket_path": str(socket_path),
         "client_id": client_id,
+        "read_only_client_ids": list(read_only_client_ids),
+        "socket_mode": format(socket_mode, "04o"),
         "target_kind": manifest.target_kind,
         "current_mode": manifest.current_mode,
         "runtime_session_id": manifest.runtime_session_id,
@@ -282,6 +301,19 @@ def main(argv: list[str] | None = None) -> int:
     socket_path = _absolute_path(parser, args.socket_path, flag="--socket-path")
     if args.client_uid < 0:
         parser.error("--client-uid must be non-negative")
+    try:
+        client_bindings = compile_agent_gateway_unix_client_bindings(
+            primary_client_id=args.client_id,
+            primary_client_uid=args.client_uid,
+            ssh_read_only_clients=args.ssh_read_only_client,
+        )
+    except (TypeError, ValueError) as error:
+        parser.error(f"invalid Agent Gateway client bindings: {error}")
+    if client_bindings.read_only_client_ids:
+        try:
+            validate_agent_gateway_unix_group_parent(socket_path=socket_path)
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"invalid read-only socket parent: {error}")
     if args.max_retained_operations <= 0:
         parser.error("--max-retained-operations must be positive")
     try:
@@ -325,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     session = build_mujoco_agent_tcp_pose_gateway_session(
         target_config=target_config,
-        allowed_client_ids=(args.client_id,),
+        allowed_client_ids=client_bindings.allowed_client_ids,
         max_retained_operations=args.max_retained_operations,
         history_storage=history_storage,
         artifact_storage=artifact_storage,
@@ -340,7 +372,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     server = session.build_unix_json_server(
         socket_path=str(socket_path),
-        client_id_by_uid={args.client_uid: args.client_id},
+        client_id_by_uid=client_bindings.client_id_by_uid,
+        read_only_client_ids=client_bindings.read_only_client_ids,
+        socket_mode=client_bindings.socket_mode,
         peer_idle_timeout_sec=args.peer_idle_timeout_sec,
     )
     stop_requested = threading.Event()
@@ -398,6 +432,10 @@ def main(argv: list[str] | None = None) -> int:
                     socket_path=socket_path,
                     client_id=args.client_id,
                     viewer=viewer,
+                    read_only_client_ids=tuple(
+                        sorted(client_bindings.read_only_client_ids)
+                    ),
+                    socket_mode=client_bindings.socket_mode,
                 ),
                 sort_keys=True,
             ),
