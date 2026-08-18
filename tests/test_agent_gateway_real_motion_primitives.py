@@ -5,6 +5,7 @@ import pytest
 
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     RealAgentPrimitiveConvergenceProfile,
     build_real_agent_primitive_contract_bundle,
@@ -14,6 +15,7 @@ from agent_gateway.profiles.real.observation_gateway import (
 )
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from robot_motion.coordinate_frames import (
@@ -79,6 +81,10 @@ def _inputs():
     route_ids = (
         REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
         *tuple(
+            REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
+            for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+        ),
+        *tuple(
             REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
             for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
         ),
@@ -104,11 +110,14 @@ def _bundle():
     )
 
 
-def test_real_bundle_exposes_read_plus_six_plus_three_motion_primitives() -> None:
+def test_real_bundle_exposes_read_diagnostic_and_fixed_motion_primitives() -> None:
     bundle = _bundle()
 
-    assert len(bundle.route_manifest.skill_routes) == 5
+    assert len(bundle.route_manifest.skill_routes) == 11
     assert len(bundle.cardinal_profile.primitives) == 6
+    assert {
+        entry.route.skill_id for entry in bundle.route_manifest.skill_routes
+    } >= set(FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1)
     assert {item.skill_id for item in bundle.orientation_profiles} == set(
         FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
     )

@@ -14,6 +14,7 @@ from agent_gateway.profiles.real.motion_gateway_session import (
 )
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     build_real_agent_primitive_contract_bundle,
 )
@@ -37,6 +38,9 @@ from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRe
 from agent_gateway.runtime.access_policy import issue_skill_execution_grant
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from agent_gateway.skills.motion.schemas import CARDINAL_TCP_STEP_DIRECTIONS_V1
@@ -169,6 +173,10 @@ def _runtime_fixture():
     route_ids = (
         REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
         *tuple(
+            REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
+            for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+        ),
+        *tuple(
             REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
             for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
         ),
@@ -222,11 +230,16 @@ def _owner_state(bundle, *, captured_at: float) -> RealControlOwnerState:
 def _request(bundle, snapshot, *, skill_id: str, direction: str | None):
     entry = bundle.route_manifest.route(skill_id, "1")
     route = entry.route
-    if skill_id == "motion.step_tcp_cardinal":
+    if skill_id == "motion.step_tcp_cardinal" or skill_id in (
+        FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+    ):
         profile = bundle.cardinal_profile
+        fixed_direction = FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
+            skill_id
+        )
         parameters = {
             "component_id": profile.component_id,
-            "direction": direction,
+            "direction": fixed_direction or direction,
             "reference_frame_id": profile.reference_frame_id,
             "reference_frame_spec_hash": profile.reference_frame_spec_hash,
             "controlled_frame_id": "tool_tcp",
@@ -308,6 +321,13 @@ PRIMITIVE_CASES = (
     *tuple(
         ("motion.step_tcp_cardinal", direction)
         for direction in CARDINAL_TCP_STEP_DIRECTIONS_V1
+    ),
+    *tuple(
+        (
+            skill_id,
+            FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[skill_id],
+        )
+        for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
     ),
     *tuple(
         (skill_id, None)
@@ -578,7 +598,7 @@ def test_one_shot_authorization_issues_exactly_one_bound_grant() -> None:
     request = _request(
         bundle,
         snapshot,
-        skill_id="motion.step_tcp_cardinal",
+        skill_id=FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1["forward"],
         direction="forward",
     )
     authorization = RealAgentPrimitiveOneShotAuthorization(
@@ -652,7 +672,7 @@ def test_one_shot_authorization_accepts_one_request_from_listed_actions() -> Non
     request = _request(
         bundle,
         snapshot,
-        skill_id="motion.step_tcp_cardinal",
+        skill_id=FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1["backward"],
         direction="backward",
     )
     authorization = RealAgentPrimitiveOneShotAuthorization(
@@ -713,6 +733,7 @@ def test_real_factory_attaches_gateway_and_realteleop_to_one_lower_port() -> Non
     )
     assert set(attached.gateway_session.executors_by_skill_id) == {
         "motion.step_tcp_cardinal",
+        *FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
         *FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     }
 
@@ -741,7 +762,7 @@ def test_wire_adapter_atomically_binds_one_use_grant_to_exact_request() -> None:
     request = _request(
         bundle,
         observation.snapshot,
-        skill_id="motion.step_tcp_cardinal",
+        skill_id=FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1["forward"],
         direction="forward",
     )
     assert request.skill_execution_grant_id is None

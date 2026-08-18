@@ -52,6 +52,7 @@ from .motion_gateway_session import (
 )
 from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_MAX_ROTATION_DELTA_RAD_V1,
     MUJOCO_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
 )
@@ -280,6 +281,9 @@ def _build_standard_tcp_pose_envelope_runtime(
         allowed_route_ids=(
             MUJOCO_AGENT_TCP_POSE_ROUTE_ID_V1,
             MUJOCO_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+            *tuple(
+                MUJOCO_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values()
+            ),
         ),
     )
     orientation_profile = TCPPoseEnvelopeProfile(

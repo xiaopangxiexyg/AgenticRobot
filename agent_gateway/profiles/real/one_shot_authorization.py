@@ -12,6 +12,8 @@ from agent_gateway.runtime.access_policy import (
     issue_skill_execution_grant,
 )
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
@@ -34,6 +36,7 @@ REAL_AGENT_PRIMITIVE_ACTIONS = (
     "level_forward_right_30",
 )
 _FIXED_SKILL_ID_BY_ACTION = {
+    **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
     "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
@@ -102,10 +105,7 @@ class RealAgentPrimitiveOneShotAuthorization:
     def expected_skill_id(self) -> str:
         if self.action is None:
             raise RuntimeError("expected_skill_id is undefined for an action set.")
-        return _FIXED_SKILL_ID_BY_ACTION.get(
-            self.action,
-            "motion.step_tcp_cardinal",
-        )
+        return _FIXED_SKILL_ID_BY_ACTION[self.action]
 
     @property
     def grant_issued(self) -> bool:
@@ -120,10 +120,22 @@ class RealAgentPrimitiveOneShotAuthorization:
 
         if request.client_id != self.client_id:
             return None
+        fixed_cardinal_action = (
+            FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
+                request.skill_id
+            )
+        )
+        if fixed_cardinal_action is not None and request.parameters.get(
+            "direction"
+        ) != fixed_cardinal_action:
+            return None
         requested_action = (
             request.parameters.get("direction")
             if request.skill_id == "motion.step_tcp_cardinal"
-            else _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id)
+            else (
+                fixed_cardinal_action
+                or _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id)
+            )
         )
         if requested_action not in self.authorized_actions:
             return None

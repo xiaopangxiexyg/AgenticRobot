@@ -6,6 +6,7 @@ import numpy as np
 
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
     REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     build_real_agent_primitive_contract_bundle,
 )
@@ -18,6 +19,7 @@ from agent_gateway.profiles.real.observation_gateway import (
 from agent_gateway.protocol.contracts import AgentSkillOperation, AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
 )
 from robot_motion.coordinate_frames import (
@@ -142,6 +144,10 @@ def _runtime_fixture():
     )
     route_ids = (
         REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+        *tuple(
+            REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
+            for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+        ),
         *tuple(
             REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
             for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1

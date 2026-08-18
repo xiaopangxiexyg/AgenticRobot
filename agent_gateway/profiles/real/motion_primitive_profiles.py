@@ -32,16 +32,20 @@ from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorSet,
 )
 from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1,
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
     FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1,
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
     cardinal_tcp_step_skill_definition_v1,
+    fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
 )
 from agent_gateway.skills.motion.schemas import (
     CARDINAL_TCP_STEP_DIRECTIONS_V1,
     cardinal_tcp_step_schema_entry_v1,
+    fixed_cardinal_tcp_step_schema_entry_v1,
     fixed_level_tcp_orientation_schema_entry_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
@@ -73,6 +77,23 @@ REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1 = (
 )
 REAL_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1 = (
     "real-tool-tcp-cardinal-short-step-v1"
+)
+REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1 = {
+    skill_id: (
+        "real.rm65.agent_skill_" + skill_id.removeprefix("motion.")
+    )
+    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+}
+REAL_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1 = {
+    skill_id: (
+        "control-station.real-agent-"
+        + skill_id.removeprefix("motion.").replace("_", "-")
+        + ".v1"
+    )
+    for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+}
+REAL_AGENT_TCP_FIXED_CARDINAL_STEP_DIRECTION_BY_SKILL_ID_V1 = dict(
+    FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1
 )
 REAL_AGENT_TCP_LEVEL_FORWARD_ROUTE_ID_V1 = (
     "real.rm65.agent_skill_tcp_level_forward"
@@ -437,17 +458,21 @@ class RealAgentPrimitiveContractBundle:
         self.payload_validators.validate_manifest(self.route_manifest)
         if (
             len(self.orientation_profiles) != 3
-            or len(self.deployment_bindings) != 4
+            or len(self.deployment_bindings) != 10
         ):
             raise ValueError(
-                "Real primitive bundle requires one cardinal and three "
-                "orientation bindings."
+                "Real primitive bundle requires one generic cardinal, six "
+                "fixed-cardinal and three orientation bindings."
             )
+        for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
+            self.route_manifest.route(skill_id, "1")
         if self.route_manifest.skill_io_catalog_hash != self.io_catalog.semantic_content_hash:
             raise ValueError("Real primitive bundle I/O catalog mismatch.")
         if self.tcp_pose_observe.attachment != self.attachment:
             raise ValueError("Real primitive and TCP-pose attachments disagree.")
-        expected_route_count = 5 + (2 if self.perception_capture is not None else 0)
+        expected_route_count = 11 + (
+            2 if self.perception_capture is not None else 0
+        )
         if len(self.route_manifest.skill_routes) != expected_route_count:
             raise ValueError("Real perception registration and manifest disagree.")
 
@@ -472,6 +497,7 @@ def _payload_validator(
     *,
     route: SkillExecutionRoute,
     profile: RealAgentTcpCardinalStepProfile | RealAgentTcpFixedOrientationProfile,
+    fixed_cardinal_direction: str | None = None,
 ) -> AgentSkillPayloadValidatorSet:
     cardinal = isinstance(profile, RealAgentTcpCardinalStepProfile)
     parameter_fields = (
@@ -512,8 +538,10 @@ def _payload_validator(
             "allowed_component_ids": (profile.component_id,),
         }
         if isinstance(profile, RealAgentTcpCardinalStepProfile):
-            validation_kwargs["allowed_cardinal_directions"] = tuple(
-                item.direction.value for item in profile.primitives
+            validation_kwargs["allowed_cardinal_directions"] = (
+                tuple(item.direction.value for item in profile.primitives)
+                if fixed_cardinal_direction is None
+                else (fixed_cardinal_direction,)
             )
         validate_agent_motion_parameters_v1(**validation_kwargs)
         exact = {
@@ -537,6 +565,11 @@ def _payload_validator(
                 raise ValueError(f"Real primitive {field_name} mismatch.")
         if cardinal:
             profile.primitive(str(payload["direction"]))
+            if (
+                fixed_cardinal_direction is not None
+                and payload["direction"] != fixed_cardinal_direction
+            ):
+                raise ValueError("Fixed cardinal Skill direction changed.")
 
     def validate_execution_result(payload: Mapping[str, Any]) -> None:
         if not isinstance(payload, Mapping) or set(payload) != {
@@ -574,6 +607,11 @@ def _payload_validator(
         validator_id=(
             "payload-validator:real-agent-primitive:"
             + profile.semantic_content_hash
+            + (
+                ""
+                if fixed_cardinal_direction is None
+                else ":" + route.skill_id
+            )
         ),
         skill_id=route.skill_id,
         skill_version=route.skill_version,
@@ -680,6 +718,29 @@ def build_real_agent_primitive_contract_bundle(
             item.direction.value for item in cardinal_profile.primitives
         ),
     )
+    fixed_cardinal_definitions = tuple(
+        fixed_cardinal_tcp_step_skill_definition_v1(
+            skill_id=skill_id,
+            controlled_component_ids=(component_id,),
+        )
+        for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
+    )
+    fixed_cardinal_schemas = tuple(
+        fixed_cardinal_tcp_step_schema_entry_v1(
+            skill_id=definition.skill_id,
+            skill_definition_hash=definition.semantic_content_hash,
+            parameter_profile_id=cardinal_profile.parameter_profile_id,
+            parameter_profile_hash=cardinal_profile.semantic_content_hash,
+            allowed_component_ids=(component_id,),
+            allowed_reference_frame_ids=(cardinal_profile.reference_frame_id,),
+            reference_frame_spec_hash=cardinal_profile.reference_frame_spec_hash,
+            frame_graph_hash=cardinal_profile.frame_graph_hash,
+            tool_config_hash=cardinal_profile.tool_config_hash,
+            calibration_hash=cardinal_profile.calibration_hash,
+            primitive_catalog_hash=cardinal_profile.primitive_catalog_hash,
+        )
+        for definition in fixed_cardinal_definitions
+    )
 
     orientation_profiles = tuple(
         RealAgentTcpFixedOrientationProfile(
@@ -761,6 +822,22 @@ def build_real_agent_primitive_contract_bundle(
         schema=cardinal_schema,
         route_id=REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
     )
+    fixed_cardinal_routes = tuple(
+        route_for(
+            definition=definition,
+            schema=schema,
+            route_id=(
+                REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[
+                    definition.skill_id
+                ]
+            ),
+        )
+        for definition, schema in zip(
+            fixed_cardinal_definitions,
+            fixed_cardinal_schemas,
+            strict=True,
+        )
+    )
     orientation_routes = tuple(
         route_for(
             definition=definition,
@@ -776,7 +853,11 @@ def build_real_agent_primitive_contract_bundle(
             strict=True,
         )
     )
-    all_routes = (cardinal_route, *orientation_routes)
+    all_routes = (
+        cardinal_route,
+        *fixed_cardinal_routes,
+        *orientation_routes,
+    )
     for route in all_routes:
         if not any(route.route_id in ref.allowed_route_ids for ref in refs):
             raise ValueError(
@@ -798,6 +879,10 @@ def build_real_agent_primitive_contract_bundle(
     profile_by_route_hash = {
         cardinal_route.semantic_content_hash: cardinal_profile,
         **{
+            route.semantic_content_hash: cardinal_profile
+            for route in fixed_cardinal_routes
+        },
+        **{
             route.semantic_content_hash: profile
             for route, profile in zip(
                 orientation_routes,
@@ -808,6 +893,14 @@ def build_real_agent_primitive_contract_bundle(
     }
     executor_by_route_hash = {
         cardinal_route.semantic_content_hash: REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
+        **{
+            route.semantic_content_hash: (
+                REAL_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1[
+                    route.skill_id
+                ]
+            )
+            for route in fixed_cardinal_routes
+        },
         **{
             route.semantic_content_hash: (
                 REAL_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1[
@@ -870,6 +963,7 @@ def build_real_agent_primitive_contract_bundle(
         skill_definitions=(
             tcp_pose_definition,
             cardinal_definition,
+            *fixed_cardinal_definitions,
             *orientation_definitions,
             *(item.definition for item in perception_registrations),
         ),
@@ -880,6 +974,7 @@ def build_real_agent_primitive_contract_bundle(
         schema_entries=(
             tcp_pose_schema,
             cardinal_schema,
+            *fixed_cardinal_schemas,
             *orientation_schemas,
             *(item.schema_entry for item in perception_registrations),
         ),
@@ -994,6 +1089,18 @@ def build_real_agent_primitive_contract_bundle(
             ),
             _payload_validator(route=cardinal_route, profile=cardinal_profile),
             *tuple(
+                _payload_validator(
+                    route=route,
+                    profile=cardinal_profile,
+                    fixed_cardinal_direction=(
+                        FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
+                            route.skill_id
+                        ]
+                    ),
+                )
+                for route in fixed_cardinal_routes
+            ),
+            *tuple(
                 _payload_validator(route=route, profile=profile)
                 for route, profile in zip(
                     orientation_routes,
@@ -1029,6 +1136,9 @@ __all__ = [
     "REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1",
     "REAL_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1",
     "REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1",
+    "REAL_AGENT_TCP_FIXED_CARDINAL_STEP_DIRECTION_BY_SKILL_ID_V1",
+    "REAL_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1",
+    "REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1",
     "REAL_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1",
     "REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1",
     "REAL_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1",
