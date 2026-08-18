@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from dataset_contracts.progress_detail_annotations import (
@@ -14,7 +15,10 @@ from dataset_contracts.progress_stage_annotations import StageAnnotationBundleV1
 from dataset_contracts.progress_stages import TaskStageProfileV1
 
 from .progress_detail_annotation_artifacts import (
+    DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT,
+    DetailStageAnnotationArtifactReadError,
     LoadedDetailStageAnnotationSet,
+    load_detail_stage_annotation_set,
 )
 from .progress_stage_annotation_artifacts import LoadedStageAnnotationSet
 
@@ -123,9 +127,127 @@ def resolve_detail_stage_annotation_view(
     )
 
 
+def load_latest_detail_stage_annotation_set(
+    *,
+    dataset_root: str | Path,
+    episode_uuid: str,
+    source_progress_manifest: Any,
+    base_annotation_set: LoadedStageAnnotationSet,
+    base_stage_profile: TaskStageProfileV1,
+    detail_stage_profile: TaskStageProfileV1,
+) -> LoadedDetailStageAnnotationSet | None:
+    """Find the newest valid overlay for one exact coarse annotation set.
+
+    Older overlays remain immutable history and are skipped when they bind to
+    a different coarse annotation version.  A directory that claims to be a
+    visible detail set but is internally malformed raises instead of being
+    silently downgraded to coarse analysis.
+    """
+
+    normalized_episode_uuid = str(episode_uuid).strip()
+    if (
+        not normalized_episode_uuid
+        or normalized_episode_uuid in {".", ".."}
+        or Path(normalized_episode_uuid).name != normalized_episode_uuid
+    ):
+        raise DetailStageAnnotationResolutionError(
+            "episode_uuid is not a safe detail annotation path component."
+        )
+    root = (
+        Path(dataset_root).expanduser().resolve()
+        / DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT
+        / normalized_episode_uuid
+    )
+    if not root.is_dir():
+        return None
+    matches: list[LoadedDetailStageAnnotationSet] = []
+    try:
+        children = tuple(sorted(root.iterdir(), key=lambda value: value.name))
+    except OSError as exc:
+        raise DetailStageAnnotationResolutionError(
+            f"Cannot inspect detail annotation root {root}: {exc}"
+        ) from exc
+    for child in children:
+        if not child.is_dir() or not (child / "manifest.cjson").is_file():
+            continue
+        try:
+            loaded = load_detail_stage_annotation_set(child)
+        except DetailStageAnnotationArtifactReadError as exc:
+            raise DetailStageAnnotationResolutionError(str(exc)) from exc
+        binding = loaded.binding
+        if (
+            binding.episode_capture_identity_hash
+            != base_annotation_set.binding.episode_capture_identity_hash
+            or binding.source_progress_manifest_hash
+            != base_annotation_set.binding.source_progress_manifest_hash
+            or binding.base_annotation_set_id
+            != base_annotation_set.binding.annotation_set_id
+            or binding.base_annotation_set_manifest_hash
+            != base_annotation_set.manifest.semantic_content_hash
+            or binding.base_task_stage_profile_hash
+            != base_stage_profile.semantic_content_hash
+            or binding.detail_task_stage_profile_hash
+            != detail_stage_profile.semantic_content_hash
+        ):
+            continue
+        try:
+            validate_detail_stage_annotation_set(
+                source_progress_manifest=source_progress_manifest,
+                base_binding=base_annotation_set.binding,
+                base_bundle=base_annotation_set.bundle,
+                base_manifest=base_annotation_set.manifest,
+                base_stage_profile=base_stage_profile,
+                detail_stage_profile=detail_stage_profile,
+                binding=binding,
+                bundle=loaded.bundle,
+            )
+        except (TypeError, ValueError) as exc:
+            raise DetailStageAnnotationResolutionError(str(exc)) from exc
+        matches.append(loaded)
+    if not matches:
+        return None
+    return max(
+        matches,
+        key=lambda value: (
+            value.binding.created_at,
+            value.binding.annotation_set_id,
+        ),
+    )
+
+
+def resolve_latest_detail_stage_annotation_view(
+    *,
+    dataset_root: str | Path,
+    episode_uuid: str,
+    source_progress_manifest: Any,
+    base_annotation_set: LoadedStageAnnotationSet,
+    base_stage_profile: TaskStageProfileV1,
+    detail_stage_profile: TaskStageProfileV1,
+) -> ResolvedDetailStageAnnotationView:
+    """Resolve the exact current overlay, or explicitly fall back to coarse."""
+
+    detail_annotation_set = load_latest_detail_stage_annotation_set(
+        dataset_root=dataset_root,
+        episode_uuid=episode_uuid,
+        source_progress_manifest=source_progress_manifest,
+        base_annotation_set=base_annotation_set,
+        base_stage_profile=base_stage_profile,
+        detail_stage_profile=detail_stage_profile,
+    )
+    return resolve_detail_stage_annotation_view(
+        source_progress_manifest=source_progress_manifest,
+        base_annotation_set=base_annotation_set,
+        base_stage_profile=base_stage_profile,
+        detail_stage_profile=detail_stage_profile,
+        detail_annotation_set=detail_annotation_set,
+    )
+
+
 __all__ = [
     "DETAIL_ANNOTATION_RESOLUTION_LEVELS_V1",
     "DetailStageAnnotationResolutionError",
     "ResolvedDetailStageAnnotationView",
+    "load_latest_detail_stage_annotation_set",
     "resolve_detail_stage_annotation_view",
+    "resolve_latest_detail_stage_annotation_view",
 ]

@@ -236,10 +236,18 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert b'id="failed-attempt-editors"' in body
         assert b'id="capture-end-step-editor"' in body
         assert b'id="recoverable-failure-track"' in body
+        assert b'id="detail-annotation-panel"' in body
+        assert b'id="detail-stage-track"' in body
+        assert b'id="publish-detail-annotation"' in body
         assert b'id="mark-recoverable-start"' in body
         assert b'id="cancel-recoverable-capture"' in body
         assert "中间失误后恢复".encode() in body
         assert "function renderRecoverableFailureTools" in app_source
+        assert "function renderDetailAnnotation" in app_source
+        assert "function confirmDetailAnnotation" in app_source
+        assert "/api/commit-detail/" in app_source
+        assert "当前有效分析仍使用粗粒度 fallback" in app_source
+        assert "detail_overlay" in app_source
         assert "function currentTimelineSamplePoint" in app_source
         assert "function successOccurrenceOwningSample" in app_source
         assert "function recoverableFailureConflict" in app_source
@@ -944,6 +952,114 @@ def test_failed_stage_reflow_adds_success_prefix_and_realigns_retry(
         report = application.commit(episode_uuid, result["draft"])
         assert report["coverage_status"] == "COMPLETE"
         assert report["exclusion_count"] == 1
+    finally:
+        application.close()
+
+
+def test_detail_overlay_is_optional_until_explicitly_sealed(
+    tmp_path: Path,
+) -> None:
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    detail_profile_root = tmp_path / "detail-profiles"
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+        detail_profile_root=detail_profile_root,
+    )
+    try:
+        item = application._item(episode_uuid)
+        progress_profile = item.progress.profile
+        detail_stage_profile = TaskStageProfileV1(
+            profile_id="annotation-fixture-detail-stages",
+            profile_version="1",
+            task_progress_profile_hash=progress_profile.semantic_content_hash,
+            stages=(
+                ProgressStageDefinitionV1(
+                    "a",
+                    "a.start",
+                    "开始",
+                    "开始阶段",
+                    1,
+                ),
+                ProgressStageDefinitionV1(
+                    "a",
+                    "a.body",
+                    "主体",
+                    "主体阶段",
+                    2,
+                ),
+                ProgressStageDefinitionV1(
+                    "a",
+                    "a.finish",
+                    "收尾",
+                    "收尾阶段",
+                    3,
+                ),
+            ),
+        )
+        detail_profile_root.mkdir()
+        (detail_profile_root / "fixture.progress_detailed.json").write_text(
+            json.dumps(progress_profile.to_payload(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (detail_profile_root / "fixture.stages_detailed.json").write_text(
+            json.dumps(detail_stage_profile.to_payload(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        initial = application.episode_detail(episode_uuid)
+        assert initial["detail_annotation"]["available"] is False
+
+        coarse_report = application.commit(episode_uuid, initial["draft"])
+        assert coarse_report["detail_annotation"]["available"] is True
+        assert (
+            coarse_report["detail_annotation"]["resolution_level"]
+            == "COARSE_FALLBACK"
+        )
+
+        detail = application.episode_detail(episode_uuid)
+        detail_draft = json.loads(json.dumps(detail["draft"]))
+        meta = detail["detail_annotation"]
+        failure_attempt = meta["failure_attempts"][0]
+        failure_attempt_id = failure_attempt["attempt_id"]
+        failure_fact_id = failure_attempt["failure_fact_id"]
+        overlay = detail_draft["detail_overlay"]
+        overlay["occurrences"] = [
+            {
+                **value,
+                **(
+                    {
+                        "outcome": "FAILURE",
+                        "source_failure_fact_id": failure_fact_id,
+                    }
+                    if (
+                        value["coarse_attempt_id"] == failure_attempt_id
+                        and value["stage_id"] == "a.body"
+                    )
+                    else {}
+                ),
+            }
+            for value in overlay["occurrences"]
+            if not (
+                value["coarse_attempt_id"] == failure_attempt_id
+                and value["stage_id"] == "a.finish"
+            )
+        ]
+        overlay["failure_stage_by_attempt"][failure_attempt_id] = "a.body"
+        overlay["confirmed"] = True
+
+        detail_report = application.commit_detail(
+            episode_uuid,
+            detail_draft,
+        )
+        assert detail_report["detail_annotation"]["resolution_level"] == (
+            "DETAIL_COMPLETE"
+        )
+        reopened = application.episode_detail(episode_uuid)
+        assert reopened["detail_annotation"]["resolution_level"] == (
+            "DETAIL_COMPLETE"
+        )
+        assert reopened["detail_annotation"]["draft_state"] == "SEALED"
     finally:
         application.close()
 

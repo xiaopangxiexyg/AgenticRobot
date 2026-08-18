@@ -15,6 +15,9 @@ from dataset_contracts.progress_detail_annotations import (
     validate_detail_stage_annotation_set,
 )
 from dataset_contracts.progress_facts import ProgressEpisodeManifestV1
+from dataset_contracts.retrospective_progress import (
+    RetrospectiveProgressMigrationManifestV1,
+)
 from dataset_contracts.progress_stages import TaskStageProfileV1
 from dataset_interface.progress_detail_annotation_artifacts import (
     DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT,
@@ -57,7 +60,10 @@ def commit_detail_stage_annotation_set(
     *,
     dataset_root: str | Path,
     episode_uuid: str,
-    source_progress_manifest: ProgressEpisodeManifestV1,
+    source_progress_manifest: (
+        ProgressEpisodeManifestV1
+        | RetrospectiveProgressMigrationManifestV1
+    ),
     base_annotation_set: LoadedStageAnnotationSet,
     base_stage_profile: TaskStageProfileV1,
     detail_stage_profile: TaskStageProfileV1,

@@ -109,6 +109,38 @@ rename 释放锁。锁不会按时间自动抢占；新客户端只会自动隔�
 的旧数据不会被静默伪造成 Failure。当前版本也不会把后标注的 SUCCESS 改 FAILURE 当成
 新的采集 Failure。
 
+## 2.1 旧 coarse 标注的可选 detail 补充
+
+detail 是叠加在 coarse annotation set 之上的独立补充，不修改原有 stage bundle、
+Progress facts、视频、Parquet 或采集协议。当前配套 profile 使用同名的
+`.progress_detailed.json` 和 `.stages_detailed.json`；它必须只把一个 coarse Progress
+Step 拆成新的 fine stages，其余 Step 保持不变。
+
+已有 coarse annotation set 在没有 detail 补充时明确解析为 `COARSE_FALLBACK`，因此旧
+数据集不需要迁移文件就能继续使用，且不会把均分出来的界面草稿当成 detail 数据。后标注
+页面只有在 coarse set 已封存后才显示 detail 轨道；detail 轨道独立于 coarse 轨道，可单独
+拖动其边界。原始 Failure 仍只读，Failure Attempt 必须在 detail 轨道中选择失败发生的
+fine stage；选择前不能确认或封存。
+
+detail 封存采用独立的不可变目录：
+
+```text
+meta/progress/detail_stage_annotations/<episode_uuid>/<detail_set_id>/
+  binding.cjson
+  annotations.cjson
+  manifest.cjson
+```
+
+它精确绑定当前 Episode、当前 coarse annotation set 和目标 detail profile。成功 Attempt
+必须覆盖目标 fine-stage 的完整顺序；原始 Failure Attempt 只能是从第一 stage 开始、以
+对应 Failure 结束的顺序前缀；Retry 是独立 Attempt，仍需覆盖完整序列。任一 Attempt 未
+完成 detail，detail set 都不会发布，分析继续使用 `COARSE_FALLBACK`。粗标注重新封存会
+产生新的 base 版本并使旧 detail overlay 失效，页面会从新 base 重新生成未封存的 detail
+草稿，不会静默沿用旧 detail。
+
+detail overlay 只供后标注和后续显式选择 detail 视图的分析使用；现有只读取 coarse
+annotation set 的调用不改变。采集端不需要改动。
+
 ## 2. 时间轴语义
 
 - 粗粒度 Progress Step、Attempt、Advance 和原始 Failure 来自第一次采集事实；

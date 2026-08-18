@@ -229,6 +229,52 @@
           <div id="coarse-track" class="timeline-track coarse-track"></div>
           <div id="stage-track" class="timeline-track stage-track"></div>
           <div
+            id="detail-annotation-panel"
+            class="detail-annotation-panel hidden"
+            aria-label="详细阶段补充标注"
+          >
+            <div class="detail-annotation-heading">
+              <div>
+                <h3>详细阶段补充（可选 overlay）</h3>
+                <p id="detail-annotation-status" class="panel-note"></p>
+              </div>
+              <div class="detail-annotation-actions">
+                <button
+                  id="confirm-detail-annotation"
+                  class="secondary compact"
+                  type="button"
+                >
+                  确认详细时间轴
+                </button>
+                <button
+                  id="publish-detail-annotation"
+                  class="primary compact"
+                  type="button"
+                >
+                  封存详细补充
+                </button>
+              </div>
+            </div>
+            <p class="detail-annotation-note">
+              该轨迹只补充一个粗粒度子任务，不替换原有阶段时间轴。没有封存 detail
+              时，分析继续使用原来的粗标注；粗标注重新封存后，旧 detail 不会自动套用。
+            </p>
+            <div
+              id="detail-stage-track"
+              class="timeline-track detail-stage-track"
+              aria-label="详细阶段时间轴"
+            ></div>
+            <div
+              id="detail-failure-editors"
+              class="detail-failure-editors"
+              aria-label="详细 Failure 子阶段选择"
+            ></div>
+            <div
+              id="detail-stage-descriptions"
+              class="stage-descriptions detail-stage-descriptions"
+            ></div>
+          </div>
+          <div
             id="failure-trigger-track"
             class="timeline-track failure-trigger-track"
             aria-label="failure_trigger 时间轴"

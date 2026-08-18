@@ -23,6 +23,14 @@ from collection_runtime.progress.stage_annotation_store import (
     commit_stage_annotation_set,
     load_stage_annotation_set,
 )
+from collection_runtime.progress.detail_stage_annotation_store import (
+    DetailStageAnnotationStoreError,
+    commit_detail_stage_annotation_set,
+)
+from collection_runtime.progress.profiles.catalog import (
+    load_task_progress_profile_file,
+    load_task_stage_profile_file,
+)
 from collection_runtime.progress.failure_trigger_store import (
     FailureTriggerStoreError,
     commit_failure_trigger_annotation_set,
@@ -41,6 +49,12 @@ from dataset_contracts.progress_failure_triggers import (
 )
 from dataset_contracts.progress_recoverable_failures import (
     RecoverableFailureAnnotationSetV1,
+)
+from dataset_contracts.progress_detail_annotations import (
+    DetailStageAnnotationBundleV1,
+    DetailStageAnnotationSetBindingV1,
+    validate_detail_stage_annotation_set,
+    validate_detail_stage_profile_compatibility,
 )
 from dataset_contracts.progress_stage_annotations import (
     AbnormalIntervalAnnotationV1,
@@ -73,6 +87,12 @@ from dataset_interface.progress_recoverable_failures import (
     recoverable_failure_sample_axis_hash,
 )
 from dataset_interface.progress_stages import resolve_stage_training_index
+from dataset_interface.progress_detail_annotation_artifacts import (
+    DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT,
+    DetailStageAnnotationArtifactReadError,
+    LoadedDetailStageAnnotationSet,
+    load_detail_stage_annotation_set as load_detail_stage_annotation_set_readonly,
+)
 from dataset_interface.retrospective_progress_artifacts import (
     LoadedRetrospectiveProgressEpisode,
 )
@@ -83,6 +103,7 @@ from dataset_interface.progress_annotation_read_cache import (
 
 
 _DRAFT_SCHEMA = "dexteleop.stage_annotation_draft.local.v1"
+_DETAIL_DRAFT_SCHEMA = "dexteleop.detail_stage_annotation_draft.local.v1"
 _SAMPLE_AXIS_CACHE_LIMIT = 16
 _ANNOTATION_SET_CACHE_LIMIT = 16
 _RETRYABLE_STAGE_STORE_ERRNOS = frozenset(
@@ -121,6 +142,14 @@ class _EpisodeAnnotationSummary:
         return self.review_state == "PENDING"
 
 
+@dataclass(frozen=True)
+class _DetailProfileSelection:
+    stage_profile: Any
+    target_progress_step_id: str
+    progress_profile_path: Path
+    stage_profile_path: Path
+
+
 class RefinementAnnotationApplication:
     """Own one dataset view and at most one Episode editing lock."""
 
@@ -133,6 +162,7 @@ class RefinementAnnotationApplication:
         allowed_source_roots: Sequence[str | Path] = (),
         defer_initial_refresh: bool = False,
         read_cache: ProgressAnnotationReadCache | None = None,
+        detail_profile_root: str | Path | None = None,
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.annotator_id = str(annotator_id).strip()
@@ -144,6 +174,14 @@ class RefinementAnnotationApplication:
         self.allowed_source_roots = tuple(
             Path(value).expanduser().resolve()
             for value in allowed_source_roots
+        )
+        self.detail_profile_root = (
+            Path(detail_profile_root).expanduser().resolve()
+            if detail_profile_root is not None
+            else Path(__file__).resolve().parents[2]
+            / "collection_runtime"
+            / "progress"
+            / "profiles"
         )
         self.workspace = DatasetStageAnnotationWorkspace(
             self.dataset_root,
@@ -184,6 +222,10 @@ class RefinementAnnotationApplication:
             str,
             tuple[tuple[object, ...], EpisodeSampleAxis],
         ] = OrderedDict()
+        self._detail_profile_cache: dict[
+            str,
+            tuple[_DetailProfileSelection | None, str | None],
+        ] = {}
         # The GUI can return immediately and expose a loading state while the
         # first remote catalog scan runs. Direct application callers retain
         # the historical synchronous initialization by default.
@@ -210,6 +252,7 @@ class RefinementAnnotationApplication:
                 self._annotation_summary_cache.clear()
                 self._annotation_root_fingerprints.clear()
                 self._sample_axis_cache.clear()
+                self._detail_profile_cache.clear()
 
     def _catalog_fingerprint(self) -> tuple[object, ...]:
         return progress_annotation_catalog_fingerprint(self.dataset_root)
@@ -622,124 +665,137 @@ class RefinementAnnotationApplication:
         self,
         item: ProgressAnnotationWorkItem,
     ) -> tuple[_DetailProfileSelection | None, str | None]:
-        """Find one explicit detail profile compatible with this Episode.
+        """Find one additive fine-stage profile for the loaded coarse profile.
 
-        Detail profiles are editable assets, so their source-file hash is not
-        used as a configuration admission key.  The loader computes the
-        semantic profile content hash, and this method only accepts a single
-        candidate whose coarse progress content matches the sealed Episode and
-        whose stage changes are confined to one coarse step.
+        Detailed profiles are editable configuration, not sealed dataset
+        receipts.  Their contract hashes are derived through the catalog
+        loader; source-file hashes are never used as admission checks.
         """
 
-        base_profile = item.progress.profile
         base_stage_profile = item.progress.stage_profile
         if base_stage_profile is None:
-            return None, "Episode 没有可用的 coarse stage profile。"
-        cache_key = base_profile.semantic_content_hash
-        with self._lock:
-            cached = self._detail_profile_cache.get(cache_key)
-        if cached is not None:
-            return cached
+            return None, "当前 Episode 没有可用的粗粒度 stage profile。"
         root = self.detail_profile_root
-        if not root.is_dir():
-            result = (None, f"未找到 detail profile 目录：{root}")
-            with self._lock:
-                self._detail_profile_cache[cache_key] = result
-            return result
-        candidates: list[_DetailProfileSelection] = []
-        errors: list[str] = []
         try:
             progress_paths = tuple(
                 sorted(root.rglob("*.progress_detailed.json"))
             )
         except OSError as exc:
-            result = (None, f"无法读取 detail profile 目录：{exc}")
-            with self._lock:
-                self._detail_profile_cache[cache_key] = result
-            return result
+            return None, f"无法读取详细 stage profile 目录：{exc}"
+        fingerprints: list[tuple[object, ...]] = []
+        pairs: list[tuple[Path, Path]] = []
         for progress_path in progress_paths:
-            stage_name = progress_path.name.replace(
-                ".progress_detailed.json",
-                ".stages_detailed.json",
+            stage_path = progress_path.with_name(
+                progress_path.name.replace(
+                    ".progress_detailed.json",
+                    ".stages_detailed.json",
+                )
             )
-            stage_path = progress_path.with_name(stage_name)
+            try:
+                progress_stat = progress_path.stat()
+                stage_stat = stage_path.stat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                return None, f"无法读取详细 stage profile 文件：{exc}"
             if not stage_path.is_file():
                 continue
+            fingerprints.append(
+                (
+                    str(progress_path),
+                    progress_stat.st_size,
+                    progress_stat.st_mtime_ns,
+                    stage_stat.st_size,
+                    stage_stat.st_mtime_ns,
+                )
+            )
+            pairs.append((progress_path, stage_path))
+        cache_key = repr(
+            (
+                base_stage_profile.semantic_content_hash,
+                tuple(fingerprints),
+            )
+        )
+        with self._lock:
+            cached = self._detail_profile_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        candidates: list[_DetailProfileSelection] = []
+        errors: list[str] = []
+        base_step_ids = {
+            step.progress_step_id for step in item.progress.profile.steps
+        }
+        for progress_path, stage_path in pairs:
             try:
                 detail_progress = load_task_progress_profile_file(
                     progress_path
                 )
                 if (
                     detail_progress.semantic_content_hash
-                    != base_profile.semantic_content_hash
+                    != base_stage_profile.task_progress_profile_hash
                 ):
                     continue
-                detail_stage = load_task_stage_profile_file(
+                detail_stage_profile = load_task_stage_profile_file(
                     stage_path,
                     progress_profile=detail_progress,
                 )
+                detail_step_ids = {
+                    stage.progress_step_id
+                    for stage in detail_stage_profile.stages
+                }
+                if detail_step_ids != base_step_ids:
+                    continue
                 changed_steps = tuple(
                     step_id
-                    for step_id in sorted(
-                        {
-                            value.progress_step_id
-                            for value in base_stage_profile.stages
-                        }
-                        | {
-                            value.progress_step_id
-                            for value in detail_stage.stages
-                        }
-                    )
+                    for step_id in sorted(base_step_ids)
                     if base_stage_profile.stages_for_step(step_id)
-                    != detail_stage.stages_for_step(step_id)
+                    != detail_stage_profile.stages_for_step(step_id)
                 )
                 if len(changed_steps) != 1:
+                    errors.append(
+                        f"{stage_path.name}: 详细 profile 必须只改变一个子任务"
+                    )
                     continue
+                target_step_id = changed_steps[0]
                 validate_detail_stage_profile_compatibility(
                     base_stage_profile=base_stage_profile,
-                    detail_stage_profile=detail_stage,
-                    target_progress_step_id=changed_steps[0],
+                    detail_stage_profile=detail_stage_profile,
+                    target_progress_step_id=target_step_id,
                 )
-            except (
-                OSError,
-                ProgressProfileCatalogError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                errors.append(f"{progress_path.name}: {exc}")
-                continue
-            candidates.append(
-                _DetailProfileSelection(
-                    stage_profile=detail_stage,
-                    target_progress_step_id=changed_steps[0],
-                    progress_profile_path=progress_path,
-                    stage_profile_path=stage_path,
+                candidates.append(
+                    _DetailProfileSelection(
+                        stage_profile=detail_stage_profile,
+                        target_progress_step_id=target_step_id,
+                        progress_profile_path=progress_path,
+                        stage_profile_path=stage_path,
+                    )
                 )
+            except (OSError, TypeError, ValueError) as exc:
+                errors.append(f"{stage_path.name}: {exc}")
+
+        if len(candidates) == 1:
+            result: tuple[_DetailProfileSelection | None, str | None] = (
+                candidates[0],
+                None,
             )
-        unique = {
-            (
-                value.stage_profile.semantic_content_hash,
-                value.target_progress_step_id,
-            ): value
-            for value in candidates
-        }
-        if len(unique) == 1:
-            result = (next(iter(unique.values())), None)
-        elif len(unique) > 1:
+        elif len(candidates) > 1:
             result = (
                 None,
-                "发现多个互相冲突的 detail profile；为避免猜测，当前 Episode "
-                "保持 coarse fallback。",
+                "当前粗 profile 匹配到多个详细 profile，已停用详细标注以避免歧义。",
             )
         elif errors:
-            result = (None, "detail profile 无法加载：" + "；".join(errors))
+            result = (None, errors[0])
         else:
             result = (
                 None,
-                "没有找到与该 Episode coarse progress 完全匹配的 detail profile。",
+                "当前数据集没有匹配的详细 stage profile；继续使用粗粒度标注。",
             )
         with self._lock:
             self._detail_profile_cache[cache_key] = result
+            if len(self._detail_profile_cache) > 8:
+                for key in tuple(self._detail_profile_cache)[:-8]:
+                    self._detail_profile_cache.pop(key, None)
         return result
 
     def _detail_annotation_root(
@@ -755,46 +811,48 @@ class RefinementAnnotationApplication:
     def _current_detail_annotation_set(
         self,
         item: ProgressAnnotationWorkItem,
-        base_annotation_set: LoadedStageAnnotationSet | None,
+        base_annotation_set: LoadedStageAnnotationSet,
         selection: _DetailProfileSelection,
     ) -> tuple[LoadedDetailStageAnnotationSet | None, str | None]:
-        """Load only a detail set bound to the current latest coarse set."""
+        """Load only the newest overlay bound to the exact current base set."""
 
-        if base_annotation_set is None:
-            return None, None
         root = self._detail_annotation_root(item)
-        try:
-            children = tuple(sorted(root.iterdir(), key=lambda value: value.name))
-        except FileNotFoundError:
+        if not root.is_dir():
             return None, None
+        assert item.progress.stage_profile is not None
+        matches: list[LoadedDetailStageAnnotationSet] = []
+        try:
+            children = tuple(
+                sorted(root.iterdir(), key=lambda value: value.name)
+            )
         except OSError as exc:
-            return None, f"无法读取 detail annotation 目录：{exc}"
-        loaded: list[LoadedDetailStageAnnotationSet] = []
+            return None, f"无法读取 detail 标注目录：{exc}"
         for child in children:
             if not child.is_dir() or not (child / "manifest.cjson").is_file():
                 continue
             try:
-                value = load_detail_stage_annotation_set_readonly(child)
-            except (DetailStageAnnotationArtifactReadError, OSError, ValueError) as exc:
-                # A malformed additive overlay must not hide the valid coarse
-                # set.  Keep the coarse fallback and expose the issue to the UI.
-                return None, f"detail annotation {child.name!r} 无法读取：{exc}"
+                loaded = load_detail_stage_annotation_set_readonly(child)
+            except DetailStageAnnotationArtifactReadError as exc:
+                return None, f"detail 标注版本 {child.name!r} 无法读取：{exc}"
+            binding = loaded.binding
             if (
-                value.binding.episode_capture_identity_hash
+                binding.episode_capture_identity_hash
                 != item.episode_identity_hash
-                or value.binding.source_progress_manifest_hash
+                or binding.source_progress_manifest_hash
                 != item.progress_manifest_hash
-                or value.binding.base_annotation_set_id
+                or binding.base_annotation_set_id
                 != base_annotation_set.binding.annotation_set_id
-                or value.binding.base_annotation_set_manifest_hash
+                or binding.base_annotation_set_manifest_hash
                 != base_annotation_set.manifest.semantic_content_hash
-                or value.binding.detail_task_stage_profile_hash
+                or binding.base_task_stage_profile_hash
+                != item.progress.stage_profile.semantic_content_hash
+                or binding.detail_task_stage_profile_hash
                 != selection.stage_profile.semantic_content_hash
-                or value.binding.target_progress_step_id
+                or binding.target_progress_step_id
                 != selection.target_progress_step_id
             ):
-                # Old overlays remain auditable but are stale after a new
-                # coarse set or profile is published; never apply them.
+                # Older immutable overlays remain valid history but must not
+                # shadow the current coarse base set.
                 continue
             try:
                 validate_detail_stage_annotation_set(
@@ -804,29 +862,24 @@ class RefinementAnnotationApplication:
                     base_manifest=base_annotation_set.manifest,
                     base_stage_profile=item.progress.stage_profile,
                     detail_stage_profile=selection.stage_profile,
-                    binding=value.binding,
-                    bundle=value.bundle,
+                    binding=binding,
+                    bundle=loaded.bundle,
                 )
             except (TypeError, ValueError) as exc:
-                return None, f"detail annotation {child.name!r} 绑定校验失败：{exc}"
-            loaded.append(value)
-        if not loaded:
+                return None, f"当前 detail 标注版本校验失败：{exc}"
+            matches.append(loaded)
+        if not matches:
             return None, None
-        return (
-            max(
-                loaded,
-                key=lambda value: (
-                    value.binding.created_at,
-                    value.binding.annotation_set_id,
-                ),
+        return max(
+            matches,
+            key=lambda value: (
+                value.binding.created_at,
+                value.binding.annotation_set_id,
             ),
-            None,
-        )
+        ), None
 
     @staticmethod
-    def _detail_occurrence_payload(
-        value: StageOccurrenceAnnotationV1,
-    ) -> dict[str, Any]:
+    def _detail_occurrence_payload(value: Any) -> dict[str, Any]:
         return {
             "annotation_id": value.annotation_id,
             "coarse_attempt_id": value.coarse_attempt_id,
@@ -840,118 +893,9 @@ class RefinementAnnotationApplication:
             "source_failure_fact_id": value.source_failure_fact_id,
         }
 
-    def _bootstrap_detail_draft(
-        self,
-        item: ProgressAnnotationWorkItem,
-        base_annotation_set: LoadedStageAnnotationSet,
-        selection: _DetailProfileSelection,
-        *,
-        draft_revision: int = 0,
-        failure_stage_by_attempt: Mapping[str, str] | None = None,
-    ) -> dict[str, Any]:
-        target = selection.target_progress_step_id
-        stages = selection.stage_profile.stages_for_step(target)
-        selected_failures = {
-            str(key): str(value)
-            for key, value in (failure_stage_by_attempt or {}).items()
-        }
-        occurrences: list[dict[str, Any]] = []
-        occurrence_index_by_attempt: dict[str, int] = {}
-        for base in sorted(
-            (
-                value
-                for value in base_annotation_set.bundle.occurrences
-                if value.progress_step_id == target
-            ),
-            key=lambda value: (
-                value.start_at,
-                value.end_at,
-                value.annotation_id,
-            ),
-        ):
-            if not stages:
-                continue
-            selected_failure = selected_failures.get(base.coarse_attempt_id)
-            selected_index = next(
-                (
-                    index
-                    for index, stage in enumerate(stages)
-                    if stage.stage_id == selected_failure
-                ),
-                None,
-            )
-            if base.outcome == "FAILURE" and selected_index is not None:
-                active_stages = stages[: selected_index + 1]
-            else:
-                active_stages = stages
-            duration = base.end_at - base.start_at
-            for index, stage in enumerate(active_stages):
-                occurrence_index = occurrence_index_by_attempt.get(
-                    base.coarse_attempt_id,
-                    0,
-                ) + 1
-                occurrence_index_by_attempt[base.coarse_attempt_id] = (
-                    occurrence_index
-                )
-                outcome = "SUCCESS"
-                source_failure_fact_id = None
-                if (
-                    base.outcome == "TRUNCATED_BY_ABNORMAL"
-                    and selected_index is None
-                ):
-                    outcome = "TRUNCATED_BY_ABNORMAL"
-                elif (
-                    base.outcome == "FAILURE"
-                    and selected_index is not None
-                    and index == selected_index
-                ):
-                    outcome = "FAILURE"
-                    source_failure_fact_id = base.source_failure_fact_id
-                occurrences.append(
-                    {
-                        "annotation_id": (
-                            f"detail-draft:{base.coarse_attempt_id}:"
-                            f"{stage.stage_id}:{occurrence_index}"
-                        ),
-                        "coarse_attempt_id": base.coarse_attempt_id,
-                        "progress_step_id": target,
-                        "stage_id": stage.stage_id,
-                        "occurrence_index_in_attempt": occurrence_index,
-                        "start_at": base.start_at
-                        + duration * index / len(active_stages),
-                        "end_at": base.start_at
-                        + duration * (index + 1) / len(active_stages),
-                        "outcome": outcome,
-                        "confidence": 1.0,
-                        "source_failure_fact_id": source_failure_fact_id,
-                    }
-                )
-        return {
-            "schema": _DETAIL_DRAFT_SCHEMA,
-            "episode_uuid": item.episode_uuid,
-            "base_annotation_set_id": base_annotation_set.binding.annotation_set_id,
-            "base_annotation_set_manifest_hash": base_annotation_set.manifest.semantic_content_hash,
-            "detail_task_stage_profile_hash": selection.stage_profile.semantic_content_hash,
-            "target_progress_step_id": target,
-            "draft_revision": int(draft_revision),
-            "occurrences": occurrences,
-            "failure_stage_by_attempt": selected_failures,
-            "confirmed": bool(
-                selected_failures
-                and all(
-                    value.source_failure_fact_id is not None
-                    for value in base_annotation_set.bundle.occurrences
-                    if value.progress_step_id == target
-                    and value.outcome == "FAILURE"
-                )
-            ),
-        }
-
     def _detail_draft_from_annotation_set(
         self,
         item: ProgressAnnotationWorkItem,
-        base_annotation_set: LoadedStageAnnotationSet,
-        selection: _DetailProfileSelection,
         value: LoadedDetailStageAnnotationSet,
         *,
         draft_revision: int,
@@ -960,26 +904,191 @@ class RefinementAnnotationApplication:
             occurrence.coarse_attempt_id: occurrence.stage_id
             for occurrence in value.bundle.occurrences
             if occurrence.outcome == "FAILURE"
+            and occurrence.source_failure_fact_id is not None
         }
-        draft = self._bootstrap_detail_draft(
-            item,
-            base_annotation_set,
-            selection,
-            draft_revision=draft_revision,
-            failure_stage_by_attempt=failure_stage_by_attempt,
+        return {
+            "schema": _DETAIL_DRAFT_SCHEMA,
+            "episode_uuid": item.episode_uuid,
+            "base_annotation_set_id": value.binding.base_annotation_set_id,
+            "base_annotation_set_manifest_hash": (
+                value.binding.base_annotation_set_manifest_hash
+            ),
+            "base_task_stage_profile_hash": (
+                value.binding.base_task_stage_profile_hash
+            ),
+            "detail_task_stage_profile_hash": (
+                value.binding.detail_task_stage_profile_hash
+            ),
+            "target_progress_step_id": value.binding.target_progress_step_id,
+            "draft_revision": int(draft_revision),
+            "occurrences": [
+                self._detail_occurrence_payload(occurrence)
+                for occurrence in value.bundle.occurrences
+            ],
+            "failure_stage_by_attempt": failure_stage_by_attempt,
+            "confirmed": True,
+            "last_committed_detail_annotation_set_id": (
+                value.binding.annotation_set_id
+            ),
+            "last_committed_detail_manifest_hash": (
+                value.manifest.semantic_content_hash
+            ),
+        }
+
+    @staticmethod
+    def _detail_stage_payload(stage: Any) -> dict[str, Any]:
+        return {
+            "stage_id": stage.stage_id,
+            "progress_step_id": stage.progress_step_id,
+            "display_name": stage.display_name,
+            "description": stage.description,
+            "ordinal": stage.ordinal,
+        }
+
+    def _bootstrap_detail_draft(
+        self,
+        item: ProgressAnnotationWorkItem,
+        base_annotation_set: LoadedStageAnnotationSet,
+        selection: _DetailProfileSelection,
+    ) -> dict[str, Any]:
+        """Create an unsealed equal-split detail working view.
+
+        This is only a UI starting point.  It is never treated as detail data
+        by readers until an explicit detail seal passes the immutable
+        contract, and failure Attempts remain unresolved until the annotator
+        selects their fine failure stage.
+        """
+
+        assert item.progress.stage_profile is not None
+        target = selection.target_progress_step_id
+        stages = selection.stage_profile.stages_for_step(target)
+        target_occurrences = sorted(
+            (
+                value
+                for value in base_annotation_set.bundle.occurrences
+                if value.progress_step_id == target
+            ),
+            key=lambda value: (
+                value.coarse_attempt_id,
+                value.start_at,
+                value.end_at,
+                value.annotation_id,
+            ),
         )
-        draft["occurrences"] = [
-            self._detail_occurrence_payload(occurrence)
-            for occurrence in value.bundle.occurrences
-        ]
-        draft["confirmed"] = True
-        draft["last_committed_detail_annotation_set_id"] = (
-            value.binding.annotation_set_id
-        )
-        draft["last_committed_detail_manifest_hash"] = (
-            value.manifest.semantic_content_hash
-        )
-        return draft
+        if not stages or not target_occurrences:
+            raise RefinementAnnotationApplicationError(
+                "The selected detail profile has no target stages or the "
+                "sealed coarse annotation has no target occurrence."
+            )
+        grouped: dict[str, list[Any]] = {}
+        for value in target_occurrences:
+            grouped.setdefault(value.coarse_attempt_id, []).append(value)
+        occurrences: list[dict[str, Any]] = []
+        failure_stage_by_attempt: dict[str, str | None] = {}
+        for attempt_id, values in grouped.items():
+            ordered_values = sorted(
+                values,
+                key=lambda value: (value.start_at, value.end_at),
+            )
+            source_outcome = ordered_values[-1].outcome
+            source_failure_fact_id = next(
+                (
+                    value.source_failure_fact_id
+                    for value in ordered_values
+                    if value.source_failure_fact_id is not None
+                ),
+                None,
+            )
+            if source_failure_fact_id is not None:
+                failure_stage_by_attempt[attempt_id] = None
+            total_duration = sum(
+                max(0.0, value.end_at - value.start_at)
+                for value in ordered_values
+            )
+            stage_cursor = 0
+            remaining_stages = len(stages)
+            for segment_index, value in enumerate(ordered_values):
+                segment_duration = max(0.0, value.end_at - value.start_at)
+                segments_left = len(ordered_values) - segment_index
+                if segment_index == len(ordered_values) - 1:
+                    count = remaining_stages
+                elif total_duration <= 0.0:
+                    count = max(1, remaining_stages // segments_left)
+                else:
+                    count = round(
+                        len(stages) * segment_duration / total_duration
+                    )
+                    count = max(1, count)
+                    count = min(count, remaining_stages - (segments_left - 1))
+                selected_stages = tuple(
+                    stages[stage_cursor : stage_cursor + count]
+                )
+                if not selected_stages:
+                    selected_stages = (stages[-1],)
+                stage_cursor += len(selected_stages)
+                remaining_stages = max(0, len(stages) - stage_cursor)
+                duration = value.end_at - value.start_at
+                for local_index, stage in enumerate(selected_stages, start=1):
+                    start_at = value.start_at + duration * (
+                        local_index - 1
+                    ) / len(selected_stages)
+                    end_at = value.start_at + duration * local_index / (
+                        len(selected_stages)
+                    )
+                    truncated = (
+                        source_outcome == "TRUNCATED_BY_ABNORMAL"
+                        and segment_index == len(ordered_values) - 1
+                        and local_index == len(selected_stages)
+                    )
+                    occurrences.append(
+                        {
+                            "annotation_id": (
+                                f"detail-draft:{attempt_id}:{stage.stage_id}:"
+                                f"{segment_index + 1}:{local_index}"
+                            ),
+                            "coarse_attempt_id": attempt_id,
+                            "progress_step_id": target,
+                            "stage_id": stage.stage_id,
+                            "occurrence_index_in_attempt": len(
+                                [
+                                    existing
+                                    for existing in occurrences
+                                    if existing["coarse_attempt_id"] == attempt_id
+                                ]
+                            )
+                            + 1,
+                            "start_at": start_at,
+                            "end_at": end_at,
+                            "outcome": (
+                                "TRUNCATED_BY_ABNORMAL"
+                                if truncated
+                                else "SUCCESS"
+                            ),
+                            "confidence": 1.0,
+                            "source_failure_fact_id": None,
+                        }
+                    )
+        return {
+            "schema": _DETAIL_DRAFT_SCHEMA,
+            "episode_uuid": item.episode_uuid,
+            "base_annotation_set_id": (
+                base_annotation_set.binding.annotation_set_id
+            ),
+            "base_annotation_set_manifest_hash": (
+                base_annotation_set.manifest.semantic_content_hash
+            ),
+            "base_task_stage_profile_hash": (
+                item.progress.stage_profile.semantic_content_hash
+            ),
+            "detail_task_stage_profile_hash": (
+                selection.stage_profile.semantic_content_hash
+            ),
+            "target_progress_step_id": target,
+            "draft_revision": 0,
+            "occurrences": occurrences,
+            "failure_stage_by_attempt": failure_stage_by_attempt,
+            "confirmed": False,
+        }
 
     def _normalize_detail_draft(
         self,
@@ -991,63 +1100,47 @@ class RefinementAnnotationApplication:
     ) -> dict[str, Any]:
         if not isinstance(draft, Mapping):
             raise RefinementAnnotationApplicationError(
-                "Detail draft payload must be an object."
+                "Detail draft must be an object."
             )
         if draft.get("schema") != _DETAIL_DRAFT_SCHEMA:
             raise RefinementAnnotationApplicationError(
                 "Unsupported detail annotation draft schema."
             )
-        expected = {
-            "schema",
-            "episode_uuid",
-            "base_annotation_set_id",
-            "base_annotation_set_manifest_hash",
-            "detail_task_stage_profile_hash",
-            "target_progress_step_id",
-            "draft_revision",
-            "occurrences",
-            "failure_stage_by_attempt",
-            "confirmed",
-            "last_committed_detail_annotation_set_id",
-            "last_committed_detail_manifest_hash",
-        }
-        if unknown := set(draft) - expected:
-            raise RefinementAnnotationApplicationError(
-                f"Unsupported detail draft fields: {sorted(unknown)}."
-            )
         if str(draft.get("episode_uuid", "")).strip() != item.episode_uuid:
             raise RefinementAnnotationApplicationError(
                 "Detail draft Episode identity changed."
             )
-        if (
-            draft.get("base_annotation_set_id")
-            != base_annotation_set.binding.annotation_set_id
-            or draft.get("base_annotation_set_manifest_hash")
-            != base_annotation_set.manifest.semantic_content_hash
-            or draft.get("detail_task_stage_profile_hash")
-            != selection.stage_profile.semantic_content_hash
-            or draft.get("target_progress_step_id")
-            != selection.target_progress_step_id
+        expected = {
+            "base_annotation_set_id": (
+                base_annotation_set.binding.annotation_set_id
+            ),
+            "base_annotation_set_manifest_hash": (
+                base_annotation_set.manifest.semantic_content_hash
+            ),
+            "base_task_stage_profile_hash": (
+                item.progress.stage_profile.semantic_content_hash
+            ),
+            "detail_task_stage_profile_hash": (
+                selection.stage_profile.semantic_content_hash
+            ),
+            "target_progress_step_id": selection.target_progress_step_id,
+        }
+        for key, value in expected.items():
+            if draft.get(key) != value:
+                raise RefinementAnnotationApplicationError(
+                    f"Detail draft is bound to a different {key}."
+                )
+        raw_occurrences = draft.get("occurrences", ())
+        if not isinstance(raw_occurrences, (list, tuple)) or any(
+            not isinstance(value, Mapping) for value in raw_occurrences
         ):
             raise RefinementAnnotationApplicationError(
-                "Detail draft is stale relative to the latest coarse annotation "
-                "or detail profile; reopen the Episode before editing it."
+                "Detail occurrences must be a sequence of objects."
             )
-        raw_occurrences = list(draft.get("occurrences", ()))
-        if any(not isinstance(value, Mapping) for value in raw_occurrences):
-            raise RefinementAnnotationApplicationError(
-                "Every detail occurrence must be an object."
-            )
-        target_stage_ids = {
-            value.stage_id
-            for value in selection.stage_profile.stages_for_step(
-                selection.target_progress_step_id
-            )
-        }
-        normalized_occurrences: list[dict[str, Any]] = []
+        clock = item.progress.timeline.clock_domain_id
         try:
-            for value in raw_occurrences:
-                occurrence = StageOccurrenceAnnotationV1(
+            contracts = tuple(
+                StageOccurrenceAnnotationV1(
                     annotation_id=value.get("annotation_id", ""),
                     coarse_attempt_id=value.get("coarse_attempt_id", ""),
                     progress_step_id=value.get("progress_step_id", ""),
@@ -1058,62 +1151,57 @@ class RefinementAnnotationApplication:
                     ),
                     start_at=value.get("start_at"),
                     end_at=value.get("end_at"),
-                    clock_domain_id=item.progress.timeline.clock_domain_id,
+                    clock_domain_id=clock,
                     outcome=value.get("outcome", ""),
                     confidence=value.get("confidence", 1.0),
                     source_failure_fact_id=value.get(
                         "source_failure_fact_id"
                     ),
                 )
-                if (
-                    occurrence.progress_step_id
-                    != selection.target_progress_step_id
-                    or occurrence.stage_id not in target_stage_ids
-                ):
-                    raise RefinementAnnotationApplicationError(
-                        "Detail occurrence references a stage outside the "
-                        "detail target step."
-                    )
-                normalized_occurrences.append(
-                    self._detail_occurrence_payload(occurrence)
-                )
+                for value in raw_occurrences
+            )
+            bundle = DetailStageAnnotationBundleV1(occurrences=contracts)
         except (TypeError, ValueError) as exc:
-            if isinstance(exc, RefinementAnnotationApplicationError):
-                raise
             raise RefinementAnnotationApplicationError(
                 f"Invalid detail stage occurrence: {exc}"
             ) from exc
-        failure_stage_by_attempt = draft.get("failure_stage_by_attempt", {})
-        if not isinstance(failure_stage_by_attempt, Mapping):
+        if any(
+            value.progress_step_id != selection.target_progress_step_id
+            for value in bundle.occurrences
+        ):
+            raise RefinementAnnotationApplicationError(
+                "Detail occurrences must remain inside the selected coarse "
+                "progress step."
+            )
+        raw_failure_map = draft.get("failure_stage_by_attempt", {})
+        if not isinstance(raw_failure_map, Mapping):
             raise RefinementAnnotationApplicationError(
                 "failure_stage_by_attempt must be an object."
             )
-        failure_attempts = {
-            value.coarse_attempt_id
-            for value in base_annotation_set.bundle.occurrences
-            if value.progress_step_id == selection.target_progress_step_id
-            and value.outcome == "FAILURE"
-        }
-        normalized_failures: dict[str, str] = {}
-        for attempt_id, stage_id in failure_stage_by_attempt.items():
-            attempt = str(attempt_id).strip()
-            stage = str(stage_id).strip()
-            if attempt not in failure_attempts or stage not in target_stage_ids:
+        failure_map: dict[str, str | None] = {}
+        for attempt_id, stage_id in raw_failure_map.items():
+            normalized_attempt_id = str(attempt_id).strip()
+            if not normalized_attempt_id:
                 raise RefinementAnnotationApplicationError(
-                    "Detail failure-stage selection references an unknown "
-                    "Failure Attempt or stage."
+                    "Detail failure Attempt identity must be non-empty."
                 )
-            normalized_failures[attempt] = stage
-        normalized = {
+            if stage_id is not None and not str(stage_id).strip():
+                raise RefinementAnnotationApplicationError(
+                    "Detail failure stage identity must be non-empty or null."
+                )
+            failure_map[normalized_attempt_id] = (
+                None if stage_id is None else str(stage_id).strip()
+            )
+        result = {
             "schema": _DETAIL_DRAFT_SCHEMA,
             "episode_uuid": item.episode_uuid,
-            "base_annotation_set_id": base_annotation_set.binding.annotation_set_id,
-            "base_annotation_set_manifest_hash": base_annotation_set.manifest.semantic_content_hash,
-            "detail_task_stage_profile_hash": selection.stage_profile.semantic_content_hash,
-            "target_progress_step_id": selection.target_progress_step_id,
+            **expected,
             "draft_revision": int(draft.get("draft_revision", 0)),
-            "occurrences": normalized_occurrences,
-            "failure_stage_by_attempt": normalized_failures,
+            "occurrences": [
+                self._detail_occurrence_payload(value)
+                for value in bundle.occurrences
+            ],
+            "failure_stage_by_attempt": failure_map,
             "confirmed": bool(draft.get("confirmed", False)),
         }
         for key in (
@@ -1121,8 +1209,8 @@ class RefinementAnnotationApplication:
             "last_committed_detail_manifest_hash",
         ):
             if key in draft:
-                normalized[key] = draft[key]
-        return normalized
+                result[key] = draft[key]
+        return result
 
     def _detail_bundle_from_draft(
         self,
@@ -1156,8 +1244,51 @@ class RefinementAnnotationApplication:
             )
         except (TypeError, ValueError) as exc:
             raise RefinementAnnotationApplicationError(
-                f"Invalid detail annotation bundle: {exc}"
+                f"Invalid detail stage annotation: {exc}"
             ) from exc
+
+    def _detail_failure_attempt_payload(
+        self,
+        item: ProgressAnnotationWorkItem,
+        base_annotation_set: LoadedStageAnnotationSet,
+        selection: _DetailProfileSelection,
+        detail_draft: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        target = selection.target_progress_step_id
+        by_attempt: dict[str, list[Any]] = {}
+        for value in base_annotation_set.bundle.occurrences:
+            if value.progress_step_id == target and value.source_failure_fact_id:
+                by_attempt.setdefault(value.coarse_attempt_id, []).append(value)
+        timeline_attempts = {
+            value.attempt_id: value for value in item.progress.timeline.attempts
+        }
+        selected = detail_draft.get("failure_stage_by_attempt", {})
+        stages = selection.stage_profile.stages_for_step(target)
+        result: list[dict[str, Any]] = []
+        for attempt_id, values in sorted(by_attempt.items()):
+            source = timeline_attempts.get(attempt_id)
+            failure_fact_id = next(
+                value.source_failure_fact_id
+                for value in values
+                if value.source_failure_fact_id is not None
+            )
+            result.append(
+                {
+                    "attempt_id": attempt_id,
+                    "progress_step_id": target,
+                    "start_at": min(value.start_at for value in values),
+                    "end_at": max(value.end_at for value in values),
+                    "failure_fact_id": failure_fact_id,
+                    "failure_reported_at": (
+                        None if source is None else source.failure_reported_at
+                    ),
+                    "selected_stage_id": selected.get(attempt_id),
+                    "options": [
+                        self._detail_stage_payload(stage) for stage in stages
+                    ],
+                }
+            )
+        return result
 
     def _detail_payload(
         self,
@@ -1165,86 +1296,83 @@ class RefinementAnnotationApplication:
         *,
         base_annotation_set: LoadedStageAnnotationSet | None,
         selection: _DetailProfileSelection | None,
-        selection_error: str | None,
         detail_annotation_set: LoadedDetailStageAnnotationSet | None,
         detail_draft: Mapping[str, Any] | None,
+        reason: str | None,
     ) -> dict[str, Any]:
-        if selection is None:
+        if selection is None or base_annotation_set is None:
             return {
                 "available": False,
                 "resolution_level": "COARSE_FALLBACK",
                 "draft_state": "UNAVAILABLE",
-                "reason": selection_error,
-                "target_progress_step_id": None,
+                "reason": reason
+                or "请先封存粗粒度标注，并提供匹配的详细 profile。",
                 "profile": None,
-                "target_occurrences": [],
+                "base": None,
                 "failure_attempts": [],
-                "sealed_overlay": None,
+                "sealed": None,
             }
-        target = selection.target_progress_step_id
-        profile_stages = selection.stage_profile.stages_for_step(target)
-        target_occurrences = []
-        failure_attempts = []
-        if base_annotation_set is not None:
-            for value in base_annotation_set.bundle.occurrences:
-                if value.progress_step_id != target:
-                    continue
-                target_occurrences.append(
-                    self._detail_occurrence_payload(value)
+        profile = selection.stage_profile
+        sealed = (
+            None
+            if detail_annotation_set is None
+            else {
+                "annotation_set_id": (
+                    detail_annotation_set.binding.annotation_set_id
+                ),
+                "manifest_hash": (
+                    detail_annotation_set.manifest.semantic_content_hash
+                ),
+                "created_at": detail_annotation_set.binding.created_at,
+                "annotator_id": detail_annotation_set.binding.annotator_id,
+            }
+        )
+        draft_state = "EDITING"
+        if detail_annotation_set is not None and detail_draft is not None:
+            if (
+                detail_draft.get("confirmed")
+                and detail_draft.get(
+                    "last_committed_detail_annotation_set_id"
                 )
-                if value.outcome == "FAILURE":
-                    selected = None
-                    if detail_draft is not None:
-                        selected = detail_draft.get(
-                            "failure_stage_by_attempt",
-                            {},
-                        ).get(value.coarse_attempt_id)
-                    failure_attempts.append(
-                        {
-                            "attempt_id": value.coarse_attempt_id,
-                            "failure_fact_id": value.source_failure_fact_id,
-                            "start_at": value.start_at,
-                            "end_at": value.end_at,
-                            "selected_stage_id": selected,
-                        }
-                    )
-        if detail_annotation_set is not None:
-            draft_state = "SEALED"
-            resolution = "DETAIL_COMPLETE"
-        elif detail_draft is None:
-            draft_state = "WAITING_BASE_ANNOTATION"
-            resolution = "COARSE_FALLBACK"
-        elif bool(detail_draft.get("confirmed", False)):
-            draft_state = "READY_TO_SEAL"
-            resolution = "COARSE_FALLBACK"
-        else:
-            draft_state = "PARTIAL"
-            resolution = "COARSE_FALLBACK"
+                == detail_annotation_set.binding.annotation_set_id
+            ):
+                draft_state = "SEALED"
         return {
-            "available": base_annotation_set is not None,
-            "resolution_level": resolution,
-            "draft_state": draft_state,
-            "reason": selection_error,
-            "target_progress_step_id": target,
-            "profile": {
-                "profile_id": selection.stage_profile.profile_id,
-                "profile_version": selection.stage_profile.profile_version,
-                "semantic_content_hash": selection.stage_profile.semantic_content_hash,
-                "stages": [stage.to_payload() for stage in profile_stages],
-            },
-            "target_occurrences": target_occurrences,
-            "failure_attempts": failure_attempts,
-            "sealed_overlay": (
-                None
-                if detail_annotation_set is None
-                else {
-                    "annotation_set_id": detail_annotation_set.binding.annotation_set_id,
-                    "created_at": detail_annotation_set.binding.created_at,
-                    "annotator_id": detail_annotation_set.binding.annotator_id,
-                    "manifest_hash": detail_annotation_set.manifest.semantic_content_hash,
-                    "annotation_count": len(detail_annotation_set.bundle.occurrences),
-                }
+            "available": True,
+            "resolution_level": (
+                "DETAIL_COMPLETE"
+                if detail_annotation_set is not None
+                else "COARSE_FALLBACK"
             ),
+            "draft_state": draft_state,
+            "reason": reason,
+            "profile": {
+                "profile_id": profile.profile_id,
+                "profile_version": profile.profile_version,
+                "target_progress_step_id": selection.target_progress_step_id,
+                "stages": [
+                    self._detail_stage_payload(stage)
+                    for stage in profile.stages_for_step(
+                        selection.target_progress_step_id
+                    )
+                ],
+            },
+            "base": {
+                "annotation_set_id": (
+                    base_annotation_set.binding.annotation_set_id
+                ),
+                "manifest_hash": base_annotation_set.manifest.semantic_content_hash,
+                "profile_hash": (
+                    base_annotation_set.binding.task_stage_profile_hash
+                ),
+            },
+            "failure_attempts": self._detail_failure_attempt_payload(
+                item,
+                base_annotation_set,
+                selection,
+                detail_draft or {},
+            ),
+            "sealed": sealed,
         }
 
     @staticmethod
@@ -1494,6 +1622,57 @@ class RefinementAnnotationApplication:
             draft = adjusted_draft
         latest_annotation_set = annotation_sets[-1] if annotation_sets else None
         annotation_summary = self._summarize_annotation_sets(annotation_sets)
+        detail_selection, detail_profile_reason = (
+            self._detail_profile_selection(item)
+        )
+        detail_annotation_set: LoadedDetailStageAnnotationSet | None = None
+        detail_reason = detail_profile_reason
+        detail_draft: dict[str, Any] | None = None
+        if detail_selection is not None and latest_annotation_set is not None:
+            detail_annotation_set, detail_load_reason = (
+                self._current_detail_annotation_set(
+                    item,
+                    latest_annotation_set,
+                    detail_selection,
+                )
+            )
+            if detail_load_reason is not None:
+                detail_reason = detail_load_reason
+            stored_detail = draft.get("detail_overlay")
+            if isinstance(stored_detail, Mapping):
+                try:
+                    detail_draft = self._normalize_detail_draft(
+                        item,
+                        stored_detail,
+                        base_annotation_set=latest_annotation_set,
+                        selection=detail_selection,
+                    )
+                except RefinementAnnotationApplicationError:
+                    # A draft bound to an older coarse version must not be
+                    # carried forward.  The base annotation remains intact.
+                    detail_draft = None
+            if detail_draft is None:
+                if detail_annotation_set is not None:
+                    detail_draft = self._detail_draft_from_annotation_set(
+                        item,
+                        detail_annotation_set,
+                        draft_revision=int(draft.get("draft_revision", 0)),
+                    )
+                else:
+                    detail_draft = self._bootstrap_detail_draft(
+                        item,
+                        latest_annotation_set,
+                        detail_selection,
+                    )
+            draft = {
+                **draft,
+                "detail_overlay": detail_draft,
+            }
+        else:
+            # No sealed coarse source means there is nothing safe to bind an
+            # additive overlay to.  Existing coarse bootstrap behavior stays
+            # unchanged and explicitly reports the fallback state.
+            draft = {**draft, "detail_overlay": None}
         if (
             latest_annotation_set is not None
             and self._draft_matches_annotation_set(
@@ -1558,6 +1737,14 @@ class RefinementAnnotationApplication:
                 }
                 for step in item.progress.profile.steps
             ],
+            "detail_annotation": self._detail_payload(
+                item,
+                base_annotation_set=latest_annotation_set,
+                selection=detail_selection,
+                detail_annotation_set=detail_annotation_set,
+                detail_draft=detail_draft,
+                reason=detail_reason,
+            ),
             "attempts": [
                 {
                     "attempt_id": attempt.attempt_id,
@@ -2290,6 +2477,187 @@ class RefinementAnnotationApplication:
                 progress_callback=progress_callback,
             )
 
+    def commit_detail(
+        self,
+        episode_uuid: str,
+        draft: Mapping[str, Any],
+        *,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> dict[str, Any]:
+        with self._episode_operation_lock:
+            self._report_operation_progress(
+                progress_callback,
+                5,
+                "正在确认 Episode 编辑锁",
+            )
+            self._require_active_episode(episode_uuid)
+            return self._commit_detail_owned(
+                episode_uuid,
+                draft,
+                progress_callback=progress_callback,
+            )
+
+    def _commit_detail_owned(
+        self,
+        episode_uuid: str,
+        draft: Mapping[str, Any],
+        *,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> dict[str, Any]:
+        item = self._item(episode_uuid)
+        self._report_operation_progress(
+            progress_callback,
+            15,
+            "正在校验粗标注版本与详细时间轴",
+        )
+        normalized = self._normalize_draft(item, draft)
+        annotation_sets = self._sealed_annotation_sets(item)
+        if not annotation_sets:
+            raise RefinementAnnotationApplicationError(
+                "Detail annotation requires an already sealed coarse "
+                "annotation set. Seal the coarse annotation first."
+            )
+        base_annotation_set = annotation_sets[-1]
+        if not self._draft_matches_annotation_set(
+            item,
+            normalized,
+            base_annotation_set,
+        ):
+            raise RefinementAnnotationApplicationError(
+                "The coarse annotation changed after this detail draft was "
+                "opened. Reopen the Episode and reapply the detail edits."
+            )
+        selection, profile_reason = self._detail_profile_selection(item)
+        if selection is None:
+            raise RefinementAnnotationApplicationError(
+                profile_reason
+                or "No compatible detail stage profile is available."
+            )
+        raw_detail = normalized.get("detail_overlay")
+        if not isinstance(raw_detail, Mapping):
+            raise RefinementAnnotationApplicationError(
+                "No detail annotation draft is available for this Episode."
+            )
+        detail_draft = self._normalize_detail_draft(
+            item,
+            raw_detail,
+            base_annotation_set=base_annotation_set,
+            selection=selection,
+        )
+        if not detail_draft.get("confirmed", False):
+            raise RefinementAnnotationApplicationError(
+                "Confirm the detail annotation after resolving every target "
+                "Failure Attempt."
+            )
+        detail_bundle = self._detail_bundle_from_draft(item, detail_draft)
+        assert item.progress.stage_profile is not None
+        annotation_set_id = (
+            f"detail-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        )
+        binding = DetailStageAnnotationSetBindingV1(
+            annotation_set_id=annotation_set_id,
+            episode_capture_identity_hash=item.episode_identity_hash,
+            source_progress_manifest_hash=item.progress_manifest_hash,
+            base_annotation_set_id=base_annotation_set.binding.annotation_set_id,
+            base_annotation_set_manifest_hash=(
+                base_annotation_set.manifest.semantic_content_hash
+            ),
+            base_task_stage_profile_hash=(
+                item.progress.stage_profile.semantic_content_hash
+            ),
+            detail_task_stage_profile_hash=(
+                selection.stage_profile.semantic_content_hash
+            ),
+            target_progress_step_id=selection.target_progress_step_id,
+            bound_clock_domain_id=item.progress.timeline.clock_domain_id,
+            annotator_id=self.annotator_id,
+            created_at=time.time(),
+            created_clock_domain_id=LOCAL_WALL_CLOCK,
+        )
+        self._report_operation_progress(
+            progress_callback,
+            45,
+            "正在校验详细 Attempt 覆盖与 Failure 归属",
+        )
+        try:
+            validate_detail_stage_annotation_set(
+                source_progress_manifest=item.progress.manifest,
+                base_binding=base_annotation_set.binding,
+                base_bundle=base_annotation_set.bundle,
+                base_manifest=base_annotation_set.manifest,
+                base_stage_profile=item.progress.stage_profile,
+                detail_stage_profile=selection.stage_profile,
+                binding=binding,
+                bundle=detail_bundle,
+            )
+            self.workspace.require_episode(episode_uuid=episode_uuid)
+            report = commit_detail_stage_annotation_set(
+                dataset_root=self.dataset_root,
+                episode_uuid=episode_uuid,
+                source_progress_manifest=item.progress.manifest,
+                base_annotation_set=base_annotation_set,
+                base_stage_profile=item.progress.stage_profile,
+                detail_stage_profile=selection.stage_profile,
+                binding=binding,
+                bundle=detail_bundle,
+            )
+        except (DetailStageAnnotationStoreError, TypeError, ValueError) as exc:
+            raise RefinementAnnotationApplicationError(
+                "The detail annotation was not published; the coarse "
+                f"annotation remains unchanged: {exc}"
+            ) from exc
+        committed_detail_draft = {
+            **detail_draft,
+            "confirmed": True,
+            "last_committed_detail_annotation_set_id": annotation_set_id,
+            "last_committed_detail_manifest_hash": (
+                report.manifest.semantic_content_hash
+            ),
+        }
+        committed_draft = {
+            **normalized,
+            "detail_overlay": committed_detail_draft,
+        }
+        draft_cache_warning = None
+        try:
+            self.workspace.save_draft(
+                episode_uuid=episode_uuid,
+                draft=committed_draft,
+                durable=False,
+            )
+        except StageAnnotationStoreError as exc:
+            draft_cache_warning = (
+                "The detail annotation was committed, but the local draft "
+                "cache could not be updated. Reopening will recover it from "
+                f"the immutable detail set: {exc}"
+            )
+        loaded = LoadedDetailStageAnnotationSet(
+            annotation_dir=report.annotation_dir,
+            binding=binding,
+            bundle=detail_bundle,
+            manifest=report.manifest,
+        )
+        self._mark_item_has_draft(episode_uuid)
+        self._report_operation_progress(
+            progress_callback,
+            97,
+            "详细标注已封存",
+        )
+        return {
+            "detail_annotation_set_id": annotation_set_id,
+            "detail_manifest_hash": report.manifest.semantic_content_hash,
+            "detail_annotation": self._detail_payload(
+                item,
+                base_annotation_set=base_annotation_set,
+                selection=selection,
+                detail_annotation_set=loaded,
+                detail_draft=committed_detail_draft,
+                reason=None,
+            ),
+            "draft": committed_draft,
+            "draft_cache_warning": draft_cache_warning,
+        }
+
     def _commit_owned(
         self,
         episode_uuid: str,
@@ -2402,8 +2770,34 @@ class RefinementAnnotationApplication:
             88,
             "正式标注已封存，正在更新工作缓存",
         )
+        new_base_annotation_set = LoadedStageAnnotationSet(
+            annotation_dir=report.annotation_dir,
+            binding=binding,
+            bundle=bundle,
+            manifest=report.manifest,
+        )
+        rebased_detail_draft: dict[str, Any] | None = None
+        rebased_detail_reason: str | None = None
+        rebased_detail_selection, rebased_profile_reason = (
+            self._detail_profile_selection(item)
+        )
+        if rebased_detail_selection is not None:
+            try:
+                rebased_detail_draft = self._bootstrap_detail_draft(
+                    item,
+                    new_base_annotation_set,
+                    rebased_detail_selection,
+                )
+            except RefinementAnnotationApplicationError as exc:
+                rebased_detail_reason = str(exc)
+        else:
+            rebased_detail_reason = rebased_profile_reason
         committed_draft = {
             **normalized,
+            # A coarse edit creates a new immutable base version.  Never keep
+            # a detail overlay bound to the old base; start a new unsealed
+            # local detail view instead.
+            "detail_overlay": rebased_detail_draft,
             "last_committed_annotation_set_id": annotation_set_id,
             "last_committed_manifest_hash": (
                 report.manifest.semantic_content_hash
@@ -2459,6 +2853,14 @@ class RefinementAnnotationApplication:
             "unannotated_sample_count": index.unannotated_sample_count,
             "exclusion_count": len(index.exclusions),
             "draft": committed_draft,
+            "detail_annotation": self._detail_payload(
+                item,
+                base_annotation_set=new_base_annotation_set,
+                selection=rebased_detail_selection,
+                detail_annotation_set=None,
+                detail_draft=rebased_detail_draft,
+                reason=rebased_detail_reason,
+            ),
             "draft_cache_warning": draft_cache_warning,
         }
 
@@ -3234,6 +3636,7 @@ class RefinementAnnotationApplication:
             "last_committed_manifest_hash": (
                 value.manifest.semantic_content_hash
             ),
+            "detail_overlay": None,
         }
         return draft
 
@@ -3738,6 +4141,7 @@ class RefinementAnnotationApplication:
             "episode_abnormal": None,
             "episode_review_request": None,
             "privileged_tools_enabled": False,
+            "detail_overlay": None,
         }
 
     def _normalize_draft(
@@ -3777,6 +4181,7 @@ class RefinementAnnotationApplication:
             "privileged_tools_enabled",
             "last_committed_annotation_set_id",
             "last_committed_manifest_hash",
+            "detail_overlay",
         }
         if unknown := set(draft) - allowed:
             raise RefinementAnnotationApplicationError(
@@ -3792,6 +4197,14 @@ class RefinementAnnotationApplication:
         capture_end_step = draft.get("capture_end_step")
         episode_abnormal = draft.get("episode_abnormal")
         episode_review_request = draft.get("episode_review_request")
+        detail_overlay = draft.get("detail_overlay")
+        if detail_overlay is not None and not isinstance(
+            detail_overlay,
+            Mapping,
+        ):
+            raise RefinementAnnotationApplicationError(
+                "detail_overlay must be an object or null."
+            )
         for name, values in (
             ("occurrences", occurrences),
             ("failure_triggers", failure_triggers),
@@ -3892,6 +4305,7 @@ class RefinementAnnotationApplication:
             "episode_abnormal": episode_abnormal,
             "episode_review_request": episode_review_request,
             "privileged_tools_enabled": privileged,
+            "detail_overlay": detail_overlay,
             **(
                 {
                     key: draft[key]

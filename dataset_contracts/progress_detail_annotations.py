@@ -586,7 +586,6 @@ def validate_detail_stage_annotation_set(
         )
 
     target = binding.target_progress_step_id
-    detail_stages = detail_stage_profile.stage_by_id
     target_stage_ids = {
         item.stage_id
         for item in detail_stage_profile.stages_for_step(target)
@@ -635,9 +634,30 @@ def validate_detail_stage_annotation_set(
             "Detail occurrence IDs must not overwrite base annotation IDs."
         )
 
+    base_by_attempt: dict[str, list[StageOccurrenceAnnotationV1]] = {}
+    for item in base_target_occurrences:
+        base_by_attempt.setdefault(item.coarse_attempt_id, []).append(item)
+
     by_attempt: dict[str, list[StageOccurrenceAnnotationV1]] = {}
+    detail_failure_by_attempt: dict[str, set[str]] = {}
+    detail_failure_occurrences_by_fact: dict[
+        str, list[StageOccurrenceAnnotationV1]
+    ] = {}
     for item in bundle.occurrences:
         by_attempt.setdefault(item.coarse_attempt_id, []).append(item)
+        if item.outcome == "FAILURE":
+            if item.source_failure_fact_id is None:
+                raise DetailStageAnnotationContractError(
+                    "A detail FAILURE must preserve its source Failure fact."
+                )
+            detail_failure_by_attempt.setdefault(
+                item.coarse_attempt_id,
+                set(),
+            ).add(item.source_failure_fact_id)
+            detail_failure_occurrences_by_fact.setdefault(
+                item.source_failure_fact_id,
+                [],
+            ).append(item)
         if not any(
             base.start_at <= item.start_at
             and item.end_at <= base.end_at
@@ -648,23 +668,123 @@ def validate_detail_stage_annotation_set(
                 "A detail occurrence must remain inside its coarse target "
                 "occurrence."
             )
+
+    base_failure_by_attempt = {
+        attempt_id: {
+            value.source_failure_fact_id
+            for value in values
+            if value.source_failure_fact_id is not None
+        }
+        for attempt_id, values in base_by_attempt.items()
+    }
+    if {
+        attempt_id: failure_ids
+        for attempt_id, failure_ids in base_failure_by_attempt.items()
+        if failure_ids
+    } != detail_failure_by_attempt:
+        raise DetailStageAnnotationContractError(
+            "Detail Failure facts must remain attached to their coarse "
+            "Attempts."
+        )
+    if any(
+        len(values) != 1
+        for values in detail_failure_occurrences_by_fact.values()
+    ):
+        raise DetailStageAnnotationContractError(
+            "Each source Failure fact must identify exactly one detail "
+            "Failure occurrence."
+        )
+
+    target_stages = tuple(detail_stage_profile.stages_for_step(target))
+    stage_position = {
+        stage.stage_id: position
+        for position, stage in enumerate(target_stages)
+    }
+    expected_positions = set(range(len(target_stages)))
     for attempt_id, values in by_attempt.items():
         ordered = sorted(values, key=lambda item: (item.start_at, item.end_at))
         previous_end = None
-        previous_ordinal = 0
+        previous_position = -1
         for item in ordered:
             if previous_end is not None and item.start_at < previous_end:
                 raise DetailStageAnnotationContractError(
                     "Detail occurrences cannot overlap within one Attempt."
                 )
-            ordinal = detail_stages[item.stage_id].ordinal
-            if ordinal < previous_ordinal:
+            position = stage_position[item.stage_id]
+            if position < previous_position:
                 raise DetailStageAnnotationContractError(
                     "Detail stages must remain in profile order within one "
                     f"Attempt {attempt_id!r}."
                 )
             previous_end = item.end_at
-            previous_ordinal = ordinal
+            previous_position = position
+
+        observed_positions = {stage_position[item.stage_id] for item in ordered}
+        highest_position = max(observed_positions)
+        if observed_positions != set(range(highest_position + 1)):
+            raise DetailStageAnnotationContractError(
+                "Detail stages must form a contiguous profile prefix within "
+                f"Attempt {attempt_id!r}."
+            )
+
+        base_values = base_by_attempt[attempt_id]
+        base_has_failure = bool(base_failure_by_attempt[attempt_id])
+        ordered_base_values = sorted(
+            base_values,
+            key=lambda item: (item.start_at, item.end_at),
+        )
+        # An abnormal interval can split one successful coarse occurrence into
+        # a truncated prefix and a normal suffix.  The suffix remains the
+        # terminal source outcome; only a terminal truncation requires the
+        # detail overlay to end in TRUNCATED_BY_ABNORMAL.
+        base_has_truncation = (
+            not base_has_failure
+            and ordered_base_values[-1].outcome
+            == "TRUNCATED_BY_ABNORMAL"
+        )
+        failure_values = [
+            item for item in ordered if item.outcome == "FAILURE"
+        ]
+        if base_has_failure:
+            if len(failure_values) != 1 or failure_values[0] is not ordered[-1]:
+                raise DetailStageAnnotationContractError(
+                    "A detail Failure Attempt must end at exactly one "
+                    "detail FAILURE occurrence."
+                )
+            failure_position = stage_position[failure_values[0].stage_id]
+            if observed_positions != set(range(failure_position + 1)):
+                raise DetailStageAnnotationContractError(
+                    "A detail Failure Attempt must cover the ordered stage "
+                    "prefix through its Failure stage."
+                )
+            if any(
+                item.outcome != "SUCCESS" for item in ordered[:-1]
+            ):
+                raise DetailStageAnnotationContractError(
+                    "Stages before a detail Failure must be SUCCESS."
+                )
+        elif base_has_truncation:
+            if (
+                ordered[-1].outcome != "TRUNCATED_BY_ABNORMAL"
+                or any(
+                    item.outcome != "SUCCESS" for item in ordered[:-1]
+                )
+            ):
+                raise DetailStageAnnotationContractError(
+                    "A truncated detail Attempt must end with one "
+                    "TRUNCATED_BY_ABNORMAL occurrence."
+                )
+        else:
+            if any(item.outcome != "SUCCESS" for item in ordered):
+                raise DetailStageAnnotationContractError(
+                    "A successful coarse Attempt cannot gain a detail "
+                    "Failure or truncation."
+                )
+            if observed_positions != expected_positions:
+                raise DetailStageAnnotationContractError(
+                    "A successful detail Attempt must cover every target "
+                    "fine stage."
+                )
 
 
 __all__ = [

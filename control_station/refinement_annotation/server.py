@@ -23,6 +23,9 @@ import webbrowser
 from collection_runtime.progress.stage_annotation_store import (
     StageAnnotationStoreError,
 )
+from collection_runtime.progress.detail_stage_annotation_store import (
+    DetailStageAnnotationStoreError,
+)
 
 from .application import (
     RefinementAnnotationApplication,
@@ -1012,6 +1015,61 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
             except (
                 OSError,
                 RefinementAnnotationApplicationError,
+                StageAnnotationStoreError,
+                ValueError,
+            ) as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        detail_episode_uuid = self._api_identity(
+            path,
+            "/api/commit-detail/",
+        )
+        if detail_episode_uuid is not None:
+            try:
+                self._require_same_origin()
+                draft = self._read_json()
+                operation_id = self._operation_id()
+                if operation_id is not None:
+                    self.server.begin_operation(
+                        operation_id,
+                        kind="COMMIT_DETAIL_ANNOTATION",
+                        message="正在校验详细标注",
+                    )
+                try:
+                    if operation_id is None:
+                        report = self.application.commit_detail(
+                            detail_episode_uuid,
+                            draft,
+                        )
+                    else:
+                        report = self.application.commit_detail(
+                            detail_episode_uuid,
+                            draft,
+                            progress_callback=lambda percent, message: (
+                                self.server.update_operation(
+                                    operation_id,
+                                    percent,
+                                    message,
+                                )
+                            ),
+                        )
+                except Exception as exc:
+                    if operation_id is not None:
+                        self.server.fail_operation(operation_id, str(exc))
+                    raise
+                if operation_id is not None:
+                    self.server.finish_operation(
+                        operation_id,
+                        "详细标注已封存",
+                    )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "report": report},
+                )
+            except (
+                OSError,
+                RefinementAnnotationApplicationError,
+                DetailStageAnnotationStoreError,
                 StageAnnotationStoreError,
                 ValueError,
             ) as exc:

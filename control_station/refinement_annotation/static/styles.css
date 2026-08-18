@@ -795,6 +795,86 @@ video { width: 100%; height: min(57vw, 620px); min-height: 400px; display: block
 .stage-description.selected { filter: brightness(1.2); outline: 1px solid #fff; }
 .stage-description strong, .stage-description span { display: block; }
 .stage-description span { color: inherit; opacity: .72; font-size: 11px; margin-top: 3px; }
+.detail-annotation-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(72, 202, 210, .42);
+  border-left: 4px solid var(--cyan);
+  border-radius: 8px;
+  background: rgba(28, 102, 112, .10);
+}
+.detail-annotation-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.detail-annotation-heading h3 { margin: 0 0 4px; }
+.detail-annotation-actions { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+.detail-annotation-note {
+  margin: 0 0 9px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.detail-stage-track {
+  min-height: 62px;
+  border-color: rgba(72, 202, 210, .42);
+}
+.detail-stage-block {
+  position: absolute;
+  z-index: 3;
+  top: 7px;
+  bottom: 7px;
+  min-width: 3px;
+  padding: 7px 8px;
+  overflow: hidden;
+  border: 1px solid var(--stage-color, var(--cyan));
+  border-radius: 5px;
+  background: var(--stage-bg, rgba(72, 202, 210, .18));
+  color: var(--stage-text, var(--text));
+  font-size: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.detail-stage-block:hover { filter: brightness(1.2); }
+.detail-stage-block.selected { outline: 2px solid #fff; outline-offset: -2px; z-index: 7; }
+.detail-stage-block.failure {
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(255, 94, 104, .22) 0 7px,
+    rgba(255, 94, 104, .06) 7px 14px
+  ), var(--stage-bg, rgba(255, 94, 104, .18));
+  border-bottom: 3px solid var(--red);
+}
+.detail-stage-block.truncated {
+  background: rgba(255, 184, 77, .19);
+  border-top-color: var(--amber);
+}
+.detail-stage-block strong,
+.detail-stage-block small { display: block; white-space: nowrap; }
+.detail-stage-block small { margin-top: 4px; opacity: .75; }
+.detail-boundary-handle::after {
+  background: var(--cyan);
+  box-shadow: 0 0 0 2px rgba(0,0,0,.65), 0 0 9px rgba(72,202,210,.72);
+}
+.detail-failure-editors {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+.detail-failure-editor {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(210px, 320px);
+  align-items: center;
+  gap: 12px;
+  padding: 9px 11px;
+  border: 1px solid rgba(255, 94, 104, .42);
+  border-left: 4px solid var(--red);
+  border-radius: 7px;
+  background: rgba(126, 35, 45, .11);
+}
+.detail-failure-editor select { width: 100%; }
+.detail-stage-descriptions { margin-top: 10px; }
 .recoverable-failure-card {
   margin-top: 12px;
   padding: 12px;

@@ -14,6 +14,7 @@ from dataset_contracts.progress_detail_annotations import (
     DetailStageAnnotationContractError,
     DetailStageAnnotationManifestV1,
     DetailStageAnnotationSetBindingV1,
+    validate_detail_stage_annotation_set,
     validate_detail_stage_profile_compatibility,
 )
 from dataset_contracts.progress_facts import ProgressEpisodeManifestV1
@@ -35,7 +36,9 @@ from dataset_interface.progress_detail_annotation_artifacts import (
     LoadedDetailStageAnnotationSet,
 )
 from dataset_interface.progress_detail_annotations import (
+    load_latest_detail_stage_annotation_set,
     resolve_detail_stage_annotation_view,
+    resolve_latest_detail_stage_annotation_view,
 )
 from dataset_interface.progress_stage_annotation_artifacts import (
     LoadedStageAnnotationSet,
@@ -146,6 +149,7 @@ def _source_manifest(
 def _base_set(
     *,
     base_profile: TaskStageProfileV1,
+    target_occurrences: tuple[StageOccurrenceAnnotationV1, ...] | None = None,
 ) -> LoadedStageAnnotationSet:
     source = _source_manifest(
         task_progress_profile_hash=base_profile.task_progress_profile_hash,
@@ -160,6 +164,20 @@ def _base_set(
         created_at=21.0,
         created_clock_domain_id="wall_clock",
     )
+    if target_occurrences is None:
+        target_occurrences = (
+            StageOccurrenceAnnotationV1(
+                annotation_id="base:write",
+                coarse_attempt_id="attempt:1",
+                progress_step_id="write",
+                stage_id="write.coarse",
+                occurrence_index_in_attempt=1,
+                start_at=1.0,
+                end_at=10.0,
+                clock_domain_id="episode_clock",
+                outcome="SUCCESS",
+            ),
+        )
     bundle = StageAnnotationBundleV1(
         occurrences=(
             StageOccurrenceAnnotationV1(
@@ -173,17 +191,7 @@ def _base_set(
                 clock_domain_id="episode_clock",
                 outcome="SUCCESS",
             ),
-            StageOccurrenceAnnotationV1(
-                annotation_id="base:write",
-                coarse_attempt_id="attempt:1",
-                progress_step_id="write",
-                stage_id="write.coarse",
-                occurrence_index_in_attempt=1,
-                start_at=1.0,
-                end_at=10.0,
-                clock_domain_id="episode_clock",
-                outcome="SUCCESS",
-            ),
+            *target_occurrences,
         )
     )
     manifest = StageAnnotationManifestV1(
@@ -324,6 +332,195 @@ def test_detail_overlay_replaces_only_target_coarse_occurrences() -> None:
     )
 
 
+def test_partial_detail_overlay_cannot_be_sealed_as_complete() -> None:
+    base_profile, detail_profile = _profiles()
+    base = _base_set(base_profile=base_profile)
+    detail = _detail_set(
+        base=base,
+        base_profile=base_profile,
+        detail_profile=detail_profile,
+    )
+    partial_bundle = DetailStageAnnotationBundleV1(
+        occurrences=detail.bundle.occurrences[:-1],
+    )
+
+    with pytest.raises(
+        DetailStageAnnotationContractError,
+        match="every target fine stage",
+    ):
+        validate_detail_stage_annotation_set(
+            source_progress_manifest=_source_manifest(
+                task_progress_profile_hash=base_profile.task_progress_profile_hash,
+            ),
+            base_binding=base.binding,
+            base_bundle=base.bundle,
+            base_manifest=base.manifest,
+            base_stage_profile=base_profile,
+            detail_stage_profile=detail_profile,
+            binding=replace(detail.binding, annotation_set_id="detail-partial"),
+            bundle=partial_bundle,
+        )
+
+
+def test_failure_prefix_and_retry_attempts_preserve_capture_fact() -> None:
+    base_profile, detail_profile = _profiles()
+    base = _base_set(
+        base_profile=base_profile,
+        target_occurrences=(
+            StageOccurrenceAnnotationV1(
+                annotation_id="base:write:failure",
+                coarse_attempt_id="attempt:1",
+                progress_step_id="write",
+                stage_id="write.coarse",
+                occurrence_index_in_attempt=1,
+                start_at=1.0,
+                end_at=5.0,
+                clock_domain_id="episode_clock",
+                outcome="FAILURE",
+                source_failure_fact_id="failure:1",
+            ),
+            StageOccurrenceAnnotationV1(
+                annotation_id="base:write:retry",
+                coarse_attempt_id="attempt:2",
+                progress_step_id="write",
+                stage_id="write.coarse",
+                occurrence_index_in_attempt=1,
+                start_at=5.0,
+                end_at=10.0,
+                clock_domain_id="episode_clock",
+                outcome="SUCCESS",
+            ),
+        ),
+    )
+    detail_reference = _detail_set(
+        base=base,
+        base_profile=base_profile,
+        detail_profile=detail_profile,
+    )
+    detail_bundle = DetailStageAnnotationBundleV1(
+        occurrences=(
+            StageOccurrenceAnnotationV1(
+                annotation_id="detail:failure:start",
+                coarse_attempt_id="attempt:1",
+                progress_step_id="write",
+                stage_id="write.start",
+                occurrence_index_in_attempt=1,
+                start_at=1.0,
+                end_at=2.0,
+                clock_domain_id="episode_clock",
+                outcome="SUCCESS",
+            ),
+            StageOccurrenceAnnotationV1(
+                annotation_id="detail:failure:body",
+                coarse_attempt_id="attempt:1",
+                progress_step_id="write",
+                stage_id="write.body",
+                occurrence_index_in_attempt=2,
+                start_at=2.0,
+                end_at=5.0,
+                clock_domain_id="episode_clock",
+                outcome="FAILURE",
+                source_failure_fact_id="failure:1",
+            ),
+            StageOccurrenceAnnotationV1(
+                annotation_id="detail:retry:start",
+                coarse_attempt_id="attempt:2",
+                progress_step_id="write",
+                stage_id="write.start",
+                occurrence_index_in_attempt=1,
+                start_at=5.0,
+                end_at=6.0,
+                clock_domain_id="episode_clock",
+                outcome="SUCCESS",
+            ),
+            StageOccurrenceAnnotationV1(
+                annotation_id="detail:retry:body",
+                coarse_attempt_id="attempt:2",
+                progress_step_id="write",
+                stage_id="write.body",
+                occurrence_index_in_attempt=2,
+                start_at=6.0,
+                end_at=8.0,
+                clock_domain_id="episode_clock",
+                outcome="SUCCESS",
+            ),
+            StageOccurrenceAnnotationV1(
+                annotation_id="detail:retry:finish",
+                coarse_attempt_id="attempt:2",
+                progress_step_id="write",
+                stage_id="write.finish",
+                occurrence_index_in_attempt=3,
+                start_at=8.0,
+                end_at=10.0,
+                clock_domain_id="episode_clock",
+                outcome="SUCCESS",
+            ),
+        )
+    )
+
+    validate_detail_stage_annotation_set(
+        source_progress_manifest=_source_manifest(
+            task_progress_profile_hash=base_profile.task_progress_profile_hash,
+        ),
+        base_binding=base.binding,
+        base_bundle=base.bundle,
+        base_manifest=base.manifest,
+        base_stage_profile=base_profile,
+        detail_stage_profile=detail_profile,
+        binding=detail_reference.binding,
+        bundle=detail_bundle,
+    )
+
+
+def test_abnormal_prefix_with_normal_suffix_keeps_success_detail_semantics() -> None:
+    base_profile, detail_profile = _profiles()
+    base = _base_set(
+        base_profile=base_profile,
+        target_occurrences=(
+            StageOccurrenceAnnotationV1(
+                annotation_id="base:write:abnormal-prefix",
+                coarse_attempt_id="attempt:1",
+                progress_step_id="write",
+                stage_id="write.coarse",
+                occurrence_index_in_attempt=1,
+                start_at=1.0,
+                end_at=2.0,
+                clock_domain_id="episode_clock",
+                outcome="TRUNCATED_BY_ABNORMAL",
+            ),
+            StageOccurrenceAnnotationV1(
+                annotation_id="base:write:normal-suffix",
+                coarse_attempt_id="attempt:1",
+                progress_step_id="write",
+                stage_id="write.coarse",
+                occurrence_index_in_attempt=2,
+                start_at=2.0,
+                end_at=10.0,
+                clock_domain_id="episode_clock",
+                outcome="SUCCESS",
+            ),
+        ),
+    )
+    detail = _detail_set(
+        base=base,
+        base_profile=base_profile,
+        detail_profile=detail_profile,
+    )
+
+    validate_detail_stage_annotation_set(
+        source_progress_manifest=_source_manifest(
+            task_progress_profile_hash=base_profile.task_progress_profile_hash,
+        ),
+        base_binding=base.binding,
+        base_bundle=base.bundle,
+        base_manifest=base.manifest,
+        base_stage_profile=base_profile,
+        detail_stage_profile=detail_profile,
+        binding=detail.binding,
+        bundle=detail.bundle,
+    )
+
+
 def test_detail_profile_must_not_change_non_target_steps() -> None:
     base_profile, detail_profile = _profiles()
     changed = replace(
@@ -381,3 +578,61 @@ def test_detail_store_roundtrip_preserves_immutable_overlay(tmp_path: Path) -> N
     assert report.annotation_dir == (
         tmp_path / "meta/progress/detail_stage_annotations/episode-1/detail-1"
     )
+
+
+def test_latest_detail_loader_falls_back_or_resolves_exact_current_base(
+    tmp_path: Path,
+) -> None:
+    base_profile, detail_profile = _profiles()
+    base = _base_set(base_profile=base_profile)
+    source = _source_manifest(
+        task_progress_profile_hash=base_profile.task_progress_profile_hash,
+    )
+
+    assert (
+        load_latest_detail_stage_annotation_set(
+            dataset_root=tmp_path,
+            episode_uuid="episode-1",
+            source_progress_manifest=source,
+            base_annotation_set=base,
+            base_stage_profile=base_profile,
+            detail_stage_profile=detail_profile,
+        )
+        is None
+    )
+
+    detail = _detail_set(
+        base=base,
+        base_profile=base_profile,
+        detail_profile=detail_profile,
+    )
+    commit_detail_stage_annotation_set(
+        dataset_root=tmp_path,
+        episode_uuid="episode-1",
+        source_progress_manifest=source,
+        base_annotation_set=base,
+        base_stage_profile=base_profile,
+        detail_stage_profile=detail_profile,
+        binding=detail.binding,
+        bundle=detail.bundle,
+    )
+
+    loaded = load_latest_detail_stage_annotation_set(
+        dataset_root=tmp_path,
+        episode_uuid="episode-1",
+        source_progress_manifest=source,
+        base_annotation_set=base,
+        base_stage_profile=base_profile,
+        detail_stage_profile=detail_profile,
+    )
+    assert loaded is not None
+    resolved = resolve_latest_detail_stage_annotation_view(
+        dataset_root=tmp_path,
+        episode_uuid="episode-1",
+        source_progress_manifest=source,
+        base_annotation_set=base,
+        base_stage_profile=base_profile,
+        detail_stage_profile=detail_profile,
+    )
+    assert resolved.resolution_level == "DETAIL_COMPLETE"
+    assert resolved.detail_annotation_set == loaded
