@@ -129,6 +129,11 @@ envelope through this mechanism.
 
 ## Entrypoints
 
+Operator-facing startup, shutdown, risk levels, and remote-developer setup are
+maintained in the canonical [`docs/agent_gateway/`](../docs/agent_gateway/README.md)
+domain. This package README remains the technical protocol and profile
+reference.
+
 The canonical MuJoCo entrypoint is:
 
 ```bash
@@ -170,6 +175,11 @@ forwarder. It creates no Gateway implementation or runtime state inside
 `control_station`.
 
 ### Read-only SSH attachment
+
+The canonical host-administration and remote-developer procedure is
+[`docs/agent_gateway/SSH_READ_ONLY.md`](../docs/agent_gateway/SSH_READ_ONLY.md).
+The details below define the implementation contract rather than a second run
+recipe.
 
 `ssh-readonly-proxy` is a small forced-command bridge to an already-running
 host-local Unix Gateway. It does not start hardware, create another Gateway,

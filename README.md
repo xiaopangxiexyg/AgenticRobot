@@ -18,6 +18,7 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 | 真机遥操、正式数采、replay、deploy | [`docs/real/`](./docs/real/README.md) |
 | OpenPI 固定源码与 server/client 接入 | [`deployments/openpi/`](./deployments/openpi/README.md) |
 | MuJoCo、VIVE sim teleop、dataset replay | [`docs/sim/`](./docs/sim/README.md) |
+| 外部 Agent Skill、Gateway 与 SSH 只读接入 | [`docs/agent_gateway/`](./docs/agent_gateway/README.md) |
 | 设备枚举、USB、标定 | [`docs/hardware/`](./docs/hardware/README.md) |
 | 数据后处理、分析、测试、验收 | [`docs/data/`](./docs/data/README.md) |
 | 单源直通、多源组合与模块所有权 | [`docs/architecture/runtime_domain_boundaries.md`](./docs/architecture/runtime_domain_boundaries.md) |
@@ -37,7 +38,7 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
   `python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui`
 - Headless/compatibility collection：`python -m teleop_runtime.collection`
 - Policy deployment：`python -m teleop_runtime.deploy`
-- External Agent Gateway（MuJoCo profile）：`python -m agent_gateway mujoco`
+- External Agent Gateway（MuJoCo/real/SSH read-only）：[`docs/agent_gateway/`](./docs/agent_gateway/README.md)
 
 这里只声明入口身份；可直接运行的完整参数、前置条件和风险等级见对应 `docs/` 页面。
 

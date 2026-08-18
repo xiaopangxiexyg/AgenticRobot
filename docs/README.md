@@ -8,6 +8,7 @@
 | 环境安装与基础检查 | [setup](./setup/README.md) | [环境与复现权威说明](../README_ENV.md) |
 | 真机遥操、数采、Replay、Deploy | [real](./real/README.md) | [参数数组](./real/teleop_args.sh)、[遥操数采与长程 Progress Profile](./real/TELEOP_COLLECTION.md)、[Replay](./real/REPLAY.md)、[Deploy](./real/DEPLOY.md)、[UMI](./real/UMI.md)、[OpenPI](./real/OPENPI.md) |
 | MuJoCo 与仿真 | [sim](./sim/README.md) | [MuJoCo/仿真说明](./sim/MUJOCO.md) |
+| 外部 Agent Skill 接入 | [agent_gateway](./agent_gateway/README.md) | [局域网 SSH 只读接入](./agent_gateway/SSH_READ_ONLY.md)、[协议与 package 技术说明](../agent_gateway/README.md) |
 | Sim human-in-the-loop | [HIL](./HIL/README.md) | [profile 速览、安全边界、owner 导航与综合操作指南](./HIL/README.md) |
 | 设备、USB、标定 | [hardware](./hardware/README.md) | [设备与标定](./hardware/DEVICES_AND_CALIBRATION.md)、[DMTAC/Q6](./hardware/DMTAC.md) |
 | 数据格式、后处理、分析、测试、验收 | [data](./data/README.md) | [v2.5-p2 数据格式](./data/v25p2/README.md)、[数据集内容与交付](./data/v25p2/DATASET_CONTENT_AND_HANDOFF.md)、[长程任务细粒度阶段标注](./real/LONG_HORIZON_STAGE_ANNOTATION.md)、[后处理与测试](./data/POSTPROCESS_AND_TESTING.md)、[v2.3 验收](./data/ACCEPTANCE_V23.md) |
@@ -84,6 +85,7 @@
 | Policy deploy 检查 | `python -m teleop_runtime.deploy --help` | R0 |
 | Direct replay 入口检查 | `python -m teleop_runtime.replay --help` | R0 |
 | MuJoCo replay 检查 | `python -m sim.mujoco.replay --help` | R0 |
+| Agent Gateway 入口检查 | `python -m agent_gateway --help` | R0 |
 | 最快单元测试 | `PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -m 'unit and not optional' -q` | R0 |
 | 统一设备只读检查 | `python -m teleop_runtime.configure_devices --check` | H1 |
 
@@ -100,6 +102,7 @@ dry-run，再显式应用。
 |---|---|---|
 | `teleop_runtime/**/README.md` | 单个 teleop/collection/replay/deploy 模块接口 | [real](./real/README.md) |
 | `sim/**/README.md` | 仿真 backend、任务和调试参数 | [sim](./sim/README.md) |
+| `agent_gateway/README.md` | Skill/Gateway 协议、profile 和 transport 技术契约 | [agent_gateway](./agent_gateway/README.md) |
 | `hardware/**/README.md` | 单设备枚举、配置和厂商工具 | [hardware](./hardware/README.md) |
 | `utils/dataset_postprocess/**`、`utils/statistic/**` | 单个数据工具参数 | [data](./data/README.md) |
 | `README_ENV.md` | 环境依赖与安装细节 | [setup](./setup/README.md) |
