@@ -38,6 +38,17 @@ python scripts/dev_environment_doctor.py
 多个 worktree 可以共享同一个 Conda 依赖环境，但所有项目命令都必须从各自 worktree 根目录
 运行；安装脚本不会把 DexTeleop editable 绑定到其中某一个 worktree。
 
+解压的机器人模型等大文件也不应复制到每个 worktree。按
+[`CONTRIBUTING.md`](../../CONTRIBUTING.md) 配置一次 development asset store，并通过标准
+认领工具创建 worktree。RM65 仿真或 IK 启动前执行：
+
+```bash
+python scripts/dev_environment_doctor.py --require-development-assets
+```
+
+该检查只验证开发资产根和 presence-only bundle requirements；运行时资产内容身份仍以
+TargetRuntime 的版本化 hash 合同为准。
+
 ## 2. 入口检查（R0）
 
 ```bash
