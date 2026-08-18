@@ -159,7 +159,7 @@ def _provider(
                     for entry in manifest.skill_routes
                 ),
                 health_provider=health_provider,
-                occupied_provider=lambda: False,
+                control_claimed_provider=lambda: False,
             ),
         ),
     )
@@ -220,7 +220,7 @@ def test_profile_binding_projects_capabilities_without_owning_hardware() -> None
     ("effect", "expected_occupancy", "expected_reason"),
     [
         ("read_only", "free", "active_shared_read_operation"),
-        ("motion", "occupied", "active_exclusive_operation"),
+        ("motion", "occupied", "active_operation_reservation"),
     ],
 )
 def test_status_projects_existing_operation_without_adding_a_lease(
@@ -259,7 +259,7 @@ def test_health_failure_is_bounded_and_fail_closed() -> None:
     assert status.reason_code == "status_provider_unavailable_fail_closed"
 
 
-def test_lower_owner_occupancy_prevents_a_false_free_projection() -> None:
+def test_exclusive_lower_control_claim_is_occupied_while_idle() -> None:
     route = _route(effect="read_only")
     manifest = _manifest(route)
     binding = HardwareResourceBinding(
@@ -267,7 +267,7 @@ def test_lower_owner_occupancy_prevents_a_false_free_projection() -> None:
         resource_kind="robot_arm",
         route_hashes=(route.semantic_content_hash,),
         health_provider=lambda: "ready",
-        occupied_provider=lambda: True,
+        control_claimed_provider=lambda: True,
     )
     status = HardwareViewProvider(
         manifest=manifest,
@@ -275,7 +275,9 @@ def test_lower_owner_occupancy_prevents_a_false_free_projection() -> None:
         bindings=(binding,),
     ).status_views(station_revision=8)[0]
     assert status.occupancy == "occupied"
-    assert status.reason_code == "lower_resource_occupied"
+    assert status.reason_code == "lower_control_claim_occupied"
+    assert status.active_operation_id is None
+    assert status.active_skill_ref is None
 
 
 class _SubmissionService:

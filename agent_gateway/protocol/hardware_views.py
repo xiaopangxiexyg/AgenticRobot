@@ -115,7 +115,12 @@ class HardwareResourceView:
 
 @dataclass(frozen=True)
 class HardwareStatusView:
-    """Bounded occupancy/health projection, never a lower safety receipt."""
+    """Bounded ownership/activity view, never a lower safety receipt.
+
+    ``occupancy`` describes a current control/resource claim.  The optional
+    operation fields separately describe Skill execution activity.  READY,
+    idle, or lower-confirmed HOLD therefore never implies ``free``.
+    """
 
     resource_id: str
     occupancy: str
