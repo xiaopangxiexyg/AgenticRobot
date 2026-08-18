@@ -8,8 +8,9 @@ construct authority, apply safety, resolve IK, or dispatch commands.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -204,14 +205,21 @@ def build_mujoco_sim_hil_coordinate_profiles(
         )
         reference_by_component[component_id] = reference_frame_id
 
+    scene_profile_name = str(scene.conversion.scene_profile_name).strip()
+    if not scene_profile_name:
+        raise ValueError("scene conversion profile name must be non-empty.")
     urdf_path = Path(scene.conversion.urdf_path).expanduser().resolve()
     target_profile = TargetFrameProfile(
-        profile_id=f"mujoco-target-frame:{scene.conversion.scene_profile_name}",
+        profile_id=f"mujoco-target-frame:{scene_profile_name}",
         target_kind="simulation",
-        artifact_id=str(urdf_path),
+        # The resolved path is a deployment-local locator, not semantic
+        # identity. Bind the logical scene profile here and retain the exact
+        # file bytes separately through artifact_hash so equivalent Git
+        # checkouts and worktrees publish identical contracts.
+        artifact_id=f"dexteleop.mujoco.target_urdf.v1:{scene_profile_name}",
         artifact_hash=_file_sha256(urdf_path),
         frame_graph=CoordinateFrameGraph(
-            graph_id=f"mujoco-target-frame:{scene.conversion.scene_profile_name}",
+            graph_id=f"mujoco-target-frame:{scene_profile_name}",
             frames=tuple(frames),
             transforms=tuple(transforms),
         ),
@@ -231,6 +239,9 @@ def build_mujoco_sim_hil_coordinate_profiles(
         "left": task_config.left_tool_profile_path,
         "right": task_config.right_tool_profile_path,
     }
+    task_profile_name = str(task_config.name).strip()
+    if not task_profile_name:
+        raise ValueError("task profile name must be non-empty.")
     for side in sides:
         profile_path = profile_path_by_side[side]
         resolved = resolve_path(profile_path)
@@ -238,12 +249,19 @@ def build_mujoco_sim_hil_coordinate_profiles(
             ToolFrameBinding(
                 component_id=f"{side}_arm",
                 controlled_frame_id="tool_tcp",
-                artifact_id=str(resolved),
+                # Keep the local source path out of the content-addressed
+                # motion contract. The task profile and component identify
+                # the semantic artifact while artifact_hash proves the exact
+                # calibration bytes used by this deployment.
+                artifact_id=(
+                    "dexteleop.mujoco.tool_profile.v1:"
+                    f"{task_profile_name}:{side}"
+                ),
                 artifact_hash=_file_sha256(resolved),
             )
         )
     tool_profile = ToolFrameProfile(
-        profile_id=f"mujoco-tool-frame:{task_config.name}",
+        profile_id=f"mujoco-tool-frame:{task_profile_name}",
         target_frame_profile_hash=target_profile.semantic_content_hash,
         bindings=tuple(tool_bindings),
     )
