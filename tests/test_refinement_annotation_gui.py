@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import threading
 import time
 from urllib.error import HTTPError
@@ -247,6 +248,10 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "中间失误后恢复".encode() in body
         assert "function renderRecoverableFailureTools" in app_source
         assert "function renderDetailAnnotation" in app_source
+        assert "PROFILE_PREVIEW" in app_source or "profileStages" in app_source
+        assert "detail-stage-preview-empty" in app_source
+        assert "preserveViewport" in app_source
+        assert "scrollbar-gutter: stable" in style_source
         assert "function confirmDetailAnnotation" in app_source
         assert "/api/commit-detail/" in app_source
         assert "当前有效分析仍使用粗粒度 fallback" in app_source
@@ -271,7 +276,10 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "sealedPending && Boolean(request)" in app_source
         assert "function clearVideoLoadListeners" in app_source
         assert 'video.removeEventListener("error", onError)' in app_source
-        assert "if (episodesChanged) renderEpisodeList()" in app_source
+        assert (
+            "if (episodesChanged) renderEpisodeList({preserveViewport: true})"
+            in app_source
+        )
         episodes_changed = app_source.split(
             "if (episodesChanged) {", 1
         )[1].split("\n    }", 1)[0]
@@ -1012,6 +1020,13 @@ def test_detail_overlay_is_optional_until_explicitly_sealed(
 
         initial = application.episode_detail(episode_uuid)
         assert initial["detail_annotation"]["available"] is False
+        assert initial["detail_annotation"]["draft_state"] == (
+            "PROFILE_PREVIEW"
+        )
+        assert [
+            value["stage_id"]
+            for value in initial["detail_annotation"]["profile"]["stages"]
+        ] == ["a.start", "a.body", "a.finish"]
 
         coarse_report = application.commit(episode_uuid, initial["draft"])
         assert coarse_report["detail_annotation"]["available"] is True
@@ -1075,6 +1090,58 @@ def test_detail_overlay_is_optional_until_explicitly_sealed(
         assert complete_summary["summaries"][0][
             "detail_annotation_complete"
         ] is True
+    finally:
+        application.close()
+
+
+def test_builtin_writing_detail_profile_exposes_three_write_stages(
+    tmp_path: Path,
+) -> None:
+    from collection_runtime.progress.profiles.catalog import (
+        load_task_progress_profile_file,
+        load_task_stage_profile_file,
+    )
+
+    profile_root = (
+        Path(__file__).resolve().parents[1]
+        / "collection_runtime"
+        / "progress"
+        / "profiles"
+        / "linear"
+    )
+    progress = load_task_progress_profile_file(
+        profile_root
+        / "dmtac_rm65_bimanual_position_writing_four_stage.progress.json"
+    )
+    coarse_stages = load_task_stage_profile_file(
+        profile_root
+        / "dmtac_rm65_bimanual_position_writing_four_stage.stages.json",
+        progress_profile=progress,
+    )
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+        defer_initial_refresh=True,
+    )
+    try:
+        selection, reason = application._detail_profile_selection(
+            SimpleNamespace(
+                progress=SimpleNamespace(
+                    profile=progress,
+                    stage_profile=coarse_stages,
+                )
+            )
+        )
+        assert reason is None
+        assert selection is not None
+        assert [
+            value.stage_id
+            for value in selection.stage_profile.stages_for_step("right_write")
+        ] == [
+            "right_write.pen_down",
+            "right_write.write",
+            "right_write.pen_up",
+        ]
     finally:
         application.close()
 

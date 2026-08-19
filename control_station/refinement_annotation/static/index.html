@@ -238,7 +238,7 @@
                 <h3>详细阶段补充（可选 overlay）</h3>
                 <p id="detail-annotation-status" class="panel-note"></p>
               </div>
-              <div class="detail-annotation-actions">
+              <div id="detail-annotation-actions" class="detail-annotation-actions">
                 <button
                   id="confirm-detail-annotation"
                   class="secondary compact"
@@ -257,7 +257,8 @@
             </div>
             <p class="detail-annotation-note">
               该轨迹只补充一个粗粒度子任务，不替换原有阶段时间轴。没有封存 detail
-              时，分析继续使用原来的粗标注；粗标注重新封存后，旧 detail 不会自动套用。
+              时，分析继续使用原来的粗标注；粗标注封存前仅显示详细 profile 预览，
+              粗标注重新封存后，旧 detail 不会自动套用。
             </p>
             <div
               id="detail-stage-track"

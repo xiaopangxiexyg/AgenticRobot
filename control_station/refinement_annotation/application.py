@@ -1405,7 +1405,7 @@ class RefinementAnnotationApplication:
         detail_draft: Mapping[str, Any] | None,
         reason: str | None,
     ) -> dict[str, Any]:
-        if selection is None or base_annotation_set is None:
+        if selection is None:
             return {
                 "available": False,
                 "resolution_level": "COARSE_FALLBACK",
@@ -1418,6 +1418,30 @@ class RefinementAnnotationApplication:
                 "sealed": None,
             }
         profile = selection.stage_profile
+        profile_payload = {
+            "profile_id": profile.profile_id,
+            "profile_version": profile.profile_version,
+            "target_progress_step_id": selection.target_progress_step_id,
+            "stages": [
+                self._detail_stage_payload(stage)
+                for stage in profile.stages_for_step(
+                    selection.target_progress_step_id
+                )
+            ],
+        }
+        if base_annotation_set is None:
+            return {
+                "available": False,
+                "resolution_level": "COARSE_FALLBACK",
+                "draft_state": "PROFILE_PREVIEW",
+                "reason": reason
+                or "详细 profile 已匹配；请先封存粗粒度标注，"
+                "再生成可编辑的详细时间轴。",
+                "profile": profile_payload,
+                "base": None,
+                "failure_attempts": [],
+                "sealed": None,
+            }
         sealed = (
             None
             if detail_annotation_set is None
@@ -1451,17 +1475,7 @@ class RefinementAnnotationApplication:
             ),
             "draft_state": draft_state,
             "reason": reason,
-            "profile": {
-                "profile_id": profile.profile_id,
-                "profile_version": profile.profile_version,
-                "target_progress_step_id": selection.target_progress_step_id,
-                "stages": [
-                    self._detail_stage_payload(stage)
-                    for stage in profile.stages_for_step(
-                        selection.target_progress_step_id
-                    )
-                ],
-            },
+            "profile": profile_payload,
             "base": {
                 "annotation_set_id": (
                     base_annotation_set.binding.annotation_set_id

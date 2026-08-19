@@ -782,7 +782,7 @@ function resetAnnotationStateForWorkspace() {
   state.loadedMediaKey = null;
   state.loadingMediaKey = null;
   state.videoLoading = false;
-  renderEpisodeList();
+  renderEpisodeList({preserveViewport: false});
   renderEditor();
   updateEpisodeNavigation();
 }
@@ -1559,23 +1559,38 @@ function renderDetailAnnotation() {
   if (!panel) return;
   const meta = detailAnnotationMeta();
   const overlay = detailOverlayDraft();
+  const profileStages = Array.isArray(meta?.profile?.stages)
+    ? meta.profile.stages
+    : [];
   const available = Boolean(meta?.available && overlay);
-  panel.classList.toggle("hidden", !available);
-  if (!available) return;
+  const previewAvailable = Boolean(!available && profileStages.length);
+  panel.classList.toggle("hidden", !(available || previewAvailable));
+  if (!(available || previewAvailable)) return;
   const status = $("detail-annotation-status");
   const sealed = meta.resolution_level === "DETAIL_COMPLETE";
   const confirmed = Boolean(overlay.confirmed);
-  status.textContent = [
-    sealed ? "已发布详细 overlay" : "当前有效分析仍使用粗粒度 fallback",
-    confirmed ? "当前详细草稿已确认" : "当前详细草稿未确认",
-    meta.profile?.target_progress_step_id
-      ? "补充子任务：" + meta.profile.target_progress_step_id
-      : "",
-    meta.reason || "",
-  ].filter(Boolean).join(" · ");
+  status.textContent = previewAvailable
+    ? [
+        "详细 profile 已匹配；粗粒度封存后生成可编辑的"
+        + profileStages.length + "个子阶段预览",
+        meta.profile?.target_progress_step_id
+          ? "补充子任务：" + meta.profile.target_progress_step_id
+          : "",
+        meta.reason || "",
+      ].filter(Boolean).join(" · ")
+    : [
+        sealed ? "已发布详细 overlay" : "当前有效分析仍使用粗粒度 fallback",
+        confirmed ? "当前详细草稿已确认" : "当前详细草稿未确认",
+        meta.profile?.target_progress_step_id
+          ? "补充子任务：" + meta.profile.target_progress_step_id
+          : "",
+        meta.reason || "",
+      ].filter(Boolean).join(" · ");
+  $("detail-annotation-actions")?.classList.toggle("hidden", !available);
   const track = $("detail-stage-track");
   track.replaceChildren();
-  for (const value of detailSortedOccurrences()) {
+  const values = detailSortedOccurrences();
+  for (const value of values) {
     const stage = detailStageById(value.stage_id);
     const block = element(
       "div",
@@ -1610,13 +1625,21 @@ function renderDetailAnnotation() {
     });
     track.appendChild(block);
   }
+  if (previewAvailable) {
+    track.appendChild(
+      element(
+        "div",
+        "detail-stage-preview-empty",
+        "粗粒度标注封存后，这里会按详细 profile 生成可编辑时间块。",
+      ),
+    );
+  }
   for (const gap of state.timelineMap?.compressedGaps || []) {
     const marker = element("div", "compressed-gap");
     setPosition(marker, gap.realStart, gap.realEnd);
     marker.title = "无样本/Hold 间隔";
     track.appendChild(marker);
   }
-  const values = detailSortedOccurrences();
   for (let index = 1; index < values.length; index += 1) {
     const left = values[index - 1];
     const right = values[index];
@@ -1685,20 +1708,24 @@ function renderDetailAnnotation() {
   track.appendChild(playhead);
   const descriptions = $("detail-stage-descriptions");
   descriptions.replaceChildren();
-  for (const stage of detailStages()) {
-    if (!values.some((value) => value.stage_id === stage.stage_id)) continue;
+  for (const stage of profileStages) {
+    const hasOccurrence = values.some((value) => value.stage_id === stage.stage_id);
     const card = element("div", "stage-description");
+    if (!hasOccurrence) card.classList.add("not-yet-materialized");
     const palette = detailStagePalette(stage.stage_id);
     card.style.setProperty("--stage-color", palette.solid);
     card.style.setProperty("--stage-bg", palette.background);
     card.style.setProperty("--stage-text", palette.text);
     card.appendChild(element("strong", "", stage.display_name));
     card.appendChild(element("span", "", stage.description));
+    if (!hasOccurrence) {
+      card.appendChild(element("small", "", "等待详细时间块生成"));
+    }
     descriptions.appendChild(card);
   }
   const failureEditors = $("detail-failure-editors");
   failureEditors.replaceChildren();
-  for (const attempt of meta.failure_attempts || []) {
+  for (const attempt of available ? (meta.failure_attempts || []) : []) {
     const row = element("div", "detail-failure-editor");
     row.appendChild(element("strong", "", "Failure Attempt " + attempt.attempt_id));
     const select = document.createElement("select");
@@ -1717,8 +1744,8 @@ function renderDetailAnnotation() {
     row.appendChild(select);
     failureEditors.appendChild(row);
   }
-  $("confirm-detail-annotation").disabled = state.busy || confirmed;
-  $("publish-detail-annotation").disabled = state.busy || !confirmed;
+  $("confirm-detail-annotation").disabled = !available || state.busy || confirmed;
+  $("publish-detail-annotation").disabled = !available || state.busy || !confirmed;
   $("detail-stage-track").querySelectorAll(".playhead").forEach((node) => {
     node.style.left = timelineRatio(currentTimelineTime()) * 100 + "%";
   });
@@ -2216,12 +2243,12 @@ async function loadEpisodes({silent = false, force = false} = {}) {
     }
     $("dataset-root").textContent = payload.dataset_root;
     $("episode-count").textContent = String(payload.episodes.length);
-    if (episodesChanged) renderEpisodeList();
+    if (episodesChanged) renderEpisodeList({preserveViewport: true});
     else if (state.episodes.slice(0, state.episodeRenderLimit).some((item) => (
       item.episode_uuid !== state.selectedEpisode
       && Date.now() - (episodeSummaryRefreshedAt.get(item.episode_uuid) || 0)
         >= EPISODE_SUMMARY_REFRESH_MS
-    ))) renderEpisodeList();
+    ))) renderEpisodeList({preserveViewport: true});
     if (
       state.selectedEpisode
       && !payload.episodes.some((value) => value.episode_uuid === state.selectedEpisode)
@@ -2325,7 +2352,7 @@ async function flushEpisodeSummaryQueue() {
         7000,
       );
     }
-    renderEpisodeList();
+    renderEpisodeList({preserveViewport: true});
   } catch (error) {
     if (workspaceGeneration === state.workspaceGeneration) {
       showToast(`读取可见 Episode 标注摘要失败：${error.message}`, "error", 7000);
@@ -2343,8 +2370,12 @@ async function flushEpisodeSummaryQueue() {
   }
 }
 
-function renderEpisodeList() {
+function renderEpisodeList({preserveViewport = true} = {}) {
   const root = $("episode-list");
+  const scrollTop = preserveViewport ? root.scrollTop : 0;
+  const focusedEpisodeUuid = preserveViewport
+    && document.activeElement?.closest?.("[data-episode-uuid]")
+    ?.dataset.episodeUuid;
   root.replaceChildren();
   if (episodeSummaryObserver) episodeSummaryObserver.disconnect();
   episodeSummaryObserver = new IntersectionObserver((entries) => {
@@ -2365,6 +2396,7 @@ function renderEpisodeList() {
       ),
     );
     updateEpisodeNavigation();
+    root.scrollTop = scrollTop;
     return;
   }
   const renderedEpisodes = state.episodes.slice(0, state.episodeRenderLimit);
@@ -2456,6 +2488,13 @@ function renderEpisodeList() {
     });
     root.appendChild(loadMore);
   }
+  root.scrollTop = scrollTop;
+  if (focusedEpisodeUuid) {
+    const focusTarget = Array.from(
+      root.querySelectorAll("[data-episode-uuid]"),
+    ).find((node) => node.dataset.episodeUuid === focusedEpisodeUuid);
+    focusTarget?.focus({preventScroll: true});
+  }
   updateEpisodeNavigation();
 }
 
@@ -2525,7 +2564,7 @@ async function selectEpisode(episodeUuid) {
       episodeSummaryRefreshedAt.set(episodeUuid, Date.now());
     }
     buildTimelineMap();
-    renderEpisodeList();
+    renderEpisodeList({preserveViewport: true});
     renderEditor();
     if (payload.episode.review_label_auto_cleared) {
       showToast(
@@ -3780,7 +3819,7 @@ async function publishDetailAnnotations() {
   }
   setSavedDraftSnapshot(state.draft);
   renderTimeline();
-  renderEpisodeList();
+  renderEpisodeList({preserveViewport: true});
   await loadEpisodes();
   return report;
 }
