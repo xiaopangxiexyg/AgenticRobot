@@ -44,6 +44,15 @@ SAMPLE_ALIGNED_SOURCE_LATCH_MODES = (
     SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP,
 )
 
+# The safety workspace extends well beyond the four transitions that are
+# committed for each 60 Hz source cut.  Giving the remaining transitions only
+# a 1% position-tracking weight makes the solver optimize the first cut as if
+# the static target did not need to be reached, so each subsequent cut can
+# reverse the still-moving tail.  That produces a repeatable right-arm limit
+# cycle even when the incoming target is constant.  A 3% tail weight keeps the
+# short tracking horizon responsive while making the long horizon converge to
+# a stationary target instead of repeatedly correcting it.
+_SAMPLE_ALIGNED_SAFETY_TAIL_TRACKING_WEIGHT = 0.03
 
 def normalize_sample_aligned_source_latch_mode(value: object) -> str:
     normalized = str(value).strip().lower().replace("-", "_")
@@ -250,7 +259,11 @@ class SampleAlignedJerkLimitedJointTrajectoryPlanner:
             "horizon_transitions": safety_horizon_transitions,
             "tracking_horizon_transitions": self.horizon_transitions,
             "tail_tracking_weight": (
-                0.01 if self.safety_horizon_source_steps is not None else 0.0
+                (
+                    _SAMPLE_ALIGNED_SAFETY_TAIL_TRACKING_WEIGHT
+                    if self.safety_horizon_source_steps is not None
+                    else 0.0
+                )
             ),
             "position_constraint_interior_rad": (
                 1e-5

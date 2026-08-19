@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 import inspect
+import os
+from pathlib import Path
 import sys
 
 import numpy as np
@@ -108,6 +110,58 @@ def bind_legacy_support(namespace: Mapping[str, object]) -> None:
             for name in _SUPPORT_NAMES
         }
     )
+
+
+def _validate_tactile_bundle_root(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """Validate the native tactile root before a writer can be spawned.
+
+    Native tactile datasets bind two disjoint, durable roots.  The tactile
+    root is intentionally allowed to share the dataset filesystem during live
+    collection; requiring a different ``st_dev`` here was an offline-copy
+    test policy and made normal same-device capture fail before the writer
+    could start.  Keep the checks limited to the properties the live writer
+    actually needs: an existing non-symlink directory and a disjoint formal
+    dataset root.
+    """
+
+    configured = str(getattr(args, "tactile_bundle_root", "") or "").strip()
+    if not configured:
+        return
+    tactile_root = Path(os.path.expandvars(configured)).expanduser()
+    if tactile_root.is_symlink() or not tactile_root.is_dir():
+        parser.error(
+            "--tactile-bundle-root must be an existing real directory (not a symlink): "
+            f"{tactile_root}"
+        )
+    try:
+        tactile_resolved = tactile_root.resolve()
+        dataset_resolved = (
+            Path(str(getattr(args, "dataset_root", "")))
+            .expanduser()
+            .resolve()
+        )
+        if (
+            tactile_resolved == dataset_resolved
+            or tactile_resolved.is_relative_to(dataset_resolved)
+            or dataset_resolved.is_relative_to(tactile_resolved)
+        ):
+            parser.error(
+                "--tactile-bundle-root and the formal --dataset-root must be "
+                f"disjoint directories: tactile={tactile_resolved} "
+                f"dataset={dataset_resolved}"
+            )
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.error(
+            "cannot validate --tactile-bundle-root and --dataset-root separation: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    # Pass the expanded spelling to the writer/process worker so an env-var or
+    # ``~`` form is resolved once at startup rather than independently in each
+    # child process.
+    args.tactile_bundle_root = str(tactile_root)
 
 
 def _parse_real_teleop_args(
@@ -641,6 +695,7 @@ def _parse_real_teleop_args(
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
     _apply_formal_dataset_layout(args)
+    _validate_tactile_bundle_root(args, parser)
     progress_profile = getattr(args, "collection_progress_profile", None)
     if bool(getattr(args, "collection_progress_gui", False)) and bool(
         getattr(args, "no_collection", False)

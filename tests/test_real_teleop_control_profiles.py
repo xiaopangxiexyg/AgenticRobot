@@ -818,20 +818,22 @@ def test_idle_tactile_compression_is_opt_in_and_rejects_hot_path_conflicts() -> 
             _parse_real_teleop_args(conflicting)
 
 
-def test_native_tactile_bundle_cli_is_opt_in_and_fail_closed() -> None:
+def test_native_tactile_bundle_cli_is_opt_in_and_fail_closed(tmp_path: Path) -> None:
     defaults = _parse_real_teleop_args([])
     assert defaults.tactile_bundle_root == ""
     assert defaults.tactile_bundle_min_free_gb == 0.0
 
+    tactile_root = tmp_path / "tactile-device"
+    tactile_root.mkdir()
     enabled = _parse_real_teleop_args(
         [
             "--tactile-bundle-root",
-            "/tmp/dexteleop-test-tactile-device",
+            str(tactile_root),
             "--tactile-bundle-min-free-gb",
             "12.5",
         ]
     )
-    assert enabled.tactile_bundle_root == "/tmp/dexteleop-test-tactile-device"
+    assert enabled.tactile_bundle_root == str(tactile_root)
     assert enabled.tactile_bundle_min_free_gb == 12.5
     assert enabled.tactile_storage == "external"
     assert enabled.tactile_artifact_integrity is True
@@ -857,7 +859,7 @@ def test_native_tactile_bundle_cli_is_opt_in_and_fail_closed() -> None:
     native_idle = _parse_real_teleop_args(
         [
             "--tactile-bundle-root",
-            "/tmp/tactile",
+            str(tactile_root),
             "--idle-tactile-compression",
             "--tactile-compression",
             "none",
@@ -865,6 +867,19 @@ def test_native_tactile_bundle_cli_is_opt_in_and_fail_closed() -> None:
     )
     assert native_idle.idle_tactile_compression is True
     assert native_idle.tactile_compression == "none"
+
+
+def test_native_tactile_bundle_cli_reads_tactile_bundle_root_environment(
+    monkeypatch, tmp_path: Path
+) -> None:
+    tactile_root = tmp_path / "env-tactile"
+    tactile_root.mkdir()
+    monkeypatch.setenv("TACTILE_BUNDLE_ROOT", str(tactile_root))
+
+    enabled = _parse_real_teleop_args([])
+
+    assert enabled.tactile_bundle_root == str(tactile_root)
+    assert enabled.tactile_artifact_integrity is True
 
 
 def test_real_teleop_velocity_planner_rejects_non_position_or_disabled_stream() -> None:

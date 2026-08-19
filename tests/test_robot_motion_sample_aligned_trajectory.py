@@ -146,6 +146,69 @@ def test_split_horizon_contract_is_default_off_and_linear_hold_only() -> None:
         )
 
 
+def test_split_horizon_static_target_converges_without_a_tail_limit_cycle() -> None:
+    """A stationary right-arm target must not keep reversing the qcmd tail.
+
+    The formal 60 Hz profile commits two 120 Hz commands per source cut while
+    certifying a 20-source-step safety horizon.  Before the tail objective was
+    strengthened, a constant J3 target settled into a roughly 0.2 rad limit
+    cycle because only the first four transitions carried tracking cost.
+    """
+
+    limits = JointHorizonLimits(
+        min_position_rad=np.array([-2.0]),
+        max_position_rad=np.array([2.0]),
+        max_velocity_rad_s=np.array([7.2]),
+        max_acceleration_rad_s2=np.array([72.0]),
+        max_jerk_rad_s3=np.array([1440.0]),
+    )
+    planner = SampleAlignedJerkLimitedJointTrajectoryPlanner(
+        limits,
+        source_hz=60.0,
+        command_hz=120.0,
+        source_latch_mode=SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP,
+        horizon_source_steps=2,
+        safety_horizon_source_steps=20,
+        scale_degraded_target=False,
+        jerk_regularization=1e-6,
+        jerk_delta_regularization=1e-4,
+    )
+    planner.reset(np.zeros(1))
+    target = np.array([0.35])
+    q_rows: list[float] = []
+    qd_rows: list[float] = []
+    last_admission = None
+    for source_index in range(120):
+        admission = planner.prepare_target(
+            target,
+            source_timestamp=source_index / 60.0,
+            speed_scale=1.0,
+            mode="tracking",
+            reason="stationary_target_regression",
+        )
+        last_admission = admission
+        if admission.new_source_bucket:
+            planner.activate_target(admission, sequence=source_index + 1)
+        for command_index in range(planner.commands_per_source):
+            proposal = planner.propose(
+                monotonic_time=(
+                    source_index * planner.commands_per_source + command_index
+                )
+                / planner.command_hz
+            )
+            q_rows.append(float(proposal.q_command[0]))
+            qd_rows.append(float(proposal.qd_command_rad_s[0]))
+            planner.commit(proposal)
+
+    assert last_admission is not None and last_admission.plan is not None
+    assert last_admission.plan.metadata["tail_tracking_weight"] == pytest.approx(
+        0.03
+    )
+    # The final half-second is the stationary portion, not the initial move.
+    assert np.max(np.abs(np.asarray(q_rows[-60:]) - target[0])) < 1e-6
+    assert np.max(np.abs(np.asarray(qd_rows[-60:]))) < 1e-4
+
+
 def test_certified_qp_position_roundoff_is_projected_inside_transport_limits() -> None:
     planner = _planner()
     horizon_rows = planner.horizon_transitions + 1

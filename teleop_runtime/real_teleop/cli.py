@@ -8,6 +8,7 @@ entrypoint parse_args coordinator.
 from __future__ import annotations
 
 import argparse
+import os
 
 from dataset_contracts.pose_frames import load_pose_frame_contract
 from dataset_contracts.v25p_native_storage import (
@@ -2488,13 +2489,15 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tactile-bundle-root",
         type=str,
-        default="",
+        default=os.environ.get("TACTILE_BUNDLE_ROOT", ""),
         help=(
-            "Optional pre-existing local storage-device root for native tactile "
-            "separation. Tactile payloads and portable bundle metadata are written "
-            "under datasets/<dataset_uuid>; the core dataset stores logical paths "
-            "and mirrored commit receipts only. The filesystem must differ from "
-            "--dataset-root. Empty (default) preserves existing storage."
+            "Pre-existing local storage root for native tactile separation. Tactile "
+            "payloads and portable bundle metadata are written under "
+            "datasets/<dataset_uuid>; the core dataset stores logical paths and "
+            "mirrored commit receipts only. The two roots must be disjoint real "
+            "directories (neither may be a symlink); they may be on the same "
+            "filesystem for live collection. Defaults to TACTILE_BUNDLE_ROOT when "
+            "set, otherwise empty (native separation disabled)."
         ),
     )
     parser.add_argument(
