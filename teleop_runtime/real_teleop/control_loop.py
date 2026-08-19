@@ -450,6 +450,128 @@ def _consume_joint_hard_limit_dispatch(
     return True
 
 
+_HORIZON_CERTIFICATION_MARKERS = (
+    "reused batched joint horizon candidate failed certification",
+    "batched joint horizon candidate failed certification",
+    "joint horizon QP candidate failed certification",
+    "reused batched joint horizon QP failed",
+    "joint horizon numeric position projection would violate",
+    "joint horizon position output exceeds numeric projection budget",
+)
+
+
+def _joint_horizon_certification_dispatch_context(
+    error: BaseException,
+) -> dict[str, object] | None:
+    """Recognize only planner hard-certificate rejections.
+
+    Horizon certification is a safety failure, but it is not a process
+    failure.  The rig's fail-stop path has already held the command streams;
+    the real-teleop loop must close the episode and enter its ordinary Hold
+    state instead of allowing this expected runtime rejection to terminate
+    the GUI process.
+    """
+
+    exception_chain = _exception_chain_text(error)
+    for text in exception_chain:
+        lowered = text.lower()
+        for marker in _HORIZON_CERTIFICATION_MARKERS:
+            if marker in lowered:
+                return {
+                    "marker": marker,
+                    "exception_chain": exception_chain,
+                }
+    return None
+
+
+def _consume_joint_horizon_certification_dispatch(
+    error: BaseException,
+    *,
+    clutch_input: Any,
+    recording_active: Callable[[], bool],
+    stop_recording: Callable[..., Any],
+    cancel_recording_countdown: Callable[..., Any],
+    now: float,
+    step_index: int,
+    last_state: object,
+    log: Callable[..., Any],
+    control_ui: Any,
+) -> bool:
+    """Retain the runtime after an uncertified horizon dispatch.
+
+    The candidate was not admitted and must not be retried in the same
+    realtime frame.  Recording/countdown state is closed best-effort, then a
+    normal safety Hold request is latched.  Cleanup and UI failures are
+    intentionally contained so the operator can inspect the still-live GUI
+    and devices rather than losing the whole process to a planner exception.
+    """
+
+    context = _joint_horizon_certification_dispatch_context(error)
+    if context is None:
+        return False
+    exception_chain = tuple(context["exception_chain"])
+    summary: dict[str, object] = {
+        "last_step_index": int(step_index),
+        "last_state": last_state,
+        "reason": "joint_horizon_certification",
+        "joint_horizon_certification_detected": True,
+        "joint_horizon_certification_marker": str(context["marker"]),
+        "message": " <- ".join(exception_chain),
+    }
+    _cancel_safety_recording_countdown_best_effort(
+        cancel_recording_countdown,
+        now=now,
+        reason="joint_horizon_certification",
+        log=log,
+    )
+    _stop_recording_best_effort(
+        recording_active=recording_active,
+        stop_recording=stop_recording,
+        now=now,
+        end_reason="joint_horizon_certification",
+        summary=summary,
+        log=log,
+        control_ui=control_ui,
+        ui_tag="JointHorizon",
+        ui_failure_message=(
+            "位控轨迹证书无法确认；当前数采已停止，机械臂保持 Hold，"
+            "请调整位置后重新采集 runtime Home。"
+        ),
+    )
+    # BimanualRig fail-stop has already held all backends when enabled.  The
+    # latch below routes the next control-loop turn through the normal Hold
+    # reducer, which performs session state transition and Home invalidation;
+    # it also covers rigs configured without group fail-stop.
+    _request_safety_hold_best_effort(
+        clutch_input,
+        reason="joint_horizon_certification",
+        log=log,
+        now=now,
+    )
+    log(
+        "JointHorizon",
+        "uncertified joint horizon dispatch consumed; episode closed and "
+        "GUI/devices retained in Hold: "
+        + " <- ".join(exception_chain),
+        now=now,
+    )
+    if control_ui is not None:
+        try:
+            control_ui.append_message(
+                "JointHorizon",
+                "位控轨迹未通过关节安全证书：数采已停止，GUI/设备连接保持在 Hold；"
+                "请人工调整机械臂后点击“开始遥操”重新采集 runtime Home。",
+            )
+        except Exception as exc:  # noqa: BLE001 - UI cannot change safety state.
+            log(
+                "JointHorizon",
+                "horizon-certification Hold message could not be published: "
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
+    return True
+
+
 def _stop_recording_best_effort(
     *,
     recording_active: Callable[[], bool],
@@ -1809,6 +1931,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 "position_force_guard_fault",
                 "impedance_force_collision",
                 "emergency_stop_latched",
+                "joint_horizon_certification",
                 "position_admittance_endpoint_limit",
             }
             fix_hold_escalation = fix_hold_coordinator.escalate_to_regular_hold()
@@ -1874,6 +1997,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             elif hold_reason == "emergency_stop_latched":
                 hold_hardware_reason = (
                     "emergency stop latch observed during command dispatch; "
+                    "runtime home recalibration required"
+                )
+            elif hold_reason == "joint_horizon_certification":
+                hold_hardware_reason = (
+                    "joint horizon candidate could not be certified; "
                     "runtime home recalibration required"
                 )
             elif hold_reason == "position_admittance_endpoint_limit":
@@ -2867,6 +2995,19 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 stop_recording=stop_recording,
                 cancel_recording_countdown=cancel_recording_countdown,
                 emergency_stop_real_arms=_emergency_stop_real_arms,
+                now=loop_start,
+                step_index=step_index,
+                last_state=episode_last_state,
+                log=_log,
+                control_ui=control_ui,
+            ):
+                return True
+            if teleop_active and _consume_joint_horizon_certification_dispatch(
+                error,
+                clutch_input=clutch_input,
+                recording_active=recording_active,
+                stop_recording=stop_recording,
+                cancel_recording_countdown=cancel_recording_countdown,
                 now=loop_start,
                 step_index=step_index,
                 last_state=episode_last_state,

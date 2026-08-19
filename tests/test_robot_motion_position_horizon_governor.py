@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -235,6 +237,106 @@ def test_reused_horizon_rejects_invalid_previous_jerk() -> None:
             ),
             commit_count=2,
             previous_jerk_rad_s3=np.zeros(2),
+        )
+
+
+def test_reused_horizon_projects_microradian_position_residue_before_certificate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dispatched candidate is the same position that gets certified."""
+
+    limits = JointHorizonLimits(
+        min_position_rad=np.array([-1.0]),
+        max_position_rad=np.array([1.0]),
+        max_velocity_rad_s=np.array([1.0]),
+        max_acceleration_rad_s2=np.array([2.0]),
+        max_jerk_rad_s3=np.array([10.0]),
+    )
+    workspace = JointHorizonBatchedWorkspace(
+        limits=limits,
+        dt_sec=0.01,
+        horizon_transitions=1,
+        solver_tolerance=1e-7,
+    )
+    info = SimpleNamespace(
+        status="solved",
+        status_val=1,
+        prim_res=0.0,
+        dual_res=0.0,
+        iter=1,
+        solve_time=0.0,
+    )
+    monkeypatch.setattr(
+        workspace,
+        "_solver",
+        SimpleNamespace(
+            update=lambda **_: None,
+            solve=lambda: SimpleNamespace(x=np.zeros(1), info=info),
+        ),
+    )
+
+    plan = workspace.solve(
+        np.array([[0.999], [1.0]]),
+        initial_state=JointHorizonState(
+            q_rad=np.array([0.999]),
+            qd_rad_s=np.array([0.10012]),
+            qdd_rad_s2=np.zeros(1),
+        ),
+        commit_count=1,
+    )
+
+    assert plan.metadata["position_output_roundoff_projected"] is True
+    assert plan.metadata["position_output_max_projection_rad"] < 2e-6
+    assert plan.q_path_rad[1, 0] < limits.max_position_rad[0]
+    assert plan.metadata["solver_receipts"][0][
+        "position_output_roundoff_projected"
+    ] is True
+    assert np.max(np.abs(plan.qd_path_rad_s[1:])) <= 1.0 + 1e-6
+    assert np.max(np.abs(plan.qdd_path_rad_s2[1:])) <= 2.0 + 1e-6
+    assert np.max(np.abs(np.diff(plan.qdd_path_rad_s2, axis=0) / 0.01)) <= 10.0 + 1e-6
+
+
+def test_reused_horizon_does_not_silently_project_a_real_position_violation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = JointHorizonLimits(
+        min_position_rad=np.array([-1.0]),
+        max_position_rad=np.array([1.0]),
+        max_velocity_rad_s=np.array([1.0]),
+        max_acceleration_rad_s2=np.array([2.0]),
+        max_jerk_rad_s3=np.array([10.0]),
+    )
+    workspace = JointHorizonBatchedWorkspace(
+        limits=limits,
+        dt_sec=0.01,
+        horizon_transitions=1,
+    )
+    info = SimpleNamespace(
+        status="solved",
+        status_val=1,
+        prim_res=0.0,
+        dual_res=0.0,
+        iter=1,
+        solve_time=0.0,
+    )
+    monkeypatch.setattr(
+        workspace,
+        "_solver",
+        SimpleNamespace(
+            update=lambda **_: None,
+            solve=lambda: SimpleNamespace(x=np.zeros(1), info=info),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="projection budget"):
+        workspace.solve(
+            np.array([[0.999], [1.0]]),
+            initial_state=JointHorizonState(
+                q_rad=np.array([0.999]),
+                qd_rad_s=np.array([0.2]),
+                qdd_rad_s2=np.zeros(1),
+            ),
+            commit_count=1,
         )
 
 

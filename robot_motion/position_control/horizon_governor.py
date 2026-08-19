@@ -1317,7 +1317,6 @@ class JointHorizonBatchedWorkspace:
         q_path = np.empty_like(reference)
         qd_path = np.empty_like(reference)
         qdd_path = np.empty_like(reference)
-        receipts: list[dict[str, Any]] = []
         for joint, problem in enumerate(self._problems):
             joint_q = np.empty(horizon + 1)
             joint_qd = np.empty(horizon + 1)
@@ -1338,8 +1337,76 @@ class JointHorizonBatchedWorkspace:
                 joint_q[step] = (
                     joint_q[step - 1] + joint_qd[step] * self.dt_sec
                 )
+            q_path[:, joint] = joint_q
+            qd_path[:, joint] = joint_qd
+            qdd_path[:, joint] = joint_qdd
+
+        base_metadata = {
+            "planner": "jerk_limited_joint_horizon_qp_v4_reused_batched",
+            "bound_guard": guard,
+            "solver_tolerance": self.solver_tolerance,
+            "horizon_transitions": horizon,
+            "tracking_horizon_transitions": self.tracking_horizon_transitions,
+            "tail_tracking_weight": self.tail_tracking_weight,
+            "jerk_braking_viability": True,
+            "position_constraint_interior_rad": (
+                self.position_constraint_interior_rad
+            ),
+            "position_constraint_min_interior_rad": (
+                self.position_constraint_min_interior_rad
+            ),
+            "solver_workspace_reused": True,
+            "regularization": dict(self._regularization),
+            "solver_receipts": (),
+        }
+        normalized_metadata = base_metadata
+        # OSQP can return a mathematically safe trajectory with a tiny
+        # absolute-position residue outside a hard joint bound.  Normalize
+        # that residue before the certificate gate so the certificate covers
+        # the exact trajectory that will be dispatched.  The shared helper
+        # has a strict microradian budget and reconstructs qdot/qddot before
+        # checking the dynamic envelopes; a real violation still raises.
+        # Avoid constructing/copying an intermediate plan on the ordinary
+        # interior path because this method runs on every realtime frame.
+        safe_lower = (
+            np.asarray(limits.min_position_rad, dtype=float)
+            + _POSITION_OUTPUT_INTERIOR_RAD
+        )
+        safe_upper = (
+            np.asarray(limits.max_position_rad, dtype=float)
+            - _POSITION_OUTPUT_INTERIOR_RAD
+        )
+        if np.any(safe_upper <= safe_lower):
+            raise RuntimeError(
+                "joint horizon position envelope is narrower than the output interior."
+            )
+        needs_position_projection = bool(
+            np.any(q_path[1:] < safe_lower)
+            or np.any(q_path[1:] > safe_upper)
+        )
+        if needs_position_projection:
+            normalized_plan = _normalize_joint_horizon_position_roundoff(
+                JointHorizonPlan(
+                    q_path_rad=q_path,
+                    qd_path_rad_s=qd_path,
+                    qdd_path_rad_s2=qdd_path,
+                    commit_count=committed,
+                    dt_sec=self.dt_sec,
+                    metadata=base_metadata,
+                ),
+                limits=limits,
+            )
+            q_path = normalized_plan.q_path_rad
+            qd_path = normalized_plan.qd_path_rad_s
+            qdd_path = normalized_plan.qdd_path_rad_s2
+            normalized_metadata = dict(normalized_plan.metadata)
+        receipts: list[dict[str, Any]] = []
+        tolerance = _SOLVER_CERTIFICATE_TOLERANCE_RAD
+        for joint, problem in enumerate(self._problems):
+            joint_q = q_path[:, joint]
+            joint_qd = qd_path[:, joint]
+            joint_qdd = qdd_path[:, joint]
             joint_jerk = np.diff(joint_qdd) / self.dt_sec
-            tolerance = _SOLVER_CERTIFICATE_TOLERANCE_RAD
             certificate_passed = bool(
                 np.all(
                     joint_q
@@ -1378,9 +1445,6 @@ class JointHorizonBatchedWorkspace:
                     f"max_acceleration={float(np.max(np.abs(joint_qdd[1:]))):.9g}rad/s^2; "
                     f"max_jerk={float(np.max(np.abs(joint_jerk))):.9g}rad/s^3."
                 )
-            q_path[:, joint] = joint_q
-            qd_path[:, joint] = joint_qd
-            qdd_path[:, joint] = joint_qdd
             receipts.append(
                 {
                     "joint_index": joint + 1,
@@ -1389,36 +1453,26 @@ class JointHorizonBatchedWorkspace:
                     "solve_time_sec": float(result.info.solve_time),
                     "hard_constraint_certificate_passed": True,
                     "accepted_suboptimal": bool(result.info.status_val == 7),
+                    "position_output_roundoff_projected": bool(
+                        normalized_metadata.get(
+                            "position_output_roundoff_projected", False
+                        )
+                    ),
                     **solve_data[joint],
                 }
             )
-        return _normalize_joint_horizon_position_roundoff(JointHorizonPlan(
+        metadata = {
+            **dict(normalized_metadata),
+            "solver_receipts": tuple(receipts),
+        }
+        return JointHorizonPlan(
             q_path_rad=q_path,
             qd_path_rad_s=qd_path,
             qdd_path_rad_s2=qdd_path,
             commit_count=committed,
             dt_sec=self.dt_sec,
-            metadata={
-                "planner": "jerk_limited_joint_horizon_qp_v4_reused_batched",
-                "bound_guard": guard,
-                "solver_tolerance": self.solver_tolerance,
-                "horizon_transitions": horizon,
-                "tracking_horizon_transitions": (
-                    self.tracking_horizon_transitions
-                ),
-                "tail_tracking_weight": self.tail_tracking_weight,
-                "jerk_braking_viability": True,
-                "position_constraint_interior_rad": (
-                    self.position_constraint_interior_rad
-                ),
-                "position_constraint_min_interior_rad": (
-                    self.position_constraint_min_interior_rad
-                ),
-                "solver_workspace_reused": True,
-                "regularization": dict(self._regularization),
-                "solver_receipts": tuple(receipts),
-            },
-        ), limits=limits)
+            metadata=metadata,
+        )
 
 
 __all__ = [
