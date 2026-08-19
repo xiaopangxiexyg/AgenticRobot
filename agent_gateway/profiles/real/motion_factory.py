@@ -65,6 +65,7 @@ def attach_real_agent_primitive_gateway(
     allowed_client_ids: tuple[str, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     max_retained_operations: int = 16,
+    max_session_admissions_per_route: int | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RealAgentPrimitiveRealTeleopAttachment:
@@ -134,6 +135,7 @@ def attach_real_agent_primitive_gateway(
         ),
         allowed_client_ids=allowed_client_ids,
         max_retained_operations=max_retained_operations,
+        max_session_admissions_per_route=max_session_admissions_per_route,
         clock=clock,
         sleep=sleep,
     )

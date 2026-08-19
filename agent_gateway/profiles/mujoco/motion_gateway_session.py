@@ -417,6 +417,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     contract_bundle: MujocoAgentTcpPoseContractBundle,
     allowed_client_ids: tuple[str, ...],
     max_retained_operations: int = 16,
+    max_session_admissions_per_route: int | None = None,
     clock: Callable[[], float] | None = None,
     source_observation_history_store: SQLiteSourceObservationHistoryStore | None = None,
     owns_source_observation_history_store: bool = False,
@@ -467,6 +468,14 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
     retention = _positive_integer(
         max_retained_operations,
         field_name="max_retained_operations",
+    )
+    session_admission_limit = (
+        None
+        if max_session_admissions_per_route is None
+        else _positive_integer(
+            max_session_admissions_per_route,
+            field_name="max_session_admissions_per_route",
+        )
     )
     runtime = application.runtime
     runtime_clock = runtime.clock if clock is None else clock
@@ -1158,10 +1167,14 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         ),
         max_grant_lifetime_sec=30.0,
     )
-    admissions_by_route_hash = {
-        entry.route.semantic_content_hash: retention
-        for entry in contract_bundle.route_manifest.skill_routes
-    }
+    admissions_by_route_hash = (
+        {}
+        if session_admission_limit is None
+        else {
+            entry.route.semantic_content_hash: session_admission_limit
+            for entry in contract_bundle.route_manifest.skill_routes
+        }
+    )
     if artifact_store is None:
         protocol_runtime = AgentGatewayProtocolRuntime.control_plane_only(
             manifest=contract_bundle.route_manifest,

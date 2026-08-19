@@ -125,6 +125,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="bounded lower operation-retention capacity",
     )
     parser.add_argument(
+        "--max-session-admissions-per-route",
+        type=int,
+        default=None,
+        help=(
+            "optional explicit lifetime admission budget for each Route in "
+            "this Gateway session; omitted means no count-based Route limit"
+        ),
+    )
+    parser.add_argument(
         "--peer-idle-timeout-sec",
         type=float,
         default=10.0,
@@ -323,6 +332,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (FileExistsError, TypeError, ValueError) as error:
         parser.error(f"--socket-path preflight failed: {error}")
+    if (
+        args.max_session_admissions_per_route is not None
+        and args.max_session_admissions_per_route <= 0
+    ):
+        parser.error("--max-session-admissions-per-route must be positive")
     runtime_session_id = _resolved_runtime_session_id(args.runtime_session_id)
     history_storage = None
     if args.history_root is not None:
@@ -359,6 +373,9 @@ def main(argv: list[str] | None = None) -> int:
         target_config=target_config,
         allowed_client_ids=client_bindings.allowed_client_ids,
         max_retained_operations=args.max_retained_operations,
+        max_session_admissions_per_route=(
+            args.max_session_admissions_per_route
+        ),
         history_storage=history_storage,
         artifact_storage=artifact_storage,
     )

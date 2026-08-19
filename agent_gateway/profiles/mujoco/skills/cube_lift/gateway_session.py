@@ -337,7 +337,6 @@ def assemble_mujoco_cube_lift_agent_gateway_session(
             max_retained_operations=retention,
             max_admissions_by_route_hash={
                 route.semantic_content_hash: 1,
-                state_entry.route.semantic_content_hash: retention,
             },
         ),
         clock=runtime_clock,

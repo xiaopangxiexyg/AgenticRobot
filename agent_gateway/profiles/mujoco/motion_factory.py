@@ -341,6 +341,7 @@ def build_mujoco_agent_tcp_pose_gateway_session(
     target_config: MujocoSimHILTargetConfig,
     allowed_client_ids: tuple[str, ...],
     max_retained_operations: int = 16,
+    max_session_admissions_per_route: int | None = None,
     trace_sink: Callable[[Any], None] | None = None,
     history_storage: MujocoAgentTcpPoseHistoryStorageConfig | None = None,
     artifact_storage: MujocoAgentArtifactStorageConfig | None = None,
@@ -489,6 +490,9 @@ def build_mujoco_agent_tcp_pose_gateway_session(
             contract_bundle=contract_bundle,
             allowed_client_ids=allowed_client_ids,
             max_retained_operations=max_retained_operations,
+            max_session_admissions_per_route=(
+                max_session_admissions_per_route
+            ),
             source_observation_history_store=history_store,
             owns_source_observation_history_store=history_store is not None,
             artifact_store=artifact_store,

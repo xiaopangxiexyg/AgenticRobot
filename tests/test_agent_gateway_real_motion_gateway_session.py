@@ -556,6 +556,7 @@ def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
         clock=clock,
         sleep=owner_sleep,
     )
+    assert gateway.service.operation_store.max_admissions_by_route_hash == {}
     observation_outcome = gateway.observation_producer.capture_and_publish(
         gateway.service
     )
@@ -756,6 +757,27 @@ def test_one_shot_authorization_accepts_one_request_from_listed_actions() -> Non
     assert grant is not None
     assert authorization.action is None
     assert authorization.authorized_actions == ("backward", "forward")
+
+
+def test_real_gateway_applies_only_an_explicit_session_admission_budget() -> None:
+    bundle, port, _ = _runtime_fixture()
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=10.0),
+        allowed_client_ids=(CLIENT_ID,),
+        max_retained_operations=2,
+        max_session_admissions_per_route=7,
+    )
+
+    assert gateway.service.operation_store.max_retained_operations == 2
+    assert set(gateway.service.operation_store.max_admissions_by_route_hash) == {
+        entry.route.semantic_content_hash
+        for entry in bundle.route_manifest.skill_routes
+    }
+    assert set(
+        gateway.service.operation_store.max_admissions_by_route_hash.values()
+    ) == {7}
 
 
 def test_real_factory_attaches_gateway_and_realteleop_to_one_lower_port() -> None:

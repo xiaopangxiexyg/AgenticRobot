@@ -772,6 +772,7 @@ def assemble_real_agent_primitive_gateway_session(
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     revision_tracker: AgentStationRevisionTracker | None = None,
+    max_session_admissions_per_route: int | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RealAgentPrimitiveGatewaySession:
@@ -810,6 +811,14 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError("Real perception registration requires its Artifact store.")
     if owns_artifact_store and artifact_store is None:
         raise ValueError("Owned Artifact store must be injected.")
+    if max_session_admissions_per_route is not None and (
+        isinstance(max_session_admissions_per_route, bool)
+        or not isinstance(max_session_admissions_per_route, int)
+        or max_session_admissions_per_route <= 0
+    ):
+        raise ValueError(
+            "max_session_admissions_per_route must be positive or None."
+        )
     producer = RealAgentPrimitiveObservationProducer(
         contract_bundle=contract_bundle,
         port=port,
@@ -1159,10 +1168,16 @@ def assemble_real_agent_primitive_gateway_session(
         payload_validators=contract_bundle.payload_validators,
         operation_store=BoundedInMemoryAgentSkillOperationStore(
             max_retained_operations=max_retained_operations,
-            max_admissions_by_route_hash={
-                entry.route.semantic_content_hash: max_retained_operations
-                for entry in contract_bundle.route_manifest.skill_routes
-            },
+            max_admissions_by_route_hash=(
+                {}
+                if max_session_admissions_per_route is None
+                else {
+                    entry.route.semantic_content_hash: (
+                        max_session_admissions_per_route
+                    )
+                    for entry in contract_bundle.route_manifest.skill_routes
+                }
+            ),
         ),
         protocol_runtime=protocol_runtime,
         clock=clock,

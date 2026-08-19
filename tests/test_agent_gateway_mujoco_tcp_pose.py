@@ -1582,6 +1582,8 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
             skill_id
         ]
     assert route_to_port["state.read_tcp_pose"] is session.state_executor
+    assert session.service.operation_store.max_retained_operations == 3
+    assert session.service.operation_store.max_admissions_by_route_hash == {}
     assert not motion_application.started
 
     adapter = session.wire_adapter(authenticated_client_id="rpent:fixture")
