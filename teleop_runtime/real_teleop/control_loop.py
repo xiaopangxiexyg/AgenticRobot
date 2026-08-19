@@ -42,6 +42,8 @@ from ..target_safety.tcp_pose_envelope_runtime import (
 )
 from .defaults import runtime_home_fresh_data_timeout_sec
 
+_POSITION_ADMITTANCE_CONTROL_PLANE_REARM_THRESHOLD_SEC = 0.05
+
 _REQUIRED_SUPPORT_NAMES = (
     "AsyncDMTacDistributedForceVisualizer",
     "DEFAULT_LEFT_ARM_QPOS",
@@ -869,6 +871,70 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 clutch_input.request_hold(
                     reason="position_admittance_tare_reset_failed"
                 )
+
+    def rearm_position_admittance_after_control_plane_pause(
+        *,
+        started_at: float,
+        reason: str,
+        now: float,
+    ) -> None:
+        """Re-arm Active force clocks after a measured runtime pause.
+
+        Dataset/tactile startup is a named control-plane transition, so its
+        blocking duration is known even though it currently runs in this
+        thread.  Only pauses above the explicit threshold use the timing-only
+        re-arm; an unrelated sensor gap still reaches the normal
+        ``force_dt_exceeded`` fail-closed path.
+        """
+
+        elapsed_sec = max(0.0, time.perf_counter() - float(started_at))
+        if elapsed_sec < _POSITION_ADMITTANCE_CONTROL_PLANE_REARM_THRESHOLD_SEC:
+            return
+        shadow = position_admittance_shadow
+        rearm = (
+            None
+            if shadow is None
+            else getattr(shadow, "rearm_after_control_plane_pause", None)
+        )
+        if not callable(rearm):
+            return
+        try:
+            result = rearm(
+                now_sec=time.monotonic(),
+                pause_duration_sec=elapsed_sec,
+                reason=str(reason),
+            )
+        except Exception as exc:  # noqa: BLE001 - Active mode remains fail-closed.
+            message = (
+                "position admittance control-plane re-arm failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log("PositionAdmittance", message, now=now)
+            if bool(getattr(shadow, "apply_to_target", False)):
+                components.session.hold_hardware(
+                    message,
+                    require_home_recalibration=True,
+                )
+                clutch_input.request_hold(
+                    reason="position_admittance_control_plane_rearm_failed"
+                )
+            return
+        rearmed_sides = tuple(
+            str(side)
+            for side in (
+                result.get("sides", ())
+                if isinstance(result, Mapping)
+                else ()
+            )
+        )
+        if rearmed_sides:
+            _log(
+                "PositionAdmittance",
+                "rearmed force sample clocks after known control-plane pause "
+                f"reason={reason} elapsed={elapsed_sec * 1000.0:.1f}ms "
+                f"sides={list(rearmed_sides)}",
+                now=now,
+            )
 
     def apply_progress_arm_plan_direct(
         plan: ProgressArmTransitionPlan,
@@ -2498,6 +2564,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     )
         if clutch_input.consume_episode_start_request():
             if not recording_active():
+                control_plane_pause_started_at = time.perf_counter()
                 try:
                     require_idle_tactile_quiesced("formal_episode_start")
                 except Exception as exc:  # noqa: BLE001 - deny start, keep Hold/runtime.
@@ -2512,6 +2579,12 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     schedule_recording_countdown(
                         loop_start,
                         start_reason="manual_key_start",
+                    )
+                finally:
+                    rearm_position_admittance_after_control_plane_pause(
+                        started_at=control_plane_pause_started_at,
+                        reason="formal_episode_start",
+                        now=loop_start,
                     )
         mark_loop_phase("loop.keys")
 
@@ -3297,7 +3370,13 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             camera_previewer=camera_previewer,
             now=loop_start,
         )
+        countdown_control_plane_started_at = time.perf_counter()
         advance_recording_countdown(loop_start, step_result=step_result)
+        rearm_position_admittance_after_control_plane_pause(
+            started_at=countdown_control_plane_started_at,
+            reason="recording_countdown_or_episode_open",
+            now=loop_start,
+        )
         dataset_recorder = context.dataset_recorder()
         episode_last_state = context.episode_last_state()
         mark_loop_phase("loop.gripper_control")

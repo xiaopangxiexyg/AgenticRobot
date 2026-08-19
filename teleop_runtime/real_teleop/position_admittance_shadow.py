@@ -1526,6 +1526,120 @@ class PositionAdmittanceShadowTargetFilter:
             self._rotation_contact_seen_by_side[side] = False
             self._rotation_release_started_at_by_side[side] = None
 
+    def rearm_after_control_plane_pause(
+        self,
+        *,
+        sides: Sequence[str] | None = None,
+        now_sec: float | None = None,
+        pause_duration_sec: float = 0.0,
+        reason: str = "known_control_plane_pause",
+    ) -> dict[str, object]:
+        """Re-arm force sample clocks after one explicit runtime pause.
+
+        Formal collection startup may synchronously quiesce tactile workers and
+        start/reconfigure the dataset writer from the control-loop thread.  If
+        that known transition takes longer than ``max_force_dt_sec``, the next
+        wrench sample must not be integrated across the pause.  This method
+        clears only the causal sample/output clocks while preserving the
+        already admitted force and rotation offsets; the next fresh sample is
+        therefore a clock re-arm, not a force step.
+
+        ``pause_duration_sec`` advances only the admitted-qref freshness clock
+        by the measured blocked interval.  The pose and target remain exactly
+        unchanged, while the normal nominal-target residual checks still see
+        the old admitted pose and can reject real operator motion.
+
+        Callers must use this only for a measured, named control-plane pause.
+        Unexpected sensor gaps continue through ``force_dt_exceeded`` /
+        ``torque_dt_exceeded`` and remain fail-closed.
+        """
+
+        now = time.monotonic() if now_sec is None else float(now_sec)
+        if not np.isfinite(now):
+            raise ValueError("control-plane rearm time must be finite")
+        pause_duration = float(pause_duration_sec)
+        if not np.isfinite(pause_duration) or pause_duration < 0.0:
+            raise ValueError(
+                "control-plane pause duration must be finite and nonnegative"
+            )
+        selected = (
+            self.active_sides
+            if sides is None
+            else tuple(str(side) for side in sides)
+        )
+        rearmed: list[str] = []
+        for side in selected:
+            if side not in self.controllers:
+                raise ValueError(f"unknown position admittance shadow side {side!r}")
+            # A fixed/held side owns no live force target and must keep its
+            # existing lifecycle state.  Only a side that was active before
+            # the measured pause is eligible for this one-shot re-arm.
+            if not self._mode_active_by_side.get(side, False):
+                continue
+
+            controller = self.controllers[side]
+            controller_snapshot = controller.snapshot(now_sec=now)
+            if controller_snapshot.frozen:
+                raise RuntimeError(
+                    f"{side} force controller is already frozen: "
+                    f"{controller_snapshot.reason}"
+                )
+            previous_output = controller_snapshot.output_offset_m
+            controller.resume()
+            # ``resume`` intentionally preserves the force offset but leaves
+            # the output clock at its pre-pause value.  Rebase that realized
+            # output timestamp without changing the requested offset so the
+            # first post-pause frame cannot consume the whole pause as a
+            # synthetic output-slew interval.
+            controller.rebase_realized_offset(
+                previous_output,
+                output_time_sec=now,
+                preserve_requested=True,
+            )
+
+            rotation_controller = self.rotation_controllers.get(side)
+            if rotation_controller is not None:
+                rotation_snapshot = rotation_controller.snapshot(now_sec=now)
+                if rotation_snapshot.frozen:
+                    raise RuntimeError(
+                        f"{side} rotation controller is already frozen: "
+                        f"{rotation_snapshot.reason}"
+                    )
+                previous_rotation = rotation_snapshot.output_rotvec_rad
+                rotation_controller.resume()
+                rotation_controller.rebase_realized_rotation(
+                    previous_rotation,
+                    output_time_sec=now,
+                    preserve_requested=True,
+                )
+
+            self._last_composed_time_by_side[side] = now
+            self._last_composed_rotation_time_by_side[side] = now
+            # The admitted-qref pose itself remains the last safe baseline.
+            # Advance only its causal timestamp by the measured blocked
+            # duration, so the freshness guard counts active control time and
+            # never treats the writer/quiesce pause as a sensor-age interval.
+            # No pose or target is invented by this timing-only operation.
+            if side in self._last_admitted_observed_at_by_side:
+                self._last_admitted_observed_at_by_side[side] = min(
+                    now,
+                    self._last_admitted_observed_at_by_side[side]
+                    + pause_duration,
+                )
+            latest = self._latest_by_side.get(side)
+            if latest is not None:
+                latest["control_plane_rearm"] = {
+                    "reason": str(reason),
+                    "at_monotonic_sec": now,
+                }
+            rearmed.append(side)
+        return {
+            "reason": str(reason),
+            "at_monotonic_sec": now,
+            "pause_duration_sec": pause_duration,
+            "sides": rearmed,
+        }
+
     def latch_admission_feedback_fault(self, reason: str) -> None:
         """Keep active output frozen until a fresh runtime-Home reset."""
 

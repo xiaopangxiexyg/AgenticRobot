@@ -1565,6 +1565,53 @@ def test_active_removes_overlay_while_inactive_and_does_not_reapply_old_offset(
     assert left["applied_offset_m"] == [0.0, 0.0, 0.0]
 
 
+def test_known_control_plane_pause_rearms_force_clock_without_resetting_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 1.0}
+    monkeypatch.setattr(
+        "teleop_runtime.real_teleop.position_admittance_shadow.time.monotonic",
+        lambda: clock["now"],
+    )
+    monitor = _Monitor()
+    observer = _observer(
+        monitor,
+        apply_to_target=True,
+        config=_active_cautious_config(),
+    )
+    targets = _targets()
+    monitor.values_by_side["left"][0] = 5.0
+    monitor.source_time = 1.05
+    clock["now"] = 1.05
+    first = observer(targets, object(), object())
+    _record_aligned_admitted_feedback(observer, first, now_sec=1.05)
+    monitor.source_time = 1.10
+    clock["now"] = 1.10
+    second = observer(targets, object(), object())
+    _record_aligned_admitted_feedback(observer, second, now_sec=1.10)
+    before = observer.snapshot(now_sec=1.10)["sides"]["left"]
+    assert np.linalg.norm(before["applied_offset_m"]) > 0.0
+
+    # A writer/quiesce transition can block the control thread for much longer
+    # than max_force_dt_sec.  The explicit transition marker clears only the
+    # sample clocks and must retain the already admitted modifier.
+    monitor.source_time = 1.70
+    clock["now"] = 1.70
+    rearm = observer.rearm_after_control_plane_pause(
+        now_sec=1.70,
+        pause_duration_sec=0.60,
+        reason="formal_episode_start",
+    )
+    assert rearm["sides"] == ["left", "right"]
+
+    resumed = observer(targets, object(), object())
+    left = observer.snapshot(now_sec=1.70)["sides"]["left"]
+    assert left["sample_state_reason"] == "sample_clock_rearmed"
+    assert left["applied_offset_m"] == pytest.approx(before["applied_offset_m"])
+    assert left["admission_feedback_fault"] is None
+    assert isinstance(resumed, dict)
+
+
 def test_active_observer_failure_fails_closed_instead_of_dispatching_base_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
