@@ -24,8 +24,7 @@ Collect options:
   -h, --help                  Show this help.
 
 Run both commands from separate terminals in an activated dexteleop310
-environment. The tactile root must already exist, must not be a symlink, and
-must be on a different filesystem from the formal dataset root.
+environment. The tactile root must already exist and must not be a symlink.
 EOF
 }
 
@@ -124,12 +123,6 @@ done
 
 if [[ -n "$DATASET_ROOT" ]]; then
   [[ "$DATASET_ROOT" == /* ]] || die "dataset root must be absolute: $DATASET_ROOT"
-  if [[ -e "$DATASET_ROOT" ]]; then
-    dataset_device="$(stat -c '%d' -- "$DATASET_ROOT")"
-    tactile_device="$(stat -c '%d' -- "$TACTILE_ROOT")"
-    [[ "$dataset_device" != "$tactile_device" ]] || die \
-      "tactile bundle root must be on a different filesystem from dataset root."
-  fi
   export DATASET_BASE="$DATASET_ROOT"
 fi
 export TACTILE_BUNDLE_ROOT="$TACTILE_ROOT"

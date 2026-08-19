@@ -198,7 +198,7 @@ class NativeTactileBundleTest(unittest.TestCase):
             ):
                 self._store(core, storage)
 
-    def test_distinct_device_requirement_is_default_fail_closed(self) -> None:
+    def test_distinct_device_requirement_is_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             core, storage = self._roots(temporary)
             with self.assertRaisesRegex(
@@ -209,7 +209,18 @@ class NativeTactileBundleTest(unittest.TestCase):
                     core_dataset_root=core,
                     tactile_storage_root=storage,
                     dataset_label="unit_dataset",
+                    require_distinct_device=True,
                 )
+
+    def test_same_device_native_bundle_is_allowed_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            core, storage = self._roots(temporary)
+            store = NativeTactileBundleStore(
+                core_dataset_root=core,
+                tactile_storage_root=storage,
+                dataset_label="unit_dataset",
+            )
+            self.assertTrue(store.bundle_dataset_root.is_dir())
 
     def test_seal_mirrors_commit_and_keeps_only_logical_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -332,7 +343,6 @@ class NativeTactileBundleTest(unittest.TestCase):
                     tactile_compression="none",
                     tactile_artifact_integrity=True,
                     tactile_bundle_root=storage,
-                    tactile_bundle_require_distinct_device=False,
                 )
             )
             identity = self._identity()

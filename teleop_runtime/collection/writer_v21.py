@@ -302,7 +302,9 @@ class LeRobotV21WriterConfig:
     tactile_compression: str = TACTILE_COMPRESSION_NONE
     tactile_artifact_integrity: bool = False
     tactile_bundle_root: str | Path | None = None
-    tactile_bundle_require_distinct_device: bool = True
+    # Native live collection permits disjoint roots on one filesystem; callers
+    # performing an explicit offline copy may opt into the stricter check.
+    tactile_bundle_require_distinct_device: bool = False
     tactile_bundle_minimum_free_bytes: int = 0
     allow_missing_video_frames: bool = False
     arm_action_specs: Mapping[str, Any] | None = None

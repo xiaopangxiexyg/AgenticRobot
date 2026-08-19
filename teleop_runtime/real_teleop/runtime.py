@@ -1144,8 +1144,19 @@ def run_real_teleop(
             startup_progress.close()
 
         if bool(getattr(args, "idle_tactile_compression", False)):
+            tactile_bundle_min_free_gb = float(
+                getattr(args, "tactile_bundle_min_free_gb", 0.0) or 0.0
+            )
             idle_tactile_compression = RealTeleopIdleTactileCompression(
-                enabled=True
+                enabled=True,
+                tactile_bundle_root=(
+                    getattr(args, "tactile_bundle_root", "") or None
+                ),
+                tactile_bundle_min_free_bytes=(
+                    int(tactile_bundle_min_free_gb * (1024**3))
+                    if tactile_bundle_min_free_gb > 0.0
+                    else None
+                ),
             )
             _log(
                 "TactileCompression",
@@ -1186,6 +1197,10 @@ def run_real_teleop(
                     if dataset_recorder is None
                     else getattr(dataset_recorder, "dataset_root", None)
                 ),
+                tactile_bundle_root=getattr(
+                    args, "tactile_bundle_root", ""
+                )
+                or None,
                 integrity_enabled=bool(
                     getattr(args, "tactile_artifact_integrity", False)
                 ),

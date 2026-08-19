@@ -79,7 +79,7 @@ def test_collection_requires_explicit_tactile_root(monkeypatch) -> None:
     assert "--tactile-bundle-root" in result.stderr
 
 
-def test_collection_rejects_existing_roots_on_same_filesystem(
+def test_collection_accepts_existing_roots_on_same_filesystem(
     tmp_path: Path,
 ) -> None:
     dataset_root = tmp_path / "datasets"
@@ -96,5 +96,5 @@ def test_collection_rejects_existing_roots_on_same_filesystem(
         str(tactile_root),
     )
 
-    assert result.returncode == 2
-    assert "different filesystem" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "--tactile-bundle-root" in result.stdout

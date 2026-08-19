@@ -187,7 +187,9 @@ class NativeTactileBundleStore:
         core_dataset_root: str | Path,
         tactile_storage_root: str | Path,
         dataset_label: str,
-        require_distinct_device: bool = True,
+        # Same-filesystem, disjoint roots are valid for live collection.  The
+        # strict cross-device check remains an explicit offline/copy policy.
+        require_distinct_device: bool = False,
         minimum_free_bytes: int = 0,
         uuid_factory=uuid.uuid4,
     ) -> None:

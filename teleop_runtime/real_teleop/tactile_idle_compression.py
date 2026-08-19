@@ -16,6 +16,10 @@ from collection_runtime.idle_maintenance import (
 from collection_runtime.tactile_recompression import (
     run_idle_tactile_recompression_worker,
 )
+from collection_runtime.tactile_bundle_recompression import (
+    run_idle_native_tactile_recompression_worker,
+)
+from dataset_interface.tactile_bundle import attach_tactile_bundle
 from dataset_interface.modality_artifacts import (
     assert_dataset_capture_integrity_compatible,
     assert_dataset_capture_writable,
@@ -40,6 +44,7 @@ def assert_idle_tactile_transition_safe(
     receipt: IdleMaintenanceQuiesceReceipt,
     *,
     dataset_root: str | Path | None,
+    tactile_bundle_root: str | Path | None = None,
     integrity_enabled: bool,
 ) -> None:
     """Fail closed before returning from idle mutation to a hot runtime.
@@ -68,19 +73,91 @@ def assert_idle_tactile_transition_safe(
             "idle tactile compression reported an error but no dataset root "
             "is available for capture-admission validation"
         )
+    native_identity = (
+        dataset_root is not None
+        and Path(dataset_root).expanduser().resolve()
+        / "meta/tactile_bundle_v1/dataset_identity.cjson"
+    ).is_file()
+    if native_identity:
+        if tactile_bundle_root is None or not str(tactile_bundle_root).strip():
+            raise RuntimeError(
+                "native tactile worker reported an error but no tactile bundle root "
+                "is available for attachment validation"
+            )
+        assert_dataset_capture_writable(
+            dataset_root,
+            tactile_bundle_root=tactile_bundle_root,
+        )
+        attach_tactile_bundle(
+            dataset_root,
+            tactile_bundle_root,
+            verify_payload_hashes=bool(integrity_enabled),
+        )
+        return
+    # Preserve the legacy single-root admission call shape for existing
+    # callers/tests and for datasets that do not use native separation.
     assert_dataset_capture_writable(dataset_root)
     if bool(integrity_enabled):
         assert_dataset_capture_integrity_compatible(dataset_root)
 
 
+class _IdleTactileWorker:
+    """Picklable worker adapter carrying the optional native bundle root."""
+
+    def __init__(
+        self,
+        tactile_bundle_root: str | Path | None,
+        *,
+        native_min_free_bytes: int | None = None,
+    ) -> None:
+        value = str(tactile_bundle_root or "").strip()
+        self.tactile_bundle_root = value or None
+        self.native_min_free_bytes = (
+            None
+            if native_min_free_bytes is None
+            else int(native_min_free_bytes)
+        )
+
+    def __call__(self, dataset_root: str, stop_event: Any) -> dict[str, Any]:
+        if self.tactile_bundle_root is None:
+            return dict(run_idle_tactile_recompression_worker(dataset_root, stop_event))
+        return dict(
+            run_idle_native_tactile_recompression_worker(
+                dataset_root,
+                stop_event,
+                self.tactile_bundle_root,
+                self.native_min_free_bytes,
+            )
+        )
+
+
 class RealTeleopIdleTactileCompression:
     """Map authoritative RealTeleop state onto a generic maintenance process."""
 
-    def __init__(self, *, enabled: bool) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        tactile_bundle_root: str | Path | None = None,
+        tactile_bundle_min_free_bytes: int | None = None,
+    ) -> None:
         self.enabled = bool(enabled)
+        self.tactile_bundle_root = (
+            None
+            if not str(tactile_bundle_root or "").strip()
+            else str(Path(tactile_bundle_root).expanduser())
+        )
         self._last_runtime_status: tuple[object, ...] | None = None
+        worker = (
+            run_idle_tactile_recompression_worker
+            if self.tactile_bundle_root is None
+            else _IdleTactileWorker(
+                self.tactile_bundle_root,
+                native_min_free_bytes=tactile_bundle_min_free_bytes,
+            )
+        )
         self.controller = IdleMaintenanceProcessController(
-            run_idle_tactile_recompression_worker,
+            worker,
             config=IdleMaintenanceConfig(
                 process_name="real_teleop_idle_tactile_compression",
                 worker_nice=19,
@@ -204,6 +281,7 @@ class RealTeleopIdleTactileCompression:
         *,
         reason: str,
         dataset_root: str | Path | None,
+        tactile_bundle_root: str | Path | None = None,
         integrity_enabled: bool,
         log: Callable[..., None],
         timeout_sec: float | None = None,
@@ -217,6 +295,11 @@ class RealTeleopIdleTactileCompression:
         assert_idle_tactile_transition_safe(
             receipt,
             dataset_root=dataset_root,
+            tactile_bundle_root=(
+                self.tactile_bundle_root
+                if tactile_bundle_root is None
+                else tactile_bundle_root
+            ),
             integrity_enabled=integrity_enabled,
         )
         self.acknowledge_safe_transition(receipt)

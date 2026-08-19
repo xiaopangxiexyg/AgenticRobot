@@ -477,12 +477,6 @@ def _parse_real_teleop_args(
             parser.error(
                 "--tactile-bundle-root requires --tactile-storage external."
             )
-        if bool(getattr(args, "idle_tactile_compression", False)):
-            parser.error(
-                "--tactile-bundle-root is not yet compatible with "
-                "--idle-tactile-compression; use inline --tactile-compression "
-                "zstd/lz4/none."
-            )
         if _argv_has_option(raw_argv, "--no-tactile-artifact-integrity"):
             parser.error(
                 "--tactile-bundle-root cannot be combined with explicit "

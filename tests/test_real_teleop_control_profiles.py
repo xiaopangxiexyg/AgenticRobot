@@ -848,16 +848,23 @@ def test_native_tactile_bundle_cli_is_opt_in_and_fail_closed() -> None:
         [
             "--tactile-bundle-root",
             "/tmp/tactile",
-            "--idle-tactile-compression",
-        ],
-        [
-            "--tactile-bundle-root",
-            "/tmp/tactile",
             "--no-tactile-artifact-integrity",
         ],
     ):
         with pytest.raises(SystemExit):
             _parse_real_teleop_args(conflicting)
+
+    native_idle = _parse_real_teleop_args(
+        [
+            "--tactile-bundle-root",
+            "/tmp/tactile",
+            "--idle-tactile-compression",
+            "--tactile-compression",
+            "none",
+        ]
+    )
+    assert native_idle.idle_tactile_compression is True
+    assert native_idle.tactile_compression == "none"
 
 
 def test_real_teleop_velocity_planner_rejects_non_position_or_disabled_stream() -> None:

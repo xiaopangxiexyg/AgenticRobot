@@ -196,7 +196,8 @@ bash scripts/run_formal_60hz_writing_collection.sh collect \
   --tactile-bundle-root /absolute/path/to/DexTeleopTactile
 ```
 
-触觉根目录必须预先存在、不能是符号链接，并且必须与 dataset root 位于不同文件系统。
+触觉根目录必须预先存在、不能是符号链接，并且必须与 dataset root 保持目录隔离；
+两者可以位于同一文件系统。
 launcher 默认保留 200 GiB 空闲空间，可用 `--tactile-min-free-gb` 显式调整。dataset 根目录
 和 task name 也可以分别用 `--dataset-root`、`--task-name` 覆盖；等价的环境变量是
 `TACTILE_BUNDLE_ROOT`、`TACTILE_BUNDLE_MIN_FREE_GB`、`DATASET_BASE` 和

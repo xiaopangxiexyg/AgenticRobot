@@ -844,6 +844,9 @@ def recompress_tactile_zstd_in_place(
 def run_idle_tactile_recompression_worker(
     dataset_root: str,
     stop_event: Any,
+    tactile_bundle_root: str | Path | None = None,
+    native_min_free_bytes: int | None = None,
+    native_require_distinct_device: bool = False,
 ) -> Mapping[str, Any]:
     """Run verified recompression under external idle-lifecycle admission.
 
@@ -851,6 +854,20 @@ def run_idle_tactile_recompression_worker(
     dataset is idle and revoke that admission through ``stop_event``.
     """
 
+    if tactile_bundle_root is not None and str(tactile_bundle_root).strip():
+        # Keep the historical worker entry point usable by process controllers
+        # while routing native two-root maintenance to its dedicated owner.
+        from .tactile_bundle_recompression import (
+            run_idle_native_tactile_recompression_worker,
+        )
+
+        return run_idle_native_tactile_recompression_worker(
+            dataset_root,
+            stop_event,
+            str(tactile_bundle_root),
+            native_min_free_bytes,
+            native_require_distinct_device,
+        )
     root = Path(dataset_root).expanduser().resolve()
     if stop_event.is_set():
         return {"outcome": "cancelled", "dataset_root": str(root)}

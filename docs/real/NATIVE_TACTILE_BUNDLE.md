@@ -60,11 +60,21 @@ Add these options to an existing formal real-teleop collection command:
 --tactile-bundle-min-free-gb 200
 ```
 
-The storage root must already exist, be writable, not be a symlink, and be on a
-different filesystem device from the core dataset. `--tactile-bundle-root` is
-empty by default; omitting it preserves the established self-contained writer.
-Native separation forces artifact integrity sealing and is incompatible with
-idle tactile recompression. Use inline `zstd`, `lz4`, or `none` compression.
+The storage root must already exist, be writable, and not be a symlink.
+The core and tactile roots must be disjoint directories; they may be on the
+same filesystem. `--tactile-bundle-root` is empty by default; omitting it
+preserves the established self-contained writer.
+Native separation forces artifact integrity sealing. Keep collection-path
+compression at `none` when using `--idle-tactile-compression`; the idle worker
+resolves the UUID-addressed external bundle and performs verified lossless Zstd
+conversion during Hold or other recorder-idle gaps. Inline `zstd`/`lz4` remains
+available when idle compression is not requested.
+
+An idle conversion publishes the updated external manifest and tactile component,
+mirrors the new episode commit to both roots, updates the core catalog binding,
+and only then removes the verified raw predecessor. Cooperative cancellation
+before that commit restores the last committed revision; forced termination
+remains fail-closed and requires explicit artifact recovery before resume.
 
 Native separation is fail-closed:
 
