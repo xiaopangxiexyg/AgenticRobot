@@ -672,16 +672,43 @@ def _request_safety_hold_best_effort(
     log: Callable[..., Any],
     now: float,
 ) -> None:
-    """Latch Hold even if the normal input/UI callback raises."""
+    """Latch Hold even if the normal input/UI callback raises or is a no-op.
+
+    ``OperatorControlRuntime.request_hold`` intentionally ignores requests
+    before teleop admission (while it is waiting for the first runtime Home).
+    That is useful for ordinary UI events, but it is unsafe for an asynchronous
+    safety fault: the next control frame must observe a durable local Hold
+    request even during Calibration.  Treat a callback that returns without
+    setting both local latches as a no-op and apply the same fail-closed
+    fallback used for callback exceptions.
+    """
 
     try:
         clutch_input.request_hold(reason=reason)
-        return
     except Exception as exc:  # noqa: BLE001 - safety Hold must still be latched.
         log(
             "Hold",
             "safety Hold request callback failed; forcing the local Hold latch: "
             f"{type(exc).__name__}: {exc}",
+            now=now,
+        )
+    else:
+        # The real operator-control implementation sets both fields
+        # atomically.  A callback that silently returns (notably during the
+        # pre-teleop Calibration wait) did not establish a consumable Hold
+        # request and must be promoted to the fallback below.
+        try:
+            hold_requested = bool(getattr(clutch_input, "_hold_requested"))
+            hold_active = bool(getattr(clutch_input, "_hold_active"))
+        except Exception:
+            hold_requested = False
+            hold_active = False
+        if hold_requested and hold_active:
+            return
+        log(
+            "Hold",
+            "safety Hold request callback returned without latching Hold; "
+            "forcing the local Hold latch",
             now=now,
         )
     fallback_values = {
@@ -700,6 +727,22 @@ def _request_safety_hold_best_effort(
                 f"{type(exc).__name__}: {exc}",
                 now=now,
             )
+
+
+def _position_force_guard_fault_pending(
+    fault: Any,
+    *,
+    handled: bool,
+) -> bool:
+    """Return whether a latched force fault still needs one Hold transition.
+
+    This predicate deliberately has no ``_teleop_started`` admission gate.
+    Force monitoring is active before the first runtime Home, and a trip in
+    that Calibration window must still stop the episode/countdown and retain
+    the process in Hold.
+    """
+
+    return fault is not None and not bool(handled)
 
 
 def _request_position_admittance_endpoint_hold(
@@ -1844,10 +1887,9 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             # allow the next independent collision in the same process to be
             # consumed exactly once as well.
             force_guard_fault_handled = False
-        if (
-            force_guard_fault is not None
-            and not force_guard_fault_handled
-            and bool(getattr(clutch_input, "_teleop_started", False))
+        if _position_force_guard_fault_pending(
+            force_guard_fault,
+            handled=force_guard_fault_handled,
         ):
             consume_position_force_guard_fault(force_guard_fault, now=loop_start)
             continue
@@ -2973,8 +3015,10 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 if position_force_guard_monitor is None
                 else position_force_guard_monitor.fault
             )
-            teleop_active = bool(getattr(clutch_input, "_teleop_started", False))
-            if force_guard_fault_now is not None and teleop_active:
+            if _position_force_guard_fault_pending(
+                force_guard_fault_now,
+                handled=force_guard_fault_handled,
+            ):
                 consume_position_force_guard_fault(
                     force_guard_fault_now,
                     now=loop_start,

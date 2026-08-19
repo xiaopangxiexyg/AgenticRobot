@@ -860,19 +860,17 @@ def run_real_teleop(
                 def position_force_guard_stop(
                     fault: PositionForceGuardFault,
                 ) -> None:
-                    # During startup a force-guard fault remains fail-closed
-                    # and terminates the not-yet-admitted runtime, preserving
-                    # the historical safety contract.  Once teleop has been
-                    # admitted, the stop is an episode/runtime transition:
-                    # keep the GUI and device sessions alive so the operator
-                    # can manually reposition the arms and capture a fresh
-                    # Home.  The control loop consumes the latched fault and
-                    # enters Hold before any further command dispatch.
+                    # A force-guard fault is always a retained safety state,
+                    # including while Calibration is waiting for the operator
+                    # to press ``p``.  Do not turn the asynchronous safety
+                    # callback into a process-quit request: the control loop
+                    # consumes the latched fault, closes any active episode,
+                    # and keeps command dispatch disabled in Hold.  This also
+                    # leaves the GUI/device sessions available for inspection
+                    # and a fresh operator-led Home after the stop is checked.
                     teleop_active = bool(
                         getattr(clutch_input, "_teleop_started", False)
                     )
-                    if not teleop_active:
-                        clutch_input.should_quit = True
                     stop_error: Exception | None = None
                     try:
                         _emergency_stop_real_arms(
@@ -908,7 +906,8 @@ def run_real_teleop(
                             else:
                                 message = (
                                     "位控受力急停已触发，左右臂均已锁存停机；"
-                                    "当前启动/遥操进程将退出，必须检查设备后重启。"
+                                    "当前保持不下发指令，GUI/设备连接保持，"
+                                    "请检查设备后重新采集 runtime Home。"
                                 )
                             control_ui.append_message(
                                 "PositionForceGuard",
@@ -952,15 +951,56 @@ def run_real_teleop(
                         reason="position_force_guard_setup_failed",
                     )
                     clutch_input.should_quit = True
+                    if startup_progress is not None:
+                        startup_progress.fail(
+                            "arm.force_guard",
+                            f"{type(exc).__name__}: {exc}",
+                            message="位控受力急停未能安全就绪，拒绝启动遥操",
+                        )
+                    # A setup failure has no latched runtime fault for the
+                    # control loop to consume, so retain the historical
+                    # fail-closed startup refusal in this case.
+                    raise
+                # ``PositionForceGuardMonitor.start`` raises when its first
+                # valid sample is already over the force/torque limit.  That
+                # is a runtime safety trip, not a component-construction
+                # failure: the monitor has already latched the fault and
+                # requested Arm_Stop.  Keep the GUI/device session alive so
+                # the control loop can consume the fault, close any active
+                # episode, and remain in Hold without tearing down the
+                # process.
+                _log(
+                    "PositionForceGuard",
+                    "startup force trip latched; entering the control loop in "
+                    "Hold instead of terminating the GUI: "
+                    f"{monitor_fault.message}",
+                    now=monitor_fault.wall_time_sec,
+                )
                 if startup_progress is not None:
                     startup_progress.fail(
                         "arm.force_guard",
                         f"{type(exc).__name__}: {exc}",
-                        message="位控受力急停未能安全就绪，拒绝启动遥操",
+                        message=(
+                            "位控受力阈值已触发；双臂保持停机，"
+                            "当前保持不下发指令并等待人工检查"
+                        ),
                     )
-                # This safety component is always fail-closed, including
-                # capability-admission GUI mode.
-                raise
+                if control_ui is not None:
+                    try:
+                        control_ui.append_message(
+                            "PositionForceGuard",
+                            "启动阶段检测到受力超过安全阈值；"
+                            "双臂已急停，当前不下发任何指令；"
+                            "GUI/设备连接保持，请检查设备后重新采集 runtime Home。",
+                        )
+                    except Exception as ui_exc:  # noqa: BLE001 - UI is observational.
+                        _log(
+                            "PositionForceGuard",
+                            "startup force-trip UI notification failed; "
+                            "preserving the backend stop result: "
+                            f"{type(ui_exc).__name__}: {ui_exc}",
+                            now=monitor_fault.wall_time_sec,
+                        )
             else:
                 readings = force_guard_snapshot.get("last_reading_by_side", {})
                 reading_text = []
@@ -1397,47 +1437,74 @@ def run_real_teleop(
         if clutch_input.should_quit:
             return
         if position_force_guard_monitor is not None:
-            try:
-                force_guard_snapshot = (
-                    position_force_guard_monitor.arm_stale_watchdog()
-                )
-            except Exception as exc:
+            startup_force_fault = position_force_guard_monitor.fault
+            if startup_force_fault is not None:
+                # A trip may have happened while camera startup was in
+                # progress.  Do not replace the latched safety transition with
+                # a startup exception; the control loop will consume it before
+                # any session/rig dispatch.
                 _log(
                     "PositionForceGuard",
-                    "stale watchdog failed to arm after camera startup; "
-                    f"motion remains rejected: {type(exc).__name__}: {exc}",
+                    "stale watchdog remains disarmed after a latched force trip; "
+                    "motion admission stays blocked",
+                    now=startup_force_fault.wall_time_sec,
                 )
-                if control_ui is not None:
-                    control_ui.append_message(
-                        "PositionForceGuard",
-                        "相机启动后无法取得双侧新鲜力数据；"
-                        "已拒绝归位/遥操并锁存双臂停机。"
-                        f"\n{type(exc).__name__}: {exc}",
+            else:
+                try:
+                    force_guard_snapshot = (
+                        position_force_guard_monitor.arm_stale_watchdog()
                     )
-                raise
-            readings = force_guard_snapshot.get("last_reading_by_side", {})
-            reading_text: list[str] = []
-            if isinstance(readings, Mapping):
-                for side in components.active_sides:
-                    reading = readings.get(side, {})
-                    if isinstance(reading, Mapping):
-                        reading_text.append(
-                            f"{side}=|F|"
-                            f"{float(reading.get('force_norm_n', 0.0)):.2f}N/"
-                            f"|T|{float(reading.get('torque_norm_nm', 0.0)):.2f}Nm"
+                except Exception as exc:
+                    # A force trip can race this arm call.  If the monitor now
+                    # owns a fault, retain the process and let the control loop
+                    # perform the normal episode-stop/Hold transition; only a
+                    # genuine stale-watchdog setup failure aborts startup.
+                    raced_force_fault = position_force_guard_monitor.fault
+                    if raced_force_fault is None:
+                        _log(
+                            "PositionForceGuard",
+                            "stale watchdog failed to arm after camera startup; "
+                            f"motion remains rejected: {type(exc).__name__}: {exc}",
                         )
-            _log(
-                "PositionForceGuard",
-                "stale_watchdog=armed_after_fresh_post_camera_samples "
-                "motion_admission=ready "
-                + " ".join(reading_text),
-            )
-            if control_ui is not None:
-                control_ui.append_message(
-                    "PositionForceGuard",
-                    "相机启动后双侧新鲜力数据已确认；"
-                    "位控受力与读取陈旧急停均已锁存就绪。",
-                )
+                        if control_ui is not None:
+                            control_ui.append_message(
+                                "PositionForceGuard",
+                                "相机启动后无法取得双侧新鲜力数据；"
+                                "已拒绝归位/遥操并锁存双臂停机。"
+                                f"\n{type(exc).__name__}: {exc}",
+                            )
+                        raise
+                    _log(
+                        "PositionForceGuard",
+                        "force trip raced stale-watchdog arming; "
+                        "motion admission remains blocked: "
+                        f"{raced_force_fault.message}",
+                        now=raced_force_fault.wall_time_sec,
+                    )
+                else:
+                    readings = force_guard_snapshot.get("last_reading_by_side", {})
+                    reading_text: list[str] = []
+                    if isinstance(readings, Mapping):
+                        for side in components.active_sides:
+                            reading = readings.get(side, {})
+                            if isinstance(reading, Mapping):
+                                reading_text.append(
+                                    f"{side}=|F|"
+                                    f"{float(reading.get('force_norm_n', 0.0)):.2f}N/"
+                                    f"|T|{float(reading.get('torque_norm_nm', 0.0)):.2f}Nm"
+                                )
+                    _log(
+                        "PositionForceGuard",
+                        "stale_watchdog=armed_after_fresh_post_camera_samples "
+                        "motion_admission=ready "
+                        + " ".join(reading_text),
+                    )
+                    if control_ui is not None:
+                        control_ui.append_message(
+                            "PositionForceGuard",
+                            "相机启动后双侧新鲜力数据已确认；"
+                            "位控受力与读取陈旧急停均已锁存就绪。",
+                        )
         if camera_sources:
             _log(
                 "Camera",
