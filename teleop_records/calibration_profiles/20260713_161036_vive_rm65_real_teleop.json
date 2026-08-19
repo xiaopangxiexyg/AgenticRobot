@@ -1,0 +1,745 @@
+{
+  "desk_frame": {
+    "name": "desk",
+    "axes": {
+      "x": "forward",
+      "y": "left",
+      "z": "up"
+    }
+  },
+  "arms": {
+    "left_arm": {
+      "name": "left_arm",
+      "side": "left",
+      "T_D_B": [
+        [
+          6.123233995736766e-17,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -1.0,
+          6.123233995736766e-17,
+          0.0,
+          -0.2625
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "home_qpos": null,
+      "home_pose": null,
+      "tcp_frame": "tool_tcp",
+      "metadata": {
+        "preset": "annotated_dual_rm65",
+        "base_distance_m": 0.525,
+        "desk_slot": "-y(screen_left)"
+      }
+    },
+    "right_arm": {
+      "name": "right_arm",
+      "side": "right",
+      "T_D_B": [
+        [
+          6.123233995736766e-17,
+          -1.0,
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          6.123233995736766e-17,
+          0.0,
+          0.2625
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "home_qpos": null,
+      "home_pose": null,
+      "tcp_frame": "tool_tcp",
+      "metadata": {
+        "preset": "annotated_dual_rm65",
+        "base_distance_m": 0.525,
+        "desk_slot": "+y(screen_right)"
+      }
+    }
+  },
+  "hands": {},
+  "T_W_O": [
+    [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "T_O_D": [
+    [
+      -0.5132514454544552,
+      -0.8557709779019651,
+      -0.0650306629185563,
+      0.16493837554159752
+    ],
+    [
+      -0.032381030953398,
+      -0.05640919171956574,
+      0.9978824940462381,
+      0.16335206389587628
+    ],
+    [
+      -0.8576272048934244,
+      0.5142703923718143,
+      0.0012413526625213965,
+      -1.0724943457509757
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "tracker_offsets": {
+    "left_wrist": [
+      [
+        0.06740879787180147,
+        -0.9846861838035915,
+        -0.16077678127079906,
+        0.0
+      ],
+      [
+        -0.9951172543692586,
+        -0.054709791876775285,
+        -0.08214918581086975,
+        0.0
+      ],
+      [
+        0.07209510403673422,
+        0.16552932700618225,
+        -0.9835661329442027,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "right_wrist": [
+      [
+        -0.11897599224942365,
+        -0.9885459877344809,
+        0.09285226654382071,
+        0.0
+      ],
+      [
+        -0.9897046908843712,
+        0.11058061489977511,
+        -0.09086557351307077,
+        0.0
+      ],
+      [
+        0.07955713739028528,
+        -0.10270714552769569,
+        -0.9915250395969917,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "captured_home_qpos": {},
+  "metadata": {
+    "preset": "annotated_dual_rm65",
+    "base_distance_m": 0.525,
+    "note": "Dual-arm desk/base relation for teleop_runtime where desk axes are +x=forward, +y=left, +z=up, while the default viewer places left_arm at desk -Y (screen-left) and right_arm at desk +Y (screen-right).",
+    "source_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
+    "left_tracker_name": "tracker_1",
+    "right_tracker_name": "tracker_2",
+    "aux_tracker_name": "",
+    "active_sides": [
+      "left",
+      "right"
+    ],
+    "arm_mode": "real",
+    "left_arm_ip": "192.168.101.21",
+    "right_arm_ip": "192.168.1.20",
+    "left_hand_ip": "",
+    "right_hand_ip": "",
+    "left_hand_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+    "right_hand_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+    "hand_backend": "dmtac-gripper",
+    "session_record_commands": false,
+    "session_record_flush_every": 60,
+    "session_record_compact_json": true,
+    "q6_config": "latest",
+    "q6_config_loaded_ports": {},
+    "dmtac_config": "latest",
+    "dmtac_default_config_enabled": true,
+    "dmtac_config_loaded_sides": [
+      "left",
+      "right"
+    ],
+    "dmtac_tactile_compute_profile": "dist-only",
+    "dmtac_tactile_parallel_read": true,
+    "dmtac_tactile_global_read_lock": true,
+    "dmtac_tactile_read_hz": 15.0,
+    "dmtac_tactile_process_read": true,
+    "dmtac_tactile_worker_cpus": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "dmtac_tactile_worker_nice": 15,
+    "dmtac_tactile_worker_queue_size": 4,
+    "dmtac_tactile_max_fps": null,
+    "dmtac_tactile_warmup_frames": null,
+    "dmtac_tactile_denoise": false,
+    "dmtac_tactile_flat_vector": false,
+    "gripper_task_profile": "teleop_runtime/configs/gripper_task_profile.example.json",
+    "gripper_policy": {
+      "source_dim": 2,
+      "output_dim": 0,
+      "invert": false,
+      "alpha": 1.0,
+      "input_min": 0.1,
+      "input_max": 0.9,
+      "speed": 1.0,
+      "torque": 1.0,
+      "max_action": 1.0,
+      "send_threshold": 0.002,
+      "command_hz": 40.0,
+      "continuous_grasp": true,
+      "telemetry_hz": 10.0
+    },
+    "left_logical_tracker_name": "tracker_1",
+    "right_logical_tracker_name": "tracker_2",
+    "hand_reader_baudrate": 115200,
+    "exo_hand_calibration": false,
+    "exo_hand_calibration_path": null,
+    "hand_joint_order": [
+      5,
+      4,
+      3,
+      2,
+      0,
+      1
+    ],
+    "hand_invert": true,
+    "hand_command_alpha": 1.0,
+    "hand_send_threshold": 0.002,
+    "hand_telemetry_hz": 30.0,
+    "hand_tactile_regions": [
+      "little_1",
+      "little_2",
+      "little_3",
+      "ring_1",
+      "ring_2",
+      "ring_3",
+      "middle_1",
+      "middle_2",
+      "middle_3",
+      "index_1",
+      "index_2",
+      "index_3",
+      "thumb_1",
+      "thumb_2",
+      "thumb_3",
+      "thumb_4",
+      "palm"
+    ],
+    "max_fingertip_force": 800,
+    "teleop_hardware_ip": "",
+    "teleop_hardware_port": 0,
+    "swap_arm_sides": false,
+    "swap_operator_sides": false,
+    "tracker_input_mapping": {
+      "left": "right",
+      "right": "left"
+    },
+    "action_dt": 0.06666666666666667,
+    "arm_control_hz": 40.0,
+    "arm_control_dt": 0.025,
+    "arm_control_mode": "impedance",
+    "impedance_mode": "pose",
+    "strict_tool_profile": true,
+    "auto_sync_tool_frame": true,
+    "force_tare_sec": 3.0,
+    "left_tool_profile": "hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json",
+    "right_tool_profile": "hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json",
+    "arm_io_threads": 4,
+    "arm_step_dt_scaling": true,
+    "arm_step_dt_alpha": 0.25,
+    "arm_step_dt_max_scale": 3.0,
+    "arm_step_dt_stall_reset_sec": 0.25,
+    "dual_arm_collision_avoidance_requested": true,
+    "dual_arm_temporary_safety_enabled": true,
+    "dual_arm_temporary_safety": {
+      "max_xyz_step_m": 0.03,
+      "max_rot_step_deg": 8.0,
+      "max_joint_step_deg": 6.0,
+      "command_scale": 1.0
+    },
+    "collision_avoidance_mode": "boundary_slide",
+    "collision_scene_profile": "dual_arm_hand_proxy_open",
+    "ik_tuning_source": "/home/user/zc/DexTeleop_StableCollect_0705/teleop_runtime/configs/rm65_ik_tuning.json",
+    "ik_objective_mode": "orientation_priority",
+    "initial_alignment_source": "",
+    "vive_tracker_height_correction_enabled": true,
+    "vive_tracker_height_correction_m": 0.04,
+    "vive_tracker_local_translation_offset_m": [
+      0.0,
+      0.0,
+      -0.04
+    ],
+    "dual_arm_collision_avoidance_enabled": true,
+    "collision_avoidance_setup_error": null,
+    "world_to_desk_mode": "direct",
+    "calibration_mode": "vive_rm65_virtual_desk",
+    "virtual_desk": {
+      "T_W_V": [
+        [
+          0.5132514454544553,
+          0.855770977901965,
+          -0.0650306629185563,
+          0.16493837554159752
+        ],
+        [
+          0.032381030953398005,
+          0.05640919171956573,
+          0.9978824940462381,
+          0.16335206389587628
+        ],
+        [
+          0.8576272048934243,
+          -0.5142703923718144,
+          0.0012413526625213965,
+          -1.0724943457509757
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "origin_world": [
+        0.16493837554159752,
+        0.16335206389587628,
+        -1.0724943457509757
+      ],
+      "origin_source": "sweep_mean",
+      "x_axis_world": [
+        0.5132514454544553,
+        0.032381030953398005,
+        0.8576272048934243
+      ],
+      "y_axis_world": [
+        0.855770977901965,
+        0.05640919171956573,
+        -0.5142703923718144
+      ],
+      "z_axis_world": [
+        -0.0650306629185563,
+        0.9978824940462381,
+        0.0012413526625213965
+      ],
+      "xy_non_orthogonality_deg": 2.2067443078064883,
+      "xz_non_orthogonality_deg": 9.500267029807745,
+      "yz_non_orthogonality_deg": 1.3456343451312875,
+      "x_axis_correction_deg": 0.0,
+      "y_axis_correction_deg": 2.206744307806186,
+      "z_axis_correction_deg": 9.551837668469757,
+      "z_axis_alignment_before_flip_deg": 9.551837668469757,
+      "handedness_flip_applied": false,
+      "x_fit": {
+        "axis_world": [
+          0.5132514454544553,
+          0.032381030953398005,
+          0.8576272048934243
+        ],
+        "mean_world": [
+          0.1250260520666357,
+          0.2213761161171621,
+          -1.1856201526618773
+        ],
+        "quality": {
+          "sample_count": 248,
+          "extent_m": 0.3446159621625501,
+          "variance_ratio": 0.9981153246742036,
+          "start_end_distance_m": 0.33750867281623737
+        }
+      },
+      "y_fit": {
+        "axis_world": [
+          0.8748992991652274,
+          0.05761420374610713,
+          -0.4808656983471541
+        ],
+        "mean_world": [
+          0.1291079107709999,
+          0.21867012508934544,
+          -1.0321468617166243
+        ],
+        "quality": {
+          "sample_count": 248,
+          "extent_m": 0.4306294366250797,
+          "variance_ratio": 0.9992188111870618,
+          "start_end_distance_m": 0.41993895088018685
+        }
+      },
+      "z_fit": {
+        "axis_world": [
+          0.03525289352113792,
+          0.990359189055529,
+          0.13396234602179202
+        ],
+        "mean_world": [
+          0.24098781475171385,
+          0.049551075528025144,
+          -0.9994213737939533
+        ],
+        "quality": {
+          "sample_count": 247,
+          "extent_m": 0.3993537384777811,
+          "variance_ratio": 0.9989286338089619,
+          "start_end_distance_m": 0.3903689722558995
+        }
+      }
+    },
+    "virtual_desk_tracker_role": "right_wrist",
+    "virtual_desk_channel_name": "right_wrist_pose",
+    "virtual_desk_sweep_convention_version": 2,
+    "virtual_desk_post_yaw_deg": 180.0,
+    "runtime_gui_vive_calibrated_at": "2026-07-13T16:10:18",
+    "tracker_offset_calibration": {
+      "left_wrist": {
+        "method": "runtime_gui_wrist_neutral_capture",
+        "canonical_hand_rpy_deg": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "canonical_hand_frame_version": 1,
+        "translation_tracker_to_hand": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "coarse_offset": [
+          [
+            0.06740879787180147,
+            -0.9846861838035915,
+            -0.16077678127079906,
+            0.0
+          ],
+          [
+            -0.9951172543692586,
+            -0.054709791876775285,
+            -0.08214918581086975,
+            0.0
+          ],
+          [
+            0.07209510403673422,
+            0.16552932700618225,
+            -0.9835661329442027,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "fine_tune_rpy_deg": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "final_offset": [
+          [
+            0.06740879787180147,
+            -0.9846861838035915,
+            -0.16077678127079906,
+            0.0
+          ],
+          [
+            -0.9951172543692586,
+            -0.054709791876775285,
+            -0.08214918581086975,
+            0.0
+          ],
+          [
+            0.07209510403673422,
+            0.16552932700618225,
+            -0.9835661329442027,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "captured_tracker_pose_virtual": [
+          [
+            0.06740879787180147,
+            -0.9951172543692586,
+            0.07209510403673422,
+            -0.096818448023881
+          ],
+          [
+            -0.9846861838035915,
+            -0.054709791876775285,
+            0.16552932700618225,
+            -0.210230532820068
+          ],
+          [
+            -0.16077678127079906,
+            -0.08214918581086975,
+            -0.9835661329442027,
+            -0.004676563504323936
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ]
+      },
+      "right_wrist": {
+        "method": "runtime_gui_wrist_neutral_capture",
+        "canonical_hand_rpy_deg": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "canonical_hand_frame_version": 1,
+        "translation_tracker_to_hand": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "coarse_offset": [
+          [
+            -0.11897599224942365,
+            -0.9885459877344809,
+            0.09285226654382071,
+            0.0
+          ],
+          [
+            -0.9897046908843712,
+            0.11058061489977511,
+            -0.09086557351307077,
+            0.0
+          ],
+          [
+            0.07955713739028528,
+            -0.10270714552769569,
+            -0.9915250395969917,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "fine_tune_rpy_deg": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "final_offset": [
+          [
+            -0.11897599224942365,
+            -0.9885459877344809,
+            0.09285226654382071,
+            0.0
+          ],
+          [
+            -0.9897046908843712,
+            0.11058061489977511,
+            -0.09086557351307077,
+            0.0
+          ],
+          [
+            0.07955713739028528,
+            -0.10270714552769569,
+            -0.9915250395969917,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "captured_tracker_pose_virtual": [
+          [
+            -0.11897599224942365,
+            -0.9897046908843712,
+            0.07955713739028528,
+            -0.10406718339411826
+          ],
+          [
+            -0.9885459877344809,
+            0.11058061489977511,
+            -0.10270714552769569,
+            0.16138962503925025
+          ],
+          [
+            0.09285226654382071,
+            -0.09086557351307077,
+            -0.9915250395969917,
+            0.0027896845058585666
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ]
+      }
+    },
+    "profile_scope": "tracker_station_only",
+    "runtime_home_used_for_visual_check": false,
+    "home_policy": "session home anchors are intentionally not saved; real teleop must recapture wrist home",
+    "saved_at": "2026-07-13T16:10:36",
+    "saved_from_entrypoint": "teleop_runtime.debug.run_vive_rm65_real_teleop",
+    "saved_from_gui": true,
+    "movement_multiple": 1.0,
+    "translation_scale": 1.0,
+    "gripper_task": null,
+    "gripper_policy_by_side": {
+      "left": {
+        "source_dim": 2,
+        "output_dim": 0,
+        "invert": false,
+        "alpha": 1.0,
+        "input_min": 0.1,
+        "input_max": 0.9,
+        "speed": 1.0,
+        "torque": 1.0,
+        "max_action": 1.0,
+        "send_threshold": 0.002,
+        "command_hz": 40.0,
+        "continuous_grasp": true,
+        "telemetry_hz": 10.0
+      },
+      "right": {
+        "source_dim": 2,
+        "output_dim": 0,
+        "invert": false,
+        "alpha": 1.0,
+        "input_min": 0.1,
+        "input_max": 0.9,
+        "speed": 1.0,
+        "torque": 1.0,
+        "max_action": 1.0,
+        "send_threshold": 0.002,
+        "command_hz": 40.0,
+        "continuous_grasp": true,
+        "telemetry_hz": 10.0
+      }
+    },
+    "target_pose_smoothing": {
+      "schema_version": "teleop_runtime.pose_smoothing.v1",
+      "enabled": true,
+      "time_constant_sec": 0.1,
+      "nominal_dt_sec": 0.0666666667,
+      "min_dt_sec": 0.0,
+      "max_dt_sec": 0.12,
+      "reset_after_gap_sec": 0.5,
+      "deadband_translation_m": 0.0003,
+      "deadband_rotation_deg": 0.05,
+      "snap_translation_m": 0.08,
+      "snap_rotation_deg": 20.0,
+      "source_path": "/home/user/zc/DexTeleop_StableCollect_0705/teleop_runtime/configs/pose_smoothing.json"
+    },
+    "dmtac_tactile_fields": [],
+    "record_actual_wrist_camera_pose": true,
+    "actual_wrist_camera_pose_source": "rm65_feedback_qpos_fk",
+    "actual_wrist_camera_pose_hz": 30.0,
+    "actual_wrist_camera_pose_max_age_sec": 0.2,
+    "rm65_ik_framework": "robot_motion",
+    "workspace_config_source": "/home/user/zc/DexTeleop_StableCollect_0705/teleop_runtime/configs/arm_workspace.json",
+    "debug_timing": false,
+    "debug_timing_legacy_all": false,
+    "debug_timing_modules": [],
+    "debug_timing_console": false,
+    "debug_timing_light_log": false,
+    "rm65_backend_debug_timing": false,
+    "debug_timing_ik_profile": false,
+    "debug_timing_watchdog": false,
+    "debug_timing_threshold_sec": 0.06666666666666667,
+    "debug_timing_report_interval_sec": 1.0,
+    "workspace_policy": "managed_by_teleop_runtime_config",
+    "workspace_config_path": "/home/user/zc/DexTeleop_StableCollect_0705/teleop_runtime/configs/arm_workspace.json",
+    "fix_arm_mode": {
+      "enabled": true,
+      "initial_selected_side": "left",
+      "required_effectors_by_side": {
+        "left": [
+          "left_arm",
+          "left_hand"
+        ],
+        "right": [
+          "right_arm",
+          "right_hand"
+        ]
+      }
+    }
+  }
+}
