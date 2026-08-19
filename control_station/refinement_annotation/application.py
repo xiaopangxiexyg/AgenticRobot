@@ -107,6 +107,9 @@ _DETAIL_DRAFT_SCHEMA = "dexteleop.detail_stage_annotation_draft.local.v1"
 _SAMPLE_AXIS_CACHE_LIMIT = 16
 _ANNOTATION_SET_CACHE_LIMIT = 16
 _DETAIL_ANNOTATION_STATUS_CACHE_LIMIT = 64
+# Keep the HTTP/browser page deliberately bounded.  Direct Python callers
+# still receive the historical complete list unless they opt into pagination.
+_EPISODE_PAGE_MAX = 1000
 _RETRYABLE_STAGE_STORE_ERRNOS = frozenset(
     value
     for value in (
@@ -231,6 +234,8 @@ class RefinementAnnotationApplication:
             str,
             tuple[_DetailProfileSelection | None, str | None],
         ] = {}
+        self._ordered_items_cache: tuple[ProgressAnnotationWorkItem, ...] = ()
+        self._ordered_items_cache_revision = -1
         # The GUI can return immediately and expose a loading state while the
         # first remote catalog scan runs. Direct application callers retain
         # the historical synchronous initialization by default.
@@ -253,6 +258,8 @@ class RefinementAnnotationApplication:
                 self._active_episode_uuid = None
                 self.workspace.close()
                 self._items.clear()
+                self._ordered_items_cache = ()
+                self._ordered_items_cache_revision = -1
                 self._annotation_sets_cache.clear()
                 self._annotation_summary_cache.clear()
                 self._annotation_root_fingerprints.clear()
@@ -522,16 +529,70 @@ class RefinementAnnotationApplication:
         wait_for_refresh: bool = True,
         force_refresh: bool = False,
         include_annotation_summaries: bool = True,
+        offset: int | None = None,
+        limit: int | None = None,
     ) -> dict[str, Any]:
+        """Return the current Episode snapshot, optionally as one page.
+
+        The annotation editor historically returned every Episode to direct
+        callers.  That remains the default for compatibility, while the HTTP
+        client can request a bounded page so a large dataset does not require
+        serializing and retaining the complete catalog in one browser update.
+        """
+
+        if offset is not None:
+            try:
+                offset = int(offset)
+            except (TypeError, ValueError) as exc:
+                raise RefinementAnnotationApplicationError(
+                    "Episode page offset must be an integer."
+                ) from exc
+            if offset < 0:
+                raise RefinementAnnotationApplicationError(
+                    "Episode page offset must be non-negative."
+                )
+        if limit is not None:
+            try:
+                limit = int(limit)
+            except (TypeError, ValueError) as exc:
+                raise RefinementAnnotationApplicationError(
+                    "Episode page limit must be an integer."
+                ) from exc
+            if limit <= 0 or limit > _EPISODE_PAGE_MAX:
+                raise RefinementAnnotationApplicationError(
+                    f"Episode page limit must be between 1 and {_EPISODE_PAGE_MAX}."
+                )
+        if (offset is None) != (limit is None):
+            raise RefinementAnnotationApplicationError(
+                "Episode page offset and limit must be supplied together."
+            )
         self.refresh(wait=wait_for_refresh, force=force_refresh)
         with self._lock:
             self._require_open()
-            items = tuple(self._items.values())
             revision = self._episode_list_revision
             refreshing = self._refresh_in_flight
             refresh_error = self._refresh_error
             refresh_completed = self._refresh_completed
             refresh_total = self._refresh_total
+            if self._ordered_items_cache_revision != revision:
+                self._ordered_items_cache = tuple(
+                    sorted(
+                        self._items.values(),
+                        key=lambda value: (
+                            value.episode_index,
+                            value.episode_uuid,
+                        ),
+                    )
+                )
+                self._ordered_items_cache_revision = revision
+            ordered_items = self._ordered_items_cache
+        total_count = len(ordered_items)
+        page_offset = 0 if offset is None else offset
+        page_items = (
+            ordered_items
+            if limit is None
+            else ordered_items[page_offset : page_offset + limit]
+        )
         return {
             "dataset_root": str(self.dataset_root),
             "annotator_id": self.annotator_id,
@@ -545,15 +606,16 @@ class RefinementAnnotationApplication:
                 "completed": refresh_completed,
                 "total": refresh_total,
             },
+            "total_count": total_count,
+            "offset": page_offset,
+            "limit": limit,
+            "has_more": page_offset + len(page_items) < total_count,
             "episodes": [
                 self._episode_summary(
                     item,
                     load_annotations=include_annotation_summaries,
                 )
-                for item in sorted(
-                    items,
-                    key=lambda value: value.episode_index,
-                )
+                for item in page_items
             ],
         }
 

@@ -326,6 +326,27 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
     replacement.close()
 
 
+def test_http_episode_list_supports_bounded_page_query(tmp_path: Path) -> None:
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    gui = RefinementAnnotationGui(
+        tmp_path,
+        annotator_id="fixture",
+        open_browser=False,
+    )
+    try:
+        url = gui.start()
+        page = _read_json(f"{url}api/episodes?offset=0&limit=1")
+        assert page["total_count"] == 1
+        assert page["offset"] == 0
+        assert page["limit"] == 1
+        assert page["has_more"] is False
+        assert [value["episode_uuid"] for value in page["episodes"]] == [
+            episode_uuid
+        ]
+    finally:
+        gui.close()
+
+
 def test_cli_and_bind_validation_are_fail_closed(tmp_path: Path) -> None:
     launcher_args = build_parser().parse_args([])
     assert launcher_args.dataset_root is None
@@ -910,6 +931,43 @@ def test_lightweight_episode_list_does_not_load_annotation_bundles(
         assert payload["episodes"][0]["review_state"] is None
     finally:
         reader.close()
+
+
+def test_episode_list_supports_bounded_pages_without_changing_default(
+    tmp_path: Path,
+) -> None:
+    episode_uuid = _finalized_failure_retry_dataset(tmp_path)
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+    )
+    try:
+        complete = application.list_episodes(
+            include_annotation_summaries=False,
+        )
+        page = application.list_episodes(
+            include_annotation_summaries=False,
+            offset=0,
+            limit=1,
+        )
+        empty = application.list_episodes(
+            include_annotation_summaries=False,
+            offset=1,
+            limit=1,
+        )
+        assert complete["episodes"][0]["episode_uuid"] == episode_uuid
+        assert page["total_count"] == 1
+        assert page["offset"] == 0
+        assert page["limit"] == 1
+        assert page["has_more"] is False
+        assert [value["episode_uuid"] for value in page["episodes"]] == [
+            episode_uuid
+        ]
+        assert empty["total_count"] == 1
+        assert empty["episodes"] == []
+        assert empty["has_more"] is False
+    finally:
+        application.close()
 
 
 def test_failed_stage_reflow_adds_success_prefix_and_realigns_retry(

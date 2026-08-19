@@ -756,6 +756,22 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
                     "true",
                     "yes",
                 }
+                page_offset: int | None = None
+                page_limit: int | None = None
+                has_offset = "offset" in query
+                has_limit = "limit" in query
+                if has_offset or has_limit:
+                    if not (has_offset and has_limit):
+                        raise RefinementAnnotationApplicationError(
+                            "Episode page offset and limit must be supplied together."
+                        )
+                    try:
+                        page_offset = int(query["offset"][0])
+                        page_limit = int(query["limit"][0])
+                    except (TypeError, ValueError) as exc:
+                        raise RefinementAnnotationApplicationError(
+                            "Episode page offset and limit must be integers."
+                        ) from exc
                 self._send_json(
                     HTTPStatus.OK,
                     {
@@ -764,6 +780,8 @@ class _AnnotationHandler(BaseHTTPRequestHandler):
                             wait_for_refresh=not stale_ok or force_refresh,
                             force_refresh=force_refresh,
                             include_annotation_summaries=False,
+                            offset=page_offset,
+                            limit=page_limit,
                         ),
                     },
                 )

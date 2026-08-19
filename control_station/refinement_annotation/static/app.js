@@ -19,7 +19,10 @@ const state = {
   workspace: null,
   serverOnline: true,
   episodeRefreshInFlight: false,
+  episodePageInFlight: false,
   episodeRevision: null,
+  episodeTotalCount: 0,
+  episodeHasMore: false,
   episodeRenderLimit: 200,
   episodeScanInProgress: false,
   lastEpisodeRefreshError: null,
@@ -59,6 +62,9 @@ const datasetBrowserCache = new Map();
 const datasetBrowserRequests = new Map();
 
 const EPISODE_REFRESH_INTERVAL_MS = 4000;
+// Keep the initial HTTP response and the browser's retained catalog bounded.
+// The sidebar loads additional pages only when the operator asks for them.
+const EPISODE_PAGE_SIZE = 200;
 const EPISODE_RENDER_BATCH_SIZE = 200;
 const EPISODE_SUMMARY_BATCH_SIZE = 32;
 const EPISODE_SUMMARY_REFRESH_MS = 15000;
@@ -91,6 +97,13 @@ function element(tag, className, text) {
 
 function clamp(value, lower, upper) {
   return Math.min(upper, Math.max(lower, value));
+}
+
+function compareEpisodeOrder(left, right) {
+  const indexDelta = Number(left.episode_index) - Number(right.episode_index);
+  return indexDelta || String(left.episode_uuid).localeCompare(
+    String(right.episode_uuid),
+  );
 }
 
 function formatTime(seconds) {
@@ -423,7 +436,7 @@ function selectedEpisodeListIndex() {
 }
 
 function updateEpisodeNavigation() {
-  const count = state.episodes.length;
+  const count = state.episodeTotalCount || state.episodes.length;
   const index = selectedEpisodeListIndex();
   const hasSelection = index >= 0;
   const positionText = hasSelection ? `${index + 1} / ${count}` : `0 / ${count}`;
@@ -491,7 +504,18 @@ async function navigateEpisode(offset) {
     await selectEpisode(state.episodes[initialIndex].episode_uuid);
     return;
   }
-  const targetIndex = clamp(index + offset, 0, state.episodes.length - 1);
+  let targetIndex = index + offset;
+  if (
+    targetIndex >= state.episodes.length
+    && state.episodeHasMore
+  ) {
+    await loadEpisodes({append: true});
+  }
+  targetIndex = clamp(
+    targetIndex,
+    0,
+    state.episodes.length - 1,
+  );
   if (targetIndex === index) return;
   await selectEpisode(state.episodes[targetIndex].episode_uuid);
 }
@@ -761,7 +785,10 @@ function resetAnnotationStateForWorkspace() {
   video.removeAttribute("src");
   video.load();
   state.episodes = [];
+  state.episodePageInFlight = false;
   state.episodeRevision = null;
+  state.episodeTotalCount = 0;
+  state.episodeHasMore = false;
   state.episodeRenderLimit = EPISODE_RENDER_BATCH_SIZE;
   state.episodeScanInProgress = false;
   state.lastEpisodeRefreshError = null;
@@ -2207,14 +2234,29 @@ function updatePlayhead(timestamp = currentTimelineTime()) {
     `${stage?.display_name || occurrence.stage_id} · ${occurrenceOutcomeLabel(occurrence.outcome)}`;
 }
 
-async function loadEpisodes({silent = false, force = false} = {}) {
-  if (state.episodeRefreshInFlight || !state.workspaceConfigured) return;
+async function loadEpisodes({
+  silent = false,
+  force = false,
+  append = false,
+} = {}) {
+  if (
+    state.episodeRefreshInFlight
+    || state.episodePageInFlight
+    || !state.workspaceConfigured
+    || (append && !state.episodeHasMore)
+  ) return false;
   state.episodeRefreshInFlight = true;
+  state.episodePageInFlight = append;
   const previousIds = new Set(
     state.episodes.map((value) => value.episode_uuid),
   );
   try {
-    const query = force ? "?refresh=1" : "?stale_ok=1";
+    const params = new URLSearchParams();
+    params.set("stale_ok", "1");
+    params.set("offset", String(append ? state.episodes.length : 0));
+    params.set("limit", String(EPISODE_PAGE_SIZE));
+    if (force) params.set("refresh", "1");
+    const query = `?${params.toString()}`;
     const payload = await requestJson(`/api/episodes${query}`);
     setServerOnline(true);
     state.episodeScanInProgress = Boolean(payload.refreshing);
@@ -2227,22 +2269,65 @@ async function loadEpisodes({silent = false, force = false} = {}) {
     }
     const nextRevision = Number(payload.revision);
     const revisionKnown = Number.isFinite(nextRevision);
-    const episodesChanged = !revisionKnown
+    const revisionChanged = !revisionKnown
       || state.episodeRevision !== nextRevision;
-    if (episodesChanged) {
-      state.episodes = payload.episodes;
-      state.episodeRevision = revisionKnown ? nextRevision : null;
-      const selectedIndex = state.episodes.findIndex(
+    const replaceLoadedPage = !append
+      && (state.episodeRevision === null || state.episodes.length === 0);
+    if (append) {
+      const byId = new Map(
+        state.episodes.map((value) => [value.episode_uuid, value]),
+      );
+      for (const item of payload.episodes) byId.set(item.episode_uuid, item);
+      state.episodes = Array.from(byId.values()).sort(
+        compareEpisodeOrder,
+      );
+    } else if (replaceLoadedPage || revisionChanged) {
+      // Retain already loaded pages (and the currently selected row) during a
+      // background revision update.  Only the first page is replaced; this
+      // avoids pulling the entire catalog back over the wire every 4 seconds.
+      const selectedItem = state.episodes.find(
         (value) => value.episode_uuid === state.selectedEpisode,
       );
+      const byId = new Map(
+        (replaceLoadedPage
+          ? (selectedItem ? [selectedItem] : [])
+          : state.episodes
+        ).map(
+          (value) => [value.episode_uuid, value],
+        ),
+      );
+      for (const item of payload.episodes) byId.set(item.episode_uuid, item);
+      state.episodes = Array.from(byId.values()).sort(
+        compareEpisodeOrder,
+      );
+    } else {
+      const byId = new Map(
+        state.episodes.map((value) => [value.episode_uuid, value]),
+      );
+      for (const item of payload.episodes) byId.set(item.episode_uuid, item);
+      state.episodes = Array.from(byId.values()).sort(
+        compareEpisodeOrder,
+      );
+    }
+    state.episodeRevision = revisionKnown ? nextRevision : null;
+    state.episodeTotalCount = Number.isFinite(Number(payload.total_count))
+      ? Number(payload.total_count)
+      : state.episodes.length;
+    state.episodeHasMore = Boolean(payload.has_more);
+    const episodesChanged = append || replaceLoadedPage || revisionChanged;
+    if (episodesChanged) {
+      // Do not expand the DOM just because a selected Episode lives in a
+      // later page.  The operator can explicitly reveal more rows below.
       state.episodeRenderLimit = Math.max(
-        state.episodeRenderLimit,
         EPISODE_RENDER_BATCH_SIZE,
-        selectedIndex + 1,
+        Math.min(
+          state.episodeRenderLimit,
+          Math.max(state.episodes.length, EPISODE_RENDER_BATCH_SIZE),
+        ),
       );
     }
     $("dataset-root").textContent = payload.dataset_root;
-    $("episode-count").textContent = String(payload.episodes.length);
+    $("episode-count").textContent = String(state.episodeTotalCount);
     if (episodesChanged) renderEpisodeList({preserveViewport: true});
     else if (state.episodes.slice(0, state.episodeRenderLimit).some((item) => (
       item.episode_uuid !== state.selectedEpisode
@@ -2251,7 +2336,7 @@ async function loadEpisodes({silent = false, force = false} = {}) {
     ))) renderEpisodeList({preserveViewport: true});
     if (
       state.selectedEpisode
-      && !payload.episodes.some((value) => value.episode_uuid === state.selectedEpisode)
+      && !state.episodes.some((value) => value.episode_uuid === state.selectedEpisode)
     ) {
       state.selectedEpisode = null;
       state.detail = null;
@@ -2271,11 +2356,14 @@ async function loadEpisodes({silent = false, force = false} = {}) {
         4200,
       );
     }
+    return true;
   } catch (error) {
     setServerOnline(false);
     if (!silent) showToast(error.message, "error", 6000);
+    return false;
   } finally {
     state.episodeRefreshInFlight = false;
+    state.episodePageInFlight = false;
   }
 }
 
@@ -2479,12 +2567,26 @@ function renderEpisodeList({preserveViewport = true} = {}) {
     const loadMore = element(
       "button",
       "episode-item",
-      `加载后续 ${Math.min(EPISODE_RENDER_BATCH_SIZE, remaining)} 条`,
+      `显示后续 ${Math.min(EPISODE_RENDER_BATCH_SIZE, remaining)} 条`,
     );
     loadMore.type = "button";
     loadMore.addEventListener("click", () => {
       state.episodeRenderLimit += EPISODE_RENDER_BATCH_SIZE;
       renderEpisodeList();
+    });
+    root.appendChild(loadMore);
+  } else if (state.episodeHasMore) {
+    const loadMore = element(
+      "button",
+      "episode-item",
+      state.episodePageInFlight
+        ? "正在读取后续 Episode…"
+        : `读取后续 ${EPISODE_PAGE_SIZE} 条`,
+    );
+    loadMore.type = "button";
+    loadMore.disabled = state.episodePageInFlight;
+    loadMore.addEventListener("click", () => {
+      void loadEpisodes({append: true});
     });
     root.appendChild(loadMore);
   }
