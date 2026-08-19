@@ -336,14 +336,11 @@ def _parse_real_teleop_args(
             parser.error(
                 "--position-admittance-active-side must be included in --active-sides."
             )
-        if (
-            set(position_admittance_apply_sides) == {"left", "right"}
-            and bool(getattr(args, "fix_arm", False))
-        ):
-            parser.error(
-                "dual-side position admittance Active requires --no-fix-arm so "
-                "both commanded sides retain live authority"
-            )
+        # Active admittance and fix-arm are compatible.  The runtime installer
+        # receives a per-side activity callback and suspends the modifier on a
+        # fixed side, while the live side retains the bounded overlay.  A
+        # global --no-fix-arm requirement would disable the five-pedal
+        # side-switch contract before the hardware topology is even opened.
     if position_admittance_shadow or position_admittance_active:
         if args.arm_control_mode != "position":
             parser.error("Position admittance requires position arm control mode.")

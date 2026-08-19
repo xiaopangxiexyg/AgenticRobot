@@ -54,6 +54,8 @@ def test_collection_dry_run_fixes_control_progress_and_tactile_contract(
     output = result.stdout
     assert "POSITION_FORMAL" not in output
     assert "--position-admittance-active" in output
+    assert "--fix-arm" in output
+    assert "--no-fix-arm" not in output
     assert (
         "--position-control-profile "
         "rm65_bimanual_position_v2_balanced_60hz_jerk_v2"

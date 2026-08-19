@@ -262,7 +262,11 @@ POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ARGS=(
 # Active 会拒绝超出响应权重 [0.25,4] 或 filter tau > 0.1 s 的配置。
 POSITION_FORMAL_V2_BALANCED_60HZ_ADMITTANCE_ARGS=(
   "${POSITION_FORMAL_V2_BALANCED_ARGS[@]}"
-  --no-fix-arm
+  # Keep fix-arm available for the five-pedal side-switch contract.  The
+  # active admittance installer already gates each fixed side through its
+  # side_activity callback, so disabling the controller globally is neither
+  # required for safety nor compatible with formal pedal collection.
+  --fix-arm
   --no-position-admittance-shadow
   --position-admittance-active
   --position-admittance-active-side both

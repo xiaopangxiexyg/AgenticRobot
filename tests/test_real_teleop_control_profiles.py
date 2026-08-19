@@ -580,17 +580,27 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
             *dual_formal_args,
             "--position-admittance-active-endpoint-policy",
             "formal_teleop",
-            "--no-fix-arm",
         ]
     )
     assert dual_formal.position_admittance_active_side == "both"
-    assert dual_formal.fix_arm is False
+    assert dual_formal.fix_arm is True
+
+    five_pedal_formal = _parse_real_teleop_args(
+        [
+            *dual_formal_args,
+            "--position-admittance-active-endpoint-policy",
+            "formal_teleop",
+            "--special-arm-control-mode",
+            "foot-pad",
+        ]
+    )
+    assert five_pedal_formal.fix_arm is True
+    assert five_pedal_formal.special_arm_control_mode == "foot-pad"
 
     tuned_dual_formal_args = [
         *dual_formal_args,
         "--position-admittance-active-endpoint-policy",
         "formal_teleop",
-        "--no-fix-arm",
         "--position-admittance-translation-response-weight",
         "1.25",
         "--position-admittance-rotation-response-weight",
@@ -638,16 +648,6 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
     with pytest.raises(SystemExit, match="2"):
         _parse_real_teleop_args([*dual_formal_args, "--no-fix-arm"])
     assert "dual-side Active requires formal_teleop" in capsys.readouterr().err
-
-    with pytest.raises(SystemExit, match="2"):
-        _parse_real_teleop_args(
-            [
-                *dual_formal_args,
-                "--position-admittance-active-endpoint-policy",
-                "formal_teleop",
-            ]
-        )
-    assert "requires --no-fix-arm" in capsys.readouterr().err
 
     with pytest.raises(SystemExit, match="2"):
         _parse_real_teleop_args(

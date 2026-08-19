@@ -208,6 +208,9 @@ launcher 默认保留 200 GiB 空闲空间，可用 `--tactile-min-free-gb` 显�
 `POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_DAMPED_ADMITTANCE_ARGS`，即 15 Hz
 操作输入、60 Hz IK/qref、120 Hz qcmd，以及双臂平移/旋转 bounded force-admittance
 overlay；同时启用 Progress GUI、external tactile、artifact integrity 和空闲期无损压缩。
+该 profile 保留 fix-arm 控制器；active admittance 在固定侧通过运行时 side-activity
+门控暂停 modifier，在活动侧继续使用相同的 bounded overlay，因此不会因五踏板侧切换而
+丢失原有 60 Hz 控制配置。
 五踏板 1/2 继续使用单臂 Fix 语义，3/4/5 分别为 Advance、Failure、Undo；踏板服务必须
 与数采进程分终端运行。
 

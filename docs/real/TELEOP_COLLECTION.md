@@ -356,6 +356,9 @@ progress 采集可选用额外的物理踏板快捷键，不改变 GUI typed int
 五踏板的 A 仍开始/停止数采；B/C 的派发与双踏板专用 B/C 完全一致：B 负责双臂遥操、
 Hold、快速 Home 和单臂 Fix 释放，C 负责进入常规 Hold。网页和键盘都沿用同一套语义；
 五踏板的 F15/F16/F17 只增加 progress Advance/Failure/Undo，不会覆盖 G/GUI 的 Init。
+正式双侧 active force-admittance 不再通过全局 `--no-fix-arm` 关闭 Fix；modifier 在
+运行时对固定侧暂停、对活动侧保持原有 bounded overlay，因此五踏板侧切换与 60 Hz
+控制/数采配置可以同时生效。
 
 ```bash
 python -m hardware.foot_pad --count 5
