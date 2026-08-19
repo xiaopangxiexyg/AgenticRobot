@@ -4,11 +4,6 @@ DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy de
 和 dataset contracts。运行命令按领域统一维护在 [`docs/`](./docs/README.md)，不要从历史
 实验报告或日志中拼接参数。
 
-# 下载并解压assets: https://disk.pku.edu.cn/link/AAFC87022DDDD74051882C5F926A1DD540
-文件名：assets.zip
-有效期限：2026-09-17 12:16
-提取码：rDpF
-
 解压后不要为每个 linked worktree 复制约 3 GB 资产。按
 [`CONTRIBUTING.md`](./CONTRIBUTING.md) 用 `dev_asset_store.py configure` 记录一次本机资产根；
 以后 `claim_worktree.py` 会自动建立兼容映射并验证必需的 RM65 bundle。
