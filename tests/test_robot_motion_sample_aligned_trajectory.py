@@ -6,6 +6,7 @@ import pytest
 from robot_motion.position_control import (
     JointHorizonLimits,
     JointHorizonPlan,
+    JointHorizonState,
     SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP,
     SAMPLE_ALIGNED_SOURCE_LATCH_TIME_BUCKET,
     SampleAlignedJerkLimitedJointTrajectoryPlanner,
@@ -131,6 +132,44 @@ def test_split_horizon_remains_certified_when_next_source_is_late() -> None:
     planner.commit(extension)
     snapshot = planner.snapshot()
     assert snapshot["safety_horizon_source_steps"] == 6
+
+
+def test_split_horizon_certifies_near_joint_limit_with_qd_and_qdd() -> None:
+    # This is the boundary state that previously exposed the mismatch between
+    # the 1e-5 OSQP safety-horizon tolerance and the 1e-6-rad certificate.  The
+    # state is still inside the configured envelope; its positive qd/qdd make
+    # the long horizon actively brake toward the J3 upper limit.
+    planner = _planner(
+        safety_horizon_source_steps=6,
+        solver_tolerance=1e-4,
+    )
+    state = JointHorizonState(
+        q_rad=np.array([0.0, 0.0, 1.99, 0.0, 0.0, 0.0]),
+        qd_rad_s=np.array([0.0, 0.0, 0.003, 0.0, 0.0, 0.0]),
+        qdd_rad_s2=np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+    )
+    # reset() intentionally starts from a stationary state; inject the
+    # measured third-order state here to exercise the real continuation path.
+    planner._state = state
+    planner._active_admitted_qpos = state.q_rad.copy()
+    planner._active_requested_qpos = state.q_rad.copy()
+
+    assert planner._workspace.solver_tolerance == pytest.approx(1e-6)
+    admission = planner.prepare_target(
+        np.array([0.0, 0.0, 2.0, 0.0, 0.0, 0.0]),
+        source_timestamp=1.0,
+        speed_scale=1.0,
+        mode="tracking",
+        reason="joint_limit_regression",
+    )
+
+    assert admission.plan is not None
+    assert admission.plan.metadata["solver_tolerance"] == pytest.approx(1e-6)
+    assert np.max(admission.plan.q_path_rad[:, 2]) <= 2.0
+    assert np.max(np.abs(admission.plan.qd_path_rad_s[1:, 2])) <= 1.4 + 1e-6
+    assert np.max(np.abs(admission.plan.qdd_path_rad_s2[1:, 2])) <= 7.0 + 1e-6
+    jerk = np.diff(admission.plan.qdd_path_rad_s2[:, 2]) * planner.command_hz
+    assert np.max(np.abs(jerk)) <= (7.0 / 0.075) + 1e-5
 
 
 def test_split_horizon_contract_is_default_off_and_linear_hold_only() -> None:

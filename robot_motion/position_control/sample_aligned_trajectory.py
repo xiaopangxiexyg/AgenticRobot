@@ -44,6 +44,14 @@ SAMPLE_ALIGNED_SOURCE_LATCH_MODES = (
     SAMPLE_ALIGNED_SOURCE_LATCH_STRICT_TIMESTAMP,
 )
 
+# The horizon certificate accepts only microradian-scale numerical residue.
+# A long safety horizon uses normalized position rows, so OSQP's absolute
+# tolerance is multiplied by each joint's position scale.  Keeping the safety
+# workspace at 1e-6 prevents that normalized residual from crossing the
+# configured hard position envelope while leaving the physical limits and
+# certificate unchanged.
+_SAMPLE_ALIGNED_SAFETY_SOLVER_TOLERANCE = 1e-6
+
 # The safety workspace extends well beyond the four transitions that are
 # committed for each 60 Hz source cut.  Giving the remaining transitions only
 # a 1% position-tracking weight makes the solver optimize the first cut as if
@@ -276,7 +284,10 @@ class SampleAlignedJerkLimitedJointTrajectoryPlanner:
                 else 1e-7
             ),
             "solver_tolerance": (
-                min(float(solver_tolerance), 1e-5)
+                min(
+                    float(solver_tolerance),
+                    _SAMPLE_ALIGNED_SAFETY_SOLVER_TOLERANCE,
+                )
                 if self.safety_horizon_source_steps is not None
                 else float(solver_tolerance)
             ),
