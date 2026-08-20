@@ -161,6 +161,12 @@ class IdleMaintenanceProcessController:
         self._dataset_root: Path | None = None
         self._revision: str | None = None
         self._last_attempt_revision: str | None = None
+        # A forcibly stopped worker may have been killed between two durable
+        # artifact boundaries. Keep that revision blocked until the
+        # application validates and acknowledges recovery; otherwise the next
+        # idle tick immediately starts the same worker again.
+        self._blocked_revision: str | None = None
+        self._forced_termination_pending = False
         self._phase = "idle" if self.enabled else "disabled"
         self._pid: int | None = None
         self._outcome: str | None = None
@@ -260,10 +266,18 @@ class IdleMaintenanceProcessController:
         revision_text = str(revision).strip()
         if not revision_text:
             raise ValueError("revision must be non-empty.")
+        if self._forced_termination_pending:
+            return False
+        if self._blocked_revision == revision_text:
+            return False
+        if self._blocked_revision is not None and self._blocked_revision != revision_text:
+            # A changed catalog revision is a new maintenance candidate.
+            self._blocked_revision = None
         if self._last_attempt_revision == revision_text and self._outcome in {
             "completed",
             "no_work",
             "failed",
+            "recovered",
         }:
             return False
         receive_connection, send_connection = self._ctx.Pipe(duplex=False)
@@ -301,6 +315,8 @@ class IdleMaintenanceProcessController:
             self._result_connection = None
             self._phase = "error"
             self._last_attempt_revision = None
+            self._blocked_revision = None
+            self._forced_termination_pending = False
             raise
         send_connection.close()
         self._process = process
@@ -329,7 +345,7 @@ class IdleMaintenanceProcessController:
         requested_at = time.time()
         self.request_quiesce(reason=reason)
         process = self._process
-        forced = False
+        forced = bool(self._forced_termination_pending)
         timeout = (
             float(self.config.stop_timeout_sec)
             if timeout_sec is None
@@ -352,7 +368,9 @@ class IdleMaintenanceProcessController:
             if forced:
                 self._outcome = "cancelled"
                 self._error = "maintenance worker required forced termination"
-                self._last_attempt_revision = None
+                self._blocked_revision = self._revision
+                self._last_attempt_revision = self._revision
+                self._forced_termination_pending = True
             elif self._outcome is None:
                 self._outcome = "cancelled"
                 self._last_attempt_revision = None
@@ -393,6 +411,10 @@ class IdleMaintenanceProcessController:
 
         if not receipt.quiesced or receipt.forced_termination:
             raise RuntimeError("Only a cooperatively quiesced receipt may be acknowledged.")
+        if self._forced_termination_pending:
+            raise RuntimeError(
+                "Forced termination requires artifact recovery acknowledgement."
+            )
         if receipt.worker_error is None:
             return
         if self.running:
@@ -403,6 +425,36 @@ class IdleMaintenanceProcessController:
         if receipt.worker_error != self._error:
             raise RuntimeError("Quiesce receipt worker error is stale.")
         self._error = None
+
+    def acknowledge_forced_quiesce_receipt(
+        self,
+        receipt: IdleMaintenanceQuiesceReceipt,
+    ) -> None:
+        """Acknowledge a forced stop after application-level recovery.
+
+        The controller does not inspect dataset files itself. The caller must
+        validate its owned artifact graph first. The forced revision remains
+        blocked after acknowledgement, so it cannot be restarted until a new
+        catalog revision is observed.
+        """
+
+        if not receipt.quiesced or not receipt.forced_termination:
+            raise RuntimeError("Expected a forcibly quiesced receipt.")
+        if self.running:
+            raise RuntimeError(
+                "Cannot acknowledge forced termination while maintenance is running."
+            )
+        current_root = None if self._dataset_root is None else str(self._dataset_root)
+        if receipt.dataset_root != current_root:
+            raise RuntimeError("Quiesce receipt dataset root is stale.")
+        if receipt.worker_error != self._error:
+            raise RuntimeError("Quiesce receipt worker error is stale.")
+        if not self._forced_termination_pending:
+            raise RuntimeError("No forced termination is pending acknowledgement.")
+        self._error = None
+        self._outcome = "recovered"
+        self._forced_termination_pending = False
+        self._phase = "quiesced" if self.enabled else "disabled"
 
     def close(self) -> None:
         self.quiesce(reason="controller_close")

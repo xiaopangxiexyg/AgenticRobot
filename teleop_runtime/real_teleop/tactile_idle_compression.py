@@ -40,6 +40,54 @@ def _catalog_revision(dataset_root: Path) -> str | None:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _validate_capture_artifact_graph(
+    *,
+    dataset_root: str | Path | None,
+    tactile_bundle_root: str | Path | None,
+    integrity_enabled: bool,
+    failure_context: str,
+) -> None:
+    """Validate the post-worker graph before a hot runtime transition.
+
+    This is deliberately read-only.  The idle worker already owns all
+    recompression mutations; the transition boundary only proves that the
+    committed graph remains append-compatible (and, when requested, that
+    stored payload hashes still verify).
+    """
+
+    if dataset_root is None:
+        raise RuntimeError(
+            f"{failure_context} but no dataset root is available for "
+            "capture-admission validation"
+        )
+    admission_root = dataset_root
+    root = Path(dataset_root).expanduser().resolve()
+    native_identity = (
+        root / "meta/tactile_bundle_v1/dataset_identity.cjson"
+    ).is_file()
+    if native_identity:
+        if tactile_bundle_root is None or not str(tactile_bundle_root).strip():
+            raise RuntimeError(
+                f"{failure_context} but no tactile bundle root is available "
+                "for attachment validation"
+            )
+        assert_dataset_capture_writable(
+            admission_root,
+            tactile_bundle_root=tactile_bundle_root,
+        )
+        attach_tactile_bundle(
+            admission_root,
+            tactile_bundle_root,
+            verify_payload_hashes=bool(integrity_enabled),
+        )
+        return
+    # Preserve the legacy single-root admission call shape for existing
+    # callers/tests and for datasets that do not use native separation.
+    assert_dataset_capture_writable(admission_root)
+    if bool(integrity_enabled):
+        assert_dataset_capture_integrity_compatible(admission_root)
+
+
 def assert_idle_tactile_transition_safe(
     receipt: IdleMaintenanceQuiesceReceipt,
     *,
@@ -51,10 +99,10 @@ def assert_idle_tactile_transition_safe(
 
     A cooperative worker error can be tolerated only after the canonical
     dataset admission checks prove that the currently referenced graph is
-    complete.  Forced termination is different: the worker may have been
-    killed inside a codec subprocess or atomic transaction boundary, so the
-    operator must retry/recover from the idle state instead of entering Home
-    or starting an Episode with uncertain process/file state.
+    complete.  A forced termination takes the same read-only recovery path:
+    the graph must validate before the hot transition is admitted.  Once that
+    proof succeeds the controller latches the attempted catalog revision and
+    will not restart it until the catalog changes.
     """
 
     if not receipt.quiesced:
@@ -62,43 +110,34 @@ def assert_idle_tactile_transition_safe(
             f"idle tactile compression did not quiesce: {receipt.reason}"
         )
     if receipt.forced_termination:
-        raise RuntimeError(
-            "idle tactile compression required forced termination; remain in "
-            "the idle/Hold state and retry after artifact recovery"
-        )
+        try:
+            _validate_capture_artifact_graph(
+                dataset_root=dataset_root,
+                tactile_bundle_root=tactile_bundle_root,
+                integrity_enabled=integrity_enabled,
+                failure_context=(
+                    "idle tactile compression required forced termination; "
+                    "artifact recovery validation failed"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve Hold fail-closed path.
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "idle tactile compression required forced termination;"
+            ):
+                raise
+            raise RuntimeError(
+                "idle tactile compression required forced termination; "
+                f"artifact recovery validation failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return
     if not receipt.worker_error:
         return
-    if dataset_root is None:
-        raise RuntimeError(
-            "idle tactile compression reported an error but no dataset root "
-            "is available for capture-admission validation"
-        )
-    native_identity = (
-        dataset_root is not None
-        and Path(dataset_root).expanduser().resolve()
-        / "meta/tactile_bundle_v1/dataset_identity.cjson"
-    ).is_file()
-    if native_identity:
-        if tactile_bundle_root is None or not str(tactile_bundle_root).strip():
-            raise RuntimeError(
-                "native tactile worker reported an error but no tactile bundle root "
-                "is available for attachment validation"
-            )
-        assert_dataset_capture_writable(
-            dataset_root,
-            tactile_bundle_root=tactile_bundle_root,
-        )
-        attach_tactile_bundle(
-            dataset_root,
-            tactile_bundle_root,
-            verify_payload_hashes=bool(integrity_enabled),
-        )
-        return
-    # Preserve the legacy single-root admission call shape for existing
-    # callers/tests and for datasets that do not use native separation.
-    assert_dataset_capture_writable(dataset_root)
-    if bool(integrity_enabled):
-        assert_dataset_capture_integrity_compatible(dataset_root)
+    _validate_capture_artifact_graph(
+        dataset_root=dataset_root,
+        tactile_bundle_root=tactile_bundle_root,
+        integrity_enabled=integrity_enabled,
+        failure_context="idle tactile compression reported an error",
+    )
 
 
 class _IdleTactileWorker:
@@ -272,9 +311,12 @@ class RealTeleopIdleTactileCompression:
         self,
         receipt: IdleMaintenanceQuiesceReceipt,
     ) -> None:
-        """Consume a sticky worker error after dataset admission succeeds."""
+        """Consume a sticky worker result after artifact admission succeeds."""
 
-        self.controller.acknowledge_quiesce_receipt(receipt)
+        if receipt.forced_termination:
+            self.controller.acknowledge_forced_quiesce_receipt(receipt)
+        else:
+            self.controller.acknowledge_quiesce_receipt(receipt)
 
     def require_safe_transition(
         self,
@@ -307,7 +349,8 @@ class RealTeleopIdleTactileCompression:
             "TactileCompression",
             "quiesced before latency-sensitive transition "
             f"reason={reason} forced={receipt.forced_termination} "
-            f"syncfs={receipt.filesystem_barrier_applied}",
+            f"syncfs={receipt.filesystem_barrier_applied} "
+            f"recovery={'validated' if receipt.forced_termination else 'not_needed'}",
         )
         return receipt
 

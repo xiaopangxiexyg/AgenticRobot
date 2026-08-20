@@ -37,6 +37,12 @@ def _failing_worker(dataset_root: str, stop_event: object) -> dict[str, object]:
     raise RuntimeError("synthetic maintenance failure")
 
 
+def _uncooperative_worker(dataset_root: str, stop_event: object) -> dict[str, object]:
+    del dataset_root, stop_event
+    while True:
+        time.sleep(1.0)
+
+
 def _wait_until(predicate: object, *, timeout_sec: float = 5.0) -> None:
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -124,6 +130,35 @@ class IdleMaintenanceProcessControllerTest(unittest.TestCase):
                 controller.start_if_eligible(temporary, revision="revision-1")
             )
 
+    def test_forced_stop_blocks_same_revision_until_recovery_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = IdleMaintenanceProcessController(
+                _uncooperative_worker,
+                config=IdleMaintenanceConfig(
+                    stop_timeout_sec=0.01,
+                    terminate_timeout_sec=0.5,
+                ),
+            )
+            self.assertTrue(
+                controller.start_if_eligible(temporary, revision="revision-1")
+            )
+            receipt = controller.quiesce(reason="runtime_home")
+            self.assertTrue(receipt.forced_termination)
+            retry_receipt = controller.quiesce(reason="runtime_home_retry")
+            self.assertTrue(retry_receipt.forced_termination)
+            self.assertFalse(
+                controller.start_if_eligible(temporary, revision="revision-1")
+            )
+
+            controller.acknowledge_forced_quiesce_receipt(retry_receipt)
+            self.assertFalse(
+                controller.start_if_eligible(temporary, revision="revision-1")
+            )
+            self.assertTrue(
+                controller.start_if_eligible(temporary, revision="revision-2")
+            )
+            controller.quiesce(reason="test_cleanup")
+
 
 class RealTeleopIdleTactileCompressionAdmissionTest(unittest.TestCase):
     def test_acknowledged_error_does_not_rescan_open_episode_on_runtime_home(self) -> None:
@@ -163,7 +198,7 @@ class RealTeleopIdleTactileCompressionAdmissionTest(unittest.TestCase):
                 )
             writable.assert_not_called()
 
-    def test_forced_worker_stop_never_admits_hot_transition(self) -> None:
+    def test_forced_worker_stop_admits_after_graph_validation(self) -> None:
         receipt = IdleMaintenanceQuiesceReceipt(
             quiesced=True,
             reason="episode_start",
@@ -176,12 +211,43 @@ class RealTeleopIdleTactileCompressionAdmissionTest(unittest.TestCase):
             worker_error="maintenance worker required forced termination",
         )
 
-        with self.assertRaisesRegex(RuntimeError, "forced termination"):
+        with mock.patch(
+            "teleop_runtime.real_teleop.tactile_idle_compression."
+            "assert_dataset_capture_writable"
+        ) as writable:
             assert_idle_tactile_transition_safe(
                 receipt,
                 dataset_root="/tmp/synthetic-dataset",
                 integrity_enabled=True,
             )
+        writable.assert_called_once_with("/tmp/synthetic-dataset")
+
+    def test_forced_worker_stop_keeps_transition_closed_when_recovery_fails(self) -> None:
+        receipt = IdleMaintenanceQuiesceReceipt(
+            quiesced=True,
+            reason="episode_start",
+            dataset_root="/tmp/synthetic-dataset",
+            requested_at=1.0,
+            effective_at=2.0,
+            forced_termination=True,
+            filesystem_barrier_applied=True,
+            worker_outcome="cancelled",
+            worker_error="maintenance worker required forced termination",
+        )
+
+        with mock.patch(
+            "teleop_runtime.real_teleop.tactile_idle_compression."
+            "assert_dataset_capture_writable",
+            side_effect=RuntimeError("synthetic recovery failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "artifact recovery validation failed"
+            ):
+                assert_idle_tactile_transition_safe(
+                    receipt,
+                    dataset_root="/tmp/synthetic-dataset",
+                    integrity_enabled=False,
+                )
 
     def test_cooperative_worker_error_revalidates_integrity_graph(self) -> None:
         receipt = IdleMaintenanceQuiesceReceipt(
