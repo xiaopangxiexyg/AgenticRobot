@@ -339,7 +339,114 @@ FormalCollection 的 8/19、8/20 都是 P2-4，但 8/19 tactile 已在 NAS、8/2
 tactile 仍在 FormalCollection 外置容器；二者可以作为同 profile 的逻辑候选，
 但不能在没有 attachment receipt、annotation 和 identity 去重前物理合并。
 
-### 8.2 明确不能自动合并的对象
+### 8.2 “合并”的四种不同含义
+
+后续执行时不能把下面四种操作都叫“merge”，否则很容易把派生副本重复计入
+训练，或误删仍被 OpenPI 引用的 source：
+
+| 类型 | 含义 | 是否增加 episode | 是否改变原目录 | 当前建议 |
+|---|---|---:|---:|---|
+| `D0_ALIAS_DEDUP` | 两个路径只是同一 symlink/alias/同一 dataset identity | 否 | 否 | 只在 index 中保留一个 canonical path；2026-08-07 根目录 alias 属于此类 |
+| `D1_LINEAGE_DEDUP` | 同一采集源的 `_v22`、`_v23`、filtered、pose-consistent 或 camera projection | 否 | 否 | 保留 parent + derived lineage；训练 selector 选择一个视图，不把变体相加 |
+| `D2_LOGICAL_APPEND` | 不同采集 session、episode identity 不重叠，但 profile/schema/modality 兼容 | 是 | 否 | 首选方式；生成只读 logical manifest/index，源目录保持原样 |
+| `D3_MATERIALIZED_MERGE` | 将 D2 结果写入一个新物理目录 | 是 | 不覆盖源 | 只有 D2 manifest、inode、backup、视频/Parquet/tactile 校验全部通过后才考虑 |
+
+因此，“同一日期的相同采集数据合并”在本计划中默认指 **D2 logical append**，
+不是把几个目录直接 `cp` 到同一个目录，也不是删除原始来源。对于同一 session
+的变体，优先判为 D1；对于同一天分多次正式采集、profile 和 schema 完全一致的
+session，才判为 D2。
+
+### 8.3 同日期/同采集主题的逐组合并建议
+
+下表是当前最具体的执行建议。`候选 episode 数` 是物理计数的算术和，只能作为
+预估；最终 manifest 必须按 dataset UUID、episode identity、时间戳和 content
+hash 去重后再确定实际数量。
+
+| 日期/组 | 涉及目录 | 关系判定 | 建议的合并目标 | 当前动作 |
+|---|---|---|---|---|
+| 2026-07-23 C05 vive | `2026-07-23_vive_rm65_real_teleop_old_version`、`_v22`、`_v22_measured_state`、`_v23` | 同一 C05 采集的语义/状态变体，D1；不是四份独立数据 | `lineage/C05`，只保留一个 parent identity；视觉训练使用已验证的 13-episode `old_version_v23.camera_only_v1` | 不做 D2；502 条腕视频损坏，禁止把四个 515-episode 目录相加 |
+| 2026-07-23 DMTAC | `2026-07-23_dmtac_rm65_bimanual_position_v1` | 与 C05 不同采集协议，虽同日但不是同一主题 | 独立 `P1-1` 小集合 | 不与 vive 合并 |
+| 2026-07-24 vive | `2026-07-24_vive_rm65_real_teleop`、`_filtered_no184`、`_v22`、`_v22_pose_consistent`、`_v23` | base 与筛选/语义变体，D1；241-episode 版本很可能是 base 去掉 episode 184 的派生 | parent + `filtered_no184`/`v23` camera selector | 不把 242 和 241 相加；使用 `v23_camera_only_v1` 时只读其 241/35667 视图 |
+| 2026-07-24 DMTAC | `2026-07-24_dmtac_rm65_bimanual_position_v1` | 与 vive 不同 protocol/task，D0/D1 均不成立 | 独立无 profile 小集合 | 不合并 |
+| 2026-07-25 C12 | `2026-07-25_vive_rm65_real_teleop`、`_filtered_no283`、`_v22` | 同一 C12 parent/filtered/v22，D1 | 仅以 episode 283 的完整相机证据建立小型 camera selector | 不把 311、310、310 相加；`filtered_no283` 的 camera-only 结果为空 |
+| 2026-07-27 | `2026-07-27_dmtac_rm65_bimanual_position_v1_old`、`...v2_responsive` | task/profile/采集目的不同，D2 条件不满足 | C15 repair projection 单独；responsive 单独 | 不合并；旧源只作为相机修复 lineage |
+| 2026-07-30 | `2026-07-30_dmtac_rm65_bimanual_position_v1` | 单个 `P1-1` session | `P1-1` logical group | 无同日候选，保持独立 |
+| 2026-07-31 | `...bimanual_position_v2`、`...writing_four_stage`、`DexTeleop_StableCollect_0705/...vive...` | 语义/profile/设备来源不同；前者 progress 不完整 | `P1-4` 只和自己的 camera-only view 配对 | 不跨 profile/设备合并；v2 缺 profile 先冻结 |
+| 2026-08-03 P2-4 | `DexTeleop/datasets/2026-08-03...4_stage`（5 ep）与 `DexTeleop_0803/datasets/2026-08-03...4_stage`（202 ep） | 同日、同 task、同 progress/stage hash 的两次采集，D2 候选 | `logical/p2-4/2026-08-03`，预估 207 ep；保留两个 source path 和来源字段 | 先做 identity/overlap 校验；不覆盖 OpenPI profile |
+| 2026-08-03 P2-5 | `DexTeleop_0803/datasets/2026-08-03...5_stage` | 与 P2-4 多一个 `right_dip_ink`，D2 不兼容 | 独立 `P2-5` logical group | 不加入 P2-4 |
+| 2026-08-04 | `DexTeleop_0803/datasets/2026-08-04...4_stage` | 单一 P2-4 session，当前为 OpenPI 保护源 | 保持原 source；可加入受保护 P2-4 selector | 不物理移动、不改配置 |
+| 2026-08-05 | `DexTeleop_0803/datasets/2026-08-05...4_stage` | 单一 P2-4 session，当前为 OpenPI 保护源 | 保持原 source；可加入受保护 P2-4 selector | 不物理移动、不改配置 |
+| 2026-08-06 P2-4 | `...2026-08-06...4_stage`（35 ep）、`..._1453`（206 ep）、`..._stable`（53 ep） | 同日、同 task、同 P2-4 hashes，三次 session，D2 强候选 | `logical/p2-4/2026-08-06`，预估 294 ep；保留 session/source 字段 | OpenPI 当前期望 eligible 为 35+203+51=289，不能用物理总数替换 selector |
+| 2026-08-07 FormalCollection | `2026-08-07...4_stage`（129 ep）与 `...4_stage__part02`（202 ep） | 同日、同 profile；`/home/user/zc/datasets/2026-08-07...` 是指向 part02 的 alias，D0 + D2 组合 | `logical/formal/2026-08-07/p2-4`，预估 331 ep（不重复计算 alias） | 先校验两目录 identity/时间不重叠；alias 不能计为第三份 |
+| 2026-08-10 P2-4 | `...multi_choise_stage1`（113 ep）、`...4_stage`（53 ep）、`...4_stage_stable`（296 ep）、另一个同名 `...multi_choise_stage1`（153 ep） | 同 profile，但 normal/stable/multi-choice 是场景标签；两个同名目录必须按 UUID 区分 | 建立 `logical/formal/2026-08-10/p2-4/all`，并派生 `normal`、`stable`、`multi_choice` 子 selector；预估 615 ep | 可以 D2 logical append，但不能抹掉场景标签或直接物理改名 |
+| 2026-08-11 P2-4 | `...interrupt_choice_stage1`（201 ep）、`...multi_choise_stage1`（251 ep） | 同 profile、不同 scenario，D2 候选 | `logical/formal/2026-08-11/p2-4/all`，保留 `interrupt_choice`/`multi_choice` 标签；预估 452 ep | 待确认训练是否允许两种场景进入同一 selector |
+| 2026-08-12 | `...60hz_admittance_left_gripper_offline_test` | 0 episode/0 frame scratch，非正式采集 | 不进入任何训练集合 | 永久标记 scratch，不合并 |
+| 2026-08-19/20 | `2026-08-19_4_stage_writing_detail`（159 ep）、`2026-08-20_4_stage_writing_detail`（46 ep） | 不同日期但同 P2-4 profile；tactile 分别 NAS external 与 FormalCollection external | `logical/formal/p2-4/detail`，预估 205 ep，保留 date/session/tactile receipt | 先补齐两份 external graph 和 annotation/quality，再 D2 |
+
+#### 同日合并的实际优先级
+
+若目标是先整理“同一日期的相同采集”，建议按以下顺序推进：
+
+1. **第一优先：2026-08-06 P2-4**。三目录 profile/hash 完全一致，且 OpenPI
+   已有明确的 35/203/51 eligible selector；只需生成不改变旧配置的 logical
+   append index。
+2. **第二优先：2026-08-07 FormalCollection P2-4**。先处理 part02 alias 去重，
+   再确认 129 与 202 episode 没有重复 identity。
+3. **第三优先：2026-08-03 P2-4**。5 episode 与 202 episode 可同组，但五阶段
+   108 episode 必须隔离。
+4. **第四优先：2026-08-10/11 P2-4 场景组**。可以同 profile 追加，但保留
+   `normal/stable/multi_choice/interrupt_choice` 场景标签，先建立总 selector
+   和子 selector，不急于物理合并。
+5. **第五优先：2026-08-19/20 detail**。两者 tactile attachment 状态不同，待
+   NAS/FormalCollection receipt 完整后再加入 P2-4 detail selector。
+
+### 8.4 同日合并必须满足的“相同采集”定义
+
+“同一天、目录名相似”不足以判定相同采集。一个目录只有同时满足以下条件，
+才能进入同日 D2 logical append：
+
+```text
+same normalized task_id
+same action/observation schema hash
+same progress hash and stage hash (or both explicitly have no progress)
+same physical embodiment/end-effector semantics
+same camera role/normalization and declared color/depth contract
+episode identity and source time range are disjoint
+no unresolved failure/annotation/quality conflict
+tactile graph is either equally local, or each external reference has a receipt
+no source is an invalid audit, camera-only projection, or known damaged lineage
+```
+
+只要其中一项不满足：
+
+- 仍可保留为同一日期的**目录族/lineage group**；
+- 不能进入同一个默认训练 selector；
+- 不能以 episode 数相加作为合并成功证据；
+- 不能覆盖任何 OpenPI 现有 source path。
+
+### 8.5 camera-only 视图与 native source 的对应关系
+
+为避免同一 episode 被 native 和 camera-only 重复计入，派生视图应记录明确的
+`source_dataset_identity` 与 `source_episode_id`。当前已知映射如下：
+
+| camera-only/repair 视图 | 对应 source | 允许用途 |
+|---|---|---|
+| 2026-07-23 DMTAC `camera_only_v3` | 2026-07-23 DMTAC P1-1 | camera-only P1-1 |
+| C05 `old_version_v23.camera_only_v1` | C05 四个 vive lineage 目录 | 仅 13 个完整 episode 的视觉 selector |
+| 2026-07-24 DMTAC `camera_only_v1` | 2026-07-24 DMTAC | camera-only 单 episode |
+| 2026-07-24 vive `v23_camera_only_v1` | 2026-07-24 vive v23/filtered lineage | 241 episode 视觉 selector |
+| 2026-07-25 `v22.camera_only_v1` | C12 lineage | 当前为空，不可用 |
+| 2026-07-27 responsive camera-only | 2026-07-27 responsive source | camera-only responsive |
+| 2026-07-30 DMTAC camera-only | 2026-07-30 P1-1 | camera-only P1-1 |
+| 2026-07-31 v2 / writing four-stage camera-only | 对应同名 native source | 各自 profile；不能互相替代 |
+| 2026-08-03/04/05/StableCollect views | 对应 source path 前缀 | camera-only selector；不含 tactile |
+| C15 `camera_semantic_repairs/...` | 2026-07-27 old source | 修复后的独立 camera projection |
+
+camera-only 视图最多只能作为同 source 的一个 modality projection。若训练需要
+action/qpos/tactile，必须回到 native/external graph；不能因为 camera-only 目录
+可正常加载就把它当成完整 dataset。
+
+### 8.6 明确不能自动合并的对象
 
 - C05/C12 损坏源及其 full-size 变体；
 - `camera_semantic_prepared_views/_invalid_audit/*`；
@@ -392,6 +499,14 @@ tactile 仍在 FormalCollection 外置容器；二者可以作为同 profile 的
   是测试材料，不是训练数据。
 - 当前最安全的整理顺序是：先按 profile/hash 和质量语义建立 logical index，
   再处理 tactile attachment，最后才考虑 fresh-inode 的物理合并。
+- 同日期同采集的首批 D2 logical append 目标已经明确为：2026-08-06 P2-4
+  （35+206+53）、2026-08-07 FormalCollection P2-4（129+202，排除 alias
+  重复）、2026-08-03 P2-4（5+202）、2026-08-10/11 P2-4 场景组，以及
+  2026-08-19/20 detail P2-4。这里的数量只是待校验上限，不能替代最终
+  identity 去重和 OpenPI eligibility。
+- 同日不同 task/protocol、同一 source 的 v22/v23/filtered 变体、camera-only
+  projection 和 P2-4/P2-5 profile 差异，明确保持 D0/D1/隔离，不进行 episode
+  相加。
 - OpenPI 现有 profile 和 8/4–8/6 保护源必须保持不变；任何合并计划都只能
   通过新的 selector/manifest 或原子配置迁移实现。
 - 旧路径与 canonical 路径的 link 语义存在文档与 `lstat` 证据不一致，必须
