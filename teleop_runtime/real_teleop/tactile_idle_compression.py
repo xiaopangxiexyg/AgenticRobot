@@ -19,7 +19,9 @@ from collection_runtime.tactile_recompression import (
 from collection_runtime.tactile_bundle_recompression import (
     run_idle_native_tactile_recompression_worker,
 )
-from dataset_interface.tactile_bundle import attach_tactile_bundle
+from dataset_interface.tactile_bundle import (
+    attach_tactile_bundle,
+)
 from dataset_interface.modality_artifacts import (
     assert_dataset_capture_integrity_compatible,
     assert_dataset_capture_writable,
@@ -86,6 +88,41 @@ def _validate_capture_artifact_graph(
     assert_dataset_capture_writable(admission_root)
     if bool(integrity_enabled):
         assert_dataset_capture_integrity_compatible(admission_root)
+
+
+def _is_historical_payload_hash_mismatch(error: BaseException) -> bool:
+    """Recognize only a physical payload hash fault in the committed graph.
+
+    Identity, manifest, component, and commit mismatches remain hard admission
+    failures.  A payload hash mismatch is handled separately because an old
+    compressed payload may be irrecoverable in-place after its raw predecessor
+    has been retired; repeatedly blocking the live operator cannot repair it.
+    """
+
+    marker = "tactile artifact hash mismatch:"
+    payload_marker = "tactile payload hash mismatch:"
+    pending: list[BaseException | None] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        message = str(current)
+        if payload_marker in message:
+            return True
+        if marker in message:
+            # Older bundle validators used one marker for both manifest and
+            # payload hashes. Preserve compatibility with those errors while
+            # keeping a manifest hash failure fail-closed: native manifests
+            # are committed JSON files, whereas stream payloads are binary
+            # artifacts (for example ``*.uint8.bin.tdelta8.zst``).
+            suffix = message.split(marker, 1)[1].strip().split(None, 1)[0]
+            if suffix and not suffix.lower().endswith((".json", ".cjson")):
+                return True
+        pending.append(current.__cause__)
+        pending.append(current.__context__)
+    return False
 
 
 def assert_idle_tactile_transition_safe(
@@ -334,16 +371,35 @@ class RealTeleopIdleTactileCompression:
             reason=reason,
             timeout_sec=timeout_sec,
         )
-        assert_idle_tactile_transition_safe(
-            receipt,
-            dataset_root=dataset_root,
-            tactile_bundle_root=(
-                self.tactile_bundle_root
-                if tactile_bundle_root is None
-                else tactile_bundle_root
-            ),
-            integrity_enabled=integrity_enabled,
-        )
+        try:
+            assert_idle_tactile_transition_safe(
+                receipt,
+                dataset_root=dataset_root,
+                tactile_bundle_root=(
+                    self.tactile_bundle_root
+                    if tactile_bundle_root is None
+                    else tactile_bundle_root
+                ),
+                integrity_enabled=integrity_enabled,
+            )
+        except Exception as exc:  # noqa: BLE001 - classify one explicit degraded path.
+            if not _is_historical_payload_hash_mismatch(exc):
+                raise
+            degraded_reason = (
+                "historical tactile payload hash mismatch; idle compression disabled"
+            )
+            self.controller.disable_after_degraded_quiesce_receipt(
+                receipt,
+                reason=degraded_reason,
+            )
+            self.enabled = False
+            log(
+                "TactileCompression",
+                "历史触觉 payload 校验失败，已保留原文件并停用后台压缩；"
+                "本次 Home/数采继续，需离线修复该 episode 后重启 idle 压缩："
+                f"{type(exc).__name__}: {exc}",
+            )
+            return receipt
         self.acknowledge_safe_transition(receipt)
         log(
             "TactileCompression",

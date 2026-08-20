@@ -17,6 +17,7 @@ from teleop_runtime.real_teleop.tactile_idle_compression import (
     RealTeleopIdleTactileCompression,
     assert_idle_tactile_transition_safe,
 )
+from dataset_interface.tactile_bundle import TactileBundleAttachmentError
 
 
 def _cooperative_worker(dataset_root: str, stop_event: object) -> dict[str, object]:
@@ -159,8 +160,141 @@ class IdleMaintenanceProcessControllerTest(unittest.TestCase):
             )
             controller.quiesce(reason="test_cleanup")
 
+    def test_degraded_quiesce_disables_worker_without_restarting_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = IdleMaintenanceProcessController(_no_work_worker)
+            self.assertTrue(
+                controller.start_if_eligible(temporary, revision="revision-1")
+            )
+            _wait_until(lambda: controller.poll().phase == "completed")
+            receipt = controller.quiesce(reason="runtime_home")
+
+            controller.disable_after_degraded_quiesce_receipt(
+                receipt,
+                reason="historical tactile payload hash mismatch",
+            )
+
+            snapshot = controller.snapshot()
+            self.assertFalse(snapshot.enabled)
+            self.assertEqual(snapshot.phase, "disabled")
+            self.assertEqual(snapshot.outcome, "degraded")
+            self.assertFalse(
+                controller.start_if_eligible(temporary, revision="revision-2")
+            )
+
 
 class RealTeleopIdleTactileCompressionAdmissionTest(unittest.TestCase):
+    def test_historical_payload_hash_mismatch_disables_idle_and_admits_transition(self) -> None:
+        receipt = IdleMaintenanceQuiesceReceipt(
+            quiesced=True,
+            reason="runtime_home",
+            dataset_root="/tmp/synthetic-dataset",
+            requested_at=1.0,
+            effective_at=2.0,
+            forced_termination=False,
+            filesystem_barrier_applied=True,
+            worker_outcome="failed",
+            worker_error="TactileBundleAttachmentError: tactile artifact hash mismatch: tactile/foo.zst",
+        )
+        facade = RealTeleopIdleTactileCompression(enabled=True)
+        facade.controller = mock.Mock()
+        facade.require_quiesced = mock.Mock(return_value=receipt)
+        logs: list[tuple[str, str]] = []
+
+        with mock.patch(
+            "teleop_runtime.real_teleop.tactile_idle_compression.assert_idle_tactile_transition_safe",
+            side_effect=TactileBundleAttachmentError(
+                "tactile artifact hash mismatch: tactile/foo.zst"
+            ),
+        ):
+            returned = facade.require_safe_transition(
+                reason="runtime_home",
+                dataset_root="/tmp/synthetic-dataset",
+                integrity_enabled=True,
+                log=lambda category, message: logs.append((category, message)),
+            )
+
+        self.assertIs(returned, receipt)
+        facade.controller.disable_after_degraded_quiesce_receipt.assert_called_once()
+        self.assertFalse(facade.enabled)
+        self.assertTrue(logs)
+        self.assertIn("Home/数采继续", logs[0][1])
+
+    def test_wrapped_forced_payload_hash_mismatch_uses_same_degraded_path(self) -> None:
+        receipt = IdleMaintenanceQuiesceReceipt(
+            quiesced=True,
+            reason="runtime_home",
+            dataset_root="/tmp/synthetic-dataset",
+            requested_at=1.0,
+            effective_at=2.0,
+            forced_termination=True,
+            filesystem_barrier_applied=True,
+            worker_outcome="cancelled",
+            worker_error="maintenance worker required forced termination",
+        )
+        facade = RealTeleopIdleTactileCompression(enabled=True)
+        facade.controller = mock.Mock()
+        facade.require_quiesced = mock.Mock(return_value=receipt)
+        logs: list[tuple[str, str]] = []
+
+        with mock.patch(
+            "teleop_runtime.real_teleop.tactile_idle_compression.assert_idle_tactile_transition_safe",
+            side_effect=RuntimeError(
+                "idle tactile compression required forced termination; "
+                "artifact recovery validation failed: TactileBundleAttachmentError: "
+                "tactile artifact hash mismatch: tactile/foo.zst"
+            ),
+        ):
+            returned = facade.require_safe_transition(
+                reason="runtime_home",
+                dataset_root="/tmp/synthetic-dataset",
+                integrity_enabled=True,
+                log=lambda category, message: logs.append((category, message)),
+            )
+
+        self.assertIs(returned, receipt)
+        facade.controller.disable_after_degraded_quiesce_receipt.assert_called_once()
+        self.assertFalse(facade.enabled)
+        self.assertTrue(logs)
+
+    def test_manifest_hash_mismatch_remains_fail_closed(self) -> None:
+        receipt = IdleMaintenanceQuiesceReceipt(
+            quiesced=True,
+            reason="runtime_home",
+            dataset_root="/tmp/synthetic-dataset",
+            requested_at=1.0,
+            effective_at=2.0,
+            forced_termination=False,
+            filesystem_barrier_applied=True,
+            worker_outcome="failed",
+            worker_error=(
+                "TactileBundleAttachmentError: tactile artifact hash mismatch: "
+                "tactile/chunk-000/episode_000018/right/manifest.json"
+            ),
+        )
+        facade = RealTeleopIdleTactileCompression(enabled=True)
+        facade.controller = mock.Mock()
+        facade.require_quiesced = mock.Mock(return_value=receipt)
+
+        error = TactileBundleAttachmentError(
+            "tactile artifact hash mismatch: "
+            "tactile/chunk-000/episode_000018/right/manifest.json"
+        )
+        with mock.patch(
+            "teleop_runtime.real_teleop.tactile_idle_compression.assert_idle_tactile_transition_safe",
+            side_effect=error,
+        ):
+            with self.assertRaisesRegex(TactileBundleAttachmentError, "manifest.json"):
+                facade.require_safe_transition(
+                    reason="runtime_home",
+                    dataset_root="/tmp/synthetic-dataset",
+                    integrity_enabled=True,
+                    log=lambda *_args: None,
+                )
+
+        facade.controller.disable_after_degraded_quiesce_receipt.assert_not_called()
+        self.assertTrue(facade.enabled)
+
     def test_acknowledged_error_does_not_rescan_open_episode_on_runtime_home(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = IdleMaintenanceProcessController(_failing_worker)

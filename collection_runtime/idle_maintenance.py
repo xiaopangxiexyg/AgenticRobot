@@ -456,6 +456,45 @@ class IdleMaintenanceProcessController:
         self._forced_termination_pending = False
         self._phase = "quiesced" if self.enabled else "disabled"
 
+    def disable_after_degraded_quiesce_receipt(
+        self,
+        receipt: IdleMaintenanceQuiesceReceipt,
+        *,
+        reason: str,
+    ) -> None:
+        """Disable idle maintenance after a known historical artifact fault.
+
+        This is deliberately narrower than acknowledging a successful recovery:
+        the caller has determined that an already-committed artifact is
+        irreparably inconsistent, so the worker must never be restarted for the
+        same catalog revision.  The artifact remains untouched for offline
+        repair, while the live application can continue without repeatedly
+        blocking Home or formal collection.
+        """
+
+        if not receipt.quiesced:
+            raise RuntimeError("Expected a quiesced receipt.")
+        if self.running:
+            raise RuntimeError(
+                "Cannot disable idle maintenance while the worker is running."
+            )
+        current_root = None if self._dataset_root is None else str(self._dataset_root)
+        if receipt.dataset_root != current_root:
+            raise RuntimeError("Quiesce receipt dataset root is stale.")
+        if receipt.forced_termination:
+            if not self._forced_termination_pending:
+                raise RuntimeError("No forced termination is pending acknowledgement.")
+        elif receipt.worker_error != self._error:
+            raise RuntimeError("Quiesce receipt worker error is stale.")
+        self.enabled = False
+        self._phase = "disabled"
+        self._error = None
+        self._outcome = "degraded"
+        self._forced_termination_pending = False
+        self._blocked_revision = self._revision
+        self._last_attempt_revision = self._revision
+        self._needs_filesystem_barrier = False
+
     def close(self) -> None:
         self.quiesce(reason="controller_close")
 
