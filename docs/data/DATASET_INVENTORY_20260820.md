@@ -172,8 +172,8 @@ UUID 为 `e25d726e-bef0-4414-ba14-a3a2b6d7b14e` 和
 | 7 | `2026-08-11_dmtac_rm65_bimanual_position_v2_writing_interrupt_choice_stage1` | 4.5G | 201 / 37069 | external, `T-local`, none | `P2-4` | interrupt-choice 场景；后续需按语义标签决定是否进入主集合 |
 | 8 | `2026-08-11_dmtac_rm65_bimanual_position_v2_writing_multi_choise_stage1` | 3.7G | 251 / 29620 | external, `T-local`, none | `P2-4` | multi-choice 场景；需和同名 8/10 数据按 identity 分开 |
 | 9 | `2026-08-12_dmtac_rm65_bimanual_60hz_admittance_left_gripper_offline_test` | 56K | 0 / 0 | 无 tactile | 无 profile | 空 scratch/test；不属于可合并训练数据 |
-| 10 | `2026-08-19_4_stage_writing_detail` | 3.9G | 159 / 32042 | external, `T-ext` | `P2-4` | tactile UUID `68d9f362-a864-4970-aec5-56ce882050ca` 已在 NAS；本地只留 attachment metadata |
-| 11 | `2026-08-20_4_stage_writing_detail` | 928M | 46 / 7662 | external, `T-ext` | `P2-4` | tactile UUID `e25d726e-bef0-4414-ba14-a3a2b6d7b14e` 当前在 FormalCollection/tactile |
+| 10 | `2026-08-19_4_stage_writing_detail` | 3.9G | 159 / 32042 | external, `T-ext` | `P2-4 hash only / task mismatch` | `info.task_id=4_stage_writing_detail`；tactile UUID `68d9f362-a864-4970-aec5-56ce882050ca` 已在 NAS；本地只留 attachment metadata |
+| 11 | `2026-08-20_4_stage_writing_detail` | 约 928M（需重新 `du`） | 168 / 26249（早期摘要曾记录 46/7662，已过时） | external, `T-ext` | `P2-4 hash only / task mismatch` | `info.task_id=dmtac_rm65_bimanual_position_v1`；tactile UUID `e25d726e-bef0-4414-ba14-a3a2b6d7b14e` 当前在 FormalCollection/tactile |
 
 ## 4. Valid camera-only prepared views（17 个）
 
@@ -335,9 +335,12 @@ camera-only view，但 profile 仍必须是 P2-5。
 只能在 camera-only profile、camera role registry、frame validity 和 episode
 membership 完全一致时建立视觉逻辑视图；不和 native/tactile source 混装。
 
-FormalCollection 的 8/19、8/20 都是 P2-4，但 8/19 tactile 已在 NAS、8/20
-tactile 仍在 FormalCollection 外置容器；二者可以作为同 profile 的逻辑候选，
-但不能在没有 attachment receipt、annotation 和 identity 去重前物理合并。
+FormalCollection 的 8/19、8/20 都携带 P2-4 的 progress hash，但 task identity
+并不等于当前 full-task v2：8/19 是 `4_stage_writing_detail`，8/20 是
+`dmtac_rm65_bimanual_position_v1`。因此它们目前只能作为 detail 独立 selector；
+8/19 tactile 已在 NAS、8/20 tactile 仍在 FormalCollection 外置容器。不能仅凭
+progress hash 将其加入 P2-4 full-task，也不能在没有 task correction、attachment
+receipt、annotation 和 identity 去重前物理合并。
 
 ### 8.2 “合并”的四种不同含义
 
@@ -381,7 +384,7 @@ hash 去重后再确定实际数量。
 | 2026-08-10 P2-4 | `...multi_choise_stage1`（113 ep）、`...4_stage`（53 ep）、`...4_stage_stable`（296 ep）、另一个同名 `...multi_choise_stage1`（153 ep） | 同 profile，但 normal/stable/multi-choice 是场景标签；两个同名目录必须按 UUID 区分 | 建立 `logical/formal/2026-08-10/p2-4/all`，并派生 `normal`、`stable`、`multi_choice` 子 selector；预估 615 ep | 可以 D2 logical append，但不能抹掉场景标签或直接物理改名 |
 | 2026-08-11 P2-4 | `...interrupt_choice_stage1`（201 ep）、`...multi_choise_stage1`（251 ep） | 同 profile、不同 scenario，D2 候选 | `logical/formal/2026-08-11/p2-4/all`，保留 `interrupt_choice`/`multi_choice` 标签；预估 452 ep | 待确认训练是否允许两种场景进入同一 selector |
 | 2026-08-12 | `...60hz_admittance_left_gripper_offline_test` | 0 episode/0 frame scratch，非正式采集 | 不进入任何训练集合 | 永久标记 scratch，不合并 |
-| 2026-08-19/20 | `2026-08-19_4_stage_writing_detail`（159 ep）、`2026-08-20_4_stage_writing_detail`（46 ep） | 不同日期但同 P2-4 profile；tactile 分别 NAS external 与 FormalCollection external | `logical/formal/p2-4/detail`，预估 205 ep，保留 date/session/tactile receipt | 先补齐两份 external graph 和 annotation/quality，再 D2 |
+| 2026-08-19/20 | `2026-08-19_4_stage_writing_detail`（159 ep）、`2026-08-20_4_stage_writing_detail`（当前 info 为 168 ep） | progress hash 虽为 P2-4，但 `info.task_id` 分别为 `4_stage_writing_detail` 与 `dmtac_rm65_bimanual_position_v1`，不是当前 full-task 期望的 v2 task；D2 不成立 | 暂存 `detail` 独立 selector，不能直接放入 P2-4 full-task；先做 task identity 纠正/adapter 决策 | 先补齐 external graph、task correction 和 annotation/quality；不能按“同 profile hash”直接合并 |
 
 #### 同日合并的实际优先级
 
@@ -397,8 +400,9 @@ hash 去重后再确定实际数量。
 4. **第四优先：2026-08-10/11 P2-4 场景组**。可以同 profile 追加，但保留
    `normal/stable/multi_choice/interrupt_choice` 场景标签，先建立总 selector
    和子 selector，不急于物理合并。
-5. **第五优先：2026-08-19/20 detail**。两者 tactile attachment 状态不同，待
-   NAS/FormalCollection receipt 完整后再加入 P2-4 detail selector。
+5. **第五优先：2026-08-19/20 detail**。先建立独立 detail selector；两者 task
+   identity 需要 correction，且 tactile attachment 状态不同，完成修正前不加入
+   P2-4 full-task。
 
 ### 8.4 同日合并必须满足的“相同采集”定义
 
@@ -502,7 +506,8 @@ action/qpos/tactile，必须回到 native/external graph；不能因为 camera-o
 - 同日期同采集的首批 D2 logical append 目标已经明确为：2026-08-06 P2-4
   （35+206+53）、2026-08-07 FormalCollection P2-4（129+202，排除 alias
   重复）、2026-08-03 P2-4（5+202）、2026-08-10/11 P2-4 场景组，以及
-  2026-08-19/20 detail P2-4。这里的数量只是待校验上限，不能替代最终
+ 2026-08-10/11 P2-4 场景组。8/19、8/20 detail 暂不属于 full-task 合并组，
+ 直到 task identity correction 完成。这里的数量只是待校验上限，不能替代
   identity 去重和 OpenPI eligibility。
 - 同日不同 task/protocol、同一 source 的 v22/v23/filtered 变体、camera-only
   projection 和 P2-4/P2-5 profile 差异，明确保持 D0/D1/隔离，不进行 episode
@@ -511,3 +516,200 @@ action/qpos/tactile，必须回到 native/external graph；不能因为 camera-o
   通过新的 selector/manifest 或原子配置迁移实现。
 - 旧路径与 canonical 路径的 link 语义存在文档与 `lstat` 证据不一致，必须
   先做完整 inode 审计，不能把“看起来同名/同日期”当作独立数据或可删除备份。
+
+## 12. 训练暂停期间的 OpenPI profile 合并方案
+
+本节是基于 2026-08-21 的只读复核给出的可执行方案；没有修改远端 OpenPI 文件。
+训练暂停使得切换 profile 成为可行选项，但不应直接覆盖当前 profile 或复用旧
+normalization/checkpoint。
+
+### 12.1 先保留不可变的 879-episode baseline
+
+远端当前 profile：
+
+```text
+/home/user/zc/openpi/configs/training/
+  writing_stage3_0804_0806_front_h16_absolute_history_state_v1.json
+```
+
+它固定使用 2026-08-04、08-05、08-06 三天的五个 source root，expected eligible
+为 `344 + 246 + 35 + 203 + 51 = 879`，并绑定：
+
+```text
+task_id                 = dmtac_rm65_bimanual_position_v2_writing_4_stage
+progress_profile_hash   = 0874f6b9...
+stage_profile_hash      = b3e3d19d...
+camera                  = front only
+action_horizon          = 16
+action_pose_mode        = absolute
+history-state contract  = db215d...
+```
+
+该文件、对应 norm-stats、checkpoint、organized workspace 都应作为回滚锚点，
+不原地修改。即使新的合并 profile 失败，也可以直接恢复原训练命令。
+
+### 12.2 推荐的新 full-task profile：先纳入 8/7，不立即纳入 detail/场景集
+
+仓库中已经存在一个可作为候选模板的本地 profile：
+
+```text
+deployments/openpi/configs/training/
+  writing_stage3_0804_0807_front_h16_absolute_v1.json
+```
+
+它在 879 基础上追加 2026-08-07 FormalCollection 两个 source：
+
+```text
+2026-08-07 part1: raw 129, eligible 126
+2026-08-07 part2: raw 202, eligible 195
+```
+
+因此新的 full-task P2-4 候选总 eligibility 是 **1200**，而不是简单把两个
+目录的物理 episode 数相加。建议实际落地时生成一个新的 profile id，例如：
+
+```text
+writing_fulltask_p2_4_0804_0807_front_h16_absolute_v2
+```
+
+并执行以下策略：
+
+1. 复制旧 profile 的模型输入契约，不改变 front-only、h16、absolute、history
+   state、policy IO layout 和 prompt/stage projection 语义。
+2. source list 保留 7 个独立 source id，不先物理拼接目录；每条 source 记录
+   raw/eligible/frame/window 计数、日期、session、quality 和 tactile receipt。
+3. 使用新的 `organized_dataset_root`、`openpi_asset_id`、norm-stats asset id
+   和 experiment name；不能复用 879 集合的 norm stats。
+4. 新 profile 从基础权重或明确指定的旧 checkpoint warm-start，但不使用旧
+   experiment 的 `--resume` 语义；数据分布已经改变，必须产生独立 checkpoint
+   lineage。
+5. `writing_multistage_prompt_family_0804_0807_front_h16_absolute_v2.json`
+   已经提供了 4 个阶段的 prompt-family 结构，可作为 stage-conditioned 训练
+   的上层组合；若训练目标仍是完整任务策略，则使用新的 full-task profile，
+   不把 stage1-only profile 当作完整任务数据。
+
+这一步满足“同一日期相同采集可合并”的要求：8/6 的三个 session 已经在旧
+profile 中作为独立 source 逻辑追加，8/7 的两个 session 追加到新的 v2 profile；
+不会破坏任何原始 episode 或 OpenPI 旧路径。
+
+### 12.3 2026-08-03 是否纳入：作为第二个扩展 profile，不直接混入首版
+
+2026-08-03 有两个 P2-4 目录（5 episode 和 202 episode），profile/stage hash
+与 P2-4 一致，理论上可以追加到 8/4–8/7 full-task 集合，物理上限为 207
+episode。但它不在当前 879/1200 的既有 OpenPI eligibility 统计里，建议先生成
+独立候选：
+
+```text
+writing_fulltask_p2_4_0803_0807_front_h16_absolute_candidate
+```
+
+只有完成以下检查后，才将它升级为正式 profile v3：
+
+- 两个 8/3 source 的 task id、profile hash、stage hash 和 action schema 与
+  8/4–8/7 完全一致；
+- 8/3 两目录之间没有重复 episode identity；
+- failure/abnormal interval、camera front、Parquet/video tail decode 通过；
+- tactile local/external graph 有明确状态，不因缺少本地 payload 而误判为纯视觉；
+- 重新计算 eligibility 后，训练窗口数量和 norm stats 可复现。
+
+这样可以把“同日 8/3 的 5+202”合并为 logical source group，同时不让未完成
+审查的早期采集直接改变主训练 profile。
+
+### 12.4 8/10–8/11 必须继续使用 stage1 scenario profile
+
+以下现有 profile 已经正确表达了这些数据的实际采集范围：
+
+```text
+deployments/openpi/configs/training/
+  writing_stage1_scenarios_0804_0811_front_h16_absolute_repeat146_v1.json
+```
+
+它的 source mixing 明确使用：
+
+```text
+fixed_middle       repeat_weight=1
+initial_multi_choice repeat_weight=4
+midcourse_interrupt repeat_weight=6
+target_step_id     = right_acquire_brush
+task_scope         = full_writing_sequence 或 stage1_only（逐 source 声明）
+expected eligible  = 2283
+```
+
+因此建议：
+
+- 8/10 两个同名 `multi_choise` 目录和 8/11 `multi_choise` 继续在该 profile
+  中逻辑追加，使用不同的 source id 和 dataset identity 区分，不能按文件夹名
+  去重；
+- 8/10 `stable`、8/10 `fixed_middle`、8/11 `interrupt_choice` 保留
+  `scenario_class`，不要因为 progress hash 相同就加入 full-task `P2-4`；
+- repeat weight 是为 stage1 场景补偿采样设计的，不能原样搬到 full-task 4-stage
+  profile，否则会改变阶段分布；
+- 如果未来要训练完整任务而不是 stage1，必须把这些数据先通过明确的窗口/阶段
+  projection 转为完整 task 语义，不能只改 `expected_task_id`。
+
+### 12.5 8/19、8/20 detail 暂时隔离
+
+只看 progress hash 会错误地把这两个目录归入 P2-4。实际只读证据是：
+
+| 数据集 | `meta/info.json task_id` | `meta/progress/profile.cjson task_id` | 结论 |
+|---|---|---|---|
+| 2026-08-19 detail | `4_stage_writing_detail` | `dmtac_rm65_bimanual_position_v1` | 不是当前 full-task v2 task，暂不合并 |
+| 2026-08-20 detail | `dmtac_rm65_bimanual_position_v1` | `dmtac_rm65_bimanual_position_v1` | 不是当前 full-task v2 task，暂不合并 |
+
+它们可以先建立独立的：
+
+```text
+logical/formal/detail_20260819_20260820
+```
+
+但只能用于 detail/质量分析或专用 selector。要进入 full-task profile，必须先
+由数据接口层完成显式的 task identity correction/adapter，并重新确认：
+
+1. 四个 progress step 的 coverage 是完整任务还是局部 detail overlay；
+2. action/state/camera schema 是否与 P2-4 full-task 完全一致；
+3. 60 Hz force-admittance 或 post-capture detail 是否改变了训练域；
+4. tactile external receipt 和 source episode identity 是否完整；
+5. correction 产生新 profile hash/manifest，且旧事实仍可回读。
+
+在这些条件完成前，不修改它们的 `task_id`，也不把它们加入 1200 或 879 的
+norm-stats 统计。
+
+### 12.6 推荐的 profile 层次
+
+最终不要制造一个“所有 writing 目录的超级 profile”，而是保留三个可独立回滚
+的训练层：
+
+| profile 层 | 内容 | 预期用途 |
+|---|---|---|
+| `fulltask_p2_4_baseline_v1` | 8/4–8/6，879 eligible | 当前稳定基线，永久保留 |
+| `fulltask_p2_4_extended_v2` | 8/4–8/7，1200 eligible；8/6/8/7 按 source 逻辑追加 | 完整四阶段策略训练 |
+| `stage1_scenarios_0804_0811_v1` | 8/4–8/11 的 stage1/scenario projection，2283 eligible，带 repeat weights | 首阶段、异常/中断恢复专项训练 |
+
+8/3 作为待验证 v3 candidate，8/19/20 作为 detail candidate，P2-5 五阶段永远
+单独维护。每个 profile 使用独立：
+
+```text
+source manifest
+eligibility/annotation receipt
+norm-stats asset
+organized workspace
+OpenPI config name
+checkpoint lineage
+```
+
+### 12.7 Profile 改动的回滚与验证顺序
+
+如果决定实际切换 OpenPI，建议只新增文件/配置，不覆盖远端旧 profile：
+
+1. 在本地生成新 profile，并验证 JSON、source path、hash、计数和 schema。
+2. 只读扫描所有 source，生成 episode identity overlap 报告。
+3. 在新 workspace 生成 prepared manifest；旧 workspace 保持不动。
+4. 重新计算新 profile 的 norm stats，记录 stats hash。
+5. 先运行 1–10 step smoke train，验证 loader、camera、action/state layout、
+   history-state 和 loss 没有异常。
+6. 再用独立 experiment name 开始正式训练；不要给旧 experiment 加 `--resume`。
+7. 若失败，停用新 profile/experiment 即可回到 879 baseline；不需要恢复数据
+   目录或撤销历史配置。
+
+目前最合理的切换结论是：**先把 8/7 纳入新的 1200-eligible full-task profile，
+保留 879 baseline；8/10–8/11 继续使用已有 stage1 scenario profile；8/3 等验证
+通过后再扩展；8/19/20 detail 暂不进入 full-task。**
