@@ -86,6 +86,14 @@ C2 路径。CPU 隔离在 no-action/full-load deadline soak 通过前不解除�
 | `python -m teleop_runtime.deploy.run_policy` / `run_policy.main` | **受支持**的直接与程序化入口 | `teleop_runtime.deploy` 真机部署运行时 | OpenPI real launcher 当前直接依赖；未来若收敛调用面，应迁向上述 canonical CLI wrapper 或其稳定 API。 |
 | `python -m deployments.openpi.client.real` | **受支持**的 OpenPI 历史命令入口 | `teleop_runtime.deploy.openpi_application` 负责真实部署装配；`deployments.openpi.client` 只负责 OpenPI transport/adapter | 兼容模块只转发到现有 `run_policy.main` 控制循环。 |
 
+OpenPI 真机入口的 `rm65_bimanual_dmtac` 站点默认值由版本化 profile
+[`teleop_runtime/configs/deployments/openpi/rm65_bimanual_dmtac_v1.json`](../configs/deployments/openpi/rm65_bimanual_dmtac_v1.json)
+持有。profile 只包含已审查的设备、tool、camera、queue 和启动事实，由
+`openpi_deployment_profile.py` 严格校验并投影成原有参数顺序；它没有任意参数面，也不能包含
+`--send-actions`。`--deployment-profile rm65_bimanual_dmtac` 名称保持不变，用户在其后显式传入的
+runtime 参数仍按原顺序覆盖 profile。profile 的 semantic content hash 与参数等价测试用于区分内容
+变更和 checkout 绝对路径变化。
+
 本仓库目前没有 `CODEOWNERS` 或个人维护人清单；上表的模块责任边界就是当前可审计的
 owner 记录。`run_policy` 没有已宣布的结束日期，兼容期持续到所有直接调用方完成迁移、
 替代 API/入口与迁移文档发布，并经过明确的弃用期为止。在此之前不得删除、降级或仅按

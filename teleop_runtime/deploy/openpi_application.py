@@ -34,9 +34,15 @@ from robot_motion.deploy.async_producer import (
     RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
 )
 
+from .openpi_deployment_profile import (
+    RM65_BIMANUAL_DMTAC_OPENPI_PROFILE_ID,
+    available_openpi_real_deployment_profiles,
+    openpi_real_deployment_profile_args,
+)
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEPLOYMENT_PROFILES = ("rm65_bimanual_dmtac",)
+_DEPLOYMENT_PROFILES = available_openpi_real_deployment_profiles()
 _IMAGE_WIRE_CLI_TO_CODEC = {
     "legacy-raw": OPENPI_IMAGE_WIRE_LEGACY_RAW_V1,
     "resize-raw": OPENPI_IMAGE_WIRE_RESIZE_RAW_V1,
@@ -45,81 +51,13 @@ _IMAGE_WIRE_CLI_TO_CODEC = {
 
 
 def _rm65_bimanual_dmtac_args(*, rtc_real_shadow: bool = False) -> list[str]:
-    """Return the audited lab defaults without granting dispatch authority."""
+    """Compatibility wrapper for the reviewed versioned lab profile."""
 
-    args = [
-        "--active-sides",
-        "both",
-        "--end-effector-sides",
-        "both",
-        "--arm-execution-profile",
-        "impedance_40hz",
-        "--left-arm-ip",
-        "192.168.101.21",
-        "--right-arm-ip",
-        "192.168.1.20",
-        "--left-tool-profile",
-        str(
-            _PROJECT_ROOT
-            / "hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json"
-        ),
-        "--right-tool-profile",
-        str(
-            _PROJECT_ROOT
-            / "hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json"
-        ),
-        "--enable-hands",
-        "--hand-backend",
-        "dmtac-gripper",
-        "--dmtac-config",
-        "latest",
-        "--require-dmtac-config",
-        # The prepared OpenPI deployment contract consumes only each DMTac
-        # gripper's measured scalar state.  Raw tactile frames are not a model
-        # input here, and receiving their large multiprocessing payloads in the
-        # parent can hold the Python GIL long enough to starve the 60/120 Hz arm
-        # workers.  Keep tactile as an explicit opt-in; later user arguments are
-        # appended after this profile and --dmtac-with-tactile remains the exact
-        # rollback.
-        "--dmtac-no-tactile",
-        "--camera-mode",
-        "multi",
-        "--camera-config",
-        str(_PROJECT_ROOT / "teleop_runtime/configs/devices/realsense.json"),
-        "--require-camera-frame",
-        "--require-ready-observation",
-        "--action-queue-policy",
-        "replace",
-        "--min-action-queue",
-        "0",
-        "--init-source",
-        "current",
-    ]
-    if bool(rtc_real_shadow):
-        args.extend(
-            [
-                "--auto-start",
-                "--no-wait-for-ready-confirm",
-                "--camera-start-stagger-sec",
-                "0.5",
-            ]
-        )
-    else:
-        args.extend(
-            [
-                "--wait-for-ready-confirm",
-                "--policy-qpos-init-dataset",
-                str(_PROJECT_ROOT / "datasets/sorted_v22/bimanual-cube-new-success"),
-                "--policy-qpos-init-episode",
-                "0",
-                "--policy-qpos-init-frame",
-                "0",
-                "--policy-qpos-init-source",
-                "auto",
-                "--policy-qpos-init-collision-check",
-            ]
-        )
-    return args
+    return openpi_real_deployment_profile_args(
+        RM65_BIMANUAL_DMTAC_OPENPI_PROFILE_ID,
+        rtc_real_shadow=rtc_real_shadow,
+        project_root=_PROJECT_ROOT,
+    )
 
 
 def _artifact_path_from_checkpoint(checkpoint_dir: Path) -> Path:

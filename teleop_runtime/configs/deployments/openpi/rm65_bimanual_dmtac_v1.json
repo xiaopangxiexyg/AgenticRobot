@@ -1,0 +1,40 @@
+{
+  "schema": "dexteleop_openpi_real_deployment_profile_v1",
+  "profile_id": "rm65_bimanual_dmtac",
+  "runtime": {
+    "active_sides": "both",
+    "end_effector_sides": "both",
+    "arm_execution_profile": "impedance_40hz",
+    "left_arm_ip": "192.168.101.21",
+    "right_arm_ip": "192.168.1.20",
+    "enable_hands": true,
+    "hand_backend": "dmtac-gripper",
+    "dmtac_config": "latest",
+    "require_dmtac_config": true,
+    "dmtac_tactile": false,
+    "camera_mode": "multi",
+    "require_camera_frame": true,
+    "require_ready_observation": true,
+    "action_queue_policy": "replace",
+    "min_action_queue": 0,
+    "init_source": "current"
+  },
+  "paths": {
+    "left_tool_profile": "hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json",
+    "right_tool_profile": "hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json",
+    "camera_config": "teleop_runtime/configs/devices/realsense.json"
+  },
+  "interactive_startup": {
+    "wait_for_ready_confirm": true,
+    "policy_qpos_init_dataset": "datasets/sorted_v22/bimanual-cube-new-success",
+    "policy_qpos_init_episode": 0,
+    "policy_qpos_init_frame": 0,
+    "policy_qpos_init_source": "auto",
+    "policy_qpos_init_collision_check": true
+  },
+  "rtc_real_shadow_startup": {
+    "auto_start": true,
+    "wait_for_ready_confirm": false,
+    "camera_start_stagger_sec": 0.5
+  }
+}
