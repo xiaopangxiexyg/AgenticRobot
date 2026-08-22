@@ -94,7 +94,15 @@ include = [
     "teleop_runtime*",
     "utils*",
 ]
-exclude = ["tests*", "legacy*", "assets*"]
+exclude = [
+    "tests*",
+    "legacy*",
+    "assets*",
+    # Independently versioned vendor source.  AgenticRobot integration must
+    # cross an explicit hardware adapter rather than package this Git submodule
+    # as part of the parent distribution.
+    "hardware.reBotArm_control_py*",
+]
 namespaces = false
 
 [tool.setuptools]

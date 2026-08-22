@@ -1,3 +1,6 @@
 [submodule "model/openpi"]
 	path = model/openpi
 	url = git@github.com:CYBER-QAQ/Openpi.git
+[submodule "hardware/reBotArm_control_py"]
+	path = hardware/reBotArm_control_py
+	url = https://github.com/Seeed-Projects/reBotArm_control_py.git
