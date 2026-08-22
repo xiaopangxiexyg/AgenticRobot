@@ -46,6 +46,7 @@ def test_repository_local_resource_policy_matches_gitignore_and_tracking() -> No
     policies = {item["resource_id"]: item for item in payload["resources"]}
     assert {
         "development-assets",
+        "quest-development-certificates",
         "offline-datasets",
         "runtime-and-collection-evidence",
         "models-and-local-vendors",
@@ -54,6 +55,7 @@ def test_repository_local_resource_policy_matches_gitignore_and_tracking() -> No
         "developer-private-state",
     } <= policies.keys()
     assert policies["development-assets"]["migration"] == "asset-store-link"
+    assert policies["quest-development-certificates"]["migration"] == "recreate"
 
     locations = {
         location["path"]: location
@@ -65,9 +67,14 @@ def test_repository_local_resource_policy_matches_gitignore_and_tracking() -> No
         "teleop_records",
         "model",
         "hardware/VIVE/triad_openvr",
+        "hardware/quest_dev/assets/certs",
     ):
         assert locations[mixed_root]["tracked_policy"] == "mixed"
         assert locations[mixed_root]["tracked_count"] > 0
+
+    quest_certs = locations["hardware/quest_dev/assets/certs"]
+    assert quest_certs["ignore_source"] == "hardware/quest_dev/.gitignore"
+    assert quest_certs["matched_rule"]["source"] == "hardware/quest_dev/.gitignore"
 
 
 def test_only_development_assets_are_automatically_linkable(tmp_path: Path) -> None:

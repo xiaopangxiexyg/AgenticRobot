@@ -11,8 +11,30 @@
           "label": "development asset root",
           "path": "assets",
           "probe": "assets",
-          "expected_rule": "assets",
+          "expected_rule": "/assets",
           "tracked_policy": "none"
+        }
+      ]
+    },
+    {
+      "resource_id": "quest-development-certificates",
+      "classification": "local-secret",
+      "migration": "recreate",
+      "summary": "Quest Dev self-signed TLS certificate and private key generated locally for Browser secure-context development.",
+      "locations": [
+        {
+          "label": "Quest Dev certificate directory mixed root",
+          "path": "hardware/quest_dev/assets/certs",
+          "probe": "hardware/quest_dev/assets/certs/quest_dev.crt",
+          "expected_rule": "assets/certs/*.crt",
+          "ignore_source": "hardware/quest_dev/.gitignore",
+          "tracked_policy": "mixed"
+        },
+        {
+          "label": "Quest Dev private key",
+          "probe": "hardware/quest_dev/assets/certs/quest_dev.key",
+          "expected_rule": "assets/certs/*.key",
+          "ignore_source": "hardware/quest_dev/.gitignore"
         }
       ]
     },

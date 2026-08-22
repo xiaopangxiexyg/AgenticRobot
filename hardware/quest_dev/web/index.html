@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quest Dev</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main>
+    <h1>Quest Dev</h1>
+    <p>
+      通用 Quest Browser/WebXR 开发基座。核心层负责 HTTPS/WSS 与 XR 生命周期；
+      visualization 等能力通过 feature registry 独立加载。
+    </p>
+
+    <section class="panel status-grid">
+      <div class="status-item"><span class="label">WebSocket</span><span id="ws-status">—</span></div>
+      <div class="status-item"><span class="label">XR Session</span><span id="xr-status">—</span></div>
+      <div id="feature-status-grid" class="feature-status-contents"></div>
+    </section>
+
+    <section class="panel">
+      <button id="start-xr">Enter MR/VR</button>
+      <p>Quest Browser 通过 HTTPS 打开本页面。这个入口不需要 APK 或开发者模式。</p>
+    </section>
+
+    <section class="panel">
+      <span class="label">Protocol events</span>
+      <pre id="event-log">waiting for server...</pre>
+    </section>
+  </main>
+  <script src="/xr_math.js"></script>
+  <script src="/feature_registry.js"></script>
+  <script src="/features/visualization/renderer.js"></script>
+  <script src="/features/visualization/feature.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
