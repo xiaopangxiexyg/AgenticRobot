@@ -5,13 +5,324 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
+from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.action.execution_observation import (
+    ExecutionFactReference,
+    ExecutionMeasurementObservation,
+    ExecutionObservationBinding,
+    ExecutionObservationCapabilitySpec,
+    validate_execution_observation_binding,
+)
+from robot_motion.deploy.schema import pose_matrix_to_xyzquat
 from robot_motion.runtime.causal_history import CausalSnapshotHistory
+from robot_motion.runtime.identity import ClockDomainDescriptor
+from robot_motion.runtime.observation_cut import ObservationSampleRef
+from robot_motion.runtime.pose_observation import (
+    PassivePoseMeasurementJournal,
+    PoseCoordinateBinding,
+    PoseMeasurementJournalCut,
+    PoseMeasurementJournalEvent,
+    PoseMeasurementPublication,
+)
 
 from ..interfaces import EffectorBackend
+
+REAL_ARM_QPOS_MEASUREMENT_HASH_DOMAIN_V1 = (
+    "dexteleop.real_arm.hardware_qpos_measurement.v1"
+)
+REAL_ARM_TCP_POSE_MEASUREMENT_ID_HASH_DOMAIN_V1 = (
+    "dexteleop.real_arm.hardware_qpos_fk_pose_measurement_id.v1"
+)
+HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY = "hardware_pose_coordinate_binding"
+ACTUAL_TCP_POSE_COORDINATE_BINDING_HASH_STATE_KEY = (
+    "actual_tcp_pose_coordinate_binding_hash"
+)
+
+
+@dataclass(frozen=True)
+class ArmPoseObservationProjection:
+    """Exact contracts required to publish one side's measured TCP pose."""
+
+    coordinate_binding: PoseCoordinateBinding
+    capability: ExecutionObservationCapabilitySpec
+    observation_binding: ExecutionObservationBinding
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.coordinate_binding, PoseCoordinateBinding):
+            raise TypeError("coordinate_binding must be a PoseCoordinateBinding.")
+        if not isinstance(self.capability, ExecutionObservationCapabilitySpec):
+            raise TypeError("capability must be an ExecutionObservationCapabilitySpec.")
+        if not isinstance(self.observation_binding, ExecutionObservationBinding):
+            raise TypeError(
+                "observation_binding must be an ExecutionObservationBinding."
+            )
+        coordinate = self.coordinate_binding
+        capability = self.capability
+        binding = self.observation_binding
+        if (
+            binding.binding_id != coordinate.observation_binding_id
+            or binding.semantic_content_hash != coordinate.observation_binding_hash
+            or binding.plan_hash != coordinate.observation_plan_hash
+        ):
+            raise ValueError("Coordinate and execution observation bindings differ.")
+        if (
+            capability.semantic_content_hash != binding.capability_hash
+            or capability.capability_id != binding.capability_id
+            or capability.clock_domain_id != coordinate.measurement_clock_domain_id
+            or binding.clock_domain_id != coordinate.measurement_clock_domain_id
+        ):
+            raise ValueError("Pose capability/binding clock or identity mismatch.")
+        component_id = coordinate.component_id
+        if (
+            component_id not in binding.component_ids
+            or capability.representation_by_component.get(component_id)
+            != "cartesian_pose"
+            or capability.schema_hash_by_component.get(component_id)
+            != coordinate.pose_schema_hash
+        ):
+            raise ValueError("Pose component is not covered by the accepted binding.")
+
+
+def _fact_reference(
+    *,
+    stage: str,
+    fact_id: str,
+    fact_hash: str,
+    observed_at: float,
+    clock_domain_id: str,
+    status: str,
+) -> ExecutionFactReference:
+    return ExecutionFactReference(
+        stage=stage,
+        fact_id=fact_id,
+        fact_hash=fact_hash,
+        observed_at=observed_at,
+        clock_domain_id=clock_domain_id,
+        status=status,
+    )
+
+
+def project_arm_tcp_pose_measurement(
+    selected_state: Mapping[str, Any],
+    *,
+    projection: ArmPoseObservationProjection,
+    received_monotonic_ns: int,
+    receiver_clock: ClockDomainDescriptor,
+) -> PoseMeasurementPublication:
+    """Project an already-read hardware-qpos snapshot without device I/O."""
+
+    if not isinstance(selected_state, Mapping):
+        raise TypeError("selected_state must be a mapping.")
+    if not isinstance(projection, ArmPoseObservationProjection):
+        raise TypeError("projection must be an ArmPoseObservationProjection.")
+    if not isinstance(receiver_clock, ClockDomainDescriptor):
+        raise TypeError("receiver_clock must be a ClockDomainDescriptor.")
+    if (
+        selected_state.get("causal_snapshot_missing") is True
+        or selected_state.get("hardware_measurement_valid") is not True
+        or selected_state.get("hardware_read_success") is not True
+        or selected_state.get("actual_tcp_pose_source") != "hardware_qpos_fk"
+    ):
+        raise ValueError("state does not contain a valid hardware-qpos TCP pose.")
+    raw_sequence = selected_state.get("hardware_measurement_sequence")
+    if (
+        isinstance(raw_sequence, bool)
+        or not isinstance(raw_sequence, (int, np.integer))
+        or int(raw_sequence) <= 0
+    ):
+        raise ValueError("hardware measurement sequence must be a positive integer.")
+    source_sequence = int(raw_sequence)
+    measured_at = float(selected_state.get("hardware_measurement_timestamp"))
+    available_at = float(selected_state.get("available_timestamp"))
+    if (
+        not math.isfinite(measured_at)
+        or not math.isfinite(available_at)
+        or available_at + 1e-12 < measured_at
+    ):
+        raise ValueError("hardware measurement timing is invalid.")
+    coordinate = projection.coordinate_binding
+    source_coordinate_binding = selected_state.get(
+        HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY
+    )
+    if not isinstance(source_coordinate_binding, PoseCoordinateBinding):
+        raise TypeError("hardware state has no typed pose-coordinate attestation.")
+    if source_coordinate_binding != coordinate:
+        raise ValueError(
+            "hardware pose-coordinate attestation differs from projection."
+        )
+    if (
+        selected_state.get(ACTUAL_TCP_POSE_COORDINATE_BINDING_HASH_STATE_KEY)
+        != coordinate.semantic_content_hash
+    ):
+        raise ValueError("FK output is not attested to the pose-coordinate binding.")
+    if (
+        receiver_clock.monotonic is not True
+        or receiver_clock.clock_domain_id != coordinate.receipt_clock_domain_id
+    ):
+        raise ValueError("receiver clock does not match the coordinate binding.")
+    source_clock = str(selected_state.get("source_clock") or "").strip()
+    available_clock = str(selected_state.get("available_clock") or "").strip()
+    if (
+        source_clock != coordinate.measurement_clock_domain_id
+        or available_clock != coordinate.measurement_clock_domain_id
+    ):
+        raise ValueError("hardware measurement clocks do not match the binding.")
+    if float(selected_state.get("source_timestamp")) != measured_at:
+        raise ValueError("causal source timestamp differs from hardware measurement.")
+    if float(selected_state.get("actual_tcp_pose_timestamp")) != measured_at:
+        raise ValueError("actual TCP pose timestamp differs from hardware measurement.")
+    try:
+        qpos = np.asarray(selected_state.get("hardware_qpos"), dtype=float).reshape(-1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("hardware_qpos must be a finite six-vector.") from exc
+    if qpos.shape != (6,) or not np.all(np.isfinite(qpos)):
+        raise ValueError("hardware_qpos must be a finite six-vector.")
+    try:
+        pose = np.asarray(
+            selected_state.get("actual_tcp_pose"),
+            dtype=float,
+        ).reshape(4, 4)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actual_tcp_pose must be a finite rigid 4x4 matrix.") from exc
+    if (
+        not np.all(np.isfinite(pose))
+        or not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6)
+        or not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-6)
+        or not np.isclose(np.linalg.det(pose[:3, :3]), 1.0, atol=1e-6)
+    ):
+        raise ValueError("actual_tcp_pose must be a finite rigid 4x4 matrix.")
+    pose_xyzquat = pose_matrix_to_xyzquat(pose)
+    if pose_xyzquat is None or pose_xyzquat.shape != (7,):
+        raise ValueError("actual_tcp_pose cannot be represented as xyz+quat_xyzw.")
+    if (
+        isinstance(received_monotonic_ns, bool)
+        or not isinstance(received_monotonic_ns, (int, np.integer))
+        or int(received_monotonic_ns) < 0
+    ):
+        raise ValueError("received_monotonic_ns must be a non-negative integer.")
+    received_at = int(received_monotonic_ns) / 1_000_000_000.0
+    source_measurement_hash = canonical_content_hash(
+        {
+            "source_instance_id": coordinate.source_instance_id,
+            "source_epoch_id": coordinate.source_epoch_id,
+            "source_binding_hash": coordinate.source_binding_hash,
+            "source_sequence": source_sequence,
+            "measured_at": measured_at,
+            "clock_domain_id": coordinate.measurement_clock_domain_id,
+            "hardware_qpos": qpos,
+            "hardware_read_success": True,
+            "hardware_measurement_valid": True,
+        },
+        domain=REAL_ARM_QPOS_MEASUREMENT_HASH_DOMAIN_V1,
+    )
+    measurement_identity_hash = canonical_content_hash(
+        {
+            "source_measurement_hash": source_measurement_hash,
+            "coordinate_binding_hash": coordinate.semantic_content_hash,
+            "pose_xyz_quat_xyzw": tuple(float(value) for value in pose_xyzquat),
+        },
+        domain=REAL_ARM_TCP_POSE_MEASUREMENT_ID_HASH_DOMAIN_V1,
+    )
+    measurement_id = f"real-arm-tcp-pose:{measurement_identity_hash}"
+    parent_facts = (
+        _fact_reference(
+            stage="real_robot.source_binding",
+            fact_id=(f"{coordinate.source_instance_id}:{coordinate.source_epoch_id}"),
+            fact_hash=coordinate.source_binding_hash,
+            observed_at=available_at,
+            clock_domain_id=coordinate.measurement_clock_domain_id,
+            status="bound",
+        ),
+        _fact_reference(
+            stage="real_robot.hardware_qpos",
+            fact_id=(
+                f"{coordinate.source_instance_id}:"
+                f"{coordinate.source_epoch_id}:{source_sequence}"
+            ),
+            fact_hash=source_measurement_hash,
+            observed_at=measured_at,
+            clock_domain_id=coordinate.measurement_clock_domain_id,
+            status="observed",
+        ),
+        _fact_reference(
+            stage="real_robot.fk_contract",
+            fact_id=coordinate.fk_contract_id,
+            fact_hash=coordinate.fk_contract_hash,
+            observed_at=available_at,
+            clock_domain_id=coordinate.measurement_clock_domain_id,
+            status="applied",
+        ),
+        _fact_reference(
+            stage="real_robot.pose_coordinate_binding",
+            fact_id=coordinate.binding_id,
+            fact_hash=coordinate.semantic_content_hash,
+            observed_at=available_at,
+            clock_domain_id=coordinate.measurement_clock_domain_id,
+            status="applied",
+        ),
+    )
+    measurement = ExecutionMeasurementObservation(
+        measurement_id=measurement_id,
+        source_measurement_hash=source_measurement_hash,
+        control_domain_id=coordinate.control_domain_id,
+        measured_at=measured_at,
+        available_at=available_at,
+        clock_domain_id=coordinate.measurement_clock_domain_id,
+        value_by_component={
+            coordinate.component_id: tuple(float(value) for value in pose_xyzquat),
+        },
+        representation_by_component={coordinate.component_id: "cartesian_pose"},
+        schema_hash_by_component={
+            coordinate.component_id: coordinate.pose_schema_hash,
+        },
+        observation_binding_id=projection.observation_binding.binding_id,
+        observation_plan_hash=projection.observation_binding.plan_hash,
+        parent_facts=parent_facts,
+    )
+    validate_execution_observation_binding(
+        measurement,
+        projection.observation_binding,
+        projection.capability,
+    )
+    sample = ObservationSampleRef(
+        stream_id=coordinate.stream_id,
+        sample_id=measurement.measurement_id,
+        sequence=source_sequence,
+        measured_at=measurement.measured_at,
+        measured_clock_domain_id=measurement.clock_domain_id,
+        available_at=received_at,
+        available_clock_domain_id=coordinate.receipt_clock_domain_id,
+        payload_object_id=measurement.semantic_content_hash,
+        valid=True,
+        stale=False,
+        content_metadata={
+            "source_instance_id": coordinate.source_instance_id,
+            "source_epoch_id": coordinate.source_epoch_id,
+            "source_kind": coordinate.source_kind,
+            "source_sequence": source_sequence,
+            "coordinate_binding_hash": coordinate.semantic_content_hash,
+            "reference_frame_id": coordinate.reference_frame_id,
+            "reference_frame_spec_hash": coordinate.reference_frame_spec_hash,
+            "moving_frame_id": coordinate.moving_frame_id,
+            "tool_profile_hash": coordinate.tool_profile_hash,
+            "measurement_available_at": measurement.available_at,
+            "measurement_available_clock_domain_id": measurement.clock_domain_id,
+            "received_monotonic_ns": int(received_monotonic_ns),
+        },
+    )
+    return PoseMeasurementPublication(
+        coordinate_binding=coordinate,
+        source_sequence=source_sequence,
+        measurement=measurement,
+        sample_ref=sample,
+        received_monotonic_ns=int(received_monotonic_ns),
+        receiver_clock=receiver_clock,
+    )
 
 
 class ArmStateReader:
@@ -29,13 +340,74 @@ class ArmStateReader:
         refresh_hz: float,
         compute_tcp_pose: bool = True,
         clock: Any = time.time,
+        pose_projection_by_side: Mapping[
+            str,
+            ArmPoseObservationProjection,
+        ]
+        | None = None,
+        receipt_clock: ClockDomainDescriptor | None = None,
+        receipt_monotonic_ns_clock: Any = time.monotonic_ns,
     ):
         self.backends = dict(backends)
         self.refresh_hz = float(refresh_hz)
         self.compute_tcp_pose = bool(compute_tcp_pose)
         if not callable(clock):
             raise TypeError("clock must be callable")
+        if not callable(receipt_monotonic_ns_clock):
+            raise TypeError("receipt_monotonic_ns_clock must be callable")
         self.clock = clock
+        self.receipt_monotonic_ns_clock = receipt_monotonic_ns_clock
+        self.pose_projection_by_side = dict(pose_projection_by_side or {})
+        unknown_projection_sides = set(self.pose_projection_by_side) - set(
+            self.backends
+        )
+        if unknown_projection_sides:
+            raise ValueError(
+                "pose_projection_by_side contains unknown backends: "
+                f"{sorted(unknown_projection_sides)}"
+            )
+        if any(
+            not isinstance(value, ArmPoseObservationProjection)
+            for value in self.pose_projection_by_side.values()
+        ):
+            raise TypeError(
+                "pose_projection_by_side values must be ArmPoseObservationProjection."
+            )
+        if self.pose_projection_by_side:
+            if not isinstance(receipt_clock, ClockDomainDescriptor):
+                raise TypeError(
+                    "receipt_clock must be a ClockDomainDescriptor when pose "
+                    "projection is enabled."
+                )
+            if receipt_clock.monotonic is not True:
+                raise ValueError("receipt_clock.monotonic must be exactly True.")
+            mismatched_clock_sides = sorted(
+                side
+                for side, projection in self.pose_projection_by_side.items()
+                if projection.coordinate_binding.receipt_clock_domain_id
+                != receipt_clock.clock_domain_id
+            )
+            if mismatched_clock_sides:
+                raise ValueError(
+                    "pose projection receipt clocks differ from receipt_clock: "
+                    f"{mismatched_clock_sides}"
+                )
+            self.pose_measurement_journal: PassivePoseMeasurementJournal | None = (
+                PassivePoseMeasurementJournal(receiver_clock=receipt_clock)
+            )
+        else:
+            if receipt_clock is not None and not isinstance(
+                receipt_clock,
+                ClockDomainDescriptor,
+            ):
+                raise TypeError(
+                    "receipt_clock must be a ClockDomainDescriptor or None."
+                )
+            self.pose_measurement_journal = None
+        self.receipt_clock = receipt_clock
+        self._pose_observation_error_by_side: dict[str, str | None] = {
+            side: None for side in self.backends
+        }
         self._last_refresh_at = {side: 0.0 for side in self.backends}
         self._history_by_side = {
             side: CausalSnapshotHistory(
@@ -45,6 +417,33 @@ class ArmStateReader:
             )
             for side in self.backends
         }
+
+    def _invalidate_pose_projection(
+        self,
+        *,
+        side: str,
+        projection: ArmPoseObservationProjection,
+        reason: str,
+        error: Exception,
+    ) -> None:
+        """Clear a passive latest value after a source/projection failure."""
+
+        self._pose_observation_error_by_side[side] = f"{type(error).__name__}: {error}"
+        journal = self.pose_measurement_journal
+        assert journal is not None
+        try:
+            journal.invalidate(
+                coordinate_binding=projection.coordinate_binding,
+                reason=reason,
+                received_monotonic_ns=int(self.receipt_monotonic_ns_clock()),
+                next_coordinate_binding=projection.coordinate_binding,
+            )
+        except Exception as invalidation_exc:  # noqa: BLE001
+            self._pose_observation_error_by_side[side] += (
+                "; invalidation_failed:"
+                f"{type(invalidation_exc).__name__}:"
+                f"{invalidation_exc}"
+            )
 
     def snapshot(
         self,
@@ -68,10 +467,34 @@ class ArmStateReader:
         states: dict[str, dict[str, Any]] = {}
         refresh_period = 0.0 if self.refresh_hz <= 0.0 else 1.0 / self.refresh_hz
         for side, backend in self.backends.items():
+            projection = self.pose_projection_by_side.get(side)
+            projection_source_ready = True
+            if projection is not None:
+                try:
+                    projection_source_ready = backend.is_ready() is True
+                    if not projection_source_ready:
+                        self._invalidate_pose_projection(
+                            side=side,
+                            projection=projection,
+                            reason="backend_not_ready",
+                            error=RuntimeError("backend is not ready"),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    projection_source_ready = False
+                    self._invalidate_pose_projection(
+                        side=side,
+                        projection=projection,
+                        reason="backend_readiness_unavailable",
+                        error=exc,
+                    )
             refresh_error: str | None = None
             if (
                 refresh_period > 0.0
-                and backend.is_ready()
+                and (
+                    projection_source_ready
+                    if projection is not None
+                    else backend.is_ready()
+                )
                 and now - self._last_refresh_at.get(side, 0.0) >= refresh_period
             ):
                 try:
@@ -80,13 +503,32 @@ class ArmStateReader:
                         refresh()
                 except Exception as exc:  # noqa: BLE001
                     refresh_error = f"refresh_failed:{type(exc).__name__}:{exc}"
+                    if projection is not None:
+                        self._invalidate_pose_projection(
+                            side=side,
+                            projection=projection,
+                            reason="hardware_refresh_failed",
+                            error=RuntimeError(refresh_error),
+                        )
                 self._last_refresh_at[side] = now
-            state = dict(backend.get_state())
+            try:
+                state = dict(backend.get_state())
+            except Exception as exc:
+                if projection is not None:
+                    self._invalidate_pose_projection(
+                        side=side,
+                        projection=projection,
+                        reason="backend_state_unavailable",
+                        error=exc,
+                    )
+                raise
             if refresh_error is not None:
                 state["state_error"] = refresh_error
             state["actual_tcp_pose"] = None
             state["actual_tcp_pose_source"] = None
             state["actual_tcp_pose_timestamp"] = None
+            if projection is not None:
+                state[ACTUAL_TCP_POSE_COORDINATE_BINDING_HASH_STATE_KEY] = None
             if self.compute_tcp_pose:
                 try:
                     hardware_qpos = state.get("hardware_qpos")
@@ -136,6 +578,17 @@ class ArmStateReader:
                             state["actual_tcp_pose_timestamp"] = float(
                                 measurement_timestamp
                             )
+                            source_binding = state.get(
+                                HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY
+                            )
+                            if (
+                                projection is not None
+                                and isinstance(source_binding, PoseCoordinateBinding)
+                                and source_binding == projection.coordinate_binding
+                            ):
+                                state[
+                                    ACTUAL_TCP_POSE_COORDINATE_BINDING_HASH_STATE_KEY
+                                ] = source_binding.semantic_content_hash
                     else:
                         state["current_tcp_pose"] = compute_pose()
                         state["tcp_pose_source"] = "current_qpos_fk"
@@ -148,11 +601,66 @@ class ArmStateReader:
                 "hardware_measurement_timestamp",
                 state.get("hardware_refresh_time"),
             )
-            self._history_by_side[side].publish(
+            published_state = self._history_by_side[side].publish(
                 state,
                 source_timestamp=source_timestamp,
                 available_timestamp=None,
+                source_clock=str(
+                    state.get(
+                        "hardware_measurement_clock_domain_id",
+                        "local_wall_time",
+                    )
+                ),
+                available_clock=str(
+                    state.get(
+                        "hardware_availability_clock_domain_id",
+                        "local_wall_time",
+                    )
+                ),
             )
+            if projection is not None:
+                if not projection_source_ready or refresh_error is not None:
+                    continue
+                journal = self.pose_measurement_journal
+                receiver_clock = self.receipt_clock
+                assert journal is not None
+                assert isinstance(receiver_clock, ClockDomainDescriptor)
+                try:
+                    projection_state = published_state
+                    received_monotonic_ns = int(self.receipt_monotonic_ns_clock())
+                    latest = journal.latest(
+                        stream_id=projection.coordinate_binding.stream_id
+                    )
+                    raw_source_sequence = published_state.get(
+                        "hardware_measurement_sequence"
+                    )
+                    if (
+                        latest is not None
+                        and latest.coordinate_binding == projection.coordinate_binding
+                        and not isinstance(raw_source_sequence, bool)
+                        and isinstance(raw_source_sequence, (int, np.integer))
+                        and int(raw_source_sequence) == latest.source_sequence
+                    ):
+                        projection_state = dict(published_state)
+                        projection_state["available_timestamp"] = (
+                            latest.measurement.available_at
+                        )
+                        received_monotonic_ns = latest.received_monotonic_ns
+                    publication = project_arm_tcp_pose_measurement(
+                        projection_state,
+                        projection=projection,
+                        received_monotonic_ns=received_monotonic_ns,
+                        receiver_clock=receiver_clock,
+                    )
+                    journal.publish(publication)
+                    self._pose_observation_error_by_side[side] = None
+                except Exception as exc:  # noqa: BLE001 - passive feed is fail-closed.
+                    self._invalidate_pose_projection(
+                        side=side,
+                        projection=projection,
+                        reason="pose_projection_unavailable",
+                        error=exc,
+                    )
 
         cutoff = (
             max(requested_at, float(self.clock()))
@@ -191,5 +699,87 @@ class ArmStateReader:
                 states[side] = selected_state
         return states
 
+    def pose_measurement_journal_cut(self) -> PoseMeasurementJournalCut | None:
+        """Return one atomic passive cursor/latest cut without backend I/O."""
 
-__all__ = ["ArmStateReader"]
+        journal = self.pose_measurement_journal
+        return None if journal is None else journal.atomic_cut()
+
+    def pose_measurement_events_after(
+        self,
+        event_sequence: int,
+    ) -> tuple[PoseMeasurementJournalEvent, ...]:
+        """Read retained passive events; never refresh or query a backend."""
+
+        journal = self.pose_measurement_journal
+        if journal is None:
+            return ()
+        return journal.events_after(event_sequence)
+
+    def latest_pose_measurement(
+        self,
+        *,
+        side: str,
+    ) -> PoseMeasurementPublication | None:
+        """Return the passive latest fact; never refresh a backend."""
+
+        projection = self.pose_projection_by_side.get(str(side))
+        journal = self.pose_measurement_journal
+        if projection is None or journal is None:
+            return None
+        return journal.latest(
+            stream_id=projection.coordinate_binding.stream_id,
+        )
+
+    def invalidate_pose_measurements(
+        self,
+        *,
+        reason: str,
+        terminal: bool = True,
+    ) -> tuple[PoseMeasurementJournalEvent, ...]:
+        """Publish passive lifecycle invalidations without device or motion I/O."""
+
+        journal = self.pose_measurement_journal
+        if journal is None:
+            return ()
+        events: list[PoseMeasurementJournalEvent] = []
+        for side, projection in self.pose_projection_by_side.items():
+            try:
+                event = journal.invalidate(
+                    coordinate_binding=projection.coordinate_binding,
+                    reason=reason,
+                    received_monotonic_ns=int(self.receipt_monotonic_ns_clock()),
+                    next_coordinate_binding=(
+                        None if terminal else projection.coordinate_binding
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - status remains fail-closed.
+                self._pose_observation_error_by_side[side] = (
+                    f"invalidation_failed:{type(exc).__name__}:{exc}"
+                )
+                continue
+            if event is not None:
+                events.append(event)
+        return tuple(events)
+
+    def pose_observation_status(self) -> dict[str, Any]:
+        journal = self.pose_measurement_journal
+        return {
+            **(
+                {"mode": "disabled", "event_sequence": 0}
+                if journal is None
+                else journal.snapshot_status()
+            ),
+            "error_by_side": dict(self._pose_observation_error_by_side),
+        }
+
+
+__all__ = [
+    "ACTUAL_TCP_POSE_COORDINATE_BINDING_HASH_STATE_KEY",
+    "HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY",
+    "REAL_ARM_QPOS_MEASUREMENT_HASH_DOMAIN_V1",
+    "REAL_ARM_TCP_POSE_MEASUREMENT_ID_HASH_DOMAIN_V1",
+    "ArmPoseObservationProjection",
+    "ArmStateReader",
+    "project_arm_tcp_pose_measurement",
+]
