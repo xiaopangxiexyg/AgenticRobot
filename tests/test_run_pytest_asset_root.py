@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 
 SOURCE_WRAPPER = Path(__file__).resolve().parents[1] / "scripts/run_pytest.sh"
+SOURCE_PYTHON_RESOLVER = (
+    Path(__file__).resolve().parents[1] / "scripts/resolve_dev_python.sh"
+)
 
 
 def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path]:
@@ -15,6 +18,7 @@ def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path]:
     scripts.mkdir(parents=True)
     wrapper = scripts / "run_pytest.sh"
     shutil.copy2(SOURCE_WRAPPER, wrapper)
+    shutil.copy2(SOURCE_PYTHON_RESOLVER, scripts / "resolve_dev_python.sh")
     return checkout, wrapper
 
 
