@@ -38,7 +38,41 @@ python hardware/DMTAC_gripper/run_gripper.py --help
 python hardware/DMTAC_gripper/run_gripper.py configure-usb --scan-only
 ```
 
-## 5. 生成 RM65 qpos 初始化 plan（R0）
+## 5. 夹爪状态微动（M）
+
+默认只生成左右夹爪（`all`）的预览，不连接设备；也可用 `--side left` 或
+`--side right`。默认使用归一化正常力度 `0.20`、速度 `0.20`，在实测当前位置附近
+做总跨度 `0.04` 的低位/高位/原位顺序微动，并在正常完成后恢复原始速度、力度和
+continuous-grasp 设置。
+
+```bash
+python scripts/check_dmtac_gripper_health.py
+```
+
+实际微动属于 M：必须先停止 teleop/数采及其他夹爪进程，清空夹爪工作区，确认现场
+操作员和急停可用，再显式解锁。两侧按 left -> right 顺序执行，不会同时运动；若运动
+阶段异常，脚本请求该侧夹爪 stop，并保留错误供排查。
+
+```bash
+python scripts/check_dmtac_gripper_health.py \
+  --side all \
+  --execute \
+  --confirmation GRIPPER_HEALTH_CHECK
+```
+
+## 6. RM65 信息与状态读取（H1，只读）
+
+默认从 `latest` RM65 IP assignment 顺序读取两侧；支持 `--side left/right` 和
+`--left-ip` / `--right-ip` 覆盖。输出包括机械臂基本信息、软件版本、当前关节/末端
+状态、关节使能、温度、电流、电压、关节错误及抱闸状态。命令只调用读取接口和关闭
+连接，不发送运动、使能、停止或配置写入，但仍会占用机械臂连接。
+
+```bash
+python scripts/read_rm65_status.py
+python scripts/read_rm65_status.py --side left
+```
+
+## 7. 生成 RM65 qpos 初始化 plan（R0）
 
 该命令不连接真机：
 
@@ -55,7 +89,7 @@ PYTHONPATH=. python -m robot_motion.rm65.arm_init.qpos_init \
 [`robot_motion/rm65/arm_init/README.md`](../../robot_motion/rm65/arm_init/README.md)。生成 plan
 不等于批准执行该 plan。
 
-## 6. Quest Browser/WebXR 开发基座（R0 测试）
+## 8. Quest Browser/WebXR 开发基座（R0 测试）
 
 [`hardware/quest_dev`](../../hardware/quest_dev/README.md) 是自包含的通用 HTTPS/WSS 与 WebXR
 开发模块。默认 robot feedback 关闭；可选 adapter 只读 Redis，不发布控制目标，也不会由
