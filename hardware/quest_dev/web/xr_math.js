@@ -26,9 +26,22 @@
     ]);
   }
 
+  function mat4Translation(x, y, z) {
+    const out = mat4Identity();
+    out[12] = Number(x);
+    out[13] = Number(y);
+    out[14] = Number(z);
+    return out;
+  }
+
   function posePosition(matrix) {
     return [matrix[12], matrix[13], matrix[14]];
   }
 
-  global.QuestDevXRMath = { mat4Multiply, mat4Identity, posePosition };
+  global.QuestDevXRMath = {
+    mat4Multiply,
+    mat4Identity,
+    mat4Translation,
+    posePosition,
+  };
 }(window));

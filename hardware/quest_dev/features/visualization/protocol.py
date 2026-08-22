@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - direct module compatibility.
 
 
 FEATURE_NAME = "visualization"
+FEATURE_PROTOCOL_VERSION = 1
 
 
 def robot_tcp_message(robots: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
@@ -20,6 +21,7 @@ def robot_tcp_message(robots: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
         "type": "robot_tcp",
         "feature": FEATURE_NAME,
         "protocol_version": PROTOCOL_VERSION,
+        "feature_protocol_version": FEATURE_PROTOCOL_VERSION,
         "server_timestamp": time.time(),
         "robots": dict(robots),
     }
@@ -30,6 +32,7 @@ def feedback_error_message(error: str) -> dict[str, Any]:
         "type": "robot_tcp",
         "feature": FEATURE_NAME,
         "protocol_version": PROTOCOL_VERSION,
+        "feature_protocol_version": FEATURE_PROTOCOL_VERSION,
         "server_timestamp": time.time(),
         "robots": {},
         "source_error": str(error),

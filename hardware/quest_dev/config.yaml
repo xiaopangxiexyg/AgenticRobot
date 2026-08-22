@@ -4,6 +4,12 @@ server:
   https: true
   cert: assets/certs/quest_dev.crt
   key: assets/certs/quest_dev.key
+  max_ws_clients: 4
+  auth_timeout_s: 5.0
+  pairing:
+    enabled: true
+    token_env: QUEST_DEV_PAIRING_TOKEN
+    require_same_origin: true
 
 xr:
   reference_space: local-floor
@@ -14,6 +20,10 @@ features:
     client:
       axis_length_m: 0.18
       show_controller_axes: true
+      show_reference_marker: true
+      reference_marker_size_m: 0.10
+      reference_marker_forward_m: 0.8
+      reference_marker_down_from_viewer_m: 0.15
     # 可选的机械臂只读反馈。默认关闭；启用后只调用 Redis GET。
     robot_feedback:
       enabled: false
@@ -27,3 +37,10 @@ features:
       sources:
         ar5_1: ar5:feedback:ar5_1
         ar5_2: ar5:feedback:ar5_2
+  controller_pose:
+    enabled: true
+    client:
+      publish_rate_hz: 20
+    admission:
+      max_rate_hz: 40
+      max_controllers: 2

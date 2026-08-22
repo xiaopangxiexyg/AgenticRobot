@@ -1,35 +1,74 @@
-# Quest Dev Core Protocol v1
+# Quest Dev Core Protocol v2
 
-核心通信使用同源 WebSocket `/ws`，消息为 UTF-8 JSON text frame，最大 1 MB。
+核心通信使用页面同源 WebSocket `/ws`，消息为 UTF-8 JSON text frame，最大 1 MB。
+v2 的首要变化是：任何生命周期或 feature 消息前都必须完成配对认证。
 
-## `server_hello`
+## 连接与配对
 
-连接建立后主机发送：
+WebSocket upgrade 默认要求 `Origin` 的 scheme 为 HTTP(S)，且 `Origin.netloc` 与请求
+`Host` 完全一致。只接受浏览器规范要求的 masked、单帧、无 RSV 数据；不支持 fragmented
+或 extension frame。server 最多接纳 4 个连接，未认证连接默认只有 5 秒绝对总期限；
+ping、非法 JSON 或其他 frame 不会延长该期限。
+
+连接建立后 server 先发送：
 
 ```json
 {
   "type": "server_hello",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "server_timestamp": 1710000000.0,
-  "mode": "quest_dev"
+  "mode": "quest_dev",
+  "server_instance_id": "...",
+  "authentication_required": true
 }
 ```
 
-## Quest 生命周期消息
+浏览器的第一条 text 消息必须是：
 
-浏览器核心目前发送：
+```json
+{
+  "type": "client_auth",
+  "protocol_version": 2,
+  "client_instance_id": "browser-...",
+  "pairing_token": "..."
+}
+```
 
-- `client_hello`
-- `xr_session_state`
-- `reference_space_reset`
+server 使用恒定时间比较 token。类型、版本、实例 ID 或 token 任一不合法时返回失败的
+`client_auth_result` 并关闭连接；成功时返回 `authenticated: true` 和连接局部
+`client_id`。后续带 `client_instance_id` 的消息必须与认证身份一致，否则关闭连接。
+未认证连接不会收到 feature 广播。
 
-核心 server 会记录最后一条客户端消息，并将已注册的消息类型分发给 feature handler。核心协议不定义机器人或控制消息。
+配对不可在配置中关闭。默认 token 每次进程启动随机生成；也可由 16–256 个 URL-safe
+ASCII 字符组成的 `QUEST_DEV_PAIRING_TOKEN` 注入。启动 URL 使用 `#pair=` fragment，
+fragment 不进入 HTTP 请求；它仍是 bearer secret，应只通过可信终端/局域网传递。
+明文 HTTP/WS 被强制限制在 loopback。
+
+## XR 生命周期
+
+认证后，浏览器核心发送：
+
+- `xr_session_state`：`started`/`ended`、页面实例、XR session、实际 reference-space
+  type 与 generation；
+- `reference_space_reset`：同一 session/type 下 `previous_generation` 到
+  `new_generation=previous+1`；
+- feature 自己注册的上行消息。
+
+所有消息使用 `protocol_version: 2`。controller-pose runtime 会拒绝非零初始 generation、
+重叠 session、错误 generation、乱序样本和身份不一致；end/reset/disconnect 都会让旧
+latest pose 失效。核心协议不定义机器人动作或控制消息。
 
 ## Feature 消息
 
-Feature 可以通过 `server.publish_feature_message(feature_name, payload)` 广播自己的版本化消息。最后一条 feature 消息会出现在 `/api/status` 的 `last_feature_messages` 中。
+Feature 可通过 `server.publish_feature_message(feature_name, payload)` 向所有已认证
+客户端广播自己的版本化消息。core version 与 `feature_protocol_version` 分开演进。
 
-## HTTP 接口
+## HTTP 接口与状态最小化
 
-- `/api/status`：核心连接和各 feature 最后一条状态。
-- `/api/config`：只返回浏览器需要的安全配置，不暴露 Redis 地址等 host-only 配置。
+- `/api/config`：只返回 browser-safe 配置；不含 token、token env 名、Redis 地址或
+  host admission 配置；
+- `/api/status`：要求 `Authorization: Bearer <pairing-token>`，只保存连接认证状态、
+  消息类型、身份/generation/sequence/count 等摘要；不保存 token、controller matrix
+  或 robot pose body。
+
+这些开发接口不应暴露到不可信网络。

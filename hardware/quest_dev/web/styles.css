@@ -41,6 +41,18 @@ button {
   font-weight: 800;
   cursor: pointer;
 }
+button:disabled { cursor: not-allowed; filter: grayscale(1); opacity: 0.55; }
+input {
+  min-width: min(420px, 60vw);
+  margin: 0 10px 12px 0;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--background);
+}
+#pairing-panel { margin-bottom: 18px; }
+#pairing-status { margin-left: 8px; }
 pre { max-height: 320px; overflow: auto; white-space: pre-wrap; color: #b9d8ff; }
 code { color: #b9d8ff; }
 @media (max-width: 700px) { .status-grid { grid-template-columns: 1fr; } }

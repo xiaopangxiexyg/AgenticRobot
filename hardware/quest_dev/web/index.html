@@ -21,7 +21,13 @@
     </section>
 
     <section class="panel">
-      <button id="start-xr">Enter MR/VR</button>
+      <div id="pairing-panel">
+        <label class="label" for="pairing-token">Ephemeral pairing token</label>
+        <input id="pairing-token" type="password" autocomplete="off" spellcheck="false" />
+        <button id="connect-ws" type="button">Pair</button>
+        <span id="pairing-status" class="bad">not paired</span>
+      </div>
+      <button id="start-xr" disabled>Enter MR/VR</button>
       <p>Quest Browser 通过 HTTPS 打开本页面。这个入口不需要 APK 或开发者模式。</p>
     </section>
 
@@ -34,6 +40,7 @@
   <script src="/feature_registry.js"></script>
   <script src="/features/visualization/renderer.js"></script>
   <script src="/features/visualization/feature.js"></script>
+  <script src="/features/controller_pose/feature.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
