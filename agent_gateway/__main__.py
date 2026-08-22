@@ -16,6 +16,10 @@ def main(argv: list[str] | None = None) -> int:
         from .profiles.real.gateway_cli import main as real_rm65_main
 
         return int(real_rm65_main(values[1:]))
+    if values and values[0] == "real-perception":
+        from .profiles.real.perception_cli import main as real_perception_main
+
+        return int(real_perception_main(values[1:]))
     if values and values[0] == "allocate-unix-endpoint":
         from .transport.endpoint_cli import main as endpoint_main
 
@@ -35,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=(
             "mujoco",
             "real-rm65",
+            "real-perception",
             "allocate-unix-endpoint",
             "ssh-readonly-proxy",
         ),

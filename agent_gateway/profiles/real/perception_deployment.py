@@ -271,8 +271,13 @@ def build_real_perception_capture_registration(
     station_manifest_hash: str,
     execution_manifest_hash: str,
     source_binding_hash: str,
+    current_mode: str = "real_active",
 ) -> RealPerceptionCaptureRegistration:
     """Build both exact T0 Routes from one reviewed real-camera inventory."""
+
+    mode = _required(current_mode, field_name="current_mode")
+    if mode not in {"real_active", "real_observe"}:
+        raise ValueError("current_mode must be real_active or real_observe.")
 
     profile = RealPerceptionCaptureProfile(
         rgb_sources=_source_tuples(rgb_source_catalog, label="RGB"),
@@ -352,7 +357,7 @@ def build_real_perception_capture_registration(
             allowed_parameter_profiles=schema.parameter_profiles,
             control_effect_class="read_only",
             privilege_tier="t0_read_only",
-            supported_modes=("real_active",),
+            supported_modes=(mode,),
             target_kind="real",
             may_move_robot=False,
             may_open_publication=False,

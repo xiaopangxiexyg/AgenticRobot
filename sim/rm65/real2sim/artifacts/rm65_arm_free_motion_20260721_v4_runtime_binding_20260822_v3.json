@@ -1,0 +1,140 @@
+{
+  "schema_version": "dexteleop.sim.real2sim_artifact.v1",
+  "name": "rm65_arm_free_motion_20260721_v4_runtime_binding_20260822_v3",
+  "simulation_contract": {
+    "artifact_id": "rm65-bimanual-physics-runtime-20260822-v3",
+    "artifact_kind": "simulation_contract",
+    "sha256": "dbf0cd77b5e8ffbd0f7951f9a4ae10c6c25757e6f32657e16f1fe14cf100938d",
+    "locator": "sim/configs/rm65_bimanual_physics_v1.json"
+  },
+  "resolved_timing": {
+    "sample_hz": 15.0,
+    "policy_hz": 15.0,
+    "reference_hz": 60.0,
+    "ik_hz": 60.0,
+    "command_hz": 120.0,
+    "physics_hz": 1000.0,
+    "camera_hz": 30.0,
+    "interpolation": "timestamp_linear",
+    "command_hold": "zero_order_hold_between_command_ticks",
+    "parameter_source": "project_default_pending_real_system_id"
+  },
+  "dependency_artifacts": [
+    {
+      "artifact_id": "rm65-arm-free-motion-fit-20260721-v4",
+      "artifact_kind": "real2sim_fit_artifact",
+      "sha256": "89d72aed454bdc309959f7489486eb5ef3eae13d688be444efd849b637d6bd53",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json"
+    },
+    {
+      "artifact_id": "rm65-camera-registry-runtime-20260822-v3",
+      "artifact_kind": "camera_registry",
+      "sha256": "7a0c1e612508c15dc5e0d8445e362498d92b28606e6f7157f47b88fda965e9ba",
+      "locator": "robot_motion/configs/rm65_camera_registry.json"
+    },
+    {
+      "artifact_id": "rm65-camera-registry-runtime-20260724-v1-archive",
+      "artifact_kind": "camera_registry",
+      "sha256": "0a453ebd6836cf32efe1c25c24519adc2829e41c666e575000061103700d9d50",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_camera_registry_runtime_20260724_v1.json"
+    },
+    {
+      "artifact_id": "rm65-bimanual-physics-runtime-20260811-v2-archive",
+      "artifact_kind": "simulation_contract",
+      "sha256": "c3d4703b460905d130e59885661a7b037585b98e898ab9fdd59b01457aa5eae5",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_bimanual_physics_runtime_20260811_v2.json"
+    },
+    {
+      "artifact_id": "rm65-arm-runtime-binding-20260811-v2-archive",
+      "artifact_kind": "real2sim_runtime_binding",
+      "sha256": "ccdd6e5e60ea78bd6c791c2c2102b212a5584de2db3c4b994bd8f289af8fb80f",
+      "locator": "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260811_v2.json"
+    }
+  ],
+  "fidelity_claims": [
+    {
+      "component": "arm.position_response.free_motion.runtime_binding",
+      "status": "provisional",
+      "evidence_artifact_ids": [
+        "rm65-arm-free-motion-fit-20260721-v4",
+        "rm65-camera-registry-runtime-20260822-v3",
+        "rm65-camera-registry-runtime-20260724-v1-archive",
+        "rm65-bimanual-physics-runtime-20260811-v2-archive",
+        "rm65-arm-runtime-binding-20260811-v2-archive"
+      ],
+      "limitations": [
+        "This binding reuses the frozen 20260721.v4 arm fit; no arm parameters were refit or revalidated.",
+        "The simulation contract now selects the reviewed 4B2 CAD-with-legacy-housing scene and its explicit adjacent-link collision exclusions; this is a geometry/runtime binding change, not new arm-response evidence.",
+        "The current camera registry swaps the wrist D405 serial assignments and adds the 4B2 CAD scene to the three reviewed camera frame associations relative to the archived 20260724.v1 registry.",
+        "The original v4 held-out status remains not_run, so this binding does not promote the arm fidelity claim.",
+        "Camera geometry and photometry remain provisional and are not validated by the arm free-motion evidence."
+      ],
+      "notes": "The v3 runtime binding content-addresses the current simulation contract and camera registry while retaining the exact v2 runtime binding, v2 simulation contract, and v1 camera registry as recoverable evidence."
+    }
+  ],
+  "validation_evidence": [
+    {
+      "validation_id": "runtime-contract-4b2-cad-rebind-integrity",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "changed_simulation_contract_field_count_from_20260811_v2": 2.0,
+        "changed_default_scene_urdf_field_count": 1.0,
+        "changed_collision_exclusion_field_count": 1.0,
+        "changed_arm_dynamics_field_count": 0.0,
+        "changed_timing_field_count": 0.0
+      },
+      "evidence_artifact_ids": [
+        "rm65-bimanual-physics-runtime-20260822-v3",
+        "rm65-bimanual-physics-runtime-20260811-v2-archive",
+        "rm65-arm-runtime-binding-20260811-v2-archive"
+      ],
+      "notes": "Structural review pins the 4B2 CAD scene selection and its reviewed collision exclusions without claiming an arm-profile refit."
+    },
+    {
+      "validation_id": "camera-registry-cad-association-and-serial-rebind-integrity",
+      "split": "validation",
+      "status": "passed",
+      "metrics": {
+        "changed_camera_registry_field_count_from_20260724_v1": 5.0,
+        "changed_camera_registry_serial_field_count": 2.0,
+        "added_camera_urdf_association_count": 3.0,
+        "changed_other_camera_registry_field_count": 0.0
+      },
+      "evidence_artifact_ids": [
+        "rm65-camera-registry-runtime-20260822-v3",
+        "rm65-camera-registry-runtime-20260724-v1-archive"
+      ],
+      "notes": "Structural comparison records exactly two wrist serial exchanges and one added 4B2 CAD URDF association for each reviewed camera role."
+    },
+    {
+      "validation_id": "new-untouched-clean-held-out-v4-runtime-binding",
+      "split": "held_out",
+      "status": "not_run",
+      "metrics": {},
+      "evidence_artifact_ids": [],
+      "notes": "The scene and camera-registry rebinding is not new arm-response evidence. A later clean capture must remain untouched before the reused v4 fit can pass held-out validation."
+    }
+  ],
+  "code_revision": "1abfff9fb2cf6c4955aaf96f08c776eeacd8c9d4",
+  "environment_fingerprint": {
+    "python": "3.10.20",
+    "mujoco": "3.10.0",
+    "source_commit": "1abfff9fb2cf6c4955aaf96f08c776eeacd8c9d4"
+  },
+  "metadata": {
+    "owner": "sim.rm65",
+    "binding_kind": "runtime_contract_and_camera_registry_rebind",
+    "fit_profile_name": "rm65_bimanual_udp_feedback_20260721.v4",
+    "fit_artifact_sha256": "501702e3b741096fc3038b082405073bad51f63626b7296b75d2847e85df778d",
+    "fit_simulation_contract_sha256": "baa5efcd490f27b0d2e261ac2e5c91181a0618de75596017a05714a02333a0df",
+    "previous_runtime_binding_artifact_sha256": "ca0d2e58c6799557f9ed1f781da9a4fc7e9f5b9c28ccff0caad99b8dd613a60b",
+    "previous_simulation_contract_sha256": "c3d4703b460905d130e59885661a7b037585b98e898ab9fdd59b01457aa5eae5",
+    "previous_camera_registry_sha256": "8534a6d2ec9ec3ebb1b1d9822255537f5fe66590aed4453dc4206c5aa4292aef",
+    "migration": "4b2_cad_scene_and_camera_registry_association_rebind",
+    "arm_profile_refit": false,
+    "runtime_behavior_change": true,
+    "runtime_behavior_change_scope": "simulation_scene_geometry_and_real_camera_selection"
+  },
+  "artifact_sha256": "c8781f8b9f206133adb58eb0393f4932e9f4442bbc533206deb9479a13b693c1"
+}

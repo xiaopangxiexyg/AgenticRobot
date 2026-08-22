@@ -394,6 +394,91 @@ class ExclusiveRealPerceptionResources:
             raise RuntimeError("real perception resource close failed: " + "; ".join(errors))
 
 
+class CameraOnlyRealPerceptionResources:
+    """Own only cameras and Artifact storage; never touches a robot backend."""
+
+    def __init__(
+        self,
+        *,
+        camera_sources: Mapping[str, object],
+        artifact_store: _CloseResource,
+        start_cameras: Callable[[Mapping[str, Any]], None] | None = None,
+        admit_cameras: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> None:
+        if not camera_sources:
+            raise ValueError("camera_sources must not be empty.")
+        if not callable(getattr(artifact_store, "close", None)):
+            raise TypeError("artifact_store must expose close.")
+        start_cameras = (
+            start_realsense_sources if start_cameras is None else start_cameras
+        )
+        admit_cameras = (
+            admit_realsense_sources if admit_cameras is None else admit_cameras
+        )
+        if not callable(start_cameras) or not callable(admit_cameras):
+            raise TypeError("camera lifecycle callbacks must be callable.")
+        self.camera_sources = dict(camera_sources)
+        self.artifact_store = artifact_store
+        self._start_cameras = start_cameras
+        self._admit_cameras = admit_cameras
+        self._lock = threading.Lock()
+        self._started = False
+        self._closed = False
+
+    @property
+    def started(self) -> bool:
+        with self._lock:
+            return self._started
+
+    def start(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("closed camera-only resources cannot restart.")
+            if self._started:
+                return
+        try:
+            self._start_cameras(self.camera_sources)
+            self._admit_cameras(self.camera_sources)
+        except Exception as start_error:
+            cleanup_errors = self._close_cameras()
+            try:
+                self.artifact_store.close()
+            except Exception as exc:  # noqa: BLE001 - preserve all cleanup evidence.
+                cleanup_errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
+            with self._lock:
+                self._closed = True
+            if cleanup_errors:
+                raise RuntimeError(
+                    "camera-only perception startup cleanup failed: "
+                    + "; ".join(cleanup_errors)
+                ) from start_error
+            raise
+        with self._lock:
+            self._started = True
+
+    def _close_cameras(self) -> list[str]:
+        try:
+            _formal_close_camera_sources(self.camera_sources)
+        except Exception as exc:  # noqa: BLE001 - formal close covers all cameras.
+            return [f"cameras:{type(exc).__name__}:{exc}"]
+        return []
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        errors = self._close_cameras()
+        try:
+            self.artifact_store.close()
+        except Exception as exc:  # noqa: BLE001 - cameras were already attempted.
+            errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
+        if errors:
+            raise RuntimeError(
+                "camera-only perception resource close failed: " + "; ".join(errors)
+            )
+
+
 def start_realsense_sources(camera_sources: Mapping[str, Any]) -> None:
     """Compatibility name delegating to formal real-teleop startup."""
 
@@ -754,14 +839,15 @@ def _depth_intrinsics(
 
 
 __all__ = [
+    "CameraOnlyRealPerceptionResources",
     "EncodedRealDepthFrame",
     "EncodedRealRgbFrame",
     "ExclusiveRealPerceptionResources",
     "RealPerceptionSourceBinding",
     "RealRgbCapture",
     "RealSenseAgentPerceptionProvider",
-    "build_real_perception_source_binding",
     "admit_realsense_sources",
+    "build_real_perception_source_binding",
     "real_camera_role_for_source",
     "start_realsense_sources",
 ]

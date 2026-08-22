@@ -1,0 +1,341 @@
+"""Process owner for the independent camera-only real perception Gateway."""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.transport.client_bindings import AgentGatewayUnixClientBindings
+from dataset_contracts.canonical_encoding import canonical_content_hash
+
+from .perception_deployment import (
+    REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
+    RealPerceptionCaptureRegistration,
+    build_real_perception_capture_registration,
+)
+from .perception_gateway import (
+    RealPerceptionContractBundle,
+    RealPerceptionGatewaySession,
+    assemble_real_perception_gateway_session,
+    build_real_perception_contract_bundle,
+)
+from .realsense_perception import (
+    CameraOnlyRealPerceptionResources,
+    RealPerceptionSourceBinding,
+    RealSenseAgentPerceptionProvider,
+)
+
+
+class CameraOnlyRealPerceptionApplicationState(str, Enum):
+    CREATED = "created"
+    RUNNING = "running"
+    FAULT = "fault"
+    CLOSED = "closed"
+
+
+class CameraOnlyRealPerceptionApplication:
+    """Start camera resources before publishing the Unix endpoint."""
+
+    def __init__(
+        self,
+        *,
+        session: RealPerceptionGatewaySession,
+        resources: CameraOnlyRealPerceptionResources,
+        server_factory: Callable[[], object],
+    ) -> None:
+        if not isinstance(session, RealPerceptionGatewaySession):
+            raise TypeError("session must be typed.")
+        if not isinstance(resources, CameraOnlyRealPerceptionResources):
+            raise TypeError("resources must be typed.")
+        if not callable(server_factory):
+            raise TypeError("server_factory must be callable.")
+        self.session = session
+        self.resources = resources
+        self.server_factory = server_factory
+        self._lock = threading.RLock()
+        self._state = CameraOnlyRealPerceptionApplicationState.CREATED
+        self._server: object | None = None
+
+    @property
+    def state(self) -> CameraOnlyRealPerceptionApplicationState:
+        with self._lock:
+            return self._state
+
+    def start(self) -> None:
+        with self._lock:
+            if self._state != CameraOnlyRealPerceptionApplicationState.CREATED:
+                raise RuntimeError("camera-only perception application starts once.")
+        resources_started = False
+        server = None
+        try:
+            self.resources.start()
+            resources_started = True
+            # Publish one admitted planning snapshot before accepting requests.
+            outcome = self.session.observation_producer.capture_and_publish(
+                self.session.service
+            )
+            if not outcome.accepted or outcome.snapshot is None:
+                raise RuntimeError("camera-only startup observation was rejected.")
+            server = self.server_factory()
+            for name in ("serve_forever", "shutdown", "server_close"):
+                if not callable(getattr(server, name, None)):
+                    raise TypeError(f"server must expose {name}.")
+            with self._lock:
+                self._server = server
+                self._state = CameraOnlyRealPerceptionApplicationState.RUNNING
+        except Exception as start_error:
+            cleanup_errors = []
+            if server is not None:
+                try:
+                    server.server_close()
+                except Exception as exc:  # noqa: BLE001 - aggregate startup cleanup.
+                    cleanup_errors.append(f"gateway:{type(exc).__name__}:{exc}")
+            else:
+                try:
+                    self.session.close()
+                except Exception as exc:  # noqa: BLE001 - aggregate startup cleanup.
+                    cleanup_errors.append(f"gateway:{type(exc).__name__}:{exc}")
+            if resources_started:
+                try:
+                    self.resources.close()
+                except Exception as exc:  # noqa: BLE001 - aggregate startup cleanup.
+                    cleanup_errors.append(f"resources:{type(exc).__name__}:{exc}")
+            with self._lock:
+                self._state = CameraOnlyRealPerceptionApplicationState.FAULT
+            if cleanup_errors:
+                raise RuntimeError(
+                    "camera-only perception startup cleanup failed: "
+                    + "; ".join(cleanup_errors)
+                ) from start_error
+            raise
+
+    def serve_forever(
+        self,
+        *,
+        ready_callback: Callable[[], None] | None = None,
+        poll_interval_sec: float = 0.05,
+    ) -> None:
+        if ready_callback is not None and not callable(ready_callback):
+            raise TypeError("ready_callback must be callable or None.")
+        self.start()
+        with self._lock:
+            server = self._server
+        assert server is not None
+        try:
+            if ready_callback is not None:
+                ready_callback()
+            server.serve_forever(poll_interval=float(poll_interval_sec))
+        finally:
+            self.close()
+
+    def request_shutdown(self) -> bool:
+        with self._lock:
+            server = self._server
+        if server is None:
+            return False
+        server.shutdown()
+        return True
+
+    def close(self) -> None:
+        with self._lock:
+            if self._state == CameraOnlyRealPerceptionApplicationState.CLOSED:
+                return
+            server = self._server
+        errors = []
+        if server is not None:
+            try:
+                server.server_close()
+            except Exception as exc:  # noqa: BLE001 - resources still must close.
+                errors.append(f"gateway:{type(exc).__name__}:{exc}")
+        else:
+            try:
+                self.session.close()
+            except Exception as exc:  # noqa: BLE001 - resources still must close.
+                errors.append(f"gateway:{type(exc).__name__}:{exc}")
+        try:
+            self.resources.close()
+        except Exception as exc:  # noqa: BLE001 - aggregate cleanup evidence.
+            errors.append(f"resources:{type(exc).__name__}:{exc}")
+        with self._lock:
+            self._state = (
+                CameraOnlyRealPerceptionApplicationState.CLOSED
+                if not errors
+                else CameraOnlyRealPerceptionApplicationState.FAULT
+            )
+        if errors:
+            raise RuntimeError(
+                "camera-only perception shutdown failed: " + "; ".join(errors)
+            )
+
+
+@dataclass(frozen=True)
+class CameraOnlyRealPerceptionComposition:
+    source_binding: RealPerceptionSourceBinding
+    registration: RealPerceptionCaptureRegistration
+    contract_bundle: RealPerceptionContractBundle
+    artifact_store: RecoverableAgentArtifactStore
+    resources: CameraOnlyRealPerceptionResources
+    session: RealPerceptionGatewaySession
+    application: CameraOnlyRealPerceptionApplication
+    socket_path: Path
+    client_bindings: AgentGatewayUnixClientBindings
+    deployment_profile_hash: str
+
+
+def assemble_camera_only_real_perception_composition(
+    *,
+    source_binding: RealPerceptionSourceBinding,
+    socket_path: str | Path,
+    artifact_root: str | Path,
+    client_bindings: AgentGatewayUnixClientBindings,
+    runtime_session_id: str,
+    control_domain_id: str,
+    scene_geometry_hash: str,
+    max_retained_operations: int = 16,
+    peer_idle_timeout_sec: float = 10.0,
+    clock: Callable[[], float] = time.time,
+) -> CameraOnlyRealPerceptionComposition:
+    """Assemble camera-only resources and Routes without starting hardware."""
+
+    if not isinstance(source_binding, RealPerceptionSourceBinding):
+        raise TypeError("source_binding must be typed.")
+    if not isinstance(client_bindings, AgentGatewayUnixClientBindings):
+        raise TypeError("client_bindings must be typed.")
+    endpoint = Path(socket_path)
+    root = Path(artifact_root)
+    if not endpoint.is_absolute() or not root.is_absolute():
+        raise ValueError("socket_path and artifact_root must be absolute.")
+    runtime_id = str(runtime_session_id).strip()
+    domain_id = str(control_domain_id).strip()
+    geometry_hash = str(scene_geometry_hash).strip()
+    if not runtime_id or not domain_id or not geometry_hash:
+        raise ValueError("session, control-domain, and geometry IDs are required.")
+    target_binding_hash = canonical_content_hash(
+        {
+            "source_binding_hash": source_binding.semantic_content_hash,
+            "scene_geometry_hash": geometry_hash,
+            "resource_kind": "camera_bundle",
+        },
+        domain="dexteleop.real_perception.target_binding.v1",
+    )
+    target_binding_id = "real-realsense-only:" + target_binding_hash
+    station_manifest_hash = canonical_content_hash(
+        {
+            "scene_geometry_hash": geometry_hash,
+            "source_binding_hash": source_binding.semantic_content_hash,
+        },
+        domain="dexteleop.real_perception.station_manifest.v1",
+    )
+    execution_manifest_hash = canonical_content_hash(
+        {
+            "resource_owner": "camera_only_real_perception_application",
+            "source_binding_hash": source_binding.semantic_content_hash,
+            "robot_backend": "absent",
+            "command_owner_count": 0,
+            "downstream_control_effects": "forbidden",
+        },
+        domain="dexteleop.real_perception.execution_manifest.v1",
+    )
+    catalog_provider = RealSenseAgentPerceptionProvider(
+        source_binding=source_binding,
+        current_station_revision=lambda: 0,
+        clock=clock,
+    )
+    registration = build_real_perception_capture_registration(
+        rgb_source_catalog=catalog_provider.rgb_source_catalog(),
+        depth_source_catalog=catalog_provider.depth_source_catalog(),
+        runtime_session_id=runtime_id,
+        control_domain_id=domain_id,
+        target_binding_id=target_binding_id,
+        station_manifest_hash=station_manifest_hash,
+        execution_manifest_hash=execution_manifest_hash,
+        source_binding_hash=source_binding.semantic_content_hash,
+        current_mode="real_observe",
+    )
+    tool_config_hash = canonical_content_hash(
+        {"tool_configuration": "not_applicable_camera_only"},
+        domain="dexteleop.real_perception.no_tool_config.v1",
+    )
+    source_binding_id = "real-realsense:" + source_binding.semantic_content_hash
+    bundle = build_real_perception_contract_bundle(
+        registration=registration,
+        source_binding_id=source_binding_id,
+        frame_graph_hash=geometry_hash,
+        tool_config_hash=tool_config_hash,
+        calibration_hash=source_binding.semantic_content_hash,
+    )
+    partition = canonical_content_hash(
+        {"runtime_session_id": runtime_id},
+        domain="dexteleop.agent_gateway.artifact_store_partition.v1",
+    )
+    artifact_store = RecoverableAgentArtifactStore(
+        root=root / partition,
+        quota_bytes=512 * 1024 * 1024,
+        max_artifact_bytes=REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
+        max_chunk_bytes=1024 * 1024,
+    )
+    try:
+        session = assemble_real_perception_gateway_session(
+            bundle=bundle,
+            source_binding=source_binding,
+            artifact_store=artifact_store,
+            allowed_client_ids=client_bindings.allowed_client_ids,
+            max_retained_operations=max_retained_operations,
+            clock=clock,
+        )
+    except Exception:
+        artifact_store.close()
+        raise
+    resources = CameraOnlyRealPerceptionResources(
+        camera_sources=source_binding.camera_sources,
+        artifact_store=artifact_store,
+    )
+
+    def server_factory():
+        return session.build_unix_json_server(
+            socket_path=str(endpoint),
+            client_id_by_uid=client_bindings.client_id_by_uid,
+            socket_mode=client_bindings.socket_mode,
+            peer_idle_timeout_sec=peer_idle_timeout_sec,
+        )
+
+    application = CameraOnlyRealPerceptionApplication(
+        session=session,
+        resources=resources,
+        server_factory=server_factory,
+    )
+    deployment_profile_hash = canonical_content_hash(
+        {
+            "source_binding_hash": source_binding.semantic_content_hash,
+            "scene_geometry_hash": geometry_hash,
+            "route_manifest_hash": bundle.route_manifest.semantic_content_hash,
+            "artifact_max_bytes": REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
+            "robot_backend": "absent",
+        },
+        domain="dexteleop.real_perception.camera_only_profile.v1",
+    )
+    return CameraOnlyRealPerceptionComposition(
+        source_binding=source_binding,
+        registration=registration,
+        contract_bundle=bundle,
+        artifact_store=artifact_store,
+        resources=resources,
+        session=session,
+        application=application,
+        socket_path=endpoint,
+        client_bindings=client_bindings,
+        deployment_profile_hash=deployment_profile_hash,
+    )
+
+
+__all__ = [
+    "CameraOnlyRealPerceptionApplication",
+    "CameraOnlyRealPerceptionApplicationState",
+    "CameraOnlyRealPerceptionComposition",
+    "assemble_camera_only_real_perception_composition",
+]

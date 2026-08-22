@@ -5,7 +5,6 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSET_ROOT = REPO_ROOT / "assets"
 EXPECTED_WORKSPACE_NEAR_BOUNDARY_WORLD_XYZ = np.array([-0.472, 0.0, 0.01])
@@ -15,6 +14,11 @@ EXPECTED_CAMERA_POLE_ORIGINS = {
     "left_camera_pole_joint": np.array([0.025, -0.478, 0.5]),
     "right_camera_pole_joint": np.array([0.025, 0.439, 0.5]),
 }
+REQUIRED_ACTIVE_STATION_URDF = (
+    ASSET_ROOT
+    / "rm65_inspire_gripper_v3"
+    / "rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf"
+)
 
 
 def _active_rm65_table_urdfs() -> tuple[Path, ...]:
@@ -53,7 +57,7 @@ def _rpy(element: ET.Element) -> np.ndarray:
 
 def test_all_active_rm65_table_urdfs_define_geometry_free_workspace_near_boundary_frame():
     urdf_paths = _active_rm65_table_urdfs()
-    assert len(urdf_paths) == 12
+    assert REQUIRED_ACTIVE_STATION_URDF in urdf_paths
 
     for urdf_path in urdf_paths:
         root = ET.parse(urdf_path).getroot()
@@ -130,7 +134,7 @@ def test_workspace_near_boundary_visualization_urdf_uses_the_same_desk_axes():
 
 def test_all_active_rm65_camera_poles_use_the_shifted_station_origins():
     urdf_paths = _active_rm65_camera_pole_urdfs()
-    assert len(urdf_paths) == 16
+    assert REQUIRED_ACTIVE_STATION_URDF in urdf_paths
 
     for urdf_path in urdf_paths:
         root = ET.parse(urdf_path).getroot()

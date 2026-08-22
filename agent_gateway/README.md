@@ -326,6 +326,27 @@ python -m agent_gateway real-rm65 \
   --confirm AUTHORIZE_ONE_REAL_TCP_PRIMITIVE
 ```
 
+For passive camera input without constructing or connecting either RM65 backend,
+use the separate camera-only profile:
+
+```bash
+python -m agent_gateway real-perception \
+  --socket-path /absolute/private/gateway.sock \
+  --camera-config /absolute/DexTeleop/teleop_runtime/configs/devices/agent_gateway_realsense.json \
+  --camera-registry /absolute/DexTeleop/robot_motion/configs/rm65_camera_registry.json \
+  --artifact-root /absolute/private/artifact_cache
+```
+
+`real-perception` exposes exactly `perception.capture_rgb` and
+`perception.capture_depth` in `real_observe` mode. It owns the configured
+RealSense inventory and transient Artifact store, starts and admits cameras
+before publishing the Unix socket, and has no RM65 backend, motion Route,
+operator Grant, command owner, dispatch path, or domain HOLD path. It therefore
+does not accept `--arm-ip-assignment`, tool/envelope profiles, an authorized
+motion action, or `--confirm`. The selected collision-scene profile is read only
+to derive fixed arm-base geometry for static camera poses; it does not construct
+or connect a robot backend.
+
 The three perception flags are all-or-none. The checked-in deployment profile
 publishes RGB for `main`, `wrist_left`, and `wrist_right`, but publishes depth
 only for `main`. The front camera has a reviewed static camera-to-arm-base
@@ -340,22 +361,21 @@ color intrinsics and the trusted world pose. Payload bytes are committed to
 the same generic transient Artifact CAS and retrieved through `chunked_rpc` or
 a reviewed same-host `local_path` grant.
 
-The selected `--collision-scene-profile` is the single source of Station
-geometry for this independent Skill process. Its scene URDF fixed-joint chain
-defines both arm bases in `dual_arm_solver_world`; the camera registry then
-defines each fixed camera relative to its parent link. A Vive/teleoperation
-`TeleopCalibration` is neither loaded nor accepted by this entrypoint. Runtime
-TCP-envelope anchors come from the fresh lower-measured qpos/FK cut after the
-startup HOLD, not from a teleoperation Home record.
+For both real profiles, the selected `--collision-scene-profile` is the source
+of Station geometry. Its scene URDF fixed-joint chain defines both arm bases in
+`dual_arm_solver_world`; the camera registry then defines each fixed camera
+relative to its parent link. A Vive/teleoperation `TeleopCalibration` is neither
+loaded nor accepted by either entrypoint.
 
-This is currently a combined real application, not a camera-only diagnostic
-launcher. Starting it acquires and admits all configured cameras, then starts
-the exclusive dual-RM65 lower owner before publishing the socket; consequently
-the existing one-use motion confirmation and real-hardware safety preflight
-remain mandatory even when an upper client intends to invoke only passive
-Skills. A capture invocation itself has no downstream control effect. Live
-camera or robot execution is not established by the repository's offline
-tests.
+`real-rm65` remains the combined real application. Starting it acquires and
+admits all configured cameras, then starts the exclusive dual-RM65 lower owner
+before publishing the socket; consequently the existing one-use motion
+confirmation and real-hardware safety preflight remain mandatory even when an
+upper client intends to invoke only passive Skills. Its runtime TCP-envelope
+anchors come from the fresh lower-measured qpos/FK cut after startup HOLD, not
+from a teleoperation Home record. A capture invocation itself has no downstream
+control effect. Repository offline tests establish neither live camera nor
+robot execution for either profile.
 
 The CLI is a concrete lower deployment leaf, not an Agent API. All files and
 the selected side/action are trusted operator inputs. The process exposes no
