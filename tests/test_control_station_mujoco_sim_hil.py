@@ -92,6 +92,11 @@ from sim.mujoco.deploy import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
     prepare_mujoco_sim_hil_target,
 )
+from sim.mujoco.tasks.cube_lift.config import CubeLiftTaskConfig
+from sim.mujoco_temp_pipeline.checkpoint import (
+    check_task_config_compatibility,
+    load_checkpoint_payload,
+)
 from teleop_runtime.calibration import TeleopCalibration
 from teleop_runtime.action.human_proposal import HumanCommandEmission
 from teleop_runtime.calibration import ArmCalibration
@@ -104,6 +109,36 @@ from teleop_runtime.schemas import ObservationChannel, TeleopObservation
 
 def _require_mujoco_runtime() -> None:
     pytest.importorskip("mujoco")
+
+
+def _require_optional_default_checkpoint_fixture(
+    config: object | None = None,
+) -> None:
+    selected = MujocoSimHILApplicationConfig() if config is None else config
+    try:
+        payload = load_checkpoint_payload(
+            selected.checkpoint_path,
+            map_location="cpu",
+        )
+        check_task_config_compatibility(payload, selected.task_config_path)
+        CubeLiftTaskConfig.load(selected.task_config_path).base_contract()
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        pytest.skip(
+            "optional Sim-HIL checkpoint fixture unavailable: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def test_optional_default_checkpoint_fixture_skips_when_incomplete(
+    tmp_path: Path,
+) -> None:
+    config = SimpleNamespace(
+        checkpoint_path=tmp_path / "missing-checkpoint.pt",
+        task_config_path=tmp_path / "missing-task.json",
+    )
+
+    with pytest.raises(pytest.skip.Exception, match="fixture unavailable"):
+        _require_optional_default_checkpoint_fixture(config)
 
 
 def test_preflight_uses_readiness_required_by_active_mix() -> None:
@@ -822,6 +857,7 @@ def test_real_checkpoint_virtual_human_runs_hold_rearm_and_differences(
     """Exercise the concrete application without opening VIVE/Q6 devices."""
 
     _require_mujoco_runtime()
+    _require_optional_default_checkpoint_fixture()
 
     class DebugOnlyState:
         value = "DEBUG_ONLY"
@@ -1306,6 +1342,7 @@ def test_policy_only_application_defers_human_device_and_profile_binding(
     monkeypatch,
 ) -> None:
     _require_mujoco_runtime()
+    _require_optional_default_checkpoint_fixture()
 
     def reject_human_device_resolution(**_kwargs):
         raise AssertionError("policy-only construction touched a human device")
