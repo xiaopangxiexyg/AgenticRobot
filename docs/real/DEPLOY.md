@@ -73,14 +73,20 @@ same-chunk successor。两类运行会在 planner/profile 解析前关闭 chunk 
 OpenPI server 使用 OpenPI 环境，DexTeleop client 使用 `dexteleop310`。Checkpoint 目录必须
 包含有效 `policy_artifact.json`。
 
-无硬件 contract 检查和“只观测/推理、不发送动作”的可执行命令统一在
-[real README 的第 3 节](./README.md) 维护。
+训练路线、环境分工、checkpoint/profile 绑定、恢复和部署副作用统一在
+[`deployments/openpi/COMMANDS.md`](../../deployments/openpi/COMMANDS.md) 维护；
+现场两终端最短顺序见 [OpenPI 现场部署](./OPENPI.md)。
+
+`--contract-check-only` 才是不连接 server、相机、手部设备或机械臂的静态检查。
+“只观测/推理、不发送动作”的 client 仍可能打开真实 observation/backend；它只因缺少
+`--send-actions` 而不下发 policy action，不能称为无硬件检查。
 
 只有在完整 preflight、qpos-init 和人工 ready gate 都确认后，才可增加 `--send-actions`
 进入 M 级。不要同时加入 `--auto-start` 或 `--start-init_qpos`。
 
 Server 启动、checkpoint 选择和现场按键以
-[OpenPI 部署](./OPENPI.md)为准。
+[OpenPI 现场部署](./OPENPI.md)为准；具体已审计 checkpoint/profile 长命令见
+[`deployments/openpi/cmd_list.md`](../../deployments/openpi/cmd_list.md)。
 
 ## 3. 验收工具（R1）
 

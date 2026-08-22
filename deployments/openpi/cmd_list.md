@@ -1,8 +1,14 @@
-# OpenPI Policy → DexTeleop 部署与训练命令
+# OpenPI 详细命令与 checkpoint 目录
 
-本文档是远端 `/home/user/zc/openpi` policy 接入
-`/home/user/zc/DexTeleop` 的自包含运行手册。内容覆盖 checkpoint 选择、OpenPI server、
-契约检查、no-action 检查、真实 RM65 部署，以及历史训练入口。
+本文档保留远端 `/home/user/zc/openpi` policy 接入
+`/home/user/zc/DexTeleop` 的具体 checkpoint/profile、实验名和长命令。系统性的路线选择、
+环境分工、副作用、恢复规则和部署阶梯统一以
+[`COMMANDS.md`](./COMMANDS.md) 为入口；模型契约以 checkpoint 的
+`policy_artifact.json` 和 [`README.md`](./README.md) 为准。
+
+本文件中的 checkpoint 清单是带审计日期的站点快照，不是自动更新的 registry。执行前
+必须重新检查远端身份、路径、实际 step、artifact/profile hash 和进程/GPU 状态。不要从
+不同章节复制参数拼成未定义的 server/client 组合。
 
 本文档中的命令仅供操作者按节执行；本次整理没有启动训练、OpenPI server、相机、
 机械臂或夹爪。
@@ -19,7 +25,7 @@
 | prepared writing 当前 Stage1–4 组合 | 第 20 节 | 四个独立 checkpoint/profile；Stage1 qpos-init，Stage2–4 当前姿态接管 |
 | trained model-RTC | 第 11 节 | 仅 conditioned no-action shadow；当前没有动作部署入口 |
 | 老 v1 registry policy | 第 12 节 | legacy registry；不属于 v2 artifact contract |
-| 训练与恢复参考 | 第 13～15 节 | 只在明确要训练时使用，不是部署前置步骤 |
+| 原生/prepared/prompt-family 训练与恢复 | 第 13～18 节 | 只在明确要训练时使用，不是部署前置步骤；先按 `COMMANDS.md` 第 4～5 节选路线 |
 
 不要把不同路线的 server/client 参数混合。例如 prepared policy 不能改用通用
 `--config`，RTC shadow 不能复制 `--send-actions`。
