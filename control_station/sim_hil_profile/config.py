@@ -20,6 +20,7 @@ from .validation import _finite
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SIM_HIL_CHECKPOINT_ENV = "DEXTELEOP_SIM_HIL_CHECKPOINT"
+SIM_HIL_TASK_CONFIG_ENV = "DEXTELEOP_SIM_HIL_TASK_CONFIG"
 LOCAL_DEFAULT_CHECKPOINT = (
     REPO_ROOT
     / "sim"
@@ -29,6 +30,29 @@ LOCAL_DEFAULT_CHECKPOINT = (
     / "checkpoints"
     / "step_000050176_final.pt"
 )
+LOCAL_DEFAULT_TASK_CONFIG = (
+    REPO_ROOT
+    / "sim"
+    / "configs"
+    / "tasks"
+    / "rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json"
+)
+
+
+def _resolve_absolute_host_path(
+    *,
+    environment_name: str,
+    fallback: Path,
+    environ: Mapping[str, str] | None,
+) -> Path:
+    environment = os.environ if environ is None else environ
+    configured = str(environment.get(environment_name, "")).strip()
+    if not configured:
+        return fallback
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{environment_name} must be an absolute path.")
+    return path.resolve()
 
 
 def resolve_default_checkpoint_path(
@@ -36,24 +60,27 @@ def resolve_default_checkpoint_path(
 ) -> Path:
     """Resolve the optional host-supplied Sim-HIL checkpoint fail closed."""
 
-    environment = os.environ if environ is None else environ
-    configured = str(environment.get(SIM_HIL_CHECKPOINT_ENV, "")).strip()
-    if not configured:
-        return LOCAL_DEFAULT_CHECKPOINT
-    checkpoint = Path(configured).expanduser()
-    if not checkpoint.is_absolute():
-        raise ValueError(f"{SIM_HIL_CHECKPOINT_ENV} must be an absolute path.")
-    return checkpoint.resolve()
+    return _resolve_absolute_host_path(
+        environment_name=SIM_HIL_CHECKPOINT_ENV,
+        fallback=LOCAL_DEFAULT_CHECKPOINT,
+        environ=environ,
+    )
+
+
+def resolve_default_task_config_path(
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve the task config paired with the optional Sim-HIL checkpoint."""
+
+    return _resolve_absolute_host_path(
+        environment_name=SIM_HIL_TASK_CONFIG_ENV,
+        fallback=LOCAL_DEFAULT_TASK_CONFIG,
+        environ=environ,
+    )
 
 
 DEFAULT_CHECKPOINT = resolve_default_checkpoint_path()
-DEFAULT_TASK_CONFIG = (
-    REPO_ROOT
-    / "sim"
-    / "configs"
-    / "tasks"
-    / "rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json"
-)
+DEFAULT_TASK_CONFIG = resolve_default_task_config_path()
 DEFAULT_CALIBRATION_PROFILE = (
     REPO_ROOT
     / "teleop_records"
@@ -383,11 +410,14 @@ __all__ = [
     "DEFAULT_VIVE_COORDINATE_PROFILE",
     "DEFAULT_VIVE_PORT",
     "LOCAL_DEFAULT_CHECKPOINT",
+    "LOCAL_DEFAULT_TASK_CONFIG",
     "SIM_HIL_BLEND_FAILURE_FALLBACKS",
     "SIM_HIL_CHECKPOINT_ENV",
     "SIM_HIL_HUMAN_TIMEOUT_FALLBACKS",
     "SIM_HIL_POLICY_BACKENDS",
+    "SIM_HIL_TASK_CONFIG_ENV",
     "MujocoSimHILApplicationConfig",
     "acceptance_profile_config",
     "resolve_default_checkpoint_path",
+    "resolve_default_task_config_path",
 ]
