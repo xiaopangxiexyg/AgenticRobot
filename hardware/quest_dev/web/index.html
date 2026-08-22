@@ -22,9 +22,17 @@
 
     <section class="panel">
       <div id="pairing-panel">
-        <label class="label" for="pairing-token">Ephemeral pairing token</label>
-        <input id="pairing-token" type="password" autocomplete="off" spellcheck="false" />
-        <button id="connect-ws" type="button">Pair</button>
+        <label class="label" for="pairing-token">6 位局域网配对码</label>
+        <input
+          id="pairing-token"
+          type="text"
+          inputmode="numeric"
+          pattern="[0-9]{6}"
+          maxlength="6"
+          autocomplete="one-time-code"
+          spellcheck="false"
+        />
+        <button id="connect-ws" type="button">配对</button>
         <span id="pairing-status" class="bad">not paired</span>
       </div>
       <button id="start-xr" disabled>Enter MR/VR</button>
