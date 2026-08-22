@@ -147,3 +147,115 @@ def test_stage1_training_snapshot_matches_logical_organization() -> None:
         assert item["expected_raw_episode_count"] == source.raw_episode_count
         assert item["expected_raw_frame_count"] == source.raw_frame_count
         assert item["repeat_weight"] == expected_weights[source.scenario_class]
+
+
+def test_stage3_fulltask_profiles_match_logical_source_organization() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    manifest = load_logical_task_dataset_manifest(
+        repository
+        / "dataset_interface/logical_task_manifests/"
+        "writing_stage3_fulltask_sources_2026_08_04_through_08_07_v1.json"
+    )
+    profile_root = repository / "deployments/openpi/configs/training"
+    baseline = json.loads(
+        (
+            profile_root
+            / "writing_stage3_0804_0806_front_h16_absolute_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    replay = json.loads(
+        (
+            profile_root
+            / "writing_stage3_0804_0806_front_h16_absolute_replay_v2.json"
+        ).read_text(encoding="utf-8")
+    )
+    extended_profiles = tuple(
+        json.loads(
+            (
+                profile_root
+                / f"writing_stage{stage}_0804_0807_front_h16_absolute_v1.json"
+            ).read_text(encoding="utf-8")
+        )
+        for stage in (2, 3, 4)
+    )
+    extended = extended_profiles[1]
+
+    assert manifest.progress_step_id == "right_write"
+    assert {source.task_scope for source in manifest.sources} == {
+        "full_writing_sequence"
+    }
+    assert sum(source.raw_episode_count for source in manifest.sources) == 1241
+    assert sum(source.raw_frame_count for source in manifest.sources) == 471797
+
+    manifest_sources = {
+        source.source_dataset_id: source for source in manifest.sources
+    }
+    logical_source_root = Path(
+        "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/"
+        "writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources"
+    )
+    baseline_ids = tuple(item["source_dataset_id"] for item in baseline["sources"])
+    extended_ids = tuple(item["source_dataset_id"] for item in extended["sources"])
+    assert baseline_ids == tuple(manifest_sources)[:5]
+    assert all(
+        tuple(item["source_dataset_id"] for item in profile["sources"])
+        == tuple(manifest_sources)
+        for profile in extended_profiles
+    )
+    assert extended_ids == tuple(manifest_sources)
+    assert baseline["expected_total_eligible_episode_count"] == 879
+    assert extended["expected_total_eligible_episode_count"] == 1200
+    assert replay["sources"] == baseline["sources"]
+    assert replay["expected_prepared_binding_hash"] == (
+        "28c9d7693324fe738f635e6da11ab8875dd793302af6e4dcf3081687b838f39e"
+    )
+    assert replay["annotation_selection"][
+        "a4f276be5948bb7c1900b047c31f69c5ea7c4695e7aa3d2e7e05864d8bf90f22"
+    ] == "stage-1786011149701-e78dad71"
+
+    for profile in (baseline, replay, *extended_profiles):
+        assert profile["expected_task_id"] == manifest.canonical_task_id
+        for item in profile["sources"]:
+            source = manifest_sources[item["source_dataset_id"]]
+            assert Path(item["dataset_root"]) == (
+                logical_source_root / source.source_dataset_id
+            )
+    assert baseline["target_skill_id"] == "writing.write_with_brush"
+    assert replay["target_skill_id"] == "writing.write_with_brush"
+    assert tuple(profile["target_skill_id"] for profile in extended_profiles) == (
+        "writing.remove_brush_cap_and_return_cap",
+        "writing.write_with_brush",
+        "writing.return_brush",
+    )
+
+
+def test_all_openpi_profiles_use_the_fulltask_logical_source_view() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    manifest = load_logical_task_dataset_manifest(
+        repository
+        / "dataset_interface/logical_task_manifests/"
+        "writing_stage3_fulltask_sources_2026_08_04_through_08_07_v1.json"
+    )
+    logical_source_root = Path(
+        "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/"
+        "writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources"
+    )
+    known_source_ids = {
+        source.source_dataset_id for source in manifest.sources
+    }
+    checked_bindings = 0
+    profile_root = repository / "deployments/openpi/configs/training"
+    for profile_path in sorted(profile_root.glob("*.json")):
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        sources = profile.get("sources", ())
+        if not isinstance(sources, list):
+            continue
+        for item in sources:
+            source_id = str(item.get("source_dataset_id", ""))
+            if source_id not in known_source_ids:
+                continue
+            assert Path(str(item["dataset_root"])) == (
+                logical_source_root / source_id
+            ), profile_path.name
+            checked_bindings += 1
+    assert checked_bindings > len(known_source_ids)

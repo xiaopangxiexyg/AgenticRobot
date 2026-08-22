@@ -5,37 +5,37 @@
   "sources": [
     {
       "source_dataset_id": "writing4_2026_08_04",
-      "dataset_root": "/home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources/writing4_2026_08_04",
       "expected_eligible_episode_count": 344
     },
     {
       "source_dataset_id": "writing4_2026_08_05",
-      "dataset_root": "/home/user/zc/DexTeleop_0803/datasets/2026-08-05_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources/writing4_2026_08_05",
       "expected_eligible_episode_count": 247
     },
     {
       "source_dataset_id": "writing4_2026_08_06_part1",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources/writing4_2026_08_06_part1",
       "expected_eligible_episode_count": 35
     },
     {
       "source_dataset_id": "writing4_2026_08_06_part2",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_1453",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources/writing4_2026_08_06_part2",
       "expected_eligible_episode_count": 203
     },
     {
       "source_dataset_id": "writing4_2026_08_06_part3",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_stable",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources/writing4_2026_08_06_part3",
       "expected_eligible_episode_count": 51
     },
     {
       "source_dataset_id": "writing4_2026_08_07_part1",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources/writing4_2026_08_07_part1",
       "expected_eligible_episode_count": 126
     },
     {
       "source_dataset_id": "writing4_2026_08_07_part2",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage__part02",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/LogicalCollections/writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources/writing4_2026_08_07_part2",
       "expected_eligible_episode_count": 197
     }
   ],
@@ -65,6 +65,7 @@
     "7d7c3969d375ec3ad6498e45099977754f26dba01cb95381c3e5ce31ddd9467f": "stage-1785996431946-dae64488",
     "91b18532cb56a2090d0189c0c98e17045788594c02bf6e722abe995e52f51d4c": "stage-1786184398878-51dc27c2",
     "9a93e85dd15d911ba5dab16e75c0c0927c03804d706f33af23230c7f7945435c": "stage-1786181966622-8bd28af6",
+    "a4f276be5948bb7c1900b047c31f69c5ea7c4695e7aa3d2e7e05864d8bf90f22": "stage-1786011149701-e78dad71",
     "aa8bc881c8f5ecc140e74d1ba28e1a7445d2da064fb29f210bb9c43fb8387071": "stage-1786182264025-1fb809fb",
     "ace1426a8269ced855b42ed88d999a71130faf4edf03a0c3a7af74ca4a7fd84a": "stage-1786183072405-999ef8fc",
     "c9c7729cb9f5aaa62b9b41081dd5f73c02fde24b968538d6fb4008e362fad199": "stage-1786184501847-5df701c9",

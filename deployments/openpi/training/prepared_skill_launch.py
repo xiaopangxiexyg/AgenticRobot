@@ -1149,6 +1149,95 @@ def prepare_profile(
         return report, None, None
 
     organized_root = Path(str(profile["organized_dataset_root"]))
+    expected_binding_hash = str(
+        profile.get("expected_prepared_binding_hash", "")
+    ).strip()
+    if expected_binding_hash:
+        if (
+            len(expected_binding_hash) != 64
+            or any(char not in "0123456789abcdef" for char in expected_binding_hash)
+        ):
+            raise ValueError(
+                "expected_prepared_binding_hash must be a lowercase SHA-256."
+            )
+        binding_root = (
+            organized_root.expanduser().resolve()
+            / "derived/openpi_prepared_skill_bindings"
+            / expected_binding_hash
+        )
+        binding = load_openpi_prepared_skill_binding_manifest(binding_root)
+        if binding.binding_hash != expected_binding_hash:
+            raise ValueError(
+                "Prepared binding hash differs from the replay profile."
+            )
+        expected_identities = tuple(report.included_episode_identities)
+        binding_identities = tuple(
+            episode.episode_capture_identity_hash for episode in binding.episodes
+        )
+        if binding_identities != expected_identities:
+            raise ValueError(
+                "Prepared replay binding Episode order differs from the current "
+                "pinned eligibility audit."
+            )
+        expected_roots = {
+            source.source_dataset_id: source.dataset_root.resolve()
+            for source in sources
+        }
+        binding_roots: dict[str, Path] = {}
+        for episode in binding.episodes:
+            existing = binding_roots.setdefault(
+                episode.source_dataset_id,
+                episode.source_dataset_root.resolve(),
+            )
+            if existing != episode.source_dataset_root.resolve():
+                raise ValueError(
+                    "Prepared replay binding contains inconsistent source roots."
+                )
+        if binding_roots != expected_roots:
+            raise ValueError(
+                "Prepared replay binding source roots differ from the profile."
+            )
+        expected_contract = {
+            "skill_id": str(profile["target_skill_id"]),
+            "training_domain": str(profile.get("training_domain", "NOMINAL")),
+            "camera_slot_to_dataset_key": tuple(
+                (str(key), str(value))
+                for key, value in dict(
+                    profile["camera_slot_to_dataset_key"]
+                ).items()
+            ),
+            "action_horizon": int(profile["action_horizon"]),
+            "action_pose_mode": str(profile["action_pose_mode"]),
+            "source_mixing_policy": str(profile["source_mixing_policy"]),
+        }
+        actual_contract = {
+            "skill_id": binding.skill_id,
+            "training_domain": binding.training_domain,
+            "camera_slot_to_dataset_key": binding.camera_slot_to_dataset_key,
+            "action_horizon": binding.action_horizon,
+            "action_pose_mode": binding.action_pose_mode,
+            "source_mixing_policy": binding.source_mixing_policy,
+        }
+        if actual_contract != expected_contract:
+            raise ValueError(
+                "Prepared replay binding contract differs from the profile."
+            )
+        if verify_source_files:
+            from dataset_interface.prepared_training import (
+                load_prepared_training_view,
+            )
+
+            loaded = load_prepared_training_view(
+                binding.view_root,
+                organized_dataset_root=organized_root,
+                verify_source_files=True,
+            )
+            if loaded.training_view_hash != binding.training_view_hash:
+                raise ValueError(
+                    "Prepared replay binding points at a different training view."
+                )
+        return report, binding, binding_root
+
     result = build_prepared_training_view(
         organized_root,
         sources,

@@ -1,0 +1,100 @@
+{
+  "schema": "dexteleop.logical_task_dataset.v1",
+  "logical_dataset_id": "writing-stage3-fulltask-sources-2026-08-04-through-08-07",
+  "logical_dataset_version": "1",
+  "canonical_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+  "canonical_task_description": "Nominal four-stage RM65 bimanual writing captures used to derive the right-write training Skill.",
+  "progress_step_id": "right_write",
+  "source_identity_policy": "canonical_task_alias_preserve_immutable_source_identity_v1",
+  "scenario_classes": [
+    {
+      "scenario_class": "nominal_fulltask_source",
+      "description": "A complete nominal four-stage capture source; stage-specific training windows are selected downstream."
+    }
+  ],
+  "sources": [
+    {
+      "source_dataset_id": "writing4_2026_08_04",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_fingerprint": "4d353533a9dd61d9e44514894eb6b1022ad3d3162bf230d200c7d62c675b3ea3",
+      "scenario_class": "nominal_fulltask_source",
+      "task_scope": "full_writing_sequence",
+      "raw_episode_count": 355,
+      "raw_frame_count": 142576
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_05",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-05_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_fingerprint": "e532ba3508f75965ad2ae90f8ab25abcc8a5baa34e447330518ba91becb308f7",
+      "scenario_class": "nominal_fulltask_source",
+      "task_scope": "full_writing_sequence",
+      "raw_episode_count": 261,
+      "raw_frame_count": 102887
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part1",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_fingerprint": "dc48ae10f35bf1b99143b6e8ad37581301b9700ce5dc548d2fa49dc0082c383f",
+      "scenario_class": "nominal_fulltask_source",
+      "task_scope": "full_writing_sequence",
+      "raw_episode_count": 35,
+      "raw_frame_count": 13057
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part2",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_1453",
+      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_fingerprint": "087446e4640b80fccb601965abfd7f60027a6fc6462133fd14b8017d2b2100d3",
+      "scenario_class": "nominal_fulltask_source",
+      "task_scope": "full_writing_sequence",
+      "raw_episode_count": 206,
+      "raw_frame_count": 80069
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_06_part3",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_stable",
+      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_fingerprint": "538648d74081d3e012d4c9e55e6525b1bc3722cccb9734b2fdd03bd3b6ef3ab2",
+      "scenario_class": "nominal_fulltask_source",
+      "task_scope": "full_writing_sequence",
+      "raw_episode_count": 53,
+      "raw_frame_count": 19691
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_07_part1",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_fingerprint": "573765bec33b2acf1e790d48dc5d83d0b954df16c0a1f3776a883c251287259a",
+      "scenario_class": "nominal_fulltask_source",
+      "task_scope": "full_writing_sequence",
+      "raw_episode_count": 129,
+      "raw_frame_count": 46153
+    },
+    {
+      "source_dataset_id": "writing4_2026_08_07_part2",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage__part02",
+      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_fingerprint": "b550c759a694601f460006565d2dd0c7eca819f535f4c8bde5206431fd083562",
+      "scenario_class": "nominal_fulltask_source",
+      "task_scope": "full_writing_sequence",
+      "raw_episode_count": 202,
+      "raw_frame_count": 67364
+    }
+  ],
+  "totals": {
+    "source_count": 7,
+    "raw_episode_count": 1241,
+    "raw_frame_count": 471797,
+    "by_scenario_class": {
+      "nominal_fulltask_source": {
+        "source_count": 7,
+        "raw_episode_count": 1241,
+        "raw_frame_count": 471797
+      }
+    }
+  },
+  "semantic_content_hash": "4e25e15f4ec7cb49544cf646bbb8e621b7a86b4ccd1705383f5ed49a450ed623"
+}

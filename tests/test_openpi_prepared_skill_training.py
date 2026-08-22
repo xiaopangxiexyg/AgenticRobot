@@ -43,6 +43,7 @@ from deployments.openpi.training.prepared_skill_launch import (
     _sources,
     _validate_source_task_ids,
     _validate_checkpoint_training_run,
+    prepare_profile,
 )
 from deployments.openpi.training.task_metadata import (
     normalize_profile_task_metadata,
@@ -400,6 +401,135 @@ def _prompt_binding(tmp_path: Path):
         ),
         organized_dataset_root=tmp_path / "joint",
     )
+
+
+def test_prepared_profile_can_replay_one_exact_immutable_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding(tmp_path)
+    binding_root = materialize_openpi_prepared_skill_binding(binding, tmp_path)
+    report = types.SimpleNamespace(
+        included_episode_identities=("c" * 64, "d" * 64),
+        exclusions=(),
+        annotation_selection={},
+    )
+    profile = {
+        "organized_dataset_root": str(tmp_path),
+        "sources": [
+            {
+                "source_dataset_id": "source-a",
+                "dataset_root": str(tmp_path / "source-a"),
+                "expected_eligible_episode_count": 1,
+            },
+            {
+                "source_dataset_id": "source-b",
+                "dataset_root": str(tmp_path / "source-b"),
+                "expected_eligible_episode_count": 1,
+            },
+        ],
+        "expected_total_eligible_episode_count": 2,
+        "target_skill_id": binding.skill_id,
+        "training_domain": binding.training_domain,
+        "camera_slot_to_dataset_key": dict(
+            binding.camera_slot_to_dataset_key
+        ),
+        "action_horizon": binding.action_horizon,
+        "action_pose_mode": binding.action_pose_mode,
+        "source_mixing_policy": binding.source_mixing_policy,
+        "expected_prepared_binding_hash": binding.binding_hash,
+    }
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "_validate_source_task_ids",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "_skill_projection_catalog",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "select_strict_successful_skill_episodes",
+        lambda *_args, **_kwargs: report,
+    )
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "_included_counts_by_source",
+        lambda *_args, **_kwargs: {"source-a": 1, "source-b": 1},
+    )
+
+    loaded_report, loaded_binding, loaded_root = prepare_profile(
+        profile,
+        verify_source_files=False,
+    )
+
+    assert loaded_report is report
+    assert loaded_binding is not None
+    assert loaded_binding.to_payload() == binding.to_payload()
+    assert loaded_root == binding_root
+
+
+def test_prepared_profile_replay_rejects_episode_order_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding(tmp_path)
+    materialize_openpi_prepared_skill_binding(binding, tmp_path)
+    report = types.SimpleNamespace(
+        included_episode_identities=("d" * 64, "c" * 64),
+        exclusions=(),
+        annotation_selection={},
+    )
+    profile = {
+        "organized_dataset_root": str(tmp_path),
+        "sources": [
+            {
+                "source_dataset_id": "source-a",
+                "dataset_root": str(tmp_path / "source-a"),
+                "expected_eligible_episode_count": 1,
+            },
+            {
+                "source_dataset_id": "source-b",
+                "dataset_root": str(tmp_path / "source-b"),
+                "expected_eligible_episode_count": 1,
+            },
+        ],
+        "expected_total_eligible_episode_count": 2,
+        "target_skill_id": binding.skill_id,
+        "training_domain": binding.training_domain,
+        "camera_slot_to_dataset_key": dict(
+            binding.camera_slot_to_dataset_key
+        ),
+        "action_horizon": binding.action_horizon,
+        "action_pose_mode": binding.action_pose_mode,
+        "source_mixing_policy": binding.source_mixing_policy,
+        "expected_prepared_binding_hash": binding.binding_hash,
+    }
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "_validate_source_task_ids",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "_skill_projection_catalog",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "select_strict_successful_skill_episodes",
+        lambda *_args, **_kwargs: report,
+    )
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "_included_counts_by_source",
+        lambda *_args, **_kwargs: {"source-a": 1, "source-b": 1},
+    )
+
+    with pytest.raises(ValueError, match="Episode order differs"):
+        prepare_profile(profile, verify_source_files=False)
 
 
 def test_prepared_prompt_binding_injects_exact_prompt_and_round_trips(
@@ -1537,6 +1667,34 @@ def test_writing_later_stage_profiles_are_independent_pi05_runs() -> None:
     assert len(workspace_roots) == 3
 
 
+def test_fulltask_profiles_pin_the_historical_annotation_after_late_relabel() -> None:
+    root = (
+        Path(__file__).resolve().parents[1]
+        / "deployments/openpi/configs/training"
+    )
+    identity = (
+        "a4f276be5948bb7c1900b047c31f69c5ea7c4695e7aa3d2e7e05864d8bf90f22"
+    )
+    expected_set = "stage-1786011149701-e78dad71"
+    affected: list[str] = []
+    for path in sorted(root.glob("*.json")):
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        sources = profile.get("sources", ())
+        if not any(
+            isinstance(source, dict)
+            and source.get("source_dataset_id")
+            == "writing4_2026_08_06_part2"
+            for source in sources
+        ):
+            continue
+        selection = profile.get("annotation_selection")
+        if not isinstance(selection, dict):
+            continue
+        affected.append(path.name)
+        assert selection.get(identity) == expected_set
+    assert len(affected) == 17
+
+
 def test_writing_0804_0806_profiles_are_independent_pi05_runs() -> None:
     root = (
         Path(__file__).resolve().parents[1]
@@ -1588,7 +1746,11 @@ def test_writing_0804_0806_profiles_are_independent_pi05_runs() -> None:
         assert profile["expected_task_id"] == (
             "dmtac_rm65_bimanual_position_v2_writing_4_stage"
         )
-        assert len(profile["annotation_selection"]) == 18
+        # The late relabel of one historical Episode made the formerly unique
+        # capture-time annotation ambiguous.  Pinning the set that produced the
+        # immutable historical bindings adds one explicit selector without
+        # changing the eligible Episode set.
+        assert len(profile["annotation_selection"]) == 19
         assert all(
             len(identity) == 64
             and all(character in "0123456789abcdef" for character in identity)
@@ -1680,7 +1842,7 @@ def test_writing_0804_0807_prompt_family_profile_binds_all_stages() -> None:
     assert profile["expected_effective_epoch_window_count"] == 39300
     assert profile["canonical_prompt_percent"] == 80
     assert profile["training_variant_prompt_percent"] == 20
-    assert all(len(stage["profile"]["annotation_selection"]) == 34 for stage in stages)
+    assert all(len(stage["profile"]["annotation_selection"]) == 35 for stage in stages)
 
 
 def test_prepared_profile_rejects_unknown_skill_catalog(tmp_path: Path) -> None:
