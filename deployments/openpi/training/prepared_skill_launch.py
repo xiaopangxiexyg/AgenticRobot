@@ -77,6 +77,7 @@ PROMPT_FAMILY_PROFILE_SCHEMA_V2 = (
 STAGE1_SCENARIO_PROFILE_SCHEMA_V1 = (
     "dexteleop.openpi_stage1_scenario_training_profile.v1"
 )
+STANDARD_NON_RTC_TRAINING_MODE_V1 = "standard_non_rtc_v1"
 DEFAULT_PROFILE = (
     Path(__file__).resolve().parents[1]
     / "configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json"
@@ -290,6 +291,11 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             "State-only OpenPI training requires "
             "openpi_norm_stats_assets_dir."
+        )
+    training_mode = str(payload.get("openpi_training_mode", "")).strip()
+    if training_mode and training_mode != STANDARD_NON_RTC_TRAINING_MODE_V1:
+        raise ValueError(
+            "openpi_training_mode must be standard_non_rtc_v1 when declared."
         )
     if is_prompt_profile:
         raw_stages = payload.get("prompt_stages")
@@ -2005,6 +2011,14 @@ def main(argv: list[str] | None = None) -> int:
             "--model-rtc-profile is supported only by sample-check and train"
         )
     profile = _load_profile(args.profile)
+    if (
+        profile.get("openpi_training_mode")
+        == STANDARD_NON_RTC_TRAINING_MODE_V1
+        and args.model_rtc_profile is not None
+    ):
+        parser.error(
+            "standard_non_rtc_v1 profiles reject --model-rtc-profile"
+        )
     if (
         profile.get("schema") in {
             PROMPT_PROFILE_SCHEMA_V1,
