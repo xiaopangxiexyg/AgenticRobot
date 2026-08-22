@@ -67,6 +67,7 @@ class ResourceLocation:
     path: str | None
     probe: str
     expected_rule: str
+    ignore_source: str
     tracked_policy: str | None
 
 
@@ -102,6 +103,7 @@ def _load_location(raw: Any, *, resource_id: str) -> ResourceLocation:
     path = raw.get("path")
     probe = raw.get("probe")
     expected_rule = raw.get("expected_rule")
+    ignore_source = raw.get("ignore_source", ".gitignore")
     tracked_policy = raw.get("tracked_policy")
     if not isinstance(label, str) or not label.strip():
         raise LocalResourceError(f"resource {resource_id!r} location label is invalid")
@@ -125,11 +127,20 @@ def _load_location(raw: Any, *, resource_id: str) -> ResourceLocation:
         raise LocalResourceError(
             f"resource {resource_id!r} location {label!r} must be ignored, not exempted"
         )
+    ignore_source = _safe_relative(
+        ignore_source,
+        field=f"resource {resource_id!r} ignore_source",
+    )
+    if PurePosixPath(ignore_source).name != ".gitignore":
+        raise LocalResourceError(
+            f"resource {resource_id!r} ignore_source must name a .gitignore file"
+        )
     return ResourceLocation(
         label=label,
         path=path,
         probe=probe,
         expected_rule=expected_rule,
+        ignore_source=ignore_source,
         tracked_policy=tracked_policy,
     )
 
@@ -297,17 +308,27 @@ def _path_status(root: Path, relative_path: str) -> tuple[bool, str, str | None]
     return True, "special", None
 
 
-def _gitignore_rules(repo_root: Path) -> tuple[str, ...]:
-    path = repo_root / ".gitignore"
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise LocalResourceError(f"cannot read {path}: {exc}") from exc
-    return tuple(
-        line.strip()
-        for line in lines
-        if line.strip() and not line.lstrip().startswith("#")
-    )
+def _gitignore_rules(
+    repo_root: Path,
+    sources: set[str],
+) -> tuple[tuple[str, str], ...]:
+    rules: list[tuple[str, str]] = []
+    for source in sorted(sources):
+        path = repo_root / source
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise LocalResourceError(f"cannot read {path}: {exc}") from exc
+        rules.extend(
+            (source, line.strip())
+            for line in lines
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return tuple(rules)
+
+
+def _rule_label(source: str, rule: str) -> str:
+    return rule if source == ".gitignore" else f"{source}:{rule}"
 
 
 def audit_resources(
@@ -318,23 +339,32 @@ def audit_resources(
     root = _require_repository(repo_root)
     resources, exceptions = load_manifest(manifest_path)
     manifest_rules = {
-        location.expected_rule
+        (location.ignore_source, location.expected_rule)
         for resource in resources
         for location in resource.locations
     } | {
-        exception.expected_rule
+        (".gitignore", exception.expected_rule)
         for exception in exceptions
         if exception.expected_rule is not None
     }
-    gitignore_rules = _gitignore_rules(root)
+    gitignore_rules = _gitignore_rules(root, {source for source, _ in manifest_rules})
     rule_counts = Counter(gitignore_rules)
     duplicate_rules = sorted(rule for rule, count in rule_counts.items() if count > 1)
     unregistered_rules = sorted(set(gitignore_rules) - manifest_rules)
     missing_rules = sorted(manifest_rules - set(gitignore_rules))
     inventory_issues = [
-        *(f"unregistered .gitignore rule: {rule}" for rule in unregistered_rules),
-        *(f"manifest rule missing from .gitignore: {rule}" for rule in missing_rules),
-        *(f"duplicate .gitignore rule: {rule}" for rule in duplicate_rules),
+        *(
+            f"unregistered .gitignore rule: {_rule_label(source, rule)}"
+            for source, rule in unregistered_rules
+        ),
+        *(
+            f"manifest rule missing from .gitignore: {_rule_label(source, rule)}"
+            for source, rule in missing_rules
+        ),
+        *(
+            f"duplicate .gitignore rule: {_rule_label(source, rule)}"
+            for source, rule in duplicate_rules
+        ),
     ]
     reports: list[dict[str, Any]] = []
     issue_count = len(inventory_issues)
@@ -345,9 +375,10 @@ def audit_resources(
             match = _ignore_match(root, location.probe)
             if match is None:
                 issues.append("ignore probe is not matched")
-            elif match.source != ".gitignore":
+            elif match.source != location.ignore_source:
                 issues.append(
-                    f"ignore probe is owned by {match.source!r}, expected root .gitignore"
+                    f"ignore probe is owned by {match.source!r}, expected "
+                    f"{location.ignore_source!r}"
                 )
             elif not match.ignored:
                 issues.append(f"ignore probe is exempted by {match.rule!r}")
@@ -379,6 +410,7 @@ def audit_resources(
                     "path": location.path,
                     "probe": location.probe,
                     "expected_rule": location.expected_rule,
+                    "ignore_source": location.ignore_source,
                     "matched_rule": asdict(match) if match is not None else None,
                     "present": present,
                     "path_kind": path_kind,

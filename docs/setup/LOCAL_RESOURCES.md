@@ -109,6 +109,11 @@ evidence，不能代替数据迁移。
 `.env*`、`local_paths.json` 和设备配置从 example 或密钥管理重新创建。迁移计划和提交信息不得写入
 密钥值、令牌、设备凭据或不必要的本机绝对路径。
 
+`hardware/quest_dev/assets/certs/` 是 mixed root：只跟踪 `.gitkeep`，首次 HTTPS 启动生成的
+`.crt` 和 `.key` 由模块内 `.gitignore` 排除。它们是本机开发证书与私钥，应在目标 worktree
+重新生成，不复制、不提交，也不通过 assets 软链接共享。根 `/assets` 规则只管理仓库根的
+reviewed asset store，不得再次改成会匹配嵌套模块目录的未锚定规则。
+
 ## 4. 开发维护规则
 
 新增或修改离线数据、记录、模型、厂商目录、秘密配置、生成输出或个人状态的 `.gitignore`

@@ -1,0 +1,3 @@
+# Generated development TLS material. Keep the directory itself versioned.
+assets/certs/*.crt
+assets/certs/*.key

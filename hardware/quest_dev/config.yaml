@@ -1,0 +1,29 @@
+server:
+  host: 0.0.0.0
+  port: 8444
+  https: true
+  cert: assets/certs/quest_dev.crt
+  key: assets/certs/quest_dev.key
+
+xr:
+  reference_space: local-floor
+
+features:
+  visualization:
+    enabled: true
+    client:
+      axis_length_m: 0.18
+      show_controller_axes: true
+    # 可选的机械臂只读反馈。默认关闭；启用后只调用 Redis GET。
+    robot_feedback:
+      enabled: false
+      redis:
+        host: localhost
+        port: 6379
+        db: 0
+        socket_timeout_s: 0.2
+      rate_hz: 30
+      max_age_s: 0.25
+      sources:
+        ar5_1: ar5:feedback:ar5_1
+        ar5_2: ar5:feedback:ar5_2

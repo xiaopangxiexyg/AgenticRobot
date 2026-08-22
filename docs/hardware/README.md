@@ -54,3 +54,16 @@ PYTHONPATH=. python -m robot_motion.rm65.arm_init.qpos_init \
 `CURRENT_QPOS_JSON` 必须符合 RM65 qpos target schema；格式和执行器边界见
 [`robot_motion/rm65/arm_init/README.md`](../../robot_motion/rm65/arm_init/README.md)。生成 plan
 不等于批准执行该 plan。
+
+## 6. Quest Browser/WebXR 开发基座（R0 测试）
+
+[`hardware/quest_dev`](../../hardware/quest_dev/README.md) 是自包含的通用 HTTPS/WSS 与 WebXR
+开发模块。默认 robot feedback 关闭；可选 adapter 只读 Redis，不发布控制目标，也不会由
+AgenticRobot 自动启动。无需启动服务即可运行离线单元测试：
+
+```bash
+bash scripts/run_pytest.sh -q hardware/quest_dev/tests
+```
+
+实际启动会绑定网络端口，并可能生成本机自签名证书；应按模块 README 显式执行，不属于统一
+开发门禁或硬件激活步骤。

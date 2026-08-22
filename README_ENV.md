@@ -269,6 +269,10 @@ PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   bash scripts/run_pytest.sh -q
 ```
 
+`verify_dev_base.sh` 与 `run_pytest.sh` 都通过 `scripts/resolve_dev_python.sh`
+选择 `dexteleop310`（或 `DEXTELEOP_PYTHON` 显式指定的 Python 3.10），因此从未激活
+Conda 的 shell 调用时也不会误用 RPent 或系统 Python。
+
 测试按 `unit`、`contract`、`integration`、`optional`、`slow_sim` 和 `hardware` marker 分层；
 `slow_sim` 是与执行层正交的耗时标记，仅用于显式快速选择，完整单元/集成门禁仍会执行它。
 mocked 硬件行为仍属于 `unit`/`integration`，`hardware` 仅留给未来必须连接真实设备的测试。

@@ -7,8 +7,10 @@ cd "$REPO_ROOT"
 export PYTHONNOUSERSITE=1
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 
-python scripts/dev_environment_doctor.py
+PYTHON_BIN="$(bash "$REPO_ROOT/scripts/resolve_dev_python.sh")"
+"$PYTHON_BIN" scripts/dev_environment_doctor.py
 bash scripts/run_pytest.sh -q \
+  hardware/quest_dev/tests \
   tests/test_dev_asset_store.py \
   tests/test_dev_local_resources.py \
   tests/test_dev_environment_doctor.py \
