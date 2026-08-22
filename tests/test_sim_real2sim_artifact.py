@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -15,7 +14,6 @@ from sim.rm65.real2sim import (
     ValidationEvidence,
 )
 
-
 CONTRACT_PATH = Path("sim/configs/rm65_bimanual_physics_v1.json")
 ARM_PROFILE_PATH = Path("sim/rm65/actuation/profile.py")
 ARM_CORE_PATH = Path("sim/rm65/actuation/core.py")
@@ -27,6 +25,10 @@ ARM_BASELINE_PATH = Path(
     "sim/rm65/real2sim/artifacts/rm65_arm_free_motion_20260721_v4.json"
 )
 ARM_RUNTIME_BINDING_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
+    "rm65_arm_free_motion_20260721_v4_runtime_binding_20260822_v3.json"
+)
+ARM_RUNTIME_BINDING_V2_PATH = Path(
     "sim/rm65/real2sim/artifacts/"
     "rm65_arm_free_motion_20260721_v4_runtime_binding_20260811_v2.json"
 )
@@ -47,24 +49,20 @@ CAMERA_REGISTRY_PATH = Path("robot_motion/configs/rm65_camera_registry.json")
 CAMERA_REGISTRY_V1_ARCHIVE_PATH = Path(
     "sim/rm65/real2sim/artifacts/rm65_camera_registry_runtime_20260724_v1.json"
 )
+CONTRACT_V2_ARCHIVE_PATH = Path(
+    "sim/rm65/real2sim/artifacts/"
+    "rm65_bimanual_physics_runtime_20260811_v2.json"
+)
 
-_LEGACY_CAMERA_REGISTRY_PATH = (
-    "cameras/configs/rm65/cameras/realsense_registry.json"
+_CAD_SCENE_URDF = (
+    "assets/rm65_inspire_gripper_v3/"
+    "rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf"
 )
-_CURRENT_CAMERA_REGISTRY_PATH = "robot_motion/configs/rm65_camera_registry.json"
-_LEGACY_CAMERA_REGISTRY_DESCRIPTION = (
-    "Project-level RealSense camera registry. Intrinsics are profile-specific "
-    "and may be filled from runtime device_info; extrinsics are keyed by camera "
-    "frame so multiple URDFs can reuse the same logical camera."
-)
-_CURRENT_CAMERA_REGISTRY_DESCRIPTION = (
-    "RM65 shared RealSense camera registry v1. Intrinsics are profile-specific "
-    "and may be filled from runtime device_info; extrinsics are keyed by camera "
-    "frame so multiple URDFs can reuse the same logical camera."
-)
-_LEGACY_CAMERA_REGISTRY_SHA256 = (
-    "19f8b43445bb9e3acf45372456d279ae03cd26198c0b09383618af97b3bd00e5"
-)
+_CAMERA_FRAME_BY_ROLE = {
+    "front": ("head_camera_frame", "left_arm_base_link"),
+    "left_wrist": ("left_camera_rgb", "left_arm_link6"),
+    "right_wrist": ("right_camera_rgb", "right_arm_link6"),
+}
 
 
 def _ref(artifact_id: str, artifact_kind: str, digit: str) -> ArtifactRef:
@@ -291,7 +289,7 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
             artifact_kind="real2sim_fit_artifact",
         ).sha256
     )
-    assert artifacts["rm65-camera-registry-runtime-20260811-v2"].sha256 == (
+    assert artifacts["rm65-camera-registry-runtime-20260822-v3"].sha256 == (
         ArtifactRef.from_file(
             CAMERA_REGISTRY_PATH,
             artifact_id="camera-registry-check",
@@ -305,15 +303,38 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         artifact_id="camera-registry-v1-archive-check",
         artifact_kind="camera_registry",
     ).sha256
+    assert artifacts[
+        "rm65-bimanual-physics-runtime-20260811-v2-archive"
+    ].sha256 == ArtifactRef.from_file(
+        CONTRACT_V2_ARCHIVE_PATH,
+        artifact_id="simulation-contract-v2-archive-check",
+        artifact_kind="simulation_contract",
+    ).sha256
+    assert artifacts[
+        "rm65-arm-runtime-binding-20260811-v2-archive"
+    ].sha256 == ArtifactRef.from_file(
+        ARM_RUNTIME_BINDING_V2_PATH,
+        artifact_id="runtime-binding-v2-archive-check",
+        artifact_kind="real2sim_runtime_binding",
+    ).sha256
     assert binding.resolved_timing == (
         Real2SimArtifactManifest.resolved_timing_from_contract_file(CONTRACT_PATH)
     )
     assert binding.metadata["fit_artifact_sha256"] == fit.artifact_sha256
     assert (
         binding.metadata["previous_simulation_contract_sha256"]
+        == artifacts[
+            "rm65-bimanual-physics-runtime-20260811-v2-archive"
+        ].sha256
+    )
+    assert (
+        binding.metadata["fit_simulation_contract_sha256"]
         == fit.simulation_contract.sha256
     )
     assert binding.metadata["arm_profile_refit"] is False
+    assert binding.metadata["runtime_behavior_change_scope"] == (
+        "simulation_scene_geometry_and_real_camera_selection"
+    )
     assert binding.fidelity_claims[0].status == "provisional"
     held_out = next(
         evidence
@@ -342,33 +363,31 @@ def test_v1_runtime_binding_camera_dependency_remains_recoverable() -> None:
     )
 
 
-def test_camera_registry_owner_migration_is_the_only_v1_contract_change() -> None:
-    fit = Real2SimArtifactManifest.load(ARM_BASELINE_PATH)
-    current_contract = CONTRACT_PATH.read_text(encoding="utf-8")
+def test_v2_runtime_binding_remains_recoverable() -> None:
+    binding = Real2SimArtifactManifest.load(ARM_RUNTIME_BINDING_V2_PATH)
 
-    assert current_contract.count(_CURRENT_CAMERA_REGISTRY_PATH) == 1
-    assert _LEGACY_CAMERA_REGISTRY_PATH not in current_contract
-    reconstructed_fit_contract = current_contract.replace(
-        _CURRENT_CAMERA_REGISTRY_PATH,
-        _LEGACY_CAMERA_REGISTRY_PATH,
-    )
-    assert hashlib.sha256(reconstructed_fit_contract.encode("utf-8")).hexdigest() == (
-        fit.simulation_contract.sha256
-    )
-
-    archived_registry = CAMERA_REGISTRY_V1_ARCHIVE_PATH.read_text(encoding="utf-8")
-    assert archived_registry.count(_CURRENT_CAMERA_REGISTRY_DESCRIPTION) == 1
-    assert _LEGACY_CAMERA_REGISTRY_DESCRIPTION not in archived_registry
-    reconstructed_legacy_registry = archived_registry.replace(
-        _CURRENT_CAMERA_REGISTRY_DESCRIPTION,
-        _LEGACY_CAMERA_REGISTRY_DESCRIPTION,
-    )
-    assert hashlib.sha256(reconstructed_legacy_registry.encode("utf-8")).hexdigest() == (
-        _LEGACY_CAMERA_REGISTRY_SHA256
+    assert binding.artifact_sha256 == (
+        "ca0d2e58c6799557f9ed1f781da9a4fc7e9f5b9c28ccff0caad99b8dd613a60b"
     )
 
 
-def test_current_camera_registry_change_is_exactly_the_wrist_serial_swap() -> None:
+def test_current_runtime_binding_records_exact_scene_contract_migration() -> None:
+    current = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    archived = json.loads(CONTRACT_V2_ARCHIVE_PATH.read_text(encoding="utf-8"))
+
+    assert current["scene"]["urdf_path"] == _CAD_SCENE_URDF
+    assert archived["scene"]["urdf_path"].endswith(
+        "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+    )
+    assert archived["scene"]["collision"]["excluded_body_pairs"] == []
+    assert len(current["scene"]["collision"]["excluded_body_pairs"]) == 24
+
+    current["scene"]["urdf_path"] = archived["scene"]["urdf_path"]
+    current["scene"]["collision"]["excluded_body_pairs"] = []
+    assert current == archived
+
+
+def test_current_camera_registry_change_is_exactly_documented_v3_migration() -> None:
     archived_registry = json.loads(
         CAMERA_REGISTRY_V1_ARCHIVE_PATH.read_text(encoding="utf-8")
     )
@@ -385,6 +404,18 @@ def test_current_camera_registry_change_is_exactly_the_wrist_serial_swap() -> No
 
     archived_registry["cameras"]["left_wrist"]["serial"] = archived_right_serial
     archived_registry["cameras"]["right_wrist"]["serial"] = archived_left_serial
+
+    for role, (frame_id, parent_frame) in _CAMERA_FRAME_BY_ROLE.items():
+        associations = archived_registry["cameras"][role]["extrinsics"][
+            "frames"
+        ][frame_id]["placements"]
+        associations.append(
+            {
+                "urdf": _CAD_SCENE_URDF,
+                "frame": frame_id,
+                "parent_frame": parent_frame,
+            }
+        )
     assert current_registry == archived_registry
 
 

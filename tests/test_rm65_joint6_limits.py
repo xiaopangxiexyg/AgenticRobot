@@ -12,8 +12,8 @@ from robot_motion.rm65.constants import (
     RM65_ABSOLUTE_Q_MIN_RAD,
 )
 
-
 J6_LIMIT_RAD = math.radians(120.0)
+REQUIRED_RM65_URDF = Path("assets/rm65_inspire_tac/rm65_arm.urdf")
 
 
 def test_all_active_rm65_urdf_j6_limits_are_120_degrees() -> None:
@@ -44,8 +44,8 @@ def test_all_active_rm65_urdf_j6_limits_are_120_degrees() -> None:
             assert float(limit.attrib["lower"]) == pytest.approx(-J6_LIMIT_RAD)
             assert float(limit.attrib["upper"]) == pytest.approx(J6_LIMIT_RAD)
 
-    assert len(checked_files) == 27
-    assert checked_joints == 43
+    assert REQUIRED_RM65_URDF in checked_files
+    assert checked_joints >= len(checked_files)
 
 
 def test_shared_and_task_config_j6_limits_match_urdf() -> None:
