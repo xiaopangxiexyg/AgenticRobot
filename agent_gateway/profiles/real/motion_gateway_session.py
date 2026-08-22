@@ -9,23 +9,18 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 
 from agent_gateway.protocol.contracts import AgentObservationSnapshot, AgentSkillRequest
-from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.runtime.access_policy import (
     AgentSkillAccessPolicy,
     SkillExecutionGrant,
 )
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.runtime.artifact_transfer import AgentArtifactTransferBroker
+from agent_gateway.runtime.event_journal import BoundedAgentGatewayEventJournal
 from agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
     SkillExecutorRegistry,
 )
-from agent_gateway.runtime.artifact_producer import (
-    artifact_ref_for_bytes,
-    commit_artifact_bytes,
-)
-from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
-from agent_gateway.runtime.artifact_transfer import AgentArtifactTransferBroker
-from agent_gateway.runtime.event_journal import BoundedAgentGatewayEventJournal
 from agent_gateway.runtime.hardware_view_provider import (
     HardwareResourceBinding,
     HardwareViewProvider,
@@ -46,24 +41,19 @@ from agent_gateway.runtime.service import (
     AgentGatewayOperationOutcome,
     AgentGatewayService,
 )
-from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
 from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleControlEvidence,
     StationOperationWorkerBinding,
+)
+from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
+from agent_gateway.skills.motion.definition import (
+    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
 )
 from agent_gateway.transport.unix_transport import (
     AgentGatewayUnixJsonServer,
     AgentGatewayUnixPeerClientMap,
 )
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
-from agent_gateway.skills.perception.schemas import (
-    RGB_FRAME_COMPRESSION_V1,
-    RGB_FRAME_ENCODING_V1,
-    RGB_FRAME_SCHEMA_ID_V1,
-)
-from agent_gateway.skills.motion.definition import (
-    FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
-)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import pose_matrix_to_xyzquat
 from teleop_runtime.skill_deploy.motion_port import (
@@ -76,10 +66,7 @@ from .motion_primitive_profiles import (
 )
 from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
 from .observation_gateway import RealControlOwnerState
-from .perception_deployment import (
-    REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
-    REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
-)
+from .perception_gateway import build_real_perception_passive_executors
 from .realsense_perception import RealSenseAgentPerceptionProvider
 
 
@@ -934,163 +921,19 @@ def assemble_real_agent_primitive_gateway_session(
     if perception_provider is not None and artifact_store is not None:
         registration = contract_bundle.perception_capture
         assert registration is not None
-        rgb_route = registration.rgb.routes[0]
-        depth_route = registration.depth.routes[0]
-
-        def read_rgb(request, operation) -> PassiveReadResult:
-            capture = perception_provider.capture_rgb(
-                request.parameters,
-                expected_station_revision=request.expected_station_revision,
-            )
-            bindings = []
-            frame_metadata = []
-            total_bytes = 0
-            for ordinal, frame in enumerate(capture.frames):
-                artifact = artifact_ref_for_bytes(
-                    frame.data,
-                    media_type=frame.media_type,
-                    schema_id=RGB_FRAME_SCHEMA_ID_V1,
-                    encoding=RGB_FRAME_ENCODING_V1,
-                    compression=RGB_FRAME_COMPRESSION_V1,
-                )
-                committed = commit_artifact_bytes(
-                    store=artifact_store,
-                    data=frame.data,
-                    artifact=artifact,
-                    producer_id="agent_gateway.provider.real_realsense_rgb",
-                    runtime_session_id=contract_bundle.attachment.runtime_session_id,
-                    idempotency_key=f"rgb-output:{operation.operation_id}:{ordinal}",
-                    now=capture.captured_at,
-                )
-                total_bytes += committed.byte_length
-                metadata = {
-                    "ordinal": ordinal,
-                    "source_id": frame.source_id,
-                    "role": frame.role,
-                    "media_type": committed.media_type,
-                    "width": frame.width,
-                    "height": frame.height,
-                    "media_content_hash": committed.sha256,
-                }
-                frame_metadata.append(metadata)
-                bindings.append(
-                    AgentArtifactBinding(
-                        slot_id=REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
-                        ordinal=ordinal,
-                        artifact=committed,
-                        production_receipt_ref=(
-                            f"real-rgb-frame:{operation.operation_id}:{ordinal}:"
-                            + committed.sha256
-                        ),
-                    )
-                )
-            identity = canonical_content_hash(
-                {
-                    "operation_id": operation.operation_id,
-                    "request_hash": request.semantic_content_hash,
-                    "station_revision": capture.station_revision,
-                    "captured_at": capture.captured_at,
-                    "frames": frame_metadata,
-                },
-                domain="dexteleop.agent_skill.real_rgb_capture_receipt.v1",
-            )
-            return PassiveReadResult(
-                execution_result={
-                    "snapshot_id": "rgb-snapshot:" + identity,
-                    "station_revision": capture.station_revision,
-                    "captured_at": capture.captured_at,
-                    "frames": frame_metadata,
-                    "total_bytes": total_bytes,
-                },
-                evidence_refs=("real-rgb-capture:" + identity,),
-                output_artifact_bindings=tuple(bindings),
-                reason_code="passive_rgb_capture_completed",
-            )
-
-        def read_depth(request, operation) -> PassiveReadResult:
-            frame = perception_provider.capture_depth(
-                role=str(request.parameters["role"]),
-                expected_station_revision=request.expected_station_revision,
-            )
-            artifact = artifact_ref_for_bytes(
-                frame.data,
-                media_type=frame.media_type,
-                schema_id=frame.schema_id,
-                encoding=frame.encoding,
-                compression=frame.compression,
-            )
-            committed = commit_artifact_bytes(
-                store=artifact_store,
-                data=frame.data,
-                artifact=artifact,
-                producer_id="agent_gateway.provider.real_realsense_depth",
-                runtime_session_id=contract_bundle.attachment.runtime_session_id,
-                idempotency_key="depth-output:" + operation.operation_id,
-                now=frame.captured_at,
-            )
-            result = {
-                "source_id": frame.source_id,
-                "role": frame.role,
-                "captured_at": frame.captured_at,
-                "width": frame.width,
-                "height": frame.height,
-                "depth_unit": "meter",
-                "invalid_depth_value": 0.0,
-                "camera_pose_world_xyz_quat_xyzw": list(
-                    frame.camera_pose_world_xyz_quat_xyzw
-                ),
-                "intrinsics": dict(frame.intrinsics),
-            }
-            identity = canonical_content_hash(
-                {
-                    "operation_id": operation.operation_id,
-                    "request_hash": request.semantic_content_hash,
-                    "result": result,
-                    "artifact_ref_hash": committed.semantic_content_hash,
-                },
-                domain="dexteleop.agent_skill.real_depth_capture_receipt.v1",
-            )
-            evidence_ref = "real-depth-capture:" + identity
-            return PassiveReadResult(
-                execution_result=result,
-                evidence_refs=(evidence_ref,),
-                output_artifact_bindings=(
-                    AgentArtifactBinding(
-                        slot_id=REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
-                        ordinal=0,
-                        artifact=committed,
-                        production_receipt_ref=evidence_ref,
-                    ),
-                ),
-                reason_code="passive_depth_capture_completed",
-            )
-
-        rgb_executor = PassiveReadSkillExecutor(
-            port_id=(
-                "agent-gateway:real-passive-rgb:"
-                + contract_bundle.attachment.runtime_session_id
-            ),
-            executor_id=registration.rgb_binding.executor_id,
-            read=read_rgb,
+        rgb_executor, depth_executor = build_real_perception_passive_executors(
+            registration=registration,
+            provider=perception_provider,
+            artifact_store=artifact_store,
+            runtime_session_id=contract_bundle.attachment.runtime_session_id,
             current_station_revision=lambda: producer.current_station_revision,
-            clock=clock,
             max_retained_operations=max_retained_operations,
-        )
-        depth_executor = PassiveReadSkillExecutor(
-            port_id=(
-                "agent-gateway:real-passive-depth:"
-                + contract_bundle.attachment.runtime_session_id
-            ),
-            executor_id=registration.depth_binding.executor_id,
-            read=read_depth,
-            current_station_revision=lambda: producer.current_station_revision,
             clock=clock,
-            max_retained_operations=max_retained_operations,
         )
         execution_port_by_route_hash.update(
             {
-                rgb_route.semantic_content_hash: rgb_executor,
-                depth_route.semantic_content_hash: depth_executor,
+                registration.rgb.routes[0].semantic_content_hash: rgb_executor,
+                registration.depth.routes[0].semantic_content_hash: depth_executor,
             }
         )
     registry = SkillExecutorRegistry(
