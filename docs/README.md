@@ -11,7 +11,7 @@
 | 外部 Agent Skill 接入 | [agent_gateway](./agent_gateway/README.md) | [局域网 SSH 只读接入](./agent_gateway/SSH_READ_ONLY.md)、[协议与 package 技术说明](../agent_gateway/README.md) |
 | Sim human-in-the-loop | [HIL](./HIL/README.md) | [profile 速览、安全边界、owner 导航与综合操作指南](./HIL/README.md) |
 | 设备、USB、标定 | [hardware](./hardware/README.md) | [设备与标定](./hardware/DEVICES_AND_CALIBRATION.md)、[DMTAC/Q6](./hardware/DMTAC.md) |
-| 数据格式、后处理、分析、测试、验收 | [data](./data/README.md) | [v2.5-p2 数据格式](./data/v25p2/README.md)、[数据集内容与交付](./data/v25p2/DATASET_CONTENT_AND_HANDOFF.md)、[长程任务细粒度阶段标注](./real/LONG_HORIZON_STAGE_ANNOTATION.md)、[后处理与测试](./data/POSTPROCESS_AND_TESTING.md)、[v2.3 验收](./data/ACCEPTANCE_V23.md) |
+| 数据格式、后处理、分析、测试、验收 | [data](./data/README.md) | [v2.5-p2 数据格式](./data/v25p2/README.md)、[数据集内容与交付](./data/v25p2/DATASET_CONTENT_AND_HANDOFF.md)、[数据集系统盘点](./data/DATASET_INVENTORY_20260820.md)、[长程任务细粒度阶段标注](./real/LONG_HORIZON_STAGE_ANNOTATION.md)、[后处理与测试](./data/POSTPROCESS_AND_TESTING.md)、[v2.3 验收](./data/ACCEPTANCE_V23.md) |
 | 跨层端到端指南 | [showcase](./showcase/README.md) | 已落地合同、训练接口和部署链路的贯通说明；不作为新的运行入口 |
 | 执行模式与模块边界 | [architecture](./architecture/README.md) | [单源直通、多源组合与运行域边界](./architecture/runtime_domain_boundaries.md)；不作为新的运行入口 |
 | 被替代命令和历史报告 | [legacy](./legacy/README.md) | 仅用于追溯和复现实验 |
