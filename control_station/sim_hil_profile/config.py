@@ -8,6 +8,8 @@ The canonical CLI continues to live in :mod:`control_station.sim_hil`.
 from __future__ import annotations
 
 import math
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -16,9 +18,9 @@ from robot_motion.position_control import POSITION_15_60_120_PROFILE_NAME
 from .profile_selection import SIM_HIL_CONTROL_PROFILE_FIXED_ALPHA_COMPATIBILITY
 from .validation import _finite
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CHECKPOINT = (
+SIM_HIL_CHECKPOINT_ENV = "DEXTELEOP_SIM_HIL_CHECKPOINT"
+LOCAL_DEFAULT_CHECKPOINT = (
     REPO_ROOT
     / "sim"
     / "mujoco_temp_pipeline"
@@ -27,6 +29,24 @@ DEFAULT_CHECKPOINT = (
     / "checkpoints"
     / "step_000050176_final.pt"
 )
+
+
+def resolve_default_checkpoint_path(
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve the optional host-supplied Sim-HIL checkpoint fail closed."""
+
+    environment = os.environ if environ is None else environ
+    configured = str(environment.get(SIM_HIL_CHECKPOINT_ENV, "")).strip()
+    if not configured:
+        return LOCAL_DEFAULT_CHECKPOINT
+    checkpoint = Path(configured).expanduser()
+    if not checkpoint.is_absolute():
+        raise ValueError(f"{SIM_HIL_CHECKPOINT_ENV} must be an absolute path.")
+    return checkpoint.resolve()
+
+
+DEFAULT_CHECKPOINT = resolve_default_checkpoint_path()
 DEFAULT_TASK_CONFIG = (
     REPO_ROOT
     / "sim"
@@ -362,9 +382,12 @@ __all__ = [
     "DEFAULT_TASK_CONFIG",
     "DEFAULT_VIVE_COORDINATE_PROFILE",
     "DEFAULT_VIVE_PORT",
-    "MujocoSimHILApplicationConfig",
+    "LOCAL_DEFAULT_CHECKPOINT",
     "SIM_HIL_BLEND_FAILURE_FALLBACKS",
+    "SIM_HIL_CHECKPOINT_ENV",
     "SIM_HIL_HUMAN_TIMEOUT_FALLBACKS",
     "SIM_HIL_POLICY_BACKENDS",
+    "MujocoSimHILApplicationConfig",
     "acceptance_profile_config",
+    "resolve_default_checkpoint_path",
 ]
