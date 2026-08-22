@@ -35,6 +35,7 @@
     configure,
     handleServerMessage,
     onXRReady: (context) => invoke('onXRReady', context),
+    onXRFrame: (context) => invoke('onXRFrame', context),
     renderView: (context) => invoke('renderView', context),
     onReferenceSpaceReset: (context) => invoke('onReferenceSpaceReset', context),
     onSessionEnd: (context) => invoke('onSessionEnd', context),

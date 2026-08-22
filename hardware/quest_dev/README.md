@@ -1,114 +1,116 @@
 # Quest Dev
 
-`quest_dev` 是从现有 `quest_pose/` 中抽取的通用 Quest Browser/WebXR 开发基座。它不以机械臂末端显示为模块身份；visualization 是第一个可插拔 feature，后续可以并列增加交互、采集、诊断或其他 Quest 功能。
+`quest_dev` 是 AgenticRobot 内独立的 Quest Browser/WebXR 开发基座。当前 R0 只建立
+安全连接、最小几何可视化、只读手柄位姿遥测和可重放标定拟合；它尚未接入
+`control_composition` 的 future visualization，也不会启动机械臂、产生控制目标或执行运动。
+
+## R0 已有边界
+
+- core protocol v2：同源 WSS、页面会话配对、认证客户端广播；
+- WebXR `immersive-ar` 优先、`immersive-vr` 回退，并报告实际 reference space；
+- 每个 reference-space generation 独立锚定的黄色线框立方体；
+- 手柄坐标轴和最多 20 Hz 的 `gripSpace` 只读遥测；
+- host 侧按认证客户端保留 latest-only 样本，reset/end/disconnect 立即失效；
+- 固定在 TCP 上的 Quest 手柄与机器人 TCP 成对位姿离线拟合；
+- 可选 AR5 Redis `GET` 反馈；默认关闭，且当前不会在 Quest 中绘制机器人 TCP。
 
 ## 目录结构
 
 ```text
 hardware/quest_dev/
-├── server.py                       # 通用 HTTPS/WSS host 与 feature 生命周期
-├── protocol.py                     # core protocol
+├── server.py                          # HTTPS/WSS、配对与 feature 生命周期
+├── protocol.py                        # core protocol v2
 ├── config.yaml
 ├── features/
+│   ├── controller_pose/
+│   │   ├── protocol.py                # 严格的只读 grip pose wire parser
+│   │   └── runtime.py                 # session/generation 绑定的 latest-only 状态
 │   └── visualization/
-│       ├── runtime.py              # host-side feature runtime
-│       ├── protocol.py             # robot_tcp feature protocol
-│       ├── robot_feedback.py       # 可选 Redis GET adapter
-│       ├── transforms.py           # pose/SE(3)/WebGL matrix
-│       └── alignment.py            # Kabsch 空间标定
+│       ├── runtime.py                 # host-side visualization runtime
+│       ├── protocol.py                # robot_tcp 下行协议
+│       ├── paired_pose_calibration.py # 两个固定 SE(3) 的离线拟合
+│       ├── alignment.py               # 已有的对应点 Kabsch 工具
+│       └── transforms.py
 ├── web/
-│   ├── app.js                      # 通用 WebXR/WSS lifecycle
-│   ├── feature_registry.js         # browser feature hooks
-│   ├── xr_math.js
-│   └── features/visualization/     # visualization renderer 与 browser hooks
+│   ├── app.js                         # 认证后的 WebXR/WSS lifecycle
+│   ├── feature_registry.js            # browser feature hooks
+│   └── features/                      # visualization 与 controller_pose
 ├── docs/
-├── examples/
 ├── tools/
 └── tests/
 ```
 
-架构和新增 feature 的方法见 [docs/architecture.md](docs/architecture.md)。
-
-## Core 提供什么
-
-- Quest Browser HTTPS secure context；
-- WebSocket/WSS 连接、重连和 1 MB 消息上限；
-- `immersive-ar` 优先、`immersive-vr` 回退；
-- WebXR reference-space 生命周期和 `reset` 通知；
-- 逐眼 framebuffer、view/projection context；
-- host/browser feature registry；
-- `/api/status` 与安全的 `/api/config`；
-- 脚本入口和 Python package 入口。
-
-Core 不 import Redis、AR5、Pinocchio、IK 或真机 SDK，也不定义机器人控制协议。
-
-## 当前 visualization feature
-
-visualization feature 包含：
-
-- RGB 坐标轴 WebGL renderer；
-- 可选 AR5 `tcp_pose` 只读反馈；
-- 新鲜度、机器人身份和 pose 校验；
-- quaternion/刚体矩阵/WebGL column-major 转换；
-- 三点以上 Kabsch 标定和残差门限；
-- `robot_tcp` 下行协议。
-
-未经 `T_quest_from_robot` 标定的 robot pose 不会被直接当成 Quest pose 绘制。协议见 [docs/features/visualization-protocol.md](docs/features/visualization-protocol.md)。
+架构与 feature 规则见 [docs/architecture.md](docs/architecture.md)。
 
 ## 安装与启动
 
 ```bash
 python -m pip install -r hardware/quest_dev/requirements.txt
-python hardware/quest_dev/server.py
-```
-
-需要 visualization 的离线标定或 Redis 反馈时，再安装：
-
-```bash
-python -m pip install -r hardware/quest_dev/requirements-visualization.txt
-```
-
-也可以使用 package 入口：
-
-```bash
 python -m hardware.quest_dev.server
 ```
 
-默认监听 `8444`，避免与现有 `quest_pose` 的 `8443` 冲突。首次 HTTPS 启动会生成开发用自签名证书。Quest 与主机需要在同一局域网，并在 Quest Browser 中手动接受证书风险。
+默认监听 `8444`。首次 HTTPS 启动会生成本机开发用自签名证书；Quest 与主机需在
+同一受信局域网，且需在 Quest Browser 中手动接受证书风险。
 
-桌面 HTTP 测试：
+每次启动默认生成新的随机配对 token，并只在主机终端打印含 `#pair=...` fragment
+的 URL。URL fragment 不随 HTTP 请求发送；浏览器读取后立即从地址栏移除，但 token
+会在当前页面内存中保留以支持 WSS 重连。需要固定 token 时由调用环境提供 16–256 个
+URL-safe ASCII 字符组成的 `QUEST_DEV_PAIRING_TOKEN`，不要把它写入仓库或日志。
+
+桌面传输测试可使用：
 
 ```bash
-python hardware/quest_dev/server.py --http
+python -m hardware.quest_dev.server --http
 ```
 
-## Feature 配置
+明文 HTTP/WS 模式会无条件绑定 `127.0.0.1`，不能从 Quest 或 LAN 访问，也不能代替
+Quest WebXR 的 HTTPS secure-context 检查。
 
-Feature 位于：
+`/api/status` 需要同一 pairing token：
 
-```yaml
-features:
-  visualization:
-    enabled: true
-    client:
-      axis_length_m: 0.18
-      show_controller_axes: true
+```bash
+curl -H "Authorization: Bearer $QUEST_DEV_PAIRING_TOKEN" \
+  https://HOST:8444/api/status
 ```
 
-只有 `client` 子项会通过 `/api/config` 发给浏览器。Redis 等 host-only 配置不会暴露。
+使用随机 token 启动时，请从终端 pairing URL 取得 token；避免让包含 header 的命令进入
+共享 shell history。
 
-AR5 反馈默认关闭。需要时启用：
+## 最小几何体与手柄遥测
 
-```yaml
-features:
-  visualization:
-    robot_feedback:
-      enabled: true
+进入 MR/VR 后，visualization feature 在首次有效 viewer pose 前方放置一个黄色线框
+立方体，并绘制手柄 RGB 坐标轴。reference space 发生 `reset` 时旧锚点立即失效，下一
+帧在新 generation 中重新锚定。参数位于 `features.visualization.client`。
+
+`controller_pose` feature 上传 `T_reference_from_grip`，但不保存轨迹，也不提供动作、
+目标或控制字段。协议见
+[docs/features/controller-pose-protocol.md](docs/features/controller-pose-protocol.md)。
+
+## 固定手柄的成对位姿标定
+
+将 Quest 手柄刚性固定在机器人 TCP 后，单纯对 TCP 与手柄原点做 Kabsch 会把未知安装
+偏置误当成空间变换。R0 因此拟合：
+
+```text
+T_questReference_from_controllerGrip(i)
+  = T_questReference_from_robotReference
+  × T_robotReference_from_tcp(i)
+  × T_tcp_from_controllerGrip
 ```
 
-该 adapter 只调用 Redis `GET`，模块没有 Redis 写入接口。
+离线工具同时求 `T_questReference_from_robotReference` 和
+`T_tcp_from_controllerGrip`：
 
-## 离线标定工具
+```bash
+python -m hardware.quest_dev.tools.fit_paired_pose_calibration paired_poses.json
+```
+
+数据格式、静止窗口证据和退化判据见
+[docs/features/paired-pose-calibration.md](docs/features/paired-pose-calibration.md)。工具输出
+固定为 `accepted: null`：拟合结果只是可重放诊断证据，不会写入 frame graph，也不能
+自行授权机器人绘制或运动。R0 尚未实现真实机器人/Quest 同步采样器与人工验收 profile。
+
+已有的 `fit_alignment` 只适合确实共点、且不存在未知旋转安装偏置的对应点场景：
 
 ```bash
 python -m hardware.quest_dev.tools.fit_alignment \
@@ -119,17 +121,19 @@ python -m hardware.quest_dev.tools.fit_alignment \
 
 ```bash
 bash scripts/run_pytest.sh -q hardware/quest_dev/tests
+node --test hardware/quest_dev/tests/*.test.js
 ```
 
-## 来源与边界
+测试覆盖协议、认证、位姿严格校验、生命周期失效、变换、只读反馈与合成成对位姿拟合；
+它们不构成 Quest 真机显示、网络时延、真实静止检测或机械臂运动证据。
 
-- `server.py` 来自 `quest_pose/server.py` 的 HTTPS、证书和 WebSocket 部分；遥操作发布、标定和 Redis 写入已移除。
-- WebXR core 和 renderer 来自 `quest_pose/web/app.js`，现已拆成 core 与 browser feature。
-- visualization 的反馈解析来自 `AR5_real/tools/target_pose_viewer.py`。
-- pose 变换来自 `AR5_real/tools/jog.py`。
-- Kabsch 拟合来自 `AR5_real/tools/estimate_workstation_y_rotation.py`。
+## 来源与所有权
 
-本目录不跨模块 import `quest_pose` 或 `AR5_real`，原遥操作入口保持不变。
-模块不会由 AgenticRobot 自动启动，也不拥有机器人控制或运动权限。首次 HTTPS 启动生成的
-`assets/certs/*.crt` 与 `*.key` 是本机开发材料，已被模块 `.gitignore` 排除；只提交用于保留
-目录边界的 `.gitkeep`。
+- HTTPS/WSS 与 WebXR 基础来自既有 `quest_pose`，遥操作发布和 Redis 写入已移除；
+- visualization 反馈解析来自既有 AR5 只读反馈契约；
+- `hardware/quest_dev` 只拥有 Quest 接入与 feature-local 诊断，不拥有控制 authority、
+  canonical safety、轨迹生成、future selection 或执行生命周期；
+- 模块不会被 AgenticRobot 自动启动，也不跨模块 import `quest_pose`、AR5 runtime、
+  `control_composition`、`control_station` 或 RPent。
+
+证书私钥和生成材料位于忽略的 `assets/certs/`；只提交 `.gitkeep` 以保留目录边界。

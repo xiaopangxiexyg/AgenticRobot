@@ -7,7 +7,9 @@
     gl.shaderSource(shader, source);
     gl.compileShader(shader);
     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-      throw new Error(gl.getShaderInfoLog(shader) || 'WebGL shader compile failed');
+      const message = gl.getShaderInfoLog(shader) || 'WebGL shader compile failed';
+      gl.deleteShader(shader);
+      throw new Error(message);
     }
     return shader;
   }
@@ -60,6 +62,28 @@
     return { positions, colors };
   }
 
+  function createWireCubeGeometry(sizeM) {
+    const half = Number(sizeM) / 2;
+    const vertices = [
+      [-half, -half, -half], [half, -half, -half],
+      [half, -half, -half], [half, half, -half],
+      [half, half, -half], [-half, half, -half],
+      [-half, half, -half], [-half, -half, -half],
+      [-half, -half, half], [half, -half, half],
+      [half, -half, half], [half, half, half],
+      [half, half, half], [-half, half, half],
+      [-half, half, half], [-half, -half, half],
+      [-half, -half, -half], [-half, -half, half],
+      [half, -half, -half], [half, -half, half],
+      [half, half, -half], [half, half, half],
+      [-half, half, -half], [-half, half, half],
+    ];
+    const positions = [];
+    const colors = [];
+    for (const point of vertices) pushVertex(positions, colors, point, [1.0, 0.78, 0.05]);
+    return { positions, colors };
+  }
+
   function createBuffer(gl, values) {
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -78,18 +102,30 @@
         v_color = a_color;
       }
     `);
-    const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, `
-      precision mediump float;
-      varying vec3 v_color;
-      void main() { gl_FragColor = vec4(v_color, 1.0); }
-    `);
+    let fragmentShader;
+    try {
+      fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, `
+        precision mediump float;
+        varying vec3 v_color;
+        void main() { gl_FragColor = vec4(v_color, 1.0); }
+      `);
+    } catch (error) {
+      gl.deleteShader(vertexShader);
+      throw error;
+    }
     const program = gl.createProgram();
     gl.attachShader(program, vertexShader);
     gl.attachShader(program, fragmentShader);
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error(gl.getProgramInfoLog(program) || 'WebGL program link failed');
+      const message = gl.getProgramInfoLog(program) || 'WebGL program link failed';
+      gl.deleteProgram(program);
+      gl.deleteShader(vertexShader);
+      gl.deleteShader(fragmentShader);
+      throw new Error(message);
     }
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
 
     const length = Number(options.axisLength || 0.18);
     const geometry = createArrowAxesGeometry({
@@ -99,7 +135,9 @@
       headLength: length * 0.226,
       segments: 12,
     });
+    const markerGeometry = createWireCubeGeometry(Number(options.markerSizeM || 0.10));
     return {
+      gl,
       program,
       aPosition: gl.getAttribLocation(program, 'a_position'),
       aColor: gl.getAttribLocation(program, 'a_color'),
@@ -107,20 +145,62 @@
       positionBuffer: createBuffer(gl, geometry.positions),
       colorBuffer: createBuffer(gl, geometry.colors),
       count: geometry.positions.length / 3,
+      markerPositionBuffer: createBuffer(gl, markerGeometry.positions),
+      markerColorBuffer: createBuffer(gl, markerGeometry.colors),
+      markerCount: markerGeometry.positions.length / 3,
     };
   }
 
-  function drawAxes(gl, renderer, mvp) {
+  function drawBuffers(gl, renderer, mvp, positionBuffer, colorBuffer, mode, count) {
     gl.useProgram(renderer.program);
     gl.uniformMatrix4fv(renderer.uMvp, false, mvp);
-    gl.bindBuffer(gl.ARRAY_BUFFER, renderer.positionBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
     gl.vertexAttribPointer(renderer.aPosition, 3, gl.FLOAT, false, 0, 0);
     gl.enableVertexAttribArray(renderer.aPosition);
-    gl.bindBuffer(gl.ARRAY_BUFFER, renderer.colorBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
     gl.vertexAttribPointer(renderer.aColor, 3, gl.FLOAT, false, 0, 0);
     gl.enableVertexAttribArray(renderer.aColor);
-    gl.drawArrays(gl.TRIANGLES, 0, renderer.count);
+    gl.drawArrays(mode, 0, count);
   }
 
-  global.QuestDevVisualizationRenderer = { create, drawAxes };
+  function drawAxes(gl, renderer, mvp) {
+    drawBuffers(
+      gl,
+      renderer,
+      mvp,
+      renderer.positionBuffer,
+      renderer.colorBuffer,
+      gl.TRIANGLES,
+      renderer.count,
+    );
+  }
+
+  function drawReferenceMarker(gl, renderer, mvp) {
+    drawBuffers(
+      gl,
+      renderer,
+      mvp,
+      renderer.markerPositionBuffer,
+      renderer.markerColorBuffer,
+      gl.LINES,
+      renderer.markerCount,
+    );
+  }
+
+  function destroy(renderer) {
+    if (!renderer) return;
+    const gl = renderer.gl;
+    gl.deleteBuffer(renderer.positionBuffer);
+    gl.deleteBuffer(renderer.colorBuffer);
+    gl.deleteBuffer(renderer.markerPositionBuffer);
+    gl.deleteBuffer(renderer.markerColorBuffer);
+    gl.deleteProgram(renderer.program);
+  }
+
+  global.QuestDevVisualizationRenderer = {
+    create,
+    destroy,
+    drawAxes,
+    drawReferenceMarker,
+  };
 }(window));
