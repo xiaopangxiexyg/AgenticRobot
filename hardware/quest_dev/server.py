@@ -43,9 +43,7 @@ MODULE_ROOT = Path(__file__).resolve().parent
 WEB_ROOT = MODULE_ROOT / "web"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_WS_MESSAGE_BYTES = 1_000_000
-PAIRING_TOKEN_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
-)
+PAIRING_CODE_DIGITS = 6
 
 
 @dataclass
@@ -99,11 +97,11 @@ def same_origin_allowed(
 def validate_pairing_token(value: Any, name: str = "pairing_token") -> str:
     if (
         not isinstance(value, str)
-        or not 16 <= len(value) <= 256
+        or len(value) != PAIRING_CODE_DIGITS
         or not value.isascii()
-        or any(character not in PAIRING_TOKEN_CHARS for character in value)
+        or not value.isdecimal()
     ):
-        raise ValueError(f"{name} must contain 16-256 URL-safe ASCII characters")
+        raise ValueError(f"{name} must contain exactly 6 ASCII digits")
     return value
 
 
@@ -687,7 +685,11 @@ def resolve_pairing_settings(server_cfg: dict[str, Any]) -> tuple[str, bool]:
         raise ValueError("Quest Dev pairing cannot be disabled")
     token_env = str(pairing_cfg.get("token_env", "QUEST_DEV_PAIRING_TOKEN"))
     configured = os.environ.get(token_env)
-    token = configured if configured else secrets.token_urlsafe(24)
+    token = (
+        configured
+        if configured
+        else f"{secrets.randbelow(10**PAIRING_CODE_DIGITS):0{PAIRING_CODE_DIGITS}d}"
+    )
     return validate_pairing_token(token, token_env), bool(
         pairing_cfg.get("require_same_origin", True)
     )
@@ -764,10 +766,11 @@ def main() -> None:
 
     scheme = "https" if use_https else "http"
     display_host = lan_ip if host in {"0.0.0.0", "::"} else host
-    pairing_url = (
-        f"{scheme}://{display_host}:{port}/#pair={quote(pairing_token, safe='')}"
-    )
-    print(f"[quest-dev] pairing URL: {pairing_url}", flush=True)
+    base_url = f"{scheme}://{display_host}:{port}/"
+    pairing_url = f"{base_url}#pair={quote(pairing_token, safe='')}"
+    print(f"[quest-dev] open on Quest: {base_url}", flush=True)
+    print(f"[quest-dev] 6-digit pairing code: {pairing_token}", flush=True)
+    print(f"[quest-dev] one-step pairing URL: {pairing_url}", flush=True)
 
     stop_once = threading.Event()
     runtimes: list[Any] = []

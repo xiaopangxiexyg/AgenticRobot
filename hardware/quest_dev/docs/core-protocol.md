@@ -39,10 +39,10 @@ server 使用恒定时间比较 token。类型、版本、实例 ID 或 token �
 `client_id`。后续带 `client_instance_id` 的消息必须与认证身份一致，否则关闭连接。
 未认证连接不会收到 feature 广播。
 
-配对不可在配置中关闭。默认 token 每次进程启动随机生成；也可由 16–256 个 URL-safe
-ASCII 字符组成的 `QUEST_DEV_PAIRING_TOKEN` 注入。启动 URL 使用 `#pair=` fragment，
-fragment 不进入 HTTP 请求；它仍是 bearer secret，应只通过可信终端/局域网传递。
-明文 HTTP/WS 被强制限制在 loopback。
+配对不可在配置中关闭。默认 pairing code 每次进程启动随机生成，为恰好 6 位 ASCII
+数字；也可由 `QUEST_DEV_PAIRING_TOKEN` 注入固定 6 位数字。启动 URL 使用 `#pair=`
+fragment，fragment 不进入 HTTP 请求；它仍是局域网内的短期 bearer secret，只适用于
+明确受信的开发局域网，不应暴露到互联网。明文 HTTP/WS 被强制限制在 loopback。
 
 ## XR 生命周期
 

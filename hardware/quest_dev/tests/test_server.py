@@ -111,21 +111,39 @@ class ConfigurationTests(unittest.TestCase):
             "0.0.0.0",
         )
 
-    def test_pairing_token_is_bounded_url_safe_ascii(self) -> None:
-        self.assertEqual(
-            server.validate_pairing_token("valid-token_123456789"),
-            "valid-token_123456789",
-        )
+    def test_pairing_token_is_exactly_six_ascii_digits(self) -> None:
+        self.assertEqual(server.validate_pairing_token("042731"), "042731")
         for invalid in (
-            "short",
-            "含非ASCII字符的token-123456",
-            "contains space 123456",
+            "12345",
+            "1234567",
+            "１２３４５６",
+            "12a456",
         ):
             with (
                 self.subTest(invalid=invalid),
-                self.assertRaisesRegex(ValueError, "URL-safe ASCII"),
+                self.assertRaisesRegex(ValueError, "exactly 6 ASCII digits"),
             ):
                 server.validate_pairing_token(invalid)
+
+    def test_default_pairing_code_is_six_digits_and_keeps_leading_zeros(self) -> None:
+        config = {"pairing": {"token_env": "QUEST_DEV_TEST_PAIRING_TOKEN"}}
+        with (
+            mock.patch.dict(server.os.environ, {}, clear=True),
+            mock.patch.object(server.secrets, "randbelow", return_value=42),
+        ):
+            code, require_same_origin = server.resolve_pairing_settings(config)
+        self.assertEqual(code, "000042")
+        self.assertTrue(require_same_origin)
+
+    def test_fixed_pairing_code_must_also_be_six_digits(self) -> None:
+        config = {"pairing": {"token_env": "QUEST_DEV_TEST_PAIRING_TOKEN"}}
+        with mock.patch.dict(
+            server.os.environ,
+            {"QUEST_DEV_TEST_PAIRING_TOKEN": "314159"},
+            clear=True,
+        ):
+            code, _ = server.resolve_pairing_settings(config)
+        self.assertEqual(code, "314159")
 
     def test_lan_ip_probe_falls_back_when_socket_creation_is_denied(self) -> None:
         with mock.patch.object(server.socket, "socket", side_effect=PermissionError):
@@ -140,7 +158,7 @@ class AuthenticationTests(unittest.TestCase):
     def make_server() -> server.QuestDevHTTPServer:
         host = object.__new__(server.QuestDevHTTPServer)
         host.client_config = {}
-        host._pairing_token = "correct-pairing-token-1234"
+        host._pairing_token = "314159"
         host.require_same_origin = True
         host.max_ws_clients = 2
         host.auth_timeout_s = 5.0

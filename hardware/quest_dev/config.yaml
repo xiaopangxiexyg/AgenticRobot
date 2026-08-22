@@ -8,6 +8,7 @@ server:
   auth_timeout_s: 5.0
   pairing:
     enabled: true
+    # 每次启动默认生成新的 6 位数字；也可通过下列环境变量注入固定 6 位数字。
     token_env: QUEST_DEV_PAIRING_TOKEN
     require_same_origin: true
 

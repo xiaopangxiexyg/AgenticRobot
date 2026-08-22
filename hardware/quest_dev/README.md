@@ -52,10 +52,27 @@ python -m hardware.quest_dev.server
 默认监听 `8444`。首次 HTTPS 启动会生成本机开发用自签名证书；Quest 与主机需在
 同一受信局域网，且需在 Quest Browser 中手动接受证书风险。
 
-每次启动默认生成新的随机配对 token，并只在主机终端打印含 `#pair=...` fragment
-的 URL。URL fragment 不随 HTTP 请求发送；浏览器读取后立即从地址栏移除，但 token
-会在当前页面内存中保留以支持 WSS 重连。需要固定 token 时由调用环境提供 16–256 个
-URL-safe ASCII 字符组成的 `QUEST_DEV_PAIRING_TOKEN`，不要把它写入仓库或日志。
+每次启动默认生成新的随机 6 位数字配对码。终端会分别打印基础网址、6 位码和含
+`#pair=...` fragment 的一键网址：可以只在 Quest 输入一次基础网址，然后在页面的数字
+键盘中输入 6 位码；也可以直接输入一键网址。URL fragment 不随 HTTP 请求发送，浏览器
+读取后立即从地址栏移除，但配对码会在当前页面内存中保留以支持 WSS 重连。需要固定码
+时由调用环境提供恰好 6 位 ASCII 数字组成的 `QUEST_DEV_PAIRING_TOKEN`，不要把它写入
+仓库或共享日志。
+
+若 Quest 显示网页不可访问，依次确认：输入的是终端打印的 `https://LAN_IP:8444/`
+（不是 `http://` 或 `localhost`）；已在 Quest Browser 高级选项中接受自签名证书；主机
+防火墙已允许 Quest 所在局域网访问 TCP `8444`；Wi-Fi/热点没有开启 AP/client isolation。
+主机可先用下列命令确认服务和证书监听正常：
+
+```bash
+curl --noproxy '*' -k https://LAN_IP:8444/api/config
+```
+
+若 UFW 已启用，按实际网段最小范围放行，例如：
+
+```bash
+sudo ufw allow from 192.168.70.0/24 to any port 8444 proto tcp
+```
 
 桌面传输测试可使用：
 
@@ -66,7 +83,7 @@ python -m hardware.quest_dev.server --http
 明文 HTTP/WS 模式会无条件绑定 `127.0.0.1`，不能从 Quest 或 LAN 访问，也不能代替
 Quest WebXR 的 HTTPS secure-context 检查。
 
-`/api/status` 需要同一 pairing token：
+`/api/status` 需要同一 6 位 pairing code：
 
 ```bash
 curl -H "Authorization: Bearer $QUEST_DEV_PAIRING_TOKEN" \

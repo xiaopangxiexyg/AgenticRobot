@@ -100,7 +100,7 @@
 
   function connectWebSocket() {
     if (!pairingToken) {
-      setStatus(pairingStatus, 'pairing token required', false);
+      setStatus(pairingStatus, '请输入主机终端显示的 6 位配对码', false);
       return;
     }
     clearTimeout(reconnectTimer);
@@ -474,7 +474,7 @@
     if (pairingToken) {
       connectWebSocket();
     } else {
-      setStatus(pairingStatus, 'enter the token from the host pairing URL', false);
+      setStatus(pairingStatus, '请输入主机终端显示的 6 位配对码', false);
     }
   });
 }());
