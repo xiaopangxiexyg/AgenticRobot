@@ -59,7 +59,10 @@ def test_direct_script_bootstraps_repository_import_path(tmp_path: Path) -> None
     )
 
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", code],
+        # ``-I`` ignores PYTHON* environment variables, including the
+        # snapshot runner's PYTHONPYCACHEPREFIX.  Keep the direct-script
+        # import probe isolated and explicitly prevent source-tree bytecode.
+        [sys.executable, "-I", "-B", "-c", code],
         cwd=tmp_path,
         text=True,
         capture_output=True,
