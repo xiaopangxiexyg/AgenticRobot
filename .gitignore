@@ -1,3 +1,7 @@
+# Ignored datasets, records, models, secrets, outputs, and developer-local state
+# are registered in docs/setup/local_resources_manifest_v1.json. When a durable
+# local-resource rule changes, update that manifest, LOCAL_RESOURCES.md, and its
+# focused test in the same commit.
 __pycache__
 .idea/
 data/
@@ -16,7 +20,6 @@ output
 assets
 curobo
 panda_drake
-tests/*.log
 tests/*.txt
 polygons.png
 _isaac_sim_410
@@ -60,7 +63,6 @@ logs/
 
 # Local scratch outputs and raw UMI data are not repository artifacts.
 temp/
-remote_data/umi/
 remote_data/
 
 camera_process/wrist_cam_adjust/outputs/

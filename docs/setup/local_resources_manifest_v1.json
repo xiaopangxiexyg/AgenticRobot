@@ -1,0 +1,774 @@
+{
+  "schema_version": "dexteleop.development_local_resources.v1",
+  "resources": [
+    {
+      "resource_id": "development-assets",
+      "classification": "shared-read-mostly",
+      "migration": "asset-store-link",
+      "summary": "Unpacked robot models and other reviewed development asset bundles.",
+      "locations": [
+        {
+          "label": "development asset root",
+          "path": "assets",
+          "probe": "assets",
+          "expected_rule": "assets",
+          "tracked_policy": "none"
+        }
+      ]
+    },
+    {
+      "resource_id": "offline-datasets",
+      "classification": "external-input",
+      "migration": "external-binding",
+      "summary": "Raw, imported, remote, debug, and historical datasets that must stay outside Git and outside live worktree sharing.",
+      "locations": [
+        {
+          "label": "generic data root",
+          "path": "data",
+          "probe": "data/.dexteleop-local-resource-probe",
+          "expected_rule": "data/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "dataset collection root",
+          "path": "dataset_collection",
+          "probe": "dataset_collection/.dexteleop-local-resource-probe",
+          "expected_rule": "dataset_collection",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "dataset root",
+          "path": "datasets",
+          "probe": "datasets/.dexteleop-local-resource-probe",
+          "expected_rule": "datasets",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "hand camera dataset",
+          "path": "hand_camera_dataset",
+          "probe": "hand_camera_dataset/.dexteleop-local-resource-probe",
+          "expected_rule": "hand_camera_dataset",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "remote imported data",
+          "path": "remote_data",
+          "probe": "remote_data/.dexteleop-local-resource-probe",
+          "expected_rule": "remote_data/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "debug datasets",
+          "path": "datasets_debug",
+          "probe": "datasets_debug/.dexteleop-local-resource-probe",
+          "expected_rule": "datasets_debug",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "BaselineVLA data",
+          "path": "BaselineVLA_deployment/Data",
+          "probe": "BaselineVLA_deployment/Data/.dexteleop-local-resource-probe",
+          "expected_rule": "BaselineVLA_deployment/Data",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "BaselineVLA post-fix outputs",
+          "path": "BaselineVLA_deployment/Datasets/post_fix_realrobot_data/outputs",
+          "probe": "BaselineVLA_deployment/Datasets/post_fix_realrobot_data/outputs/.dexteleop-local-resource-probe",
+          "expected_rule": "BaselineVLA_deployment/Datasets/post_fix_realrobot_data/outputs",
+          "tracked_policy": "none"
+        }
+      ]
+    },
+    {
+      "resource_id": "historical-offline-datasets",
+      "classification": "external-input",
+      "migration": "manual-review",
+      "summary": "Legacy project-local dataset roots retained only for compatibility; bind a reviewed external canonical root before reusing them.",
+      "locations": [
+        {
+          "label": "UV conversion data",
+          "path": "UV_conversion",
+          "probe": "UV_conversion/.dexteleop-local-resource-probe",
+          "expected_rule": "UV_conversion",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "paper fold datasets",
+          "path": "paper_fold_datasets",
+          "probe": "paper_fold_datasets/.dexteleop-local-resource-probe",
+          "expected_rule": "paper_fold_datasets/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "left fix datasets",
+          "path": "test_left_fix_datasets",
+          "probe": "test_left_fix_datasets/.dexteleop-local-resource-probe",
+          "expected_rule": "test_left_fix_datasets/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "legacy calibration fixture data",
+          "path": "test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration",
+          "probe": "test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration/.dexteleop-local-resource-probe",
+          "expected_rule": "test_datasets/2026-04-28_grasp_demo_left_arm_jitter/meta/calibration/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "heavy light wasted data",
+          "path": "heavy_light_wasted",
+          "probe": "heavy_light_wasted/.dexteleop-local-resource-probe",
+          "expected_rule": "heavy_light_wasted/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "dated heavy light data",
+          "path": "2026-04-30_heavy_light",
+          "probe": "2026-04-30_heavy_light/.dexteleop-local-resource-probe",
+          "expected_rule": "2026-04-30_heavy_light/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "legacy real dataset",
+          "path": "real_dataset",
+          "probe": "real_dataset/.dexteleop-local-resource-probe",
+          "expected_rule": "real_dataset/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "portable right arm data",
+          "path": "portable_rm_right_arm",
+          "probe": "portable_rm_right_arm/.dexteleop-local-resource-probe",
+          "expected_rule": "portable_rm_right_arm/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "left fix warping data",
+          "path": "test_left_fix_datasets_waping",
+          "probe": "test_left_fix_datasets_waping/.dexteleop-local-resource-probe",
+          "expected_rule": "test_left_fix_datasets_waping/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "left fix warping debug data",
+          "path": "test_left_fix_datasets_waping_debug",
+          "probe": "test_left_fix_datasets_waping_debug/.dexteleop-local-resource-probe",
+          "expected_rule": "test_left_fix_datasets_waping_debug/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "left fix warping fixed data",
+          "path": "test_left_fix_datasets_waping_fixed",
+          "probe": "test_left_fix_datasets_waping_fixed/.dexteleop-local-resource-probe",
+          "expected_rule": "test_left_fix_datasets_waping_fixed/",
+          "tracked_policy": "none"
+        }
+      ]
+    },
+    {
+      "resource_id": "runtime-and-collection-evidence",
+      "classification": "mutable-evidence",
+      "migration": "verified-copy",
+      "summary": "Runtime artifacts, collection records, logs, and generated evidence; stop writers and verify a copy before rebinding.",
+      "locations": [
+        {
+          "label": "canonical runtime artifacts",
+          "path": "runtime_artifacts",
+          "probe": "runtime_artifacts/.dexteleop-local-resource-probe",
+          "expected_rule": "/runtime_artifacts/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "teleoperation records mixed root",
+          "path": "teleop_records",
+          "probe": "teleop_records/.dexteleop-local-resource-probe",
+          "expected_rule": "teleop_records/*",
+          "tracked_policy": "mixed"
+        },
+        {
+          "label": "unversioned VIVE coordinate records",
+          "probe": "teleop_records/control_station_vive_coordinate_profiles/.dexteleop-local-resource-probe",
+          "expected_rule": "teleop_records/control_station_vive_coordinate_profiles/*"
+        },
+        {
+          "label": "generic output root",
+          "path": "output",
+          "probe": "output/.dexteleop-local-resource-probe",
+          "expected_rule": "output",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "generic log root",
+          "path": "logs",
+          "probe": "logs/.dexteleop-local-resource-probe",
+          "expected_rule": "logs/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "camera adjustment outputs",
+          "path": "camera_process/wrist_cam_adjust/outputs",
+          "probe": "camera_process/wrist_cam_adjust/outputs/.dexteleop-local-resource-probe",
+          "expected_rule": "camera_process/wrist_cam_adjust/outputs/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "dataset postprocess outputs",
+          "path": "utils/dataset_postprocess/wrist_cam_adjust/outputs",
+          "probe": "utils/dataset_postprocess/wrist_cam_adjust/outputs/.dexteleop-local-resource-probe",
+          "expected_rule": "utils/dataset_postprocess/wrist_cam_adjust/outputs/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "simulation outputs",
+          "path": "sim/outputs",
+          "probe": "sim/outputs/.dexteleop-local-resource-probe",
+          "expected_rule": "sim/outputs/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "generated random backgrounds",
+          "path": "utils/random_background/generated",
+          "probe": "utils/random_background/generated/.dexteleop-local-resource-probe",
+          "expected_rule": "utils/random_background/generated/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "sampled random backgrounds",
+          "path": "utils/random_background/samples",
+          "probe": "utils/random_background/samples/.dexteleop-local-resource-probe",
+          "expected_rule": "utils/random_background/samples/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "real random-background inputs",
+          "path": "utils/random_background/real_images",
+          "probe": "utils/random_background/real_images/.dexteleop-local-resource-probe",
+          "expected_rule": "utils/random_background/real_images/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "BaselineVLA outputs",
+          "path": "BaselineVLA_deployment/Outputs",
+          "probe": "BaselineVLA_deployment/Outputs/.dexteleop-local-resource-probe",
+          "expected_rule": "BaselineVLA_deployment/Outputs",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "HDF5 artifacts",
+          "probe": ".dexteleop-local-resource-probes/artifact.hdf5",
+          "expected_rule": "*.hdf5"
+        },
+        {
+          "label": "H5 artifacts",
+          "probe": ".dexteleop-local-resource-probes/artifact.h5",
+          "expected_rule": "*.h5"
+        },
+        {
+          "label": "LMDB artifacts",
+          "probe": ".dexteleop-local-resource-probes/artifact.lmdb",
+          "expected_rule": "*.lmdb"
+        },
+        {
+          "label": "database artifacts",
+          "probe": ".dexteleop-local-resource-probes/artifact.db",
+          "expected_rule": "*.db"
+        },
+        {
+          "label": "video artifacts",
+          "probe": ".dexteleop-local-resource-probes/artifact.mp4",
+          "expected_rule": "*.mp4"
+        },
+        {
+          "label": "log artifacts",
+          "probe": ".dexteleop-local-resource-probes/runtime.log",
+          "expected_rule": "*.log"
+        },
+        {
+          "label": "stderr captures",
+          "probe": ".dexteleop-local-resource-probes/runtime.err",
+          "expected_rule": "*.err"
+        },
+        {
+          "label": "stdout captures",
+          "probe": ".dexteleop-local-resource-probes/runtime.out",
+          "expected_rule": "*.out"
+        }
+      ]
+    },
+    {
+      "resource_id": "models-and-local-vendors",
+      "classification": "local-vendor",
+      "migration": "manual-review",
+      "summary": "Weights, checkpoints, local simulator trees, and vendor checkouts; preserve tracked boundaries and bind reviewed external content explicitly.",
+      "locations": [
+        {
+          "label": "model mixed root",
+          "path": "model",
+          "probe": "model/.dexteleop-local-resource-probe.bin",
+          "expected_rule": "/model/*",
+          "tracked_policy": "mixed"
+        },
+        {
+          "label": "CuRobo checkout",
+          "path": "curobo",
+          "probe": "curobo/.dexteleop-local-resource-probe",
+          "expected_rule": "curobo",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "Panda Drake checkout",
+          "path": "panda_drake",
+          "probe": "panda_drake/.dexteleop-local-resource-probe",
+          "expected_rule": "panda_drake",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "Isaac Sim installation",
+          "path": "_isaac_sim_410",
+          "probe": "_isaac_sim_410/.dexteleop-local-resource-probe",
+          "expected_rule": "_isaac_sim_410",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "InterDataEngine documentation checkout",
+          "path": "InterDataEngine-docs",
+          "probe": "InterDataEngine-docs/.dexteleop-local-resource-probe",
+          "expected_rule": "InterDataEngine-docs",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "BaselineVLA third party tree",
+          "path": "BaselineVLA_deployment/ThirdParty",
+          "probe": "BaselineVLA_deployment/ThirdParty/.dexteleop-local-resource-probe",
+          "expected_rule": "BaselineVLA_deployment/ThirdParty",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "BaselineVLA Pi deployment",
+          "path": "BaselineVLA_deployment/ServerClientDeploy/Pi",
+          "probe": "BaselineVLA_deployment/ServerClientDeploy/Pi/.dexteleop-local-resource-probe",
+          "expected_rule": "BaselineVLA_deployment/ServerClientDeploy/Pi",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "OpenVR wrapper mixed root",
+          "path": "hardware/VIVE/triad_openvr",
+          "probe": "hardware/VIVE/triad_openvr/.dexteleop-local-resource-probe",
+          "expected_rule": "hardware/VIVE/triad_openvr/*",
+          "tracked_policy": "mixed"
+        },
+        {
+          "label": "VIVE sender checkout",
+          "path": "hardware/VIVE/VIVE_sender",
+          "probe": "hardware/VIVE/VIVE_sender/.dexteleop-local-resource-probe",
+          "expected_rule": "hardware/VIVE/VIVE_sender/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "VIVE sender archive",
+          "path": "hardware/VIVE/VIVE_sender.zip",
+          "probe": "hardware/VIVE/VIVE_sender.zip",
+          "expected_rule": "hardware/VIVE/VIVE_sender.zip",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "PyTorch state dictionaries",
+          "probe": ".dexteleop-local-resource-probes/model.pth",
+          "expected_rule": "*.pth"
+        },
+        {
+          "label": "PyTorch artifacts",
+          "probe": ".dexteleop-local-resource-probes/model.pt",
+          "expected_rule": "*.pt"
+        },
+        {
+          "label": "training checkpoints",
+          "probe": ".dexteleop-local-resource-probes/model.ckpt",
+          "expected_rule": "*.ckpt"
+        },
+        {
+          "label": "safetensors weights",
+          "probe": ".dexteleop-local-resource-probes/model.safetensors",
+          "expected_rule": "*.safetensors"
+        }
+      ]
+    },
+    {
+      "resource_id": "machine-local-configuration",
+      "classification": "local-secret",
+      "migration": "recreate",
+      "summary": "Machine paths, environment secrets, device-local settings, and debug configuration; recreate from tracked examples without copying credentials.",
+      "locations": [
+        {
+          "label": "local path bindings",
+          "path": "local_paths.json",
+          "probe": "local_paths.json",
+          "expected_rule": "local_paths.json",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "dotenv base file",
+          "path": ".env",
+          "probe": ".env",
+          "expected_rule": ".env",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "dotenv variants",
+          "probe": ".env.local",
+          "expected_rule": ".env.*"
+        },
+        {
+          "label": "BaselineVLA local path bindings",
+          "path": "BaselineVLA_deployment/local_paths.env",
+          "probe": "BaselineVLA_deployment/local_paths.env",
+          "expected_rule": "BaselineVLA_deployment/local_paths.env",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "local debug shell",
+          "path": "debug.sh",
+          "probe": "debug.sh",
+          "expected_rule": "debug.sh",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "local debug configuration",
+          "path": "debug.yaml",
+          "probe": "debug.yaml",
+          "expected_rule": "debug.yaml",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "remote sync exclusions",
+          "path": ".realtime_sync_ssh.exclude",
+          "probe": ".realtime_sync_ssh.exclude",
+          "expected_rule": ".realtime_sync_ssh.exclude",
+          "tracked_policy": "none"
+        }
+      ]
+    },
+    {
+      "resource_id": "generated-and-rebuildable-state",
+      "classification": "generated",
+      "migration": "rebuild",
+      "summary": "Build products, environments, caches, test reports, probes, and scratch files that must be regenerated rather than migrated.",
+      "locations": [
+        {
+          "label": "build tree",
+          "path": "build",
+          "probe": "build/.dexteleop-local-resource-probe",
+          "expected_rule": "build",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "distribution tree",
+          "path": "dist",
+          "probe": "dist/.dexteleop-local-resource-probe",
+          "expected_rule": "dist",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "scratch tree",
+          "path": "temp",
+          "probe": "temp/.dexteleop-local-resource-probe",
+          "expected_rule": "temp/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "general cache",
+          "path": ".cache",
+          "probe": ".cache/.dexteleop-local-resource-probe",
+          "expected_rule": ".cache/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "full development virtual environment",
+          "path": ".venv",
+          "probe": ".venv/.dexteleop-local-resource-probe",
+          "expected_rule": ".venv/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "annotation virtual environment",
+          "path": ".venv-annotation",
+          "probe": ".venv-annotation/.dexteleop-local-resource-probe",
+          "expected_rule": ".venv-annotation/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "pytest cache",
+          "path": ".pytest_cache",
+          "probe": ".pytest_cache/.dexteleop-local-resource-probe",
+          "expected_rule": ".pytest_cache/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "mypy cache",
+          "path": ".mypy_cache",
+          "probe": ".mypy_cache/.dexteleop-local-resource-probe",
+          "expected_rule": ".mypy_cache/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "ruff cache",
+          "path": ".ruff_cache",
+          "probe": ".ruff_cache/.dexteleop-local-resource-probe",
+          "expected_rule": ".ruff_cache/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "temporary collection probe",
+          "path": ".tmp_collect_probe",
+          "probe": ".tmp_collect_probe/.dexteleop-local-resource-probe",
+          "expected_rule": ".tmp_collect_probe/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "second temporary collection probe",
+          "path": ".tmp_collect_probe2",
+          "probe": ".tmp_collect_probe2/.dexteleop-local-resource-probe",
+          "expected_rule": ".tmp_collect_probe2/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "temporary commands",
+          "path": "scripts/temp_cmd",
+          "probe": "scripts/temp_cmd/.dexteleop-local-resource-probe",
+          "expected_rule": "scripts/temp_cmd/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "Jupyter checkpoint cache",
+          "probe": ".ipynb_checkpoints/.dexteleop-local-resource-probe",
+          "expected_rule": ".ipynb_checkpoints/"
+        },
+        {
+          "label": "Python bytecode cache",
+          "probe": "__pycache__/.dexteleop-local-resource-probe",
+          "expected_rule": "__pycache__"
+        },
+        {
+          "label": "Python bytecode files",
+          "probe": ".dexteleop-local-resource-probes/module.pyc",
+          "expected_rule": "*.py[cod]"
+        },
+        {
+          "label": "Python egg metadata",
+          "probe": ".dexteleop-local-resource-probes/package.egg-info/PKG-INFO",
+          "expected_rule": "*.egg-info/"
+        },
+        {
+          "label": "Python egg artifact",
+          "probe": ".dexteleop-local-resource-probes/package.egg",
+          "expected_rule": "*.egg"
+        },
+        {
+          "label": "Python wheel artifact",
+          "probe": ".dexteleop-local-resource-probes/package.whl",
+          "expected_rule": "*.whl"
+        },
+        {
+          "label": "coverage worker data",
+          "probe": ".coverage.worker",
+          "expected_rule": ".coverage.*"
+        },
+        {
+          "label": "coverage base data",
+          "probe": ".coverage",
+          "expected_rule": ".coverage"
+        },
+        {
+          "label": "coverage XML report",
+          "probe": "coverage.xml",
+          "expected_rule": "coverage.xml"
+        },
+        {
+          "label": "coverage HTML report",
+          "probe": "htmlcov/.dexteleop-local-resource-probe",
+          "expected_rule": "htmlcov/"
+        },
+        {
+          "label": "JUnit report",
+          "probe": "junit-local.xml",
+          "expected_rule": "junit*.xml"
+        },
+        {
+          "label": "test results",
+          "probe": "test-results/.dexteleop-local-resource-probe",
+          "expected_rule": "test-results/"
+        },
+        {
+          "label": "Playwright report",
+          "probe": "playwright-report/.dexteleop-local-resource-probe",
+          "expected_rule": "playwright-report/"
+        },
+        {
+          "label": "test text output",
+          "probe": "tests/.dexteleop-local-resource-probe.txt",
+          "expected_rule": "tests/*.txt"
+        },
+        {
+          "label": "local polygon preview",
+          "path": "polygons.png",
+          "probe": "polygons.png",
+          "expected_rule": "polygons.png",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "legacy dependency scratch",
+          "path": "depre",
+          "probe": "depre/.dexteleop-local-resource-probe",
+          "expected_rule": "depre",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "macOS metadata",
+          "probe": ".DS_Store",
+          "expected_rule": ".DS_Store"
+        }
+      ]
+    },
+    {
+      "resource_id": "developer-private-state",
+      "classification": "developer-private",
+      "migration": "do-not-migrate",
+      "summary": "Editor, agent, and personal planning state that cannot become a source or runtime dependency.",
+      "locations": [
+        {
+          "label": "Codex local state",
+          "path": ".codex",
+          "probe": ".codex/.dexteleop-local-resource-probe",
+          "expected_rule": ".codex",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "agent local state",
+          "path": ".agents",
+          "probe": ".agents/.dexteleop-local-resource-probe",
+          "expected_rule": ".agents",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "personal task plans",
+          "path": "todos",
+          "probe": "todos/.dexteleop-local-resource-probe",
+          "expected_rule": "/todos/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "local skill prompt",
+          "path": "SKILL_PROMPT.md",
+          "probe": "SKILL_PROMPT.md",
+          "expected_rule": "SKILL_PROMPT.md",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "local skill draft",
+          "path": "YOUR_SKILL.md",
+          "probe": "YOUR_SKILL.md",
+          "expected_rule": "YOUR_SKILL.md",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "IDEA metadata",
+          "path": ".idea",
+          "probe": ".idea/.dexteleop-local-resource-probe",
+          "expected_rule": ".idea/",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "VS Code metadata",
+          "path": ".vscode",
+          "probe": ".vscode/.dexteleop-local-resource-probe",
+          "expected_rule": ".vscode",
+          "tracked_policy": "none"
+        },
+        {
+          "label": "Cursor metadata",
+          "path": ".cursor",
+          "probe": ".cursor/.dexteleop-local-resource-probe",
+          "expected_rule": ".cursor",
+          "tracked_policy": "none"
+        }
+      ]
+    },
+    {
+      "resource_id": "local-code-archive",
+      "classification": "local-archive",
+      "migration": "verified-copy",
+      "summary": "The ignored root legacy code archive; versioned historical documentation remains under docs/legacy.",
+      "locations": [
+        {
+          "label": "local legacy archive",
+          "path": "legacy",
+          "probe": "legacy/.dexteleop-local-resource-probe",
+          "expected_rule": "/legacy/",
+          "tracked_policy": "none"
+        }
+      ]
+    }
+  ],
+  "ignore_exceptions": [
+    {
+      "label": "versioned data documentation",
+      "probe": "docs/data/.dexteleop-local-resource-probe",
+      "expected_rule": "!docs/data/**"
+    },
+    {
+      "label": "versioned data documentation root",
+      "probe": "docs/data",
+      "expected_rule": "!docs/data/"
+    },
+    {
+      "label": "portable UV assets exception",
+      "probe": "portable_init_UV/assets",
+      "expected_rule": "!portable_init_UV/assets"
+    },
+    {
+      "label": "dotenv example",
+      "probe": ".env.example",
+      "expected_rule": "!.env.example"
+    },
+    {
+      "label": "model README",
+      "probe": "model/README.md",
+      "expected_rule": "!/model/README.md"
+    },
+    {
+      "label": "OpenPI submodule boundary",
+      "probe": "model/openpi",
+      "expected_rule": "!/model/openpi"
+    },
+    {
+      "label": "tracked calibration profiles",
+      "probe": "teleop_records/calibration_profiles",
+      "expected_rule": "!teleop_records/calibration_profiles/"
+    },
+    {
+      "label": "tracked hand zero pose calibrations",
+      "probe": "teleop_records/hand_zero_pose_calibrations",
+      "expected_rule": "!teleop_records/hand_zero_pose_calibrations/"
+    },
+    {
+      "label": "tracked VIVE coordinate profile root",
+      "probe": "teleop_records/control_station_vive_coordinate_profiles",
+      "expected_rule": "!teleop_records/control_station_vive_coordinate_profiles/"
+    },
+    {
+      "label": "tracked VIVE coordinate profile",
+      "probe": "teleop_records/control_station_vive_coordinate_profiles/vive_rm65_virtual_desk_coordinate_v1.json",
+      "expected_rule": "!teleop_records/control_station_vive_coordinate_profiles/vive_rm65_virtual_desk_coordinate_v1.json"
+    },
+    {
+      "label": "tracked OpenVR package initializer",
+      "probe": "hardware/VIVE/triad_openvr/__init__.py",
+      "expected_rule": "!hardware/VIVE/triad_openvr/__init__.py"
+    },
+    {
+      "label": "tracked OpenVR wrapper",
+      "probe": "hardware/VIVE/triad_openvr/triad_openvr.py",
+      "expected_rule": "!hardware/VIVE/triad_openvr/triad_openvr.py"
+    }
+  ]
+}

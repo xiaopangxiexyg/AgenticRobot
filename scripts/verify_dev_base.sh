@@ -10,6 +10,7 @@ export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 python scripts/dev_environment_doctor.py
 bash scripts/run_pytest.sh -q \
   tests/test_dev_asset_store.py \
+  tests/test_dev_local_resources.py \
   tests/test_dev_environment_doctor.py \
   tests/test_annotation_environment.py \
   tests/test_collection_runtime_boundaries.py \

@@ -53,6 +53,22 @@ python scripts/dev_asset_store.py link-worktree --worktree /absolute/path/to/wor
 被正式文档引用的计划应放入实际 owner 的 `docs/**/plans/`，可复用脚本则放入 `scripts/`
 或所属 package，不能让 tracked 代码、测试或文档依赖本地 `todos/`。
 
+`assets/` 之外的离线数据、运行记录、模型权重、秘密配置和生成输出不能假定会随 worktree
+自动出现。开始开发或迁移前运行：
+
+```bash
+python scripts/dev_local_resources.py audit
+python scripts/dev_local_resources.py plan \
+  --source-worktree /absolute/path/to/source \
+  --target-worktree /absolute/path/to/target
+```
+
+完整分类和迁移边界见
+[`docs/setup/LOCAL_RESOURCES.md`](./docs/setup/LOCAL_RESOURCES.md)。其中只有 reviewed、read-mostly
+的 `assets/` 使用自动软链接；`runtime_artifacts/` 和采集记录保持 writer 隔离；
+`teleop_records/`、`model/`、`hardware/VIVE/triad_openvr/` 含 tracked 例外，禁止整体链接或覆盖。
+修改本地资源相关 `.gitignore` 规则时，必须同步更新版本化清单、说明和 focused test。
+
 ## 2. 共享 Conda 环境
 
 创建或修复完整依赖环境：

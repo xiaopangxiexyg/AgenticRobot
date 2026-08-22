@@ -49,6 +49,19 @@ python scripts/dev_environment_doctor.py --require-development-assets
 该检查只验证开发资产根和 presence-only bundle requirements；运行时资产内容身份仍以
 TargetRuntime 的版本化 hash 合同为准。
 
+离线数据集、采集记录、运行证据、模型权重和机器本地配置不属于 asset store。使用
+[`LOCAL_RESOURCES.md`](./LOCAL_RESOURCES.md) 的分类和只读工具盘点或规划 worktree 迁移：
+
+```bash
+python scripts/dev_local_resources.py audit
+python scripts/dev_local_resources.py plan \
+  --source-worktree /absolute/path/to/source \
+  --target-worktree /absolute/path/to/target
+```
+
+该工具不会复制或链接数据。只有 `assets/` 允许标准自动链接；可变记录保持 writer 隔离，mixed
+tracked/ignored 根目录不得整体替换。
+
 ## 2. 入口检查（R0）
 
 ```bash

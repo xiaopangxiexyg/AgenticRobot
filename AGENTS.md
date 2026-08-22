@@ -107,6 +107,24 @@ have one authoritative owner. Passive bounded observers, fanout queues, and UI
 caches are allowed, but they must not mutate or independently reconstruct the
 owned state.
 
+## Worktree-local resources
+
+Ignored local state is governed by
+`docs/setup/local_resources_manifest_v1.json` and
+`docs/setup/LOCAL_RESOURCES.md`, not by `.gitignore` alone. When adding or
+changing an ignored dataset, record, model/vendor artifact, secret/config,
+generated output, or developer-local root, update the manifest, documentation,
+and focused policy test in the same commit. Run
+`python scripts/dev_local_resources.py audit` before handoff.
+
+Only the reviewed read-mostly `assets/` store may use the automatic worktree
+symlink flow. Mutable runtime/collection evidence must remain writer-isolated
+and use inventory plus verified copy before rebinding. Never replace a mixed
+tracked/ignored root such as `teleop_records/`, `model/`, or
+`hardware/VIVE/triad_openvr/` with a whole-root symlink. Tracked code, tests, and
+profiles must not depend on a developer's ignored path or machine-local absolute
+path.
+
 ## Delivery scope and evidence
 
 - Judge completion against the user-requested outcome. A contract, module,
