@@ -36,6 +36,9 @@ from .motion_factory import (
     mujoco_agent_tcp_pose_execution_observation_plan_v1,
 )
 
+_RGB_BACKEND_WARMUP_WIDTH = 16
+_RGB_BACKEND_WARMUP_HEIGHT = 16
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -303,6 +306,56 @@ def _close_viewer_for_stopped_payload(
     return dict(viewer.status()), close_error
 
 
+def _prepare_gateway_before_ready(*, session: Any, viewer: Any | None) -> None:
+    """Start lower resources and prove advertised passive reads are ready.
+
+    MuJoCo's first offscreen renderer construction may include GLFW and shader
+    initialization that exceeds the RGB Route's operation deadline when a
+    passive viewer is already open.  Absorb that one-time cost before the
+    socket is published instead of weakening the Skill deadline or letting the
+    first admitted read expire.  The warmup is a discarded lower-local frame;
+    it creates no Artifact, Agent observation, or operation.
+    """
+
+    if viewer is not None:
+        viewer.start()
+    application = session.application
+    application.start_observation_ready()
+    if session.rgb_executor is not None:
+        if (
+            not application.started
+            or not application.held
+            or application.active_operation_id is not None
+        ):
+            raise RuntimeError(
+                "RGB backend warmup requires a running lower application in HOLD"
+            )
+        sources = tuple(application.visual_source_catalog())
+        if not sources:
+            raise RuntimeError("Advertised RGB Route has no visual source")
+        source_id = sources[0].get("source_id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise RuntimeError("Advertised RGB Route has an invalid visual source")
+        snapshot = application.capture_visual_jpeg_snapshot(
+            source_ids=(source_id,),
+            width=_RGB_BACKEND_WARMUP_WIDTH,
+            height=_RGB_BACKEND_WARMUP_HEIGHT,
+        )
+        frames = getattr(snapshot, "frames", None)
+        frame = None if not isinstance(frames, Mapping) else frames.get(source_id)
+        if (
+            frame is None
+            or getattr(frame, "width", None) != _RGB_BACKEND_WARMUP_WIDTH
+            or getattr(frame, "height", None) != _RGB_BACKEND_WARMUP_HEIGHT
+            or not isinstance(getattr(frame, "data", None), bytes)
+            or not frame.data
+        ):
+            raise RuntimeError("MuJoCo RGB backend warmup returned an invalid frame")
+    if session.history_recorder is not None:
+        session.history_recorder.capture_once()
+        session.history_recorder.start()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -434,12 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         # The passive viewer must open first: its native window and the realtime
         # physics worker share MjModel/MjData, and concurrent startup has caused
         # native GLFW/GLX crashes on some systems.
-        if viewer is not None:
-            viewer.start()
-        session.application.start_observation_ready()
-        if session.history_recorder is not None:
-            session.history_recorder.capture_once()
-            session.history_recorder.start()
+        _prepare_gateway_before_ready(session=session, viewer=viewer)
         server_thread.start()
         server_thread_started = True
         print(
