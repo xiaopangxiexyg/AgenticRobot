@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import re
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .episode_curation import source_dataset_base_fingerprint
-
 
 LOGICAL_TASK_DATASET_SCHEMA_V1 = "dexteleop.logical_task_dataset.v1"
 LOGICAL_TASK_DATASET_HASH_DOMAIN_V1 = (
@@ -45,6 +45,7 @@ class LogicalTaskDatasetSource:
     source_dataset_id: str
     dataset_root: Path
     source_task_id: str
+    source_task_id_aliases: tuple[str, ...]
     source_dataset_fingerprint: str
     scenario_class: str
     task_scope: str
@@ -154,11 +155,27 @@ def load_logical_task_dataset_manifest(
             raise LogicalTaskDatasetError(
                 f"Invalid source_dataset_fingerprint for {source_id!r}."
             )
+        source_task_id = _text(item.get("source_task_id"), name="source_task_id")
+        raw_aliases = item.get("source_task_id_aliases", [])
+        if not isinstance(raw_aliases, list):
+            raise LogicalTaskDatasetError(
+                f"source_task_id_aliases must be a list for {source_id!r}."
+            )
+        aliases = tuple(
+            _text(value, name="source_task_id_aliases[]")
+            for value in raw_aliases
+        )
+        if len(set(aliases)) != len(aliases) or source_task_id in aliases:
+            raise LogicalTaskDatasetError(
+                "source_task_id_aliases must be unique and must not repeat "
+                f"source_task_id for {source_id!r}."
+            )
         sources.append(
             LogicalTaskDatasetSource(
                 source_dataset_id=source_id,
                 dataset_root=root,
-                source_task_id=_text(item.get("source_task_id"), name="source_task_id"),
+                source_task_id=source_task_id,
+                source_task_id_aliases=aliases,
                 source_dataset_fingerprint=fingerprint,
                 scenario_class=scenario_class,
                 task_scope=task_scope,
@@ -278,7 +295,10 @@ def audit_logical_task_dataset_sources(
         )
         if not task_rows or len(task_ids) != len(task_rows):
             errors.append("TASK_MANIFEST_INVALID")
-        elif any(task_id != source.source_task_id for task_id in task_ids):
+        elif set(task_ids) != {
+            source.source_task_id,
+            *source.source_task_id_aliases,
+        }:
             errors.append("TASK_MANIFEST_ID_MISMATCH")
         if info.get("episode_count") != source.raw_episode_count:
             errors.append("RAW_EPISODE_COUNT_MISMATCH")
@@ -297,6 +317,7 @@ def audit_logical_task_dataset_sources(
                 "scenario_class": source.scenario_class,
                 "task_scope": source.task_scope,
                 "source_task_id": source.source_task_id,
+                "source_task_id_aliases": list(source.source_task_id_aliases),
                 "source_dataset_fingerprint": fingerprint,
                 "ok": not errors,
                 "errors": errors,

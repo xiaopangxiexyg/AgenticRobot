@@ -5,9 +5,23 @@ identity without rewriting source metadata. `source_task_id` and
 `source_dataset_fingerprint` are capture provenance; `canonical_task_id` is the
 shared semantic identity used to organize later training snapshots.
 
+An immutable historical source whose `meta/tasks.jsonl` contains more than one
+task identity may additionally pin `source_task_id_aliases`. The primary
+`source_task_id` must still match `meta/info.json`, and the audit requires the
+set of task rows to match the primary ID plus the declared aliases exactly.
+This is a fail-closed compatibility binding for existing captures, not a
+license for new collection or physical-merge outputs to emit mixed task IDs;
+those outputs must continue to use one canonical task ID.
+
 Create a new versioned manifest when sources are added. Do not edit an old
 manifest after a training profile or report has bound its
 `semantic_content_hash`.
+
+The all-valid Stage1 snapshot through 2026-08-21 is pinned by
+`writing_stage1_all_valid_through_2026_08_21_v1.json`. It replaces the two raw
+2026-08-20 detail shards with their verified 400-Episode physical merge and
+adds the single 2026-08-21 Stage1 source. The latter preserves its historical
+secondary task row as an explicit alias; no source metadata is rewritten.
 
 Audit a manifest and every pinned source read-only with:
 
