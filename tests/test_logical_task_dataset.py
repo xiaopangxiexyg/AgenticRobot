@@ -16,7 +16,12 @@ from dataset_interface.logical_task_dataset import (
 )
 
 
-def _write_manifest(tmp_path: Path, *, task_scope: str = "stage1_only") -> Path:
+def _write_manifest(
+    tmp_path: Path,
+    *,
+    task_scope: str = "stage1_only",
+    task_aliases: tuple[str, ...] = (),
+) -> Path:
     source = tmp_path / "source"
     meta = source / "meta"
     meta.mkdir(parents=True)
@@ -32,7 +37,10 @@ def _write_manifest(tmp_path: Path, *, task_scope: str = "stage1_only") -> Path:
         encoding="utf-8",
     )
     (meta / "tasks.jsonl").write_text(
-        json.dumps({"task_id": "historical-capture-name"}) + "\n",
+        "".join(
+            json.dumps({"task_id": task_id}) + "\n"
+            for task_id in ("historical-capture-name", *task_aliases)
+        ),
         encoding="utf-8",
     )
     payload = {
@@ -54,6 +62,7 @@ def _write_manifest(tmp_path: Path, *, task_scope: str = "stage1_only") -> Path:
                 "source_dataset_id": "source-a",
                 "dataset_root": str(source),
                 "source_task_id": "historical-capture-name",
+                "source_task_id_aliases": list(task_aliases),
                 "source_dataset_fingerprint": source_dataset_base_fingerprint(source),
                 "scenario_class": "initial_multi_choice",
                 "task_scope": task_scope,
@@ -86,7 +95,27 @@ def test_logical_task_dataset_keeps_source_task_as_provenance(
     manifest = load_logical_task_dataset_manifest(_write_manifest(tmp_path))
     assert manifest.canonical_task_id == "canonical-writing-task"
     assert manifest.sources[0].source_task_id == "historical-capture-name"
+    assert manifest.sources[0].source_task_id_aliases == ()
     assert audit_logical_task_dataset_sources(manifest)["ok"] is True
+
+
+def test_logical_task_dataset_pins_explicit_historical_task_aliases(
+    tmp_path: Path,
+) -> None:
+    manifest = load_logical_task_dataset_manifest(
+        _write_manifest(tmp_path, task_aliases=("legacy-task-row",))
+    )
+    assert manifest.sources[0].source_task_id_aliases == ("legacy-task-row",)
+    assert audit_logical_task_dataset_sources(manifest)["ok"] is True
+
+    tasks_path = manifest.sources[0].dataset_root / "meta" / "tasks.jsonl"
+    tasks_path.write_text(
+        json.dumps({"task_id": "historical-capture-name"}) + "\n",
+        encoding="utf-8",
+    )
+    report = audit_logical_task_dataset_sources(manifest)
+    assert report["ok"] is False
+    assert "TASK_MANIFEST_ID_MISMATCH" in report["sources"][0]["errors"]
 
 
 def test_logical_task_dataset_audit_detects_source_identity_change(

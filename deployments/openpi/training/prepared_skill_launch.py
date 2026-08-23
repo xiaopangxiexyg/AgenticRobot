@@ -46,7 +46,6 @@ from .prepared_skill import (
     binding_source_manifests,
     compose_openpi_prepared_prompt_binding,
     effective_prompt_stage_window_count,
-    load_openpi_prepared_prompt_binding,
     load_openpi_prepared_skill_binding_manifest,
     load_openpi_prepared_skill_binding,
     materialize_openpi_prepared_skill_binding,
@@ -77,6 +76,7 @@ PROMPT_FAMILY_PROFILE_SCHEMA_V2 = (
 STAGE1_SCENARIO_PROFILE_SCHEMA_V1 = (
     "dexteleop.openpi_stage1_scenario_training_profile.v1"
 )
+STANDARD_NON_RTC_TRAINING_MODE_V1 = "standard_non_rtc_v1"
 DEFAULT_PROFILE = (
     Path(__file__).resolve().parents[1]
     / "configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json"
@@ -291,6 +291,11 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
             "State-only OpenPI training requires "
             "openpi_norm_stats_assets_dir."
         )
+    training_mode = str(payload.get("openpi_training_mode", "")).strip()
+    if training_mode and training_mode != STANDARD_NON_RTC_TRAINING_MODE_V1:
+        raise ValueError(
+            "openpi_training_mode must be standard_non_rtc_v1 when declared."
+        )
     if is_prompt_profile:
         raw_stages = payload.get("prompt_stages")
         if not isinstance(raw_stages, list) or len(raw_stages) < 2:
@@ -473,6 +478,14 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
             scenario_class = str(item.get("scenario_class", "")).strip()
             task_scope = str(item.get("task_scope", "")).strip()
             expected_task_id = str(item.get("expected_task_id", "")).strip()
+            raw_task_aliases = item.get("expected_task_id_aliases", [])
+            if not isinstance(raw_task_aliases, list):
+                raise TypeError(
+                    "expected_task_id_aliases must be a list when present."
+                )
+            task_aliases = tuple(
+                str(value).strip() for value in raw_task_aliases
+            )
             repeat_weight = int(item.get("repeat_weight", 0))
             raw_episodes = int(item.get("expected_raw_episode_count", 0))
             raw_frames = int(item.get("expected_raw_frame_count", 0))
@@ -485,6 +498,9 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
                 or scenario_class not in expected_weights
                 or not task_scope
                 or not expected_task_id
+                or any(not value for value in task_aliases)
+                or len(set(task_aliases)) != len(task_aliases)
+                or expected_task_id in task_aliases
                 or repeat_weight != expected_weights.get(scenario_class)
                 or raw_episodes <= 0
                 or raw_frames <= 0
@@ -552,6 +568,14 @@ def _validate_source_task_ids(
         for item in profile.get("sources", ())
         if isinstance(item, Mapping)
     }
+    aliases_by_source = {
+        str(item["source_dataset_id"]): tuple(
+            str(value).strip()
+            for value in item.get("expected_task_id_aliases", ())
+        )
+        for item in profile.get("sources", ())
+        if isinstance(item, Mapping)
+    }
     if not global_expected and not any(expected_by_source.values()):
         return
 
@@ -565,6 +589,17 @@ def _validate_source_task_ids(
             raise ValueError(
                 f"Source {source.source_dataset_id!r} has no expected task_id."
             )
+        aliases = aliases_by_source.get(source.source_dataset_id, ())
+        if (
+            any(not value for value in aliases)
+            or len(set(aliases)) != len(aliases)
+            or expected in aliases
+        ):
+            raise ValueError(
+                "Source task aliases must be non-empty, unique, and must not "
+                f"repeat the primary task id: {source.source_dataset_id!r}."
+            )
+        allowed_task_ids = {expected, *aliases}
         root = source.dataset_root.expanduser().resolve()
         info_path = root / "meta" / "info.json"
         tasks_path = root / "meta" / "tasks.jsonl"
@@ -601,7 +636,7 @@ def _validate_source_task_ids(
             mismatches.append(
                 f"{source.source_dataset_id}:meta/tasks.jsonl=invalid"
             )
-        elif any(task_id != expected for task_id in task_ids):
+        elif set(task_ids) != allowed_task_ids:
             mismatches.append(
                 f"{source.source_dataset_id}:meta/tasks.jsonl={task_ids!r}"
             )
@@ -2094,6 +2129,14 @@ def main(argv: list[str] | None = None) -> int:
             "--model-rtc-profile is supported only by sample-check and train"
         )
     profile = _load_profile(args.profile)
+    if (
+        profile.get("openpi_training_mode")
+        == STANDARD_NON_RTC_TRAINING_MODE_V1
+        and args.model_rtc_profile is not None
+    ):
+        parser.error(
+            "standard_non_rtc_v1 profiles reject --model-rtc-profile"
+        )
     if (
         profile.get("schema") in {
             PROMPT_PROFILE_SCHEMA_V1,
