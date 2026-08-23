@@ -9,6 +9,11 @@ from typing import Any, Callable, Mapping
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from dataset_contracts.hitl import (
+    EXCLUSIVE_HITL_COMMAND_METADATA_KEYS,
+    EXCLUSIVE_HITL_SAMPLE_METADATA_KEY,
+    ExclusiveHITLSampleLineage,
+)
 from robot_motion.deploy.schema import (
     ACTION_ARM_POSE_SLICES,
     ACTION_HAND_SLICES,
@@ -80,6 +85,7 @@ _COMPACT_COMMAND_METADATA_KEYS = frozenset(
         "execution_step_metadata",
         "solver_output_qpos",
         "tcp_frame",
+        *EXCLUSIVE_HITL_COMMAND_METADATA_KEYS,
     }
 )
 
@@ -1272,6 +1278,28 @@ def _normalize_position_reference(
     sequence = _to_serializable(_reference_value(reference, "sequence", default=None))
     if sequence is None:
         return None, "missing_reference_sequence"
+    raw_frame_metadata = _reference_value(
+        reference,
+        "frame_metadata",
+        "metadata",
+        default={},
+    )
+    if raw_frame_metadata is None:
+        raw_frame_metadata = {}
+    if not isinstance(raw_frame_metadata, Mapping):
+        return None, "invalid_reference_frame_metadata"
+    frame_metadata = dict(_to_serializable(raw_frame_metadata))
+    hitl_payload = frame_metadata.get(EXCLUSIVE_HITL_SAMPLE_METADATA_KEY)
+    if hitl_payload is not None:
+        if not isinstance(hitl_payload, Mapping):
+            return None, "invalid_reference_hitl_lineage"
+        try:
+            hitl_lineage = ExclusiveHITLSampleLineage.from_payload(hitl_payload)
+        except (TypeError, ValueError):
+            return None, "invalid_reference_hitl_lineage"
+        frame_metadata[EXCLUSIVE_HITL_SAMPLE_METADATA_KEY] = (
+            hitl_lineage.to_payload()
+        )
 
     q_ref_by_side: dict[str, np.ndarray] = {}
     q_ik_raw_by_side: dict[str, np.ndarray] = {}
@@ -1391,6 +1419,7 @@ def _normalize_position_reference(
         },
         "side_valid_by_side": side_valid_by_side,
         "side_hold_by_side": side_hold_by_side,
+        "frame_metadata": frame_metadata,
     }, None
 
 
@@ -1401,9 +1430,36 @@ def _position_reference_command(
     active_sides: Sequence[str],
 ) -> TeleopCommand:
     published_timestamp = float(reference["published_timestamp"])
+    current_hitl = ExclusiveHITLSampleLineage.from_command_metadata(
+        None if command is None else command.metadata
+    )
+    frame_metadata = reference.get("frame_metadata", {})
+    if not isinstance(frame_metadata, Mapping):
+        raise ValueError("position reference frame_metadata must be a mapping.")
+    reference_hitl_payload = frame_metadata.get(EXCLUSIVE_HITL_SAMPLE_METADATA_KEY)
+    reference_hitl = None
+    if reference_hitl_payload is not None:
+        if not isinstance(reference_hitl_payload, Mapping):
+            raise ValueError("position reference HITL lineage must be a mapping.")
+        reference_hitl = ExclusiveHITLSampleLineage.from_payload(
+            reference_hitl_payload
+        )
+    if current_hitl is not None and reference_hitl is None:
+        raise ValueError(
+            "HITL collection cannot reuse a position reference without causal lineage."
+        )
+    base_metadata = (
+        {}
+        if command is None
+        else {
+            key: value
+            for key, value in command.metadata.items()
+            if key not in EXCLUSIVE_HITL_COMMAND_METADATA_KEYS
+        }
+    )
     out = TeleopCommand(
         timestamp=published_timestamp,
-        metadata={} if command is None else dict(command.metadata),
+        metadata=base_metadata,
     )
     if command is not None:
         for effector_name, effector_command in command.commands.items():
@@ -1451,6 +1507,8 @@ def _position_reference_command(
             "position_reference_published_timestamp": published_timestamp,
         }
     )
+    if reference_hitl is not None:
+        out.metadata.update(reference_hitl.to_command_metadata())
     return out
 
 
@@ -2119,6 +2177,9 @@ class CollectorSampleBuilder:
                 for effector_name, effector_command in command.commands.items()
             }
         )
+        hitl_lineage = ExclusiveHITLSampleLineage.from_command_metadata(
+            None if command is None else command.metadata
+        )
         channel_metadata = {
             channel_name: {
                 "timestamp": float(channel.timestamp),
@@ -2151,6 +2212,10 @@ class CollectorSampleBuilder:
             "channel_metadata": channel_metadata,
             "camera_keys": sorted(str(camera_key) for camera_key in camera_frames),
         }
+        if hitl_lineage is not None:
+            metadata[EXCLUSIVE_HITL_SAMPLE_METADATA_KEY] = (
+                hitl_lineage.to_payload()
+            )
         if include_action_debug_metadata:
             metadata["arm_action_debug_by_side"] = _arm_action_debug_snapshot(
                 sample_timestamp=float(step_result.timestamp),

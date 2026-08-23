@@ -7,6 +7,10 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
+from dataset_contracts.hitl import (
+    EXCLUSIVE_HITL_SAMPLE_METADATA_KEY,
+    ExclusiveHITLSampleLineage,
+)
 from robot_motion.pose import pose_delta_metrics
 from robot_motion.position_control import (
     POSITION_TRANSPORT_TARGET_SEQUENCE_KEY,
@@ -171,6 +175,7 @@ class PositionReferencePublisher:
             "generated_monotonic_time": frame.generated_monotonic_time,
             "published_monotonic_time": frame.published_monotonic_time,
             "references": frame.references,
+            "frame_metadata": frame.frame_metadata,
             "valid": frame.valid,
             "hold": frame.hold,
             "selection_age_sec": monotonic_age_sec,
@@ -218,6 +223,20 @@ class PositionReferencePublisher:
             selected_command,
             sides=self.config.active_sides,
         )
+        hitl_lineage = ExclusiveHITLSampleLineage.from_command_metadata(
+            selected_command.metadata
+        )
+        frame_metadata: dict[str, object] = {
+            "session_state": result.state.value,
+            "control_hz": float(result.control_hz),
+            "command_timestamp": selected_command.timestamp,
+            "command_dispatched": bool(result.command_dispatched),
+            POSITION_TRANSPORT_TARGET_SEQUENCES_KEY: transport_target_sequences,
+        }
+        if hitl_lineage is not None:
+            frame_metadata[EXCLUSIVE_HITL_SAMPLE_METADATA_KEY] = (
+                hitl_lineage.to_payload()
+            )
         frame = PositionReferenceFrame(
             epoch=self._epoch,
             sequence=self._next_sequence,
@@ -228,13 +247,7 @@ class PositionReferencePublisher:
             published_monotonic_time=published_monotonic,
             references=references,
             source=str(self.config.source),
-            frame_metadata={
-                "session_state": result.state.value,
-                "control_hz": float(result.control_hz),
-                "command_timestamp": selected_command.timestamp,
-                "command_dispatched": bool(result.command_dispatched),
-                POSITION_TRANSPORT_TARGET_SEQUENCES_KEY: transport_target_sequences,
-            },
+            frame_metadata=frame_metadata,
         )
         self.timeline.publish(frame)
         self._stamp_command(selected_command, frame)

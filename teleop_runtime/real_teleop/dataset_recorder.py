@@ -20,6 +20,10 @@ from typing import Any
 
 from dataset_contracts.capture_modalities import CaptureModalityContract
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
+from dataset_contracts.hitl import (
+    EXCLUSIVE_HITL_DATASET_METADATA_KEY,
+    ExclusiveHITLDatasetContract,
+)
 from dataset_contracts.v25p_native_storage import (
     V25P_NATIVE_STORAGE_LAYOUTS_V1,
     V25P_RECORD_CJSON_LAYOUT_V1,
@@ -29,6 +33,7 @@ from dataset_interface.gripper_force import (
     bind_gripper_force_contract,
     read_gripper_force_contract,
 )
+from dataset_interface.hitl import validate_exclusive_hitl_dataset_append
 from dataset_interface.modality_artifacts import (
     assert_dataset_capture_integrity_compatible,
 )
@@ -145,6 +150,29 @@ from .wrist_depth_freshness import (
 )
 
 
+def _exclusive_hitl_dataset_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    enabled = bool(getattr(args, "hitl_policy_control", False))
+    value = getattr(args, "_exclusive_hitl_dataset_contract", None)
+    if value is None:
+        if enabled:
+            raise RuntimeError(
+                "Exclusive HITL collection is missing its dataset contract; "
+                "build the control-station application before the recorder."
+            )
+        return {}
+    if not enabled:
+        raise RuntimeError(
+            "An exclusive HITL dataset contract cannot be attached when HITL is disabled."
+        )
+    if isinstance(value, Mapping):
+        value = ExclusiveHITLDatasetContract.from_payload(value)
+    if not isinstance(value, ExclusiveHITLDatasetContract):
+        raise TypeError(
+            "_exclusive_hitl_dataset_contract must be typed or a mapping."
+        )
+    return {EXCLUSIVE_HITL_DATASET_METADATA_KEY: value.to_payload()}
+
+
 def _collection_hand_action_specs(
     args: argparse.Namespace,
     active_sides: Sequence[str],
@@ -185,6 +213,17 @@ class RealTeleopDatasetRecorder:
         self.args = args
         self.components = components
         self.dataset_root = Path(args.dataset_root)
+        self.exclusive_hitl_dataset_metadata = _exclusive_hitl_dataset_metadata(
+            args
+        )
+        hitl_payload = self.exclusive_hitl_dataset_metadata.get(
+            EXCLUSIVE_HITL_DATASET_METADATA_KEY
+        )
+        if hitl_payload is not None:
+            validate_exclusive_hitl_dataset_append(
+                self.dataset_root,
+                ExclusiveHITLDatasetContract.from_payload(hitl_payload),
+            )
         tactile_bundle_root = str(
             getattr(args, "tactile_bundle_root", "") or ""
         ).strip()
@@ -306,11 +345,14 @@ class RealTeleopDatasetRecorder:
             wrist_depth_max_m=float(
                 getattr(args, "wrist_depth_max_m", DEFAULT_WRIST_DEPTH_MAX_M)
             ),
-            dataset_metadata=_gripper_force_dataset_metadata(
-                args,
-                components,
-                contract=self.gripper_force_contract,
-            ),
+            dataset_metadata={
+                **_gripper_force_dataset_metadata(
+                    args,
+                    components,
+                    contract=self.gripper_force_contract,
+                ),
+                **self.exclusive_hitl_dataset_metadata,
+            },
         )
         self.writer_storage_config = writer_config
         requested_progress_profile = resolve_real_teleop_progress_profile(
@@ -468,6 +510,7 @@ class RealTeleopDatasetRecorder:
                     components,
                     contract=self.gripper_force_contract,
                 ),
+                **self.exclusive_hitl_dataset_metadata,
             },
         )
         # The process worker discovers persisted episode/sample indices during
