@@ -181,6 +181,9 @@ def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None
         # Station; discovery/resolution/indexing remain lower-owned.
         "control_station/refinement_annotation/application.py": ["dataset_interface"],
         "control_station/refinement_annotation/cli.py": ["dataset_interface"],
+        "control_station/refinement_annotation/detail_annotation.py": [
+            "dataset_interface"
+        ],
     }
 
 
