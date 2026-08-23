@@ -6,14 +6,14 @@ Python package, discover devices, open CAN, or register a runtime backend.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
-from typing import Sequence
 
 import numpy as np
-
 
 B601_RS_ARM_JOINT_NAMES = (
     "joint1",
@@ -22,6 +22,10 @@ B601_RS_ARM_JOINT_NAMES = (
     "joint4",
     "joint5",
     "joint6",
+)
+B601_RS_AUXILIARY_JOINT_NAMES = (
+    "joint_left",
+    "joint_right",
 )
 B601_RS_BASE_FRAME = "base_link"
 B601_RS_END_EFFECTOR_FRAME = "gripper_end"
@@ -100,9 +104,12 @@ class B601PinocchioModel:
 
     Inputs are the six arm joints in :data:`B601_RS_ARM_JOINT_NAMES` order.
     Gripper joints in the upstream URDF remain at their Pinocchio neutral
-    configuration.  Poses are ``base_link_T_gripper_end`` in SI units.  The
-    Jacobian maps arm joint velocity to a world/base-axis-aligned twist at the
-    ``gripper_end`` origin, ordered linear XYZ then angular XYZ.
+    configuration for kinematics.  Gravity evaluation accepts their positions
+    explicitly so a simulation backend cannot silently mix a neutral Pinocchio
+    model with an open MuJoCo gripper.  Poses are
+    ``base_link_T_gripper_end`` in SI units.  The Jacobian maps arm joint
+    velocity to a world/base-axis-aligned twist at the ``gripper_end`` origin,
+    ordered linear XYZ then angular XYZ.
     """
 
     def __init__(
@@ -125,7 +132,7 @@ class B601PinocchioModel:
 
         try:
             self._model = self._pin.buildModelFromUrdf(str(self._urdf_path))
-        except Exception as exc:  # noqa: BLE001 - annotate external parser failures.
+        except Exception as exc:
             raise B601ModelError(
                 f"failed to build Pinocchio model from {self._urdf_path}"
             ) from exc
@@ -174,6 +181,54 @@ class B601PinocchioModel:
         if any(index < 0 or index >= self._model.nv for index in v_indices):
             raise B601ModelError("B601-RS arm joint v index is outside the model")
 
+        auxiliary_q_indices: list[int] = []
+        auxiliary_v_indices: list[int] = []
+        auxiliary_limits: dict[str, tuple[float, float]] = {}
+        for name in B601_RS_AUXILIARY_JOINT_NAMES:
+            joint_id = int(self._model.getJointId(name))
+            if joint_id <= 0 or joint_id >= self._model.njoints:
+                raise B601ModelError(f"B601-RS auxiliary joint is absent: {name}")
+            joint = self._model.joints[joint_id]
+            if int(joint.nq) != 1 or int(joint.nv) != 1:
+                raise B601ModelError(
+                    f"B601-RS auxiliary joint must have nq=nv=1: {name} "
+                    f"has nq={joint.nq}, nv={joint.nv}"
+                )
+            q_index = int(joint.idx_q)
+            v_index = int(joint.idx_v)
+            if (
+                q_index < 0
+                or q_index >= self._model.nq
+                or v_index < 0
+                or v_index >= self._model.nv
+            ):
+                raise B601ModelError(
+                    "B601-RS auxiliary joint coordinate index is outside the model"
+                )
+            lower_limit = float(self._model.lowerPositionLimit[q_index])
+            upper_limit = float(self._model.upperPositionLimit[q_index])
+            if (
+                not math.isfinite(lower_limit)
+                or not math.isfinite(upper_limit)
+                or lower_limit >= upper_limit
+            ):
+                raise B601ModelError(
+                    f"B601-RS auxiliary joint has invalid position limits: {name}"
+                )
+            auxiliary_q_indices.append(q_index)
+            auxiliary_v_indices.append(v_index)
+            auxiliary_limits[name] = (lower_limit, upper_limit)
+
+        if (
+            len(set(auxiliary_q_indices)) != len(auxiliary_q_indices)
+            or len(set(auxiliary_v_indices)) != len(auxiliary_v_indices)
+            or set(auxiliary_q_indices).intersection(q_indices)
+            or set(auxiliary_v_indices).intersection(v_indices)
+        ):
+            raise B601ModelError(
+                "B601-RS auxiliary joints must use unique coordinates disjoint "
+                "from the arm"
+            )
         lower = np.asarray(self._model.lowerPositionLimit, dtype=float)[q_indices]
         upper = np.asarray(self._model.upperPositionLimit, dtype=float)[q_indices]
         if (
@@ -192,6 +247,9 @@ class B601PinocchioModel:
         self._arm_v_indices = tuple(v_indices)
         self._arm_lower_position_limits = lower.copy()
         self._arm_upper_position_limits = upper.copy()
+        self._auxiliary_joint_names = B601_RS_AUXILIARY_JOINT_NAMES
+        self._auxiliary_q_indices = tuple(auxiliary_q_indices)
+        self._auxiliary_position_limits = auxiliary_limits
         self._end_effector_frame = str(end_effector_frame)
         self._end_effector_frame_id = frame_id
 
@@ -202,7 +260,7 @@ class B601PinocchioModel:
         *,
         end_effector_frame: str = B601_RS_END_EFFECTOR_FRAME,
         arm_joint_names: Sequence[str] = B601_RS_ARM_JOINT_NAMES,
-    ) -> "B601PinocchioModel":
+    ) -> B601PinocchioModel:
         """Construct from the root of an explicit reBotArm source snapshot."""
 
         return cls(
@@ -232,6 +290,21 @@ class B601PinocchioModel:
         return len(self._arm_joint_names)
 
     @property
+    def auxiliary_joint_names(self) -> tuple[str, ...]:
+        """Return the non-arm coordinates required for gravity evaluation."""
+
+        return self._auxiliary_joint_names
+
+    @property
+    def gravity_mps2(self) -> tuple[float, float, float]:
+        """Return the Pinocchio model gravity vector in base/world axes."""
+
+        gravity = np.asarray(self._model.gravity.linear, dtype=float)
+        if gravity.shape != (3,) or not np.all(np.isfinite(gravity)):
+            raise B601ModelError("Pinocchio model has an invalid gravity vector")
+        return tuple(float(value) for value in gravity)
+
+    @property
     def full_model_nq(self) -> int:
         return int(self._model.nq)
 
@@ -254,6 +327,39 @@ class B601PinocchioModel:
             self._arm_lower_position_limits.copy(),
             self._arm_upper_position_limits.copy(),
         )
+
+    def auxiliary_position_limits(self) -> dict[str, tuple[float, float]]:
+        """Return a copy of the auxiliary joint position-limit mapping."""
+
+        return dict(self._auxiliary_position_limits)
+
+    def arm_generalized_gravity(
+        self,
+        q_arm: Sequence[float] | np.ndarray,
+        *,
+        auxiliary_joint_positions: Mapping[str, float] | None = None,
+    ) -> np.ndarray:
+        """Return six compensating gravity torques in arm-joint order.
+
+        ``auxiliary_joint_positions=None`` deliberately means the Pinocchio
+        neutral configuration.  A backend whose gripper is not neutral must
+        pass all names in :attr:`auxiliary_joint_names` explicitly.
+        """
+
+        q_full = self._full_configuration(
+            q_arm,
+            auxiliary_joint_positions=auxiliary_joint_positions,
+        )
+        data = self._model.createData()
+        gravity = np.asarray(
+            self._pin.computeGeneralizedGravity(self._model, data, q_full),
+            dtype=float,
+        )[list(self._arm_v_indices)]
+        if gravity.shape != (6,) or not np.all(np.isfinite(gravity)):
+            raise B601ModelError(
+                "Pinocchio returned invalid B601-RS generalized gravity"
+            )
+        return gravity.copy()
 
     def forward_kinematics(self, q_arm: Sequence[float] | np.ndarray) -> np.ndarray:
         """Return ``base_link_T_gripper_end`` as a 4-by-4 matrix."""
@@ -356,6 +462,8 @@ class B601PinocchioModel:
     def _full_configuration(
         self,
         q_arm: Sequence[float] | np.ndarray,
+        *,
+        auxiliary_joint_positions: Mapping[str, float] | None = None,
     ) -> np.ndarray:
         try:
             arm = np.asarray(q_arm, dtype=float)
@@ -368,18 +476,51 @@ class B601PinocchioModel:
 
         q_full = np.asarray(self._pin.neutral(self._model), dtype=float).copy()
         q_full[list(self._arm_q_indices)] = arm
+        if auxiliary_joint_positions is not None:
+            if not isinstance(auxiliary_joint_positions, Mapping):
+                raise TypeError("auxiliary_joint_positions must be a mapping")
+            supplied_names = set(auxiliary_joint_positions)
+            expected_names = set(self._auxiliary_joint_names)
+            if supplied_names != expected_names:
+                missing = sorted(expected_names - supplied_names)
+                unexpected = sorted(supplied_names - expected_names)
+                raise ValueError(
+                    "auxiliary_joint_positions must contain exactly "
+                    f"{self._auxiliary_joint_names}; missing={missing}, "
+                    f"unexpected={unexpected}"
+                )
+            for name, q_index in zip(
+                self._auxiliary_joint_names,
+                self._auxiliary_q_indices,
+                strict=True,
+            ):
+                try:
+                    value = float(auxiliary_joint_positions[name])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"auxiliary joint {name} position must be numeric"
+                    ) from exc
+                lower, upper = self._auxiliary_position_limits[name]
+                if not math.isfinite(value):
+                    raise ValueError(f"auxiliary joint {name} position must be finite")
+                if not lower <= value <= upper:
+                    raise ValueError(
+                        f"auxiliary joint {name} position exceeds its limits"
+                    )
+                q_full[q_index] = value
         return q_full
 
 
 __all__ = [
-    "B601ModelDependencyError",
-    "B601ModelError",
-    "B601PinocchioModel",
-    "B601SingularityMetrics",
     "B601_RS_ARM_JOINT_NAMES",
+    "B601_RS_AUXILIARY_JOINT_NAMES",
     "B601_RS_BASE_FRAME",
     "B601_RS_END_EFFECTOR_FRAME",
     "B601_RS_JACOBIAN_REFERENCE",
     "B601_RS_TWIST_ORDER",
     "B601_RS_URDF_RELATIVE_PATH",
+    "B601ModelDependencyError",
+    "B601ModelError",
+    "B601PinocchioModel",
+    "B601SingularityMetrics",
 ]

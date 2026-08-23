@@ -1,4 +1,4 @@
-"""B601-RS MuJoCo visualization plant and position driver.
+"""B601-RS MuJoCo position and ideal-effort pre-hardware backends.
 
 This package consumes the model-only B601 contract and the generic MuJoCo
 scene infrastructure.  It intentionally exposes no hardware backend.
@@ -9,6 +9,12 @@ from .driver import (
     B601PositionDriver,
     B601PositionTick,
     default_b601_position_timing,
+)
+from .mit_driver import (
+    B601EffortTick,
+    B601MujocoEffortDriver,
+    default_b601_mit_profile,
+    default_b601_mit_timing,
 )
 from .scene import (
     B601_RS_DEFAULT_ARM_QPOS,
@@ -22,10 +28,14 @@ __all__ = [
     "B601_RS_DEFAULT_ARM_QPOS",
     "B601_RS_GRIPPER_OPEN_QPOS",
     "B601_RS_SIM_ARM_KEY",
+    "B601EffortTick",
     "B601JointPositionCommand",
+    "B601MujocoEffortDriver",
     "B601PositionDriver",
     "B601PositionTick",
     "build_b601_mjcf_xml",
     "build_b601_mujoco_scene",
+    "default_b601_mit_profile",
+    "default_b601_mit_timing",
     "default_b601_position_timing",
 ]
