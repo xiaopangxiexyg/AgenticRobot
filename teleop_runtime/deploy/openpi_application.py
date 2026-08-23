@@ -673,22 +673,11 @@ def main(argv: list[str] | None = None) -> int:
 
         rtc_model_adapter_factory = _create_openpi_rtc_adapter
 
-    prediction_args = (
-        []
-        if args.rtc_profile not in {None, "off"}
-        else [
-            "--policy-prediction-mode",
-            "threaded-prefetch",
-            "--policy-prediction-prefetch-queue-threshold",
-            "4",
-        ]
-    )
     delegated_args = [
         "--policy",
         "deployments.openpi.client.policy:create_policy",
         "--policy-kwargs-json",
         json.dumps(policy_kwargs, separators=(",", ":")),
-        *prediction_args,
         *runtime_args,
     ]
     if rtc_model_adapter_factory is None:

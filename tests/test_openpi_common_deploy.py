@@ -999,12 +999,30 @@ class OpenPICommonDeployTest(unittest.TestCase):
         )
         self.assertIn("--no-arm-canfd-follow", launched_args)
 
-    def test_openpi_prediction_prefetch_default_allows_trailing_sync_override(self) -> None:
+    def test_openpi_prediction_prefetch_is_explicit_opt_in(self) -> None:
+        with mock.patch(
+            "teleop_runtime.deploy.run_policy.main", return_value=0
+        ) as run_main:
+            result = openpi_real_launcher.main([])
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        self.assertNotIn("--policy-prediction-mode", launched_args)
+        self.assertNotIn(
+            "--policy-prediction-prefetch-queue-threshold",
+            launched_args,
+        )
+
         with mock.patch(
             "teleop_runtime.deploy.run_policy.main", return_value=0
         ) as run_main:
             result = openpi_real_launcher.main(
-                ["--policy-prediction-mode", "synchronous"]
+                [
+                    "--policy-prediction-mode",
+                    "threaded-prefetch",
+                    "--policy-prediction-prefetch-queue-threshold",
+                    "4",
+                ]
             )
 
         self.assertEqual(result, 0)
@@ -1014,7 +1032,16 @@ class OpenPICommonDeployTest(unittest.TestCase):
             for index, token in enumerate(launched_args)
             if token == "--policy-prediction-mode"
         ]
-        self.assertEqual(mode_values, ["threaded-prefetch", "synchronous"])
+        self.assertEqual(mode_values, ["threaded-prefetch"])
+        self.assertEqual(
+            launched_args[
+                launched_args.index(
+                    "--policy-prediction-prefetch-queue-threshold"
+                )
+                + 1
+            ],
+            "4",
+        )
 
     def test_openpi_profile_forwards_no_init_qpos_over_injected_dataset_default(self) -> None:
         resolved: list[tuple[bool, bool, object, object]] = []
