@@ -227,6 +227,13 @@
           "tracked_policy": "none"
         },
         {
+          "label": "MuJoCo default native warning log",
+          "path": "MUJOCO_LOG.TXT",
+          "probe": "MUJOCO_LOG.TXT",
+          "expected_rule": "/MUJOCO_LOG.TXT",
+          "tracked_policy": "none"
+        },
+        {
           "label": "camera adjustment outputs",
           "path": "camera_process/wrist_cam_adjust/outputs",
           "probe": "camera_process/wrist_cam_adjust/outputs/.dexteleop-local-resource-probe",

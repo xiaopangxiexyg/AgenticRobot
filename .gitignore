@@ -107,6 +107,8 @@ hardware/VIVE/VIVE_sender.zip
 
 
 *.log
+# MuJoCo's default native warning sink when no explicit log target is set.
+/MUJOCO_LOG.TXT
 
 *.hdf5
 *.h5

@@ -101,6 +101,13 @@ evidence，不能代替数据迁移。
 `teleop_records/` 中的 calibration profiles、hand-zero calibrations 和指定 VIVE coordinate profile
 受 Git 跟踪；只迁移被忽略的具体子项，不能复制或链接整个根覆盖这些版本化文件。
 
+MuJoCo 3.10 的原生日志默认开启文件输出，并在进程当前目录追加
+`MUJOCO_LOG.TXT`。该文件包含带本机时间戳的数值告警，是可变运行证据而不是源码；根目录的
+`/MUJOCO_LOG.TXT` 因此由 Git 精确忽略。项目 pytest 配置会仅关闭这个默认文件 sink，同时保留
+MuJoCo 的控制台告警，避免测试在 worktree 根目录留下文件。手工仿真产生的现有日志在排障期间
+应先保留；需要长期保存时，应按 runtime evidence 流程转存到显式绑定的运行证据目录，而不是
+提交默认日志文件。
+
 ### 3.4 模型、厂商目录和秘密配置
 
 `model/` 保留 tracked `README.md` 与 `openpi` gitlink；`triad_openvr/` 保留 portable wrapper。

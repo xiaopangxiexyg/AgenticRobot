@@ -29,6 +29,8 @@ from pathlib import Path
 import pytest
 
 _LINUX_UNIX_SOCKET_PATH_LIMIT_BYTES = 107
+_MUJOCO_DEFAULT_LOG_NAME = "MUJOCO_LOG.TXT"
+_MUJOCO_ORIGINAL_LOG_CONFIG = None
 
 OPTIONAL_MODULES = frozenset(
     {
@@ -116,6 +118,39 @@ CONTRACT_MODULES = frozenset(
         "test_v25p_contracts.py",
     }
 )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Keep MuJoCo's default native log out of the worktree during tests."""
+
+    del config
+    global _MUJOCO_ORIGINAL_LOG_CONFIG
+
+    try:
+        import mujoco
+    except (ImportError, OSError):
+        return
+
+    original = mujoco.MjLogConfig.get()
+    if not original.logto_file or original.logfile != _MUJOCO_DEFAULT_LOG_NAME:
+        return
+
+    configured = mujoco.MjLogConfig.get()
+    configured.logto_file = False
+    configured.set()
+    _MUJOCO_ORIGINAL_LOG_CONFIG = original
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Restore the process-wide MuJoCo log configuration after pytest."""
+
+    del config
+    global _MUJOCO_ORIGINAL_LOG_CONFIG
+
+    if _MUJOCO_ORIGINAL_LOG_CONFIG is None:
+        return
+    _MUJOCO_ORIGINAL_LOG_CONFIG.set()
+    _MUJOCO_ORIGINAL_LOG_CONFIG = None
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

@@ -76,6 +76,10 @@ def test_repository_local_resource_policy_matches_gitignore_and_tracking() -> No
     assert quest_certs["ignore_source"] == "hardware/quest_dev/.gitignore"
     assert quest_certs["matched_rule"]["source"] == "hardware/quest_dev/.gitignore"
 
+    mujoco_log = locations["MUJOCO_LOG.TXT"]
+    assert mujoco_log["tracked_policy"] == "none"
+    assert mujoco_log["matched_rule"]["rule"] == "/MUJOCO_LOG.TXT"
+
 
 def test_only_development_assets_are_automatically_linkable(tmp_path: Path) -> None:
     tool = _load_tool()
