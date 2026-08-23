@@ -67,3 +67,10 @@ bash scripts/run_pytest.sh -q hardware/quest_dev/tests
 
 实际启动会绑定网络端口，并可能生成本机自签名证书；应按模块 README 显式执行，不属于统一
 开发门禁或硬件激活步骤。
+
+## 7. B601-RS 力觉离线验收与真机验收计划
+
+[`rebot_b601_rs_haptic_acceptance.md`](./rebot_b601_rs_haptic_acceptance.md) 给出无设备的
+数学/闭环效果验收命令，以及机械臂到货后从只读反馈、急停/watchdog、单关节 MIT、重力阻尼
+到低幅弹簧/虚拟墙的分阶段验收。当前只能执行 H0；H1–H8 均为 `NOT_RUN`，不构成真机运动
+授权。
