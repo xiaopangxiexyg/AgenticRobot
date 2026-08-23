@@ -815,6 +815,7 @@ class OpenPICommonDeployTest(unittest.TestCase):
         delegated = run_main.call_args.args[0]
         self.assertIn("--rtc-profile", delegated)
         self.assertIn(RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1, delegated)
+        self.assertNotIn("--policy-prediction-mode", delegated)
         factory = run_main.call_args.kwargs["rtc_model_adapter_factory"]
         self.assertTrue(callable(factory))
         creator = mock.Mock(return_value="absolute-adapter")
@@ -997,6 +998,23 @@ class OpenPICommonDeployTest(unittest.TestCase):
             "40",
         )
         self.assertIn("--no-arm-canfd-follow", launched_args)
+
+    def test_openpi_prediction_prefetch_default_allows_trailing_sync_override(self) -> None:
+        with mock.patch(
+            "teleop_runtime.deploy.run_policy.main", return_value=0
+        ) as run_main:
+            result = openpi_real_launcher.main(
+                ["--policy-prediction-mode", "synchronous"]
+            )
+
+        self.assertEqual(result, 0)
+        launched_args = run_main.call_args.args[0]
+        mode_values = [
+            launched_args[index + 1]
+            for index, token in enumerate(launched_args)
+            if token == "--policy-prediction-mode"
+        ]
+        self.assertEqual(mode_values, ["threaded-prefetch", "synchronous"])
 
     def test_openpi_profile_forwards_no_init_qpos_over_injected_dataset_default(self) -> None:
         resolved: list[tuple[bool, bool, object, object]] = []
