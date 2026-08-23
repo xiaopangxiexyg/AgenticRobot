@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal
 
 import numpy as np
 
@@ -21,6 +22,7 @@ from ..geometry import (
     resolve_repo_relative_path,
     tool_transform_from_profile,
 )
+from ..progress import ProgressPrinter
 from .mask import (
     GEOMETRY_BACKGROUND_MASK_NAME,
     GEOMETRY_KEEP_MASK_NAME,
@@ -28,7 +30,6 @@ from .mask import (
     STATIC_BODY_MASK_NAME,
     TABLE_GEOMETRY_MASK_NAME,
 )
-from ..progress import ProgressPrinter
 from .video import MaskBuildConfig, VideoAdjustResult, WristMaskBuilder, process_video
 
 
@@ -299,6 +300,7 @@ class DatasetVideoJob:
     parquet_path: Path
     record: Mapping[str, Any]
     intrinsics: CameraIntrinsics
+    devices_json_path: Path
     body_mask_path: Path | None
     tool_profile_path: Path | None
     T_end_tool: np.ndarray | None
@@ -327,6 +329,7 @@ def adjust_dataset(
     cameras: Sequence[str] | None = None,
     episodes: Sequence[int] | None = None,
     devices_json: str | Path | None = None,
+    devices_json_by_episode: Mapping[int, str | Path] | None = None,
     left_camera_key: str = "left_wrist",
     right_camera_key: str = "right_wrist",
     left_body_mask: str | Path | None = None,
@@ -374,19 +377,25 @@ def adjust_dataset(
     base_from_stored_pose, pose_storage_frame = _base_from_stored_pose_by_side(
         dataset_info
     )
-    intrinsics = _intrinsics_by_camera(
-        source_root,
-        None if devices_json is None else Path(devices_json).expanduser().resolve(),
+    if devices_json is not None and devices_json_by_episode:
+        raise ValueError(
+            "devices_json and devices_json_by_episode are mutually exclusive"
+        )
+    episode_devices = {
+        int(episode_index): Path(path).expanduser().resolve()
+        for episode_index, path in (devices_json_by_episode or {}).items()
+    }
+    default_devices_path = (
+        (source_root / "meta" / "devices" / "realsense.json").resolve()
+        if devices_json is None
+        else Path(devices_json).expanduser().resolve()
     )
+    intrinsics_cache: dict[Path, dict[str, CameraIntrinsics]] = {}
     selected_cameras = _select_cameras(
         requested=cameras,
         left_camera_key=left_camera_key,
         right_camera_key=right_camera_key,
     )
-    missing_intrinsics = [key for key in selected_cameras if key not in intrinsics]
-    if missing_intrinsics:
-        raise KeyError(f"missing camera intrinsics for: {', '.join(missing_intrinsics)}")
-
     requested_episodes = _parse_episode_filter(episodes)
     episode_records = _read_jsonl(source_root / "meta" / "episodes.jsonl")
     selected_records = [record for record in episode_records if _episode_matches(record, requested_episodes)]
@@ -402,6 +411,29 @@ def adjust_dataset(
     jobs_to_run: list[DatasetVideoJob] = []
     for record in selected_records:
         episode_index = int(record["episode_index"])
+        episode_devices_path = episode_devices.get(
+            episode_index,
+            default_devices_path,
+        )
+        if episode_devices and episode_index not in episode_devices:
+            raise KeyError(
+                "devices_json_by_episode has no entry for selected episode "
+                f"{episode_index}."
+            )
+        if episode_devices_path not in intrinsics_cache:
+            intrinsics_cache[episode_devices_path] = _intrinsics_by_camera(
+                source_root,
+                episode_devices_path,
+            )
+        intrinsics = intrinsics_cache[episode_devices_path]
+        missing_intrinsics = [
+            key for key in selected_cameras if key not in intrinsics
+        ]
+        if missing_intrinsics:
+            raise KeyError(
+                f"missing camera intrinsics for episode {episode_index}: "
+                + ", ".join(missing_intrinsics)
+            )
         video_paths = record.get("video_paths")
         if not isinstance(video_paths, Mapping):
             continue
@@ -454,6 +486,7 @@ def adjust_dataset(
                     parquet_path=parquet_path,
                     record=record,
                     intrinsics=intrinsics[str(camera_key)],
+                    devices_json_path=episode_devices_path,
                     body_mask_path=body_masks[side],
                     tool_profile_path=profile_path,
                     T_end_tool=T_end_tool,
@@ -623,6 +656,7 @@ def adjust_dataset(
                     job.T_base_from_stored_pose is not None
                 ),
                 "body_mask_path": None if job.body_mask_path is None else str(job.body_mask_path),
+                "devices_json_path": str(job.devices_json_path),
                 "tool_profile_path": None if job.tool_profile_path is None else str(job.tool_profile_path),
             }
             for job in jobs_to_run

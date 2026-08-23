@@ -2,11 +2,27 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from dataset_interface.logical_task_dataset import load_logical_task_dataset_manifest
-from deployments.openpi.training.prepared_skill_launch import _load_profile
+from deployments.openpi.training.prepared_skill import OpenPIPreparedSkillError
+from deployments.openpi.training.prepared_skill_launch import (
+    _bind_source_partitioned_final_masks_to_dataset,
+    _load_profile,
+)
+from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.core import (
+    pack_binary_mask,
+)
+from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.postprocess import (
+    DepthMaskPostprocessConfig,
+    process_mask_stream,
+)
+from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.visualize import (
+    MaskStream,
+)
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
 _MANIFEST = (
@@ -77,6 +93,31 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     assert profile["action_pose_mode"] == "absolute"
     assert profile["openpi_training_mode"] == "standard_non_rtc_v1"
     assert profile["openpi_num_workers"] == 4
+    run_root = Path(
+        "/mnt/nas2/zc/stage1_openpi_runs/20260824T0709_snapshot_v1"
+    )
+    assert Path(profile["organized_dataset_root"]) == (
+        run_root
+        / "workspace/prepared/"
+        "writing_stage1_all_valid_through_2026_08_21_"
+        "front_right_wrist_h32_absolute_non_rtc_v1"
+    )
+    assert profile["openpi_final_mask_root_layout"] == (
+        "source_dataset_id_partitioned_v1"
+    )
+    assert Path(profile["openpi_final_mask_root"]) == (
+        run_root / "workspace/derived/final_keep_masks"
+    )
+    assert Path(profile["openpi_assets_base_dir"]) == (
+        run_root / "artifacts/assets"
+    )
+    assert Path(profile["openpi_checkpoint_base_dir"]) == (
+        run_root / "artifacts/checkpoints"
+    )
+    assert Path(profile["openpi_checkout"]) == (
+        Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
+        / "code-r2/AgenticRobot/model/openpi"
+    )
 
     assert profile["expected_total_raw_episode_count"] == sum(
         int(source["expected_raw_episode_count"]) for source in sources
@@ -129,3 +170,100 @@ def test_through_2026_08_21_profile_rejects_untyped_task_aliases(
 
     with pytest.raises(TypeError, match="expected_task_id_aliases"):
         _load_profile(invalid)
+
+
+def test_source_partitioned_final_masks_bind_before_pipeline_open(
+    tmp_path: Path,
+) -> None:
+    source_a = (tmp_path / "source-a" / "shared-name").resolve()
+    source_b = (tmp_path / "source-b" / "shared-name").resolve()
+    final_base = (tmp_path / "final").resolve()
+    child_a = SimpleNamespace(
+        dataset_root=source_a,
+        final_mask_root=tmp_path / "wrong",
+        explicit_mask_keys=("wrist_final_keep_mask_paths",),
+        _masked_pipeline=None,
+    )
+    child_b = SimpleNamespace(
+        dataset_root=source_b,
+        final_mask_root=tmp_path / "wrong",
+        explicit_mask_keys=("wrist_final_keep_mask_paths",),
+        _masked_pipeline=None,
+    )
+    prepared = SimpleNamespace(
+        dataset=SimpleNamespace(_datasets=(child_a, child_b))
+    )
+
+    result = _bind_source_partitioned_final_masks_to_dataset(
+        prepared,
+        {
+            source_a: ("source_a", final_base / "source_a"),
+            source_b: ("source_b", final_base / "source_b"),
+        },
+    )
+
+    assert result is prepared
+    assert child_a.final_mask_root == final_base / "source_a"
+    assert child_b.final_mask_root == final_base / "source_b"
+
+
+def test_source_partitioned_final_masks_reject_raw_depth_fallback(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "source").resolve()
+    prepared = SimpleNamespace(
+        dataset=SimpleNamespace(
+            dataset_root=source,
+            final_mask_root=tmp_path / "wrong",
+            explicit_mask_keys=("wrist_depth_mask_paths",),
+            _masked_pipeline=None,
+        )
+    )
+
+    with pytest.raises(OpenPIPreparedSkillError, match="forbids"):
+        _bind_source_partitioned_final_masks_to_dataset(
+            prepared,
+            {source: ("source", tmp_path / "final" / "source")},
+        )
+
+
+def test_depth_postprocess_repairs_only_complete_trailing_frames(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "raw.bitpack.bin"
+    frames = [
+        np.asarray([[1, 0, 1, 0, 1, 0, 1, 0]], dtype=np.uint8),
+        np.asarray([[0, 1, 0, 1, 0, 1, 0, 1]], dtype=np.uint8),
+        np.asarray([[1, 1, 0, 0, 1, 1, 0, 0]], dtype=np.uint8),
+    ]
+    source_path.write_bytes(b"".join(pack_binary_mask(frame) for frame in frames))
+    stream = MaskStream(
+        label="right_wrist",
+        stream_path=source_path,
+        height=1,
+        width=8,
+        frame_count=2,
+        packed_bytes_per_frame=1,
+    )
+
+    result = process_mask_stream(
+        stream,
+        tmp_path / "derived" / "right_wrist",
+        config=DepthMaskPostprocessConfig(
+            close_radius_px=0,
+            median_ksize=0,
+            fill_hole_max_area_px=0,
+            temporal_gap_fill_frames=0,
+        ),
+    )
+
+    assert result.frame_count == 2
+    assert result.source_declared_bytes == 2
+    assert result.source_actual_bytes == 3
+    assert result.source_trailing_bytes == 1
+    assert result.stream_path.stat().st_size == 2
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source"]["integrity"]["read_policy"] == (
+        "exact_declared_frames_v1"
+    )
+    assert manifest["source"]["integrity"]["source_modified"] is False

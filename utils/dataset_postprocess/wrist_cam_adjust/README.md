@@ -228,6 +228,64 @@ python -m utils.dataset_postprocess.wrist_cam_adjust dataset \
 当前默认 final mask 不使用 proxy，也不额外合并 painted body mask。需要只保留桌面时不要传
 `--left-body-mask` / `--right-body-mask`。
 
+## Stage1 多 Source 正式 Final Mask
+
+Stage1 all-valid profile 必须使用 Prepared binding 中的有效 episode，而不是按目录名
+猜测数据范围。正式流水线为：
+
+```text
+raw wrist_depth_mask_paths (只读)
+  -> 默认空间/时序 depth 后处理
+  -> OR table sampled-raycast geometry keep-mask
+  -> source_dataset_id 分区的 final_keep.bitpack.bin
+```
+
+训练只读取最后一层；`wrist_depth_mask_paths` 只是生成输入，不能作为训练时的静默
+fallback。同名数据集（例如来自不同根目录但 basename 相同的分片）按
+`source_dataset_id` 分区，输出布局为：
+
+```text
+<final-mask-root>/<source_dataset_id>/<dataset-name>/episode_XXXXXX/right_wrist/
+```
+
+先运行 `prepared_skill_launch prepare` 并记录其 `openpi_binding_root`，再执行：
+
+```bash
+python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline \
+  --profile deployments/openpi/configs/training/writing_stage1_all_valid_through_2026_08_21_front_right_wrist_h32_absolute_non_rtc_v1.json \
+  --binding-root /absolute/path/from/openpi_binding_root \
+  --urdf /absolute/pinned/assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --jobs 4
+```
+
+物理整合集合不假定单一相机内参。流水线读取 `meta/build_audit.json` 的
+`source_root -> output_episode_index` 绑定，并逐 episode 使用
+`meta/source_devices/<source-name>/realsense.json`；保存副本必须与原 source 的
+内参文件 SHA-256 一致。
+
+depth 后处理按 manifest 声明帧数精确读取。完整的额外尾随帧会记录在 receipt 中，
+但不会进入派生结果；短流、半帧尾随、table 视频提前结束或额外可解码尾帧都会停止
+流水线。每个 bitpack episode 先写独立临时目录并原子发布，原始数据始终只读。
+receipt 位于：
+
+```text
+<workspace>/receipts/stage1_final_masks/<source_dataset_id>.json
+<workspace>/receipts/stage1_final_masks/summary.json
+```
+
+两帧管线 smoke 必须使用独立 workspace，不能写入正式 final-mask root：
+
+```bash
+python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline \
+  --profile <profile.json> \
+  --binding-root <binding-root> \
+  --urdf <pinned-urdf> \
+  --workspace-root <fresh-smoke-workspace> \
+  --source-id <one-source-id> \
+  --max-frames 2 \
+  --jobs 1
+```
+
 ## 推荐大批量 Wrist Mask 路径
 
 ```bash
