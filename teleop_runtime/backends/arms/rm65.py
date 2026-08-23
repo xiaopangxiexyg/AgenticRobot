@@ -6,6 +6,7 @@ from pathlib import Path
 import math
 import threading
 from typing import Callable, Mapping, Sequence
+from uuid import uuid4
 
 import numpy as np
 import time
@@ -105,6 +106,12 @@ from .rm65_control_dispatch_call import (
     RM65ControlDispatchContext,
     RM65PreSdkControlAdapter,
 )
+from .rm65_pose_source import (
+    HARDWARE_POSE_SOURCE_ATTESTATION_STATE_KEY,
+    RM65PoseSourceAttestation,
+    _bind_rm65_solver_urdf_provenance,
+    build_rm65_pose_source_attestation,
+)
 
 
 RM65_IK_FRAMEWORK_ROBOT_MOTION = "robot_motion"
@@ -177,6 +184,7 @@ _BACKGROUND_WORKER_TERMINAL_STAGE = "rm65_background_stream_worker_terminal"
 # and no new motion can be admitted while these calls run.
 _EMERGENCY_STOP_RETRY_DELAY_SEC = 0.05
 _EMERGENCY_STOP_ARM_STOP_ATTEMPTS = 2
+_RM65_HARDWARE_MEASUREMENT_CLOCK_DOMAIN_ID = "local_wall_time"
 
 
 def _derive_backend_execution_work_item(
@@ -551,6 +559,7 @@ class RM65ArmBackendConfig:
     ik_framework: str = RM65_IK_FRAMEWORK_ROBOT_MOTION
     builtin_empty_tool_frame: bool = field(default=False, init=False, repr=False)
     position_endpoint_profile: bool = field(default=False, init=False, repr=False)
+    resolved_tool_name: str | None = field(default=None, init=False, repr=False)
     # Deployment-only live observation shadow.  Kept at the end of the public
     # init fields so legacy positional construction keeps its old meaning.
     observation_only: bool = False
@@ -855,6 +864,7 @@ class RM65ArmBackendConfig:
             self.ik_tuning = load_ik_tuning_config(self.ik_tuning_json_path)
         if _is_empty_tool_frame_name(self.tool_profile):
             self.builtin_empty_tool_frame = True
+            self.resolved_tool_name = EMPTY_TOOL_FRAME
             self.tool_profile = None
             self.auto_load_tool_profile = False
             if self.tcp_pose_flange_m_rad is None:
@@ -865,6 +875,9 @@ class RM65ArmBackendConfig:
             profile = load_profile(self.tool_profile, arm=self.side if self.side in ("left", "right") else None)
             if str(profile.get("arm")) != self.side:
                 raise ValueError(f"tool_profile arm={profile.get('arm')} does not match backend side={self.side}")
+            self.resolved_tool_name = str(
+                profile.get("tool_name") or profile.get("name") or self.tool_profile
+            ).strip()
             tcp = profile.get("tcp") if isinstance(profile.get("tcp"), dict) else {}
             pose = tcp.get("pose_flange_m_rad")
             if pose is None:
@@ -896,6 +909,7 @@ class RM65ArmBackend(EffectorBackend):
         execution_epoch_guard: ExecutionEpochGuard | None = None,
         worker_drain_participant: ExecutionCancellationParticipantSpec | None = None,
         hardware_idle_worker_preflight_binding: object | None = None,
+        pose_source_instance_id: str | None = None,
     ):
         self.config = config
         self._hardware_idle_worker_preflight_binding_id: str | None = None
@@ -1061,6 +1075,8 @@ class RM65ArmBackend(EffectorBackend):
         self._prepared_effective_step_time: float | None = None
         self._state_lock = threading.RLock()
         self._send_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._solver_lock = threading.RLock()
         # Dedicated state connections may serve both dataset qpos polling and
         # the position-force safety guard.  The RM65 SDK handle is not safe for
         # concurrent request/response calls, so serialize reads without
@@ -1310,6 +1326,17 @@ class RM65ArmBackend(EffectorBackend):
         self._jump_hold_frames = 0
         self._last_target_pose: np.ndarray | None = None
         self._last_ik_metadata: dict[str, object] = {}
+        # Runtime tool discovery is attachment-owned state.  Keep it separate
+        # from the caller's reusable config object so rebuilding a backend with
+        # that config cannot inherit a previous device attachment's TCP.
+        self._caller_configured_tcp_pose_flange_m_rad = (
+            None
+            if config.tcp_pose_flange_m_rad is None
+            else tuple(float(value) for value in config.tcp_pose_flange_m_rad)
+        )
+        self._runtime_tcp_pose_flange_m_rad = (
+            self._caller_configured_tcp_pose_flange_m_rad
+        )
         self._hand_base_to_configured_tcp = self._build_hand_base_to_configured_tcp()
         self._configured_tcp_enabled = not np.allclose(
             self._hand_base_to_configured_tcp,
@@ -1319,7 +1346,67 @@ class RM65ArmBackend(EffectorBackend):
         self._active_tool_profile_path: str | None = None
         self._active_tool_name: str | None = None
         self._builtin_empty_tool_frame = bool(config.builtin_empty_tool_frame)
+        self._configured_builtin_empty_tool_frame = bool(
+            config.builtin_empty_tool_frame
+        )
         self._position_endpoint_profile = bool(config.position_endpoint_profile)
+        self._pose_source_side = str(config.side).strip().lower()
+        self._pose_source_effector_name = str(config.effector_name or "").strip()
+        self._pose_source_default_tcp_frame = canonical_arm_controlled_frame(
+            config.default_tcp_frame
+        )
+        # Every fresh attachment must re-read a device-owned binding.  The
+        # discovered pose lives only in this backend instance and never mutates
+        # the caller's reusable config object.
+        self._pose_tool_binding_requires_attachment_refresh = bool(
+            config.auto_load_tool_profile
+            and config.tool_profile is None
+            and config.tcp_pose_flange_m_rad is None
+        )
+        explicit_source_instance_id = (
+            None
+            if pose_source_instance_id is None
+            else str(pose_source_instance_id).strip()
+        )
+        if pose_source_instance_id is not None and not explicit_source_instance_id:
+            raise ValueError("pose_source_instance_id must be non-empty when supplied.")
+        self._pose_source_instance_id = (
+            explicit_source_instance_id
+            or f"rm65-pose-source:{self._pose_source_side}:{uuid4().hex}"
+        )
+        self._pose_source_epoch_id: str | None = None
+        self._pose_source_attachment_endpoint: str | None = None
+        self._pose_source_epoch_measurement_sequence_floor: int | None = None
+        self._pose_source_attestation: RM65PoseSourceAttestation | None = None
+        self._pose_source_attested_solver: object | None = None
+        self._pose_source_attested_compute_pose_token: tuple[int | None, int] | None = (
+            None
+        )
+        self._pose_source_identity_drift_latched = False
+        self._pose_source_attestation_attempted = False
+        self._pose_source_attestation_error = (
+            "hardware_not_started"
+            if config.connect_hardware
+            else "hardware_connection_disabled"
+        )
+        self._pose_tool_name = config.resolved_tool_name
+        if self._position_endpoint_profile:
+            self._pose_tool_binding_evidence: str | None = (
+                "configured_position_endpoint_profile"
+            )
+        elif self._builtin_empty_tool_frame:
+            self._pose_tool_binding_evidence = "configured_builtin_empty_tool"
+        elif config.tool_profile:
+            self._pose_tool_binding_evidence = "configured_tool_profile"
+        elif config.tcp_pose_flange_m_rad is not None:
+            self._pose_tool_binding_evidence = "configured_tcp_pose"
+        elif not config.auto_load_tool_profile:
+            self._pose_tool_binding_evidence = "configured_arm_endpoint_default"
+        else:
+            self._pose_tool_binding_evidence = None
+        self._pose_tool_binding_attestable = bool(
+            self._pose_tool_binding_evidence is not None
+        )
 
     def set_command_control_dt(self, control_dt_sec: float) -> None:
         value = float(control_dt_sec)
@@ -1993,7 +2080,389 @@ class RM65ArmBackend(EffectorBackend):
 
         return self._normalize_local_qpos_observation(qpos, label=label)
 
+    def _begin_pose_source_epoch(self, *, attachment_endpoint: str) -> None:
+        """Start one attachment-local pose-source identity.
+
+        The backend object owns the source instance.  Every newly constructed
+        SDK attachment receives a fresh epoch, including an attachment whose
+        later startup checks fail.  An idempotent ``start()`` on the same live
+        handle returns before this method and therefore preserves the epoch.
+        """
+
+        normalized_endpoint = str(attachment_endpoint).strip()
+        if not normalized_endpoint:
+            raise ValueError("attachment_endpoint must be non-empty.")
+        with self._state_lock:
+            if self._pose_tool_binding_requires_attachment_refresh:
+                # Fail closed before consulting the new SDK attachment.  This
+                # also removes an auto-loaded TCP cached by a prior attachment
+                # whose startup later failed.
+                self._runtime_tcp_pose_flange_m_rad = (
+                    self._caller_configured_tcp_pose_flange_m_rad
+                )
+                self._active_tool_profile_path = None
+                self._active_tool_name = None
+                self._builtin_empty_tool_frame = (
+                    self._configured_builtin_empty_tool_frame
+                )
+                self._hand_base_to_configured_tcp = (
+                    self._build_hand_base_to_configured_tcp()
+                )
+                self._configured_tcp_enabled = not np.allclose(
+                    self._hand_base_to_configured_tcp,
+                    np.eye(4, dtype=float),
+                    atol=1e-9,
+                )
+                self._pose_tool_binding_evidence = None
+                self._pose_tool_name = None
+                self._pose_tool_binding_attestable = False
+            self._pose_source_epoch_id = (
+                f"{self._pose_source_instance_id}:attach:{uuid4().hex}"
+            )
+            self._pose_source_attachment_endpoint = normalized_endpoint
+            self._pose_source_epoch_measurement_sequence_floor = int(
+                self._measured_sequence
+            )
+            self._pose_source_attestation = None
+            self._pose_source_attested_solver = None
+            self._pose_source_attested_compute_pose_token = None
+            self._pose_source_identity_drift_latched = False
+            self._pose_source_attestation_attempted = False
+            self._pose_source_attestation_error = (
+                "awaiting_trusted_hardware_measurement"
+            )
+
+    def _clear_pose_source_epoch_locked(self, *, reason: str) -> None:
+        self._pose_source_epoch_id = None
+        self._pose_source_attachment_endpoint = None
+        self._pose_source_epoch_measurement_sequence_floor = None
+        self._pose_source_attestation = None
+        self._pose_source_attested_solver = None
+        self._pose_source_attested_compute_pose_token = None
+        self._pose_source_identity_drift_latched = False
+        self._pose_source_attestation_attempted = False
+        self._pose_source_attestation_error = str(reason)
+
+    def _set_pose_tool_binding_resolution(
+        self,
+        *,
+        evidence: str | None,
+        tool_name: str | None,
+        attestable: bool,
+        error: str | None = None,
+    ) -> None:
+        normalized_evidence = None if evidence is None else str(evidence).strip()
+        normalized_tool_name = None if tool_name is None else str(tool_name).strip()
+        with self._state_lock:
+            self._pose_tool_binding_evidence = normalized_evidence or None
+            self._pose_tool_name = normalized_tool_name or None
+            self._pose_tool_binding_attestable = bool(attestable)
+            self._pose_source_attestation = None
+            self._pose_source_attested_solver = None
+            self._pose_source_attested_compute_pose_token = None
+            if self._pose_source_identity_drift_latched:
+                self._pose_source_attestation_attempted = True
+                self._pose_source_attestation_error = (
+                    "pose_source_identity_config_drift"
+                )
+            else:
+                self._pose_source_attestation_attempted = False
+            if not attestable and not self._pose_source_identity_drift_latched:
+                self._pose_source_attestation_error = str(
+                    error or "tool_binding_unresolved"
+                )
+
+    def _maybe_materialize_pose_source_attestation(
+        self,
+        *,
+        controlled_frame: str,
+        solver: object,
+    ) -> None:
+        """Best-effort materialize exact lower FK facts without changing FK.
+
+        Missing provenance must only remove the optional attestation.  It must
+        never make the long-standing diagnostic FK path fail or trigger
+        another SDK read.  The full application ``PoseCoordinateBinding`` is
+        intentionally not constructed here because stream, observation-plan,
+        and receipt-clock facts are owned above this backend.
+        """
+
+        if canonical_arm_controlled_frame(controlled_frame) != TOOL_TCP_FRAME:
+            return
+        if not self._pose_source_config_identity_matches():
+            with self._state_lock:
+                if self._pose_source_attestation is not None:
+                    self._pose_source_attestation = None
+                    self._pose_source_attested_solver = None
+                    self._pose_source_attested_compute_pose_token = None
+                # Identity drift is an epoch-terminal proof condition even if
+                # it is observed before the first proof has materialized.
+                self._pose_source_identity_drift_latched = True
+                self._pose_source_attestation_attempted = True
+                self._pose_source_attestation_error = (
+                    "pose_source_identity_config_drift"
+                )
+            return
+        with self._state_lock:
+            if self._pose_source_identity_drift_latched:
+                self._pose_source_attestation = None
+                self._pose_source_attested_solver = None
+                self._pose_source_attested_compute_pose_token = None
+                self._pose_source_attestation_attempted = True
+                self._pose_source_attestation_error = (
+                    "pose_source_identity_config_drift"
+                )
+                return
+        if (
+            self._pose_source_side not in {"left", "right"}
+            or not self._pose_source_effector_name
+        ):
+            with self._state_lock:
+                if self._pose_source_attestation is not None:
+                    self._pose_source_attestation = None
+                    self._pose_source_attested_solver = None
+                    self._pose_source_attested_compute_pose_token = None
+                    self._pose_source_attestation_attempted = True
+                self._pose_source_attestation_error = (
+                    "pose_source_identity_is_not_attestable"
+                )
+            return
+        if self._pose_source_default_tcp_frame != TOOL_TCP_FRAME:
+            with self._state_lock:
+                if self._pose_source_attestation is not None:
+                    self._pose_source_attestation = None
+                    self._pose_source_attested_solver = None
+                    self._pose_source_attested_compute_pose_token = None
+                    self._pose_source_attestation_attempted = True
+                self._pose_source_attestation_error = (
+                    "default_tcp_frame_is_not_tool_tcp"
+                )
+            return
+        with self._state_lock:
+            existing_attestation = self._pose_source_attestation
+        try:
+            compute_pose_token = self._solver_compute_pose_token(solver)
+        except Exception as exc:  # noqa: BLE001 - optional provenance only.
+            with self._state_lock:
+                if self._pose_source_attestation is existing_attestation:
+                    self._pose_source_attestation = None
+                    self._pose_source_attested_solver = None
+                    self._pose_source_attested_compute_pose_token = None
+                    self._pose_source_attestation_attempted = True
+                    self._pose_source_attestation_error = (
+                        f"{'attestation_drift_detected' if existing_attestation is not None else 'attestation_build_failed'}:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+            return
+        with self._state_lock:
+            # Do not validate a proof that was concurrently replaced between
+            # the initial snapshot and callable inspection.
+            if self._pose_source_attestation is not existing_attestation:
+                return
+            if existing_attestation is not None and (
+                self._pose_source_attested_solver is not solver
+                or self._pose_source_attested_compute_pose_token
+                != compute_pose_token
+            ):
+                self._pose_source_attestation = None
+                self._pose_source_attested_solver = None
+                self._pose_source_attested_compute_pose_token = None
+                self._pose_source_attestation_attempted = True
+                self._pose_source_attestation_error = (
+                    "attestation_drift_detected:solver_identity_or_compute_pose_changed"
+                )
+                return
+            if existing_attestation is None and self._pose_source_attestation_attempted:
+                return
+            epoch_id = self._pose_source_epoch_id
+            attachment_endpoint = self._pose_source_attachment_endpoint
+            sequence_floor = self._pose_source_epoch_measurement_sequence_floor
+            if (
+                not self.config.connect_hardware
+                or self.arm is None
+                or self._closed
+                or epoch_id is None
+                or attachment_endpoint is None
+                or sequence_floor is None
+                or not self._hardware_ready
+                or self._last_hardware_read_success is not True
+                or self._measured_sequence <= sequence_floor
+            ):
+                return
+            if not self._pose_tool_binding_attestable:
+                if not self._pose_source_attestation_error:
+                    self._pose_source_attestation_error = (
+                        "tool_binding_unresolved"
+                    )
+                return
+            tcp_evidence = str(self._pose_tool_binding_evidence or "").strip()
+            tool_name = self._pose_tool_name
+            tcp_pose = self._active_tcp_pose_flange_m_rad()
+            configured_tcp_enabled = bool(self._configured_tcp_enabled)
+            applied_solver_eef_to_tool_tcp_matrix = (
+                self._hand_base_to_configured_tcp.copy()
+                if configured_tcp_enabled
+                else np.eye(4, dtype=float)
+            )
+            attached_arm = self.arm
+            if existing_attestation is None:
+                self._pose_source_attestation_attempted = True
+
+        try:
+            attestation = build_rm65_pose_source_attestation(
+                side=self._pose_source_side,
+                effector_name=self._pose_source_effector_name,
+                source_instance_id=self._pose_source_instance_id,
+                source_epoch_id=epoch_id,
+                arm_ip=attachment_endpoint,
+                tcp_pose_flange_m_rad=tcp_pose,
+                tcp_evidence=tcp_evidence,
+                tool_name=tool_name,
+                configured_tcp_enabled=configured_tcp_enabled,
+                applied_solver_eef_to_tool_tcp_matrix=(
+                    applied_solver_eef_to_tool_tcp_matrix
+                ),
+                solver=solver,
+                measurement_clock_domain_id=(
+                    _RM65_HARDWARE_MEASUREMENT_CLOCK_DOMAIN_ID
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - optional provenance only.
+            with self._solver_lock:
+                with self._state_lock:
+                    if (
+                        self._pose_source_attestation is existing_attestation
+                        and self.arm is attached_arm
+                        and self._pose_source_epoch_id == epoch_id
+                        and not self._pose_source_identity_drift_latched
+                        and self._solvers.get(TOOL_TCP_FRAME) is solver
+                    ):
+                        if existing_attestation is not None:
+                            self._pose_source_attestation = None
+                            self._pose_source_attested_solver = None
+                            self._pose_source_attested_compute_pose_token = None
+                        self._pose_source_attestation_error = (
+                            f"{'attestation_drift_detected' if existing_attestation is not None else 'attestation_build_failed'}:"
+                            f"{type(exc).__name__}:{exc}"
+                        )
+            return
+        # Serialize the final cache/token check with every supported solver
+        # cache writer.  The full semantic hash remains outside this lock, but
+        # its result can only publish while the captured solver is still the
+        # cache owner.  Lock order is always solver -> state at this boundary.
+        with self._solver_lock:
+            try:
+                final_compute_pose_token = self._solver_compute_pose_token(solver)
+            except Exception:  # noqa: BLE001 - handled as validation drift below.
+                final_compute_pose_token = None
+            with self._state_lock:
+                # Compare-and-set against the exact proof and attachment snapshot.
+                # A concurrent validator, tool transition, or close may have
+                # invalidated this result while the full model hash was computed;
+                # an older success must never resurrect that cleared proof or
+                # overwrite the terminal reason.
+                if (
+                    self._pose_source_attestation is not existing_attestation
+                    or self.arm is not attached_arm
+                    or self._pose_source_epoch_id != epoch_id
+                ):
+                    return
+                if (
+                    self._hardware_ready
+                    and self._last_hardware_read_success is True
+                    and self._measured_sequence > sequence_floor
+                    and self._pose_tool_binding_attestable
+                    and not self._pose_source_identity_drift_latched
+                    and self._pose_source_config_identity_matches()
+                    and self._solvers.get(TOOL_TCP_FRAME) is solver
+                    and final_compute_pose_token == compute_pose_token
+                    and self._pose_tool_binding_evidence == tcp_evidence
+                    and self._pose_tool_name == tool_name
+                    and self._active_tcp_pose_flange_m_rad() == tcp_pose
+                    and self._configured_tcp_enabled == configured_tcp_enabled
+                    and np.array_equal(
+                        (
+                            self._hand_base_to_configured_tcp
+                            if self._configured_tcp_enabled
+                            else np.eye(4, dtype=float)
+                        ),
+                        applied_solver_eef_to_tool_tcp_matrix,
+                    )
+                ):
+                    if (
+                        existing_attestation is not None
+                        and attestation != existing_attestation
+                    ):
+                        self._pose_source_attestation = None
+                        self._pose_source_attested_solver = None
+                        self._pose_source_attested_compute_pose_token = None
+                        self._pose_source_attestation_attempted = True
+                        self._pose_source_attestation_error = (
+                            "attestation_drift_detected:semantic_contract_changed"
+                        )
+                    else:
+                        self._pose_source_attestation = (
+                            existing_attestation or attestation
+                        )
+                        self._pose_source_attested_solver = solver
+                        self._pose_source_attested_compute_pose_token = (
+                            compute_pose_token
+                        )
+                        self._pose_source_attestation_error = None
+                elif self._pose_source_identity_drift_latched:
+                    self._pose_source_attestation = None
+                    self._pose_source_attested_solver = None
+                    self._pose_source_attested_compute_pose_token = None
+                    self._pose_source_attestation_attempted = True
+                    self._pose_source_attestation_error = (
+                        "pose_source_identity_config_drift"
+                    )
+                elif existing_attestation is not None:
+                    self._pose_source_attestation = None
+                    self._pose_source_attested_solver = None
+                    self._pose_source_attested_compute_pose_token = None
+                    self._pose_source_attestation_attempted = True
+                    self._pose_source_attestation_error = (
+                        "attestation_drift_detected:runtime_changed_during_validation"
+                    )
+                else:
+                    self._pose_source_attestation_error = (
+                        "attestation_build_failed:runtime_changed_during_validation"
+                    )
+
+    @staticmethod
+    def _solver_compute_pose_token(solver: object) -> tuple[int | None, int]:
+        compute_pose = getattr(solver, "compute_pose", None)
+        if not callable(compute_pose):
+            raise TypeError("solver.compute_pose must be callable.")
+        bound_owner = getattr(compute_pose, "__self__", None)
+        implementation = getattr(compute_pose, "__func__", compute_pose)
+        return (
+            None if bound_owner is None else id(bound_owner),
+            id(implementation),
+        )
+
+    def _pose_source_config_identity_matches(self) -> bool:
+        """Return whether mutable compatibility config still names this owner."""
+
+        try:
+            current_default_frame = canonical_arm_controlled_frame(
+                self.config.default_tcp_frame
+            )
+        except Exception:  # noqa: BLE001 - optional proof must stay best-effort.
+            return False
+        return bool(
+            str(self.config.side).strip().lower() == self._pose_source_side
+            and str(self.config.effector_name or "").strip()
+            == self._pose_source_effector_name
+            and current_default_frame == self._pose_source_default_tcp_frame
+        )
+
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_under_lifecycle_lock()
+
+    def _start_under_lifecycle_lock(self) -> None:
         if not self.config.connect_hardware:
             return
         with self._state_lock:
@@ -2006,8 +2475,14 @@ class RM65ArmBackend(EffectorBackend):
                     )
                 return
         Arm, RM65 = _load_rm65_sdk()
-        self.arm = Arm(RM65, self.config.arm_ip)
+        attachment_endpoint = str(self.config.arm_ip).strip()
+        if not attachment_endpoint:
+            raise ValueError("RM65 arm_ip must be non-empty before attachment.")
+        self.arm = Arm(RM65, attachment_endpoint)
         try:
+            self._begin_pose_source_epoch(
+                attachment_endpoint=attachment_endpoint,
+            )
             self._auto_load_active_tool_profile()
             if not self.config.observation_only:
                 self._configure_singularity_protection()
@@ -2073,6 +2548,7 @@ class RM65ArmBackend(EffectorBackend):
         with self._state_lock:
             self._hardware_ready = False
             self._hardware_ready_source = "startup_failed"
+            self._clear_pose_source_epoch_locked(reason="startup_failed")
             # ``initial_qpos`` is a local/preview seed, not trusted hardware
             # feedback. Do not leave it exposed as a live hardware anchor after
             # startup failure. Even an explicitly verified fallback is cleared
@@ -4188,24 +4664,51 @@ class RM65ArmBackend(EffectorBackend):
 
     def _solver_for_tcp_frame(self, tcp_frame: str):
         tcp_frame = canonical_arm_controlled_frame(tcp_frame)
-        if tcp_frame not in self._solvers:
-            try:
-                arm_urdf_path = self.config.arm_urdf_path or require_asset_path("rm65_arm.urdf")
-                self._solvers[tcp_frame] = build_rm65_single_arm_ik_solver(
-                    RM65SingleArmIKConfig(
-                        arm_urdf_path=arm_urdf_path,
-                        controlled_frame=tcp_frame,
-                        ik_tuning=self._ik_tuning,
-                        dry_run_max_iterations=int(self.config.dry_run_max_iterations),
-                        dry_run_max_joint_step_rad=tuple(self.config.dry_run_max_joint_step),
-                        dry_run_damping=float(self.config.dry_run_damping),
+        with self._solver_lock:
+            if tcp_frame not in self._solvers:
+                try:
+                    arm_urdf_path = self.config.arm_urdf_path or require_asset_path("rm65_arm.urdf")
+                    try:
+                        urdf_raw_bytes_before_build = Path(
+                            arm_urdf_path
+                        ).expanduser().read_bytes()
+                    except Exception:
+                        urdf_raw_bytes_before_build = None
+                    solver = build_rm65_single_arm_ik_solver(
+                        RM65SingleArmIKConfig(
+                            arm_urdf_path=arm_urdf_path,
+                            controlled_frame=tcp_frame,
+                            ik_tuning=self._ik_tuning,
+                            dry_run_max_iterations=int(self.config.dry_run_max_iterations),
+                            dry_run_max_joint_step_rad=tuple(self.config.dry_run_max_joint_step),
+                            dry_run_damping=float(self.config.dry_run_damping),
+                        )
                     )
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    f"{self.name} could not resolve tcp_frame '{tcp_frame}' against the arm URDF."
-                ) from exc
-        return self._solvers[tcp_frame]
+                    try:
+                        if urdf_raw_bytes_before_build is None:
+                            raise ValueError(
+                                "URDF bytes were unavailable before solver construction"
+                            )
+                        _bind_rm65_solver_urdf_provenance(
+                            solver=solver,
+                            urdf_path=arm_urdf_path,
+                            expected_raw_bytes=urdf_raw_bytes_before_build,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - optional proof only.
+                        try:
+                            setattr(
+                                solver,
+                                "_rm65_pose_source_provenance_error",
+                                f"{type(exc).__name__}:{exc}",
+                            )
+                        except Exception:
+                            pass
+                    self._solvers[tcp_frame] = solver
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{self.name} could not resolve tcp_frame '{tcp_frame}' against the arm URDF."
+                    ) from exc
+            return self._solvers[tcp_frame]
 
     def _candidate_tcp_frames(self, tcp_frame: str) -> tuple[str, ...]:
         return rm65_single_arm_candidate_frames(canonical_arm_controlled_frame(tcp_frame))
@@ -4219,8 +4722,8 @@ class RM65ArmBackend(EffectorBackend):
     def _active_tcp_pose_flange_m_rad(self) -> tuple[float, ...]:
         pose_flange_m_rad = (
             ARM_ENDPOINT_TCP_POSE_FLANGE_M_RAD
-            if self.config.tcp_pose_flange_m_rad is None
-            else self.config.tcp_pose_flange_m_rad
+            if self._runtime_tcp_pose_flange_m_rad is None
+            else self._runtime_tcp_pose_flange_m_rad
         )
         return tuple(float(value) for value in pose_flange_m_rad)
 
@@ -4229,54 +4732,105 @@ class RM65ArmBackend(EffectorBackend):
             return "position_endpoint_profile"
         if self._builtin_empty_tool_frame:
             return "builtin_empty_arm_endpoint"
-        if self.config.tcp_pose_flange_m_rad is None:
-            return "arm_endpoint_default"
         if self._active_tool_profile_path:
             return "active_tool_profile"
         if self.config.tool_profile:
             return "configured_tool_profile"
-        return "configured_tcp_pose"
+        if self._runtime_tcp_pose_flange_m_rad is not None:
+            return "configured_tcp_pose"
+        return "arm_endpoint_default"
 
     def _set_configured_tcp_pose(self, pose_flange_m_rad: Sequence[float]) -> None:
         pose = np.asarray(pose_flange_m_rad, dtype=float).reshape(6)
         if not np.all(np.isfinite(pose)):
             raise ValueError("tcp_pose_flange_m_rad must contain finite values.")
-        self.config.tcp_pose_flange_m_rad = tuple(float(value) for value in pose)
+        runtime_pose = tuple(float(value) for value in pose)
         _warn_if_tcp_outside_safety_limits(
             owner=self.name,
-            pose_flange_m_rad=self.config.tcp_pose_flange_m_rad,
+            pose_flange_m_rad=runtime_pose,
             source="active tool profile",
         )
-        self._hand_base_to_configured_tcp = self._build_hand_base_to_configured_tcp()
-        self._configured_tcp_enabled = not np.allclose(
-            self._hand_base_to_configured_tcp,
-            np.eye(4, dtype=float),
-            atol=1e-9,
-        )
+        with self._state_lock:
+            self._runtime_tcp_pose_flange_m_rad = runtime_pose
+            self._hand_base_to_configured_tcp = (
+                self._build_hand_base_to_configured_tcp()
+            )
+            self._configured_tcp_enabled = not np.allclose(
+                self._hand_base_to_configured_tcp,
+                np.eye(4, dtype=float),
+                atol=1e-9,
+            )
+            # The caller must resolve the new pose back to a concrete tool
+            # binding before this attachment may attest it.
+            self._pose_tool_binding_evidence = None
+            self._pose_tool_name = None
+            self._pose_tool_binding_attestable = False
+            self._pose_source_attestation = None
+            self._pose_source_attested_solver = None
+            self._pose_source_attested_compute_pose_token = None
+            if self._pose_source_identity_drift_latched:
+                self._pose_source_attestation_attempted = True
+                self._pose_source_attestation_error = (
+                    "pose_source_identity_config_drift"
+                )
+            else:
+                self._pose_source_attestation_attempted = False
+                self._pose_source_attestation_error = (
+                    "tool_binding_changed_requires_resolution"
+                )
 
     def _auto_load_active_tool_profile(self) -> None:
         if self.arm is None:
             return
-        if self.config.tcp_pose_flange_m_rad is not None:
+        if self._runtime_tcp_pose_flange_m_rad is not None:
             return
         if self.config.tool_profile or not self.config.auto_load_tool_profile:
             return
-        if self.config.side not in ("left", "right"):
+        if self._pose_source_side not in ("left", "right"):
+            self._set_pose_tool_binding_resolution(
+                evidence=None,
+                tool_name=None,
+                attestable=False,
+                error="unsupported_side_for_tool_binding",
+            )
             return
         try:
             code, frame = self.arm.Get_Current_Tool_Frame()
         except Exception as exc:
+            self._set_pose_tool_binding_resolution(
+                evidence=None,
+                tool_name=None,
+                attestable=False,
+                error="active_tool_frame_read_failed",
+            )
             print(f"WARNING: {self.name} could not read active RM65 tool frame for TCP profile auto-load: {exc}")
             return
         if int(code) != 0:
+            self._set_pose_tool_binding_resolution(
+                evidence=None,
+                tool_name=None,
+                attestable=False,
+                error="active_tool_frame_result_rejected",
+            )
             print(f"WARNING: {self.name} Get_Current_Tool_Frame failed during TCP profile auto-load: {code}")
             return
         tool_name = _tool_name_from_frame_result((code, frame))
         self._active_tool_name = tool_name or None
         if not tool_name:
+            self._set_pose_tool_binding_resolution(
+                evidence=None,
+                tool_name=None,
+                attestable=False,
+                error="active_tool_frame_name_missing",
+            )
             return
         if _is_empty_tool_frame_name(tool_name):
             self._builtin_empty_tool_frame = True
+            self._set_pose_tool_binding_resolution(
+                evidence="sdk_active_empty_tool_frame",
+                tool_name=tool_name,
+                attestable=True,
+            )
             print(
                 f"{self.name}: active tool frame is '{tool_name}'; using built-in "
                 "arm_endpoint TCP and skipping calibration profile auto-load for position control."
@@ -4285,21 +4839,32 @@ class RM65ArmBackend(EffectorBackend):
         try:
             from hardware.rm65.calibration_profiles import load_profile
 
-            profile = load_profile(tool_name, arm=self.config.side)
+            profile = load_profile(tool_name, arm=self._pose_source_side)
             profile_tool = str(profile.get("tool_name") or profile.get("name") or "")
             if profile_tool != tool_name:
                 raise ValueError(f"profile tool_name={profile_tool!r} does not match active tool {tool_name!r}")
             tcp = profile.get("tcp") if isinstance(profile.get("tcp"), dict) else {}
             pose = tcp.get("pose_flange_m_rad")
             if pose is None:
+                self._set_pose_tool_binding_resolution(
+                    evidence=None,
+                    tool_name=tool_name,
+                    attestable=False,
+                    error="active_tool_profile_tcp_missing",
+                )
                 print(
-                    f"WARNING: {self.name} active tool profile arm={self.config.side} "
+                    f"WARNING: {self.name} active tool profile arm={self._pose_source_side} "
                     f"tool={tool_name} has no tcp.pose_flange_m_rad; using arm_endpoint"
                 )
                 return
             self._set_configured_tcp_pose(pose)
-            metrics = tcp_endpoint_delta(self.config.tcp_pose_flange_m_rad)
+            metrics = tcp_endpoint_delta(self._active_tcp_pose_flange_m_rad())
             self._active_tool_profile_path = str(profile.get("_profile_path") or "")
+            self._set_pose_tool_binding_resolution(
+                evidence="sdk_active_tool_profile_match",
+                tool_name=tool_name,
+                attestable=True,
+            )
             print(
                 f"{self.name}: auto-loaded TCP profile "
                 f"tool={tool_name} path={self._active_tool_profile_path or '(unknown)'} "
@@ -4307,9 +4872,15 @@ class RM65ArmBackend(EffectorBackend):
                 f"tcp_endpoint_delta={metrics['translation_m']:.4f}m/{metrics['rotation_deg']:.2f}deg"
             )
         except Exception as exc:
+            self._set_pose_tool_binding_resolution(
+                evidence=None,
+                tool_name=tool_name,
+                attestable=False,
+                error="active_tool_profile_unusable",
+            )
             print(
                 f"WARNING: {self.name} no usable TCP profile for active tool "
-                f"arm={self.config.side} tool={tool_name}: {exc}. Using arm_endpoint."
+                f"arm={self._pose_source_side} tool={tool_name}: {exc}. Using arm_endpoint."
             )
 
     def _target_pose_for_solver(self, tcp_frame: str, target_pose: object) -> np.ndarray:
@@ -4335,7 +4906,9 @@ class RM65ArmBackend(EffectorBackend):
             value = command.metadata.get(key)
             if value:
                 return canonical_arm_controlled_frame(str(value))
-        return canonical_arm_controlled_frame(command.metadata.get("tcp_frame", self.config.default_tcp_frame))
+        return canonical_arm_controlled_frame(
+            command.metadata.get("tcp_frame", self._pose_source_default_tcp_frame)
+        )
 
     def _solve_cartesian_command(
         self,
@@ -5706,11 +6279,15 @@ class RM65ArmBackend(EffectorBackend):
         hardware_read_retry_delay_sec: float | None = None,
         include_derived_pose: bool = True,
         include_timing_percentiles: bool = True,
+        include_pose_source_attestation: bool | None = None,
     ) -> dict[str, object]:
         if self.arm is None:
             return self.get_state(
                 include_derived_pose=bool(include_derived_pose),
                 include_timing_percentiles=bool(include_timing_percentiles),
+                include_pose_source_attestation=(
+                    include_pose_source_attestation
+                ),
             )
         refresh_wall_started = time.perf_counter()
         refresh_cpu_started = time.thread_time()
@@ -5854,6 +6431,7 @@ class RM65ArmBackend(EffectorBackend):
         return self.get_state(
             include_derived_pose=bool(include_derived_pose),
             include_timing_percentiles=bool(include_timing_percentiles),
+            include_pose_source_attestation=include_pose_source_attestation,
         )
 
     def read_force_data(self) -> dict[str, object]:
@@ -5994,12 +6572,15 @@ class RM65ArmBackend(EffectorBackend):
         *,
         include_derived_pose: bool = True,
         include_timing_percentiles: bool = True,
+        include_pose_source_attestation: bool | None = None,
     ) -> dict[str, object]:
         """Return a backend snapshot.
 
         The compatibility default remains the complete diagnostic snapshot.
         High-rate callers may omit FK-derived poses and percentile sorting;
         neither field participates in command admission or transport safety.
+        Exact pose-source attestation is independently opt-in because its full
+        model/tool revalidation is materially more expensive than FK alone.
         """
 
         with self._state_lock:
@@ -6058,6 +6639,38 @@ class RM65ArmBackend(EffectorBackend):
                 last_target_tcp_pose = self.compute_tcp_pose(qpos=last_target_qpos)
             except Exception:
                 last_target_tcp_pose = None
+        validate_pose_source_attestation = bool(include_pose_source_attestation)
+        if validate_pose_source_attestation:
+            # A published proof must describe the exact solver/model/tool state
+            # at this boundary.  This intentionally full validation is opt-in
+            # so existing diagnostic, deploy, and high-rate paths retain their
+            # pre-attestation cost unless their composition root requests proof.
+            with self._solver_lock:
+                attestation_solver = self._solvers.get(TOOL_TCP_FRAME)
+            if attestation_solver is not None:
+                self._maybe_materialize_pose_source_attestation(
+                    controlled_frame=TOOL_TCP_FRAME,
+                    solver=attestation_solver,
+                )
+            else:
+                with self._state_lock:
+                    if self._pose_source_attestation is not None:
+                        self._pose_source_attestation = None
+                        self._pose_source_attested_solver = None
+                        self._pose_source_attested_compute_pose_token = None
+                        self._pose_source_attestation_attempted = True
+                        self._pose_source_attestation_error = (
+                            "attestation_drift_detected:solver_cache_missing"
+                        )
+        with self._state_lock:
+            cached_pose_source_attestation = self._pose_source_attestation
+            pose_source_attestation = (
+                cached_pose_source_attestation
+                if validate_pose_source_attestation
+                else None
+            )
+            pose_source_epoch_id = self._pose_source_epoch_id
+            pose_source_attestation_error = self._pose_source_attestation_error
         tcp_pose_flange = self._active_tcp_pose_flange_m_rad()
         tcp_delta = tcp_endpoint_delta(tcp_pose_flange)
         ik_metadata = dict(self._last_ik_metadata)
@@ -6100,6 +6713,9 @@ class RM65ArmBackend(EffectorBackend):
             "hardware_refresh_time": hardware_refresh_time,
             "hardware_measurement_timestamp": measured_timestamp,
             "hardware_measurement_sequence": measured_sequence,
+            "hardware_measurement_clock_domain_id": (
+                _RM65_HARDWARE_MEASUREMENT_CLOCK_DOMAIN_ID
+            ),
             "hardware_measurement_valid": bool(
                 hardware_qpos is not None and hardware_refresh_time is not None
             ),
@@ -6133,6 +6749,27 @@ class RM65ArmBackend(EffectorBackend):
             "tool_tcp_pose_flange_m_rad": np.asarray(tcp_pose_flange, dtype=float),
             "tool_tcp_endpoint_delta_m": float(tcp_delta["translation_m"]),
             "tool_tcp_endpoint_delta_deg": float(tcp_delta["rotation_deg"]),
+            "pose_source_instance_id": self._pose_source_instance_id,
+            "pose_source_epoch_id": pose_source_epoch_id,
+            HARDWARE_POSE_SOURCE_ATTESTATION_STATE_KEY: pose_source_attestation,
+            "hardware_pose_source_binding_hash": (
+                None
+                if pose_source_attestation is None
+                else pose_source_attestation.source_binding_hash
+            ),
+            "hardware_pose_source_attestation_status": (
+                "attested"
+                if pose_source_attestation is not None
+                else (
+                    "not_requested"
+                    if cached_pose_source_attestation is not None
+                    and not validate_pose_source_attestation
+                    else "unavailable"
+                )
+            ),
+            "hardware_pose_source_attestation_error": (
+                pose_source_attestation_error
+            ),
         }
 
     def set_local_qpos(self, qpos: Sequence[float] | np.ndarray | None) -> None:
@@ -6179,7 +6816,7 @@ class RM65ArmBackend(EffectorBackend):
             if qpos_array.shape != (6,) or not np.all(np.isfinite(qpos_array)):
                 raise RuntimeError(f"{self.name} does not have a current joint state yet.")
         tcp_frame = canonical_arm_controlled_frame(
-            self.config.default_tcp_frame if tcp_frame is None else tcp_frame
+            self._pose_source_default_tcp_frame if tcp_frame is None else tcp_frame
         )
         solver = self._solver_for_tcp_frame(tcp_frame)
         solver_pose = np.asarray(solver.compute_pose(qpos_array), dtype=float)
@@ -6298,6 +6935,10 @@ class RM65ArmBackend(EffectorBackend):
             )
 
     def close(self) -> None:
+        with self._lifecycle_lock:
+            self._close_under_lifecycle_lock()
+
+    def _close_under_lifecycle_lock(self) -> None:
         with self._send_lock:
             self._stream_stop_event.set()
             with self._state_lock:
@@ -6310,6 +6951,7 @@ class RM65ArmBackend(EffectorBackend):
                 self._closed = True
                 self._hardware_ready = False
                 self._hardware_ready_source = "closed"
+                self._clear_pose_source_epoch_locked(reason="closed")
                 self._stream_shutdown_requested = True
                 self._clear_stream_target_locked()
                 stream_thread = self._stream_thread
