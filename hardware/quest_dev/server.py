@@ -23,11 +23,12 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, TypeVar
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
@@ -44,6 +45,8 @@ WEB_ROOT = MODULE_ROOT / "web"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_WS_MESSAGE_BYTES = 1_000_000
 PAIRING_CODE_DIGITS = 6
+
+RuntimeT = TypeVar("RuntimeT")
 
 
 @dataclass
@@ -720,6 +723,308 @@ def load_feature_runtime(
     return factory(server, config, stop_event)
 
 
+@dataclass(frozen=True)
+class QuestDevLaunchInfo:
+    """Operator-facing connection facts for one host instance.
+
+    Pairing credentials are intentionally excluded from ``repr`` so an
+    application can pass this object around without accidentally copying them
+    into diagnostic logs.  They are not projected into the HTTP status endpoint.
+    """
+
+    base_url: str
+    pairing_url: str = field(repr=False)
+    pairing_code: str = field(repr=False)
+    use_https: bool
+
+
+class QuestDevHost:
+    """Own one Quest HTTP server and each of its enabled feature runtimes.
+
+    Feature runtimes are constructed and started exactly once.  Application
+    leaves may borrow a running runtime by explicit name and type, but the host
+    remains its sole lifecycle owner.  There is deliberately no module-global
+    runtime registry and no fallback that constructs a missing runtime.
+    """
+
+    def __init__(
+        self,
+        server: QuestDevHTTPServer,
+        features: dict[str, dict[str, Any]],
+        launch_info: QuestDevLaunchInfo,
+        *,
+        runtime_loader: Callable[
+            [str, QuestDevHTTPServer, dict[str, Any], threading.Event], Any
+        ] = load_feature_runtime,
+    ) -> None:
+        if not callable(runtime_loader):
+            raise TypeError("runtime_loader must be callable")
+        self.server = server
+        self.launch_info = launch_info
+        self.stop_event = threading.Event()
+        self._feature_configs = tuple(
+            (str(name), dict(config)) for name, config in features.items()
+        )
+        self._runtime_loader = runtime_loader
+        self._feature_runtimes: dict[str, Any] = {}
+        self._owned_runtimes: list[tuple[str, Any]] = []
+        self._lock = threading.RLock()
+        self._state = "created"
+        self._shutdown_requested = False
+        self._serve_loop_started = False
+        self._server_shutdown_started = False
+        self._server_close_attempted = False
+
+    def start(self) -> None:
+        """Start each enabled feature once without entering the HTTP loop."""
+
+        with self._lock:
+            if self._state not in {"created", "running", "serving"}:
+                raise RuntimeError(f"Quest Dev host cannot start from {self._state}")
+            if self._shutdown_requested:
+                raise RuntimeError("Quest Dev host shutdown was already requested")
+            if self._state in {"running", "serving"}:
+                return
+            self._state = "starting"
+            try:
+                for name, feature_cfg in self._feature_configs:
+                    if not bool(feature_cfg.get("enabled", False)):
+                        continue
+                    runtime = self._runtime_loader(
+                        name,
+                        self.server,
+                        feature_cfg,
+                        self.stop_event,
+                    )
+                    start_runtime = getattr(runtime, "start", None)
+                    stop_runtime = getattr(runtime, "stop", None)
+                    if not callable(start_runtime) or not callable(stop_runtime):
+                        raise TypeError(
+                            f"feature {name!r} runtime must expose start() and stop()"
+                        )
+                    # Record ownership before start: a partially-started runtime
+                    # must still be included in fail-closed cleanup.
+                    self._owned_runtimes.append((name, runtime))
+                    start_runtime()
+                    self._feature_runtimes[name] = runtime
+                    print(f"[quest-dev] feature enabled: {name}", flush=True)
+                    if self._shutdown_requested:
+                        raise RuntimeError(
+                            "Quest Dev host shutdown was requested during startup"
+                        )
+            except BaseException as start_error:
+                cleanup_errors = self._close_owned_resources_locked()
+                self._state = "fault"
+                if cleanup_errors:
+                    raise RuntimeError(
+                        "Quest Dev host startup cleanup failed: "
+                        + "; ".join(cleanup_errors)
+                    ) from start_error
+                raise
+            self._state = "running"
+
+    def require_running_feature_runtime(
+        self,
+        name: str,
+        expected_type: type[RuntimeT],
+    ) -> RuntimeT:
+        """Borrow the unique running feature runtime, failing closed otherwise."""
+
+        if not isinstance(expected_type, type):
+            raise TypeError("expected_type must be a runtime type")
+        with self._lock:
+            if self._state not in {"running", "serving"}:
+                raise RuntimeError("Quest Dev feature runtimes are not running")
+            if self._shutdown_requested:
+                raise RuntimeError("Quest Dev host shutdown is in progress")
+            try:
+                runtime = self._feature_runtimes[str(name)]
+            except KeyError:
+                raise KeyError(f"Quest Dev feature {name!r} is not enabled") from None
+            if not isinstance(runtime, expected_type):
+                raise TypeError(
+                    f"Quest Dev feature {name!r} runtime is "
+                    f"{type(runtime).__name__}, expected {expected_type.__name__}"
+                )
+            return runtime
+
+    def serve_forever(
+        self,
+        *,
+        ready_callback: Callable[[], None] | None = None,
+    ) -> None:
+        """Start features, expose the borrowing seam, then serve until stopped."""
+
+        if ready_callback is not None and not callable(ready_callback):
+            raise TypeError("ready_callback must be callable or None")
+        try:
+            # Keep the pre-start check, one-time start, and serving transition
+            # under one re-entrant host lock. A concurrent shutdown request can
+            # then observe either the pre-start state or ``serving``, never a
+            # socket-owning gap outside this method's cleanup boundary.
+            with self._lock:
+                if self._shutdown_requested:
+                    return
+                self.start()
+                if self._state != "running":
+                    raise RuntimeError("Quest Dev host is not ready to serve")
+                self._state = "serving"
+            if ready_callback is not None:
+                ready_callback()
+            with self._lock:
+                # Reserve entry before checking the flag. A Python signal can
+                # re-enter request_shutdown() at any bytecode boundary even
+                # while this thread owns the RLock. Once this flag is true,
+                # either that request or this handoff starts exactly one
+                # shutdown worker, and we still enter BaseServer so the worker
+                # cannot wait forever for a loop that never started.
+                self._serve_loop_started = True
+                start_shutdown = (
+                    self._shutdown_requested and not self._server_shutdown_started
+                )
+                if start_shutdown:
+                    self._server_shutdown_started = True
+            if start_shutdown:
+                self._start_server_shutdown_worker()
+            self.server.serve_forever()
+        finally:
+            with self._lock:
+                self._serve_loop_started = False
+                if self._state == "serving":
+                    self._state = "running"
+            self.close()
+
+    def request_shutdown(self) -> bool:
+        """Request stop without ever calling ``shutdown`` on the serving thread."""
+
+        with self._lock:
+            if self._state in {"closing", "closed", "fault"}:
+                return False
+            if self._shutdown_requested:
+                return False
+            self._shutdown_requested = True
+            self.stop_event.set()
+            start_shutdown = (
+                self._state == "serving"
+                and self._serve_loop_started
+                and not self._server_shutdown_started
+            )
+            if start_shutdown:
+                self._server_shutdown_started = True
+        if start_shutdown:
+            self._start_server_shutdown_worker()
+        return True
+
+    def _start_server_shutdown_worker(self) -> None:
+        try:
+            threading.Thread(
+                target=self.server.shutdown,
+                name="quest-dev-shutdown",
+                daemon=True,
+            ).start()
+        except BaseException:
+            with self._lock:
+                self._server_shutdown_started = False
+            raise
+
+    def close(self) -> None:
+        """Stop owned runtimes in reverse order and close the server once."""
+
+        with self._lock:
+            if self._state in {"closing", "closed", "fault"}:
+                return
+            if self._state == "serving":
+                raise RuntimeError(
+                    "cannot close Quest Dev host while serving; request shutdown first"
+                )
+            self._state = "closing"
+            errors = self._close_owned_resources_locked()
+            self._state = "closed" if not errors else "fault"
+        if errors:
+            raise RuntimeError("Quest Dev host cleanup failed: " + "; ".join(errors))
+
+    def _close_owned_resources_locked(self) -> list[str]:
+        self._shutdown_requested = True
+        self.stop_event.set()
+        errors: list[str] = []
+        for name, runtime in reversed(self._owned_runtimes):
+            try:
+                runtime.stop()
+            except Exception as exc:  # noqa: BLE001 - finish reverse cleanup.
+                errors.append(f"feature {name}: {type(exc).__name__}: {exc}")
+        self._feature_runtimes.clear()
+        if not self._server_close_attempted:
+            self._server_close_attempted = True
+            try:
+                self.server.server_close()
+            except Exception as exc:  # noqa: BLE001 - aggregate cleanup evidence.
+                errors.append(f"server: {type(exc).__name__}: {exc}")
+        return errors
+
+
+def build_quest_dev_host(
+    config_path: Path = MODULE_ROOT / "config.yaml",
+    *,
+    force_http: bool = False,
+) -> QuestDevHost:
+    """Bind one Quest server without starting features or its request loop."""
+
+    config = load_config(Path(config_path).resolve())
+    server_cfg = config.get("server", {})
+    if not isinstance(server_cfg, dict):
+        raise TypeError("server config must be a mapping")
+    port = int(server_cfg.get("port", 8444))
+    use_https = bool(server_cfg.get("https", True)) and not force_http
+    bind_host = resolve_bind_host(server_cfg, use_https=use_https)
+    lan_ip = detect_lan_ip() if use_https else "127.0.0.1"
+    pairing_code, require_same_origin = resolve_pairing_settings(server_cfg)
+
+    features = feature_configs(config)
+    client_config = build_client_config(config, features)
+    handler = partial(QuestDevHandler, directory=str(WEB_ROOT))
+    server: QuestDevHTTPServer | None = None
+    try:
+        server = QuestDevHTTPServer(
+            (bind_host, port),
+            handler,
+            client_config=client_config,
+            pairing_token=pairing_code,
+            require_same_origin=require_same_origin,
+            max_ws_clients=int(server_cfg.get("max_ws_clients", 4)),
+            auth_timeout_s=float(server_cfg.get("auth_timeout_s", 5.0)),
+            use_https=use_https,
+        )
+        if use_https:
+            cert = resolve_module_path(
+                str(server_cfg.get("cert", "assets/certs/quest_dev.crt"))
+            )
+            key = resolve_module_path(
+                str(server_cfg.get("key", "assets/certs/quest_dev.key"))
+            )
+            ensure_certificate(cert, key, lan_ip)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=cert, keyfile=key)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+    except BaseException:
+        if server is not None:
+            server.server_close()
+        raise
+
+    assert server is not None
+    bound_port = int(server.server_address[1])
+    scheme = "https" if use_https else "http"
+    display_host = lan_ip if bind_host in {"0.0.0.0", "::"} else bind_host
+    base_url = f"{scheme}://{display_host}:{bound_port}/"
+    pairing_url = f"{base_url}#pair={quote(pairing_code, safe='')}"
+    launch_info = QuestDevLaunchInfo(
+        base_url=base_url,
+        pairing_url=pairing_url,
+        pairing_code=pairing_code,
+        use_https=use_https,
+    )
+    return QuestDevHost(server, features, launch_info)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=MODULE_ROOT / "config.yaml")
@@ -731,73 +1036,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config.resolve())
-    server_cfg = config.get("server", {})
-    port = int(server_cfg.get("port", 8444))
-    use_https = bool(server_cfg.get("https", True)) and not args.http
-    host = resolve_bind_host(server_cfg, use_https=use_https)
-    lan_ip = detect_lan_ip() if use_https else "127.0.0.1"
-    pairing_token, require_same_origin = resolve_pairing_settings(server_cfg)
-
-    features = feature_configs(config)
-    client_config = build_client_config(config, features)
-    handler = partial(QuestDevHandler, directory=str(WEB_ROOT))
-    server = QuestDevHTTPServer(
-        (host, port),
-        handler,
-        client_config=client_config,
-        pairing_token=pairing_token,
-        require_same_origin=require_same_origin,
-        max_ws_clients=int(server_cfg.get("max_ws_clients", 4)),
-        auth_timeout_s=float(server_cfg.get("auth_timeout_s", 5.0)),
-        use_https=use_https,
-    )
-    if use_https:
-        cert = resolve_module_path(
-            str(server_cfg.get("cert", "assets/certs/quest_dev.crt"))
-        )
-        key = resolve_module_path(
-            str(server_cfg.get("key", "assets/certs/quest_dev.key"))
-        )
-        ensure_certificate(cert, key, lan_ip)
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile=cert, keyfile=key)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
-
-    scheme = "https" if use_https else "http"
-    display_host = lan_ip if host in {"0.0.0.0", "::"} else host
-    base_url = f"{scheme}://{display_host}:{port}/"
-    pairing_url = f"{base_url}#pair={quote(pairing_token, safe='')}"
-    print(f"[quest-dev] open on Quest: {base_url}", flush=True)
-    print(f"[quest-dev] 6-digit pairing code: {pairing_token}", flush=True)
-    print(f"[quest-dev] one-step pairing URL: {pairing_url}", flush=True)
-
-    stop_once = threading.Event()
-    runtimes: list[Any] = []
+    host = build_quest_dev_host(args.config, force_http=args.http)
+    launch = host.launch_info
+    print(f"[quest-dev] open on Quest: {launch.base_url}", flush=True)
+    print(f"[quest-dev] 6-digit pairing code: {launch.pairing_code}", flush=True)
+    print(f"[quest-dev] one-step pairing URL: {launch.pairing_url}", flush=True)
 
     def request_stop(signum: int, frame: Any) -> None:
         del signum, frame
-        if stop_once.is_set():
-            return
-        stop_once.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        host.request_shutdown()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    try:
-        for name, feature_cfg in features.items():
-            if not bool(feature_cfg.get("enabled", False)):
-                continue
-            runtime = load_feature_runtime(name, server, feature_cfg, stop_once)
-            runtimes.append(runtime)
-            runtime.start()
-            print(f"[quest-dev] feature enabled: {name}", flush=True)
-        server.serve_forever()
-    finally:
-        stop_once.set()
-        for runtime in reversed(runtimes):
-            runtime.stop()
-        server.server_close()
+    host.serve_forever()
 
 
 if __name__ == "__main__":

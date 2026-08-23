@@ -1,7 +1,8 @@
 # Quest Dev
 
-`quest_dev` 是 AgenticRobot 内独立的 Quest Browser/WebXR 开发基座。当前 R0 只建立
-安全连接、最小几何可视化、只读手柄位姿遥测和可重放标定拟合；它尚未接入
+`quest_dev` 是 AgenticRobot 内独立的 Quest Browser/WebXR 开发基座。最初 R0 建立了
+安全连接、最小几何可视化、只读手柄位姿遥测和可重放标定拟合；后续切片增加了可信的
+静态配对候选采集合同和程序化 host。它尚未接入
 `control_composition` 的 future visualization，也不会启动机械臂、产生控制目标或执行运动。
 
 ## R0 已有边界
@@ -82,6 +83,44 @@ python -m hardware.quest_dev.server --http
 
 明文 HTTP/WS 模式会无条件绑定 `127.0.0.1`，不能从 Quest 或 LAN 访问，也不能代替
 Quest WebXR 的 HTTPS secure-context 检查。
+
+## 程序化 host 与唯一 feature runtime
+
+CLI 已使用 `build_quest_dev_host()` 和 `QuestDevHost`；后续应用内接线也必须复用这条
+路径。host 是 HTTP server、
+共享 stop event 以及所有 enabled feature runtime 的唯一生命周期 owner；应用叶只能在
+host 启动后按 feature 名称和显式 expected type 借用已有 runtime，不能自行调用 feature factory，
+也不能对借用对象调用 `start()`/`stop()`：
+
+```python
+from hardware.quest_dev.features.controller_pose.runtime import (
+    ControllerPoseTelemetryRuntime,
+)
+from hardware.quest_dev.server import build_quest_dev_host
+
+host = build_quest_dev_host()
+try:
+    host.start()
+    controller_pose = host.require_running_feature_runtime(
+        "controller_pose",
+        ControllerPoseTelemetryRuntime,
+    )
+    # 将 controller_pose 显式注入具体应用；不要创建第二个 runtime。
+    host.serve_forever()
+finally:
+    host.close()
+```
+
+`serve_forever()` 也可从未启动状态直接调用，并允许用 `ready_callback` 在 feature 已启动、
+HTTP 尚未开始接收请求的边界完成依赖注入。多次查询返回同一对象；未启动、已关闭、feature
+未启用或类型不匹配都会 fail closed。host 不使用 Python 全局 registry，也不会把 runtime、
+pose 或 pairing code 投影到 `/api/status`。具体 composition root 必须只为一个配置 endpoint
+构造一个 host，并把借用引用显式传给应用叶。
+
+`build_quest_dev_host()` 会立即绑定配置的监听 socket，并在 HTTPS 模式下检查或生成开发
+证书；它不会启动 feature，也不会处理 HTTP 请求。`start()` 只启动 feature，直到
+`serve_forever()` 才进入 request loop。若配置端口为 `0`，连接信息使用操作系统实际分配
+的端口。
 
 `/api/status` 需要同一 6 位 pairing code：
 
