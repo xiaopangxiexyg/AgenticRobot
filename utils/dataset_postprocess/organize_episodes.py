@@ -4,8 +4,11 @@ The existing ``split-episodes`` and ``delete-episodes`` tools operate on one
 dataset at a time.  This module complements them with an immutable-source
 workflow that can select episodes from multiple roots, merge them into a new
 dataset, assign contiguous episode indices, and apply narrowly-scoped schema
-migrations.  Large immutable modality files are hard-linked by default; all
-metadata and parquet files that may be rewritten are newly written.
+migrations.  Artifact materialization is an explicit manifest policy.  The
+legacy default remains hard-link-or-copy for existing callers, while reviewed
+physical consolidations can require copy-on-write reflinks and independent
+inodes.  All metadata and parquet files that may be rewritten are newly
+written.
 
 The input is a JSON manifest.  See ``manifests/dexteleop_2026_07_sort.json``
 for a complete example.  A build is staged beside its destination and only
@@ -14,6 +17,8 @@ published once every selected episode has been materialised successfully.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import math
 import os
@@ -26,15 +31,57 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .io import episode_artifact_paths, read_json, read_jsonl, write_json, write_jsonl
-from .selection import parse_episode_selection
+from dataset_interface.dataset_task_binding import (
+    DatasetTaskBindingError,
+    inspect_dataset_task_binding,
+)
+from dataset_interface.progress_artifacts import (
+    ProgressArtifactReadError,
+    load_dataset_progress_profile,
+    load_dataset_task_stage_profile,
+    load_sealed_progress_episode,
+)
+from dataset_interface.progress_detail_annotation_artifacts import (
+    DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT,
+    DetailStageAnnotationArtifactReadError,
+    load_detail_stage_annotation_set,
+)
+from dataset_interface.progress_stage_annotation_artifacts import (
+    STAGE_ANNOTATION_RELATIVE_ROOT,
+    StageAnnotationArtifactReadError,
+    load_stage_annotation_set,
+)
 
+from .io import (
+    episode_artifact_paths,
+    read_json,
+    read_jsonl,
+    write_json,
+    write_jsonl,
+)
+from .selection import parse_episode_selection
 
 _EPISODE_TOKEN_RE = re.compile(r"episode_\d+")
 _CHUNK_TOKEN_RE = re.compile(r"chunk-\d+")
 _PATH_FIELD_RE = re.compile(r"(?:^|_)(?:path|paths|relative_dir)$")
 _DMTAC_SLOT_MIGRATION = "dmtac_slot1_to_slot0"
 _DMTAC_SIDES = ("left", "right")
+_ARTIFACT_POLICY_HARDLINK_OR_COPY = "hardlink_or_copy"
+_ARTIFACT_POLICY_COPY = "copy"
+_ARTIFACT_POLICY_REFLINK_REQUIRED = "reflink_required"
+_ARTIFACT_POLICIES = frozenset(
+    {
+        _ARTIFACT_POLICY_HARDLINK_OR_COPY,
+        _ARTIFACT_POLICY_COPY,
+        _ARTIFACT_POLICY_REFLINK_REQUIRED,
+    }
+)
+_PROGRESS_POLICY_OMIT = "omit"
+_PROGRESS_POLICY_PRESERVE = "preserve"
+_PROGRESS_POLICIES = frozenset(
+    {_PROGRESS_POLICY_OMIT, _PROGRESS_POLICY_PRESERVE}
+)
+_FICLONE = 0x40049409
 _VECTOR_COLUMN_SPECS: tuple[tuple[str, tuple[tuple[int, int], tuple[int, int]]], ...] = (
     ("action", ((14, 20), (20, 26))),
     ("observation.last_action", ((14, 20), (20, 26))),
@@ -68,6 +115,20 @@ class PlannedEpisode:
 
 
 @dataclass(frozen=True)
+class PlannedTaskRebinding:
+    """One explicitly reviewed legacy source-task normalization."""
+
+    source_root: str
+    source_binding_sha256: str
+    source_info_task_id: str
+    source_info_task_description: str
+    source_task_rows: tuple[dict[str, Any], ...]
+    target_task_id: str
+    target_task_description: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class DatasetBuildPlan:
     """A no-write description of one destination dataset."""
 
@@ -82,6 +143,11 @@ class DatasetBuildPlan:
     filtered_by_minimum_duration: tuple[dict[str, Any], ...]
     missing_requested_indices: tuple[dict[str, Any], ...]
     missing_artifacts: tuple[dict[str, Any], ...]
+    artifact_materialization_policy: str
+    progress_artifact_policy: str
+    progress_profile_hash: str | None
+    task_stage_profile_hash: str | None
+    task_rebindings: tuple[PlannedTaskRebinding, ...]
     episodes: tuple[PlannedEpisode, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -90,6 +156,127 @@ class DatasetBuildPlan:
 
 class DatasetOrganizationError(ValueError):
     """Raised when an immutable-source derived dataset cannot be built safely."""
+
+
+_REVIEWED_TASK_REBINDING_SCHEMA = (
+    "dexteleop.dataset_source_task_rebinding.v1"
+)
+_FRAME_TASK_COLUMN_NAMES = frozenset(
+    {"task", "task_id", "task_index", "task_description"}
+)
+
+
+def _source_task_binding_snapshot(
+    source_root: Path,
+    source_info: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Return the narrowly scoped legacy task metadata bound by a review hash."""
+
+    rows = read_jsonl(source_root / "meta" / "tasks.jsonl")
+    payload = {
+        "schema": "dexteleop.dataset_source_task_binding_snapshot.v1",
+        "info_task_id": str(source_info.get("task_id", "") or "").strip(),
+        "info_task_description": str(
+            source_info.get("task_description", "") or ""
+        ).strip(),
+        "task_rows": rows,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return payload, hashlib.sha256(encoded).hexdigest()
+
+
+def _task_rebinding_from_source(
+    *,
+    raw_source: Mapping[str, Any],
+    source_root: Path,
+    source_info: Mapping[str, Any],
+    task_id: str,
+    task_description: str,
+    binding_error: DatasetTaskBindingError | None,
+    observed_task_id: str | None,
+) -> PlannedTaskRebinding | None:
+    """Validate a manifest-pinned, metadata-only legacy task rebinding."""
+
+    raw_rebinding = raw_source.get("reviewed_task_rebinding")
+    task_matches = binding_error is None and observed_task_id == task_id
+    if task_matches:
+        if raw_rebinding is not None:
+            raise DatasetOrganizationError(
+                "reviewed_task_rebinding is unnecessary for an already canonical "
+                f"source: {source_root}."
+            )
+        return None
+    if not isinstance(raw_rebinding, Mapping):
+        if binding_error is not None:
+            raise DatasetOrganizationError(
+                f"Source has invalid task binding and no reviewed rebinding: "
+                f"{binding_error}"
+            ) from binding_error
+        raise DatasetOrganizationError(
+            "Dataset source task_id differs from the canonical merge task and no reviewed "
+            f"rebinding was supplied: source={observed_task_id!r}, "
+            f"canonical={task_id!r}, root={source_root}."
+        )
+    if str(raw_rebinding.get("schema") or "") != _REVIEWED_TASK_REBINDING_SCHEMA:
+        raise DatasetOrganizationError(
+            "reviewed_task_rebinding has an unsupported schema for "
+            f"{source_root}."
+        )
+    expected_target_id = str(raw_rebinding.get("target_task_id") or "").strip()
+    expected_target_description = str(
+        raw_rebinding.get("target_task_description") or ""
+    ).strip()
+    if (expected_target_id, expected_target_description) != (
+        task_id,
+        task_description,
+    ):
+        raise DatasetOrganizationError(
+            "reviewed_task_rebinding target differs from the dataset canonical task: "
+            f"root={source_root}."
+        )
+    reason = str(raw_rebinding.get("reason") or "").strip()
+    if not reason:
+        raise DatasetOrganizationError(
+            f"reviewed_task_rebinding requires a non-empty reason: {source_root}."
+        )
+    snapshot, observed_snapshot_sha256 = _source_task_binding_snapshot(
+        source_root,
+        source_info,
+    )
+    expected_snapshot_sha256 = str(
+        raw_rebinding.get("source_binding_sha256") or ""
+    ).strip()
+    if expected_snapshot_sha256 != observed_snapshot_sha256:
+        raise DatasetOrganizationError(
+            "reviewed_task_rebinding source snapshot changed: "
+            f"expected={expected_snapshot_sha256!r}, "
+            f"observed={observed_snapshot_sha256!r}, root={source_root}."
+        )
+    feature_names = {
+        str(name).strip().lower()
+        for name in (source_info.get("features") or {})
+    }
+    embedded = sorted(feature_names & _FRAME_TASK_COLUMN_NAMES)
+    if embedded:
+        raise DatasetOrganizationError(
+            "reviewed_task_rebinding is metadata-only but the source declares "
+            f"frame-level task columns {embedded}: {source_root}."
+        )
+    return PlannedTaskRebinding(
+        source_root=str(source_root),
+        source_binding_sha256=observed_snapshot_sha256,
+        source_info_task_id=str(snapshot["info_task_id"]),
+        source_info_task_description=str(snapshot["info_task_description"]),
+        source_task_rows=tuple(dict(row) for row in snapshot["task_rows"]),
+        target_task_id=task_id,
+        target_task_description=task_description,
+        reason=reason,
+    )
 
 
 def _require_pyarrow() -> tuple[Any, Any]:
@@ -101,6 +288,44 @@ def _require_pyarrow() -> tuple[Any, Any]:
             "organize-datasets requires pyarrow. Run it in the DexTeleop Python environment."
         ) from exc
     return pa, pq
+
+
+def _assert_rebinding_has_no_frame_task_columns(
+    source_root: Path,
+    records_by_index: Mapping[int, Mapping[str, Any]],
+) -> None:
+    """Reject metadata-only rebinding if any selected frame schema owns task state."""
+
+    _pa, pq = _require_pyarrow()
+    del _pa
+    for episode_index, record in records_by_index.items():
+        parquet_value = record.get("parquet_path")
+        if not parquet_value:
+            raise DatasetOrganizationError(
+                "Cannot verify metadata-only task rebinding because an Episode has "
+                f"no parquet_path: root={source_root}, episode={episode_index}."
+            )
+        parquet_path = source_root / _safe_relative_path(
+            source_root,
+            str(parquet_value),
+        )
+        try:
+            schema = pq.read_schema(parquet_path)
+        except Exception as exc:
+            raise DatasetOrganizationError(
+                "Cannot verify frame schema before reviewed task rebinding: "
+                f"{parquet_path}: {exc}"
+            ) from exc
+        embedded = sorted(
+            name
+            for name in schema.names
+            if str(name).strip().lower() in _FRAME_TASK_COLUMN_NAMES
+        )
+        if embedded:
+            raise DatasetOrganizationError(
+                "reviewed_task_rebinding is metadata-only but a source Parquet "
+                f"contains frame-level task columns {embedded}: {parquet_path}."
+            )
 
 
 def _read_manifest(path: str | Path) -> tuple[Path, dict[str, Any]]:
@@ -189,6 +414,202 @@ def _minimum_duration_sec(
     if not math.isfinite(value) or value < 0.0:
         raise DatasetOrganizationError("min_duration_sec must be a non-negative finite number.")
     return value
+
+
+def _artifact_materialization_policy(dataset: Mapping[str, Any]) -> str:
+    value = str(
+        dataset.get(
+            "artifact_materialization_policy",
+            _ARTIFACT_POLICY_HARDLINK_OR_COPY,
+        )
+    ).strip()
+    if value not in _ARTIFACT_POLICIES:
+        raise DatasetOrganizationError(
+            "artifact_materialization_policy must be one of "
+            f"{sorted(_ARTIFACT_POLICIES)}, got {value!r}."
+        )
+    return value
+
+
+def _progress_artifact_policy(dataset: Mapping[str, Any]) -> str:
+    value = str(
+        dataset.get("progress_artifact_policy", _PROGRESS_POLICY_OMIT)
+    ).strip()
+    if value not in _PROGRESS_POLICIES:
+        raise DatasetOrganizationError(
+            "progress_artifact_policy must be one of "
+            f"{sorted(_PROGRESS_POLICIES)}, got {value!r}."
+        )
+    return value
+
+
+def _safe_progress_episode_uuid(record: Mapping[str, Any]) -> str:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise DatasetOrganizationError(
+            "Progress-preserving merge requires Episode metadata."
+        )
+    reference = metadata.get("progress_episode")
+    if not isinstance(reference, Mapping):
+        raise DatasetOrganizationError(
+            "Progress-preserving merge requires metadata.progress_episode."
+        )
+    episode_uuid = str(reference.get("episode_uuid") or "").strip()
+    if (
+        not episode_uuid
+        or episode_uuid in {".", ".."}
+        or Path(episode_uuid).name != episode_uuid
+    ):
+        raise DatasetOrganizationError(
+            f"Invalid progress Episode UUID {episode_uuid!r}."
+        )
+    return episode_uuid
+
+
+def _progress_reference(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata = record.get("metadata")
+    reference = (
+        metadata.get("progress_episode")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    if not isinstance(reference, Mapping):
+        raise DatasetOrganizationError(
+            "Progress-preserving merge requires metadata.progress_episode."
+        )
+    return reference
+
+
+def _require_progress_reference_path(
+    *,
+    source_root: Path,
+    reference: Mapping[str, Any],
+    field: str,
+    expected: Path,
+) -> None:
+    raw = str(reference.get(field) or "").strip()
+    if not raw:
+        raise DatasetOrganizationError(
+            f"Progress Episode reference is missing {field}."
+        )
+    relative = _safe_relative_path(source_root, raw)
+    if relative != expected:
+        raise DatasetOrganizationError(
+            f"Progress Episode {field} mismatch: expected={expected} actual={relative}."
+        )
+
+
+def _validate_annotation_sets(
+    *,
+    source_root: Path,
+    episode_uuid: str,
+    episode_identity_hash: str,
+    progress_manifest_hash: str,
+) -> None:
+    roots_and_loaders = (
+        (STAGE_ANNOTATION_RELATIVE_ROOT, load_stage_annotation_set),
+        (
+            DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT,
+            load_detail_stage_annotation_set,
+        ),
+    )
+    for relative_root, loader in roots_and_loaders:
+        episode_root = source_root / relative_root / episode_uuid
+        if not episode_root.exists():
+            continue
+        if not episode_root.is_dir():
+            raise DatasetOrganizationError(
+                f"Progress annotation path is not a directory: {episode_root}."
+            )
+        for annotation_dir in sorted(episode_root.iterdir()):
+            if not annotation_dir.is_dir():
+                raise DatasetOrganizationError(
+                    "Progress annotation Episode directory contains a non-directory: "
+                    f"{annotation_dir}."
+                )
+            loaded = loader(annotation_dir)
+            binding = loaded.binding
+            if (
+                binding.episode_capture_identity_hash
+                != episode_identity_hash
+                or binding.source_progress_manifest_hash
+                != progress_manifest_hash
+            ):
+                raise DatasetOrganizationError(
+                    "Progress annotation does not bind the selected sealed Episode: "
+                    f"{annotation_dir}."
+                )
+
+
+def _validate_progress_episode(
+    *,
+    source_root: Path,
+    record: Mapping[str, Any],
+    expected_profile_hash: str,
+    expected_stage_profile_hash: str | None,
+) -> tuple[str, str]:
+    reference = _progress_reference(record)
+    episode_uuid = _safe_progress_episode_uuid(record)
+    episode_relative = Path("meta/progress/episodes") / episode_uuid
+    _require_progress_reference_path(
+        source_root=source_root,
+        reference=reference,
+        field="manifest_ref",
+        expected=episode_relative / "manifest.cjson",
+    )
+    _require_progress_reference_path(
+        source_root=source_root,
+        reference=reference,
+        field="binding_ref",
+        expected=episode_relative / "binding.cjson",
+    )
+    _require_progress_reference_path(
+        source_root=source_root,
+        reference=reference,
+        field="profile_ref",
+        expected=episode_relative / "profile.cjson",
+    )
+    try:
+        loaded = load_sealed_progress_episode(
+            source_root / episode_relative,
+            expected_episode_identity_hash=str(
+                reference.get("episode_identity_hash") or ""
+            ),
+            expected_profile_hash=expected_profile_hash,
+            expected_binding_hash=str(
+                reference.get("progress_episode_binding_hash") or ""
+            ),
+        )
+    except ProgressArtifactReadError as exc:
+        raise DatasetOrganizationError(
+            f"Invalid selected progress Episode {episode_uuid}: {exc}"
+        ) from exc
+    observed_stage_hash = (
+        None
+        if loaded.stage_profile is None
+        else loaded.stage_profile.semantic_content_hash
+    )
+    if observed_stage_hash != expected_stage_profile_hash:
+        raise DatasetOrganizationError(
+            "Selected Episode stage profile differs from the dataset merge contract: "
+            f"episode_uuid={episode_uuid} expected={expected_stage_profile_hash} "
+            f"actual={observed_stage_hash}."
+        )
+    try:
+        _validate_annotation_sets(
+            source_root=source_root,
+            episode_uuid=episode_uuid,
+            episode_identity_hash=loaded.binding.episode_capture_identity_hash,
+            progress_manifest_hash=loaded.manifest.semantic_content_hash,
+        )
+    except (
+        StageAnnotationArtifactReadError,
+        DetailStageAnnotationArtifactReadError,
+    ) as exc:
+        raise DatasetOrganizationError(
+            f"Invalid annotation set for progress Episode {episode_uuid}: {exc}"
+        ) from exc
+    return episode_uuid, loaded.binding.episode_capture_identity_hash
 
 
 def _passes_minimum_duration(record: Mapping[str, Any], minimum_duration_sec: float | None) -> bool:
@@ -411,6 +832,8 @@ def plan_dataset_build(
         task_description = str(task.get("description") or "").strip()
         if not task_id or not task_description:
             raise DatasetOrganizationError(f"Dataset {name} task requires id and description.")
+        artifact_policy = _artifact_materialization_policy(raw_dataset)
+        progress_policy = _progress_artifact_policy(raw_dataset)
         output_chunk_size = int(raw_dataset.get("chunk_size", 1000))
         if output_chunk_size <= 0:
             raise DatasetOrganizationError(f"Dataset {name} chunk_size must be positive.")
@@ -420,13 +843,95 @@ def plan_dataset_build(
         selected: list[tuple[Path, dict[str, Any], tuple[str, ...]]] = []
         minimum_duration_sec = _minimum_duration_sec(manifest, raw_dataset)
         source_fingerprint: dict[str, Any] | None = None
+        progress_profile_hash: str | None = None
+        task_stage_profile_hash: str | None = None
+        progress_identities: set[str] = set()
+        progress_episode_uuids: set[str] = set()
+        task_rebindings: list[PlannedTaskRebinding] = []
         for raw_source in raw_sources:
             if not isinstance(raw_source, Mapping):
                 raise DatasetOrganizationError(f"Dataset {name} has an invalid source entry.")
             source_root = _resolve_manifest_path(path, raw_source.get("dataset_root"), label=f"dataset_root for {name}")
             if output_root == source_root or output_root.is_relative_to(source_root):
                 raise DatasetOrganizationError(f"Output {output_root} must not be inside source {source_root}.")
+            source_info = read_json(source_root / "meta" / "info.json")
+            source_task_binding = None
+            binding_error: DatasetTaskBindingError | None = None
+            try:
+                source_task_binding = inspect_dataset_task_binding(
+                    source_root,
+                    require_complete=True,
+                )
+            except DatasetTaskBindingError as exc:
+                binding_error = exc
+            rebinding = _task_rebinding_from_source(
+                raw_source=raw_source,
+                source_root=source_root,
+                source_info=source_info,
+                task_id=task_id,
+                task_description=task_description,
+                binding_error=binding_error,
+                observed_task_id=(
+                    None
+                    if source_task_binding is None
+                    else source_task_binding.task_id
+                ),
+            )
+            if rebinding is not None:
+                task_rebindings.append(rebinding)
+            fingerprint = _source_info_fingerprint(source_info)
+            if source_fingerprint is None:
+                source_fingerprint = fingerprint
+            elif fingerprint != source_fingerprint:
+                raise DatasetOrganizationError(
+                    f"Dataset {name} has incompatible source info metadata. "
+                    "Split by schema or explicitly migrate the source first."
+                )
             records_by_index = _record_by_episode_index(source_root)
+            if rebinding is not None:
+                _assert_rebinding_has_no_frame_task_columns(
+                    source_root,
+                    records_by_index,
+                )
+            source_progress_profile = None
+            source_stage_profile = None
+            if progress_policy == _PROGRESS_POLICY_PRESERVE:
+                try:
+                    source_progress_profile = load_dataset_progress_profile(
+                        source_root,
+                        require_explicit_binding=True,
+                    )
+                    if source_progress_profile is None:
+                        raise DatasetOrganizationError(
+                            f"Dataset has no progress profile: {source_root}."
+                        )
+                    source_stage_profile = load_dataset_task_stage_profile(
+                        source_root,
+                        progress_profile=source_progress_profile,
+                    )
+                except ProgressArtifactReadError as exc:
+                    raise DatasetOrganizationError(
+                        f"Cannot preserve progress artifacts from {source_root}: {exc}"
+                    ) from exc
+                observed_progress_hash = (
+                    source_progress_profile.semantic_content_hash
+                )
+                observed_stage_hash = (
+                    None
+                    if source_stage_profile is None
+                    else source_stage_profile.semantic_content_hash
+                )
+                if progress_profile_hash is None:
+                    progress_profile_hash = observed_progress_hash
+                    task_stage_profile_hash = observed_stage_hash
+                elif (
+                    observed_progress_hash != progress_profile_hash
+                    or observed_stage_hash != task_stage_profile_hash
+                ):
+                    raise DatasetOrganizationError(
+                        "Progress-preserving merge requires identical progress and "
+                        "stage profiles across every source."
+                    )
             selected_spec, excluded = _selection_from_source(raw_source)
             transforms = _normalise_transforms(raw_source)
             if selected_spec == "all":
@@ -455,17 +960,35 @@ def plan_dataset_build(
                         }
                     )
                     continue
+                if progress_policy == _PROGRESS_POLICY_PRESERVE:
+                    if source_progress_profile is None:
+                        raise AssertionError("validated progress profile disappeared")
+                    episode_uuid, identity_hash = _validate_progress_episode(
+                        source_root=source_root,
+                        record=record,
+                        expected_profile_hash=(
+                            source_progress_profile.semantic_content_hash
+                        ),
+                        expected_stage_profile_hash=(
+                            None
+                            if source_stage_profile is None
+                            else source_stage_profile.semantic_content_hash
+                        ),
+                    )
+                    if episode_uuid in progress_episode_uuids:
+                        raise DatasetOrganizationError(
+                            "Duplicate progress Episode UUID selected across sources: "
+                            f"{episode_uuid}."
+                        )
+                    if identity_hash in progress_identities:
+                        raise DatasetOrganizationError(
+                            "Duplicate capture identity selected across sources: "
+                            f"{identity_hash}."
+                        )
+                    progress_episode_uuids.add(episode_uuid)
+                    progress_identities.add(identity_hash)
                 missing_artifacts.extend(_validate_artifacts(source_root, record))
                 selected.append((source_root, record, transforms))
-            source_info = read_json(source_root / "meta" / "info.json")
-            fingerprint = _source_info_fingerprint(source_info)
-            if source_fingerprint is None:
-                source_fingerprint = fingerprint
-            elif fingerprint != source_fingerprint:
-                raise DatasetOrganizationError(
-                    f"Dataset {name} has incompatible source info metadata. "
-                    "Split by schema or explicitly migrate the source first."
-                )
         if missing_requested:
             raise DatasetOrganizationError(
                 f"Dataset {name} requested missing episode indices: {missing_requested}"
@@ -499,18 +1022,80 @@ def plan_dataset_build(
                 filtered_by_minimum_duration=tuple(filtered_by_duration),
                 missing_requested_indices=tuple(missing_requested),
                 missing_artifacts=tuple(missing_artifacts),
+                artifact_materialization_policy=artifact_policy,
+                progress_artifact_policy=progress_policy,
+                progress_profile_hash=progress_profile_hash,
+                task_stage_profile_hash=task_stage_profile_hash,
+                task_rebindings=tuple(task_rebindings),
                 episodes=episodes,
             )
         )
     return plans
 
 
-def _hardlink_or_copy(source: Path, destination: Path) -> None:
+def _require_independent_inode(source: Path, destination: Path) -> None:
+    source_stat = source.stat()
+    destination_stat = destination.stat()
+    if (
+        source_stat.st_dev == destination_stat.st_dev
+        and source_stat.st_ino == destination_stat.st_ino
+    ):
+        raise DatasetOrganizationError(
+            f"Artifact materialization reused the source inode: {source}."
+        )
+    if destination_stat.st_nlink != 1:
+        raise DatasetOrganizationError(
+            "Independent artifact destination must have exactly one hard link: "
+            f"{destination}."
+        )
+    if source_stat.st_size != destination_stat.st_size:
+        raise DatasetOrganizationError(
+            "Artifact size changed during materialization: "
+            f"source={source} destination={destination}."
+        )
+
+
+def _reflink_required(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        os.link(source, destination)
-    except OSError:
+        with source.open("rb") as source_handle, destination.open("xb") as output:
+            fcntl.ioctl(output.fileno(), _FICLONE, source_handle.fileno())
+            output.flush()
+            os.fsync(output.fileno())
+        shutil.copystat(source, destination)
+        _require_independent_inode(source, destination)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def _materialize_file(
+    source: Path,
+    destination: Path,
+    *,
+    policy: str,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if policy == _ARTIFACT_POLICY_HARDLINK_OR_COPY:
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+        return
+    if policy == _ARTIFACT_POLICY_COPY:
         shutil.copy2(source, destination)
+        _require_independent_inode(source, destination)
+        return
+    if policy == _ARTIFACT_POLICY_REFLINK_REQUIRED:
+        try:
+            _reflink_required(source, destination)
+        except OSError as exc:
+            raise DatasetOrganizationError(
+                "Required reflink materialization failed; refusing an implicit "
+                f"full-copy fallback for {source}: {exc}"
+            ) from exc
+        return
+    raise AssertionError(f"unsupported artifact policy {policy!r}")
 
 
 def _copy_artifact(
@@ -520,6 +1105,7 @@ def _copy_artifact(
     *,
     output_episode_index: int,
     chunk_size: int,
+    artifact_policy: str,
 ) -> None:
     relative = _safe_relative_path(source_root, artifact_path)
     source = source_root / relative
@@ -533,7 +1119,7 @@ def _copy_artifact(
         destination_relative = destination_relative.parent
     destination = staging_root / destination_relative
     if source.is_file():
-        _hardlink_or_copy(source, destination)
+        _materialize_file(source, destination, policy=artifact_policy)
         return
     if not source.is_dir():
         raise DatasetOrganizationError(f"Declared artifact disappeared during build: {source}")
@@ -543,7 +1129,7 @@ def _copy_artifact(
         rel_child = file_path.relative_to(source)
         target = destination / rel_child
         if file_path.name != "manifest.json":
-            _hardlink_or_copy(file_path, target)
+            _materialize_file(file_path, target, policy=artifact_policy)
             continue
         try:
             payload = json.loads(file_path.read_text(encoding="utf-8"))
@@ -826,6 +1412,140 @@ def _copy_source_devices(source_roots: Iterable[Path], staging_root: Path) -> No
             )
 
 
+def _copy_tree_independent(source: Path, destination: Path) -> None:
+    for path in source.rglob("*"):
+        if path.is_symlink():
+            raise DatasetOrganizationError(
+                f"Refusing a symlink in immutable semantic artifacts: {path}."
+            )
+    shutil.copytree(source, destination, copy_function=shutil.copy2)
+    for source_file in source.rglob("*"):
+        if not source_file.is_file():
+            continue
+        destination_file = destination / source_file.relative_to(source)
+        _require_independent_inode(source_file, destination_file)
+
+
+def _copy_progress_episode_artifacts(
+    *,
+    source_root: Path,
+    staging_root: Path,
+    source_record: Mapping[str, Any],
+) -> None:
+    episode_uuid = _safe_progress_episode_uuid(source_record)
+    source_episode_dir = (
+        source_root / "meta" / "progress" / "episodes" / episode_uuid
+    )
+    destination_episode_dir = (
+        staging_root / "meta" / "progress" / "episodes" / episode_uuid
+    )
+    if destination_episode_dir.exists():
+        raise DatasetOrganizationError(
+            f"Duplicate progress Episode destination: {episode_uuid}."
+        )
+    _copy_tree_independent(source_episode_dir, destination_episode_dir)
+    for relative_root in (
+        STAGE_ANNOTATION_RELATIVE_ROOT,
+        DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT,
+    ):
+        source_annotation_dir = source_root / relative_root / episode_uuid
+        if not source_annotation_dir.exists():
+            continue
+        destination_annotation_dir = (
+            staging_root / relative_root / episode_uuid
+        )
+        if destination_annotation_dir.exists():
+            raise DatasetOrganizationError(
+                "Duplicate progress annotation destination: "
+                f"{destination_annotation_dir}."
+            )
+        _copy_tree_independent(
+            source_annotation_dir,
+            destination_annotation_dir,
+        )
+
+
+def _copy_shared_metadata_file(
+    *,
+    source_roots: Iterable[Path],
+    relative_path: Path,
+    staging_root: Path,
+    required: bool,
+) -> None:
+    existing: list[Path] = []
+    missing: list[Path] = []
+    for source_root in dict.fromkeys(path.resolve() for path in source_roots):
+        source = source_root / relative_path
+        if source.is_file():
+            existing.append(source)
+        else:
+            missing.append(source_root)
+    if required and missing:
+        raise DatasetOrganizationError(
+            f"Required shared metadata {relative_path} is absent from {missing}."
+        )
+    if not existing:
+        return
+    if missing:
+        raise DatasetOrganizationError(
+            f"Sources mix present and absent shared metadata {relative_path}."
+        )
+    first_bytes = existing[0].read_bytes()
+    if any(path.read_bytes() != first_bytes for path in existing[1:]):
+        raise DatasetOrganizationError(
+            f"Sources disagree on shared metadata {relative_path}."
+        )
+    destination = staging_root / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(existing[0], destination)
+    _require_independent_inode(existing[0], destination)
+
+
+def _validate_output_progress(
+    *,
+    output_root: Path,
+    output_episodes: Sequence[Mapping[str, Any]],
+    expected_profile_hash: str,
+    expected_stage_profile_hash: str | None,
+) -> None:
+    profile = load_dataset_progress_profile(
+        output_root,
+        require_explicit_binding=True,
+    )
+    if profile is None or profile.semantic_content_hash != expected_profile_hash:
+        raise DatasetOrganizationError(
+            "Published progress profile differs from the merge plan."
+        )
+    stage_profile = load_dataset_task_stage_profile(
+        output_root,
+        progress_profile=profile,
+    )
+    observed_stage_hash = (
+        None
+        if stage_profile is None
+        else stage_profile.semantic_content_hash
+    )
+    if observed_stage_hash != expected_stage_profile_hash:
+        raise DatasetOrganizationError(
+            "Published task stage profile differs from the merge plan."
+        )
+    identities: set[str] = set()
+    episode_uuids: set[str] = set()
+    for record in output_episodes:
+        episode_uuid, identity_hash = _validate_progress_episode(
+            source_root=output_root,
+            record=record,
+            expected_profile_hash=expected_profile_hash,
+            expected_stage_profile_hash=expected_stage_profile_hash,
+        )
+        if episode_uuid in episode_uuids or identity_hash in identities:
+            raise DatasetOrganizationError(
+                "Merged output contains duplicate progress identity."
+            )
+        episode_uuids.add(episode_uuid)
+        identities.add(identity_hash)
+
+
 def _readme_text(
     raw_dataset: Mapping[str, Any],
     plan: DatasetBuildPlan,
@@ -839,7 +1559,11 @@ def _readme_text(
         f"# {plan.name}",
         "",
         "这是由 `utils.dataset_postprocess.organize_episodes` 生成的派生 LeRobot v2.1-style 数据集。",
-        "原始数据集未被移动或修改；大型视频、触觉和深度二进制流以硬链接复用。",
+        "原始数据集未被移动或修改。",
+        (
+            "大型视频、触觉和深度二进制流采用 "
+            f"`{plan.artifact_materialization_policy}` 策略物化。"
+        ),
         "",
         "## 分类",
         "",
@@ -855,6 +1579,10 @@ def _readme_text(
             "## 来源与重编号",
             "",
             "输出 episode 编号连续为 `0..N-1`。原始数据集路径、原始 episode 编号及任何迁移规则记录在 `meta/provenance.jsonl`。",
+            (
+                "Episode 顺序严格保留 manifest 中的 source 顺序及各 source "
+                "内部 episode 顺序，用于复现合并前的训练输入顺序。"
+            ),
             "",
         ]
     )
@@ -923,7 +1651,12 @@ def build_datasets(
             raise AssertionError("validated dataset entry became non-mapping")
         output_root = Path(plan.output_root)
         chunk_size = int(raw_dataset.get("chunk_size", 1000))
+        artifact_policy = plan.artifact_materialization_policy
+        progress_policy = plan.progress_artifact_policy
         minimum_duration_sec = _minimum_duration_sec(manifest, raw_dataset)
+        task_rebinding_by_root = {
+            Path(item.source_root): item for item in plan.task_rebindings
+        }
         staging_root = _prepare_output(output_root, overwrite=bool(overwrite))
         try:
             source_entries: list[tuple[Path, dict[str, Any], tuple[str, ...]]] = []
@@ -953,15 +1686,44 @@ def build_datasets(
                         source_stats_by_key[(source_root, source_episode_index)] = stats_by_index[source_episode_index]
                     selected_count += 1
                 source_infos[source_root] = read_json(source_root / "meta" / "info.json")
-                source_summary.append(
-                    {
-                        "source_dataset_root": str(source_root),
-                        "episode_count": selected_count,
-                        "transforms": list(transforms),
-                    }
-                )
+                summary = {
+                    "source_dataset_root": str(source_root),
+                    "episode_count": selected_count,
+                    "transforms": list(transforms),
+                }
+                task_rebinding = task_rebinding_by_root.get(source_root)
+                if task_rebinding is not None:
+                    _snapshot, current_snapshot_sha256 = (
+                        _source_task_binding_snapshot(
+                            source_root,
+                            source_infos[source_root],
+                        )
+                    )
+                    if current_snapshot_sha256 != task_rebinding.source_binding_sha256:
+                        raise DatasetOrganizationError(
+                            "Source task metadata changed after preflight planning: "
+                            f"root={source_root}."
+                        )
+                    summary["reviewed_task_rebinding"] = asdict(task_rebinding)
+                source_summary.append(summary)
             if len(source_entries) != plan.episode_count:
                 raise DatasetOrganizationError("Build selection no longer matches its preflight plan.")
+            source_roots = tuple(entry[0] for entry in source_entries)
+            if progress_policy == _PROGRESS_POLICY_PRESERVE:
+                if plan.progress_profile_hash is None:
+                    raise AssertionError("progress-preserving plan has no profile hash")
+                _copy_shared_metadata_file(
+                    source_roots=source_roots,
+                    relative_path=Path("meta/progress/profile.cjson"),
+                    staging_root=staging_root,
+                    required=True,
+                )
+                _copy_shared_metadata_file(
+                    source_roots=source_roots,
+                    relative_path=Path("meta/progress/stages.cjson"),
+                    staging_root=staging_root,
+                    required=plan.task_stage_profile_hash is not None,
+                )
             output_episodes: list[dict[str, Any]] = []
             output_stats: list[dict[str, Any]] = []
             provenance: list[dict[str, Any]] = []
@@ -992,6 +1754,13 @@ def build_datasets(
                         artifact_path,
                         output_episode_index=output_index,
                         chunk_size=chunk_size,
+                        artifact_policy=artifact_policy,
+                    )
+                if progress_policy == _PROGRESS_POLICY_PRESERVE:
+                    _copy_progress_episode_artifacts(
+                        source_root=source_root,
+                        staging_root=staging_root,
+                        source_record=source_record,
                     )
                 output_episodes.append(rewritten_record)
                 source_index = int(source_record["episode_index"])
@@ -1019,6 +1788,15 @@ def build_datasets(
             info["task_id"] = plan.task_id
             info["task_description"] = plan.task_description
             info["source_datasets"] = source_summary
+            if any(record.get("tactile_paths") for record in output_episodes):
+                # Source-side integrity inventories bind source-relative paths
+                # and cannot be copied after re-indexing.  The merged payload
+                # stays self-contained, but detachable-artifact integrity must
+                # be rebuilt by the existing explicit offline full scan.
+                info["tactile_artifact_integrity"] = False
+                info["tactile_artifact_integrity_merge_status"] = (
+                    "legacy_unsealed_requires_offline_full_scan"
+                )
             if any(_DMTAC_SLOT_MIGRATION in entry[2] for entry in source_entries):
                 info = _update_dmtac_metadata(info)
                 info["dmtac_slot_migration"] = {
@@ -1049,6 +1827,12 @@ def build_datasets(
             )
             write_jsonl(meta_dir / "provenance.jsonl", provenance)
             write_json(meta_dir / "info.json", info)
+            _copy_shared_metadata_file(
+                source_roots=source_roots,
+                relative_path=Path("meta/modality_validity.json"),
+                staging_root=staging_root,
+                required=False,
+            )
             write_json(
                 meta_dir / "build_audit.json",
                 {
@@ -1057,7 +1841,18 @@ def build_datasets(
                     "manifest": str(manifest_file),
                     "plan": plan.to_dict(),
                     "source_summary": source_summary,
-                    "artifact_policy": "parquet/metadata rewritten; unchanged video/tactile/wrist-depth files hard-linked with copy fallback",
+                    "artifact_policy": (
+                        "parquet/metadata rewritten; unchanged "
+                        "video/tactile/wrist-depth files materialized with "
+                        f"{artifact_policy}"
+                    ),
+                    "progress_artifact_policy": progress_policy,
+                    "progress_profile_hash": plan.progress_profile_hash,
+                    "task_stage_profile_hash": plan.task_stage_profile_hash,
+                    "tactile_integrity_policy": (
+                        "source inventories omitted after path re-indexing; "
+                        "offline full scan required before detach"
+                    ),
                 },
             )
             shutil.copy2(manifest_file, meta_dir / "sort_manifest.json")
@@ -1066,6 +1861,15 @@ def build_datasets(
                 _readme_text(raw_dataset, plan, source_summary=source_summary),
                 encoding="utf-8",
             )
+            if progress_policy == _PROGRESS_POLICY_PRESERVE:
+                if plan.progress_profile_hash is None:
+                    raise AssertionError("progress-preserving plan has no profile hash")
+                _validate_output_progress(
+                    output_root=staging_root,
+                    output_episodes=output_episodes,
+                    expected_profile_hash=plan.progress_profile_hash,
+                    expected_stage_profile_hash=plan.task_stage_profile_hash,
+                )
             _published_output(staging_root, output_root)
         except BaseException:
             shutil.rmtree(staging_root, ignore_errors=True)

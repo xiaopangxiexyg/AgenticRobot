@@ -679,18 +679,27 @@ python -m utils.dataset_postprocess causal-align \
 如果同时做卡顿清理和因果对齐，建议先 `clean-stutters`，再对输出运行
 `causal-align`，避免对齐跨过已切开的长 gap。
 
-## 派生数据集组织与 mask metadata 迁移
+## 派生数据集组织、物理合并与 mask metadata 迁移
 
 `organize_episodes.py` 用 JSON manifest 从多个源 dataset 选择 episode，生成连续的
 `episode_index`，并执行受限的 schema migration。源 dataset 保持不变；构建过程先写入
-staging 目录，成功后才发布，不能把输出目录放在源 dataset 内。大文件默认使用 hardlink，
-会被重写的 metadata/Parquet 文件写入新文件。已有 manifest 示例：
+staging 目录，全部成功后才原子发布，不能把输出目录放在源 dataset 内。已有 manifest 示例：
 
 - `manifests/dexteleop_2026_07_sort.json`
 - `manifests/bimanual_cube_new_success_wrist_mask_cleanup.json`
 - `manifests/bimanual_cube_new_failure_case_wrist_mask_cleanup.json`
 
-该工具目前作为 Python API 使用，可先规划再构建：
+命令行默认只规划；`--apply` 才发布新输出，并且始终拒绝已有输出目录：
+
+```bash
+python -m utils.dataset_postprocess organize-datasets MANIFEST.json
+
+python -m utils.dataset_postprocess organize-datasets MANIFEST.json \
+  --dataset REVIEWED_OUTPUT_NAME \
+  --apply
+```
+
+也可作为 Python API 使用：
 
 ```python
 from utils.dataset_postprocess.organize_episodes import build_datasets, plan_dataset_build
@@ -698,6 +707,47 @@ from utils.dataset_postprocess.organize_episodes import build_datasets, plan_dat
 plan = plan_dataset_build("/abs/path/manifest.json", dataset_names=["example"])
 result = build_datasets("/abs/path/manifest.json", dataset_names=["example"])
 ```
+
+### 物理合并安全合同
+
+- 每个 source 必须已经具有完整且内部一致的 dataset task binding：
+  `meta/info.json.task_id/task_description` 必须与 `meta/tasks.jsonl` 的每一条记录一致。
+  source `task_id` 还必须等于 manifest 的 canonical task ID；不允许在物理合并时静默把未知
+  task 改名成目标 task。输出只写 manifest 指定的一条 canonical task identity。唯一例外是
+  manifest 的 source 显式提供 `reviewed_task_rebinding`：它必须绑定旧 task metadata 的精确
+  snapshot SHA-256、目标 task identity 和非空审计原因；只允许没有任何帧级 task 列的
+  metadata-only 旧数据。snapshot 变化、Parquet 出现 `task/task_id/task_index/task_description`
+  列或目标 task 不一致都会 fail closed。源数据仍保持不变，重绑定 receipt 写入输出 plan/audit。
+- 只有 task、数据内容形式以及 progress/stage profile 完全一致的 source 才能写进同一个
+  output。目标 `task_description` 可以作为同一 task ID 的规范展示说明统一写入输出，但不能
+  用它掩盖 source 内部不一致。Stage1-only 数据不能和完整四阶段数据合并。
+- `artifact_materialization_policy=reflink_required` 要求视频、触觉、depth 等大文件生成
+  独立 inode 的 CoW reflink；不允许 hardlink，也不在 reflink 不可用时静默退化成整文件复制。
+- 文件系统不支持 reflink 时，必须在 manifest 中显式改用 `copy`，并在 apply 前核对预计输出
+  体积和剩余空间；`copy` 同样要求独立 inode 与 `nlink=1`，只是会真实占用完整空间。
+- `progress_artifact_policy=preserve` 会逐 episode 校验 sealed progress identity、profile hash
+  和 annotation binding，然后只白名单复制正式 episode UUID。未封存或未被
+  `meta/episodes.jsonl` 引用的临时目录不会进入输出。
+- 合并只重排物理 `episode_index` 和 artifact path；原 capture identity、progress fact、
+  Attempt/Failure/annotation 语义保持不变。
+- manifest source 顺序是输出的规范顺序；同一 source 内按原 episode index 排序，从而能够
+  复现合并前 OpenPI 多 source 的样本顺序。
+- tactile 路径重编号后，source 的 detachable-artifact integrity sidecar 不再有效。输出保留
+  hot tactile payload，但明确标为需要一次离线 full scan 才能再次 detach；不能复制旧 hash
+  并冒充已校验。
+- 发布后仍须校验 episode/frame 数、progress identity、Parquet 可读性、视频完整解码和尾帧、
+  source/output inode 独立性，以及 OpenPI stage eligibility/order 等价性。验证完成前不得删除
+  或改写 source。
+
+截至 2026-08-23，0807 的两个完整四阶段分片已按上述合同物理合并到
+`/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage`。
+输出包含 331 个 episode / 113,517 帧；Parquet 逐 episode 等价、993 段视频完整解码、progress
+identity/annotation 与 source 顺序均已验证，且所有输出 payload 都是 `nlink=1` 的独立 inode。
+当前 0804–0807 OpenPI profiles 通过
+`LogicalCollections/writing_four_stage_fulltask_2026_08_04_through_08_07_v1/sources/writing4_2026_08_07`
+软链接使用该物理输出；旧 source、旧 source 链接与旧 binding 仍保留作回退。
+0806 的三个完整四阶段分片已纳入同一 manifest，但目标盘不足以容纳约 71.6 GiB 的全量独立
+复制，在释放其已备份 tactile payload 前不得 apply，也不得用 hardlink 规避空间检查。
 
 `relocate_mask_metadata.py` 用于目录迁移后重写 mask JSON/JSONL 中记录的绝对路径，
 不会修改 bitpack 等二进制文件。默认是 dry-run；确认输出后才使用 `--apply`：
