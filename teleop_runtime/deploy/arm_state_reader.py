@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +42,45 @@ HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY = "hardware_pose_coordinate_binding"
 ACTUAL_TCP_POSE_COORDINATE_BINDING_HASH_STATE_KEY = (
     "actual_tcp_pose_coordinate_binding_hash"
 )
+
+
+@dataclass(frozen=True)
+class ArmPoseStateReadResult:
+    """One already-refreshed state plus an application-owned pose binding.
+
+    The binding travels separately from the backend mapping so a concrete lower
+    backend cannot impersonate the application-owned canonical binding.  A
+    missing binding is a passive-observation failure and must carry a diagnostic
+    reason; it does not make the legacy arm state unavailable.
+    """
+
+    state: Mapping[str, Any]
+    coordinate_binding: PoseCoordinateBinding | None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, Mapping):
+            raise TypeError("state must be a mapping.")
+        if self.coordinate_binding is not None and not isinstance(
+            self.coordinate_binding,
+            PoseCoordinateBinding,
+        ):
+            raise TypeError(
+                "coordinate_binding must be a PoseCoordinateBinding or None."
+            )
+        error = self.error
+        if error is not None:
+            if not isinstance(error, str) or not error.strip():
+                raise ValueError("error must be a non-empty string when supplied.")
+            error = error.strip()
+            object.__setattr__(self, "error", error)
+        if self.coordinate_binding is None and error is None:
+            raise ValueError("A missing coordinate_binding requires an error reason.")
+        if self.coordinate_binding is not None and error is not None:
+            raise ValueError("A successful coordinate_binding cannot carry an error.")
+
+
+ArmPoseStateReader = Callable[[EffectorBackend], ArmPoseStateReadResult]
 
 
 @dataclass(frozen=True)
@@ -345,6 +384,7 @@ class ArmStateReader:
             ArmPoseObservationProjection,
         ]
         | None = None,
+        pose_state_read_by_side: Mapping[str, ArmPoseStateReader] | None = None,
         receipt_clock: ClockDomainDescriptor | None = None,
         receipt_monotonic_ns_clock: Any = time.monotonic_ns,
     ):
@@ -373,6 +413,17 @@ class ArmStateReader:
             raise TypeError(
                 "pose_projection_by_side values must be ArmPoseObservationProjection."
             )
+        self.pose_state_read_by_side = dict(pose_state_read_by_side or {})
+        unknown_state_read_sides = set(self.pose_state_read_by_side) - set(
+            self.pose_projection_by_side
+        )
+        if unknown_state_read_sides:
+            raise ValueError(
+                "pose_state_read_by_side requires matching pose projections: "
+                f"{sorted(unknown_state_read_sides)}"
+            )
+        if any(not callable(value) for value in self.pose_state_read_by_side.values()):
+            raise TypeError("pose_state_read_by_side values must be callable.")
         if self.pose_projection_by_side:
             if not isinstance(receipt_clock, ClockDomainDescriptor):
                 raise TypeError(
@@ -469,6 +520,7 @@ class ArmStateReader:
         for side, backend in self.backends.items():
             projection = self.pose_projection_by_side.get(side)
             projection_source_ready = True
+            projection_binding_ready = True
             if projection is not None:
                 try:
                     projection_source_ready = backend.is_ready() is True
@@ -512,7 +564,42 @@ class ArmStateReader:
                         )
                 self._last_refresh_at[side] = now
             try:
-                state = dict(backend.get_state())
+                pose_state_read = self.pose_state_read_by_side.get(side)
+                if pose_state_read is None:
+                    state = dict(backend.get_state())
+                else:
+                    state_read = pose_state_read(backend)
+                    if not isinstance(state_read, ArmPoseStateReadResult):
+                        raise TypeError(
+                            "pose state reader must return ArmPoseStateReadResult."
+                        )
+                    state = dict(state_read.state)
+                    state.pop(HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY, None)
+                    source_binding = state_read.coordinate_binding
+                    assert projection is not None
+                    if source_binding is None:
+                        projection_binding_ready = False
+                        self._invalidate_pose_projection(
+                            side=side,
+                            projection=projection,
+                            reason="pose_coordinate_binding_unavailable",
+                            error=RuntimeError(str(state_read.error)),
+                        )
+                    elif source_binding != projection.coordinate_binding:
+                        projection_binding_ready = False
+                        self._invalidate_pose_projection(
+                            side=side,
+                            projection=projection,
+                            reason="pose_coordinate_binding_mismatch",
+                            error=ValueError(
+                                "pose state reader returned a coordinate binding "
+                                "that differs from the configured projection"
+                            ),
+                        )
+                    else:
+                        state[HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY] = (
+                            source_binding
+                        )
             except Exception as exc:
                 if projection is not None:
                     self._invalidate_pose_projection(
@@ -619,7 +706,11 @@ class ArmStateReader:
                 ),
             )
             if projection is not None:
-                if not projection_source_ready or refresh_error is not None:
+                if (
+                    not projection_source_ready
+                    or not projection_binding_ready
+                    or refresh_error is not None
+                ):
                     continue
                 journal = self.pose_measurement_journal
                 receiver_clock = self.receipt_clock
@@ -780,6 +871,8 @@ __all__ = [
     "REAL_ARM_QPOS_MEASUREMENT_HASH_DOMAIN_V1",
     "REAL_ARM_TCP_POSE_MEASUREMENT_ID_HASH_DOMAIN_V1",
     "ArmPoseObservationProjection",
+    "ArmPoseStateReadResult",
+    "ArmPoseStateReader",
     "ArmStateReader",
     "project_arm_tcp_pose_measurement",
 ]

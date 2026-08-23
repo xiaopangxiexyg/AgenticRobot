@@ -20,6 +20,7 @@ from teleop_runtime.deploy.arm_state_reader import (
     ACTUAL_TCP_POSE_COORDINATE_BINDING_HASH_STATE_KEY,
     HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY,
     ArmPoseObservationProjection,
+    ArmPoseStateReadResult,
     ArmStateReader,
     project_arm_tcp_pose_measurement,
 )
@@ -479,6 +480,7 @@ class _Backend:
         self.ready_error: Exception | None = None
         self.refresh_error: Exception | None = None
         self.get_state_error: Exception | None = None
+        self.get_state_calls = 0
 
     def is_ready(self) -> bool:
         if self.ready_error is not None:
@@ -491,6 +493,7 @@ class _Backend:
             raise self.refresh_error
 
     def get_state(self) -> dict[str, object]:
+        self.get_state_calls += 1
         if self.get_state_error is not None:
             raise self.get_state_error
         qpos = np.asarray([self.qpos_x, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -509,6 +512,131 @@ class _Backend:
         pose = np.eye(4, dtype=float)
         pose[0, 3] = float(np.asarray(qpos, dtype=float).reshape(6)[0])
         return pose
+
+
+def test_arm_state_reader_uses_one_attested_state_read_and_rejects_spoofed_key() -> (
+    None
+):
+    projection = _projection()
+    backend = _Backend(projection)
+    backend.coordinate_binding = _projection(
+        tool_profile_hash="sha256:" + "2" * 64
+    ).coordinate_binding
+    state_read_calls = 0
+
+    def read_attested_state(candidate: object) -> ArmPoseStateReadResult:
+        nonlocal state_read_calls
+        state_read_calls += 1
+        assert candidate is backend
+        return ArmPoseStateReadResult(
+            state=backend.get_state(),
+            coordinate_binding=projection.coordinate_binding,
+        )
+
+    reader = ArmStateReader(
+        {"right": backend},
+        refresh_hz=30.0,
+        clock=lambda: 100.0,
+        pose_projection_by_side={"right": projection},
+        pose_state_read_by_side={"right": read_attested_state},
+        receipt_clock=_receiver_clock(),
+        receipt_monotonic_ns_clock=lambda: 5_000_000_000,
+    )
+
+    state = reader.snapshot(100.0)["right"]
+
+    assert backend.refresh_calls == 1
+    assert backend.get_state_calls == 1
+    assert state_read_calls == 1
+    assert state[HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY] == (
+        projection.coordinate_binding
+    )
+    assert reader.latest_pose_measurement(side="right") is not None
+
+
+def test_arm_state_reader_keeps_legacy_state_when_attested_binding_is_unavailable() -> (
+    None
+):
+    projection = _projection()
+    backend = _Backend(projection)
+
+    def read_drifted_state(candidate: object) -> ArmPoseStateReadResult:
+        assert candidate is backend
+        return ArmPoseStateReadResult(
+            state=backend.get_state(),
+            coordinate_binding=None,
+            error="source_epoch_drift",
+        )
+
+    reader = ArmStateReader(
+        {"right": backend},
+        refresh_hz=0.0,
+        clock=lambda: 100.0,
+        pose_projection_by_side={"right": projection},
+        pose_state_read_by_side={"right": read_drifted_state},
+        receipt_clock=_receiver_clock(),
+        receipt_monotonic_ns_clock=lambda: 5_000_000_000,
+    )
+
+    state = reader.snapshot(100.0)["right"]
+
+    assert state["causal_snapshot_missing"] is False
+    assert HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY not in state
+    assert reader.latest_pose_measurement(side="right") is None
+    assert (
+        "source_epoch_drift"
+        in (reader.pose_observation_status()["error_by_side"]["right"])
+    )
+
+
+def test_arm_state_reader_rejects_mismatched_separate_binding() -> None:
+    projection = _projection()
+    mismatched_projection = _projection(tool_profile_hash="sha256:" + "2" * 64)
+    backend = _Backend(projection)
+
+    def read_mismatched_state(candidate: object) -> ArmPoseStateReadResult:
+        assert candidate is backend
+        return ArmPoseStateReadResult(
+            state=backend.get_state(),
+            coordinate_binding=mismatched_projection.coordinate_binding,
+        )
+
+    reader = ArmStateReader(
+        {"right": backend},
+        refresh_hz=0.0,
+        clock=lambda: 100.0,
+        pose_projection_by_side={"right": projection},
+        pose_state_read_by_side={"right": read_mismatched_state},
+        receipt_clock=_receiver_clock(),
+        receipt_monotonic_ns_clock=lambda: 5_000_000_000,
+    )
+
+    state = reader.snapshot(100.0)["right"]
+
+    assert state["causal_snapshot_missing"] is False
+    assert HARDWARE_POSE_COORDINATE_BINDING_STATE_KEY not in state
+    assert reader.latest_pose_measurement(side="right") is None
+    assert (
+        "differs from the configured projection"
+        in reader.pose_observation_status()["error_by_side"]["right"]
+    )
+
+
+def test_arm_state_reader_rejects_state_read_without_matching_projection() -> None:
+    projection = _projection()
+    backend = _Backend(projection)
+
+    with pytest.raises(ValueError, match="matching pose projections"):
+        ArmStateReader(
+            {"right": backend},
+            refresh_hz=0.0,
+            pose_state_read_by_side={
+                "right": lambda candidate: ArmPoseStateReadResult(
+                    state=backend.get_state(),
+                    coordinate_binding=projection.coordinate_binding,
+                )
+            },
+        )
 
 
 def test_arm_state_reader_passive_pose_port_does_not_refresh_on_read() -> None:

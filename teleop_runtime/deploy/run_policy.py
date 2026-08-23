@@ -398,6 +398,11 @@ from .replay import (
 )
 from .resource_lifecycle import PolicyDeployResourceLifecycle
 from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
+from .rm65_pose_observation import (
+    RM65PoseObservationAssembly,
+    assemble_rm65_pose_observation,
+    build_policy_deploy_receiver_clock,
+)
 from .rtc_debug import (
     RTC_DEBUG_LEVEL_OFF,
     RTC_DEBUG_LEVEL_SUMMARY,
@@ -1748,6 +1753,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--arm-state-refresh-hz", type=float, default=10.0)
     parser.add_argument(
+        "--rm65-pose-observation",
+        action="store_true",
+        help=(
+            "Default-off passive RM65 hardware-qpos/FK pose journal for a "
+            "started position backend. This does not start Quest, perform "
+            "calibration, render a trajectory, or grant control authority; "
+            "--send-actions is forbidden until proof-path timing is validated."
+        ),
+    )
+    parser.add_argument(
         "--rm65-hardware-read-retries", type=_non_negative_int, default=1
     )
     parser.add_argument(
@@ -2647,6 +2662,35 @@ def validate_args(
     args.arm_control_hz = execution_config.arm_control_hz
     args.position_reference_hz = execution_config.position_reference_hz
     args.arm_follow_qpos_alpha = execution_config.arm_follow_qpos_alpha
+    if bool(args.rm65_pose_observation):
+        if not bool(args.arms_enabled):
+            raise ValueError("--rm65-pose-observation requires enabled arms.")
+        if args.arm_control_mode != RM65_ARM_CONTROL_MODE_POSITION:
+            raise ValueError(
+                "--rm65-pose-observation currently supports position mode only."
+            )
+        if bool(args.send_actions):
+            raise ValueError(
+                "--rm65-pose-observation is forbidden with --send-actions until "
+                "the full attestation cost has real deadline evidence."
+            )
+        if bool(args.allow_arm_connect_failure):
+            raise ValueError(
+                "--rm65-pose-observation requires every selected RM65 backend "
+                "to start and attest; omit --allow-arm-connect-failure."
+            )
+        arm_state_refresh_hz = float(args.arm_state_refresh_hz)
+        if not math.isfinite(arm_state_refresh_hz) or arm_state_refresh_hz <= 0.0:
+            raise ValueError(
+                "--rm65-pose-observation requires a finite "
+                "--arm-state-refresh-hz > 0."
+            )
+        for side in active_sides:
+            if not str(getattr(args, f"{side}_arm_ip", "") or "").strip():
+                raise ValueError(
+                    "--rm65-pose-observation requires "
+                    f"--{side}-arm-ip for active side {side!r}."
+                )
     tcp_pose_envelope_requested = args.tcp_pose_envelope_profile is not None
     if bool(args.tcp_pose_envelope_active) and not tcp_pose_envelope_requested:
         raise ValueError(
@@ -3143,6 +3187,32 @@ def _begin_policy_qpos_init_with_force_guard(
     return message
 
 
+def _build_arm_state_reader(
+    *,
+    args: argparse.Namespace,
+    arm_backends: Mapping[str, EffectorBackend],
+    pose_observation: RM65PoseObservationAssembly | None,
+) -> ArmStateReader:
+    """Construct the one deployment reader from an optional immutable binding."""
+
+    pose_kwargs: dict[str, Any] = {}
+    if pose_observation is not None:
+        pose_kwargs = {
+            "pose_projection_by_side": pose_observation.projection_by_side,
+            "pose_state_read_by_side": pose_observation.state_read_by_side,
+            "receipt_clock": pose_observation.receipt_clock,
+            "receipt_monotonic_ns_clock": (
+                pose_observation.receipt_monotonic_ns_clock
+            ),
+        }
+    return ArmStateReader(
+        arm_backends,
+        refresh_hz=float(args.arm_state_refresh_hz),
+        compute_tcp_pose=bool(args.arms_enabled),
+        **pose_kwargs,
+    )
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -3622,10 +3692,14 @@ def main(
         args,
         hand_action_specs,
     )
-    arm_reader = ArmStateReader(
-        arm_backends,
-        refresh_hz=float(args.arm_state_refresh_hz),
-        compute_tcp_pose=bool(args.arms_enabled),
+    arm_reader: ArmStateReader | None = (
+        None
+        if bool(args.rm65_pose_observation)
+        else _build_arm_state_reader(
+            args=args,
+            arm_backends=arm_backends,
+            pose_observation=None,
+        )
     )
     camera_sources = build_camera_sources(
         args,
@@ -4840,6 +4914,30 @@ def main(
                 warm_start_impedance_force_control_backends
             ),
         )
+        if bool(args.rm65_pose_observation):
+            receipt_monotonic_ns_clock = time.monotonic_ns
+            pose_observation = assemble_rm65_pose_observation(
+                arm_backends,
+                receipt_clock=build_policy_deploy_receiver_clock(),
+                control_domain_id="deploy-control-0",
+                bound_at=time.time(),
+                receipt_monotonic_ns_clock=receipt_monotonic_ns_clock,
+            )
+            arm_reader = _build_arm_state_reader(
+                args=args,
+                arm_backends=arm_backends,
+                pose_observation=pose_observation,
+            )
+            print(
+                "[RM65PoseObservation] READY: passive robot pose journal "
+                f"bound for sides={sorted(pose_observation.projection_by_side)} "
+                f"receipt_clock={pose_observation.receipt_clock.clock_domain_id}; "
+                "Quest subscription, calibration, and trajectory rendering remain "
+                "disconnected.",
+                flush=True,
+            )
+        if arm_reader is None:
+            raise RuntimeError("ArmStateReader was not constructed after startup.")
         print_controls(
             send_actions=send_actions,
             auto_start=bool(args.auto_start),
@@ -7015,9 +7113,16 @@ def main(
                     flush=True,
                 )
     finally:
-        cleanup_errors = resource_lifecycle.close(
-            keyboard_interrupt_stop_error=keyboard_interrupt_stop_error,
-        )
+        try:
+            if arm_reader is not None:
+                arm_reader.invalidate_pose_measurements(
+                    reason="policy_deploy_shutdown",
+                    terminal=True,
+                )
+        finally:
+            cleanup_errors = resource_lifecycle.close(
+                keyboard_interrupt_stop_error=keyboard_interrupt_stop_error,
+            )
     return 1 if cleanup_errors else 0
 
 
