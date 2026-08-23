@@ -284,7 +284,7 @@ def test_qpos_init_serializes_target_admission_for_velocity_continuity(
     assert timing["send_lock_wait_ms"] >= 20.0
 
 
-def test_openpi_policy_serializes_target_admission_for_velocity_continuity() -> None:
+def test_openpi_policy_keeps_latest_target_admission_nonblocking() -> None:
     backend, _arm = _backend(
         target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
     )
@@ -307,8 +307,7 @@ def test_openpi_policy_serializes_target_admission_for_velocity_continuity() -> 
     with backend._send_lock:
         thread = threading.Thread(target=admit_target, daemon=True)
         thread.start()
-        assert not completed.wait(0.03)
-    assert completed.wait(0.25)
+        assert completed.wait(0.25), "OpenPI reference admission waited for _send_lock"
     thread.join(timeout=0.25)
 
     assert not errors
@@ -317,11 +316,11 @@ def test_openpi_policy_serializes_target_admission_for_velocity_continuity() -> 
     assert timing["requested_mode"] == (
         RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
     )
-    assert timing["mode"] == RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
-    assert timing["fallback_reason"] == (
-        "openpi_policy_requires_serialized_velocity_continuity"
+    assert timing["mode"] == (
+        RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
     )
-    assert timing["send_lock_wait_ms"] >= 20.0
+    assert timing["fallback_reason"] is None
+    assert timing["send_lock_wait_ms"] == 0.0
 
 
 def test_synchronous_target_admission_remains_explicit_rollback() -> None:
@@ -354,7 +353,7 @@ def test_synchronous_target_admission_remains_explicit_rollback() -> None:
     assert timing["send_lock_wait_ms"] >= 20.0
 
 
-def test_inflight_sdk_completion_rebases_planner_onto_latest_target() -> None:
+def test_inflight_sdk_completion_activates_latest_target_without_velocity_reset() -> None:
     class BlockingFirstSendArm(_FakeArm):
         def __init__(self) -> None:
             super().__init__()
@@ -378,7 +377,7 @@ def test_inflight_sdk_completion_rebases_planner_onto_latest_target() -> None:
     )
     blocking_arm = BlockingFirstSendArm()
     backend.arm = blocking_arm
-    backend.send_command(_command(0.04))
+    first_receipt = backend.send_command(_command(0.04))
     backend._stream_thread = threading.Thread(
         target=backend._background_stream_loop,
         daemon=True,
@@ -387,26 +386,56 @@ def test_inflight_sdk_completion_rebases_planner_onto_latest_target() -> None:
     try:
         assert blocking_arm.first_send_entered.wait(0.25)
         admitted_started = time.perf_counter()
-        latest_receipt = backend.send_command(_command(0.08))
+        deferred_receipt = backend.send_command(_command(0.08))
         admission_ms = (time.perf_counter() - admitted_started) * 1000.0
         assert admission_ms < 20.0
+        assert deferred_receipt.metadata["target_admission_timing"][
+            "target_activation_deferred"
+        ] is True
+        latest_receipt = backend.send_command(_command(0.12))
+        assert latest_receipt.metadata["target_admission_timing"][
+            "target_activation_deferred"
+        ] is True
+        assert deferred_receipt.metadata["transport_target_sequence"] < (
+            latest_receipt.metadata["transport_target_sequence"]
+        )
+        inflight = backend.get_state()["background_streaming"]
+        assert inflight["target_sequence"] == first_receipt.metadata[
+            "transport_target_sequence"
+        ]
+        assert inflight["deferred_target_pending"] is True
+        assert inflight["deferred_target_sequence"] == latest_receipt.metadata[
+            "transport_target_sequence"
+        ]
+        assert inflight["deferred_target_replacement_count"] == 1
         blocking_arm.release_first_send.set()
 
         deadline = time.monotonic() + 0.5
         while time.monotonic() < deadline:
             stream = backend.get_state()["background_streaming"]
             if (
-                stream["inflight_target_preemption_count"] >= 1
+                stream["deferred_target_activation_count"] >= 1
                 and len(blocking_arm.sent_joint_deg) >= 2
             ):
                 break
             time.sleep(0.001)
         stream = backend.get_state()["background_streaming"]
         assert stream["fault"] is None
-        assert stream["inflight_target_preemption_count"] == 1
-        assert stream["last_inflight_target_preemption"][
+        assert stream["inflight_target_preemption_count"] == 0
+        assert stream["deferred_target_activation_count"] == 1
+        assert stream["deferred_target_replacement_count"] == 1
+        assert stream["deferred_target_pending"] is False
+        assert stream["last_deferred_target_activation"][
             "completed_target_sequence"
-        ] < stream["last_inflight_target_preemption"]["active_target_sequence"]
+        ] < stream["last_deferred_target_activation"][
+            "activated_target_sequence"
+        ]
+        assert stream["last_deferred_target_activation"][
+            "planner_velocity_preserved"
+        ] is True
+        assert stream["last_deferred_target_activation"][
+            "planner_rebased_from_zero_velocity"
+        ] is False
         assert stream["target_sequence"] == latest_receipt.metadata[
             "transport_target_sequence"
         ]
@@ -414,6 +443,36 @@ def test_inflight_sdk_completion_rebases_planner_onto_latest_target() -> None:
     finally:
         blocking_arm.release_first_send.set()
         backend.close()
+
+
+def test_inflight_quick_stop_discards_deferred_tracking_target() -> None:
+    backend, _arm = _backend(
+        target_admission_mode=RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
+    )
+    first_receipt = backend.send_command(_command(0.04))
+    with backend._state_lock:
+        backend._stream_sdk_inflight_target_sequence = first_receipt.metadata[
+            "transport_target_sequence"
+        ]
+
+    deferred_receipt = backend.send_command(_command(0.08))
+    assert deferred_receipt.metadata["target_admission_timing"][
+        "target_activation_deferred"
+    ] is True
+
+    hold_receipt = backend.send_command(
+        _command(0.20, collision_status="hold_last_safe")
+    )
+    stream = backend.get_state()["background_streaming"]
+
+    assert stream["quick_stop_active"] is True
+    assert stream["deferred_target_pending"] is False
+    assert stream["target_sequence"] == hold_receipt.metadata[
+        "transport_target_sequence"
+    ]
+    assert stream["target_sequence"] > deferred_receipt.metadata[
+        "transport_target_sequence"
+    ]
 
 
 def test_acceleration_planner_defaults_to_30ms_target_velocity_filter() -> None:
