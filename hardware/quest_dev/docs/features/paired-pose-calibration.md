@@ -85,6 +85,48 @@ column-major 数组只能通过 `controller_wire_matrix_to_transform()` 转换�
 唯一的 `stationary_evidence_id`。时间戳明确保留各自 clock domain；R0 不会假装两个时钟
 可直接相减。`synthetic_replay` 只用于离线测试，不要求静止证据。
 
+## 封存证据与诊断绑定
+
+真实采集路径的优先输入不是单独保存的裸 `PairedPoseDataset`，而是
+`PairedPoseCaptureEvidence`。它同时封存 profile、坐标与时钟 binding、每个静止窗口的
+原始 typed events、最终 journal cuts、由窗口重建的 R0 dataset，以及外层语义 hash。
+严格 parser 会重放这些证据并重新生成 dataset，且固定要求
+`candidate_only=true`、`calibration_accepted=null`。
+
+显式持久化及离线诊断调用为：
+
+```python
+from runtime_artifact_paths import RuntimeArtifactLayout
+from teleop_runtime.deploy.quest_paired_pose_evidence_store import (
+    fit_quest_paired_pose_evidence,
+    load_sealed_quest_paired_pose_evidence,
+    publish_sealed_quest_paired_pose_evidence,
+)
+
+layout = RuntimeArtifactLayout.configured()
+commit = publish_sealed_quest_paired_pose_evidence(
+    layout=layout,
+    evidence=application.request_seal(),
+)
+sealed = load_sealed_quest_paired_pose_evidence(
+    layout=layout,
+    evidence_semantic_content_hash=commit.evidence_semantic_content_hash,
+)
+report = fit_quest_paired_pose_evidence(sealed)
+```
+
+证据文件相对 `layout.root` 位于
+`evidence/quest_paired_pose_capture/<evidence-hash>.cjson`；默认 root 下即为
+`runtime_artifacts/evidence/...`，本机覆盖 root 时以 `commit.path` 为准。只有显式 publish
+才创建文件。文件名绑定完整 capture evidence hash；文件内仍保留不同域的 R0 dataset
+SHA-256，commit 另外报告 canonical 文件字节 SHA-256。诊断报告 schema 为
+`dexteleop.quest_paired_pose_diagnostic_fit.v1`，再用独立 hash domain 绑定完整 evidence
+hash、dataset hash 与原 solver fit payload。该报告只在内存返回，不是 acceptance，也不
+写 calibration profile。
+
+原有 CLI 仍可读取裸 dataset 进行算法诊断，但裸 dataset 不能证明它来自上述完整封存、
+不可变且可重放的采集证据，因此不能作为后续 acceptance 的充分输入。
+
 ## 拟合与输出
 
 ```bash
@@ -117,16 +159,17 @@ python -m hardware.quest_dev.tools.fit_paired_pose_calibration paired_poses.json
 ```
 
 R0 不定义残差阈值，不写 calibration 文件，不安装 frame graph，不启动机器人，也不让
-visualization 使用该结果。后续验收至少还需绑定数据集 hash、fit hash、tool profile、
-robot epoch、Quest session/reference generation，审查残差/可观测性和独立验证姿态；
-reference-space reset、重新安装手柄或 tool profile 改变都必须使旧结果失效。
+visualization 使用该结果。后续验收至少还需绑定完整 capture evidence hash、数据集 hash、
+fit hash、tool profile、robot epoch、Quest session/reference generation，审查残差/
+可观测性和独立验证姿态；reference-space reset、重新安装手柄或 tool profile 改变都必须
+使旧结果失效。
 
-## 尚未实现
+## 尚未实现或验证
 
-- 机器人权威只读 pose 与 Quest latest sample 的同步采集器；
-- 静止窗口检测/证据生成；
-- mount 刚性检查与独立验证姿态；
-- reviewed acceptance profile 和持久化 receipt；
-- 接入 future visualization 的只读 frame/trajectory 投影。
+- 尚无真实 Quest + RM65 多姿态采集、噪声与重装数据的验证证据；
+- mount 刚性检查、held-out/leave-one-window-out 验证和鲁棒 refinement；
+- reviewed acceptance profile、持久化 acceptance receipt 和失效生命周期；
+- accepted transform 的只读 frame 安装与 future-trajectory 投影/Quest 渲染。
 
-因此当前工具只能处理人工构造或后续采集器导出的数据集，不能作为真实标定完成证明。
+因此当前链路能封存、持久化并离线拟合完整采集证据，但仍不能作为真实标定完成、变换
+可安装或 future visualization 已就绪的证明。
