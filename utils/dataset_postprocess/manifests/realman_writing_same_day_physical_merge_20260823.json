@@ -1,0 +1,171 @@
+{
+  "schema": "dexteleop.dataset_organization_manifest.v1",
+  "datasets": [
+    {
+      "name": "writing_4_stage_2026_08_03_physical",
+      "output_root": "/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-03_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "chunk_size": 1000,
+      "artifact_materialization_policy": "copy",
+      "progress_artifact_policy": "preserve",
+      "task": {
+        "id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+        "description": "formal rm65 bimanual position v2: accepted-qref FK action, IK 1.0/0.35 min2/max4, 15/60/60/120"
+      },
+      "labels": {
+        "capture_date": "2026-08-03",
+        "scenario_class": "fixed_middle",
+        "task_scope": "full_writing_sequence",
+        "content_form": "writing_4_stage_full_task",
+        "merge_kind": "same_date_same_structure_physical"
+      },
+      "notes": [
+        "Only the two reviewed August 3 full four-stage shards are included.",
+        "The five-episode source is currently rehydrated; the 202-episode source remains bound to its independently verified retired tactile archive.",
+        "Stage1-only detail datasets are intentionally excluded.",
+        "The target filesystem rejected FICLONE; explicit full copy is required for independent inodes.",
+        "Sources remain immutable rollback inputs until the merged output is fully verified."
+      ],
+      "sources": [
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop/datasets/2026-08-03_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+          "episode_indices": "all"
+        },
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-03_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+          "episode_indices": "all",
+          "retired_tactile_inventory_hash": "75d5146eb3b9ced108ebf05f42c930ecdac98c90b81b9f4b567df5c3c4917db6",
+          "retired_tactile_artifact_root": "/mnt/nas2/zc/tactile_data/fcea47badf47184e28a49fb531c7208995a4ed44b72b57373bb747285939437a/75d5146eb3b9ced108ebf05f42c930ecdac98c90b81b9f4b567df5c3c4917db6"
+        }
+      ]
+    },
+    {
+      "name": "writing_4_stage_2026_08_06_physical",
+      "output_root": "/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "chunk_size": 1000,
+      "artifact_materialization_policy": "copy",
+      "progress_artifact_policy": "preserve",
+      "task": {
+        "id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+        "description": "formal rm65 bimanual position v2 balanced"
+      },
+      "labels": {
+        "capture_date": "2026-08-06",
+        "scenario_class": "fixed_middle",
+        "task_scope": "full_writing_sequence",
+        "content_form": "writing_4_stage_full_task",
+        "merge_kind": "same_date_same_structure_physical"
+      },
+      "notes": [
+        "Only the three reviewed August 6 full four-stage shards are included.",
+        "Stage1-only detail datasets are intentionally excluded.",
+        "The target filesystem rejected FICLONE; explicit full copy is required for independent inodes.",
+        "Sources remain immutable rollback inputs until the merged output is fully verified."
+      ],
+      "sources": [
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+          "episode_indices": "all"
+        },
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_1453",
+          "episode_indices": "all"
+        },
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_stable",
+          "episode_indices": "all"
+        }
+      ]
+    },
+    {
+      "name": "writing_stage1_fixed_middle_2026_08_10_physical",
+      "output_root": "/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-10_dmtac_rm65_bimanual_position_v2_writing_stage1_fixed_middle",
+      "chunk_size": 1000,
+      "artifact_materialization_policy": "copy",
+      "progress_artifact_policy": "preserve",
+      "task": {
+        "id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+        "description": "formal rm65 bimanual position v2 balanced"
+      },
+      "labels": {
+        "capture_date": "2026-08-10",
+        "scenario_class": "fixed_middle",
+        "task_scope": "stage1_capture",
+        "content_form": "writing_stage1_capture",
+        "merge_kind": "same_date_same_structure_physical"
+      },
+      "notes": [
+        "Only the two reviewed August 10 fixed-middle Stage1 capture shards are included.",
+        "The historical stable suffix is a capture-session label, not a different frame-level task.",
+        "The target filesystem rejected FICLONE; explicit full copy is required for independent inodes.",
+        "Sources remain immutable rollback inputs until the merged output is fully verified."
+      ],
+      "sources": [
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-10_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+          "episode_indices": "all",
+          "retired_tactile_inventory_hash": "9f538c4d8df777dbc0b07b3e48dedd603f8a4458742c2f7a650a2c929935ef93",
+          "retired_tactile_artifact_root": "/mnt/nas2/zc/tactile_data/fcea47badf47184e28a49fb531c7208995a4ed44b72b57373bb747285939437a/9f538c4d8df777dbc0b07b3e48dedd603f8a4458742c2f7a650a2c929935ef93"
+        },
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-10_dmtac_rm65_bimanual_position_v2_writing_4_stage_stable",
+          "episode_indices": "all",
+          "retired_tactile_inventory_hash": "aad235b86611c49d8f615ccdb96ee2ccdfabfee7612100d3bfe46ce70839c10b",
+          "retired_tactile_artifact_root": "/mnt/nas2/zc/tactile_data/fcea47badf47184e28a49fb531c7208995a4ed44b72b57373bb747285939437a/aad235b86611c49d8f615ccdb96ee2ccdfabfee7612100d3bfe46ce70839c10b",
+          "reviewed_task_rebinding": {
+            "schema": "dexteleop.dataset_source_task_rebinding.v1",
+            "source_binding_sha256": "f2b010084f4b2d7a00a6c0d6a990838d9064078c2356a429eccf1c7ad0ce2879",
+            "target_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+            "target_task_description": "formal rm65 bimanual position v2 balanced",
+            "reason": "The stable suffix records the August 10 capture session; schema, action layout, Progress profile, Stage profile, scenario class, and task scope match the canonical fixed-middle Stage1 source."
+          }
+        }
+      ]
+    },
+    {
+      "name": "writing_stage1_multi_choice_2026_08_10_physical",
+      "output_root": "/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-10_dmtac_rm65_bimanual_position_v2_writing_stage1_multi_choice",
+      "chunk_size": 1000,
+      "artifact_materialization_policy": "copy",
+      "progress_artifact_policy": "preserve",
+      "task": {
+        "id": "dmtac_rm65_bimanual_position_v2_writing_multi_choise_stage1",
+        "description": "dmtac_rm65_bimanual_position_v2_writing_multi_choise_stage1"
+      },
+      "labels": {
+        "capture_date": "2026-08-10",
+        "scenario_class": "initial_multi_choice",
+        "task_scope": "stage1_capture",
+        "content_form": "writing_stage1_capture",
+        "merge_kind": "same_date_same_structure_physical"
+      },
+      "notes": [
+        "Only the two reviewed August 10 initial-multi-choice Stage1 capture shards are included.",
+        "The repeated date prefix and historical task prefix are naming defects, not distinct task semantics.",
+        "One source contains a preserved operator progress advance beyond Stage1; physical merge preserves that fact and does not broaden Stage1 training selectors.",
+        "The target filesystem rejected FICLONE; explicit full copy is required for independent inodes.",
+        "Sources remain immutable rollback inputs until the merged output is fully verified."
+      ],
+      "sources": [
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-10_2026-08-10_dmtac_rm65_bimanual_position_v2_writing_multi_choise_stage1",
+          "episode_indices": "all",
+          "retired_tactile_inventory_hash": "b5157d919340abb766efca0c2cdeb401169e1b09e43ffa2f51e33746555f36e3",
+          "retired_tactile_artifact_root": "/mnt/nas2/zc/tactile_data/fcea47badf47184e28a49fb531c7208995a4ed44b72b57373bb747285939437a/b5157d919340abb766efca0c2cdeb401169e1b09e43ffa2f51e33746555f36e3",
+          "reviewed_task_rebinding": {
+            "schema": "dexteleop.dataset_source_task_rebinding.v1",
+            "source_binding_sha256": "390b1c1d3463d237a7d49abc1708d71f67f60d92dd53dc78e975e63212b1a579",
+            "target_task_id": "dmtac_rm65_bimanual_position_v2_writing_multi_choise_stage1",
+            "target_task_description": "dmtac_rm65_bimanual_position_v2_writing_multi_choise_stage1",
+            "reason": "The duplicated date prefix and date-prefixed task ID are legacy naming defects; schema, action layout, Progress profile, Stage profile, scenario class, and intended Stage1 capture scope match the canonical August 10 multi-choice source."
+          }
+        },
+        {
+          "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-10_dmtac_rm65_bimanual_position_v2_writing_multi_choise_stage1",
+          "episode_indices": "all",
+          "retired_tactile_inventory_hash": "264dc21ed0a4760c026ae8dd7fadb0ae39860df0f8132663e90bcea1f4110aeb",
+          "retired_tactile_artifact_root": "/mnt/nas2/zc/tactile_data/fcea47badf47184e28a49fb531c7208995a4ed44b72b57373bb747285939437a/264dc21ed0a4760c026ae8dd7fadb0ae39860df0f8132663e90bcea1f4110aeb"
+        }
+      ]
+    }
+  ]
+}

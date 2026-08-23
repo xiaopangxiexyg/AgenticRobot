@@ -31,13 +31,24 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from collection_runtime.modality_inventory import (
+    ModalityInventoryPublishError,
+    load_modality_inventory,
+)
+from dataset_contracts.modality_artifacts import ModalityArtifactInventoryV1
 from dataset_interface.dataset_task_binding import (
     DatasetTaskBindingError,
     inspect_dataset_task_binding,
 )
 from dataset_interface.modality_artifacts import (
+    DETACHED_VERIFIED,
     DatasetCaptureWritableError,
+    ModalityArtifactInventoryError,
+    ModalityStorageEvidenceError,
     assert_dataset_capture_writable,
+    resolve_modality_availability,
+    verified_detachment_scope,
+    verify_modality_artifact_inventory,
 )
 from dataset_interface.progress_artifacts import (
     ProgressArtifactReadError,
@@ -72,6 +83,7 @@ from .selection import parse_episode_selection
 
 _EPISODE_TOKEN_RE = re.compile(r"episode_\d+")
 _CHUNK_TOKEN_RE = re.compile(r"chunk-\d+")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PATH_FIELD_RE = re.compile(r"(?:^|_)(?:path|paths|relative_dir)$")
 _DMTAC_SLOT_MIGRATION = "dmtac_slot1_to_slot0"
 _DMTAC_SIDES = ("left", "right")
@@ -152,6 +164,48 @@ class PlannedExternalTactileSource:
 
 
 @dataclass(frozen=True)
+class PlannedRetiredTactileSource:
+    """One hash-pinned legacy tactile archive used as an immutable source."""
+
+    source_root: str
+    artifact_root: str
+    inventory_hash: str
+    detachment_scope: str
+    artifact_count: int
+    payload_count: int
+    total_bytes: int
+    payload_bytes: int
+    payload_hashes_verified: bool
+
+
+@dataclass(frozen=True)
+class _AttachedRetiredTactileSource:
+    """Verified physical storage for a legacy detached tactile graph."""
+
+    source_root: Path
+    artifact_root: Path
+    inventory: ModalityArtifactInventoryV1
+    detachment_scope: str
+
+    @property
+    def logical_paths(self) -> frozenset[str]:
+        return frozenset(item.logical_path for item in self.inventory.artifacts)
+
+    def resolve(self, logical_path: str) -> Path:
+        if str(logical_path) not in self.logical_paths:
+            raise DatasetOrganizationError(
+                "Retired tactile archive does not own logical artifact "
+                f"{logical_path!r}: {self.source_root}."
+            )
+        path = self.artifact_root / str(logical_path)
+        if path.is_symlink() or not path.is_file():
+            raise DatasetOrganizationError(
+                f"Retired tactile artifact is unsafe or absent: {path}."
+            )
+        return path
+
+
+@dataclass(frozen=True)
 class DatasetBuildPlan:
     """A no-write description of one destination dataset."""
 
@@ -172,6 +226,7 @@ class DatasetBuildPlan:
     task_stage_profile_hash: str | None
     task_rebindings: tuple[PlannedTaskRebinding, ...]
     external_tactile_sources: tuple[PlannedExternalTactileSource, ...]
+    retired_tactile_sources: tuple[PlannedRetiredTactileSource, ...]
     episodes: tuple[PlannedEpisode, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -524,6 +579,168 @@ def _planned_external_tactile_source(
     )
 
 
+def _attach_manifest_retired_tactile_source(
+    *,
+    manifest_path: Path,
+    raw_source: Mapping[str, Any],
+    source_root: Path,
+) -> _AttachedRetiredTactileSource | None:
+    """Verify an explicitly pinned legacy detached tactile archive.
+
+    This compatibility path is deliberately separate from native tactile
+    bundles.  Both the immutable inventory hash and its exact physical archive
+    root are mandatory; discovery by directory name or storage ID is never
+    accepted.
+    """
+
+    raw_artifact_root = raw_source.get("retired_tactile_artifact_root")
+    raw_inventory_hash = str(
+        raw_source.get("retired_tactile_inventory_hash") or ""
+    ).strip()
+    if raw_artifact_root is None and not raw_inventory_hash:
+        return None
+    if raw_artifact_root is None or not str(raw_artifact_root).strip():
+        raise DatasetOrganizationError(
+            "retired_tactile_inventory_hash requires an explicit "
+            f"retired_tactile_artifact_root: {source_root}."
+        )
+    if not raw_inventory_hash:
+        raise DatasetOrganizationError(
+            "retired_tactile_artifact_root requires an explicit "
+            f"retired_tactile_inventory_hash: {source_root}."
+        )
+    if not _SHA256_RE.fullmatch(raw_inventory_hash):
+        raise DatasetOrganizationError(
+            "retired_tactile_inventory_hash must be a lowercase SHA-256: "
+            f"{source_root}."
+        )
+    if raw_source.get("tactile_storage_root") is not None:
+        raise DatasetOrganizationError(
+            "A source cannot bind both native tactile_storage_root and legacy "
+            f"retired_tactile_artifact_root: {source_root}."
+        )
+    if (source_root / "meta/tactile_bundle_v1/dataset_identity.cjson").is_file():
+        raise DatasetOrganizationError(
+            "Native tactile bundle sources must use tactile_storage_root, not "
+            f"retired_tactile_artifact_root: {source_root}."
+        )
+    configured_artifact_root = Path(str(raw_artifact_root).strip()).expanduser()
+    if not configured_artifact_root.is_absolute():
+        configured_artifact_root = manifest_path.parent / configured_artifact_root
+    if configured_artifact_root.is_symlink():
+        raise DatasetOrganizationError(
+            "Retired tactile artifact root must not be a symlink: "
+            f"{configured_artifact_root}."
+        )
+    artifact_root = configured_artifact_root.resolve()
+    if not artifact_root.is_dir():
+        raise DatasetOrganizationError(
+            f"Retired tactile artifact root is not a directory: {artifact_root}."
+        )
+    if (
+        artifact_root == source_root
+        or artifact_root.is_relative_to(source_root)
+        or source_root.is_relative_to(artifact_root)
+    ):
+        raise DatasetOrganizationError(
+            "Retired tactile artifact root must be disjoint from its source "
+            f"dataset: source={source_root}, artifact_root={artifact_root}."
+        )
+    try:
+        inventory = load_modality_inventory(source_root, raw_inventory_hash)
+    except ModalityInventoryPublishError as exc:
+        raise DatasetOrganizationError(
+            f"Cannot load retired tactile inventory for {source_root}: {exc}"
+        ) from exc
+    try:
+        scope = verified_detachment_scope(source_root, raw_inventory_hash)
+    except ModalityStorageEvidenceError as exc:
+        raise DatasetOrganizationError(
+            f"Cannot verify tactile retirement evidence for {source_root}: {exc}"
+        ) from exc
+    if scope is None:
+        raise DatasetOrganizationError(
+            "Retired tactile source has no current independently verified "
+            f"retirement receipt: {source_root}."
+        )
+    hot_status = resolve_modality_availability(
+        source_root,
+        inventory,
+        detachment_scope=scope,
+    )
+    if hot_status.status != DETACHED_VERIFIED:
+        raise DatasetOrganizationError(
+            "Retired tactile source is not in the expected detached state: "
+            f"root={source_root}, status={hot_status.status}, "
+            f"reason={hot_status.reason}."
+        )
+    try:
+        archive_inventory = ModalityArtifactInventoryV1.from_dict(
+            read_json(artifact_root / "inventory.json")
+        )
+    except Exception as exc:
+        raise DatasetOrganizationError(
+            f"Cannot read retired tactile archive inventory {artifact_root}: {exc}"
+        ) from exc
+    if archive_inventory != inventory:
+        raise DatasetOrganizationError(
+            "Retired tactile archive inventory differs from the source-pinned "
+            f"inventory: {artifact_root}."
+        )
+    tactile_root = artifact_root / "tactile"
+    entries = tuple(tactile_root.rglob("*")) if tactile_root.is_dir() else ()
+    if any(path.is_symlink() for path in entries):
+        raise DatasetOrganizationError(
+            f"Retired tactile archive contains symlinks: {artifact_root}."
+        )
+    observed = {
+        path.relative_to(artifact_root).as_posix()
+        for path in entries
+        if path.is_file()
+    }
+    expected = {item.logical_path for item in inventory.artifacts}
+    if observed != expected:
+        raise DatasetOrganizationError(
+            "Retired tactile archive tree differs from its frozen inventory: "
+            f"missing={sorted(expected - observed)[:5]}, "
+            f"extra={sorted(observed - expected)[:5]}, root={artifact_root}."
+        )
+    try:
+        verify_modality_artifact_inventory(
+            source_root,
+            inventory,
+            artifact_root=artifact_root,
+        )
+    except ModalityArtifactInventoryError as exc:
+        raise DatasetOrganizationError(
+            f"Retired tactile archive verification failed for {source_root}: {exc}"
+        ) from exc
+    return _AttachedRetiredTactileSource(
+        source_root=source_root,
+        artifact_root=artifact_root,
+        inventory=inventory,
+        detachment_scope=scope,
+    )
+
+
+def _planned_retired_tactile_source(
+    attached: _AttachedRetiredTactileSource,
+) -> PlannedRetiredTactileSource:
+    inventory = attached.inventory
+    payloads = tuple(item for item in inventory.artifacts if item.role == "payload")
+    return PlannedRetiredTactileSource(
+        source_root=str(attached.source_root),
+        artifact_root=str(attached.artifact_root),
+        inventory_hash=inventory.semantic_content_hash,
+        detachment_scope=attached.detachment_scope,
+        artifact_count=inventory.file_count,
+        payload_count=len(payloads),
+        total_bytes=inventory.total_bytes,
+        payload_bytes=sum(item.size_bytes for item in payloads),
+        payload_hashes_verified=True,
+    )
+
+
 def _progress_artifact_policy(dataset: Mapping[str, Any]) -> str:
     value = str(
         dataset.get("progress_artifact_policy", _PROGRESS_POLICY_OMIT)
@@ -870,6 +1087,7 @@ def _validate_artifacts(
     record: Mapping[str, Any],
     *,
     tactile_bundle: AttachedTactileBundle | None = None,
+    retired_tactile_source: _AttachedRetiredTactileSource | None = None,
 ) -> list[dict[str, Any]]:
     missing: list[dict[str, Any]] = []
     for artifact_path in episode_artifact_paths(record):
@@ -878,6 +1096,7 @@ def _validate_artifacts(
             source_root=source_root,
             relative_path=relative,
             tactile_bundle=tactile_bundle,
+            retired_tactile_source=retired_tactile_source,
         )
         target = physical_root / relative
         if relative.name == "manifest.json":
@@ -898,15 +1117,25 @@ def _artifact_physical_source_root(
     source_root: Path,
     relative_path: Path,
     tactile_bundle: AttachedTactileBundle | None,
+    retired_tactile_source: _AttachedRetiredTactileSource | None = None,
 ) -> Path:
     """Return the immutable physical root for one logical source artifact."""
 
-    if relative_path.parts[0] != "tactile" or tactile_bundle is None:
+    if relative_path.parts[0] != "tactile":
         return source_root
-    # Resolve the exact logical artifact first so a directory that merely
-    # resembles the expected layout cannot bypass bundle ownership checks.
-    tactile_bundle.resolve(relative_path.as_posix())
-    return tactile_bundle.bundle_dataset_root
+    if tactile_bundle is not None and retired_tactile_source is not None:
+        raise DatasetOrganizationError(
+            f"Source has two tactile physical owners: {source_root}."
+        )
+    if tactile_bundle is not None:
+        # Resolve the exact logical artifact first so a directory that merely
+        # resembles the expected layout cannot bypass bundle ownership checks.
+        tactile_bundle.resolve(relative_path.as_posix())
+        return tactile_bundle.bundle_dataset_root
+    if retired_tactile_source is not None:
+        retired_tactile_source.resolve(relative_path.as_posix())
+        return retired_tactile_source.artifact_root
+    return source_root
 
 
 def _strip_native_tactile_bundle_binding(
@@ -980,6 +1209,7 @@ def plan_dataset_build(
         progress_episode_uuids: set[str] = set()
         task_rebindings: list[PlannedTaskRebinding] = []
         external_tactile_sources: list[PlannedExternalTactileSource] = []
+        retired_tactile_sources: list[PlannedRetiredTactileSource] = []
         for raw_source in raw_sources:
             if not isinstance(raw_source, Mapping):
                 raise DatasetOrganizationError(f"Dataset {name} has an invalid source entry.")
@@ -992,6 +1222,15 @@ def plan_dataset_build(
             if tactile_bundle is not None:
                 external_tactile_sources.append(
                     _planned_external_tactile_source(tactile_bundle)
+                )
+            retired_tactile_source = _attach_manifest_retired_tactile_source(
+                manifest_path=path,
+                raw_source=raw_source,
+                source_root=source_root,
+            )
+            if retired_tactile_source is not None:
+                retired_tactile_sources.append(
+                    _planned_retired_tactile_source(retired_tactile_source)
                 )
             if output_root == source_root or output_root.is_relative_to(source_root):
                 raise DatasetOrganizationError(f"Output {output_root} must not be inside source {source_root}.")
@@ -1133,6 +1372,7 @@ def plan_dataset_build(
                         source_root,
                         record,
                         tactile_bundle=tactile_bundle,
+                        retired_tactile_source=retired_tactile_source,
                     )
                 )
                 selected.append((source_root, record, transforms))
@@ -1175,6 +1415,7 @@ def plan_dataset_build(
                 task_stage_profile_hash=task_stage_profile_hash,
                 task_rebindings=tuple(task_rebindings),
                 external_tactile_sources=tuple(external_tactile_sources),
+                retired_tactile_sources=tuple(retired_tactile_sources),
                 episodes=episodes,
             )
         )
@@ -1862,6 +2103,9 @@ def build_datasets(
             source_stats_by_key: dict[tuple[Path, int], dict[str, Any]] = {}
             source_infos: dict[Path, dict[str, Any]] = {}
             source_tactile_bundles: dict[Path, AttachedTactileBundle] = {}
+            source_retired_tactile: dict[
+                Path, _AttachedRetiredTactileSource
+            ] = {}
             source_summary: list[dict[str, Any]] = []
             for raw_source in raw_dataset["sources"]:
                 source_root = _resolve_manifest_path(manifest_file, raw_source.get("dataset_root"), label="dataset_root")
@@ -1882,6 +2126,27 @@ def build_datasets(
                             f"roots: {source_root}."
                         )
                     source_tactile_bundles[source_root] = tactile_bundle
+                retired_tactile_source = _attach_manifest_retired_tactile_source(
+                    manifest_path=manifest_file,
+                    raw_source=raw_source,
+                    source_root=source_root,
+                )
+                if retired_tactile_source is not None:
+                    previous_retired = source_retired_tactile.get(source_root)
+                    if (
+                        previous_retired is not None
+                        and (
+                            previous_retired.artifact_root
+                            != retired_tactile_source.artifact_root
+                            or previous_retired.inventory.semantic_content_hash
+                            != retired_tactile_source.inventory.semantic_content_hash
+                        )
+                    ):
+                        raise DatasetOrganizationError(
+                            "One source root was bound to multiple retired tactile "
+                            f"archives: {source_root}."
+                        )
+                    source_retired_tactile[source_root] = retired_tactile_source
                 records_by_index = _record_by_episode_index(source_root)
                 stats_by_index = {
                     int(record["episode_index"]): record
@@ -1926,6 +2191,12 @@ def build_datasets(
                     summary["external_tactile_source"] = asdict(
                         _planned_external_tactile_source(tactile_bundle)
                     )
+                if retired_tactile_source is not None:
+                    summary["retired_tactile_source"] = asdict(
+                        _planned_retired_tactile_source(
+                            retired_tactile_source
+                        )
+                    )
                 source_summary.append(summary)
             if len(source_entries) != plan.episode_count:
                 raise DatasetOrganizationError("Build selection no longer matches its preflight plan.")
@@ -1957,6 +2228,7 @@ def build_datasets(
                     transforms=transforms,
                 )
                 tactile_bundle = source_tactile_bundles.get(source_root)
+                retired_tactile_source = source_retired_tactile.get(source_root)
                 if tactile_bundle is not None:
                     rewritten_record = _strip_native_tactile_bundle_binding(
                         rewritten_record
@@ -1982,6 +2254,7 @@ def build_datasets(
                         source_root=source_root,
                         relative_path=relative_artifact,
                         tactile_bundle=tactile_bundle,
+                        retired_tactile_source=retired_tactile_source,
                     )
                     _copy_artifact(
                         physical_source_root,
@@ -2097,6 +2370,9 @@ def build_datasets(
                     "external_tactile_sources": [
                         asdict(item) for item in plan.external_tactile_sources
                     ],
+                    "retired_tactile_sources": [
+                        asdict(item) for item in plan.retired_tactile_sources
+                    ],
                 },
             )
             shutil.copy2(manifest_file, meta_dir / "sort_manifest.json")
@@ -2132,8 +2408,9 @@ def build_datasets(
 __all__ = [
     "DatasetBuildPlan",
     "DatasetOrganizationError",
-    "PlannedExternalTactileSource",
     "PlannedEpisode",
+    "PlannedExternalTactileSource",
+    "PlannedRetiredTactileSource",
     "build_datasets",
     "plan_dataset_build",
 ]

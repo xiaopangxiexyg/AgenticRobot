@@ -741,6 +741,14 @@ result = build_datasets("/abs/path/manifest.json", dataset_names=["example"])
   `artifact_materialization_policy` 物化进 staging，manifest 内部路径随 episode 一起重编号，随后
   输出成为自包含的兼容 external-tactile 数据集；`meta/info.json` 明确标记需要离线 full scan 后
   才能再次拆分。source core 与 source tactile bundle 始终只读且保持原绑定，可直接回退。
+- 对采用旧式 inventory/receipt 迁出布局、只在热目录保留 tactile manifest 的 source，不允许
+  依赖 storage ID 或目录名猜测 NAS 数据。manifest 必须同时显式指定
+  `retired_tactile_inventory_hash` 与指向该 inventory 精确目录的
+  `retired_tactile_artifact_root`。预检要求当前 independently-verified retirement receipt、源绑定、
+  archive `inventory.json`、精确 artifact 集合、所有尺寸与 SHA-256 全部一致，并拒绝 symlink、部分
+  hot 状态、额外文件、过期 inventory 或 native/legacy 双重绑定。验证通过后才可从 archive 直接
+  物化到 staging；源 core 和 NAS archive 始终只读。该入口默认关闭且仅对 manifest 中逐 source
+  显式钉死的旧数据生效。
 - 合并只重排物理 `episode_index` 和 artifact path；原 capture identity、progress fact、
   Attempt/Failure/annotation 语义保持不变。
 - manifest source 顺序是输出的规范顺序；同一 source 内按原 episode index 排序，从而能够

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import utils.dataset_postprocess.organize_episodes as organizer_module
+from collection_runtime import modality_storage
 from collection_runtime.progress import (
     CompleteEpisodeProgressRequest,
     ProgressController,
@@ -267,6 +268,79 @@ def _add_native_external_tactile(root: Path, storage: Path) -> None:
     info["tactile_artifact_integrity"] = True
     info["tactile_bundle"] = store.dataset_binding_payload
     info_path.write_text(json.dumps(info), encoding="utf-8")
+
+
+def _add_legacy_detached_tactile(
+    root: Path,
+    cold: Path,
+) -> tuple[str, str, bytes]:
+    relative_dir = (
+        "tactile/observation.hand.left.tactile/chunk-000/episode_000005"
+    )
+    payload_relative = f"{relative_dir}/M_RAW.uint8.bin"
+    manifest_relative = f"{relative_dir}/manifest.json"
+    payload = bytes(range(8))
+    payload_path = root / payload_relative
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path.write_bytes(payload)
+    manifest = {
+        "format": "binary_stream_v1",
+        "side": "left",
+        "relative_dir": relative_dir,
+        "frame_count": 2,
+        "sensor_keys": ["M_RAW"],
+        "streams": {
+            "M_RAW": {
+                "path": payload_relative,
+                "dtype": "uint8",
+                "shape": [4],
+                "frame_count": 2,
+                "encoding": "raw_c_order",
+                "compression": "none",
+            }
+        },
+        "frames": [
+            {
+                "sample_frame_index": index,
+                "tactile_frame_index": index,
+                "timestamp": float(index + 1),
+            }
+            for index in range(2)
+        ],
+    }
+    (root / manifest_relative).write_text(
+        json.dumps(manifest, sort_keys=True),
+        encoding="utf-8",
+    )
+    catalog = root / "meta/episodes.jsonl"
+    record = json.loads(catalog.read_text(encoding="utf-8"))
+    record["tactile_paths"] = {"left": manifest_relative}
+    catalog.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["tactile_storage"] = "external"
+    info["tactile_artifact_integrity"] = True
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    cold.mkdir()
+    plan = modality_storage.plan_modality_detach(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+    )
+    assert plan.ready, plan.errors
+    result = modality_storage.detach_modality(
+        root,
+        cold,
+        expected_plan_hash=plan.plan_hash,
+        confirm_dataset_fingerprint=plan.dataset_fingerprint,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        confirm_no_active_readers=True,
+    )
+    assert not payload_path.exists()
+    return result.cold_artifact_root, result.inventory_hash, payload
 
 
 def _add_progress(root: Path, *, episode_uuid: str) -> str:
@@ -861,6 +935,224 @@ def test_native_external_tactile_is_materialized_as_self_contained_output(
     assert output_payload.read_bytes() == source_payload.read_bytes()
     assert output_payload.stat().st_ino != source_payload.stat().st_ino
     assert_dataset_capture_writable(output)
+
+
+@pytest.mark.optional
+def test_legacy_retired_tactile_is_hash_pinned_and_materialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        modality_storage,
+        "_active_collection_processes",
+        lambda: (),
+    )
+    source = tmp_path / "source"
+    cold = tmp_path / "cold"
+    output = tmp_path / "merged"
+    _make_source(source)
+    artifact_root, inventory_hash, expected_payload = (
+        _add_legacy_detached_tactile(source, cold)
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "name": "merged",
+                        "output_root": "merged",
+                        "task": {"id": "cube", "description": "cube"},
+                        "artifact_materialization_policy": "copy",
+                        "sources": [
+                            {
+                                "dataset_root": "source",
+                                "episode_indices": [5],
+                                "retired_tactile_artifact_root": artifact_root,
+                                "retired_tactile_inventory_hash": inventory_hash,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = plan_dataset_build(manifest_path)[0]
+    assert len(plan.retired_tactile_sources) == 1
+    retired = plan.retired_tactile_sources[0]
+    assert retired.inventory_hash == inventory_hash
+    assert retired.payload_count == 1
+    assert retired.payload_hashes_verified is True
+    build_datasets(manifest_path)
+
+    record = json.loads(
+        (output / "meta/episodes.jsonl").read_text(encoding="utf-8")
+    )
+    output_manifest = output / record["tactile_paths"]["left"]
+    output_manifest_payload = json.loads(output_manifest.read_text())
+    output_payload = output / output_manifest_payload["streams"]["M_RAW"]["path"]
+    archived_payload = (
+        Path(artifact_root)
+        / "tactile/observation.hand.left.tactile/chunk-000/episode_000005/M_RAW.uint8.bin"
+    )
+    assert output_payload.read_bytes() == expected_payload
+    assert output_payload.stat().st_ino != archived_payload.stat().st_ino
+    audit = json.loads((output / "meta/build_audit.json").read_text())
+    assert audit["retired_tactile_sources"] == [
+        {
+            "artifact_count": retired.artifact_count,
+            "artifact_root": retired.artifact_root,
+            "detachment_scope": retired.detachment_scope,
+            "inventory_hash": retired.inventory_hash,
+            "payload_bytes": retired.payload_bytes,
+            "payload_count": retired.payload_count,
+            "payload_hashes_verified": True,
+            "source_root": retired.source_root,
+            "total_bytes": retired.total_bytes,
+        }
+    ]
+    assert_dataset_capture_writable(output)
+
+
+@pytest.mark.optional
+def test_legacy_retired_tactile_requires_both_hash_and_artifact_root(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _make_source(source)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "name": "merged",
+                        "output_root": "merged",
+                        "task": {"id": "cube", "description": "cube"},
+                        "sources": [
+                            {
+                                "dataset_root": "source",
+                                "episode_indices": [5],
+                                "retired_tactile_inventory_hash": "0" * 64,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        DatasetOrganizationError,
+        match="requires an explicit retired_tactile_artifact_root",
+    ):
+        plan_dataset_build(manifest_path)
+
+
+@pytest.mark.optional
+def test_legacy_retired_tactile_rejects_corrupt_archive_without_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        modality_storage,
+        "_active_collection_processes",
+        lambda: (),
+    )
+    source = tmp_path / "source"
+    cold = tmp_path / "cold"
+    output = tmp_path / "merged"
+    _make_source(source)
+    artifact_root, inventory_hash, _expected_payload = (
+        _add_legacy_detached_tactile(source, cold)
+    )
+    archived_payload = (
+        Path(artifact_root)
+        / "tactile/observation.hand.left.tactile/chunk-000/episode_000005/M_RAW.uint8.bin"
+    )
+    archived_payload.write_bytes(b"corrupt")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "name": "merged",
+                        "output_root": "merged",
+                        "task": {"id": "cube", "description": "cube"},
+                        "sources": [
+                            {
+                                "dataset_root": "source",
+                                "episode_indices": [5],
+                                "retired_tactile_artifact_root": artifact_root,
+                                "retired_tactile_inventory_hash": inventory_hash,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        DatasetOrganizationError,
+        match="Retired tactile archive verification failed",
+    ):
+        build_datasets(manifest_path)
+    assert not output.exists()
+
+
+@pytest.mark.optional
+def test_legacy_retired_tactile_rejects_symlink_archive_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        modality_storage,
+        "_active_collection_processes",
+        lambda: (),
+    )
+    source = tmp_path / "source"
+    cold = tmp_path / "cold"
+    archive_link = tmp_path / "archive-link"
+    _make_source(source)
+    artifact_root, inventory_hash, _expected_payload = (
+        _add_legacy_detached_tactile(source, cold)
+    )
+    archive_link.symlink_to(artifact_root, target_is_directory=True)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "name": "merged",
+                        "output_root": "merged",
+                        "task": {"id": "cube", "description": "cube"},
+                        "sources": [
+                            {
+                                "dataset_root": "source",
+                                "episode_indices": [5],
+                                "retired_tactile_artifact_root": str(archive_link),
+                                "retired_tactile_inventory_hash": inventory_hash,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        DatasetOrganizationError,
+        match="artifact root must not be a symlink",
+    ):
+        plan_dataset_build(manifest_path)
 
 
 @pytest.mark.optional
