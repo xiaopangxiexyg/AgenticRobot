@@ -28,7 +28,9 @@ from dataset_contracts.tactile_bundle import (
     TACTILE_BUNDLE_EPISODE_COMMIT_FILE_DOMAIN_V1,
     TactileBundleArtifactV1,
     TactileBundleContractError,
+    TactileBundleDatasetLocatorV1,
     core_dataset_identity_relative_path,
+    tactile_dataset_locator_relative_path,
 )
 from dataset_interface.tactile_bundle import (
     TactileBundleAttachmentError,
@@ -221,6 +223,78 @@ class NativeTactileBundleTest(unittest.TestCase):
                 dataset_label="unit_dataset",
             )
             self.assertTrue(store.bundle_dataset_root.is_dir())
+
+    def test_store_publishes_readable_dataset_locator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            core, storage = self._roots(temporary)
+            store = self._store(core, storage)
+
+            expected_relative = tactile_dataset_locator_relative_path(
+                dataset_label="unit_dataset",
+                dataset_uuid=store.dataset_identity.dataset_uuid,
+            )
+            self.assertEqual(
+                store.dataset_locator_path,
+                storage / expected_relative,
+            )
+            self.assertEqual(
+                store.bundle_dataset_root,
+                storage / "datasets" / store.dataset_identity.dataset_uuid,
+            )
+            payload = json.loads(
+                store.dataset_locator_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["core_dataset_name"], "unit_dataset")
+            locator = TactileBundleDatasetLocatorV1.from_payload(payload)
+            self.assertEqual(locator.dataset_label, "unit_dataset")
+            self.assertEqual(
+                locator.bundle_relative_path,
+                f"datasets/{store.dataset_identity.dataset_uuid}",
+            )
+            self.assertEqual(
+                locator.core_episode_catalog_ref,
+                "meta/episodes.jsonl",
+            )
+            serialized = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn(str(core), serialized)
+            self.assertNotIn(str(storage), serialized)
+
+    def test_store_refuses_conflicting_readable_dataset_locator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            core, storage = self._roots(temporary)
+            store = self._store(core, storage)
+            payload = json.loads(
+                store.dataset_locator_path.read_text(encoding="utf-8")
+            )
+            payload["bundle_relative_path"] = "datasets/unrelated"
+            store.dataset_locator_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                TactileBundleStorageError,
+                "cannot validate tactile dataset locator",
+            ):
+                self._store(core, storage)
+            self.assertEqual(
+                json.loads(store.dataset_locator_path.read_text(encoding="utf-8")),
+                payload,
+            )
+
+    def test_readable_dataset_locator_sanitizes_arbitrary_dataset_name(self) -> None:
+        relative = tactile_dataset_locator_relative_path(
+            dataset_label="../书写 task",
+            dataset_uuid="3ef8a7b7-22f5-44e7-812c-79d2f66f69d1",
+        )
+        parts = Path(relative).parts
+        self.assertEqual(parts[0], "datasets_by_name")
+        self.assertNotIn("..", parts)
+        self.assertIn("书写_task", parts[1])
+        self.assertEqual(
+            parts[-1],
+            "3ef8a7b7-22f5-44e7-812c-79d2f66f69d1.json",
+        )
 
     def test_seal_mirrors_commit_and_keeps_only_logical_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -487,9 +561,12 @@ class NativeTactileBundleTest(unittest.TestCase):
             for job in writer.plan_sample_jobs(self._collector_sample()):
                 writer.handle_job(job)
             writer.finalize_episode(0)
+            locator_path = writer.tactile_bundle_store.dataset_locator_path
+            locator_path.unlink()
 
             restarted = LeRobotV21Writer(config)
             self.assertEqual(restarted.next_episode_index, 1)
+            self.assertTrue(locator_path.is_file())
             self.assertEqual(
                 restarted.tactile_bundle_store.dataset_identity,
                 writer.tactile_bundle_store.dataset_identity,
