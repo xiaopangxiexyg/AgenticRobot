@@ -30,6 +30,10 @@ from teleop_runtime.real_teleop.progress_contracts import (
     PromotableHoldPause,
     RealTeleopProgressWorkflowPort,
 )
+from teleop_runtime.real_teleop.hitl_terminal import (
+    HITLTerminalClutchInput,
+    validate_hitl_terminal_keys,
+)
 
 from .real_teleop.progress import (
     PROGRESS_ADVANCE_EVENT,
@@ -46,6 +50,9 @@ from .real_teleop.progress import (
     progress_profile_selection_intent_from_event,
 )
 from .real_teleop.progress_workflow import RealTeleopProgressWorkflow
+from .real_teleop.hitl_application import (
+    build_exclusive_hitl_real_teleop_extension,
+)
 
 
 class StationProgressWorkflowAdapter:
@@ -489,6 +496,54 @@ def build_real_teleop_progress_application(
     args: argparse.Namespace,
 ) -> StationProgressApplication:
     """Build the canonical application leaf at the RealTeleop entry edge."""
+
+    hitl_extension = None
+    if bool(getattr(args, "hitl_policy_control", False)):
+        # Keep the default RealTeleop import domain unchanged. The concrete
+        # policy/composition consumer is loaded only for the explicit HITL
+        # application profile.
+        from teleop_runtime.real_teleop.hitl_policy_runtime import (
+            ExclusiveHITLPolicyCommandSelector,
+            build_normal_hitl_policy_source,
+            preflight_normal_hitl_policy_source,
+        )
+
+        normal_source_config = (
+            preflight_normal_hitl_policy_source(args)
+            if str(getattr(args, "hitl_policy_mode", "normal")) == "normal"
+            else None
+        )
+        hitl_extension = build_exclusive_hitl_real_teleop_extension(
+            args,
+            selector_factory=ExclusiveHITLPolicyCommandSelector,
+            normal_policy_source_builder=build_normal_hitl_policy_source,
+            normal_source_config=normal_source_config,
+        )
+    if hitl_extension is not None:
+        existing_extension = getattr(
+            args,
+            "_real_teleop_runtime_extension",
+            None,
+        )
+        if existing_extension is not None:
+            raise RuntimeError(
+                "Exclusive HITL and the Agent Primitive runtime cannot share "
+                "the single RealTeleop application-extension slot."
+            )
+        takeover_key, resume_key = validate_hitl_terminal_keys(
+            getattr(args, "hitl_takeover_key", "u"),
+            getattr(args, "hitl_policy_resume_key", "i"),
+        )
+
+        def build_hitl_terminal(keyboard_source: object) -> HITLTerminalClutchInput:
+            return HITLTerminalClutchInput(
+                keyboard_source,
+                takeover_key=takeover_key,
+                policy_resume_key=resume_key,
+            )
+
+        args._real_teleop_runtime_extension = hitl_extension
+        args._real_teleop_terminal_factory = build_hitl_terminal
 
     return StationProgressApplication(args)
 

@@ -17,6 +17,7 @@ import sys
 import numpy as np
 
 from .artifact_context import configure_real_teleop_artifact_paths
+from .hitl_cli import add_exclusive_hitl_arguments
 from .position_admittance_shadow import (
     POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE,
     POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
@@ -991,7 +992,9 @@ def _parse_real_teleop_args(
 def parse_real_teleop_args() -> argparse.Namespace:
     """Preserve the frozen canonical parser entrypoint."""
 
-    return _parse_real_teleop_args(build_real_teleop_argument_parser())
+    parser = build_real_teleop_argument_parser()
+    add_exclusive_hitl_arguments(parser)
+    return _parse_real_teleop_args(parser)
 
 
 def parse_real_teleop_args_with_parser(
@@ -1001,6 +1004,7 @@ def parse_real_teleop_args_with_parser(
 
     if not isinstance(parser, argparse.ArgumentParser):
         raise TypeError("parser must be an argparse.ArgumentParser.")
+    add_exclusive_hitl_arguments(parser)
     return _parse_real_teleop_args(parser)
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .components import RealTeleopComponents
 
@@ -23,6 +23,24 @@ class RealTeleopRuntimeExtension(Protocol):
     ) -> RealTeleopComponents: ...
 
     def start(self, *, components: RealTeleopComponents) -> None: ...
+
+    def bind_runtime(
+        self,
+        *,
+        components: RealTeleopComponents,
+        clutch_input: Any,
+        camera_sources: Mapping[str, Any],
+        dataset_recorder: object | None,
+        dataset_recorder_provider: Callable[[], object | None],
+        episode_recorder: object,
+        control_ui: object | None,
+        recording_active: Callable[[], bool],
+        pause_recording: Callable[..., bool],
+    ) -> None: ...
+
+    def after_control_input_poll(self, *, now: float) -> None: ...
+
+    def after_session_step(self, *, step_result: object, now: float) -> None: ...
 
     def close_before_session(
         self,

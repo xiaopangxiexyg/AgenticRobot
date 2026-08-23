@@ -889,6 +889,7 @@ class RealTeleopControlLoopContext:
     set_episode_last_state: Callable[[str | None], None]
     step_index: Callable[[], int]
     set_step_index: Callable[[int], None]
+    runtime_extension: object | None = None
 
 
 def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
@@ -903,6 +904,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     close_tactile_preview = context.close_tactile_preview
     clutch_input = context.clutch_input
     components = context.components
+    runtime_extension = context.runtime_extension
     console_stream = context.console_stream
     control_ui = context.control_ui
     debug_timing_log_recorder = context.debug_timing_log_recorder
@@ -1408,6 +1410,15 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
 
         clutch_input.poll()
         mark_loop_phase("loop.control_input_poll")
+        if runtime_extension is not None:
+            after_control_input_poll = getattr(
+                runtime_extension,
+                "after_control_input_poll",
+                None,
+            )
+            if callable(after_control_input_poll):
+                after_control_input_poll(now=loop_start)
+                mark_loop_phase("loop.runtime_extension_after_control_input")
         consume_profile_selections = getattr(
             clutch_input,
             "consume_progress_profile_selection_intents",
@@ -3164,6 +3175,15 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 continue
             raise
         mark_loop_phase("loop.session_run_step")
+        if runtime_extension is not None:
+            after_session_step = getattr(
+                runtime_extension,
+                "after_session_step",
+                None,
+            )
+            if callable(after_session_step):
+                after_session_step(step_result=step_result, now=loop_start)
+                mark_loop_phase("loop.runtime_extension_after_session_step")
         if agent_motion_port is not None:
             agent_motion_snapshot = agent_motion_port.observe_session_step(
                 command=step_result.command,

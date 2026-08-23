@@ -214,3 +214,112 @@ def test_override_provider_failure_holds_and_faults_without_human_fallback() -> 
     assert rig.sent == []
     assert len(rig.holds) == 1
     assert "operation target unavailable" in rig.holds[0]
+
+
+def test_post_human_selection_uses_common_filter_guard_and_dispatch_path() -> None:
+    rig = _Rig()
+    retargeter = _HumanRetargeter()
+    phases: list[str] = []
+
+    def selector(observation, human_command, now):
+        del observation, now
+        assert human_command.metadata["source"] == "human"
+        return TeleopCommandOverride(_command(source="policy", timestamp=None))
+
+    def command_filter(command, observation, now):
+        del observation, now
+        phases.append("filter")
+        command.metadata["filtered"] = True
+        return command
+
+    def command_guard(command, observation, now):
+        del observation, now
+        phases.append("guard")
+        assert command.metadata["source"] == "policy"
+        assert command.metadata["filtered"] is True
+
+    session = TeleopSession(
+        config=TeleopSessionConfig(
+            record_enabled=False,
+            allow_hardware_after_debug_pass=False,
+        ),
+        retargeters=[retargeter],
+        rig=rig,
+        human_command_selection_provider=selector,
+        command_filter=command_filter,
+        command_guard=command_guard,
+    )
+    try:
+        _arm(session)
+        step = session.run_step(now=4.0)
+    finally:
+        session.close()
+
+    assert retargeter.calls == 1
+    assert phases == ["filter", "guard"]
+    assert step.command is not None
+    assert step.command.metadata["source"] == "policy"
+    assert step.command.timestamp == 4.0
+    assert step.command_dispatched is True
+    assert len(rig.sent) == 1
+
+
+def test_post_human_selection_commandless_claim_never_falls_back() -> None:
+    rig = _Rig()
+    retargeter = _HumanRetargeter()
+    session = TeleopSession(
+        config=TeleopSessionConfig(
+            record_enabled=False,
+            allow_hardware_after_debug_pass=False,
+        ),
+        retargeters=[retargeter],
+        rig=rig,
+        human_command_selection_provider=(
+            lambda observation, human_command, now: TeleopCommandOverride(None)
+        ),
+    )
+    try:
+        _arm(session)
+        step = session.run_step(now=4.5)
+    finally:
+        session.close()
+
+    assert retargeter.calls == 1
+    assert step.command is None
+    assert step.command_dispatched is False
+    assert rig.sent == []
+
+
+def test_post_human_selection_failure_holds_without_dispatching_human() -> None:
+    rig = _Rig()
+    retargeter = _HumanRetargeter()
+
+    def selector(observation, human_command, now):
+        del observation, human_command, now
+        raise RuntimeError("policy selector unavailable")
+
+    session = TeleopSession(
+        config=TeleopSessionConfig(
+            record_enabled=False,
+            allow_hardware_after_debug_pass=False,
+        ),
+        retargeters=[retargeter],
+        rig=rig,
+        human_command_selection_provider=selector,
+    )
+    try:
+        _arm(session)
+        step = session.run_step(now=5.0)
+    finally:
+        session.close()
+
+    assert retargeter.calls == 1
+    assert step.state == TeleopRunState.FAULT
+    assert step.command is None
+    assert step.command_dispatched is False
+    assert [fault.code for fault in step.faults] == [
+        "human_command_selection_provider_error"
+    ]
+    assert rig.sent == []
+    assert len(rig.holds) == 1
+    assert "policy selector unavailable" in rig.holds[0]
