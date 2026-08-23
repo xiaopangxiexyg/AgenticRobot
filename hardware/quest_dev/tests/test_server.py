@@ -192,10 +192,14 @@ class _FakeHostServer:
         *,
         fail_serve: bool = False,
         block_serve: bool = False,
+        fail_close: bool = False,
+        close_error: BaseException | None = None,
     ) -> None:
         self.events = events
         self.fail_serve = fail_serve
         self.block_serve = block_serve
+        self.fail_close = fail_close
+        self.close_error = close_error
         self.serve_entered = threading.Event()
         self.serve_release = threading.Event()
         self.socket = object()
@@ -215,6 +219,10 @@ class _FakeHostServer:
 
     def server_close(self) -> None:
         self.events.append("server_close")
+        if self.close_error is not None:
+            raise self.close_error
+        if self.fail_close:
+            raise RuntimeError("server-close-probe")
 
 
 class QuestDevHostTests(unittest.TestCase):
@@ -376,6 +384,45 @@ class QuestDevHostTests(unittest.TestCase):
                 "server_close",
             ],
         )
+
+    def test_cleanup_failure_is_permanently_re_reported(self) -> None:
+        events: list[str] = []
+        fake_server = _FakeHostServer(events, fail_close=True)
+        host, _, _ = self.make_host(
+            events,
+            {"controller_pose": {"enabled": True}},
+            fake_server=fake_server,
+        )
+        host.start()
+
+        with self.assertRaisesRegex(RuntimeError, "server-close-probe"):
+            host.close()
+        with self.assertRaisesRegex(RuntimeError, "server-close-probe"):
+            host.close()
+
+        self.assertEqual(events.count("stop:controller_pose"), 1)
+        self.assertEqual(events.count("server_close"), 1)
+
+    def test_cleanup_base_exception_is_latched_before_propagation(self) -> None:
+        events: list[str] = []
+        fake_server = _FakeHostServer(
+            events,
+            close_error=KeyboardInterrupt("server-close-interrupt"),
+        )
+        host, _, _ = self.make_host(
+            events,
+            {"controller_pose": {"enabled": True}},
+            fake_server=fake_server,
+        )
+        host.start()
+
+        with self.assertRaises(KeyboardInterrupt):
+            host.close()
+        with self.assertRaisesRegex(RuntimeError, "server-close-interrupt"):
+            host.close()
+
+        self.assertEqual(events.count("stop:controller_pose"), 1)
+        self.assertEqual(events.count("server_close"), 1)
 
     def test_shutdown_before_serving_never_calls_blocking_server_shutdown(
         self,
@@ -546,6 +593,62 @@ class QuestDevHostTests(unittest.TestCase):
         host.close()
         self.assertEqual(events, ["server_close"])
 
+    def test_builder_forwards_shared_clock_and_delays_custom_runtime_loader(
+        self,
+    ) -> None:
+        events: list[str] = []
+        fake_server = _FakeHostServer(events)
+        fake_server.server_address = ("127.0.0.1", 49153)
+        config = {
+            "server": {
+                "host": "127.0.0.1",
+                "port": 0,
+                "https": False,
+                "pairing": {"enabled": True},
+            },
+            "features": {"controller_pose": {"enabled": True}},
+        }
+        monotonic_ns_clock = mock.Mock(return_value=123)
+        loaded: list[tuple[str, object, dict, threading.Event]] = []
+
+        def runtime_loader(name, supplied_server, feature_config, stop_event):
+            loaded.append((name, supplied_server, feature_config, stop_event))
+            return _FakeFeatureRuntime(name, events)
+
+        with (
+            mock.patch.object(server, "load_config", return_value=config),
+            mock.patch.object(
+                server, "QuestDevHTTPServer", return_value=fake_server
+            ) as constructor,
+        ):
+            host = server.build_quest_dev_host(
+                Path("unused.yaml"),
+                force_http=True,
+                monotonic_ns_clock=monotonic_ns_clock,
+                runtime_loader=runtime_loader,
+            )
+
+        self.assertIs(
+            constructor.call_args.kwargs["monotonic_ns_clock"],
+            monotonic_ns_clock,
+        )
+        self.assertEqual(loaded, [])
+        host.start()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0][0], "controller_pose")
+        self.assertIs(loaded[0][1], fake_server)
+        self.assertEqual(loaded[0][2], {"enabled": True})
+        self.assertIs(loaded[0][3], host.stop_event)
+        host.close()
+
+    def test_builder_rejects_noncallables_before_server_construction(self) -> None:
+        with mock.patch.object(server, "QuestDevHTTPServer") as constructor:
+            with self.assertRaisesRegex(TypeError, "monotonic_ns_clock"):
+                server.build_quest_dev_host(monotonic_ns_clock=None)  # type: ignore[arg-type]
+            with self.assertRaisesRegex(TypeError, "runtime_loader"):
+                server.build_quest_dev_host(runtime_loader=None)  # type: ignore[arg-type]
+        constructor.assert_not_called()
+
     def test_cli_delegates_to_the_same_programmatic_host(self) -> None:
         config_path = Path("quest-config.yaml")
         fake_host = mock.Mock()
@@ -597,6 +700,7 @@ class AuthenticationTests(unittest.TestCase):
         host.client_disconnect_handlers = []
         host.feature_status_providers = {}
         host.started_at = time.time()
+        host.monotonic_ns_clock = time.monotonic_ns
         return host
 
     def test_same_origin_requires_matching_host(self) -> None:
@@ -675,6 +779,44 @@ class AuthenticationTests(unittest.TestCase):
                 {"type": "probe", "client_instance_id": "different-browser"},
             )
         )
+
+    def test_post_auth_record_uses_authoritative_injected_receipt_clock(self) -> None:
+        host = self.make_server()
+        self.assertTrue(
+            host.process_client_message(
+                1,
+                {
+                    "type": "client_auth",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "client_instance_id": "browser-instance",
+                    "pairing_token": host._pairing_token,
+                },
+            )
+        )
+        monotonic_ns_clock = mock.Mock(return_value=987654321)
+        host.monotonic_ns_clock = monotonic_ns_clock
+        records: list[dict] = []
+        host.register_client_message_handler(
+            "probe", lambda _, record: records.append(record)
+        )
+        payload = {
+            "type": "probe",
+            "client_instance_id": "browser-instance",
+            "client_id": 999,
+            "server_timestamp": -1.0,
+            "server_monotonic_ns": 1,
+        }
+
+        with mock.patch.object(server.time, "time", return_value=123.5):
+            self.assertTrue(host.process_client_message(1, payload))
+
+        self.assertEqual(payload["client_id"], 999)
+        self.assertEqual(payload["server_timestamp"], -1.0)
+        self.assertEqual(payload["server_monotonic_ns"], 1)
+        self.assertEqual(records[0]["client_id"], 1)
+        self.assertEqual(records[0]["server_timestamp"], 123.5)
+        self.assertEqual(records[0]["server_monotonic_ns"], 987654321)
+        monotonic_ns_clock.assert_called_once_with()
 
     def test_broadcast_excludes_unauthenticated_clients(self) -> None:
         host = self.make_server()
