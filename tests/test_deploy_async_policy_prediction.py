@@ -17,7 +17,6 @@ from robot_motion.deploy import (
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES
 from teleop_runtime.deploy import run_policy
 
-
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 

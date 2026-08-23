@@ -69,9 +69,7 @@ class ThreadedPolicyPredictionWorker:
             raise TypeError("runtime must be a PolicyDeployRuntime.")
         if not callable(getattr(policy, "predict", None)):
             raise TypeError("policy must expose predict(observation).")
-        transaction_owner = (
-            policy if transaction_policy is None else transaction_policy
-        )
+        transaction_owner = policy if transaction_policy is None else transaction_policy
         transaction_hooks = tuple(
             hook
             for hook in (
@@ -84,8 +82,7 @@ class ThreadedPolicyPredictionWorker:
         if transaction_hooks:
             raise TypeError(
                 "threaded prediction is incompatible with policy transaction "
-                "hooks; use the synchronous queue: "
-                + ",".join(transaction_hooks)
+                "hooks; use the synchronous queue: " + ",".join(transaction_hooks)
             )
         if reset_callback is not None and not callable(reset_callback):
             raise TypeError("reset_callback must be callable or None.")
@@ -96,16 +93,12 @@ class ThreadedPolicyPredictionWorker:
         self.source_id = source
         self.runtime = runtime
         self.policy = _PredictionOnlyPolicy(policy.predict)
-        self.lifecycle_policy = (
-            policy if lifecycle_policy is None else lifecycle_policy
-        )
+        self.lifecycle_policy = policy if lifecycle_policy is None else lifecycle_policy
         self.reset_callback = reset_callback
         self.join_timeout_sec = timeout
 
         self._tasks: queue.Queue[_PredictionTask | None] = queue.Queue(maxsize=1)
-        self._completions: queue.Queue[_PredictionCompletion] = queue.Queue(
-            maxsize=1
-        )
+        self._completions: queue.Queue[_PredictionCompletion] = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
         self._started = False
@@ -289,9 +282,7 @@ class ThreadedPolicyPredictionWorker:
                 self._reset_policy_session()
             return None
         if completion.error is not None:
-            self._last_error = (
-                f"{type(completion.error).__name__}:{completion.error}"
-            )
+            self._last_error = f"{type(completion.error).__name__}:{completion.error}"
             raise RuntimeError("policy prediction worker failed") from completion.error
         assert completion.candidate is not None
         self._last_error = None
@@ -346,9 +337,7 @@ class ThreadedPolicyPredictionWorker:
             "in_flight": self._in_flight,
             "reset_pending": self._reset_pending,
             "activation_generation": self._generation,
-            "discarded_late_completion_count": (
-                self._discarded_late_completion_count
-            ),
+            "discarded_late_completion_count": (self._discarded_late_completion_count),
             "last_error": self._last_error,
         }
 
