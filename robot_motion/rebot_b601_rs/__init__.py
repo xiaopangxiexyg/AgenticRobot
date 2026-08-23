@@ -3,6 +3,7 @@
 Importing this package has no hardware or vendor-package side effects.
 """
 
+from .ik import B601DampedLeastSquaresIK, B601IKConfig, B601IKResult
 from .model import (
     B601ModelDependencyError,
     B601ModelError,
@@ -19,6 +20,9 @@ from .model import (
 __all__ = [
     "B601ModelDependencyError",
     "B601ModelError",
+    "B601DampedLeastSquaresIK",
+    "B601IKConfig",
+    "B601IKResult",
     "B601PinocchioModel",
     "B601SingularityMetrics",
     "B601_RS_ARM_JOINT_NAMES",
