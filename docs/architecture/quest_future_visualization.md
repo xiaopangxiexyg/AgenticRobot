@@ -60,15 +60,41 @@ The implemented source contracts now provide:
   explicit expected-type borrowing seam only while those runtimes are running.
   The CLI uses this same host; one composition root creates one host for the
   configured endpoint, so no second controller runtime or global registry is
-  required.
+  required;
+- an RM65 position-backend source attestation that is created only after a new
+  SDK attachment has produced a trusted hardware-qpos measurement and the
+  exact tool-TCP and FK inputs have been resolved.  It binds a fresh source
+  epoch, hashed configured endpoint, canonical typed arm-base frame, the
+  backend's effective tool transform, construction-time raw-URDF hash, actual
+  six-joint solver-model fingerprint/order/frame, construction-time FK callable
+  identity, FK implementation version, and the host wall-clock measurement
+  domain.  Hardware-slot degrees to solver radians are bound slot-for-joint
+  with no offset.  The attestation performs no
+  SDK read of its own; startup/close are lifecycle-serialized, and failed
+  startup, fresh attachment, or close clears the prior proof.  The endpoint
+  passed to the SDK, side, effector identity, and default controlled frame are
+  frozen at their owning construction/attachment boundary.  SDK-discovered TCP
+  state is backend-runtime state and never mutates a caller-reusable config.
+  If mutable compatibility config later diverges from the frozen side,
+  effector, or default frame, publication fails closed for the rest of that
+  attachment epoch rather than pairing the proof with changed runtime identity.
+  Each published proof is revalidated against the exact solver/model/tool
+  state; drift removes it rather than publishing a stale hash.  Attestation
+  construction, full revalidation, and publication are independently opt-in
+  through `include_pose_source_attestation=True`; ordinary diagnostic, deploy,
+  and lean snapshots neither pay the model-fingerprint cost nor return an
+  unvalidated proof.  A cached proof remains hidden unless explicitly
+  requested again.
 
-The robot projection remains opt-in.  No current production caller supplies an
-`ArmPoseObservationProjection`, and the RM65 backend does not yet emit the typed
-`PoseCoordinateBinding` attestation required by that projection.  Therefore the
-robot publication and R2 paired-capture contracts are verified offline with
-fake sources, not wired real-robot paired-pose evidence.  R2 does not add a
-Control Station lifecycle, persistence, calibration fit or acceptance, or a
-frame installation path.
+The robot projection remains opt-in.  The new RM65 object is deliberately a
+narrow lower-owned source/tool/FK attestation, not a second copy of the
+canonical `PoseCoordinateBinding`.  No current production composition joins it
+with the application-owned control domain, component, stream, observation plan,
+or receiver clock, and no current production caller supplies the resulting
+`ArmPoseObservationProjection`.  Therefore the robot publication and R2
+paired-capture contracts remain offline evidence rather than wired real-robot
+paired-pose evidence.  R2 does not add a Control Station lifecycle,
+persistence, calibration fit or acceptance, or a frame installation path.
 
 ## Ownership and data flow
 
@@ -80,6 +106,8 @@ Quest WebXR gripSpace
                                        -> lower paired-pose capture engine
                                       /
 real arm owner -> hardware qpos -> bound FK pose
+  -> lower source/tool/FK attestation
+  -> application-owned canonical coordinate binding
   -> canonical measurement -> bounded passive event journal
 
 paired-pose capture candidate
@@ -111,6 +139,26 @@ lifecycle.
 It must not import Quest, hardware, Control Station, or a concrete policy
 deployment.  A concrete application leaf will adapt an already-selected future
 trajectory into the accepted visualization frame and publish it passively.
+
+The R4a attestation is owned beside the concrete RM65 position backend.  It
+does not contain `control_domain_id`, component or stream identity, receipt
+clock, observation capability/binding, observation plan, or pose schema.  Those
+facts are known only by the application composition root and continue to enter
+the one canonical `PoseCoordinateBinding`.  The impedance backend has a
+different tool/FK lifecycle and is explicitly outside this slice; it must fail
+closed for this Quest pose-publication path until it receives equivalent
+attestation support.
+
+The typed reference frame is the canonical `CoordinateFrameSpec` for
+`<side>_arm_base`: fixed-base Pinocchio world and the exact URDF root are equal
+under `T_reference_frame_from_pinocchio_world = I`, with right-handed URDF axes,
+metres, and radians.  Tool-TCP proof is available only when the actual solver
+frame is `hand_base`; an `arm_link6` fallback may continue to serve the existing
+diagnostic FK behavior but cannot publish this attestation.  Solver provenance
+failure is likewise optional-proof failure and does not replace or break the
+legacy FK owner.  The backend's construction-time default controlled frame must
+also be `tool_tcp`, so the existing no-argument FK consumer cannot accidentally
+pair an arm-endpoint pose with a tool-TCP proof.
 
 ## Time and sequence rules
 
@@ -209,11 +257,13 @@ against real capture evidence.
 
 ## Next implementation slices
 
-The unique-running-runtime host prerequisite is now implemented. The remaining
-ordered slices are:
+The unique-running-runtime host prerequisite and the RM65 position-backend
+lower attestation are now implemented. The remaining ordered slices are:
 
-1. Add an RM65-owned typed coordinate/FK/tool attestation and bind it to the
-   existing arm-state owner without creating a second hardware reader.
+1. At the application composition root, validate the RM65 lower attestation,
+   join it with observation/stream/receiver-clock facts into the existing
+   canonical `PoseCoordinateBinding`, and pass that binding to the existing
+   `ArmStateReader`; do not create a second hardware reader.
 2. Add the thin Control Station operator lifecycle for begin/complete/cancel and
    pose-redacted status.
 3. Add an explicit persistence owner for reviewed capture evidence; the R2
