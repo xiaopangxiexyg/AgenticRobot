@@ -8,6 +8,7 @@ Quest Browser
   web/features/controller_pose/ read-only grip-pose publisher
              ⇅ HTTPS / authenticated WSS
 server.py                       static host, auth hub, safe config/status
+  QuestDevHost                  sole server/feature lifecycle + typed borrowing seam
   features/controller_pose/     strict latest-only telemetry
   features/visualization/       optional read-only robot feedback + fit tools
 ```
@@ -22,6 +23,23 @@ Core owns：
 - browser-safe config 投影和 pose/token-redacted authenticated status。
 
 Core 不拥有 Redis、机器人 schema、标定 acceptance、轨迹、控制、safety 或渲染语义。
+
+每个 `QuestDevHost` 是其 server、stop event 和 feature runtime 的唯一 host-side lifecycle
+owner。它按 YAML 顺序构造并启动每个 enabled feature，失败或退出时按相反顺序停止，再
+关闭 server。具体应用可通过 `require_running_feature_runtime(name, expected_type)` 借用
+通过显式 expected-type 检查的已运行对象；该接口不会构造缺失 runtime、不会转移
+lifecycle ownership，也没有模块级 singleton/global registry。具体 composition root 必须
+只为一个配置 endpoint 构造一个 host。CLI 只负责参数、打印连接信息和安装 signal handler，
+实际 host 构造与生命周期走同一程序化 API。
+
+`build_quest_dev_host()` 构造 `QuestDevHTTPServer` 时即绑定 socket，HTTPS 模式还会检查或
+生成开发证书；此时尚未启动 feature 或 request loop。`start()` 与 `serve_forever()` 分别
+拥有这两个后续边界，动态端口的 launch info 来自 server 实际绑定地址。
+
+借用 runtime 的应用必须显式依赖注入。它不能调用借用对象的 `start()`/`stop()`，也不能
+把对象、pose 或 pairing credential 暴露到 HTTP status。host 终止前，上层应先关闭自身
+的 observer/capture 生命周期，使 `controller_pose.stop()` 的 terminal invalidation 成为
+最后一道边界。
 
 ## 当前 feature ownership
 

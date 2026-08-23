@@ -55,6 +55,12 @@ The implemented source contracts now provide:
   Quest/robot binding, global Quest callback reordering, deterministic
   representative pairing, stationarity evidence, and strict outer evidence
   projection into the unchanged R0 paired-pose dataset.
+- a programmatic `QuestDevHost` that owns its HTTP server, shared stop
+  event, and enabled feature runtime instances, and exposes an exact-name,
+  explicit expected-type borrowing seam only while those runtimes are running.
+  The CLI uses this same host; one composition root creates one host for the
+  configured endpoint, so no second controller runtime or global registry is
+  required.
 
 The robot projection remains opt-in.  No current production caller supplies an
 `ArmPoseObservationProjection`, and the RM65 backend does not yet emit the typed
@@ -203,15 +209,16 @@ against real capture evidence.
 
 ## Next implementation slices
 
-1. Expose the unique running Quest feature runtime through a programmatic host,
-   rather than creating a second runtime or using a global registry.
-2. Add an RM65-owned typed coordinate/FK/tool attestation and bind it to the
+The unique-running-runtime host prerequisite is now implemented. The remaining
+ordered slices are:
+
+1. Add an RM65-owned typed coordinate/FK/tool attestation and bind it to the
    existing arm-state owner without creating a second hardware reader.
-3. Add the thin Control Station operator lifecycle for begin/complete/cancel and
+2. Add the thin Control Station operator lifecycle for begin/complete/cancel and
    pose-redacted status.
-4. Add an explicit persistence owner for reviewed capture evidence; the R2
+3. Add an explicit persistence owner for reviewed capture evidence; the R2
    in-memory reducer deliberately writes nothing.
-5. Collect real stationary-pose evidence, fit, independently validate, and
+4. Collect real stationary-pose evidence, fit, independently validate, and
    review an acceptance profile.
-6. Only after acceptance, transform the measured TCP and selected policy future
+5. Only after acceptance, transform the measured TCP and selected policy future
    trajectory into Quest space and render them as read-only geometry.
