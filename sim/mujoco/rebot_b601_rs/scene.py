@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -34,18 +35,34 @@ B601_RS_GRIPPER_OPEN_QPOS = {
     "joint_left": 0.05,
     "joint_right": 0.0715,
 }
+_B601_RS_GRIPPER_LOCK_SOLREF = (0.002, 1.0)
 
 # These gains are upstream configuration values used only as an initial
 # visualization seed.  They are not identified hardware or haptic gains.
 B601_RS_PROVISIONAL_POSITION_KP = (50.0, 150.0, 150.0, 50.0, 50.0, 50.0)
 B601_RS_PROVISIONAL_POSITION_KV = (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
 B601_RS_PROVISIONAL_PROFILE_NAME = "rebot_b601_rs_visualization_only_provisional_seed"
+B601_RS_EFFORT_PROFILE_NAME = "rebot_b601_rs_ideal_effort_simulation_only"
+B601ActuationMode = Literal["position", "effort"]
 
 
 def b601_position_actuator_name(joint_name: str) -> str:
     """Return the stable actuator name for one B601 arm joint."""
 
     return f"b601_rs_position_{joint_name}"
+
+
+def b601_effort_actuator_name(joint_name: str) -> str:
+    """Return the stable ideal-effort actuator name for one arm joint."""
+
+    return f"b601_rs_effort_{joint_name}"
+
+
+def _validate_actuation_mode(value: str) -> B601ActuationMode:
+    normalized = str(value).strip()
+    if normalized not in {"position", "effort"}:
+        raise ValueError("actuation_mode must be 'position' or 'effort'")
+    return normalized  # type: ignore[return-value]
 
 
 def _source_paths(source_root: str | Path) -> tuple[Path, Path, Path]:
@@ -196,11 +213,67 @@ def _add_provisional_position_actuators(
         )
 
 
+def _add_ideal_effort_actuators(
+    root: ET.Element,
+    model: URDFModel,
+) -> None:
+    joint_elements = {
+        str(element.attrib["name"]): element
+        for element in root.iter("joint")
+        if "name" in element.attrib
+    }
+    actuator_root = ET.SubElement(root, "actuator")
+    for name in B601_RS_ARM_JOINT_NAMES:
+        _lower, _upper, effort = _arm_joint_limits(model, name)
+        if name not in joint_elements:
+            raise B601ModelError(f"converted MJCF is missing arm joint {name!r}")
+        ET.SubElement(
+            actuator_root,
+            "motor",
+            {
+                "name": b601_effort_actuator_name(name),
+                "joint": name,
+                "gear": "1",
+                "ctrllimited": "true",
+                "ctrlrange": f"{-effort:.12g} {effort:.12g}",
+                "forcelimited": "true",
+                "forcerange": f"{-effort:.12g} {effort:.12g}",
+            },
+        )
+
+
+def _add_fixed_open_gripper_constraints(root: ET.Element) -> None:
+    """Keep non-actuated gripper DOFs fixed during ideal-effort simulation.
+
+    Gravity compensation is evaluated with the two auxiliary joints fixed at
+    ``B601_RS_GRIPPER_OPEN_QPOS``.  A continuous MuJoCo equality constraint is
+    required here: rewriting qpos/qvel between physics steps would inject
+    impulses through the coupled arm dynamics.
+    """
+
+    equality_root = root.find("equality")
+    if equality_root is None:
+        equality_root = ET.SubElement(root, "equality")
+    solref = " ".join(f"{value:.12g}" for value in _B601_RS_GRIPPER_LOCK_SOLREF)
+    for joint_name, open_qpos in B601_RS_GRIPPER_OPEN_QPOS.items():
+        ET.SubElement(
+            equality_root,
+            "joint",
+            {
+                "name": f"b601_rs_fixed_open_{joint_name}",
+                "joint1": joint_name,
+                "polycoef": f"{open_qpos:.12g} 0 0 0 0",
+                "solref": solref,
+            },
+        )
+
+
 def _mjcf_xml_from_model(
     model: URDFModel,
     *,
     timestep: float,
     gravity: np.ndarray,
+    actuation_mode: B601ActuationMode,
 ) -> str:
     xml_text = convert_urdf_to_mjcf_xml(
         model,
@@ -213,7 +286,11 @@ def _mjcf_xml_from_model(
     if option is None:
         raise B601ModelError("converted B601-RS MJCF has no option element")
     option.attrib["integrator"] = "implicitfast"
-    _add_provisional_position_actuators(root, model)
+    if actuation_mode == "position":
+        _add_provisional_position_actuators(root, model)
+    else:
+        _add_ideal_effort_actuators(root, model)
+        _add_fixed_open_gripper_constraints(root)
     ET.indent(root, space="  ")
     return ET.tostring(root, encoding="unicode")
 
@@ -223,6 +300,7 @@ def build_b601_mjcf_xml(
     *,
     timestep_sec: float = 1.0 / B601_RS_PHYSICS_HZ,
     gravity_mps2: Sequence[float] = (0.0, 0.0, 0.0),
+    actuation_mode: B601ActuationMode = "position",
 ) -> str:
     """Return in-memory MJCF without modifying or copying upstream assets."""
 
@@ -232,11 +310,13 @@ def build_b601_mjcf_xml(
         raise ValueError("timestep_sec must be finite and positive")
     if gravity.shape != (3,) or not np.all(np.isfinite(gravity)):
         raise ValueError("gravity_mps2 must contain three finite values")
+    mode = _validate_actuation_mode(actuation_mode)
     _urdf_path, urdf_model = _load_normalized_urdf(source_root)
     return _mjcf_xml_from_model(
         urdf_model,
         timestep=timestep,
         gravity=gravity,
+        actuation_mode=mode,
     )
 
 
@@ -257,6 +337,7 @@ def build_b601_mujoco_scene(
     timestep_sec: float = 1.0 / B601_RS_PHYSICS_HZ,
     gravity_mps2: Sequence[float] = (0.0, 0.0, 0.0),
     initial_arm_qpos: Sequence[float] = B601_RS_DEFAULT_ARM_QPOS,
+    actuation_mode: B601ActuationMode = "position",
 ) -> MujocoScene:
     """Compile the B601 plant and wrap it in the generic scene facade."""
 
@@ -275,10 +356,12 @@ def build_b601_mujoco_scene(
         raise ValueError("timestep_sec must be finite and positive")
     if gravity.shape != (3,) or not np.all(np.isfinite(gravity)):
         raise ValueError("gravity_mps2 must contain three finite values")
+    mode = _validate_actuation_mode(actuation_mode)
     xml_text = _mjcf_xml_from_model(
         urdf_model,
         timestep=timestep,
         gravity=gravity,
+        actuation_mode=mode,
     )
     model = mujoco.MjModel.from_xml_string(xml_text)
     data = mujoco.MjData(model)
@@ -290,7 +373,11 @@ def build_b601_mujoco_scene(
             joint.name for joint in urdf_model.joints if joint.joint_type != "fixed"
         ),
         body_names=tuple(urdf_model.links),
-        scene_profile_name=B601_RS_PROVISIONAL_PROFILE_NAME,
+        scene_profile_name=(
+            B601_RS_PROVISIONAL_PROFILE_NAME
+            if mode == "position"
+            else B601_RS_EFFORT_PROFILE_NAME
+        ),
     )
     arm_spec = ArmSpec(
         side=B601_RS_SIM_ARM_KEY,
@@ -314,15 +401,18 @@ def build_b601_mujoco_scene(
     for name, value in B601_RS_GRIPPER_OPEN_QPOS.items():
         scene.data.qpos[scene.joint_qpos_addr(name)] = float(value)
         scene.data.qvel[scene.joint_dof_addr(name)] = 0.0
-    actuator_ids = [
-        mujoco.mj_name2id(
-            model,
-            mujoco.mjtObj.mjOBJ_ACTUATOR,
-            b601_position_actuator_name(name),
-        )
-        for name in B601_RS_ARM_JOINT_NAMES
-    ]
-    scene.data.ctrl[np.asarray(actuator_ids, dtype=np.int32)] = initial
+    if mode == "position":
+        actuator_ids = [
+            mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_ACTUATOR,
+                b601_position_actuator_name(name),
+            )
+            for name in B601_RS_ARM_JOINT_NAMES
+        ]
+        scene.data.ctrl[np.asarray(actuator_ids, dtype=np.int32)] = initial
+    else:
+        scene.data.ctrl[:] = 0.0
     scene.forward()
     return scene
 
@@ -330,12 +420,15 @@ def build_b601_mujoco_scene(
 __all__ = [
     "B601_RS_COMMAND_HZ",
     "B601_RS_DEFAULT_ARM_QPOS",
+    "B601_RS_EFFORT_PROFILE_NAME",
     "B601_RS_GRIPPER_OPEN_QPOS",
     "B601_RS_PHYSICS_HZ",
     "B601_RS_PROVISIONAL_POSITION_KP",
     "B601_RS_PROVISIONAL_POSITION_KV",
     "B601_RS_PROVISIONAL_PROFILE_NAME",
     "B601_RS_SIM_ARM_KEY",
+    "B601ActuationMode",
+    "b601_effort_actuator_name",
     "b601_position_actuator_name",
     "build_b601_mjcf_xml",
     "build_b601_mujoco_scene",
