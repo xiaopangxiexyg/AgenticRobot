@@ -184,6 +184,22 @@ def apply_real_teleop_dataset_selection(
             args.collection_task_description
         )
 
+    previous_progress_profile_hash = str(
+        getattr(
+            getattr(args, "collection_progress_profile", None),
+            "semantic_content_hash",
+            "",
+        )
+        or ""
+    )
+    previous_stage_profile_hash = str(
+        getattr(
+            getattr(args, "collection_stage_profile", None),
+            "semantic_content_hash",
+            "",
+        )
+        or ""
+    )
     refresh_formal_dataset_layout(args)
     try:
         target_dataset_root = Path(args.dataset_root)
@@ -249,6 +265,33 @@ def apply_real_teleop_dataset_selection(
         # profile from the previously selected task.
         args.collection_progress_profile = None
         args.collection_stage_profile = None
+
+    selected_progress_profile_hash = str(
+        getattr(
+            getattr(args, "collection_progress_profile", None),
+            "semantic_content_hash",
+            "",
+        )
+        or ""
+    )
+    selected_stage_profile_hash = str(
+        getattr(
+            getattr(args, "collection_stage_profile", None),
+            "semantic_content_hash",
+            "",
+        )
+        or ""
+    )
+    if (
+        selected_progress_profile_hash != previous_progress_profile_hash
+        or selected_stage_profile_hash != previous_stage_profile_hash
+    ):
+        # Entry selection is profile-local and Episode-local. Adopting another
+        # dataset's immutable profile must not retain a stale coarse/fine entry
+        # from the previous task.
+        args.collection_progress_entry_step = ""
+        args.collection_progress_entry_stage = ""
+        args.collection_progress_entry_condition = "nominal"
 
     if bind_dataset_contract:
         try:

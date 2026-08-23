@@ -19,8 +19,10 @@ from agent_gateway.profiles.real.observation_gateway import (
 from .control_availability import GuiControlEvents, GuiControlState
 from .input_mapping import RealTeleopInputBatch, prioritize_input_batch
 from .progress import (
+    PROGRESS_ENTRY_STEP_SELECT_EVENT,
     PROGRESS_PROFILE_SELECT_EVENT,
     ProgressControlAvailability,
+    ProgressEntryStepSelectionIntent,
     ProgressOperatorIntent,
     ProgressProfileOption,
     ProgressProfileSelectionIntent,
@@ -28,6 +30,7 @@ from .progress import (
     build_progress_ui_payload,
     build_real_teleop_progress_ui_payload,
     progress_intent_from_event,
+    progress_entry_step_selection_intent_from_event,
     progress_profile_selection_intent_from_event,
 )
 
@@ -48,16 +51,19 @@ __all__ = [
     "RealTcpPoseObserveGatewaySession",
     "RealTcpPosePublishedRead",
     "ProgressControlAvailability",
+    "ProgressEntryStepSelectionIntent",
     "ProgressOperatorIntent",
     "ProgressProfileOption",
     "ProgressProfileSelectionIntent",
     "PROGRESS_PROFILE_SELECT_EVENT",
+    "PROGRESS_ENTRY_STEP_SELECT_EVENT",
     "available_progress_controls",
     "assemble_real_tcp_pose_observe_gateway_session",
     "build_real_tcp_pose_observe_contract_bundle",
     "build_progress_ui_payload",
     "build_real_teleop_progress_ui_payload",
     "progress_intent_from_event",
+    "progress_entry_step_selection_intent_from_event",
     "progress_profile_selection_intent_from_event",
     "prioritize_input_batch",
 ]

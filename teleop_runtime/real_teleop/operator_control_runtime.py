@@ -32,6 +32,7 @@ from .progress_contracts import (
     PROGRESS_ARM_CONTROL_MODE_STRICT,
     ProgressApplicationPort,
     ProgressArmControlModeSelectionCommand,
+    ProgressEntryStepSelectionCommand,
     ProgressMutationCommand,
     ProgressProfileSelectionCommand,
     PromotableHoldPause,
@@ -326,6 +327,9 @@ class RealTeleopControlInput:
         self._progress_operator_intents: deque[ProgressMutationCommand] = deque()
         self._progress_profile_selection_intents: deque[
             ProgressProfileSelectionCommand
+        ] = deque()
+        self._progress_entry_step_selection_intents: deque[
+            ProgressEntryStepSelectionCommand
         ] = deque()
         self._progress_arm_control_mode_selection_intents: deque[
             ProgressArmControlModeSelectionCommand
@@ -1412,6 +1416,19 @@ class RealTeleopControlInput:
                         self.ui.append_message(
                             "Progress",
                             f"长程进度 profile 选择已提交：{event}",
+                        )
+                elif event.startswith("progress_entry_step_select:"):
+                    if not self.submit_progress_entry_step_selection_ui_event(
+                        event
+                    ):
+                        self.ui.append_message(
+                            "Progress",
+                            f"无法解析或已有待处理的起始子任务选择：{event}",
+                        )
+                    else:
+                        self.ui.append_message(
+                            "Progress",
+                            f"长程进度起始子任务选择已提交：{event}",
                         )
                 elif event.startswith("progress_arm_control_mode_select:"):
                     if not self.submit_progress_arm_control_mode_selection_ui_event(
@@ -3976,6 +3993,17 @@ class RealTeleopControlInput:
             profile_id=profile_id,
         )
 
+    def select_progress_entry_step(
+        self,
+        *,
+        dataset_recorder: object | None,
+        progress_step_id: str,
+    ) -> str:
+        return self._progress_application_port().select_progress_entry_step(
+            dataset_recorder=dataset_recorder,
+            progress_step_id=progress_step_id,
+        )
+
     def publish_progress_application_state(
         self,
         *,
@@ -4162,6 +4190,50 @@ class RealTeleopControlInput:
         ) + 1
         return True
 
+    def submit_progress_entry_step_selection_intent(
+        self,
+        command: ProgressEntryStepSelectionCommand,
+    ) -> bool:
+        """Admit one next-Episode coarse entry selection."""
+
+        if not isinstance(command, ProgressEntryStepSelectionCommand):
+            raise TypeError(
+                "command must be ProgressEntryStepSelectionCommand."
+            )
+        pending = getattr(
+            self,
+            "_progress_entry_step_selection_intents",
+            None,
+        )
+        if pending is None:
+            pending = deque()
+            self._progress_entry_step_selection_intents = pending
+        if pending:
+            return False
+        pending.append(command)
+        self._progress_ui_payload = {}
+        self._progress_ui_controls = ()
+        self._progress_ui_transport_revision = int(
+            getattr(self, "_progress_ui_transport_revision", 0)
+        ) + 1
+        return True
+
+    def submit_progress_entry_step_selection_ui_event(
+        self,
+        event: str,
+    ) -> bool:
+        self._progress_operator_intent_sequence += 1
+        command = self._progress_application_port().entry_step_selection_from_event(
+            event=str(event),
+            command_id=(
+                "real-teleop-progress-entry-step-gui:"
+                f"{self._progress_operator_intent_sequence}"
+            ),
+        )
+        if command is None:
+            return False
+        return self.submit_progress_entry_step_selection_intent(command)
+
     def submit_progress_arm_control_mode_selection_ui_event(
         self,
         event: str,
@@ -4266,6 +4338,18 @@ class RealTeleopControlInput:
         pending = getattr(
             self,
             "_progress_arm_control_mode_selection_intents",
+            None,
+        )
+        if not pending:
+            return ()
+        return (pending.popleft(),)
+
+    def consume_progress_entry_step_selection_intents(
+        self,
+    ) -> tuple[ProgressEntryStepSelectionCommand, ...]:
+        pending = getattr(
+            self,
+            "_progress_entry_step_selection_intents",
             None,
         )
         if not pending:

@@ -70,6 +70,7 @@ from teleop_runtime.real_teleop.progress_adapter import (
     resolve_real_teleop_default_progress_profile,
     resolve_real_teleop_task_stage_profile,
     select_real_teleop_managed_progress_profile,
+    select_real_teleop_progress_entry_step,
     validate_real_teleop_initial_progress_profile,
 )
 
@@ -522,6 +523,70 @@ def test_progress_gui_keeps_profile_selection_available_for_any_formal_task(
     assert configured["profile_id"] == selected.profile_id
 
 
+def test_gui_entry_step_selects_truncated_episode_with_annotation_binding(
+    tmp_path: Path,
+) -> None:
+    profile = load_real_teleop_managed_progress_profile(
+        "dmtac_rm65_bimanual_position_writing_five_stage_progress"
+    )
+    stage_profile = resolve_real_teleop_task_stage_profile(profile)
+    assert stage_profile is not None
+    args = SimpleNamespace(
+        collection_progress_gui=True,
+        collection_progress_profile=profile,
+        collection_stage_profile=stage_profile,
+        collection_task_id="writing",
+        dataset_root=tmp_path,
+        collection_progress_entry_step="right_acquire_brush",
+        collection_progress_entry_stage="right_acquire_brush.grasp",
+        collection_progress_entry_condition="recovery_from_failure",
+    )
+
+    selected = select_real_teleop_progress_entry_step(
+        args=args,
+        dataset_recorder=None,
+        progress_step_id="right_write",
+    )
+    bind_dataset_progress_profile(tmp_path, profile)
+    payload = build_real_teleop_startup_progress_ui_payload(
+        args=args,
+        dataset_recorder=None,
+    )
+    episode = RealTeleopProgressEpisode(
+        dataset_root=tmp_path,
+        identity=_identity("episode-progress-gui-entry"),
+        profile=profile,
+        stage_profile=stage_profile,
+        entry_step_id=args.collection_progress_entry_step,
+        entry_stage_id=args.collection_progress_entry_stage,
+        entry_condition=args.collection_progress_entry_condition,
+    )
+
+    assert selected == "right_write"
+    assert [item["progress_step_id"] for item in payload["entry_steps"]] == [
+        "right_acquire_brush",
+        "left_remove_brush_cap",
+        "right_dip_ink",
+        "right_write",
+        "right_return_brush",
+    ]
+    assert payload["selected_entry_step_id"] == "right_write"
+    assert payload["current_progress_step_id"] == "right_write"
+    assert payload["profile_selection_locked"] is True
+    assert "progress_profile_select" not in payload["active_controls"]
+    assert "progress_entry_step_select" in payload["active_controls"]
+    assert args.collection_progress_entry_stage == ""
+    assert args.collection_progress_entry_condition == "nominal"
+    assert episode.binding.entry_step_id == "right_write"
+    assert episode.binding.entry_mode == "ACTUAL_TRUNCATED_HISTORY"
+    assert episode.binding.truncated_at_start is True
+    assert episode.stage_entry_binding is not None
+    assert episode.stage_entry_binding.entry_stage_id == "right_write.write"
+    assert episode.stage_entry_binding.entry_condition == "NOMINAL"
+    assert "stage_entry_ref" in episode.metadata_reference
+    episode.close_unsealed()
+
+
 def test_four_stage_writing_is_default_only_for_blank_gui_dataset(
     tmp_path: Path,
 ) -> None:
@@ -591,6 +656,9 @@ def test_switching_to_new_dataset_unlocks_profile_without_mutating_old_recorder(
         collection_progress_profile=old_profile,
         collection_task_id="formal-task",
         dataset_root=new_root,
+        collection_progress_entry_step="execute_task",
+        collection_progress_entry_stage="execute_task.manipulate",
+        collection_progress_entry_condition="recovery_from_failure",
     )
 
     switched = build_real_teleop_startup_progress_ui_payload(
@@ -607,6 +675,9 @@ def test_switching_to_new_dataset_unlocks_profile_without_mutating_old_recorder(
     assert "progress_profile_select" in switched["active_controls"]
     assert selected.profile_id == "example_three_stage_pick_place_progress"
     assert args.collection_progress_profile == selected
+    assert args.collection_progress_entry_step == ""
+    assert args.collection_progress_entry_stage == ""
+    assert args.collection_progress_entry_condition == "nominal"
     assert old_selection_attempts == []
 
 

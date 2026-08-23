@@ -97,6 +97,25 @@ class ProgressProfileSelectionCommand:
 
 
 @dataclass(frozen=True)
+class ProgressEntryStepSelectionCommand:
+    """Station-admitted next-Episode coarse entry-step selection."""
+
+    command_id: str
+    progress_step_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("command_id", "progress_step_id"):
+            value = str(getattr(self, name)).strip()
+            if not value:
+                raise ValueError(f"{name} must be non-empty.")
+            object.__setattr__(self, name, value)
+
+    @property
+    def intent_id(self) -> str:
+        return self.command_id
+
+
+@dataclass(frozen=True)
 class ProgressArmControlModeSelectionCommand:
     """Station-admitted idle arm-control-mode selection."""
 
@@ -268,6 +287,13 @@ class ProgressApplicationPort(Protocol):
         command_id: str,
     ) -> ProgressProfileSelectionCommand | None: ...
 
+    def entry_step_selection_from_event(
+        self,
+        *,
+        event: str,
+        command_id: str,
+    ) -> ProgressEntryStepSelectionCommand | None: ...
+
     def arm_control_mode_selection_from_event(
         self,
         *,
@@ -289,6 +315,13 @@ class ProgressApplicationPort(Protocol):
         profile_id: str,
     ) -> Any: ...
 
+    def select_progress_entry_step(
+        self,
+        *,
+        dataset_recorder: object | None,
+        progress_step_id: str,
+    ) -> str: ...
+
     def project_progress_application_state(
         self,
         *,
@@ -309,6 +342,7 @@ __all__ = [
     "ProgressApplicationProjection",
     "ProgressApplicationPort",
     "ProgressArmControlModeSelectionCommand",
+    "ProgressEntryStepSelectionCommand",
     "ProgressEventBindings",
     "ProgressMutationCommand",
     "ProgressMutationKind",

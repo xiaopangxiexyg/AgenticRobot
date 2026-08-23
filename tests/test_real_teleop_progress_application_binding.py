@@ -17,6 +17,7 @@ from control_station.real_teleop_application import (
 )
 from teleop_runtime.real_teleop.progress_contracts import (
     ProgressArmControlModeSelectionCommand,
+    ProgressEntryStepSelectionCommand,
     PROGRESS_ARM_CONTROL_MODES as RUNTIME_ARM_CONTROL_MODES,
     ProgressMutationCommand,
     ProgressProfileSelectionCommand,
@@ -57,6 +58,13 @@ def test_station_progress_application_returns_only_lower_commands() -> None:
     ) == ProgressProfileSelectionCommand(
         command_id="station:profile:3",
         profile_id="writing-v1",
+    )
+    assert application.entry_step_selection_from_event(
+        event="progress_entry_step_select:right_write",
+        command_id="station:entry:4",
+    ) == ProgressEntryStepSelectionCommand(
+        command_id="station:entry:4",
+        progress_step_id="right_write",
     )
 
 
@@ -203,7 +211,9 @@ class _StartupProgressControl:
         self.published: list[dict[str, object]] = []
         self.profile_selections: list[ProgressProfileSelectionCommand] = []
         self.arm_mode_selections: list[ProgressArmControlModeSelectionCommand] = []
+        self.entry_step_selections: list[ProgressEntryStepSelectionCommand] = []
         self.selected_profiles: list[tuple[object | None, str]] = []
+        self.selected_entry_steps: list[tuple[object | None, str]] = []
 
     def build_startup_progress_ui_payload(
         self,
@@ -231,6 +241,13 @@ class _StartupProgressControl:
         self.arm_mode_selections.clear()
         return result
 
+    def consume_progress_entry_step_selection_intents(
+        self,
+    ) -> tuple[ProgressEntryStepSelectionCommand, ...]:
+        result = tuple(self.entry_step_selections)
+        self.entry_step_selections.clear()
+        return result
+
     def select_managed_progress_profile(
         self,
         *,
@@ -239,6 +256,15 @@ class _StartupProgressControl:
     ) -> object:
         self.selected_profiles.append((dataset_recorder, profile_id))
         return SimpleNamespace(profile_id=profile_id, profile_version="1")
+
+    def select_progress_entry_step(
+        self,
+        *,
+        dataset_recorder: object | None,
+        progress_step_id: str,
+    ) -> str:
+        self.selected_entry_steps.append((dataset_recorder, progress_step_id))
+        return progress_step_id
 
 
 def test_startup_progress_runtime_deduplicates_unchanged_projection(
@@ -250,6 +276,7 @@ def test_startup_progress_runtime_deduplicates_unchanged_projection(
         collection_task_id="writing",
         collection_progress_profile=None,
         collection_progress_arm_control_mode="profile",
+        collection_progress_entry_step="",
     )
     control = _StartupProgressControl()
     messages: list[tuple[str, str]] = []
@@ -278,6 +305,7 @@ def test_startup_progress_runtime_consumes_idle_configuration_selections(
         collection_task_id="writing",
         collection_progress_profile=None,
         collection_progress_arm_control_mode="profile",
+        collection_progress_entry_step="",
     )
     recorder = object()
     control = _StartupProgressControl()
@@ -293,6 +321,12 @@ def test_startup_progress_runtime_consumes_idle_configuration_selections(
             profile_id="writing-v1",
         )
     )
+    control.entry_step_selections.append(
+        ProgressEntryStepSelectionCommand(
+            command_id="entry:1",
+            progress_step_id="right_write",
+        )
+    )
     messages: list[tuple[str, str]] = []
     runtime = RealTeleopStartupProgressRuntime(
         args=args,
@@ -306,5 +340,7 @@ def test_startup_progress_runtime_consumes_idle_configuration_selections(
 
     assert args.collection_progress_arm_control_mode == "strict_profile"
     assert control.selected_profiles == [(recorder, "writing-v1")]
+    assert control.selected_entry_steps == [(recorder, "right_write")]
     assert any("strict_profile" in message for _, message in messages)
     assert any("writing-v1@1" in message for _, message in messages)
+    assert any("right_write" in message for _, message in messages)

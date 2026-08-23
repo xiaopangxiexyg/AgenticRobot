@@ -384,6 +384,14 @@ meta/progress/profile.cjson
 但没有 progress profile 的数据集不能中途启用，必须使用新的数据集目录。因此一个
 数据集不会混装不同 profile，也不会混装 profile-less 与 profiled Episode。
 
+选择 progress profile 后，GUI 还会显示“下一个 Episode 起始子任务”。空闲时可从当前
+LINEAR profile 的任意 coarse 子任务开始；录制、倒计时、失败暂停或保存期间选择器禁用。
+选择非首子任务不会伪造或补写前置 Advance/成功事实，而是把该 Episode 显式记录为
+`ACTUAL_TRUNCATED_HISTORY`，从所选子任务的第一个 fine stage 以 `NOMINAL` 条件开始。
+从该点之后，五踏板 Advance/Failure/Undo、Episode 结束/保存以及离线 annotation 流程
+与完整任务采集完全一致。更换 profile 会把起始子任务重置为新 profile 的首项，避免旧
+profile 的 step/stage 选择泄漏到新合同。
+
 这里的“一个数据集”是一次正式任务对应的最终 dataset 目录，而不是可以同时容纳多个
 日期/任务目录的上层 `--dataset-root` 容器。唯一绑定文件始终位于该最终目录下：
 

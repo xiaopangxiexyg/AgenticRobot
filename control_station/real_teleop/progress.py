@@ -24,6 +24,7 @@ PROGRESS_ADVANCE_EVENT = "progress_advance"
 PROGRESS_UNDO_EVENT = "progress_undo"
 PROGRESS_FAILURE_EVENT = "progress_failure"
 PROGRESS_PROFILE_SELECT_EVENT = "progress_profile_select"
+PROGRESS_ENTRY_STEP_SELECT_EVENT = "progress_entry_step_select"
 PROGRESS_ARM_CONTROL_MODE_SELECT_EVENT = "progress_arm_control_mode_select"
 PROGRESS_ARM_CONTROL_MODE_STRICT = "strict_profile"
 PROGRESS_ARM_CONTROL_MODE_PROFILE = "profile"
@@ -89,6 +90,21 @@ class ProgressProfileSelectionIntent:
 
     def __post_init__(self) -> None:
         for name in ("intent_id", "profile_id"):
+            value = str(getattr(self, name)).strip()
+            if not value:
+                raise ValueError(f"{name} must be non-empty.")
+            object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True)
+class ProgressEntryStepSelectionIntent:
+    """Typed idle selection for the next Episode's coarse entry step."""
+
+    intent_id: str
+    progress_step_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("intent_id", "progress_step_id"):
             value = str(getattr(self, name)).strip()
             if not value:
                 raise ValueError(f"{name} must be non-empty.")
@@ -256,6 +272,26 @@ def progress_profile_selection_intent_from_event(
     )
 
 
+def progress_entry_step_selection_intent_from_event(
+    event: str,
+    *,
+    intent_id: str,
+) -> ProgressEntryStepSelectionIntent | None:
+    """Translate a next-Episode coarse entry selection into a typed intent."""
+
+    event_name, separator, suffix = str(event).strip().partition(":")
+    if (
+        event_name != PROGRESS_ENTRY_STEP_SELECT_EVENT
+        or not separator
+        or not suffix.strip()
+    ):
+        return None
+    return ProgressEntryStepSelectionIntent(
+        intent_id=intent_id,
+        progress_step_id=suffix,
+    )
+
+
 def progress_arm_control_mode_selection_intent_from_event(
     event: str,
     *,
@@ -290,6 +326,9 @@ def build_progress_ui_payload(
     current_step_ordinal: int | None = None,
     total_step_count: int = 0,
     next_steps: Sequence[tuple[str, str]] = (),
+    entry_steps: Sequence[tuple[str, str]] = (),
+    selected_entry_step_id: str = "",
+    entry_step_selection_enabled: bool = False,
     available_profiles: Sequence[ProgressProfileOption] = (),
     profile_selection_enabled: bool = False,
     profile_selection_locked: bool = False,
@@ -334,6 +373,28 @@ def build_progress_ui_payload(
             raise ValueError("Progress profile options must have unique IDs.")
         seen_profile_ids.add(option.profile_id)
         normalized_profiles.append(option.to_payload())
+    normalized_entry_steps: list[dict[str, str]] = []
+    seen_entry_step_ids: set[str] = set()
+    for step_id, display_name in entry_steps:
+        normalized_id = str(step_id).strip()
+        normalized_display = str(display_name).strip()
+        if not normalized_id or not normalized_display:
+            raise ValueError("Progress UI entry-step entries must be non-empty.")
+        if normalized_id in seen_entry_step_ids:
+            raise ValueError("Progress UI entry-step IDs must be unique.")
+        seen_entry_step_ids.add(normalized_id)
+        normalized_entry_steps.append(
+            {
+                "progress_step_id": normalized_id,
+                "display_name": normalized_display,
+            }
+        )
+    normalized_selected_entry = str(selected_entry_step_id).strip()
+    if (
+        normalized_selected_entry
+        and normalized_selected_entry not in seen_entry_step_ids
+    ):
+        raise ValueError("Selected progress entry step is not available.")
     selection_enabled = bool(
         enabled
         and profile_selection_enabled
@@ -346,6 +407,12 @@ def build_progress_ui_payload(
     arm_control_selection_enabled = bool(
         enabled and arm_control_mode_selection_enabled
     )
+    entry_selection_enabled = bool(
+        enabled
+        and configured
+        and entry_step_selection_enabled
+        and normalized_entry_steps
+    )
     active_controls = (
         list(available_progress_controls(availability))
         if enabled and configured
@@ -353,6 +420,8 @@ def build_progress_ui_payload(
     )
     if selection_enabled:
         active_controls.append(PROGRESS_PROFILE_SELECT_EVENT)
+    if entry_selection_enabled:
+        active_controls.append(PROGRESS_ENTRY_STEP_SELECT_EVENT)
     if arm_control_selection_enabled:
         active_controls.append(PROGRESS_ARM_CONTROL_MODE_SELECT_EVENT)
     return {
@@ -370,6 +439,9 @@ def build_progress_ui_payload(
         "current_step_ordinal": current_step_ordinal,
         "total_step_count": int(total_step_count),
         "next_steps": normalized_next_steps,
+        "entry_steps": normalized_entry_steps,
+        "selected_entry_step_id": normalized_selected_entry,
+        "entry_step_selection_enabled": entry_selection_enabled,
         "available_profiles": normalized_profiles,
         "profile_selection_enabled": selection_enabled,
         "profile_selection_locked": bool(profile_selection_locked),
@@ -406,6 +478,8 @@ def build_real_teleop_progress_ui_payload(
     profile_binding_source: str = "",
     arm_control_mode: str = PROGRESS_ARM_CONTROL_MODE_PROFILE,
     arm_control_mode_selection_enabled: bool = False,
+    selected_entry_step_id: str = "",
+    entry_step_selection_enabled: bool = False,
 ) -> dict[str, object]:
     """Project canonical progress state into ephemeral RealTeleop UI state."""
 
@@ -458,8 +532,13 @@ def build_real_teleop_progress_ui_payload(
         for step in profile.steps
     }
     state = None if episode is None else episode.state
+    normalized_entry_step_id = (
+        str(selected_entry_step_id).strip() or profile.initial_step_id
+    )
+    if normalized_entry_step_id not in steps_by_id:
+        raise ValueError("Selected progress entry step is not in the profile.")
     current_step_id = (
-        profile.initial_step_id
+        normalized_entry_step_id
         if state is None or state.current_progress_step_id is None
         else state.current_progress_step_id
     )
@@ -473,7 +552,7 @@ def build_real_teleop_progress_ui_payload(
     )
     phase = "IDLE" if state is None else state.phase
     message_by_phase = {
-        "IDLE": "开始正式数采后进入第一个进度阶段。",
+        "IDLE": "开始正式数采后将从所选起始子任务进入；之后的推进、失败、撤销和标注流程保持不变。",
         "ACTIVE_ATTEMPT": "当前阶段正在采集；推进只结束当前阶段，不停止 episode。",
         "AWAITING_HOLD_RECEIPT": "失败已记录，正在等待机械臂 Hold 与正式采集暂停。",
         "PAUSED_NO_ACTIVE_ATTEMPT": (
@@ -533,6 +612,12 @@ def build_real_teleop_progress_ui_payload(
         current_step_ordinal=current_step.ordinal,
         total_step_count=len(profile.steps),
         next_steps=next_steps,
+        entry_steps=tuple(
+            (step.progress_step_id, step.display_name)
+            for step in profile.steps
+        ),
+        selected_entry_step_id=normalized_entry_step_id,
+        entry_step_selection_enabled=entry_step_selection_enabled,
         available_profiles=available_profiles,
         profile_selection_enabled=profile_selection_enabled,
         profile_selection_locked=profile_selection_locked,
@@ -561,11 +646,13 @@ __all__ = [
     "PROGRESS_ARM_CONTROL_MODE_SELECT_EVENT",
     "PROGRESS_ARM_CONTROL_MODE_STRICT",
     "PROGRESS_ADVANCE_EVENT",
+    "PROGRESS_ENTRY_STEP_SELECT_EVENT",
     "PROGRESS_FAILURE_EVENT",
     "PROGRESS_PROFILE_SELECT_EVENT",
     "PROGRESS_UNDO_EVENT",
     "ProgressControlAvailability",
     "ProgressArmControlModeSelectionIntent",
+    "ProgressEntryStepSelectionIntent",
     "ProgressOperatorIntent",
     "ProgressOperatorIntentKind",
     "ProgressProfileOption",
@@ -577,6 +664,7 @@ __all__ = [
     "build_real_teleop_progress_ui_payload",
     "progress_intent_from_event",
     "progress_arm_control_mode_selection_intent_from_event",
+    "progress_entry_step_selection_intent_from_event",
     "normalize_progress_arm_control_mode",
     "progress_profile_selection_intent_from_event",
 ]

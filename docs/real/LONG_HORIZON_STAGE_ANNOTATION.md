@@ -369,6 +369,12 @@ Episode-local `stages.cjson` 和 `stage_entry.cjson`，并在 dataset 级
 `meta/progress/stages.cjson` 锁定唯一 stage profile；同一数据集不能混装不同 stage
 profile 或 profiled/unprofiled progress Episode。
 
+若只需要从某个 coarse 子任务的开头采集（不是从该子任务内部的失败 fine stage 恢复），
+可直接在真机 progress GUI 的“下一个 Episode 起始子任务”中选择。GUI 会绑定所选 coarse
+step 的第一个 fine stage，写入 `NOMINAL + ACTUAL_TRUNCATED_HISTORY`，因此后标注页面会从
+该 fine stage 开始构造 occurrence，不会要求为未采集的前置子任务补标。fine-stage recovery
+仍必须使用上面的显式三参数入口，GUI 不会猜测失败恢复语义。
+
 ## 7. 无真机 mock 流程（仅完整源码仓库）
 
 完整 DexTeleop 源码仓库提供一个仅用于离线界面验证的 probe。它复用真实采集侧的

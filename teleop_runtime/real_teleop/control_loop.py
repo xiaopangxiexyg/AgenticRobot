@@ -1418,6 +1418,16 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             if not callable(consume_profile_selections)
             else consume_profile_selections()
         )
+        consume_entry_step_selections = getattr(
+            clutch_input,
+            "consume_progress_entry_step_selection_intents",
+            None,
+        )
+        entry_step_selection_intents = (
+            ()
+            if not callable(consume_entry_step_selections)
+            else consume_entry_step_selections()
+        )
         consume_arm_mode_selections = getattr(
             clutch_input,
             "consume_progress_arm_control_mode_selection_intents",
@@ -1494,6 +1504,42 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             except Exception as exc:  # noqa: BLE001 - selection has no control effect.
                 message = (
                     "长程进度 profile 选择失败，原配置保持不变："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _log("Progress", message, now=loop_start)
+                if control_ui is not None:
+                    control_ui.append_message("Progress", message)
+        for selection_intent in entry_step_selection_intents:
+            try:
+                if bool(
+                    getattr(clutch_input, "_episode_busy", lambda: True)()
+                ):
+                    raise RuntimeError(
+                        "Episode countdown, recording, pause, or finalization "
+                        "is active"
+                    )
+                select_entry_step = getattr(
+                    clutch_input,
+                    "select_progress_entry_step",
+                    None,
+                )
+                if not callable(select_entry_step):
+                    raise RuntimeError(
+                        "Progress application entry-step selection is unavailable."
+                    )
+                selected_step_id = select_entry_step(
+                    dataset_recorder=context.dataset_recorder(),
+                    progress_step_id=selection_intent.progress_step_id,
+                )
+                if control_ui is not None:
+                    control_ui.append_message(
+                        "Progress",
+                        "下一个 Episode 将从子任务开始："
+                        f"{selected_step_id}；之后沿用正常推进与标注流程。",
+                    )
+            except Exception as exc:  # noqa: BLE001 - selection has no control effect.
+                message = (
+                    "长程进度起始子任务选择失败，原配置保持不变："
                     f"{type(exc).__name__}: {exc}"
                 )
                 _log("Progress", message, now=loop_start)

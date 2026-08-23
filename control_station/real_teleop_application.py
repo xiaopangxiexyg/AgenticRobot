@@ -18,10 +18,12 @@ from collection_runtime.progress.profiles import (
 from teleop_runtime.real_teleop.progress_adapter import (
     list_real_teleop_managed_progress_profiles,
     select_real_teleop_managed_progress_profile,
+    select_real_teleop_progress_entry_step,
 )
 from teleop_runtime.real_teleop.progress_contracts import (
     ProgressApplicationProjection,
     ProgressArmControlModeSelectionCommand,
+    ProgressEntryStepSelectionCommand,
     ProgressEventBindings,
     ProgressMutationCommand,
     ProgressProfileSelectionCommand,
@@ -39,6 +41,7 @@ from .real_teleop.progress import (
     available_progress_controls,
     build_real_teleop_progress_ui_payload,
     progress_arm_control_mode_selection_intent_from_event,
+    progress_entry_step_selection_intent_from_event,
     progress_intent_from_event,
     progress_profile_selection_intent_from_event,
 )
@@ -185,6 +188,10 @@ def build_real_teleop_startup_progress_ui_payload(
             )
         ),
         arm_control_mode_selection_enabled=profile_selection_enabled,
+        selected_entry_step_id=str(
+            getattr(args, "collection_progress_entry_step", "") or ""
+        ),
+        entry_step_selection_enabled=profile_selection_enabled,
     )
     if (
         bool(getattr(args, "collection_progress_gui", False))
@@ -315,6 +322,23 @@ class StationProgressApplication:
             mode=intent.mode,
         )
 
+    def entry_step_selection_from_event(
+        self,
+        *,
+        event: str,
+        command_id: str,
+    ) -> ProgressEntryStepSelectionCommand | None:
+        intent = progress_entry_step_selection_intent_from_event(
+            event,
+            intent_id=command_id,
+        )
+        if intent is None:
+            return None
+        return ProgressEntryStepSelectionCommand(
+            command_id=intent.intent_id,
+            progress_step_id=intent.progress_step_id,
+        )
+
     def build_startup_progress_ui_payload(
         self,
         *,
@@ -337,6 +361,18 @@ class StationProgressApplication:
             args=self._args,
             dataset_recorder=dataset_recorder,
             profile_id=profile_id,
+        )
+
+    def select_progress_entry_step(
+        self,
+        *,
+        dataset_recorder: object | None,
+        progress_step_id: str,
+    ) -> str:
+        return select_real_teleop_progress_entry_step(
+            args=self._args,
+            dataset_recorder=dataset_recorder,
+            progress_step_id=progress_step_id,
         )
 
     def project_progress_application_state(
@@ -427,6 +463,15 @@ class StationProgressApplication:
                 )
             ),
             arm_control_mode_selection_enabled=profile_selection_enabled,
+            selected_entry_step_id=str(
+                getattr(
+                    self._args,
+                    "collection_progress_entry_step",
+                    "",
+                )
+                or ""
+            ),
+            entry_step_selection_enabled=profile_selection_enabled,
         )
         return ProgressApplicationProjection(
             configured=profile is not None,

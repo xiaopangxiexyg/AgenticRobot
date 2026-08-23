@@ -6825,6 +6825,7 @@ class CalibrationWebUi:
             "plus_curation_save",
             "progress_advance",
             "progress_profile_select",
+            "progress_entry_step_select",
             "progress_arm_control_mode_select",
             "task_select",
             "fix_arm_select",
@@ -6868,6 +6869,24 @@ class CalibrationWebUi:
                     and not bool(
                         self._state.progress_ui.get(
                             "profile_selection_locked",
+                            False,
+                        )
+                    )
+                )
+            if accepted and event_control == "progress_entry_step_select":
+                _, separator, progress_step_id = event_name.partition(":")
+                configured_entry_step_ids = {
+                    str(item.get("progress_step_id", "")).strip()
+                    for item in self._state.progress_ui.get("entry_steps", ())
+                    if isinstance(item, Mapping)
+                    and str(item.get("progress_step_id", "")).strip()
+                }
+                accepted = bool(
+                    separator
+                    and progress_step_id.strip() in configured_entry_step_ids
+                    and bool(
+                        self._state.progress_ui.get(
+                            "entry_step_selection_enabled",
                             False,
                         )
                     )
@@ -6935,6 +6954,12 @@ class CalibrationWebUi:
                     control
                     for control in self._state.active_controls
                     if str(control) != "progress_profile_select"
+                ]
+            if accepted and event_control == "progress_entry_step_select":
+                self._state.active_controls = [
+                    control
+                    for control in self._state.active_controls
+                    if str(control) != "progress_entry_step_select"
                 ]
             if accepted and event_control == "episode_start":
                 self._state.episode_event_status = "preparing"

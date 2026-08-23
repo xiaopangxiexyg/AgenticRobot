@@ -2906,6 +2906,9 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 collection_progress_profile=load_managed_task_profile(
                     "dmtac_rm65_bimanual_position_v1_progress"
                 ).progress_profile,
+                collection_progress_entry_step="execute_task",
+                collection_progress_entry_stage="execute_task.manipulate",
+                collection_progress_entry_condition="recovery_from_failure",
             )
             real_teleop._apply_formal_dataset_layout(args)
             control = real_teleop.RealTeleopControlInput(
@@ -2936,6 +2939,9 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
             args.collection_progress_profile.profile_id,
             target_profile.profile_id,
         )
+        self.assertEqual(args.collection_progress_entry_step, "")
+        self.assertEqual(args.collection_progress_entry_stage, "")
+        self.assertEqual(args.collection_progress_entry_condition, "nominal")
 
     def test_task_selection_defaults_new_blank_dataset_to_four_stage_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

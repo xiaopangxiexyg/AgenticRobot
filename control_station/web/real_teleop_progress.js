@@ -16,6 +16,9 @@
   let profileSelect = null;
   let profileApplyButton = null;
   let profileBindingElement = null;
+  let entryStepSelect = null;
+  let entryStepApplyButton = null;
+  let entryStepStatusElement = null;
   let armControlModeSelect = null;
   let armControlModeApplyButton = null;
   let armControlModeStatusElement = null;
@@ -30,6 +33,7 @@
   let pendingSignature = "";
   let pendingTimer = null;
   let renderedDatasetRoot = "";
+  let renderedProfileId = "";
 
   function addStyle() {
     if (document.getElementById("realTeleopProgressStyle")) return;
@@ -253,6 +257,18 @@
     profileBindingElement = document.createElement("div");
     profileBindingElement.className = "long-horizon-progress-meta mono";
 
+    const entryStepControls = document.createElement("div");
+    entryStepControls.className = "long-horizon-progress-profile";
+    entryStepSelect = document.createElement("select");
+    entryStepSelect.id = "progressEntryStepSelect";
+    entryStepApplyButton = makeButton(
+      "secondary progress-entry-step-select",
+      "应用起始子任务",
+    );
+    entryStepControls.append(entryStepSelect, entryStepApplyButton);
+    entryStepStatusElement = document.createElement("div");
+    entryStepStatusElement.className = "long-horizon-progress-meta mono";
+
     const armControlModeControls = document.createElement("div");
     armControlModeControls.className = "long-horizon-progress-profile";
     armControlModeSelect = document.createElement("select");
@@ -295,6 +311,8 @@
       messageElement,
       profileControls,
       profileBindingElement,
+      entryStepControls,
+      entryStepStatusElement,
       armControlModeControls,
       armControlModeStatusElement,
       controls,
@@ -318,6 +336,12 @@
     profileApplyButton.addEventListener("click", () => {
       const profileId = String(profileSelect.value || "").trim();
       if (profileId) submitEvent(`progress_profile_select:${profileId}`);
+    });
+    entryStepApplyButton.addEventListener("click", () => {
+      const progressStepId = String(entryStepSelect.value || "").trim();
+      if (progressStepId) {
+        submitEvent(`progress_entry_step_select:${progressStepId}`);
+      }
     });
     armControlModeApplyButton.addEventListener("click", () => {
       const mode = String(armControlModeSelect.value || "").trim();
@@ -365,6 +389,7 @@
       progress.current_progress_step_id || "",
       progress.current_attempt_id || "",
       progress.profile_id || "",
+      progress.selected_entry_step_id || "",
       Boolean(progress.profile_selection_locked),
       Boolean(progress.can_undo_last_advance),
       Boolean(progress.application_held),
@@ -451,6 +476,9 @@
     const profiles = Array.isArray(progress.available_profiles)
       ? progress.available_profiles
       : [];
+    const entrySteps = Array.isArray(progress.entry_steps)
+      ? progress.entry_steps
+      : [];
     const armControlModes = Array.isArray(progress.arm_control_modes)
       ? progress.arm_control_modes.map(String)
       : [];
@@ -472,6 +500,7 @@
       profileSelect.appendChild(option);
     }
     const selectedProfileId = String(progress.profile_id || "");
+    const profileChanged = selectedProfileId !== renderedProfileId;
     // Keep the operator's local draft while polling one dataset. A dataset
     // switch must instead adopt the target dataset's canonical binding;
     // otherwise a locked target can misleadingly display the previous
@@ -490,6 +519,37 @@
       profileSelect.value = selectedProfileId;
     }
     renderedDatasetRoot = currentDatasetRoot;
+    renderedProfileId = selectedProfileId;
+    const priorEntrySelection = String(entryStepSelect.value || "");
+    entryStepSelect.replaceChildren();
+    for (const item of entrySteps) {
+      const option = document.createElement("option");
+      option.value = String(item.progress_step_id || "");
+      option.textContent = [
+        String(item.display_name || item.progress_step_id || "-"),
+        `id=${String(item.progress_step_id || "-")}`,
+      ].join(" · ");
+      entryStepSelect.appendChild(option);
+    }
+    const selectedEntryStepId = String(
+      progress.selected_entry_step_id || "",
+    );
+    if (
+      !datasetChanged
+      && !profileChanged
+      && Boolean(progress.entry_step_selection_enabled)
+      && entrySteps.some(
+        (item) => String(item.progress_step_id) === priorEntrySelection,
+      )
+    ) {
+      entryStepSelect.value = priorEntrySelection;
+    } else if (
+      entrySteps.some(
+        (item) => String(item.progress_step_id) === selectedEntryStepId,
+      )
+    ) {
+      entryStepSelect.value = selectedEntryStepId;
+    }
     const priorSelection = String(nextSelect.value || "");
     nextSelect.replaceChildren();
     for (const item of nextSteps) {
@@ -550,6 +610,21 @@
         ? "当前可自由选择 Profile；Task name/id 与 Profile 独立，首个 progress Episode 才会按 hash 绑定。"
         : "当前没有可选的 LINEAR managed profile。";
     }
+
+    const entryStepSelectionAllowed = (
+      activeControls.has("progress_entry_step_select")
+      && Boolean(progress.entry_step_selection_enabled)
+      && entrySteps.length > 0
+      && !requestPending
+    );
+    entryStepSelect.disabled = !entryStepSelectionAllowed;
+    entryStepApplyButton.disabled = !entryStepSelectionAllowed;
+    const selectedEntry = entrySteps.find(
+      (item) => String(item.progress_step_id) === selectedEntryStepId,
+    );
+    entryStepStatusElement.textContent = selectedEntry
+      ? `下一个 Episode 起点：${String(selectedEntry.display_name || selectedEntry.progress_step_id)} · ${selectedEntryStepId === String(entrySteps[0]?.progress_step_id || "") ? "完整任务起点" : "截断历史起点；前置子任务不会伪造为已采集"}`
+      : "请先选择 progress profile；起始子任务只影响下一个 Episode。";
 
     const armModeLabels = {
       strict_profile: "严格 Profile：禁止手动 Fix/单臂踏板，并启用 writer 一致性门",

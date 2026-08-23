@@ -9,6 +9,7 @@ import pytest
 from control_station.real_teleop.progress import (
     ProgressArmControlModeSelectionIntent,
     ProgressControlAvailability,
+    ProgressEntryStepSelectionIntent,
     ProgressOperatorIntent,
     ProgressProfileOption,
     ProgressProfileSelectionIntent,
@@ -17,6 +18,7 @@ from control_station.real_teleop.progress import (
     build_real_teleop_progress_ui_payload,
     progress_profile_selection_intent_from_event,
     progress_arm_control_mode_selection_intent_from_event,
+    progress_entry_step_selection_intent_from_event,
     progress_intent_from_event,
 )
 from control_station.real_teleop_application import (
@@ -28,6 +30,7 @@ from teleop_runtime.real_teleop.operator_control_runtime import (
 )
 from teleop_runtime.real_teleop.progress_contracts import (
     ProgressArmControlModeSelectionCommand,
+    ProgressEntryStepSelectionCommand,
     ProgressProfileSelectionCommand,
 )
 import teleop_runtime.real_teleop.operator_control_runtime as operator_runtime
@@ -119,6 +122,17 @@ def test_progress_event_mapping_is_typed_and_dataset_neutral() -> None:
     assert progress_profile_selection_intent_from_event(
         "progress_profile_select:",
         intent_id="select-empty",
+    ) is None
+    assert progress_entry_step_selection_intent_from_event(
+        "progress_entry_step_select:write",
+        intent_id="entry-1",
+    ) == ProgressEntryStepSelectionIntent(
+        intent_id="entry-1",
+        progress_step_id="write",
+    )
+    assert progress_entry_step_selection_intent_from_event(
+        "progress_entry_step_select:",
+        intent_id="entry-empty",
     ) is None
     assert progress_arm_control_mode_selection_intent_from_event(
         "progress_arm_control_mode_select:strict_profile",
@@ -240,6 +254,36 @@ def test_profile_selector_is_available_before_configuration_and_lock() -> None:
     )
     assert locked["active_controls"] == []
     assert locked["profile_selection_locked"] is True
+
+
+def test_entry_step_selector_is_idle_only_and_independent_of_profile_lock() -> None:
+    payload = build_progress_ui_payload(
+        gui_enabled=True,
+        configured=True,
+        availability=ProgressControlAvailability(),
+        entry_steps=(("acquire", "取笔"), ("write", "书写")),
+        selected_entry_step_id="write",
+        entry_step_selection_enabled=True,
+        profile_selection_locked=True,
+    )
+
+    assert payload["entry_steps"] == [
+        {"progress_step_id": "acquire", "display_name": "取笔"},
+        {"progress_step_id": "write", "display_name": "书写"},
+    ]
+    assert payload["selected_entry_step_id"] == "write"
+    assert payload["active_controls"] == ["progress_entry_step_select"]
+
+    busy = build_progress_ui_payload(
+        gui_enabled=True,
+        configured=True,
+        availability=ProgressControlAvailability(),
+        entry_steps=(("acquire", "取笔"), ("write", "书写")),
+        selected_entry_step_id="write",
+        entry_step_selection_enabled=False,
+    )
+    assert busy["active_controls"] == []
+    assert busy["entry_step_selection_enabled"] is False
 
 
 def test_busy_profile_projection_explains_that_selection_returns_after_idle() -> None:
@@ -395,6 +439,9 @@ def test_progress_failure_is_immediate_and_does_not_open_confirmation() -> None:
     assert "当前阶段（本次采集）" in script
     assert "下一阶段（完成当前后进入）" in script
     assert "renderNextStagePreview" in script
+    assert 'entryStepSelect.id = "progressEntryStepSelect"' in script
+    assert "progress_entry_step_select:${progressStepId}" in script
+    assert "前置子任务不会伪造为已采集" in script
     assert script.index(
         "String(item.profile_id) === priorProfileSelection"
     ) < script.index("String(item.profile_id) === selectedProfileId")
@@ -454,6 +501,27 @@ def test_web_transport_validates_progress_arm_control_mode_selection() -> None:
     assert ui.consume_events() == [
         "progress_arm_control_mode_select:strict_profile"
     ]
+
+
+def test_web_transport_validates_next_episode_entry_step_selection() -> None:
+    ui = CalibrationWebUi(open_browser=False)
+    ui.publish(
+        progress_ui={
+            "enabled": True,
+            "entry_steps": [
+                {"progress_step_id": "acquire", "display_name": "取笔"},
+                {"progress_step_id": "write", "display_name": "书写"},
+            ],
+            "entry_step_selection_enabled": True,
+        },
+        active_controls=["progress_entry_step_select"],
+    )
+
+    assert not ui.push_event("progress_entry_step_select:")
+    assert not ui.push_event("progress_entry_step_select:unknown")
+    assert ui.push_event("progress_entry_step_select:write")
+    assert not ui.push_event("progress_entry_step_select:acquire")
+    assert ui.consume_events() == ["progress_entry_step_select:write"]
 
 
 def test_concurrent_progress_requests_admit_exactly_one_mutation() -> None:
@@ -531,6 +599,9 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
     control._progress_profile_selection_intents = (
         __import__("collections").deque()
     )
+    control._progress_entry_step_selection_intents = (
+        __import__("collections").deque()
+    )
     control._progress_operator_intent_sequence = 0
 
     assert control.submit_progress_ui_event("progress_advance")
@@ -566,6 +637,19 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
         ),
     )
 
+    assert control.submit_progress_entry_step_selection_ui_event(
+        "progress_entry_step_select:write"
+    )
+    assert not control.submit_progress_entry_step_selection_ui_event(
+        "progress_entry_step_select:return"
+    )
+    assert control.consume_progress_entry_step_selection_intents() == (
+        ProgressEntryStepSelectionCommand(
+            command_id="real-teleop-progress-entry-step-gui:9",
+            progress_step_id="write",
+        ),
+    )
+
     assert control.submit_progress_arm_control_mode_selection_ui_event(
         "progress_arm_control_mode_select:strict_profile"
     )
@@ -574,7 +658,7 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
     )
     assert arm_mode_selections == (
         ProgressArmControlModeSelectionCommand(
-            command_id="real-teleop-progress-arm-mode-gui:9",
+            command_id="real-teleop-progress-arm-mode-gui:11",
             mode="strict_profile",
         ),
     )

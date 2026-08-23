@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from ..operator_ui_ports import OperatorUiPort
 from .progress_contracts import (
     ProgressArmControlModeSelectionCommand,
+    ProgressEntryStepSelectionCommand,
     ProgressProfileSelectionCommand,
 )
 
@@ -34,12 +35,23 @@ class StartupProgressControlPort(Protocol):
         self,
     ) -> tuple[ProgressArmControlModeSelectionCommand, ...]: ...
 
+    def consume_progress_entry_step_selection_intents(
+        self,
+    ) -> tuple[ProgressEntryStepSelectionCommand, ...]: ...
+
     def select_managed_progress_profile(
         self,
         *,
         dataset_recorder: object | None,
         profile_id: str,
     ) -> Any: ...
+
+    def select_progress_entry_step(
+        self,
+        *,
+        dataset_recorder: object | None,
+        progress_step_id: str,
+    ) -> str: ...
 
 
 class StartupProgressLogger(Protocol):
@@ -113,6 +125,14 @@ class RealTeleopStartupProgressRuntime:
                     "profile",
                 )
             ),
+            str(
+                getattr(
+                    self._args,
+                    "collection_progress_entry_step",
+                    "",
+                )
+                or ""
+            ),
         )
 
     def publish(self, *, force: bool = False) -> None:
@@ -184,6 +204,31 @@ class RealTeleopStartupProgressRuntime:
             except Exception as exc:  # noqa: BLE001 - configuration remains usable.
                 message = (
                     "长程进度 profile 选择失败，原配置保持不变："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._log("Progress", message, now=now)
+                if self._control_ui is not None:
+                    self._control_ui.append_message("Progress", message)
+            finally:
+                self.publish(force=True)
+        entry_selections = (
+            self._control_input.consume_progress_entry_step_selection_intents()
+        )
+        for selection in entry_selections:
+            try:
+                selected_step_id = self._control_input.select_progress_entry_step(
+                    dataset_recorder=self._dataset_recorder(),
+                    progress_step_id=selection.progress_step_id,
+                )
+                if self._control_ui is not None:
+                    self._control_ui.append_message(
+                        "Progress",
+                        "下一个 Episode 将从子任务开始："
+                        f"{selected_step_id}；之后沿用正常推进与标注流程。",
+                    )
+            except Exception as exc:  # noqa: BLE001 - configuration remains usable.
+                message = (
+                    "长程进度起始子任务选择失败，原配置保持不变："
                     f"{type(exc).__name__}: {exc}"
                 )
                 self._log("Progress", message, now=now)

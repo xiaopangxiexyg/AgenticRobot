@@ -351,7 +351,71 @@ def select_real_teleop_managed_progress_profile(
             requested_profile=selected,
         )
         args.collection_progress_profile = selected
+    # Episode entry is a profile-local choice. A profile switch must not carry
+    # a stale coarse/fine entry into the newly selected contract, even when two
+    # profiles happen to reuse an ID.
+    args.collection_progress_entry_step = ""
+    args.collection_progress_entry_stage = ""
+    args.collection_progress_entry_condition = "nominal"
     return selected
+
+
+def select_real_teleop_progress_entry_step(
+    *,
+    args: argparse.Namespace,
+    dataset_recorder: object | None,
+    progress_step_id: str,
+) -> str:
+    """Select the coarse entry used when the next formal Episode is prepared.
+
+    GUI entry selection deliberately starts at the selected coarse step's first
+    fine stage with nominal conditions. Fine-stage recovery remains available
+    through the explicit CLI contract and is never guessed by this helper.
+    """
+
+    if not bool(getattr(args, "collection_progress_gui", False)):
+        raise RuntimeError("collection progress GUI selection is disabled")
+    recorder_matches = _dataset_recorder_matches_progress_selection(
+        args=args,
+        dataset_recorder=dataset_recorder,
+    )
+    if recorder_matches and bool(
+        getattr(dataset_recorder, "is_recording", False)
+        or getattr(dataset_recorder, "finalizing", False)
+    ):
+        raise RuntimeError(
+            "Cannot select a progress entry step while an Episode is recording "
+            "or finalizing."
+        )
+    profile = (
+        getattr(dataset_recorder, "progress_profile", None)
+        if recorder_matches
+        else resolve_real_teleop_progress_profile(
+            getattr(args, "collection_progress_profile", None),
+            collection_task_id=str(getattr(args, "collection_task_id", "")),
+        )
+    )
+    if profile is None:
+        raise RuntimeError("Select a collection progress profile first.")
+    stage_profile = (
+        getattr(dataset_recorder, "stage_profile", None)
+        if recorder_matches
+        else resolve_real_teleop_task_stage_profile(
+            profile,
+            getattr(args, "collection_stage_profile", ""),
+        )
+    )
+    step_id, _, _ = resolve_real_teleop_progress_entry(
+        progress_profile=profile,
+        stage_profile=stage_profile,
+        entry_step_id=progress_step_id,
+        entry_stage_id="",
+        entry_condition="nominal",
+    )
+    args.collection_progress_entry_step = step_id
+    args.collection_progress_entry_stage = ""
+    args.collection_progress_entry_condition = "nominal"
+    return step_id
 
 
 def _request_context(
@@ -828,5 +892,6 @@ __all__ = [
     "resolve_real_teleop_progress_profile",
     "resolve_real_teleop_default_progress_profile",
     "select_real_teleop_managed_progress_profile",
+    "select_real_teleop_progress_entry_step",
     "validate_real_teleop_initial_progress_profile",
 ]
