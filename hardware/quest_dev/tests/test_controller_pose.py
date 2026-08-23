@@ -288,6 +288,55 @@ class ControllerPoseRuntimeTests(unittest.TestCase):
         self.assertEqual(events[0].server_instance_id, "quest-host-instance")
         self.assertTrue(self.runtime.unsubscribe(subscription.token))
 
+    def test_atomic_event_cut_is_pose_redacted_and_does_not_subscribe(self) -> None:
+        before = self.runtime.atomic_event_cut()
+        self.assertEqual(before.next_event_sequence, 0)
+        self.assertEqual(before.server_instance_id, "quest-host-instance")
+        self.assertEqual(before.receipt_clock_domain_id, "host-boot-1.monotonic")
+        self.assertFalse(before.stopped)
+        self.assertEqual(len(before.active_sessions), 1)
+        self.assertNotIn("matrix", repr(before))
+        self.assertEqual(self.runtime.snapshot_status()["observer_count"], 0)
+
+        self.server.handlers["controller_pose_sample"](1, pose_payload(sequence=1))
+        after_sample = self.runtime.atomic_event_cut()
+        self.assertEqual(after_sample.next_event_sequence, 1)
+        self.assertEqual(
+            after_sample.active_sessions[0].last_accepted_sample_sequence,
+            1,
+        )
+
+        self.runtime.stop()
+        after_stop = self.runtime.atomic_event_cut()
+        self.assertTrue(after_stop.stopped)
+        self.assertEqual(after_stop.next_event_sequence, 2)
+        self.assertEqual(after_stop.active_sessions, ())
+
+    def test_unsubscribe_with_cut_has_no_event_allocation_gap(self) -> None:
+        events: list[ControllerPoseAcceptedEvent] = []
+        subscription = self.runtime.subscribe_with_cut(on_sample=events.append)
+        self.server.handlers["controller_pose_sample"](
+            1,
+            pose_payload(sequence=1),
+        )
+
+        close_cut = self.runtime.unsubscribe_with_cut(subscription.token)
+
+        self.assertEqual(close_cut.subscription_token, subscription.token)
+        self.assertEqual(close_cut.next_event_sequence, 1)
+        self.assertEqual(
+            close_cut.active_sessions[0].last_accepted_sample_sequence,
+            1,
+        )
+        self.assertEqual(self.runtime.snapshot_status()["observer_count"], 0)
+        self.server.handlers["controller_pose_sample"](
+            1,
+            pose_payload(sequence=2, monotonic_ns=1_030_000_000),
+        )
+        self.assertEqual([event.event_sequence for event in events], [0])
+        with self.assertRaisesRegex(KeyError, "not active"):
+            self.runtime.unsubscribe_with_cut(subscription.token)
+
     def test_observer_failure_does_not_reclassify_an_admitted_sample(self) -> None:
         def fail(_event) -> None:
             raise RuntimeError("observer boom")

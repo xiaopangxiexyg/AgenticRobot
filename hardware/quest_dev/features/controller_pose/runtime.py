@@ -80,6 +80,29 @@ class ControllerPoseSubscription:
 
 
 @dataclass(frozen=True)
+class ControllerPoseEventCut:
+    """Pose-redacted exclusive event watermark at one runtime lock boundary."""
+
+    server_instance_id: str
+    next_event_sequence: int
+    active_sessions: tuple[ControllerPoseActiveSessionCut, ...]
+    receipt_clock_domain_id: str | None
+    stopped: bool
+
+
+@dataclass(frozen=True)
+class ControllerPoseObserverCloseCut:
+    """Exclusive event watermark proven to atomically remove one observer."""
+
+    subscription_token: int
+    server_instance_id: str
+    next_event_sequence: int
+    active_sessions: tuple[ControllerPoseActiveSessionCut, ...]
+    receipt_clock_domain_id: str | None
+    stopped: bool
+
+
+@dataclass(frozen=True)
 class _Observer:
     on_sample: Callable[[ControllerPoseAcceptedEvent], None] | None
     on_invalidation: Callable[[ControllerPoseInvalidationEvent], None] | None
@@ -225,26 +248,51 @@ class ControllerPoseTelemetryRuntime:
             token = self._next_observer_token
             self._next_observer_token += 1
             self._observers[token] = _Observer(on_sample, on_invalidation)
-            active_sessions = tuple(
-                ControllerPoseActiveSessionCut(
-                    client_id=int(client_id),
-                    client_instance_id=state.client_instance_id,
-                    xr_session_id=state.xr_session_id,
-                    reference_space_type=state.reference_space_type,
-                    reference_space_generation=state.reference_space_generation,
-                    last_accepted_sample_sequence=(
-                        None if state.last_sequence < 0 else state.last_sequence
-                    ),
-                )
-                for client_id, state in sorted(self.states.items())
-            )
             return ControllerPoseSubscription(
                 token=token,
                 server_instance_id=self.server_instance_id,
                 next_event_sequence=self._next_event_sequence,
-                active_sessions=active_sessions,
+                active_sessions=self._active_session_cuts_locked(),
                 receipt_clock_domain_id=self.receipt_clock_domain_id,
             )
+
+    def atomic_event_cut(self) -> ControllerPoseEventCut:
+        """Return an exclusive event watermark without registering an observer.
+
+        Events allocated before this lock boundary have sequence numbers below
+        ``next_event_sequence``. Their callbacks may still be in flight because
+        callbacks deliberately execute outside the source lock; consumers must
+        drain through the watermark before sealing evidence.
+        """
+
+        with self.lock:
+            return self._event_cut_locked()
+
+    def _event_cut_locked(self) -> ControllerPoseEventCut:
+        return ControllerPoseEventCut(
+            server_instance_id=self.server_instance_id,
+            next_event_sequence=self._next_event_sequence,
+            active_sessions=self._active_session_cuts_locked(),
+            receipt_clock_domain_id=self.receipt_clock_domain_id,
+            stopped=self._stopped,
+        )
+
+    def _active_session_cuts_locked(
+        self,
+    ) -> tuple[ControllerPoseActiveSessionCut, ...]:
+        return tuple(
+            ControllerPoseActiveSessionCut(
+                client_id=int(client_id),
+                client_instance_id=state.client_instance_id,
+                xr_session_id=state.xr_session_id,
+                reference_space_type=state.reference_space_type,
+                reference_space_generation=state.reference_space_generation,
+                last_accepted_sample_sequence=(
+                    None if state.last_sequence < 0 else state.last_sequence
+                ),
+            )
+            for client_id, state in sorted(self.states.items())
+        )
 
     def unsubscribe(self, token: int) -> bool:
         """Prevent future event snapshots from including ``token``.
@@ -255,6 +303,31 @@ class ControllerPoseTelemetryRuntime:
 
         with self.lock:
             return self._observers.pop(int(token), None) is not None
+
+    def unsubscribe_with_cut(self, token: int) -> ControllerPoseObserverCloseCut:
+        """Atomically remove one observer and return its exclusive close cut.
+
+        Events allocated before this lock boundary already captured the
+        observer and have sequence numbers below the returned watermark.
+        Events allocated after it cannot capture the removed observer and have
+        sequence numbers at or above the watermark.  This avoids both an
+        unsubscribe-to-cut event gap and a cut-to-unsubscribe callback race.
+        In-flight callbacks below the cut still need to be drained by sequence.
+        """
+
+        with self.lock:
+            normalized_token = int(token)
+            if self._observers.pop(normalized_token, None) is None:
+                raise KeyError("controller-pose observer token is not active")
+            cut = self._event_cut_locked()
+            return ControllerPoseObserverCloseCut(
+                subscription_token=normalized_token,
+                server_instance_id=cut.server_instance_id,
+                next_event_sequence=cut.next_event_sequence,
+                active_sessions=cut.active_sessions,
+                receipt_clock_domain_id=cut.receipt_clock_domain_id,
+                stopped=cut.stopped,
+            )
 
     def _event_sequence_locked(self) -> int:
         sequence = self._next_event_sequence
@@ -568,7 +641,9 @@ def create_runtime(
 __all__ = [
     "ControllerPoseAcceptedEvent",
     "ControllerPoseActiveSessionCut",
+    "ControllerPoseEventCut",
     "ControllerPoseInvalidationEvent",
+    "ControllerPoseObserverCloseCut",
     "ControllerPoseSubscription",
     "ControllerPoseTelemetryRuntime",
     "create_runtime",
