@@ -7,6 +7,7 @@
 - [单源直通、多源组合及数采/部署/仿真的运行域边界](./runtime_domain_boundaries.md)
 - [Embodiment runtime provider 当前接口合同](./embodiment_runtime_provider_contract.md)
 - [reBot B601 HITL 拓扑与厂商源码边界](./rebot_b601_hitl_topology.md)
+- [Quest 与机器人静态配对姿态采集边界](./quest_future_visualization.md)
 
 其中运行域边界页区分 deploy、human teleop、replay 的默认单源直通模式与显式多源
 `control_composition` profile。它只记录当前代码、import contract 和入口解析已经建立的边界；
