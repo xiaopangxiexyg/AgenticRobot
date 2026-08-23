@@ -73,10 +73,12 @@ from robot_motion.deploy.observation import (
     DEFAULT_HAND_STATE_MAX_AGE_SEC,
     build_deployment_observation,
 )
+from robot_motion.deploy.prediction_worker import ThreadedPolicyPredictionWorker
 from robot_motion.deploy.pose_adapter import (
     convert_policy_absolute_vector_to_runtime_raw,
 )
 from robot_motion.deploy.runtime import (
+    PolicyChunkPredictionResult,
     PolicyDeployRuntime,
     PolicyDeployRuntimeConfig,
     resolve_action_queue_policy,
@@ -1223,6 +1225,27 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--policy-prediction-mode",
+        choices=("synchronous", "threaded-prefetch"),
+        default="synchronous",
+        help=(
+            "Prediction scheduling for the legacy action queue. synchronous "
+            "preserves the compatibility path; threaded-prefetch runs only "
+            "model inference on one bounded worker while the control thread "
+            "retains queue admission, safety and dispatch authority."
+        ),
+    )
+    parser.add_argument(
+        "--policy-prediction-prefetch-queue-threshold",
+        type=_non_negative_int,
+        default=4,
+        metavar="ACTIONS",
+        help=(
+            "Submit the next threaded prediction when at most this many "
+            "admitted actions remain (default: 4)."
+        ),
+    )
+    parser.add_argument(
         "--deployment-full-ik-preempts-local",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2030,6 +2053,29 @@ def validate_args(
         position_force_guard_config(args)
     rtc_profile_id = str(getattr(args, "rtc_profile", "off")).strip()
     rtc_profile_enabled = rtc_profile_id != "off"
+    threaded_prediction = str(args.policy_prediction_mode) == "threaded-prefetch"
+    if threaded_prediction and rtc_profile_enabled:
+        raise ValueError(
+            "--policy-prediction-mode threaded-prefetch is only valid for the "
+            "legacy non-RTC action queue."
+        )
+    if threaded_prediction and (
+        args.debug_replay_dataset is not None or args.debug_replay_parquet is not None
+    ):
+        raise ValueError(
+            "dataset replay owns prediction transactions and must use "
+            "--policy-prediction-mode synchronous."
+        )
+    if (
+        threaded_prediction
+        and args.action_chunk_execution_steps is not None
+        and int(args.policy_prediction_prefetch_queue_threshold)
+        >= int(args.action_chunk_execution_steps)
+    ):
+        raise ValueError(
+            "--policy-prediction-prefetch-queue-threshold must be smaller "
+            "than --action-chunk-execution-steps."
+        )
     if bool(args.position_stream_start_acquisition) and not bool(
         args.position_plan_splice_governor
     ):
@@ -3345,6 +3391,17 @@ def main(
             ),
         )
     )
+    policy_prediction_worker = (
+        ThreadedPolicyPredictionWorker(
+            source_id="legacy-openpi-prefetch",
+            runtime=policy_deploy_runtime,
+            policy=policy,
+            lifecycle_policy=getattr(policy, "policy", policy),
+            transaction_policy=getattr(policy, "policy", policy),
+        )
+        if str(args.policy_prediction_mode) == "threaded-prefetch"
+        else None
+    )
     policy.metadata["resolved_deploy_session_contract"] = (
         deploy_session_contract.to_dict()
     )
@@ -4449,6 +4506,136 @@ def main(
         submit_legacy_owner_state=submit_legacy_owner_state,
     )
 
+    def reset_policy_for_activation() -> None:
+        """Reset without racing an in-flight threaded model call."""
+
+        if policy_prediction_worker is None:
+            policy.reset()
+        else:
+            policy_prediction_worker.reset_for_activation()
+
+    def invalidate_in_flight_policy_prediction() -> None:
+        if (
+            policy_prediction_worker is not None
+            and policy_prediction_worker.in_flight
+            and not policy_prediction_worker.reset_pending
+        ):
+            policy_prediction_worker.reset_for_activation()
+
+    def record_policy_prediction_result(
+        prediction: PolicyChunkPredictionResult,
+        *,
+        queue_policy: str,
+        synchronous: bool,
+        faults: list[str],
+        timestamp: float,
+        step_index: int,
+        observation_step_index: int,
+    ) -> tuple[bool, bool]:
+        """Record caller-admitted prediction state and return defer/pause."""
+
+        queue_len_before = prediction.queue_len_before
+        defer_until_fresh_cut = False
+        pause_policy = False
+        if prediction.error is None:
+            if prediction.accepted:
+                ik_action_gate.mark_policy_output_accepted()
+                defer_until_fresh_cut = (
+                    synchronous
+                    and _defer_position_action_after_synchronous_prediction(
+                        prediction_accepted=True,
+                        position_executor_enabled=(
+                            position_deploy_executor is not None
+                        ),
+                    )
+                )
+            elif prediction.discarded_by_gate:
+                print(
+                    "[Deploy] IK recovery active; discarded "
+                    + ("predicted" if synchronous else "prefetched")
+                    + " action chunk."
+                )
+            else:
+                faults.extend(prediction.faults)
+            debug_logger.log_policy_chunk(
+                timestamp=timestamp,
+                step_index=step_index,
+                policy_name=policy.name,
+                policy_output=prediction.policy_output,
+                actions=(
+                    list(prediction.actions)
+                    if prediction.accepted or prediction.discarded_by_gate
+                    else []
+                ),
+                accepted=bool(prediction.accepted),
+                discarded_by_ik=bool(prediction.discarded_by_gate),
+                queue_policy=queue_policy,
+                queue_len_before=queue_len_before,
+                queue_len_after=prediction.queue_len_after,
+                faults=faults,
+                ik_recovery_statuses=ik_action_gate.last_statuses,
+                ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
+            )
+            if prediction.accepted:
+                if synchronous and defer_until_fresh_cut:
+                    debug_logger.log_event(
+                        "policy_chunk_execution_deferred",
+                        {
+                            "schema": (
+                                "dexteleop_policy_chunk_execution_deferred_v1"
+                            ),
+                            "reason": (
+                                "fresh_post_inference_observation_cut_required"
+                            ),
+                            "queue_len": int(prediction.queue_len_after),
+                            "observation_step_index": int(observation_step_index),
+                        },
+                    )
+                elif not synchronous:
+                    debug_logger.log_event(
+                        "policy_prediction_prefetch_admitted",
+                        {
+                            "schema": "dexteleop_policy_prediction_prefetch_v1",
+                            "queue_policy": queue_policy,
+                            "queue_len_before": int(queue_len_before),
+                            "queue_len_after": int(prediction.queue_len_after),
+                            "inference_duration_sec": (
+                                None
+                                if prediction.chunk_lineage is None
+                                else max(
+                                    0.0,
+                                    prediction.chunk_lineage.inference_completed_at
+                                    - prediction.chunk_lineage.inference_started_at,
+                                )
+                            ),
+                            "observation_step_index": int(observation_step_index),
+                        },
+                    )
+        else:
+            faults.extend(prediction.faults)
+            if prediction.rollback_error is not None:
+                rollback_error = prediction.rollback_error
+                print(
+                    "[Deploy] policy prediction rollback error: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            exc = prediction.error
+            print(
+                "[Deploy] policy "
+                + ("error: " if synchronous else "prefetch error: ")
+                + f"{type(exc).__name__}: {exc}"
+            )
+            faults.append(f"policy_error:{type(exc).__name__}")
+            debug_logger.log_policy_error(
+                timestamp=timestamp,
+                step_index=step_index,
+                policy_name=policy.name,
+                exc=exc,
+                queue_len_before=queue_len_before,
+            )
+            pause_policy = bool(args.pause_on_policy_error)
+        return defer_until_fresh_cut, pause_policy
+
     resource_lifecycle = PolicyDeployResourceLifecycle(
         debug_logger=debug_logger,
         rtc_frontend=rtc_frontend,
@@ -4465,6 +4652,7 @@ def main(
         tactile_visualizer=visualizer,
         submit_legacy_owner_state=submit_legacy_owner_state,
         flush_position_executor_debug_events=flush_position_executor_debug_events,
+        policy_prediction_worker=policy_prediction_worker,
     )
     cleanup_errors: tuple[str, ...] = ()
     keyboard_interrupt_stop_error: str | None = None
@@ -4483,6 +4671,7 @@ def main(
             f"policy_hz={float(effective_policy_hz):.2f} "
             f"backend_hz={backend_control_hz:.2f} "
             f"queue_policy={action_queue_policy} "
+            f"prediction_mode={args.policy_prediction_mode} "
             f"rtc_profile={args.rtc_profile}"
         )
         if disconnected_gripper_sides:
@@ -4813,7 +5002,7 @@ def main(
                     ):
                         policy_active = False
                         continue
-                    policy.reset()
+                    reset_policy_for_activation()
                     policy_deploy_runtime.clear_action_queue()
                     _reset_startup_initializer(
                         startup_initializer,
@@ -5216,7 +5405,7 @@ def main(
                                     ),
                                 )
                             )
-                            policy.reset()
+                            reset_policy_for_activation()
                             _reset_startup_initializer(
                                 startup_initializer,
                                 current_pose_start_allowed=current_pose_start_override,
@@ -5279,7 +5468,7 @@ def main(
                                 )
                             )
                             last_action = np.full(ACTION_DIM, np.nan, dtype=np.float32)
-                            policy.reset()
+                            reset_policy_for_activation()
                             _reset_startup_initializer(
                                 startup_initializer,
                                 current_pose_start_allowed=current_pose_start_override,
@@ -5333,7 +5522,7 @@ def main(
                     if fixed_result.message:
                         print(fixed_result.message)
                     if fixed_result.completed:
-                        policy.reset()
+                        reset_policy_for_activation()
                         policy_deploy_runtime.clear_action_queue()
                         _reset_startup_initializer(
                             startup_initializer,
@@ -5374,7 +5563,7 @@ def main(
                     if policy_qpos_result.message and not policy_qpos_result.completed:
                         print(policy_qpos_result.message)
                     if policy_qpos_result.completed:
-                        policy.reset()
+                        reset_policy_for_activation()
                         policy_deploy_runtime.clear_action_queue()
                         if not policy_qpos_result.requires_fresh_observation:
                             raise RuntimeError(
@@ -5421,6 +5610,13 @@ def main(
                     policy_active = False
                 if position_force_guard_fault_latched:
                     policy_active = False
+                if not policy_active:
+                    invalidate_in_flight_policy_prediction()
+                    if (
+                        policy_prediction_worker is not None
+                        and policy_prediction_worker.reset_pending
+                    ):
+                        policy_prediction_worker.poll_completion()
                 if policy_active:
                     position_action_submitted_this_loop = False
                     defer_position_action_until_fresh_cut = False
@@ -5535,6 +5731,55 @@ def main(
                         can_run_policy = False
                     if (
                         rtc_frontend is None
+                        and can_run_policy
+                        and policy_prediction_worker is not None
+                    ):
+                        prediction_candidate = (
+                            policy_prediction_worker.poll_completion()
+                        )
+                        if prediction_candidate is not None:
+                            prediction_queue_policy = (
+                                "append"
+                                if policy_deploy_runtime.action_queue_length() > 0
+                                else "replace"
+                            )
+                            prediction = (
+                                policy_deploy_runtime.admit_prediction_result(
+                                    prediction_candidate,
+                                    now=control_loop_started_at,
+                                    queue_policy=prediction_queue_policy,
+                                    discard_policy_output=(
+                                        ik_action_gate.discards_policy_output
+                                    ),
+                                    action_keyframe_period_sec=(
+                                        1.0 / float(effective_action_hz)
+                                    ),
+                                )
+                            )
+                            (
+                                prefetch_defer,
+                                prefetch_pause,
+                            ) = record_policy_prediction_result(
+                                prediction,
+                                queue_policy=prediction_queue_policy,
+                                synchronous=False,
+                                faults=faults,
+                                timestamp=loop_started_at,
+                                step_index=step_index,
+                                observation_step_index=observation.step_index,
+                            )
+                            defer_position_action_until_fresh_cut = (
+                                defer_position_action_until_fresh_cut
+                                or prefetch_defer
+                            )
+                            if prefetch_pause:
+                                policy_active = False
+                                can_run_policy = False
+                                if position_deploy_executor is not None:
+                                    position_deploy_executor.clear()
+                                    last_action = observation.hold_action()
+                    if (
+                        rtc_frontend is None
                         and position_deploy_executor is not None
                         and can_run_policy
                         and policy_deploy_runtime.action_queue_length() == 0
@@ -5562,14 +5807,22 @@ def main(
                         console_log_event(
                             "Policy",
                             "WAIT: action chunk exhausted; position stream entered "
-                            "Hold before synchronous inference.",
+                            + (
+                                "Hold because threaded prefetch missed the chunk boundary."
+                                if policy_prediction_worker is not None
+                                else "Hold before synchronous inference."
+                            ),
                             now=loop_started_at,
                         )
                         debug_logger.log_event(
                             "position_chunk_gap_hold",
                             {
                                 "schema": "dexteleop_position_chunk_gap_hold_v1",
-                                "reason": "synchronous_inference_with_empty_action_queue",
+                                "reason": (
+                                    "threaded_prefetch_missed_empty_action_queue"
+                                    if policy_prediction_worker is not None
+                                    else "synchronous_inference_with_empty_action_queue"
+                                ),
                                 "queue_len": 0,
                                 "observation_step_index": int(observation.step_index),
                             },
@@ -5588,6 +5841,46 @@ def main(
                     if (
                         rtc_frontend is None
                         and can_run_policy
+                        and policy_prediction_worker is not None
+                        and not policy_prediction_worker.in_flight
+                        and not policy_prediction_worker.reset_pending
+                        and policy_deploy_runtime.should_predict(
+                            now=control_loop_started_at,
+                            policy_interval_s=1.0 / float(effective_policy_hz),
+                            min_action_queue=int(
+                                args.policy_prediction_prefetch_queue_threshold
+                            ),
+                        )
+                    ):
+                        inference_id = (
+                            policy_deploy_runtime.reserve_prediction_inference_id()
+                        )
+                        if policy_prediction_worker.submit(
+                            observation,
+                            inference_id=inference_id,
+                        ):
+                            debug_logger.log_event(
+                                "policy_prediction_prefetch_submitted",
+                                {
+                                    "schema": (
+                                        "dexteleop_policy_prediction_prefetch_v1"
+                                    ),
+                                    "inference_id": inference_id,
+                                    "queue_len": int(
+                                        policy_deploy_runtime.action_queue_length()
+                                    ),
+                                    "threshold": int(
+                                        args.policy_prediction_prefetch_queue_threshold
+                                    ),
+                                    "observation_step_index": int(
+                                        observation.step_index
+                                    ),
+                                },
+                            )
+                    if (
+                        rtc_frontend is None
+                        and can_run_policy
+                        and policy_prediction_worker is None
                         and policy_deploy_runtime.should_predict(
                             now=control_loop_started_at,
                             policy_interval_s=1.0 / float(effective_policy_hz),
@@ -5604,107 +5897,28 @@ def main(
                                 1.0 / float(effective_action_hz)
                             ),
                         )
-                        queue_len_before_update = prediction.queue_len_before
-                        if prediction.accepted:
-                            ik_action_gate.mark_policy_output_accepted()
-                            defer_position_action_until_fresh_cut = (
-                                _defer_position_action_after_synchronous_prediction(
-                                    prediction_accepted=True,
-                                    position_executor_enabled=(
-                                        position_deploy_executor is not None
-                                    ),
-                                )
-                            )
-                            debug_logger.log_policy_chunk(
-                                timestamp=loop_started_at,
-                                step_index=step_index,
-                                policy_name=policy.name,
-                                policy_output=prediction.policy_output,
-                                actions=list(prediction.actions),
-                                accepted=True,
-                                discarded_by_ik=False,
-                                queue_policy=action_queue_policy,
-                                queue_len_before=queue_len_before_update,
-                                queue_len_after=prediction.queue_len_after,
-                                faults=faults,
-                                ik_recovery_statuses=ik_action_gate.last_statuses,
-                                ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
-                            )
-                            if defer_position_action_until_fresh_cut:
-                                debug_logger.log_event(
-                                    "policy_chunk_execution_deferred",
-                                    {
-                                        "schema": (
-                                            "dexteleop_policy_chunk_execution_deferred_v1"
-                                        ),
-                                        "reason": (
-                                            "fresh_post_inference_observation_cut_required"
-                                        ),
-                                        "queue_len": int(prediction.queue_len_after),
-                                        "observation_step_index": int(
-                                            observation.step_index
-                                        ),
-                                    },
-                                )
-                        elif prediction.discarded_by_gate:
-                            print(
-                                "[Deploy] IK recovery active; discarded predicted action chunk."
-                            )
-                            debug_logger.log_policy_chunk(
-                                timestamp=loop_started_at,
-                                step_index=step_index,
-                                policy_name=policy.name,
-                                policy_output=prediction.policy_output,
-                                actions=list(prediction.actions),
-                                accepted=False,
-                                discarded_by_ik=True,
-                                queue_policy=action_queue_policy,
-                                queue_len_before=queue_len_before_update,
-                                queue_len_after=prediction.queue_len_after,
-                                faults=faults,
-                                ik_recovery_statuses=ik_action_gate.last_statuses,
-                                ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
-                            )
-                        elif prediction.error is None:
-                            faults.extend(prediction.faults)
-                            debug_logger.log_policy_chunk(
-                                timestamp=loop_started_at,
-                                step_index=step_index,
-                                policy_name=policy.name,
-                                policy_output=prediction.policy_output,
-                                actions=[],
-                                accepted=False,
-                                discarded_by_ik=False,
-                                queue_policy=action_queue_policy,
-                                queue_len_before=queue_len_before_update,
-                                queue_len_after=prediction.queue_len_after,
-                                faults=faults,
-                                ik_recovery_statuses=ik_action_gate.last_statuses,
-                                ik_recovery_diagnostics=ik_action_gate.last_diagnostics,
-                            )
-                        else:
-                            faults.extend(prediction.faults)
-                            if prediction.rollback_error is not None:
-                                rollback_error = prediction.rollback_error
-                                print(
-                                    "[Deploy] policy prediction rollback error: "
-                                    f"{type(rollback_error).__name__}: {rollback_error}"
-                                )
-                            exc = prediction.error
-                            print(f"[Deploy] policy error: {type(exc).__name__}: {exc}")
-                            faults.append(f"policy_error:{type(exc).__name__}")
-                            debug_logger.log_policy_error(
-                                timestamp=loop_started_at,
-                                step_index=step_index,
-                                policy_name=policy.name,
-                                exc=exc,
-                                queue_len_before=queue_len_before_update,
-                            )
-                            if bool(args.pause_on_policy_error):
-                                policy_active = False
-                                if position_deploy_executor is not None:
-                                    position_deploy_executor.clear()
-                                    last_action = observation.hold_action()
+                        (
+                            synchronous_defer,
+                            synchronous_pause,
+                        ) = record_policy_prediction_result(
+                            prediction,
+                            queue_policy=action_queue_policy,
+                            synchronous=True,
+                            faults=faults,
+                            timestamp=loop_started_at,
+                            step_index=step_index,
+                            observation_step_index=observation.step_index,
+                        )
+                        defer_position_action_until_fresh_cut = (
+                            defer_position_action_until_fresh_cut
+                            or synchronous_defer
+                        )
+                        if synchronous_pause:
+                            policy_active = False
+                            can_run_policy = False
+                            if position_deploy_executor is not None:
+                                position_deploy_executor.clear()
+                                last_action = observation.hold_action()
 
                     # An empty policy queue is a measured-pose soft hold for
                     # impedance arms.  A fresh policy command releases that
@@ -6096,6 +6310,7 @@ def main(
                             + type(action_step.emission_error).__name__
                         )
                         policy_deploy_runtime.clear_action_queue()
+                        invalidate_in_flight_policy_prediction()
                         if bool(args.pause_on_policy_error):
                             policy_active = False
                     queue_len_before_pop = action_step.queue_len_before

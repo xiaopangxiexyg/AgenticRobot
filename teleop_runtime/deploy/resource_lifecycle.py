@@ -39,6 +39,7 @@ class PolicyDeployResourceLifecycle:
         tactile_visualizer: Any | None,
         submit_legacy_owner_state: Callable[..., Any],
         flush_position_executor_debug_events: Callable[[], None],
+        policy_prediction_worker: Any | None = None,
     ) -> None:
         self.debug_logger = debug_logger
         self.rtc_frontend = rtc_frontend
@@ -57,6 +58,7 @@ class PolicyDeployResourceLifecycle:
         self.flush_position_executor_debug_events = (
             flush_position_executor_debug_events
         )
+        self.policy_prediction_worker = policy_prediction_worker
 
     def start(
         self,
@@ -230,6 +232,8 @@ class PolicyDeployResourceLifecycle:
                     "position_lookahead=false, timed-plan admission enabled.",
                     flush=True,
                 )
+        if self.policy_prediction_worker is not None:
+            self.policy_prediction_worker.start()
 
     def close(
         self,
@@ -270,6 +274,12 @@ class PolicyDeployResourceLifecycle:
                     },
                 )
                 print(f"[DeployCleanup] {error}", file=sys.stderr)
+
+        if self.policy_prediction_worker is not None:
+            close_resource(
+                "policy_prediction_worker",
+                self.policy_prediction_worker,
+            )
 
         if self.rtc_frontend is not None:
             try:
