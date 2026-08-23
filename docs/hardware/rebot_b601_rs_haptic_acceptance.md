@@ -134,8 +134,9 @@ H2 及以后不得标记通过。
 
 1. 在仍未施加 haptic overlay 前验证物理急停、软件 stop、进程异常退出和 CAN 断开。
 2. 注入本地 command stale、错误 frame、`valid=false`、反馈 stale/nonfinite 和单关节发送失败。
-3. 检查命令陈旧时撤销上层参考；frame/invalid 立即撤销；反馈故障进入预审 safe-stop；
-   部分发送不得被报告为六关节成功。
+3. 检查旧 sequence/timestamp 样本被拒绝且不刷新 watchdog；上一合法参考只保留到 watchdog
+   到期后撤销；frame/invalid 立即撤销；反馈故障进入预审 safe-stop；部分发送不得被报告为
+   六关节成功。
 
 通过条件：fault 在一个 watchdog 窗口内被检测并锁存；日志包含触发原因与 stop receipt；
 机械臂没有无界运动。去使能后的承重由物理支撑保证，不能用机械臂“看起来没动”替代支撑证明。
