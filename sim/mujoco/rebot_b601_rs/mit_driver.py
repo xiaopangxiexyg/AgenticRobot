@@ -158,6 +158,8 @@ class B601MujocoEffortDriver:
     This backend is intentionally not named as a RobStride driver: it validates
     the joint-space law, gravity sign, damping ownership and final effort
     conditioning, but makes no claim about a real motor's internal MIT loop.
+    Command admission models one local, wired producer rather than a remote or
+    network-synchronized transport.
     """
 
     execution_mode = "rebot_b601_rs_mujoco_ideal_generalized_effort"
@@ -320,6 +322,16 @@ class B601MujocoEffortDriver:
             "physics_hz": float(self.timing.physics_hz),
             "command_hold": "zero_order_hold_between_reference_ticks",
             "command_timeout_sec": self.command_timeout_sec,
+            "transport_scope": "single_host_local_wired_control",
+            "network_transport": "out_of_scope",
+            "timestamp_contract": "host_local_monotonic_observability",
+            "watchdog_clock": "driver_owned_local_acceptance_time",
+            "stale_sample_action": (
+                "reject_without_preemption_until_local_watchdog"
+            ),
+            "unexpected_frame_action": (
+                "deactivate_reference_keep_local_gravity_and_damping"
+            ),
             "plant_step_owner": "exclusive_driver_mj_step",
             "actuator_semantics": "ideal_generalized_joint_effort_nm",
             "robstride_internal_mit_fidelity": "not_claimed",
@@ -431,6 +443,13 @@ class B601MujocoEffortDriver:
                 rejection_reason = "driver_fault_latched"
             elif not reference.valid:
                 rejection_reason = "invalid_sample"
+                self._deactivate_reference(qpos)
+            elif reference.frame_id != B601_RS_JOINT_MIT_FRAME:
+                # A frame mismatch on the intended wired path is a local
+                # configuration/command-contract error, not packet jitter.
+                # Relinquish the active reference immediately while retaining
+                # the backend-owned gravity and zero-velocity damping fallback.
+                rejection_reason = "unexpected_frame"
                 self._deactivate_reference(qpos)
             elif not due:
                 rejection_reason = "command_before_deadline"
@@ -795,8 +814,6 @@ class B601MujocoEffortDriver:
         )
 
     def _rejection_reason(self, reference: B601MitReference) -> str | None:
-        if reference.frame_id != B601_RS_JOINT_MIT_FRAME:
-            return "unexpected_frame"
         if (
             self._last_accepted_sequence is not None
             and reference.sequence <= self._last_accepted_sequence
