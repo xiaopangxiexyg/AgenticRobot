@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -12,12 +14,14 @@ from collection_runtime.progress import (
     ProgressRequestContext,
     StartEpisodeProgressRequest,
 )
+from collection_runtime.tactile_bundle_store import NativeTactileBundleStore
 from dataset_contracts.episode_identity import EpisodeCaptureIdentity
 from dataset_contracts.progress_profile import (
     ProgressEpisodeBindingV1,
     ProgressStepDefinitionV1,
     TaskProgressProfileV1,
 )
+from dataset_interface.modality_artifacts import assert_dataset_capture_writable
 from dataset_interface.progress_artifacts import load_sealed_progress_episode
 from utils.dataset_postprocess.organize_episodes import (
     DatasetOrganizationError,
@@ -115,6 +119,102 @@ def _make_source(root: Path) -> None:
     )
     (root / "meta/episodes.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
     (root / "meta/episodes_stats.jsonl").write_text(json.dumps({"episode_index": 5, "frame_count": 2}) + "\n", encoding="utf-8")
+
+
+def _add_native_external_tactile(root: Path, storage: Path) -> None:
+    storage.mkdir()
+    catalog = root / "meta/episodes.jsonl"
+    original_catalog = catalog.read_bytes()
+    catalog.unlink()
+    store = NativeTactileBundleStore(
+        core_dataset_root=root,
+        tactile_storage_root=storage,
+        dataset_label="source",
+        require_distinct_device=False,
+        uuid_factory=lambda: uuid.UUID(
+            "3ef8a7b7-22f5-44e7-812c-79d2f66f69d1"
+        ),
+    )
+    catalog.write_bytes(original_catalog)
+    relative_dir = (
+        "tactile/observation.hand.left.tactile/chunk-000/episode_000005"
+    )
+    payload_relative = f"{relative_dir}/M_RAW.uint8.bin"
+    manifest_relative = f"{relative_dir}/manifest.json"
+    payload = bytes(range(8))
+    payload_path = store.tactile_artifact_path(payload_relative)
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path.write_bytes(payload)
+    frames = [
+        {
+            "sample_frame_index": index,
+            "tactile_frame_index": index,
+            "timestamp": float(index + 1),
+            "snapshot_sequence": index + 7,
+        }
+        for index in range(2)
+    ]
+    manifest = {
+        "format": "binary_stream_v1",
+        "side": "left",
+        "relative_dir": relative_dir,
+        "frame_count": 2,
+        "sensor_keys": ["M_RAW"],
+        "streams": {
+            "M_RAW": {
+                "path": payload_relative,
+                "dtype": "uint8",
+                "shape": [4],
+                "frame_count": 2,
+                "encoding": "raw_c_order",
+                "compression": "none",
+                "chunk_frame_count": None,
+                "chunks": [],
+                "stored_size_bytes": len(payload),
+                "stored_sha256": hashlib.sha256(payload).hexdigest(),
+                "stored_hash_profile": "stored_bytes_sha256_v1",
+            }
+        },
+        "frames": frames,
+    }
+    store.tactile_artifact_path(manifest_relative).write_text(
+        json.dumps(manifest, sort_keys=True),
+        encoding="utf-8",
+    )
+    rows = [
+        {
+            "frame_index": index,
+            "observation.hand.left.tactile_path": manifest_relative,
+            "observation.hand.left.tactile_frame_index": index,
+        }
+        for index in range(2)
+    ]
+    identity = EpisodeCaptureIdentity(
+        episode_uuid="native-external-episode",
+        legacy_episode_index=5,
+        lifecycle_owner_id="organize-fixture",
+        prepared_at=1.0,
+        prepared_clock_domain_id="fixture-clock",
+    )
+    store.prepare_episode(identity)
+    report = store.seal_episode(
+        identity=identity,
+        rows=rows,
+        tactile_paths={"left": manifest_relative},
+    )
+    record = json.loads(catalog.read_text(encoding="utf-8"))
+    record["tactile_paths"] = {"left": manifest_relative}
+    record["tactile_bundle"] = report.episode_binding_payload()
+    record["metadata"]["tactile_bundle_episode"] = (
+        report.episode_binding_payload()
+    )
+    catalog.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["tactile_storage"] = "external"
+    info["tactile_artifact_integrity"] = True
+    info["tactile_bundle"] = store.dataset_binding_payload
+    info_path.write_text(json.dumps(info), encoding="utf-8")
 
 
 def _add_progress(root: Path, *, episode_uuid: str) -> str:
@@ -610,6 +710,155 @@ def test_reflink_required_never_falls_back_to_copy(
             policy="reflink_required",
         )
     assert not destination.exists()
+
+
+@pytest.mark.optional
+def test_native_external_tactile_requires_explicit_storage_root(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    storage = tmp_path / "tactile-storage"
+    _make_source(source)
+    _add_native_external_tactile(source, storage)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "name": "merged",
+                        "output_root": "merged",
+                        "task": {"id": "cube", "description": "cube"},
+                        "sources": [
+                            {"dataset_root": "source", "episode_indices": [5]}
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        DatasetOrganizationError,
+        match="requires an explicit tactile_storage_root",
+    ):
+        plan_dataset_build(manifest_path)
+
+
+@pytest.mark.optional
+def test_native_external_tactile_is_materialized_as_self_contained_output(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    storage = tmp_path / "tactile-storage"
+    output = tmp_path / "merged"
+    _make_source(source)
+    _add_native_external_tactile(source, storage)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "name": "merged",
+                        "output_root": "merged",
+                        "task": {"id": "cube", "description": "cube"},
+                        "artifact_materialization_policy": "copy",
+                        "sources": [
+                            {
+                                "dataset_root": "source",
+                                "episode_indices": [5],
+                                "tactile_storage_root": "tactile-storage",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = plan_dataset_build(manifest_path)[0]
+    assert len(plan.external_tactile_sources) == 1
+    assert plan.external_tactile_sources[0].episode_count == 1
+    assert plan.external_tactile_sources[0].payload_hashes_verified is False
+    build_datasets(manifest_path)
+
+    record = json.loads(
+        (output / "meta/episodes.jsonl").read_text(encoding="utf-8")
+    )
+    info = json.loads((output / "meta/info.json").read_text(encoding="utf-8"))
+    assert "tactile_bundle" not in record
+    assert "tactile_bundle_episode" not in record["metadata"]
+    assert "tactile_bundle" not in info
+    assert info["tactile_storage"] == "external"
+    assert info["tactile_artifact_integrity"] is False
+    assert not (output / "meta/tactile_bundle_v1").exists()
+    manifest_relative = record["tactile_paths"]["left"]
+    output_manifest = output / manifest_relative
+    assert output_manifest.is_file()
+    output_manifest_payload = json.loads(output_manifest.read_text())
+    payload_relative = output_manifest_payload["streams"]["M_RAW"]["path"]
+    output_payload = output / payload_relative
+    source_payload = (
+        storage
+        / "datasets/3ef8a7b7-22f5-44e7-812c-79d2f66f69d1"
+        / "tactile/observation.hand.left.tactile/chunk-000/episode_000005/M_RAW.uint8.bin"
+    )
+    assert output_payload.read_bytes() == source_payload.read_bytes()
+    assert output_payload.stat().st_ino != source_payload.stat().st_ino
+    assert_dataset_capture_writable(output)
+
+
+@pytest.mark.optional
+def test_native_external_tactile_rejects_unowned_output_and_cleans_staging(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    storage = tmp_path / "tactile-storage"
+    output = tmp_path / "merged"
+    _make_source(source)
+    _add_native_external_tactile(source, storage)
+    bundle_dataset = (
+        storage / "datasets/3ef8a7b7-22f5-44e7-812c-79d2f66f69d1"
+    )
+    tactile_episode = (
+        bundle_dataset
+        / "tactile/observation.hand.left.tactile/chunk-000/episode_000005"
+    )
+    (tactile_episode / "UNOWNED.bin").write_bytes(b"must-not-publish")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "name": "merged",
+                        "output_root": "merged",
+                        "task": {"id": "cube", "description": "cube"},
+                        "artifact_materialization_policy": "copy",
+                        "sources": [
+                            {
+                                "dataset_root": "source",
+                                "episode_indices": [5],
+                                "tactile_storage_root": "tactile-storage",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        DatasetOrganizationError,
+        match="failed self-contained admission",
+    ):
+        build_datasets(manifest_path)
+    assert not output.exists()
+    assert list(tmp_path.glob(".merged.staging-*")) == []
 
 
 @pytest.mark.optional

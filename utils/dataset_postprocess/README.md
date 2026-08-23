@@ -728,6 +728,15 @@ result = build_datasets("/abs/path/manifest.json", dataset_names=["example"])
 - `progress_artifact_policy=preserve` 会逐 episode 校验 sealed progress identity、profile hash
   和 annotation binding，然后只白名单复制正式 episode UUID。未封存或未被
   `meta/episodes.jsonl` 引用的临时目录不会进入输出。
+- 对采用 native `core + tactile bundle` 分离布局的 source，manifest 必须在该 source 上显式
+  指定 `tactile_storage_root`。预检会用标准 bundle reader 校验 dataset/episode identity、commit、
+  manifest、artifact ownership、文件尺寸和帧对齐；默认不重复哈希全部大 payload，只有显式设置
+  `verify_tactile_payload_hashes=true` 才执行逐 payload SHA-256。未声明 storage root、绑定错误、
+  payload 缺失或 source 不是 native bundle 都会 fail closed。
+- 合并输出不会继承只对 source UUID 有效的 native bundle binding。所选触觉 artifact 会按
+  `artifact_materialization_policy` 物化进 staging，manifest 内部路径随 episode 一起重编号，随后
+  输出成为自包含的兼容 external-tactile 数据集；`meta/info.json` 明确标记需要离线 full scan 后
+  才能再次拆分。source core 与 source tactile bundle 始终只读且保持原绑定，可直接回退。
 - 合并只重排物理 `episode_index` 和 artifact path；原 capture identity、progress fact、
   Attempt/Failure/annotation 语义保持不变。
 - manifest source 顺序是输出的规范顺序；同一 source 内按原 episode index 排序，从而能够
