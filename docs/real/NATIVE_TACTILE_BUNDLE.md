@@ -28,7 +28,9 @@ and the core half of each tactile commit:
         bundle_commit.cjson
 ```
 
-The configured tactile storage-device root contains one UUID-addressed bundle:
+The configured tactile storage-device root keeps the UUID-addressed bundle as
+the authoritative location and also publishes a human-readable locator grouped
+by the core dataset name:
 
 ```text
 <tactile-storage-root>/
@@ -42,12 +44,23 @@ The configured tactile storage-device root contains one UUID-addressed bundle:
         identity.cjson
         tactile_component.cjson
         bundle_commit.cjson
+  datasets_by_name/<dataset_name>/<dataset_uuid>.json
 ```
 
 Paths stored in the core rows remain logical paths below `tactile/`. The same
 dataset identity, episode identity, and bundle commit are mirrored between the
 two roots. Artifact size and SHA-256, manifest identity, sample/tactile frame
 alignment, and episode identity are content-bound.
+
+`datasets_by_name` is a readable, rebuildable index rather than a second copy
+of the tactile data. Its JSON locator records the core dataset name, shared
+`dataset_uuid`, canonical `datasets/<dataset_uuid>` bundle location, core
+identity/catalog references, and the episode join fields. It never records an
+absolute core path or storage mount point. Existing UUID-only bundles remain
+valid; reopening one with the collection writer backfills a missing locator.
+For each Episode, join the core `meta/episodes.jsonl` row by `episode_index`,
+`tactile_bundle.dataset_uuid`, and `tactile_bundle.episode_uuid`; its
+`tactile_paths` then resolve below the locator's bundle directory.
 
 ## Collection contract
 
@@ -108,7 +121,9 @@ python -m utils.dataset_postprocess \
   --tactile-root /path/to/tactile-storage-root
 ```
 
-The command discovers `datasets/<dataset_uuid>` from the core identity. It
+The command discovers `datasets/<dataset_uuid>` from the core identity; the
+`datasets_by_name` entry is for operator navigation and is not trusted as the
+attachment authority. It
 validates every committed episode, mirrored commit, artifact size and hash,
 manifest ownership, and core-to-tactile frame alignment. For a quick admission
 check, `--no-verify-payload-hashes` skips payload hashing but still verifies

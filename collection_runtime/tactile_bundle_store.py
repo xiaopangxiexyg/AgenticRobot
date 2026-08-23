@@ -33,7 +33,9 @@ from dataset_contracts.tactile_bundle import (
     TACTILE_BUNDLE_LOGICAL_PREFIX_V1,
     TACTILE_BUNDLE_TACTILE_COMPONENT_FILE_DOMAIN_V1,
     TactileBundleArtifactV1,
+    TactileBundleContractError,
     TactileBundleDatasetIdentityV1,
+    TactileBundleDatasetLocatorV1,
     TactileEpisodeBundleCommitV1,
     TactileEpisodeComponentV1,
     TactileManifestBindingV1,
@@ -42,6 +44,7 @@ from dataset_contracts.tactile_bundle import (
     normalize_bundle_relative_path,
     storage_dataset_identity_relative_path,
     storage_episode_relative_dir,
+    tactile_dataset_locator_relative_path,
     tactile_frame_alignment_hash,
 )
 
@@ -262,6 +265,7 @@ class NativeTactileBundleStore:
         self.bundle_dataset_root = bundle_dataset_path.resolve()
         self._bundle_device_id = int(self.bundle_dataset_root.stat().st_dev)
         self._publish_dataset_identity_to_storage()
+        self._publish_dataset_locator()
         self._recover_abandoned_tail()
 
     @property
@@ -271,6 +275,13 @@ class NativeTactileBundleStore:
     @property
     def storage_identity_path(self) -> Path:
         return self.bundle_dataset_root / storage_dataset_identity_relative_path()
+
+    @property
+    def dataset_locator_path(self) -> Path:
+        return self.tactile_storage_root / tactile_dataset_locator_relative_path(
+            dataset_label=self.dataset_identity.dataset_label,
+            dataset_uuid=self.dataset_identity.dataset_uuid,
+        )
 
     @property
     def dataset_binding_payload(self) -> dict[str, Any]:
@@ -336,6 +347,87 @@ class NativeTactileBundleStore:
             self.dataset_identity.to_payload(),
             domain=TACTILE_BUNDLE_DATASET_IDENTITY_FILE_DOMAIN_V1,
         )
+
+    def _publish_dataset_locator(self) -> None:
+        """Publish a readable, derived pointer without changing UUID authority."""
+
+        locator = TactileBundleDatasetLocatorV1(
+            dataset_uuid=self.dataset_identity.dataset_uuid,
+            dataset_label=self.dataset_identity.dataset_label,
+            dataset_identity_hash=self.dataset_identity.semantic_content_hash,
+        )
+        locator_root = self.tactile_storage_root / "datasets_by_name"
+        if locator_root.is_symlink() or self.dataset_locator_path.parent.is_symlink():
+            raise TactileBundleStorageError(
+                "tactile dataset locator directories must not be symlinks"
+            )
+        try:
+            self.dataset_locator_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise TactileBundleStorageError(
+                f"cannot create tactile dataset locator directory: {exc}"
+            ) from exc
+        locator_parent = self.dataset_locator_path.parent
+        if (
+            not locator_root.is_dir()
+            or not locator_parent.is_dir()
+            or locator_root.is_symlink()
+            or locator_parent.is_symlink()
+            or not locator_parent.resolve().is_relative_to(self.tactile_storage_root)
+            or int(locator_parent.stat().st_dev) != self._tactile_device_id
+        ):
+            raise TactileBundleStorageError(
+                "tactile dataset locator must remain on the configured storage "
+                "filesystem"
+            )
+        path = self.dataset_locator_path
+        if path.is_symlink():
+            raise TactileBundleStorageError(
+                "tactile dataset locator must not be a symlink"
+            )
+        payload = locator.to_payload()
+        if path.exists():
+            try:
+                existing_payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(existing_payload, Mapping):
+                    raise TactileBundleContractError(
+                        "tactile bundle dataset locator must be an object"
+                    )
+                existing = TactileBundleDatasetLocatorV1.from_payload(
+                    existing_payload
+                )
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                TactileBundleContractError,
+            ) as exc:
+                raise TactileBundleStorageError(
+                    f"cannot validate tactile dataset locator {path}: {exc}"
+                ) from exc
+            if existing != locator:
+                raise TactileBundleStorageError(
+                    f"tactile dataset locator conflicts with bound identity: {path}"
+                )
+            return
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            fsync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @property
     def _recovery_journal_path(self) -> Path:

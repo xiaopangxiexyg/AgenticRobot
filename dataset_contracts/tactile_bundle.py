@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping, Sequence
+import unicodedata
 import uuid
 
 from .canonical_encoding import canonical_content_hash
@@ -38,6 +39,9 @@ TACTILE_BUNDLE_EPISODE_COMMIT_SCHEMA_V1 = (
 )
 TACTILE_BUNDLE_DATASET_BINDING_SCHEMA_V1 = (
     "dexteleop.tactile_bundle.dataset_binding.v1"
+)
+TACTILE_BUNDLE_DATASET_LOCATOR_SCHEMA_V1 = (
+    "dexteleop.tactile_bundle.dataset_locator.v1"
 )
 TACTILE_BUNDLE_EPISODE_BINDING_SCHEMA_V1 = (
     "dexteleop.tactile_bundle.episode_binding.v1"
@@ -82,6 +86,9 @@ _EPISODE_COMMIT_HASH_DOMAIN = (
 TACTILE_BUNDLE_LOGICAL_PREFIX_V1 = "tactile"
 TACTILE_BUNDLE_CORE_RELATIVE_ROOT_V1 = PurePosixPath("meta/tactile_bundle_v1")
 TACTILE_BUNDLE_STORAGE_RELATIVE_ROOT_V1 = PurePosixPath("meta/tactile_bundle_v1")
+TACTILE_BUNDLE_DATASET_LOCATOR_RELATIVE_ROOT_V1 = PurePosixPath(
+    "datasets_by_name"
+)
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SIDE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -128,6 +135,30 @@ def _episode_uuid(value: object) -> str:
             "episode_uuid must be safe for relative storage"
         )
     return text
+
+
+def _dataset_label_path_token(value: object) -> str:
+    """Return a readable, bounded path token without changing label identity."""
+
+    label = _required_text(value, field_name="dataset_label")
+    normalized = unicodedata.normalize("NFKC", label).strip()
+    token = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in normalized
+    )
+    token = re.sub(r"_+", "_", token).strip("._-") or "dataset"
+    changed = token != normalized
+    while len(token.encode("utf-8")) > 96:
+        token = token[:-1]
+        changed = True
+    token = token.rstrip("._-") or "dataset"
+    if changed:
+        suffix = canonical_content_hash(
+            label,
+            domain="dexteleop.tactile_bundle.dataset_label_path.v1",
+        )[:8]
+        token = f"{token}--{suffix}"
+    return token
 
 
 def _non_negative_int(value: object, *, field_name: str) -> int:
@@ -238,6 +269,89 @@ class TactileBundleDatasetIdentityV1:
         if declared is not None and declared != result.semantic_content_hash:
             raise TactileBundleContractError(
                 "tactile bundle dataset identity hash mismatch"
+            )
+        return result
+
+
+@dataclass(frozen=True)
+class TactileBundleDatasetLocatorV1:
+    """Rebuildable human-facing pointer to one UUID-addressed bundle."""
+
+    dataset_uuid: str
+    dataset_label: str
+    dataset_identity_hash: str
+    bundle_relative_path: str = field(init=False)
+    core_identity_ref: str = field(init=False)
+    core_episode_catalog_ref: str = field(init=False)
+    schema: str = field(
+        default=TACTILE_BUNDLE_DATASET_LOCATOR_SCHEMA_V1,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        dataset_uuid = _dataset_uuid(self.dataset_uuid)
+        object.__setattr__(self, "dataset_uuid", dataset_uuid)
+        object.__setattr__(
+            self,
+            "dataset_label",
+            _required_text(self.dataset_label, field_name="dataset_label"),
+        )
+        object.__setattr__(
+            self,
+            "dataset_identity_hash",
+            _sha256(
+                self.dataset_identity_hash,
+                field_name="dataset_identity_hash",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "bundle_relative_path",
+            (PurePosixPath("datasets") / dataset_uuid).as_posix(),
+        )
+        object.__setattr__(
+            self,
+            "core_identity_ref",
+            (TACTILE_BUNDLE_CORE_RELATIVE_ROOT_V1 / "dataset_identity.cjson").as_posix(),
+        )
+        object.__setattr__(
+            self,
+            "core_episode_catalog_ref",
+            "meta/episodes.jsonl",
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "dataset_uuid": self.dataset_uuid,
+            "core_dataset_name": self.dataset_label,
+            "dataset_identity_hash": self.dataset_identity_hash,
+            "bundle_relative_path": self.bundle_relative_path,
+            "core_identity_ref": self.core_identity_ref,
+            "core_episode_catalog_ref": self.core_episode_catalog_ref,
+            "episode_join_fields": [
+                "episode_index",
+                "tactile_bundle.dataset_uuid",
+                "tactile_bundle.episode_uuid",
+            ],
+        }
+
+    @classmethod
+    def from_payload(
+        cls, payload: Mapping[str, Any]
+    ) -> TactileBundleDatasetLocatorV1:
+        if payload.get("schema") != TACTILE_BUNDLE_DATASET_LOCATOR_SCHEMA_V1:
+            raise TactileBundleContractError(
+                "unsupported tactile bundle dataset locator schema"
+            )
+        result = cls(
+            dataset_uuid=payload.get("dataset_uuid", ""),
+            dataset_label=payload.get("core_dataset_name", ""),
+            dataset_identity_hash=payload.get("dataset_identity_hash", ""),
+        )
+        if dict(payload) != result.to_payload():
+            raise TactileBundleContractError(
+                "tactile bundle dataset locator fields do not match its identity"
             )
         return result
 
@@ -842,6 +956,18 @@ def storage_dataset_identity_relative_path() -> str:
     return (TACTILE_BUNDLE_STORAGE_RELATIVE_ROOT_V1 / "dataset_identity.cjson").as_posix()
 
 
+def tactile_dataset_locator_relative_path(
+    *,
+    dataset_label: str,
+    dataset_uuid: str,
+) -> str:
+    return (
+        TACTILE_BUNDLE_DATASET_LOCATOR_RELATIVE_ROOT_V1
+        / _dataset_label_path_token(dataset_label)
+        / f"{_dataset_uuid(dataset_uuid)}.json"
+    ).as_posix()
+
+
 def core_episode_relative_dir(episode_uuid: str) -> str:
     return (
         TACTILE_BUNDLE_CORE_RELATIVE_ROOT_V1 / "episodes" / _episode_uuid(episode_uuid)
@@ -862,6 +988,8 @@ __all__ = [
     "TACTILE_BUNDLE_CORE_COMPONENT_FILE_DOMAIN_V1",
     "TACTILE_BUNDLE_DATASET_BINDING_SCHEMA_V1",
     "TACTILE_BUNDLE_DATASET_IDENTITY_FILE_DOMAIN_V1",
+    "TACTILE_BUNDLE_DATASET_LOCATOR_RELATIVE_ROOT_V1",
+    "TACTILE_BUNDLE_DATASET_LOCATOR_SCHEMA_V1",
     "TACTILE_BUNDLE_EPISODE_BINDING_SCHEMA_V1",
     "TACTILE_BUNDLE_EPISODE_COMMIT_FILE_DOMAIN_V1",
     "TACTILE_BUNDLE_EPISODE_IDENTITY_FILE_DOMAIN_V1",
@@ -870,6 +998,7 @@ __all__ = [
     "TactileBundleArtifactV1",
     "TactileBundleContractError",
     "TactileBundleDatasetIdentityV1",
+    "TactileBundleDatasetLocatorV1",
     "TactileEpisodeBundleCommitV1",
     "TactileEpisodeComponentV1",
     "TactileManifestBindingV1",
@@ -878,5 +1007,6 @@ __all__ = [
     "normalize_bundle_relative_path",
     "storage_dataset_identity_relative_path",
     "storage_episode_relative_dir",
+    "tactile_dataset_locator_relative_path",
     "tactile_frame_alignment_hash",
 ]
