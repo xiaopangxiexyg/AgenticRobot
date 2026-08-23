@@ -240,6 +240,40 @@ def test_prepared_profile_validates_canonical_source_task_id(
     _validate_source_task_ids(profile, _sources(profile))
 
 
+def test_prepared_profile_accepts_only_explicit_source_task_aliases(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    meta = source / "meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(
+        json.dumps({"task_id": "primary-task"}) + "\n",
+        encoding="utf-8",
+    )
+    (meta / "tasks.jsonl").write_text(
+        "".join(
+            json.dumps({"task_id": task_id}) + "\n"
+            for task_id in ("legacy-task", "primary-task")
+        ),
+        encoding="utf-8",
+    )
+    profile = {
+        "sources": [
+            {
+                "source_dataset_id": "source-a",
+                "dataset_root": str(source),
+                "expected_task_id": "primary-task",
+                "expected_task_id_aliases": ["legacy-task"],
+            }
+        ]
+    }
+    _validate_source_task_ids(profile, _sources(profile))
+
+    profile["sources"][0]["expected_task_id_aliases"] = ["wrong-alias"]
+    with pytest.raises(ValueError, match="explicitly bound expected value"):
+        _validate_source_task_ids(profile, _sources(profile))
+
+
 def test_train_checkpoint_policy_handles_fresh_resume_and_empty_root(
     tmp_path: Path,
 ) -> None:
