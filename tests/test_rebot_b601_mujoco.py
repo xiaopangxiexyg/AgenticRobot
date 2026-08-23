@@ -34,9 +34,7 @@ def model_and_scene():
     pytest.importorskip("mujoco")
     if not (REBOT_SOURCE_ROOT / B601_RS_URDF_RELATIVE_PATH).is_file():
         pytest.skip("initialize the pinned reBotArm_control_py gitlink")
-    pinocchio_model = B601PinocchioModel.from_rebot_source_root(
-        REBOT_SOURCE_ROOT
-    )
+    pinocchio_model = B601PinocchioModel.from_rebot_source_root(REBOT_SOURCE_ROOT)
     scene = build_b601_mujoco_scene(REBOT_SOURCE_ROOT)
     return pinocchio_model, scene
 
@@ -48,6 +46,16 @@ def _command(sequence: int, qpos, timestamp: float) -> B601JointPositionCommand:
         receive_timestamp_sec=timestamp,
         qpos=tuple(qpos),
     )
+
+
+def test_command_rejects_boolean_sequence() -> None:
+    with pytest.raises(TypeError, match="non-negative integer"):
+        B601JointPositionCommand(
+            sequence=True,
+            source_timestamp_sec=0.0,
+            receive_timestamp_sec=0.0,
+            qpos=(0.0, 1.0, 1.0, 0.0, 0.0, 0.0),
+        )
 
 
 def test_compiled_scene_preserves_full_chain_and_six_arm_actuators(
@@ -62,10 +70,10 @@ def test_compiled_scene_preserves_full_chain_and_six_arm_actuators(
     assert scene.model.nu == 6
     assert scene.model.opt.timestep == pytest.approx(0.001)
     np.testing.assert_array_equal(scene.model.opt.gravity, [0.0, 0.0, 0.0])
-    assert int(scene.model.opt.integrator) == int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST)
-    assert scene.arm_specs[B601_RS_SIM_ARM_KEY].joint_names == (
-        B601_RS_ARM_JOINT_NAMES
+    assert int(scene.model.opt.integrator) == int(
+        mujoco.mjtIntegrator.mjINT_IMPLICITFAST
     )
+    assert scene.arm_specs[B601_RS_SIM_ARM_KEY].joint_names == (B601_RS_ARM_JOINT_NAMES)
     assert (
         scene.arm_specs[B601_RS_SIM_ARM_KEY].controlled_body
         == B601_RS_END_EFFECTOR_FRAME
@@ -254,9 +262,7 @@ def test_b601_sim_package_has_no_hardware_or_rm65_runtime_imports() -> None:
     )
     violations: dict[str, list[str]] = {}
 
-    for path in sorted(
-        (REPO_ROOT / "sim" / "mujoco" / "rebot_b601_rs").glob("*.py")
-    ):
+    for path in sorted((REPO_ROOT / "sim" / "mujoco" / "rebot_b601_rs").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         imports: set[str] = set()
         for node in ast.walk(tree):

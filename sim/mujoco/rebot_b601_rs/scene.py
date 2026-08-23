@@ -39,9 +39,7 @@ B601_RS_GRIPPER_OPEN_QPOS = {
 # visualization seed.  They are not identified hardware or haptic gains.
 B601_RS_PROVISIONAL_POSITION_KP = (50.0, 150.0, 150.0, 50.0, 50.0, 50.0)
 B601_RS_PROVISIONAL_POSITION_KV = (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
-B601_RS_PROVISIONAL_PROFILE_NAME = (
-    "rebot_b601_rs_visualization_only_provisional_seed"
-)
+B601_RS_PROVISIONAL_PROFILE_NAME = "rebot_b601_rs_visualization_only_provisional_seed"
 
 
 def b601_position_actuator_name(joint_name: str) -> str:

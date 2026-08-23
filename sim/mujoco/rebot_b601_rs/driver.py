@@ -38,7 +38,7 @@ def default_b601_position_timing() -> TimingSpec:
 
 def _non_negative_integer(value: int, *, name: str) -> int:
     if isinstance(value, bool):
-        raise ValueError(f"{name} must be a non-negative integer")
+        raise TypeError(f"{name} must be a non-negative integer")
     normalized = int(value)
     if normalized != value or normalized < 0:
         raise ValueError(f"{name} must be a non-negative integer")
@@ -150,9 +150,7 @@ class B601PositionDriver:
             rel_tol=0.0,
             abs_tol=1e-12,
         ):
-            raise ValueError(
-                "scene timestep does not match TimingSpec.physics_hz"
-            )
+            raise ValueError("scene timestep does not match TimingSpec.physics_hz")
         try:
             arm_spec = scene.arm_specs[B601_RS_SIM_ARM_KEY]
         except KeyError as exc:
@@ -262,12 +260,8 @@ class B601PositionDriver:
                 if rejection_reason is None:
                     self._target_qpos = np.asarray(command.qpos, dtype=float)
                     self._accepted_sequence = int(command.sequence)
-                    self._source_timestamp_sec = float(
-                        command.source_timestamp_sec
-                    )
-                    self._receive_timestamp_sec = float(
-                        command.receive_timestamp_sec
-                    )
+                    self._source_timestamp_sec = float(command.source_timestamp_sec)
+                    self._receive_timestamp_sec = float(command.receive_timestamp_sec)
                     self._frame_id = command.frame_id
                     applied = True
         if due:

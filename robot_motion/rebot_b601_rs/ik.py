@@ -33,18 +33,15 @@ class B601IKConfig:
 
     def __post_init__(self) -> None:
         if isinstance(self.max_iterations, bool):
-            raise ValueError("max_iterations must be a positive integer")
+            raise TypeError("max_iterations must be a positive integer")
         iterations = int(self.max_iterations)
         if iterations != self.max_iterations or iterations <= 0:
             raise ValueError("max_iterations must be a positive integer")
         object.__setattr__(self, "max_iterations", iterations)
         if isinstance(self.backtracking_steps, bool):
-            raise ValueError("backtracking_steps must be a positive integer")
+            raise TypeError("backtracking_steps must be a positive integer")
         backtracking_steps = int(self.backtracking_steps)
-        if (
-            backtracking_steps != self.backtracking_steps
-            or backtracking_steps <= 0
-        ):
+        if backtracking_steps != self.backtracking_steps or backtracking_steps <= 0:
             raise ValueError("backtracking_steps must be a positive integer")
         object.__setattr__(self, "backtracking_steps", backtracking_steps)
         positive = {
@@ -126,11 +123,9 @@ class B601DampedLeastSquaresIK:
             position_error = float(np.linalg.norm(position_delta))
             orientation_error = float(np.linalg.norm(rotation_delta))
 
-            if (
-                position_error <= float(self.config.position_tolerance_m)
-                and orientation_error
-                <= float(self.config.orientation_tolerance_rad)
-            ):
+            if position_error <= float(
+                self.config.position_tolerance_m
+            ) and orientation_error <= float(self.config.orientation_tolerance_rad):
                 status = "converged"
                 return self._result(
                     success=True,
@@ -180,9 +175,7 @@ class B601DampedLeastSquaresIK:
                 candidate = qpos + alpha * bounded_delta
                 clipped = np.clip(candidate, self._lower, self._upper)
                 candidate_pose = self.model.forward_kinematics(clipped)
-                candidate_position_delta = (
-                    target[:3, 3] - candidate_pose[:3, 3]
-                )
+                candidate_position_delta = target[:3, 3] - candidate_pose[:3, 3]
                 candidate_rotation_delta = Rotation.from_matrix(
                     target[:3, :3] @ candidate_pose[:3, :3].T
                 ).as_rotvec()

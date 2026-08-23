@@ -146,3 +146,7 @@ def test_seed_shape_finiteness_and_physical_limits_are_fail_closed(
         B601IKConfig(max_iterations=1.5)
     with pytest.raises(ValueError, match="positive integer"):
         B601IKConfig(backtracking_steps=0)
+    with pytest.raises(TypeError, match="positive integer"):
+        B601IKConfig(max_iterations=True)
+    with pytest.raises(TypeError, match="positive integer"):
+        B601IKConfig(backtracking_steps=False)
