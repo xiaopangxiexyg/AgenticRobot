@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import queue
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from dataset_contracts.hitl import (
+    ExclusiveHITLSampleLineage,
+    exclusive_hitl_policy_artifact_contract_hash,
+)
 from robot_motion.action import BIMANUAL_QPOS_V1, RobotAction
 from robot_motion.deploy import NormalizedAction, PolicyActionEmission
 from robot_motion.deploy.runtime import SourceValidationResult
 from teleop_runtime.real_teleop.hitl_policy_runtime import (
     ExclusiveHITLPolicyCommandSelector,
+    build_exclusive_hitl_dataset_contract,
 )
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand, TeleopObservation
 
@@ -101,6 +107,48 @@ class _PolicySource:
         self.closed = True
 
 
+def test_normal_dataset_contract_binds_artifact_and_scheduling_identity() -> None:
+    artifact_payload = {
+        "schema": "policy-artifact-fixture",
+        "policy_io_layout_hash": "layout-hash:1",
+    }
+    artifact = SimpleNamespace(
+        to_dict=lambda: artifact_payload,
+        layout_hash="layout-hash:1",
+        model_id="openpi-fixture",
+        checkpoint_step=50176,
+    )
+    config = SimpleNamespace(
+        policy_artifact=artifact,
+        prompt="write text",
+        action_hz=15.0,
+        policy_hz=10.0,
+        action_chunk_execution_steps=8,
+        prediction_request_queue_threshold=4,
+    )
+    args = SimpleNamespace(
+        active_sides=("right",),
+        hitl_policy_mode="normal",
+        hitl_initial_source="policy",
+        hitl_takeover_key="u",
+        hitl_policy_resume_key="i",
+        _hitl_policy_emission_source=None,
+    )
+
+    contract = build_exclusive_hitl_dataset_contract(
+        args,
+        normal_source_config=config,
+    )
+
+    assert contract.policy_source_kind == "openpi_artifact"
+    assert contract.policy_artifact_contract_hash == (
+        exclusive_hitl_policy_artifact_contract_hash(artifact_payload)
+    )
+    assert contract.policy_io_layout_hash == "layout-hash:1"
+    assert contract.checkpoint_step == 50176
+    assert contract.action_chunk_execution_steps == 8
+
+
 def test_normal_policy_command_is_identity_composed_before_common_command_path() -> None:
     source = _PolicySource([_emission(1, emitted_at=10.0)])
     selector = ExclusiveHITLPolicyCommandSelector(
@@ -131,6 +179,11 @@ def test_normal_policy_command_is_identity_composed_before_common_command_path()
     assert command.metadata["hitl_composition_evaluation_id"].startswith(
         "composition-evaluation:"
     )
+    lineage = ExclusiveHITLSampleLineage.from_command_metadata(command.metadata)
+    assert lineage is not None
+    assert lineage.source == "policy"
+    assert lineage.policy_emission_id == "policy-emission:1"
+    assert lineage.policy_lineage_complete is True
 
 
 def test_human_selection_preserves_human_candidate_and_adds_lineage() -> None:

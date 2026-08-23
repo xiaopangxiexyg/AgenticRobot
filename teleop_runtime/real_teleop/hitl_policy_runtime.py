@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from dataset_contracts.hitl import (
+    ExclusiveHITLDatasetContract,
+    exclusive_hitl_policy_artifact_contract_hash,
+)
 from deployments.openpi.client import (
     OpenPIEmissionSourceConfig,
     build_openpi_policy_emission_source,
@@ -137,6 +141,84 @@ def build_normal_hitl_policy_source(
         last_action_sink=capture.observe_last_action,
     )
     return source, capture
+
+
+def build_exclusive_hitl_dataset_contract(
+    args: object,
+    *,
+    normal_source_config: OpenPIEmissionSourceConfig | None,
+) -> ExclusiveHITLDatasetContract:
+    """Freeze the explicit HITL profile before the dataset writer starts.
+
+    Network endpoint details are intentionally excluded: the policy artifact
+    sidecar, prompt, scheduling parameters, and active embodiment define the
+    persisted policy identity.  An injected source remains visibly unbound and
+    is intended for source validation, not artifact-attributed deployment data.
+    """
+
+    mode = str(getattr(args, "hitl_policy_mode", HITL_POLICY_MODE_NORMAL)).strip().lower()
+    active_sides = tuple(str(side) for side in getattr(args, "active_sides", ()))
+    common = {
+        "policy_mode": mode,
+        "initial_source": str(getattr(args, "hitl_initial_source", "policy")),
+        "active_sides": active_sides,
+        "rtc_no_action": mode == HITL_POLICY_MODE_RTC,
+        "takeover_key": str(getattr(args, "hitl_takeover_key", "u")),
+        "policy_resume_key": str(getattr(args, "hitl_policy_resume_key", "i")),
+    }
+    if mode == HITL_POLICY_MODE_RTC:
+        return ExclusiveHITLDatasetContract(
+            **common,
+            policy_source_kind="rtc_committed_emission",
+            prediction_request_queue_threshold=0,
+        )
+    if mode != HITL_POLICY_MODE_NORMAL:
+        raise ValueError("HITL policy mode must be normal or rtc.")
+
+    injected = getattr(args, "_hitl_policy_emission_source", None) is not None
+    if normal_source_config is None and not injected:
+        raise RuntimeError("Normal HITL dataset contract requires completed preflight.")
+    if normal_source_config is None:
+        execution_steps = int(
+            getattr(args, "hitl_policy_chunk_execution_steps", 0)
+        )
+        return ExclusiveHITLDatasetContract(
+            **common,
+            policy_source_kind="injected_policy_emission",
+            policy_prompt=(
+                str(getattr(args, "hitl_policy_prompt", "") or "").strip()
+                or None
+            ),
+            action_hz=float(getattr(args, "hitl_policy_action_hz", 15.0)),
+            policy_hz=float(getattr(args, "hitl_policy_inference_hz", 15.0)),
+            action_chunk_execution_steps=(
+                None if execution_steps <= 0 else execution_steps
+            ),
+            prediction_request_queue_threshold=int(
+                getattr(args, "hitl_policy_prefetch_threshold", 4)
+            ),
+        )
+
+    artifact = normal_source_config.policy_artifact
+    return ExclusiveHITLDatasetContract(
+        **common,
+        policy_source_kind="openpi_artifact",
+        policy_artifact_contract_hash=exclusive_hitl_policy_artifact_contract_hash(
+            artifact.to_dict()
+        ),
+        policy_io_layout_hash=artifact.layout_hash,
+        model_id=artifact.model_id,
+        checkpoint_step=artifact.checkpoint_step,
+        policy_prompt=normal_source_config.prompt,
+        action_hz=normal_source_config.action_hz,
+        policy_hz=normal_source_config.policy_hz,
+        action_chunk_execution_steps=(
+            normal_source_config.action_chunk_execution_steps
+        ),
+        prediction_request_queue_threshold=(
+            normal_source_config.prediction_request_queue_threshold
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -479,6 +561,7 @@ __all__ = [
     "HITL_POLICY_MODES",
     "ExclusiveHITLPolicyCommandSelector",
     "HITLPolicySelectionStatus",
+    "build_exclusive_hitl_dataset_contract",
     "build_normal_hitl_policy_source",
     "preflight_normal_hitl_policy_source",
 ]

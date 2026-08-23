@@ -109,6 +109,7 @@ def _components(session: _Session):
 
 def _args(**overrides):
     values = {
+        "active_sides": ("right",),
         "hitl_policy_control": True,
         "hitl_policy_mode": "normal",
         "hitl_initial_source": "policy",
@@ -210,6 +211,10 @@ def test_application_leaf_installs_one_extension_and_additive_terminal() -> None
     assert isinstance(terminal, HITLTerminalClutchInput)
     assert terminal.takeover_key == "u"
     assert terminal.policy_resume_key == "i"
+    dataset_contract = args._exclusive_hitl_dataset_contract
+    assert dataset_contract.policy_source_kind == "injected_policy_emission"
+    assert dataset_contract.policy_identity_status == "unbound_injected_source"
+    assert dataset_contract.active_sides == ("right",)
 
 
 def test_application_leaf_rejects_competing_runtime_extension() -> None:
@@ -333,6 +338,12 @@ def test_rtc_committed_emission_intervention_fails_held_without_motion() -> None
         _hitl_rtc_committed_emissions=inbox,
     )
     extension = _configured_extension(args)
+    assert args._exclusive_hitl_dataset_contract.policy_mode == "rtc"
+    assert args._exclusive_hitl_dataset_contract.rtc_no_action is True
+    assert (
+        args._exclusive_hitl_dataset_contract.policy_identity_status
+        == "rtc_no_action"
+    )
     session = _Session()
     components = _components(session)
     clutch = _Clutch()

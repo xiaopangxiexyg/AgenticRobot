@@ -504,6 +504,7 @@ def build_real_teleop_progress_application(
         # application profile.
         from teleop_runtime.real_teleop.hitl_policy_runtime import (
             ExclusiveHITLPolicyCommandSelector,
+            build_exclusive_hitl_dataset_contract,
             build_normal_hitl_policy_source,
             preflight_normal_hitl_policy_source,
         )
@@ -512,6 +513,12 @@ def build_real_teleop_progress_application(
             preflight_normal_hitl_policy_source(args)
             if str(getattr(args, "hitl_policy_mode", "normal")) == "normal"
             else None
+        )
+        args._exclusive_hitl_dataset_contract = (
+            build_exclusive_hitl_dataset_contract(
+                args,
+                normal_source_config=normal_source_config,
+            )
         )
         hitl_extension = build_exclusive_hitl_real_teleop_extension(
             args,

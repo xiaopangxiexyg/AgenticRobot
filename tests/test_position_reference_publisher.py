@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from dataset_contracts.hitl import (
+    EXCLUSIVE_HITL_SAMPLE_METADATA_KEY,
+    ExclusiveHITLSampleLineage,
+)
 from robot_motion.position_control import (
     POSITION_TRANSPORT_TARGET_SEQUENCE_KEY,
     POSITION_TRANSPORT_TARGET_SEQUENCES_KEY,
@@ -77,6 +81,37 @@ def test_publisher_builds_atomic_fk_reference_and_causal_lookup() -> None:
     assert publisher.latest_at_or_before(10.119) is None
     assert publisher.latest_at_or_before(10.12) is frame
     assert publisher.latest_at_or_before(10.321) is None
+
+
+def test_publisher_freezes_hitl_lineage_into_causal_reference_frame() -> None:
+    result = _result()
+    lineage = ExclusiveHITLSampleLineage(
+        source="human",
+        policy_mode="normal",
+        rtc_no_action=False,
+        switch_id="switch:takeover",
+    )
+    command_metadata = lineage.to_command_metadata()
+    command_metadata.pop(EXCLUSIVE_HITL_SAMPLE_METADATA_KEY)
+    result.command.metadata.update(command_metadata)
+    publisher = PositionReferencePublisher(
+        config=PositionReferencePublisherConfig(active_sides=("left", "right")),
+        fk_by_side={"left": _fk, "right": _fk},
+        wall_clock=_Clock((10.1, 10.2)),
+        monotonic_clock=_Clock((1.0, 1.1, 1.15)),
+        epoch=8,
+    )
+
+    frame = publisher.publish_step(result)
+    selected = publisher.reference_for_sample(10.25)
+
+    assert frame is not None and selected is not None
+    assert frame.frame_metadata[EXCLUSIVE_HITL_SAMPLE_METADATA_KEY] == (
+        lineage.to_payload()
+    )
+    assert selected["frame_metadata"][EXCLUSIVE_HITL_SAMPLE_METADATA_KEY] == (
+        lineage.to_payload()
+    )
 
 
 def test_publisher_requires_complete_dispatched_group() -> None:

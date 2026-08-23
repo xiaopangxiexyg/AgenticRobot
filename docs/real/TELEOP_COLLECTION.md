@@ -549,6 +549,42 @@ RealTeleop 与 UMI 共用的双栏页面现在默认允许调整栏宽。可拖�
 输入边沿并展示，不会产生新 operator event、改变事件优先级或写入数据集。使用
 `--no-gui-input-activity-indicators` 可完整隐藏色块和其脚本；UMI 命令同样支持该开关。
 
+### 3.9 Exclusive HITL 数据组织（默认关闭）
+
+Exclusive HITL 仍使用正式 collection writer 和同一 action/state/camera/tactile schema，
+不建立第二套 Episode 生命周期。开启后，一个数据集只能绑定一份不可变
+`meta/info.json.exclusive_hitl_capture` 契约，其中记录：
+
+- `exclusive_single_source_no_blending` 选择语义，以及只记录最终选中并实际执行 action；
+- normal/RTC 模式、初始来源、active sides、接管/放回按键；
+- normal OpenPI 的 artifact contract hash、policy-I/O layout hash、model/checkpoint、prompt
+  与 chunk/rate 配置；注入测试源会显式标为 `unbound_injected_source`；
+- RTC 在当前版本固定为 `rtc_no_action`，不能产生 policy-owned action 样本。
+
+写入已有非空数据集时，如果缺少该契约或契约内容不同，writer 在追加前拒绝启动。不要把
+HITL Episode 追加到普通 human-only 数据集，也不要在同一 root 中更换 policy artifact、
+prompt、active sides 或 normal/RTC 模式。
+
+每个正式 row 的 `sample_metadata_json.exclusive_hitl` 是训练/审计使用的 canonical
+样本记录，包含唯一 action 来源 `human|policy`、mode、RTC no-action 标记、switch/intent
+lineage；policy-owned 样本还必须具有完整 policy emission/output/inference 和
+composition input/evaluation/spec hash。该记录带独立语义 hash，缺字段或互相矛盾时 reader
+fail closed。`command_metadata` 中保留相同字段只是兼容与诊断视图，不是第二份权威标签。
+
+Position profile 的 sample tick 可能没有新 command，而是继续使用最后一个已发布 qref。
+因此 HITL lineage 在 qref 发布时冻结进 `PositionReferenceFrame.frame_metadata`；采样时从
+实际选中的 causal frame 恢复并与 canonical 样本记录核对。禁止按采样时“当前 GUI 选中
+来源”回填，也禁止缓存最近标签来猜测 qref 来源，否则接管边界会发生错标。
+
+当前数据语义不是 DAgger 式 paired residual：human 接管期间不在后台额外保存同一 observation
+对应的 counterfactual policy action。训练侧可以按 canonical `source`、`switch_id` 和完整
+policy lineage 分段或加权；如需 paired human/policy proposal，必须另立采集契约和任务，不能
+从本字段推断。可通过 `dataset_interface.hitl.validate_exclusive_hitl_dataset_rows` 对读取到的
+rows 做 dataset/sample/qref 三层一致性检查。
+
+本节只定义持久化与读取边界，不构成真机启动授权；正式 launcher/offline acceptance 仍需
+在独立交付步骤中验证，RTC Active motion 也不在当前版本范围内。
+
 ## 4. Impedance/力控数采
 
 力控没有被 position profile 替代。当前设备全开 15→40 Hz 命令只在
