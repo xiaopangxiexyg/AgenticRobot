@@ -352,7 +352,10 @@ class QuestDevHTTPServer(ThreadingHTTPServer):
         max_ws_clients: int = 4,
         auth_timeout_s: float = 5.0,
         use_https: bool = True,
+        monotonic_ns_clock: Callable[[], int] = time.monotonic_ns,
     ) -> None:
+        if not callable(monotonic_ns_clock):
+            raise TypeError("monotonic_ns_clock must be callable")
         super().__init__(server_address, handler_cls)
         self.client_config = dict(client_config or {})
         self._pairing_token = validate_pairing_token(pairing_token)
@@ -364,6 +367,7 @@ class QuestDevHTTPServer(ThreadingHTTPServer):
         if not 0.5 <= self.auth_timeout_s <= 60.0:
             raise ValueError("auth_timeout_s must be between 0.5 and 60 seconds")
         self.use_https = bool(use_https)
+        self.monotonic_ns_clock = monotonic_ns_clock
         self.server_instance_id = str(server_instance_id or uuid4().hex)
         self.lock = threading.RLock()
         self.ws_connections: dict[int, WebSocketClient] = {}
@@ -497,7 +501,7 @@ class QuestDevHTTPServer(ThreadingHTTPServer):
         record = dict(payload)
         record["client_id"] = client_id
         record["server_timestamp"] = time.time()
-        record["server_monotonic_ns"] = time.monotonic_ns()
+        record["server_monotonic_ns"] = int(self.monotonic_ns_clock())
         with self.lock:
             self.last_client_message = {
                 **summarize_message(record),
@@ -774,6 +778,7 @@ class QuestDevHost:
         self._serve_loop_started = False
         self._server_shutdown_started = False
         self._server_close_attempted = False
+        self._cleanup_failure: tuple[str, ...] = ()
 
     def start(self) -> None:
         """Start each enabled feature once without entering the HTTP loop."""
@@ -813,8 +818,14 @@ class QuestDevHost:
                             "Quest Dev host shutdown was requested during startup"
                         )
             except BaseException as start_error:
-                cleanup_errors = self._close_owned_resources_locked()
+                cleanup_errors, cleanup_base_error = (
+                    self._close_owned_resources_locked()
+                )
+                if cleanup_errors:
+                    self._cleanup_failure = tuple(cleanup_errors)
                 self._state = "fault"
+                if cleanup_base_error is not None:
+                    raise cleanup_base_error from start_error
                 if cleanup_errors:
                     raise RuntimeError(
                         "Quest Dev host startup cleanup failed: "
@@ -928,46 +939,73 @@ class QuestDevHost:
             raise
 
     def close(self) -> None:
-        """Stop owned runtimes in reverse order and close the server once."""
+        """Stop owned resources once and permanently re-report cleanup failure."""
 
         with self._lock:
-            if self._state in {"closing", "closed", "fault"}:
+            if self._state == "fault":
+                if self._cleanup_failure:
+                    raise RuntimeError(
+                        "Quest Dev host cleanup failed: "
+                        + "; ".join(self._cleanup_failure)
+                    )
+                return
+            if self._state in {"closing", "closed"}:
                 return
             if self._state == "serving":
                 raise RuntimeError(
                     "cannot close Quest Dev host while serving; request shutdown first"
                 )
             self._state = "closing"
-            errors = self._close_owned_resources_locked()
+            errors, cleanup_base_error = self._close_owned_resources_locked()
+            if errors:
+                self._cleanup_failure = tuple(errors)
             self._state = "closed" if not errors else "fault"
+        if cleanup_base_error is not None:
+            raise cleanup_base_error
         if errors:
             raise RuntimeError("Quest Dev host cleanup failed: " + "; ".join(errors))
 
-    def _close_owned_resources_locked(self) -> list[str]:
+    def _close_owned_resources_locked(
+        self,
+    ) -> tuple[list[str], BaseException | None]:
         self._shutdown_requested = True
         self.stop_event.set()
         errors: list[str] = []
+        first_base_error: BaseException | None = None
         for name, runtime in reversed(self._owned_runtimes):
             try:
                 runtime.stop()
-            except Exception as exc:  # noqa: BLE001 - finish reverse cleanup.
+            except BaseException as exc:  # noqa: BLE001 - finish reverse cleanup.
                 errors.append(f"feature {name}: {type(exc).__name__}: {exc}")
+                if not isinstance(exc, Exception) and first_base_error is None:
+                    first_base_error = exc
         self._feature_runtimes.clear()
         if not self._server_close_attempted:
             self._server_close_attempted = True
             try:
                 self.server.server_close()
-            except Exception as exc:  # noqa: BLE001 - aggregate cleanup evidence.
+            except BaseException as exc:  # noqa: BLE001 - aggregate cleanup evidence.
                 errors.append(f"server: {type(exc).__name__}: {exc}")
-        return errors
+                if not isinstance(exc, Exception) and first_base_error is None:
+                    first_base_error = exc
+        return errors, first_base_error
 
 
 def build_quest_dev_host(
     config_path: Path = MODULE_ROOT / "config.yaml",
     *,
     force_http: bool = False,
+    monotonic_ns_clock: Callable[[], int] = time.monotonic_ns,
+    runtime_loader: Callable[
+        [str, QuestDevHTTPServer, dict[str, Any], threading.Event], Any
+    ] = load_feature_runtime,
 ) -> QuestDevHost:
     """Bind one Quest server without starting features or its request loop."""
+
+    if not callable(monotonic_ns_clock):
+        raise TypeError("monotonic_ns_clock must be callable")
+    if not callable(runtime_loader):
+        raise TypeError("runtime_loader must be callable")
 
     config = load_config(Path(config_path).resolve())
     server_cfg = config.get("server", {})
@@ -993,6 +1031,7 @@ def build_quest_dev_host(
             max_ws_clients=int(server_cfg.get("max_ws_clients", 4)),
             auth_timeout_s=float(server_cfg.get("auth_timeout_s", 5.0)),
             use_https=use_https,
+            monotonic_ns_clock=monotonic_ns_clock,
         )
         if use_https:
             cert = resolve_module_path(
@@ -1022,7 +1061,12 @@ def build_quest_dev_host(
         pairing_code=pairing_code,
         use_https=use_https,
     )
-    return QuestDevHost(server, features, launch_info)
+    return QuestDevHost(
+        server,
+        features,
+        launch_info,
+        runtime_loader=runtime_loader,
+    )
 
 
 def parse_args() -> argparse.Namespace:

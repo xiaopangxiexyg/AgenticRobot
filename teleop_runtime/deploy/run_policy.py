@@ -396,6 +396,12 @@ from .replay import (
     load_dataset_replay_policy,
     skip_startup_replay_frames as _skip_startup_replay_frames,
 )
+from .quest_paired_pose_capture import (
+    QuestPairedPoseCaptureApplicationPort,
+    QuestPairedPoseCaptureFactory,
+    bind_passive_robot_pose_journal_source,
+    require_quest_paired_pose_capture_application,
+)
 from .resource_lifecycle import PolicyDeployResourceLifecycle
 from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
 from .rm65_pose_observation import (
@@ -3222,6 +3228,7 @@ def main(
     rtc_model_adapter_factory: Callable[..., Any] | None = None,
     policy_emission_observer: PassivePolicyEmissionObserverPort | None = None,
     legacy_worker_binding: RM65LegacyWorkerExecutionBinding | None = None,
+    quest_paired_pose_capture_factory: QuestPairedPoseCaptureFactory | None = None,
 ) -> int:
     if rtc_step_fanout is not None and not isinstance(
         rtc_step_fanout,
@@ -3255,6 +3262,14 @@ def main(
     ):
         raise TypeError(
             "legacy_worker_binding must be an RM65LegacyWorkerExecutionBinding or None."
+        )
+    if quest_paired_pose_capture_factory is not None and not isinstance(
+        quest_paired_pose_capture_factory,
+        QuestPairedPoseCaptureFactory,
+    ):
+        raise TypeError(
+            "quest_paired_pose_capture_factory must be a "
+            "QuestPairedPoseCaptureFactory or None."
         )
     parser = argparse.ArgumentParser(
         description="Deploy a policy on teleop_runtime RM65 arms, optional InspireTac hands, and RealSense."
@@ -3324,6 +3339,12 @@ def main(
             policy_artifact is not None and policy_artifact.arm_hold_output is not None
         ),
     )
+    if quest_paired_pose_capture_factory is not None and not bool(
+        args.rm65_pose_observation
+    ):
+        raise ValueError(
+            "quest_paired_pose_capture_factory requires --rm65-pose-observation."
+        )
     if rtc_step_fanout is not None and str(args.rtc_profile) != (
         RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1
     ):
@@ -3692,6 +3713,7 @@ def main(
         args,
         hand_action_specs,
     )
+    pose_observation: RM65PoseObservationAssembly | None = None
     arm_reader: ArmStateReader | None = (
         None
         if bool(args.rm65_pose_observation)
@@ -3701,6 +3723,10 @@ def main(
             pose_observation=None,
         )
     )
+    quest_paired_pose_capture: QuestPairedPoseCaptureApplicationPort | None = None
+    quest_paired_pose_poll_enabled = False
+    quest_paired_pose_capture_error: str | None = None
+    quest_paired_pose_factory_attempted = False
     camera_sources = build_camera_sources(
         args,
         selected_camera_keys=selected_camera_keys,
@@ -4938,6 +4964,35 @@ def main(
             )
         if arm_reader is None:
             raise RuntimeError("ArmStateReader was not constructed after startup.")
+        if quest_paired_pose_capture_factory is not None:
+            if pose_observation is None:
+                raise RuntimeError("RM65 pose observation assembly is unavailable.")
+            robot_pose_journal = bind_passive_robot_pose_journal_source(
+                arm_reader=arm_reader,
+                pose_observation=pose_observation,
+            )
+            quest_paired_pose_factory_attempted = True
+            created_quest_capture = quest_paired_pose_capture_factory(
+                robot_pose_journal=robot_pose_journal,
+            )
+            if (
+                quest_paired_pose_capture_factory.application
+                is not created_quest_capture
+            ):
+                raise RuntimeError(
+                    "Quest paired-pose factory did not retain its returned application"
+                )
+            quest_paired_pose_capture = require_quest_paired_pose_capture_application(
+                created_quest_capture,
+                robot_pose_journal=robot_pose_journal,
+            )
+            quest_paired_pose_poll_enabled = True
+            print(
+                "[QuestPairedPoseCapture] READY: unique Quest host is bound "
+                "to the existing passive robot journal; controller/side/frame "
+                "selection remains explicit.",
+                flush=True,
+            )
         print_controls(
             send_actions=send_actions,
             auto_start=bool(args.auto_start),
@@ -5252,6 +5307,25 @@ def main(
                 arm_states = arm_reader.snapshot(loop_started_at)
                 arm_snapshot_cpu_completed = time.thread_time()
                 pre_action_arm_snapshot_completed_at = time.monotonic()
+                if (
+                    quest_paired_pose_capture is not None
+                    and quest_paired_pose_poll_enabled
+                ):
+                    try:
+                        quest_paired_pose_capture.poll()
+                    except Exception as exc:  # noqa: BLE001 - passive observer only.
+                        quest_paired_pose_capture_error = (
+                            "quest_paired_pose_capture_poll_failed:"
+                            f"{type(exc).__name__}:{exc}"
+                        )
+                        print(
+                            "[QuestPairedPoseCapture] ERROR: passive capture "
+                            "disabled after poll failure; policy control is unchanged: "
+                            f"{quest_paired_pose_capture_error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        quest_paired_pose_poll_enabled = False
                 ik_gate_event = ik_action_gate.update(arm_states)
                 if ik_action_gate.blocks_action_output:
                     policy_deploy_runtime.clear_action_queue()
@@ -7114,15 +7188,38 @@ def main(
                 )
     finally:
         try:
-            if arm_reader is not None:
-                arm_reader.invalidate_pose_measurements(
-                    reason="policy_deploy_shutdown",
-                    terminal=True,
-                )
+            if (
+                quest_paired_pose_factory_attempted
+                and quest_paired_pose_capture_factory is not None
+            ):
+                try:
+                    quest_paired_pose_capture_factory.close()
+                except Exception as exc:  # noqa: BLE001 - continue robot cleanup.
+                    factory_error = (
+                        "quest_paired_pose_factory_close_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    quest_paired_pose_capture_error = (
+                        factory_error
+                        if quest_paired_pose_capture_error is None
+                        else f"{quest_paired_pose_capture_error};{factory_error}"
+                    )
         finally:
-            cleanup_errors = resource_lifecycle.close(
-                keyboard_interrupt_stop_error=keyboard_interrupt_stop_error,
-            )
+            try:
+                if arm_reader is not None:
+                    arm_reader.invalidate_pose_measurements(
+                        reason="policy_deploy_shutdown",
+                        terminal=True,
+                    )
+            finally:
+                cleanup_errors = resource_lifecycle.close(
+                    keyboard_interrupt_stop_error=keyboard_interrupt_stop_error,
+                )
+                if quest_paired_pose_capture_error is not None:
+                    cleanup_errors = (
+                        quest_paired_pose_capture_error,
+                        *cleanup_errors,
+                    )
     return 1 if cleanup_errors else 0
 
 

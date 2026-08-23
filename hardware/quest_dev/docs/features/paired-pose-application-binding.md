@@ -1,0 +1,238 @@
+# Quest paired-pose application binding
+
+## Scope
+
+This application leaf connects three existing owners without moving their
+responsibilities:
+
+1. `hardware.quest_dev` owns the unique HTTP/WebSocket host and admitted
+   controller-pose runtime.
+2. policy deploy owns the single RM65 `ArmStateReader` and passive pose journal.
+3. `ManualStaticPairedPoseCapture` remains the pure lower reducer for typed
+   static-window evidence.
+
+The binding lives in
+`teleop_runtime.deploy.quest_paired_pose_capture`. It never calls an arm
+backend, `ArmStateReader.snapshot()`, `get_state()`, or `refresh()`. The factory
+receives only a narrow source containing the exact receiver-clock descriptor,
+the same monotonic callable, explicit side-to-coordinate bindings, and passive
+`atomic_cut`/`events_after` functions.
+
+This slice does **not** persist evidence, fit or accept calibration, install a
+frame transform, publish a policy trajectory, or render that trajectory on
+Quest. It also adds no Quest CLI default and makes no controller, handedness,
+robot-side, frame, or static-window-profile choice.
+
+## Clock and cursor proof
+
+The application supplies the same callable to:
+
+- the HTTP server stamp that becomes an accepted Quest sample's
+  `received_monotonic_ns`;
+- controller-runtime invalidations;
+- the existing RM65 pose journal.
+
+It also injects the full receiver descriptor's `clock_domain_id` into a copied
+controller feature config. A conflicting configured ID fails before the
+runtime starts. The default standalone Quest CLI keeps its existing behavior.
+
+Robot journal cuts are inclusive, so the reducer binding/window boundary uses
+`robot_cut.event_sequence + 1`. Quest subscription, event, and observer-close
+cuts already contain an exclusive `next_event_sequence` and are used directly.
+Both journals advance globally before the reducer filters the selected robot
+side or Quest controller.
+
+Candidate discovery and capture use two consecutive Quest subscriptions. The
+discovery subscription projects globally ordered, pose-redacted identities and
+then discards pose events that are no longer needed for ordering. An explicit
+selection atomically closes that observer, opens a fresh capture observer, and
+requires the reviewed XR epoch to remain active with non-regressing event and
+sample cursors. The application also takes a fresh robot cut at selection and
+rejects a drifted or terminal-invalidated selected stream. Thus operator review
+time is not hidden inside either the Quest pose-history bound or the robot
+journal retention window; `max_event_history` still bounds actual reordering
+and the selected static-window capture.
+
+## Programmatic lifecycle
+
+There is deliberately no production selection default. A coordinator can
+construct an explicit factory and inject it into `run_policy.main()`:
+
+```python
+from pathlib import Path
+from threading import Thread
+
+from hardware.quest_dev.features.visualization.paired_pose_capture import (
+    StaticWindowCaptureProfile,
+)
+from teleop_runtime.deploy.quest_paired_pose_capture import (
+    QuestCaptureFrameFacts,
+    QuestCaptureSelectionIntent,
+    QuestPairedPoseCaptureFactory,
+    QuestPairedPoseCaptureLaunchConfig,
+)
+from teleop_runtime.deploy.run_policy import main as run_policy_main
+
+
+profile = StaticWindowCaptureProfile(
+    profile_id="operator-reviewed-profile-id",
+    min_window_duration_ns=...,
+    max_window_duration_ns=...,
+    min_source_span_ns=...,
+    max_pair_skew_ns=...,
+    min_robot_samples=...,
+    max_robot_samples=...,
+    min_quest_samples=...,
+    max_quest_samples=...,
+    max_robot_translation_excursion_m=...,
+    max_robot_rotation_excursion_deg=...,
+    max_quest_translation_excursion_m=...,
+    max_quest_rotation_excursion_deg=...,
+    max_quest_reorder_events=...,
+    max_event_history=...,
+    max_completed_windows=...,
+)
+factory = QuestPairedPoseCaptureFactory(
+    QuestPairedPoseCaptureLaunchConfig(
+        config_path=Path("hardware/quest_dev/config.yaml"),
+        force_http=False,
+        profile=profile,
+        capture_id="operator-issued-capture-id",
+        startup_timeout_s=...,
+        callback_drain_timeout_s=...,
+        host_join_timeout_s=...,
+    )
+)
+
+deploy_thread = Thread(
+    target=run_policy_main,
+    kwargs={
+        "argv": [
+            "--rm65-pose-observation",
+            "--active-sides",
+            "right",
+            "--right-arm-ip",
+            "<reviewed-rm65-ip>",
+        ],
+        "quest_paired_pose_capture_factory": factory,
+    },
+)
+deploy_thread.start()
+
+application = factory.wait_for_application(timeout_s=...)
+launch = factory.launch_info
+assert launch is not None
+print(launch.base_url)
+print(launch.pairing_code)
+```
+
+`run_policy.main()` accepts this concrete lifecycle factory, not a marker-only
+callable. It verifies that the returned concrete application is the factory's
+own application and is bound to the exact passive journal passed by deploy.
+After injection, policy deploy is the shutdown caller: its `finally` calls the
+idempotent `factory.close()` before invalidating the robot journal or closing
+backends. The coordinator should keep the factory reference until the deploy
+thread has exited and must not independently race that normal shutdown.
+
+Startup and cleanup failures are explicit. A
+`QuestPairedPoseCaptureStartupError` whose message says cleanup remains
+unproven means the factory still owns a host or non-daemon serving thread; keep
+the object while `factory.cleanup_pending` is true and retry `factory.close()`
+after the underlying shutdown condition changes.
+`QuestPairedPoseCaptureCleanupError` likewise never marks the factory or
+application closed without a proven observer removal, dead serving thread, and
+successful host close. A permanent host cleanup failure remains latched and
+cannot be converted into success by a second `close()` call.
+
+This is a real-hardware observation profile even though action sending is
+forbidden by `--rm65-pose-observation`. Use the repository's normal hardware
+safety and remote-wrapper requirements before running it. The examples above
+leave every threshold, endpoint, side, and timeout explicit on purpose.
+
+After the Quest page connects, candidates are pose-redacted and do not contain
+controller matrices:
+
+```python
+candidates = application.candidates()
+reviewed_candidate_hash = "<operator-reviewed-candidate-hash>"
+candidate = next(
+    value
+    for value in candidates
+    if value.candidate_hash == reviewed_candidate_hash
+)
+
+application.select(
+    intent=QuestCaptureSelectionIntent(
+        candidate_hash=candidate.candidate_hash,
+        robot_side="<explicit-left-or-right>",
+    ),
+    frame_facts=QuestCaptureFrameFacts(
+        candidate_hash=candidate.candidate_hash,
+        reference_frame_id="<explicit-quest-reference-frame-id>",
+        moving_frame_id="<explicit-controller-grip-frame-id>",
+        xr_frame_clock_domain_id="<explicit-webxr-frame-clock-id>",
+    ),
+)
+```
+
+The coordinator then declares each stationary interval mechanically:
+
+```python
+application.begin_window(window_id="stationary-window-001")
+
+# The operator keeps the rigidly mounted controller and robot TCP stationary.
+# The policy loop calls application.poll() once after its existing arm snapshot.
+
+receipt = application.complete_window()
+while receipt is None:
+    # Retry drains the first immutable end tuple; it never enlarges the window.
+    receipt = application.complete_window()
+```
+
+Once all intended windows are accepted, sealing is a separate explicit action:
+
+```python
+evidence = application.request_seal()
+```
+
+For the capture observer, `request_seal()` uses exactly one
+`unsubscribe_with_cut()` and one typed robot cut, then boundedly drains
+callbacks below the close watermark. A timeout, gap, selected-source
+invalidation, clock drift, or conflicting duplicate leaves evidence absent.
+Ordinary `close()` only unsubscribes and tears down resources; it never turns
+completed or partial windows into sealed evidence automatically. A terminal
+`poll()` raises a typed terminal error. Policy deploy disables further passive
+polls immediately but defers potentially blocking host teardown to its ordered
+`finally`, after the current snapshot reaches the normal IK/safety gate.
+
+## Runtime order
+
+The concrete caller order is:
+
+```text
+resource lifecycle start
+  -> RM65 pose observation assembly
+  -> single ArmStateReader
+  -> narrow passive journal source
+  -> unique Quest host + discovery subscription
+  -> explicit candidate/side/frame selection
+       -> fresh capture subscription cut + fresh robot journal cut
+  -> each existing ArmStateReader.snapshot()
+       -> paired application poll()
+  -> factory close -> paired application unsubscribe + host teardown
+  -> robot journal terminal invalidation
+  -> backend/resource close
+```
+
+Quest callbacks only enter a bounded staging area. They never invoke the
+reducer and never advance robot state. `poll()` performs deterministic reducer
+ingress on the policy thread. Capture terminal state is non-authoritative and
+cannot select a policy source, alter safety, gate IK, dispatch an action, or
+commit an episode.
+
+## Evidence boundary
+
+Focused tests use fake servers, typed events, and passive journals only. They
+do not bind a socket, connect a Quest, query RM65 hardware, or execute motion.
+Consequently they establish the in-process application seam, not physical
+calibration quality or future-trajectory visualization readiness.
