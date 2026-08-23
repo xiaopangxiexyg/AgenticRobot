@@ -508,7 +508,7 @@ def test_reference_timeout_clears_at_the_exact_physics_deadline(
     assert at_deadline.active_sequence is None
 
 
-def test_driver_rejects_stale_and_wrong_frame_references_without_preemption(
+def test_driver_rejects_local_stale_references_without_preemption(
     pinocchio_model: B601PinocchioModel,
 ) -> None:
     driver = B601MujocoEffortDriver(_effort_scene(), pinocchio_model)
@@ -528,15 +528,69 @@ def test_driver_rejects_stale_and_wrong_frame_references_without_preemption(
             qpos_rad=tuple(qpos),
         )
     )
-    driver.step_physics()
-    wrong_frame = driver.step_physics(_reference(3, qpos, 4.0, frame_id="unexpected"))
-
     assert accepted.command_applied is True
     assert stale_sequence.rejection_reason == "stale_sequence"
     assert stale_source.rejection_reason == "stale_source_timestamp"
     assert stale_receive.rejection_reason == "stale_receive_timestamp"
+    assert stale_sequence.active_sequence == 2
+    assert stale_source.active_sequence == 2
+    assert stale_receive.active_sequence == 2
+
+
+def test_unexpected_local_joint_frame_deactivates_reference_immediately(
+    pinocchio_model: B601PinocchioModel,
+) -> None:
+    scene = _effort_scene()
+    base_profile = default_b601_mit_profile(scene)
+    profile = replace(base_profile, max_abs_overlay_torque_nm=(0.5,) * 6)
+    driver = B601MujocoEffortDriver(
+        scene,
+        pinocchio_model,
+        profile=profile,
+        enable_gravity_compensation=True,
+    )
+    qpos = np.asarray(B601_RS_DEFAULT_ARM_QPOS, dtype=float)
+    overlay = (0.25, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    accepted = driver.step_physics(_reference(2, qpos, 2.0, overlay=overlay))
+    # The next 1 kHz physics tick is before the 500 Hz command deadline.  A
+    # frame mismatch is nevertheless a local command-contract error and must
+    # deactivate immediately rather than being hidden as an early command.
+    wrong_frame = driver.step_physics(
+        _reference(3, qpos, 2.001, frame_id="unexpected", overlay=overlay)
+    )
+
+    assert accepted.command_applied is True
+    assert accepted.active_sequence == 2
     assert wrong_frame.rejection_reason == "unexpected_frame"
-    assert wrong_frame.active_sequence == 2
+    assert wrong_frame.active_sequence is None
+    assert wrong_frame.reference_timed_out is False
+    assert wrong_frame.driver_faulted is False
+    assert wrong_frame.plant_advanced is True
+    assert wrong_frame.torque_breakdown is not None
+    np.testing.assert_allclose(
+        wrong_frame.torque_breakdown.overlay_effective_nm,
+        0.0,
+    )
+    np.testing.assert_allclose(
+        wrong_frame.torque_breakdown.position_torque_nm,
+        0.0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        wrong_frame.torque_breakdown.damping_torque_nm,
+        -np.asarray(wrong_frame.control_qvel),
+        atol=1e-12,
+    )
+    expected_gravity = pinocchio_model.arm_generalized_gravity(
+        wrong_frame.control_qpos,
+        auxiliary_joint_positions=B601_RS_GRIPPER_OPEN_QPOS,
+    )
+    np.testing.assert_allclose(
+        wrong_frame.torque_breakdown.gravity_torque_nm,
+        expected_gravity,
+        atol=1e-10,
+    )
 
 
 def test_reference_and_measured_velocity_limits_are_independent(
@@ -769,6 +823,18 @@ def test_effort_metadata_disclaims_hardware_fidelity(
     assert metadata["robstride_internal_mit_fidelity"] == "not_claimed"
     assert metadata["plant_step_owner"] == "exclusive_driver_mj_step"
     assert metadata["damping_owner"] == "software_mit_profile_only"
+    assert metadata["transport_scope"] == "single_host_local_wired_control"
+    assert metadata["network_transport"] == "out_of_scope"
+    assert metadata["timestamp_contract"] == (
+        "host_local_monotonic_observability"
+    )
+    assert metadata["watchdog_clock"] == "driver_owned_local_acceptance_time"
+    assert metadata["stale_sample_action"] == (
+        "reject_without_preemption_until_local_watchdog"
+    )
+    assert metadata["unexpected_frame_action"] == (
+        "deactivate_reference_keep_local_gravity_and_damping"
+    )
     assert metadata["hardware_safety_claim"] is False
     assert metadata["profile"]["position_kp_nm_per_rad"] == (0.0,) * 6
     assert metadata["profile"]["damping_kd_nm_s_per_rad"] == (1.0,) * 6

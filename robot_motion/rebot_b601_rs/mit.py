@@ -65,7 +65,18 @@ def _six_non_negative(
 
 @dataclass(frozen=True)
 class B601MitReference:
-    """Timestamped joint reference plus a gravity-exclusive torque overlay."""
+    """Timestamped local joint reference plus a torque overlay.
+
+    The intended hardware path is a single-host, wired control process.
+    ``source_timestamp_sec`` and ``receive_timestamp_sec`` therefore describe
+    producer and driver-ingress observations in a host-local monotonic clock;
+    they are not a network clock-synchronization contract.  A backend must use
+    its own local acceptance clock for the command watchdog.
+
+    ``frame_id`` identifies the six-joint command convention and ordering.  It
+    is retained even for a wired backend so a configuration error cannot be
+    mistaken for a valid B601 torque reference.
+    """
 
     sequence: int
     source_timestamp_sec: float
