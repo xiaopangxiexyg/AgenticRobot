@@ -85,16 +85,44 @@ The implemented source contracts now provide:
   and lean snapshots neither pay the model-fingerprint cost nor return an
   unvalidated proof.  A cached proof remains hidden unless explicitly
   requested again.
+- a default-off policy-deployment application binding selected by
+  `--rm65-pose-observation`.  After the existing RM65 resource lifecycle has
+  started, it requires every active position backend to be ready, obtains and
+  validates one typed R4a attestation per side, and joins the exact lower source,
+  epoch, frame, tool, FK, and measurement-clock facts with side-local
+  application-owned component, stream, observation-plan, pose-schema, control
+  domain, and receiver-clock facts.  All sides must bind before the single
+  existing `ArmStateReader` is constructed with the result.  Its injected state
+  reader performs no SDK refresh: after the reader's existing cadence-owned
+  refresh it makes one explicit cached-state read with full proof revalidation.
+  The generic reader removes any canonical binding supplied inside lower state
+  and injects the application binding only when the separately returned typed
+  result exactly equals the configured projection.  A missing or drifting proof
+  invalidates only the passive pose latest while preserving the legacy arm-state
+  snapshot.  Shutdown terminally invalidates the journal before backend close.
 
-The robot projection remains opt-in.  The new RM65 object is deliberately a
-narrow lower-owned source/tool/FK attestation, not a second copy of the
-canonical `PoseCoordinateBinding`.  No current production composition joins it
-with the application-owned control domain, component, stream, observation plan,
-or receiver clock, and no current production caller supplies the resulting
-`ArmPoseObservationProjection`.  Therefore the robot publication and R2
-paired-capture contracts remain offline evidence rather than wired real-robot
-paired-pose evidence.  R2 does not add a Control Station lifecycle,
-persistence, calibration fit or acceptance, or a frame installation path.
+The robot projection remains opt-in.  The RM65 lower object is deliberately a
+narrow source/tool/FK attestation, not a second copy of the canonical
+`PoseCoordinateBinding`; the deploy application is now the sole owner of that
+join.  This makes the production robot-side passive journal reachable, but it
+does not connect the journal to `QuestDevHost` or the R2 reducer.  The standalone
+Quest server and policy-deploy process still have no in-memory event bridge and
+do not share one complete `ClockDomainDescriptor`.  Consequently this is not
+yet production paired-pose capture, calibration evidence, or Quest trajectory
+rendering.  R2 still does not add a Control Station lifecycle, persistence,
+calibration fit or acceptance, or a frame installation path.
+
+The app-root option is intentionally unavailable with `--send-actions`: every
+projected state explicitly requests the materially expensive full lower proof,
+and there is not yet real deadline evidence for putting that work on an active
+control loop.  It also requires position mode, enabled arms, a configured IP for
+every active side, a positive refresh rate, and no allow-connect-failure mode.
+These checks make binding failure atomic; they do not turn the ordinary
+policy-deploy backend lifecycle into an observation-only hardware profile.
+Depending on its existing configuration, RM65 startup may still perform tool,
+singularity, or background-worker setup.  The new option itself sends no arm
+command and owns no device lifecycle, but it must not be described or operated
+as a zero-write hardware commissioning path.
 
 ## Ownership and data flow
 
@@ -148,6 +176,15 @@ the one canonical `PoseCoordinateBinding`.  The impedance backend has a
 different tool/FK lifecycle and is explicitly outside this slice; it must fail
 closed for this Quest pose-publication path until it receives equivalent
 attestation support.
+
+R4b is owned by `teleop_runtime/deploy/`: the concrete adapter validates the
+RM65 proof and returns an immutable side-local projection/state-read bundle;
+`run_policy` owns the exact receipt clock and passes that bundle into the one
+reader.  `ArmStateReader` remains concrete-backend-neutral and imports neither
+RM65 nor Quest.  It owns only refresh cadence, causal history, and the bounded
+passive journal.  The callable replaces its existing one state read rather than
+adding another read, and no wrapper or second backend/resource facade is
+created.
 
 The typed reference frame is the canonical `CoordinateFrameSpec` for
 `<side>_arm_base`: fixed-base Pinocchio world and the exact URDF root are equal
@@ -242,8 +279,12 @@ against real capture evidence.
 ## Safety invariants
 
 - All Quest and calibration paths are read-only with respect to robot state.
+- The R4b adapter and passive journal do not send robot commands, but the
+  surrounding ordinary policy-deploy RM65 startup is not proven observation-only
+  and may perform its pre-existing configuration operations.
 - No module in this path starts, homes, servos, replays, holds, or commands a
-  robot.
+  robot solely on behalf of pose observation; the existing deploy resource owner
+  remains the only backend lifecycle owner.
 - Reading the robot pose journal or latest publication never refreshes a backend.
 - A source failure clears the published latest pose before downstream sealing.
 - Source callbacks only enter bounded in-memory evidence; this slice does not
@@ -257,13 +298,15 @@ against real capture evidence.
 
 ## Next implementation slices
 
-The unique-running-runtime host prerequisite and the RM65 position-backend
-lower attestation are now implemented. The remaining ordered slices are:
+The unique-running-runtime host, the RM65 lower attestation, and the
+policy-deployment robot-side canonical binding are now implemented. The
+remaining ordered slices are:
 
-1. At the application composition root, validate the RM65 lower attestation,
-   join it with observation/stream/receiver-clock facts into the existing
-   canonical `PoseCoordinateBinding`, and pass that binding to the existing
-   `ArmStateReader`; do not create a second hardware reader.
+1. At one concrete application leaf, inject the same complete receiver-clock
+   descriptor and monotonic clock into the unique Quest host, bind the existing
+   robot journal and Quest event subscription to the R2 reducer, and preserve
+   their independent lifecycle owners.  Do not call `ArmStateReader.snapshot()`
+   from capture or create another hardware reader.
 2. Add the thin Control Station operator lifecycle for begin/complete/cancel and
    pose-redacted status.
 3. Add an explicit persistence owner for reviewed capture evidence; the R2
