@@ -699,6 +699,10 @@ python -m utils.dataset_postprocess organize-datasets MANIFEST.json \
   --apply
 ```
 
+`copy` 与 `reflink_required` 物化在 staging 中逐文件读回并做 byte-for-byte
+校验；独立复制若发生瞬时不一致最多重试三次，仍不一致或源文件在复制期间变化时整次构建
+fail closed，目标目录不会发布。该检查用于避免只验证文件大小而漏过单字节复制损坏。
+
 也可作为 Python API 使用：
 
 ```python

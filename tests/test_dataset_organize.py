@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import utils.dataset_postprocess.organize_episodes as organizer_module
 from collection_runtime.progress import (
     CompleteEpisodeProgressRequest,
     ProgressController,
@@ -32,6 +33,57 @@ from utils.dataset_postprocess.organize_episodes import (
     build_datasets,
     plan_dataset_build,
 )
+
+
+def test_verified_copy_retries_one_transient_content_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source.write_bytes(b"source-payload")
+    original_copy2 = organizer_module.shutil.copy2
+    calls = 0
+
+    def flaky_copy2(source_path: Path, destination_path: Path):
+        nonlocal calls
+        calls += 1
+        result = original_copy2(source_path, destination_path)
+        if calls == 1:
+            Path(destination_path).write_bytes(b"source-payloae")
+        return result
+
+    monkeypatch.setattr(organizer_module.shutil, "copy2", flaky_copy2)
+    _materialize_file(source, destination, policy="copy")
+
+    assert calls == 2
+    assert destination.read_bytes() == source.read_bytes()
+    assert destination.stat().st_ino != source.stat().st_ino
+
+
+def test_verified_copy_fails_closed_after_repeated_content_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source.write_bytes(b"source-payload")
+    original_copy2 = organizer_module.shutil.copy2
+    calls = 0
+
+    def corrupt_copy2(source_path: Path, destination_path: Path):
+        nonlocal calls
+        calls += 1
+        result = original_copy2(source_path, destination_path)
+        Path(destination_path).write_bytes(b"source-payloae")
+        return result
+
+    monkeypatch.setattr(organizer_module.shutil, "copy2", corrupt_copy2)
+    with pytest.raises(DatasetOrganizationError, match="byte-for-byte|content changed"):
+        _materialize_file(source, destination, policy="copy")
+
+    assert calls == 3
+    assert not destination.exists()
 
 
 def _hand_vector(value: float) -> list[float]:

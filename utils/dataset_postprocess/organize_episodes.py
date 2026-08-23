@@ -1203,6 +1203,53 @@ def _require_independent_inode(source: Path, destination: Path) -> None:
         )
 
 
+def _files_equal(source: Path, destination: Path) -> bool:
+    """Read both files back and require byte-for-byte equality."""
+
+    with source.open("rb") as source_handle, destination.open("rb") as output:
+        while True:
+            source_block = source_handle.read(4 * 1024 * 1024)
+            output_block = output.read(4 * 1024 * 1024)
+            if source_block != output_block:
+                return False
+            if not source_block:
+                return True
+
+
+def _stable_source_signature(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _copy2_verified(
+    source: Path,
+    destination: Path,
+    *,
+    attempts: int = 3,
+) -> None:
+    """Copy an immutable artifact and verify the persisted bytes before return."""
+
+    expected_source = _stable_source_signature(source)
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        destination.unlink(missing_ok=True)
+        shutil.copy2(source, destination)
+        _require_independent_inode(source, destination)
+        if _stable_source_signature(source) != expected_source:
+            destination.unlink(missing_ok=True)
+            raise DatasetOrganizationError(
+                f"Source artifact changed during materialization: {source}."
+            )
+        if _files_equal(source, destination):
+            return
+        destination.unlink(missing_ok=True)
+        if attempt == max(1, int(attempts)):
+            raise DatasetOrganizationError(
+                "Artifact content changed during independent copy after "
+                f"{attempt} verified attempt(s): source={source} "
+                f"destination={destination}."
+            )
+
+
 def _reflink_required(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1212,6 +1259,11 @@ def _reflink_required(source: Path, destination: Path) -> None:
             os.fsync(output.fileno())
         shutil.copystat(source, destination)
         _require_independent_inode(source, destination)
+        if not _files_equal(source, destination):
+            raise DatasetOrganizationError(
+                "Reflink artifact failed byte-for-byte readback verification: "
+                f"source={source} destination={destination}."
+            )
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
@@ -1228,11 +1280,10 @@ def _materialize_file(
         try:
             os.link(source, destination)
         except OSError:
-            shutil.copy2(source, destination)
+            _copy2_verified(source, destination)
         return
     if policy == _ARTIFACT_POLICY_COPY:
-        shutil.copy2(source, destination)
-        _require_independent_inode(source, destination)
+        _copy2_verified(source, destination)
         return
     if policy == _ARTIFACT_POLICY_REFLINK_REQUIRED:
         try:
@@ -2031,6 +2082,10 @@ def build_datasets(
                         "parquet/metadata rewritten; unchanged "
                         "video/tactile/wrist-depth files materialized with "
                         f"{artifact_policy}"
+                    ),
+                    "artifact_materialization_integrity": (
+                        "independent copy/reflink bytes read back and compared "
+                        "before atomic publication"
                     ),
                     "progress_artifact_policy": progress_policy,
                     "progress_profile_hash": plan.progress_profile_hash,
