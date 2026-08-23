@@ -10,6 +10,7 @@ from agent_gateway.profiles.mujoco import gateway_cli
 from agent_gateway.profiles.mujoco.gateway_cli import (
     _absolute_managed_directory,
     _close_viewer_for_stopped_payload,
+    _prepare_gateway_before_ready,
     _resolved_runtime_session_id,
     _stopped_payload,
     build_parser,
@@ -148,6 +149,77 @@ def test_viewer_close_failure_is_reported_before_it_is_reraised() -> None:
     assert status is not None
     assert status["state"] == "close_faulted"
     assert status["teardown_confirmed"] is False
+
+
+def test_gateway_warms_rgb_backend_in_lower_hold_before_history() -> None:
+    calls: list[object] = []
+
+    class _Application:
+        started = False
+        held = False
+        active_operation_id = None
+
+        def start_observation_ready(self) -> None:
+            calls.append("observation_ready")
+            self.started = True
+            self.held = True
+
+        def visual_source_catalog(self):
+            calls.append("visual_catalog")
+            return ({"source_id": "front"},)
+
+        def capture_visual_jpeg_snapshot(self, **request):
+            calls.append(("rgb_warmup", request))
+            return SimpleNamespace(
+                frames={
+                    "front": SimpleNamespace(
+                        width=16,
+                        height=16,
+                        data=b"warmup-jpeg",
+                    )
+                }
+            )
+
+    viewer = SimpleNamespace(start=lambda: calls.append("viewer"))
+    history = SimpleNamespace(
+        capture_once=lambda: calls.append("history_capture"),
+        start=lambda: calls.append("history_start"),
+    )
+    session = SimpleNamespace(
+        application=_Application(),
+        rgb_executor=object(),
+        history_recorder=history,
+    )
+
+    _prepare_gateway_before_ready(session=session, viewer=viewer)
+
+    assert calls == [
+        "viewer",
+        "observation_ready",
+        "visual_catalog",
+        (
+            "rgb_warmup",
+            {"source_ids": ("front",), "width": 16, "height": 16},
+        ),
+        "history_capture",
+        "history_start",
+    ]
+
+
+def test_gateway_skips_visual_warmup_when_rgb_route_is_not_advertised() -> None:
+    calls: list[str] = []
+    application = SimpleNamespace(
+        start_observation_ready=lambda: calls.append("observation_ready")
+    )
+    session = SimpleNamespace(
+        application=application,
+        rgb_executor=None,
+        history_recorder=None,
+    )
+
+    _prepare_gateway_before_ready(session=session, viewer=None)
+
+    assert calls == ["observation_ready"]
 
 
 def test_runtime_session_identity_is_unique_by_default_and_overridable() -> None:
