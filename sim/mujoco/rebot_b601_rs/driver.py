@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from robot_motion.joint_limits import JointRateLimiter, JointVelocityLimitProfile
 from robot_motion.rebot_b601_rs.model import B601_RS_ARM_JOINT_NAMES
 from sim.contracts import TimingSpec
 from sim.mujoco.scene import MujocoScene
@@ -22,6 +23,7 @@ from .scene import (
 )
 
 B601_RS_JOINT_POSITION_FRAME = "b601_rs/joint_position"
+_B601_RS_PROVISIONAL_VISUALIZATION_MAX_VELOCITY_RAD_S = 0.5
 
 
 def default_b601_position_timing() -> TimingSpec:
@@ -33,6 +35,27 @@ def default_b601_position_timing() -> TimingSpec:
         parameter_source=(
             "rebot_b601_rs_visualization_only_provisional_position_servo"
         ),
+    )
+
+
+def _default_b601_velocity_profile(
+    timing: TimingSpec,
+) -> JointVelocityLimitProfile:
+    """Build the provisional simulation-only position target rate profile."""
+
+    velocity_deg_s = math.degrees(_B601_RS_PROVISIONAL_VISUALIZATION_MAX_VELOCITY_RAD_S)
+    return JointVelocityLimitProfile(
+        name="b601_rs_visualization_only_provisional",
+        max_velocity_deg_s=(velocity_deg_s,) * 6,
+        max_dt_sec=1.0 / float(timing.command_hz),
+        joint_names=B601_RS_ARM_JOINT_NAMES,
+        metadata={
+            "parameter_source": (
+                "pinned_rebotarm_safe_home_default_max_vel_0.5_rad_s_"
+                "used_as_visualization_seed_only"
+            ),
+            "hardware_safety_claim": False,
+        },
     )
 
 
@@ -102,7 +125,14 @@ class B601JointPositionCommand:
 
 @dataclass(frozen=True)
 class B601PositionTick:
-    """Audit record for one physical MuJoCo step."""
+    """Audit record for one physical MuJoCo step.
+
+    ``command_applied`` means admission accepted a sample. ``target_qpos``
+    remains that latest requested goal for M2 compatibility, while
+    ``actuator_target_qpos`` is the rate-limited value written to MuJoCo.
+    ``state_valid`` retains the finite-state meaning; limit faults are exposed
+    separately through ``state_within_limits`` and ``driver_faulted``.
+    """
 
     physics_tick: int
     physics_time_sec: float
@@ -119,16 +149,24 @@ class B601PositionTick:
     measured_qpos: tuple[float, ...]
     measured_qvel: tuple[float, ...]
     state_valid: bool
+    actuator_target_qpos: tuple[float, ...] = ()
+    actuator_target_changed: bool = False
+    slew_limited: bool = False
+    slew_limit_ratio: float = 0.0
+    state_within_limits: bool = True
+    driver_faulted: bool = False
+    fault_reason: str | None = None
+    plant_advanced: bool = True
 
 
 class B601PositionDriver:
     """Apply joint-limit-checked q targets through six position actuators.
 
-    The driver owns only command deadlines, validation, zero-order hold and one
-    ``mj_step`` per call.  IK, trajectories, collision planning and hardware
-    transport remain outside this module.  It does not limit target slew or
-    velocity and does not guard simulated state excursions, so M2 is restricted
-    to modest visualization commands.
+    The driver owns command deadlines, validation, final actuator-target rate
+    limiting, a latched simulated-state guard and one ``mj_step`` per call. IK,
+    trajectories, collision planning and hardware transport remain outside this
+    module. The limits here are provisional visualization parameters, not a
+    hardware safety envelope.
     """
 
     execution_mode = "rebot_b601_rs_mujoco_position_servo"
@@ -138,6 +176,9 @@ class B601PositionDriver:
         self,
         scene: MujocoScene,
         timing: TimingSpec | None = None,
+        *,
+        velocity_profile: JointVelocityLimitProfile | None = None,
+        state_limit_tolerance_rad: float = 1e-4,
     ) -> None:
         if not isinstance(scene, MujocoScene):
             raise TypeError("scene must be a MujocoScene")
@@ -158,8 +199,31 @@ class B601PositionDriver:
         if tuple(arm_spec.joint_names) != B601_RS_ARM_JOINT_NAMES:
             raise ValueError("scene B601-RS arm joint order does not match the model")
 
+        resolved_velocity_profile = velocity_profile or _default_b601_velocity_profile(
+            resolved_timing
+        )
+        if not isinstance(resolved_velocity_profile, JointVelocityLimitProfile):
+            raise TypeError("velocity_profile must be a JointVelocityLimitProfile")
+        if resolved_velocity_profile.dof != len(B601_RS_ARM_JOINT_NAMES):
+            raise ValueError("velocity_profile must contain six joint limits")
+        if resolved_velocity_profile.joint_names and (
+            tuple(resolved_velocity_profile.joint_names) != B601_RS_ARM_JOINT_NAMES
+        ):
+            raise ValueError(
+                "velocity_profile joint order does not match the B601 model"
+            )
+        if isinstance(state_limit_tolerance_rad, bool):
+            raise TypeError("state_limit_tolerance_rad must be finite and non-negative")
+        tolerance = float(state_limit_tolerance_rad)
+        if not math.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError(
+                "state_limit_tolerance_rad must be finite and non-negative"
+            )
+
         self.scene = scene
         self.timing = resolved_timing
+        self.velocity_profile = resolved_velocity_profile
+        self.state_limit_tolerance_rad = tolerance
         self._qpos_addresses = np.asarray(
             [scene.joint_qpos_addr(name) for name in B601_RS_ARM_JOINT_NAMES],
             dtype=np.int32,
@@ -182,7 +246,10 @@ class B601PositionDriver:
         self._upper = np.asarray(scene.model.jnt_range[joint_ids, 1], dtype=float)
         self._physics_tick = 0
         self._next_command_time_sec = 0.0
-        self._target_qpos = np.zeros(6, dtype=float)
+        self._requested_qpos = np.zeros(6, dtype=float)
+        self._actuator_target_qpos = np.zeros(6, dtype=float)
+        self._rate_limiter = JointRateLimiter(self.velocity_profile)
+        self._fault_reason: str | None = None
         self._accepted_sequence: int | None = None
         self._source_timestamp_sec: float | None = None
         self._receive_timestamp_sec: float | None = None
@@ -211,9 +278,19 @@ class B601PositionDriver:
             "gravity_compensation": "not_implemented_m2",
             "collision": "disabled_in_m2",
             "gripper": "fixed_open_geometry_only",
-            "target_slew_limit": "not_implemented_m2",
-            "state_limit_guard": "not_implemented_m2",
+            "target_slew_limit": "per_joint_velocity_limit_at_command_rate",
+            "target_slew_profile": {
+                "name": self.velocity_profile.name,
+                "max_velocity_deg_s": tuple(
+                    float(value) for value in self.velocity_profile.max_velocity_deg_s
+                ),
+                "max_dt_sec": float(self.velocity_profile.max_dt_sec),
+                "metadata": dict(self.velocity_profile.metadata),
+            },
+            "state_limit_guard": "latched_simulated_joint_position_guard",
+            "state_limit_tolerance_rad": self.state_limit_tolerance_rad,
             "command_scope": "modest_visualization_targets_only",
+            "bounded_target_stage": "simulation_only_position_target_conditioning",
             "hardware_fidelity": "not_claimed",
         }
 
@@ -229,7 +306,10 @@ class B601PositionDriver:
         self.scene.mujoco.mj_resetData(self.scene.model, self.scene.data)
         self.scene.data.qpos[self._qpos_addresses] = qpos
         self.scene.data.qvel[self._qvel_addresses] = 0.0
-        self._target_qpos = qpos.copy()
+        self._requested_qpos = qpos.copy()
+        self._actuator_target_qpos = qpos.copy()
+        self._rate_limiter.reset(qpos)
+        self._fault_reason = None
         self._physics_tick = 0
         self._next_command_time_sec = 0.0
         self._accepted_sequence = None
@@ -244,45 +324,87 @@ class B601PositionDriver:
         self,
         command: B601JointPositionCommand | None = None,
     ) -> B601PositionTick:
-        """Validate an optional due command and advance exactly one 1 kHz tick."""
+        """Validate a due command and attempt one 1 kHz plant step.
+
+        A pre-existing non-finite simulated state latches the driver fault and
+        fails closed without calling MuJoCo again. Reset is then required.
+        """
 
         due = self.command_due
         scheduled_time = self._next_command_time_sec if due else None
         applied = False
         rejection_reason = None
+        actuator_target_changed = False
+        slew_limited = False
+        slew_limit_ratio = 0.0
+        current_state_finite = self._latch_state_fault_if_needed()
+        non_finite_fault = (
+            not current_state_finite
+            or self._fault_reason == "non_finite_simulated_state"
+        )
         if command is not None:
             if not isinstance(command, B601JointPositionCommand):
                 raise TypeError("command must be a B601JointPositionCommand")
-            if not due:
+            if self._fault_reason is not None:
+                rejection_reason = "driver_fault_latched"
+            elif not due:
                 rejection_reason = "command_before_deadline"
             else:
                 rejection_reason = self._rejection_reason(command)
                 if rejection_reason is None:
-                    self._target_qpos = np.asarray(command.qpos, dtype=float)
+                    self._requested_qpos = np.asarray(command.qpos, dtype=float)
                     self._accepted_sequence = int(command.sequence)
                     self._source_timestamp_sec = float(command.source_timestamp_sec)
                     self._receive_timestamp_sec = float(command.receive_timestamp_sec)
                     self._frame_id = command.frame_id
                     applied = True
-        if due:
+        if due and self._fault_reason is None:
+            previous_target = self._actuator_target_qpos.copy()
+            limited_step = self._rate_limiter.step(
+                target_qpos=self._requested_qpos,
+                dt_sec=1.0 / float(self.timing.command_hz),
+                reference_qpos=self._actuator_target_qpos,
+            )
+            self._actuator_target_qpos = np.clip(
+                limited_step.qpos,
+                self._lower,
+                self._upper,
+            )
+            if not np.array_equal(
+                self._actuator_target_qpos,
+                limited_step.qpos,
+            ):
+                self._rate_limiter.reset(self._actuator_target_qpos)
+            slew_limited = bool(limited_step.limited)
+            slew_limit_ratio = float(limited_step.limit_ratio)
+            actuator_target_changed = not np.array_equal(
+                self._actuator_target_qpos,
+                previous_target,
+            )
+        if due and not non_finite_fault:
             period = 1.0 / float(self.timing.command_hz)
             while self._next_command_time_sec <= self.physics_time_sec + 1e-12:
                 self._next_command_time_sec += period
 
         tick_index = self._physics_tick
         tick_time = self.physics_time_sec
-        self._write_ctrl()
-        self._hold_gripper_open()
-        self.scene.mujoco.mj_step(self.scene.model, self.scene.data)
-        self._hold_gripper_open()
-        self.scene.forward()
-        self._physics_tick += 1
+        plant_advanced = False
+        if not non_finite_fault:
+            self._write_ctrl()
+            self._hold_gripper_open()
+            self.scene.mujoco.mj_step(self.scene.model, self.scene.data)
+            self._hold_gripper_open()
+            self.scene.forward()
+            self._physics_tick += 1
+            plant_advanced = True
+            self._latch_state_fault_if_needed()
         measured_qpos = np.asarray(
             self.scene.data.qpos[self._qpos_addresses], dtype=float
         )
         measured_qvel = np.asarray(
             self.scene.data.qvel[self._qvel_addresses], dtype=float
         )
+        state_finite, state_within_limits, _reason = self._state_status()
         return B601PositionTick(
             physics_tick=tick_index,
             physics_time_sec=tick_time,
@@ -295,10 +417,20 @@ class B601PositionDriver:
             accepted_receive_timestamp_sec=self._receive_timestamp_sec,
             accepted_frame_id=self._frame_id,
             rejection_reason=rejection_reason,
-            target_qpos=tuple(float(value) for value in self._target_qpos),
+            target_qpos=tuple(float(value) for value in self._requested_qpos),
             measured_qpos=tuple(float(value) for value in measured_qpos),
             measured_qvel=tuple(float(value) for value in measured_qvel),
-            state_valid=self.scene.state_is_finite(),
+            state_valid=state_finite,
+            actuator_target_qpos=tuple(
+                float(value) for value in self._actuator_target_qpos
+            ),
+            actuator_target_changed=actuator_target_changed,
+            slew_limited=slew_limited,
+            slew_limit_ratio=slew_limit_ratio,
+            state_within_limits=state_within_limits,
+            driver_faulted=self._fault_reason is not None,
+            fault_reason=self._fault_reason,
+            plant_advanced=plant_advanced,
         )
 
     def _actuator_id(self, joint_name: str) -> int:
@@ -340,7 +472,46 @@ class B601PositionDriver:
         return None
 
     def _write_ctrl(self) -> None:
-        self.scene.data.ctrl[self._actuator_ids] = self._target_qpos
+        self.scene.data.ctrl[self._actuator_ids] = self._actuator_target_qpos
+
+    def _state_status(self) -> tuple[bool, bool, str | None]:
+        qpos = np.asarray(self.scene.data.qpos[self._qpos_addresses], dtype=float)
+        qvel = np.asarray(self.scene.data.qvel[self._qvel_addresses], dtype=float)
+        finite = bool(
+            self.scene.state_is_finite()
+            and np.all(np.isfinite(qpos))
+            and np.all(np.isfinite(qvel))
+        )
+        if not finite:
+            return False, False, "non_finite_simulated_state"
+
+        lower_excursion = self._lower - qpos
+        upper_excursion = qpos - self._upper
+        excursion = np.maximum(lower_excursion, upper_excursion)
+        index = int(np.argmax(excursion))
+        maximum_excursion = float(excursion[index])
+        within_limits = maximum_excursion <= self.state_limit_tolerance_rad
+        if within_limits:
+            return True, True, None
+
+        direction = (
+            "below_lower"
+            if lower_excursion[index] >= upper_excursion[index]
+            else "above_upper"
+        )
+        reason = (
+            f"joint_state_limit_violation:{B601_RS_ARM_JOINT_NAMES[index]}:"
+            f"{direction}:excursion_rad={maximum_excursion:.9g}"
+        )
+        return True, False, reason
+
+    def _latch_state_fault_if_needed(self) -> bool:
+        finite, _within_limits, reason = self._state_status()
+        if not finite:
+            self._fault_reason = "non_finite_simulated_state"
+        elif self._fault_reason is None and reason is not None:
+            self._fault_reason = reason
+        return finite
 
     def _hold_gripper_open(self) -> None:
         for name, value in B601_RS_GRIPPER_OPEN_QPOS.items():
