@@ -18,9 +18,12 @@ receives only a narrow source containing the exact receiver-clock descriptor,
 the same monotonic callable, explicit side-to-coordinate bindings, and passive
 `atomic_cut`/`events_after` functions.
 
-This slice does **not** persist evidence, fit or accept calibration, install a
-frame transform, publish a policy trajectory, or render that trajectory on
-Quest. It also adds no Quest CLI default and makes no controller, handedness,
+The capture binding itself never persists or fits evidence automatically. The
+separate `teleop_runtime.deploy.quest_paired_pose_evidence_store` application
+leaf provides an explicit candidate-evidence publication/load step and an
+offline diagnostic-fit wrapper. Neither module accepts calibration, installs a
+frame transform, publishes a policy trajectory, or renders that trajectory on
+Quest. They also add no Quest CLI default and make no controller, handedness,
 robot-side, frame, or static-window-profile choice.
 
 ## Clock and cursor proof
@@ -195,6 +198,61 @@ Once all intended windows are accepted, sealing is a separate explicit action:
 evidence = application.request_seal()
 ```
 
+Persistence is another explicit action after a successful seal. Constructing
+the layout, creating the application, and ordinary `close()` do not create an
+evidence directory or file:
+
+```python
+from runtime_artifact_paths import RuntimeArtifactLayout
+from teleop_runtime.deploy.quest_paired_pose_evidence_store import (
+    fit_quest_paired_pose_evidence,
+    load_sealed_quest_paired_pose_evidence,
+    publish_sealed_quest_paired_pose_evidence,
+)
+
+layout = RuntimeArtifactLayout.configured()
+commit = publish_sealed_quest_paired_pose_evidence(
+    layout=layout,
+    evidence=evidence,
+)
+sealed = load_sealed_quest_paired_pose_evidence(
+    layout=layout,
+    evidence_semantic_content_hash=commit.evidence_semantic_content_hash,
+)
+diagnostic = fit_quest_paired_pose_evidence(sealed)
+```
+
+The immutable canonical file is content-addressed relative to `layout.root`;
+with the default root it is:
+
+```text
+runtime_artifacts/evidence/quest_paired_pose_capture/
+  <capture-evidence-semantic-content-hash>.cjson
+```
+
+`commit.path` is the authoritative resolved path when a local configuration
+overrides the runtime-artifact root.
+`layout.root` must remain isolated to the current evidence writer/worktree; do
+not point mutable evidence at an automatically shared symlink. Any later
+rebind or migration must follow `docs/setup/LOCAL_RESOURCES.md`, including
+stopping the writer and inventory/copy/hash verification.
+
+Publication strictly replays the evidence before writing and again after a
+canonical readback. Identical retries are idempotent; an existing different,
+truncated, non-canonical, wrong-domain, symlinked, or hash-misnamed target fails
+closed and is never replaced. The commit receipt keeps three distinct
+digests: the outer capture-evidence hash, the derived R0 dataset SHA-256, and
+the canonical file-byte SHA-256. They have different coverage and must not be
+substituted for one another.
+
+The diagnostic wrapper strictly reparses the full evidence and calls the
+existing feature-local AX=XB solver. Its report binds both the outer evidence
+hash and dataset hash and remains `candidate_only=true` with
+`calibration_accepted=null`. The report is returned in memory; this slice does
+not publish a fit or an acceptance receipt. Solver observability gates still
+apply, including the minimum of three poses; real capture should follow the
+calibration document's stronger diversity guidance.
+
 For the capture observer, `request_seal()` uses exactly one
 `unsubscribe_with_cut()` and one typed robot cut, then boundedly drains
 callbacks below the close watermark. A timeout, gap, selected-source
@@ -232,7 +290,8 @@ commit an episode.
 
 ## Evidence boundary
 
-Focused tests use fake servers, typed events, and passive journals only. They
-do not bind a socket, connect a Quest, query RM65 hardware, or execute motion.
-Consequently they establish the in-process application seam, not physical
-calibration quality or future-trajectory visualization readiness.
+Focused tests use fake servers, typed events, passive journals, and temporary
+local evidence directories only. They do not bind a socket, connect a Quest,
+query RM65 hardware, or execute motion. Consequently they establish the
+in-process application and offline artifact seams, not physical calibration
+quality or future-trajectory visualization readiness.
