@@ -222,6 +222,13 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "详细标注完成" in app_source
         assert "detail_annotation_complete" in app_source
         assert ".badge.detail-complete" in style_source
+        assert "function episodeStatus" in app_source
+        assert "function renderEpisodeRow" in app_source
+        assert "episodeRowSignatures" in app_source
+        assert "annotationSummarySignature(updated)" in app_source
+        assert "详细标注需重做" in app_source
+        assert ".episode-item.attention-critical" in style_source
+        assert "content-visibility: auto" in style_source
         assert "/api/reflow-capture-end-step/" in app_source
         assert "function timelineCoverageGaps" in app_source
         assert "function occurrenceReferenceIssues" in app_source
@@ -1098,6 +1105,9 @@ def test_detail_overlay_is_optional_until_explicitly_sealed(
         assert coarse_summary["summaries"][0][
             "detail_annotation_complete"
         ] is False
+        assert coarse_summary["summaries"][0][
+            "detail_annotation_state"
+        ] == "PENDING"
 
         detail = application.episode_detail(episode_uuid)
         detail_draft = json.loads(json.dumps(detail["draft"]))
@@ -1148,6 +1158,28 @@ def test_detail_overlay_is_optional_until_explicitly_sealed(
         assert complete_summary["summaries"][0][
             "detail_annotation_complete"
         ] is True
+        assert complete_summary["summaries"][0][
+            "detail_annotation_state"
+        ] == "COMPLETE"
+        assert "DETAIL_COMPLETE" in {
+            badge["code"]
+            for badge in complete_summary["summaries"][0][
+                "annotation_status"
+            ]["badges"]
+        }
+
+        application.commit(episode_uuid, reopened["draft"])
+        stale_summary = application.episode_annotation_summaries(
+            (episode_uuid,)
+        )["summaries"][0]
+        assert stale_summary["detail_annotation_state"] == "STALE"
+        assert stale_summary["annotation_status"]["attention_level"] == (
+            "WARNING"
+        )
+        assert "DETAIL_STALE" in {
+            badge["code"]
+            for badge in stale_summary["annotation_status"]["badges"]
+        }
     finally:
         application.close()
 
@@ -1724,6 +1756,12 @@ def test_standard_mode_cannot_clear_a_sealed_review_request(
         assert summary["annotation_set_count"] == 1
         assert summary["review_state"] == "PENDING"
         assert summary["needs_second_review"] is True
+        assert summary["annotation_status"]["attention_level"] == "WARNING"
+        assert summary["annotation_status"]["primary_label"] == "待二次复核"
+        assert {
+            badge["code"]
+            for badge in summary["annotation_status"]["badges"]
+        } >= {"SECOND_REVIEW_PENDING", "COARSE_SEALED"}
         assert (
             application.episode_detail(episode_uuid)["annotation_sets"][0][
                 "annotation_set_id"
@@ -1758,6 +1796,8 @@ def test_episode_summary_reports_whole_episode_abnormal_independently(
         assert summary["whole_episode_abnormal_reason"] == "BAD_CAPTURE"
         assert summary["review_state"] == "NONE"
         assert summary["needs_second_review"] is False
+        assert summary["annotation_status"]["attention_level"] == "CRITICAL"
+        assert summary["annotation_status"]["primary_label"] == "整条异常"
     finally:
         application.close()
 
@@ -2315,6 +2355,32 @@ def test_application_poll_uses_catalog_cursor_after_append(
         application.close()
 
 
+def test_unchanged_catalog_poll_skips_exact_rescan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+    )
+    try:
+        known_probe = application._known_catalog_probe
+        monkeypatch.setattr(application, "_catalog_probe", lambda: known_probe)
+
+        def unexpected_exact_scan() -> tuple[object, ...]:
+            raise AssertionError("unchanged poll performed an exact rescan")
+
+        monkeypatch.setattr(
+            application,
+            "_catalog_fingerprint",
+            unexpected_exact_scan,
+        )
+
+        assert application.list_episodes()["episodes"] == []
+    finally:
+        application.close()
+
+
 def test_full_catalog_scan_publishes_verified_items_incrementally(
     tmp_path: Path,
 ) -> None:
@@ -2528,7 +2594,7 @@ def test_visible_annotation_summary_reuses_unchanged_immutable_sets(
         reader.close()
 
 
-def test_annotation_set_object_cache_is_bounded_but_summaries_remain(
+def test_annotation_object_and_summary_caches_are_bounded(
     tmp_path: Path,
 ) -> None:
     application = RefinementAnnotationApplication(
@@ -2536,11 +2602,61 @@ def test_annotation_set_object_cache_is_bounded_but_summaries_remain(
         annotator_id="fixture",
     )
     try:
-        for index in range(20):
+        for index in range(300):
             application._cache_annotation_sets(f"episode-{index}", ())
 
         assert len(application._annotation_sets_cache) == 16
-        assert len(application._annotation_summary_cache) == 20
+        assert len(application._annotation_summary_cache) == 256
+    finally:
+        application.close()
+
+
+def test_visible_episode_summaries_overlap_independent_remote_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+    )
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def observed_summary(item: object, *, load_annotations: bool) -> dict[str, object]:
+        nonlocal active, max_active
+        assert load_annotations is True
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return {
+            "annotation_set_count": 0,
+            "needs_second_review": False,
+            "review_state": "NONE",
+            "latest_annotation_mode": None,
+            "whole_episode_abnormal": False,
+            "whole_episode_abnormal_reason": None,
+            "detail_annotation_complete": False,
+            "detail_annotation_state": "NOT_APPLICABLE",
+            "annotation_status": {"schema": "fixture", "badges": []},
+        }
+
+    episode_uuids = tuple(f"episode-{index}" for index in range(8))
+    with application._lock:
+        application._items = {
+            episode_uuid: SimpleNamespace(episode_uuid=episode_uuid)
+            for episode_uuid in episode_uuids
+        }
+    monkeypatch.setattr(application, "_episode_summary", observed_summary)
+    try:
+        result = application.episode_annotation_summaries(episode_uuids)
+
+        assert len(result["summaries"]) == len(episode_uuids)
+        assert result["errors"] == []
+        assert max_active > 1
     finally:
         application.close()
 

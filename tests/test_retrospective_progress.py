@@ -53,6 +53,7 @@ from dataset_interface.progress_annotation_jobs import (
     ProgressAnnotationJobError,
     list_progress_annotation_work_items,
     progress_annotation_catalog_fingerprint,
+    progress_annotation_catalog_probe_fingerprint,
 )
 from dataset_interface.retrospective_progress import (
     RetrospectiveProgressResolutionError,
@@ -684,6 +685,10 @@ def test_refinement_annotation_gui_adapter_opens_and_seals_retrospective_episode
         assert detail["resolution_kind"] == "RETROSPECTIVE_MIGRATED"
         assert detail["recording_scope"] == "PROGRESS_STEP_WINDOW"
         assert detail["full_task_outcome"] == "NOT_APPLICABLE"
+        assert detail["annotation_status"]["loaded"] is True
+        assert detail["annotation_status"]["schema"] == (
+            "dexteleop.refinement_annotation.episode_status.v1"
+        )
         assert tuple(
             stage["stage_id"]
             for stage in detail["progress_steps"][0]["stages"]
@@ -713,6 +718,32 @@ def test_refinement_annotation_gui_adapter_opens_and_seals_retrospective_episode
         ).is_file()
     finally:
         application.close()
+
+
+def test_retrospective_catalog_probe_does_not_enumerate_episode_children(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    episodes = workspace / "episodes"
+    campaigns = workspace / "campaigns"
+    episodes.mkdir(parents=True)
+    campaigns.mkdir()
+    (workspace / "profile.cjson").write_text("{}", encoding="utf-8")
+    (workspace / "stages.cjson").write_text("{}", encoding="utf-8")
+    (episodes / "episode-a").mkdir()
+    original_iterdir = Path.iterdir
+
+    def rejected_enumeration(path: Path):
+        if path in {episodes, campaigns}:
+            raise AssertionError("cheap catalog probe enumerated children")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", rejected_enumeration)
+
+    probe = progress_annotation_catalog_probe_fingerprint(workspace)
+
+    assert probe[0] == "retrospective_probe"
 
 
 def test_pilot_publisher_automatically_creates_and_recovers_migration_identity(

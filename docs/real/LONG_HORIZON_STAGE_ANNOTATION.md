@@ -141,6 +141,20 @@ meta/progress/detail_stage_annotations/<episode_uuid>/<detail_set_id>/
 detail overlay 只供后标注和后续显式选择 detail 视图的分析使用；现有只读取 coarse
 annotation set 的调用不改变。采集端不需要改动。
 
+当前实现把 detail profile 发现、当前 overlay 选择和完成/失效状态统一放在
+`control_station.refinement_annotation.detail_annotation` 模块；GUI application 只协调
+Episode lock、draft 和封存。粗标注重封存后，旧 overlay 会显示为“详细标注需重做”，
+而不是与“尚未配置 detail profile”混为同一个布尔值。左侧栏使用版本化的 additive
+`annotation_status` 投影突出“整条异常”“待二次复核”和“详细标注需重做”，同时继续
+返回旧的 `review_state`、`whole_episode_abnormal` 和 `detail_annotation_complete` 字段，
+因此旧 GUI/数据集仍按原语义工作。
+
+大数据集仍按页加载，只有可见 Episode 才读取精确状态；摘要批次并行覆盖远程文件系统
+延迟，服务端对象/摘要缓存都有上限。浏览器复用既有 Episode 行，只更新状态确实变化的
+行，并降低不可变摘要的重复检查频率。`RETROSPECTIVE_MIGRATED` 工作区轮询使用固定次数
+的目录 metadata probe，只有检测到变化或到达保守复核周期才枚举完整历史 Episode；
+初次接入和检测到变化后的完整合同校验不省略。
+
 ## 2. 时间轴语义
 
 - 粗粒度 Progress Step、Attempt、Advance 和原始 Failure 来自第一次采集事实；

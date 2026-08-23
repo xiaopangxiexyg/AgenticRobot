@@ -203,6 +203,69 @@ def progress_annotation_catalog_fingerprint(
     )
 
 
+def progress_annotation_catalog_probe_fingerprint(
+    dataset_root: str | Path,
+) -> tuple[object, ...]:
+    """Return a cheap change probe without enumerating historical Episodes.
+
+    Native datasets need one catalog stat.  Retrospective workspaces are
+    immutable/append-only at the admitted artifact boundary, so root directory
+    and profile metadata are sufficient to decide whether the expensive exact
+    fingerprint and full validation scan need to run again.
+    """
+
+    root = Path(dataset_root).expanduser().resolve()
+    native = root / "meta" / "episodes.jsonl"
+    try:
+        stat = native.stat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return ("error", type(exc).__name__, getattr(exc, "errno", None))
+    else:
+        return (
+            "file",
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+
+    paths = (
+        root / "episodes",
+        root / "campaigns",
+        root / "profile.cjson",
+        root / "stages.cjson",
+    )
+    values: list[tuple[object, ...]] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            values.append((path.name, "missing"))
+        except OSError as exc:
+            values.append(
+                (
+                    path.name,
+                    "error",
+                    type(exc).__name__,
+                    getattr(exc, "errno", None),
+                )
+            )
+        else:
+            values.append(
+                (
+                    path.name,
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+            )
+    return ("retrospective_probe", *values)
+
+
 def _retrospective_camera_key(modality_id: str) -> str:
     aliases = {
         "front_rgb": "front",
@@ -687,5 +750,6 @@ __all__ = [
     "list_progress_annotation_work_items",
     "load_episode_sample_axis",
     "progress_annotation_catalog_fingerprint",
+    "progress_annotation_catalog_probe_fingerprint",
     "read_progress_annotation_work_item_batch",
 ]

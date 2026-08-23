@@ -58,6 +58,8 @@ let episodeSummaryFlushTimer = 0;
 const pendingEpisodeSummaryIds = new Set();
 const inFlightEpisodeSummaryIds = new Set();
 const episodeSummaryRefreshedAt = new Map();
+const episodeRowNodes = new Map();
+const episodeRowSignatures = new Map();
 const datasetBrowserCache = new Map();
 const datasetBrowserRequests = new Map();
 
@@ -67,7 +69,7 @@ const EPISODE_REFRESH_INTERVAL_MS = 4000;
 const EPISODE_PAGE_SIZE = 200;
 const EPISODE_RENDER_BATCH_SIZE = 200;
 const EPISODE_SUMMARY_BATCH_SIZE = 32;
-const EPISODE_SUMMARY_REFRESH_MS = 15000;
+const EPISODE_SUMMARY_REFRESH_MS = 60000;
 const DATASET_BROWSER_CACHE_MS = 15000;
 const DATASET_BROWSER_RENDER_BATCH_SIZE = 250;
 const EPISODE_PANEL_STORAGE_KEY =
@@ -104,6 +106,115 @@ function compareEpisodeOrder(left, right) {
   return indexDelta || String(left.episode_uuid).localeCompare(
     String(right.episode_uuid),
   );
+}
+
+function legacyEpisodeStatus(item) {
+  const badges = [];
+  const add = (code, label, tone, priority) => {
+    badges.push({code, label, tone, priority});
+  };
+  if (item.whole_episode_abnormal) {
+    add(
+      "WHOLE_EPISODE_ABNORMAL",
+      `整条异常${item.whole_episode_abnormal_reason ? ` · ${item.whole_episode_abnormal_reason}` : ""}`,
+      "CRITICAL",
+      10,
+    );
+  }
+  if (item.review_state === "PENDING" || item.needs_second_review) {
+    add("SECOND_REVIEW_PENDING", "待二次复核", "WARNING", 20);
+  } else if (
+    item.review_state === "COMPLETED"
+    || (
+      item.review_state == null
+      && item.latest_annotation_mode === "SECOND_REVIEW"
+      && !item.needs_second_review
+    )
+  ) {
+    add("SECOND_REVIEW_COMPLETED", "二次复核完成", "SUCCESS", 50);
+  }
+  const detailState = String(item.detail_annotation_state || "").toUpperCase();
+  if (item.detail_annotation_complete === true || detailState === "COMPLETE") {
+    add("DETAIL_COMPLETE", "详细标注完成", "SUCCESS", 60);
+  } else if (detailState === "PENDING") {
+    add("DETAIL_PENDING", "待详细标注", "INFO", 40);
+  } else if (detailState === "STALE") {
+    add("DETAIL_STALE", "详细标注需重做", "WARNING", 25);
+  } else if (detailState === "ERROR") {
+    add("DETAIL_ERROR", "详细标注状态异常", "CRITICAL", 15);
+  }
+  if (item.annotation_set_count) {
+    add(
+      "COARSE_SEALED",
+      `已封存 ${item.annotation_set_count} 版`,
+      "SEALED",
+      70,
+    );
+  }
+  if (item.has_draft) add("LOCAL_DRAFT", "有未封存草稿", "DRAFT", 30);
+  badges.sort((left, right) => left.priority - right.priority);
+  const attentionLevel = item.whole_episode_abnormal || detailState === "ERROR"
+    ? "CRITICAL"
+    : item.review_state === "PENDING" || detailState === "STALE"
+      ? "WARNING"
+      : "NONE";
+  return {
+    loaded: Boolean(item.annotation_summary_loaded),
+    attention_level: attentionLevel,
+    attention_required: attentionLevel !== "NONE",
+    primary_label: item.whole_episode_abnormal
+      ? "整条异常"
+      : item.review_state === "PENDING"
+        ? "待二次复核"
+        : detailState === "STALE"
+          ? "详细标注需重做"
+          : "状态正常",
+    badges,
+  };
+}
+
+function episodeStatus(item) {
+  const status = item?.annotation_status;
+  if (
+    status
+    && status.schema === "dexteleop.refinement_annotation.episode_status.v1"
+    && Array.isArray(status.badges)
+  ) return status;
+  return legacyEpisodeStatus(item || {});
+}
+
+function annotationSummarySignature(item) {
+  return JSON.stringify({
+    annotation_set_count: item.annotation_set_count,
+    annotation_summary_loaded: item.annotation_summary_loaded,
+    annotation_summary_error: item.annotation_summary_error || null,
+    needs_second_review: item.needs_second_review,
+    review_state: item.review_state,
+    latest_annotation_mode: item.latest_annotation_mode,
+    whole_episode_abnormal: item.whole_episode_abnormal,
+    whole_episode_abnormal_reason: item.whole_episode_abnormal_reason,
+    detail_annotation_complete: item.detail_annotation_complete,
+    detail_annotation_state: item.detail_annotation_state,
+    annotation_status: item.annotation_status || null,
+    has_draft: item.has_draft,
+  });
+}
+
+function badgeClassForStatus(code, tone) {
+  const byCode = {
+    WHOLE_EPISODE_ABNORMAL: "abnormal",
+    SECOND_REVIEW_PENDING: "review",
+    SECOND_REVIEW_COMPLETED: "review-complete",
+    DETAIL_COMPLETE: "detail-complete",
+    DETAIL_PENDING: "detail-pending",
+    DETAIL_STALE: "detail-stale",
+    DETAIL_ERROR: "summary-error",
+    COARSE_SEALED: "sealed",
+    COARSE_PENDING: "pending",
+    LOCAL_DRAFT: "draft",
+    STATUS_LOADING: "loading",
+  };
+  return byCode[code] || `tone-${String(tone || "info").toLowerCase()}`;
 }
 
 function formatTime(seconds) {
@@ -450,18 +561,28 @@ function updateEpisodeNavigation() {
     : "尚未选择 Episode";
   const selected = hasSelection ? state.episodes[index] : null;
   const status = $("collapsed-episode-status");
-  const labels = [];
-  if (selected?.whole_episode_abnormal) labels.push("整条异常");
-  if (selected?.review_state === "PENDING") labels.push("待复核");
-  else if (selected?.review_state === "COMPLETED") labels.push("已复核");
-  if (selected?.detail_annotation_complete === true) labels.push("详细完成");
+  const projectedStatus = selected ? episodeStatus(selected) : null;
+  const labels = (projectedStatus?.badges || [])
+    .filter((badge) => [
+      "WHOLE_EPISODE_ABNORMAL",
+      "SECOND_REVIEW_PENDING",
+      "SECOND_REVIEW_COMPLETED",
+      "DETAIL_COMPLETE",
+      "DETAIL_STALE",
+      "DETAIL_ERROR",
+    ].includes(String(badge.code)))
+    .map((badge) => String(badge.label));
   status.textContent = labels.join(" / ") || "—";
   status.className = [
     "collapsed-episode-status",
-    selected?.whole_episode_abnormal ? "abnormal" : "",
-    selected?.review_state === "PENDING" ? "review" : "",
-    selected?.review_state === "COMPLETED" ? "review-complete" : "",
-    selected?.detail_annotation_complete === true ? "detail-complete" : "",
+    projectedStatus?.attention_level === "CRITICAL" ? "abnormal" : "",
+    projectedStatus?.attention_level === "WARNING" ? "review" : "",
+    projectedStatus?.badges?.some(
+      (badge) => badge.code === "SECOND_REVIEW_COMPLETED",
+    ) ? "review-complete" : "",
+    projectedStatus?.badges?.some(
+      (badge) => badge.code === "DETAIL_COMPLETE",
+    ) ? "detail-complete" : "",
   ].filter(Boolean).join(" ");
   status.title = labels.join("；") || "当前 Episode 无整条异常、复核或详细标注状态";
   for (const id of ["previous-episode", "previous-episode-collapsed"]) {
@@ -795,6 +916,8 @@ function resetAnnotationStateForWorkspace() {
   pendingEpisodeSummaryIds.clear();
   inFlightEpisodeSummaryIds.clear();
   episodeSummaryRefreshedAt.clear();
+  episodeRowNodes.clear();
+  episodeRowSignatures.clear();
   if (episodeSummaryObserver) episodeSummaryObserver.disconnect();
   state.detail = null;
   state.draft = null;
@@ -2415,8 +2538,9 @@ async function flushEpisodeSummaryQueue() {
     const errorsById = new Map(
       payload.errors.map((value) => [value.episode_uuid, value.error]),
     );
-    state.episodes = state.episodes.map((item) => (
-      byId.has(item.episode_uuid)
+    let summariesChanged = false;
+    state.episodes = state.episodes.map((item) => {
+      const updated = byId.has(item.episode_uuid)
         ? {
             ...item,
             ...byId.get(item.episode_uuid),
@@ -2427,8 +2551,14 @@ async function flushEpisodeSummaryQueue() {
               ...item,
               annotation_summary_error: errorsById.get(item.episode_uuid),
             }
-          : item
-    ));
+          : item;
+      if (
+        updated !== item
+        && annotationSummarySignature(updated)
+          !== annotationSummarySignature(item)
+      ) summariesChanged = true;
+      return updated;
+    });
     const refreshedAt = Date.now();
     for (const episodeUuid of byId.keys()) {
       episodeSummaryRefreshedAt.set(episodeUuid, refreshedAt);
@@ -2440,7 +2570,8 @@ async function flushEpisodeSummaryQueue() {
         7000,
       );
     }
-    renderEpisodeList({preserveViewport: true});
+    if (summariesChanged) renderEpisodeList({preserveViewport: true});
+    else updateEpisodeNavigation();
   } catch (error) {
     if (workspaceGeneration === state.workspaceGeneration) {
       showToast(`读取可见 Episode 标注摘要失败：${error.message}`, "error", 7000);
@@ -2456,6 +2587,82 @@ async function flushEpisodeSummaryQueue() {
       );
     }
   }
+}
+
+function renderEpisodeRow(item) {
+  const status = episodeStatus(item);
+  const signature = JSON.stringify({
+    episode_index: item.episode_index,
+    duration_sec: item.duration_sec,
+    frame_count: item.frame_count,
+    resolution_kind: item.resolution_kind,
+    source_batch_id: item.source_batch_id || null,
+    selected: item.episode_uuid === state.selectedEpisode,
+    summary: annotationSummarySignature(item),
+  });
+  let button = episodeRowNodes.get(item.episode_uuid);
+  if (!button) {
+    button = element("button", "episode-item");
+    button.type = "button";
+    button.addEventListener("click", () => {
+      void selectEpisode(button.dataset.episodeUuid);
+    });
+    episodeRowNodes.set(item.episode_uuid, button);
+  }
+  if (episodeRowSignatures.get(item.episode_uuid) === signature) return button;
+
+  button.className = [
+    "episode-item",
+    item.episode_uuid === state.selectedEpisode ? "active" : "",
+    status.attention_level === "CRITICAL" ? "attention-critical" : "",
+    status.attention_level === "WARNING" ? "attention-warning" : "",
+  ].filter(Boolean).join(" ");
+  button.title = `${item.episode_uuid} · ${status.primary_label || "状态未知"}`;
+  button.dataset.episodeUuid = item.episode_uuid;
+
+  const content = document.createDocumentFragment();
+  content.appendChild(
+    element(
+      "strong",
+      "",
+      `#${item.episode_index} · ${formatTime(item.duration_sec)}`,
+    ),
+  );
+  if (["CRITICAL", "WARNING"].includes(status.attention_level)) {
+    content.appendChild(
+      element("small", "episode-attention-line", status.primary_label),
+    );
+  }
+  const badges = element("div", "episode-badges");
+  badges.appendChild(element("span", "badge", `${item.frame_count} 帧`));
+  if (item.resolution_kind === "RETROSPECTIVE_MIGRATED") {
+    badges.appendChild(element("span", "badge", "历史迁移"));
+  }
+  if (item.source_batch_id) {
+    badges.appendChild(element("span", "badge", item.source_batch_id));
+  }
+  if (item.annotation_summary_error) {
+    const badge = element("span", "badge summary-error", "状态读取失败");
+    badge.title = item.annotation_summary_error;
+    badges.appendChild(badge);
+  }
+  for (const badgeStatus of status.badges || []) {
+    if (
+      item.annotation_summary_error
+      && badgeStatus.code === "STATUS_LOADING"
+    ) continue;
+    badges.appendChild(
+      element(
+        "span",
+        `badge ${badgeClassForStatus(badgeStatus.code, badgeStatus.tone)}`,
+        String(badgeStatus.label),
+      ),
+    );
+  }
+  content.appendChild(badges);
+  button.replaceChildren(content);
+  episodeRowSignatures.set(item.episode_uuid, signature);
+  return button;
 }
 
 function renderEpisodeList({preserveViewport = true} = {}) {
@@ -2489,67 +2696,7 @@ function renderEpisodeList({preserveViewport = true} = {}) {
   }
   const renderedEpisodes = state.episodes.slice(0, state.episodeRenderLimit);
   for (const item of renderedEpisodes) {
-    const button = element(
-      "button",
-      `episode-item${item.episode_uuid === state.selectedEpisode ? " active" : ""}`,
-    );
-    button.type = "button";
-    button.title = item.episode_uuid;
-    button.dataset.episodeUuid = item.episode_uuid;
-    button.appendChild(element("strong", "", `#${item.episode_index} · ${formatTime(item.duration_sec)}`));
-    const badges = element("div", "episode-badges");
-    badges.appendChild(element("span", "badge", `${item.frame_count} 帧`));
-    if (item.resolution_kind === "RETROSPECTIVE_MIGRATED") {
-      badges.appendChild(element("span", "badge", "历史迁移"));
-    }
-    if (item.source_batch_id) {
-      badges.appendChild(element("span", "badge", item.source_batch_id));
-    }
-    if (item.annotation_set_count) {
-      badges.appendChild(
-        element(
-          "span",
-          "badge sealed",
-          `已封存 ${item.annotation_set_count} 版`,
-        ),
-      );
-    }
-    if (item.detail_annotation_complete === true) {
-      badges.appendChild(
-        element("span", "badge detail-complete", "详细标注完成"),
-      );
-    }
-    if (item.annotation_summary_error) {
-      const badge = element("span", "badge summary-error", "状态读取失败");
-      badge.title = item.annotation_summary_error;
-      badges.appendChild(badge);
-    } else if (!item.annotation_summary_loaded) {
-      badges.appendChild(element("span", "badge loading", "状态读取中"));
-    }
-    if (item.whole_episode_abnormal) {
-      badges.appendChild(
-        element(
-          "span",
-          "badge abnormal",
-          `整条异常${item.whole_episode_abnormal_reason ? ` · ${item.whole_episode_abnormal_reason}` : ""}`,
-        ),
-      );
-    }
-    if (item.review_state === "PENDING" || item.needs_second_review) {
-      badges.appendChild(element("span", "badge review", "待二次复核"));
-    }
-    if (
-      item.review_state === "COMPLETED"
-      || (
-        item.review_state == null
-        && item.latest_annotation_mode === "SECOND_REVIEW"
-        && !item.needs_second_review
-      )
-    ) {
-      badges.appendChild(element("span", "badge review-complete", "二次复核完成"));
-    }
-    button.appendChild(badges);
-    button.addEventListener("click", () => selectEpisode(item.episode_uuid));
+    const button = renderEpisodeRow(item);
     root.appendChild(button);
     const refreshedAt = episodeSummaryRefreshedAt.get(item.episode_uuid) || 0;
     if (
@@ -2561,6 +2708,15 @@ function renderEpisodeList({preserveViewport = true} = {}) {
     ) {
       episodeSummaryObserver.observe(button);
     }
+  }
+  const retainedEpisodeIds = new Set(
+    state.episodes.map((item) => item.episode_uuid),
+  );
+  for (const episodeUuid of episodeRowNodes.keys()) {
+    if (retainedEpisodeIds.has(episodeUuid)) continue;
+    episodeRowNodes.delete(episodeUuid);
+    episodeRowSignatures.delete(episodeUuid);
+    episodeSummaryRefreshedAt.delete(episodeUuid);
   }
   if (renderedEpisodes.length < state.episodes.length) {
     const remaining = state.episodes.length - renderedEpisodes.length;
@@ -2656,6 +2812,8 @@ async function selectEpisode(episodeUuid) {
           payload.episode.detail_annotation_complete === true
           || payload.episode.detail_annotation?.resolution_level
             === "DETAIL_COMPLETE",
+        detail_annotation_state: payload.episode.detail_annotation_state,
+        annotation_status: payload.episode.annotation_status,
         annotation_summary_loaded: true,
         annotation_summary_error: null,
       };
@@ -3907,6 +4065,11 @@ async function publishDetailAnnotations() {
   }
   state.detail.detail_annotation_complete =
     report.detail_annotation?.resolution_level === "DETAIL_COMPLETE";
+  state.detail.detail_annotation_state = state.detail.detail_annotation_complete
+    ? "COMPLETE"
+    : report.detail_annotation?.available
+      ? "PENDING"
+      : "NOT_APPLICABLE";
   const episodeIndex = state.episodes.findIndex(
     (value) => value.episode_uuid === state.detail.episode_uuid,
   );
@@ -3914,6 +4077,8 @@ async function publishDetailAnnotations() {
     state.episodes[episodeIndex] = {
       ...state.episodes[episodeIndex],
       detail_annotation_complete: state.detail.detail_annotation_complete,
+      detail_annotation_state: state.detail.detail_annotation_state,
+      annotation_status: null,
       annotation_summary_loaded: true,
       annotation_summary_error: null,
     };
@@ -3976,6 +4141,11 @@ async function publishCurrentAnnotations() {
   }
   state.detail.detail_annotation_complete =
     report.detail_annotation?.resolution_level === "DETAIL_COMPLETE";
+  state.detail.detail_annotation_state = state.detail.detail_annotation_complete
+    ? "COMPLETE"
+    : report.detail_annotation?.available
+      ? "PENDING"
+      : "NOT_APPLICABLE";
   setSavedDraftSnapshot(state.draft);
   state.sealedReeditBaseline = null;
   state.sealedReeditSourceId = null;
@@ -4025,6 +4195,8 @@ async function publishCurrentAnnotations() {
       whole_episode_abnormal_reason:
         state.detail.whole_episode_abnormal_reason,
       detail_annotation_complete: state.detail.detail_annotation_complete,
+      detail_annotation_state: state.detail.detail_annotation_state,
+      annotation_status: null,
       annotation_summary_loaded: true,
       annotation_summary_error: null,
     };

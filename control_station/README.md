@@ -46,6 +46,15 @@ annotator identity are selected in the loopback GUI before the lower-owned
 annotation workspace and writer lock are opened. CLI values remain optional
 GUI prefill only.
 
+Within that leaf, `refinement_annotation/detail_annotation.py` is the reusable
+optional-overlay capability: it discovers compatible detail profiles, selects
+only immutable overlays bound to the current coarse set, and projects
+`PENDING`/`STALE`/`COMPLETE` status. `episode_status.py` converts coarse review,
+whole-Episode abnormal, draft, and detail state into a versioned additive UI
+projection. The application still owns locks and commit coordination; these
+modules do not define schemas or persistence and old scalar response fields
+remain available for compatibility.
+
 Current concrete-profile and migration debt is frozen as follows:
 
 | Current Station area | Long-term owner |

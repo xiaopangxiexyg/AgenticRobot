@@ -29,6 +29,8 @@ include = [
     "control_station/refinement_annotation/__init__.py",
     "control_station/refinement_annotation/application.py",
     "control_station/refinement_annotation/cli.py",
+    "control_station/refinement_annotation/detail_annotation.py",
+    "control_station/refinement_annotation/episode_status.py",
     "control_station/refinement_annotation/media.py",
     "control_station/refinement_annotation/server.py",
     "control_station/refinement_annotation/static/app.js",

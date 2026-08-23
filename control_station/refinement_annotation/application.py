@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import replace
 import errno
 import math
 import os
@@ -26,10 +26,6 @@ from collection_runtime.progress.stage_annotation_store import (
 from collection_runtime.progress.detail_stage_annotation_store import (
     DetailStageAnnotationStoreError,
     commit_detail_stage_annotation_set,
-)
-from collection_runtime.progress.profiles.catalog import (
-    load_task_progress_profile_file,
-    load_task_stage_profile_file,
 )
 from collection_runtime.progress.failure_trigger_store import (
     FailureTriggerStoreError,
@@ -54,7 +50,6 @@ from dataset_contracts.progress_detail_annotations import (
     DetailStageAnnotationBundleV1,
     DetailStageAnnotationSetBindingV1,
     validate_detail_stage_annotation_set,
-    validate_detail_stage_profile_compatibility,
 )
 from dataset_contracts.progress_stage_annotations import (
     AbnormalIntervalAnnotationV1,
@@ -72,6 +67,7 @@ from dataset_interface.progress_annotation_jobs import (
     ProgressAnnotationWorkItem,
     load_episode_sample_axis,
     progress_annotation_catalog_fingerprint,
+    progress_annotation_catalog_probe_fingerprint,
     read_progress_annotation_work_item_batch,
 )
 from dataset_interface.progress_failure_triggers import (
@@ -88,10 +84,7 @@ from dataset_interface.progress_recoverable_failures import (
 )
 from dataset_interface.progress_stages import resolve_stage_training_index
 from dataset_interface.progress_detail_annotation_artifacts import (
-    DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT,
-    DetailStageAnnotationArtifactReadError,
     LoadedDetailStageAnnotationSet,
-    load_detail_stage_annotation_set as load_detail_stage_annotation_set_readonly,
 )
 from dataset_interface.retrospective_progress_artifacts import (
     LoadedRetrospectiveProgressEpisode,
@@ -101,12 +94,23 @@ from dataset_interface.progress_annotation_read_cache import (
     ProgressAnnotationReadCache,
 )
 
+from .detail_annotation import (
+    DetailAnnotationModule,
+    DetailProfileSelection,
+)
+from .episode_status import (
+    EpisodeAnnotationSummary,
+    build_episode_status_payload,
+    summarize_annotation_sets,
+)
+
 
 _DRAFT_SCHEMA = "dexteleop.stage_annotation_draft.local.v1"
 _DETAIL_DRAFT_SCHEMA = "dexteleop.detail_stage_annotation_draft.local.v1"
 _SAMPLE_AXIS_CACHE_LIMIT = 16
 _ANNOTATION_SET_CACHE_LIMIT = 16
-_DETAIL_ANNOTATION_STATUS_CACHE_LIMIT = 64
+_ANNOTATION_SUMMARY_CACHE_LIMIT = 256
+_CATALOG_EXACT_RECHECK_INTERVAL_SEC = 60.0
 # Keep the HTTP/browser page deliberately bounded.  Direct Python callers
 # still receive the historical complete list unless they opt into pagination.
 _EPISODE_PAGE_MAX = 1000
@@ -131,27 +135,6 @@ _RETRYABLE_STAGE_STORE_ERRNOS = frozenset(
 
 class RefinementAnnotationApplicationError(ValueError):
     """Raised when a UI request cannot preserve annotation semantics."""
-
-
-@dataclass(frozen=True)
-class _EpisodeAnnotationSummary:
-    annotation_set_count: int
-    review_state: str
-    latest_annotation_mode: str | None
-    whole_episode_abnormal: bool
-    whole_episode_abnormal_reason: str | None
-
-    @property
-    def needs_second_review(self) -> bool:
-        return self.review_state == "PENDING"
-
-
-@dataclass(frozen=True)
-class _DetailProfileSelection:
-    stage_profile: Any
-    target_progress_step_id: str
-    progress_profile_path: Path
-    stage_profile_path: Path
 
 
 class RefinementAnnotationApplication:
@@ -204,6 +187,8 @@ class RefinementAnnotationApplication:
         self._items: dict[str, ProgressAnnotationWorkItem] = {}
         self._catalog_cursor: ProgressAnnotationCatalogCursor | None = None
         self._known_catalog_fingerprint: tuple[object, ...] | None = None
+        self._known_catalog_probe: tuple[object, ...] | None = None
+        self._last_exact_catalog_check_at = 0.0
         self._refresh_in_flight = False
         self._refresh_thread: threading.Thread | None = None
         self._refresh_error: Exception | None = None
@@ -213,27 +198,23 @@ class RefinementAnnotationApplication:
             str,
             tuple[LoadedStageAnnotationSet, ...],
         ] = OrderedDict()
-        self._annotation_summary_cache: dict[
+        self._annotation_summary_cache: OrderedDict[
             str,
-            _EpisodeAnnotationSummary,
-        ] = {}
+            EpisodeAnnotationSummary,
+        ] = OrderedDict()
         self._annotation_root_fingerprints: dict[
             str,
             tuple[object, ...],
         ] = {}
-        self._detail_annotation_status_cache: OrderedDict[
-            str,
-            tuple[tuple[object, ...], bool],
-        ] = OrderedDict()
+        self._detail_annotations = DetailAnnotationModule(
+            self.dataset_root,
+            profile_root=self.detail_profile_root,
+        )
         self._episode_list_revision = 0
         self._sample_axis_cache: OrderedDict[
             str,
             tuple[tuple[object, ...], EpisodeSampleAxis],
         ] = OrderedDict()
-        self._detail_profile_cache: dict[
-            str,
-            tuple[_DetailProfileSelection | None, str | None],
-        ] = {}
         self._ordered_items_cache: tuple[ProgressAnnotationWorkItem, ...] = ()
         self._ordered_items_cache_revision = -1
         # The GUI can return immediately and expose a loading state while the
@@ -263,18 +244,21 @@ class RefinementAnnotationApplication:
                 self._annotation_sets_cache.clear()
                 self._annotation_summary_cache.clear()
                 self._annotation_root_fingerprints.clear()
-                self._detail_annotation_status_cache.clear()
                 self._sample_axis_cache.clear()
-                self._detail_profile_cache.clear()
+                self._detail_annotations.close()
 
     def _catalog_fingerprint(self) -> tuple[object, ...]:
         return progress_annotation_catalog_fingerprint(self.dataset_root)
+
+    def _catalog_probe(self) -> tuple[object, ...]:
+        return progress_annotation_catalog_probe_fingerprint(self.dataset_root)
 
     def _finish_refresh(
         self,
         items: dict[str, ProgressAnnotationWorkItem] | None,
         cursor: ProgressAnnotationCatalogCursor | None,
         catalog_fingerprint: tuple[object, ...] | None,
+        catalog_probe: tuple[object, ...] | None,
         error: Exception | None,
     ) -> None:
         with self._lock:
@@ -304,6 +288,8 @@ class RefinementAnnotationApplication:
                 self._items = items
                 self._catalog_cursor = cursor
                 self._known_catalog_fingerprint = catalog_fingerprint
+                self._known_catalog_probe = catalog_probe
+                self._last_exact_catalog_check_at = time.monotonic()
                 self._refresh_error = None
                 self._episode_list_revision += 1
                 eligible = set(items)
@@ -311,12 +297,12 @@ class RefinementAnnotationApplication:
                     self._annotation_sets_cache,
                     self._annotation_summary_cache,
                     self._annotation_root_fingerprints,
-                    self._detail_annotation_status_cache,
                     self._sample_axis_cache,
                 ):
                     for episode_uuid in tuple(cache):
                         if episode_uuid not in eligible:
                             cache.pop(episode_uuid, None)
+                self._detail_annotations.prune(eligible)
             elif not self._closed and error is not None:
                 self._refresh_error = error
             self._refresh_in_flight = False
@@ -361,7 +347,7 @@ class RefinementAnnotationApplication:
                 if batch.full_scan:
                     self._read_cache.save_catalog(batch)
         except Exception as exc:
-            self._finish_refresh(None, None, None, exc)
+            self._finish_refresh(None, None, None, None, exc)
             if raise_error:
                 raise
             return
@@ -390,6 +376,7 @@ class RefinementAnnotationApplication:
             items,
             batch.cursor,
             batch.catalog_fingerprint,
+            self._catalog_probe(),
             None,
         )
 
@@ -446,10 +433,24 @@ class RefinementAnnotationApplication:
                     raise self._refresh_error
                 return
 
-        # A forced scan does not need a pre-scan fingerprint. This matters for
-        # retrospective workspaces whose fingerprint itself enumerates every
-        # Episode on a remote mount.
-        catalog_fingerprint = None if force else self._catalog_fingerprint()
+        # Polling first uses a bounded metadata probe.  Retrospective exact
+        # fingerprints enumerate every sealed Episode, so repeat that scan
+        # only when the probe changes or at a conservative fail-safe interval.
+        catalog_probe: tuple[object, ...] | None = None
+        catalog_fingerprint: tuple[object, ...] | None = None
+        if not force:
+            catalog_probe = self._catalog_probe()
+            now = time.monotonic()
+            with self._lock:
+                probe_unchanged = catalog_probe == self._known_catalog_probe
+                exact_recent = (
+                    now - self._last_exact_catalog_check_at
+                    < _CATALOG_EXACT_RECHECK_INTERVAL_SEC
+                )
+                refresh_error = self._refresh_error
+            if probe_unchanged and exact_recent and refresh_error is None:
+                return
+            catalog_fingerprint = self._catalog_fingerprint()
         with self._lock:
             self._require_open()
             needs_refresh = (
@@ -458,6 +459,8 @@ class RefinementAnnotationApplication:
                 or catalog_fingerprint != self._known_catalog_fingerprint
             )
             if not needs_refresh:
+                self._known_catalog_probe = catalog_probe
+                self._last_exact_catalog_check_at = time.monotonic()
                 return
             if self._refresh_in_flight:
                 if not wait:
@@ -636,9 +639,10 @@ class RefinementAnnotationApplication:
             raise RefinementAnnotationApplicationError(
                 "At most 32 Episode annotation summaries may be loaded at once."
             )
-        summaries: list[dict[str, Any]] = []
-        errors: list[dict[str, str]] = []
-        for episode_uuid in normalized:
+
+        def load_one(
+            episode_uuid: str,
+        ) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
             try:
                 item = self._item(episode_uuid)
                 with self._summary_load_lock(episode_uuid):
@@ -655,17 +659,14 @@ class RefinementAnnotationApplication:
                             # manifest-last set. Reload only after the Episode
                             # annotation directory actually changed; visible
                             # rows must not reread every sealed version every
-                            # 15 seconds on a remote mount.
+                            # refresh interval on a remote mount.
                             self._annotation_sets_cache.pop(episode_uuid, None)
                             self._annotation_summary_cache.pop(episode_uuid, None)
                             self._annotation_root_fingerprints.pop(
                                 episode_uuid,
                                 None,
                             )
-                            self._detail_annotation_status_cache.pop(
-                                episode_uuid,
-                                None,
-                            )
+                        self._detail_annotations.invalidate(episode_uuid)
                     summary = self._episode_summary(
                         item,
                         load_annotations=True,
@@ -676,11 +677,11 @@ class RefinementAnnotationApplication:
                 StageAnnotationStoreError,
                 ValueError,
             ) as exc:
-                errors.append(
-                    {"episode_uuid": episode_uuid, "error": str(exc)}
-                )
-                continue
-            summaries.append(
+                return None, {
+                    "episode_uuid": episode_uuid,
+                    "error": str(exc),
+                }
+            return (
                 {
                     "episode_uuid": episode_uuid,
                     "annotation_set_count": summary["annotation_set_count"],
@@ -698,9 +699,33 @@ class RefinementAnnotationApplication:
                     "detail_annotation_complete": summary[
                         "detail_annotation_complete"
                     ],
+                    "detail_annotation_state": summary[
+                        "detail_annotation_state"
+                    ],
+                    "annotation_status": summary["annotation_status"],
                     "annotation_summary_loaded": True,
-                }
+                },
+                None,
             )
+
+        # Visible rows are independent immutable reads.  A small pool avoids
+        # multiplying SSHFS/NFS latency by the batch size without allowing a
+        # sidebar refresh to monopolize the application.
+        if len(normalized) == 1:
+            loaded = (load_one(normalized[0]),)
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(8, len(normalized)),
+                thread_name_prefix="annotation-summary",
+            ) as executor:
+                loaded = tuple(executor.map(load_one, normalized))
+        summaries: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for summary, error in loaded:
+            if error is not None:
+                errors.append(error)
+            elif summary is not None:
+                summaries.append(summary)
         return {"summaries": summaries, "errors": errors}
 
     def _annotation_root_fingerprint(
@@ -740,310 +765,20 @@ class RefinementAnnotationApplication:
     def _detail_profile_selection(
         self,
         item: ProgressAnnotationWorkItem,
-    ) -> tuple[_DetailProfileSelection | None, str | None]:
-        """Find one additive fine-stage profile for the loaded coarse profile.
-
-        Detailed profiles are editable configuration, not sealed dataset
-        receipts.  Their contract hashes are derived through the catalog
-        loader; source-file hashes are never used as admission checks.
-        """
-
-        base_stage_profile = item.progress.stage_profile
-        if base_stage_profile is None:
-            return None, "当前 Episode 没有可用的粗粒度 stage profile。"
-        root = self.detail_profile_root
-        try:
-            progress_paths = tuple(
-                sorted(root.rglob("*.progress_detailed.json"))
-            )
-        except OSError as exc:
-            return None, f"无法读取详细 stage profile 目录：{exc}"
-        fingerprints: list[tuple[object, ...]] = []
-        pairs: list[tuple[Path, Path]] = []
-        for progress_path in progress_paths:
-            stage_path = progress_path.with_name(
-                progress_path.name.replace(
-                    ".progress_detailed.json",
-                    ".stages_detailed.json",
-                )
-            )
-            try:
-                progress_stat = progress_path.stat()
-                stage_stat = stage_path.stat()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                return None, f"无法读取详细 stage profile 文件：{exc}"
-            if not stage_path.is_file():
-                continue
-            fingerprints.append(
-                (
-                    str(progress_path),
-                    progress_stat.st_size,
-                    progress_stat.st_mtime_ns,
-                    stage_stat.st_size,
-                    stage_stat.st_mtime_ns,
-                )
-            )
-            pairs.append((progress_path, stage_path))
-        cache_key = repr(
-            (
-                base_stage_profile.semantic_content_hash,
-                tuple(fingerprints),
-            )
-        )
-        with self._lock:
-            cached = self._detail_profile_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        candidates: list[_DetailProfileSelection] = []
-        errors: list[str] = []
-        base_step_ids = {
-            step.progress_step_id for step in item.progress.profile.steps
-        }
-        for progress_path, stage_path in pairs:
-            try:
-                detail_progress = load_task_progress_profile_file(
-                    progress_path
-                )
-                if (
-                    detail_progress.semantic_content_hash
-                    != base_stage_profile.task_progress_profile_hash
-                ):
-                    continue
-                detail_stage_profile = load_task_stage_profile_file(
-                    stage_path,
-                    progress_profile=detail_progress,
-                )
-                detail_step_ids = {
-                    stage.progress_step_id
-                    for stage in detail_stage_profile.stages
-                }
-                if detail_step_ids != base_step_ids:
-                    continue
-                changed_steps = tuple(
-                    step_id
-                    for step_id in sorted(base_step_ids)
-                    if base_stage_profile.stages_for_step(step_id)
-                    != detail_stage_profile.stages_for_step(step_id)
-                )
-                if len(changed_steps) != 1:
-                    errors.append(
-                        f"{stage_path.name}: 详细 profile 必须只改变一个子任务"
-                    )
-                    continue
-                target_step_id = changed_steps[0]
-                validate_detail_stage_profile_compatibility(
-                    base_stage_profile=base_stage_profile,
-                    detail_stage_profile=detail_stage_profile,
-                    target_progress_step_id=target_step_id,
-                )
-                candidates.append(
-                    _DetailProfileSelection(
-                        stage_profile=detail_stage_profile,
-                        target_progress_step_id=target_step_id,
-                        progress_profile_path=progress_path,
-                        stage_profile_path=stage_path,
-                    )
-                )
-            except (OSError, TypeError, ValueError) as exc:
-                errors.append(f"{stage_path.name}: {exc}")
-
-        if len(candidates) == 1:
-            result: tuple[_DetailProfileSelection | None, str | None] = (
-                candidates[0],
-                None,
-            )
-        elif len(candidates) > 1:
-            result = (
-                None,
-                "当前粗 profile 匹配到多个详细 profile，已停用详细标注以避免歧义。",
-            )
-        elif errors:
-            result = (None, errors[0])
-        else:
-            result = (
-                None,
-                "当前数据集没有匹配的详细 stage profile；继续使用粗粒度标注。",
-            )
-        with self._lock:
-            self._detail_profile_cache[cache_key] = result
-            if len(self._detail_profile_cache) > 8:
-                for key in tuple(self._detail_profile_cache)[:-8]:
-                    self._detail_profile_cache.pop(key, None)
-        return result
-
-    def _detail_annotation_root(
-        self,
-        item: ProgressAnnotationWorkItem,
-    ) -> Path:
-        return (
-            self.dataset_root
-            / DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT
-            / item.episode_uuid
-        )
-
-    def _detail_annotation_root_fingerprint(
-        self,
-        item: ProgressAnnotationWorkItem,
-    ) -> tuple[object, ...]:
-        root = self._detail_annotation_root(item)
-        try:
-            value = root.stat()
-        except FileNotFoundError:
-            return ("missing",)
-        except OSError as exc:
-            return ("error", type(exc).__name__, getattr(exc, "errno", None))
-        return (
-            "directory",
-            value.st_dev,
-            value.st_ino,
-            value.st_size,
-            value.st_mtime_ns,
-            value.st_ctime_ns,
-        )
-
-    def _detail_annotation_is_complete(
-        self,
-        item: ProgressAnnotationWorkItem,
-        annotation_sets: Sequence[LoadedStageAnnotationSet],
-    ) -> bool:
-        """Return whether the current coarse base has a valid detail set.
-
-        The sidebar status is intentionally derived from the same binding
-        rules as the Episode editor.  A detail set for an older coarse base,
-        or a profile target absent from this Episode, must not produce a
-        completion badge.
-        """
-
-        if not annotation_sets:
-            return False
-        selection, _ = self._detail_profile_selection(item)
-        if selection is None:
-            return False
-        target = selection.target_progress_step_id
-        if not selection.stage_profile.stages_for_step(target):
-            return False
-        base_annotation_set = annotation_sets[-1]
-        if not any(
-            occurrence.progress_step_id == target
-            for occurrence in base_annotation_set.bundle.occurrences
-        ):
-            return False
-        root_fingerprint = self._detail_annotation_root_fingerprint(item)
-        cache_key = (
-            root_fingerprint,
-            base_annotation_set.binding.annotation_set_id,
-            base_annotation_set.manifest.semantic_content_hash,
-            selection.stage_profile.semantic_content_hash,
-            target,
-        )
-        with self._lock:
-            cached = self._detail_annotation_status_cache.get(
-                item.episode_uuid
-            )
-            if cached is not None and cached[0] == cache_key:
-                self._detail_annotation_status_cache.move_to_end(
-                    item.episode_uuid
-                )
-                return cached[1]
-
-        try:
-            detail_annotation_set, _ = self._current_detail_annotation_set(
-                item,
-                base_annotation_set,
-                selection,
-            )
-            complete = detail_annotation_set is not None
-        except (OSError, TypeError, ValueError):
-            # Detail is an optional overlay.  A transient or malformed
-            # optional artifact must not hide the valid coarse summary.
-            complete = False
-        with self._lock:
-            self._detail_annotation_status_cache[item.episode_uuid] = (
-                cache_key,
-                complete,
-            )
-            self._detail_annotation_status_cache.move_to_end(
-                item.episode_uuid
-            )
-            while (
-                len(self._detail_annotation_status_cache)
-                > _DETAIL_ANNOTATION_STATUS_CACHE_LIMIT
-            ):
-                self._detail_annotation_status_cache.popitem(last=False)
-        return complete
+    ) -> tuple[DetailProfileSelection | None, str | None]:
+        return self._detail_annotations.profile_selection(item)
 
     def _current_detail_annotation_set(
         self,
         item: ProgressAnnotationWorkItem,
         base_annotation_set: LoadedStageAnnotationSet,
-        selection: _DetailProfileSelection,
+        selection: DetailProfileSelection,
     ) -> tuple[LoadedDetailStageAnnotationSet | None, str | None]:
-        """Load only the newest overlay bound to the exact current base set."""
-
-        root = self._detail_annotation_root(item)
-        if not root.is_dir():
-            return None, None
-        assert item.progress.stage_profile is not None
-        matches: list[LoadedDetailStageAnnotationSet] = []
-        try:
-            children = tuple(
-                sorted(root.iterdir(), key=lambda value: value.name)
-            )
-        except OSError as exc:
-            return None, f"无法读取 detail 标注目录：{exc}"
-        for child in children:
-            if not child.is_dir() or not (child / "manifest.cjson").is_file():
-                continue
-            try:
-                loaded = load_detail_stage_annotation_set_readonly(child)
-            except DetailStageAnnotationArtifactReadError as exc:
-                return None, f"detail 标注版本 {child.name!r} 无法读取：{exc}"
-            binding = loaded.binding
-            if (
-                binding.episode_capture_identity_hash
-                != item.episode_identity_hash
-                or binding.source_progress_manifest_hash
-                != item.progress_manifest_hash
-                or binding.base_annotation_set_id
-                != base_annotation_set.binding.annotation_set_id
-                or binding.base_annotation_set_manifest_hash
-                != base_annotation_set.manifest.semantic_content_hash
-                or binding.base_task_stage_profile_hash
-                != item.progress.stage_profile.semantic_content_hash
-                or binding.detail_task_stage_profile_hash
-                != selection.stage_profile.semantic_content_hash
-                or binding.target_progress_step_id
-                != selection.target_progress_step_id
-            ):
-                # Older immutable overlays remain valid history but must not
-                # shadow the current coarse base set.
-                continue
-            try:
-                validate_detail_stage_annotation_set(
-                    source_progress_manifest=item.progress.manifest,
-                    base_binding=base_annotation_set.binding,
-                    base_bundle=base_annotation_set.bundle,
-                    base_manifest=base_annotation_set.manifest,
-                    base_stage_profile=item.progress.stage_profile,
-                    detail_stage_profile=selection.stage_profile,
-                    binding=binding,
-                    bundle=loaded.bundle,
-                )
-            except (TypeError, ValueError) as exc:
-                return None, f"当前 detail 标注版本校验失败：{exc}"
-            matches.append(loaded)
-        if not matches:
-            return None, None
-        return max(
-            matches,
-            key=lambda value: (
-                value.binding.created_at,
-                value.binding.annotation_set_id,
-            ),
-        ), None
+        return self._detail_annotations.current_annotation_set(
+            item,
+            base_annotation_set,
+            selection,
+        )
 
     @staticmethod
     def _detail_occurrence_payload(value: Any) -> dict[str, Any]:
@@ -1116,7 +851,7 @@ class RefinementAnnotationApplication:
         self,
         item: ProgressAnnotationWorkItem,
         base_annotation_set: LoadedStageAnnotationSet,
-        selection: _DetailProfileSelection,
+        selection: DetailProfileSelection,
     ) -> dict[str, Any]:
         """Create an unsealed equal-split detail working view.
 
@@ -1263,7 +998,7 @@ class RefinementAnnotationApplication:
         draft: Mapping[str, Any],
         *,
         base_annotation_set: LoadedStageAnnotationSet,
-        selection: _DetailProfileSelection,
+        selection: DetailProfileSelection,
     ) -> dict[str, Any]:
         if not isinstance(draft, Mapping):
             raise RefinementAnnotationApplicationError(
@@ -1418,7 +1153,7 @@ class RefinementAnnotationApplication:
         self,
         item: ProgressAnnotationWorkItem,
         base_annotation_set: LoadedStageAnnotationSet,
-        selection: _DetailProfileSelection,
+        selection: DetailProfileSelection,
         detail_draft: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
         target = selection.target_progress_step_id
@@ -1462,7 +1197,7 @@ class RefinementAnnotationApplication:
         item: ProgressAnnotationWorkItem,
         *,
         base_annotation_set: LoadedStageAnnotationSet | None,
-        selection: _DetailProfileSelection | None,
+        selection: DetailProfileSelection | None,
         detail_annotation_set: LoadedDetailStageAnnotationSet | None,
         detail_draft: Mapping[str, Any] | None,
         reason: str | None,
@@ -1618,10 +1353,7 @@ class RefinementAnnotationApplication:
                         self._annotation_sets_cache.pop(normalized, None)
                         self._annotation_summary_cache.pop(normalized, None)
                         self._annotation_root_fingerprints.pop(normalized, None)
-                        self._detail_annotation_status_cache.pop(
-                            normalized,
-                            None,
-                        )
+                    self._detail_annotations.invalidate(normalized)
                     try:
                         detail = self._episode_detail_owned(normalized)
                     except Exception:
@@ -1634,11 +1366,8 @@ class RefinementAnnotationApplication:
                                 normalized,
                                 None,
                             )
-                            self._detail_annotation_status_cache.pop(
-                                normalized,
-                                None,
-                            )
                             self._sample_axis_cache.pop(normalized, None)
+                        self._detail_annotations.invalidate(normalized)
                         raise
 
                     if current is not None:
@@ -1657,11 +1386,8 @@ class RefinementAnnotationApplication:
                         self._annotation_sets_cache.pop(normalized, None)
                         self._annotation_summary_cache.pop(normalized, None)
                         self._annotation_root_fingerprints.pop(normalized, None)
-                        self._detail_annotation_status_cache.pop(
-                            normalized,
-                            None,
-                        )
                         self._sample_axis_cache.pop(normalized, None)
+                    self._detail_annotations.invalidate(normalized)
                 try:
                     self.workspace.release_episode(episode_uuid=normalized)
                 except StageAnnotationStoreError as release_exc:
@@ -1815,6 +1541,10 @@ class RefinementAnnotationApplication:
             draft = adjusted_draft
         latest_annotation_set = annotation_sets[-1] if annotation_sets else None
         annotation_summary = self._summarize_annotation_sets(annotation_sets)
+        # Profile files are editable configuration.  Observe changes when an
+        # operator explicitly opens an Episode, while sidebar summary batches
+        # reuse the module inventory instead of rescanning once per row.
+        self._detail_annotations.refresh_profiles()
         detail_selection, detail_profile_reason = (
             self._detail_profile_selection(item)
         )
@@ -1908,6 +1638,12 @@ class RefinementAnnotationApplication:
             "UNSEALED_DRAFT",
             "SECOND_REVIEW_UNSEALED",
         }
+        detail_status = self._detail_annotations.status(item, annotation_sets)
+        annotation_status = build_episode_status_payload(
+            annotation_summary,
+            has_draft=item.has_draft,
+            detail_state=detail_status.state,
+        )
         step_by_id = item.progress.profile.step_by_id
         return {
             **item.summary_payload(),
@@ -1921,6 +1657,7 @@ class RefinementAnnotationApplication:
             "whole_episode_abnormal_reason": (
                 annotation_summary.whole_episode_abnormal_reason
             ),
+            "annotation_status": annotation_status,
             "annotation_summary_loaded": True,
             "annotation_mode": self.annotation_mode,
             "review_label_auto_cleared": review_label_auto_cleared,
@@ -1961,10 +1698,8 @@ class RefinementAnnotationApplication:
                 detail_draft=detail_draft,
                 reason=detail_reason,
             ),
-            "detail_annotation_complete": (
-                detail_payload_selection is not None
-                and detail_annotation_set is not None
-            ),
+            "detail_annotation_complete": detail_status.complete,
+            "detail_annotation_state": detail_status.state,
             "attempts": [
                 {
                     "attempt_id": attempt.attempt_id,
@@ -2001,36 +1736,8 @@ class RefinementAnnotationApplication:
     @staticmethod
     def _summarize_annotation_sets(
         values: Sequence[LoadedStageAnnotationSet],
-    ) -> _EpisodeAnnotationSummary:
-        latest = values[-1] if values else None
-        latest_mode = None if latest is None else latest.binding.annotation_mode
-        needs_review = bool(
-            latest is not None
-            and latest.bundle.episode_review_request is not None
-        )
-        review_state = (
-            "PENDING"
-            if needs_review
-            else (
-                "COMPLETED"
-                if latest_mode == "SECOND_REVIEW"
-                else "NONE"
-            )
-        )
-        episode_abnormal = (
-            None if latest is None else latest.bundle.episode_abnormal
-        )
-        return _EpisodeAnnotationSummary(
-            annotation_set_count=len(values),
-            review_state=review_state,
-            latest_annotation_mode=latest_mode,
-            whole_episode_abnormal=episode_abnormal is not None,
-            whole_episode_abnormal_reason=(
-                None
-                if episode_abnormal is None
-                else episode_abnormal.reason_code
-            ),
-        )
+    ) -> EpisodeAnnotationSummary:
+        return summarize_annotation_sets(values)
 
     def _episode_summary(
         self,
@@ -2042,6 +1749,8 @@ class RefinementAnnotationApplication:
             annotation_summary = self._annotation_summary_cache.get(
                 item.episode_uuid
             )
+            if annotation_summary is not None:
+                self._annotation_summary_cache.move_to_end(item.episode_uuid)
         annotation_sets: tuple[LoadedStageAnnotationSet, ...] | None = None
         if annotation_summary is None and load_annotations:
             annotation_sets = self._sealed_annotation_sets(item)
@@ -2049,13 +1758,16 @@ class RefinementAnnotationApplication:
                 annotation_sets
             )
         detail_annotation_complete: bool | None = None
+        detail_annotation_state: str | None = None
         if load_annotations and annotation_summary is not None:
             if annotation_sets is None:
                 annotation_sets = self._sealed_annotation_sets(item)
-            detail_annotation_complete = self._detail_annotation_is_complete(
+            detail_status = self._detail_annotations.status(
                 item,
                 annotation_sets,
             )
+            detail_annotation_complete = detail_status.complete
+            detail_annotation_state = detail_status.state
         if annotation_summary is None:
             set_count = item.annotation_set_count
             needs_second_review = None
@@ -2087,7 +1799,13 @@ class RefinementAnnotationApplication:
                 whole_episode_abnormal_reason
             ),
             "detail_annotation_complete": detail_annotation_complete,
+            "detail_annotation_state": detail_annotation_state,
             "annotation_summary_loaded": annotation_summary is not None,
+            "annotation_status": build_episode_status_payload(
+                annotation_summary,
+                has_draft=item.has_draft,
+                detail_state=detail_annotation_state,
+            ),
         }
 
     def reopen_sealed_annotation(
@@ -2867,8 +2585,7 @@ class RefinementAnnotationApplication:
             bundle=detail_bundle,
             manifest=report.manifest,
         )
-        with self._lock:
-            self._detail_annotation_status_cache.pop(episode_uuid, None)
+        self._detail_annotations.invalidate(episode_uuid)
         self._mark_item_has_draft(episode_uuid)
         self._report_operation_progress(
             progress_callback,
@@ -3056,7 +2773,7 @@ class RefinementAnnotationApplication:
             self._annotation_sets_cache.pop(episode_uuid, None)
             self._annotation_summary_cache.pop(episode_uuid, None)
             self._annotation_root_fingerprints.pop(episode_uuid, None)
-            self._detail_annotation_status_cache.pop(episode_uuid, None)
+        self._detail_annotations.invalidate(episode_uuid)
         self._mark_item_annotation_committed(episode_uuid)
         self._report_operation_progress(
             progress_callback,
@@ -3586,6 +3303,7 @@ class RefinementAnnotationApplication:
             self._annotation_sets_cache[episode_uuid] = values
             self._annotation_sets_cache.move_to_end(episode_uuid)
             self._annotation_summary_cache[episode_uuid] = summary
+            self._annotation_summary_cache.move_to_end(episode_uuid)
             if root_fingerprint is not None:
                 self._annotation_root_fingerprints[episode_uuid] = (
                     root_fingerprint
@@ -3612,6 +3330,11 @@ class RefinementAnnotationApplication:
                     evicted_episode_uuid,
                     None,
                 )
+            while (
+                len(self._annotation_summary_cache)
+                > _ANNOTATION_SUMMARY_CACHE_LIMIT
+            ):
+                self._annotation_summary_cache.popitem(last=False)
 
     @staticmethod
     def _annotation_set_summary(
