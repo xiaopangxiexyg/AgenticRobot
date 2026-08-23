@@ -148,13 +148,28 @@ _SERIALIZED_QPOS_INIT_TARGET_SOURCES = frozenset(
         "replay_qpos_init_final_hold",
     }
 )
-_SERIALIZED_POLICY_TARGET_SOURCES = frozenset({"openpi_v22_policy"})
 _SINGULARITY_LABELS = {
     0: "normal",
     -1: "shoulder_singularity",
     -2: "elbow_singularity",
     -3: "wrist_singularity",
 }
+
+
+@dataclass(frozen=True)
+class _DeferredAccelerationTarget:
+    qpos: np.ndarray
+    source: str
+    timestamp_wall: float
+    timestamp_monotonic: float
+    sequence: int
+    reference_epoch: int | None
+    reference_sequence: int | None
+    execution_work_item: ExecutionWorkItem | None
+    policy_mode: str
+    policy_speed_scale: float
+    policy_reason: str
+
 
 # These are the absolute position limits in the canonical RM65 URDF.  They are
 # intentionally enforced again at the transport boundary: upstream IK/safety
@@ -463,9 +478,8 @@ class RM65ArmBackendConfig:
     background_streaming_target_max_age_sec: float = 0.25
     background_streaming_shutdown_timeout_sec: float = 1.0
     # Keep the backend-wide default compatible for teleop/replay callers.
-    # Policy deployment selects latest_nonblocking; sources whose planner
-    # continuity would be broken by in-flight supersession are narrowed back
-    # to serialized admission inside send_command.
+    # Policy deployment explicitly selects latest_nonblocking so a slow SDK
+    # call cannot make 60 Hz reference admission wait on the 120 Hz worker.
     background_streaming_target_admission_mode: str = (
         RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
     )
@@ -1093,6 +1107,11 @@ class RM65ArmBackend(EffectorBackend):
         self._last_background_target_admission_timing: dict[str, object] = {}
         self._stream_inflight_target_preemption_count = 0
         self._stream_last_inflight_target_preemption: dict[str, object] = {}
+        self._stream_sdk_inflight_target_sequence: int | None = None
+        self._stream_deferred_target: _DeferredAccelerationTarget | None = None
+        self._stream_deferred_target_activation_count = 0
+        self._stream_deferred_target_replacement_count = 0
+        self._stream_last_deferred_target_activation: dict[str, object] = {}
         self._stream_segment_start_qpos: np.ndarray | None = None
         self._stream_segment_start_time: float | None = None
         self._stream_segment_duration_sec = self._base_control_dt
@@ -1708,6 +1727,12 @@ class RM65ArmBackend(EffectorBackend):
         return int(self._measured_sequence)
 
     def _clear_stream_target_locked(self) -> None:
+        deferred_sequence = (
+            None
+            if self._stream_deferred_target is None
+            else int(self._stream_deferred_target.sequence)
+        )
+        self._stream_deferred_target = None
         self._stream_target_qpos = None
         self._stream_target_source = ""
         self._stream_target_timestamp = None
@@ -1719,7 +1744,13 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_execution_work_item = None
         # Invalidate a target already copied by the worker before it can enter
         # the SDK call.  This is what makes hold/close a hard send boundary.
-        self._stream_target_sequence += 1
+        self._stream_target_sequence = (
+            max(
+                int(self._stream_target_sequence),
+                -1 if deferred_sequence is None else deferred_sequence,
+            )
+            + 1
+        )
         self._stream_quick_stop_active = False
         self._stream_quick_stop_reason = ""
         self._stream_planner_policy_mode = "linear"
@@ -1823,6 +1854,91 @@ class RM65ArmBackend(EffectorBackend):
             "planner_rebased_from_zero_velocity": True,
         }
 
+    def _next_stream_target_sequence_locked(self) -> int:
+        deferred_sequence = (
+            -1
+            if self._stream_deferred_target is None
+            else int(self._stream_deferred_target.sequence)
+        )
+        return max(int(self._stream_target_sequence), deferred_sequence) + 1
+
+    def _activate_deferred_acceleration_target_locked(
+        self,
+        *,
+        accepted_qpos: np.ndarray,
+        activated_monotonic_time: float,
+        completed_target_sequence: int,
+    ) -> bool:
+        deferred = self._stream_deferred_target
+        if deferred is None:
+            return False
+        if not isinstance(
+            self._stream_planner,
+            AccelerationLimitedJointTrajectoryPlanner,
+        ):
+            raise TypeError(
+                "deferred target activation requires the acceleration-limited planner"
+            )
+        anchor = np.asarray(accepted_qpos, dtype=float).reshape(6).copy()
+        activated = float(activated_monotonic_time)
+        planner_before = self._stream_planner.snapshot()
+        qd_before = np.asarray(
+            planner_before["qd_command_rad_s"],
+            dtype=float,
+        ).reshape(6)
+        self._stream_planner.accept_target(
+            deferred.qpos,
+            sequence=int(deferred.sequence),
+            published_monotonic_time=float(deferred.timestamp_monotonic),
+            monotonic_time=activated,
+            speed_scale=float(deferred.policy_speed_scale),
+            mode=str(deferred.policy_mode),
+            reason=str(deferred.policy_reason),
+            anchor_q_command=anchor,
+        )
+        planner_after = self._stream_planner.snapshot()
+        qd_after = np.asarray(
+            planner_after["qd_command_rad_s"],
+            dtype=float,
+        ).reshape(6)
+        self._stream_deferred_target = None
+        self._stream_target_sequence = int(deferred.sequence)
+        self._stream_target_qpos = deferred.qpos.copy()
+        self._stream_target_source = str(deferred.source)
+        self._stream_target_timestamp = float(deferred.timestamp_wall)
+        self._stream_target_monotonic = float(deferred.timestamp_monotonic)
+        self._stream_segment_start_qpos = anchor
+        self._stream_segment_start_time = activated
+        self._stream_segment_duration_sec = float(
+            self.config.position_velocity_ramp_sec
+        )
+        self._stream_reference_epoch = deferred.reference_epoch
+        self._stream_reference_sequence = deferred.reference_sequence
+        self._stream_execution_work_item = deferred.execution_work_item
+        self._stream_quick_stop_active = False
+        self._stream_quick_stop_reason = ""
+        self._stream_planner_policy_mode = str(deferred.policy_mode)
+        self._stream_planner_policy_speed_scale = float(
+            deferred.policy_speed_scale
+        )
+        self._stream_planner_policy_reason = str(deferred.policy_reason)
+        velocity_preserved = bool(
+            np.allclose(qd_after, qd_before, rtol=0.0, atol=1e-12)
+        )
+        self._stream_deferred_target_activation_count += 1
+        self._stream_last_deferred_target_activation = {
+            "completed_target_sequence": int(completed_target_sequence),
+            "activated_target_sequence": int(deferred.sequence),
+            "activated_monotonic_time": activated,
+            "planner_velocity_preserved": velocity_preserved,
+            "planner_rebased_from_zero_velocity": False,
+        }
+        if not velocity_preserved:
+            raise RuntimeError(
+                "deferred target activation changed committed planner velocity"
+            )
+        return True
+
     def _activate_stream_quick_stop_locked(
         self,
         *,
@@ -1853,7 +1969,19 @@ class RM65ArmBackend(EffectorBackend):
             atol=1e-10,
         ):
             self._stream_planner.reset(anchor, monotonic_time=float(monotonic_time))
-        target_sequence = int(self._stream_target_sequence + 1)
+        deferred_sequence = (
+            None
+            if self._stream_deferred_target is None
+            else int(self._stream_deferred_target.sequence)
+        )
+        self._stream_deferred_target = None
+        target_sequence = (
+            max(
+                int(self._stream_target_sequence),
+                -1 if deferred_sequence is None else deferred_sequence,
+            )
+            + 1
+        )
         self._stream_planner.quick_stop(
             sequence=target_sequence,
             monotonic_time=float(monotonic_time),
@@ -1893,6 +2021,7 @@ class RM65ArmBackend(EffectorBackend):
             self._stream_fault_monotonic = monotonic_time
             self._stream_fault_count += 1
             self._clear_stream_target_locked()
+            self._stream_sdk_inflight_target_sequence = None
         self._stream_stop_event.set()
 
     def _attempt_background_fault_stop(self) -> None:
@@ -4164,25 +4293,6 @@ class RM65ArmBackend(EffectorBackend):
             elif (
                 target_admission_mode
                 == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
-                and command_source in _SERIALIZED_POLICY_TARGET_SOURCES
-            ):
-                # The OpenPI reference loop publishes at 60 Hz while this
-                # worker streams the acceleration-limited trajectory at
-                # 120 Hz.  Superseding an SDK call already in flight forces
-                # the conservative completion rebase to restart from zero
-                # velocity.  Serialize only this policy source so each new
-                # reference is admitted after the physical application order
-                # is known; teleop and other latest-target callers retain the
-                # non-blocking admission contract.
-                effective_target_admission_mode = (
-                    RM65_BACKGROUND_TARGET_ADMISSION_SYNCHRONOUS_LOCK
-                )
-                target_admission_fallback_reason = (
-                    "openpi_policy_requires_serialized_velocity_continuity"
-                )
-            elif (
-                target_admission_mode
-                == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
                 and not isinstance(
                     self._stream_planner,
                     AccelerationLimitedJointTrajectoryPlanner,
@@ -4227,11 +4337,24 @@ class RM65ArmBackend(EffectorBackend):
                     # while the solver was running.
                     transport_target_wall_time = time.time()
                     transport_target_monotonic = time.monotonic()
-                    transport_target_sequence = int(self._stream_target_sequence + 1)
+                    transport_target_sequence = (
+                        self._next_stream_target_sequence_locked()
+                    )
+                    sdk_inflight_target_sequence_at_admission = (
+                        self._stream_sdk_inflight_target_sequence
+                    )
                     backend_execution_work = _derive_backend_execution_work_item(
                         upstream_execution_work,
                         side=str(self.config.side),
                         target_sequence=transport_target_sequence,
+                    )
+                    reference_epoch = _metadata_non_negative_int(
+                        command.metadata,
+                        "position_reference_epoch",
+                    )
+                    reference_sequence = _metadata_non_negative_int(
+                        command.metadata,
+                        "position_reference_sequence",
                     )
                     if (
                         isinstance(
@@ -4295,6 +4418,7 @@ class RM65ArmBackend(EffectorBackend):
                             source=command_source,
                         )
                     sample_aligned_bucket_held = False
+                    target_activation_deferred = False
                     if trajectory_policy is not None and trajectory_policy.quick_stop:
                         transport_target_sequence = self._activate_stream_quick_stop_locked(
                             reason=trajectory_policy.reason,
@@ -4375,40 +4499,86 @@ class RM65ArmBackend(EffectorBackend):
                         self._stream_planner_policy_reason = "normal"
                     else:
                         assert trajectory_policy is not None
-                        self._stream_planner.accept_target(
-                            qpos_target,
-                            sequence=transport_target_sequence,
-                            published_monotonic_time=transport_target_monotonic,
-                            monotonic_time=transport_target_monotonic,
-                            speed_scale=trajectory_policy.speed_scale,
-                            mode=trajectory_policy.mode,
-                            reason=trajectory_policy.reason,
-                            anchor_q_command=segment_start_qpos,
+                        target_activation_deferred = bool(
+                            effective_target_admission_mode
+                            == RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING
+                            and sdk_inflight_target_sequence_at_admission
+                            is not None
                         )
-                        self._stream_target_sequence = transport_target_sequence
-                        self._stream_target_qpos = qpos_target.copy()
-                        self._stream_target_source = command_source
-                        self._stream_target_timestamp = transport_target_wall_time
-                        self._stream_target_monotonic = transport_target_monotonic
-                        self._stream_segment_start_qpos = segment_start_qpos
-                        self._stream_segment_start_time = transport_target_monotonic
-                        self._stream_segment_duration_sec = float(
-                            self.config.position_velocity_ramp_sec
-                        )
-                        self._stream_quick_stop_active = False
-                        self._stream_quick_stop_reason = ""
-                        self._stream_planner_policy_mode = trajectory_policy.mode
-                        self._stream_planner_policy_speed_scale = trajectory_policy.speed_scale
-                        self._stream_planner_policy_reason = trajectory_policy.reason
-                    if not sample_aligned_bucket_held:
-                        self._stream_reference_epoch = _metadata_non_negative_int(
-                            command.metadata,
-                            "position_reference_epoch",
-                        )
-                        self._stream_reference_sequence = _metadata_non_negative_int(
-                            command.metadata,
-                            "position_reference_sequence",
-                        )
+                        if target_activation_deferred:
+                            if self._stream_deferred_target is not None:
+                                self._stream_deferred_target_replacement_count += 1
+                            self._stream_deferred_target = (
+                                _DeferredAccelerationTarget(
+                                    qpos=qpos_target.copy(),
+                                    source=str(command_source),
+                                    timestamp_wall=float(
+                                        transport_target_wall_time
+                                    ),
+                                    timestamp_monotonic=float(
+                                        transport_target_monotonic
+                                    ),
+                                    sequence=int(transport_target_sequence),
+                                    reference_epoch=reference_epoch,
+                                    reference_sequence=reference_sequence,
+                                    execution_work_item=backend_execution_work,
+                                    policy_mode=str(trajectory_policy.mode),
+                                    policy_speed_scale=float(
+                                        trajectory_policy.speed_scale
+                                    ),
+                                    policy_reason=str(trajectory_policy.reason),
+                                )
+                            )
+                        else:
+                            self._stream_planner.accept_target(
+                                qpos_target,
+                                sequence=transport_target_sequence,
+                                published_monotonic_time=(
+                                    transport_target_monotonic
+                                ),
+                                monotonic_time=transport_target_monotonic,
+                                speed_scale=trajectory_policy.speed_scale,
+                                mode=trajectory_policy.mode,
+                                reason=trajectory_policy.reason,
+                                anchor_q_command=segment_start_qpos,
+                            )
+                            self._stream_target_sequence = (
+                                transport_target_sequence
+                            )
+                            self._stream_target_qpos = qpos_target.copy()
+                            self._stream_target_source = command_source
+                            self._stream_target_timestamp = (
+                                transport_target_wall_time
+                            )
+                            self._stream_target_monotonic = (
+                                transport_target_monotonic
+                            )
+                            self._stream_segment_start_qpos = (
+                                segment_start_qpos
+                            )
+                            self._stream_segment_start_time = (
+                                transport_target_monotonic
+                            )
+                            self._stream_segment_duration_sec = float(
+                                self.config.position_velocity_ramp_sec
+                            )
+                            self._stream_quick_stop_active = False
+                            self._stream_quick_stop_reason = ""
+                            self._stream_planner_policy_mode = (
+                                trajectory_policy.mode
+                            )
+                            self._stream_planner_policy_speed_scale = (
+                                trajectory_policy.speed_scale
+                            )
+                            self._stream_planner_policy_reason = (
+                                trajectory_policy.reason
+                            )
+                    if (
+                        not sample_aligned_bucket_held
+                        and not target_activation_deferred
+                    ):
+                        self._stream_reference_epoch = reference_epoch
+                        self._stream_reference_sequence = reference_sequence
                         self._stream_execution_work_item = backend_execution_work
                     command.metadata.update(
                         {
@@ -4419,6 +4589,9 @@ class RM65ArmBackend(EffectorBackend):
                             "position_transport_planner": self._stream_planner_mode,
                             "position_transport_sample_aligned_bucket_held": bool(
                                 sample_aligned_bucket_held
+                            ),
+                            "position_transport_target_activation_deferred": bool(
+                                target_activation_deferred
                             ),
                         }
                     )
@@ -4445,6 +4618,12 @@ class RM65ArmBackend(EffectorBackend):
                 ),
                 "transport_target_sequence": int(transport_target_sequence),
                 "sample_aligned_bucket_held": bool(sample_aligned_bucket_held),
+                "target_activation_deferred": bool(target_activation_deferred),
+                "sdk_inflight_target_sequence": (
+                    None
+                    if sdk_inflight_target_sequence_at_admission is None
+                    else int(sdk_inflight_target_sequence_at_admission)
+                ),
             }
             post_admission_metadata_started = time.perf_counter()
             singularity_timing = _metadata_mapping(
@@ -5136,6 +5315,26 @@ class RM65ArmBackend(EffectorBackend):
             "last_inflight_target_preemption": dict(
                 self._stream_last_inflight_target_preemption
             ),
+            "sdk_inflight_target_sequence": (
+                None
+                if self._stream_sdk_inflight_target_sequence is None
+                else int(self._stream_sdk_inflight_target_sequence)
+            ),
+            "deferred_target_pending": self._stream_deferred_target is not None,
+            "deferred_target_sequence": (
+                None
+                if self._stream_deferred_target is None
+                else int(self._stream_deferred_target.sequence)
+            ),
+            "deferred_target_activation_count": int(
+                self._stream_deferred_target_activation_count
+            ),
+            "deferred_target_replacement_count": int(
+                self._stream_deferred_target_replacement_count
+            ),
+            "last_deferred_target_activation": dict(
+                self._stream_last_deferred_target_activation
+            ),
             "warning_threshold_hz": target_hz * warning_ratio,
             "warning_ratio": warning_ratio,
             "thread_alive": thread_alive,
@@ -5736,6 +5935,11 @@ class RM65ArmBackend(EffectorBackend):
                                     self._last_old_epoch_invocation_started_at = (
                                         sdk_attempt_monotonic_time
                                     )
+                                    self._stream_sdk_inflight_target_sequence = (
+                                        None
+                                        if target_sequence is None
+                                        else int(target_sequence)
+                                    )
                                     sdk_attempted = True
                         if sdk_attempted:
                             call_started = time.monotonic()
@@ -5797,6 +6001,7 @@ class RM65ArmBackend(EffectorBackend):
                                                     target_sequence
                                                 ),
                                             )
+                                            self._stream_deferred_target = None
                                         else:
                                             self._stream_planner.commit(
                                                 trajectory_proposal,
@@ -5806,12 +6011,29 @@ class RM65ArmBackend(EffectorBackend):
                                                     follow_smoothing_applied
                                                 ),
                                             )
+                                            self._activate_deferred_acceleration_target_locked(
+                                                accepted_qpos=next_qpos,
+                                                activated_monotonic_time=(
+                                                    call_finished
+                                                ),
+                                                completed_target_sequence=int(
+                                                    target_sequence
+                                                ),
+                                            )
                                     accepted_sequence = self._record_command_accepted_locked(
                                         next_qpos,
                                         timestamp=time.time(),
                                         monotonic_time=call_finished,
                                     )
                                     self._last_send_time = wakeup_wall_time
+                                elif self._stream_deferred_target is not None:
+                                    # A failed SDK call provides no accepted
+                                    # qcmd anchor on which a deferred reference
+                                    # can be safely activated. The worker fault
+                                    # path will hold/stop before accepting more
+                                    # motion.
+                                    self._stream_deferred_target = None
+                                self._stream_sdk_inflight_target_sequence = None
                 else:
                     transport_block_reason = "arm_not_connected"
 
