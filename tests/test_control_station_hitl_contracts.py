@@ -8,7 +8,18 @@ from control_station.hitl import (
     EXCLUSIVE_HITL_POLICY_TO_HUMAN,
     ExclusiveHITLTransitionObservation,
     ExclusiveHITLTransitionPort,
+    ExclusiveHITLSourceIntent,
+    ExclusiveHITLTransitionState,
+    HITL_SWITCH_WAITING_HUMAN_HOME,
+    HITL_SWITCH_WAITING_POLICY_EMISSION,
+    HITL_SWITCH_WAITING_TARGET_DISPATCH,
+    begin_exclusive_hitl_transition,
     build_hitl_activation_prime_evidence,
+    complete_exclusive_hitl_transition,
+    observe_exclusive_hitl_hold,
+    observe_exclusive_hitl_human_home,
+    observe_exclusive_hitl_policy_emission,
+    observe_exclusive_hitl_policy_reset,
     run_exclusive_hitl_switch_transaction,
     run_exclusive_hitl_switch_via_port,
 )
@@ -184,3 +195,76 @@ def test_exclusive_switch_port_is_backend_neutral_and_preserves_evidence() -> No
     assert result == {"backend": "opaque"}
     assert evidence.status == "ready"
     assert evidence.home_capture["anchors"]["component-x"] == "opaque"
+
+
+def _intent(source: str, *, sequence: int = 0) -> ExclusiveHITLSourceIntent:
+    return ExclusiveHITLSourceIntent(
+        requested_source=source,
+        requested_at=50.0 + sequence,
+        clock_domain_id="test.monotonic",
+        input_source="terminal",
+        input_event="key:u" if source == "human" else "key:i",
+        sequence=sequence,
+    )
+
+
+def test_nonblocking_policy_to_human_requires_hold_then_fresh_home_then_dispatch() -> None:
+    state = begin_exclusive_hitl_transition(
+        ExclusiveHITLTransitionState(active_source="policy"),
+        _intent("human"),
+    )
+    state = observe_exclusive_hitl_hold(
+        state,
+        established_at=50.1,
+        evidence_refs=("rig-hold:50",),
+    )
+    assert state.phase == HITL_SWITCH_WAITING_HUMAN_HOME
+
+    with pytest.raises(ValueError, match="fresh"):
+        observe_exclusive_hitl_human_home(
+            state,
+            home_capture_id="home:old",
+            home_capture_hash="home-hash:old",
+            captured_at=50.0,
+        )
+
+    state = observe_exclusive_hitl_human_home(
+        state,
+        home_capture_id="home:51",
+        home_capture_hash="home-hash:51",
+        captured_at=50.2,
+    )
+    assert state.phase == HITL_SWITCH_WAITING_TARGET_DISPATCH
+    state = complete_exclusive_hitl_transition(state)
+    assert state.active_source == "human"
+    assert state.phase == "idle"
+
+
+def test_nonblocking_human_to_policy_rejects_pre_reset_emission() -> None:
+    state = begin_exclusive_hitl_transition(
+        ExclusiveHITLTransitionState(active_source="human"),
+        _intent("policy", sequence=1),
+    )
+    state = observe_exclusive_hitl_hold(
+        state,
+        established_at=51.1,
+        evidence_refs=("rig-hold:51",),
+    )
+    state = observe_exclusive_hitl_policy_reset(state, reset_at=51.2)
+    assert state.phase == HITL_SWITCH_WAITING_POLICY_EMISSION
+
+    with pytest.raises(ValueError, match="fresh"):
+        observe_exclusive_hitl_policy_emission(
+            state,
+            emission_id="emission:old",
+            emission_hash="emission-hash:old",
+            emitted_at=51.19,
+        )
+
+    state = observe_exclusive_hitl_policy_emission(
+        state,
+        emission_id="emission:new",
+        emission_hash="emission-hash:new",
+        emitted_at=51.3,
+    )
+    assert state.phase == HITL_SWITCH_WAITING_TARGET_DISPATCH

@@ -142,6 +142,11 @@ class TeleopSession:
             TeleopCommandOverride | TeleopCommand | None,
         ]
         | None = None,
+        human_command_selection_provider: Callable[
+            [TeleopObservation, TeleopCommand, float],
+            TeleopCommandOverride | None,
+        ]
+        | None = None,
         fault_filter: Callable[
             [Sequence[FaultEvent], dict[str, ObservationChannel], float], Sequence[FaultEvent]
         ]
@@ -166,6 +171,7 @@ class TeleopSession:
         self.command_guard = command_guard
         self.command_dispatch_admission = command_dispatch_admission
         self.command_override_provider = command_override_provider
+        self.human_command_selection_provider = human_command_selection_provider
         self.fault_filter = fault_filter
         self.human_command_observer = human_command_observer
         self.human_command_filter_observer = human_command_filter_observer
@@ -287,6 +293,37 @@ class TeleopSession:
             self.recorder.record_fault(fault)
         reason = f"pre-dispatch command override failed: {fault.message}"
         held = self._hold_rig_motion(reason, context="command override provider")
+        self.fault(reason if held else f"{reason}; hold_motion failed")
+        return fault
+
+    def _reject_human_command_selection_provider_error(
+        self,
+        error: BaseException,
+        *,
+        timestamp: float,
+    ) -> FaultEvent:
+        """Fail closed when exclusive source selection cannot answer.
+
+        Selection runs after the Human candidate has been built, but before
+        command filtering, canonical safety, recording, or dispatch.  A
+        selector failure therefore cannot silently fall back to Human in the
+        failing frame.
+        """
+
+        fault = FaultEvent(
+            code="human_command_selection_provider_error",
+            message=(
+                "human command selection provider raised "
+                f"{type(error).__name__}: {error}"
+            ),
+            severity=FaultSeverity.ERROR,
+            timestamp=float(timestamp),
+            component="teleop_session",
+        )
+        if self.recorder is not None:
+            self.recorder.record_fault(fault)
+        reason = f"pre-dispatch exclusive source selection failed: {fault.message}"
+        held = self._hold_rig_motion(reason, context="human command selection provider")
         self.fault(reason if held else f"{reason}; hold_motion failed")
         return fault
 
@@ -1122,6 +1159,60 @@ class TeleopSession:
                 phase_recorder=phase_recorder,
             )
             mark_phase("session.build_command")
+            if self.human_command_selection_provider is not None:
+                try:
+                    selection = self.human_command_selection_provider(
+                        observation,
+                        command,
+                        current_time,
+                    )
+                    if selection is not None and not isinstance(
+                        selection,
+                        TeleopCommandOverride,
+                    ):
+                        raise TypeError(
+                            "human_command_selection_provider must return "
+                            "TeleopCommandOverride or None."
+                        )
+                    if selection is not None:
+                        # An explicit selection claim means that the Human
+                        # candidate was not selected.  Clear the observe-only
+                        # Human execution carrier before all downstream hooks.
+                        self._current_human_command_emission = None
+                        command = selection.command
+                except Exception as exc:  # noqa: BLE001 - selection must fail closed.
+                    fault = self._reject_human_command_selection_provider_error(
+                        exc,
+                        timestamp=current_time,
+                    )
+                    faults.append(fault)
+                    mark_phase("session.human_command_selection_provider_fault")
+                    return self._step_result(
+                        timestamp=current_time,
+                        state=self.state_machine.state,
+                        control_hz=control_hz,
+                        channels=channels,
+                        raw_channels=raw_channels,
+                        observation=observation,
+                        faults=faults,
+                    )
+                mark_phase("session.human_command_selection_provider")
+                if command is None:
+                    mark_phase("session.human_command_selection_inhibited")
+                    return self._step_result(
+                        timestamp=current_time,
+                        state=self.state_machine.state,
+                        control_hz=control_hz,
+                        channels=channels,
+                        raw_channels=raw_channels,
+                        observation=observation,
+                        faults=faults,
+                    )
+                command = self._copy_command(command)
+                if command.timestamp is None:
+                    command.timestamp = observation.timestamp
+                command.metadata.setdefault("tcp_mode", self.config.tcp_mode)
+                mark_phase("session.copy_selected_command")
         else:
             command = self._copy_command(command)
             if command.timestamp is None:

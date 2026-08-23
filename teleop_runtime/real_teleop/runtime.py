@@ -585,8 +585,15 @@ def run_real_teleop(
             ),
         )
     )
+    terminal_factory = getattr(
+        args,
+        "_real_teleop_terminal_factory",
+        TerminalClutchInput,
+    )
+    if not callable(terminal_factory):
+        raise TypeError("_real_teleop_terminal_factory must be callable.")
     clutch_input = RealTeleopControlInput(
-        terminal=TerminalClutchInput(components.keyboard_source),
+        terminal=terminal_factory(components.keyboard_source),
         ui=control_ui,
         args=args,
         components=components,
@@ -2468,6 +2475,19 @@ def run_real_teleop(
             return camera_previewer, bool(camera_preview_active), tactile_visualizer
 
         if runtime_extension is not None:
+            bind_extension_runtime = getattr(runtime_extension, "bind_runtime", None)
+            if callable(bind_extension_runtime):
+                bind_extension_runtime(
+                    components=components,
+                    clutch_input=clutch_input,
+                    camera_sources=camera_sources,
+                    dataset_recorder=current_dataset_recorder(),
+                    dataset_recorder_provider=current_dataset_recorder,
+                    episode_recorder=episode_recorder,
+                    control_ui=control_ui,
+                    recording_active=recording_active,
+                    pause_recording=pause_recording,
+                )
             start_extension = getattr(runtime_extension, "start", None)
             if not callable(start_extension):
                 raise TypeError("runtime_extension lacks start().")
@@ -2542,6 +2562,7 @@ def run_real_teleop(
                 set_episode_last_state=set_current_episode_last_state,
                 step_index=current_step_index,
                 set_step_index=set_current_step_index,
+                runtime_extension=runtime_extension,
             )
         )
     finally:

@@ -338,6 +338,7 @@ class RealTeleopControlInput:
         # quit request. Preserve every other event so profile selection and
         # the common GUI/pedal contract are observed by the normal poll path.
         self._deferred_ui_events: deque[str] = deque()
+        self._hitl_source_requests: deque[str] = deque()
         self._progress_operator_intent_sequence = 0
         self._progress_ui_transport_revision = 0
         self._progress_ui_payload: dict[str, object] = {"enabled": False}
@@ -1185,6 +1186,16 @@ class RealTeleopControlInput:
         self._poll_two_pedal_alert_timeout(now=current_time)
         self._poll_tracker_side_request_timeout(now=current_time)
         self.terminal.poll()
+        consume_hitl_requests = getattr(
+            self.terminal,
+            "consume_hitl_source_requests",
+            None,
+        )
+        if callable(consume_hitl_requests) and not self.terminal.should_quit:
+            for requested_source in consume_hitl_requests():
+                source = str(requested_source).strip().lower()
+                if source in {"human", "policy"}:
+                    self._hitl_source_requests.append(source)
         foot_pad_state_published = False
         deferred_ui_events = list(getattr(self, "_deferred_ui_events", ()))
         if deferred_ui_events:
@@ -3408,6 +3419,23 @@ class RealTeleopControlInput:
                     gripper_control_enabled=False,
                 )
         return requested
+
+    def consume_hitl_source_requests(self) -> tuple[str, ...]:
+        requests = tuple(self._hitl_source_requests)
+        self._hitl_source_requests.clear()
+        return requests
+
+    def request_runtime_home_for_hitl(self) -> bool:
+        """Queue the established guarded runtime-Home flow from HITL HOLD."""
+
+        if not self._teleop_started or not self._hold_active:
+            return False
+        self._request_calibration_with_tracker_side_guard(source="hitl")
+        return bool(
+            self._calibration_requested
+            or self._tracker_side_request_pending
+            or self._tracker_side_confirmation_pending
+        )
 
     def consume_two_pedal_fast_home_target(
         self,

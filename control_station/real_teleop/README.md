@@ -43,6 +43,54 @@ The first real-robot gate remains LINEAR-only. The selector is intentionally
 capable of displaying explicit next-step choices, but RealTeleop must continue
 to reject rooted-tree profiles until the branch workflow has its own gate.
 
+## Default-off exclusive HITL collection
+
+The canonical RealTeleop entrypoint has an additive, default-off exclusive
+Human/Policy profile behind `--hitl-policy-control`. It does not enable two
+sources at once: every control cut selects exactly one complete source action.
+The selected Policy action is identity-composed through the backend-neutral
+`control_composition` contract; the existing Human candidate is preserved
+directly. Both then follow the existing Session command filter, guard,
+admission, Rig dispatch, and recorder path.
+
+Normal policy inference reuses the existing OpenPI artifact/client and the
+formal collector's causal arm/hand pollers and camera buffers. It performs no
+extra synchronous hardware read. A policy queue gap emits explicit no-command
+and never falls back to the sampled Human command. Normal mode therefore
+requires formal collection, the resolved pose-frame contract, and an existing
+prepared policy artifact:
+
+```bash
+python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui \
+  --hitl-policy-control \
+  --hitl-policy-mode normal \
+  --hitl-policy-artifact-json /path/to/policy_artifact.json
+```
+
+The terminal keys are additive: `u` requests Human takeover and `i` requests
+Policy return. They may be changed with `--hitl-takeover-key` and
+`--hitl-policy-resume-key`; established RealTeleop keys cannot be reused.
+
+- Policy to Human pauses the open capture segment, requests the ordinary lower
+  Hold, performs the existing guarded runtime Home flow, selects Human, and
+  completes only after the first Human command is safely dispatched.
+- Human to Policy pauses capture, establishes lower Hold, resets the policy
+  source, waits for a fresh post-reset `PolicyActionEmission`, selects Policy,
+  and completes only after the first Policy command is safely dispatched.
+- Capture resumes through the existing consecutive-stable-frame rule, so rows
+  never bridge the Hold/Home/reset transition window.
+- A source error or failed transition keeps the Session held and capture
+  paused; it never restores the other source implicitly.
+
+RTC uses the same committed `PolicyActionEmission` consumer seam and bounded
+application inbox, but the repository's current RTC application profiles are
+still explicitly no-action. Selecting RTC Policy therefore validates the
+post-reset committed emission and then fails held; it cannot be upgraded to a
+real motion command by this profile. This preserves the current RTC landing
+contract: producer commit is not downstream target/safety/reference/dispatch
+authorization. The RTC inbox is an application binding, not a second policy
+worker or a new CLI transport owner.
+
 ## Attach-only Agent observation
 
 The top-level
