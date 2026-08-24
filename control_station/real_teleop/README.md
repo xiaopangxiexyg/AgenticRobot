@@ -67,6 +67,47 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop --gui \
   --hitl-policy-artifact-json /path/to/policy_artifact.json
 ```
 
+Before a deployment session, the dedicated launcher can perform the same
+policy-artifact and HITL dataset-contract admission as a read-only offline
+check. It requires an explicit dataset base root, task name, and task id so a
+machine-local default cannot silently select the capture target:
+
+```bash
+python -m teleop_runtime.real_teleop.hitl_launch -- \
+  --gui \
+  --hitl-policy-control \
+  --hitl-policy-mode normal \
+  --hitl-policy-artifact-json /path/to/policy_artifact.json \
+  --dataset-root /path/to/formal-datasets \
+  --collection-task-name "Write Words" \
+  --collection-task-id write_words_v1
+```
+
+The default command only reads local contracts, the artifact sidecar, and
+existing dataset metadata. Its JSON report records the resolved target,
+immutable HITL contract, policy preflight, and every resource class left
+unopened. It does not contact the policy endpoint, open cameras or teleop
+devices, construct a writer, or command a robot. After reviewing that report,
+normal mode may be handed to the canonical RealTeleop entrypoint with the
+separate launcher option `--execute` placed before the `--` separator:
+
+```bash
+python -m teleop_runtime.real_teleop.hitl_launch --execute -- \
+  --gui \
+  --hitl-policy-control \
+  --hitl-policy-mode normal \
+  --hitl-policy-artifact-json /path/to/policy_artifact.json \
+  --dataset-root /path/to/formal-datasets \
+  --collection-task-name "Write Words" \
+  --collection-task-id write_words_v1
+```
+
+`--execute` is a real-process handoff, not a dry run: the canonical entrypoint
+retains all existing device, safety, calibration, operator-supervision, and
+motion gates. The offline report does not establish policy-service
+reachability, hardware readiness, safe motion, or downstream dataset
+publication readiness.
+
 The terminal keys are additive: `u` requests Human takeover and `i` requests
 Policy return. They may be changed with `--hitl-takeover-key` and
 `--hitl-policy-resume-key`; established RealTeleop keys cannot be reused.
@@ -90,6 +131,12 @@ real motion command by this profile. This preserves the current RTC landing
 contract: producer commit is not downstream target/safety/reference/dispatch
 authorization. The RTC inbox is an application binding, not a second policy
 worker or a new CLI transport owner.
+
+RTC may use the launcher for dataset-contract inspection by replacing
+`--hitl-policy-mode normal` with `rtc` and omitting the artifact option. The
+report remains `rtc_no_action`; `--execute` is rejected because no external
+committed-emission producer or RTC Active authorization is bound at this
+entrypoint.
 
 ## Attach-only Agent observation
 
