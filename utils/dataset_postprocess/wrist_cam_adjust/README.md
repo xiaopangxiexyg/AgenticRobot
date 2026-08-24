@@ -288,6 +288,23 @@ receipt 位于：
 <workspace>/receipts/stage1_final_masks/summary.json
 ```
 
+当 final root 位于 CIFS/NAS 时，可以把需要被 FFmpeg 复读的 table-geometry 与
+postprocessed 中间层固定到本机文件系统，final 与 receipt 仍写入全新的 NAS workspace：
+
+```bash
+python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline \
+  --profile <profile.json> \
+  --binding-root <binding-root> \
+  --urdf <pinned-urdf> \
+  --workspace-root <fresh-final-and-receipt-workspace> \
+  --intermediate-workspace-root <fresh-local-intermediate-workspace> \
+  --jobs 4
+```
+
+该选项不改变 mask 语义、source/episode 选择或 final 布局，只分离中间层存储。
+中间层必须保留到 full verify-only 完成；不得用它绕过 decoder warning 或 strict-media
+失败。
+
 两帧管线 smoke 必须使用独立 workspace，不能写入正式 final-mask root：
 
 ```bash

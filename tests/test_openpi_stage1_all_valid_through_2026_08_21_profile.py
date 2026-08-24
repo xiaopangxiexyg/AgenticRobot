@@ -33,6 +33,7 @@ from utils.dataset_postprocess.wrist_cam_adjust.geometry_mask.dataset import (
 )
 from utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline import (
     _intrinsics_overlay_for_source,
+    _resolve_pipeline_derived_roots,
 )
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
@@ -117,7 +118,7 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
         "source_dataset_id_partitioned_v1"
     )
     assert Path(profile["openpi_final_mask_root"]) == (
-        run_root / "workspace/derived/final_keep_masks"
+        run_root / "workspace-mask-retry2/derived/final_keep_masks"
     )
     assert Path(profile["openpi_assets_base_dir"]) == (
         run_root / "artifacts/assets"
@@ -127,7 +128,7 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-final8/AgenticRobot/model/openpi"
+        / "code-final9/AgenticRobot/model/openpi"
     )
     assert profile["openpi_source_revision"] == (
         "97b3720515b18e94697573ba55caa6c1bc28af69"
@@ -331,6 +332,25 @@ def test_openpi_checkout_activation_rejects_client_contract_drift(
                 ).hexdigest(),
             }
         )
+
+
+def test_stage1_mask_pipeline_can_separate_local_intermediates(
+    tmp_path: Path,
+) -> None:
+    configured_final = tmp_path / "configured/derived/final_keep_masks"
+    final_workspace = tmp_path / "final-workspace"
+    intermediate_workspace = tmp_path / "local-intermediates"
+
+    final_derived, intermediate_derived = _resolve_pipeline_derived_roots(
+        configured_final_root=configured_final,
+        workspace_root=final_workspace,
+        intermediate_workspace_root=intermediate_workspace,
+    )
+
+    assert final_derived == (final_workspace / "derived").resolve()
+    assert intermediate_derived == (
+        intermediate_workspace / "derived"
+    ).resolve()
 
 
 def test_source_partitioned_final_masks_bind_before_pipeline_open(

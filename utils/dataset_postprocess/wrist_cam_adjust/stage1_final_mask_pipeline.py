@@ -432,12 +432,35 @@ def _source_receipt(
     }
 
 
+def _resolve_pipeline_derived_roots(
+    *,
+    configured_final_root: Path,
+    workspace_root: Path | None,
+    intermediate_workspace_root: Path | None,
+) -> tuple[Path, Path]:
+    final_derived_root = (
+        configured_final_root.parent
+        if workspace_root is None
+        else workspace_root.expanduser().resolve() / "derived"
+    )
+    final_base = final_derived_root / "final_keep_masks"
+    if workspace_root is None and final_base != configured_final_root:
+        raise ValueError("profile final-mask path is not under one derived root")
+    intermediate_derived_root = (
+        final_derived_root
+        if intermediate_workspace_root is None
+        else intermediate_workspace_root.expanduser().resolve() / "derived"
+    )
+    return final_derived_root, intermediate_derived_root
+
+
 def run_pipeline(
     *,
     profile_path: Path,
     binding_root: Path,
     urdf_path: Path,
     workspace_root: Path | None,
+    intermediate_workspace_root: Path | None = None,
     source_ids: Sequence[str],
     jobs: int,
     max_frames: int,
@@ -466,18 +489,16 @@ def run_pipeline(
     ]
 
     configured_final_root = Path(str(profile["openpi_final_mask_root"])).resolve()
-    derived_root = (
-        configured_final_root.parent
-        if workspace_root is None
-        else workspace_root.expanduser().resolve() / "derived"
+    derived_root, intermediate_derived_root = _resolve_pipeline_derived_roots(
+        configured_final_root=configured_final_root,
+        workspace_root=workspace_root,
+        intermediate_workspace_root=intermediate_workspace_root,
     )
     final_base = derived_root / "final_keep_masks"
-    if workspace_root is None and final_base != configured_final_root:
-        raise ValueError("profile final-mask path is not under one derived root")
-    table_base = derived_root / "table_geometry_keep_masks"
-    post_base = derived_root / "postprocessed_depth_keep_masks"
+    table_base = intermediate_derived_root / "table_geometry_keep_masks"
+    post_base = intermediate_derived_root / "postprocessed_depth_keep_masks"
     receipt_base = derived_root.parent / "receipts" / "stage1_final_masks"
-    overlay_base = derived_root / "calibration_overlays"
+    overlay_base = intermediate_derived_root / "calibration_overlays"
 
     summaries: list[dict[str, Any]] = []
     for source_id in run_sources:
@@ -621,6 +642,7 @@ def run_pipeline(
         "binding_root": str(binding_root),
         "binding_hash": binding.binding_hash,
         "workspace_derived_root": str(derived_root),
+        "intermediate_workspace_derived_root": str(intermediate_derived_root),
         "source_count": len(summaries),
         "eligible_episode_count": sum(
             int(item["final"]["episode_count"]) for item in summaries
@@ -646,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--binding-root", required=True, type=Path)
     parser.add_argument("--urdf", required=True, type=Path)
     parser.add_argument("--workspace-root", type=Path, default=None)
+    parser.add_argument("--intermediate-workspace-root", type=Path, default=None)
     parser.add_argument("--source-id", action="append", default=[])
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--max-frames", type=int, default=0)
@@ -660,6 +683,7 @@ def main(argv: list[str] | None = None) -> int:
         binding_root=args.binding_root.expanduser().resolve(),
         urdf_path=args.urdf.expanduser().resolve(),
         workspace_root=args.workspace_root,
+        intermediate_workspace_root=args.intermediate_workspace_root,
         source_ids=tuple(str(value) for value in args.source_id),
         jobs=args.jobs,
         max_frames=args.max_frames,
