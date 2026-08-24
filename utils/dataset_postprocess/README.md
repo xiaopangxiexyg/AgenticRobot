@@ -465,6 +465,21 @@ python -m utils.dataset_postprocess tactile-recompress-zstd DATASET_ROOT \
 并在 `meta/tactile_recompression/` 写事务收据。它与会改变 raw 空间/量化精度的 compact v1
 是不同 profile，不能在同一 stream 上叠加解释。
 
+批量维护脚本默认只生成全量只读计划。扫描根目录同时包含多个 raw 数据集时，先审查未过滤
+计划中的稳定顺序，再用零基 `--entry-index` 精确冻结一个或多个条目；选择集合会进入
+`plan_sha256`，apply 必须回显同一 hash，因此计划变化或条目漂移都会 fail closed：
+
+```bash
+python scripts/probes/recompress_verified_tactile_batch.py DATASET_SCAN_ROOT
+python scripts/probes/recompress_verified_tactile_batch.py DATASET_SCAN_ROOT \
+  --entry-index 1
+python scripts/probes/recompress_verified_tactile_batch.py DATASET_SCAN_ROOT \
+  --entry-index 1 --apply --expected-plan-sha256 SHA256
+```
+
+这里的 index 只对未过滤计划中 `stream_count > 0` 的 eligible 数据集编号；rejected 或已经完全
+压缩的数据集不占 index。apply 完成后应重新生成计划，不得复用旧 index/hash 处理下一批。
+
 ## Stable/source 与 sorted 数据的 hardlink 去重
 
 对已经生成的 sorted dataset，可把内容完全相同的不可变大 artifact 改为指向 stable/source
