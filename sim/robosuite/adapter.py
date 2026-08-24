@@ -8,12 +8,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
-from control_composition.allocation import (
-    COMPOSITION_ALLOCATION_MODE_ABSOLUTE_OVERLAY_OWNER,
-    COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
-    COMPOSITION_ALLOCATION_MODE_RELATIVE_OVERLAY,
-    COMPOSITION_ALLOCATION_MODES_DEVELOPMENT,
-)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .contracts import RobosuiteResetManifest, RobosuiteResetReceipt
@@ -23,6 +17,16 @@ ROBOSUITE_MIXED_CONTROL_ACTION_HASH_DOMAIN_A0 = (
 )
 ROBOSUITE_BACKEND_STEP_HASH_DOMAIN_A0 = "dexteleop.robosuite.backend_step.a0"
 ROBOSUITE_OBSERVATION_HASH_DOMAIN_A0 = "dexteleop.robosuite.observation.a0"
+ROBOSUITE_MIXED_CONTROL_MODE_BASE_ONLY_A0 = "base_only"
+ROBOSUITE_MIXED_CONTROL_MODE_RELATIVE_OVERLAY_A0 = "relative_overlay"
+ROBOSUITE_MIXED_CONTROL_MODE_ABSOLUTE_OVERLAY_OWNER_A0 = "absolute_overlay_owner"
+ROBOSUITE_MIXED_CONTROL_MODES_A0 = frozenset(
+    {
+        ROBOSUITE_MIXED_CONTROL_MODE_BASE_ONLY_A0,
+        ROBOSUITE_MIXED_CONTROL_MODE_RELATIVE_OVERLAY_A0,
+        ROBOSUITE_MIXED_CONTROL_MODE_ABSOLUTE_OVERLAY_OWNER_A0,
+    }
+)
 
 
 def _required(value: object, *, name: str) -> str:
@@ -70,7 +74,7 @@ class MixedControlActionSelection:
 
     def __post_init__(self) -> None:
         mode = _required(self.mode, name="mode")
-        if mode not in COMPOSITION_ALLOCATION_MODES_DEVELOPMENT:
+        if mode not in ROBOSUITE_MIXED_CONTROL_MODES_A0:
             raise ValueError(f"Unsupported mixed-control mode {mode!r}.")
         dimension = len(self.applied_action)
         if dimension == 0:
@@ -207,7 +211,7 @@ class RobosuiteMixedControlAdapter:
 
     @property
     def supported_modes(self) -> frozenset[str]:
-        return COMPOSITION_ALLOCATION_MODES_DEVELOPMENT
+        return ROBOSUITE_MIXED_CONTROL_MODES_A0
 
     def compose(
         self,
@@ -217,7 +221,7 @@ class RobosuiteMixedControlAdapter:
         intervention_action: tuple[float, ...] | list[float] | None = None,
     ) -> MixedControlActionSelection:
         normalized_mode = _required(mode, name="mode")
-        if normalized_mode not in COMPOSITION_ALLOCATION_MODES_DEVELOPMENT:
+        if normalized_mode not in ROBOSUITE_MIXED_CONTROL_MODES_A0:
             raise ValueError(f"Unsupported mixed-control mode {normalized_mode!r}.")
         base = _finite_vector(
             base_action,
@@ -225,7 +229,7 @@ class RobosuiteMixedControlAdapter:
             dimension=self.action_dimension,
         )
         if intervention_action is None:
-            if normalized_mode != COMPOSITION_ALLOCATION_MODE_BASE_ONLY:
+            if normalized_mode != ROBOSUITE_MIXED_CONTROL_MODE_BASE_ONLY_A0:
                 raise ValueError(
                     "intervention_action is required outside base_only mode."
                 )
@@ -236,9 +240,9 @@ class RobosuiteMixedControlAdapter:
                 name="intervention_action",
                 dimension=self.action_dimension,
             )
-        if normalized_mode == COMPOSITION_ALLOCATION_MODE_BASE_ONLY:
+        if normalized_mode == ROBOSUITE_MIXED_CONTROL_MODE_BASE_ONLY_A0:
             preclip = base
-        elif normalized_mode == COMPOSITION_ALLOCATION_MODE_RELATIVE_OVERLAY:
+        elif normalized_mode == ROBOSUITE_MIXED_CONTROL_MODE_RELATIVE_OVERLAY_A0:
             preclip = tuple(
                 base_value + intervention_value
                 for base_value, intervention_value in zip(
@@ -247,7 +251,7 @@ class RobosuiteMixedControlAdapter:
                     strict=True,
                 )
             )
-        elif normalized_mode == COMPOSITION_ALLOCATION_MODE_ABSOLUTE_OVERLAY_OWNER:
+        elif normalized_mode == ROBOSUITE_MIXED_CONTROL_MODE_ABSOLUTE_OVERLAY_OWNER_A0:
             preclip = intervention
         else:  # pragma: no cover - guarded by the mode set above.
             raise AssertionError("unreachable mixed-control mode")
@@ -301,6 +305,10 @@ class RobosuiteMixedControlAdapter:
 __all__ = [
     "ROBOSUITE_BACKEND_STEP_HASH_DOMAIN_A0",
     "ROBOSUITE_MIXED_CONTROL_ACTION_HASH_DOMAIN_A0",
+    "ROBOSUITE_MIXED_CONTROL_MODES_A0",
+    "ROBOSUITE_MIXED_CONTROL_MODE_ABSOLUTE_OVERLAY_OWNER_A0",
+    "ROBOSUITE_MIXED_CONTROL_MODE_BASE_ONLY_A0",
+    "ROBOSUITE_MIXED_CONTROL_MODE_RELATIVE_OVERLAY_A0",
     "ROBOSUITE_OBSERVATION_HASH_DOMAIN_A0",
     "MixedControlActionSelection",
     "RobosuiteA0Backend",

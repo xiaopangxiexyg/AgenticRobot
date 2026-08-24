@@ -67,6 +67,12 @@ def test_adapter_composes_three_modes_then_enforces_final_envelope() -> None:
         action_high=(1.0, 1.0),
     )
 
+    assert adapter.supported_modes == {
+        COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
+        COMPOSITION_ALLOCATION_MODE_RELATIVE_OVERLAY,
+        COMPOSITION_ALLOCATION_MODE_ABSOLUTE_OVERLAY_OWNER,
+    }
+
     base_only = adapter.compose(
         mode=COMPOSITION_ALLOCATION_MODE_BASE_ONLY,
         base_action=(0.25, -0.5),
