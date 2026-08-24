@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from experiments.sim_learning.state_bc.contracts import StateBCArtifactMetadata
+from experiments.sim_learning.state_bc.model import fit_linear_state_bc
 from robot_motion.deploy import DeploymentObservation
 from sim.mujoco.deploy.state_policy_adapter import (
     STATE_BC_LAYOUT_HASH_V1,
@@ -72,3 +74,26 @@ def test_canonical_desk_mode_requires_an_explicit_pose_frame_contract():
     adapter = StatePolicyAdapter(model=_DummyStatePolicy())
     with pytest.raises(ValueError, match="pose frame contract"):
         adapter.predict(_observation())
+
+
+def test_state_policy_adapter_validates_the_serialized_artifact_hash(tmp_path):
+    states = np.tile(np.arange(16, dtype=np.float32), (3, 1))
+    actions = states.copy()
+    model = fit_linear_state_bc(
+        states,
+        actions,
+        artifact_metadata=StateBCArtifactMetadata(
+            selector_id="fixture-artifact",
+            train_episode_count=2,
+            test_episode_count=0,
+            train_frame_count=3,
+            test_frame_count=0,
+        ),
+    )
+    artifact = model.save(tmp_path / "state_policy.npz")
+
+    adapter = StatePolicyAdapter(
+        artifact_path=artifact,
+        config=StatePolicyAdapterConfig(policy_absolute_frame="runtime_raw"),
+    )
+    assert adapter.artifact_hash == model.artifact_hash
