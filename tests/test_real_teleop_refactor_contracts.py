@@ -2029,6 +2029,63 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
     ) == (True, "warmup 输入稳定。")
 
 
+def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
+    backend = legacy_entrypoint.DMTacGripperBackend(
+        legacy_entrypoint.DMTacGripperBackendConfig(
+            side="right",
+            connect_hardware=True,
+            connect_tactile=False,
+        )
+    )
+    backend._apply_gripper_state(
+        SimpleNamespace(
+            joint_pos=0.993,
+            timestamp=10.0,
+            error_code=16,
+            status_code=5,
+            status_text="正在张开",
+            is_moving=True,
+            current=0,
+            temperature_c=36,
+        )
+    )
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="none",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        left_hand_backend=None,
+        right_hand_backend=backend,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=object(),
+        channels={},
+    )
+
+    ready, message = recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        args=args,
+        components=components_snapshot,
+        clutch_input=SimpleNamespace(hold_active=lambda: False),
+        dataset_recorder=None,
+        camera_sources={},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=recording_admission.recording_auto_stop_reason,
+        gripper_warmup_probe_status=lambda now, *, reason: (True, "ready"),
+        camera_status_blocking_message=lambda status: None,
+    )
+
+    assert not ready
+    assert message == "等待 right 夹爪故障恢复：error_code=16，status=5:正在张开。"
+
+
 def test_position_episode_debug_detaches_before_deferred_close(
     tmp_path: Path,
 ) -> None:

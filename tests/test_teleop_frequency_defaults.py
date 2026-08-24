@@ -520,6 +520,11 @@ def test_real_teleop_gripper_health_signature_ignores_live_command_values() -> N
         "left=disconnected/q6/cmd=-/meas=- input=q6 valid=invalid dim=2 src=- "
         "target=- filt=- vals=- send=failed/0 send_ms=- q6_error=serial lost",
     )
+    hardware_faulted = (
+        "right=connected/q6/cmd=0.000/meas=0.993 hardware_fault=16 "
+        "hw_status=5:正在张开 input=q6 valid=ok dim=2 src=0.000 target=0.000 "
+        "filt=0.000 vals=[0.00] send=hardware_fault/0 skip=error_code=16",
+    )
 
     assert real_teleop._gripper_runtime_health_signature(first) == (
         "left=connected/q6 valid=ok unhealthy=0",
@@ -528,6 +533,9 @@ def test_real_teleop_gripper_health_signature_ignores_live_command_values() -> N
     assert first_health == real_teleop._gripper_runtime_health_signature(second)
     assert real_teleop._gripper_runtime_health_signature(faulted) == (
         "left=disconnected/q6 valid=invalid unhealthy=1",
+    )
+    assert real_teleop._gripper_runtime_health_signature(hardware_faulted) == (
+        "right=connected/q6 valid=ok unhealthy=1",
     )
 
 

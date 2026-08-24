@@ -5079,6 +5079,18 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
                 connect_tactile=False,
             )
         )
+        backend._apply_gripper_state(
+            SimpleNamespace(
+                joint_pos=0.993,
+                timestamp=9.9,
+                error_code=16,
+                status_code=5,
+                status_text="正在张开",
+                is_moving=True,
+                current=0,
+                temperature_c=36,
+            )
+        )
         components = _components()
         components.right_hand_backend = backend
         components.right_gripper_retargeter = real_teleop.ScalarToGripperRetargeter(
@@ -5124,6 +5136,8 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertIn("target=0.650", status[0])
         self.assertIn("send=sent/1", status[0])
         self.assertIn("send_target=0.620", status[0])
+        self.assertIn("hardware_fault=16", status[0])
+        self.assertIn("hw_status=5:正在张开", status[0])
 
     def test_dmtac_tactile_visualizer_builder_uses_force_window(self) -> None:
         vis = real_teleop._build_tactile_visualizer(
