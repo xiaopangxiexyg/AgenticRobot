@@ -220,6 +220,12 @@ def _gripper_status_for_side(
         "commanded": state.get("gripper_commanded_scalar"),
         "measured": state.get("gripper_measured_scalar"),
         "state": state.get("gripper_state_scalar"),
+        "error_code": state.get("gripper_error_code"),
+        "status_code": state.get("gripper_status_code"),
+        "status_text": state.get("gripper_status_text"),
+        "is_moving": state.get("gripper_is_moving"),
+        "current": state.get("gripper_current"),
+        "temperature_c": state.get("gripper_temperature_c"),
         "last_sent_at": state.get("last_sent_command_timestamp"),
         "joint_at": state.get("joint_timestamp"),
         "telemetry_at": state.get("telemetry_timestamp"),
@@ -379,6 +385,9 @@ def _gripper_runtime_status_signature(
                 error = state.get("telemetry_error")
                 measured = state.get("gripper_measured_scalar")
                 commanded = state.get("gripper_commanded_scalar")
+                error_code = state.get("gripper_error_code")
+                status_code = state.get("gripper_status_code")
+                status_text = str(state.get("gripper_status_text") or "").strip()
                 measured_text = _compact_runtime_float(measured)
                 commanded_text = _compact_runtime_float(commanded)
                 if bool(state.get("gripper_read_forced")):
@@ -394,7 +403,22 @@ def _gripper_runtime_status_signature(
                         digits=1,
                     )
                 q6_mode = str(getattr(components, "gripper_input_source", "q6")) if retargeter is not None else "manual"
-                suffix = f":{error}" if error else ""
+                hardware_fault = (
+                    ""
+                    if error_code in (None, 0)
+                    else f" hardware_fault={error_code}"
+                )
+                hardware_status = ""
+                if status_code is not None or status_text:
+                    hardware_status = (
+                        f" hw_status={status_code if status_code is not None else '-'}"
+                        f"{':' + status_text if status_text else ''}"
+                    )
+                suffix = (
+                    (f":{error}" if error else "")
+                    + hardware_fault
+                    + hardware_status
+                )
                 prefix = f"{side}={connected}/{q6_mode}/cmd={commanded_text}/meas={measured_text}{suffix}"
         statuses.append(
             f"{prefix} input={getattr(components, 'gripper_input_source', 'q6')} valid={q6_valid} dim={q6_source_dim} src={q6_source} "
@@ -435,6 +459,7 @@ def _gripper_runtime_health_signature(statuses: Sequence[str]) -> tuple[str, ...
                 "invalid",
                 "error",
                 "failed",
+                "hardware_fault=",
             )
         )
         health_statuses.append(f"{route} valid={valid} unhealthy={int(unhealthy)}")

@@ -134,6 +134,31 @@ def recording_warmup_status(
             if hand_age > 0.5:
                 return False, f"等待 {side} hand_q6 最新输入，当前 age={hand_age:.2f}s。"
     for side in components.active_sides:
+        backend = _gripper_backend_for_side(components, side)
+        if backend is None:
+            continue
+        backend_config = getattr(backend, "config", None)
+        if not bool(getattr(backend_config, "connect_hardware", False)):
+            continue
+        get_state = getattr(backend, "get_state")
+        try:
+            state = get_state(include_tactile_arrays=False)
+        except TypeError:
+            state = get_state()
+        error_code = state.get("gripper_error_code")
+        if error_code not in (None, 0):
+            status_code = state.get("gripper_status_code")
+            status_text = str(state.get("gripper_status_text") or "").strip()
+            status_suffix = ""
+            if status_code is not None or status_text:
+                status_suffix = (
+                    f"，status={status_code if status_code is not None else '-'}"
+                    f"{':' + status_text if status_text else ''}"
+                )
+            return False, (
+                f"等待 {side} 夹爪故障恢复：error_code={error_code}{status_suffix}。"
+            )
+    for side in components.active_sides:
         if (
             side
             in CaptureModalityContract(
