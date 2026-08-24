@@ -20,10 +20,11 @@ the same monotonic callable, explicit side-to-coordinate bindings, and passive
 
 The capture binding itself never persists or fits evidence automatically. The
 separate `teleop_runtime.deploy.quest_paired_pose_evidence_store` application
-leaf provides an explicit candidate-evidence publication/load step and an
-offline diagnostic-fit wrapper. Neither module accepts calibration, installs a
-frame transform, publishes a policy trajectory, or renders that trajectory on
-Quest. They also add no Quest CLI default and make no controller, handedness,
+leaf provides explicit candidate-evidence publication/load, an offline
+diagnostic-fit wrapper, and explicit candidate diagnostic-report
+publication/load. Neither module accepts calibration, installs a frame
+transform, publishes a policy trajectory, or renders that trajectory on Quest.
+They also add no Quest CLI default and make no controller, handedness,
 robot-side, frame, or static-window-profile choice.
 
 ## Clock and cursor proof
@@ -206,7 +207,9 @@ evidence directory or file:
 from runtime_artifact_paths import RuntimeArtifactLayout
 from teleop_runtime.deploy.quest_paired_pose_evidence_store import (
     fit_quest_paired_pose_evidence,
+    load_quest_paired_pose_diagnostic_fit,
     load_sealed_quest_paired_pose_evidence,
+    publish_quest_paired_pose_diagnostic_fit,
     publish_sealed_quest_paired_pose_evidence,
 )
 
@@ -220,20 +223,33 @@ sealed = load_sealed_quest_paired_pose_evidence(
     evidence_semantic_content_hash=commit.evidence_semantic_content_hash,
 )
 diagnostic = fit_quest_paired_pose_evidence(sealed)
+diagnostic_commit = publish_quest_paired_pose_diagnostic_fit(
+    layout=layout,
+    diagnostic_fit=diagnostic,
+)
+persisted_diagnostic = load_quest_paired_pose_diagnostic_fit(
+    layout=layout,
+    diagnostic_fit_semantic_content_hash=(
+        diagnostic_commit.diagnostic_fit_semantic_content_hash
+    ),
+)
 ```
 
-The immutable canonical file is content-addressed relative to `layout.root`;
-with the default root it is:
+The immutable canonical files are content-addressed relative to `layout.root`;
+with the default root they are:
 
 ```text
 runtime_artifacts/evidence/quest_paired_pose_capture/
   <capture-evidence-semantic-content-hash>.cjson
+
+runtime_artifacts/derived/quest_paired_pose_diagnostic_fit/
+  <diagnostic-report-semantic-content-hash>/report.cjson
 ```
 
-`commit.path` is the authoritative resolved path when a local configuration
-overrides the runtime-artifact root.
-`layout.root` must remain isolated to the current evidence writer/worktree; do
-not point mutable evidence at an automatically shared symlink. Any later
+`commit.path` and `diagnostic_commit.path` are the authoritative resolved paths
+when a local configuration overrides the runtime-artifact root.
+`layout.root` must remain isolated to the current artifact writer/worktree; do
+not point mutable artifacts at an automatically shared symlink. Any later
 rebind or migration must follow `docs/setup/LOCAL_RESOURCES.md`, including
 stopping the writer and inventory/copy/hash verification.
 
@@ -248,10 +264,26 @@ substituted for one another.
 The diagnostic wrapper strictly reparses the full evidence and calls the
 existing feature-local AX=XB solver. Its report binds both the outer evidence
 hash and dataset hash and remains `candidate_only=true` with
-`calibration_accepted=null`. The report is returned in memory; this slice does
-not publish a fit or an acceptance receipt. Solver observability gates still
-apply, including the minimum of three poses; real capture should follow the
-calibration document's stronger diversity guidance.
+`calibration_accepted=null`; its nested fit independently remains
+`accepted=null`.  Publishing that report is a second explicit action using a
+separate file domain and the outer report hash as the derived artifact id.
+Strict reload verifies the outer and nested hashes, redundant transform
+representations, residual summaries, observability fields, and candidate-only
+sentinels without rerunning the solver.  It does not create an acceptance
+receipt, install a frame, or require the referenced capture file to be present;
+the evidence hash is a content reference, not proof that its source artifact is
+available.  Any later acceptance workflow must load and validate both.
+These checks establish structural and internal numerical consistency only;
+reload neither recomputes the fit nor validates the reported transform,
+residuals, or observability metrics against the referenced capture.
+
+The capture, dataset, nested fit, outer report, and canonical file-byte hashes
+have different coverage and must not be substituted for one another. The outer
+report and persisted report file additionally use distinct explicit semantic
+and file domains; that statement does not assign a domain envelope to every
+digest. Solver observability gates still apply, including the minimum of three
+poses; real capture should follow the calibration document's stronger diversity
+guidance.
 
 For the capture observer, `request_seal()` uses exactly one
 `unsubscribe_with_cut()` and one typed robot cut, then boundedly drains
@@ -290,8 +322,10 @@ commit an episode.
 
 ## Evidence boundary
 
-Focused tests use fake servers, typed events, passive journals, and temporary
-local evidence directories only. They do not bind a socket, connect a Quest,
-query RM65 hardware, or execute motion. Consequently they establish the
-in-process application and offline artifact seams, not physical calibration
-quality or future-trajectory visualization readiness.
+Focused tests use fake servers, typed events, passive journals, real reducer and
+AX=XB code on synthetic poses, and temporary local artifact directories only.
+They do not bind a socket, connect a Quest, query RM65 hardware, or execute
+motion. Consequently they establish the in-process application plus immutable
+capture/diagnostic-report seams, not physical calibration quality, reviewed
+acceptance, frame-installation readiness, or future-trajectory visualization
+readiness.

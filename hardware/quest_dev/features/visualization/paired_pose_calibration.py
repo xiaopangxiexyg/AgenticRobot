@@ -31,6 +31,7 @@ from .transforms import (
 DATASET_SCHEMA = "quest_dev.visualization.paired_pose_dataset.v1"
 FIT_SCHEMA = "quest_dev.visualization.paired_pose_fit.v1"
 ALGORITHM_ID = "ax_xb_numpy_svd.v1"
+FIT_ACCEPTANCE_NOTE = "fit only; a reviewed acceptance profile is required"
 PAIRING_METHODS = {"operator_static_window", "synthetic_replay"}
 MIN_EFFECTIVE_RELATIVE_ROTATION_DEG = 5.0
 MIN_ROTATION_AXIS_SEPARATION_DEG = 15.0
@@ -38,6 +39,50 @@ MIN_ROTATION_CONSTRAINT_RATIO = 1e-2
 MAX_ROTATION_NULLSPACE_RATIO = 1e-3
 MIN_ROTATION_NULLSPACE_GAP = 10.0
 MIN_TRANSLATION_SINGULAR_VALUE_RATIO = 2e-2
+
+_FIT_FRAME_KEYS = {
+    "first_reference",
+    "first_moving",
+    "second_reference",
+    "second_moving",
+}
+_FIT_OBSERVABILITY_INTEGER_KEYS = {
+    "relative_pair_count",
+    "effective_relative_rotation_count",
+    "translation_system_rank",
+}
+_FIT_OBSERVABILITY_FLOAT_KEYS = {
+    "max_relative_rotation_deg",
+    "max_rotation_axis_separation_deg",
+    "first_reference_translation_span_m",
+    "rotation_constraint_ratio",
+    "rotation_nullspace_ratio",
+    "rotation_nullspace_gap",
+    "translation_system_min_singular_value",
+    "translation_system_singular_value_ratio",
+}
+_FIT_KEYS = {
+    "schema",
+    "algorithm_id",
+    "dataset_sha256",
+    "frames",
+    "tool_profile_hash",
+    "second_reference_from_first_reference",
+    "second_reference_from_first_reference_column_major",
+    "first_moving_from_second_moving",
+    "first_moving_from_second_moving_column_major",
+    "translation_residuals_m",
+    "rotation_residuals_deg",
+    "translation_rms_m",
+    "translation_max_m",
+    "rotation_rms_deg",
+    "rotation_max_deg",
+    "sample_count",
+    "observability",
+    "accepted",
+    "acceptance_note",
+    "fit_semantic_sha256",
+}
 
 
 def _identifier(value: Any, name: str, *, max_length: int = 200) -> str:
@@ -59,6 +104,16 @@ def _sha256_reference(value: Any, name: str) -> str:
     ):
         raise ValueError(f"{name} must use sha256:<64 lowercase hex chars>")
     return result
+
+
+def _raw_sha256(value: Any, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must contain 64 lowercase SHA-256 hex chars")
+    return value
 
 
 def _require_exact_keys(
@@ -84,7 +139,7 @@ def _finite_float(value: Any, name: str) -> float:
     result = float(value)
     if not math.isfinite(result):
         raise ValueError(f"{name} must be finite")
-    return result
+    return 0.0 if result == 0.0 else result
 
 
 def _non_negative_int(value: Any, name: str) -> int:
@@ -99,6 +154,10 @@ def _matrix(value: Any, name: str) -> np.ndarray:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a numeric 4x4 matrix") from exc
     matrix = validate_rigid_transform(matrix)
+    # The persisted canonical encoder intentionally collapses signed zero.
+    # Normalize at the feature boundary as well so JSON-derived semantic
+    # hashes remain stable across an immutable file round trip.
+    matrix[matrix == 0.0] = 0.0
     matrix.flags.writeable = False
     return matrix
 
@@ -142,6 +201,11 @@ class PoseObservation:
     matrix_reference_from_moving: np.ndarray
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "observed_at",
+            _finite_float(self.observed_at, "observed_at"),
+        )
         object.__setattr__(
             self,
             "matrix_reference_from_moving",
@@ -276,10 +340,242 @@ class PairedPoseFit:
             "sample_count": self.sample_count,
             "observability": dict(self.observability),
             "accepted": None,
-            "acceptance_note": "fit only; a reviewed acceptance profile is required",
+            "acceptance_note": FIT_ACCEPTANCE_NOTE,
         }
         payload["fit_semantic_sha256"] = _canonical_sha256(payload)
         return payload
+
+
+def _canonical_non_negative_float(value: Any, name: str) -> float:
+    if type(value) is not float:
+        raise TypeError(f"{name} must be a canonical float")
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return 0.0 if value == 0.0 else value
+
+
+def _parse_fit_float_list(value: Any, name: str, *, length: int) -> np.ndarray:
+    if not isinstance(value, list) or len(value) != length:
+        raise ValueError(f"{name} must be a list with {length} values")
+    values = np.asarray(
+        [
+            _canonical_non_negative_float(item, f"{name}[{index}]")
+            for index, item in enumerate(value)
+        ],
+        dtype=float,
+    )
+    values.flags.writeable = False
+    return values
+
+
+def _require_fit_summary(
+    supplied: float,
+    expected: float,
+    name: str,
+) -> None:
+    if supplied != expected:
+        raise ValueError(f"{name} does not match the residual values")
+
+
+def parse_paired_pose_fit(payload: Mapping[str, Any]) -> PairedPoseFit:
+    """Strictly reconstruct one candidate-only diagnostic fit payload.
+
+    The parser validates every redundant representation and recomputes the
+    nested semantic hash. It applies the solver's numerical-observability gates
+    and algorithm-implied ranges; residual quality remains unaccepted.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("paired-pose fit must be a mapping")
+    _require_exact_keys(payload, _FIT_KEYS, "fit")
+    if payload.get("schema") != FIT_SCHEMA:
+        raise ValueError(f"schema must be {FIT_SCHEMA!r}")
+    if payload.get("algorithm_id") != ALGORITHM_ID:
+        raise ValueError(f"algorithm_id must be {ALGORITHM_ID!r}")
+    if payload.get("accepted") is not None:
+        raise ValueError("accepted must remain null for a diagnostic fit")
+    if payload.get("acceptance_note") != FIT_ACCEPTANCE_NOTE:
+        raise ValueError("acceptance_note does not match the diagnostic contract")
+
+    dataset_sha256 = _raw_sha256(payload.get("dataset_sha256"), "dataset_sha256")
+    fit_semantic_sha256 = _raw_sha256(
+        payload.get("fit_semantic_sha256"),
+        "fit_semantic_sha256",
+    )
+    semantic_payload = dict(payload)
+    semantic_payload.pop("fit_semantic_sha256")
+    if _canonical_sha256(semantic_payload) != fit_semantic_sha256:
+        raise ValueError("fit_semantic_sha256 does not match the fit payload")
+
+    raw_frames = payload.get("frames")
+    if not isinstance(raw_frames, Mapping) or set(raw_frames) != _FIT_FRAME_KEYS:
+        raise ValueError(f"frames must contain exactly {sorted(_FIT_FRAME_KEYS)}")
+    frames = {
+        key: _identifier(raw_frames.get(key), f"frames.{key}")
+        for key in sorted(_FIT_FRAME_KEYS)
+    }
+    tool_profile_hash = _sha256_reference(
+        payload.get("tool_profile_hash"),
+        "tool_profile_hash",
+    )
+
+    transforms: dict[str, np.ndarray] = {}
+    for matrix_name in (
+        "second_reference_from_first_reference",
+        "first_moving_from_second_moving",
+    ):
+        matrix = _matrix(payload.get(matrix_name), matrix_name)
+        column_name = f"{matrix_name}_column_major"
+        raw_column = payload.get(column_name)
+        if not isinstance(raw_column, list) or len(raw_column) != 16:
+            raise ValueError(f"{column_name} must be a list with 16 values")
+        for index, value in enumerate(raw_column):
+            if type(value) is not float or not math.isfinite(value):
+                raise ValueError(
+                    f"{column_name}[{index}] must be a finite canonical float"
+                )
+        if raw_column != matrix_to_column_major(matrix):
+            raise ValueError(f"{column_name} does not match {matrix_name}")
+        transforms[matrix_name] = matrix
+
+    sample_count = payload.get("sample_count")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int):
+        raise TypeError("sample_count must be an integer")
+    if sample_count < 3:
+        raise ValueError("sample_count must be at least 3")
+    translation_residuals = _parse_fit_float_list(
+        payload.get("translation_residuals_m"),
+        "translation_residuals_m",
+        length=sample_count,
+    )
+    rotation_residuals = _parse_fit_float_list(
+        payload.get("rotation_residuals_deg"),
+        "rotation_residuals_deg",
+        length=sample_count,
+    )
+    if np.any(rotation_residuals > 180.0):
+        raise ValueError("rotation_residuals_deg values cannot exceed 180")
+    summaries = {
+        name: _canonical_non_negative_float(payload.get(name), name)
+        for name in (
+            "translation_rms_m",
+            "translation_max_m",
+            "rotation_rms_deg",
+            "rotation_max_deg",
+        )
+    }
+    _require_fit_summary(
+        summaries["translation_rms_m"],
+        float(np.sqrt(np.mean(translation_residuals**2))),
+        "translation_rms_m",
+    )
+    _require_fit_summary(
+        summaries["translation_max_m"],
+        float(np.max(translation_residuals)),
+        "translation_max_m",
+    )
+    _require_fit_summary(
+        summaries["rotation_rms_deg"],
+        float(np.sqrt(np.mean(rotation_residuals**2))),
+        "rotation_rms_deg",
+    )
+    _require_fit_summary(
+        summaries["rotation_max_deg"],
+        float(np.max(rotation_residuals)),
+        "rotation_max_deg",
+    )
+
+    raw_observability = payload.get("observability")
+    observability_keys = _FIT_OBSERVABILITY_INTEGER_KEYS | _FIT_OBSERVABILITY_FLOAT_KEYS
+    if (
+        not isinstance(raw_observability, Mapping)
+        or set(raw_observability) != observability_keys
+    ):
+        raise ValueError(
+            f"observability must contain exactly {sorted(observability_keys)}"
+        )
+    observability: dict[str, float | int] = {}
+    for name in sorted(_FIT_OBSERVABILITY_INTEGER_KEYS):
+        value = raw_observability.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"observability.{name} must be a non-negative integer")
+        observability[name] = value
+    for name in sorted(_FIT_OBSERVABILITY_FLOAT_KEYS):
+        observability[name] = _canonical_non_negative_float(
+            raw_observability.get(name),
+            f"observability.{name}",
+        )
+
+    expected_relative_pair_count = sample_count * (sample_count - 1) // 2
+    if observability["relative_pair_count"] != expected_relative_pair_count:
+        raise ValueError(
+            "observability.relative_pair_count does not match sample_count"
+        )
+    if not (
+        2
+        <= observability["effective_relative_rotation_count"]
+        <= observability["relative_pair_count"]
+    ):
+        raise ValueError("observability effective relative rotation count is invalid")
+    if observability["max_relative_rotation_deg"] < MIN_EFFECTIVE_RELATIVE_ROTATION_DEG:
+        raise ValueError("observability does not satisfy the effective rotation gate")
+    if observability["max_relative_rotation_deg"] > 180.0:
+        raise ValueError("observability.max_relative_rotation_deg cannot exceed 180")
+    if (
+        observability["max_rotation_axis_separation_deg"]
+        < MIN_ROTATION_AXIS_SEPARATION_DEG
+    ):
+        raise ValueError("observability does not satisfy the axis separation gate")
+    if observability["max_rotation_axis_separation_deg"] > 90.0:
+        raise ValueError(
+            "observability.max_rotation_axis_separation_deg cannot exceed 90"
+        )
+    if observability["rotation_constraint_ratio"] < MIN_ROTATION_CONSTRAINT_RATIO:
+        raise ValueError("observability does not satisfy the rotation constraint gate")
+    if observability["rotation_constraint_ratio"] > 1.0:
+        raise ValueError("observability.rotation_constraint_ratio cannot exceed 1")
+    if observability["rotation_nullspace_ratio"] > MAX_ROTATION_NULLSPACE_RATIO:
+        raise ValueError("observability does not satisfy the rotation nullspace gate")
+    if observability["rotation_nullspace_gap"] < MIN_ROTATION_NULLSPACE_GAP:
+        raise ValueError(
+            "observability does not satisfy the rotation nullspace gap gate"
+        )
+    if observability["translation_system_rank"] != 3:
+        raise ValueError("observability.translation_system_rank must be 3")
+    if observability["translation_system_min_singular_value"] <= 0.0:
+        raise ValueError(
+            "observability.translation_system_min_singular_value must be positive"
+        )
+    if (
+        observability["translation_system_singular_value_ratio"]
+        < MIN_TRANSLATION_SINGULAR_VALUE_RATIO
+    ):
+        raise ValueError("observability does not satisfy the translation system gate")
+    if observability["translation_system_singular_value_ratio"] > 1.0:
+        raise ValueError(
+            "observability.translation_system_singular_value_ratio cannot exceed 1"
+        )
+
+    fit = PairedPoseFit(
+        dataset_sha256=dataset_sha256,
+        frames=frames,
+        tool_profile_hash=tool_profile_hash,
+        second_reference_from_first_reference=transforms[
+            "second_reference_from_first_reference"
+        ],
+        first_moving_from_second_moving=transforms["first_moving_from_second_moving"],
+        translation_residuals_m=translation_residuals,
+        rotation_residuals_deg=rotation_residuals,
+        translation_rms_m=summaries["translation_rms_m"],
+        translation_max_m=summaries["translation_max_m"],
+        rotation_rms_deg=summaries["rotation_rms_deg"],
+        rotation_max_deg=summaries["rotation_max_deg"],
+        sample_count=sample_count,
+        observability=observability,
+    )
+    if fit.as_dict() != dict(payload):
+        raise ValueError("paired-pose fit payload is not canonical")
+    return fit
 
 
 def _parse_observation(

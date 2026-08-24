@@ -103,14 +103,22 @@ The implemented source contracts now provide:
 
 The robot projection remains opt-in.  The RM65 lower object is deliberately a
 narrow source/tool/FK attestation, not a second copy of the canonical
-`PoseCoordinateBinding`; the deploy application is now the sole owner of that
-join.  This makes the production robot-side passive journal reachable, but it
-does not connect the journal to `QuestDevHost` or the R2 reducer.  The standalone
-Quest server and policy-deploy process still have no in-memory event bridge and
-do not share one complete `ClockDomainDescriptor`.  Consequently this is not
-yet production paired-pose capture, calibration evidence, or Quest trajectory
-rendering.  R2 still does not add a Control Station lifecycle, persistence,
-calibration fit or acceptance, or a frame installation path.
+`PoseCoordinateBinding`; the deploy application is the sole owner of that
+join.  A default-off concrete application bridge now injects one complete
+receiver-clock descriptor and monotonic clock into the unique Quest host,
+subscribes the existing robot journal and Quest event stream to the R2 reducer,
+and exposes programmatic begin/complete/cancel/seal actions without adding a
+second robot reader.  A separate deploy-owned store provides explicit immutable
+capture publication/reload, offline diagnostic fitting, and explicit immutable
+diagnostic-report publication/reload.  Reducer construction, ordinary polling,
+fit computation, and ordinary close remain non-writing operations.
+
+Those connections have only offline synthetic/contract evidence.  There is
+still no Control Station GUI/intent/status lifecycle, real Quest + RM65
+multi-pose calibration evidence, reviewed acceptance, frame installation, or
+Quest future-trajectory renderer.  The existence or successful reload of a
+candidate report therefore cannot be used as calibration or visualization
+readiness.
 
 The app-root option is intentionally unavailable with `--send-actions`: every
 projected state explicitly requests the materially expensive full lower proof,
@@ -141,6 +149,7 @@ real arm owner -> hardware qpos -> bound FK pose
 paired-pose capture candidate
   -> unchanged R0 dataset parser
   -> diagnostic fit
+  -> explicit immutable diagnostic report (candidate-only)
   -> reviewed acceptance + independent validation (not implemented)
   -> immutable visualization frame binding
   -> measured TCP + selected policy future trajectory
@@ -264,7 +273,9 @@ is diagnostic only and continues to emit `accepted: null`.  Neither may be
 installed into a visualization or execution frame graph without a reviewed
 acceptance receipt binding at least:
 
-- paired dataset and fit hashes;
+- complete capture-evidence semantic hash and outer diagnostic-report semantic
+  hash;
+- derived paired dataset hash and nested fit hash;
 - robot source instance/epoch and coordinate-binding hash;
 - tool profile and FK contract hashes;
 - Quest server/page/XR session/reference generation/controller identity;
@@ -287,8 +298,10 @@ against real capture evidence.
   remains the only backend lifecycle owner.
 - Reading the robot pose journal or latest publication never refreshes a backend.
 - A source failure clears the published latest pose before downstream sealing.
-- Source callbacks only enter bounded in-memory evidence; this slice does not
-  write capture files or own persistence.
+- Source callbacks only enter bounded in-memory evidence.  The reducer,
+  callbacks, ordinary polling, fit computation, and ordinary close do not
+  write artifacts; only explicit application-level publish calls write the
+  immutable capture or candidate diagnostic-report files.
 - A gap, reorder overflow, identity drift, source invalidation, clock mismatch,
   non-atomic close attempt, or incomplete asynchronous drain prevents sealing.
 - Visualization never grants control authority and never weakens canonical
@@ -298,20 +311,22 @@ against real capture evidence.
 
 ## Next implementation slices
 
-The unique-running-runtime host, the RM65 lower attestation, and the
-policy-deployment robot-side canonical binding are now implemented. The
-remaining ordered slices are:
+The unique-running-runtime host, RM65 lower attestation, policy-deployment
+robot-side canonical binding, default-off application bridge, explicit capture
+store, and explicit candidate diagnostic-report store are now implemented.
+The remaining ordered slices are:
 
-1. At one concrete application leaf, inject the same complete receiver-clock
-   descriptor and monotonic clock into the unique Quest host, bind the existing
-   robot journal and Quest event subscription to the R2 reducer, and preserve
-   their independent lifecycle owners.  Do not call `ArmStateReader.snapshot()`
-   from capture or create another hardware reader.
-2. Add the thin Control Station operator lifecycle for begin/complete/cancel and
-   pose-redacted status.
-3. Add an explicit persistence owner for reviewed capture evidence; the R2
-   in-memory reducer deliberately writes nothing.
-4. Collect real stationary-pose evidence, fit, independently validate, and
-   review an acceptance profile.
-5. Only after acceptance, transform the measured TCP and selected policy future
-   trajectory into Quest space and render them as read-only geometry.
+1. Add the thin Control Station operator lifecycle for
+   begin/complete/cancel/seal and pose-redacted status; keep the reducer and
+   artifact writers in their current lower owners.
+2. Collect real stationary multi-pose Quest + RM65 evidence, including remount,
+   noise, and held-out/leave-one-window-out validation.
+3. Review residual and observability policy, then define a content-bound
+   acceptance profile/receipt and invalidation lifecycle.  A persisted
+   diagnostic report alone must never satisfy this step.
+4. Only from a valid reviewed acceptance receipt, install the accepted transform
+   into a read-only visualization-frame binding with reset/remount/tool/source
+   invalidation.
+5. Project the schema-aware selected policy future plus measured TCP through
+   that accepted frame, publish a bounded passive protocol, and render it as
+   read-only Quest geometry.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import unittest
 
@@ -12,6 +14,7 @@ from hardware.quest_dev.features.visualization.paired_pose_calibration import (
     controller_wire_matrix_to_transform,
     fit_paired_pose_calibration,
     parse_paired_pose_dataset,
+    parse_paired_pose_fit,
 )
 
 
@@ -126,6 +129,19 @@ def synthetic_payload() -> tuple[dict, np.ndarray, np.ndarray]:
     )
 
 
+def rehash_fit_payload(payload: dict) -> None:
+    semantic_payload = copy.deepcopy(payload)
+    semantic_payload.pop("fit_semantic_sha256", None)
+    encoded = json.dumps(
+        semantic_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    payload["fit_semantic_sha256"] = hashlib.sha256(encoded).hexdigest()
+
+
 class PairedPoseCalibrationTests(unittest.TestCase):
     def test_recovers_reference_and_mount_extrinsics(self) -> None:
         payload, expected_reference, expected_mount = synthetic_payload()
@@ -152,6 +168,198 @@ class PairedPoseCalibrationTests(unittest.TestCase):
         first = parse_paired_pose_dataset(payload)
         second = parse_paired_pose_dataset(first.as_dict())
         self.assertEqual(first.semantic_sha256, second.semantic_sha256)
+
+    def test_dataset_semantic_hash_normalizes_signed_zero(self) -> None:
+        payload, _, _ = synthetic_payload()
+        payload["samples"][0]["first_observation"]["matrix_reference_from_moving"][0][
+            1
+        ] = -0.0
+        payload["samples"][0]["first_observation"]["observed_at"] = -0.0
+
+        first = parse_paired_pose_dataset(payload)
+        second = parse_paired_pose_dataset(first.as_dict())
+
+        self.assertEqual(first.semantic_sha256, second.semantic_sha256)
+        self.assertEqual(
+            math.copysign(
+                1.0,
+                first.samples[0].first.matrix_reference_from_moving[0, 1],
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            math.copysign(1.0, first.samples[0].first.observed_at),
+            1.0,
+        )
+
+    def test_fit_parser_round_trip_is_strict_and_frozen(self) -> None:
+        payload, _, _ = synthetic_payload()
+        original = fit_paired_pose_calibration(
+            parse_paired_pose_dataset(payload)
+        ).as_dict()
+
+        parsed = parse_paired_pose_fit(copy.deepcopy(original))
+
+        self.assertEqual(parsed.as_dict(), original)
+        self.assertFalse(parsed.translation_residuals_m.flags.writeable)
+        self.assertFalse(parsed.rotation_residuals_deg.flags.writeable)
+        self.assertFalse(parsed.second_reference_from_first_reference.flags.writeable)
+        with self.assertRaises(TypeError):
+            parsed.frames["first_reference"] = "changed"
+        with self.assertRaises(TypeError):
+            parsed.observability["relative_pair_count"] = 0
+
+    def test_fit_parser_rejects_schema_algorithm_and_acceptance_drift(self) -> None:
+        payload, _, _ = synthetic_payload()
+        baseline = fit_paired_pose_calibration(
+            parse_paired_pose_dataset(payload)
+        ).as_dict()
+        mutations = (
+            ("schema", "wrong.schema"),
+            ("algorithm_id", "wrong.algorithm"),
+            ("accepted", True),
+            ("acceptance_note", "accepted by nobody"),
+        )
+        for field_name, value in mutations:
+            with self.subTest(field_name=field_name):
+                changed = copy.deepcopy(baseline)
+                changed[field_name] = value
+                rehash_fit_payload(changed)
+                with self.assertRaises(ValueError):
+                    parse_paired_pose_fit(changed)
+
+        missing = copy.deepcopy(baseline)
+        missing.pop("rotation_max_deg")
+        with self.assertRaisesRegex(ValueError, "missing"):
+            parse_paired_pose_fit(missing)
+        unknown = copy.deepcopy(baseline)
+        unknown["annotation"] = "not hashed by contract"
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            parse_paired_pose_fit(unknown)
+
+    def test_fit_parser_recomputes_hash_and_validates_digest_formats(self) -> None:
+        payload, _, _ = synthetic_payload()
+        baseline = fit_paired_pose_calibration(
+            parse_paired_pose_dataset(payload)
+        ).as_dict()
+
+        changed = copy.deepcopy(baseline)
+        changed["translation_max_m"] += 0.1
+        with self.assertRaisesRegex(ValueError, "fit_semantic_sha256"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["fit_semantic_sha256"] = "A" * 64
+        with self.assertRaisesRegex(ValueError, "lowercase"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["dataset_sha256"] = "sha256:" + "a" * 64
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "dataset_sha256"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["tool_profile_hash"] = "a" * 64
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "sha256:"):
+            parse_paired_pose_fit(changed)
+
+    def test_fit_parser_rejects_matrix_redundancy_drift(self) -> None:
+        payload, _, _ = synthetic_payload()
+        baseline = fit_paired_pose_calibration(
+            parse_paired_pose_dataset(payload)
+        ).as_dict()
+
+        changed = copy.deepcopy(baseline)
+        changed["second_reference_from_first_reference_column_major"][12] += 0.1
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["first_moving_from_second_moving"][3][3] = 2.0
+        changed["first_moving_from_second_moving_column_major"][15] = 2.0
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "last row"):
+            parse_paired_pose_fit(changed)
+
+    def test_fit_parser_rejects_residual_and_summary_drift(self) -> None:
+        payload, _, _ = synthetic_payload()
+        baseline = fit_paired_pose_calibration(
+            parse_paired_pose_dataset(payload)
+        ).as_dict()
+
+        changed = copy.deepcopy(baseline)
+        changed["translation_residuals_m"][0] = -0.01
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["rotation_rms_deg"] += 0.01
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["translation_rms_m"] += 5e-16
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["rotation_residuals_deg"][0] = 180.0001
+        changed["rotation_rms_deg"] = float(
+            np.sqrt(np.mean(np.asarray(changed["rotation_residuals_deg"]) ** 2))
+        )
+        changed["rotation_max_deg"] = max(changed["rotation_residuals_deg"])
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "cannot exceed 180"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["sample_count"] = True
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(TypeError, "sample_count"):
+            parse_paired_pose_fit(changed)
+
+    def test_fit_parser_rejects_observability_drift(self) -> None:
+        payload, _, _ = synthetic_payload()
+        baseline = fit_paired_pose_calibration(
+            parse_paired_pose_dataset(payload)
+        ).as_dict()
+
+        changed = copy.deepcopy(baseline)
+        changed["observability"].pop("rotation_nullspace_gap")
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "exactly"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["observability"]["translation_system_rank"] = True
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            parse_paired_pose_fit(changed)
+
+        changed = copy.deepcopy(baseline)
+        changed["observability"]["rotation_nullspace_gap"] = 0.0
+        rehash_fit_payload(changed)
+        with self.assertRaisesRegex(ValueError, "nullspace gap"):
+            parse_paired_pose_fit(changed)
+
+        for field_name in (
+            "max_relative_rotation_deg",
+            "max_rotation_axis_separation_deg",
+            "rotation_constraint_ratio",
+            "translation_system_singular_value_ratio",
+        ):
+            with self.subTest(field_name=field_name):
+                changed = copy.deepcopy(baseline)
+                changed["observability"][field_name] = 1000.0
+                rehash_fit_payload(changed)
+                with self.assertRaisesRegex(ValueError, "cannot exceed"):
+                    parse_paired_pose_fit(changed)
 
     def test_dataset_is_frozen_and_fit_rechecks_semantic_hash(self) -> None:
         payload, _, _ = synthetic_payload()
