@@ -121,6 +121,26 @@ def build_progress_arm_transition_plan(
     )
 
 
+def build_progress_entry_arm_transition_plan(
+    *,
+    profile: TaskProgressProfileV1,
+    selected_entry_step_id: object,
+    current_fixed_sides: tuple[str, ...],
+    enforcement_mode: str,
+) -> ProgressArmTransitionPlan | None:
+    """Bind the next-Episode entry selection to its exact arm restriction."""
+
+    target_step_id = str(selected_entry_step_id or "").strip()
+    if not target_step_id:
+        target_step_id = profile.initial_step_id
+    return build_progress_arm_transition_plan(
+        profile=profile,
+        target_progress_step_id=target_step_id,
+        current_fixed_sides=current_fixed_sides,
+        enforcement_mode=enforcement_mode,
+    )
+
+
 def strict_progress_arm_sample_rejection(
     *,
     profile: TaskProgressProfileV1,
@@ -178,6 +198,7 @@ def strict_progress_arm_sample_rejection(
 __all__ = [
     "PendingProgressArmTransition",
     "ProgressArmTransitionPlan",
+    "build_progress_entry_arm_transition_plan",
     "build_progress_arm_transition_plan",
     "progress_step_arm_requirement",
     "progress_step_arm_requirements_differ",

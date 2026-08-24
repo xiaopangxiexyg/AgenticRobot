@@ -30,6 +30,7 @@ from dataset_contracts.stats import (
 from .progress_arm_control import (
     PendingProgressArmTransition,
     ProgressArmTransitionPlan,
+    build_progress_entry_arm_transition_plan,
     build_progress_arm_transition_plan,
     progress_step_arm_requirements_differ,
 )
@@ -824,6 +825,36 @@ def bind_legacy_support(namespace: Mapping[str, object]) -> None:
     )
 
 
+def _reconcile_idle_progress_entry_arm_control(
+    *,
+    profile: Any,
+    selected_entry_step_id: object,
+    current_fixed_sides: tuple[str, ...],
+    enforcement_mode: str,
+    apply_direct: Callable[[ProgressArmTransitionPlan], bool],
+) -> tuple[
+    ProgressArmTransitionPlan | None,
+    PendingProgressArmTransition | None,
+]:
+    """Apply or gate the selected entry restriction before Episode start."""
+
+    plan = build_progress_entry_arm_transition_plan(
+        profile=profile,
+        selected_entry_step_id=selected_entry_step_id,
+        current_fixed_sides=current_fixed_sides,
+        enforcement_mode=enforcement_mode,
+    )
+    if plan is None or not plan.changes_arm_control:
+        return plan, None
+    if apply_direct(plan):
+        return plan, None
+    return plan, PendingProgressArmTransition(
+        intent=None,
+        plan=plan,
+        capture_sides=plan.newly_teleop_sides,
+    )
+
+
 @dataclass(frozen=True)
 class RealTeleopControlLoopContext:
     action_debug_log_recorder: Any
@@ -1522,6 +1553,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     control_ui.append_message("Progress", message)
         for selection_intent in entry_step_selection_intents:
             try:
+                if pending_progress_arm_transition is not None:
+                    raise RuntimeError(
+                        "A profile arm transition is already waiting for "
+                        "runtime Home."
+                    )
                 if bool(
                     getattr(clutch_input, "_episode_busy", lambda: True)()
                 ):
@@ -1607,6 +1643,66 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     "active_progress_episode",
                     None,
                 )
+                if (
+                    active_progress_episode is None
+                    and pending_progress_arm_transition is None
+                ):
+                    fix_controller = getattr(
+                        components,
+                        "fix_arm_controller",
+                        None,
+                    )
+                    (
+                        idle_entry_plan,
+                        idle_entry_pending,
+                    ) = _reconcile_idle_progress_entry_arm_control(
+                        profile=dataset_recorder.progress_profile,
+                        selected_entry_step_id=getattr(
+                            args,
+                            "collection_progress_entry_step",
+                            "",
+                        ),
+                        current_fixed_sides=tuple(
+                            getattr(fix_controller, "fixed_sides", ()) or ()
+                        ),
+                        enforcement_mode=str(
+                            getattr(
+                                args,
+                                "collection_progress_arm_control_mode",
+                                "profile",
+                            )
+                        ),
+                        apply_direct=lambda plan: apply_progress_arm_plan_direct(
+                            plan,
+                            now=loop_start,
+                        ),
+                    )
+                    if (
+                        idle_entry_plan is not None
+                        and idle_entry_plan.changes_arm_control
+                    ):
+                        if idle_entry_pending is None:
+                            if control_ui is not None:
+                                control_ui.append_message(
+                                    "Progress",
+                                    "已在 Episode 启动前应用所选起始子任务的 "
+                                    "arm+end-effector Hold 限制："
+                                    f"{idle_entry_plan.target_progress_step_id}。",
+                                )
+                        else:
+                            pending_progress_arm_transition = idle_entry_pending
+                            clutch_input.request_hold(
+                                reason="progress_arm_profile_transition"
+                            )
+                            if control_ui is not None:
+                                control_ui.append_message(
+                                    "Progress",
+                                    "所选起始子任务需要切换活动臂；已在 Episode "
+                                    "启动前进入 Hold。请完成目标活动臂 runtime Home，"
+                                    "限制同步完成后再开始数采。",
+                                )
+                            publish_progress_ui_state(now=time.time())
+                            continue
                 active_identity_hash = str(
                     getattr(
                         None

@@ -11,11 +11,15 @@ from dataset_contracts.progress_profile import (
 )
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.real_teleop.progress_arm_control import (
+    build_progress_entry_arm_transition_plan,
     build_progress_arm_transition_plan,
     progress_step_arm_requirements_differ,
     strict_progress_arm_sample_rejection,
 )
 from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
+from teleop_runtime.real_teleop.control_loop import (
+    _reconcile_idle_progress_entry_arm_control,
+)
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand
 from teleop_runtime.session import SessionStepResult
 
@@ -93,6 +97,105 @@ def test_profile_plan_only_requires_home_for_a_newly_live_arm() -> None:
     )
     assert release is not None
     assert release.newly_teleop_sides == ("right",)
+
+
+def test_selected_entry_step_drives_pre_episode_arm_restriction() -> None:
+    profile = TaskProgressProfileV1(
+        profile_id="entry-arm-profile",
+        profile_version="1",
+        task_id="task",
+        steps=(
+            ProgressStepDefinitionV1(
+                "both_move",
+                "MOVE",
+                "Both move",
+                1,
+                allowed_next_step_ids=("right_move",),
+                arm_control=ProgressStepArmControlV1(
+                    left="teleop",
+                    right="teleop",
+                ),
+            ),
+            ProgressStepDefinitionV1(
+                "right_move",
+                "MOVE",
+                "Right move",
+                2,
+                allowed_next_step_ids=("left_move",),
+                arm_control=ProgressStepArmControlV1(
+                    left="fixed_hold",
+                    right="teleop",
+                ),
+            ),
+            ProgressStepDefinitionV1(
+                "left_move",
+                "MOVE",
+                "Left move",
+                3,
+                arm_control=ProgressStepArmControlV1(
+                    left="teleop",
+                    right="fixed_hold",
+                ),
+            ),
+        ),
+        initial_step_id="both_move",
+        terminal_step_ids=("left_move",),
+    )
+
+    default_plan = build_progress_entry_arm_transition_plan(
+        profile=profile,
+        selected_entry_step_id="",
+        current_fixed_sides=(),
+        enforcement_mode="profile",
+    )
+    selected_plan = build_progress_entry_arm_transition_plan(
+        profile=profile,
+        selected_entry_step_id="left_move",
+        current_fixed_sides=("left",),
+        enforcement_mode="profile",
+    )
+
+    assert default_plan is not None
+    assert default_plan.target_progress_step_id == "both_move"
+    assert default_plan.target_fixed_sides == ()
+    assert not default_plan.changes_arm_control
+    assert selected_plan is not None
+    assert selected_plan.target_progress_step_id == "left_move"
+    assert selected_plan.target_fixed_sides == ("right",)
+    assert selected_plan.newly_teleop_sides == ("left",)
+    assert selected_plan.requires_home
+
+
+def test_pre_episode_entry_reconciliation_applies_hold_or_gates_on_home() -> None:
+    direct_plans = []
+
+    def apply_direct(plan: object) -> bool:
+        direct_plans.append(plan)
+        return True
+
+    direct_plan, direct_pending = _reconcile_idle_progress_entry_arm_control(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=(),
+        enforcement_mode="profile",
+        apply_direct=apply_direct,
+    )
+    home_plan, home_pending = _reconcile_idle_progress_entry_arm_control(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=("right",),
+        enforcement_mode="profile",
+        apply_direct=lambda _plan: False,
+    )
+
+    assert direct_plan is not None
+    assert direct_plans == [direct_plan]
+    assert direct_pending is None
+    assert home_plan is not None
+    assert home_pending is not None
+    assert home_pending.intent is None
+    assert home_pending.plan == home_plan
+    assert home_pending.capture_sides == ("right",)
 
 
 def test_undeclared_profile_is_compatible_except_in_strict_mode() -> None:
