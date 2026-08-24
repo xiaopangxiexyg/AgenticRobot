@@ -127,7 +127,7 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-final6/AgenticRobot/model/openpi"
+        / "code-final7/AgenticRobot/model/openpi"
     )
     assert profile["openpi_source_revision"] == (
         "97b3720515b18e94697573ba55caa6c1bc28af69"

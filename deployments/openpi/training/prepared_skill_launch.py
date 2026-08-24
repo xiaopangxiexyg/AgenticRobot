@@ -1637,7 +1637,7 @@ def _openpi_config(
         ),
         asset_id=str(profile["openpi_asset_id"]),
     )
-    data_overrides: dict[str, Any] = {}
+    data_overrides: dict[str, Any] = {"strict_media_integrity": True}
     configured_final_mask_root = str(
         profile.get("openpi_final_mask_root") or ""
     ).strip()
@@ -1658,7 +1658,6 @@ def _openpi_config(
         action_pose_mode=binding.action_pose_mode,
         last_action_pose_mode=binding.action_pose_mode,
         tail_policy="drop",
-        strict_media_integrity=True,
         state_augmentation=state_augmentation,
         dataset_sources=source_configs,
         default_prompt=str(
