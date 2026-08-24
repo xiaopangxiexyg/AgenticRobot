@@ -190,8 +190,8 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     assert Path(profile["openpi_assets_base_dir"]) == (
         run_root / "artifacts/assets"
     )
-    assert Path(profile["openpi_checkpoint_base_dir"]) == (
-        run_root / "artifacts/checkpoints"
+    assert Path(profile["openpi_checkpoint_base_dir"]) == Path(
+        "/home/user/zc/checkpoints/openpi"
     )
     assert Path(profile["openpi_weight_loader_params_path"]) == (
         Path("/home/user/zc/openpi/pi05_base_para/params")

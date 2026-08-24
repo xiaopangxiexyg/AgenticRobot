@@ -266,7 +266,7 @@
     }
   },
   "openpi_assets_base_dir": "/mnt/nas2/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/artifacts/assets",
-  "openpi_checkpoint_base_dir": "/mnt/nas2/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/artifacts/checkpoints",
+  "openpi_checkpoint_base_dir": "/home/user/zc/checkpoints/openpi",
   "openpi_weight_loader_params_path": "/home/user/zc/openpi/pi05_base_para/params",
   "openpi_training_mode": "standard_non_rtc_v1",
   "openpi_wrist_background_augmentation": {
