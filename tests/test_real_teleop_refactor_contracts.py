@@ -1110,6 +1110,115 @@ def test_device_retry_runtime_immediately_refreshes_camera_projection() -> None:
     assert published[-1]["hardware_status"]["camera.front"]["status_level"] == "ok"
 
 
+def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> None:
+    errors = {"dataset.writer": "initial writer startup failure"}
+    published: list[dict[str, object]] = []
+
+    class FailedRecorder:
+        def __init__(self) -> None:
+            self.start_calls = 0
+            self.closed = False
+
+        def start(self) -> None:
+            self.start_calls += 1
+            raise AssertionError("cannot start a process twice")
+
+        def close(self) -> None:
+            self.closed = True
+
+    failed_recorder = FailedRecorder()
+    current_recorder: dict[str, object | None] = {"value": failed_recorder}
+
+    class Recorder:
+        instances: list[Recorder] = []
+
+        def __init__(self, **_kwargs: object) -> None:
+            self.instance_index = len(self.instances)
+            self.start_calls = 0
+            self.config_writes = 0
+            self.closed = False
+            self.instances.append(self)
+
+        def start(self) -> None:
+            self.start_calls += 1
+            if self.start_calls > 1:
+                raise AssertionError("cannot start a process twice")
+            if self.instance_index < 2:
+                raise RuntimeError(f"retry {self.instance_index} failed")
+
+        def write_camera_device_config(self) -> None:
+            self.config_writes += 1
+
+        def close(self) -> None:
+            self.closed = True
+
+    clutch = SimpleNamespace(
+        _current_active_controls=lambda: ("device_retry",),
+        device_retry_admission=lambda: (True, ""),
+        _episode_busy=lambda: False,
+        _teleop_started=False,
+        hold_active=lambda: True,
+    )
+    components = SimpleNamespace(
+        gripper_input_source="",
+        left_state_backend=None,
+        right_state_backend=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    runtime = device_retry_runtime.build_device_retry_runtime(
+        args=SimpleNamespace(
+            foot_pad_requested=False,
+            ignore_camera=(),
+            q6_config_required=False,
+        ),
+        components=components,
+        control_ui=SimpleNamespace(
+            publish=lambda **kwargs: published.append(kwargs),
+            append_message=lambda *_args: None,
+        ),
+        clutch_input=clutch,
+        camera_sources={},
+        vive_source=None,
+        startup_device_errors=errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: current_recorder["value"],
+        set_dataset_recorder=lambda value: current_recorder.__setitem__(
+            "value", value
+        ),
+        foot_pad_input_provider=lambda: None,
+        set_foot_pad_input=lambda _value: None,
+        dataset_recorder_type=Recorder,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=object,
+        foot_pad_control_mode="foot-pad",
+        has_dmtac_gripper_backend=lambda _components: False,
+        promote_angle_trigger_gripper_input_to_q6=lambda *_args, **_kwargs: (
+            False,
+            "",
+        ),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    runtime.retry_failed_devices()
+    assert "retry 0 failed" in errors["dataset.writer"]
+    assert current_recorder["value"] is None
+    assert failed_recorder.closed is True
+    assert failed_recorder.start_calls == 0
+
+    runtime.retry_failed_devices()
+    assert "retry 1 failed" in errors["dataset.writer"]
+    assert current_recorder["value"] is None
+
+    runtime.retry_failed_devices()
+    assert "dataset.writer" not in errors
+    assert current_recorder["value"] is Recorder.instances[2]
+    assert [item.start_calls for item in Recorder.instances] == [1, 1, 1]
+    assert [item.closed for item in Recorder.instances] == [True, True, False]
+    assert [item.config_writes for item in Recorder.instances] == [0, 0, 1]
+    assert published[-1]["hardware_status"]["dataset.writer"]["status_level"] == "ok"
+
+
 def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -> None:
     outer_states: list[tuple[object | None, bool, object | None]] = []
     visualization_updates: list[dict[str, object]] = []
