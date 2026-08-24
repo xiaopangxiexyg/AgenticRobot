@@ -23,6 +23,10 @@ from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.postprocess import (
 from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.visualize import (
     MaskStream,
 )
+from utils.dataset_postprocess.wrist_cam_adjust.geometry_mask.dataset import (
+    _clone_non_video_files,
+    _clone_unprocessed_videos,
+)
 from utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline import (
     _intrinsics_overlay_for_source,
 )
@@ -119,7 +123,7 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-final/AgenticRobot/model/openpi"
+        / "code-final2/AgenticRobot/model/openpi"
     )
     intrinsics_overrides = profile["right_wrist_intrinsics_overrides"]
     assert set(intrinsics_overrides) == {
@@ -360,3 +364,25 @@ def test_intrinsics_overlay_binds_donor_by_serial_without_source_write(
     assert overlay["right_wrist"]["intrinsics"]["fx"] == 395.0
     assert overlay["right_wrist"]["serial"] == "serial-a"
     assert target_path.read_bytes() == original_target
+
+
+def test_geometry_copy_mode_skip_does_not_walk_or_clone_dataset(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    (source / "meta").mkdir(parents=True)
+    (source / "videos/chunk-000").mkdir(parents=True)
+    (source / "meta/info.json").write_text("{}", encoding="utf-8")
+    (source / "videos/chunk-000/episode.mp4").write_bytes(b"video")
+
+    _clone_non_video_files(source, target, copy_mode="skip", overwrite=False)
+    _clone_unprocessed_videos(
+        source,
+        target,
+        processed_relative_paths=set(),
+        copy_mode="skip",
+        overwrite=False,
+    )
+
+    assert not target.exists()

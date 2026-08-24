@@ -32,7 +32,6 @@ from .mask import (
 )
 from .video import MaskBuildConfig, VideoAdjustResult, WristMaskBuilder, process_video
 
-
 CopyMode = Literal["hardlink", "copy", "skip"]
 
 
@@ -110,6 +109,8 @@ def _copy_or_link(source: Path, target: Path, *, copy_mode: CopyMode, overwrite:
 
 
 def _clone_non_video_files(source_root: Path, output_root: Path, *, copy_mode: CopyMode, overwrite: bool) -> None:
+    if copy_mode == "skip":
+        return
     for source_path in source_root.rglob("*"):
         if not source_path.is_file():
             continue
@@ -133,6 +134,8 @@ def _clone_unprocessed_videos(
     copy_mode: CopyMode,
     overwrite: bool,
 ) -> None:
+    if copy_mode == "skip":
+        return
     videos_root = source_root / "videos"
     if not videos_root.exists():
         return
