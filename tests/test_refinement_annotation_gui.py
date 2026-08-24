@@ -44,6 +44,7 @@ from dataset_contracts.progress_stages import (
 )
 from dataset_interface.progress_annotation_jobs import (
     list_progress_annotation_work_items,
+    load_episode_sample_continuity,
     read_progress_annotation_work_item_batch,
 )
 from dataset_interface.progress_recoverable_failure_artifacts import (
@@ -578,6 +579,94 @@ def _finalized_manual_stop_dataset(
         encoding="utf-8",
     )
     return identity.episode_uuid
+
+
+def test_pause_aware_detail_exposes_break_and_does_not_bootstrap_pause_tail(
+    tmp_path: Path,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    episode_uuid = _finalized_manual_stop_dataset(tmp_path)
+    parquet_path = tmp_path / "data/chunk-000/episode_000000.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "timestamp": [0.0, 1.0, 4.0, 4.5, 5.0, 5.5, 6.0],
+                "collection.continuity_segment_index": [0, 0, 1, 1, 1, 1, 1],
+            }
+        ),
+        parquet_path,
+    )
+    catalog_path = tmp_path / "meta/episodes.jsonl"
+    record = json.loads(catalog_path.read_text(encoding="utf-8"))
+    record["summary"] = {
+        "recording_pause_segments": [
+            {
+                "start_timestamp": 2.0,
+                "end_timestamp": 4.0,
+                # This deliberately differs from wall time: alignment must
+                # never back-compute from the monotonic duration.
+                "duration_sec": 99.0,
+                "reason": "progress_arm_profile_transition",
+                "reasons": ["hold_requested", "runtime_home"],
+            }
+        ]
+    }
+    catalog_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    item = list_progress_annotation_work_items(tmp_path)[0]
+    continuity = load_episode_sample_continuity(item)
+    assert continuity.break_indices == (2,)
+    assert continuity.sources == (
+        "PARQUET_CONTINUITY_SEGMENT",
+        "EPISODE_PAUSE_SUMMARY",
+    )
+
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+    )
+    try:
+        detail = application.episode_detail(episode_uuid)
+        a_occurrences = [
+            value
+            for value in detail["draft"]["occurrences"]
+            if value["progress_step_id"] == "a"
+        ]
+        assert a_occurrences[-1]["end_at"] == 2.0
+        assert detail["sample_continuity_break_indices"] == [2]
+        assert detail["recording_pause_segments"][0]["duration_sec"] == 2.0
+        status_codes = {
+            value["code"]
+            for value in detail["annotation_status"]["badges"]
+        }
+        assert "COLLECTION_PAUSED" in status_codes
+    finally:
+        application.close()
+
+
+def test_legacy_episode_without_continuity_column_infers_large_gap(
+    tmp_path: Path,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    _finalized_failure_retry_dataset(tmp_path)
+    pq.write_table(
+        pa.table(
+            {
+                "timestamp": [0.0, 0.1, 0.2, 3.0, 3.1, 3.2, 3.3, 3.4, 3.5],
+            }
+        ),
+        tmp_path / "data/chunk-000/episode_000000.parquet",
+    )
+
+    item = list_progress_annotation_work_items(tmp_path)[0]
+    continuity = load_episode_sample_continuity(item)
+
+    assert continuity.break_indices == (3,)
+    assert continuity.sources == ("TIMESTAMP_GAP_LEGACY",)
 
 
 def test_manual_stop_defaults_to_recorded_step_and_can_reflow_to_early_step(
@@ -2101,7 +2190,7 @@ def test_episode_detail_reuses_immutable_sample_axis(
 
     episode_uuid = _finalized_failure_retry_dataset(tmp_path)
     calls = 0
-    original = application_module.load_episode_sample_axis
+    original = application_module.load_episode_sample_continuity
 
     def counted_load(item: object) -> object:
         nonlocal calls
@@ -2110,7 +2199,7 @@ def test_episode_detail_reuses_immutable_sample_axis(
 
     monkeypatch.setattr(
         application_module,
-        "load_episode_sample_axis",
+        "load_episode_sample_continuity",
         counted_load,
     )
     application = RefinementAnnotationApplication(
@@ -2429,7 +2518,7 @@ def test_persistent_read_cache_avoids_reloading_immutable_catalog_and_axis(
     )
     monkeypatch.setattr(
         application_module,
-        "load_episode_sample_axis",
+        "load_episode_sample_continuity",
         unexpected_sample_axis,
     )
     second = RefinementAnnotationApplication(

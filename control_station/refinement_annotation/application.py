@@ -63,9 +63,10 @@ from dataset_contracts.progress_stage_annotations import (
     capture_end_projected_attempt_id,
 )
 from dataset_interface.progress_annotation_jobs import (
+    EpisodeSampleContinuity,
     ProgressAnnotationCatalogCursor,
     ProgressAnnotationWorkItem,
-    load_episode_sample_axis,
+    load_episode_sample_continuity,
     progress_annotation_catalog_fingerprint,
     progress_annotation_catalog_probe_fingerprint,
     read_progress_annotation_work_item_batch,
@@ -131,6 +132,80 @@ _RETRYABLE_STAGE_STORE_ERRNOS = frozenset(
     )
     if value is not None
 )
+
+
+def _active_wall_intervals(
+    item: ProgressAnnotationWorkItem,
+    start_at: float,
+    end_at: float,
+) -> tuple[tuple[float, float], ...]:
+    """Return wall-clock pieces that contain collectable Episode time."""
+
+    clipped = sorted(
+        (
+            max(start_at, pause.start_timestamp),
+            min(end_at, pause.end_timestamp),
+        )
+        for pause in item.recording_pause_segments
+        if pause.end_timestamp > start_at and pause.start_timestamp < end_at
+    )
+    merged: list[tuple[float, float]] = []
+    for begin, end in clipped:
+        if end <= begin:
+            continue
+        if merged and begin <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((begin, end))
+    active: list[tuple[float, float]] = []
+    cursor = start_at
+    for begin, end in merged:
+        if cursor < begin:
+            active.append((cursor, begin))
+        cursor = max(cursor, end)
+    if cursor < end_at:
+        active.append((cursor, end_at))
+    return tuple(active)
+
+
+def _equal_active_time_splits(
+    item: ProgressAnnotationWorkItem,
+    start_at: float,
+    end_at: float,
+    count: int,
+) -> tuple[tuple[float, float], ...]:
+    """Split collectable time evenly without assigning a leading/tail pause."""
+
+    if count <= 0 or end_at <= start_at:
+        return ()
+    active = _active_wall_intervals(item, start_at, end_at)
+    total = sum(end - begin for begin, end in active)
+    if total <= 0.0:
+        duration = end_at - start_at
+        return tuple(
+            (
+                start_at + duration * index / count,
+                start_at + duration * (index + 1) / count,
+            )
+            for index in range(count)
+        )
+
+    def wall_at_active_offset(offset: float) -> float:
+        if offset <= 0.0:
+            return active[0][0]
+        remaining = min(offset, total)
+        for begin, end in active:
+            duration = end - begin
+            if remaining <= duration:
+                return begin + remaining
+            remaining -= duration
+        return active[-1][1]
+
+    boundaries = tuple(
+        wall_at_active_offset(total * index / count)
+        for index in range(count + 1)
+    )
+    return tuple(zip(boundaries, boundaries[1:]))
 
 
 class RefinementAnnotationApplicationError(ValueError):
@@ -213,7 +288,7 @@ class RefinementAnnotationApplication:
         self._episode_list_revision = 0
         self._sample_axis_cache: OrderedDict[
             str,
-            tuple[tuple[object, ...], EpisodeSampleAxis],
+            tuple[tuple[object, ...], EpisodeSampleContinuity],
         ] = OrderedDict()
         self._ordered_items_cache: tuple[ProgressAnnotationWorkItem, ...] = ()
         self._ordered_items_cache_revision = -1
@@ -500,8 +575,11 @@ class RefinementAnnotationApplication:
             str(item.parquet_path),
         )
 
-    def _sample_axis(self, item: ProgressAnnotationWorkItem) -> EpisodeSampleAxis:
-        """Reuse immutable Episode timestamps while the annotation app is open."""
+    def _sample_continuity(
+        self,
+        item: ProgressAnnotationWorkItem,
+    ) -> EpisodeSampleContinuity:
+        """Reuse immutable Episode timestamps and continuity while open."""
 
         cache_key = self._sample_axis_cache_key(item)
         with self._lock:
@@ -510,21 +588,24 @@ class RefinementAnnotationApplication:
                 self._sample_axis_cache.move_to_end(item.episode_uuid)
                 return cached[1]
 
-        persistent = self._read_cache.load_sample_axis(item)
+        persistent = self._read_cache.load_sample_continuity(item)
         if persistent is not None:
-            sample_axis = persistent
+            continuity = persistent
         else:
-            sample_axis = load_episode_sample_axis(item)
-            self._read_cache.save_sample_axis(item, sample_axis)
+            continuity = load_episode_sample_continuity(item)
+            self._read_cache.save_sample_continuity(item, continuity)
         with self._lock:
             self._sample_axis_cache[item.episode_uuid] = (
                 cache_key,
-                sample_axis,
+                continuity,
             )
             self._sample_axis_cache.move_to_end(item.episode_uuid)
             while len(self._sample_axis_cache) > _SAMPLE_AXIS_CACHE_LIMIT:
                 self._sample_axis_cache.popitem(last=False)
-        return sample_axis
+        return continuity
+
+    def _sample_axis(self, item: ProgressAnnotationWorkItem) -> EpisodeSampleAxis:
+        return self._sample_continuity(item).sample_axis
 
     def list_episodes(
         self,
@@ -929,14 +1010,17 @@ class RefinementAnnotationApplication:
                     selected_stages = (stages[-1],)
                 stage_cursor += len(selected_stages)
                 remaining_stages = max(0, len(stages) - stage_cursor)
-                duration = value.end_at - value.start_at
-                for local_index, stage in enumerate(selected_stages, start=1):
-                    start_at = value.start_at + duration * (
-                        local_index - 1
-                    ) / len(selected_stages)
-                    end_at = value.start_at + duration * local_index / (
-                        len(selected_stages)
-                    )
+                split_bounds = _equal_active_time_splits(
+                    item,
+                    value.start_at,
+                    value.end_at,
+                    len(selected_stages),
+                )
+                for local_index, (stage, bounds) in enumerate(
+                    zip(selected_stages, split_bounds),
+                    start=1,
+                ):
+                    start_at, end_at = bounds
                     truncated = (
                         source_outcome == "TRUNCATED_BY_ABNORMAL"
                         and segment_index == len(ordered_values) - 1
@@ -1456,13 +1540,14 @@ class RefinementAnnotationApplication:
                 self._sealed_annotation_sets,
                 item,
             )
-            sample_axis_future = executor.submit(self._sample_axis, item)
+            sample_axis_future = executor.submit(self._sample_continuity, item)
             stored_draft_future = executor.submit(
                 self.workspace.load_draft,
                 episode_uuid=episode_uuid,
             )
             annotation_sets = annotation_sets_future.result()
-            sample_axis = sample_axis_future.result()
+            sample_continuity = sample_axis_future.result()
+            sample_axis = sample_continuity.sample_axis
             try:
                 stored_draft = stored_draft_future.result()
             except StageAnnotationStoreError as exc:
@@ -1643,6 +1728,7 @@ class RefinementAnnotationApplication:
             annotation_summary,
             has_draft=item.has_draft,
             detail_state=detail_status.state,
+            recording_pause_count=len(item.recording_pause_segments),
         )
         step_by_id = item.progress.profile.step_by_id
         return {
@@ -1673,6 +1759,14 @@ class RefinementAnnotationApplication:
             # across intentional Hold/Pause gaps without changing any stored
             # timestamp or annotation contract.
             "sample_timestamps": list(sample_axis.cut_times),
+            "sample_continuity_break_indices": list(
+                sample_continuity.break_indices
+            ),
+            "sample_continuity_sources": list(sample_continuity.sources),
+            "recording_pause_segments": [
+                value.to_payload()
+                for value in item.recording_pause_segments
+            ],
             "entry_stage_id": stage_entry.entry_stage_id,
             "entry_condition": stage_entry.entry_condition,
             "capture_end_step_editor": (
@@ -1805,6 +1899,7 @@ class RefinementAnnotationApplication:
                 annotation_summary,
                 has_draft=item.has_draft,
                 detail_state=detail_annotation_state,
+                recording_pause_count=len(item.recording_pause_segments),
             ),
         }
 
@@ -4027,17 +4122,17 @@ class RefinementAnnotationApplication:
             else:
                 selected = (stages[cursor],)
                 outcomes = ("SUCCESS",)
-            duration = attempt.end_at - attempt.start_at
-            for index, (stage, outcome) in enumerate(
-                zip(selected, outcomes),
+            split_bounds = _equal_active_time_splits(
+                item,
+                attempt.start_at,
+                attempt.end_at,
+                len(selected),
+            )
+            for index, (stage, outcome, bounds) in enumerate(
+                zip(selected, outcomes, split_bounds),
                 start=1,
             ):
-                start_at = attempt.start_at + (
-                    duration * (index - 1) / len(selected)
-                )
-                end_at = attempt.start_at + (
-                    duration * index / len(selected)
-                )
+                start_at, end_at = bounds
                 occurrences.append(
                     {
                         "annotation_id": (

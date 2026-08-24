@@ -30,18 +30,20 @@ from dataset_contracts.progress_stages import (
     validate_progress_stage_entry_binding,
 )
 from dataset_interface.progress_annotation_jobs import (
+    EpisodeSampleContinuity,
     ProgressAnnotationCatalogBatch,
     ProgressAnnotationCatalogCursor,
     ProgressAnnotationWorkItem,
+    RecordingPauseSegment,
 )
 from dataset_interface.progress_artifacts import SealedProgressEpisode
 from dataset_interface.progress_timeline import resolve_progress_timeline
 from dataset_interface.sample_axis import EpisodeSampleAxis
 
 
-_CATALOG_CACHE_SCHEMA = "dexteleop.refinement_annotation.catalog_cache.v1"
+_CATALOG_CACHE_SCHEMA = "dexteleop.refinement_annotation.catalog_cache.v2"
 _SAMPLE_AXIS_CACHE_SCHEMA = (
-    "dexteleop.refinement_annotation.sample_axis_cache.v1"
+    "dexteleop.refinement_annotation.sample_continuity_cache.v2"
 )
 
 
@@ -127,6 +129,9 @@ def _work_item_payload(root: Path, item: ProgressAnnotationWorkItem) -> dict[str
         "frame_count": item.frame_count,
         "start_timestamp": item.start_timestamp,
         "end_timestamp": item.end_timestamp,
+        "recording_pause_segments": [
+            value.to_payload() for value in item.recording_pause_segments
+        ],
         "profile": progress.profile.to_payload(),
         "binding": progress.binding.to_payload(),
         "facts": [value.to_payload() for value in progress.facts],
@@ -223,6 +228,16 @@ def _work_item_from_payload(
         # visible-row summaries or exact Episode opening.
         annotation_set_count=0,
         has_draft=False,
+        recording_pause_segments=tuple(
+            RecordingPauseSegment(
+                start_timestamp=float(value["start_timestamp"]),
+                end_timestamp=float(value["end_timestamp"]),
+                reason=str(value.get("reason", "")),
+                reasons=tuple(str(reason) for reason in value.get("reasons", ())),
+            )
+            for value in payload.get("recording_pause_segments", ())
+            if isinstance(value, Mapping)
+        ),
     )
 
 
@@ -407,15 +422,18 @@ class ProgressAnnotationReadCache:
             },
         )
 
-    def load_sample_axis(
+    def load_sample_continuity(
         self,
         item: ProgressAnnotationWorkItem,
-    ) -> EpisodeSampleAxis | None:
+    ) -> EpisodeSampleContinuity | None:
         if not self._available:
             return None
         try:
             payload = self._read_json(self._sample_axis_path(item))
             values = payload.get("cut_times")
+            segment_values = payload.get("segment_indices")
+            break_values = payload.get("break_indices")
+            source_values = payload.get("sources")
             if (
                 payload.get("schema") != _SAMPLE_AXIS_CACHE_SCHEMA
                 or payload.get("cache_key") != self._sample_axis_key(item)
@@ -423,23 +441,44 @@ class ProgressAnnotationReadCache:
                 != item.progress.timeline.clock_domain_id
                 or not isinstance(values, list)
                 or len(values) != item.frame_count
+                or not isinstance(segment_values, list)
+                or len(segment_values) != item.frame_count
+                or not isinstance(break_values, list)
+                or not isinstance(source_values, list)
             ):
                 return None
             cut_times = tuple(float(value) for value in values)
             if not all(math.isfinite(value) for value in cut_times):
                 return None
-            return EpisodeSampleAxis(
+            sample_axis = EpisodeSampleAxis(
                 clock_domain_id=item.progress.timeline.clock_domain_id,
                 cut_times=cut_times,
+            )
+            segment_indices = tuple(
+                None if value is None else int(value)
+                for value in segment_values
+            )
+            break_indices = tuple(int(value) for value in break_values)
+            if any(
+                value <= 0 or value >= item.frame_count
+                for value in break_indices
+            ) or tuple(sorted(set(break_indices))) != break_indices:
+                return None
+            return EpisodeSampleContinuity(
+                sample_axis=sample_axis,
+                segment_indices=segment_indices,
+                break_indices=break_indices,
+                sources=tuple(str(value) for value in source_values),
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
-    def save_sample_axis(
+    def save_sample_continuity(
         self,
         item: ProgressAnnotationWorkItem,
-        sample_axis: EpisodeSampleAxis,
+        continuity: EpisodeSampleContinuity,
     ) -> None:
+        sample_axis = continuity.sample_axis
         if len(sample_axis.cut_times) != item.frame_count:
             return
         self._atomic_write(
@@ -449,7 +488,36 @@ class ProgressAnnotationReadCache:
                 "cache_key": self._sample_axis_key(item),
                 "clock_domain_id": sample_axis.clock_domain_id,
                 "cut_times": list(sample_axis.cut_times),
+                "segment_indices": list(continuity.segment_indices),
+                "break_indices": list(continuity.break_indices),
+                "sources": list(continuity.sources),
             },
+        )
+
+    def load_sample_axis(
+        self,
+        item: ProgressAnnotationWorkItem,
+    ) -> EpisodeSampleAxis | None:
+        """Compatibility projection for callers that only need timestamps."""
+
+        continuity = self.load_sample_continuity(item)
+        return None if continuity is None else continuity.sample_axis
+
+    def save_sample_axis(
+        self,
+        item: ProgressAnnotationWorkItem,
+        sample_axis: EpisodeSampleAxis,
+    ) -> None:
+        """Compatibility writer for timestamp-only callers."""
+
+        self.save_sample_continuity(
+            item,
+            EpisodeSampleContinuity(
+                sample_axis=sample_axis,
+                segment_indices=tuple(None for _ in sample_axis.cut_times),
+                break_indices=(),
+                sources=(),
+            ),
         )
 
 

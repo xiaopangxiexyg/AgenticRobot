@@ -13,7 +13,7 @@ from dataset_interface.prepared_training.skill_selection import (
 )
 from dataset_interface.progress_annotation_jobs import (
     list_progress_annotation_work_items,
-    load_episode_sample_axis,
+    load_episode_sample_continuity,
 )
 from dataset_interface.progress_stage_annotation_artifacts import (
     STAGE_ANNOTATION_RELATIVE_ROOT,
@@ -210,10 +210,14 @@ def prepare_stage1_scenario_selections(
 
             intervals: tuple[tuple[int, int], ...] = ()
             if reason is None:
-                sample_axis = load_episode_sample_axis(item)
+                sample_continuity = load_episode_sample_continuity(item)
+                sample_axis = sample_continuity.sample_axis
                 semantic = build_episode_training_semantic_index(
                     timeline=item.progress.timeline,
                     sample_axis=sample_axis,
+                    continuity_break_indices=(
+                        sample_continuity.break_indices
+                    ),
                 )
                 attempts = tuple(
                     span.sample_interval

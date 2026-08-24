@@ -46,6 +46,11 @@ from dataset_interface.prepared_training_view import (
 from dataset_interface.prepared_training import (
     select_strict_successful_skill_episodes,
 )
+from dataset_interface.prepared_training.sources import prepare_episode
+from dataset_interface.progress_annotation_jobs import (
+    list_progress_annotation_work_items,
+)
+from dataset_interface.sample_axis import SampleIndexInterval
 
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -106,6 +111,7 @@ def _dataset(
     profiles: tuple[TaskProgressProfileV1, TaskStageProfileV1],
     annotate: bool,
     annotation_set_id: str = "set-1",
+    continuity_segments: list[int] | None = None,
 ) -> str:
     progress, stages = profiles
     identity = EpisodeCaptureIdentity(
@@ -154,15 +160,13 @@ def _dataset(
 
     parquet_path = root / "data" / "chunk-000" / f"episode_{episode_index:06d}.parquet"
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        pa.table(
-            {
-                "timestamp": [1.0, 2.0, 3.0, 4.0],
-                "observation.state": [[0.0], [1.0], [2.0], [3.0]],
-            }
-        ),
-        parquet_path,
-    )
+    columns: dict[str, object] = {
+        "timestamp": [1.0, 2.0, 3.0, 4.0],
+        "observation.state": [[0.0], [1.0], [2.0], [3.0]],
+    }
+    if continuity_segments is not None:
+        columns["collection.continuity_segment_index"] = continuity_segments
+    pq.write_table(pa.table(columns), parquet_path)
     video_path = root / "videos" / "front" / f"episode_{episode_index:06d}.mp4"
     video_path.parent.mkdir(parents=True, exist_ok=True)
     video_path.write_bytes(f"video:{episode_uuid}".encode())
@@ -240,6 +244,36 @@ def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
         for path in root.rglob("*")
         if path.is_file()
     }
+
+
+def test_prepared_episode_training_semantics_split_at_collection_continuity(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    _dataset(
+        source_root,
+        episode_uuid="episode-continuity",
+        episode_index=0,
+        profiles=_profiles(),
+        annotate=False,
+        continuity_segments=[0, 0, 1, 1],
+    )
+    source = PreparedSourceDataset("continuity-source", source_root)
+    item = list_progress_annotation_work_items(source_root)[0]
+
+    prepared = prepare_episode(
+        source=source,
+        item=item,
+        dataset_fingerprint="fixture-fingerprint",
+        selector=None,
+        column_projection=("timestamp", "observation.state"),
+        modality_selection=("numeric",),
+    )
+
+    assert prepared.semantic_index.nominal_intervals == (
+        SampleIndexInterval(0, 2),
+        SampleIndexInterval(2, 4),
+    )
 
 
 def _add_then_detach_tactile(root: Path) -> None:

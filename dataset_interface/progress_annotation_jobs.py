@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
+from statistics import median
 from typing import Any, Callable, Mapping, Sequence
 
 from .progress_artifacts import (
@@ -34,6 +37,72 @@ class ProgressAnnotationJobError(ValueError):
 
 _FULL_SCAN_MAX_WORKERS = 24
 _FULL_SCAN_PARALLEL_THRESHOLD = 8
+
+
+@dataclass(frozen=True)
+class RecordingPauseSegment:
+    """Wall-clock pause interval persisted in an Episode summary."""
+
+    start_timestamp: float
+    end_timestamp: float
+    reason: str
+    reasons: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        start = float(self.start_timestamp)
+        end = float(self.end_timestamp)
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ProgressAnnotationJobError(
+                "A recording pause must have finite increasing wall timestamps."
+            )
+        object.__setattr__(self, "start_timestamp", start)
+        object.__setattr__(self, "end_timestamp", end)
+        object.__setattr__(self, "reason", str(self.reason).strip())
+        object.__setattr__(
+            self,
+            "reasons",
+            tuple(str(value).strip() for value in self.reasons if str(value).strip()),
+        )
+
+    @property
+    def duration_sec(self) -> float:
+        # Deliberately derive this from wall-clock endpoints. The persisted
+        # duration_sec uses a monotonic clock and cannot align annotations.
+        return max(0.0, self.end_timestamp - self.start_timestamp)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "start_timestamp": self.start_timestamp,
+            "end_timestamp": self.end_timestamp,
+            "duration_sec": self.duration_sec,
+            "reason": self.reason,
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass(frozen=True)
+class EpisodeSampleContinuity:
+    """Sample axis plus boundaries that temporal windows must not cross."""
+
+    sample_axis: EpisodeSampleAxis
+    segment_indices: tuple[int | None, ...]
+    break_indices: tuple[int, ...]
+    sources: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        count = self.sample_axis.sample_count
+        if len(self.segment_indices) != count:
+            raise ProgressAnnotationJobError(
+                "Continuity segment count differs from the sample axis."
+            )
+        breaks = tuple(self.break_indices)
+        if (
+            tuple(sorted(set(breaks))) != breaks
+            or any(value <= 0 or value >= count for value in breaks)
+        ):
+            raise ProgressAnnotationJobError(
+                "Continuity breaks must be unique ordered interior indices."
+            )
 
 
 @dataclass(frozen=True)
@@ -85,6 +154,7 @@ class ProgressAnnotationWorkItem:
     progress: SealedProgressEpisode | LoadedRetrospectiveProgressEpisode
     annotation_set_count: int
     has_draft: bool
+    recording_pause_segments: tuple[RecordingPauseSegment, ...] = ()
 
     @property
     def default_camera_key(self) -> str:
@@ -98,6 +168,9 @@ class ProgressAnnotationWorkItem:
             len(self.progress.stage_profile.stages)
             if self.progress.stage_profile is not None
             else 0
+        )
+        pause_duration_sec = sum(
+            value.duration_sec for value in self.recording_pause_segments
         )
         return {
             "episode_index": self.episode_index,
@@ -115,6 +188,8 @@ class ProgressAnnotationWorkItem:
             "default_camera_key": self.default_camera_key,
             "annotation_set_count": self.annotation_set_count,
             "has_draft": self.has_draft,
+            "recording_pause_count": len(self.recording_pause_segments),
+            "recording_pause_duration_sec": pause_duration_sec,
             "progress_profile_id": self.progress.profile.profile_id,
             "task_stage_profile_id": (
                 None
@@ -135,6 +210,59 @@ class ProgressAnnotationWorkItem:
             # eager playback and next-Episode warmup.
             "stage_count": stage_count,
         }
+
+
+def _recording_pause_segments(
+    record: Mapping[str, Any],
+) -> tuple[RecordingPauseSegment, ...]:
+    summary = record.get("summary")
+    raw_segments = (
+        summary.get("recording_pause_segments")
+        if isinstance(summary, Mapping)
+        else None
+    )
+    if not isinstance(raw_segments, Sequence) or isinstance(
+        raw_segments,
+        (str, bytes),
+    ):
+        return ()
+    values: list[RecordingPauseSegment] = []
+    for raw in raw_segments:
+        if not isinstance(raw, Mapping):
+            continue
+        try:
+            start = float(raw["start_timestamp"])
+            end = float(raw["end_timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        reason = str(raw.get("reason", "")).strip()
+        raw_reasons = raw.get("reasons")
+        reasons = (
+            tuple(
+                str(value).strip()
+                for value in raw_reasons
+                if str(value).strip()
+            )
+            if isinstance(raw_reasons, Sequence)
+            and not isinstance(raw_reasons, (str, bytes))
+            else ()
+        )
+        values.append(
+            RecordingPauseSegment(
+                start_timestamp=start,
+                end_timestamp=end,
+                reason=reason,
+                reasons=reasons,
+            )
+        )
+    return tuple(
+        sorted(
+            values,
+            key=lambda value: (value.start_timestamp, value.end_timestamp),
+        )
+    )
 
 
 def progress_annotation_catalog_fingerprint(
@@ -373,6 +501,7 @@ def _retrospective_work_items(
                     / episode_uuid
                     / "draft.json"
                 ).is_file(),
+                recording_pause_segments=(),
             )
         )
     return tuple(
@@ -509,6 +638,7 @@ def _work_item_from_record(
         progress=progress,
         annotation_set_count=set_count,
         has_draft=has_draft,
+        recording_pause_segments=_recording_pause_segments(record),
     )
 
 
@@ -714,10 +844,61 @@ def list_progress_annotation_work_items(
 def load_episode_sample_axis(
     work_item: ProgressAnnotationWorkItem,
 ) -> EpisodeSampleAxis:
-    """Load only the timestamp column needed by timeline indexing."""
+    """Load the timestamp axis while preserving the historical public API."""
+
+    return load_episode_sample_continuity(work_item).sample_axis
+
+
+def _inferred_timestamp_break_indices(
+    cut_times: tuple[float, ...],
+) -> tuple[int, ...]:
+    positive = tuple(
+        current - previous
+        for previous, current in zip(cut_times, cut_times[1:])
+        if current > previous
+    )
+    if not positive:
+        return ()
+    threshold = max(0.5, 5.0 * median(positive))
+    return tuple(
+        index
+        for index in range(1, len(cut_times))
+        if cut_times[index] - cut_times[index - 1] > threshold
+    )
+
+
+def _pause_break_indices(
+    cut_times: tuple[float, ...],
+    pauses: Sequence[RecordingPauseSegment],
+) -> tuple[int, ...]:
+    values: set[int] = set()
+    for pause in pauses:
+        index = bisect_left(cut_times, pause.end_timestamp)
+        if 0 < index < len(cut_times):
+            values.add(index)
+    return tuple(sorted(values))
+
+
+def load_episode_sample_continuity(
+    work_item: ProgressAnnotationWorkItem,
+) -> EpisodeSampleContinuity:
+    """Load sample timestamps and derive fail-closed continuity boundaries.
+
+    Current datasets use the persisted continuity-segment column. Episode
+    pause summaries add an independently auditable wall-clock projection. Old
+    datasets lacking both retain compatibility through a conservative gap
+    inference rather than being silently treated as continuous.
+    """
 
     if isinstance(work_item.progress, LoadedRetrospectiveProgressEpisode):
-        return work_item.progress.sample_axis
+        sample_axis = work_item.progress.sample_axis
+        inferred = _inferred_timestamp_break_indices(sample_axis.cut_times)
+        return EpisodeSampleContinuity(
+            sample_axis=sample_axis,
+            segment_indices=tuple(None for _ in sample_axis.cut_times),
+            break_indices=inferred,
+            sources=(("TIMESTAMP_GAP_LEGACY",) if inferred else ()),
+        )
 
     try:
         import pyarrow.parquet as pq  # type: ignore[import-not-found]
@@ -726,8 +907,24 @@ def load_episode_sample_axis(
             "pyarrow is required to read finalized Episode timestamps."
         ) from exc
     try:
-        table = pq.read_table(work_item.parquet_path, columns=["timestamp"])
+        parquet_file = pq.ParquetFile(work_item.parquet_path)
+        continuity_column = "collection.continuity_segment_index"
+        has_continuity_column = (
+            parquet_file.schema_arrow.get_field_index(continuity_column) >= 0
+        )
+        columns = ["timestamp"]
+        if has_continuity_column:
+            columns.append(continuity_column)
+        table = parquet_file.read(columns=columns)
         values = tuple(float(value.as_py()) for value in table["timestamp"])
+        segment_indices = (
+            tuple(
+                None if value.as_py() is None else int(value.as_py())
+                for value in table[continuity_column]
+            )
+            if has_continuity_column
+            else tuple(None for _ in values)
+        )
     except Exception as exc:
         raise ProgressAnnotationJobError(
             f"Cannot read Episode sample timestamps: {exc}"
@@ -736,9 +933,36 @@ def load_episode_sample_axis(
         raise ProgressAnnotationJobError(
             "Parquet timestamp count differs from finalized frame_count."
         )
-    return EpisodeSampleAxis(
+    sample_axis = EpisodeSampleAxis(
         clock_domain_id=work_item.progress.timeline.clock_domain_id,
         cut_times=values,
+    )
+    breaks: set[int] = set()
+    sources: list[str] = []
+    if has_continuity_column:
+        breaks.update(
+            index
+            for index in range(1, len(segment_indices))
+            if segment_indices[index] != segment_indices[index - 1]
+        )
+        sources.append("PARQUET_CONTINUITY_SEGMENT")
+    pause_breaks = _pause_break_indices(
+        values,
+        work_item.recording_pause_segments,
+    )
+    if pause_breaks:
+        breaks.update(pause_breaks)
+        sources.append("EPISODE_PAUSE_SUMMARY")
+    if not has_continuity_column and not work_item.recording_pause_segments:
+        inferred = _inferred_timestamp_break_indices(values)
+        if inferred:
+            breaks.update(inferred)
+            sources.append("TIMESTAMP_GAP_LEGACY")
+    return EpisodeSampleContinuity(
+        sample_axis=sample_axis,
+        segment_indices=segment_indices,
+        break_indices=tuple(sorted(breaks)),
+        sources=tuple(sources),
     )
 
 
@@ -747,8 +971,11 @@ __all__ = [
     "ProgressAnnotationCatalogCursor",
     "ProgressAnnotationJobError",
     "ProgressAnnotationWorkItem",
+    "EpisodeSampleContinuity",
+    "RecordingPauseSegment",
     "list_progress_annotation_work_items",
     "load_episode_sample_axis",
+    "load_episode_sample_continuity",
     "progress_annotation_catalog_fingerprint",
     "progress_annotation_catalog_probe_fingerprint",
     "read_progress_annotation_work_item_batch",

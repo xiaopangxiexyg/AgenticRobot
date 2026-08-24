@@ -61,6 +61,7 @@ def build_episode_status_payload(
     *,
     has_draft: bool,
     detail_state: str | None,
+    recording_pause_count: int = 0,
 ) -> dict[str, Any]:
     """Build an additive, versioned status model while old fields remain valid."""
 
@@ -134,6 +135,14 @@ def build_episode_status_payload(
         else:
             attention_level = "NONE"
             primary_label = "状态正常"
+
+    if recording_pause_count > 0:
+        add_badge(
+            "COLLECTION_PAUSED",
+            f"采集暂停 {recording_pause_count} 次",
+            "INFO",
+            45,
+        )
 
     badges.sort(key=lambda value: (value["priority"], value["code"]))
     return {
