@@ -36,7 +36,9 @@ def test_five_pedal_dry_run_is_fixed_to_count_five() -> None:
 
 def test_collection_dry_run_fixes_control_progress_and_tactile_contract(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.delenv("GRIPPER_WARMUP_PROBE", raising=False)
     tactile_root = tmp_path / "tactile"
     tactile_root.mkdir()
     dataset_root = tmp_path / "not-created-dataset-root"
@@ -70,6 +72,26 @@ def test_collection_dry_run_fixes_control_progress_and_tactile_contract(
     assert f"--tactile-bundle-root {tactile_root}" in output
     assert "--tactile-artifact-integrity" in output
     assert "--idle-tactile-compression" in output
+    assert "--no-gripper-warmup-probe" in output
+
+
+def test_collection_can_explicitly_enable_gripper_motion_probe(
+    tmp_path: Path,
+) -> None:
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+
+    result = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+        "--gripper-warmup-probe",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--gripper-warmup-probe" in result.stdout
+    assert "--no-gripper-warmup-probe" not in result.stdout
 
 
 def test_collection_requires_explicit_tactile_root(monkeypatch) -> None:
