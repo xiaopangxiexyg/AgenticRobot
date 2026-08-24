@@ -99,7 +99,9 @@ column-major 数组只能通过 `controller_wire_matrix_to_transform()` 转换�
 from runtime_artifact_paths import RuntimeArtifactLayout
 from teleop_runtime.deploy.quest_paired_pose_evidence_store import (
     fit_quest_paired_pose_evidence,
+    load_quest_paired_pose_diagnostic_fit,
     load_sealed_quest_paired_pose_evidence,
+    publish_quest_paired_pose_diagnostic_fit,
     publish_sealed_quest_paired_pose_evidence,
 )
 
@@ -113,16 +115,40 @@ sealed = load_sealed_quest_paired_pose_evidence(
     evidence_semantic_content_hash=commit.evidence_semantic_content_hash,
 )
 report = fit_quest_paired_pose_evidence(sealed)
+report_commit = publish_quest_paired_pose_diagnostic_fit(
+    layout=layout,
+    diagnostic_fit=report,
+)
+persisted_report = load_quest_paired_pose_diagnostic_fit(
+    layout=layout,
+    diagnostic_fit_semantic_content_hash=(
+        report_commit.diagnostic_fit_semantic_content_hash
+    ),
+)
 ```
 
 证据文件相对 `layout.root` 位于
-`evidence/quest_paired_pose_capture/<evidence-hash>.cjson`；默认 root 下即为
-`runtime_artifacts/evidence/...`，本机覆盖 root 时以 `commit.path` 为准。只有显式 publish
-才创建文件。文件名绑定完整 capture evidence hash；文件内仍保留不同域的 R0 dataset
-SHA-256，commit 另外报告 canonical 文件字节 SHA-256。诊断报告 schema 为
-`dexteleop.quest_paired_pose_diagnostic_fit.v1`，再用独立 hash domain 绑定完整 evidence
-hash、dataset hash 与原 solver fit payload。该报告只在内存返回，不是 acceptance，也不
-写 calibration profile。
+`evidence/quest_paired_pose_capture/<evidence-hash>.cjson`；候选诊断报告独立位于
+`derived/quest_paired_pose_diagnostic_fit/<report-hash>/report.cjson`。默认 root 下二者
+都在 `runtime_artifacts/`，本机覆盖 root 时分别以 `commit.path` 与
+`report_commit.path` 为准。构造 layout、封存、fit 和 ordinary close 均不写文件；只有
+两个各自显式的 publish 调用才创建对应 artifact。
+
+capture 文件名绑定完整 capture evidence hash，文件内另有不同域的 R0 dataset SHA-256，
+capture commit 还报告 canonical 文件字节 SHA-256。诊断报告 schema 为
+`dexteleop.quest_paired_pose_diagnostic_fit.v1`，用独立 semantic hash domain 绑定完整
+evidence hash、dataset hash、原 solver fit payload、`candidate_only=true` 和
+`calibration_accepted=null`；其 canonical 文件再使用独立 file domain。report commit
+分别给出 outer report、evidence、dataset、nested fit 和 file-byte hashes。它们覆盖范围
+不同，不能相互替代。
+
+严格 report reload 会重新解析 nested fit，核验两组矩阵表示、残差汇总、observability、
+nested/outer hashes 与候选态哨兵，但不会重新运行 solver。报告可作为独立 derived artifact
+重载；这只证明报告内容自洽，并不证明其引用的 capture 文件当前存在。任何后续 acceptance
+流程都必须另外取得并严格核验完整 capture evidence。该报告不是 acceptance，也不写
+accepted calibration profile/receipt。
+这里的核验仅证明结构和内部数值自洽；reload 不会从所引用的 capture 重算 fit，也不会
+证明报告中的 transform、residual 或 observability metrics 确实由该 capture 产生。
 
 原有 CLI 仍可读取裸 dataset 进行算法诊断，但裸 dataset 不能证明它来自上述完整封存、
 不可变且可重放的采集证据，因此不能作为后续 acceptance 的充分输入。
@@ -158,11 +184,12 @@ python -m hardware.quest_dev.tools.fit_paired_pose_calibration paired_poses.json
 {"accepted": null, "acceptance_note": "fit only; a reviewed acceptance profile is required"}
 ```
 
-R0 不定义残差阈值，不写 calibration 文件，不安装 frame graph，不启动机器人，也不让
-visualization 使用该结果。后续验收至少还需绑定完整 capture evidence hash、数据集 hash、
-fit hash、tool profile、robot epoch、Quest session/reference generation，审查残差/
-可观测性和独立验证姿态；reference-space reset、重新安装手柄或 tool profile 改变都必须
-使旧结果失效。
+R0 不定义残差阈值，不写 accepted calibration profile/receipt，不安装 frame graph，不
+启动机器人，也不让 visualization 使用该结果。显式写入 candidate-only diagnostic report
+不改变这些边界。后续验收至少还需绑定完整 capture evidence semantic hash、outer
+diagnostic-report semantic hash、derived dataset hash、nested fit hash、tool profile、robot
+epoch、Quest session/reference generation，审查残差/可观测性和独立验证姿态；
+reference-space reset、重新安装手柄或 tool profile 改变都必须使旧结果失效。
 
 ## 尚未实现或验证
 
@@ -171,5 +198,6 @@ fit hash、tool profile、robot epoch、Quest session/reference generation，审
 - reviewed acceptance profile、持久化 acceptance receipt 和失效生命周期；
 - accepted transform 的只读 frame 安装与 future-trajectory 投影/Quest 渲染。
 
-因此当前链路能封存、持久化并离线拟合完整采集证据，但仍不能作为真实标定完成、变换
-可安装或 future visualization 已就绪的证明。
+因此当前链路能封存并持久化 capture evidence、离线拟合，并显式持久化/严格重载
+candidate-only diagnostic report；现有证据仍仅为 offline synthetic/contract evidence，
+不能作为真实标定完成、变换可安装或 future visualization 已就绪的证明。
