@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 from dataclasses import replace
+import shutil
 from typing import Any
 
 from ..operator_ui_ports import RealTeleopInputBatchPrioritizer
@@ -334,6 +335,32 @@ def _position_admittance_runtime_event_payload(
     if endpoint_excursion_guard is not None:
         payload["endpoint_excursion_guard"] = dict(endpoint_excursion_guard)
     return payload
+
+
+def _tactile_storage_capacity_summary(args: argparse.Namespace) -> str | None:
+    """Describe the effective tactile reserve without owning its admission check."""
+
+    root = str(getattr(args, "tactile_bundle_root", "") or "").strip()
+    if not root:
+        return None
+    minimum_gib = float(
+        getattr(args, "tactile_bundle_min_free_gb", 0.0) or 0.0
+    )
+    source = str(
+        getattr(args, "tactile_bundle_min_free_source", "unknown") or "unknown"
+    )
+    try:
+        free_gib = float(shutil.disk_usage(root).free) / float(1024**3)
+    except OSError as exc:
+        return (
+            f"root={root} free_gib=unavailable minimum_free_gib={minimum_gib:g} "
+            f"source={source} diagnostic_error={type(exc).__name__}: {exc}"
+        )
+    capacity = "sufficient" if free_gib >= minimum_gib else "insufficient"
+    return (
+        f"root={root} free_gib={free_gib:.1f} "
+        f"minimum_free_gib={minimum_gib:g} source={source} capacity={capacity}"
+    )
 
 
 def run_real_teleop(
@@ -1137,6 +1164,9 @@ def run_real_teleop(
                     startup_progress=startup_progress,
                 )
         if dataset_recorder is not None:
+            tactile_capacity_summary = _tactile_storage_capacity_summary(args)
+            if tactile_capacity_summary is not None:
+                _log("TactileStorage", tactile_capacity_summary)
             if startup_progress is not None:
                 startup_progress.begin(
                     "dataset.writer",

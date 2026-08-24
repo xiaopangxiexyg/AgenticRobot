@@ -170,6 +170,13 @@ def _parse_real_teleop_args(
 ) -> argparse.Namespace:
     raw_argv = list(sys.argv[1:])
     args = parser.parse_args()
+    args.tactile_bundle_min_free_source = (
+        "command_line"
+        if _argv_has_option(raw_argv, "--tactile-bundle-min-free-gb")
+        else "environment"
+        if str(os.environ.get("TACTILE_BUNDLE_MIN_FREE_GB", "")).strip()
+        else "default"
+    )
     if not str(getattr(args, "dataset_root", "")).strip():
         parser.error(
             "--dataset-root must not be empty; omit it to use the configured default."
