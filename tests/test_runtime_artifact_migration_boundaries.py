@@ -83,7 +83,7 @@ CONFIGURED_LAYOUT_CLI_FILES = {
     "hardware/rm65/utils/scripts/rm65_udp_actuator_trace.py": "--artifact-layout",
     "scripts/identify_bimanual_gripper_position.py": "--artifact-layout",
     "teleop_runtime/debug/rm65_real_debug/run_rm65_idle_worker_drain_preflight.py": "--artifact-layout",
-    "teleop_runtime/deploy/run_policy.py": "--artifact-layout",
+    "teleop_runtime/deploy/deploy_cli_parser.py": "--artifact-layout",
     "teleop_runtime/real_teleop/cli.py": "--artifact-layout",
 }
 
