@@ -139,7 +139,12 @@ meta/progress/detail_stage_annotations/<episode_uuid>/<detail_set_id>/
 草稿，不会静默沿用旧 detail。
 
 detail overlay 只供后标注和后续显式选择 detail 视图的分析使用；现有只读取 coarse
-annotation set 的调用不改变。采集端不需要改动。
+annotation set 的调用不改变。对于新 dataset，采集 GUI 也可以显式选择
+`dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed`，此时三个 writing
+fine stage 会作为 capture-time stage profile 直接进入 coarse timeline，不再需要重复的
+detail overlay；这个 variant 不能与已经绑定 coarse stage profile 的 dataset 混用。用旧
+coarse profile 采集的 Episode（包括只从 `right_write` 开始的窗口）仍可在粗标注封存后按
+上面的 additive overlay 流程补齐 detail。
 
 当前实现把 detail profile 发现、当前 overlay 选择和完成/失效状态统一放在
 `control_station.refinement_annotation.detail_annotation` 模块；GUI application 只协调

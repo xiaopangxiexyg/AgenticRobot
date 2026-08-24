@@ -146,6 +146,48 @@ def test_writing_profiles_preserve_exact_coarse_and_fine_stage_semantics() -> No
     )
 
 
+def test_detailed_writing_profile_is_an_explicit_additive_selection() -> None:
+    coarse = load_managed_task_profile(
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress"
+    )
+    detailed = load_managed_task_profile(
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+    )
+
+    assert detailed.is_detailed is True
+    assert detailed.profile_id == coarse.profile_id
+    assert detailed.selection_id.endswith("_detailed")
+    assert detailed.progress_profile == coarse.progress_profile
+    assert detailed.stage_profile is not None
+    assert coarse.stage_profile is not None
+    assert tuple(
+        stage.stage_id
+        for stage in detailed.stage_profile.stages_for_step("right_write")
+    ) == (
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
+    )
+    assert tuple(
+        stage.stage_id
+        for stage in coarse.stage_profile.stages_for_step("right_write")
+    ) == ("right_write.write",)
+    assert tuple(
+        item.selection_id
+        for item in list_managed_task_profiles(topology_kind="LINEAR")
+    ) == tuple(
+        item.profile_id
+        for item in list_managed_task_profiles(topology_kind="LINEAR")
+    )
+    assert any(
+        item.selection_id == detailed.selection_id
+        for item in list_managed_task_profiles(
+            topology_kind="LINEAR",
+            include_detailed=True,
+        )
+    )
+
+
 def test_writing_five_stage_profile_adds_only_the_ink_dipping_stage() -> None:
     five = load_managed_task_profile(
         "dmtac_rm65_bimanual_position_writing_five_stage_progress"

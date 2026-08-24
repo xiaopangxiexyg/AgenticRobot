@@ -581,6 +581,84 @@ def _finalized_manual_stop_dataset(
     return identity.episode_uuid
 
 
+def _finalized_writing_entry_dataset(root: Path) -> str:
+    """Build a coarse writing profile Episode entered at ``right_write``."""
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from collection_runtime.progress.profiles.catalog import (
+        load_task_progress_profile_file,
+        load_task_stage_profile_file,
+    )
+
+    profile_root = (
+        Path(__file__).resolve().parents[1]
+        / "collection_runtime"
+        / "progress"
+        / "profiles"
+        / "linear"
+    )
+    progress = load_task_progress_profile_file(
+        profile_root
+        / "dmtac_rm65_bimanual_position_writing_four_stage.progress.json"
+    )
+    stages = load_task_stage_profile_file(
+        profile_root
+        / "dmtac_rm65_bimanual_position_writing_four_stage.stages.json",
+        progress_profile=progress,
+    )
+    identity = EpisodeCaptureIdentity(
+        episode_uuid="writing-entry-episode",
+        legacy_episode_index=0,
+        lifecycle_owner_id="fixture",
+        prepared_at=0.0,
+        prepared_clock_domain_id="local_wall_time",
+    )
+    episode = RealTeleopProgressEpisode(
+        dataset_root=root,
+        identity=identity,
+        profile=progress,
+        stage_profile=stages,
+        entry_step_id="right_write",
+    )
+    episode.bind(started_at=0.0)
+    episode.terminate(reason="manual_key_stop", effective_at=8.0)
+    episode.seal(sealed_at=8.1)
+
+    parquet_path = root / "data" / "chunk-000" / "episode_000000.parquet"
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table({"timestamp": [float(value) for value in range(9)]}),
+        parquet_path,
+    )
+    video_path = root / "videos" / "front" / "episode_000000.mp4"
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"fixture-video")
+    catalog_path = root / "meta" / "episodes.jsonl"
+    catalog_path.parent.mkdir(parents=True, exist_ok=True)
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "episode_index": 0,
+                "frame_count": 9,
+                "start_timestamp": 0.0,
+                "end_timestamp": 8.0,
+                "parquet_path": str(parquet_path.relative_to(root)),
+                "video_paths": {
+                    "front": str(video_path.relative_to(root)),
+                },
+                "metadata": {
+                    "progress_episode": episode.metadata_reference,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return identity.episode_uuid
+
+
 def test_pause_aware_detail_exposes_break_and_does_not_bootstrap_pause_tail(
     tmp_path: Path,
 ) -> None:
@@ -1316,6 +1394,50 @@ def test_builtin_writing_detail_profile_exposes_three_write_stages(
         assert [
             value.stage_id
             for value in selection.stage_profile.stages_for_step("right_write")
+        ] == [
+            "right_write.pen_down",
+            "right_write.write",
+            "right_write.pen_up",
+        ]
+    finally:
+        application.close()
+
+
+def test_coarse_writing_entry_can_receive_detail_overlay(
+    tmp_path: Path,
+) -> None:
+    """A coarse-only writing capture remains eligible for later detail work."""
+
+    episode_uuid = _finalized_writing_entry_dataset(tmp_path)
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+    )
+    try:
+        initial = application.episode_detail(episode_uuid)
+        assert initial["detail_annotation"]["draft_state"] == (
+            "PROFILE_PREVIEW"
+        )
+        assert [
+            value["stage_id"]
+            for value in initial["detail_annotation"]["profile"]["stages"]
+        ] == [
+            "right_write.pen_down",
+            "right_write.write",
+            "right_write.pen_up",
+        ]
+
+        coarse_report = application.commit(episode_uuid, initial["draft"])
+        assert coarse_report["detail_annotation"]["available"] is True
+        assert coarse_report["detail_annotation"]["resolution_level"] == (
+            "COARSE_FALLBACK"
+        )
+
+        reopened = application.episode_detail(episode_uuid)
+        assert reopened["detail_annotation"]["available"] is True
+        assert [
+            value["stage_id"]
+            for value in reopened["draft"]["detail_overlay"]["occurrences"]
         ] == [
             "right_write.pen_down",
             "right_write.write",

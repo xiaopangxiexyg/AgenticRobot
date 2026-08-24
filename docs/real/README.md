@@ -179,6 +179,12 @@ printf '[DexTeleop] command exited with status=%s\n' "$rc"
 stage profile 会在后标注程序中自动匹配 writing detail overlay，因此不要把
 `.stages_detailed.json` 作为采集端基础 stage profile 传入。
 
+如果是全新的、尚未绑定 stage profile 的 dataset，也可以在 progress GUI 中显式选择
+`dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed`。这个选择会直接把
+`pen_down / write / pen_up` 三个 fine stage 绑定到新 dataset；已有 coarse dataset 不能
+在原目录内混用两种 stage hash。8 月 24 日这类已经用 coarse profile 采集的 writing
+Episode，继续使用上面的 coarse 入口即可，后标注时再封存 additive detail overlay。
+
 先在终端 1 启动五踏板转发服务：
 
 ```bash

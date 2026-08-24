@@ -24,6 +24,12 @@ Each task is self-contained:
 - optional `<name>.refinement.json` owns post-capture boundaries inside those
   coarse steps and is rebound to the co-located progress profile; this is the
   compatibility salvage-boundary model rather than the new occurrence model;
+- an optional pair of `<name>.progress_detailed.json` and
+  `<name>.stages_detailed.json` is an explicit collection variant. The
+  detailed progress source must preserve the coarse progress hash; only the
+  ordered stage profile may split one coarse step into fine stages. The
+  catalog exposes this variant with the selection ID `<progress_id>_detailed`;
+  it is not included in the compatibility coarse-only listing;
 - a stage/refinement file without a same-name progress file is invalid.
 
 `semantic_content_hash` and companion `task_progress_profile_hash` values in
@@ -47,11 +53,15 @@ Exact task meaning, step identity, and transition semantics always live in the
 task's own progress profile. This avoids making old profiles depend on a
 mutable shared primitive definition.
 
-The bundled profiles include stage profiles for post-capture occurrence
+The bundled coarse profiles include stage profiles for post-capture occurrence
 annotation and exact recovery entry. Those fine stages are not online
 Advance/Failure controls; current collection operators manage only coarse
 progress and Failure. A recovery capture may explicitly start at a noninitial
-fine stage, but must record `RECOVERY_FROM_FAILURE`.
+fine stage, but must record `RECOVERY_FROM_FAILURE`. The explicit
+`_detailed` variant is the exception for a new dataset: selecting it binds the
+fine stage profile at capture time, so the resulting coarse annotation timeline
+already contains those fine stages. It must not be mixed with a dataset that
+has already bound the coarse stage profile.
 
 The formal DMTAC task also provides three writing variants:
 
@@ -70,6 +80,15 @@ formal `dmtac_rm65_bimanual_position_v1` task ID as their own profile metadata.
 RealTeleop exposes all admitted LINEAR profiles independently of the formal
 dataset task/name, so this ID is not a GUI filtering key. They are different
 dataset-wide profile identities and must never be mixed in one dataset.
+
+The four-stage writing profile additionally owns the explicit
+`dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed` selection.
+It keeps the same four coarse steps but splits `right_write` into
+`right_write.pen_down`, `right_write.write`, and `right_write.pen_up`. For a
+coarse four-stage Episode, the annotation application discovers this same
+pair after the coarse annotation set is sealed and publishes the fine labels
+as an additive detail overlay; it never rewrites the original Episode,
+Parquet, video, or coarse annotation set.
 
 The catalog also contains
 `test_dmtac_rm65_bimanual_position_v1_three_stage_progress`. It deliberately
