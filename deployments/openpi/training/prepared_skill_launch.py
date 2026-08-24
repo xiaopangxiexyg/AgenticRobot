@@ -145,6 +145,47 @@ def _corrected_wrist_background_overrides(
     }
 
 
+def _explicit_openpi_weight_loader(
+    profile: Mapping[str, Any],
+    weight_loader: Any,
+    checkout: Path,
+) -> Any:
+    configured = str(
+        profile.get("openpi_weight_loader_params_path") or ""
+    ).strip()
+    if not configured:
+        return weight_loader
+    params_path = Path(configured).expanduser()
+    if not params_path.is_absolute():
+        params_path = checkout / params_path
+    params_path = params_path.resolve()
+    if not params_path.is_dir():
+        raise FileNotFoundError(
+            f"Pinned OpenPI base parameter directory is missing: {params_path}."
+        )
+    required = (
+        "_CHECKPOINT_METADATA",
+        "_METADATA",
+        "_sharding",
+        "commit_success.txt",
+        "manifest.ocdbt",
+    )
+    missing = [name for name in required if not (params_path / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Pinned OpenPI base parameter directory is incomplete: "
+            f"path={params_path} missing={missing}."
+        )
+    if not dataclasses.is_dataclass(weight_loader) or not hasattr(
+        weight_loader, "params_path"
+    ):
+        raise TypeError(
+            "openpi_weight_loader_params_path requires a dataclass weight "
+            "loader with params_path."
+        )
+    return dataclasses.replace(weight_loader, params_path=str(params_path))
+
+
 def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
     checkout = Path(str(profile["openpi_checkout"])).expanduser().resolve()
     source_root = checkout / "src"
@@ -1695,6 +1736,11 @@ def _openpi_config(
             if not root_path.is_absolute():
                 root_path = checkout / root_path
             train_overrides[config_key] = str(root_path.resolve())
+    train_overrides["weight_loader"] = _explicit_openpi_weight_loader(
+        profile,
+        base.weight_loader,
+        checkout,
+    )
     if "openpi_num_train_steps" in profile:
         train_steps = int(profile["openpi_num_train_steps"])
         save_interval = int(profile.get("openpi_save_interval", base.save_interval))

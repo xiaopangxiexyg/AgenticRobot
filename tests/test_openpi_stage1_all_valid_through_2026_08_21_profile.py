@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ from deployments.openpi.training.prepared_skill_launch import (
     _activate_openpi_checkout,
     _bind_source_partitioned_final_masks_to_dataset,
     _corrected_wrist_background_overrides,
+    _explicit_openpi_weight_loader,
     _load_profile,
 )
 from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.core import (
@@ -191,6 +193,9 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     assert Path(profile["openpi_checkpoint_base_dir"]) == (
         run_root / "artifacts/checkpoints"
     )
+    assert Path(profile["openpi_weight_loader_params_path"]) == (
+        Path("/home/user/zc/openpi/pi05_base_para/params")
+    )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
         / "code-final10/AgenticRobot/model/openpi"
@@ -278,6 +283,38 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     ] == 36709
     assert profile["expected_openpi_quality_valid_window_count"] == 167878
     assert profile["expected_openpi_repeated_epoch_sample_count"] == 268000
+
+
+@dataclasses.dataclass(frozen=True)
+class _CheckpointWeightLoaderStub:
+    params_path: str
+
+
+def test_explicit_openpi_weight_loader_requires_complete_pinned_params(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "openpi"
+    checkout.mkdir()
+    params = tmp_path / "pi05_base_para/params"
+    params.mkdir(parents=True)
+    required = (
+        "_CHECKPOINT_METADATA",
+        "_METADATA",
+        "_sharding",
+        "commit_success.txt",
+        "manifest.ocdbt",
+    )
+    loader = _CheckpointWeightLoaderStub("./pi05_base_para/params")
+    profile = {"openpi_weight_loader_params_path": str(params)}
+
+    with pytest.raises(FileNotFoundError, match="incomplete"):
+        _explicit_openpi_weight_loader(profile, loader, checkout)
+
+    for name in required:
+        (params / name).write_text(name, encoding="utf-8")
+    resolved = _explicit_openpi_weight_loader(profile, loader, checkout)
+    assert resolved.params_path == str(params.resolve())
+    assert loader.params_path == "./pi05_base_para/params"
 
 
 def test_through_2026_08_21_profile_rejects_untyped_task_aliases(
