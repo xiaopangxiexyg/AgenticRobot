@@ -1,8 +1,10 @@
-"""Content-addressed reset/replay contracts for the robosuite A0 seam."""
+"""Content-addressed reset/replay contracts for the robosuite seam."""
 
 from __future__ import annotations
 
+import hashlib
 import math
+import struct
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -13,6 +15,69 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 ROBOSUITE_RESET_MANIFEST_SCHEMA_A0 = "dexteleop.robosuite.reset_manifest.a0"
 ROBOSUITE_RESET_MANIFEST_HASH_DOMAIN_A0 = "dexteleop.robosuite.reset_manifest.a0"
 ROBOSUITE_RESET_RECEIPT_HASH_DOMAIN_A0 = "dexteleop.robosuite.reset_receipt.a0"
+ROBOSUITE_ENVIRONMENT_CONTRACT_SCHEMA_A1 = "dexteleop.robosuite.environment_contract.a1"
+ROBOSUITE_ENVIRONMENT_CONTRACT_HASH_DOMAIN_A1 = (
+    "dexteleop.robosuite.environment_contract.a1"
+)
+ROBOSUITE_EPISODE_START_ARTIFACT_SCHEMA_A1 = (
+    "dexteleop.robosuite.episode_start_artifact.a1"
+)
+ROBOSUITE_EPISODE_START_ARTIFACT_HASH_DOMAIN_A1 = (
+    "dexteleop.robosuite.episode_start_artifact.a1"
+)
+
+PANDA_LIFT_OSC_POSE_OBSERVATION_KEYS_A1 = (
+    "robot0_joint_pos",
+    "robot0_joint_vel",
+    "robot0_eef_pos",
+    "robot0_eef_quat_site",
+    "robot0_gripper_qpos",
+    "robot0_gripper_qvel",
+    "cube_pos",
+    "cube_quat",
+    "gripper_to_cube_pos",
+)
+PANDA_LIFT_OSC_POSE_ACTION_LAYOUT_A1 = (
+    "delta_x",
+    "delta_y",
+    "delta_z",
+    "delta_axis_angle_x",
+    "delta_axis_angle_y",
+    "delta_axis_angle_z",
+    "gripper",
+)
+PANDA_LIFT_OSC_POSE_ACTIVE_CONTROLLER_PROFILE_A1 = MappingProxyType(
+    {
+        "composite_name": "BASIC",
+        "part_names": ("right", "right_gripper"),
+        "action_splits": (("right", (0, 6)), ("right_gripper", (6, 7))),
+        "arm_name": "OSC_POSE",
+        "control_dimension": 6,
+        "use_orientation": True,
+        "input_type": "delta",
+        "input_reference_frame": "base",
+        "goal_update_mode": "achieved",
+        "impedance_mode": "fixed",
+        "input_low": (-1.0,) * 6,
+        "input_high": (1.0,) * 6,
+        "output_low": (-0.05, -0.05, -0.05, -0.5, -0.5, -0.5),
+        "output_high": (0.05, 0.05, 0.05, 0.5, 0.5, 0.5),
+        "control_low": (-1.0,) * 6,
+        "control_high": (1.0,) * 6,
+        "action_scale": (0.05, 0.05, 0.05, 0.5, 0.5, 0.5),
+        "action_input_transform": (0.0,) * 6,
+        "action_output_transform": (0.0,) * 6,
+        "interpolator_position": None,
+        "interpolator_orientation": None,
+        "kp": (150.0,) * 6,
+        "kd": (2.0 * math.sqrt(150.0),) * 6,
+        "uncoupling": True,
+        "position_limits": None,
+        "orientation_limits": None,
+        "control_frequency_hz": 20,
+        "lite_physics": True,
+    }
+)
 
 
 def _required(value: object, *, name: str) -> str:
@@ -62,6 +127,333 @@ def _freeze_primitive(value: Any, *, name: str) -> Any:
         f"{name} accepts only explicit primitive reset options; "
         f"got {type(value).__name__}."
     )
+
+
+def _finite_vector(
+    values: tuple[float, ...] | list[float],
+    *,
+    name: str,
+) -> tuple[float, ...]:
+    normalized = tuple(float(value) for value in values)
+    if not normalized:
+        raise ValueError(f"{name} must not be empty.")
+    if any(not math.isfinite(value) for value in normalized):
+        raise ValueError(f"{name} must contain only finite values.")
+    return normalized
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_digest(value: object, *, name: str) -> str:
+    normalized = _required(value, name=name).lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest.")
+    return normalized
+
+
+def _sha256_f64(values: tuple[float, ...]) -> str:
+    return hashlib.sha256(struct.pack(f"<{len(values)}d", *values)).hexdigest()
+
+
+@dataclass(frozen=True)
+class RobosuiteEnvironmentContractA1:
+    """Exact sim-only Panda / Lift / OSC_POSE runtime profile.
+
+    A1 is intentionally one closed profile. Supporting another robot, task,
+    controller, renderer, or dependency set requires another reviewed contract
+    instead of a permissive option being silently ignored.
+    """
+
+    environment_id: str = "Lift"
+    robot: str = "Panda"
+    composite_controller: str = "BASIC"
+    arm_controller: str = "OSC_POSE"
+    controller_input_type: str = "delta"
+    controller_input_reference_frame: str = "base"
+    action_layout: tuple[str, ...] = PANDA_LIFT_OSC_POSE_ACTION_LAYOUT_A1
+    action_low: tuple[float, ...] = (-1.0,) * 7
+    action_high: tuple[float, ...] = (1.0,) * 7
+    observation_keys: tuple[str, ...] = PANDA_LIFT_OSC_POSE_OBSERVATION_KEYS_A1
+    control_frequency_hz: int = 20
+    has_renderer: bool = False
+    has_offscreen_renderer: bool = False
+    use_camera_observations: bool = False
+    initialization_noise: None = None
+    reward_shaping: bool = True
+    lite_physics: bool = True
+    hard_reset: bool = True
+    ignore_done: bool = False
+    python_version: str = "3.10"
+    robosuite_version: str = "1.5.2"
+    mujoco_version: str = "3.9.0"
+    numpy_version: str = "1.26.4"
+    scipy_version: str = "1.13.1"
+    schema_id: str = ROBOSUITE_ENVIRONMENT_CONTRACT_SCHEMA_A1
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        expected = {
+            "environment_id": "Lift",
+            "robot": "Panda",
+            "composite_controller": "BASIC",
+            "arm_controller": "OSC_POSE",
+            "controller_input_type": "delta",
+            "controller_input_reference_frame": "base",
+            "action_layout": PANDA_LIFT_OSC_POSE_ACTION_LAYOUT_A1,
+            "action_low": (-1.0,) * 7,
+            "action_high": (1.0,) * 7,
+            "observation_keys": PANDA_LIFT_OSC_POSE_OBSERVATION_KEYS_A1,
+            "control_frequency_hz": 20,
+            "has_renderer": False,
+            "has_offscreen_renderer": False,
+            "use_camera_observations": False,
+            "initialization_noise": None,
+            "reward_shaping": True,
+            "lite_physics": True,
+            "hard_reset": True,
+            "ignore_done": False,
+            "python_version": "3.10",
+            "robosuite_version": "1.5.2",
+            "mujoco_version": "3.9.0",
+            "numpy_version": "1.26.4",
+            "scipy_version": "1.13.1",
+            "schema_id": ROBOSUITE_ENVIRONMENT_CONTRACT_SCHEMA_A1,
+        }
+        for name, expected_value in expected.items():
+            if getattr(self, name) != expected_value:
+                raise ValueError(
+                    f"A1 requires {name}={expected_value!r}; "
+                    f"got {getattr(self, name)!r}."
+                )
+        payload = dict(expected)
+        payload.update(
+            {
+                "active_controller_profile": (
+                    PANDA_LIFT_OSC_POSE_ACTIVE_CONTROLLER_PROFILE_A1
+                ),
+                "reset_semantics": "compiled_xml_plus_flattened_initial_state",
+                "replay_semantics": "restore_initial_state_then_replay_full_prefix",
+                "mid_episode_state_resume": "forbidden_unproven",
+                "rendering": "forbidden",
+            }
+        )
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                payload,
+                domain=ROBOSUITE_ENVIRONMENT_CONTRACT_HASH_DOMAIN_A1,
+            ),
+        )
+
+    @property
+    def contract_id(self) -> str:
+        return f"robosuite-environment-contract:{self.semantic_content_hash}"
+
+    def make_reset_manifest(
+        self,
+        *,
+        task_id: str,
+        episode_id: str,
+        reset_sequence: int,
+        seed: int,
+        max_episode_steps: int,
+    ) -> RobosuiteResetManifest:
+        return RobosuiteResetManifest(
+            environment_id=self.environment_id,
+            environment_contract_hash=self.semantic_content_hash,
+            task_id=task_id,
+            episode_id=episode_id,
+            reset_sequence=reset_sequence,
+            seed=seed,
+            action_dimension=len(self.action_layout),
+            observation_keys=self.observation_keys,
+            max_episode_steps=max_episode_steps,
+        )
+
+
+@dataclass(frozen=True)
+class RobosuiteEpisodeStartArtifactA1:
+    """Replayable episode start captured after a real robosuite reset.
+
+    It deliberately represents only the episode start. A flattened MuJoCo
+    state captured in the middle of an episode is not sufficient to restore a
+    stateful OSC controller and is outside this contract.
+    """
+
+    manifest_hash: str
+    environment_contract_hash: str
+    runtime_fingerprint: Mapping[str, Any]
+    environment_kwargs: Mapping[str, Any]
+    controller_config: Mapping[str, Any]
+    active_controller_profile: Mapping[str, Any]
+    compiled_model_xml: str
+    effective_model_xml_sha256: str
+    initial_state: tuple[float, ...]
+    episode_metadata: Mapping[str, Any]
+    rng_state: Mapping[str, Any]
+    action_low: tuple[float, ...]
+    action_high: tuple[float, ...]
+    model_dimensions: Mapping[str, int]
+    model_timestep: float
+    control_timestep: float
+    schema_id: str = ROBOSUITE_EPISODE_START_ARTIFACT_SCHEMA_A1
+    compiled_model_xml_sha256: str = field(init=False)
+    initial_state_f64_sha256: str = field(init=False)
+    controller_config_hash: str = field(init=False)
+    active_controller_profile_hash: str = field(init=False)
+    environment_kwargs_hash: str = field(init=False)
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.schema_id != ROBOSUITE_EPISODE_START_ARTIFACT_SCHEMA_A1:
+            raise ValueError(f"Unsupported episode-start schema {self.schema_id!r}.")
+        manifest_hash = _required(self.manifest_hash, name="manifest_hash")
+        contract_hash = _required(
+            self.environment_contract_hash,
+            name="environment_contract_hash",
+        )
+        runtime_fingerprint = _freeze_primitive(
+            dict(self.runtime_fingerprint),
+            name="runtime_fingerprint",
+        )
+        if not runtime_fingerprint:
+            raise ValueError("runtime_fingerprint must not be empty.")
+        environment_kwargs = _freeze_primitive(
+            dict(self.environment_kwargs),
+            name="environment_kwargs",
+        )
+        controller_config = _freeze_primitive(
+            dict(self.controller_config),
+            name="controller_config",
+        )
+        active_controller_profile = _freeze_primitive(
+            dict(self.active_controller_profile),
+            name="active_controller_profile",
+        )
+        if not active_controller_profile:
+            raise ValueError("active_controller_profile must not be empty.")
+        compiled_model_xml = _required(
+            self.compiled_model_xml,
+            name="compiled_model_xml",
+        )
+        effective_xml_hash = _sha256_digest(
+            self.effective_model_xml_sha256,
+            name="effective_model_xml_sha256",
+        )
+        initial_state = _finite_vector(self.initial_state, name="initial_state")
+        episode_metadata = _freeze_primitive(
+            dict(self.episode_metadata),
+            name="episode_metadata",
+        )
+        rng_state = _freeze_primitive(dict(self.rng_state), name="rng_state")
+        if not rng_state:
+            raise ValueError("rng_state must not be empty.")
+        action_low = _finite_vector(self.action_low, name="action_low")
+        action_high = _finite_vector(self.action_high, name="action_high")
+        if len(action_low) != len(action_high) or any(
+            lower >= upper for lower, upper in zip(action_low, action_high, strict=True)
+        ):
+            raise ValueError("action bounds must have equal size and low < high.")
+        model_dimensions_raw = dict(self.model_dimensions)
+        if not model_dimensions_raw:
+            raise ValueError("model_dimensions must not be empty.")
+        model_dimensions: dict[str, int] = {}
+        for name, value in model_dimensions_raw.items():
+            key = _required(name, name="model_dimensions.key")
+            model_dimensions[key] = _nonnegative_int(
+                value,
+                name=f"model_dimensions[{key!r}]",
+            )
+        model_dimensions_frozen = MappingProxyType(
+            dict(sorted(model_dimensions.items()))
+        )
+        model_timestep = float(self.model_timestep)
+        control_timestep = float(self.control_timestep)
+        if (
+            not math.isfinite(model_timestep)
+            or not math.isfinite(control_timestep)
+            or model_timestep <= 0.0
+            or control_timestep <= 0.0
+        ):
+            raise ValueError("model and control timesteps must be finite and positive.")
+        xml_hash = _sha256_text(compiled_model_xml)
+        state_hash = _sha256_f64(initial_state)
+        controller_hash = canonical_content_hash(
+            controller_config,
+            domain="dexteleop.robosuite.controller_config.a1",
+        )
+        active_controller_hash = canonical_content_hash(
+            active_controller_profile,
+            domain="dexteleop.robosuite.active_controller_profile.a1",
+        )
+        environment_kwargs_hash = canonical_content_hash(
+            environment_kwargs,
+            domain="dexteleop.robosuite.environment_kwargs.a1",
+        )
+        payload = {
+            "schema_id": self.schema_id,
+            "manifest_hash": manifest_hash,
+            "environment_contract_hash": contract_hash,
+            "runtime_fingerprint": runtime_fingerprint,
+            "environment_kwargs_hash": environment_kwargs_hash,
+            "controller_config_hash": controller_hash,
+            "active_controller_profile_hash": active_controller_hash,
+            "compiled_model_xml_sha256": xml_hash,
+            "effective_model_xml_sha256": effective_xml_hash,
+            "initial_state_shape": (len(initial_state),),
+            "initial_state_dtype": "<f8",
+            "initial_state_f64_sha256": state_hash,
+            "episode_metadata": episode_metadata,
+            "rng_state": rng_state,
+            "action_low": action_low,
+            "action_high": action_high,
+            "model_dimensions": model_dimensions_frozen,
+            "model_timestep": model_timestep,
+            "control_timestep": control_timestep,
+            "restore_semantics": "episode_start_only_full_prefix_required",
+        }
+        normalized = {
+            "manifest_hash": manifest_hash,
+            "environment_contract_hash": contract_hash,
+            "runtime_fingerprint": runtime_fingerprint,
+            "environment_kwargs": environment_kwargs,
+            "controller_config": controller_config,
+            "active_controller_profile": active_controller_profile,
+            "compiled_model_xml": compiled_model_xml,
+            "effective_model_xml_sha256": effective_xml_hash,
+            "initial_state": initial_state,
+            "episode_metadata": episode_metadata,
+            "rng_state": rng_state,
+            "action_low": action_low,
+            "action_high": action_high,
+            "model_dimensions": model_dimensions_frozen,
+            "model_timestep": model_timestep,
+            "control_timestep": control_timestep,
+            "compiled_model_xml_sha256": xml_hash,
+            "initial_state_f64_sha256": state_hash,
+            "controller_config_hash": controller_hash,
+            "active_controller_profile_hash": active_controller_hash,
+            "environment_kwargs_hash": environment_kwargs_hash,
+        }
+        for name, value in normalized.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                payload,
+                domain=ROBOSUITE_EPISODE_START_ARTIFACT_HASH_DOMAIN_A1,
+            ),
+        )
+
+    @property
+    def artifact_id(self) -> str:
+        return f"robosuite-episode-start:{self.semantic_content_hash}"
 
 
 @dataclass(frozen=True)
@@ -204,9 +596,18 @@ class RobosuiteResetReceipt:
 
 
 __all__ = [
+    "PANDA_LIFT_OSC_POSE_ACTION_LAYOUT_A1",
+    "PANDA_LIFT_OSC_POSE_ACTIVE_CONTROLLER_PROFILE_A1",
+    "PANDA_LIFT_OSC_POSE_OBSERVATION_KEYS_A1",
+    "ROBOSUITE_ENVIRONMENT_CONTRACT_HASH_DOMAIN_A1",
+    "ROBOSUITE_ENVIRONMENT_CONTRACT_SCHEMA_A1",
+    "ROBOSUITE_EPISODE_START_ARTIFACT_HASH_DOMAIN_A1",
+    "ROBOSUITE_EPISODE_START_ARTIFACT_SCHEMA_A1",
     "ROBOSUITE_RESET_MANIFEST_HASH_DOMAIN_A0",
     "ROBOSUITE_RESET_MANIFEST_SCHEMA_A0",
     "ROBOSUITE_RESET_RECEIPT_HASH_DOMAIN_A0",
+    "RobosuiteEnvironmentContractA1",
+    "RobosuiteEpisodeStartArtifactA1",
     "RobosuiteResetManifest",
     "RobosuiteResetReceipt",
 ]
