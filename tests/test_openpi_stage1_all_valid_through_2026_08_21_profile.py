@@ -11,6 +11,7 @@ from dataset_interface.logical_task_dataset import load_logical_task_dataset_man
 from deployments.openpi.training.prepared_skill import OpenPIPreparedSkillError
 from deployments.openpi.training.prepared_skill_launch import (
     _bind_source_partitioned_final_masks_to_dataset,
+    _corrected_wrist_background_overrides,
     _load_profile,
 )
 from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.core import (
@@ -123,8 +124,24 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-final2/AgenticRobot/model/openpi"
+        / "code-final3/AgenticRobot/model/openpi"
     )
+    background = profile["openpi_wrist_background_augmentation"]
+    assert background["original_probability"] == 0.1
+    assert background["real_image_probability"] == 0.4
+    assert background["procedural_probability"] == 0.5
+    assert background["mask_source"] == "wrist_final_keep_mask_paths"
+    assert background["wrist_depth_mask_paths_fallback_allowed"] is False
+    assert _corrected_wrist_background_overrides(profile) == {
+        "background_provider": "mixed",
+        "mixed_original_prob": 0.1,
+        "real_image_prob": 0.4,
+        "mixed_black_prob": 0.0,
+        "wrist_pair_mode": "shared_scene_family",
+        "real_image_root": background["real_image_root"],
+        "real_image_manifest": background["real_image_manifest"],
+        "strict_media_integrity": True,
+    }
     intrinsics_overrides = profile["right_wrist_intrinsics_overrides"]
     assert set(intrinsics_overrides) == {
         "fixed_middle_2026_08_03_part1",
@@ -197,6 +214,20 @@ def test_through_2026_08_21_profile_rejects_untyped_task_aliases(
     invalid.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(TypeError, match="expected_task_id_aliases"):
+        _load_profile(invalid)
+
+
+def test_through_2026_08_21_profile_rejects_background_contract_drift(
+    tmp_path: Path,
+) -> None:
+    payload = json.loads(_PROFILE.read_text(encoding="utf-8"))
+    payload["openpi_wrist_background_augmentation"][
+        "real_image_probability"
+    ] = 0.5
+    invalid = tmp_path / "invalid-background-profile.json"
+    invalid.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="corrected 10/40/50"):
         _load_profile(invalid)
 
 

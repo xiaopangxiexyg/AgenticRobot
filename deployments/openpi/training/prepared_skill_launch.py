@@ -77,6 +77,9 @@ STAGE1_SCENARIO_PROFILE_SCHEMA_V1 = (
     "dexteleop.openpi_stage1_scenario_training_profile.v1"
 )
 STANDARD_NON_RTC_TRAINING_MODE_V1 = "standard_non_rtc_v1"
+CORRECTED_WRIST_BACKGROUND_PROFILE_V1 = (
+    "dexteleop.corrected_wrist_background.v1"
+)
 DEFAULT_PROFILE = (
     Path(__file__).resolve().parents[1]
     / "configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json"
@@ -86,6 +89,58 @@ SKILL_PROJECTION_CATALOG_WRITING_FOUR_STAGE_SUBTASKS_V2 = (
     "writing_four_stage_subtasks_v2"
 )
 _EMPTY_CHECKPOINT_ROOT_ENTRIES = frozenset({"wandb", "wandb_id.txt"})
+
+
+def _corrected_wrist_background_overrides(
+    profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw = profile.get("openpi_wrist_background_augmentation")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise TypeError(
+            "openpi_wrist_background_augmentation must be an object."
+        )
+    expected = {
+        "schema": CORRECTED_WRIST_BACKGROUND_PROFILE_V1,
+        "provider": "mixed",
+        "original_probability": 0.1,
+        "real_image_probability": 0.4,
+        "procedural_probability": 0.5,
+        "black_probability": 0.0,
+        "wrist_pair_mode": "shared_scene_family",
+        "mask_source": "wrist_final_keep_mask_paths",
+        "wrist_depth_mask_paths_fallback_allowed": False,
+        "strict_media_integrity": True,
+    }
+    mismatched = {
+        key: (raw.get(key), value)
+        for key, value in expected.items()
+        if raw.get(key) != value
+    }
+    if mismatched:
+        raise ValueError(
+            "OpenPI wrist background profile differs from the corrected "
+            f"10/40/50 final-mask contract: {mismatched}."
+        )
+    real_image_root = Path(str(raw.get("real_image_root") or "")).expanduser()
+    real_image_manifest = Path(
+        str(raw.get("real_image_manifest") or "")
+    ).expanduser()
+    if not real_image_root.is_absolute() or not real_image_manifest.is_absolute():
+        raise ValueError(
+            "Corrected wrist background real-image paths must be absolute."
+        )
+    return {
+        "background_provider": "mixed",
+        "mixed_original_prob": 0.1,
+        "real_image_prob": 0.4,
+        "mixed_black_prob": 0.0,
+        "wrist_pair_mode": "shared_scene_family",
+        "real_image_root": str(real_image_root),
+        "real_image_manifest": str(real_image_manifest),
+        "strict_media_integrity": True,
+    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -296,6 +351,7 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             "openpi_training_mode must be standard_non_rtc_v1 when declared."
         )
+    _corrected_wrist_background_overrides(payload)
     if is_prompt_profile:
         raw_stages = payload.get("prompt_stages")
         if not isinstance(raw_stages, list) or len(raw_stages) < 2:
@@ -1461,6 +1517,8 @@ def _openpi_config(
         if not final_mask_root_path.is_absolute():
             final_mask_root_path = checkout / final_mask_root_path
         data_overrides["final_mask_root"] = str(final_mask_root_path.resolve())
+    corrected_background = _corrected_wrist_background_overrides(profile)
+    data_overrides.update(corrected_background)
     data = dataclasses.replace(
         base.data,
         assets=assets,
@@ -1479,6 +1537,17 @@ def _openpi_config(
         ),
         **data_overrides,
     )
+    if corrected_background:
+        explicit_mask_keys = tuple(str(value) for value in data.explicit_mask_keys)
+        if (
+            "wrist_final_keep_mask_paths" not in explicit_mask_keys
+            or "wrist_depth_mask_paths" in explicit_mask_keys
+            or not bool(data.strict_media_integrity)
+        ):
+            raise ValueError(
+                "Corrected wrist background training requires strict media, "
+                "final keep-mask input, and no raw depth-mask fallback."
+            )
     train_overrides: dict[str, Any] = {}
     for profile_key, config_key in (
         ("openpi_assets_base_dir", "assets_base_dir"),

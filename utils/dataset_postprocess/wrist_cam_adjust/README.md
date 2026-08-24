@@ -244,6 +244,12 @@ raw wrist_depth_mask_paths (只读)
 fallback。同名数据集（例如来自不同根目录但 basename 相同的分片）按
 `source_dataset_id` 分区，输出布局为：
 
+Stage1 的训练 profile 还必须显式固定 corrected 背景契约：10% 保留原图、40%
+使用固定 real-image 资产、其余 50% 使用 procedural 背景，并以
+`shared_scene_family` 绑定同一条样本中的 wrist 背景族。这个替换只作用于
+`right_wrist`；`front` 不读取 wrist mask。real-image root/manifest 必须来自本次
+训练的独立资产快照，不能继续依赖可变的开发 checkout。
+
 ```text
 <final-mask-root>/<source_dataset_id>/<dataset-name>/episode_XXXXXX/right_wrist/
 ```
