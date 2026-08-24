@@ -1585,6 +1585,12 @@ def _openpi_config(
             "OpenPI base config differs from the prepared h/camera/action contract."
         )
     source_values = binding_source_manifests(binding, binding_root)
+    corrected_background = _corrected_wrist_background_overrides(profile)
+    source_explicit_mask_keys = tuple(base.data.explicit_mask_keys)
+    if corrected_background:
+        source_explicit_mask_keys = tuple(
+            dexteleop_v23_policy.FINAL_KEEP_MASK_KEYS
+        )
     source_configs = tuple(
         dexteleop_v23_policy.DexTeleopV23DatasetSourceConfig(
             name=source_id,
@@ -1595,7 +1601,7 @@ def _openpi_config(
                 else 1
             ),
             front_occlusion_schedule=((0.0, 1.0),),
-            explicit_mask_keys=base.data.explicit_mask_keys,
+            explicit_mask_keys=source_explicit_mask_keys,
             episode_manifest=episode_manifest,
         )
         for source_id, source_root, episode_manifest in source_values
@@ -1646,8 +1652,9 @@ def _openpi_config(
         if not final_mask_root_path.is_absolute():
             final_mask_root_path = checkout / final_mask_root_path
         data_overrides["final_mask_root"] = str(final_mask_root_path.resolve())
-    corrected_background = _corrected_wrist_background_overrides(profile)
     data_overrides.update(corrected_background)
+    if corrected_background:
+        data_overrides["explicit_mask_keys"] = source_explicit_mask_keys
     data = dataclasses.replace(
         base.data,
         assets=assets,
@@ -1668,7 +1675,8 @@ def _openpi_config(
     if corrected_background:
         explicit_mask_keys = tuple(str(value) for value in data.explicit_mask_keys)
         if (
-            "wrist_final_keep_mask_paths" not in explicit_mask_keys
+            explicit_mask_keys
+            != tuple(dexteleop_v23_policy.FINAL_KEEP_MASK_KEYS)
             or "wrist_depth_mask_paths" in explicit_mask_keys
             or not bool(data.strict_media_integrity)
         ):
