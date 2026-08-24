@@ -287,8 +287,7 @@ def run_haptic_fixture_demo(
         and final_tick.state_valid
         and final_tick.state_within_limits
         and torque_limited_ticks == 0
-        and peak_applied_torque_nm
-        <= max(profile.max_abs_torque_nm) + 1e-12
+        and peak_applied_torque_nm <= max(profile.max_abs_torque_nm) + 1e-12
     )
     if fixture_name == "spring":
         effect_pass = bool(
@@ -345,9 +344,7 @@ def run_haptic_fixture_demo(
             "torque_limited_physics_ticks": torque_limited_ticks,
             "slew_limited_physics_ticks": slew_limited_ticks,
             "peak_force_norm_n": peak_force_n,
-            "peak_requested_overlay_torque_nm": (
-                peak_requested_overlay_torque_nm
-            ),
+            "peak_requested_overlay_torque_nm": (peak_requested_overlay_torque_nm),
             "peak_applied_torque_nm": peak_applied_torque_nm,
             "final_force_n": list(final_result.wrench.force_n),
             "final_qpos_rad": list(final_tick.measured_qpos),

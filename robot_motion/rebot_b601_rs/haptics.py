@@ -16,9 +16,7 @@ import numpy as np
 
 from .model import B601PinocchioModel
 
-B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME = (
-    "base_link/world_aligned@gripper_end"
-)
+B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME = "base_link/world_aligned@gripper_end"
 B601_RS_WRENCH_ORDER = ("fx", "fy", "fz", "tx", "ty", "tz")
 
 
@@ -180,9 +178,8 @@ def transform_spatial_wrench(
     rotation = transform[:3, :3]
     translation = transform[:3, 3]
     force = rotation @ np.asarray(wrench.force_n, dtype=float)
-    torque = (
-        np.cross(translation, force)
-        + rotation @ np.asarray(wrench.torque_nm, dtype=float)
+    torque = np.cross(translation, force) + rotation @ np.asarray(
+        wrench.torque_nm, dtype=float
     )
     return B601SpatialWrench(
         force_n=tuple(float(value) for value in force),
@@ -224,9 +221,7 @@ def map_world_aligned_ee_wrench_to_joint_torque(
     if not isinstance(wrench, B601SpatialWrench):
         raise TypeError("wrench must be a B601SpatialWrench")
     if wrench.frame_id != B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME:
-        raise ValueError(
-            "wrench frame must match the B601 world-aligned gripper frame"
-        )
+        raise ValueError("wrench frame must match the B601 world-aligned gripper frame")
     qpos = _finite_vector(qpos_rad, size=6, name="qpos_rad")
     jacobian = model.arm_jacobian(qpos)
     wrench_vector = wrench.as_vector()
