@@ -32,6 +32,7 @@ from teleop_runtime.position_control import (
 from teleop_runtime.real_teleop.control_profile import (
     output_qpos_smoothing_singularity_alpha,
 )
+from teleop_runtime.real_teleop.runtime import _tactile_storage_capacity_summary
 
 
 def _execution_args(**overrides):
@@ -896,7 +897,32 @@ def test_native_tactile_bundle_cli_reads_minimum_free_space_environment(
     )
 
     assert from_environment.tactile_bundle_min_free_gb == 2.0
+    assert from_environment.tactile_bundle_min_free_source == "environment"
     assert overridden.tactile_bundle_min_free_gb == 3.5
+    assert overridden.tactile_bundle_min_free_source == "command_line"
+
+
+def test_tactile_storage_capacity_summary_exposes_effective_reserve_source(
+    monkeypatch, tmp_path: Path
+) -> None:
+    usage = SimpleNamespace(free=137_187_553_280)
+    monkeypatch.setattr(
+        "teleop_runtime.real_teleop.runtime.shutil.disk_usage",
+        lambda _root: usage,
+    )
+    args = SimpleNamespace(
+        tactile_bundle_root=str(tmp_path),
+        tactile_bundle_min_free_gb=200.0,
+        tactile_bundle_min_free_source="environment",
+    )
+
+    summary = _tactile_storage_capacity_summary(args)
+
+    assert summary is not None
+    assert "free_gib=127.8" in summary
+    assert "minimum_free_gib=200" in summary
+    assert "source=environment" in summary
+    assert "capacity=insufficient" in summary
 
 
 def test_real_teleop_velocity_planner_rejects_non_position_or_disabled_stream() -> None:
