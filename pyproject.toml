@@ -115,6 +115,8 @@ control_station = [
     "web/static/*.html",
     "web/static/*.js",
     "web/static/*.css",
+    "quest_calibration/static/*.html",
+    "quest_calibration/static/*.js",
     "refinement_annotation/static/*.html",
     "refinement_annotation/static/*.js",
     "refinement_annotation/static/*.css",
