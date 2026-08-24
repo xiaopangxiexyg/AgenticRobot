@@ -1868,13 +1868,19 @@ def test_umi_components_do_not_reference_arm_backends():
 
 def test_existing_formal_gui_renders_umi_title_without_second_web_server():
     html = _render_initial_html({"ui_mode": "umi_collection", "stage": "ready"})
+    packaged_html = (
+        ROOT / "control_station/web/static/calibration_web_ui.html"
+    ).read_text(encoding="utf-8")
+    packaged_fallback = (
+        ROOT / "control_station/web/static/calibration_web_ui_fallback.js"
+    ).read_text(encoding="utf-8")
     assert "DexTeleop UMI 数采" in html
     assert "collection_web_ui" not in (
         ROOT / "teleop_runtime/collection/umi/controller.py"
     ).read_text()
     assert 'state.ui_mode || "") === "umi_collection"' in (
-        ROOT / "control_station/web/calibration_web_ui.py"
-    ).read_text()
+        packaged_html + packaged_fallback
+    )
     assert 'id="episodeWarningTitle"' in html
     assert "calibration_validity_warning" in html
     assert "calibration-warning.critical" in html
