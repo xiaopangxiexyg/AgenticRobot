@@ -251,6 +251,7 @@ def test_existing_dataset_task_identity_mismatch_fails_closed(
             {
                 "dataset_name": report["dataset"]["dataset_name"],
                 "task_id": "different_task_v1",
+                "task_description": "Write Words",
                 EXCLUSIVE_HITL_DATASET_METADATA_KEY: report[
                     "hitl_dataset_contract"
                 ],
@@ -258,10 +259,60 @@ def test_existing_dataset_task_identity_mismatch_fails_closed(
         ),
         encoding="utf-8",
     )
+    (dataset_root / "meta" / "tasks.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": "different_task_v1",
+                "description": "Write Words",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(
         HITLLaunchAcceptanceError,
         match="task binding differs",
+    ):
+        prepare_hitl_launch(real_args, date_prefix=DATE_PREFIX)
+
+
+def test_existing_dataset_inconsistent_task_metadata_fails_closed(
+    tmp_path: Path,
+) -> None:
+    real_args = _normal_args(tmp_path)
+    prepared = prepare_hitl_launch(real_args, date_prefix=DATE_PREFIX)
+    report = prepared.to_dict()
+    dataset_root = Path(report["dataset"]["root"])
+    meta = dataset_root / "meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(
+        json.dumps(
+            {
+                "dataset_name": report["dataset"]["dataset_name"],
+                "task_id": "write_words_v1",
+                "task_description": "Write Words",
+                EXCLUSIVE_HITL_DATASET_METADATA_KEY: report[
+                    "hitl_dataset_contract"
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (meta / "tasks.jsonl").write_text(
+        json.dumps(
+            {
+                "task_id": "different_task_v1",
+                "description": "Write Words",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        HITLLaunchAcceptanceError,
+        match="invalid canonical task binding",
     ):
         prepare_hitl_launch(real_args, date_prefix=DATE_PREFIX)
 

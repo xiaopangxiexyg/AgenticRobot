@@ -24,6 +24,10 @@ from collection_runtime.dataset_layout import (
     resolve_formal_dataset_layout,
 )
 from dataset_contracts.hitl import ExclusiveHITLDatasetContract
+from dataset_interface.dataset_task_binding import (
+    DatasetTaskBindingError,
+    inspect_dataset_task_binding,
+)
 from dataset_interface.hitl import validate_exclusive_hitl_dataset_append
 from deployments.openpi.client import preflight_policy_artifact
 from robot_motion.pose_frame_profiles import (
@@ -184,15 +188,23 @@ def _validate_dataset_identity(
     info = _read_dataset_info(layout.dataset_root)
     if info is None:
         return
-    existing_task_id = str(info.get("task_id", "") or "").strip()
-    if not existing_task_id:
-        raise HITLLaunchAcceptanceError(
-            "Existing target dataset has no authoritative task_id."
+    try:
+        task_binding = inspect_dataset_task_binding(
+            layout.dataset_root,
+            require_complete=True,
         )
-    if existing_task_id != layout.task_id:
+    except DatasetTaskBindingError as exc:
+        raise HITLLaunchAcceptanceError(
+            f"Existing target dataset has an invalid canonical task binding: {exc}"
+        ) from exc
+    if task_binding is None:  # ``require_complete`` makes this defensive only.
+        raise HITLLaunchAcceptanceError(
+            "Existing target dataset has no authoritative task binding."
+        )
+    if task_binding.task_id != layout.task_id:
         raise HITLLaunchAcceptanceError(
             "Target dataset task binding differs from the requested HITL launch: "
-            f"existing={existing_task_id!r}, requested={layout.task_id!r}."
+            f"existing={task_binding.task_id!r}, requested={layout.task_id!r}."
         )
     existing_dataset_name = str(info.get("dataset_name", "") or "").strip()
     if not existing_dataset_name:
