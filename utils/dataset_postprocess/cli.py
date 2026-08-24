@@ -57,6 +57,7 @@ from .modality_storage import (
     plan_modality_rehydrate,
     rehydrate_modality,
 )
+from .organize_episodes import build_datasets, plan_dataset_build
 from .split_episodes import plan_episode_split, split_episodes
 from .stutter_segments import (
     clean_stutters,
@@ -139,6 +140,24 @@ def _cmd_clean_stutters(args: argparse.Namespace) -> int:
             min_segment_frames=int(args.min_segment_frames),
         )
     _print_json(plan.to_dict())
+    return 0
+
+
+def _cmd_organize_datasets(args: argparse.Namespace) -> int:
+    selected = tuple(args.dataset or ()) or None
+    plans = (
+        build_datasets(
+            args.manifest,
+            overwrite=False,
+            dataset_names=selected,
+        )
+        if args.apply
+        else plan_dataset_build(
+            args.manifest,
+            dataset_names=selected,
+        )
+    )
+    _print_json({"datasets": [plan.to_dict() for plan in plans]})
     return 0
 
 
@@ -749,6 +768,29 @@ def build_parser() -> argparse.ArgumentParser:
         description="Postprocess DexTeleop LeRobot-style datasets."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    organize = subparsers.add_parser(
+        "organize-datasets",
+        help=(
+            "Plan or publish an immutable-source physical dataset merge from "
+            "a reviewed JSON manifest."
+        ),
+    )
+    organize.add_argument("manifest")
+    organize.add_argument(
+        "--dataset",
+        action="append",
+        help="Build only this named manifest output; may be repeated.",
+    )
+    organize.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Publish new outputs. Existing output roots are always refused; "
+            "planning is the default."
+        ),
+    )
+    organize.set_defaults(func=_cmd_organize_datasets)
 
     camera_materialize = subparsers.add_parser(
         "camera-semantics-materialize",
