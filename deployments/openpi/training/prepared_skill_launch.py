@@ -158,7 +158,17 @@ def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
             raise FileNotFoundError(
                 f"Pinned OpenPI source identity is missing: {identity_path}."
             )
-        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity_bytes = identity_path.read_bytes()
+        expected_identity_sha256 = str(
+            profile.get("openpi_source_identity_sha256") or ""
+        ).strip()
+        actual_identity_sha256 = hashlib.sha256(identity_bytes).hexdigest()
+        if actual_identity_sha256 != expected_identity_sha256:
+            raise ValueError(
+                "OpenPI source identity file hash differs from the training "
+                f"profile: {identity_path}."
+            )
+        identity = json.loads(identity_bytes)
         if (
             not isinstance(identity, Mapping)
             or identity.get("schema") != "dexteleop.openpi_source_identity.v1"
@@ -167,6 +177,17 @@ def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
             raise ValueError(
                 "OpenPI source identity differs from the training profile: "
                 f"{identity_path}."
+            )
+        declared_config_sha256 = str(
+            identity.get("training_config_sha256") or ""
+        )
+        actual_config_sha256 = hashlib.sha256(
+            (source_root / "openpi/training/config.py").read_bytes()
+        ).hexdigest()
+        if declared_config_sha256 != actual_config_sha256:
+            raise ValueError(
+                "OpenPI training config content differs from its pinned "
+                f"source identity: {checkout}."
             )
 
     for name, module in tuple(sys.modules.items()):

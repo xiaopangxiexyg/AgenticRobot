@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -126,10 +127,13 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-final4/AgenticRobot/model/openpi"
+        / "code-final5/AgenticRobot/model/openpi"
     )
     assert profile["openpi_source_revision"] == (
         "97b3720515b18e94697573ba55caa6c1bc28af69"
+    )
+    assert profile["openpi_source_identity_sha256"] == (
+        "ba05187ba874439761dbb9ac464a2a11d0a0007a07ceac1d8462073f1f7a7fdf"
     )
     background = profile["openpi_wrist_background_augmentation"]
     assert background["original_probability"] == 0.1
@@ -241,7 +245,8 @@ def test_openpi_checkout_activation_rejects_revision_drift(
 ) -> None:
     checkout = tmp_path / "openpi"
     (checkout / "src/openpi").mkdir(parents=True)
-    (checkout / "OPENPI_SOURCE_IDENTITY.json").write_text(
+    identity_path = checkout / "OPENPI_SOURCE_IDENTITY.json"
+    identity_path.write_text(
         json.dumps(
             {
                 "schema": "dexteleop.openpi_source_identity.v1",
@@ -256,6 +261,9 @@ def test_openpi_checkout_activation_rejects_revision_drift(
             {
                 "openpi_checkout": str(checkout),
                 "openpi_source_revision": "expected-revision",
+                "openpi_source_identity_sha256": hashlib.sha256(
+                    identity_path.read_bytes()
+                ).hexdigest(),
             }
         )
 
