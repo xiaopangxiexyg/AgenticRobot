@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import select
 import sys
-import termios
 import threading
 import time
-import tty
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -171,6 +167,7 @@ from .status_snapshot import (
     hand_debug_text as _snapshot_hand_debug_text,
     writer_debug_text as _snapshot_writer_debug_text,
 )
+from .terminal_keys import TerminalKeyController
 from .topology import CollectionTopology
 from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 
@@ -958,87 +955,6 @@ class ActiveUnrecordedReplayRun:
     last_action: np.ndarray = field(
         default_factory=lambda: np.full(ACTION_DIM, np.nan, dtype=np.float32)
     )
-
-class TerminalKeyController:
-    def __init__(self) -> None:
-        self.enabled = False
-        self.input_source = "disabled"
-        self.disabled_reason: str | None = None
-        self._fd: int | None = None
-        self._owns_fd = False
-        self._old_attrs: list[int] | None = None
-
-    def start(self) -> None:
-        self.close()
-        try:
-            if sys.stdin.isatty():
-                self._fd = sys.stdin.fileno()
-                self._owns_fd = False
-                self.input_source = "stdin"
-            else:
-                self._fd = os.open("/dev/tty", os.O_RDONLY)
-                self._owns_fd = True
-                self.input_source = "/dev/tty"
-            self._old_attrs = termios.tcgetattr(self._fd)
-            tty.setcbreak(self._fd)
-            self.enabled = True
-            self.disabled_reason = None
-        except (OSError, termios.error) as exc:
-            self.enabled = False
-            self.disabled_reason = f"{type(exc).__name__}: {exc}"
-            self.input_source = "disabled"
-            self._old_attrs = None
-            if self._owns_fd and self._fd is not None:
-                try:
-                    os.close(self._fd)
-                except OSError:
-                    pass
-            self._fd = None
-            self._owns_fd = False
-
-    def close(self) -> None:
-        if self._fd is not None and self._old_attrs is not None:
-            try:
-                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
-            except (OSError, termios.error):
-                pass
-        if self._owns_fd and self._fd is not None:
-            try:
-                os.close(self._fd)
-            except OSError:
-                pass
-        self.enabled = False
-        self._fd = None
-        self._owns_fd = False
-        self._old_attrs = None
-
-    def poll(self) -> list[str]:
-        if not self.enabled or self._fd is None:
-            return []
-        keys: list[str] = []
-        while True:
-            try:
-                ready, _, _ = select.select([self._fd], [], [], 0.0)
-            except OSError as exc:
-                self.enabled = False
-                self.disabled_reason = f"{type(exc).__name__}: {exc}"
-                self._old_attrs = None
-                return keys
-            if not ready:
-                return keys
-            try:
-                chunk = os.read(self._fd, 32)
-            except OSError as exc:
-                self.enabled = False
-                self.disabled_reason = f"{type(exc).__name__}: {exc}"
-                return keys
-            if not chunk:
-                return keys
-            text = chunk.decode(errors="ignore")
-            for char in text:
-                if char == "\x03":
-                    raise KeyboardInterrupt
-                keys.append(char.lower())
 
 
 def _load_calibration(args: argparse.Namespace) -> TeleopCalibration:
