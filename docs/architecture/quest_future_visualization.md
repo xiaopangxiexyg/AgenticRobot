@@ -113,11 +113,14 @@ capture publication/reload, offline diagnostic fitting, and explicit immutable
 diagnostic-report publication/reload.  Reducer construction, ordinary polling,
 fit computation, and ordinary close remain non-writing operations.
 
-Those connections have only offline synthetic/contract evidence.  There is
-still no Control Station GUI/intent/status lifecycle, real Quest + RM65
+Those connections have only offline synthetic/contract evidence.  A thin
+programmatic Control Station leaf now translates typed select/begin/complete/
+seal/cancel intents into the existing deploy application and projects bounded,
+pose-redacted operator status.  It has no GUI, Web binding, runtime composition
+caller, or device-start authority.  There is still no real Quest + RM65
 multi-pose calibration evidence, reviewed acceptance, frame installation, or
-Quest future-trajectory renderer.  The existence or successful reload of a
-candidate report therefore cannot be used as calibration or visualization
+Quest future-trajectory renderer.  The lifecycle contract or successful reload
+of a candidate report therefore cannot be used as calibration or visualization
 readiness.
 
 The app-root option is intentionally unavailable with `--send-actions`: every
@@ -162,9 +165,14 @@ and projection into the pre-existing R0 Quest calibration dataset. This is a
 feature-local integration boundary, not permission for `hardware/` to define a
 general dataset schema or become the canonical calibration owner. Promotion to
 a neutral calibration runtime is an explicit decision before non-Quest reuse.
-`control_station/quest_calibration/` may later own operator intents, application
-lifecycle, source selection, and a pose-redacted status projection, but must not
-reimplement the capture reducer or call a refreshing robot snapshot API.
+`control_station/quest_calibration/` owns typed operator intents, application
+lifecycle admission, source-selection translation, UI revision sequencing, and
+a pose-redacted status projection.  It does not construct the lower application
+or own a worker, reducer, pose stream, artifact writer, fit, acceptance, frame,
+or renderer.  Its cancel intent is the only stale-revision exception so cleanup
+remains reachable while a prior action is in progress.  Admitted attempts
+consume their client sequence even on lower failure, preventing ambiguous
+same-intent retries.  It must not call a refreshing robot snapshot API.
 
 The detailed R2 source and evidence contract is documented in
 `hardware/quest_dev/docs/features/paired-pose-capture.md`.  The reducer is a
@@ -313,12 +321,13 @@ against real capture evidence.
 
 The unique-running-runtime host, RM65 lower attestation, policy-deployment
 robot-side canonical binding, default-off application bridge, explicit capture
-store, and explicit candidate diagnostic-report store are now implemented.
-The remaining ordered slices are:
+store, explicit candidate diagnostic-report store, and thin programmatic
+Control Station operator lifecycle are now implemented.  The Station leaf is
+not yet wired into a GUI or application composition root.  The remaining
+ordered slices are:
 
-1. Add the thin Control Station operator lifecycle for
-   begin/complete/cancel/seal and pose-redacted status; keep the reducer and
-   artifact writers in their current lower owners.
+1. Bind the existing Control Station lifecycle to one reviewed operator UI and
+   the unique deploy application without adding a second device/runtime owner.
 2. Collect real stationary multi-pose Quest + RM65 evidence, including remount,
    noise, and held-out/leave-one-window-out validation.
 3. Review residual and observability policy, then define a content-bound

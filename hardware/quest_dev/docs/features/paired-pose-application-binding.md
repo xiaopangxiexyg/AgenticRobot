@@ -199,6 +199,49 @@ Once all intended windows are accepted, sealing is a separate explicit action:
 evidence = application.request_seal()
 ```
 
+## Control Station operator lifecycle
+
+`control_station.quest_calibration` provides the typed, programmatic operator
+boundary around this exact application.  It does not start the Quest host,
+refresh the robot, write evidence, fit or accept calibration, install a frame,
+or render geometry.  The application composition root must pass the already
+owned `application` instance to the controller:
+
+```python
+from control_station.quest_calibration import (
+    QuestCalibrationIntent,
+    QuestCalibrationOperatorController,
+)
+
+controller = QuestCalibrationOperatorController(application)
+status = controller.status()
+
+selection = controller.submit(
+    QuestCalibrationIntent(
+        client_id="calibration-ui",
+        client_sequence=1,
+        expected_revision=status["revision"],
+        intent_kind="select_source",
+        candidate_hash="<operator-reviewed-candidate-hash>",
+        robot_side="<explicit-left-or-right>",
+        reference_frame_id="<explicit-quest-reference-frame-id>",
+        moving_frame_id="<explicit-controller-grip-frame-id>",
+        xr_frame_clock_domain_id="<explicit-webxr-frame-clock-id>",
+    )
+)
+assert selection.accepted
+```
+
+Each later non-cancel intent must use a strictly increasing client sequence and
+the latest returned/status revision.  `begin_window` carries only `window_id`;
+`complete_window` is retried with a new sequence/revision while its outcome is
+`window_drain_pending`; `seal` carries no pose data.  `cancel` closes the lower
+application and may bypass a stale revision so cleanup is still reachable
+during an in-progress action.  Status contains candidate identity hashes,
+handedness, reference-space metadata, counts, lifecycle flags, and action
+availability, but no matrices, pose samples, raw events, evidence dataset, or
+fit.  No current GUI or Web route calls this controller yet.
+
 Persistence is another explicit action after a successful seal. Constructing
 the layout, creating the application, and ordinary `close()` do not create an
 evidence directory or file:
