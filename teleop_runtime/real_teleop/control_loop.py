@@ -835,8 +835,15 @@ def _reconcile_idle_progress_entry_arm_control(
 ) -> tuple[
     ProgressArmTransitionPlan | None,
     PendingProgressArmTransition | None,
+    bool,
 ]:
-    """Apply or gate the selected entry restriction before Episode start."""
+    """Apply or gate the selected entry restriction before Episode start.
+
+    The final boolean reports whether the exact target is ready.  Adding a
+    fixed side can briefly lack the first live command snapshot at startup;
+    that case must keep Episode admission closed while allowing one ordinary
+    control frame to populate the snapshot, rather than entering Home/Hold.
+    """
 
     plan = build_progress_entry_arm_transition_plan(
         profile=profile,
@@ -845,14 +852,20 @@ def _reconcile_idle_progress_entry_arm_control(
         enforcement_mode=enforcement_mode,
     )
     if plan is None or not plan.changes_arm_control:
-        return plan, None
+        return plan, None, True
     if apply_direct(plan):
-        return plan, None
-    return plan, PendingProgressArmTransition(
-        intent=None,
-        plan=plan,
-        capture_sides=plan.newly_teleop_sides,
-    )
+        return plan, None, True
+    if plan.requires_home:
+        return (
+            plan,
+            PendingProgressArmTransition(
+                intent=None,
+                plan=plan,
+                capture_sides=plan.newly_teleop_sides,
+            ),
+            False,
+        )
+    return plan, None, False
 
 
 @dataclass(frozen=True)
@@ -995,6 +1008,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     progress_workflow_recorder: object | None = None
     promotable_hold_pause: PromotableHoldPause | None = None
     pending_progress_arm_transition: PendingProgressArmTransition | None = None
+    progress_arm_entry_snapshot_wait_step_id = ""
     progress_arm_entry_episode_hash = ""
     next_idle_tactile_compression_tick_at = 0.0
     agent_motion_port = getattr(components, "agent_motion_port", None)
@@ -1139,7 +1153,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
         *,
         now: float,
     ) -> bool:
-        """Apply one exact target; return False only when fresh Home is absent."""
+        """Apply one exact target, or report that runtime input is not ready."""
 
         controller = getattr(components, "fix_arm_controller", None)
         if controller is None:
@@ -1230,6 +1244,10 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             if transition.ok:
                 transition = controller.freeze_selected(now=now)
             if not transition.ok:
+                if tuple(getattr(transition, "missing_effectors", ()) or ()) or tuple(
+                    getattr(transition, "missing_channels", ()) or ()
+                ):
+                    return False
                 raise RuntimeError(transition.message)
         else:
             raise RuntimeError(
@@ -1601,6 +1619,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             progress_workflow_recorder = None
             promotable_hold_pause = None
             pending_progress_arm_transition = None
+            progress_arm_entry_snapshot_wait_step_id = ""
             progress_arm_entry_episode_hash = ""
         elif progress_workflow_recorder is not dataset_recorder:
             build_workflow = getattr(
@@ -1616,6 +1635,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             progress_workflow_recorder = dataset_recorder
             promotable_hold_pause = None
             pending_progress_arm_transition = None
+            progress_arm_entry_snapshot_wait_step_id = ""
             progress_arm_entry_episode_hash = ""
         progress_failure_pending = False
         if progress_workflow is not None:
@@ -1655,6 +1675,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     (
                         idle_entry_plan,
                         idle_entry_pending,
+                        idle_entry_ready,
                     ) = _reconcile_idle_progress_entry_arm_control(
                         profile=dataset_recorder.progress_profile,
                         selected_entry_step_id=getattr(
@@ -1681,7 +1702,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         idle_entry_plan is not None
                         and idle_entry_plan.changes_arm_control
                     ):
-                        if idle_entry_pending is None:
+                        if idle_entry_ready:
+                            progress_arm_entry_snapshot_wait_step_id = ""
                             if control_ui is not None:
                                 control_ui.append_message(
                                     "Progress",
@@ -1689,7 +1711,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                                     "arm+end-effector Hold 限制："
                                     f"{idle_entry_plan.target_progress_step_id}。",
                                 )
-                        else:
+                        elif idle_entry_pending is not None:
+                            progress_arm_entry_snapshot_wait_step_id = ""
                             pending_progress_arm_transition = idle_entry_pending
                             clutch_input.request_hold(
                                 reason="progress_arm_profile_transition"
@@ -1703,6 +1726,30 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                                 )
                             publish_progress_ui_state(now=time.time())
                             continue
+                        elif (
+                            progress_arm_entry_snapshot_wait_step_id
+                            != idle_entry_plan.target_progress_step_id
+                        ):
+                            progress_arm_entry_snapshot_wait_step_id = (
+                                idle_entry_plan.target_progress_step_id
+                            )
+                            if (
+                                context.episode_start_countdown_deadline()
+                                is not None
+                            ):
+                                cancel_recording_countdown(
+                                    loop_start,
+                                    reason="progress_entry_arm_snapshot_pending",
+                                )
+                            message = (
+                                "所选起始子任务的固定臂正在等待首帧 arm/hand "
+                                "控制快照；快照建立前不会启动 Episode。"
+                            )
+                            _log("Progress", message, now=loop_start)
+                            if control_ui is not None:
+                                control_ui.append_message("Progress", message)
+                    elif idle_entry_ready:
+                        progress_arm_entry_snapshot_wait_step_id = ""
                 active_identity_hash = str(
                     getattr(
                         None
@@ -2887,6 +2934,15 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     )
         if clutch_input.consume_episode_start_request():
             if not recording_active():
+                if progress_arm_entry_snapshot_wait_step_id:
+                    message = (
+                        "数采开始被拒绝：所选起始子任务的固定臂尚未建立首帧 "
+                        "arm/hand 控制快照，请等待 GUI 提示限制已应用后重试。"
+                    )
+                    _log("Progress", message, now=loop_start)
+                    if control_ui is not None:
+                        control_ui.append_message("Progress", message)
+                    continue
                 control_plane_pause_started_at = time.perf_counter()
                 try:
                     require_idle_tactile_quiesced("formal_episode_start")

@@ -173,29 +173,51 @@ def test_pre_episode_entry_reconciliation_applies_hold_or_gates_on_home() -> Non
         direct_plans.append(plan)
         return True
 
-    direct_plan, direct_pending = _reconcile_idle_progress_entry_arm_control(
-        profile=_profile(),
-        selected_entry_step_id="right_move",
-        current_fixed_sides=(),
-        enforcement_mode="profile",
-        apply_direct=apply_direct,
+    direct_plan, direct_pending, direct_ready = (
+        _reconcile_idle_progress_entry_arm_control(
+            profile=_profile(),
+            selected_entry_step_id="right_move",
+            current_fixed_sides=(),
+            enforcement_mode="profile",
+            apply_direct=apply_direct,
+        )
     )
-    home_plan, home_pending = _reconcile_idle_progress_entry_arm_control(
-        profile=_profile(),
-        selected_entry_step_id="right_move",
-        current_fixed_sides=("right",),
-        enforcement_mode="profile",
-        apply_direct=lambda _plan: False,
+    home_plan, home_pending, home_ready = (
+        _reconcile_idle_progress_entry_arm_control(
+            profile=_profile(),
+            selected_entry_step_id="right_move",
+            current_fixed_sides=("right",),
+            enforcement_mode="profile",
+            apply_direct=lambda _plan: False,
+        )
     )
 
     assert direct_plan is not None
     assert direct_plans == [direct_plan]
     assert direct_pending is None
+    assert direct_ready
     assert home_plan is not None
     assert home_pending is not None
+    assert not home_ready
     assert home_pending.intent is None
     assert home_pending.plan == home_plan
     assert home_pending.capture_sides == ("right",)
+
+
+def test_pre_episode_fixed_side_waits_for_first_command_without_home() -> None:
+    plan, pending, ready = _reconcile_idle_progress_entry_arm_control(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=(),
+        enforcement_mode="profile",
+        apply_direct=lambda _plan: False,
+    )
+
+    assert plan is not None
+    assert plan.target_fixed_sides == ("left",)
+    assert not plan.requires_home
+    assert pending is None
+    assert not ready
 
 
 def test_undeclared_profile_is_compatible_except_in_strict_mode() -> None:
