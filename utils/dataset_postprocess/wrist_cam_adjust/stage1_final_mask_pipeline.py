@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -393,6 +394,9 @@ def _source_receipt(
     table_root: Path,
     post_root: Path,
     final_root: Path,
+    postprocessed_summary: Mapping[str, Any],
+    final_summary: Mapping[str, Any],
+    intermediates_removed: bool,
     trailing_sources: Sequence[Mapping[str, Any]],
     calibration_contract: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -425,11 +429,110 @@ def _source_receipt(
             "postprocessed_depth_keep": str(post_root),
             "final_keep": str(final_root),
         },
+        "validated_summaries": {
+            "postprocessed_depth_keep": dict(postprocessed_summary),
+            "final_keep": dict(final_summary),
+        },
+        "intermediate_retention": {
+            "table_geometry_keep": (
+                "removed_after_validation"
+                if intermediates_removed
+                else "retained"
+            ),
+            "postprocessed_depth_keep": (
+                "removed_after_validation"
+                if intermediates_removed
+                else "retained"
+            ),
+        },
         "rollback": {
             "policy": "remove only the three source-partitioned derived roots",
             "raw_source_restoration_required": False,
         },
     }
+
+
+def _validated_removed_intermediate_summary(
+    receipt: Mapping[str, Any],
+    expected_frames: Mapping[int, int],
+) -> dict[str, Any] | None:
+    retention = receipt.get("intermediate_retention")
+    if not isinstance(retention, Mapping):
+        return None
+    expected_state = "removed_after_validation"
+    if (
+        retention.get("table_geometry_keep") != expected_state
+        or retention.get("postprocessed_depth_keep") != expected_state
+    ):
+        return None
+    summaries = receipt.get("validated_summaries")
+    if not isinstance(summaries, Mapping):
+        raise ValueError("removed intermediates have no validated summaries")
+    postprocessed = summaries.get("postprocessed_depth_keep")
+    if not isinstance(postprocessed, Mapping):
+        raise ValueError("removed postprocessed masks have no validated summary")
+    expected_summary = {
+        "episode_count": len(expected_frames),
+        "frame_count": sum(expected_frames.values()),
+    }
+    mismatched = {
+        key: (postprocessed.get(key), expected_value)
+        for key, expected_value in expected_summary.items()
+        if postprocessed.get(key) != expected_value
+    }
+    if mismatched:
+        raise ValueError(
+            "removed postprocessed-mask summary differs from the fixed "
+            f"snapshot: {mismatched}"
+        )
+    stream_bytes = postprocessed.get("stream_bytes")
+    if not isinstance(stream_bytes, int) or stream_bytes <= 0:
+        raise ValueError("removed postprocessed-mask summary has invalid bytes")
+    return dict(postprocessed)
+
+
+def _remove_validated_intermediate_roots(
+    *,
+    intermediate_derived_root: Path,
+    final_derived_root: Path,
+    table_root: Path,
+    post_root: Path,
+) -> None:
+    intermediate = intermediate_derived_root.resolve()
+    final = final_derived_root.resolve()
+    if intermediate == final:
+        raise ValueError(
+            "validated intermediates can be removed only from a separately "
+            "declared intermediate workspace"
+        )
+    for label, candidate in (
+        ("table geometry", table_root),
+        ("postprocessed depth", post_root),
+    ):
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(intermediate)
+        except ValueError as exc:
+            raise ValueError(
+                f"{label} root is outside the intermediate workspace: "
+                f"{resolved}"
+            ) from exc
+        if resolved == intermediate or not resolved.is_dir():
+            raise ValueError(f"invalid {label} root for removal: {resolved}")
+    shutil.rmtree(table_root.resolve())
+    shutil.rmtree(post_root.resolve())
+
+
+def _summary_receipt_name(
+    run_sources: Sequence[str],
+    all_sources: Sequence[str],
+) -> str:
+    if tuple(run_sources) == tuple(all_sources):
+        return "summary.json"
+    digest = hashlib.sha256(
+        "\n".join(run_sources).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"summary-{digest}.json"
 
 
 def _resolve_pipeline_derived_roots(
@@ -465,6 +568,7 @@ def run_pipeline(
     jobs: int,
     max_frames: int,
     verify_only: bool,
+    remove_validated_intermediates: bool = False,
 ) -> dict[str, Any]:
     profile = _load_profile(profile_path)
     if profile.get("openpi_final_mask_root_layout") != FINAL_MASK_LAYOUT_V1:
@@ -521,6 +625,7 @@ def run_pipeline(
                 "source_dataset_root": str(dataset_root),
                 "eligible_episode_count": len(episodes),
                 "eligible_frame_count": sum(expected.values()),
+                "profile_sha256": _sha256(profile_path),
             }
             mismatched = {
                 key: (existing_receipt.get(key), expected_value)
@@ -592,12 +697,24 @@ def run_pipeline(
                 (existing_receipt or {}).get("raw_trailing_streams", [])
             )
 
-        post_summary = _verify_mask_tree(
-            post_root,
-            dataset_root.name,
-            expected,
-            stream_name="mask_postprocessed.bitpack.bin",
-            expected_mask_name=DEPTH_RANGE_POSTPROCESSED_MASK_NAME,
+        removed_post_summary = (
+            None
+            if existing_receipt is None
+            else _validated_removed_intermediate_summary(
+                existing_receipt,
+                expected,
+            )
+        )
+        post_summary = (
+            removed_post_summary
+            if removed_post_summary is not None
+            else _verify_mask_tree(
+                post_root,
+                dataset_root.name,
+                expected,
+                stream_name="mask_postprocessed.bitpack.bin",
+                expected_mask_name=DEPTH_RANGE_POSTPROCESSED_MASK_NAME,
+            )
         )
         final_summary = _verify_mask_tree(
             final_root,
@@ -616,6 +733,9 @@ def run_pipeline(
             table_root=table_root,
             post_root=post_root,
             final_root=final_root,
+            postprocessed_summary=post_summary,
+            final_summary=final_summary,
+            intermediates_removed=remove_validated_intermediates,
             trailing_sources=trailing,
             calibration_contract=(
                 calibration_contract
@@ -624,6 +744,13 @@ def run_pipeline(
             ),
         )
         if not verify_only and existing_receipt is None:
+            if remove_validated_intermediates:
+                _remove_validated_intermediate_roots(
+                    intermediate_derived_root=intermediate_derived_root,
+                    final_derived_root=derived_root,
+                    table_root=table_root,
+                    post_root=post_root,
+                )
             _write_receipt(receipt_path, receipt)
         summaries.append(
             {
@@ -653,7 +780,11 @@ def run_pipeline(
         "sources": summaries,
     }
     if not verify_only:
-        _write_receipt(receipt_base / "summary.json", summary)
+        summary_name = _summary_receipt_name(
+            run_sources,
+            tuple(profile_sources),
+        )
+        _write_receipt(receipt_base / summary_name, summary)
     return summary
 
 
@@ -673,6 +804,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--remove-validated-intermediates", action="store_true")
     args = parser.parse_args(argv)
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
@@ -688,6 +820,7 @@ def main(argv: list[str] | None = None) -> int:
         jobs=args.jobs,
         max_frames=args.max_frames,
         verify_only=args.verify_only,
+        remove_validated_intermediates=args.remove_validated_intermediates,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

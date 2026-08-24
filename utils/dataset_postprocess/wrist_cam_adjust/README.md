@@ -302,8 +302,15 @@ python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline 
 ```
 
 该选项不改变 mask 语义、source/episode 选择或 final 布局，只分离中间层存储。
-中间层必须保留到 full verify-only 完成；不得用它绕过 decoder warning 或 strict-media
-失败。
+本机空间不足以同时保留全部 source 的中间层时，可再加
+`--remove-validated-intermediates`。流水线会逐 source 严格执行：完整生成 table/post/final，
+重新核对 post 与 final 的 episode、frame、bitpack 字节数，删除该 source 在独立本机
+workspace 下的 table/post 目录，最后原子发布包含验证摘要和清理状态的 source receipt。
+删除失败或进程中断时不会发布 receipt，续跑会重新生成并验证该 source；final 与 receipt
+始终保留在新 NAS workspace，raw source 和 calibration overlay 不会被删除。已发布清理
+receipt 的 source 在续跑时用其中的固定 post 验证摘要并重新读取、验证 final，不会静默
+跳过 final 验证。未使用该参数时，中间层必须保留到 full verify-only 完成。两种模式都
+不得绕过 decoder warning 或 strict-media 失败。
 
 两帧管线 smoke 必须使用独立 workspace，不能写入正式 final-mask root：
 

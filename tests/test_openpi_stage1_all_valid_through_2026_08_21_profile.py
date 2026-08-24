@@ -33,7 +33,10 @@ from utils.dataset_postprocess.wrist_cam_adjust.geometry_mask.dataset import (
 )
 from utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline import (
     _intrinsics_overlay_for_source,
+    _remove_validated_intermediate_roots,
     _resolve_pipeline_derived_roots,
+    _summary_receipt_name,
+    _validated_removed_intermediate_summary,
 )
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
@@ -48,6 +51,68 @@ _PROFILE = (
     "writing_stage1_all_valid_through_2026_08_21_"
     "front_right_wrist_h32_absolute_non_rtc_v1.json"
 )
+
+
+def test_stage1_mask_cleanup_requires_separate_intermediate_workspace(
+    tmp_path: Path,
+) -> None:
+    derived = tmp_path / "workspace" / "derived"
+    table = derived / "table_geometry_keep_masks" / "source"
+    post = derived / "postprocessed_depth_keep_masks" / "source"
+    table.mkdir(parents=True)
+    post.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="separately declared"):
+        _remove_validated_intermediate_roots(
+            intermediate_derived_root=derived,
+            final_derived_root=derived,
+            table_root=table,
+            post_root=post,
+        )
+    assert table.is_dir()
+    assert post.is_dir()
+
+
+def test_stage1_mask_removed_summary_and_subset_receipts(tmp_path: Path) -> None:
+    intermediate = tmp_path / "intermediate" / "derived"
+    final = tmp_path / "final" / "derived"
+    table = intermediate / "table_geometry_keep_masks" / "source"
+    post = intermediate / "postprocessed_depth_keep_masks" / "source"
+    table.mkdir(parents=True)
+    post.mkdir(parents=True)
+    (table / "artifact").write_text("table", encoding="utf-8")
+    (post / "artifact").write_text("post", encoding="utf-8")
+
+    _remove_validated_intermediate_roots(
+        intermediate_derived_root=intermediate,
+        final_derived_root=final,
+        table_root=table,
+        post_root=post,
+    )
+    assert not table.exists()
+    assert not post.exists()
+
+    expected = {0: 5, 2: 7}
+    receipt = {
+        "intermediate_retention": {
+            "table_geometry_keep": "removed_after_validation",
+            "postprocessed_depth_keep": "removed_after_validation",
+        },
+        "validated_summaries": {
+            "postprocessed_depth_keep": {
+                "episode_count": 2,
+                "frame_count": 12,
+                "stream_bytes": 24,
+            }
+        },
+    }
+    assert _validated_removed_intermediate_summary(receipt, expected) == {
+        "episode_count": 2,
+        "frame_count": 12,
+        "stream_bytes": 24,
+    }
+    assert _summary_receipt_name(("a", "b"), ("a", "b")) == "summary.json"
+    assert _summary_receipt_name(("a",), ("a", "b")).startswith("summary-")
 
 
 def test_through_2026_08_21_profile_matches_logical_source_contract() -> None:
@@ -128,7 +193,7 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-final9/AgenticRobot/model/openpi"
+        / "code-final10/AgenticRobot/model/openpi"
     )
     assert profile["openpi_source_revision"] == (
         "97b3720515b18e94697573ba55caa6c1bc28af69"
