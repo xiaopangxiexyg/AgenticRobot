@@ -204,6 +204,13 @@ launcher 默认保留 200 GiB 空闲空间，可用 `--tactile-min-free-gb` 显�
 `COLLECTION_TASK_NAME`。正式启动前可在任一命令末尾追加 `--dry-run`，只打印完整解析结果，
 不会连接踏板、机械臂、相机、夹爪或触觉设备。
 
+需要临时降低 reserve 时，优先使用显式参数，例如
+`--tactile-min-free-gb 2`。Shell 写法
+`TACTILE_BUNDLE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-2}"` 只会在变量未设置时
+采用 2；若当前终端已经继承了 200，它仍会保留 200。launcher 和 canonical Python
+入口都会报告最终生效值及其来源，实际采集前应核对该诊断；降低 reserve 不会增加磁盘
+容量，仍需按预计采集量保留余量。
+
 该 collect 命令固定展开
 `POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_DAMPED_ADMITTANCE_ARGS`，即 15 Hz
 操作输入、60 Hz IK/qref、120 Hz qcmd，以及双臂平移/旋转 bounded force-admittance
