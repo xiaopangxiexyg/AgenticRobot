@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import queue
 import threading
 from collections import deque
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from teleop_runtime.collection import process_writer
 from teleop_runtime.collection.process_writer import ProcessCollectionWorker
 
 
@@ -152,6 +154,14 @@ def test_process_worker_retains_and_prints_sample_traceback(capsys) -> None:
         "Traceback (most recent call last):\n  worker.plan_jobs"
     )
     assert "[CollectionWorker] sample processing failed" in capsys.readouterr().err
+
+
+def test_worker_main_mirrors_post_start_fatal_to_health_ack_queue() -> None:
+    source = inspect.getsource(process_writer._worker_main)
+
+    assert '"kind": "ready" if writer is None else "fatal"' in source
+    assert '"kind": "worker_error"' in source
+    assert '"error": f"worker.fatal: {error}"' in source
 
 
 def test_process_worker_sample_rejection_is_nonfatal() -> None:
