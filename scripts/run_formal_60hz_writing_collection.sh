@@ -76,6 +76,11 @@ TACTILE_ROOT="${TACTILE_BUNDLE_ROOT:-}"
 DATASET_ROOT="${DATASET_BASE:-}"
 TASK_NAME="${COLLECTION_TASK_NAME:-4_stage_writing_detail}"
 TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-200}"
+if [[ -n "${TACTILE_BUNDLE_MIN_FREE_GB:-}" ]]; then
+  TACTILE_MIN_FREE_SOURCE=environment
+else
+  TACTILE_MIN_FREE_SOURCE=default
+fi
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -98,6 +103,7 @@ while [[ $# -gt 0 ]]; do
     --tactile-min-free-gb)
       [[ $# -ge 2 ]] || die "--tactile-min-free-gb requires N."
       TACTILE_MIN_FREE_GB="$2"
+      TACTILE_MIN_FREE_SOURCE=command_line
       shift 2
       ;;
     --dry-run)
@@ -173,6 +179,8 @@ RUN_COMMAND=(
 )
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
+  printf '[DexTeleop] tactile_bundle_min_free_gb=%s source=%s\n' \
+    "$TACTILE_BUNDLE_MIN_FREE_GB" "$TACTILE_MIN_FREE_SOURCE"
   print_command "${RUN_COMMAND[@]}"
   exit 0
 fi
@@ -182,5 +190,6 @@ printf '%s\n' \
   '[DexTeleop] five-pedal forwarding must be running in a separate terminal.' \
   "[DexTeleop] task=$TASK_NAME" \
   "[DexTeleop] dataset_root=$DATASET_BASE" \
-  "[DexTeleop] tactile_bundle_root=$TACTILE_BUNDLE_ROOT"
+  "[DexTeleop] tactile_bundle_root=$TACTILE_BUNDLE_ROOT" \
+  "[DexTeleop] tactile_bundle_min_free_gb=$TACTILE_BUNDLE_MIN_FREE_GB source=$TACTILE_MIN_FREE_SOURCE"
 exec "${RUN_COMMAND[@]}"

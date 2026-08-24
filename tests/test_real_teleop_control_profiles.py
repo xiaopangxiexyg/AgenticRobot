@@ -882,6 +882,23 @@ def test_native_tactile_bundle_cli_reads_tactile_bundle_root_environment(
     assert enabled.tactile_artifact_integrity is True
 
 
+def test_native_tactile_bundle_cli_reads_minimum_free_space_environment(
+    monkeypatch, tmp_path: Path
+) -> None:
+    tactile_root = tmp_path / "env-tactile"
+    tactile_root.mkdir()
+    monkeypatch.setenv("TACTILE_BUNDLE_ROOT", str(tactile_root))
+    monkeypatch.setenv("TACTILE_BUNDLE_MIN_FREE_GB", "2")
+
+    from_environment = _parse_real_teleop_args([])
+    overridden = _parse_real_teleop_args(
+        ["--tactile-bundle-min-free-gb", "3.5"]
+    )
+
+    assert from_environment.tactile_bundle_min_free_gb == 2.0
+    assert overridden.tactile_bundle_min_free_gb == 3.5
+
+
 def test_real_teleop_velocity_planner_rejects_non_position_or_disabled_stream() -> None:
     with pytest.raises(SystemExit):
         _parse_real_teleop_args(

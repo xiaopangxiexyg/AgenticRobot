@@ -100,3 +100,33 @@ def test_collection_accepts_existing_roots_on_same_filesystem(
 
     assert result.returncode == 0, result.stderr
     assert "--tactile-bundle-root" in result.stdout
+
+
+def test_collection_minimum_free_space_precedence_is_visible(
+    monkeypatch, tmp_path: Path
+) -> None:
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+    monkeypatch.setenv("TACTILE_BUNDLE_MIN_FREE_GB", "200")
+
+    inherited = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+    )
+    explicit = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+        "--tactile-min-free-gb",
+        "2",
+    )
+
+    assert inherited.returncode == 0, inherited.stderr
+    assert "--tactile-bundle-min-free-gb 200" in inherited.stdout
+    assert "tactile_bundle_min_free_gb=200 source=environment" in inherited.stdout
+    assert explicit.returncode == 0, explicit.stderr
+    assert "--tactile-bundle-min-free-gb 2" in explicit.stdout
+    assert "tactile_bundle_min_free_gb=2 source=command_line" in explicit.stdout
