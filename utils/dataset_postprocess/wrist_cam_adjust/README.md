@@ -249,6 +249,9 @@ Stage1 的训练 profile 还必须显式固定 corrected 背景契约：10% 保�
 `shared_scene_family` 绑定同一条样本中的 wrist 背景族。这个替换只作用于
 `right_wrist`；`front` 不读取 wrist mask。real-image root/manifest 必须来自本次
 训练的独立资产快照，不能继续依赖可变的开发 checkout。
+正式 profile 同时固定 `openpi_checkout` 与 `openpi_source_revision`；启动器要求 checkout
+中的 `OPENPI_SOURCE_IDENTITY.json` 与 revision 一致，并拒绝进程中已从其他路径导入的
+`openpi` 包。
 
 ```text
 <final-mask-root>/<source_dataset_id>/<dataset-name>/episode_XXXXXX/right_wrist/

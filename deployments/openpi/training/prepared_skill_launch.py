@@ -7,6 +7,7 @@ from contextlib import contextmanager, nullcontext
 import copy
 import dataclasses
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -89,6 +90,7 @@ SKILL_PROJECTION_CATALOG_WRITING_FOUR_STAGE_SUBTASKS_V2 = (
     "writing_four_stage_subtasks_v2"
 )
 _EMPTY_CHECKPOINT_ROOT_ENTRIES = frozenset({"wandb", "wandb_id.txt"})
+OPENPI_SOURCE_IDENTITY_FILENAME = "OPENPI_SOURCE_IDENTITY.json"
 
 
 def _corrected_wrist_background_overrides(
@@ -141,6 +143,61 @@ def _corrected_wrist_background_overrides(
         "real_image_manifest": str(real_image_manifest),
         "strict_media_integrity": True,
     }
+
+
+def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
+    checkout = Path(str(profile["openpi_checkout"])).expanduser().resolve()
+    source_root = checkout / "src"
+    if not (source_root / "openpi").is_dir():
+        raise FileNotFoundError(f"OpenPI checkout is missing: {checkout}.")
+
+    expected_revision = str(profile.get("openpi_source_revision") or "").strip()
+    if expected_revision:
+        identity_path = checkout / OPENPI_SOURCE_IDENTITY_FILENAME
+        if not identity_path.is_file():
+            raise FileNotFoundError(
+                f"Pinned OpenPI source identity is missing: {identity_path}."
+            )
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("schema") != "dexteleop.openpi_source_identity.v1"
+            or str(identity.get("revision") or "") != expected_revision
+        ):
+            raise ValueError(
+                "OpenPI source identity differs from the training profile: "
+                f"{identity_path}."
+            )
+
+    for name, module in tuple(sys.modules.items()):
+        if name != "openpi" and not name.startswith("openpi."):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        if not Path(str(module_file)).resolve().is_relative_to(checkout):
+            raise RuntimeError(
+                "OpenPI was already imported from outside the profile checkout: "
+                f"{name}={module_file}. Start a fresh training process."
+            )
+
+    source_text = str(source_root)
+    sys.path[:] = [
+        source_text,
+        *(
+            item
+            for item in sys.path
+            if str(Path(item or ".").resolve()) != source_text
+        ),
+    ]
+    training_config = importlib.import_module("openpi.training.config")
+    module_file = Path(str(training_config.__file__)).resolve()
+    if not module_file.is_relative_to(checkout):
+        raise RuntimeError(
+            "OpenPI training config was imported from outside the profile "
+            f"checkout: {module_file}."
+        )
+    return training_config
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1401,9 +1458,7 @@ def _openpi_config(
     overwrite: bool,
 ) -> tuple[Any, Any, Path]:
     checkout = Path(str(profile["openpi_checkout"])).expanduser().resolve()
-    if not (checkout / "src/openpi").is_dir():
-        raise FileNotFoundError(f"OpenPI checkout is missing: {checkout}.")
-    import openpi.training.config as training_config
+    training_config = _activate_openpi_checkout(profile)
     from openpi.policies import dexteleop_v23_policy
 
     base = training_config.get_config(str(profile["openpi_base_config"]))
@@ -2031,9 +2086,7 @@ def _model_rtc_checkpoint_root(
     """Resolve the model-RTC run root without compiling a live data view."""
 
     checkout = Path(str(profile["openpi_checkout"])).expanduser().resolve()
-    if not (checkout / "src/openpi").is_dir():
-        raise FileNotFoundError(f"OpenPI checkout is missing: {checkout}.")
-    import openpi.training.config as training_config
+    training_config = _activate_openpi_checkout(profile)
 
     base = training_config.get_config(str(profile["openpi_base_config"]))
     effective_exp_name = str(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +11,7 @@ import pytest
 from dataset_interface.logical_task_dataset import load_logical_task_dataset_manifest
 from deployments.openpi.training.prepared_skill import OpenPIPreparedSkillError
 from deployments.openpi.training.prepared_skill_launch import (
+    _activate_openpi_checkout,
     _bind_source_partitioned_final_masks_to_dataset,
     _corrected_wrist_background_overrides,
     _load_profile,
@@ -124,7 +126,10 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-final3/AgenticRobot/model/openpi"
+        / "code-final4/AgenticRobot/model/openpi"
+    )
+    assert profile["openpi_source_revision"] == (
+        "97b3720515b18e94697573ba55caa6c1bc28af69"
     )
     background = profile["openpi_wrist_background_augmentation"]
     assert background["original_probability"] == 0.1
@@ -229,6 +234,49 @@ def test_through_2026_08_21_profile_rejects_background_contract_drift(
 
     with pytest.raises(ValueError, match="corrected 10/40/50"):
         _load_profile(invalid)
+
+
+def test_openpi_checkout_activation_rejects_revision_drift(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "openpi"
+    (checkout / "src/openpi").mkdir(parents=True)
+    (checkout / "OPENPI_SOURCE_IDENTITY.json").write_text(
+        json.dumps(
+            {
+                "schema": "dexteleop.openpi_source_identity.v1",
+                "revision": "wrong-revision",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="source identity differs"):
+        _activate_openpi_checkout(
+            {
+                "openpi_checkout": str(checkout),
+                "openpi_source_revision": "expected-revision",
+            }
+        )
+
+
+def test_openpi_checkout_activation_rejects_foreign_loaded_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "openpi"
+    (checkout / "src/openpi").mkdir(parents=True)
+    foreign = tmp_path / "foreign/openpi/__init__.py"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("", encoding="utf-8")
+    monkeypatch.setitem(
+        sys.modules,
+        "openpi",
+        SimpleNamespace(__file__=str(foreign)),
+    )
+
+    with pytest.raises(RuntimeError, match="outside the profile checkout"):
+        _activate_openpi_checkout({"openpi_checkout": str(checkout)})
 
 
 def test_source_partitioned_final_masks_bind_before_pipeline_open(
