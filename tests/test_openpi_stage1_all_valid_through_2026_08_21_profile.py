@@ -23,6 +23,9 @@ from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.postprocess import (
 from utils.dataset_postprocess.wrist_cam_adjust.depth_mask.visualize import (
     MaskStream,
 )
+from utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline import (
+    _intrinsics_overlay_for_source,
+)
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
 _MANIFEST = (
@@ -116,8 +119,29 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-r2/AgenticRobot/model/openpi"
+        / "code-final/AgenticRobot/model/openpi"
     )
+    intrinsics_overrides = profile["right_wrist_intrinsics_overrides"]
+    assert set(intrinsics_overrides) == {
+        "fixed_middle_2026_08_03_part1",
+        "fixed_middle_2026_08_03_part2",
+    }
+    assert {
+        (
+            item["target_camera_key"],
+            item["expected_serial"],
+            item["donor_source_dataset_id"],
+            item["donor_camera_key"],
+        )
+        for item in intrinsics_overrides.values()
+    } == {
+        (
+            "right_wrist",
+            "261122273924",
+            "fixed_middle_2026_08_04",
+            "left_wrist",
+        )
+    }
 
     assert profile["expected_total_raw_episode_count"] == sum(
         int(source["expected_raw_episode_count"]) for source in sources
@@ -267,3 +291,72 @@ def test_depth_postprocess_repairs_only_complete_trailing_frames(
         "exact_declared_frames_v1"
     )
     assert manifest["source"]["integrity"]["source_modified"] is False
+
+
+def test_intrinsics_overlay_binds_donor_by_serial_without_source_write(
+    tmp_path: Path,
+) -> None:
+    target_root = tmp_path / "target"
+    donor_root = tmp_path / "donor"
+    target_path = target_root / "meta/devices/realsense.json"
+    donor_path = donor_root / "meta/devices/realsense.json"
+    target_path.parent.mkdir(parents=True)
+    donor_path.parent.mkdir(parents=True)
+    target_path.write_text(
+        json.dumps(
+            {
+                "cameras": {
+                    "right_wrist": {
+                        "serial": "serial-a",
+                        "semantic_role": "right_wrist",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    donor_path.write_text(
+        json.dumps(
+            {
+                "left_wrist": {
+                    "serial_number": "serial-a",
+                    "intrinsics": {
+                        "width": 640,
+                        "height": 480,
+                        "fx": 395.0,
+                        "fy": 394.0,
+                        "ppx": 320.0,
+                        "ppy": 240.0,
+                        "coeffs": [0.0] * 5,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_target = target_path.read_bytes()
+
+    overlay_path, contract = _intrinsics_overlay_for_source(
+        profile={
+            "right_wrist_intrinsics_overrides": {
+                "target": {
+                    "target_camera_key": "right_wrist",
+                    "expected_serial": "serial-a",
+                    "donor_source_dataset_id": "donor",
+                    "donor_camera_key": "left_wrist",
+                }
+            }
+        },
+        profile_sources={"target": target_root, "donor": donor_root},
+        source_id="target",
+        dataset_root=target_root,
+        overlay_base=tmp_path / "derived/calibration_overlays",
+    )
+
+    assert overlay_path is not None
+    assert contract is not None
+    assert contract["bound_serial"] == "serial-a"
+    overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
+    assert overlay["right_wrist"]["intrinsics"]["fx"] == 395.0
+    assert overlay["right_wrist"]["serial"] == "serial-a"
+    assert target_path.read_bytes() == original_target

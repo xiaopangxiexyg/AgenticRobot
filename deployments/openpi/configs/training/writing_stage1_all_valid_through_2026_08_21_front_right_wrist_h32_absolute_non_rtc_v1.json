@@ -242,13 +242,27 @@
   "tail_policy": "drop",
   "default_prompt": "Pick up the capped brush and present it for uncapping.",
   "expected_policy_io_layout_hash": "sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16",
-  "openpi_checkout": "/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/code-r2/AgenticRobot/model/openpi",
+  "openpi_checkout": "/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/code-final/AgenticRobot/model/openpi",
   "openpi_base_config": "writing-stage1-front-right-wrist-h32-absolute-standard-v1",
   "openpi_state_augmentation_from_config": "writing-stage1-front-right-wrist-h32-absolute-standard-v1",
   "openpi_config_name": "writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-v1",
   "openpi_asset_id": "writing_stage1_all_valid_through_2026_08_21_front_right_wrist_h32_absolute_standard_v1",
   "openpi_final_mask_root": "/mnt/nas2/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/workspace/derived/final_keep_masks",
   "openpi_final_mask_root_layout": "source_dataset_id_partitioned_v1",
+  "right_wrist_intrinsics_overrides": {
+    "fixed_middle_2026_08_03_part1": {
+      "target_camera_key": "right_wrist",
+      "expected_serial": "261122273924",
+      "donor_source_dataset_id": "fixed_middle_2026_08_04",
+      "donor_camera_key": "left_wrist"
+    },
+    "fixed_middle_2026_08_03_part2": {
+      "target_camera_key": "right_wrist",
+      "expected_serial": "261122273924",
+      "donor_source_dataset_id": "fixed_middle_2026_08_04",
+      "donor_camera_key": "left_wrist"
+    }
+  },
   "openpi_assets_base_dir": "/mnt/nas2/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/artifacts/assets",
   "openpi_checkpoint_base_dir": "/mnt/nas2/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/artifacts/checkpoints",
   "openpi_training_mode": "standard_non_rtc_v1",

@@ -263,6 +263,12 @@ python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline 
 `meta/source_devices/<source-name>/realsense.json`；保存副本必须与原 source 的
 内参文件 SHA-256 一致。
 
+如果早期 source 只保存 serial、没有保存数值内参，必须由 profile 的
+`right_wrist_intrinsics_overrides` 显式声明 donor source/camera 和 expected serial。
+流水线同时验证 target 与 donor serial，再把 donor 数值内参写入全新的
+`derived/calibration_overlays/<source_dataset_id>/realsense.json`；不能按 donor 的
+`left_wrist`/`right_wrist` 名字猜测，也不能回写 source metadata。
+
 depth 后处理按 manifest 声明帧数精确读取。完整的额外尾随帧会记录在 receipt 中，
 但不会进入派生结果；短流、半帧尾随、table 视频提前结束或额外可解码尾帧都会停止
 流水线。每个 bitpack episode 先写独立临时目录并原子发布，原始数据始终只读。

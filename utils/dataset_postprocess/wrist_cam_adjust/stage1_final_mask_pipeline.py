@@ -155,6 +155,105 @@ def _physical_devices_by_episode(
     return mapping
 
 
+def _camera_records(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    nested = payload.get("cameras")
+    return nested if isinstance(nested, Mapping) else payload
+
+
+def _camera_serial(record: Mapping[str, Any]) -> str:
+    return str(record.get("serial_number") or record.get("serial") or "").strip()
+
+
+def _intrinsics_overlay_for_source(
+    *,
+    profile: Mapping[str, Any],
+    profile_sources: Mapping[str, Path],
+    source_id: str,
+    dataset_root: Path,
+    overlay_base: Path,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    overrides = profile.get("right_wrist_intrinsics_overrides", {})
+    if not isinstance(overrides, Mapping):
+        raise TypeError("right_wrist_intrinsics_overrides must be an object")
+    raw_override = overrides.get(source_id)
+    if raw_override is None:
+        return None, None
+    if not isinstance(raw_override, Mapping):
+        raise TypeError(f"intrinsics override must be an object: {source_id}")
+    target_camera_key = str(raw_override.get("target_camera_key", "")).strip()
+    donor_source_id = str(
+        raw_override.get("donor_source_dataset_id", "")
+    ).strip()
+    donor_camera_key = str(raw_override.get("donor_camera_key", "")).strip()
+    expected_serial = str(raw_override.get("expected_serial", "")).strip()
+    if (
+        target_camera_key != "right_wrist"
+        or donor_source_id not in profile_sources
+        or not donor_camera_key
+        or not expected_serial
+    ):
+        raise ValueError(f"invalid right-wrist intrinsics override: {source_id}")
+
+    target_path = dataset_root / "meta" / "devices" / "realsense.json"
+    donor_path = (
+        profile_sources[donor_source_id]
+        / "meta"
+        / "devices"
+        / "realsense.json"
+    )
+    target_payload = _read_json(target_path)
+    donor_payload = _read_json(donor_path)
+    target_record = _camera_records(target_payload).get(target_camera_key)
+    donor_record = _camera_records(donor_payload).get(donor_camera_key)
+    if not isinstance(target_record, Mapping) or not isinstance(
+        donor_record,
+        Mapping,
+    ):
+        raise TypeError(
+            f"intrinsics override camera binding is absent: {source_id}"
+        )
+    target_serial = _camera_serial(target_record)
+    donor_serial = _camera_serial(donor_record)
+    intrinsics = donor_record.get("intrinsics")
+    if (
+        target_serial != expected_serial
+        or donor_serial != expected_serial
+        or not isinstance(intrinsics, Mapping)
+    ):
+        raise ValueError(
+            "intrinsics donor does not match the target camera serial: "
+            f"source={source_id} target={target_serial!r} "
+            f"donor={donor_serial!r} expected={expected_serial!r}"
+        )
+    overlay_path = overlay_base / source_id / "realsense.json"
+    contract = {
+        "schema": "dexteleop.serial_bound_intrinsics_overlay_v1",
+        "source_dataset_id": source_id,
+        "target_devices_path": str(target_path),
+        "target_devices_sha256": _sha256(target_path),
+        "target_camera_key": target_camera_key,
+        "donor_source_dataset_id": donor_source_id,
+        "donor_devices_path": str(donor_path),
+        "donor_devices_sha256": _sha256(donor_path),
+        "donor_camera_key": donor_camera_key,
+        "bound_serial": expected_serial,
+        "source_modified": False,
+    }
+    overlay_payload = {
+        "schema": "dexteleop.serial_bound_intrinsics_overlay.v1",
+        target_camera_key: {
+            "camera_key": target_camera_key,
+            "semantic_role": target_camera_key,
+            "serial": expected_serial,
+            "serial_number": expected_serial,
+            "intrinsics": dict(intrinsics),
+        },
+        "calibration_provenance": contract,
+    }
+    _write_receipt(overlay_path, overlay_payload)
+    return overlay_path, contract
+
+
 def _expected_frames(
     records: Mapping[int, Mapping[str, Any]],
     episodes: Sequence[int],
@@ -295,6 +394,7 @@ def _source_receipt(
     post_root: Path,
     final_root: Path,
     trailing_sources: Sequence[Mapping[str, Any]],
+    calibration_contract: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     return {
         "schema": PIPELINE_SCHEMA_V1,
@@ -315,6 +415,11 @@ def _source_receipt(
         "final_mask_root_layout": FINAL_MASK_LAYOUT_V1,
         "raw_source_modified": False,
         "raw_trailing_streams": [dict(item) for item in trailing_sources],
+        "calibration_contract": (
+            None
+            if calibration_contract is None
+            else dict(calibration_contract)
+        ),
         "derived_roots": {
             "table_geometry_keep": str(table_root),
             "postprocessed_depth_keep": str(post_root),
@@ -372,6 +477,7 @@ def run_pipeline(
     table_base = derived_root / "table_geometry_keep_masks"
     post_base = derived_root / "postprocessed_depth_keep_masks"
     receipt_base = derived_root.parent / "receipts" / "stage1_final_masks"
+    overlay_base = derived_root / "calibration_overlays"
 
     summaries: list[dict[str, Any]] = []
     for source_id in run_sources:
@@ -406,7 +512,21 @@ def run_pipeline(
                     f"snapshot: {receipt_path} {mismatched}"
                 )
 
+        calibration_contract = (
+            None
+            if existing_receipt is None
+            else existing_receipt.get("calibration_contract")
+        )
         if not verify_only and existing_receipt is None:
+            override_devices, calibration_contract = (
+                _intrinsics_overlay_for_source(
+                    profile=profile,
+                    profile_sources=profile_sources,
+                    source_id=source_id,
+                    dataset_root=dataset_root,
+                    overlay_base=overlay_base,
+                )
+            )
             devices_by_episode = _physical_devices_by_episode(
                 dataset_root,
                 episodes,
@@ -417,6 +537,7 @@ def run_pipeline(
                 urdf_path=urdf_path,
                 cameras=("right_wrist",),
                 episodes=episodes,
+                devices_json=override_devices,
                 devices_json_by_episode=devices_by_episode,
                 output_kind="keep-mask",
                 table_mask_mode="sampled-raycast",
@@ -475,6 +596,11 @@ def run_pipeline(
             post_root=post_root,
             final_root=final_root,
             trailing_sources=trailing,
+            calibration_contract=(
+                calibration_contract
+                if isinstance(calibration_contract, Mapping)
+                else None
+            ),
         )
         if not verify_only and existing_receipt is None:
             _write_receipt(receipt_path, receipt)
