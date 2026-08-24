@@ -54,8 +54,7 @@ def validate_position_worker_args(
             args.position_continuous_waypoint_async_precompute
         ):
             raise ValueError(
-                "--position-continuous-waypoint-worker-cpu requires async_c2 "
-                "precompute"
+                "--position-continuous-waypoint-worker-cpu requires async_c2 precompute"
             )
         if continuous_worker_cpu is not None and int(reference_worker_cpu) == int(
             continuous_worker_cpu

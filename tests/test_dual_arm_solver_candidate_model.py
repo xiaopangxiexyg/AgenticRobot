@@ -11,7 +11,9 @@ from robot_motion.rm65.dual_arm_solver import candidate_model
 
 def test_facade_reexports_candidate_value_objects() -> None:
     assert facade._DualArmCandidate is candidate_model._DualArmCandidate
-    assert facade._DualArmEvaluatedCandidate is candidate_model._DualArmEvaluatedCandidate
+    assert (
+        facade._DualArmEvaluatedCandidate is candidate_model._DualArmEvaluatedCandidate
+    )
 
 
 def test_candidate_defaults_and_evaluated_record_are_value_objects() -> None:

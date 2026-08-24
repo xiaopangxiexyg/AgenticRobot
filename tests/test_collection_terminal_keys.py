@@ -21,11 +21,15 @@ def test_disabled_controller_is_safe_to_poll_and_close() -> None:
     assert controller.enabled is False
 
 
-def test_start_disables_cleanly_when_no_terminal_is_available(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_start_disables_cleanly_when_no_terminal_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def fail_open(*_args: object, **_kwargs: object) -> int:
         raise OSError("no tty")
 
-    monkeypatch.setattr(terminal_keys.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(
+        terminal_keys.sys, "stdin", SimpleNamespace(isatty=lambda: False)
+    )
     monkeypatch.setattr(terminal_keys.os, "open", fail_open)
 
     controller = terminal_keys.TerminalKeyController()
@@ -37,19 +41,25 @@ def test_start_disables_cleanly_when_no_terminal_is_available(monkeypatch: pytes
     assert controller.poll() == []
 
 
-def test_poll_decodes_available_bytes_and_lowercases_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_poll_decodes_available_bytes_and_lowercases_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     controller = terminal_keys.TerminalKeyController()
     controller.enabled = True
     controller._fd = 7
     chunks = iter((b"Ab", b""))
     readiness = iter(([7], []))
-    monkeypatch.setattr(terminal_keys.select, "select", lambda *_args: (next(readiness), [], []))
+    monkeypatch.setattr(
+        terminal_keys.select, "select", lambda *_args: (next(readiness), [], [])
+    )
     monkeypatch.setattr(terminal_keys.os, "read", lambda *_args: next(chunks))
 
     assert controller.poll() == ["a", "b"]
 
 
-def test_poll_propagates_ctrl_c_as_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_poll_propagates_ctrl_c_as_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     controller = terminal_keys.TerminalKeyController()
     controller.enabled = True
     controller._fd = 7
