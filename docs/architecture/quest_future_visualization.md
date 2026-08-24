@@ -328,13 +328,19 @@ store, explicit candidate diagnostic-report store, and thin programmatic
 Control Station operator lifecycle are now implemented.  The Station leaf is
 now bound to a local operator Web UI and the unique deploy application through
 the factory's public wait port, without adding a second device/runtime owner.
-It remains an opt-in programmatic composition seam rather than a production
-CLI, and has not been exercised against real Quest + RM65 hardware. The
-remaining ordered slices are:
+An opt-in Control Station launcher now provides a closed-over `hold`, one-arm,
+no-action, no-end-effector, no-camera composition plus a thin shell wrapper. It
+prints the Quest connection details, opens the local operator page, and offers
+an explicit trusted-LAN easy pairing code while retaining protocol
+authentication. It is still an operator trial rather than a canonical policy
+deployment entrypoint and has not been exercised against real Quest + RM65
+hardware. Its stationary-window profile is candidate admission only; `seal`
+remains in-memory and does not publish an artifact. The remaining ordered
+slices are:
 
-1. Exercise the reviewed local operator UI with the existing no-action
-   observation composition under the real-hardware safety procedure, while
-   preserving policy deploy as the sole factory/application shutdown owner.
+1. Exercise the one-command operator trial under the real-hardware safety
+   procedure, while preserving policy deploy as the sole factory/application
+   shutdown owner and recording the ordinary backend startup effects.
 2. Collect real stationary multi-pose Quest + RM65 evidence, including remount,
    noise, and held-out/leave-one-window-out validation.
 3. Review residual and observability policy, then define a content-bound

@@ -280,6 +280,76 @@ safety procedure and explicit reviewed endpoints. The Web coordinator itself
 does not establish real Quest connectivity, RM65 observation readiness,
 calibration quality, acceptance, frame installation, or trajectory rendering.
 
+## One-command operator trial
+
+The reviewed Control Station composition is available through a thin script.
+Always inspect the resolved no-action contract first; this does not open a
+socket or construct a device backend:
+
+```bash
+bash scripts/run_quest_calibration.sh \
+  --side right \
+  --arm-ip <reviewed-rm65-ip> \
+  --trusted-lan \
+  --dry-run
+```
+
+For the live observation trial, remove only `--dry-run`:
+
+```bash
+bash scripts/run_quest_calibration.sh \
+  --side right \
+  --arm-ip <reviewed-rm65-ip> \
+  --trusted-lan
+```
+
+`--trusted-lan` keeps protocol authentication enabled but selects the easy
+fixed six-digit code `111111`. It is only appropriate on an explicitly trusted
+isolated LAN. Omit it for a new random code, or use `--pairing-code NNNNNN` for
+another explicit six-digit value. The desktop operator page opens
+automatically. Once the lower application is ready, the terminal prints a
+large Quest block containing the base URL, six-digit code, and one-step URL.
+The normal Quest procedure is:
+
+1. Reopen the previously entered/bookmarked `https://<LAN-IP>:8444/` address.
+2. Accept the local development certificate warning if the browser asks.
+3. Enter `111111`, start MR/VR, and keep the rigidly mounted controller still.
+4. In the desktop page, select the candidate and arm side, then start and
+   complete a stationary window. Completion drains asynchronously and advances
+   the next window ID automatically.
+5. Return to the terminal and press `Ctrl+C` for full ordered shutdown.
+
+The builtin `operator-trial-v1` profile requires at least one second per
+window, at least five robot samples, at least ten Quest samples, and explicit
+bounded stationarity excursions. It is a candidate-data admission profile, not
+a calibration acceptance policy. Real calibration diversity still calls for
+at least 15 poses spanning the workspace and rotations around two or more
+non-parallel axes, but the launcher does not move the arm; those poses require
+a separately authorized motion procedure.
+
+The script deliberately accepts no arbitrary policy-deploy passthrough. It
+fixes `--policy hold`, enables only `--rm65-pose-observation`, selects one arm,
+sets end-effectors and cameras to none, and never supplies `--send-actions`.
+This prevents the launcher itself from sending trajectories. It does not prove
+the ordinary RM65 backend startup is zero-write: the current backend may still
+perform its pre-existing tool, singularity, or worker configuration. Use the
+real-hardware safety procedure before removing `--dry-run`.
+
+Clicking `seal` constructs candidate evidence only in the running application's
+memory. This launcher does not publish artifacts, run the diagnostic fit,
+accept a calibration, or install a frame. Exit only after recording any status
+or hash needed for the trial; durable evidence publication remains a separate
+future operator action.
+
+The equivalent Python entrypoint is:
+
+```bash
+python -m control_station.quest_calibration.launch \
+  --side right \
+  --arm-ip <reviewed-rm65-ip> \
+  --trusted-lan
+```
+
 Persistence is another explicit action after a successful seal. Constructing
 the layout, creating the application, and ordinary `close()` do not create an
 evidence directory or file:

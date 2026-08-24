@@ -47,15 +47,17 @@
     <label>窗口 ID<input id="windowId" value="stationary-window-001"></label>
     <div class="actions">
       <button id="beginWindow">开始窗口</button>
-      <button id="completeWindow">完成 / 继续排空</button>
-      <button id="seal">封存候选证据</button>
+      <button id="completeWindow">完成窗口（自动排空）</button>
+      <button id="seal">封存候选（当前仅内存）</button>
       <button class="danger" id="cancel">取消并关闭采集</button>
     </div>
+    <div class="muted">完成后窗口 ID 自动递增；建议采集至少 15 个覆盖工作空间、绕两个以上非平行轴旋转的静止姿态。</div>
   </section>
   <section class="panel">
     <h2>脱敏状态</h2>
     <pre id="status">等待状态...</pre>
     <div class="muted">此页面不显示矩阵、原始 pose、事件流、证据数据集或拟合结果。</div>
+    <div class="muted">测试结束后请回到启动终端按 Ctrl+C，完成整个会话的有序关闭。</div>
   </section>
 </main>
 <script src="/app.js"></script>
