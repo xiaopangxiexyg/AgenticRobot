@@ -167,12 +167,15 @@ general dataset schema or become the canonical calibration owner. Promotion to
 a neutral calibration runtime is an explicit decision before non-Quest reuse.
 `control_station/quest_calibration/` owns typed operator intents, application
 lifecycle admission, source-selection translation, UI revision sequencing, and
-a pose-redacted status projection.  It does not construct the lower application
-or own a worker, reducer, pose stream, artifact writer, fit, acceptance, frame,
-or renderer.  Its cancel intent is the only stale-revision exception so cleanup
-remains reachable while a prior action is in progress.  Admitted attempts
-consume their client sequence even on lower failure, preventing ambiguous
-same-intent retries.  It must not call a refreshing robot snapshot API.
+a pose-redacted status projection. Its local Web coordinator waits through the
+unique factory's public application port and owns only the HTTP server,
+attachment thread, and rebuildable presentation state. It does not construct
+or close the lower factory/application, or own a worker, reducer, pose stream,
+artifact writer, fit, acceptance, frame, or renderer. Its cancel intent is the
+only stale-revision exception so cleanup remains reachable while a prior action
+is in progress. Admitted attempts consume their client sequence even on lower
+failure, preventing ambiguous same-intent retries. It must not call a
+refreshing robot snapshot API.
 
 The detailed R2 source and evidence contract is documented in
 `hardware/quest_dev/docs/features/paired-pose-capture.md`.  The reducer is a
@@ -323,11 +326,15 @@ The unique-running-runtime host, RM65 lower attestation, policy-deployment
 robot-side canonical binding, default-off application bridge, explicit capture
 store, explicit candidate diagnostic-report store, and thin programmatic
 Control Station operator lifecycle are now implemented.  The Station leaf is
-not yet wired into a GUI or application composition root.  The remaining
-ordered slices are:
+now bound to a local operator Web UI and the unique deploy application through
+the factory's public wait port, without adding a second device/runtime owner.
+It remains an opt-in programmatic composition seam rather than a production
+CLI, and has not been exercised against real Quest + RM65 hardware. The
+remaining ordered slices are:
 
-1. Bind the existing Control Station lifecycle to one reviewed operator UI and
-   the unique deploy application without adding a second device/runtime owner.
+1. Exercise the reviewed local operator UI with the existing no-action
+   observation composition under the real-hardware safety procedure, while
+   preserving policy deploy as the sole factory/application shutdown owner.
 2. Collect real stationary multi-pose Quest + RM65 evidence, including remount,
    noise, and held-out/leave-one-window-out validation.
 3. Review residual and observability policy, then define a content-bound

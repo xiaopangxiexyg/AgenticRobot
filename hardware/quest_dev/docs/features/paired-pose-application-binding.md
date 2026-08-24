@@ -240,7 +240,45 @@ application and may bypass a stale revision so cleanup is still reachable
 during an in-progress action.  Status contains candidate identity hashes,
 handedness, reference-space metadata, counts, lifecycle flags, and action
 availability, but no matrices, pose samples, raw events, evidence dataset, or
-fit.  No current GUI or Web route calls this controller yet.
+fit.
+
+The local operator Web coordinator binds that controller to the unique
+application retained by the same factory. Start the coordinator before or
+after the deploy thread; it waits through the factory's public application
+port and does not create a second Quest host, robot reader, capture reducer, or
+application:
+
+```python
+from control_station.quest_calibration import QuestCalibrationWebCoordinator
+
+coordinator = QuestCalibrationWebCoordinator(
+    factory,
+    host="127.0.0.1",
+    port=0,
+    open_browser=True,
+)
+coordinator.start()
+try:
+    deploy_thread.start()
+    print(coordinator.url)
+    deploy_thread.join()
+finally:
+    coordinator.close()
+```
+
+The page polls a pose-redacted status endpoint and sends only the five typed
+operator intents above. It uses same-origin local HTTP and has no pairing-code
+step. Binding to a LAN address remains an explicit caller choice; loopback is
+the default. `coordinator.close()` stops only its HTTP and attachment threads.
+It never closes `factory` or `application`; policy deploy remains the normal
+shutdown owner, while an explicit operator `cancel` intent still calls the
+lower application's bounded close path through the typed controller.
+
+This is a programmatic composition seam, not a new production CLI. Exercising
+it with the observation profile still requires the repository's real-hardware
+safety procedure and explicit reviewed endpoints. The Web coordinator itself
+does not establish real Quest connectivity, RM65 observation readiness,
+calibration quality, acceptance, frame installation, or trajectory rendering.
 
 Persistence is another explicit action after a successful seal. Constructing
 the layout, creating the application, and ordinary `close()` do not create an
