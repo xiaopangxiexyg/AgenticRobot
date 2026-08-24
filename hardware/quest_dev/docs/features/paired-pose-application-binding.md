@@ -1,5 +1,8 @@
 # Quest paired-pose application binding
 
+中文现场操作说明见
+[paired-pose-application-binding.zh-CN.md](paired-pose-application-binding.zh-CN.md)。
+
 ## Scope
 
 This application leaf connects three existing owners without moving their
