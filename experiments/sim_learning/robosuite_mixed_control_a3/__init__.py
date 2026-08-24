@@ -10,6 +10,11 @@ from .adapters import (
     make_standard_policy_source_a3,
 )
 from .capture import (
+    RobosuiteMixedControlCaptureRunnerA3,
+    RobosuiteMixedControlDatasetA3,
+    RobosuiteMixedControlRowA3,
+)
+from .contracts import (
     A3_COLLECTION_MODE_ORDINARY_TELEOP,
     A3_COLLECTION_MODE_STREAMING_MIXED_CONTROL,
     A3_COLLECTION_MODE_TAKEOVER_TELEOP,
@@ -21,9 +26,10 @@ from .capture import (
     A3_POLICY_VARIANT_STANDARD,
     A3_POLICY_VARIANTS,
     A3_ROW_HASH_DOMAIN,
-    RobosuiteMixedControlCaptureRunnerA3,
-    RobosuiteMixedControlDatasetA3,
-    RobosuiteMixedControlRowA3,
+    A3CollectionProfile,
+    policy_variant,
+    resolve_collection_profile,
+    validate_collection_frames,
 )
 
 __all__ = [
@@ -40,6 +46,7 @@ __all__ = [
     "A3_POLICY_VARIANT_RTC",
     "A3_POLICY_VARIANT_STANDARD",
     "A3_ROW_HASH_DOMAIN",
+    "A3CollectionProfile",
     "CallablePolicySourceA3",
     "RobosuiteMixedControlCaptureRunnerA3",
     "RobosuiteMixedControlDatasetA3",
@@ -48,4 +55,7 @@ __all__ = [
     "StandardPolicyCallableA3",
     "make_rtc_policy_source_a3",
     "make_standard_policy_source_a3",
+    "policy_variant",
+    "resolve_collection_profile",
+    "validate_collection_frames",
 ]
