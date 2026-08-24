@@ -31,10 +31,15 @@ From the repository root:
 
 ```bash
 python -m pytest --collect-only -q
+# Bounded edit feedback:
 python -m pytest -q -m "unit and not optional and not hardware and not slow_sim"
+python -m pytest -q -m "contract and not optional and not hardware and not slow_sim"
+python -m pytest -q -m "integration and not optional and not hardware and not slow_sim"
+# Complete compatibility and integration-commit acceptance:
 python -m pytest -q -m "unit and not optional and not hardware"
 python -m pytest -q -m "contract and not optional and not hardware"
 python -m pytest -q -m "integration and not optional and not hardware"
+python -m pytest -q -m "not hardware"
 ```
 
 The current `pytest.ini` default discovers the root `tests/` directory.
@@ -47,31 +52,32 @@ coverage of those suites.
 
 ## Cost gates in parallel worktrees
 
-Use the fast unit selector plus the exact tests for the owner being changed on
-ordinary feature worktrees. Run the relevant exact `slow_sim` node there only
-when the change can affect it. Run the broad `slow_sim` selection and the
-package-local sim-real full suite once on the designated integration worktree;
-do not make every parallel worktree repeat the same physical closed loops.
+Use the fast unit and integration selectors plus the exact tests for the owner
+being changed on ordinary feature worktrees. Run the relevant exact
+`slow_sim` node there only when the change can affect it. Run the full
+`not hardware` gate, the broad `slow_sim` selection, and the package-local
+sim-real full suite once for the exact designated integration commit; do not
+make every parallel worktree repeat the same high-cost acceptance behavior.
 
-`slow_sim` assignment is evidence-based and node-specific. Measure the exact
-node on the designated worktree, keep its unfiltered acceptance behavior
-unchanged, and add the marker only when simulation, shared IK replay,
-simulation-side model loading, or a physical closed loop creates material
-repeated cost. A module-level marker is valid only when every collected node in
-that module has been measured into the same tier. A filename, loop bound,
-optional dependency, or `mujoco` import alone is not sufficient evidence. Do
-not share `.pytest_cache` between worktrees or enable repository-wide test
-parallelism without first proving that the selected tests are hermetic and
+`slow_sim` is the compatibility name for the measured high-cost tier. Assign
+it from node-level timing evidence while keeping the unfiltered acceptance
+behavior unchanged. Simulation, shared IK replay, simulation-side model
+loading, physical closed loops, and high-volume persistence soaks may qualify.
+A module-level marker is valid only when every collected node in that module
+has been measured into the same tier. A filename, loop bound, optional
+dependency, or `mujoco` import alone is not sufficient evidence. Do not share
+`.pytest_cache` between worktrees or enable repository-wide test parallelism
+without first proving that the selected tests are hermetic and
 resource-independent.
 
 ## Marker semantics
 
 - `unit`: deterministic in-process behavior.  This is the transitional default
   for modules not yet listed in `tests/conftest.py`.
-- `slow_sim`: an orthogonal cost marker for long-running deterministic
-  simulation, IK replay, or physical closed-loop verification.  It remains in
-  the complete `unit`/`integration` gates and is excluded only by an explicit
-  fast selector.
+- `slow_sim`: the legacy-compatible orthogonal cost marker for measured
+  long-running deterministic simulation, IK replay, physical closed-loop, or
+  high-volume soak verification. It remains in complete `unit`/`integration`
+  and `not hardware` gates and is excluded only by an explicit fast selector.
 - `integration`: multi-component, filesystem, worker, writer, or loopback
   behavior.
 - `contract`: an orthogonal public schema, dependency-boundary, action, or data
@@ -88,10 +94,9 @@ mechanism that preserves current pytest node IDs.  New tests should carry the
 most precise marker possible; unclassified tests must not silently grow into
 multi-component or optional-dependency tests.
 
-Use the `not slow_sim` selector for local edit feedback only.  Marker changes
-must not reduce the complete merge or pre-push gate, and a slow test may move
-to this tier only when an equivalent behavior is still executed by the full
-suite.
+Use the `not slow_sim` selector for local edit feedback only. Marker changes
+must not reduce the complete integration-commit gate, and a slow test may move
+to this tier only when the same behavior is still executed by the full suite.
 
 ## Finding and adding tests
 

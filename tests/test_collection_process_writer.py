@@ -467,6 +467,7 @@ def test_process_worker_v25p_shadow_uses_owner_identity_and_same_legacy_row(
     assert (episode_dir / "native_storage_manifest.cjson").is_file()
 
 
+@pytest.mark.slow_sim
 def test_process_worker_v25p_parquet_long_episode_soak(tmp_path) -> None:
     layout = PolicyIOLayout(name="process_v25p_parquet_soak_no_end_effector")
     pose_hash = canonical_content_hash(

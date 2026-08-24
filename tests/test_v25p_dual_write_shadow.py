@@ -188,6 +188,7 @@ def test_shadow_mismatch_keeps_native_capture_and_publishes_failed_receipt(
     assert loaded.native_capture_manifest.sample_count == 1
 
 
+@pytest.mark.slow_sim
 def test_shadow_long_episode_preserves_exact_projection_for_every_sample(
     tmp_path: Path,
 ) -> None:
