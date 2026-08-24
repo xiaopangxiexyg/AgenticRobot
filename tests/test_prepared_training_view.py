@@ -46,6 +46,12 @@ from dataset_interface.prepared_training_view import (
 from dataset_interface.prepared_training import (
     select_strict_successful_skill_episodes,
 )
+from dataset_interface.prepared_training.sources import prepare_episode
+from dataset_interface.progress_annotation_jobs import (
+    ProgressAnnotationJobError,
+    list_progress_annotation_work_items,
+)
+from dataset_interface.sample_axis import SampleIndexInterval
 
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -106,6 +112,7 @@ def _dataset(
     profiles: tuple[TaskProgressProfileV1, TaskStageProfileV1],
     annotate: bool,
     annotation_set_id: str = "set-1",
+    continuity_segments: list[object] | None = None,
 ) -> str:
     progress, stages = profiles
     identity = EpisodeCaptureIdentity(
@@ -154,15 +161,13 @@ def _dataset(
 
     parquet_path = root / "data" / "chunk-000" / f"episode_{episode_index:06d}.parquet"
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        pa.table(
-            {
-                "timestamp": [1.0, 2.0, 3.0, 4.0],
-                "observation.state": [[0.0], [1.0], [2.0], [3.0]],
-            }
-        ),
-        parquet_path,
-    )
+    columns: dict[str, object] = {
+        "timestamp": [1.0, 2.0, 3.0, 4.0],
+        "observation.state": [[0.0], [1.0], [2.0], [3.0]],
+    }
+    if continuity_segments is not None:
+        columns["collection.continuity_segment_index"] = continuity_segments
+    pq.write_table(pa.table(columns), parquet_path)
     video_path = root / "videos" / "front" / f"episode_{episode_index:06d}.mp4"
     video_path.parent.mkdir(parents=True, exist_ok=True)
     video_path.write_bytes(f"video:{episode_uuid}".encode())
@@ -183,9 +188,9 @@ def _dataset(
                     "progress_episode": {
                         "episode_uuid": episode_uuid,
                         "episode_identity_hash": identity.semantic_content_hash,
-                        "manifest_ref": (
-                            progress_dir / "manifest.cjson"
-                        ).relative_to(root).as_posix(),
+                        "manifest_ref": (progress_dir / "manifest.cjson")
+                        .relative_to(root)
+                        .as_posix(),
                     }
                 },
             },
@@ -240,6 +245,74 @@ def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
         for path in root.rglob("*")
         if path.is_file()
     }
+
+
+def test_prepared_episode_training_semantics_split_at_collection_continuity(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    _dataset(
+        source_root,
+        episode_uuid="episode-continuity",
+        episode_index=0,
+        profiles=_profiles(),
+        annotate=False,
+        continuity_segments=[0, 0, 1, 1],
+    )
+    source = PreparedSourceDataset("continuity-source", source_root)
+    item = list_progress_annotation_work_items(source_root)[0]
+
+    prepared = prepare_episode(
+        source=source,
+        item=item,
+        dataset_fingerprint="fixture-fingerprint",
+        selector=None,
+        column_projection=("timestamp", "observation.state"),
+        modality_selection=("numeric",),
+    )
+
+    assert prepared.semantic_index.nominal_intervals == (
+        SampleIndexInterval(0, 2),
+        SampleIndexInterval(2, 4),
+    )
+    assert prepared.semantic_index.continuity_break_indices == (2,)
+
+
+@pytest.mark.parametrize(
+    "continuity_segments, expected_error",
+    (
+        ([0, 1, 0, 1], "must be monotonic"),
+        ([0, -1, 1, 1], "non-negative integers"),
+        ([0, None, 1, 1], "fully populated or absent"),
+        ([0.0, 0.0, 1.0, 1.0], "must use an integer type"),
+    ),
+)
+def test_prepared_episode_fails_closed_on_malformed_continuity_column(
+    tmp_path: Path,
+    continuity_segments: list[object],
+    expected_error: str,
+) -> None:
+    source_root = tmp_path / "source"
+    _dataset(
+        source_root,
+        episode_uuid="episode-invalid-continuity",
+        episode_index=0,
+        profiles=_profiles(),
+        annotate=False,
+        continuity_segments=continuity_segments,
+    )
+    source = PreparedSourceDataset("continuity-source", source_root)
+    item = list_progress_annotation_work_items(source_root)[0]
+
+    with pytest.raises(ProgressAnnotationJobError, match=expected_error):
+        prepare_episode(
+            source=source,
+            item=item,
+            dataset_fingerprint="fixture-fingerprint",
+            selector=None,
+            column_projection=("timestamp", "observation.state"),
+            modality_selection=("numeric",),
+        )
 
 
 def _add_then_detach_tactile(root: Path) -> None:
@@ -332,9 +405,10 @@ def test_multi_source_build_is_read_only_relative_and_idempotent(
 
     assert result.episode_count == 2
     assert loaded.episodes.num_rows == 2
-    assert set(
-        loaded.episodes["episode_capture_identity_hash"].to_pylist()
-    ) == {first_identity, second_identity}
+    assert set(loaded.episodes["episode_capture_identity_hash"].to_pylist()) == {
+        first_identity,
+        second_identity,
+    }
     assert set(loaded.episodes["annotation_status"].to_pylist()) == {
         "SELECTED",
         "UNANNOTATED",
@@ -451,9 +525,7 @@ def test_prepared_training_view_excludes_source_training_invalid_episode(
     ]
     source_payload = canonical_source_payload(result.view_root)
     excluded_by_source = {
-        row["source_dataset_id"]: row[
-            "training_validity_excluded_episode_indices"
-        ]
+        row["source_dataset_id"]: row["training_validity_excluded_episode_indices"]
         for row in source_payload["sources"]
     }
     assert excluded_by_source == {"invalid": [0], "valid": []}
@@ -632,9 +704,7 @@ def test_cross_profile_skill_projection_is_explicit_and_non_destructive(
     assert result.skill_interval_count == 2
     assert loaded.skill_intervals is not None
     assert loaded.skill_intervals.num_rows == 2
-    assert set(loaded.skill_intervals["skill_id"].to_pylist()) == {
-        "fixture.write"
-    }
+    assert set(loaded.skill_intervals["skill_id"].to_pylist()) == {"fixture.write"}
     assert len(loaded.skill_projection_receipts) == 2
     assert loaded.manifest["progress_profile_hash"] is None
     assert len(loaded.manifest["progress_profile_hashes"]) == 2

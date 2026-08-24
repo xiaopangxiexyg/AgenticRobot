@@ -314,15 +314,33 @@ def build_device_retry_runtime(
                     camera.close()
                     camera.start()
                 elif key == "dataset.writer":
-                    if dataset_recorder is None:
-                        dataset_recorder = RealTeleopDatasetRecorder(
+                    # multiprocessing.Process instances are one-shot even when
+                    # startup fails.  Never retain or restart the failed
+                    # recorder: build a fresh candidate and publish it only
+                    # after the writer ready handshake succeeds.
+                    previous_recorder = dataset_recorder
+                    if previous_recorder is not None:
+                        set_dataset_recorder(None)
+                        dataset_recorder = None
+                        previous_recorder.close()
+                    replacement_recorder = None
+                    try:
+                        replacement_recorder = RealTeleopDatasetRecorder(
                             args=args,
                             components=components,
                             camera_sources=camera_sources,
                         )
-                        set_dataset_recorder(dataset_recorder)
-                    dataset_recorder.start()
-                    dataset_recorder.write_camera_device_config()
+                        replacement_recorder.start()
+                        replacement_recorder.write_camera_device_config()
+                        set_dataset_recorder(replacement_recorder)
+                    except BaseException:  # noqa: BLE001 - discard one-shot candidate.
+                        if replacement_recorder is not None:
+                            try:
+                                replacement_recorder.close()
+                            except Exception:
+                                pass
+                        raise
+                    dataset_recorder = replacement_recorder
                 elif key == "rig.session":
                     components.session.start()
                     if components.human_shadow_frontend is not None:

@@ -115,16 +115,10 @@ def load_skill_projection_catalog(
             skill_id=item.get("skill_id", ""),
             skill_version=item.get("skill_version", ""),
             semantic_type=item.get("semantic_type", ""),
-            controlled_component_ids=tuple(
-                item.get("controlled_component_ids", ())
-            ),
+            controlled_component_ids=tuple(item.get("controlled_component_ids", ())),
             entry_predicate_ids=tuple(item.get("entry_predicate_ids", ())),
-            success_predicate_ids=tuple(
-                item.get("success_predicate_ids", ())
-            ),
-            conditionable_context_ids=tuple(
-                item.get("conditionable_context_ids", ())
-            ),
+            success_predicate_ids=tuple(item.get("success_predicate_ids", ())),
+            conditionable_context_ids=tuple(item.get("conditionable_context_ids", ())),
         )
         for item in payload.get("skills", ())
     )
@@ -143,27 +137,19 @@ def load_skill_projection_catalog(
                 source_progress_profile_hash=item.get(
                     "source_progress_profile_hash", ""
                 ),
-                source_stage_profile_hash=item.get(
-                    "source_stage_profile_hash", ""
-                ),
-                source_progress_step_id=item.get(
-                    "source_progress_step_id", ""
-                ),
+                source_stage_profile_hash=item.get("source_stage_profile_hash", ""),
+                source_progress_step_id=item.get("source_progress_step_id", ""),
                 source_stage_ids=tuple(item.get("source_stage_ids", ())),
                 projection_kind=item.get("projection_kind", ""),
                 skill_training_contract_hash=target.semantic_content_hash,
-                projected_component_ids=tuple(
-                    item.get("projected_component_ids", ())
-                ),
+                projected_component_ids=tuple(item.get("projected_component_ids", ())),
                 asserted_entry_predicate_ids=tuple(
                     item.get("asserted_entry_predicate_ids", ())
                 ),
                 asserted_success_predicate_ids=tuple(
                     item.get("asserted_success_predicate_ids", ())
                 ),
-                conditioned_context_ids=tuple(
-                    item.get("conditioned_context_ids", ())
-                ),
+                conditioned_context_ids=tuple(item.get("conditioned_context_ids", ())),
             )
         )
     return SkillProjectionCatalog(
@@ -176,23 +162,21 @@ def load_builtin_writing_skill_projection_catalog() -> SkillProjectionCatalog:
     """Load the reviewed 3/4/5-step writing cross-profile mappings."""
 
     return load_skill_projection_catalog(
-        Path(__file__).with_name("skill_projection_assets")
-        / "writing_v1.json"
+        Path(__file__).with_name("skill_projection_assets") / "writing_v1.json"
     )
 
 
-def load_builtin_writing_stage1_skill_projection_catalog(
-) -> SkillProjectionCatalog:
+def load_builtin_writing_stage1_skill_projection_catalog() -> SkillProjectionCatalog:
     """Load the dual-arm first-subtask mappings shared by 4/5-stage writing."""
 
     return load_skill_projection_catalog(
-        Path(__file__).with_name("skill_projection_assets")
-        / "writing_stage1_v2.json"
+        Path(__file__).with_name("skill_projection_assets") / "writing_stage1_v2.json"
     )
 
 
-def load_builtin_writing_four_stage_subtasks_skill_projection_catalog(
-) -> SkillProjectionCatalog:
+def load_builtin_writing_four_stage_subtasks_skill_projection_catalog() -> (
+    SkillProjectionCatalog
+):
     """Load reviewed stage2/3/4 mappings for four-step writing data."""
 
     return load_skill_projection_catalog(
@@ -227,23 +211,15 @@ def validate_progress_skill_projection(
         raise ProgressSkillProjectionError(
             "Projection, stage profile, and Progress profile hashes differ."
         )
-    if (
-        projection.source_stage_profile_hash
-        != stage_profile.semantic_content_hash
-    ):
+    if projection.source_stage_profile_hash != stage_profile.semantic_content_hash:
         raise ProgressSkillProjectionError(
             "Projection references a different stage profile."
         )
-    if (
-        projection.skill_training_contract_hash
-        != skill_contract.semantic_content_hash
-    ):
+    if projection.skill_training_contract_hash != skill_contract.semantic_content_hash:
         raise ProgressSkillProjectionError(
             "Projection references a different Skill contract."
         )
-    step = progress_profile.step_by_id.get(
-        projection.source_progress_step_id
-    )
+    step = progress_profile.step_by_id.get(projection.source_progress_step_id)
     if step is None:
         raise ProgressSkillProjectionError(
             "Projection references an unknown Progress Step."
@@ -275,10 +251,7 @@ def validate_progress_skill_projection(
             "STAGE_SUBSET must be a proper subset; use EXACT_STEP or "
             "CONDITIONED_STEP for a complete Progress Step."
         )
-    if (
-        projection.projected_component_ids
-        != skill_contract.controlled_component_ids
-    ):
+    if projection.projected_component_ids != skill_contract.controlled_component_ids:
         raise ProgressSkillProjectionError(
             "Projected components must exactly match the Skill output contract."
         )
@@ -434,7 +407,10 @@ def _raw_intervals(
 
 def _merge_adjacent(
     intervals: Iterable[SkillProjectionIntervalV1],
+    *,
+    blocked_break_indices: Iterable[int] = (),
 ) -> tuple[SkillProjectionIntervalV1, ...]:
+    blocked_breaks = frozenset(blocked_break_indices)
     merged: list[SkillProjectionIntervalV1] = []
     for item in intervals:
         if not merged:
@@ -443,6 +419,7 @@ def _merge_adjacent(
         previous = merged[-1]
         if (
             previous.sample_end == item.sample_begin
+            and item.sample_begin not in blocked_breaks
             and previous.training_domain == item.training_domain
             and previous.source_attempt_id == item.source_attempt_id
             and previous.source_failure_fact_id == item.source_failure_fact_id
@@ -497,14 +474,13 @@ def project_episode_skill_view(
         _raw_intervals(
             semantic_index=semantic_index,
             projection=projection,
-        )
+        ),
+        blocked_break_indices=semantic_index.continuity_break_indices,
     )
-    break_values: set[int] = set()
+    break_values: set[int] = set(semantic_index.continuity_break_indices)
     for index, item in enumerate(intervals):
         previous = None if index == 0 else intervals[index - 1]
-        following = (
-            None if index + 1 == len(intervals) else intervals[index + 1]
-        )
+        following = None if index + 1 == len(intervals) else intervals[index + 1]
         continues_from_previous = bool(
             previous is not None
             and previous.sample_end == item.sample_begin
@@ -519,19 +495,12 @@ def project_episode_skill_view(
         )
         if item.sample_begin > 0 and not continues_from_previous:
             break_values.add(item.sample_begin)
-        if (
-            item.sample_end < semantic_index.sample_count
-            and not continues_to_following
-        ):
+        if item.sample_end < semantic_index.sample_count and not continues_to_following:
             break_values.add(item.sample_end)
     breaks = tuple(sorted(break_values))
     receipt_basis = {
-        "episode_capture_identity_hash": (
-            semantic_index.episode_capture_identity_hash
-        ),
-        "source_progress_manifest_hash": (
-            semantic_index.source_progress_manifest_hash
-        ),
+        "episode_capture_identity_hash": (semantic_index.episode_capture_identity_hash),
+        "source_progress_manifest_hash": (semantic_index.source_progress_manifest_hash),
         "source_stage_annotation_manifest_hash": (
             source_stage_annotation_manifest_hash
         ),
@@ -546,15 +515,9 @@ def project_episode_skill_view(
     )
     receipt = SkillProjectionReceiptV1(
         receipt_id=f"skill_projection_{receipt_digest[:24]}",
-        episode_capture_identity_hash=(
-            semantic_index.episode_capture_identity_hash
-        ),
-        source_progress_manifest_hash=(
-            semantic_index.source_progress_manifest_hash
-        ),
-        source_stage_annotation_manifest_hash=(
-            source_stage_annotation_manifest_hash
-        ),
+        episode_capture_identity_hash=(semantic_index.episode_capture_identity_hash),
+        source_progress_manifest_hash=(semantic_index.source_progress_manifest_hash),
+        source_stage_annotation_manifest_hash=(source_stage_annotation_manifest_hash),
         skill_training_contract_hash=skill_contract.semantic_content_hash,
         progress_skill_projection_hash=projection.semantic_content_hash,
         intervals=intervals,

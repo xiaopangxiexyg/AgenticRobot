@@ -1110,6 +1110,115 @@ def test_device_retry_runtime_immediately_refreshes_camera_projection() -> None:
     assert published[-1]["hardware_status"]["camera.front"]["status_level"] == "ok"
 
 
+def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> None:
+    errors = {"dataset.writer": "initial writer startup failure"}
+    published: list[dict[str, object]] = []
+
+    class FailedRecorder:
+        def __init__(self) -> None:
+            self.start_calls = 0
+            self.closed = False
+
+        def start(self) -> None:
+            self.start_calls += 1
+            raise AssertionError("cannot start a process twice")
+
+        def close(self) -> None:
+            self.closed = True
+
+    failed_recorder = FailedRecorder()
+    current_recorder: dict[str, object | None] = {"value": failed_recorder}
+
+    class Recorder:
+        instances: list[Recorder] = []
+
+        def __init__(self, **_kwargs: object) -> None:
+            self.instance_index = len(self.instances)
+            self.start_calls = 0
+            self.config_writes = 0
+            self.closed = False
+            self.instances.append(self)
+
+        def start(self) -> None:
+            self.start_calls += 1
+            if self.start_calls > 1:
+                raise AssertionError("cannot start a process twice")
+            if self.instance_index < 2:
+                raise RuntimeError(f"retry {self.instance_index} failed")
+
+        def write_camera_device_config(self) -> None:
+            self.config_writes += 1
+
+        def close(self) -> None:
+            self.closed = True
+
+    clutch = SimpleNamespace(
+        _current_active_controls=lambda: ("device_retry",),
+        device_retry_admission=lambda: (True, ""),
+        _episode_busy=lambda: False,
+        _teleop_started=False,
+        hold_active=lambda: True,
+    )
+    components = SimpleNamespace(
+        gripper_input_source="",
+        left_state_backend=None,
+        right_state_backend=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+    )
+    runtime = device_retry_runtime.build_device_retry_runtime(
+        args=SimpleNamespace(
+            foot_pad_requested=False,
+            ignore_camera=(),
+            q6_config_required=False,
+        ),
+        components=components,
+        control_ui=SimpleNamespace(
+            publish=lambda **kwargs: published.append(kwargs),
+            append_message=lambda *_args: None,
+        ),
+        clutch_input=clutch,
+        camera_sources={},
+        vive_source=None,
+        startup_device_errors=errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: current_recorder["value"],
+        set_dataset_recorder=lambda value: current_recorder.__setitem__(
+            "value", value
+        ),
+        foot_pad_input_provider=lambda: None,
+        set_foot_pad_input=lambda _value: None,
+        dataset_recorder_type=Recorder,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=object,
+        foot_pad_control_mode="foot-pad",
+        has_dmtac_gripper_backend=lambda _components: False,
+        promote_angle_trigger_gripper_input_to_q6=lambda *_args, **_kwargs: (
+            False,
+            "",
+        ),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    runtime.retry_failed_devices()
+    assert "retry 0 failed" in errors["dataset.writer"]
+    assert current_recorder["value"] is None
+    assert failed_recorder.closed is True
+    assert failed_recorder.start_calls == 0
+
+    runtime.retry_failed_devices()
+    assert "retry 1 failed" in errors["dataset.writer"]
+    assert current_recorder["value"] is None
+
+    runtime.retry_failed_devices()
+    assert "dataset.writer" not in errors
+    assert current_recorder["value"] is Recorder.instances[2]
+    assert [item.start_calls for item in Recorder.instances] == [1, 1, 1]
+    assert [item.closed for item in Recorder.instances] == [True, True, False]
+    assert [item.config_writes for item in Recorder.instances] == [0, 0, 1]
+    assert published[-1]["hardware_status"]["dataset.writer"]["status_level"] == "ok"
+
+
 def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -> None:
     outer_states: list[tuple[object | None, bool, object | None]] = []
     visualization_updates: list[dict[str, object]] = []
@@ -1778,6 +1887,96 @@ def test_gripper_warmup_runtime_keeps_probe_state_inside_one_closure() -> None:
     assert probe.status(2.0, reason="next_episode")[0] is False
 
 
+def test_gripper_warmup_runtime_never_moves_profile_fixed_side() -> None:
+    probe_called = threading.Event()
+    called_sides: list[str] = []
+    backends = {
+        side: SimpleNamespace(config=SimpleNamespace(connect_hardware=True))
+        for side in ("left", "right")
+    }
+    components_snapshot = SimpleNamespace(
+        active_sides=("left", "right"),
+        fix_arm_controller=SimpleNamespace(fixed_sides=("left",)),
+    )
+    args = SimpleNamespace(
+        gripper_warmup_probe=True,
+        gripper_warmup_probe_tolerance=0.18,
+        gripper_warmup_probe_step_timeout_sec=0.01,
+        gripper_warmup_probe_settle_sec=0.0,
+        gripper_warmup_probe_poll_sec=0.01,
+    )
+
+    def run_probe(side: str, _backend: object, **_kwargs: object) -> dict[str, object]:
+        called_sides.append(side)
+        probe_called.set()
+        return {"ok": True, "reconnected": False}
+
+    probe = gripper_warmup_runtime.build_gripper_warmup_probe_runtime(
+        args,
+        components_snapshot,
+        gripper_backend_for_side=lambda _components, side: backends[side],
+        run_probe_for_side=run_probe,
+        safe_float_value=lambda value: None if value is None else float(value),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    assert probe.enabled()
+    assert probe.start(1.0, reason="unit_test")[0] is False
+    assert probe_called.wait(1.0)
+    for _ in range(100):
+        ready, _message = probe.status(1.1, reason="unit_test")
+        if ready:
+            break
+        threading.Event().wait(0.005)
+    assert ready
+    assert called_sides == ["right"]
+
+
+def test_gripper_warmup_runtime_keeps_partial_entry_grippers_passive_by_default() -> None:
+    called_sides: list[str] = []
+    backend = SimpleNamespace(config=SimpleNamespace(connect_hardware=True))
+    args = SimpleNamespace(
+        gripper_warmup_probe=True,
+        _gripper_warmup_probe_explicit=False,
+        collection_progress_profile=SimpleNamespace(
+            initial_step_id="right_acquire_brush",
+        ),
+        collection_progress_entry_step="right_write",
+        gripper_warmup_probe_tolerance=0.18,
+        gripper_warmup_probe_step_timeout_sec=0.01,
+        gripper_warmup_probe_settle_sec=0.0,
+        gripper_warmup_probe_poll_sec=0.01,
+    )
+    components_snapshot = SimpleNamespace(active_sides=("left", "right"))
+
+    def run_probe(side: str, _backend: object, **_kwargs: object) -> dict[str, object]:
+        called_sides.append(side)
+        return {"ok": True, "reconnected": False}
+
+    probe = gripper_warmup_runtime.build_gripper_warmup_probe_runtime(
+        args,
+        components_snapshot,
+        gripper_backend_for_side=lambda _components, _side: backend,
+        run_probe_for_side=run_probe,
+        safe_float_value=lambda value: None if value is None else float(value),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    assert not probe.enabled()
+    assert probe.start(1.0, reason="partial_entry") == (
+        True,
+        "gripper warmup probe 未启用。",
+    )
+    assert called_sides == []
+
+    args.collection_progress_entry_step = "right_acquire_brush"
+    assert probe.enabled()
+
+    args.collection_progress_entry_step = "right_write"
+    args._gripper_warmup_probe_explicit = True
+    assert probe.enabled()
+
+
 def test_recording_admission_keeps_fail_closed_check_order() -> None:
     args = SimpleNamespace(
         no_camera=True,
@@ -1828,6 +2027,63 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         step_result=running_step,
         **common,
     ) == (True, "warmup 输入稳定。")
+
+
+def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
+    backend = legacy_entrypoint.DMTacGripperBackend(
+        legacy_entrypoint.DMTacGripperBackendConfig(
+            side="right",
+            connect_hardware=True,
+            connect_tactile=False,
+        )
+    )
+    backend._apply_gripper_state(
+        SimpleNamespace(
+            joint_pos=0.993,
+            timestamp=10.0,
+            error_code=16,
+            status_code=5,
+            status_text="正在张开",
+            is_moving=True,
+            current=0,
+            temperature_c=36,
+        )
+    )
+    args = SimpleNamespace(
+        no_camera=True,
+        ignore_camera=(),
+        ignore_tactile=(),
+        hand_backend="none",
+    )
+    components_snapshot = SimpleNamespace(
+        active_sides=("right",),
+        left_hand_backend=None,
+        right_hand_backend=backend,
+    )
+    running_step = SimpleNamespace(
+        state=legacy_entrypoint.TeleopRunState.RUNNING,
+        observation=object(),
+        command=object(),
+        channels={},
+    )
+
+    ready, message = recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        args=args,
+        components=components_snapshot,
+        clutch_input=SimpleNamespace(hold_active=lambda: False),
+        dataset_recorder=None,
+        camera_sources={},
+        preview_camera_sources={},
+        camera_previewer=None,
+        recording_auto_stop_reason_fn=recording_admission.recording_auto_stop_reason,
+        gripper_warmup_probe_status=lambda now, *, reason: (True, "ready"),
+        camera_status_blocking_message=lambda status: None,
+    )
+
+    assert not ready
+    assert message == "等待 right 夹爪故障恢复：error_code=16，status=5:正在张开。"
 
 
 def test_position_episode_debug_detaches_before_deferred_close(

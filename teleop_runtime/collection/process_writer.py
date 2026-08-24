@@ -1573,14 +1573,27 @@ def _worker_main(
                     }
                 )
     except BaseException as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+        worker_traceback = traceback.format_exc()
         reply_queue.put(
             {
                 "kind": "ready" if writer is None else "fatal",
                 "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc(),
+                "error": error,
+                "traceback": worker_traceback,
             }
         )
+        if writer is not None:
+            # Post-start fatal errors have no synchronous request waiter.  The
+            # frontend health path drains ack_queue, so mirror the fatal event
+            # there instead of degrading it to a bare "worker exited" status.
+            ack_queue.put(
+                {
+                    "kind": "worker_error",
+                    "error": f"worker.fatal: {error}",
+                    "traceback": worker_traceback,
+                }
+            )
     finally:
         if native_writer is not None:
             native_writer.close_unsealed()

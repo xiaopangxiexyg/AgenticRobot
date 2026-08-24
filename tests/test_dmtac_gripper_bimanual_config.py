@@ -49,6 +49,40 @@ from teleop_runtime.schemas import (
 
 
 class DMTacGripperBimanualConfigTest(unittest.TestCase):
+    def test_dmtac_backend_surfaces_and_refuses_nonzero_hardware_fault(self) -> None:
+        backend = DMTacGripperBackend(
+            DMTacGripperBackendConfig(
+                side="right",
+                connect_hardware=False,
+                connect_tactile=False,
+            )
+        )
+        backend._apply_gripper_state(
+            SimpleNamespace(
+                joint_pos=0.993,
+                timestamp=123.0,
+                error_code=16,
+                status_code=5,
+                status_text="正在张开",
+                is_moving=True,
+                current=0,
+                temperature_c=36,
+            )
+        )
+
+        state = backend.get_state(include_tactile_arrays=False)
+
+        self.assertEqual(state["gripper_error_code"], 16)
+        self.assertEqual(state["gripper_status_code"], 5)
+        self.assertEqual(state["gripper_status_text"], "正在张开")
+        self.assertTrue(state["gripper_is_moving"])
+        self.assertEqual(state["gripper_current"], 0)
+        self.assertEqual(state["gripper_temperature_c"], 36)
+        self.assertFalse(backend.send_fixed_joint_pos(0.0))
+        state = backend.get_state(include_tactile_arrays=False)
+        self.assertEqual(state["gripper_last_send_status"], "hardware_fault")
+        self.assertEqual(state["gripper_last_send_skip_reason"], "error_code=16")
+
     def test_gui_gripper_force_request_parser_is_pure_and_side_bounded(self) -> None:
         self.assertEqual(
             parse_gripper_force_request(

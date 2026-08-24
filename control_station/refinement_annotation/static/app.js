@@ -1010,6 +1010,22 @@ function sampleTimestamps() {
 
 function buildTimelineMap() {
   const real = sampleTimestamps();
+  const explicitBreaks = new Set(
+    (state.detail?.sample_continuity_break_indices || [])
+      .map(Number)
+      .filter((value) => Number.isInteger(value) && value > 0 && value < real.length),
+  );
+  const pauseSegments = (state.detail?.recording_pause_segments || [])
+    .map((value) => ({
+      ...value,
+      start_timestamp: Number(value.start_timestamp),
+      end_timestamp: Number(value.end_timestamp),
+    }))
+    .filter((value) => (
+      Number.isFinite(value.start_timestamp)
+      && Number.isFinite(value.end_timestamp)
+      && value.end_timestamp > value.start_timestamp
+    ));
   const positiveDeltas = [];
   for (let index = 1; index < real.length; index += 1) {
     const delta = real[index] - real[index - 1];
@@ -1023,19 +1039,26 @@ function buildTimelineMap() {
   const compressedGaps = [];
   for (let index = 1; index < real.length; index += 1) {
     const realDelta = Math.max(0, real[index] - real[index - 1]);
-    const compressed = realDelta > DISPLAY_GAP_THRESHOLD_SEC;
+    const continuityBreak = explicitBreaks.has(index);
+    const compressed = continuityBreak || realDelta > DISPLAY_GAP_THRESHOLD_SEC;
     const displayDelta = compressed
       ? DISPLAY_GAP_DURATION_SEC
       : Math.max(realDelta, nominal);
     const displayStart = display[index - 1];
     display.push(displayStart + displayDelta);
     if (compressed) {
+      const pause = pauseSegments.find((value) => (
+        value.start_timestamp < real[index]
+        && value.end_timestamp > real[index - 1]
+      ));
       compressedGaps.push({
         realStart: real[index - 1],
         realEnd: real[index],
         realDuration: realDelta,
         displayStart,
         displayEnd: displayStart + displayDelta,
+        continuityBreak,
+        pause: pause || null,
       });
     }
   }
@@ -1785,9 +1808,14 @@ function renderDetailAnnotation() {
     );
   }
   for (const gap of state.timelineMap?.compressedGaps || []) {
-    const marker = element("div", "compressed-gap");
+    const marker = element(
+      "div",
+      `compressed-gap${gap.continuityBreak ? " collection-pause" : ""}`,
+    );
     setPosition(marker, gap.realStart, gap.realEnd);
-    marker.title = "无样本/Hold 间隔";
+    marker.title = gap.pause
+      ? `采集暂停：${gap.pause.reason || (gap.pause.reasons || []).join(", ") || "未记录原因"}`
+      : "样本连续性中断";
     track.appendChild(marker);
   }
   for (let index = 1; index < values.length; index += 1) {
@@ -3056,10 +3084,17 @@ function renderTimeline() {
 
   for (const gap of state.timelineMap?.compressedGaps || []) {
     for (const track of [coarse, stages, triggerTrack, recoverableTrack]) {
-      const marker = element("div", "compressed-gap");
+      const marker = element(
+        "div",
+        `compressed-gap${gap.continuityBreak ? " collection-pause" : ""}`,
+      );
       setPosition(marker, gap.realStart, gap.realEnd);
-      marker.title =
-        `无样本/Hold 间隔：真实 ${formatTime(gap.realDuration)}，标注显示为 1 秒`;
+      const reason = gap.pause
+        ? gap.pause.reason || (gap.pause.reasons || []).join(", ") || "未记录原因"
+        : "未记录原因";
+      marker.title = gap.continuityBreak
+        ? `采集暂停/连续性中断：${reason}；真实 ${formatTime(gap.realDuration)}，标注显示为 1 秒`
+        : `无样本间隔：真实 ${formatTime(gap.realDuration)}，标注显示为 1 秒`;
       track.appendChild(marker);
     }
   }

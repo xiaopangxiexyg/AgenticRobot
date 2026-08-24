@@ -583,6 +583,12 @@ class DMTacGripperBackend(EffectorBackend):
         self._latest_joint_pos: np.ndarray | None = None
         self._latest_measured_joint_pos: np.ndarray | None = None
         self._latest_joint_timestamp: float | None = None
+        self._latest_gripper_error_code: int | None = None
+        self._latest_gripper_status_code: int | None = None
+        self._latest_gripper_status_text: str | None = None
+        self._latest_gripper_is_moving: bool | None = None
+        self._latest_gripper_current: int | None = None
+        self._latest_gripper_temperature_c: int | None = None
         self._latest_tactile: np.ndarray | None = None
         self._latest_tactile_timestamp: float | None = None
         self._latest_tactile_dict: dict[str, np.ndarray] | None = None
@@ -1059,7 +1065,11 @@ class DMTacGripperBackend(EffectorBackend):
 
     def is_ready(self) -> bool:
         if self.config.connect_hardware:
-            return self.device is not None and getattr(self.device, "gripper", None) is not None
+            return (
+                self.device is not None
+                and getattr(self.device, "gripper", None) is not None
+                and self._latest_gripper_error_code in (None, 0)
+            )
         if self.config.connect_tactile:
             return self.device is not None
         return True
@@ -1173,15 +1183,72 @@ class DMTacGripperBackend(EffectorBackend):
                     raise
                 assert self.device is not None
                 gripper_state = self.device.read_gripper_state()
-            joint_value = float(getattr(gripper_state, "joint_pos"))
-            self._latest_joint_pos = self._q6_from_scalar(
-                joint_value,
-                dim=int(self.config.command_dim),
-                max_value=float(self.config.max_action),
+            return self._apply_gripper_state(gripper_state)
+
+    def _apply_gripper_state(
+        self,
+        gripper_state: object,
+        *,
+        fallback_timestamp: float | None = None,
+    ) -> dict[str, object]:
+        to_dict = getattr(gripper_state, "to_dict", None)
+        payload = dict(to_dict()) if callable(to_dict) else {}
+
+        def field(name: str, default: object = None) -> object:
+            return payload.get(name, getattr(gripper_state, name, default))
+
+        joint_value = float(field("joint_pos"))
+        joint_pos = self._q6_from_scalar(
+            joint_value,
+            dim=int(self.config.command_dim),
+            max_value=float(self.config.max_action),
+        )
+        timestamp = float(
+            field(
+                "timestamp",
+                time.time() if fallback_timestamp is None else fallback_timestamp,
             )
-            self._latest_measured_joint_pos = self._latest_joint_pos.copy()
-            self._latest_joint_timestamp = float(getattr(gripper_state, "timestamp", time.time()))
-            return gripper_state.to_dict()
+        )
+        error_code_raw = field("error_code")
+        status_code_raw = field("status_code")
+        current_raw = field("current")
+        temperature_raw = field("temperature_c")
+        with self._state_lock:
+            self._latest_joint_pos = joint_pos
+            self._latest_measured_joint_pos = joint_pos.copy()
+            self._latest_joint_timestamp = timestamp
+            self._latest_gripper_error_code = (
+                None if error_code_raw is None else int(error_code_raw)
+            )
+            self._latest_gripper_status_code = (
+                None if status_code_raw is None else int(status_code_raw)
+            )
+            status_text = field("status_text")
+            self._latest_gripper_status_text = (
+                None if status_text is None else str(status_text)
+            )
+            moving = field("is_moving")
+            self._latest_gripper_is_moving = (
+                None if moving is None else bool(moving)
+            )
+            self._latest_gripper_current = (
+                None if current_raw is None else int(current_raw)
+            )
+            self._latest_gripper_temperature_c = (
+                None if temperature_raw is None else int(temperature_raw)
+            )
+        if not payload:
+            payload = {
+                "timestamp": timestamp,
+                "joint_pos": joint_value,
+                "error_code": self._latest_gripper_error_code,
+                "status_code": self._latest_gripper_status_code,
+                "status_text": self._latest_gripper_status_text,
+                "is_moving": self._latest_gripper_is_moving,
+                "current": self._latest_gripper_current,
+                "temperature_c": self._latest_gripper_temperature_c,
+            }
+        return payload
 
     def _extract_gripper_scalar(self, joint_pos: object) -> float:
         target = np.asarray(joint_pos, dtype=np.float32).reshape(-1)
@@ -1226,6 +1293,12 @@ class DMTacGripperBackend(EffectorBackend):
 
         if not self.config.send_commands and not bool(bypass_send_commands):
             return finish("send_disabled", sent=False, skip_reason="send_disabled")
+        if self._latest_gripper_error_code not in (None, 0):
+            return finish(
+                "hardware_fault",
+                sent=False,
+                skip_reason=f"error_code={int(self._latest_gripper_error_code)}",
+            )
         if self._last_sent_command is not None and not bool(force):
             max_delta = float(np.max(np.abs(target - self._last_sent_command)))
             if max_delta < float(self.config.send_threshold):
@@ -1643,14 +1716,10 @@ class DMTacGripperBackend(EffectorBackend):
                 self._next_tactile_read_at = next_at
 
         if gripper_state is not None:
-            joint_value = float(getattr(gripper_state, "joint_pos"))
-            self._latest_joint_pos = self._q6_from_scalar(
-                joint_value,
-                dim=int(self.config.command_dim),
-                max_value=float(self.config.max_action),
+            self._apply_gripper_state(
+                gripper_state,
+                fallback_timestamp=read_started_at,
             )
-            self._latest_measured_joint_pos = self._latest_joint_pos.copy()
-            self._latest_joint_timestamp = float(getattr(gripper_state, "timestamp", read_started_at))
 
         if tactile_read_attempted:
             tactile_vec, tactile_dict, frame_ids, field_by_key = self._frames_to_tactile(
@@ -1843,6 +1912,12 @@ class DMTacGripperBackend(EffectorBackend):
             ),
             "gripper_commanded_scalar": commanded_scalar,
             "gripper_measured_scalar": measured_scalar,
+            "gripper_error_code": self._latest_gripper_error_code,
+            "gripper_status_code": self._latest_gripper_status_code,
+            "gripper_status_text": self._latest_gripper_status_text,
+            "gripper_is_moving": self._latest_gripper_is_moving,
+            "gripper_current": self._latest_gripper_current,
+            "gripper_temperature_c": self._latest_gripper_temperature_c,
             "gripper_state_scalar": None if joint_pos is None else float(joint_pos[scalar_index]),
             "tactile": tactile,
             "tactile_timestamp": latest_tactile_timestamp,

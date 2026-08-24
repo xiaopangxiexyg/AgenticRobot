@@ -11,7 +11,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from ..episode_curation import source_episode_manifest_hash
 from ..progress_annotation_jobs import (
     ProgressAnnotationWorkItem,
-    load_episode_sample_axis,
+    load_episode_sample_continuity,
 )
 from ..progress_failure_trigger_artifacts import (
     FAILURE_TRIGGER_RELATIVE_PATH,
@@ -203,7 +203,8 @@ def prepare_episode(
         for key in selected_camera_keys
     }
     annotation = _select_annotation(item, selector)
-    sample_axis = load_episode_sample_axis(item)
+    sample_continuity = load_episode_sample_continuity(item)
+    sample_axis = sample_continuity.sample_axis
     stage_index = None
     failure_triggers = ()
     failure_trigger_hash = None
@@ -247,6 +248,7 @@ def prepare_episode(
             if item.progress.stage_entry_binding is None
             else item.progress.stage_entry_binding.entry_condition
         ),
+        continuity_break_indices=sample_continuity.break_indices,
     )
     projection = _projection_schema(item.parquet_path, column_projection)
 

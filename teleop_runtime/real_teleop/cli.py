@@ -2503,10 +2503,11 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tactile-bundle-min-free-gb",
         type=_non_negative_float,
-        default=0.0,
+        default=os.environ.get("TACTILE_BUNDLE_MIN_FREE_GB", "0"),
         help=(
             "Minimum free GiB required on --tactile-bundle-root at startup. "
-            "Zero performs the normal writable/device checks without an extra reserve."
+            "Defaults to TACTILE_BUNDLE_MIN_FREE_GB when set. Zero performs "
+            "the normal writable/device checks without an extra reserve."
         ),
     )
     parser.add_argument(
