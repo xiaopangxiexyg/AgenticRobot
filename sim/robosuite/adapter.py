@@ -283,23 +283,39 @@ class RobosuiteMixedControlAdapter:
         backend: RobosuiteA0Backend,
         manifest: RobosuiteResetManifest,
     ) -> tuple[Mapping[str, Any], RobosuiteResetReceipt]:
+        observation = backend.reset(manifest)
+        return self.bind_reset_observation(
+            backend=backend,
+            manifest=manifest,
+            observation=observation,
+        )
+
+    def bind_reset_observation(
+        self,
+        *,
+        backend: RobosuiteA0Backend,
+        manifest: RobosuiteResetManifest,
+        observation: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], RobosuiteResetReceipt]:
+        """Validate and bind an already-applied reset or episode-start restore."""
+
         if not isinstance(manifest, RobosuiteResetManifest):
             raise TypeError("manifest must be a RobosuiteResetManifest.")
         if manifest.action_dimension != self.action_dimension:
             raise ValueError("manifest action dimension does not match the adapter.")
-        observation = MappingProxyType(dict(backend.reset(manifest)))
-        if tuple(observation) != manifest.observation_keys:
+        normalized_observation = MappingProxyType(dict(observation))
+        if tuple(normalized_observation) != manifest.observation_keys:
             raise ValueError(
                 "backend reset observation keys must exactly match the manifest."
             )
-        observation_hash = _observation_hash(observation)
+        observation_hash = _observation_hash(normalized_observation)
         receipt = RobosuiteResetReceipt(
             backend_id=_required(backend.backend_id, name="backend.backend_id"),
             manifest_id=manifest.manifest_id,
             manifest_hash=manifest.semantic_content_hash,
             initial_observation_hash=observation_hash,
         )
-        return observation, receipt
+        return normalized_observation, receipt
 
 
 __all__ = [

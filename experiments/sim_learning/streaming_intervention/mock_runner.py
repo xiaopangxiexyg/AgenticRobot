@@ -12,6 +12,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from sim.robosuite import (
     MixedControlActionSelection,
     RobosuiteBackendStep,
+    RobosuiteEpisodeStartArtifactA1,
     RobosuiteMixedControlAdapter,
     RobosuiteResetManifest,
     RobosuiteResetReceipt,
@@ -91,6 +92,7 @@ class DeterministicRobosuiteMockBackend:
         self._manifest: RobosuiteResetManifest | None = None
         self._state: tuple[float, ...] = ()
         self._step_index = 0
+        self._closed = False
 
     def reset(self, manifest: RobosuiteResetManifest) -> Mapping[str, object]:
         if tuple(manifest.observation_keys) != MOCK_OBSERVATION_KEYS_A0:
@@ -113,6 +115,7 @@ class DeterministicRobosuiteMockBackend:
         )
         self._manifest = manifest
         self._step_index = 0
+        self._closed = False
         return self._observation()
 
     def step(self, action: tuple[float, ...]) -> RobosuiteBackendStep:
@@ -139,6 +142,14 @@ class DeterministicRobosuiteMockBackend:
             },
         )
 
+    def close(self) -> None:
+        self._manifest = None
+        self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def _observation(self) -> Mapping[str, object]:
         manifest = self._manifest
         if manifest is None:
@@ -160,6 +171,7 @@ class StreamingInterventionStep:
     frame_hash: str
     selection: MixedControlActionSelection
     backend_step: RobosuiteBackendStep
+    input_frame: StreamingInterventionFrame | None = None
     semantic_content_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -169,6 +181,14 @@ class StreamingInterventionStep:
             raise TypeError("selection must be a MixedControlActionSelection.")
         if not isinstance(self.backend_step, RobosuiteBackendStep):
             raise TypeError("backend_step must be a RobosuiteBackendStep.")
+        input_frame = self.input_frame
+        if input_frame is not None:
+            if not isinstance(input_frame, StreamingInterventionFrame):
+                raise TypeError("input_frame must be a StreamingInterventionFrame.")
+            if input_frame.frame_id != frame_id or (
+                input_frame.semantic_content_hash != frame_hash
+            ):
+                raise ValueError("input_frame does not bind frame_id and frame_hash.")
         payload = {
             "frame_id": frame_id,
             "frame_hash": frame_hash,
@@ -177,6 +197,7 @@ class StreamingInterventionStep:
         }
         object.__setattr__(self, "frame_id", frame_id)
         object.__setattr__(self, "frame_hash", frame_hash)
+        object.__setattr__(self, "input_frame", input_frame)
         object.__setattr__(
             self,
             "semantic_content_hash",
@@ -189,12 +210,14 @@ class StreamingInterventionStep:
 
 @dataclass(frozen=True)
 class StreamingInterventionRunResult:
-    """Replay identity and ordered evidence for one completed mock run."""
+    """Replay identity and ordered evidence for one completed run."""
 
     manifest: RobosuiteResetManifest
     reset_receipt: RobosuiteResetReceipt
     steps: tuple[StreamingInterventionStep, ...]
     stop_reason: str
+    reset_artifact: RobosuiteEpisodeStartArtifactA1 | None = None
+    source_effective_model_xml_sha256: str | None = None
     semantic_content_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -218,14 +241,45 @@ class StreamingInterventionRunResult:
             "manifest_step_limit",
         }:
             raise ValueError(f"Unsupported stop_reason {stop_reason!r}.")
+        reset_artifact = self.reset_artifact
+        source_effective_xml_hash = self.source_effective_model_xml_sha256
+        if reset_artifact is not None:
+            if not isinstance(reset_artifact, RobosuiteEpisodeStartArtifactA1):
+                raise TypeError(
+                    "reset_artifact must be a RobosuiteEpisodeStartArtifactA1."
+                )
+            if reset_artifact.manifest_hash != self.manifest.semantic_content_hash:
+                raise ValueError("reset artifact does not bind the supplied manifest.")
+            source_effective_xml_hash = _required(
+                source_effective_xml_hash,
+                name="source_effective_model_xml_sha256",
+            )
+            if source_effective_xml_hash != (reset_artifact.effective_model_xml_sha256):
+                raise ValueError(
+                    "source effective XML hash does not bind the reset artifact."
+                )
+        elif source_effective_xml_hash is not None:
+            raise ValueError(
+                "source effective XML hash requires an episode-start artifact."
+            )
         payload = {
             "manifest_hash": self.manifest.semantic_content_hash,
             "reset_receipt_hash": self.reset_receipt.semantic_content_hash,
             "step_hashes": tuple(step.semantic_content_hash for step in steps),
             "stop_reason": stop_reason,
+            "reset_artifact_hash": (
+                None if reset_artifact is None else reset_artifact.semantic_content_hash
+            ),
+            "source_effective_model_xml_sha256": source_effective_xml_hash,
         }
         object.__setattr__(self, "steps", steps)
         object.__setattr__(self, "stop_reason", stop_reason)
+        object.__setattr__(self, "reset_artifact", reset_artifact)
+        object.__setattr__(
+            self,
+            "source_effective_model_xml_sha256",
+            source_effective_xml_hash,
+        )
         object.__setattr__(
             self,
             "semantic_content_hash",
@@ -254,45 +308,12 @@ class StreamingInterventionMockRunner:
         manifest: RobosuiteResetManifest,
         frames: Iterable[StreamingInterventionFrame],
     ) -> StreamingInterventionRunResult:
-        backend = DeterministicRobosuiteMockBackend()
-        _, reset_receipt = self._adapter.reset_backend(backend, manifest)
-        steps: list[StreamingInterventionStep] = []
-        stop_reason = "input_exhausted"
-        seen_frame_ids: set[str] = set()
-        for frame in frames:
-            if not isinstance(frame, StreamingInterventionFrame):
-                raise TypeError(
-                    "frames must contain StreamingInterventionFrame values."
-                )
-            if frame.frame_id in seen_frame_ids:
-                raise ValueError("frame_id values must be unique within a run.")
-            seen_frame_ids.add(frame.frame_id)
-            selection = self._adapter.compose(
-                mode=frame.mode,
-                base_action=frame.base_action,
-                intervention_action=frame.intervention_action,
-            )
-            backend_step = backend.step(selection.applied_action)
-            steps.append(
-                StreamingInterventionStep(
-                    frame_id=frame.frame_id,
-                    frame_hash=frame.semantic_content_hash,
-                    selection=selection,
-                    backend_step=backend_step,
-                )
-            )
-            if backend_step.terminated:
-                stop_reason = "backend_terminated"
-                break
-            if backend_step.truncated:
-                stop_reason = "manifest_step_limit"
-                break
-        return StreamingInterventionRunResult(
-            manifest=manifest,
-            reset_receipt=reset_receipt,
-            steps=tuple(steps),
-            stop_reason=stop_reason,
-        )
+        from .runner import StreamingInterventionRunner
+
+        return StreamingInterventionRunner(
+            adapter=self._adapter,
+            backend_factory=DeterministicRobosuiteMockBackend,
+        ).run(manifest=manifest, frames=frames)
 
 
 __all__ = [

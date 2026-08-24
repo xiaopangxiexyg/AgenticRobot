@@ -1,4 +1,4 @@
-"""Deterministic A0 streaming-intervention mock runner."""
+"""Non-canonical mixed-control streaming-intervention experiments."""
 
 from .mock_runner import (
     DeterministicRobosuiteMockBackend,
@@ -7,11 +7,14 @@ from .mock_runner import (
     StreamingInterventionRunResult,
     StreamingInterventionStep,
 )
+from .runner import PrefixReplayReceiptA1, StreamingInterventionRunner
 
 __all__ = [
     "DeterministicRobosuiteMockBackend",
+    "PrefixReplayReceiptA1",
     "StreamingInterventionFrame",
     "StreamingInterventionMockRunner",
     "StreamingInterventionRunResult",
+    "StreamingInterventionRunner",
     "StreamingInterventionStep",
 ]
