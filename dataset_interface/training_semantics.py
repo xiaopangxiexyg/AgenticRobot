@@ -52,9 +52,7 @@ SEMANTIC_ANCHOR_RECOVERY_BEGIN = "RECOVERY_BEGIN"
 
 TRAINING_DOMAIN_NOMINAL = "NOMINAL"
 TRAINING_DOMAIN_FAILURE = "FAILURE"
-TRAINING_DOMAINS = frozenset(
-    {TRAINING_DOMAIN_NOMINAL, TRAINING_DOMAIN_FAILURE}
-)
+TRAINING_DOMAINS = frozenset({TRAINING_DOMAIN_NOMINAL, TRAINING_DOMAIN_FAILURE})
 
 FAILURE_RESOLUTION_REFINED_TRIGGER = "REFINED_TRIGGER"
 FAILURE_RESOLUTION_FAILED_STAGE = "FAILED_STAGE_START"
@@ -90,9 +88,7 @@ class SemanticSpan:
     def __post_init__(self) -> None:
         kind = str(self.semantic_kind).strip().upper()
         if not kind:
-            raise TrainingSemanticResolutionError(
-                "semantic_kind must not be empty."
-            )
+            raise TrainingSemanticResolutionError("semantic_kind must not be empty.")
         object.__setattr__(self, "semantic_kind", kind)
         for field_name in (
             "progress_step_id",
@@ -126,9 +122,7 @@ class SemanticAnchor:
     def __post_init__(self) -> None:
         kind = str(self.semantic_kind).strip().upper()
         if not kind:
-            raise TrainingSemanticResolutionError(
-                "semantic_kind must not be empty."
-            )
+            raise TrainingSemanticResolutionError("semantic_kind must not be empty.")
         if (
             not isinstance(self.sample_index, int)
             or isinstance(self.sample_index, bool)
@@ -164,6 +158,23 @@ class EpisodeTrainingSemanticIndex:
     anchors: tuple[SemanticAnchor, ...]
     nominal_intervals: tuple[SampleIndexInterval, ...]
     failure_intervals: tuple[SampleIndexInterval, ...]
+    continuity_break_indices: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        breaks = tuple(self.continuity_break_indices)
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) for value in breaks
+        ):
+            raise TrainingSemanticResolutionError(
+                "continuity_break_indices must contain integers."
+            )
+        if tuple(sorted(set(breaks))) != breaks or any(
+            value <= 0 or value >= self.sample_count for value in breaks
+        ):
+            raise TrainingSemanticResolutionError(
+                "continuity_break_indices must be unique ordered interior indices."
+            )
+        object.__setattr__(self, "continuity_break_indices", breaks)
 
     def spans_of_kind(self, semantic_kind: str) -> tuple[SemanticSpan, ...]:
         kind = str(semantic_kind).strip().upper()
@@ -198,9 +209,11 @@ class SemanticWindowQuery:
             "start_anchor_kinds",
         ):
             values = tuple(
-                str(value).strip()
-                if field_name == "progress_step_ids"
-                else str(value).strip().upper()
+                (
+                    str(value).strip()
+                    if field_name == "progress_step_ids"
+                    else str(value).strip().upper()
+                )
                 for value in getattr(self, field_name)
             )
             if any(not value for value in values) or len(values) != len(set(values)):
@@ -267,10 +280,8 @@ def _subtract_intervals(
         updated: list[SampleIndexInterval] = []
         for current in remaining:
             if (
-                exclusion.sample_index_end_exclusive
-                <= current.sample_index_begin
-                or exclusion.sample_index_begin
-                >= current.sample_index_end_exclusive
+                exclusion.sample_index_end_exclusive <= current.sample_index_begin
+                or exclusion.sample_index_begin >= current.sample_index_end_exclusive
             ):
                 updated.append(current)
                 continue
@@ -284,7 +295,10 @@ def _subtract_intervals(
                         ),
                     )
                 )
-            if exclusion.sample_index_end_exclusive < current.sample_index_end_exclusive:
+            if (
+                exclusion.sample_index_end_exclusive
+                < current.sample_index_end_exclusive
+            ):
                 updated.append(
                     SampleIndexInterval(
                         max(
@@ -305,8 +319,7 @@ def _split_intervals(
     sample_count: int,
 ) -> tuple[SampleIndexInterval, ...]:
     if any(
-        not isinstance(value, int) or isinstance(value, bool)
-        for value in break_indices
+        not isinstance(value, int) or isinstance(value, bool) for value in break_indices
     ):
         raise TrainingSemanticResolutionError(
             "continuity_break_indices must contain integers."
@@ -329,6 +342,25 @@ def _split_intervals(
             begin = cut
         result.append(SampleIndexInterval(begin, interval.sample_index_end_exclusive))
     return tuple(item for item in result if not item.empty)
+
+
+def _normalize_continuity_break_indices(
+    break_indices: Sequence[int],
+    *,
+    sample_count: int,
+) -> tuple[int, ...]:
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) for value in break_indices
+    ):
+        raise TrainingSemanticResolutionError(
+            "continuity_break_indices must contain integers."
+        )
+    breaks = tuple(sorted(set(break_indices)))
+    if any(value <= 0 or value >= sample_count for value in breaks):
+        raise TrainingSemanticResolutionError(
+            "continuity_break_indices must lie strictly inside the sample axis."
+        )
+    return breaks
 
 
 def _attempt_by_id(
@@ -383,11 +415,13 @@ def build_episode_training_semantic_index(
         raise TrainingSemanticResolutionError(
             "Progress timeline and sample axis use different clocks."
         )
+    continuity_breaks = _normalize_continuity_break_indices(
+        continuity_break_indices,
+        sample_count=sample_axis.sample_count,
+    )
     entry_condition = str(episode_entry_condition).strip().upper()
     if entry_condition not in {"NOMINAL", "RECOVERY_FROM_FAILURE"}:
-        raise TrainingSemanticResolutionError(
-            "Unsupported episode_entry_condition."
-        )
+        raise TrainingSemanticResolutionError("Unsupported episode_entry_condition.")
     if stage_index is not None:
         _validate_stage_index(
             timeline=timeline,
@@ -510,18 +544,14 @@ def build_episode_training_semantic_index(
             < projected_attempt.interval.sample_index_begin
             or trigger.upper_bound_sample_index
             != projected_attempt.interval.sample_index_end_exclusive - 1
-            or trigger.trigger_sample_index
-            < trigger.lower_bound_sample_index
+            or trigger.trigger_sample_index < trigger.lower_bound_sample_index
             or trigger.trigger_sample_index > trigger.upper_bound_sample_index
         ):
             raise TrainingSemanticResolutionError(
                 "Failure trigger does not bind its failed Attempt interval."
             )
         failed_stage = failed_stage_by_fact.get(failure_id)
-        if (
-            failed_stage is not None
-            and trigger.stage_id != failed_stage.stage_id
-        ):
+        if failed_stage is not None and trigger.stage_id != failed_stage.stage_id:
             raise TrainingSemanticResolutionError(
                 "Failure trigger and failed-stage identity differ."
             )
@@ -667,13 +697,13 @@ def build_episode_training_semantic_index(
     )
     nominal = _split_intervals(
         nominal,
-        continuity_break_indices,
+        continuity_breaks,
         sample_count=sample_axis.sample_count,
     )
     failures = _subtract_intervals(failure_intervals, abnormal_intervals)
     failures = _split_intervals(
         failures,
-        continuity_break_indices,
+        continuity_breaks,
         sample_count=sample_axis.sample_count,
     )
     return EpisodeTrainingSemanticIndex(
@@ -704,6 +734,7 @@ def build_episode_training_semantic_index(
         ),
         nominal_intervals=nominal,
         failure_intervals=failures,
+        continuity_break_indices=continuity_breaks,
     )
 
 
@@ -716,7 +747,8 @@ def _owner_attempt(
         item
         for item in index.spans
         if item.semantic_kind == SEMANTIC_SPAN_ATTEMPT
-        and item.sample_interval.sample_index_begin <= sample_index
+        and item.sample_interval.sample_index_begin
+        <= sample_index
         < item.sample_interval.sample_index_end_exclusive
     )
     if len(matches) > 1:
@@ -734,7 +766,8 @@ def _containing_interval(
         (
             interval
             for interval in intervals
-            if interval.sample_index_begin <= sample_index
+            if interval.sample_index_begin
+            <= sample_index
             < interval.sample_index_end_exclusive
         ),
         None,
@@ -808,9 +841,7 @@ def plan_semantic_action_windows(
         anchor = anchor_by_start.get(start_index)
         result.append(
             SemanticActionWindowLocation(
-                episode_capture_identity_hash=(
-                    index.episode_capture_identity_hash
-                ),
+                episode_capture_identity_hash=(index.episode_capture_identity_hash),
                 start_index=start_index,
                 valid_action_count=valid_count,
                 owner_progress_step_id=owner.progress_step_id,
@@ -818,12 +849,8 @@ def plan_semantic_action_windows(
                 owner_attempt_outcome=owner.outcome,
                 training_domain=query.training_domain,
                 containing_interval=interval,
-                source_anchor_kind=(
-                    None if anchor is None else anchor.semantic_kind
-                ),
-                source_anchor_id=(
-                    None if anchor is None else anchor.source_id
-                ),
+                source_anchor_kind=(None if anchor is None else anchor.semantic_kind),
+                source_anchor_id=(None if anchor is None else anchor.source_id),
             )
         )
     return tuple(result)

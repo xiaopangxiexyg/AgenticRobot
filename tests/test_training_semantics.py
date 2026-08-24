@@ -332,9 +332,9 @@ def test_failure_and_recovery_anchor_queries_use_their_own_domains() -> None:
             training_domain=TRAINING_DOMAIN_FAILURE,
         ),
     )
-    assert [(item.start_index, item.valid_action_count) for item in failure_windows] == [
-        (10, 3)
-    ]
+    assert [
+        (item.start_index, item.valid_action_count) for item in failure_windows
+    ] == [(10, 3)]
 
     recovery_windows = plan_semantic_action_windows(
         index=index,
@@ -344,9 +344,9 @@ def test_failure_and_recovery_anchor_queries_use_their_own_domains() -> None:
             start_anchor_kinds=(SEMANTIC_ANCHOR_RECOVERY_BEGIN,),
         ),
     )
-    assert [(item.start_index, item.valid_action_count) for item in recovery_windows] == [
-        (14, 4)
-    ]
+    assert [
+        (item.start_index, item.valid_action_count) for item in recovery_windows
+    ] == [(14, 4)]
 
 
 def test_abnormal_and_continuity_boundaries_truncate_for_padding_or_drop() -> None:
@@ -362,6 +362,7 @@ def test_abnormal_and_continuity_boundaries_truncate_for_padding_or_drop() -> No
         SampleIndexInterval(14, 16),
         SampleIndexInterval(16, 18),
     )
+    assert index.continuity_break_indices == (16,)
     padded = plan_semantic_action_windows(
         index=index,
         chunk_contract=PoseActionChunkContract(

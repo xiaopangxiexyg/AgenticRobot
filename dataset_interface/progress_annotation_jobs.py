@@ -91,18 +91,46 @@ class EpisodeSampleContinuity:
 
     def __post_init__(self) -> None:
         count = self.sample_axis.sample_count
-        if len(self.segment_indices) != count:
+        segment_indices = tuple(self.segment_indices)
+        if len(segment_indices) != count:
             raise ProgressAnnotationJobError(
                 "Continuity segment count differs from the sample axis."
             )
+        populated = tuple(value for value in segment_indices if value is not None)
+        if populated and len(populated) != count:
+            raise ProgressAnnotationJobError(
+                "Continuity segment indices must be either fully populated or absent."
+            )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in populated
+        ):
+            raise ProgressAnnotationJobError(
+                "Continuity segment indices must be non-negative integers."
+            )
+        if any(
+            current < previous for previous, current in zip(populated, populated[1:])
+        ):
+            raise ProgressAnnotationJobError(
+                "Continuity segment indices must be monotonic."
+            )
+        object.__setattr__(self, "segment_indices", segment_indices)
         breaks = tuple(self.break_indices)
-        if (
-            tuple(sorted(set(breaks))) != breaks
-            or any(value <= 0 or value >= count for value in breaks)
+        if tuple(sorted(set(breaks))) != breaks or any(
+            value <= 0 or value >= count for value in breaks
         ):
             raise ProgressAnnotationJobError(
                 "Continuity breaks must be unique ordered interior indices."
             )
+        sources = tuple(self.sources)
+        if any(not str(value).strip() for value in sources) or len(sources) != len(
+            set(sources)
+        ):
+            raise ProgressAnnotationJobError(
+                "Continuity sources must be unique non-empty values."
+            )
+        object.__setattr__(self, "break_indices", breaks)
+        object.__setattr__(self, "sources", sources)
 
 
 @dataclass(frozen=True)
@@ -240,11 +268,7 @@ def _recording_pause_segments(
         reason = str(raw.get("reason", "")).strip()
         raw_reasons = raw.get("reasons")
         reasons = (
-            tuple(
-                str(value).strip()
-                for value in raw_reasons
-                if str(value).strip()
-            )
+            tuple(str(value).strip() for value in raw_reasons if str(value).strip())
             if isinstance(raw_reasons, Sequence)
             and not isinstance(raw_reasons, (str, bytes))
             else ()
@@ -427,9 +451,7 @@ def _retrospective_work_items(
             campaign_index = load_retrospective_campaign_index(root)
         except RetrospectiveCampaignArtifactReadError as exc:
             raise ProgressAnnotationJobError(str(exc)) from exc
-        admitted_identities = (
-            campaign_index.admitted_episode_identity_hashes
-        )
+        admitted_identities = campaign_index.admitted_episode_identity_hashes
     results: list[ProgressAnnotationWorkItem] = []
     for episode_dir in sorted(episodes_root.iterdir(), key=lambda item: item.name):
         if not episode_dir.is_dir():
@@ -460,8 +482,7 @@ def _retrospective_work_items(
             for video in progress.source_binding.admitted_videos
         }
         parquet_path = (
-            source_root
-            / progress.source_binding.source_parquet_relative_path
+            source_root / progress.source_binding.source_parquet_relative_path
         ).resolve()
         episode_uuid = progress.source_binding.episode_capture_identity_hash
         annotation_root = (
@@ -523,13 +544,9 @@ def _safe_dataset_path(root: Path, value: object, *, name: str) -> Path:
     try:
         path.relative_to(root)
     except ValueError as exc:
-        raise ProgressAnnotationJobError(
-            f"{name} escapes the dataset root."
-        ) from exc
+        raise ProgressAnnotationJobError(f"{name} escapes the dataset root.") from exc
     if not path.is_file():
-        raise ProgressAnnotationJobError(
-            f"{name} does not exist: {text}."
-        )
+        raise ProgressAnnotationJobError(f"{name} does not exist: {text}.")
     return path
 
 
@@ -542,9 +559,7 @@ def _work_item_from_record(
 ) -> ProgressAnnotationWorkItem | None:
     metadata = record.get("metadata")
     progress_ref = (
-        metadata.get("progress_episode")
-        if isinstance(metadata, Mapping)
-        else None
+        metadata.get("progress_episode") if isinstance(metadata, Mapping) else None
     )
     if not isinstance(progress_ref, Mapping):
         return None
@@ -600,9 +615,7 @@ def _work_item_from_record(
         raise ProgressAnnotationJobError(
             f"Episode {episode_uuid!r} has invalid summary values."
         ) from exc
-    annotation_root = (
-        root / "meta" / "progress" / "stage_annotations" / episode_uuid
-    )
+    annotation_root = root / "meta" / "progress" / "stage_annotations" / episode_uuid
     set_count = 0
     has_draft = False
     if load_annotation_state:
@@ -765,10 +778,7 @@ def read_progress_annotation_work_item_batch(
         # remain sequential because they normally contain only one new record
         # and must not compete with active annotation I/O for no useful gain.
         read_cache = ProgressArtifactReadCache()
-        if (
-            not incremental
-            and total >= _FULL_SCAN_PARALLEL_THRESHOLD
-        ):
+        if not incremental and total >= _FULL_SCAN_PARALLEL_THRESHOLD:
             workers = min(_FULL_SCAN_MAX_WORKERS, total)
             with ThreadPoolExecutor(
                 max_workers=workers,
@@ -901,6 +911,7 @@ def load_episode_sample_continuity(
         )
 
     try:
+        import pyarrow as pa  # type: ignore[import-not-found]
         import pyarrow.parquet as pq  # type: ignore[import-not-found]
     except ImportError as exc:
         raise ProgressAnnotationJobError(
@@ -914,14 +925,16 @@ def load_episode_sample_continuity(
         )
         columns = ["timestamp"]
         if has_continuity_column:
+            continuity_type = parquet_file.schema_arrow.field(continuity_column).type
+            if not pa.types.is_integer(continuity_type):
+                raise ProgressAnnotationJobError(
+                    "Episode continuity segment column must use an integer type."
+                )
             columns.append(continuity_column)
         table = parquet_file.read(columns=columns)
         values = tuple(float(value.as_py()) for value in table["timestamp"])
         segment_indices = (
-            tuple(
-                None if value.as_py() is None else int(value.as_py())
-                for value in table[continuity_column]
-            )
+            tuple(value.as_py() for value in table[continuity_column])
             if has_continuity_column
             else tuple(None for _ in values)
         )
