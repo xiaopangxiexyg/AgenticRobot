@@ -672,6 +672,7 @@ def _video_probe_frame_count(path: Path) -> int:
     decode = subprocess.run(
         [
             "ffmpeg",
+            "-nostdin",
             "-v",
             "warning",
             "-xerror",
