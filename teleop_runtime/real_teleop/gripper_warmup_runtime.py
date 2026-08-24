@@ -56,22 +56,46 @@ def build_gripper_warmup_probe_runtime(
         "results": {},
     }
 
-    def gripper_warmup_probe_enabled() -> bool:
+    def configured_gripper_backends() -> list[tuple[str, object]]:
         if not bool(getattr(args, "gripper_warmup_probe", True)):
-            return False
-        backends = [
-            _gripper_backend_for_side(components, side)
+            return []
+        return [
+            (side, backend)
             for side in components.active_sides
+            if (backend := _gripper_backend_for_side(components, side)) is not None
+            and bool(
+                getattr(
+                    getattr(backend, "config", None),
+                    "connect_hardware",
+                    True,
+                )
+            )
         ]
-        return any(
-            backend is not None
-            and bool(getattr(getattr(backend, "config", None), "connect_hardware", True))
-            for backend in backends
-        )
+
+    def profile_fixed_sides() -> set[str]:
+        controller = getattr(components, "fix_arm_controller", None)
+        explicit = tuple(getattr(controller, "fixed_sides", ()) or ())
+        if explicit:
+            return {str(side) for side in explicit}
+        if bool(getattr(controller, "fixed", False)):
+            fallback = str(getattr(controller, "fixed_side", "") or "")
+            return {fallback} if fallback else set()
+        return set()
+
+    def eligible_gripper_backends() -> list[tuple[str, object]]:
+        fixed_sides = profile_fixed_sides()
+        return [
+            (side, backend)
+            for side, backend in configured_gripper_backends()
+            if side not in fixed_sides
+        ]
+
+    def gripper_warmup_probe_enabled() -> bool:
+        return bool(eligible_gripper_backends())
 
     def reset_gripper_warmup_probe(reason: str) -> None:
         nonlocal gripper_warmup_probe_generation, gripper_warmup_probe_state
-        if not gripper_warmup_probe_enabled():
+        if not configured_gripper_backends():
             return
         with gripper_warmup_probe_lock:
             gripper_warmup_probe_generation += 1
@@ -134,16 +158,12 @@ def build_gripper_warmup_probe_runtime(
         nonlocal gripper_warmup_probe_thread
         if not gripper_warmup_probe_enabled():
             return True, "gripper warmup probe 未启用。"
-        side_backends: list[tuple[str, DMTacGripperBackend]] = []
-        for side in components.active_sides:
-            backend = _gripper_backend_for_side(components, side)
-            if backend is None:
-                continue
-            if not bool(getattr(getattr(backend, "config", None), "connect_hardware", True)):
-                continue
-            side_backends.append((side, backend))
+        side_backends: list[tuple[str, DMTacGripperBackend]] = [
+            (side, backend)
+            for side, backend in eligible_gripper_backends()
+        ]
         if not side_backends:
-            return True, "gripper warmup probe 无硬件 backend。"
+            return True, "固定侧 end-effector 保持中，无可安全主动探测的 gripper。"
         with gripper_warmup_probe_lock:
             status = str(gripper_warmup_probe_state.get("status") or "idle")
             if status == "ready":

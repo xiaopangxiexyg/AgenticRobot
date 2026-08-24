@@ -1887,6 +1887,51 @@ def test_gripper_warmup_runtime_keeps_probe_state_inside_one_closure() -> None:
     assert probe.status(2.0, reason="next_episode")[0] is False
 
 
+def test_gripper_warmup_runtime_never_moves_profile_fixed_side() -> None:
+    probe_called = threading.Event()
+    called_sides: list[str] = []
+    backends = {
+        side: SimpleNamespace(config=SimpleNamespace(connect_hardware=True))
+        for side in ("left", "right")
+    }
+    components_snapshot = SimpleNamespace(
+        active_sides=("left", "right"),
+        fix_arm_controller=SimpleNamespace(fixed_sides=("left",)),
+    )
+    args = SimpleNamespace(
+        gripper_warmup_probe=True,
+        gripper_warmup_probe_tolerance=0.18,
+        gripper_warmup_probe_step_timeout_sec=0.01,
+        gripper_warmup_probe_settle_sec=0.0,
+        gripper_warmup_probe_poll_sec=0.01,
+    )
+
+    def run_probe(side: str, _backend: object, **_kwargs: object) -> dict[str, object]:
+        called_sides.append(side)
+        probe_called.set()
+        return {"ok": True, "reconnected": False}
+
+    probe = gripper_warmup_runtime.build_gripper_warmup_probe_runtime(
+        args,
+        components_snapshot,
+        gripper_backend_for_side=lambda _components, side: backends[side],
+        run_probe_for_side=run_probe,
+        safe_float_value=lambda value: None if value is None else float(value),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    assert probe.enabled()
+    assert probe.start(1.0, reason="unit_test")[0] is False
+    assert probe_called.wait(1.0)
+    for _ in range(100):
+        ready, _message = probe.status(1.1, reason="unit_test")
+        if ready:
+            break
+        threading.Event().wait(0.005)
+    assert ready
+    assert called_sides == ["right"]
+
+
 def test_recording_admission_keeps_fail_closed_check_order() -> None:
     args = SimpleNamespace(
         no_camera=True,

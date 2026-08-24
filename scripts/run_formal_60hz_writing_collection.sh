@@ -20,6 +20,9 @@ Collect options:
                               docs/real/teleop_args.sh.
   --task-name NAME            Defaults to 4_stage_writing_detail.
   --tactile-min-free-gb N     Defaults to TACTILE_BUNDLE_MIN_FREE_GB or 200.
+  --gripper-warmup-probe      Enable active open->half->open probing. Use only
+                              when both grippers are clear of tools/objects.
+  --no-gripper-warmup-probe   Disable active gripper motion probing (default).
   --dry-run                   Print the resolved command without starting devices.
   -h, --help                  Show this help.
 
@@ -76,6 +79,7 @@ TACTILE_ROOT="${TACTILE_BUNDLE_ROOT:-}"
 DATASET_ROOT="${DATASET_BASE:-}"
 TASK_NAME="${COLLECTION_TASK_NAME:-4_stage_writing_detail}"
 TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-200}"
+GRIPPER_WARMUP_PROBE="${GRIPPER_WARMUP_PROBE:-off}"
 if [[ -n "${TACTILE_BUNDLE_MIN_FREE_GB:-}" ]]; then
   TACTILE_MIN_FREE_SOURCE=environment
 else
@@ -106,6 +110,14 @@ while [[ $# -gt 0 ]]; do
       TACTILE_MIN_FREE_SOURCE=command_line
       shift 2
       ;;
+    --gripper-warmup-probe)
+      GRIPPER_WARMUP_PROBE=on
+      shift
+      ;;
+    --no-gripper-warmup-probe)
+      GRIPPER_WARMUP_PROBE=off
+      shift
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -126,6 +138,20 @@ done
 [[ -d "$TACTILE_ROOT" ]] || die "tactile bundle root does not exist: $TACTILE_ROOT"
 [[ ! -L "$TACTILE_ROOT" ]] || die "tactile bundle root must not be a symlink: $TACTILE_ROOT"
 [[ -n "${TASK_NAME//[[:space:]]/}" ]] || die "task name must not be blank."
+
+case "${GRIPPER_WARMUP_PROBE,,}" in
+  1|true|yes|on)
+    GRIPPER_WARMUP_PROBE=on
+    GRIPPER_WARMUP_ARGS=(--gripper-warmup-probe)
+    ;;
+  0|false|no|off)
+    GRIPPER_WARMUP_PROBE=off
+    GRIPPER_WARMUP_ARGS=(--no-gripper-warmup-probe)
+    ;;
+  *)
+    die "GRIPPER_WARMUP_PROBE must be on/off, true/false, yes/no, or 1/0."
+    ;;
+esac
 
 if [[ -n "$DATASET_ROOT" ]]; then
   [[ "$DATASET_ROOT" == /* ]] || die "dataset root must be absolute: $DATASET_ROOT"
@@ -170,6 +196,7 @@ TELEOP_ARGS=(
   --tactile-bundle-min-free-gb "$TACTILE_BUNDLE_MIN_FREE_GB"
   --tactile-artifact-integrity
   --idle-tactile-compression
+  "${GRIPPER_WARMUP_ARGS[@]}"
 )
 
 RUN_COMMAND=(
@@ -191,5 +218,6 @@ printf '%s\n' \
   "[DexTeleop] task=$TASK_NAME" \
   "[DexTeleop] dataset_root=$DATASET_BASE" \
   "[DexTeleop] tactile_bundle_root=$TACTILE_BUNDLE_ROOT" \
-  "[DexTeleop] tactile_bundle_min_free_gb=$TACTILE_BUNDLE_MIN_FREE_GB source=$TACTILE_MIN_FREE_SOURCE"
+  "[DexTeleop] tactile_bundle_min_free_gb=$TACTILE_BUNDLE_MIN_FREE_GB source=$TACTILE_MIN_FREE_SOURCE" \
+  "[DexTeleop] gripper_warmup_probe=$GRIPPER_WARMUP_PROBE"
 exec "${RUN_COMMAND[@]}"
