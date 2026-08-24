@@ -391,6 +391,9 @@ from .position_stream_handoff import (
     hold_active_position_stream_for_synchronous_chunk_gap as _hold_active_position_stream_for_synchronous_chunk_gap,
     position_source_tail_pending_before_synchronous_chunk_gap as _position_source_tail_pending_before_synchronous_chunk_gap,
 )
+from .position_profile_validation import (
+    validate_position_worker_args as _validate_position_worker_args,
+)
 from .replay import (
     bind_debug_replay_arm_control_mode,
     debug_replay_execution_exhausted as _debug_replay_execution_exhausted,
@@ -835,105 +838,13 @@ def validate_args(
     args.position_continuous_waypoint_async_precompute = bool(
         production_async_c2 or args.position_continuous_waypoint_async_precompute
     )
-    continuous_worker_isolation = (
-        str(args.position_continuous_waypoint_worker_isolation).strip().lower()
+    _validate_position_worker_args(
+        args,
+        available_cpu_ids=available_cpu_ids,
+        cpu_thread_sibling_ids=cpu_thread_sibling_ids,
+        continuous_worker_thread=CONTINUOUS_WAYPOINT_WORKER_THREAD,
+        continuous_worker_process=CONTINUOUS_WAYPOINT_WORKER_PROCESS,
     )
-    if continuous_worker_isolation != CONTINUOUS_WAYPOINT_WORKER_THREAD and not bool(
-        args.position_continuous_waypoint_async_precompute
-    ):
-        raise ValueError(
-            "--position-continuous-waypoint-worker-isolation process requires "
-            "async_c2 precompute"
-        )
-    reference_worker_cpu = args.position_reference_worker_cpu
-    continuous_worker_cpu = args.position_continuous_waypoint_worker_cpu
-    if continuous_worker_cpu is not None and reference_worker_cpu is None:
-        raise ValueError(
-            "--position-continuous-waypoint-worker-cpu requires "
-            "--position-reference-worker-cpu"
-        )
-    if bool(args.position_continuous_waypoint_async_precompute) and (
-        (reference_worker_cpu is None) != (continuous_worker_cpu is None)
-    ):
-        raise ValueError(
-            "async_c2 CPU isolation requires both "
-            "--position-reference-worker-cpu and "
-            "--position-continuous-waypoint-worker-cpu"
-        )
-    args.position_worker_cpu_affinity_allowed = None
-    if reference_worker_cpu is not None:
-        if continuous_worker_cpu is not None and not bool(
-            args.position_continuous_waypoint_async_precompute
-        ):
-            raise ValueError(
-                "--position-continuous-waypoint-worker-cpu requires async_c2 "
-                "precompute"
-            )
-        if continuous_worker_cpu is not None and int(reference_worker_cpu) == int(
-            continuous_worker_cpu
-        ):
-            raise ValueError(
-                "position reference and continuous C2 workers require distinct CPUs"
-            )
-        allowed_cpus = available_cpu_ids()
-        missing_cpus = sorted(
-            (
-                {int(reference_worker_cpu)}
-                if continuous_worker_cpu is None
-                else {
-                    int(reference_worker_cpu),
-                    int(continuous_worker_cpu),
-                }
-            ).difference(allowed_cpus)
-        )
-        if missing_cpus:
-            raise ValueError(
-                "requested position worker CPUs are outside this process affinity "
-                f"mask: missing={missing_cpus} allowed={list(allowed_cpus)}"
-            )
-        args.position_worker_cpu_affinity_allowed = allowed_cpus
-    args.position_worker_cpu_reservation_cpu_ids = ()
-    if bool(args.position_worker_cpu_reservation):
-        reservation_violations: list[str] = []
-        if reference_worker_cpu is None:
-            reservation_violations.append("--position-reference-worker-cpu is required")
-        if bool(args.position_continuous_waypoint_async_precompute):
-            if continuous_worker_cpu is None:
-                reservation_violations.append(
-                    "--position-continuous-waypoint-worker-cpu is required"
-                )
-            if continuous_worker_isolation != CONTINUOUS_WAYPOINT_WORKER_PROCESS:
-                reservation_violations.append(
-                    "--position-continuous-waypoint-worker-isolation process is required"
-                )
-        if reservation_violations:
-            raise ValueError(
-                "--position-worker-cpu-reservation requirements are not met: "
-                + "; ".join(reservation_violations)
-            )
-        assert args.position_worker_cpu_affinity_allowed is not None
-        reservation_cpu_ids: set[int] = set()
-        for worker_cpu in (reference_worker_cpu, continuous_worker_cpu):
-            if worker_cpu is None:
-                continue
-            reservation_cpu_ids.update(
-                int(cpu)
-                for cpu in cpu_thread_sibling_ids(int(worker_cpu))
-                if int(cpu) in args.position_worker_cpu_affinity_allowed
-            )
-        args.position_worker_cpu_reservation_cpu_ids = tuple(
-            sorted(reservation_cpu_ids)
-        )
-    if bool(args.send_actions) and bool(
-        args.position_continuous_waypoint_experimental_admission
-    ):
-        raise ValueError(
-            "continuous C2 waypoint admission is not authorized for real "
-            "hardware dispatch: the 2026-08-08 full-runtime trace exceeded "
-            "the authoritative 60 Hz deadline. Use formal_third_order for "
-            "--send-actions; re-authorize C2 only after isolated real-executor "
-            "deadline soak passes."
-        )
     observation_firewall_mode = (
         str(getattr(args, "policy_observation_firewall_mode", "strict")).strip().lower()
     )
