@@ -81,6 +81,19 @@ def _parse_virtual_teleop_args(argv: list[str]):
         return virtual_teleop.parse_args()
 
 
+def test_gripper_warmup_probe_tracks_explicit_cli_override() -> None:
+    defaults = _parse_real_teleop_args([])
+    enabled = _parse_real_teleop_args(["--gripper-warmup-probe"])
+    disabled = _parse_real_teleop_args(["--no-gripper-warmup-probe"])
+
+    assert defaults.gripper_warmup_probe is True
+    assert defaults._gripper_warmup_probe_explicit is False
+    assert enabled.gripper_warmup_probe is True
+    assert enabled._gripper_warmup_probe_explicit is True
+    assert disabled.gripper_warmup_probe is False
+    assert disabled._gripper_warmup_probe_explicit is True
+
+
 def test_deploy_position_target_admission_defaults_nonblocking_with_rollback() -> None:
     default_args = _parse_deploy_args([])
     rollback_args = _parse_deploy_args(

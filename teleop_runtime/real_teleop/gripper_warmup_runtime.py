@@ -56,8 +56,24 @@ def build_gripper_warmup_probe_runtime(
         "results": {},
     }
 
+    def partial_progress_entry_requires_passive_grippers() -> bool:
+        if bool(getattr(args, "_gripper_warmup_probe_explicit", False)):
+            return False
+        profile = getattr(args, "collection_progress_profile", None)
+        initial_step_id = str(getattr(profile, "initial_step_id", "") or "").strip()
+        entry_step_id = str(
+            getattr(args, "collection_progress_entry_step", "") or ""
+        ).strip()
+        return bool(
+            initial_step_id
+            and entry_step_id
+            and entry_step_id != initial_step_id
+        )
+
     def configured_gripper_backends() -> list[tuple[str, object]]:
         if not bool(getattr(args, "gripper_warmup_probe", True)):
+            return []
+        if partial_progress_entry_requires_passive_grippers():
             return []
         return [
             (side, backend)
@@ -192,7 +208,10 @@ def build_gripper_warmup_probe_runtime(
 
         def cancelled() -> bool:
             with gripper_warmup_probe_lock:
-                return int(gripper_warmup_probe_generation) != generation
+                stale_generation = (
+                    int(gripper_warmup_probe_generation) != generation
+                )
+            return stale_generation or not gripper_warmup_probe_enabled()
 
         def worker() -> None:
             nonlocal gripper_warmup_probe_state

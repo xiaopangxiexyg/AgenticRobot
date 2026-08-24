@@ -1932,6 +1932,51 @@ def test_gripper_warmup_runtime_never_moves_profile_fixed_side() -> None:
     assert called_sides == ["right"]
 
 
+def test_gripper_warmup_runtime_keeps_partial_entry_grippers_passive_by_default() -> None:
+    called_sides: list[str] = []
+    backend = SimpleNamespace(config=SimpleNamespace(connect_hardware=True))
+    args = SimpleNamespace(
+        gripper_warmup_probe=True,
+        _gripper_warmup_probe_explicit=False,
+        collection_progress_profile=SimpleNamespace(
+            initial_step_id="right_acquire_brush",
+        ),
+        collection_progress_entry_step="right_write",
+        gripper_warmup_probe_tolerance=0.18,
+        gripper_warmup_probe_step_timeout_sec=0.01,
+        gripper_warmup_probe_settle_sec=0.0,
+        gripper_warmup_probe_poll_sec=0.01,
+    )
+    components_snapshot = SimpleNamespace(active_sides=("left", "right"))
+
+    def run_probe(side: str, _backend: object, **_kwargs: object) -> dict[str, object]:
+        called_sides.append(side)
+        return {"ok": True, "reconnected": False}
+
+    probe = gripper_warmup_runtime.build_gripper_warmup_probe_runtime(
+        args,
+        components_snapshot,
+        gripper_backend_for_side=lambda _components, _side: backend,
+        run_probe_for_side=run_probe,
+        safe_float_value=lambda value: None if value is None else float(value),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    assert not probe.enabled()
+    assert probe.start(1.0, reason="partial_entry") == (
+        True,
+        "gripper warmup probe 未启用。",
+    )
+    assert called_sides == []
+
+    args.collection_progress_entry_step = "right_acquire_brush"
+    assert probe.enabled()
+
+    args.collection_progress_entry_step = "right_write"
+    args._gripper_warmup_probe_explicit = True
+    assert probe.enabled()
+
+
 def test_recording_admission_keeps_fail_closed_check_order() -> None:
     args = SimpleNamespace(
         no_camera=True,
