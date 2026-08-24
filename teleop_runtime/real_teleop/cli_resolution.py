@@ -186,6 +186,13 @@ def _parse_real_teleop_args(
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     raw_arg_set = set(raw_argv)
+    args._gripper_warmup_probe_explicit = bool(
+        {
+            "--gripper-warmup-probe",
+            "--no-gripper-warmup-probe",
+        }
+        & raw_arg_set
+    )
     if bool(getattr(args, "no_debug_disk_write", False)):
         args.control_debug = "off"
         args.actuator_trace = False
