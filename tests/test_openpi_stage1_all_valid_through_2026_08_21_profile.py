@@ -127,13 +127,13 @@ def test_through_2026_08_21_profile_totals_are_derived_from_sources() -> None:
     )
     assert Path(profile["openpi_checkout"]) == (
         Path("/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1")
-        / "code-final5/AgenticRobot/model/openpi"
+        / "code-final6/AgenticRobot/model/openpi"
     )
     assert profile["openpi_source_revision"] == (
         "97b3720515b18e94697573ba55caa6c1bc28af69"
     )
     assert profile["openpi_source_identity_sha256"] == (
-        "ba05187ba874439761dbb9ac464a2a11d0a0007a07ceac1d8462073f1f7a7fdf"
+        "17bb5ec5529c2cbbf7f9b0b0b61f30ea53b2d2fc671b7e8874a56491f5130442"
     )
     background = profile["openpi_wrist_background_augmentation"]
     assert background["original_probability"] == 0.1
@@ -268,23 +268,69 @@ def test_openpi_checkout_activation_rejects_revision_drift(
         )
 
 
+@pytest.mark.parametrize("package_name", ("openpi", "openpi_client"))
 def test_openpi_checkout_activation_rejects_foreign_loaded_package(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    package_name: str,
 ) -> None:
     checkout = tmp_path / "openpi"
     (checkout / "src/openpi").mkdir(parents=True)
-    foreign = tmp_path / "foreign/openpi/__init__.py"
+    foreign = tmp_path / f"foreign/{package_name}/__init__.py"
     foreign.parent.mkdir(parents=True)
     foreign.write_text("", encoding="utf-8")
     monkeypatch.setitem(
         sys.modules,
-        "openpi",
+        package_name,
         SimpleNamespace(__file__=str(foreign)),
     )
 
     with pytest.raises(RuntimeError, match="outside the profile checkout"):
         _activate_openpi_checkout({"openpi_checkout": str(checkout)})
+
+
+def test_openpi_checkout_activation_rejects_client_contract_drift(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "openpi"
+    config_path = checkout / "src/openpi/training/config.py"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("", encoding="utf-8")
+    client_contract = (
+        checkout
+        / "packages/openpi-client/src/openpi_client/history_state_contract.py"
+    )
+    client_contract.parent.mkdir(parents=True)
+    client_contract.write_text("contract = 'actual'\n", encoding="utf-8")
+    identity_path = checkout / "OPENPI_SOURCE_IDENTITY.json"
+    identity_path.write_text(
+        json.dumps(
+            {
+                "schema": "dexteleop.openpi_source_identity.v1",
+                "revision": "expected-revision",
+                "workspace_source_roots": [
+                    "src",
+                    "packages/openpi-client/src",
+                ],
+                "training_config_sha256": hashlib.sha256(
+                    config_path.read_bytes()
+                ).hexdigest(),
+                "openpi_client_history_state_contract_sha256": "wrong",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="client contract content differs"):
+        _activate_openpi_checkout(
+            {
+                "openpi_checkout": str(checkout),
+                "openpi_source_revision": "expected-revision",
+                "openpi_source_identity_sha256": hashlib.sha256(
+                    identity_path.read_bytes()
+                ).hexdigest(),
+            }
+        )
 
 
 def test_source_partitioned_final_masks_bind_before_pipeline_open(

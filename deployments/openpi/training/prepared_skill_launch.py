@@ -151,6 +151,7 @@ def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
     if not (source_root / "openpi").is_dir():
         raise FileNotFoundError(f"OpenPI checkout is missing: {checkout}.")
 
+    source_roots = (source_root,)
     expected_revision = str(profile.get("openpi_source_revision") or "").strip()
     if expected_revision:
         identity_path = checkout / OPENPI_SOURCE_IDENTITY_FILENAME
@@ -190,8 +191,50 @@ def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
                 f"source identity: {checkout}."
             )
 
+        declared_source_roots = identity.get("workspace_source_roots")
+        if not isinstance(declared_source_roots, list) or not declared_source_roots:
+            raise ValueError(
+                "Pinned OpenPI source identity must declare workspace_source_roots."
+            )
+        resolved_source_roots: list[Path] = []
+        for value in declared_source_roots:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    "Pinned OpenPI workspace source roots must be non-empty strings."
+                )
+            resolved = (checkout / value).resolve()
+            if not resolved.is_relative_to(checkout) or not resolved.is_dir():
+                raise ValueError(
+                    "Pinned OpenPI workspace source root is invalid: "
+                    f"{value!r}."
+                )
+            resolved_source_roots.append(resolved)
+        if source_root not in resolved_source_roots:
+            raise ValueError(
+                "Pinned OpenPI workspace source roots must include src."
+            )
+        source_roots = tuple(resolved_source_roots)
+
+        client_contract = (
+            checkout
+            / "packages/openpi-client/src/openpi_client/history_state_contract.py"
+        )
+        declared_client_contract_sha256 = str(
+            identity.get("openpi_client_history_state_contract_sha256") or ""
+        )
+        if not client_contract.is_file() or declared_client_contract_sha256 != (
+            hashlib.sha256(client_contract.read_bytes()).hexdigest()
+        ):
+            raise ValueError(
+                "OpenPI client contract content differs from its pinned "
+                f"source identity: {checkout}."
+            )
+
     for name, module in tuple(sys.modules.items()):
-        if name != "openpi" and not name.startswith("openpi."):
+        if not (
+            name in {"openpi", "openpi_client"}
+            or name.startswith(("openpi.", "openpi_client."))
+        ):
             continue
         module_file = getattr(module, "__file__", None)
         if module_file is None:
@@ -202,13 +245,14 @@ def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
                 f"{name}={module_file}. Start a fresh training process."
             )
 
-    source_text = str(source_root)
+    source_texts = tuple(str(path) for path in source_roots)
+    source_text_set = set(source_texts)
     sys.path[:] = [
-        source_text,
+        *source_texts,
         *(
             item
             for item in sys.path
-            if str(Path(item or ".").resolve()) != source_text
+            if str(Path(item or ".").resolve()) not in source_text_set
         ),
     ]
     training_config = importlib.import_module("openpi.training.config")
@@ -217,6 +261,15 @@ def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
         raise RuntimeError(
             "OpenPI training config was imported from outside the profile "
             f"checkout: {module_file}."
+        )
+    client_contract_module = importlib.import_module(
+        "openpi_client.history_state_contract"
+    )
+    client_module_file = Path(str(client_contract_module.__file__)).resolve()
+    if not client_module_file.is_relative_to(checkout):
+        raise RuntimeError(
+            "OpenPI client contract was imported from outside the profile "
+            f"checkout: {client_module_file}."
         )
     return training_config
 
