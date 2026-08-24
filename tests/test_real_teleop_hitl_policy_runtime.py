@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import queue
 from types import SimpleNamespace
 
@@ -10,12 +12,27 @@ from dataset_contracts.hitl import (
     ExclusiveHITLSampleLineage,
     exclusive_hitl_policy_artifact_contract_hash,
 )
+from dataset_contracts.policy_artifact import (
+    PolicyArtifactContract,
+    PolicyCameraInputContract,
+)
+from dataset_contracts.pose_chunk import PoseActionChunkContract
+from dataset_contracts.pose_training import PoseTrainingDataContract
+from dataset_contracts.v22 import PolicyIOLayout
+from deployments.openpi.client.normalization import (
+    make_openpi_quantile_normalization_contract,
+)
 from robot_motion.action import BIMANUAL_QPOS_V1, RobotAction
 from robot_motion.deploy import NormalizedAction, PolicyActionEmission
 from robot_motion.deploy.runtime import SourceValidationResult
+from robot_motion.pose_frame_profiles import (
+    default_rm65_workspace_near_boundary_collection_pose_frame_contract,
+    default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
+)
 from teleop_runtime.real_teleop.hitl_policy_runtime import (
     ExclusiveHITLPolicyCommandSelector,
     build_exclusive_hitl_dataset_contract,
+    preflight_normal_hitl_policy_source,
 )
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand, TeleopObservation
 
@@ -105,6 +122,78 @@ class _PolicySource:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _write_prepared_policy_artifact(path: Path) -> Path:
+    collection_pose_contract = (
+        default_rm65_workspace_near_boundary_collection_pose_frame_contract(
+            ("left", "right")
+        )
+    )
+    assert collection_pose_contract is not None
+    artifact = PolicyArtifactContract(
+        policy_io_layout=PolicyIOLayout.legacy_v21_q6(),
+        model_id="hitl-runtime-pose-fixture",
+        checkpoint_step=50_176,
+        dataset_schema="dexteleop_dataset_v2.3",
+        camera_input=PolicyCameraInputContract(inputs=(), required=False),
+        pose_action_chunk=PoseActionChunkContract(
+            action_horizon=8,
+            action_pose_mode="absolute",
+        ),
+        pose_training_data=PoseTrainingDataContract.native_v23(),
+        pose_frame_contract_hashes=(collection_pose_contract.contract_hash,),
+        metadata={
+            "normalization_contract": make_openpi_quantile_normalization_contract(
+                stats_ref="norm_stats.json",
+                stats_hash="sha256:" + "1" * 64,
+            )
+        },
+    )
+    path.write_text(json.dumps(artifact.to_dict()), encoding="utf-8")
+    return path
+
+
+def test_normal_preflight_separates_collection_storage_from_runtime_pose(
+    tmp_path: Path,
+) -> None:
+    collection_pose_contract = (
+        default_rm65_workspace_near_boundary_collection_pose_frame_contract(
+            ("left", "right")
+        )
+    )
+    assert collection_pose_contract is not None
+    args = SimpleNamespace(
+        _hitl_policy_emission_source=None,
+        hitl_policy_artifact_json=str(
+            _write_prepared_policy_artifact(tmp_path / "policy_artifact.json")
+        ),
+        no_collection=False,
+        no_camera=False,
+        pose_frame_contract=collection_pose_contract,
+        active_sides=("left", "right"),
+        hitl_policy_chunk_execution_steps=0,
+        hitl_openpi_host="127.0.0.1",
+        hitl_openpi_port=8000,
+        hitl_policy_prompt="",
+        hitl_policy_action_hz=15.0,
+        hitl_policy_inference_hz=15.0,
+        hitl_policy_prefetch_threshold=4,
+    )
+
+    config = preflight_normal_hitl_policy_source(args)
+
+    assert config is not None
+    assert args.pose_frame_contract is collection_pose_contract
+    assert collection_pose_contract.is_raw_storage is False
+    assert config.runtime_pose_frame_contract.is_raw_storage is True
+    assert config.runtime_pose_frame_contract.contract_hash == (
+        default_rm65_workspace_near_boundary_runtime_pose_frame_contract().contract_hash
+    )
+    assert (
+        config.runtime_pose_frame_contract.source.config_hash
+        == collection_pose_contract.source.config_hash
+    )
 
 
 def test_normal_dataset_contract_binds_artifact_and_scheduling_identity() -> None:
