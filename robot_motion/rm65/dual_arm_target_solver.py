@@ -57,6 +57,10 @@ from robot_motion.runtime import EffectorCommand, Retargeter, TeleopCommand, Tel
 from robot_motion.tcp import HAND_BASE_TCP_FRAME, canonical_tcp_frame
 from robot_motion.transforms import as_pose_matrix, interpolate_pose, invert_pose
 
+from .dual_arm_solver.candidate_model import (
+    _DualArmCandidate,
+    _DualArmEvaluatedCandidate,
+)
 from .dual_arm_solver.geometry import (
     arm_joint_entries,
     arm_joint_indices,
@@ -110,16 +114,6 @@ def _normalize_ik_framework(value: object) -> str:
 
 
 @dataclass(frozen=True)
-class _DualArmCandidate:
-    name: str
-    qpos: np.ndarray
-    source: str
-    method: str
-    raw_score_deg: float = 0.0
-    metadata: dict[str, object] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
 class DualArmQposCollisionCheck:
     """Read-only endpoint check for a concrete pair of arm joint targets."""
 
@@ -128,14 +122,6 @@ class DualArmQposCollisionCheck:
     min_distance_m: float | None = None
     collision_pair_count: int = 0
     required_min_distance_m: float = 0.0
-
-
-@dataclass(frozen=True)
-class _DualArmEvaluatedCandidate:
-    candidate: _DualArmCandidate
-    output_qpos: np.ndarray
-    score: float
-    metadata: dict[str, object]
 
 
 def _optional_qpos(value: Sequence[float] | np.ndarray | None) -> np.ndarray | None:
