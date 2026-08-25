@@ -499,16 +499,6 @@ def persist_five_pedal_test_receipt() -> Path:
     return receipt_path
 
 
-def _require_supported_foot_pad_config() -> tuple[Any, int]:
-    config_path, count = _load_foot_pad_config()
-    if count not in FOOT_PAD_SUPPORTED_COUNTS:
-        raise FootPadUnavailableError(
-            f"foot-pad config {config_path} has {count} pedals; "
-            "teleop supports only 2, 4, or 5"
-        )
-    return config_path, count
-
-
 def _sysfs_input_device_name(event_path: str | os.PathLike[str]) -> str:
     """Read an event node's kernel name without opening the protected node."""
 

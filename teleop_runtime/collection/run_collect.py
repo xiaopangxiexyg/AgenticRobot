@@ -1253,10 +1253,6 @@ def _print_standby(app: CollectApp) -> None:
     print("=" * 100)
 
 
-def _compact_log_value(value: object, *, max_chars: int = 90) -> str:
-    return _snapshot_compact_log_value(value, max_chars=max_chars)
-
-
 def _qpos_or_none(value: Any) -> np.ndarray | None:
     if value is None:
         return None

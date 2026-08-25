@@ -8,7 +8,6 @@ import numpy as np
 
 from dataset_contracts.arm_mode import (
     ARM_MODE_IDS,
-    ARM_MODE_ID_TO_LABEL,
     ARM_MODE_SCHEMA,
 )
 from robot_motion.pose import pose_delta_metrics

@@ -99,7 +99,6 @@ _SUPPORT_NAMES = (
     "_gui_current_active_controls",
     "_gui_episode_busy",
     "_gui_episode_controls",
-    "_gui_episode_countdown_controls",
     "_gui_finalizing_controls",
     "_gui_fix_arm_controls",
     "_gui_fix_init_allowed_in_controls",
@@ -108,7 +107,6 @@ _SUPPORT_NAMES = (
     "_gui_movement_multiple_controls",
     "_gui_pose_snapshot_controls",
     "_gui_pre_home_controls",
-    "_gui_recording_controls",
     "_gui_single_arm_tracker_swap_allowed_in_hold",
     "_gui_teleop_controls",
     "_gui_visualization_controls",
@@ -600,11 +598,6 @@ class RealTeleopControlInput:
             and self._foot_pad_count() in {2, 4, 5}
         )
 
-    def _manual_special_arm_controls_enabled(self) -> bool:
-        """Foot pads never take ownership away from keyboard/GUI controls."""
-
-        return True
-
     def _foot_pad_count(self) -> int:
         return int(getattr(getattr(self, "foot_pad_input", None), "foot_pad_count", 0) or 0)
 
@@ -908,13 +901,6 @@ class RealTeleopControlInput:
 
     def _fix_init_allowed_in_controls(self) -> bool:
         return _gui_fix_init_allowed_in_controls(self._gui_control_state())
-
-    def _recording_controls(self, *, hold: bool = False) -> list[str]:
-        return _gui_recording_controls(
-            self._gui_control_state(),
-            self._gui_events(),
-            hold=hold,
-        )
 
     def _finalizing_controls(self) -> list[str]:
         return _gui_finalizing_controls(self._gui_control_state())
@@ -3529,11 +3515,6 @@ class RealTeleopControlInput:
         self._two_pedal_post_home_fixed_side = None
         return side
 
-    def _request_runtime_home_calibration_from_gui(self) -> None:
-        if self.ui is None:
-            return
-        self._request_calibration_with_tracker_side_guard(source="gui")
-
     def _publish_movement_multiple(self, *, message: str = "") -> None:
         if self.ui is None:
             return
@@ -4448,12 +4429,6 @@ class RealTeleopControlInput:
 
     def gripper_control_enabled(self) -> bool:
         return bool(self._gripper_control_enabled and _has_q6_gripper_control(self.components))
-
-    def _episode_countdown_controls(self) -> list[str]:
-        return _gui_episode_countdown_controls(
-            self._gui_control_state(),
-            self._gui_events(),
-        )
 
     def _poll_q6_hold_recalibration_gesture(self, *, now: float) -> None:
         gesture = self._q6_hold_recalibration_gesture
