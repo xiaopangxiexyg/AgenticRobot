@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from agent_gateway.protocol.skill_catalog import (
@@ -77,6 +77,9 @@ REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1 = (
 )
 REAL_AGENT_TCP_CARDINAL_STEP_PARAMETER_PROFILE_ID_V1 = (
     "real-tool-tcp-cardinal-short-step-v1"
+)
+REAL_AGENT_PUBLIC_TCP_POSE_SCHEMA_HASH_DOMAIN_V1 = (
+    "dexteleop.real_agent_motion.public_tcp_pose_schema.v1"
 )
 REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1 = {
     skill_id: (
@@ -466,10 +469,49 @@ class RealAgentPrimitiveContractBundle:
             )
         for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
             self.route_manifest.route(skill_id, "1")
-        if self.route_manifest.skill_io_catalog_hash != self.io_catalog.semantic_content_hash:
+        if (
+            self.route_manifest.skill_io_catalog_hash
+            != self.io_catalog.semantic_content_hash
+        ):
             raise ValueError("Real primitive bundle I/O catalog mismatch.")
         if self.tcp_pose_observe.attachment != self.attachment:
             raise ValueError("Real primitive and TCP-pose attachments disagree.")
+        public_frame = (
+            self.attachment.reference_frame_id,
+            self.attachment.reference_frame_spec_hash,
+        )
+        profile_public_frame = (
+            self.cardinal_profile.reference_frame_id,
+            self.cardinal_profile.reference_frame_spec_hash,
+        )
+        if public_frame != profile_public_frame:
+            raise ValueError("Real primitive public Station-frame binding mismatch.")
+        execution_frame = (
+            self.attachment.execution_reference_frame_id,
+            self.attachment.execution_reference_frame_spec_hash,
+        )
+        profile_execution_frame = (
+            self.cardinal_profile.execution_reference_frame_id,
+            self.cardinal_profile.execution_reference_frame_spec_hash,
+        )
+        if execution_frame != profile_execution_frame:
+            raise ValueError("Real primitive lower execution-frame binding mismatch.")
+        if any(
+            (
+                profile.reference_frame_id,
+                profile.reference_frame_spec_hash,
+            )
+            != public_frame
+            or (
+                profile.execution_reference_frame_id,
+                profile.execution_reference_frame_spec_hash,
+            )
+            != execution_frame
+            for profile in self.orientation_profiles
+        ):
+            raise ValueError("Real primitive profile frame bindings disagree.")
+        if self.attachment.frame_graph_hash != self.frame_graph.semantic_content_hash:
+            raise ValueError("Real primitive attachment frame graph mismatch.")
         expected_route_count = 11 + (
             2 if self.perception_capture is not None else 0
         )
@@ -649,25 +691,6 @@ def build_real_agent_primitive_contract_bundle(
         raise ValueError("Real primitive Routes require lower safety-envelope refs.")
     if attachment.frame_graph_hash != frame_graph.semantic_content_hash:
         raise ValueError("Attachment and primitive frame graph disagree.")
-    if attachment.reference_frame_id != port_config.execution_frame_id:
-        raise ValueError("Real observation must publish in the lower execution frame.")
-    if (
-        attachment.reference_frame_spec_hash
-        != port_config.execution_frame_spec_hash
-    ):
-        raise ValueError("Real observation execution-frame spec mismatch.")
-    if set(attachment.component_ids) != set(
-        port_config.component_id_by_side.values()
-    ):
-        raise ValueError("Observation and motion-port component sets disagree.")
-    if len(attachment.component_ids) != 1:
-        raise ValueError("The v1 real primitive profile binds exactly one arm component.")
-    component_id = attachment.component_ids[0]
-    side = next(
-        side
-        for side, bound_component in port_config.component_id_by_side.items()
-        if bound_component == component_id
-    )
     primitive_frame_id = _required(
         primitive_reference_frame_id,
         field_name="primitive_reference_frame_id",
@@ -683,6 +706,87 @@ def build_real_agent_primitive_contract_bundle(
         raise ValueError(
             "Primitive reference frame must declare the canonical Station axis contract."
         )
+    try:
+        execution_frame = frame_graph.frame_by_id[port_config.execution_frame_id]
+    except KeyError as exc:
+        raise ValueError("Lower execution frame is absent from the graph.") from exc
+    if (
+        execution_frame.semantic_content_hash
+        != port_config.execution_frame_spec_hash
+    ):
+        raise ValueError("Motion-port execution-frame spec is not the graph member.")
+    if (
+        attachment.execution_reference_frame_id
+        != port_config.execution_frame_id
+    ):
+        raise ValueError("Real observation execution_frame_id mismatch.")
+    if (
+        attachment.execution_reference_frame_spec_hash
+        != port_config.execution_frame_spec_hash
+    ):
+        raise ValueError("Real observation execution-frame spec mismatch.")
+
+    # Compatibility for already-reviewed composition callers that predate the
+    # public/execution split: they described the lower execution frame in the
+    # old public fields.  Upgrade only that exact legacy shape.  Any other
+    # public-frame mismatch remains fail-closed.
+    if attachment.reference_frame_id == port_config.execution_frame_id:
+        if (
+            attachment.reference_frame_spec_hash
+            != port_config.execution_frame_spec_hash
+        ):
+            raise ValueError("Legacy real observation execution-frame spec mismatch.")
+        attachment = replace(
+            attachment,
+            reference_frame_id=primitive_frame.frame_id,
+            reference_frame_spec_hash=primitive_frame.semantic_content_hash,
+            pose_schema_hash=canonical_content_hash(
+                {
+                    "representation": "cartesian_pose",
+                    "layout": "xyz_quat_xyzw",
+                    "quaternion_order": "xyzw",
+                    "reference_frame_id": primitive_frame.frame_id,
+                    "reference_frame_spec_hash": (
+                        primitive_frame.semantic_content_hash
+                    ),
+                    "controlled_frame_id": "tool_tcp",
+                    "frame_graph_hash": frame_graph.semantic_content_hash,
+                    "execution_pose_schema_hash": attachment.pose_schema_hash,
+                    "projection": "T_public_execution@T_execution_tool_tcp",
+                },
+                domain=REAL_AGENT_PUBLIC_TCP_POSE_SCHEMA_HASH_DOMAIN_V1,
+            ),
+            execution_reference_frame_id=port_config.execution_frame_id,
+            execution_reference_frame_spec_hash=(
+                port_config.execution_frame_spec_hash
+            ),
+        )
+    elif attachment.reference_frame_id != primitive_frame.frame_id:
+        raise ValueError(
+            "Real observation public frame must be the primitive Station frame."
+        )
+    elif (
+        attachment.reference_frame_spec_hash
+        != primitive_frame.semantic_content_hash
+    ):
+        raise ValueError("Real observation public Station-frame spec mismatch.")
+    frame_graph.resolve(
+        attachment.execution_reference_frame_id,
+        attachment.reference_frame_id,
+    )
+
+    if set(attachment.component_ids) != set(
+        port_config.component_id_by_side.values()
+    ):
+        raise ValueError("Observation and motion-port component sets disagree.")
+    if len(attachment.component_ids) != 1:
+        raise ValueError("The v1 real primitive profile binds exactly one arm component.")
+    component_id = attachment.component_ids[0]
+    side = next(
+        side
+        for side, bound_component in port_config.component_id_by_side.items()
+        if bound_component == component_id
+    )
     convergence = convergence_profile or RealAgentPrimitiveConvergenceProfile()
     tcp_pose_observe = build_real_tcp_pose_observe_contract_bundle(
         attachment,

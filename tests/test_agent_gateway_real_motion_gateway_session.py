@@ -51,6 +51,7 @@ from robot_motion.coordinate_frames import (
     RigidFrameTransformSpec,
 )
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
+from robot_motion.relative_action import xyzquat_to_pose_matrix
 from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.real_teleop.agent_motion_port import (
@@ -122,7 +123,13 @@ class _OwnerSession:
         return True
 
 
-def _runtime_fixture(*, exclusive_owner: bool = False):
+def _runtime_fixture(
+    *,
+    exclusive_owner: bool = False,
+    station_from_execution: np.ndarray | None = None,
+):
+    if station_from_execution is None:
+        station_from_execution = np.eye(4, dtype=float)
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
         frame_id="canonical_station",
@@ -136,7 +143,10 @@ def _runtime_fixture(*, exclusive_owner: bool = False):
                 transform_id="solver-world-to-station",
                 source_frame_id=execution_frame.frame_id,
                 target_frame_id=station_frame.frame_id,
-                matrix_target_source=tuple(tuple(row) for row in np.eye(4)),
+                matrix_target_source=tuple(
+                    tuple(row)
+                    for row in np.asarray(station_from_execution, dtype=float)
+                ),
             ),
         ),
         graph_version="1",
@@ -471,6 +481,77 @@ def test_real_gateway_reads_tcp_pose_without_consuming_motion_grant() -> None:
     )
     assert authorization.grant_issued is False
     assert port.snapshot().dispatch_count == 0
+
+
+def test_real_gateway_projects_solver_world_observation_into_station_axes() -> None:
+    station_from_execution = np.array(
+        [
+            [-1.0, 0.0, 0.0, 0.40],
+            [0.0, -1.0, 0.0, -0.10],
+            [0.0, 0.0, 1.0, 0.05],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    bundle, port, _ = _runtime_fixture(
+        station_from_execution=station_from_execution,
+    )
+    clock = _Clock()
+    execution_pose = np.eye(4, dtype=float)
+    execution_pose[:3, 3] = (0.10, 0.20, 0.30)
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: execution_pose},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:nonidentity-frame",),
+    )
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(bundle, captured_at=clock()),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+
+    snapshot = gateway.observation_producer.capture_snapshot(
+        active_operation_id=None,
+    )
+    summary = snapshot.measurement_summary
+    assert summary["reference_frame_id"] == "canonical_station"
+    assert summary["execution_reference_frame_id"] == "dual_arm_solver_world"
+    snapshot_pose = xyzquat_to_pose_matrix(
+        summary["pose_xyz_quat_xyzw_by_component"][COMPONENT_ID],
+        name="test_real_gateway_station_snapshot_pose",
+    )
+    np.testing.assert_allclose(
+        snapshot_pose,
+        station_from_execution @ execution_pose,
+        rtol=0.0,
+        atol=1e-7,
+    )
+
+    read = gateway.observation_producer.read_tcp_pose(
+        active_operation_id="real-read:station-frame",
+        parameters={
+            "component_ids": [COMPONENT_ID],
+            "reference_frame_id": bundle.attachment.reference_frame_id,
+            "controlled_frame_id": "tool_tcp",
+            "max_measurement_age_ms": (
+                bundle.attachment.max_measurement_age_ms
+            ),
+        },
+    )
+    assert read.execution_result["reference_frame_id"] == "canonical_station"
+    read_pose = xyzquat_to_pose_matrix(
+        read.execution_result["pose_by_component"][COMPONENT_ID],
+        name="test_real_gateway_station_read_pose",
+    )
+    np.testing.assert_allclose(
+        read_pose,
+        station_from_execution @ execution_pose,
+        rtol=0.0,
+        atol=1e-7,
+    )
 
 
 def test_republishing_one_measured_cut_uses_freshness_in_snapshot_identity() -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -113,6 +115,20 @@ def _bundle():
 def test_real_bundle_exposes_read_diagnostic_and_fixed_motion_primitives() -> None:
     bundle = _bundle()
 
+    assert bundle.attachment.reference_frame_id == "canonical_station"
+    assert (
+        bundle.attachment.reference_frame_spec_hash
+        == bundle.cardinal_profile.reference_frame_spec_hash
+    )
+    assert (
+        bundle.attachment.execution_reference_frame_id
+        == "dual_arm_solver_world"
+    )
+    assert (
+        bundle.attachment.execution_reference_frame_spec_hash
+        == bundle.cardinal_profile.execution_reference_frame_spec_hash
+    )
+    assert bundle.tcp_pose_observe.attachment is bundle.attachment
     assert len(bundle.route_manifest.skill_routes) == 11
     assert len(bundle.cardinal_profile.primitives) == 6
     assert {
@@ -137,6 +153,24 @@ def test_real_bundle_exposes_read_diagnostic_and_fixed_motion_primitives() -> No
         assert route.requires_deadman is False
         assert route.cancellation_policy == "hold_on_cancel_disconnect_or_timeout"
         assert entry.deployment_binding.safety_envelope_refs
+
+
+def test_legacy_execution_frame_attachment_gets_a_public_station_pose_schema() -> None:
+    attachment, port_config, graph, envelope = _inputs()
+    bundle = build_real_agent_primitive_contract_bundle(
+        attachment=attachment,
+        port_config=port_config,
+        frame_graph=graph,
+        primitive_reference_frame_id="canonical_station",
+        safety_envelope_refs=(envelope,),
+    )
+
+    assert bundle.attachment.pose_schema_hash != attachment.pose_schema_hash
+    assert bundle.attachment.reference_frame_id == "canonical_station"
+    assert (
+        bundle.attachment.execution_reference_frame_id
+        == attachment.reference_frame_id
+    )
 
 
 def test_real_cardinal_payload_is_exact_and_selects_all_six_primitives() -> None:
@@ -188,6 +222,36 @@ def test_real_contract_refuses_missing_or_unbound_lower_safety_envelope() -> Non
         build_real_agent_primitive_contract_bundle(
             **kwargs,
             safety_envelope_refs=(unbound,),
+        )
+
+
+def test_real_contract_refuses_an_explicit_nonstation_public_frame() -> None:
+    attachment, port_config, graph, envelope = _inputs()
+    alternate = CoordinateFrameSpec(frame_id="alternate_public_frame")
+    extended_graph = CoordinateFrameGraph(
+        graph_id=graph.graph_id,
+        graph_version=graph.graph_version,
+        frames=(*graph.frames, alternate),
+        transforms=graph.transforms,
+    )
+    explicit_mismatch = replace(
+        attachment,
+        reference_frame_id=alternate.frame_id,
+        reference_frame_spec_hash=alternate.semantic_content_hash,
+        execution_reference_frame_id=port_config.execution_frame_id,
+        execution_reference_frame_spec_hash=(
+            port_config.execution_frame_spec_hash
+        ),
+        frame_graph_hash=extended_graph.semantic_content_hash,
+    )
+
+    with pytest.raises(ValueError, match="public frame must be the primitive Station"):
+        build_real_agent_primitive_contract_bundle(
+            attachment=explicit_mismatch,
+            port_config=port_config,
+            frame_graph=extended_graph,
+            primitive_reference_frame_id="canonical_station",
+            safety_envelope_refs=(envelope,),
         )
 
 

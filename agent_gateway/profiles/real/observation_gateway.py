@@ -166,7 +166,15 @@ def _pose_by_component(
 
 @dataclass(frozen=True)
 class RealTcpPoseObserveAttachmentSpec:
-    """Exact deployment identities for one embodiment-neutral adapter."""
+    """Exact deployment identities for one embodiment-neutral adapter.
+
+    ``reference_frame_*`` is the public frame published to an Agent.  The
+    optional ``execution_reference_frame_*`` pair names the lower frame in
+    which measured poses arrive.  Legacy observe-only attachments omit the
+    pair and therefore use one frame for both roles; real primitive assembly
+    upgrades that legacy shape only when the old public frame is exactly the
+    bound lower execution frame.
+    """
 
     runtime_session_id: str
     control_domain_id: str
@@ -190,6 +198,8 @@ class RealTcpPoseObserveAttachmentSpec:
     calibration_hash: str
     clock_domain_id: str
     producer_epoch: int
+    execution_reference_frame_id: str | None = None
+    execution_reference_frame_spec_hash: str | None = None
     max_measurement_age_ms: int = REAL_TCP_POSE_STATE_MAX_MEASUREMENT_AGE_MS_V1
 
     def __post_init__(self) -> None:
@@ -224,6 +234,32 @@ class RealTcpPoseObserveAttachmentSpec:
             self,
             "component_ids",
             _component_ids(self.component_ids, field_name="component_ids"),
+        )
+        execution_frame_id = self.execution_reference_frame_id
+        execution_frame_spec_hash = self.execution_reference_frame_spec_hash
+        if (execution_frame_id is None) != (execution_frame_spec_hash is None):
+            raise ValueError(
+                "execution_reference_frame_id and "
+                "execution_reference_frame_spec_hash must be provided together."
+            )
+        if execution_frame_id is None:
+            execution_frame_id = self.reference_frame_id
+            execution_frame_spec_hash = self.reference_frame_spec_hash
+        object.__setattr__(
+            self,
+            "execution_reference_frame_id",
+            _required(
+                execution_frame_id,
+                field_name="execution_reference_frame_id",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "execution_reference_frame_spec_hash",
+            _required(
+                execution_frame_spec_hash,
+                field_name="execution_reference_frame_spec_hash",
+            ),
         )
         if (
             isinstance(self.producer_epoch, bool)
