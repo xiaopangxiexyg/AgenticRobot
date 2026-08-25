@@ -10,7 +10,7 @@ GUI coordinator requires reviewing its ownership and side effects.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import inspect
 
 from ..collection.episode_curation import EpisodeCurationSession
@@ -324,6 +324,7 @@ class RealTeleopControlInput:
         self._camera_depth_monitor = WristDepthFreshnessMonitor()
         self._episode_start_requested = False
         self._episode_stop_requested = False
+        self._dataset_reconfigure_callback: Callable[[], None] | None = None
         self._progress_operator_intents: deque[ProgressMutationCommand] = deque()
         self._progress_profile_selection_intents: deque[
             ProgressProfileSelectionCommand
@@ -3812,6 +3813,18 @@ class RealTeleopControlInput:
             except ValueError as exc:
                 return reject(f"Plus 变体选择无效：{exc}")
         self._apply_current_gripper_task_policy()
+        if self._dataset_reconfigure_callback is not None:
+            try:
+                # Dataset/task selection is admitted while idle.  If a live
+                # recorder exists, rebuild it now so the next countdown sees
+                # the selected path/modality contract rather than deferring a
+                # stale writer until the operator presses Start again.
+                self._dataset_reconfigure_callback()
+            except Exception as exc:  # noqa: BLE001 - restore the full draft.
+                return reject(
+                    "数据集 writer 未能按新配置重建，原配置保持不变："
+                    f"{type(exc).__name__}: {exc}"
+                )
         if self.ui is not None:
             self.ui.publish(
                 **_collection_task_ui_state(self.args),
@@ -3988,6 +4001,16 @@ class RealTeleopControlInput:
         requested = bool(self._episode_stop_requested)
         self._episode_stop_requested = False
         return bool(self.terminal.consume_episode_stop_request() or requested)
+
+    def bind_dataset_reconfigure_callback(
+        self,
+        callback: Callable[[], None] | None,
+    ) -> None:
+        """Bind the runtime-owned idle dataset/profile reconfiguration hook."""
+
+        if callback is not None and not callable(callback):
+            raise TypeError("dataset reconfigure callback must be callable or None")
+        self._dataset_reconfigure_callback = callback
 
     def build_progress_workflow(
         self,

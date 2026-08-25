@@ -207,8 +207,29 @@ bash scripts/run_formal_60hz_writing_collection.sh collect \
 launcher 默认保留 200 GiB 空闲空间，可用 `--tactile-min-free-gb` 显式调整。dataset 根目录
 和 task name 也可以分别用 `--dataset-root`、`--task-name` 覆盖；等价的环境变量是
 `TACTILE_BUNDLE_ROOT`、`TACTILE_BUNDLE_MIN_FREE_GB`、`DATASET_BASE` 和
-`COLLECTION_TASK_NAME`。正式启动前可在任一命令末尾追加 `--dry-run`，只打印完整解析结果，
+`COLLECTION_TASK_NAME`。task name 只决定正式 dataset 的任务名/目录名，不会隐式改变
+progress 语义；要选择三阶段或 detail 变体，应显式使用 launcher 的
+`--progress-profile` / `--stage-profile`，或设置 `COLLECTION_PROGRESS_PROFILE` /
+`COLLECTION_STAGE_PROFILE`。例如直接选择现有 detail 变体：
+
+```bash
+COLLECTION_TASK_NAME=3_stage_writing_detail \
+COLLECTION_PROGRESS_PROFILE=catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed \
+bash scripts/run_formal_60hz_writing_collection.sh collect \
+  --tactile-bundle-root /absolute/path/to/DexTeleopTactile --dry-run
+```
+
+launcher 会把 `*_detailed` catalog ref 展开为 coarse `--collection-progress-profile` 加
+匹配的 `--collection-stage-profile`，并在 dry-run/启动诊断中打印最终 task name、profile 和
+stage。若当前 shell 已经继承旧的 `COLLECTION_TASK_NAME`，写法
+`COLLECTION_TASK_NAME="${COLLECTION_TASK_NAME:-3_stage_writing_detail}"` 会保留旧值；
+需要强制改名时请直接写 `COLLECTION_TASK_NAME=3_stage_writing_detail` 或传
+`--task-name 3_stage_writing_detail`。正式启动前可在任一命令末尾追加 `--dry-run`，只打印完整解析结果，
 不会连接踏板、机械臂、相机、夹爪或触觉设备。
+
+正式 writer 的子进程 ready 握手不属于全局设备预检；它会在按下开始数采后，针对当前 dataset
+路径、task/profile 和模态合同一次性初始化。初始化失败只会拒绝本次数采并保留遥操/维护 GUI；
+重试会创建全新的 writer 子进程，不会复用已经失败的 `multiprocessing.Process`。
 
 需要临时降低 reserve 时，优先使用显式参数，例如
 `--tactile-min-free-gb 2`。Shell 写法

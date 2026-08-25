@@ -74,6 +74,38 @@ def build_episode_recording_runtime(
     _stop_episode_recording = support["_stop_episode_recording"]
     bind_capture_modality_contract = support["bind_capture_modality_contract"]
 
+    def construct_started_dataset_recorder() -> Any:
+        """Build one writer candidate and publish nothing until it is ready.
+
+        A process-backed collection worker owns a one-shot
+        ``multiprocessing.Process``.  If construction or the ready handshake
+        fails, that candidate is permanently unusable; retrying it would
+        surface ``AssertionError: cannot start a process twice``.  Keep the
+        candidate private through both start and device-config publication,
+        close it on every failure, and let the caller publish only a fully
+        usable recorder.
+        """
+
+        candidate = RealTeleopDatasetRecorder(
+            args=args,
+            components=components,
+            camera_sources=camera_sources,
+        )
+        try:
+            ensure_started = getattr(candidate, "ensure_started", None)
+            if callable(ensure_started):
+                ensure_started()
+            else:
+                candidate.start()
+            candidate.write_camera_device_config()
+        except BaseException:
+            try:
+                candidate.close()
+            except BaseException:
+                pass
+            raise
+        return candidate
+
     dataset_recorder = dataset_recorder_provider()
     camera_previewer = camera_previewer_provider()
     episode_last_state = episode_last_state_provider()
@@ -213,20 +245,25 @@ def build_episode_recording_runtime(
             and not bool(getattr(args, "no_collection", False))
         ):
             try:
-                dataset_recorder = RealTeleopDatasetRecorder(
-                    args=args,
-                    components=components,
-                    camera_sources=camera_sources,
-                )
-                set_dataset_recorder(dataset_recorder)
-                dataset_recorder.start()
-                dataset_recorder.write_camera_device_config()
+                candidate = construct_started_dataset_recorder()
+                dataset_recorder = candidate
+                set_dataset_recorder(candidate)
+                args.dataset_startup_error = ""
                 startup_device_errors.pop("dataset.writer", None)
                 publish_runtime_hardware_status()
             except Exception as exc:  # noqa: BLE001 - keep GUI/runtime available.
                 dataset_recorder = None
-                set_dataset_recorder(None)
+                try:
+                    set_dataset_recorder(None)
+                except Exception as detach_exc:  # noqa: BLE001 - preserve retry state.
+                    _log(
+                        "Dataset",
+                        "failed writer detach was not fully acknowledged by the "
+                        f"runtime provider: {type(detach_exc).__name__}: {detach_exc}",
+                        now=now,
+                    )
                 detail = f"{type(exc).__name__}: {exc}"
+                args.dataset_startup_error = detail
                 startup_device_errors["dataset.writer"] = detail
                 publish_runtime_hardware_status()
                 message = f"正式 dataset 当前不可用: {detail}"
@@ -459,33 +496,47 @@ def build_episode_recording_runtime(
                 )
                 return False
             try:
+                candidate_created = False
                 if dataset_recorder is None:
-                    dataset_recorder = RealTeleopDatasetRecorder(
-                        args=args,
-                        components=components,
-                        camera_sources=camera_sources,
-                    )
-                    set_dataset_recorder(dataset_recorder)
-                    dataset_recorder.start()
+                    candidate = construct_started_dataset_recorder()
+                    dataset_recorder = candidate
+                    set_dataset_recorder(candidate)
+                    candidate_created = True
                 else:
                     # Task/root/modality changes rebuild the recorder and
                     # therefore replace its actual-state poller.  Perform
                     # that replacement before warmup so the countdown gate
                     # observes the exact poller that will record the episode.
                     dataset_recorder.reconfigure_for_current_args()
-                dataset_recorder.write_camera_device_config()
+                    ensure_started = getattr(dataset_recorder, "ensure_started", None)
+                    if callable(ensure_started):
+                        ensure_started()
+                    else:
+                        dataset_recorder.start()
+                if not candidate_created:
+                    dataset_recorder.write_camera_device_config()
+                args.dataset_startup_error = ""
                 startup_device_errors.pop("dataset.writer", None)
                 publish_runtime_hardware_status()
             except Exception as exc:  # noqa: BLE001 - keep teleop available.
                 failed_recorder = dataset_recorder
                 dataset_recorder = None
-                set_dataset_recorder(None)
+                try:
+                    set_dataset_recorder(None)
+                except Exception as detach_exc:  # noqa: BLE001 - preserve retry state.
+                    _log(
+                        "Dataset",
+                        "failed writer detach was not fully acknowledged by the "
+                        f"runtime provider: {type(detach_exc).__name__}: {detach_exc}",
+                        now=now,
+                    )
                 if failed_recorder is not None:
                     try:
                         failed_recorder.close()
                     except Exception:
                         pass
                 detail = f"{type(exc).__name__}: {exc}"
+                args.dataset_startup_error = detail
                 startup_device_errors["dataset.writer"] = detail
                 publish_runtime_hardware_status()
                 message = f"正式 dataset 预备失败: {detail}"

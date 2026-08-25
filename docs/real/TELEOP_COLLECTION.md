@@ -254,6 +254,16 @@ RealTeleop 的 coarse progress/Failure 语义和 Control Station 操作面均为
 --collection-progress-gui
 ```
 
+固定 launcher 也支持在不改默认四阶段命令的前提下切换 profile：使用
+`--progress-profile REF` / `--stage-profile REF`，或设置
+`COLLECTION_PROGRESS_PROFILE` / `COLLECTION_STAGE_PROFILE`。直接传
+`catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed` 时，launcher
+会自动展开为 coarse progress profile 加对应的 `--collection-stage-profile`，从而在新数据集
+上直接采集 `pen_down / write / pen_up` 三个 fine stage。`COLLECTION_TASK_NAME` 只改变正式
+dataset 的任务名/目录名，不会替换 progress profile；例如
+`COLLECTION_TASK_NAME="${COLLECTION_TASK_NAME:-3_stage_writing_detail}"` 在当前 shell 已有
+旧值时会保留旧值，需强制改名时直接传 `--task-name` 或显式赋值。
+
 如果希望由数采员在 GUI 中从已有 managed profile 选择，只增加：
 
 ```bash

@@ -11,14 +11,18 @@ Usage:
 Commands:
   foot-pad  Start the five-pedal forwarding service.
   collect   Start formal dual-arm 60 Hz force-admittance collection with the
-            managed four-stage writing progress profile and detail-overlay
-            compatible capture metadata.
+            selected writing progress profile and detail-overlay compatible
+            capture metadata.
 
 Collect options:
   --tactile-bundle-root PATH  Required unless TACTILE_BUNDLE_ROOT is set.
   --dataset-root PATH         Defaults to DATASET_BASE or the site default in
                               docs/real/teleop_args.sh.
   --task-name NAME            Defaults to 4_stage_writing_detail.
+  --progress-profile REF      Override the coarse collection progress profile
+                              (or pass a *_detailed catalog ref; its matching
+                              fine-stage profile is selected automatically).
+  --stage-profile REF         Explicit fine-stage profile reference.
   --tactile-min-free-gb N     Defaults to TACTILE_BUNDLE_MIN_FREE_GB or 200.
   --gripper-warmup-probe      Enable active open->half->open probing. Use only
                               when both grippers are clear of tools/objects.
@@ -78,6 +82,13 @@ esac
 TACTILE_ROOT="${TACTILE_BUNDLE_ROOT:-}"
 DATASET_ROOT="${DATASET_BASE:-}"
 TASK_NAME="${COLLECTION_TASK_NAME:-4_stage_writing_detail}"
+if [[ -n "${COLLECTION_TASK_NAME:-}" ]]; then
+  TASK_NAME_SOURCE=environment
+else
+  TASK_NAME_SOURCE=default
+fi
+PROGRESS_PROFILE="${COLLECTION_PROGRESS_PROFILE:-catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress}"
+STAGE_PROFILE="${COLLECTION_STAGE_PROFILE:-}"
 TACTILE_MIN_FREE_GB="${TACTILE_BUNDLE_MIN_FREE_GB:-200}"
 GRIPPER_WARMUP_PROBE="${GRIPPER_WARMUP_PROBE:-off}"
 if [[ -n "${TACTILE_BUNDLE_MIN_FREE_GB:-}" ]]; then
@@ -102,6 +113,17 @@ while [[ $# -gt 0 ]]; do
     --task-name)
       [[ $# -ge 2 ]] || die "--task-name requires NAME."
       TASK_NAME="$2"
+      TASK_NAME_SOURCE=command_line
+      shift 2
+      ;;
+    --progress-profile)
+      [[ $# -ge 2 ]] || die "--progress-profile requires REF."
+      PROGRESS_PROFILE="$2"
+      shift 2
+      ;;
+    --stage-profile)
+      [[ $# -ge 2 ]] || die "--stage-profile requires REF."
+      STAGE_PROFILE="$2"
       shift 2
       ;;
     --tactile-min-free-gb)
@@ -138,6 +160,17 @@ done
 [[ -d "$TACTILE_ROOT" ]] || die "tactile bundle root does not exist: $TACTILE_ROOT"
 [[ ! -L "$TACTILE_ROOT" ]] || die "tactile bundle root must not be a symlink: $TACTILE_ROOT"
 [[ -n "${TASK_NAME//[[:space:]]/}" ]] || die "task name must not be blank."
+[[ -n "${PROGRESS_PROFILE//[[:space:]]/}" ]] || die "progress profile must not be blank."
+
+# ``load_real_teleop_progress_profile`` intentionally keeps a detailed
+# catalog selection's coarse task profile and resolves the fine stage through
+# ``--collection-stage-profile``.  Make a direct ``*_detailed`` launcher
+# selection do the right thing instead of silently falling back to the coarse
+# stages.  Explicit --stage-profile/COLLECTION_STAGE_PROFILE still wins.
+if [[ "$PROGRESS_PROFILE" == catalog:*_detailed && -z "$STAGE_PROFILE" ]]; then
+  STAGE_PROFILE="$PROGRESS_PROFILE"
+  PROGRESS_PROFILE="${PROGRESS_PROFILE%_detailed}"
+fi
 
 case "${GRIPPER_WARMUP_PROBE,,}" in
   1|true|yes|on)
@@ -177,9 +210,9 @@ TELEOP_ARGS=(
   --collection-task-id dmtac_rm65_bimanual_position_v1
   --collection-task-name "$TASK_NAME"
   --collection-task-description
-  "formal dual-arm 60 Hz force-admittance writing collection with four-stage progress and post-capture detail overlay"
+  "formal dual-arm 60 Hz force-admittance writing collection with selected progress profile and post-capture detail overlay"
   --collection-progress-profile
-  catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress
+  "$PROGRESS_PROFILE"
   --collection-progress-gui
   --q6-config latest
   --q6-config-required
@@ -199,6 +232,10 @@ TELEOP_ARGS=(
   "${GRIPPER_WARMUP_ARGS[@]}"
 )
 
+if [[ -n "$STAGE_PROFILE" ]]; then
+  TELEOP_ARGS+=(--collection-stage-profile "$STAGE_PROFILE")
+fi
+
 RUN_COMMAND=(
   taskset -c 0-7
   python -m teleop_runtime.debug.run_vive_rm65_real_teleop
@@ -216,7 +253,10 @@ printf '%s\n' \
   '[DexTeleop] starting formal 60 Hz force-admittance collection.' \
   '[DexTeleop] five-pedal forwarding must be running in a separate terminal.' \
   "[DexTeleop] task=$TASK_NAME" \
+  "[DexTeleop] task_name_source=$TASK_NAME_SOURCE" \
   "[DexTeleop] dataset_root=$DATASET_BASE" \
+  "[DexTeleop] progress_profile=$PROGRESS_PROFILE" \
+  "[DexTeleop] stage_profile=${STAGE_PROFILE:-auto}" \
   "[DexTeleop] tactile_bundle_root=$TACTILE_BUNDLE_ROOT" \
   "[DexTeleop] tactile_bundle_min_free_gb=$TACTILE_BUNDLE_MIN_FREE_GB source=$TACTILE_MIN_FREE_SOURCE" \
   "[DexTeleop] gripper_warmup_probe=$GRIPPER_WARMUP_PROBE"

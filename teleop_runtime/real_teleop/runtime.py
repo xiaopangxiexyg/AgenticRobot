@@ -71,7 +71,6 @@ from .startup_admission import (
     assemble_startup_components,
     configure_startup_cameras,
     initialize_startup_ui,
-    prepare_startup_dataset_recorder,
 )
 from .tactile_idle_compression import (
     RealTeleopIdleTactileCompression,
@@ -648,17 +647,25 @@ def run_real_teleop(
         merge_runtime_metadata=_merge_control_debug_runtime_metadata,
     )
     idle_tactile_compression: RealTeleopIdleTactileCompression | None = None
-    dataset_recorder = prepare_startup_dataset_recorder(
-        args,
-        components=components,
-        camera_sources=camera_sources,
-        startup_cleanup=startup_cleanup,
-        startup_progress=startup_progress,
-        control_ui=control_ui,
-        capability_admission=capability_admission,
-        recorder_type=RealTeleopDatasetRecorder,
-        log=_log,
-    )
+    # The formal writer is deliberately lazy.  Constructing/starting the
+    # process worker here used to put ``initialize_legacy_writer`` (including
+    # a full persisted-dataset scan) on the global startup critical path.  A
+    # slow or temporarily unavailable dataset then made the camera/arm GUI
+    # appear to be a startup failure even though collection had not been
+    # requested.  The recorder is now created, started, and published by the
+    # episode-preparation transaction below, after the operator has selected
+    # the final dataset path/profile.  This also gives every retry a fresh
+    # one-shot multiprocessing.Process instance.
+    dataset_recorder = None
+    # A previous in-process construction receipt must not be replayed as a
+    # global startup error now that writer construction is deferred.
+    args.dataset_startup_error = ""
+    if not bool(getattr(args, "no_collection", False)):
+        _log(
+            "Dataset",
+            "formal dataset writer deferred until collection start or an "
+            "explicit dataset/profile reconfiguration",
+        )
 
     # Profile selection is configuration-only: it does not start an Episode,
     # move an arm, or mutate the dataset binding.  Make the selector available
@@ -1163,46 +1170,15 @@ def run_real_teleop(
                     camera_sources,
                     startup_progress=startup_progress,
                 )
-        if dataset_recorder is not None:
-            tactile_capacity_summary = _tactile_storage_capacity_summary(args)
-            if tactile_capacity_summary is not None:
-                _log("TactileStorage", tactile_capacity_summary)
-            if startup_progress is not None:
-                startup_progress.begin(
-                    "dataset.writer",
-                    label=startup_device_label("dataset.writer"),
-                    message="正在启动隔离 writer 并等待 ready 握手",
-                    requirement=startup_device_requirement("dataset.writer"),
-                )
-            try:
-                dataset_recorder.start()
-                dataset_recorder.write_camera_device_config()
-                if startup_progress is not None:
-                    startup_progress.succeed(
-                        "dataset.writer",
-                        message="writer ready 握手完成",
-                    )
-            except Exception as exc:  # noqa: BLE001 - storage must not block arm maintenance.
-                detail = f"{type(exc).__name__}: {exc}"
-                if startup_progress is not None:
-                    startup_progress.fail("dataset.writer", detail)
-                if not capability_admission:
-                    if startup_progress is not None:
-                        startup_progress.close()
-                    raise
-                startup_device_errors["dataset.writer"] = detail
-                _log(
-                    "Dataset",
-                    "WARNING: writer startup failed; teleop/arm maintenance remains available: "
-                    f"{detail}",
-                )
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", f"数采 writer 启动失败：{detail}")
-                try:
-                    dataset_recorder.close()
-                except Exception:
-                    pass
-                dataset_recorder = None
+        # Dataset writer startup is intentionally not part of this global
+        # startup barrier.  ``initialize_legacy_writer`` can scan a populated
+        # dataset for several seconds; collection will perform the same ready
+        # handshake transactionally when the operator presses start.  Any
+        # failure is then isolated to the collection capability and can be
+        # retried with a fresh recorder/process instance.
+        tactile_capacity_summary = _tactile_storage_capacity_summary(args)
+        if tactile_capacity_summary is not None:
+            _log("TactileStorage", tactile_capacity_summary)
         if getattr(args, "dmtac_startup_error", ""):
             startup_device_errors["dmtac.assignment"] = str(args.dmtac_startup_error)
         if getattr(args, "angle_trigger_startup_error", ""):
@@ -1292,6 +1268,51 @@ def run_real_teleop(
             nonlocal dataset_recorder
             require_idle_tactile_quiesced("dataset_recorder_rebind")
             dataset_recorder = value
+
+        def reconfigure_dataset_recorder_for_selection() -> None:
+            """Apply an idle task/root change to the live recorder immediately."""
+
+            nonlocal dataset_recorder
+            current = dataset_recorder
+            if current is None:
+                return
+            require_idle_tactile_quiesced("dataset_selection_reconfigure")
+            try:
+                current.reconfigure_for_current_args()
+            except BaseException:
+                # ``reconfigure_for_current_args`` may already have closed
+                # the old recorder before a new candidate fails its ready
+                # handshake.  Do not leave that one-shot object published for
+                # a later retry.
+                process_worker = getattr(current, "process_worker", None)
+                writer_pool = getattr(current, "writer_pool", None)
+                candidate_is_unusable = bool(
+                    getattr(current, "_lifecycle_closed", False)
+                    or getattr(process_worker, "_closed", False)
+                    or getattr(writer_pool, "_closed", False)
+                )
+                if candidate_is_unusable:
+                    dataset_recorder = None
+                    try:
+                        set_current_dataset_recorder(None)
+                    except BaseException:
+                        pass
+                    try:
+                        current.close()
+                    except BaseException:
+                        pass
+                raise
+            args.dataset_startup_error = ""
+            startup_device_errors.pop("dataset.writer", None)
+            publish_runtime_hardware_status()
+
+        bind_reconfigure = getattr(
+            clutch_input,
+            "bind_dataset_reconfigure_callback",
+            None,
+        )
+        if callable(bind_reconfigure):
+            bind_reconfigure(reconfigure_dataset_recorder_for_selection)
 
         def current_foot_pad_input() -> object | None:
             return foot_pad_input
@@ -2330,6 +2351,12 @@ def run_real_teleop(
                 f"tactile_compression={getattr(args, 'tactile_compression', 'none')} "
                 f"worker_mode={dataset_recorder.collection_worker_mode} "
                 f"start_key='t' stop_key='s'",
+            )
+        elif not bool(getattr(args, "no_collection", False)):
+            _log(
+                "Dataset",
+                "formal collection configured; writer startup is deferred "
+                "until the selected dataset/profile is started",
             )
 
         status_gate = ChangeGate()
