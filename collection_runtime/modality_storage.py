@@ -896,9 +896,9 @@ def _partial_export_reusable_bytes(
     }
     sampled_hash_paths = (
         {
-            item.logical_path
-            for group in _sampled_manifest_groups(inventory)
-            for item in group
+            artifact.logical_path
+            for artifact in inventory.artifacts
+            if artifact.role == "manifest"
         }
         if profile == SAMPLED_REVALIDATION_V1
         else set(expected)

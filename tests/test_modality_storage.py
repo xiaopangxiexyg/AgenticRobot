@@ -1100,16 +1100,10 @@ def test_sampled_partial_precheck_is_bounded_but_apply_rejects_corruption(
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
 
-    sampled_paths = {
-        item.logical_path
-        for group in storage._sampled_manifest_groups(inventory)
-        for item in group
-    }
     corrupt = next(
         artifact
         for artifact in inventory.artifacts
         if artifact.role == "payload"
-        and artifact.logical_path not in sampled_paths
     )
     corrupt_path = stage / corrupt.logical_path
     value = bytearray(corrupt_path.read_bytes())
