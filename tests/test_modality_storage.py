@@ -90,6 +90,74 @@ def _dataset(root: Path) -> Path:
     return root
 
 
+def _multi_group_dataset(root: Path, *, episode_count: int = 10) -> Path:
+    _write_json(root / "meta/info.json", {"episode_count": episode_count, "task": "unit"})
+    (root / "meta/tasks.jsonl").write_text(
+        json.dumps({"task_index": 0, "task": "unit"}) + "\n",
+        encoding="utf-8",
+    )
+    _write_json(root / "meta/modality_validity.json", {"tactile": "valid"})
+    episodes: list[str] = []
+    for episode_index in range(episode_count):
+        tactile_paths: dict[str, str] = {}
+        for side in ("left", "right"):
+            directory = (
+                f"tactile/observation.hand.{side}.tactile/chunk-000/"
+                f"episode_{episode_index:06d}"
+            )
+            manifest_relative = f"{directory}/manifest.json"
+            sensor = f"{side[0].upper()}_{episode_index:03d}"
+            payload_relative = f"{directory}/{sensor}.uint8.bin"
+            frame_count = 8 if episode_index == episode_count // 2 else 4
+            payload = bytes(
+                value % 256 for value in range(frame_count * 6)
+            )
+            payload_path = root / payload_relative
+            payload_path.parent.mkdir(parents=True, exist_ok=True)
+            payload_path.write_bytes(payload)
+            _write_json(
+                root / manifest_relative,
+                {
+                    "format": "binary_stream_v1",
+                    "side": side,
+                    "frame_count": frame_count,
+                    "streams": {
+                        sensor: {
+                            "path": payload_relative,
+                            "dtype": "uint8",
+                            "shape": [2, 3],
+                            "frame_count": frame_count,
+                            "encoding": "raw_c_order",
+                            "compression": "none",
+                        }
+                    },
+                    "frames": [
+                        {
+                            "sample_frame_index": index,
+                            "tactile_frame_index": index,
+                        }
+                        for index in range(frame_count)
+                    ],
+                },
+            )
+            tactile_paths[side] = manifest_relative
+        episodes.append(
+            json.dumps(
+                {
+                    "episode_index": episode_index,
+                    "frame_count": 4,
+                    "tactile_paths": tactile_paths,
+                },
+                sort_keys=True,
+            )
+        )
+    (root / "meta/episodes.jsonl").write_text(
+        "\n".join(episodes) + "\n",
+        encoding="utf-8",
+    )
+    return root
+
+
 def _artifact_snapshot(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
@@ -875,6 +943,144 @@ def test_detach_plans_use_tactile_reader_validation_only(
     assert legacy.source_validation_mode == "legacy_inventory"
     assert strict.ready, strict.errors
     assert strict.source_validation_mode == "tactile_inventory"
+
+
+def test_sampled_revalidation_is_explicit_deterministic_and_side_balanced(
+    tmp_path: Path,
+    offline_validation: object,
+) -> None:
+    root = _multi_group_dataset(tmp_path / "dataset")
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    inventory = build_modality_artifact_inventory(root)
+
+    first = storage._sampled_manifest_groups(inventory)
+    second = storage._sampled_manifest_groups(inventory)
+    manifest_paths = {
+        item.logical_path
+        for group in first
+        for item in group
+        if item.role == "manifest"
+    }
+
+    assert first == second
+    assert len(first) == storage.SAMPLED_REVALIDATION_MANIFEST_COUNT
+    assert any("hand.left" in path for path in manifest_paths)
+    assert any("hand.right" in path for path in manifest_paths)
+    assert any("episode_000000" in path for path in manifest_paths)
+    assert any("episode_000009" in path for path in manifest_paths)
+
+    full = storage.plan_modality_detach(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+    )
+    sampled = storage.plan_modality_detach(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        revalidation_profile=storage.SAMPLED_REVALIDATION_V1,
+    )
+    assert full.revalidation_profile == storage.FULL_REVALIDATION
+    assert full.revalidation_manifest_count == 20
+    assert sampled.revalidation_profile == storage.SAMPLED_REVALIDATION_V1
+    assert sampled.revalidation_manifest_count == 16
+    assert "revalidation_profile" not in full.semantic_payload()
+    assert sampled.semantic_payload()["revalidation_profile"] == "sampled_v1"
+    assert sampled.plan_hash != full.plan_hash
+
+
+def test_sampled_detach_keeps_exact_copy_and_marks_sampled_receipts(
+    tmp_path: Path,
+    offline_validation: object,
+) -> None:
+    root = _multi_group_dataset(tmp_path / "dataset")
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    before = _artifact_snapshot(root)
+    plan = storage.plan_modality_detach(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        revalidation_profile=storage.SAMPLED_REVALIDATION_V1,
+    )
+
+    result = storage.detach_modality(
+        root,
+        cold,
+        expected_plan_hash=plan.plan_hash,
+        confirm_dataset_fingerprint=plan.dataset_fingerprint,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        confirm_no_active_readers=True,
+        revalidation_profile=storage.SAMPLED_REVALIDATION_V1,
+    )
+
+    assert result.final_status == DETACHED_VERIFIED
+    assert any("restore_drill.sampled_v1" in path for path in result.receipt_paths)
+    assert any("retire_hot_payloads.sampled_v1" in path for path in result.receipt_paths)
+    inventory = storage.load_modality_inventory(root, result.inventory_hash)
+    storage.verify_modality_artifact_inventory(
+        root,
+        inventory,
+        artifact_root=Path(result.cold_artifact_root),
+    )
+    restored = {
+        artifact.logical_path: (Path(result.cold_artifact_root) / artifact.logical_path).read_bytes()
+        for artifact in inventory.artifacts
+    }
+    assert restored == before
+
+
+def test_sampled_detach_aborts_when_source_stat_changes_after_export(
+    tmp_path: Path,
+    offline_validation: object,
+) -> None:
+    root = _dataset(tmp_path / "dataset")
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    payload = next((root / "tactile").rglob("*.bin"))
+    plan = storage.plan_modality_detach(
+        root,
+        cold,
+        require_distinct_device=False,
+        min_free_bytes=0,
+        revalidation_profile=storage.SAMPLED_REVALIDATION_V1,
+    )
+    original_drill = storage._restore_drill
+
+    def drill_then_touch(*args: object, **kwargs: object) -> Path:
+        receipt = original_drill(*args, **kwargs)  # type: ignore[arg-type]
+        stat = payload.stat()
+        os.utime(
+            payload,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
+        )
+        return receipt
+
+    with (
+        mock.patch.object(storage, "_restore_drill", side_effect=drill_then_touch),
+        pytest.raises(storage.ModalityStorageError, match="changed after sampled"),
+    ):
+        storage.detach_modality(
+            root,
+            cold,
+            expected_plan_hash=plan.plan_hash,
+            confirm_dataset_fingerprint=plan.dataset_fingerprint,
+            require_distinct_device=False,
+            min_free_bytes=0,
+            confirm_no_active_readers=True,
+            revalidation_profile=storage.SAMPLED_REVALIDATION_V1,
+        )
+
+    assert payload.exists()
+    assert not any(
+        path.name.startswith("retire_hot_payloads")
+        for path in (root / "meta/modality_artifacts/tactile/receipts").glob("*.json")
+    )
 
 
 def test_legacy_scan_detach_binds_actual_bytes_when_sealed_hash_is_stale(

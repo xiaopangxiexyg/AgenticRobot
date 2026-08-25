@@ -47,6 +47,7 @@ from dataset_interface.modality_artifacts import (
     PAYLOAD_HASH_PREFER_SEALED,
     PAYLOAD_HASH_SCAN,
     build_modality_artifact_inventory,
+    inventory_source_binding_matches,
     resolve_modality_availability,
     verified_detachment_scope,
     verify_modality_artifact_inventory,
@@ -79,6 +80,10 @@ _TRANSIENT_FSYNC_ERRNOS = frozenset(
 REPLACE_MAX_ATTEMPTS = 12
 REPLACE_INITIAL_RETRY_DELAY_SEC = 0.05
 REPLACE_MAX_RETRY_DELAY_SEC = 1.0
+FULL_REVALIDATION = "full"
+SAMPLED_REVALIDATION_V1 = "sampled_v1"
+REVALIDATION_PROFILES = (FULL_REVALIDATION, SAMPLED_REVALIDATION_V1)
+SAMPLED_REVALIDATION_MANIFEST_COUNT = 16
 
 
 class ModalityStorageError(RuntimeError):
@@ -107,12 +112,20 @@ class ModalityStoragePlan:
     availability: str
     min_free_bytes: int
     ready: bool
+    revalidation_profile: str = FULL_REVALIDATION
+    revalidation_manifest_count: int = 0
     errors: tuple[str, ...] = ()
 
     def semantic_payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("ready", None)
         payload.pop("errors", None)
+        # Preserve the pre-sampled-feature plan hash for the default path.
+        # Only an explicitly requested non-default profile extends the
+        # confirmation contract.
+        if self.revalidation_profile == FULL_REVALIDATION:
+            payload.pop("revalidation_profile", None)
+            payload.pop("revalidation_manifest_count", None)
         return payload
 
     @property
@@ -998,6 +1011,154 @@ def _manifest_groups(
     return tuple(groups)
 
 
+def _normalize_revalidation_profile(value: str) -> str:
+    profile = str(value or "").strip().lower()
+    if profile not in REVALIDATION_PROFILES:
+        raise ModalityStorageError(
+            f"unsupported revalidation profile: {value!r}"
+        )
+    return profile
+
+
+def _sampled_manifest_groups(
+    inventory: ModalityArtifactInventoryV1,
+    *,
+    limit: int = SAMPLED_REVALIDATION_MANIFEST_COUNT,
+) -> tuple[tuple[Any, ...], ...]:
+    """Select deterministic, side-balanced restore/read groups.
+
+    Every artifact byte remains covered by the exact copy hash verification.
+    This selection only bounds expensive tail-frame decode and restore drills.
+    """
+
+    groups = _manifest_groups(inventory)
+    if limit <= 0 or len(groups) <= limit:
+        return groups
+    buckets: dict[str, list[tuple[Any, ...]]] = {}
+    for group in groups:
+        manifest = next(item for item in group if item.role == "manifest")
+        buckets.setdefault(str(manifest.side or ""), []).append(group)
+    selected: dict[str, tuple[Any, ...]] = {}
+    bucket_items = sorted(buckets.items())
+    if len(bucket_items) > limit:
+        raise ModalityStorageError(
+            "sample limit cannot cover every tactile side: "
+            f"sides={len(bucket_items)} limit={limit}"
+        )
+    base = max(
+        1,
+        (limit - len(bucket_items)) // max(1, len(bucket_items)),
+    )
+    for _side, bucket in bucket_items:
+        ordered = sorted(
+            bucket,
+            key=lambda group: next(
+                item.logical_path for item in group if item.role == "manifest"
+            ),
+        )
+        take = min(len(ordered), base)
+        if take == 1:
+            indexes = (0,)
+        else:
+            indexes = tuple(
+                round(position * (len(ordered) - 1) / (take - 1))
+                for position in range(take)
+            )
+        largest = max(
+            ordered,
+            key=lambda group: sum(item.size_bytes for item in group),
+        )
+        for group in (ordered[index] for index in indexes):
+            manifest_path = next(
+                item.logical_path for item in group if item.role == "manifest"
+            )
+            selected[manifest_path] = group
+        largest_manifest = next(
+            item.logical_path for item in largest if item.role == "manifest"
+        )
+        selected[largest_manifest] = largest
+    if len(selected) < limit:
+        ranked = sorted(
+            groups,
+            key=lambda group: hashlib.sha256(
+                (
+                    inventory.semantic_content_hash
+                    + ":"
+                    + next(
+                        item.logical_path
+                        for item in group
+                        if item.role == "manifest"
+                    )
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        for group in ranked:
+            manifest_path = next(
+                item.logical_path for item in group if item.role == "manifest"
+            )
+            selected.setdefault(manifest_path, group)
+            if len(selected) >= limit:
+                break
+    if len(selected) > limit:
+        # The normal left/right layout cannot reach this branch, but preserve
+        # the per-side largest group if a future layout adds more side keys.
+        required = {
+            next(
+                item.logical_path
+                for item in max(
+                    bucket,
+                    key=lambda group: sum(item.size_bytes for item in group),
+                )
+                if item.role == "manifest"
+            )
+            for _side, bucket in bucket_items
+        }
+        keep = list(sorted(required))
+        keep.extend(
+            path
+            for path in sorted(selected)
+            if path not in required
+        )
+        selected = {path: selected[path] for path in keep[:limit]}
+    return tuple(selected[path] for path in sorted(selected))
+
+
+def _revalidation_groups(
+    inventory: ModalityArtifactInventoryV1,
+    profile: str,
+) -> tuple[tuple[Any, ...], ...]:
+    normalized = _normalize_revalidation_profile(profile)
+    if normalized == FULL_REVALIDATION:
+        return _manifest_groups(inventory)
+    return _sampled_manifest_groups(inventory)
+
+
+def _artifact_stat_snapshot(
+    root: Path,
+    inventory: ModalityArtifactInventoryV1,
+) -> tuple[tuple[object, ...], ...]:
+    snapshot: list[tuple[object, ...]] = []
+    for artifact in inventory.artifacts:
+        path = root / artifact.logical_path
+        if path.is_symlink() or not path.is_file():
+            raise ModalityStorageError(
+                f"source artifact is unsafe or absent: {artifact.logical_path}"
+            )
+        stat = path.stat()
+        snapshot.append(
+            (
+                artifact.logical_path,
+                int(stat.st_dev),
+                int(stat.st_ino),
+                int(stat.st_nlink),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+                int(stat.st_ctime_ns),
+            )
+        )
+    return tuple(snapshot)
+
+
 def _restore_drill_peak_bytes(inventory: ModalityArtifactInventoryV1) -> int:
     return max(
         (sum(item.size_bytes for item in group) for group in _manifest_groups(inventory)),
@@ -1049,10 +1210,12 @@ def _plan(
     min_free_bytes: int,
     source_validation_mode: str = "tactile_inventory",
     cold_staging_namespace: str = "",
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> ModalityStoragePlan:
     root = _safe_resolved(dataset_root)
     cold = _safe_resolved(cold_root)
     scope = _normalize_detachment_scope(detachment_scope)
+    profile = _normalize_revalidation_profile(revalidation_profile)
     errors: list[str] = []
     try:
         _validate_roots(root, cold)
@@ -1101,11 +1264,14 @@ def _plan(
                     raise ModalityStorageError(
                         "cold target contains another inventory"
                     )
-                verify_modality_artifact_inventory(
-                    root,
-                    inventory,
-                    artifact_root=artifact_root,
-                )
+                if profile == FULL_REVALIDATION:
+                    verify_modality_artifact_inventory(
+                        root,
+                        inventory,
+                        artifact_root=artifact_root,
+                    )
+                else:
+                    _verify_sampled_inventory(root, artifact_root, inventory)
                 _exact_artifact_tree(artifact_root, inventory)
                 reusable_export_bytes = inventory.total_bytes
             else:
@@ -1132,7 +1298,11 @@ def _plan(
         errors.append(f"rehydrate requires DETACHED_VERIFIED, got {availability}")
     try:
         if source_is_hot:
-            _verify_tactile_reader(root, inventory)
+            _verify_tactile_reader(
+                root,
+                inventory,
+                revalidation_profile=profile,
+            )
     except Exception as exc:
         errors.append(str(exc))
     if artifact_root.exists() and not source_is_hot:
@@ -1172,6 +1342,10 @@ def _plan(
         availability=availability,
         min_free_bytes=int(min_free_bytes),
         ready=not errors,
+        revalidation_profile=profile,
+        revalidation_manifest_count=len(
+            _revalidation_groups(inventory, profile)
+        ),
         errors=tuple(errors),
     )
 
@@ -1185,6 +1359,7 @@ def plan_modality_detach(
     min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
     allow_legacy_hardlinked_source: bool = False,
     legacy_scan_payload_hashes: bool = False,
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> ModalityStoragePlan:
     if legacy_scan_payload_hashes and not allow_legacy_hardlinked_source:
         raise ModalityStorageError(
@@ -1220,6 +1395,7 @@ def plan_modality_detach(
             if allow_legacy_hardlinked_source
             else "tactile_inventory"
         ),
+        revalidation_profile=revalidation_profile,
     )
 
 
@@ -1343,10 +1519,52 @@ def _verify_independent_copy(
             )
 
 
-def _verify_tactile_reader(
+def _verify_sampled_inventory(
+    dataset_root: Path,
     artifact_root: Path,
     inventory: ModalityArtifactInventoryV1,
 ) -> None:
+    """Verify all metadata/manifests and deterministic payload samples.
+
+    This is a planning/revalidation optimization only. The apply path still
+    calls :func:`_verify_independent_copy`, which hashes every cold artifact.
+    """
+
+    if not inventory_source_binding_matches(dataset_root, inventory):
+        raise ModalityStorageError("source modality reference binding changed")
+    sampled_payloads = {
+        item.logical_path
+        for group in _sampled_manifest_groups(inventory)
+        for item in group
+        if item.role == "payload"
+    }
+    for artifact in inventory.artifacts:
+        path = artifact_root / artifact.logical_path
+        if path.is_symlink() or not path.is_file():
+            raise ModalityStorageError(
+                f"inventory artifact is unsafe or absent: {artifact.logical_path}"
+            )
+        if int(path.stat().st_size) != int(artifact.size_bytes):
+            raise ModalityStorageError(
+                f"artifact size changed: {artifact.logical_path}"
+            )
+        if artifact.role == "manifest" or artifact.logical_path in sampled_payloads:
+            if _sha256_file(path) != artifact.sha256:
+                raise ModalityStorageError(
+                    f"artifact hash changed: {artifact.logical_path}"
+                )
+
+
+def _verify_tactile_reader(
+    artifact_root: Path,
+    inventory: ModalityArtifactInventoryV1,
+    *,
+    revalidation_profile: str = FULL_REVALIDATION,
+) -> None:
+    decode_manifests = {
+        next(item.logical_path for item in group if item.role == "manifest")
+        for group in _revalidation_groups(inventory, revalidation_profile)
+    }
     payload_paths = {
         artifact.logical_path
         for artifact in inventory.artifacts
@@ -1385,6 +1603,8 @@ def _verify_tactile_reader(
                     raise ModalityStorageError(
                         f"raw tactile byte count mismatch: {artifact.logical_path}:{sensor_key}"
                     )
+                continue
+            if artifact.logical_path not in decode_manifests:
                 continue
             reader = ChunkedTactileStream(dataset_root=artifact_root, spec=spec)
             if frame_count:
@@ -1496,7 +1716,9 @@ def _restore_drill(
     *,
     source_storage_id: str,
     target_storage_id: str,
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> Path:
+    profile = _normalize_revalidation_profile(revalidation_profile)
     drill = Path(
         tempfile.mkdtemp(
             prefix=f".{dataset_root.name}.tactile-restore-drill.",
@@ -1504,7 +1726,7 @@ def _restore_drill(
         )
     )
     try:
-        for group in _manifest_groups(inventory):
+        for group in _revalidation_groups(inventory, profile):
             group_inventory = ModalityArtifactInventoryV1(
                 modality_key=inventory.modality_key,
                 source_dataset_base_fingerprint=(
@@ -1533,6 +1755,11 @@ def _restore_drill(
         shutil.rmtree(drill, ignore_errors=True)
     receipt = _receipt(
         operation="restore_drill",
+        operation_id=(
+            None
+            if profile == FULL_REVALIDATION
+            else f"restore_drill.{profile}.{uuid.uuid4().hex}"
+        ),
         inventory=inventory,
         source_storage_id=source_storage_id,
         target_storage_id=target_storage_id,
@@ -1757,12 +1984,18 @@ def _retire_hot_payloads(
     source_storage_id: str,
     target_storage_id: str,
     allow_hardlinked_source: bool = False,
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> Path:
     if not _has_receipt(dataset_root, inventory.semantic_content_hash, "export_shadow"):
         raise ModalityStorageError("retirement requires a successful export receipt")
     if not _has_receipt(dataset_root, inventory.semantic_content_hash, "restore_drill"):
         raise ModalityStorageError("retirement requires a successful restore-drill receipt")
-    operation_id = f"retire_hot_payloads.{uuid.uuid4().hex}"
+    profile = _normalize_revalidation_profile(revalidation_profile)
+    operation_id = (
+        f"retire_hot_payloads.{uuid.uuid4().hex}"
+        if profile == FULL_REVALIDATION
+        else f"retire_hot_payloads.{profile}.{uuid.uuid4().hex}"
+    )
     stage, quarantine = _swap_paths(dataset_root, operation_id)
     stage.mkdir()
     committed = False
@@ -1825,12 +2058,18 @@ def _retire_hot_module_tree(
     artifact_root: Path,
     source_storage_id: str,
     target_storage_id: str,
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> Path:
     if not _has_receipt(dataset_root, inventory.semantic_content_hash, "export_shadow"):
         raise ModalityStorageError("retirement requires a successful export receipt")
     if not _has_receipt(dataset_root, inventory.semantic_content_hash, "restore_drill"):
         raise ModalityStorageError("retirement requires a successful restore-drill receipt")
-    operation_id = f"retire_hot_module_tree.{uuid.uuid4().hex}"
+    profile = _normalize_revalidation_profile(revalidation_profile)
+    operation_id = (
+        f"retire_hot_module_tree.{uuid.uuid4().hex}"
+        if profile == FULL_REVALIDATION
+        else f"retire_hot_module_tree.{profile}.{uuid.uuid4().hex}"
+    )
     stage, quarantine = _swap_paths(dataset_root, operation_id)
     stage.mkdir()
     committed = False
@@ -2004,9 +2243,11 @@ def detach_modality(
     legacy_scan_payload_hashes: bool = False,
     allow_disjoint_active_collection: bool = False,
     active_collection_dataset_roots: tuple[str | Path, ...] = (),
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> ModalityStorageResult:
     root = _safe_resolved(dataset_root)
     scope = _normalize_detachment_scope(detachment_scope)
+    profile = _normalize_revalidation_profile(revalidation_profile)
     if not confirm_no_active_readers:
         raise ModalityStorageError(
             "apply requires explicit confirmation that no dataset readers are active"
@@ -2039,6 +2280,7 @@ def detach_modality(
             min_free_bytes=min_free_bytes,
             allow_legacy_hardlinked_source=allow_legacy_hardlinked_source,
             legacy_scan_payload_hashes=legacy_scan_payload_hashes,
+            revalidation_profile=profile,
         )
         _assert_confirmation(
             plan,
@@ -2063,12 +2305,21 @@ def detach_modality(
                 allow_hardlinked_source=allow_legacy_hardlinked_source,
             )
         ]
+        source_snapshot = (
+            _artifact_stat_snapshot(root, inventory)
+            if profile == SAMPLED_REVALIDATION_V1
+            else ()
+        )
         _require_quiescent(
             root,
             allow_disjoint_active_collection=allow_disjoint_active_collection,
             active_collection_dataset_roots=explicit_active_roots,
         )
-        _verify_tactile_reader(root, inventory)
+        _verify_tactile_reader(
+            root,
+            inventory,
+            revalidation_profile=profile,
+        )
         receipt_paths.append(
             _restore_drill(
                 root,
@@ -2076,6 +2327,7 @@ def detach_modality(
                 inventory,
                 source_storage_id=target_storage_id,
                 target_storage_id=source_storage_id,
+                revalidation_profile=profile,
             )
         )
         _require_quiescent(
@@ -2092,6 +2344,10 @@ def detach_modality(
             require_single_link=not bool(allow_legacy_hardlinked_source),
         ) != inventory:
             raise ModalityStorageError("dataset changed after shadow verification")
+        if source_snapshot and _artifact_stat_snapshot(root, inventory) != source_snapshot:
+            raise ModalityStorageError(
+                "source tactile artifacts changed after sampled revalidation"
+            )
         # The inventory rebuild can be expensive for large tactile payloads.
         # Recheck process quiescence after it, immediately before the directory
         # retirement transaction, so a collector that started during hashing
@@ -2108,6 +2364,7 @@ def detach_modality(
                 artifact_root=artifact_root,
                 source_storage_id=source_storage_id,
                 target_storage_id=target_storage_id,
+                revalidation_profile=profile,
             )
         else:
             retirement_receipt = _retire_hot_payloads(
@@ -2117,6 +2374,7 @@ def detach_modality(
                 source_storage_id=source_storage_id,
                 target_storage_id=target_storage_id,
                 allow_hardlinked_source=allow_legacy_hardlinked_source,
+                revalidation_profile=profile,
             )
         receipt_paths.append(retirement_receipt)
         final = resolve_modality_availability(
