@@ -323,8 +323,11 @@ def list_real_teleop_managed_progress_profile_selections(
 
     The original coarse-only list remains available to compatibility callers.
     This variant is the only API used by the profile picker, so a detailed
-    stage profile can be selected without changing the canonical progress
-    profile identity stored in an Episode.
+    stage profile can be selected as the actual capture-time stage profile.
+    The canonical progress profile identity remains the shared progress
+    contract, while the selected stage-profile binding/hash is persisted by
+    the normal Episode path.  A later annotation overlay is a separate,
+    optional post-capture concern.
     """
 
     del collection_task_id
@@ -408,7 +411,7 @@ def load_real_teleop_managed_progress_profile(
     *,
     collection_task_id: str | None = None,
 ) -> TaskProgressProfileV1:
-    """Resolve one GUI selection without changing formal task identity."""
+    """Resolve one GUI selection without changing formal progress identity."""
 
     del collection_task_id
 

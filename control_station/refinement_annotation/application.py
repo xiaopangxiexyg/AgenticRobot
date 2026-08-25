@@ -846,8 +846,19 @@ class RefinementAnnotationApplication:
     def _detail_profile_selection(
         self,
         item: ProgressAnnotationWorkItem,
+        *,
+        selection_id: str | None = None,
     ) -> tuple[DetailProfileSelection | None, str | None]:
-        return self._detail_annotations.profile_selection(item)
+        return self._detail_annotations.profile_selection(
+            item,
+            selection_id=selection_id,
+        )
+
+    def _detail_profile_selections(
+        self,
+        item: ProgressAnnotationWorkItem,
+    ) -> tuple[tuple[DetailProfileSelection, ...], str | None]:
+        return self._detail_annotations.profile_selections(item)
 
     def _current_detail_annotation_set(
         self,
@@ -927,6 +938,28 @@ class RefinementAnnotationApplication:
             "description": stage.description,
             "ordinal": stage.ordinal,
         }
+
+    def _detail_profile_options_payload(
+        self,
+        item: ProgressAnnotationWorkItem,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        selections, reason = self._detail_profile_selections(item)
+        options = [
+            {
+                "selection_id": selection.selection_id,
+                "profile_id": selection.stage_profile.profile_id,
+                "profile_version": selection.stage_profile.profile_version,
+                "target_progress_step_id": selection.target_progress_step_id,
+                "stages": [
+                    self._detail_stage_payload(stage)
+                    for stage in selection.stage_profile.stages_for_step(
+                        selection.target_progress_step_id
+                    )
+                ],
+            }
+            for selection in selections
+        ]
+        return options, reason
 
     def _bootstrap_detail_draft(
         self,
@@ -1358,20 +1391,32 @@ class RefinementAnnotationApplication:
         detail_draft: Mapping[str, Any] | None,
         reason: str | None,
     ) -> dict[str, Any]:
+        profile_options, profile_options_reason = (
+            self._detail_profile_options_payload(item)
+        )
+        selected_profile_selection_id = (
+            None if selection is None else selection.selection_id
+        )
         if selection is None:
             return {
                 "available": False,
                 "resolution_level": "COARSE_FALLBACK",
                 "draft_state": "UNAVAILABLE",
                 "reason": reason
+                or profile_options_reason
                 or "没有匹配的详细 profile。",
                 "profile": None,
+                "profile_options": profile_options,
+                "selected_profile_selection_id": (
+                    selected_profile_selection_id
+                ),
                 "base": None,
                 "failure_attempts": [],
                 "sealed": None,
             }
         profile = selection.stage_profile
         profile_payload = {
+            "selection_id": selection.selection_id,
             "profile_id": profile.profile_id,
             "profile_version": profile.profile_version,
             "target_progress_step_id": selection.target_progress_step_id,
@@ -1399,6 +1444,10 @@ class RefinementAnnotationApplication:
                     else "详细 profile 已匹配；正在生成可编辑的详细时间轴。"
                 ),
                 "profile": profile_payload,
+                "profile_options": profile_options,
+                "selected_profile_selection_id": (
+                    selected_profile_selection_id
+                ),
                 "base": None,
                 "failure_attempts": self._detail_failure_attempt_payload(
                     item,
@@ -1442,6 +1491,8 @@ class RefinementAnnotationApplication:
             "draft_state": draft_state,
             "reason": reason,
             "profile": profile_payload,
+            "profile_options": profile_options,
+            "selected_profile_selection_id": selected_profile_selection_id,
             "base": {
                 "annotation_set_id": (
                     base_annotation_set.binding.annotation_set_id
@@ -1715,9 +1766,27 @@ class RefinementAnnotationApplication:
         # operator explicitly opens an Episode, while sidebar summary batches
         # reuse the module inventory instead of rescanning once per row.
         self._detail_annotations.refresh_profiles()
-        detail_selection, detail_profile_reason = (
-            self._detail_profile_selection(item)
+        requested_detail_selection = draft.get(
+            "detail_profile_selection_id"
         )
+        if requested_detail_selection == "":
+            # An explicit empty selection is different from a legacy draft
+            # without this field: the former means the annotator deliberately
+            # chose coarse-only annotation, while the latter keeps the old
+            # single-candidate auto-resolution behavior.
+            detail_selection = None
+            detail_profile_reason = "当前仅使用粗粒度标注（已关闭详细补充）。"
+        else:
+            detail_selection, detail_profile_reason = (
+                self._detail_profile_selection(
+                    item,
+                    selection_id=(
+                        None
+                        if requested_detail_selection is None
+                        else str(requested_detail_selection)
+                    ),
+                )
+            )
         detail_annotation_set: LoadedDetailStageAnnotationSet | None = None
         detail_reason = detail_profile_reason
         detail_draft: dict[str, Any] | None = None
@@ -1844,7 +1913,15 @@ class RefinementAnnotationApplication:
             "UNSEALED_DRAFT",
             "SECOND_REVIEW_UNSEALED",
         }
-        detail_status = self._detail_annotations.status(item, annotation_sets)
+        detail_status = self._detail_annotations.status(
+            item,
+            annotation_sets,
+            selection_id=(
+                None
+                if draft.get("detail_profile_selection_id") is None
+                else str(draft.get("detail_profile_selection_id"))
+            ),
+        )
         annotation_status = build_episode_status_payload(
             annotation_summary,
             has_draft=item.has_draft,
@@ -1867,6 +1944,9 @@ class RefinementAnnotationApplication:
             "annotation_status": annotation_status,
             "annotation_summary_loaded": True,
             "annotation_mode": self.annotation_mode,
+            "detail_profile_selection_id": (
+                draft.get("detail_profile_selection_id")
+            ),
             "review_label_auto_cleared": review_label_auto_cleared,
             "draft_persistence_state": draft_persistence_state,
             "draft_requires_seal": draft_requires_seal,
@@ -2677,11 +2757,18 @@ class RefinementAnnotationApplication:
         )
         normalized = self._normalize_draft(item, draft)
         annotation_sets = self._sealed_annotation_sets(item)
-        selection, profile_reason = self._detail_profile_selection(item)
+        selection, profile_reason = self._detail_profile_selection(
+            item,
+            selection_id=(
+                None
+                if normalized.get("detail_profile_selection_id") is None
+                else str(normalized.get("detail_profile_selection_id"))
+            ),
+        )
         if selection is None:
             raise RefinementAnnotationApplicationError(
                 profile_reason
-                or "No compatible detail stage profile is available."
+                or "No detail stage profile is selected for this Episode."
             )
         raw_detail = normalized.get("detail_overlay")
         if not isinstance(raw_detail, Mapping):
@@ -2993,9 +3080,23 @@ class RefinementAnnotationApplication:
         )
         rebased_detail_draft: dict[str, Any] | None = None
         rebased_detail_reason: str | None = None
-        rebased_detail_selection, rebased_profile_reason = (
-            self._detail_profile_selection(item)
-        )
+        rebased_selection_id = normalized.get("detail_profile_selection_id")
+        if rebased_selection_id == "":
+            rebased_detail_selection = None
+            rebased_profile_reason = (
+                "当前仅使用粗粒度标注（已关闭详细补充）。"
+            )
+        else:
+            rebased_detail_selection, rebased_profile_reason = (
+                self._detail_profile_selection(
+                    item,
+                    selection_id=(
+                        None
+                        if rebased_selection_id is None
+                        else str(rebased_selection_id)
+                    ),
+                )
+            )
         if rebased_detail_selection is not None:
             pending_detail = normalized.get("detail_overlay")
             if isinstance(pending_detail, Mapping):
@@ -3890,6 +3991,10 @@ class RefinementAnnotationApplication:
                 or bundle.progress_boundary_overrides
                 or bundle.episode_abnormal is not None
             ),
+            # None preserves the legacy single-candidate auto-resolution.
+            # An empty string is an explicit coarse-only choice made from the
+            # STANDARD annotation profile selector.
+            "detail_profile_selection_id": None,
             "last_committed_annotation_set_id": (
                 value.binding.annotation_set_id
             ),
@@ -4401,6 +4506,7 @@ class RefinementAnnotationApplication:
             "episode_abnormal": None,
             "episode_review_request": None,
             "privileged_tools_enabled": False,
+            "detail_profile_selection_id": None,
             "detail_overlay": None,
         }
 
@@ -4439,6 +4545,7 @@ class RefinementAnnotationApplication:
             "episode_abnormal",
             "episode_review_request",
             "privileged_tools_enabled",
+            "detail_profile_selection_id",
             "last_committed_annotation_set_id",
             "last_committed_manifest_hash",
             "detail_overlay",
@@ -4457,6 +4564,13 @@ class RefinementAnnotationApplication:
         capture_end_step = draft.get("capture_end_step")
         episode_abnormal = draft.get("episode_abnormal")
         episode_review_request = draft.get("episode_review_request")
+        detail_profile_selection_id = draft.get("detail_profile_selection_id")
+        if detail_profile_selection_id is not None:
+            if not isinstance(detail_profile_selection_id, str):
+                raise RefinementAnnotationApplicationError(
+                    "detail_profile_selection_id must be a string or null."
+                )
+            detail_profile_selection_id = detail_profile_selection_id.strip()
         detail_overlay = draft.get("detail_overlay")
         if detail_overlay is not None and not isinstance(
             detail_overlay,
@@ -4565,6 +4679,7 @@ class RefinementAnnotationApplication:
             "episode_abnormal": episode_abnormal,
             "episode_review_request": episode_review_request,
             "privileged_tools_enabled": privileged,
+            "detail_profile_selection_id": detail_profile_selection_id,
             "detail_overlay": detail_overlay,
             **(
                 {

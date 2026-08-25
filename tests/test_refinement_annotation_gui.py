@@ -249,6 +249,7 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert b'id="capture-end-step-editor"' in body
         assert b'id="recoverable-failure-track"' in body
         assert b'id="detail-annotation-panel"' in body
+        assert b'id="detail-profile-select"' in body
         assert b'id="detail-stage-track"' in body
         assert b'id="publish-detail-annotation"' in body
         assert b'id="mark-recoverable-start"' in body
@@ -256,6 +257,9 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "中间失误后恢复".encode() in body
         assert "function renderRecoverableFailureTools" in app_source
         assert "function renderDetailAnnotation" in app_source
+        assert "function changeDetailProfileSelection" in app_source
+        assert "detail_profile_selection_id" in app_source
+        assert "profile_options" in app_source
         assert "PROFILE_PREVIEW" in app_source or "profileStages" in app_source
         assert "detail-stage-preview-empty" in app_source
         assert "preserveViewport" in app_source
@@ -1486,6 +1490,137 @@ def test_coarse_writing_entry_can_receive_detail_overlay(
             "right_write.write",
             "right_write.pen_up",
         ]
+    finally:
+        application.close()
+
+
+def test_detail_profile_selection_is_optional_and_survives_coarse_seal(
+    tmp_path: Path,
+) -> None:
+    episode_uuid = _finalized_writing_entry_dataset(tmp_path)
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+    )
+    try:
+        initial = application.episode_detail(episode_uuid)
+        options = initial["detail_annotation"]["profile_options"]
+        assert len(options) == 1
+        selection_id = options[0]["selection_id"]
+        assert initial["draft"]["detail_profile_selection_id"] is None
+
+        coarse_only = {
+            **json.loads(json.dumps(initial["draft"])),
+            "detail_profile_selection_id": "",
+            "detail_overlay": None,
+        }
+        saved = application.save_draft(episode_uuid, coarse_only)
+        assert saved["detail_profile_selection_id"] == ""
+        reopened = application.episode_detail(episode_uuid)
+        assert reopened["draft"]["detail_profile_selection_id"] == ""
+        assert reopened["draft"]["detail_overlay"] is None
+        assert reopened["detail_annotation"]["profile"] is None
+        assert reopened["detail_annotation"]["available"] is False
+        assert reopened["detail_annotation"]["profile_options"] == options
+        assert "DETAIL_PENDING" not in {
+            badge["code"]
+            for badge in reopened["annotation_status"]["badges"]
+        }
+
+        sealed = application.commit(episode_uuid, reopened["draft"])
+        assert sealed["draft"]["detail_profile_selection_id"] == ""
+        after_seal = application.episode_detail(episode_uuid)
+        assert after_seal["draft"]["detail_profile_selection_id"] == ""
+        assert after_seal["detail_annotation"]["profile"] is None
+        assert after_seal["detail_annotation"]["available"] is False
+
+        selected = {
+            **json.loads(json.dumps(after_seal["draft"])),
+            "detail_profile_selection_id": selection_id,
+            "detail_overlay": None,
+        }
+        application.save_draft(episode_uuid, selected)
+        with_detail = application.episode_detail(episode_uuid)
+        assert with_detail["draft"]["detail_profile_selection_id"] == (
+            selection_id
+        )
+        assert with_detail["detail_annotation"][
+            "selected_profile_selection_id"
+        ] == selection_id
+        assert with_detail["detail_annotation"]["available"] is True
+        assert with_detail["draft"]["detail_overlay"] is not None
+    finally:
+        application.close()
+
+
+def test_one_detail_source_projects_multiple_independent_targets(
+    tmp_path: Path,
+) -> None:
+    episode_uuid = _finalized_manual_stop_dataset(tmp_path)
+    detail_profile_root = tmp_path / "detail-profiles"
+    application = RefinementAnnotationApplication(
+        tmp_path,
+        annotator_id="fixture",
+        detail_profile_root=detail_profile_root,
+        defer_initial_refresh=True,
+    )
+    try:
+        item = application._item(episode_uuid)
+        progress_profile = item.progress.profile
+        coarse = item.progress.stage_profile
+        assert progress_profile is not None
+        assert coarse is not None
+        detailed = TaskStageProfileV1(
+            profile_id="multi-target-detail-stages",
+            profile_version="1",
+            task_progress_profile_hash=progress_profile.semantic_content_hash,
+            stages=(
+                ProgressStageDefinitionV1(
+                    "a", "a.start", "A 开始", "A 开始阶段", 1
+                ),
+                ProgressStageDefinitionV1(
+                    "a", "a.finish", "A 收尾", "A 收尾阶段", 2
+                ),
+                ProgressStageDefinitionV1(
+                    "b", "b.start", "B 开始", "B 开始阶段", 1
+                ),
+                ProgressStageDefinitionV1(
+                    "b", "b.finish", "B 收尾", "B 收尾阶段", 2
+                ),
+                *coarse.stages_for_step("c"),
+            ),
+        )
+        detail_profile_root.mkdir()
+        (detail_profile_root / "multi.progress_detailed.json").write_text(
+            json.dumps(progress_profile.to_payload(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (detail_profile_root / "multi.stages_detailed.json").write_text(
+            json.dumps(detailed.to_payload(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        selections, reason = application._detail_profile_selections(item)
+        assert reason is None
+        assert [value.target_progress_step_id for value in selections] == [
+            "a",
+            "b",
+        ]
+        assert [
+            value.stage_id
+            for value in selections[0].stage_profile.stages_for_step("a")
+        ] == ["a.start", "a.finish"]
+        assert [
+            value.stage_id
+            for value in selections[0].stage_profile.stages_for_step("b")
+        ] == ["b1"]
+        assert [
+            value.stage_id
+            for value in selections[1].stage_profile.stages_for_step("a")
+        ] == ["a1", "a2"]
+        assert [
+            value.stage_id
+            for value in selections[1].stage_profile.stages_for_step("b")
+        ] == ["b.start", "b.finish"]
     finally:
         application.close()
 

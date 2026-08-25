@@ -175,15 +175,18 @@ printf '[DexTeleop] command exited with status=%s\n' "$rc"
 [`run_formal_60hz_writing_collection.sh`](../../scripts/run_formal_60hz_writing_collection.sh)。
 它只组合现有、已准入的参数数组和 canonical RealTeleop 入口，不维护第二份控制参数。
 默认 dataset task name 是拼写正确的 `4_stage_writing_detail`；在线 Progress profile
-固定为 `dmtac_rm65_bimanual_position_writing_four_stage_progress`。采集时封存的 coarse
-stage profile 会在后标注程序中自动匹配 writing detail overlay，因此不要把
-`.stages_detailed.json` 作为采集端基础 stage profile 传入。
+固定为 `dmtac_rm65_bimanual_position_writing_four_stage_progress`。这个默认入口选择
+coarse capture profile，采集后可以在标准 annotation 中独立选择 writing detail overlay；
+这只是默认 capture 选择，不是对 detailed profile 的禁用，detail 标注选择也不会反向改写
+采集事实。
 
 如果是全新的、尚未绑定 stage profile 的 dataset，也可以在 progress GUI 中显式选择
-`dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed`。这个选择会直接把
-`pen_down / write / pen_up` 三个 fine stage 绑定到新 dataset；已有 coarse dataset 不能
+`dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed`。这个选择是正常的
+capture profile，会直接把 `pen_down / write / pen_up` 三个 fine stage 绑定到新 dataset，
+writer、机械臂控制和 progress manifest 都沿既有采集路径运行；已有 coarse dataset 不能
 在原目录内混用两种 stage hash。8 月 24 日这类已经用 coarse profile 采集的 writing
-Episode，继续使用上面的 coarse 入口即可，后标注时再封存 additive detail overlay。
+Episode，继续使用上面的 coarse 入口即可，进入标准 annotation 后再选择并封存 additive
+detail overlay。
 
 先在终端 1 启动五踏板转发服务：
 

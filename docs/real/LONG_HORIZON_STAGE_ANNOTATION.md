@@ -113,14 +113,17 @@ rename 释放锁。锁不会按时间自动抢占；新客户端只会自动隔�
 
 detail 是叠加在 coarse annotation set 之上的独立补充，不修改原有 stage bundle、
 Progress facts、视频、Parquet 或采集协议。当前配套 profile 使用同名的
-`.progress_detailed.json` 和 `.stages_detailed.json`；它必须只把一个 coarse Progress
-Step 拆成新的 fine stages，其余 Step 保持不变。
+`.progress_detailed.json` 和 `.stages_detailed.json`。一个 source profile 可以为多个
+coarse Progress Step 提供 fine stages；进入标准 annotation 后，界面按每个 changed Step
+投影成独立的 detail 选择，每个不可变 overlay 仍只绑定一个 target Step，未选中的 Step
+继续使用 coarse stages。
 
 已有 coarse annotation set 在没有 detail 补充时明确解析为 `COARSE_FALLBACK`，因此旧
-数据集不需要迁移文件就能继续使用，且不会把均分出来的界面草稿当成 detail 数据。后标注
-页面只有在 coarse set 已封存后才显示 detail 轨道；detail 轨道独立于 coarse 轨道，可单独
-拖动其边界。原始 Failure 仍只读，Failure Attempt 必须在 detail 轨道中选择失败发生的
-fine stage；选择前不能确认或封存。
+数据集不需要迁移文件就能继续使用，且不会把均分出来的界面草稿当成 detail 数据。进入
+标准 annotation 时即可选择兼容的 detail profile，不要求 coarse set 先封存；coarse 尚未
+封存时，detail 草稿保持未绑定，待 coarse 版本确定后再绑定。detail 轨道独立于 coarse
+轨道，可单独拖动其边界。原始 Failure 仍只读，Failure Attempt 必须在 detail 轨道中选择
+失败发生的 fine stage；选择前不能确认或封存。
 
 detail 封存采用独立的不可变目录：
 
@@ -143,8 +146,10 @@ annotation set 的调用不改变。对于新 dataset，采集 GUI 也可以显�
 `dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed`，此时三个 writing
 fine stage 会作为 capture-time stage profile 直接进入 coarse timeline，不再需要重复的
 detail overlay；这个 variant 不能与已经绑定 coarse stage profile 的 dataset 混用。用旧
-coarse profile 采集的 Episode（包括只从 `right_write` 开始的窗口）仍可在粗标注封存后按
-上面的 additive overlay 流程补齐 detail。
+coarse profile 采集的 Episode（包括只从 `right_write` 开始的窗口）仍可在粗标注封存前或
+封存后按上面的 additive overlay 流程补齐 detail；两种标注草稿互不替换。采集时显式选择
+的 `_detailed` profile 则是普通 capture-time stage profile，直接进入该 Episode 的阶段
+事实，不需要再通过 overlay 重新表达同一份采集阶段。
 
 当前实现把 detail profile 发现、当前 overlay 选择和完成/失效状态统一放在
 `control_station.refinement_annotation.detail_annotation` 模块；GUI application 只协调
