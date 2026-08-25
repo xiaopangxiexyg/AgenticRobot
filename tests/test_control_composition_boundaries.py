@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 import subprocess
 import sys
@@ -35,18 +34,7 @@ from dataset_interface.composition_control_trace import (
     project_composition_session_spec,
 )
 from control_composition.policy_node import PolicyNodeOutput, PolicyNodeSpec
-from control_composition.lifecycle import (
-    CompositionSessionOperationSpec,
-    CompositionSessionRearmReceipt,
-    CompositionSessionRearmSpec,
-    CompositionSessionRegistry,
-    CompositionSessionState,
-    CompositionSessionTransition,
-    MixedControlBoundaryPolicy,
-    advance_composition_session,
-    initial_composition_session_state,
-    validate_composition_session_rearm,
-)
+from control_composition.lifecycle import CompositionSessionRegistry
 from control_station.composition_session import CompositionSessionController
 from tests.support.repository_imports import (
     absolute_import_roots as _absolute_import_roots,
