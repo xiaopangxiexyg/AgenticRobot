@@ -120,10 +120,6 @@ def _stats(values: Sequence[float]) -> dict[str, float | int | None]:
     }
 
 
-def _abs_stats(values: Sequence[float]) -> dict[str, float | int | None]:
-    return _stats([abs(float(value)) for value in values])
-
-
 def _pose_metric_stats(samples: Sequence[tuple[float, float]]) -> dict[str, Any]:
     return {
         "translation_m": _stats([item[0] for item in samples]),
