@@ -12,6 +12,7 @@ HITL binding，也没有由本目录授权的真机 motion 流程。
 | 理解 current ownership、四类 profile、trajectory 与 real gate | [HITL 当前边界](../architecture/plans/hitl_chunk_relative_migration_plan.md) |
 | 启动、操作、排障、capture、配置输入设备或 policy source | [Sim-HIL 综合操作指南](./guides/sim_hil_operator_guide.md) |
 | 追溯 R0-R4、R3.1a-c、ResidualSession/preview/rebase/handback 设计 | [HITL 历史实施台账](../architecture/reports/hitl_chunk_relative_ledger_20260807.md) |
+| 追溯 Sim-HIL VIVE/Q6 wrapper 退役原因和保留边界 | [Sim-HIL VIVE/Q6 wrapper 退役报告](../legacy/reports/sim_hil_vive_q6_wrapper_retirement_20260825.md) |
 | 理解 GUI、browser、application profile 的收口方向 | [Control Station 当前计划](../architecture/plans/dexteleop_control_station_plan.md) |
 | 理解 proposal、authority、safety、target、reference 和 dispatch | [Control Core 当前边界](../architecture/plans/dexteleop_control_core_landing_plan.md) |
 
