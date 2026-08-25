@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SOURCE_ROOTS = (
@@ -216,6 +218,7 @@ def _artifact_reference_summary(path: Path) -> _ArtifactReferenceSummary:
     )
 
 
+@pytest.mark.slow_sim
 def test_legacy_artifact_root_reference_budget_does_not_grow() -> None:
     observed = {
         path.relative_to(REPO_ROOT).as_posix()
@@ -231,6 +234,7 @@ def test_legacy_artifact_root_reference_budget_does_not_grow() -> None:
     )
 
 
+@pytest.mark.slow_sim
 def test_project_logs_literal_is_confined_to_archived_reader_roots() -> None:
     observed = {
         (path.relative_to(REPO_ROOT).as_posix(), scope)

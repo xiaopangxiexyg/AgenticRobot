@@ -81,6 +81,7 @@ def test_rebot_vendor_tree_is_not_part_of_parent_package_discovery() -> None:
     )
 
 
+@pytest.mark.slow_sim
 def test_m0_adds_no_parent_runtime_import_of_rebot_vendor_code() -> None:
     forbidden = {"reBotArm_control_py", "hardware.reBotArm_control_py"}
     violations: dict[str, list[str]] = {}

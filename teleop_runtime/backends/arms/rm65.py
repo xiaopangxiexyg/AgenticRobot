@@ -1120,6 +1120,7 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_execution_work_item: ExecutionWorkItem | None = None
         self._execution_inflight_work_item: ExecutionWorkItem | None = None
         self._last_completed_execution_work_item: ExecutionWorkItem | None = None
+        self._last_guard_rejected_execution_work_item: ExecutionWorkItem | None = None
         self._last_old_epoch_invocation_started_at: float | None = None
         self._last_old_epoch_invocation_completed_at: float | None = None
         self._execution_epoch_rejected_count = 0
@@ -1756,6 +1757,14 @@ class RM65ArmBackend(EffectorBackend):
         self._stream_planner_policy_mode = "linear"
         self._stream_planner_policy_speed_scale = 1.0
         self._stream_planner_policy_reason = "normal"
+
+    def _reject_stale_target_locked(self) -> None:
+        """Preserve the rejected lineage until cancellation drain observes it."""
+
+        self._last_guard_rejected_execution_work_item = (
+            self._stream_execution_work_item
+        )
+        self._clear_stream_target_locked()
 
     def _reset_stream_planner_locked(
         self,
@@ -3835,6 +3844,14 @@ class RM65ArmBackend(EffectorBackend):
                 ):
                     discarded = (item.work_item_id,)
                     self._clear_stream_target_locked()
+                rejected_item = self._last_guard_rejected_execution_work_item
+                if (
+                    not discarded
+                    and rejected_item is not None
+                    and rejected_item.execution_epoch
+                    == cancellation.previous_execution_epoch
+                ):
+                    discarded = (rejected_item.work_item_id,)
                 completed_item = self._last_completed_execution_work_item
                 if (
                     completed_item is not None
@@ -5922,7 +5939,7 @@ class RM65ArmBackend(EffectorBackend):
                                             transport_block_reason = epoch_check.status
                                             self._execution_epoch_rejected_count += 1
                                             if target_is_current:
-                                                self._clear_stream_target_locked()
+                                                self._reject_stale_target_locked()
                                 if transport_block_reason is None:
                                     sdk_attempt_sequence = self._record_command_attempt_locked(
                                         next_qpos,

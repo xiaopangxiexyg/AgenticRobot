@@ -168,7 +168,10 @@ def test_backend_drain_waits_for_inflight_old_sdk_call_then_blocks_tail_send() -
     )
 
     backend._stream_stop_event.clear()
-    worker = threading.Thread(target=backend._background_stream_loop_impl, daemon=True)
+    worker = threading.Thread(
+        target=backend._background_stream_loop_impl,
+        daemon=True,
+    )
     worker.start()
     assert arm.entered.wait(timeout=1.0)
 
@@ -216,6 +219,79 @@ def test_backend_drain_waits_for_inflight_old_sdk_call_then_blocks_tail_send() -
         assert "stale execution work" in str(exc)
     else:
         raise AssertionError("old execution work was accepted after cancellation")
+
+
+def test_backend_drain_reports_target_already_rejected_by_epoch_guard() -> None:
+    registry = _registry()
+    participant = ExecutionCancellationParticipantSpec.create(
+        participant_id="rm65-left-background-stream-worker",
+        worker_kind="backend_stream_worker",
+        affected_selection_group_ids=("arms",),
+    )
+    backend = RM65ArmBackend(
+        RM65ArmBackendConfig(
+            arm_ip="0.0.0.0",
+            side="left",
+            connect_hardware=False,
+            initial_qpos=np.zeros(6),
+            background_streaming_enabled=True,
+            background_streaming_hz=200.0,
+        ),
+        execution_epoch_guard=ExecutionEpochGuard(registry),
+        worker_drain_participant=participant,
+    )
+    arm = _BlockingArm()
+    backend.arm = arm
+    upstream = ExecutionWorkItem(
+        work_item_id="position-command-old",
+        work_kind="position_command",
+        control_domain_id="rm65-arms",
+        authority_epoch=2,
+        execution_epoch=3,
+        segment_generation_by_group={"arms": 7},
+        source_decision_id="decision-old",
+        source_reference_segment_id="segment-old",
+    )
+    backend.send_command(
+        EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=np.full(6, 0.01),
+            metadata={"source": "policy"},
+            execution_work_item=upstream,
+        )
+    )
+
+    cancellation = _cancel(registry)
+    backend._stream_stop_event.clear()
+    worker = threading.Thread(
+        target=backend._background_stream_loop_impl,
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with backend._state_lock:
+            if backend._stream_execution_work_item is None:
+                break
+        time.sleep(0.001)
+    else:
+        raise AssertionError("epoch guard did not reject the stale stream target")
+
+    backend._stream_stop_event.set()
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert not arm.entered.is_set(), "rejected work must not reach the SDK"
+
+    receipt = backend.drain_execution_cancellation(cancellation)
+
+    assert receipt.accepted
+    assert receipt.discarded_work_ids == (
+        "position-command-old:rm65:left:target:1",
+    )
+    assert receipt.in_flight_old_epoch_count == 0
+    assert receipt.no_future_old_epoch_calls
 
 
 def test_epoch_mediated_quick_stop_cannot_inherit_motion_work() -> None:

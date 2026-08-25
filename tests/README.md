@@ -62,7 +62,8 @@ make every parallel worktree repeat the same high-cost acceptance behavior.
 `slow_sim` is the compatibility name for the measured high-cost tier. Assign
 it from node-level timing evidence while keeping the unfiltered acceptance
 behavior unchanged. Simulation, shared IK replay, simulation-side model
-loading, physical closed loops, and high-volume persistence soaks may qualify.
+loading, repository-wide source scans, physical closed loops, and high-volume
+persistence soaks may qualify.
 A module-level marker is valid only when every collected node in that module
 has been measured into the same tier. A filename, loop bound, optional
 dependency, or `mujoco` import alone is not sufficient evidence. Do not share
@@ -75,9 +76,10 @@ resource-independent.
 - `unit`: deterministic in-process behavior.  This is the transitional default
   for modules not yet listed in `tests/conftest.py`.
 - `slow_sim`: the legacy-compatible orthogonal cost marker for measured
-  long-running deterministic simulation, IK replay, physical closed-loop, or
-  high-volume soak verification. It remains in complete `unit`/`integration`
-  and `not hardware` gates and is excluded only by an explicit fast selector.
+  long-running deterministic simulation, IK replay, repository-wide source
+  scans, physical closed-loop, or high-volume soak verification. It remains in
+  the complete `unit`/`integration` and `not hardware` gates and is excluded
+  only by an explicit fast selector.
 - `integration`: multi-component, filesystem, worker, writer, or loopback
   behavior.
 - `contract`: an orthogonal public schema, dependency-boundary, action, or data
