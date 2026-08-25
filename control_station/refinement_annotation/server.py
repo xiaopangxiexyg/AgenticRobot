@@ -1191,6 +1191,7 @@ class RefinementAnnotationGui:
             return self.url
         self._thread = threading.Thread(
             target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.05},
             name="refinement-annotation-gui",
             daemon=True,
         )

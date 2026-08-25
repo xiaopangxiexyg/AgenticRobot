@@ -65,7 +65,11 @@ def _manifest() -> ControlStationRunManifest:
 @contextmanager
 def _running_server(runtime: ControlStationRuntime):
     server = build_read_only_control_station_server(runtime, port=0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
     thread.start()
     try:
         host, port = server.server_address[:2]

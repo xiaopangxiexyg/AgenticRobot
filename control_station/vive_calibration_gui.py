@@ -676,6 +676,7 @@ class ViveCoordinateCalibrationGui:
         )
         self._thread = threading.Thread(
             target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.05},
             daemon=True,
             name="control_station_vive_calibration_gui",
         )

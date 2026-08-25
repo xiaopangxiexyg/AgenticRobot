@@ -2,36 +2,21 @@ from __future__ import annotations
 
 import ast
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
+from tests.support.repository_imports import (
+    absolute_import_roots as _absolute_import_roots,
+)
+from tests.support.repository_imports import (
+    python_files as _python_files,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
-
-
-def _python_files(root: Path) -> tuple[Path, ...]:
-    return tuple(
-        sorted(
-            path
-            for path in root.rglob("*.py")
-            if "__pycache__" not in path.parts
-        )
-    )
-
-
-def _absolute_import_roots(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    roots: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            roots.add(node.module.split(".", 1)[0])
-    return roots
 
 
 def _module_level_absolute_import_roots(path: Path) -> set[str]:

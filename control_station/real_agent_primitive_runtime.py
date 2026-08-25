@@ -396,6 +396,7 @@ class RealAgentPrimitiveSkillOnlyExtension:
         )
         thread = threading.Thread(
             target=server.serve_forever,
+            kwargs={"poll_interval": 0.05},
             name="real-agent-primitive-gateway",
             daemon=True,
         )
