@@ -910,15 +910,3 @@ class FixArmCommandController:
         if channel_name.startswith("right_"):
             return "right"
         return ""
-
-    def _side_for_command(self, effector_name: str, command: EffectorCommand) -> str:
-        for side, effectors in self.required_effectors_by_side.items():
-            if effector_name in effectors:
-                return side
-        if command.side in {"left", "right"}:
-            return str(command.side)
-        if effector_name.startswith("left_"):
-            return "left"
-        if effector_name.startswith("right_"):
-            return "right"
-        return ""

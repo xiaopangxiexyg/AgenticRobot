@@ -55,7 +55,6 @@ from dataset_interface.modality_artifacts import (
 from .dataset_layout import sanitize_dataset_name_for_path
 from .modality_inventory import (
     load_modality_inventory as _load_published_modality_inventory,
-    modality_inventory_path,
     publish_modality_inventory,
 )
 from .process_quiescence import (
@@ -180,10 +179,6 @@ def _validate_roots(dataset_root: Path, cold_root: Path) -> None:
 
 def _sidecar_root(dataset_root: Path) -> Path:
     return dataset_root / MODALITY_ARTIFACT_SIDECAR_RELATIVE
-
-
-def _inventory_path(dataset_root: Path, inventory_hash: str) -> Path:
-    return modality_inventory_path(dataset_root, inventory_hash)
 
 
 def _receipt_path(dataset_root: Path, operation_id: str) -> Path:

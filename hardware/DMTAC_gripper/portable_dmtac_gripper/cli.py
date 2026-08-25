@@ -340,10 +340,6 @@ def _is_reachable_gripper_item(item) -> bool:
     return isinstance(item.get("probe"), dict) and item.get("probe", {}).get("reachable") is True
 
 
-def _is_probe_failed_gripper_item(item) -> bool:
-    return isinstance(item.get("probe"), dict) and item.get("probe", {}).get("reachable") is False
-
-
 def _is_noise_serial_item(item) -> bool:
     port = str(item.get("preferred_port") or item.get("port") or item.get("device") or "")
     text = " ".join(

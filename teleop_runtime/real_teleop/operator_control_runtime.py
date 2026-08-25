@@ -826,15 +826,6 @@ class RealTeleopControlInput:
     def _visualization_controls(self) -> list[str]:
         return _gui_visualization_controls(self._gui_control_state())
 
-    def _vive_calibration_controls(self, *, allow_load: bool) -> list[str]:
-        return _gui_vive_calibration_controls(self._gui_events(), allow_load=allow_load)
-
-    def _movement_multiple_controls(self) -> list[str]:
-        return _gui_movement_multiple_controls(self._gui_control_state(), self._gui_events())
-
-    def _collection_task_controls(self) -> list[str]:
-        return _gui_collection_task_controls(self._gui_control_state())
-
     def _dataset_configuration_blocked_reason(self) -> str:
         return self.plus_curation.persisted_binding_lock_reason()
 
@@ -896,14 +887,8 @@ class RealTeleopControlInput:
             control_hint=message,
         )
 
-    def _episode_controls(self) -> list[str]:
-        return _gui_episode_controls(self._gui_control_state(), self._gui_events())
-
     def _fix_init_allowed_in_controls(self) -> bool:
         return _gui_fix_init_allowed_in_controls(self._gui_control_state())
-
-    def _finalizing_controls(self) -> list[str]:
-        return _gui_finalizing_controls(self._gui_control_state())
 
     def _current_active_controls(self) -> list[str]:
         controls = list(_gui_current_active_controls(
@@ -977,20 +962,11 @@ class RealTeleopControlInput:
     def _fix_arm_available(self) -> bool:
         return self._gui_control_state().fix_arm_available
 
-    def _fix_arm_controls(self) -> list[str]:
-        return _gui_fix_arm_controls(self._gui_control_state())
-
     def _init_arm_available(self) -> bool:
         return self._gui_control_state().init_arm_available
 
-    def _init_arm_controls(self) -> list[str]:
-        return _gui_init_arm_controls(self._gui_control_state())
-
     def _pose_snapshot_available(self) -> bool:
         return self._gui_control_state().pose_snapshot_available
-
-    def _pose_snapshot_controls(self) -> list[str]:
-        return _gui_pose_snapshot_controls(self._gui_control_state(), self._gui_events())
 
     def _pose_snapshot_ui_state(self) -> dict[str, object]:
         recorder = getattr(self, "_pose_snapshot_recorder", None)
@@ -1002,14 +978,8 @@ class RealTeleopControlInput:
             "pose_snapshot_status": getattr(self, "_pose_snapshot_status", ""),
         }
 
-    def _teleop_controls(self) -> list[str]:
-        return _gui_teleop_controls(self._gui_control_state(), self._gui_events())
-
     def _single_arm_tracker_swap_allowed_in_hold(self) -> bool:
         return _gui_single_arm_tracker_swap_allowed_in_hold(self._gui_control_state())
-
-    def _pre_home_controls(self) -> list[str]:
-        return _gui_pre_home_controls(self._gui_control_state(), self._gui_events())
 
     def _hold_controls(self) -> list[str]:
         return _gui_hold_controls(self._gui_control_state(), self._gui_events())

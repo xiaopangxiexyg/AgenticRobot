@@ -274,10 +274,6 @@ def _hand_vector(
     return padded, spec
 
 
-def _hand_active_mask(active_dof: int, *, slot_dof: int) -> list[bool]:
-    return [index < int(active_dof) for index in range(int(slot_dof))]
-
-
 def robot_action_from_teleop_command(
     command: TeleopCommand,
     *,

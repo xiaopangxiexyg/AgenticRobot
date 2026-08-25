@@ -2344,9 +2344,6 @@ class RM65BaseImpedanceController:
             ),
         }
 
-    def _joint_rate_limit_dt(self) -> float:
-        return self._joint_rate_limit_dt_details()["effective_dt_sec"]
-
     def _emit_joint_rate_limit_warning(self, metadata: dict[str, object]) -> None:
         now = time.time()
         if now - self._last_joint_rate_limit_warning_time < 1.0:
