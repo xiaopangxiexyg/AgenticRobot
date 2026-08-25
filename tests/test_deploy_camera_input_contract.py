@@ -58,11 +58,14 @@ def test_facade_reexports_the_extracted_contract_function() -> None:
 def test_legacy_artifact_keeps_unconstrained_camera_behavior() -> None:
     args = _args(camera_mode="multi")
 
-    assert camera_input_contract.resolve_policy_camera_input_keys(
-        args,
-        None,
-        raw_argv=[],
-    ) is None
+    assert (
+        camera_input_contract.resolve_policy_camera_input_keys(
+            args,
+            None,
+            raw_argv=[],
+        )
+        is None
+    )
 
 
 def test_required_artifact_rejects_camera_mode_none() -> None:
