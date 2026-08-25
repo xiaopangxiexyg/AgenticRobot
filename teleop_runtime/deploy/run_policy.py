@@ -278,6 +278,7 @@ from .camera_runtime import (
     select_preview_camera_sources,
     start_camera_sources,
 )
+from .camera_cli_validation import validate_camera_cli_args
 from .cli_args import argument_was_supplied as _argument_was_supplied
 from .cli_value_parsers import (
     _non_negative_float,
@@ -1373,33 +1374,7 @@ def validate_args(
         for side in end_effector_sides:
             if not getattr(args, f"{side}_hand_ip"):
                 raise ValueError(f"--visualize-tactile requires --{side}-hand-ip.")
-    if args.camera_mode in {"single", "multi"}:
-        if args.camera_mode == "multi" and args.camera_serial:
-            raise ValueError(
-                "--camera-mode multi uses --camera-config; omit --camera-serial."
-            )
-        if not args.camera_serial and not Path(args.camera_config).exists():
-            raise ValueError(
-                f"--camera-mode {args.camera_mode} requires an existing --camera-config."
-            )
-        if int(args.camera_width) <= 0 or int(args.camera_height) <= 0:
-            raise ValueError("--camera-width/--camera-height must be positive.")
-        if int(args.camera_fps) <= 0:
-            raise ValueError("--camera-fps must be positive.")
-        if int(args.camera_keep_last) <= 0:
-            raise ValueError("--camera-keep-last must be positive.")
-        if float(args.camera_frame_max_age_sec) <= 0.0:
-            raise ValueError("--camera-frame-max-age-sec must be positive.")
-        if int(args.camera_wait_timeout_ms) <= 0:
-            raise ValueError("--camera-wait-timeout-ms must be positive.")
-        if float(args.camera_stale_after_sec) <= 0.0:
-            raise ValueError("--camera-stale-after-sec must be positive.")
-        if float(args.camera_start_stagger_sec) < 0.0:
-            raise ValueError("--camera-start-stagger-sec must be >= 0.")
-    elif bool(args.vis_cam):
-        raise ValueError(
-            "--vis_cam requires --camera-mode single or --camera-mode multi."
-        )
+    validate_camera_cli_args(args)
     return active_sides
 
 
