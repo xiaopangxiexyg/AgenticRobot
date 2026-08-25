@@ -15,6 +15,7 @@ from dataset_contracts.wrist_depth import (
     mask_manifest_payload,
     pack_binary_mask,
 )
+from robot_motion.relative_action import pose_matrix_to_xyzquat
 
 from ..pointcloud import pointcloud_from_depth, pointcloud_manifest_payload
 from ..scene import MujocoScene
@@ -259,6 +260,13 @@ class SimReplayDatasetWriterConfig:
     urdf_path: Path | None = None
     mode: str = "dual"
     qpos_source: str = "auto"
+    pose_frame_contract: Mapping[str, Any] | None = None
+    pose_frame_contract_hash: str = ""
+    policy_io_layout_hash: str = ""
+    arm_pose_action_mode: str = ""
+    arm_action_specs_by_side: Mapping[str, Mapping[str, Any]] = field(
+        default_factory=dict
+    )
     gripper_command_dim: int = 1
     write_wrist_depth_raw: bool = False
     write_wrist_depth_mask: bool = False
@@ -423,6 +431,18 @@ class SimReplayDatasetWriter:
             },
             "sim_replay": self._export_metadata(),
         }
+        if self.config.pose_frame_contract is not None:
+            info["pose_frame_contract"] = _to_serializable(self.config.pose_frame_contract)
+        if str(self.config.pose_frame_contract_hash).strip():
+            info["pose_frame_contract_hash"] = str(self.config.pose_frame_contract_hash)
+        if str(self.config.policy_io_layout_hash).strip():
+            info["policy_io_layout_hash"] = str(self.config.policy_io_layout_hash)
+        if str(self.config.arm_pose_action_mode).strip():
+            info["arm_pose_action_mode"] = str(self.config.arm_pose_action_mode)
+        if self.config.arm_action_specs_by_side:
+            info["arm_action_specs_by_side"] = _to_serializable(
+                self.config.arm_action_specs_by_side
+            )
         _write_json(self.root_dir / "meta" / "info.json", info)
 
     def _open_video_writer(self, camera_name: str, image: np.ndarray) -> None:
@@ -800,6 +820,24 @@ class SimReplayDatasetWriter:
         spec = self.scene.arm_specs[side]
         return pose_to_xyz_quat_xyzw(self.scene.body_pose(spec.controlled_body))
 
+    def _action_pose(
+        self,
+        side: str,
+        action_pose_by_side: Mapping[str, Any] | None,
+    ) -> list[float]:
+        if action_pose_by_side is None or side not in action_pose_by_side:
+            return self._side_pose(side)
+        value = np.asarray(action_pose_by_side[side], dtype=float)
+        if value.reshape(-1).shape == (7,):
+            if not np.all(np.isfinite(value)):
+                raise ValueError(
+                    f"Canonical action pose for {side!r} contains non-finite values."
+                )
+            return value.reshape(7).astype(float).tolist()
+        return pose_matrix_to_xyzquat(
+            value, name=f"canonical action pose for {side!r}"
+        ).tolist()
+
     def _hand_qpos_by_side(
         self,
         gripper_close_by_side: Mapping[str, float] | None,
@@ -836,9 +874,22 @@ class SimReplayDatasetWriter:
             *right_hand,
         ]
 
-    def _action_vector(self, hand_qpos_by_side: Mapping[str, Sequence[float]]) -> list[float]:
-        left_pose = self._side_pose("left") if "left" in self.scene.arm_specs else _zero_vector(7)
-        right_pose = self._side_pose("right") if "right" in self.scene.arm_specs else _zero_vector(7)
+    def _action_vector(
+        self,
+        hand_qpos_by_side: Mapping[str, Sequence[float]],
+        *,
+        action_pose_by_side: Mapping[str, Any] | None = None,
+    ) -> list[float]:
+        left_pose = (
+            self._action_pose("left", action_pose_by_side)
+            if "left" in self.scene.arm_specs
+            else _zero_vector(7)
+        )
+        right_pose = (
+            self._action_pose("right", action_pose_by_side)
+            if "right" in self.scene.arm_specs
+            else _zero_vector(7)
+        )
         left_hand = list(hand_qpos_by_side.get("left", _zero_vector(6)))
         right_hand = list(hand_qpos_by_side.get("right", _zero_vector(6)))
         return [*left_pose, *right_pose, *left_hand, *right_hand]
@@ -854,6 +905,8 @@ class SimReplayDatasetWriter:
         depth_images: Mapping[str, np.ndarray] | None = None,
         playback_time_sec: float,
         active_sides: Sequence[str],
+        frame_metadata: Mapping[str, Any] | None = None,
+        action_pose_by_side: Mapping[str, Any] | None = None,
     ) -> None:
         if self._closed:
             raise RuntimeError("Cannot record to a closed sim replay dataset writer.")
@@ -890,7 +943,10 @@ class SimReplayDatasetWriter:
         )
         hand_qpos_by_side = self._hand_qpos_by_side(gripper_close_by_side)
         observation_state = self._observation_state(qpos_by_side, hand_qpos_by_side)
-        action = self._action_vector(hand_qpos_by_side)
+        action = self._action_vector(
+            hand_qpos_by_side,
+            action_pose_by_side=action_pose_by_side,
+        )
         row: dict[str, Any] = {
             "index": frame_index,
             "episode_index": self.episode_index,
@@ -924,6 +980,9 @@ class SimReplayDatasetWriter:
                             "gripper_source_by_side": {}
                             if gripper_sample is None
                             else gripper_sample.source_by_side,
+                            "frame_metadata": {}
+                            if frame_metadata is None
+                            else _to_serializable(dict(frame_metadata)),
                             "camera_metadata": self.scene.camera_metadata(),
                         }
                     }
@@ -934,6 +993,16 @@ class SimReplayDatasetWriter:
             "channels_json": "{}",
             "faults_json": "[]",
         }
+        if self.config.pose_frame_contract is not None:
+            storage_frame = self.config.pose_frame_contract.get("pose_storage_frame")
+            if storage_frame is not None:
+                row["dexteleop.pose_storage_frame"] = str(storage_frame)
+        if str(self.config.pose_frame_contract_hash).strip():
+            row["dexteleop.pose_frame_contract_hash"] = str(
+                self.config.pose_frame_contract_hash
+            )
+        if str(self.config.policy_io_layout_hash).strip():
+            row["policy_io_layout_hash"] = str(self.config.policy_io_layout_hash)
 
         for side in ("left", "right"):
             qpos = qpos_by_side.get(side, _zero_vector(6))
