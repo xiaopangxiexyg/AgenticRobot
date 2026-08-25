@@ -1135,29 +1135,6 @@ class VivePoseSource(ObservationSource):
             }
         return parsed
 
-    def _parse_upstream_role_diagnostics(
-        self,
-        packet: bytes,
-        received_at: float,
-        *,
-        sender_host: str | None = None,
-    ) -> dict[str, dict[str, Any]] | None:
-        """Parse sender-role facts without applying the active role mapping.
-
-        ``None`` means that the datagram was not a JSON VIVE packet.  An empty
-        mapping means that it was JSON but contained no named tracker role.
-        The result is diagnostic-only and cannot feed observation channels.
-        """
-
-        decoded = self._decode_json_packet(packet)
-        if decoded is None:
-            return None
-        return self._parse_decoded_upstream_role_diagnostics(
-            decoded,
-            received_at,
-            sender_host=sender_host,
-        )
-
     def _parse_decoded_upstream_role_diagnostics(
         self,
         decoded: dict[str, Any],
