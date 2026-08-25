@@ -156,3 +156,10 @@ also does not start a real device, GUI, policy server, or motion. The next
 bounded gate is a resettable MuJoCo task rollout that routes policy, human, and
 RTC actions through the existing authoritative runtime, followed by comparable
 metrics for ordinary policy, takeover/handback, and stream intervention.
+
+The first no-device reset attempt reached the MuJoCo task constructor but was
+blocked by a missing checked-out asset:
+`assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf`.
+No asset download, symlink rebinding, or simulator workaround was performed.
+The physical-rollout gate therefore remains open only after the supported RM65
+asset store is explicitly made available and its identity is rechecked.
