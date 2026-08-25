@@ -2008,7 +2008,12 @@ def run_real_teleop(
                 _log("DebugAction", f"standalone log disabled: {type(exc).__name__}: {exc}")
         else:
             action_debug_path = None
-        startup_progress_runtime.publish(force=True)
+        # The initial startup projection already admitted this same dataset
+        # selection.  Let the runtime dedupe an unchanged projection here;
+        # forcing a second publish would unnecessarily rebuild the pre-Home
+        # UI and, after a cache miss such as a dataset/profile change, repeat
+        # the O(number-of-legacy-episodes) admission scan.
+        startup_progress_runtime.publish()
         startup_home_captured = False
         startup_home_qpos_snapshot: dict[str, np.ndarray] = {}
         manual_startup_request = _manual_calibration_confirmation_required(args, components)

@@ -168,13 +168,21 @@ def _dataset_recorder_matches_progress_selection(
     )
 
 
-def build_real_teleop_startup_progress_ui_payload(
+def _build_real_teleop_startup_progress_ui_payload(
     *,
     args: argparse.Namespace,
     dataset_recorder: object | None,
     profile_selection_enabled: bool = True,
+    admission: DatasetProgressProfileAdmission | None = None,
 ) -> dict[str, object]:
-    """Build the pre-Home Station projection before the control loop exists."""
+    """Build the pre-Home Station projection before the control loop exists.
+
+    ``admission`` is an internal read-only handoff from
+    :class:`StationProgressApplication`.  Startup and steady-state progress
+    projections must share the same cached unmatched-dataset admission; the
+    standalone public helper keeps its historical behavior when no admission
+    is supplied.
+    """
 
     recorder_matches = _dataset_recorder_matches_progress_selection(
         args=args,
@@ -197,17 +205,19 @@ def build_real_teleop_startup_progress_ui_payload(
             )
         )
     else:
-        admission = inspect_dataset_progress_profile(
-            Path(args.dataset_root),
-            requested_profile=getattr(
-                args,
-                "collection_progress_profile",
-                None,
-            ),
-        )
-        profile = admission.profile
-        profile_selection_locked = admission.locked
-        profile_binding_source = admission.source
+        resolved_admission = admission
+        if resolved_admission is None:
+            resolved_admission = inspect_dataset_progress_profile(
+                Path(args.dataset_root),
+                requested_profile=getattr(
+                    args,
+                    "collection_progress_profile",
+                    None,
+                ),
+            )
+        profile = resolved_admission.profile
+        profile_selection_locked = resolved_admission.locked
+        profile_binding_source = resolved_admission.source
     available_profiles = list_real_teleop_managed_progress_profile_options(
         collection_task_id=str(args.collection_task_id),
     )
@@ -261,6 +271,21 @@ def build_real_teleop_startup_progress_ui_payload(
     if selection_id is not None:
         payload["profile_id"] = selection_id
     return payload
+
+
+def build_real_teleop_startup_progress_ui_payload(
+    *,
+    args: argparse.Namespace,
+    dataset_recorder: object | None,
+    profile_selection_enabled: bool = True,
+) -> dict[str, object]:
+    """Build the pre-Home Station projection before the control loop exists."""
+
+    return _build_real_teleop_startup_progress_ui_payload(
+        args=args,
+        dataset_recorder=dataset_recorder,
+        profile_selection_enabled=profile_selection_enabled,
+    )
 
 
 class StationProgressApplication:
@@ -393,10 +418,23 @@ class StationProgressApplication:
         dataset_recorder: object | None,
         profile_selection_enabled: bool,
     ) -> dict[str, object]:
-        return build_real_teleop_startup_progress_ui_payload(
+        recorder_matches = _dataset_recorder_matches_progress_selection(
+            args=self._args,
+            dataset_recorder=dataset_recorder,
+        )
+        if recorder_matches:
+            # A matching recorder is authoritative and may have just bound or
+            # sealed progress state.  Do not reuse an unmatched pending
+            # selection admission after that transition.
+            self._clear_selected_admission()
+            admission = None
+        else:
+            admission = self._inspect_selected_dataset_progress_profile()
+        return _build_real_teleop_startup_progress_ui_payload(
             args=self._args,
             dataset_recorder=dataset_recorder,
             profile_selection_enabled=profile_selection_enabled,
+            admission=admission,
         )
 
     def select_managed_progress_profile(
