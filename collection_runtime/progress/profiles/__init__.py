@@ -1,6 +1,7 @@
 """Managed, application-neutral collection progress profile catalog."""
 
 from .catalog import (
+    DETAILED_PROFILE_SELECTION_SUFFIX,
     ManagedTaskProfile,
     ProgressProfileCatalogError,
     list_managed_task_profiles,
@@ -35,6 +36,7 @@ __all__ = [
     "CommonProgressSemanticType",
     "DATASET_PROGRESS_PROFILE_RELATIVE_PATH",
     "DATASET_TASK_STAGE_PROFILE_RELATIVE_PATH",
+    "DETAILED_PROFILE_SELECTION_SUFFIX",
     "DatasetProgressProfileAdmission",
     "DatasetProgressProfileBindingError",
     "DatasetTaskStageProfileAdmission",

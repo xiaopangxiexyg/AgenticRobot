@@ -16,7 +16,8 @@ from collection_runtime.progress.profiles import (
     inspect_dataset_progress_profile,
 )
 from teleop_runtime.real_teleop.progress_adapter import (
-    list_real_teleop_managed_progress_profiles,
+    list_real_teleop_managed_progress_profile_selections,
+    real_teleop_managed_progress_selection_id,
     select_real_teleop_managed_progress_profile,
     select_real_teleop_progress_entry_step,
 )
@@ -104,16 +105,48 @@ def list_real_teleop_managed_progress_profile_options(
 
     return tuple(
         ProgressProfileOption(
-            profile_id=profile.profile_id,
-            profile_version=profile.profile_version,
-            task_id=profile.task_id,
-            display_name=profile.profile_id,
-            step_count=len(profile.steps),
+            profile_id=bundle.selection_id,
+            profile_version=bundle.progress_profile.profile_version,
+            task_id=bundle.progress_profile.task_id,
+            display_name=(
+                f"{bundle.progress_profile.profile_id} · detail"
+                if bundle.is_detailed
+                else bundle.progress_profile.profile_id
+            ),
+            step_count=len(bundle.progress_profile.steps),
         )
-        for profile in list_real_teleop_managed_progress_profiles(
+        for bundle in list_real_teleop_managed_progress_profile_selections(
             collection_task_id=collection_task_id,
         )
     )
+
+
+def _progress_profile_selection_id(
+    *,
+    args: argparse.Namespace,
+    profile: object | None,
+    dataset_recorder: object | None,
+    recorder_matches: bool,
+) -> str | None:
+    if profile is None:
+        return None
+    explicit = str(
+        getattr(args, "collection_progress_profile_selection_id", "")
+        or ""
+    ).strip()
+    stage_profile = (
+        getattr(dataset_recorder, "stage_profile", None)
+        if recorder_matches
+        else getattr(args, "collection_stage_profile", None)
+    )
+    try:
+        selection_id = real_teleop_managed_progress_selection_id(
+            profile,
+            stage_profile,
+        )
+    except (TypeError, ValueError):
+        selection_id = None
+    return explicit or selection_id
 
 
 def _dataset_recorder_matches_progress_selection(
@@ -219,6 +252,14 @@ def build_real_teleop_startup_progress_ui_payload(
         payload["message"] = (
             "设备仍在启动；完成连接检查后即可在 runtime Home 前选择进度 profile。"
         )
+    selection_id = _progress_profile_selection_id(
+        args=args,
+        profile=profile,
+        dataset_recorder=dataset_recorder,
+        recorder_matches=recorder_matches,
+    )
+    if selection_id is not None:
+        payload["profile_id"] = selection_id
     return payload
 
 
@@ -480,6 +521,14 @@ class StationProgressApplication:
             ),
             entry_step_selection_enabled=profile_selection_enabled,
         )
+        selection_id = _progress_profile_selection_id(
+            args=self._args,
+            profile=profile,
+            dataset_recorder=dataset_recorder,
+            recorder_matches=recorder_matches,
+        )
+        if selection_id is not None:
+            payload["profile_id"] = selection_id
         return ProgressApplicationProjection(
             configured=profile is not None,
             active_controls=tuple(active_controls),

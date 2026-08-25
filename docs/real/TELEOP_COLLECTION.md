@@ -295,6 +295,10 @@ GUI 列出当前真机 adapter 已准入的全部 LINEAR managed profile，不�
 
 - `dmtac_rm65_bimanual_position_writing_four_stage_progress`：新空数据集的默认
   writing profile，依次为拿笔、取笔盖、书写、放回毛笔；
+- `dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed`：显式
+  detail 采集 variant；保留同样的四个 coarse Step，但把 `right_write` 拆为
+  `right_write.pen_down`、`right_write.write`、`right_write.pen_up`。它只适用于
+  尚未绑定 stage profile 的新 dataset，GUI 选择时会同时绑定该详细 stage profile；
 - `dmtac_rm65_bimanual_position_writing_five_stage_progress`：在四阶段流程中增加独立的
   沾墨阶段；
 - `dmtac_rm65_bimanual_position_v1_progress`：单阶段正式 smoke profile；
@@ -310,6 +314,14 @@ GUI 列出当前真机 adapter 已准入的全部 LINEAR managed profile，不�
 它的 `task_id` 是 `example_three_stage_pick_place`，因此会作为独立选项出现在 GUI 中；
 它仍不代表 DMTAC 的真实任务语义。需要真实三阶段任务时，应创建语义正确的 managed
 profile，而不是依赖正式 dataset task/name 自动推断。
+
+已有 coarse 四阶段 writing Episode 不需要重采集才能补 detail。先按普通 coarse profile
+完成并封存该 Episode 的阶段标注，后处理 annotation GUI 会按同名
+`.progress_detailed.json` / `.stages_detailed.json` 自动匹配 writing detail，显示三个
+书写 fine stage，并把它们作为独立 additive overlay 封存；原始 Episode、Parquet、视频和
+coarse annotation set 都不会被改写。若一个 dataset 已绑定 coarse `.stages.json`，不能在
+同一 dataset 内再切换到 `_detailed` 采集 variant，因为 dataset-wide stage hash 必须保持
+唯一；后续 detail 采集应使用新的空 dataset 根目录。
 
 两个开关的责任如下：
 

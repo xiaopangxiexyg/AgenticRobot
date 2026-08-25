@@ -463,6 +463,7 @@ def test_progress_gui_is_visible_and_selectable_before_runtime_home(
         "dmtac_rm65_bimanual_position_v1_progress",
         "dmtac_rm65_bimanual_position_writing_five_stage_progress",
         "dmtac_rm65_bimanual_position_writing_four_stage_progress",
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed",
         "dmtac_rm65_bimanual_position_writing_three_stage_progress",
         "example_three_stage_pick_place_progress",
         "test_dmtac_rm65_bimanual_position_v1_three_stage_progress",
@@ -501,7 +502,7 @@ def test_progress_gui_keeps_profile_selection_available_for_any_formal_task(
     )
 
     assert payload["configured"] is False
-    assert len(payload["available_profiles"]) == 7
+    assert len(payload["available_profiles"]) == 8
     assert payload["profile_selection_enabled"] is True
     assert "长程任务进度 profile" in str(payload["message"])
     assert "dmtac_impedance_15_40hz" not in str(payload["message"])
@@ -521,6 +522,83 @@ def test_progress_gui_keeps_profile_selection_available_for_any_formal_task(
     )
     assert configured["configured"] is True
     assert configured["profile_id"] == selected.profile_id
+
+
+def test_detail_profile_selection_binds_explicit_fine_stage_profile(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        collection_progress_gui=True,
+        collection_progress_profile=None,
+        collection_task_id="writing",
+        dataset_root=tmp_path,
+    )
+
+    selected = select_real_teleop_managed_progress_profile(
+        args=args,
+        dataset_recorder=None,
+        profile_id=(
+            "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+        ),
+    )
+
+    assert selected.profile_id == (
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress"
+    )
+    assert args.collection_progress_profile_selection_id == (
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+    )
+    assert args.collection_stage_profile is not None
+    assert [
+        stage.stage_id
+        for stage in args.collection_stage_profile.stages_for_step("right_write")
+    ] == [
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
+    ]
+
+    payload = build_real_teleop_startup_progress_ui_payload(
+        args=args,
+        dataset_recorder=None,
+    )
+    assert payload["profile_id"] == (
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+    )
+
+
+def test_detail_profile_selection_updates_matching_dataset_recorder(
+    tmp_path: Path,
+) -> None:
+    recorder = _recorder(tmp_path, progress=True)
+    args = SimpleNamespace(
+        collection_progress_gui=True,
+        collection_progress_profile=recorder.progress_profile,
+        collection_task_id="task-a",
+        dataset_root=tmp_path,
+    )
+
+    selected = select_real_teleop_managed_progress_profile(
+        args=args,
+        dataset_recorder=recorder,
+        profile_id=(
+            "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+        ),
+    )
+
+    assert selected.profile_id == (
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress"
+    )
+    assert recorder.stage_profile is not None
+    assert [
+        stage.stage_id
+        for stage in recorder.stage_profile.stages_for_step("right_write")
+    ] == [
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
+    ]
+    assert args.collection_stage_profile == recorder.stage_profile
 
 
 def test_gui_entry_step_selects_truncated_episode_with_annotation_binding(
@@ -1113,6 +1191,29 @@ def test_idle_recorder_profile_selection_is_mutable_until_first_episode(
     assert (
         tmp_path / DATASET_PROGRESS_PROFILE_RELATIVE_PATH
     ).is_file()
+
+
+def test_idle_recorder_accepts_explicit_detailed_stage_variant(
+    tmp_path: Path,
+) -> None:
+    recorder = _recorder(tmp_path, progress=True)
+    detail_profile = load_real_teleop_managed_progress_profile(
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+    )
+    detail_stages = resolve_real_teleop_task_stage_profile(
+        detail_profile,
+        "catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed",
+    )
+    assert detail_stages is not None
+
+    recorder.select_progress_profile(
+        detail_profile,
+        stage_profile=detail_stages,
+    )
+
+    assert recorder.progress_profile == detail_profile
+    assert recorder.stage_profile == detail_stages
+    assert recorder.args.collection_stage_profile == detail_stages
 
 
 def test_profileless_episode_locks_optional_profile_selector_after_start(
