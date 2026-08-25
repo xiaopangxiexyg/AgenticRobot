@@ -17,6 +17,7 @@ import numpy as np
 
 from robot_motion.action import RobotAction
 from robot_motion.action.schema import normalize_side
+from robot_motion.action.sources import RobotActionSource
 
 from .action_frame import replay_robot_action_at_index
 from .rule_based_relative import (
@@ -170,7 +171,88 @@ class RuleBasedCustomAction:
             raise TypeError("capture must be RuleBasedCaptureSelection.")
 
 
-RuleBasedStep: TypeAlias = RuleBasedInitialize | RuleBasedReplay | RuleBasedCustomAction
+@dataclass(frozen=True)
+class RuleBasedSegmentContext:
+    """Inputs supplied to a runtime rule-based segment stop predicate."""
+
+    observation: Any
+    action: RobotAction
+    emitted_steps: int
+    plan_step_index: int
+    context: Any = None
+
+
+@dataclass(frozen=True)
+class RuleBasedSegmentStopCondition:
+    """A bounded, editable stop rule for a runtime action segment.
+
+    ``max_steps`` is always a hard upper bound.  ``stop_when`` is evaluated
+    after each produced action and may terminate the segment earlier, subject
+    to ``min_steps``.  This keeps a user-provided predicate from accidentally
+    creating an unbounded collection loop.
+    """
+
+    max_steps: int
+    min_steps: int = 1
+    stop_when: Callable[[RuleBasedSegmentContext], bool] | None = None
+    name: str = "rule_based_segment"
+
+    def __post_init__(self) -> None:
+        max_steps = _positive_int(self.max_steps, name="max_steps")
+        min_steps = _non_negative_int(self.min_steps, name="min_steps")
+        if min_steps > max_steps:
+            raise ValueError("min_steps must be less than or equal to max_steps.")
+        if self.stop_when is not None and not callable(self.stop_when):
+            raise TypeError("stop_when must be callable when provided.")
+        object.__setattr__(self, "max_steps", max_steps)
+        object.__setattr__(self, "min_steps", min_steps)
+        object.__setattr__(self, "name", _required_text(self.name, name="name"))
+
+    def evaluate(self, context: RuleBasedSegmentContext) -> tuple[bool, str | None]:
+        """Return ``(terminal, reason)`` after one action was produced."""
+
+        if not isinstance(context, RuleBasedSegmentContext):
+            raise TypeError("context must be RuleBasedSegmentContext.")
+        if context.emitted_steps >= self.max_steps:
+            return True, "max_steps"
+        if context.emitted_steps < self.min_steps:
+            return False, None
+        if self.stop_when is not None and bool(self.stop_when(context)):
+            return True, "predicate"
+        return False, None
+
+
+@dataclass(frozen=True)
+class RuleBasedActionSegment:
+    """Run an existing canonical action source for a bounded capture segment.
+
+    The source is invoked by :meth:`RuleBasedCollectionCursor.next_runtime`;
+    this object does not start or close it.  Source lifecycle, observation
+    acquisition, dispatch, safety, and persistence remain owned by their
+    existing runtime owners.
+    """
+
+    step_id: str
+    action_source: RobotActionSource
+    stop_condition: RuleBasedSegmentStopCondition
+    capture: RuleBasedCaptureSelection = field(default_factory=RuleBasedCaptureSelection)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "step_id", _required_text(self.step_id, name="step_id"))
+        if not callable(getattr(self.action_source, "produce_action", None)):
+            raise TypeError("action_source must implement produce_action().")
+        if not isinstance(self.stop_condition, RuleBasedSegmentStopCondition):
+            raise TypeError("stop_condition must be RuleBasedSegmentStopCondition.")
+        if not isinstance(self.capture, RuleBasedCaptureSelection):
+            raise TypeError("capture must be RuleBasedCaptureSelection.")
+
+
+RuleBasedStep: TypeAlias = (
+    RuleBasedInitialize
+    | RuleBasedReplay
+    | RuleBasedCustomAction
+    | RuleBasedActionSegment
+)
 RuleBasedBoundaryProvider: TypeAlias = (
     Mapping[str, RuleBasedBoundaryState]
     | Callable[[str], RuleBasedBoundaryState]
@@ -188,7 +270,15 @@ class RuleBasedCollectionPlan:
         if not steps:
             raise ValueError("A rule-based collection plan requires at least one step.")
         if any(
-            not isinstance(step, (RuleBasedInitialize, RuleBasedReplay, RuleBasedCustomAction))
+            not isinstance(
+                step,
+                (
+                    RuleBasedInitialize,
+                    RuleBasedReplay,
+                    RuleBasedCustomAction,
+                    RuleBasedActionSegment,
+                ),
+            )
             for step in steps
         ):
             raise TypeError("steps must contain supported rule-based step objects.")
@@ -211,6 +301,8 @@ class RuleBasedCollectionDirective:
     group_key: str | None = None
     replay_frame_index: int | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    segment_terminal: bool = False
+    segment_stop_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"initialize", "replay", "custom_action"}:
@@ -232,6 +324,14 @@ class RuleBasedCollectionDirective:
             },
         )
         object.__setattr__(self, "metadata", dict(self.metadata))
+        if self.segment_stop_reason is not None:
+            object.__setattr__(
+                self,
+                "segment_stop_reason",
+                _required_text(self.segment_stop_reason, name="segment_stop_reason"),
+            )
+        if self.segment_stop_reason is not None and not self.segment_terminal:
+            raise ValueError("segment_stop_reason requires segment_terminal=True.")
 
 
 class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
@@ -252,6 +352,11 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
         self._step_index = 0
         self._directive_index = 0
         self._pending: Iterator[RuleBasedCollectionDirective] = iter(())
+        self._active_segment: RuleBasedActionSegment | None = None
+        self._active_segment_plan_index: int | None = None
+        self._active_segment_emitted = 0
+        self._active_segment_terminal = False
+        self._active_segment_stop_reason: str | None = None
         for step in plan.steps:
             if (
                 isinstance(step, (RuleBasedInitialize, RuleBasedReplay))
@@ -269,11 +374,22 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
         self._step_index = 0
         self._directive_index = 0
         self._pending = iter(())
+        self._active_segment = None
+        self._active_segment_plan_index = None
+        self._active_segment_emitted = 0
+        self._active_segment_terminal = False
+        self._active_segment_stop_reason = None
 
     def __iter__(self) -> RuleBasedCollectionCursor:
         return self
 
     def __next__(self) -> RuleBasedCollectionDirective:
+        if self._active_segment is not None:
+            if not self._active_segment_terminal:
+                raise TypeError(
+                    "A runtime action segment requires next_runtime(observation, context=...)."
+                )
+            self._finish_active_segment()
         while True:
             try:
                 directive = next(self._pending)
@@ -285,8 +401,120 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                     raise
                 step = self.plan.steps[self._step_index]
                 step_index = self._step_index
+                if isinstance(step, RuleBasedActionSegment):
+                    raise TypeError(
+                        "A runtime action segment requires next_runtime(observation, context=...)."
+                    )
                 self._step_index += 1
                 self._pending = self._expand_step(step, step_index=step_index)
+
+    def next_runtime(
+        self,
+        observation: Any,
+        *,
+        context: Any = None,
+    ) -> RuleBasedCollectionDirective:
+        """Produce one directive using the current runtime observation.
+
+        Static plan steps are emitted exactly as with :func:`next`.  A
+        :class:`RuleBasedActionSegment` is driven one action at a time through
+        the existing ``RobotActionSource`` contract.  Its terminal directive
+        is returned before the cursor advances, so the caller can capture and
+        publish a measured boundary before requesting a following relative
+        replay step.
+        """
+
+        while True:
+            if self._pending is not None:
+                try:
+                    directive = next(self._pending)
+                    result = replace(directive, sequence_index=self._directive_index)
+                    self._directive_index += 1
+                    return result
+                except StopIteration:
+                    pass
+
+            if self._active_segment is not None:
+                if self._active_segment_terminal:
+                    self._finish_active_segment()
+                    continue
+                return self._next_runtime_segment_action(observation, context=context)
+
+            if self.done:
+                raise StopIteration
+            step = self.plan.steps[self._step_index]
+            step_index = self._step_index
+            if isinstance(step, RuleBasedActionSegment):
+                self._active_segment = step
+                self._active_segment_plan_index = step_index
+                self._active_segment_emitted = 0
+                self._active_segment_terminal = False
+                self._active_segment_stop_reason = None
+                continue
+            self._step_index += 1
+            self._pending = self._expand_step(step, step_index=step_index)
+
+    def _finish_active_segment(self) -> None:
+        if self._active_segment is None or self._active_segment_plan_index is None:
+            raise RuntimeError("No active runtime action segment is available to finish.")
+        self._step_index = self._active_segment_plan_index + 1
+        self._active_segment = None
+        self._active_segment_plan_index = None
+        self._active_segment_emitted = 0
+        self._active_segment_terminal = False
+        self._active_segment_stop_reason = None
+
+    def _next_runtime_segment_action(
+        self,
+        observation: Any,
+        *,
+        context: Any,
+    ) -> RuleBasedCollectionDirective:
+        step = self._active_segment
+        step_index = self._active_segment_plan_index
+        if step is None or step_index is None:
+            raise RuntimeError("No active runtime action segment is available.")
+        action = step.action_source.produce_action(observation, context=context)
+        if action is None:
+            raise ValueError(
+                f"Runtime action source for segment {step.step_id!r} returned None; "
+                "use stop_when to terminate after an explicit action."
+            )
+        if not isinstance(action, RobotAction):
+            raise TypeError(
+                f"Runtime action source for segment {step.step_id!r} must return RobotAction."
+            )
+        self._active_segment_emitted += 1
+        segment_context = RuleBasedSegmentContext(
+            observation=observation,
+            action=action,
+            emitted_steps=self._active_segment_emitted,
+            plan_step_index=step_index,
+            context=context,
+        )
+        terminal, reason = step.stop_condition.evaluate(segment_context)
+        self._active_segment_terminal = bool(terminal)
+        self._active_segment_stop_reason = reason
+        source_name = str(getattr(step.action_source, "name", "")).strip()
+        if not source_name:
+            source_name = step.action_source.__class__.__name__
+        return RuleBasedCollectionDirective(
+            sequence_index=step_index,
+            step_id=step.step_id,
+            kind="custom_action",
+            capture=step.capture,
+            action=action,
+            metadata={
+                "rule_based_schema": RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
+                "rule_based_step_index": int(step_index),
+                "custom_action_source": source_name,
+                "custom_action_mode": "runtime_source",
+                "segment_emitted_steps": int(self._active_segment_emitted),
+                "segment_stop_condition": step.stop_condition.name,
+            },
+            segment_terminal=self._active_segment_terminal,
+            segment_stop_reason=self._active_segment_stop_reason,
+        )
 
     def _expand_step(
         self,
@@ -362,19 +590,26 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                 )
             return
 
-        for _ in range(step.repeats):
-            yield RuleBasedCollectionDirective(
-                sequence_index=step_index,
-                step_id=step.step_id,
-                kind="custom_action",
-                capture=step.capture,
-                action=step.action,
-                metadata={
-                    "rule_based_schema": RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
-                    "rule_based_step_index": int(step_index),
-                    "custom_action_source": step.action.source,
-                },
+        if isinstance(step, RuleBasedCustomAction):
+            for _ in range(step.repeats):
+                yield RuleBasedCollectionDirective(
+                    sequence_index=step_index,
+                    step_id=step.step_id,
+                    kind="custom_action",
+                    capture=step.capture,
+                    action=step.action,
+                    metadata={
+                        "rule_based_schema": RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
+                        "rule_based_step_index": int(step_index),
+                        "custom_action_source": step.action.source,
+                    },
+                )
+            return
+        if isinstance(step, RuleBasedActionSegment):
+            raise TypeError(
+                "Runtime action segments must be expanded with next_runtime()."
             )
+        raise TypeError(f"Unsupported rule-based step {type(step).__name__}.")
 
     def _boundary_for(self, boundary_ref: str) -> RuleBasedBoundaryState:
         provider = self.boundary_provider
@@ -439,6 +674,7 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
 
 __all__ = [
     "RULE_BASED_COLLECTION_PLAN_SCHEMA_V1",
+    "RuleBasedActionSegment",
     "RuleBasedBoundaryProvider",
     "RuleBasedCaptureSelection",
     "RuleBasedCollectionCursor",
@@ -447,4 +683,6 @@ __all__ = [
     "RuleBasedCustomAction",
     "RuleBasedInitialize",
     "RuleBasedReplay",
+    "RuleBasedSegmentContext",
+    "RuleBasedSegmentStopCondition",
 ]

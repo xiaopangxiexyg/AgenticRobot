@@ -48,6 +48,7 @@ from .proposal_source import (
 )
 from .rule_based import (
     RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
+    RuleBasedActionSegment,
     RuleBasedCaptureSelection,
     RuleBasedCollectionCursor,
     RuleBasedCollectionDirective,
@@ -56,6 +57,8 @@ from .rule_based import (
     RuleBasedCustomAction,
     RuleBasedInitialize,
     RuleBasedReplay,
+    RuleBasedSegmentContext,
+    RuleBasedSegmentStopCondition,
 )
 from .rule_based_relative import (
     RULE_BASED_RELATIVE_REPLAY_SCHEMA_V1,
@@ -125,6 +128,7 @@ __all__ = [
     "ReplayTrajectoryGroup",
     "ReplayTrajectoryPool",
     "RULE_BASED_COLLECTION_PLAN_SCHEMA_V1",
+    "RuleBasedActionSegment",
     "RuleBasedCaptureSelection",
     "RuleBasedCollectionCursor",
     "RuleBasedCollectionDirective",
@@ -133,6 +137,8 @@ __all__ = [
     "RuleBasedCustomAction",
     "RuleBasedInitialize",
     "RuleBasedReplay",
+    "RuleBasedSegmentContext",
+    "RuleBasedSegmentStopCondition",
     "RULE_BASED_RELATIVE_REPLAY_SCHEMA_V1",
     "RuleBasedBoundaryState",
     "RuleBasedRelativeReplayError",

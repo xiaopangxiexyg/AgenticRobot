@@ -12,7 +12,7 @@ Its implementation is `robot_motion.replay.rule_based`. The collection-facing
 bridge is `teleop_runtime.collection.rule_based_adapter`; it owns only:
 
 - ordered declarative steps (`RuleBasedInitialize`, `RuleBasedReplay`, and
-  `RuleBasedCustomAction`);
+  `RuleBasedCustomAction` / `RuleBasedActionSegment`);
 - expansion of those steps into `RuleBasedCollectionDirective` values; and
 - per-step `RuleBasedCaptureSelection` intent; and
 - resolution of each directive into the existing `RobotAction` /
@@ -40,6 +40,34 @@ does not rewrite samples or writer jobs, so the existing sample builder and
 writer remain authoritative for causal cuts, validation, persistence, sealing,
 and commit.
 
+## Runtime rule-based capture segments
+
+`RuleBasedCustomAction` is appropriate for a fixed canonical action repeated a
+known number of ticks. For a rule-based segment whose action depends on the
+current runtime observation, use `RuleBasedActionSegment` instead. It reuses
+the existing `RobotActionSource.produce_action(observation, context=...)`
+contract and adds only two collection-plan facts:
+
+- `RuleBasedCaptureSelection` says which already-bound streams are eligible for
+  this segment;
+- `RuleBasedSegmentStopCondition` supplies a mandatory hard `max_steps`, an
+  optional `min_steps`, and an optional `stop_when` predicate evaluated after
+  each produced action.
+
+The runtime caller advances such a segment with
+`RuleBasedCollectionCursor.next_runtime(observation, context=...)`. A source
+returning `None` is rejected rather than interpreted as an implicit stop. The
+terminal directive is returned with `segment_terminal=True` and an explicit
+`segment_stop_reason`; only the next cursor request advances to the following
+plan step. This gives the caller a precise point to finish the capture, read
+the actual TCP state, publish a `RuleBasedBoundaryState`, and then request the
+next relative replay.
+
+The action source's `start()`/`close()` lifecycle is intentionally not called
+by the plan cursor. The existing runtime that owns the source remains
+responsible for lifecycle, observation acquisition, dispatch, safety, and
+writer interaction.
+
 ## Relative replay at a segment boundary
 
 The pure boundary contract is `RuleBasedBoundaryState` together with
@@ -51,13 +79,16 @@ runtime-measured TCP in `RuleBasedBoundaryState`. The result is an absolute
 
 This first seam is intentionally pose-only and fails closed when the source
 actual TCP history or per-side frame identity is missing. Joint-qpos replay is
-not treated as a relative pose replay. The current finite cursor still expands
-only static steps; a later step will pass a boundary state into the plan
-execution path so a collection segment can produce the state used by the next
-relative replay segment.
+not treated as a relative pose replay. A runtime action segment publishes its
+terminal directive before the cursor resolves the following step, so the
+boundary can be measured from the actual post-segment state rather than from a
+planned action target.
 
 This module is a pure, default-off composition seam. Its unit tests use only
-synthetic trajectory arrays and canonical action objects; they are not evidence
-of robot readiness or production collection integration. No existing CLI or
-GUI entrypoint is changed by this adapter; adoption is an explicit caller
-choice.
+synthetic trajectory arrays, canonical action objects, and an in-process
+source; they are not evidence of robot readiness or production collection
+integration. No existing CLI or GUI entrypoint is changed by this adapter;
+adoption is an explicit caller choice. The existing collection adapter still
+owns only command resolution; production runtime wiring for
+`next_runtime(...)`, boundary measurement, and dataset submission remains a
+separate integration step.

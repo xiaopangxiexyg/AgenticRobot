@@ -6,9 +6,11 @@ import numpy as np
 import pytest
 
 from robot_motion.action import RobotAction
+from robot_motion.action.sources import CallableActionSource
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM
 from robot_motion.replay import (
     ReplayTrajectoryGroup,
+    RuleBasedActionSegment,
     RuleBasedBoundaryState,
     RuleBasedCaptureSelection,
     RuleBasedCollectionCursor,
@@ -16,6 +18,7 @@ from robot_motion.replay import (
     RuleBasedCustomAction,
     RuleBasedRelativeReplayError,
     RuleBasedReplay,
+    RuleBasedSegmentStopCondition,
     rebase_replay_action_at_boundary,
 )
 
@@ -184,3 +187,112 @@ def test_relative_plan_requires_a_boundary_provider_at_resolution_time() -> None
 
     with pytest.raises(ValueError, match="boundary_provider"):
         next(cursor)
+
+
+def test_runtime_action_segment_is_bounded_and_defers_following_relative_replay() -> None:
+    boundaries: dict[str, RuleBasedBoundaryState] = {}
+    observed: list[dict[str, bool]] = []
+
+    def produce_action(observation: dict[str, bool]) -> RobotAction:
+        observed.append(dict(observation))
+        value = 1.0 if len(observed) == 1 else 2.0
+        return RobotAction.bimanual_qpos(
+            left_arm=np.full(6, value),
+            source="runtime_rule",
+        )
+
+    segment = RuleBasedActionSegment(
+        step_id="collect_until_done",
+        action_source=CallableActionSource(produce_action, name="fixture_rule_source"),
+        stop_condition=RuleBasedSegmentStopCondition(
+            max_steps=4,
+            min_steps=2,
+            stop_when=lambda context: bool(context.observation["done"]),
+            name="operator_done",
+        ),
+        capture=RuleBasedCaptureSelection(stream_ids=("action.left",)),
+    )
+    cursor = RuleBasedCollectionCursor(
+        RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedReplay(
+                    step_id="prelude",
+                    group_key="next_segment",
+                    start_index=0,
+                    end_index=1,
+                    capture=RuleBasedCaptureSelection(enabled=False),
+                ),
+                segment,
+                RuleBasedReplay(
+                    step_id="postlude",
+                    group_key="next_segment",
+                    start_index=1,
+                    end_index=3,
+                    relative_to="capture_end",
+                    capture=RuleBasedCaptureSelection(enabled=False),
+                ),
+            )
+        ),
+        {"next_segment": _group()},
+        boundary_provider=boundaries,
+    )
+
+    prelude = cursor.next_runtime({"done": False})
+    first_capture = cursor.next_runtime({"done": False})
+    second_capture = cursor.next_runtime({"done": True})
+
+    assert prelude.step_id == "prelude"
+    assert first_capture.step_id == "collect_until_done"
+    assert first_capture.segment_terminal is False
+    assert first_capture.capture.allows("action.left")
+    assert second_capture.segment_terminal is True
+    assert second_capture.segment_stop_reason == "predicate"
+    assert second_capture.metadata["segment_emitted_steps"] == 2
+    assert observed == [{"done": False}, {"done": True}]
+
+    boundaries["capture_end"] = _boundary()
+    postlude = cursor.next_runtime({"done": True})
+
+    assert postlude.step_id == "postlude"
+    np.testing.assert_allclose(postlude.action.arm_pose_by_side["left"], _pose(10.4))
+    np.testing.assert_allclose(
+        postlude.action.arm_pose_by_side["right"],
+        _pose(20.5, 1.0),
+    )
+
+
+def test_runtime_action_segment_requires_runtime_cursor_and_hard_bounds_steps() -> None:
+    source = CallableActionSource(
+        lambda _observation: RobotAction.bimanual_qpos(left_arm=np.zeros(6)),
+        name="bounded_source",
+    )
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedActionSegment(
+                step_id="bounded",
+                action_source=source,
+                stop_condition=RuleBasedSegmentStopCondition(max_steps=2),
+            ),
+        )
+    )
+    cursor = RuleBasedCollectionCursor(plan, {})
+
+    with pytest.raises(TypeError, match="next_runtime"):
+        next(cursor)
+
+    first = cursor.next_runtime({})
+    second = cursor.next_runtime({})
+    assert first.segment_terminal is False
+    assert second.segment_terminal is True
+    assert second.segment_stop_reason == "max_steps"
+    with pytest.raises(StopIteration):
+        cursor.next_runtime({})
+
+
+def test_segment_stop_condition_rejects_unbounded_or_invalid_bounds() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        RuleBasedSegmentStopCondition(max_steps=0)
+    with pytest.raises(ValueError, match="less than or equal"):
+        RuleBasedSegmentStopCondition(max_steps=1, min_steps=2)
+    with pytest.raises(TypeError, match="callable"):
+        RuleBasedSegmentStopCondition(max_steps=1, stop_when="done")
