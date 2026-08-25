@@ -206,8 +206,9 @@ The bounded optional test
 now exercises that next gate with the checked-in `rm65_right_cube_lift_rl_normal_v2`
 scene and `realtime_worker=False`. It captures both TCPs and grippers, converts
 the state-BC desk-frame output through the reviewed RM65 runtime pose contract,
-uses the existing `PolicyDeployRuntime` emission boundary, and submits the
-emission to `MujocoPolicySkillMotionTarget`. The target's existing component
+routes the streaming runner's 26D policy event through the existing
+`PolicyDeployRuntime` emission boundary, and submits the emission to
+`MujocoPolicySkillMotionTarget`. The target's existing component
 ingress, canonical safety, coupled IK, q-reference generation, and one manual
 MuJoCo physics tick complete with `dispatched` status and finite bilateral qpos
 measurement.

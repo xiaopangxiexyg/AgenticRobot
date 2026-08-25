@@ -7,6 +7,7 @@ import pytest
 
 from experiments.sim_learning.state_bc.contracts import StateBCArtifactMetadata
 from experiments.sim_learning.state_bc.model import fit_linear_state_bc
+from experiments.sim_learning.state_bc.stream import StateBCStreamingRunner
 from robot_motion.action import HandActionSpec
 from robot_motion.deploy import (
     DeploymentObservation,
@@ -213,12 +214,6 @@ def test_state_policy_output_reaches_existing_bimanual_mujoco_target():
                 runtime_pose_frame_contract=runtime_contract,
             ),
         )
-        prediction = adapter.predict(observation)
-
-        class _FixedPolicy:
-            def predict(self, _observation):
-                return prediction.actions[0]
-
         policy_runtime = PolicyDeployRuntime(
             PolicyDeployRuntimeConfig(
                 active_sides=("left", "right"),
@@ -229,34 +224,55 @@ def test_state_policy_output_reaches_existing_bimanual_mujoco_target():
             ),
             monotonic_clock=time.monotonic,
         )
-        prediction_result = policy_runtime.predict_and_queue(
-            _FixedPolicy(),
-            observation,
-            now=time.monotonic(),
-        )
-        assert prediction_result.accepted is True
-        prepared_result = policy_runtime.prepare_next_action(
-            observation,
-            preparer=DeployActionPreparer(
-                DeployRobotActionAdapter(
-                    active_sides=("left", "right"),
-                    arms_enabled=True,
-                    hands_enabled=True,
-                )
-            ),
-            policy_name="state_bc",
-        )
-        emission = prepared_result.emission
-        assert emission is not None
-        assert emission.pre_safety_robot_action is not None
-        assert set(emission.pre_safety_robot_action.active_effectors) == {
-            "left_arm",
-            "right_arm",
-            "left_hand",
-            "right_hand",
-        }
         target.runtime.start()
-        submission = target.runtime.submit_policy_action_emission(emission)
+        class _StaticObservationSource:
+            def capture(self):
+                return observation
+
+        class _FixedPolicy:
+            def __init__(self, action):
+                self.action = action
+
+            def predict(self, _observation):
+                return self.action
+
+        def execute(action, _event, current_observation):
+            prediction_result = policy_runtime.predict_and_queue(
+                _FixedPolicy(action),
+                current_observation,
+                now=time.monotonic(),
+            )
+            assert prediction_result.accepted is True
+            prepared_result = policy_runtime.prepare_next_action(
+                current_observation,
+                preparer=DeployActionPreparer(
+                    DeployRobotActionAdapter(
+                        active_sides=("left", "right"),
+                        arms_enabled=True,
+                        hands_enabled=True,
+                    )
+                ),
+                policy_name="state_bc",
+            )
+            emission = prepared_result.emission
+            assert emission is not None
+            assert emission.pre_safety_robot_action is not None
+            assert set(emission.pre_safety_robot_action.active_effectors) == {
+                "left_arm",
+                "right_arm",
+                "left_hand",
+                "right_hand",
+            }
+            return target.runtime.submit_policy_action_emission(emission)
+
+        trace = StateBCStreamingRunner(
+            observation_source=_StaticObservationSource(),
+            policy_adapter=adapter,
+            execute=execute,
+        ).run(["policy"])
+        assert trace.source_sequence() == ("policy",)
+        submission = trace.action_events[0].execution_receipt
+        assert submission is not None
         result = target.runtime.step(physics_ticks_after_dispatch=1)
         assert submission.accepted is True
         assert result.status == "dispatched"
