@@ -2,9 +2,43 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
 from .components import RealTeleopComponents
+
+
+@dataclass(frozen=True)
+class RealTeleopDatasetSampleAdmission:
+    """One extension's narrow gate in front of the existing formal writer."""
+
+    allowed: bool = True
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+def runtime_extension_dataset_sample_admission(
+    extension: object | None,
+    *,
+    step_result: object,
+    now: float,
+) -> RealTeleopDatasetSampleAdmission:
+    """Call the optional sample gate while preserving the default path."""
+
+    if extension is None:
+        return RealTeleopDatasetSampleAdmission()
+    hook = getattr(extension, "dataset_sample_admission", None)
+    if not callable(hook):
+        return RealTeleopDatasetSampleAdmission()
+    result = hook(step_result=step_result, now=float(now))
+    if not isinstance(result, RealTeleopDatasetSampleAdmission):
+        raise TypeError(
+            "runtime extension dataset_sample_admission() must return "
+            "RealTeleopDatasetSampleAdmission."
+        )
+    return result
 
 
 class RealTeleopRuntimeExtension(Protocol):
@@ -50,4 +84,8 @@ class RealTeleopRuntimeExtension(Protocol):
     ) -> None: ...
 
 
-__all__ = ["RealTeleopRuntimeExtension"]
+__all__ = [
+    "RealTeleopDatasetSampleAdmission",
+    "RealTeleopRuntimeExtension",
+    "runtime_extension_dataset_sample_admission",
+]

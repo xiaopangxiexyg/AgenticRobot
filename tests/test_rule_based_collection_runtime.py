@@ -4,15 +4,18 @@ import numpy as np
 import pytest
 
 from robot_motion.action import RobotAction
+from robot_motion.action.sources import CallableActionSource
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM
 from robot_motion.replay import (
     ReplayTrajectoryGroup,
     RuleBasedCaptureSelection,
+    RuleBasedActionSegment,
     RuleBasedCollectionCursor,
     RuleBasedCollectionPlan,
     RuleBasedCustomAction,
     RuleBasedInitialize,
     RuleBasedReplay,
+    RuleBasedSegmentStopCondition,
 )
 from teleop_runtime.collection.rule_based_adapter import (
     RuleBasedCollectionAdapter,
@@ -100,3 +103,30 @@ def test_adapter_reset_restarts_the_finite_cursor() -> None:
     second = next(adapter)
     assert second.directive.sequence_index == 0
     assert second.action.source == first.action.source
+
+
+def test_adapter_runtime_path_reuses_the_same_resolution_boundary() -> None:
+    source = CallableActionSource(
+        lambda observation: RobotAction.bimanual_qpos(
+            right_arm=np.full(6, float(observation["value"])),
+            source="runtime_fixture",
+        )
+    )
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedActionSegment(
+                step_id="runtime",
+                action_source=source,
+                stop_condition=RuleBasedSegmentStopCondition(max_steps=1),
+            ),
+        )
+    )
+    adapter = RuleBasedCollectionAdapter(RuleBasedCollectionCursor(plan, {}))
+
+    emission = adapter.next_runtime({"value": 2.0})
+
+    assert emission.directive.segment_terminal is True
+    np.testing.assert_allclose(
+        emission.command.commands["right_arm"].value,
+        np.full(6, 2.0),
+    )

@@ -72,6 +72,23 @@ class RuleBasedCollectionAdapter(Iterator[RuleBasedCollectionEmission]):
 
     def __next__(self) -> RuleBasedCollectionEmission:
         directive = next(self.cursor)
+        return self._emission_for(directive)
+
+    def next_runtime(
+        self,
+        observation: object,
+        *,
+        context: object = None,
+    ) -> RuleBasedCollectionEmission:
+        """Resolve one observation-driven directive without owning its source."""
+
+        directive = self.cursor.next_runtime(observation, context=context)
+        return self._emission_for(directive)
+
+    def _emission_for(
+        self,
+        directive: RuleBasedCollectionDirective,
+    ) -> RuleBasedCollectionEmission:
         action = self._action_for(directive)
         command = self.resolver.resolve(action)
         return RuleBasedCollectionEmission(
