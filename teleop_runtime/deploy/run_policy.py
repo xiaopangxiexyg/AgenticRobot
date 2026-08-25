@@ -186,7 +186,6 @@ from ..defaults import (
     DEFAULT_TELEOP_POSITION_REFERENCE_HZ,
     DEFAULT_TELEOP_SAMPLE_HZ,
 )
-from ..hand_mapping import parse_tactile_regions
 from ..interfaces import EffectorBackend
 from ..log_utils import ChangeGate
 from ..log_utils import log_event as console_log_event
@@ -407,6 +406,7 @@ from .replay_cli_validation import (
     validate_replay_prediction_mode,
 )
 from .rtc_cli_validation import validate_rtc_cli_args
+from .tactile_cli_validation import validate_tactile_cli_args
 from .quest_paired_pose_capture import (
     QuestPairedPoseCaptureApplicationPort,
     QuestPairedPoseCaptureFactory,
@@ -1196,35 +1196,13 @@ def validate_args(
             "dual-arm model must fail closed rather than guess it."
         )
     validate_debug_replay_window_and_sources(args)
-    parse_tactile_regions(args.hand_tactile_regions)
-    if bool(args.send_actions) and bool(args.arms_enabled):
-        for side in active_sides:
-            if not getattr(args, f"{side}_arm_ip"):
-                raise ValueError(
-                    f"--send-actions requires --{side}-arm-ip for active side '{side}'."
-                )
-    if bool(args.send_actions) and hands_enabled:
-        for side in end_effector_sides:
-            if (
-                _hand_backend_mode_for_side(args, side) == HAND_BACKEND_INSPIRE
-                and not getattr(args, f"{side}_hand_ip")
-            ):
-                raise ValueError(
-                    f"--send-actions with hands requires --{side}-hand-ip."
-                )
-    if bool(args.visualize_tactile):
-        if any(
-            _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
-            for side in end_effector_sides
-        ):
-            raise ValueError(
-                "--visualize-tactile currently supports InspireTac UV tactile, not DMTAC gripper tactile."
-            )
-        if not hands_enabled:
-            raise ValueError("--visualize-tactile requires hands to be enabled.")
-        for side in end_effector_sides:
-            if not getattr(args, f"{side}_hand_ip"):
-                raise ValueError(f"--visualize-tactile requires --{side}-hand-ip.")
+    validate_tactile_cli_args(
+        args,
+        active_sides=active_sides,
+        end_effector_sides=end_effector_sides,
+        hands_enabled=hands_enabled,
+        hand_backend_mode_for_side=_hand_backend_mode_for_side,
+    )
     validate_camera_cli_args(args)
     return active_sides
 
