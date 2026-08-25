@@ -74,7 +74,8 @@ DEFAULT_STAGE_A = "0:120"
 DEFAULT_STAGE_B = "250:400"
 DEFAULT_CIRCLE_STEPS = 61
 DEFAULT_CIRCLE_RADIUS_M = 0.025
-DEFAULT_CIRCLE_HZ = 60.0
+DEFAULT_CIRCLE_HZ: float | None = None
+DEFAULT_CIRCLE_SPEED_SIDE = "right"
 DEFAULT_REFERENCE_HZ = 60.0
 
 
@@ -109,6 +110,56 @@ def parse_stage_span(text: str, *, total_frames: int) -> StageSpan:
             f"stage span {text!r} exceeds source frame count {int(total_frames)}"
         )
     return span
+
+
+def _trajectory_tcp_speed_summary(
+    frame_spans: Sequence[Sequence[UmiReplayFrame]],
+    *,
+    side: str,
+) -> dict[str, Any]:
+    """Measure canonical-desk TCP path speed over selected source spans.
+
+    Spans are measured independently so an editable gap between stage A and
+    stage B is not mistaken for robot motion.  The result is a target-speed
+    reference for rule-based actions, not a claim about hardware execution.
+    """
+
+    side_name = str(side).strip().lower()
+    if side_name not in {"left", "right"}:
+        raise ValueError(f"unsupported TCP speed side {side!r}")
+    path_length_m = 0.0
+    duration_sec = 0.0
+    interval_count = 0
+    for frames in frame_spans:
+        if len(frames) < 2:
+            continue
+        positions = np.stack(
+            [
+                np.asarray(frame.pose_desk_by_side[side_name], dtype=float)[:3, 3]
+                for frame in frames
+            ]
+        )
+        timestamps = np.asarray([float(frame.timestamp) for frame in frames], dtype=float)
+        delta_t = np.diff(timestamps)
+        if not np.all(np.isfinite(delta_t)) or np.any(delta_t <= 0.0):
+            raise ValueError(
+                f"{side_name} TCP source timestamps must be finite and strictly increasing"
+            )
+        path_length_m += float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
+        duration_sec += float(delta_t.sum())
+        interval_count += int(delta_t.size)
+    if duration_sec <= 0.0 or interval_count <= 0:
+        raise ValueError(
+            f"cannot derive {side_name} TCP average speed from selected source spans"
+        )
+    return {
+        "side": side_name,
+        "pose_frame": "canonical_desk",
+        "path_length_m": float(path_length_m),
+        "duration_sec": float(duration_sec),
+        "average_linear_speed_m_s": float(path_length_m / duration_sec),
+        "interval_count": int(interval_count),
+    }
 
 
 def _json_default(value: object) -> object:
@@ -296,27 +347,48 @@ def _circle_targets(
     *,
     radius_m: float,
     steps: int,
-    hz: float,
+    hz: float | None = None,
+    linear_speed_m_s: float | None = None,
 ) -> list[TimestampedMotionTarget]:
     """Make a continuous one-cycle circle in the desk XY plane.
 
     The current right TCP is the first and last point on the circumference,
     which makes the rule-based phase continuous with the measured boundary.
-    ``z`` and the complete TCP orientation remain constant.
+    ``z`` and the complete TCP orientation remain constant.  Prefer
+    ``linear_speed_m_s`` for a speed-defined action; ``hz`` remains an explicit
+    fixed-waypoint-rate compatibility path.
     """
 
     radius = float(radius_m)
     count = int(steps)
-    rate = float(hz)
     if not np.isfinite(radius) or radius <= 0.0:
         raise ValueError("circle radius must be finite and positive")
     if count < 3:
         raise ValueError("circle steps must be >= 3")
-    if not np.isfinite(rate) or rate <= 0.0:
+    if hz is not None and linear_speed_m_s is not None:
+        raise ValueError("circle action accepts either hz or linear_speed_m_s, not both")
+    if hz is None and linear_speed_m_s is None:
+        raise ValueError("circle action requires hz or linear_speed_m_s")
+    if hz is not None and (not np.isfinite(float(hz)) or float(hz) <= 0.0):
         raise ValueError("circle hz must be finite and positive")
+    if linear_speed_m_s is not None and (
+        not np.isfinite(float(linear_speed_m_s)) or float(linear_speed_m_s) <= 0.0
+    ):
+        raise ValueError("circle linear speed must be finite and positive")
     right = np.asarray(boundary_pose_by_side["right"], dtype=float).reshape(4, 4)
     center = right[:3, 3].copy()
     center[0] -= radius
+    segment_count = count - 1
+    polygon_path_length_m = float(
+        segment_count * 2.0 * radius * np.sin(np.pi / float(segment_count))
+    )
+    if linear_speed_m_s is not None:
+        duration_sec = polygon_path_length_m / float(linear_speed_m_s)
+        speed_source = "explicit_linear_speed_m_s"
+    else:
+        duration_sec = float(segment_count) / float(hz)
+        speed_source = "explicit_circle_hz"
+    target_speed_m_s = polygon_path_length_m / duration_sec
     targets: list[TimestampedMotionTarget] = []
     for index, angle in enumerate(np.linspace(0.0, 2.0 * np.pi, count)):
         pose_by_side = {
@@ -327,8 +399,8 @@ def _circle_targets(
         pose_by_side["right"][:3, 3] = position
         targets.append(
             TimestampedMotionTarget(
-                timestamp=float(index) / rate,
-                available_timestamp=float(index) / rate,
+                timestamp=duration_sec * float(index) / float(segment_count),
+                available_timestamp=duration_sec * float(index) / float(segment_count),
                 source_index=index,
                 pose_by_side=pose_by_side,
                 metadata={
@@ -337,6 +409,11 @@ def _circle_targets(
                     "plane": "desk_xy",
                     "constant_axis": "desk_z",
                     "radius_m": radius,
+                    "pose_frame": "canonical_desk",
+                    "linear_speed_m_s": target_speed_m_s,
+                    "path_length_m": polygon_path_length_m,
+                    "duration_sec": duration_sec,
+                    "speed_source": speed_source,
                 },
             )
         )
@@ -354,6 +431,39 @@ def _actual_tcp_boundary(control: DeskTcpPositionControl) -> dict[str, np.ndarra
     return {
         side: desk_from_world @ np.asarray(world[side], dtype=float)
         for side in ("left", "right")
+    }
+
+
+def _require_pose_frame_alignment(
+    episode: UmiReplayEpisode,
+    control: DeskTcpPositionControl,
+) -> dict[str, Any]:
+    """Require source canonical desk poses and the sim station frame to match."""
+
+    source_contract = episode.pose_frame_contract
+    simulation_contract = control.station_pose_contract
+    source_hash = source_contract.contract_hash
+    if source_hash != str(episode.pose_frame_contract_hash).strip():
+        raise ValueError(
+            "source dataset pose_frame_contract_hash does not match its contract payload"
+        )
+    if source_hash != simulation_contract.contract_hash:
+        raise ValueError(
+            "source dataset canonical desk pose contract does not match the MuJoCo "
+            "station pose contract; refusing implicit sim/real coordinate conversion"
+        )
+    if source_contract.pose_storage_frame != "desk_absolute":
+        raise ValueError("source dataset must use desk_absolute storage for sim/real replay")
+    if source_contract.canonical_absolute_frame != "desk":
+        raise ValueError("source dataset canonical absolute frame must be 'desk'")
+    return {
+        "source_pose_frame_contract_hash": source_hash,
+        "simulation_station_pose_frame_contract_hash": simulation_contract.contract_hash,
+        "contract_match": True,
+        "canonical_absolute_frame": "desk",
+        "action_pose_frame": "canonical_desk",
+        "world_from_desk": np.asarray(control.world_from_desk, dtype=float),
+        "mapping_source": "calibrated_station_pose_contract_and_simulation_urdf",
     }
 
 
@@ -439,6 +549,13 @@ def _capture_frame(
 
 def _control_config_for_args(args: argparse.Namespace) -> DeskTcpPositionControlConfig:
     base = _control_config(args)
+    if args.station_pose_contract is not None:
+        return DeskTcpPositionControlConfig(
+            **{
+                **base.__dict__,
+                "station_pose_contract_path": args.station_pose_contract,
+            }
+        )
     return base
 
 
@@ -459,7 +576,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reference-hz", type=float, default=DEFAULT_REFERENCE_HZ)
     parser.add_argument("--circle-radius-m", type=float, default=DEFAULT_CIRCLE_RADIUS_M)
     parser.add_argument("--circle-steps", type=int, default=DEFAULT_CIRCLE_STEPS)
-    parser.add_argument("--circle-hz", type=float, default=DEFAULT_CIRCLE_HZ)
+    parser.add_argument(
+        "--circle-speed-m-s",
+        type=float,
+        default=None,
+        help=(
+            "Explicit right-TCP linear speed in canonical desk meters per second. "
+            "Default: average speed of the selected source replay spans."
+        ),
+    )
+    parser.add_argument(
+        "--circle-hz",
+        type=float,
+        default=DEFAULT_CIRCLE_HZ,
+        help=(
+            "Explicit fixed circle waypoint rate compatibility override. "
+            "Prefer --circle-speed-m-s for real/sim speed matching."
+        ),
+    )
     parser.add_argument("--render-width", type=int, default=320)
     parser.add_argument("--render-height", type=int, default=240)
     parser.add_argument("--record-camera", action="append", dest="record_cameras", default=None)
@@ -468,6 +602,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-sleep", action="store_true")
     parser.add_argument("--settle-seconds", type=float, default=0.5)
     parser.add_argument("--contract", type=Path, default=None)
+    parser.add_argument(
+        "--station-pose-contract",
+        type=Path,
+        default=None,
+        help=(
+            "Optional calibrated station pose contract. It must hash-match the "
+            "source dataset contract; no implicit coordinate conversion is applied."
+        ),
+    )
     parser.add_argument("--left-tool-profile", type=Path, default=None)
     parser.add_argument("--right-tool-profile", type=Path, default=None)
     parser.add_argument(
@@ -478,8 +621,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.reference_hz <= 0.0:
         parser.error("--reference-hz must be positive")
-    if args.circle_radius_m <= 0.0 or args.circle_steps < 3 or args.circle_hz <= 0.0:
-        parser.error("circle parameters must be positive and circle-steps >= 3")
+    if args.circle_radius_m <= 0.0 or args.circle_steps < 3:
+        parser.error("circle radius must be positive and circle-steps >= 3")
+    if args.circle_hz is not None and args.circle_hz <= 0.0:
+        parser.error("--circle-hz must be positive when explicitly set")
+    if args.circle_speed_m_s is not None and args.circle_speed_m_s <= 0.0:
+        parser.error("--circle-speed-m-s must be positive when explicitly set")
+    if args.circle_hz is not None and args.circle_speed_m_s is not None:
+        parser.error("use either --circle-hz or --circle-speed-m-s, not both")
     if args.render_width <= 0 or args.render_height <= 0:
         parser.error("render dimensions must be positive")
     if args.settle_seconds < 0.0:
@@ -500,6 +649,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     stage_b_group, stage_b_frames = _stage_group(
         episode, rows, stage_b_span, key="b", label="relative_stage_b"
     )
+    speed_reference_by_side = {
+        side: _trajectory_tcp_speed_summary(
+            (stage_a_frames, stage_b_frames),
+            side=side,
+        )
+        for side in ("left", "right")
+    }
     stage_a_refs = resample_motion_targets(
         _stage_targets(stage_a_frames, phase="absolute_stage_a"),
         reference_hz=float(args.reference_hz),
@@ -507,6 +663,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     control = DeskTcpPositionControl.build(_control_config_for_args(args))
+    try:
+        pose_frame_alignment = _require_pose_frame_alignment(episode, control)
+    except BaseException:
+        control.close()
+        raise
     renderer: MujocoCameraRenderer | None = None
     writer: SimReplayDatasetWriter | None = None
     control_snapshot: dict[str, Any] | None = None
@@ -659,22 +820,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         boundary_before_circle = _actual_tcp_boundary(control)
-        circle_targets = _circle_targets(
-            boundary_before_circle,
-            radius_m=float(args.circle_radius_m),
-            steps=int(args.circle_steps),
-            hz=float(args.circle_hz),
-        )
-        circle_refs = [
-            _reference_from_pose(
-                target.pose_by_side,
-                timestamp=float(target.timestamp),
-                sequence=index,
-                source_index=index,
-                metadata=dict(target.metadata),
+        circle_kwargs: dict[str, Any] = {
+            "radius_m": float(args.circle_radius_m),
+            "steps": int(args.circle_steps),
+        }
+        if args.circle_hz is not None:
+            circle_kwargs["hz"] = float(args.circle_hz)
+        else:
+            circle_kwargs["linear_speed_m_s"] = float(
+                args.circle_speed_m_s
+                if args.circle_speed_m_s is not None
+                else speed_reference_by_side[DEFAULT_CIRCLE_SPEED_SIDE][
+                    "average_linear_speed_m_s"
+                ]
             )
-            for index, target in enumerate(circle_targets)
-        ]
+        circle_targets = _circle_targets(boundary_before_circle, **circle_kwargs)
+        circle_target_metadata = dict(circle_targets[0].metadata)
+        circle_speed_plan = {
+            "reference_side": DEFAULT_CIRCLE_SPEED_SIDE,
+            "pose_frame": "canonical_desk",
+            "source_reference": speed_reference_by_side[DEFAULT_CIRCLE_SPEED_SIDE],
+            "target_linear_speed_m_s": circle_target_metadata["linear_speed_m_s"],
+            "target_path_length_m": circle_target_metadata["path_length_m"],
+            "target_duration_sec": circle_target_metadata["duration_sec"],
+            "speed_source": (
+                "explicit_circle_hz"
+                if args.circle_hz is not None
+                else (
+                    "explicit_linear_speed_m_s"
+                    if args.circle_speed_m_s is not None
+                    else "selected_source_right_tcp_average_speed"
+                )
+            ),
+        }
+        circle_refs = resample_motion_targets(
+            circle_targets,
+            reference_hz=float(args.reference_hz),
+            include_final=True,
+        )
         run_phase(
             "rule_based_circle",
             circle_refs,
@@ -762,6 +945,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "nominal_hz": float(episode.nominal_hz),
             "pose_storage_frame": episode.pose_frame_contract.pose_storage_frame,
         },
+        "pose_frame_alignment": pose_frame_alignment,
         "composition": {
             "initial_alignment": {"capture": False, "target": "stage_a.first_frame"},
             "absolute_stage_a": stage_a_span.to_dict(),
@@ -772,7 +956,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "constant_axis": "desk_z",
                 "radius_m": float(args.circle_radius_m),
                 "steps": int(args.circle_steps),
-                "hz": float(args.circle_hz),
+                "hz": None if args.circle_hz is None else float(args.circle_hz),
+                "speed": circle_speed_plan,
                 "boundary_before_circle": boundary_before_circle,
                 "boundary_after_circle": boundary_after_circle,
             },

@@ -128,6 +128,14 @@ source/boundary pose frames do not match. The optional passive viewer is
 MuJoCo-only (`--viewer`); rendered RGB/depth videos are also produced for
 headless verification.
 
+The rule-based circle defaults to the selected source spans' right-TCP average
+linear speed in the canonical desk frame. Use `--circle-speed-m-s` for an
+explicit target speed; `--circle-hz` is only an explicit fixed-waypoint-rate
+compatibility override. The demo requires the source dataset contract hash to
+match the MuJoCo station pose contract, and records the calibrated
+`world_from_desk` mapping in `pose_frame_alignment`; it does not silently apply
+an additional raw-to-desk transform.
+
 ```bash
 PYTHONPATH=. python - <<'PY'
 from sim.mujoco.replay.umi_dataset import load_umi_replay_episode
