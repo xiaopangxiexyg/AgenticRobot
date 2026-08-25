@@ -5,6 +5,7 @@
 - [当前模块与运行域图示](./dexteleop_architecture_visual_guide.md)
 - [实时 Action Chunk（RTC）图示](./dexteleop_rtc_visual_guide.md)
 - [单源直通、多源组合及数采/部署/仿真的运行域边界](./runtime_domain_boundaries.md)
+- [有界规则式数采计划与运行权限边界](./rule_based_collection.md)
 - [Embodiment runtime provider 当前接口合同](./embodiment_runtime_provider_contract.md)
 - [reBot B601 HITL 拓扑与厂商源码边界](./rebot_b601_hitl_topology.md)
 - [Quest 与机器人静态配对姿态采集边界](./quest_future_visualization.md)

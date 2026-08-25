@@ -46,6 +46,16 @@ from .proposal_source import (
     build_replay_source_frame_emission,
     create_replay_source_frame_emission,
 )
+from .rule_based import (
+    RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
+    RuleBasedCaptureSelection,
+    RuleBasedCollectionCursor,
+    RuleBasedCollectionDirective,
+    RuleBasedCollectionPlan,
+    RuleBasedCustomAction,
+    RuleBasedInitialize,
+    RuleBasedReplay,
+)
 from .trajectory import (
     QPOS_INIT_AUTO,
     QPOS_INIT_OBSERVATION_ACTUAL_QPOS,
@@ -107,6 +117,14 @@ __all__ = [
     "ReplaySourceFrameEmission",
     "ReplayTrajectoryGroup",
     "ReplayTrajectoryPool",
+    "RULE_BASED_COLLECTION_PLAN_SCHEMA_V1",
+    "RuleBasedCaptureSelection",
+    "RuleBasedCollectionCursor",
+    "RuleBasedCollectionDirective",
+    "RuleBasedCollectionPlan",
+    "RuleBasedCustomAction",
+    "RuleBasedInitialize",
+    "RuleBasedReplay",
     "annotate_replay_command_metadata",
     "build_replay_source_frame_emission",
     "create_replay_source_frame_emission",
