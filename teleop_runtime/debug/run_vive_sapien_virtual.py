@@ -99,10 +99,6 @@ def _side_retargeter(components, side: str) -> PoseToArmRetargeter:
     return components.left_retargeter if side == "left" else components.right_retargeter
 
 
-def _side_preview_backend(components, side: str) -> RM65ArmBackend:
-    return components.left_preview_backend if side == "left" else components.right_preview_backend
-
-
 def _side_state_backend(components, side: str) -> RM65ArmBackend | None:
     return components.left_state_backend if side == "left" else components.right_state_backend
 
