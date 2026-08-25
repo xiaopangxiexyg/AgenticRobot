@@ -35,6 +35,8 @@ python -m pytest --collect-only -q
 python -m pytest -q -m "unit and not optional and not hardware and not slow_sim"
 python -m pytest -q -m "contract and not optional and not hardware and not slow_sim"
 python -m pytest -q -m "integration and not optional and not hardware and not slow_sim"
+# Parallel bounded edit feedback (unit + integration, isolated caches/reports):
+bash scripts/run_fast_feedback.sh
 # Complete compatibility and integration-commit acceptance:
 python -m pytest -q -m "unit and not optional and not hardware"
 python -m pytest -q -m "contract and not optional and not hardware"
@@ -69,7 +71,15 @@ has been measured into the same tier. A filename, loop bound, optional
 dependency, or `mujoco` import alone is not sufficient evidence. Do not share
 `.pytest_cache` between worktrees or enable repository-wide test parallelism
 without first proving that the selected tests are hermetic and
-resource-independent.
+resource-independent.  `scripts/run_fast_feedback.sh` is the reviewed
+parallel entrypoint for the two bounded selectors: it starts one child for
+each marker set, gives each child its own pytest cache and JUnit report under
+`/tmp`, and keeps the complete acceptance gates unchanged.  If a clean
+worktree does not already have the reviewed `assets/` link, set
+`DEXTELEOP_ASSET_ROOT` to an absolute shared asset root before invoking it;
+the wrapper creates one shared temporary link for both children and removes
+only that link after the run.  Additional pytest options may be appended, but
+the marker, cache, JUnit, and basetemp options remain owned by the wrapper.
 
 ## Marker semantics
 

@@ -256,6 +256,11 @@ bash scripts/verify_dev_base.sh
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   bash scripts/run_pytest.sh -m 'unit and not optional and not slow_sim' -q
 
+# 日常并行快速反馈：单元与集成两层并行运行，各自使用独立 cache/JUnit。
+# 若当前 worktree 没有 assets/ 链接，先设置绝对路径的共享只读 assets 根。
+DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets \
+  bash scripts/run_fast_feedback.sh
+
 # 完整单元回归：合并、提交和推送前仍需执行，不排除 slow_sim。
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   bash scripts/run_pytest.sh -m 'unit and not optional' -q
