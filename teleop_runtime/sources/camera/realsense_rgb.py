@@ -80,6 +80,10 @@ class RealSenseRGBCameraConfig:
     restart_on_black_frames: bool = True
     restart_after_black_frames: int = 5
     black_frame_max_value: int = 1
+    # Some reviewed sensors intentionally return a near-zero color stream while
+    # still providing valid depth. Keep the historical drop/restart behavior by
+    # default and allow such frames only in an explicit deployment profile.
+    accept_near_zero_frames: bool = False
     # Default-off compatibility controls. Formal bounded-first-frame profiles
     # enable them explicitly; the legacy profile preserves the historical
     # any-frameset warmup and unbounded runtime retry behavior.
@@ -100,6 +104,11 @@ class RealSenseRGBCameraConfig:
     # the existing global camera self-check remains responsible for proving
     # multi-frame freshness.
     startup_warmup_policy: str = REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+    # Default-off, process-local retry. This only rebuilds the SDK pipeline; it
+    # never resets or re-enumerates hardware. The wait remains cancellable so a
+    # shutdown request cannot be held behind a retry sleep.
+    startup_software_retry_attempts: int = 0
+    startup_software_retry_sleep_sec: float = 0.5
     startup_hardware_reset: bool = False
     startup_hardware_reset_on_failure: bool = True
     startup_hardware_reset_retry_attempts: int = 1
@@ -160,6 +169,10 @@ class RealSenseRGBCameraConfig:
                 f"{REALSENSE_STARTUP_WARMUP_POLICIES}; got "
                 f"{self.startup_warmup_policy!r}."
             )
+        if int(self.startup_software_retry_attempts) < 0:
+            raise ValueError("startup_software_retry_attempts must be >= 0.")
+        if float(self.startup_software_retry_sleep_sec) < 0.0:
+            raise ValueError("startup_software_retry_sleep_sec must be >= 0.")
         if int(self.startup_hardware_reset_retry_attempts) < 0:
             raise ValueError("startup_hardware_reset_retry_attempts must be >= 0.")
         if float(self.startup_hardware_reset_sleep_sec) < 0.0:
@@ -202,6 +215,7 @@ class RealSenseRGBCameraConfig:
                 "restart_on_black_frames": bool(self.restart_on_black_frames),
                 "restart_after_black_frames": int(self.restart_after_black_frames),
                 "black_frame_max_value": int(self.black_frame_max_value),
+                "accept_near_zero_frames": bool(self.accept_near_zero_frames),
                 "require_complete_frameset": bool(self.require_complete_frameset),
                 "restart_on_incomplete_frameset": bool(
                     self.restart_on_incomplete_frameset
@@ -217,6 +231,12 @@ class RealSenseRGBCameraConfig:
                 "startup_reset_sleep_sec": float(self.startup_reset_sleep_sec),
                 "startup_warmup_frames": int(self.startup_warmup_frames),
                 "startup_warmup_policy": self.startup_warmup_policy,
+                "startup_software_retry_attempts": int(
+                    self.startup_software_retry_attempts
+                ),
+                "startup_software_retry_sleep_sec": float(
+                    self.startup_software_retry_sleep_sec
+                ),
                 "startup_hardware_reset": bool(self.startup_hardware_reset),
                 "startup_hardware_reset_on_failure": bool(self.startup_hardware_reset_on_failure),
                 "startup_hardware_reset_retry_attempts": int(self.startup_hardware_reset_retry_attempts),
@@ -430,6 +450,7 @@ class RealSenseRGBSource(ObservationSource):
 
     def _start_pipeline(self, rs: Any) -> tuple[Any, Any]:
         self._hardware_reset_device_if_requested(rs, reason="configured_startup_reset")
+        software_retries_remaining = int(self.config.startup_software_retry_attempts)
         hardware_reset_retries_remaining = (
             int(self.config.startup_hardware_reset_retry_attempts)
             if bool(self.config.startup_hardware_reset_on_failure)
@@ -444,6 +465,26 @@ class RealSenseRGBSource(ObservationSource):
                 return self._start_pipeline_once(rs)
             except RuntimeError as exc:
                 message = str(exc)
+                if (
+                    software_retries_remaining > 0
+                    and self._is_startup_connection_error(message)
+                ):
+                    software_retries_remaining -= 1
+                    with self._lock:
+                        self._last_runtime_error = (
+                            "startup_software_retry:"
+                            f"attempt={attempt_index}:{exc}"
+                        )
+                    retry_sleep_sec = float(
+                        self.config.startup_software_retry_sleep_sec
+                    )
+                    if retry_sleep_sec > 0.0 and self._shutdown_event.wait(
+                        retry_sleep_sec
+                    ):
+                        raise RuntimeError(
+                            "startup_cancelled:shutdown_requested"
+                        ) from exc
+                    continue
                 if (
                     hardware_reset_retries_remaining <= 0
                     or not self._should_hardware_reset_retry_startup_error(message)
@@ -891,6 +932,7 @@ class RealSenseRGBSource(ObservationSource):
             "restart_on_black_frames": bool(self.config.restart_on_black_frames),
             "restart_after_black_frames": int(self.config.restart_after_black_frames),
             "black_frame_max_value": int(self.config.black_frame_max_value),
+            "accept_near_zero_frames": bool(self.config.accept_near_zero_frames),
             "require_complete_frameset": bool(self.config.require_complete_frameset),
             "restart_on_incomplete_frameset": bool(
                 self.config.restart_on_incomplete_frameset
@@ -906,6 +948,12 @@ class RealSenseRGBSource(ObservationSource):
             "startup_reset_sleep_sec": float(self.config.startup_reset_sleep_sec),
             "startup_warmup_frames": int(self.config.startup_warmup_frames),
             "startup_warmup_policy": self.config.startup_warmup_policy,
+            "startup_software_retry_attempts": int(
+                self.config.startup_software_retry_attempts
+            ),
+            "startup_software_retry_sleep_sec": float(
+                self.config.startup_software_retry_sleep_sec
+            ),
             "startup_hardware_reset": bool(self.config.startup_hardware_reset),
             "startup_hardware_reset_on_failure": bool(self.config.startup_hardware_reset_on_failure),
             "startup_hardware_reset_retry_attempts": int(self.config.startup_hardware_reset_retry_attempts),
@@ -1181,6 +1229,9 @@ class RealSenseRGBSource(ObservationSource):
             self._black_frame_count += 1
             self._consecutive_black_frame_count += 1
             streak = int(self._consecutive_black_frame_count)
+            if bool(self.config.accept_near_zero_frames):
+                self._last_error = None
+                return False
             self._last_error = (
                 "near_zero_color_frame:"
                 f"sampled_max={sampled_max}:streak={streak}/"
