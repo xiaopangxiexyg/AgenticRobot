@@ -174,9 +174,29 @@ model view and finite 26D normalized action.
 
 The current Cube-Lift task is nevertheless a right-arm 7D task interface,
 while the state-BC artifact is a bilateral 16D-to-26D deployment policy. The
-smoke therefore validates asset loading, scene observation, and the model
-adapter seam; it does not yet route the 26D output through the bilateral
-pose-target runtime or claim task success. The next bounded gate is to bind the
-existing authoritative bilateral MuJoCo pose/IK/safety runtime, then compare
-ordinary policy, human takeover/handback, and RTC intervention on resettable
-episodes without introducing a parallel execution loop.
+earlier reset/observation smoke therefore validated asset loading, scene
+observation, and the model adapter seam only; it did not by itself route the
+26D output through the bilateral pose-target runtime or claim task success.
+The bounded runtime seam is now covered by the optional test below. The next
+experiment gate is to compare ordinary policy, human takeover/handback, and RTC
+intervention on resettable episodes without introducing a parallel execution
+loop.
+
+### Completed bilateral runtime seam smoke
+
+The bounded optional test
+`tests/test_mujoco_state_policy_adapter.py::test_state_policy_output_reaches_existing_bimanual_mujoco_target`
+now exercises that next gate with the checked-in `rm65_right_cube_lift_rl_normal_v2`
+scene and `realtime_worker=False`. It captures both TCPs and grippers, converts
+the state-BC desk-frame output through the reviewed RM65 runtime pose contract,
+uses the existing `PolicyDeployRuntime` emission boundary, and submits the
+emission to `MujocoPolicySkillMotionTarget`. The target's existing component
+ingress, canonical safety, coupled IK, q-reference generation, and one manual
+MuJoCo physics tick complete with `dispatched` status and finite bilateral qpos
+measurement.
+
+This is an execution-path contract smoke, not a task-success or policy-quality
+claim. It uses a deterministic injected policy in the test, does not use the
+ephemeral real-data artifact, and does not evaluate cube lifting, recovery
+benefit, safety-envelope margins, or human/RTC source switching inside the
+authoritative target. Those remain the next experiment-level comparisons.

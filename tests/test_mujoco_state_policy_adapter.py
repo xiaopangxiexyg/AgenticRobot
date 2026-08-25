@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
 from experiments.sim_learning.state_bc.contracts import StateBCArtifactMetadata
 from experiments.sim_learning.state_bc.model import fit_linear_state_bc
-from robot_motion.deploy import DeploymentObservation
+from robot_motion.action import HandActionSpec
+from robot_motion.deploy import (
+    DeploymentObservation,
+    PolicyDeployRuntime,
+    PolicyDeployRuntimeConfig,
+)
+from robot_motion.deploy.action_adapter import DeployRobotActionAdapter
+from robot_motion.deploy.emission_source import DeployActionPreparer
+from robot_motion.pose_frame_profiles import (
+    default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
+)
 from sim.mujoco.deploy.state_policy_adapter import (
     STATE_BC_LAYOUT_HASH_V1,
     StatePolicyAdapter,
@@ -97,3 +109,158 @@ def test_state_policy_adapter_validates_the_serialized_artifact_hash(tmp_path):
         config=StatePolicyAdapterConfig(policy_absolute_frame="runtime_raw"),
     )
     assert adapter.artifact_hash == model.artifact_hash
+
+
+@pytest.mark.optional
+def test_state_policy_output_reaches_existing_bimanual_mujoco_target():
+    """Exercise existing adapter/profile/runtime seams without new control code."""
+
+    pytest.importorskip("mujoco")
+
+    from pathlib import Path
+
+    from sim.mujoco.deploy import (
+        MujocoComponentActionRobotActionV1Materializer,
+        MujocoRobotActionV1ComponentIngressAdapter,
+        MujocoSimHILTargetConfig,
+        build_mujoco_component_execution_binding,
+        build_mujoco_pose_qpos_component_target_profile,
+        build_mujoco_policy_skill_motion_target,
+        prepare_mujoco_sim_hil_target,
+    )
+    from sim.mujoco.deploy.deployment_observation import (
+        MujocoDeploymentObservationAdapter,
+        MujocoDeploymentObservationConfig,
+    )
+
+    config = MujocoSimHILTargetConfig(
+        task_config_path=Path(
+            "sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json"
+        ),
+        realtime_worker=False,
+        allow_scripted_task_reset=False,
+    )
+    prepared = prepare_mujoco_sim_hil_target(config)
+    runtime_contract = default_rm65_workspace_near_boundary_runtime_pose_frame_contract()
+    profile = build_mujoco_pose_qpos_component_target_profile(
+        prepared.scene,
+        profile_id="state-bc.test.bimanual-pose-qpos.v1",
+        arm_side_by_component={"left_arm": "left", "right_arm": "right"},
+        gripper_name_by_component={
+            "left_gripper": "left_gripper",
+            "right_gripper": "right_gripper",
+        },
+        arm_reference_frame_by_component={
+            "left_arm": "left_arm_base",
+            "right_arm": "right_arm_base",
+        },
+    )
+    materializer = MujocoComponentActionRobotActionV1Materializer(
+        prepared.scene,
+        profile,
+        hand_action_spec_by_component={
+            "left_gripper": HandActionSpec.dmtac_gripper("left"),
+            "right_gripper": HandActionSpec.dmtac_gripper("right"),
+        },
+        support_arm_pose_provider=lambda: {},
+        support_arm_sides=(),
+        support_pose_contract_id="state-bc.test.no-support.v1",
+    )
+    ingress = MujocoRobotActionV1ComponentIngressAdapter(
+        prepared.scene,
+        profile,
+        component_id_by_effector={
+            "left_arm": "left_arm",
+            "right_arm": "right_arm",
+            "left_hand": "left_gripper",
+            "right_hand": "right_gripper",
+        },
+    )
+    binding = build_mujoco_component_execution_binding(
+        profile,
+        materializer,
+        policy_action_ingress=ingress,
+    )
+    target = build_mujoco_policy_skill_motion_target(
+        config=config,
+        component_execution_binding=binding,
+        prepared_target=prepared,
+    )
+    try:
+        observation = MujocoDeploymentObservationAdapter(
+            prepared.scene,
+            MujocoDeploymentObservationConfig(
+                active_sides=("left", "right"),
+                tcp_body_by_side={
+                    "left": prepared.scene.arm_specs["left"].controlled_body,
+                    "right": prepared.scene.arm_specs["right"].controlled_body,
+                },
+                end_effector_sides=("left", "right"),
+                gripper_name_by_side={
+                    "left": "left_gripper",
+                    "right": "right_gripper",
+                },
+                pose_frame_contract=runtime_contract,
+            ),
+            clock=time.monotonic,
+        ).capture()
+        adapter = StatePolicyAdapter(
+            model=_DummyStatePolicy(),
+            config=StatePolicyAdapterConfig(
+                policy_absolute_frame="canonical_desk",
+                runtime_pose_frame_contract=runtime_contract,
+            ),
+        )
+        prediction = adapter.predict(observation)
+
+        class _FixedPolicy:
+            def predict(self, _observation):
+                return prediction.actions[0]
+
+        policy_runtime = PolicyDeployRuntime(
+            PolicyDeployRuntimeConfig(
+                active_sides=("left", "right"),
+                hands_enabled=True,
+                policy_absolute_frame="runtime_raw",
+                policy_node_id=config.policy_node_id,
+                policy_clock_domain_id=config.clock_domain_id,
+            ),
+            monotonic_clock=time.monotonic,
+        )
+        prediction_result = policy_runtime.predict_and_queue(
+            _FixedPolicy(),
+            observation,
+            now=time.monotonic(),
+        )
+        assert prediction_result.accepted is True
+        prepared_result = policy_runtime.prepare_next_action(
+            observation,
+            preparer=DeployActionPreparer(
+                DeployRobotActionAdapter(
+                    active_sides=("left", "right"),
+                    arms_enabled=True,
+                    hands_enabled=True,
+                )
+            ),
+            policy_name="state_bc",
+        )
+        emission = prepared_result.emission
+        assert emission is not None
+        assert emission.pre_safety_robot_action is not None
+        assert set(emission.pre_safety_robot_action.active_effectors) == {
+            "left_arm",
+            "right_arm",
+            "left_hand",
+            "right_hand",
+        }
+        target.runtime.start()
+        submission = target.runtime.submit_policy_action_emission(emission)
+        result = target.runtime.step(physics_ticks_after_dispatch=1)
+        assert submission.accepted is True
+        assert result.status == "dispatched"
+        assert set(target.runtime.capture_qpos_measurement().qpos_by_side) == {
+            "left",
+            "right",
+        }
+    finally:
+        target.runtime.close()
