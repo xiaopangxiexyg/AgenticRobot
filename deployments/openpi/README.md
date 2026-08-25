@@ -1,6 +1,11 @@
-# OpenPI wrist-only 部署
+# OpenPI 训练与部署集成
 
 本目录连接 OpenPI 推理服务与 DexTeleop 真机部署运行时。OpenPI 仅负责模型加载和 websocket 推理；相机、机械臂、夹爪、初始化、限幅和力控均由 DexTeleop 负责。
+
+命令不要从本文的契约示例中零散拼接。先按
+[`COMMANDS.md`](./COMMANDS.md) 选择训练/部署路线和副作用等级，再到
+[`cmd_list.md`](./cmd_list.md) 选择经过审计的 checkpoint/profile 详细命令。
+本文只维护模型 I/O、artifact、相机、RTC 与运行时边界。
 
 ## 0. 固定的 OpenPI 源码边界
 
@@ -81,8 +86,10 @@ checkpoint-bound artifact 和 registry，再由
 绑定同时覆盖原 checkpoint artifact、训练 profile hash、base/derived config 名称、
 asset id、camera slots、action horizon/mode/tail、layout hash、state-augmentation
 契约和 checkpoint 内实际 norm-stats bytes。校验只在部署层生效，不改 checkpoint、
-数据集、OpenPI checkout、`teleop_runtime` 配置或遥操默认值。完整远端命令见
-[`cmd_list.md` 第 13 节](./cmd_list.md#13-08040805-front--absolute-prepared-checkpoint-部署绑定)。
+数据集、OpenPI checkout、`teleop_runtime` 配置或遥操默认值。prepared 训练/部署的
+选择流程见 [`COMMANDS.md`](./COMMANDS.md#4-训练路线选择)；具体 Stage1/Stage2
+命令分别见 [`cmd_list.md` 第 9 节](./cmd_list.md#9-prepared-writing-stage1checkpoint-bound-部署)
+和 [`cmd_list.md` 第 10 节](./cmd_list.md#10-prepared-writing-stage2checkpoint-bound-部署)。
 
 ### v2.2 raw 数据训练出的 relative 模型
 
