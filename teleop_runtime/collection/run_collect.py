@@ -30,7 +30,6 @@ from ..backends.hands import (
     InspireTacHandBackend,
     InspireTacHandBackendConfig,
 )
-from ..action import HandActionSpec
 from ..calibration import TeleopCalibration
 from ..cameras import build_camera_registry_snapshot, load_camera_registry
 from ..configs import build_annotated_dual_rm65_calibration
@@ -150,6 +149,9 @@ from .gripper_policy_config import (
     profile_value as _profile_value,  # noqa: F401 - compatibility export.
     resolved_gripper_policy as _resolved_gripper_policy,
 )
+from .hand_action_specs import (
+    resolve_collection_hand_action_specs as _collection_hand_action_specs,
+)
 from .diagnostics import (
     PhaseTimer,
     build_end_to_end_latency_breakdown,
@@ -192,20 +194,6 @@ from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 DEFAULT_CAMERA_CONFIG_PATH = _DEFAULT_CAMERA_CONFIG_PATH
 DEFAULT_CAMERA_REGISTRY_PATH = _DEFAULT_CAMERA_REGISTRY_PATH
 DEFAULT_DATASET_ROOT = _DEFAULT_DATASET_ROOT
-def _collection_hand_action_specs(
-    args: argparse.Namespace,
-    active_sides: Sequence[str],
-) -> Mapping[str, HandActionSpec] | None:
-    dmtac_sides = [
-        str(side)
-        for side in active_sides
-        if _hand_backend_mode_for_side(args, str(side)) == HAND_BACKEND_DMTAC_GRIPPER
-    ]
-    if not dmtac_sides:
-        return None
-    return {side: HandActionSpec.dmtac_gripper(side) for side in dmtac_sides}
-
-
 def _apply_default_q6_ports(
     args: argparse.Namespace,
     *,
