@@ -7,6 +7,7 @@ from contextlib import contextmanager, nullcontext
 import copy
 import dataclasses
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -77,6 +78,9 @@ STAGE1_SCENARIO_PROFILE_SCHEMA_V1 = (
     "dexteleop.openpi_stage1_scenario_training_profile.v1"
 )
 STANDARD_NON_RTC_TRAINING_MODE_V1 = "standard_non_rtc_v1"
+CORRECTED_WRIST_BACKGROUND_PROFILE_V1 = (
+    "dexteleop.corrected_wrist_background.v1"
+)
 DEFAULT_PROFILE = (
     Path(__file__).resolve().parents[1]
     / "configs/training/writing_stage1_0804_0805_front_h16_absolute_v1.json"
@@ -86,6 +90,229 @@ SKILL_PROJECTION_CATALOG_WRITING_FOUR_STAGE_SUBTASKS_V2 = (
     "writing_four_stage_subtasks_v2"
 )
 _EMPTY_CHECKPOINT_ROOT_ENTRIES = frozenset({"wandb", "wandb_id.txt"})
+OPENPI_SOURCE_IDENTITY_FILENAME = "OPENPI_SOURCE_IDENTITY.json"
+
+
+def _corrected_wrist_background_overrides(
+    profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw = profile.get("openpi_wrist_background_augmentation")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise TypeError(
+            "openpi_wrist_background_augmentation must be an object."
+        )
+    expected = {
+        "schema": CORRECTED_WRIST_BACKGROUND_PROFILE_V1,
+        "provider": "mixed",
+        "original_probability": 0.1,
+        "real_image_probability": 0.4,
+        "procedural_probability": 0.5,
+        "black_probability": 0.0,
+        "wrist_pair_mode": "shared_scene_family",
+        "mask_source": "wrist_final_keep_mask_paths",
+        "wrist_depth_mask_paths_fallback_allowed": False,
+        "strict_media_integrity": True,
+    }
+    mismatched = {
+        key: (raw.get(key), value)
+        for key, value in expected.items()
+        if raw.get(key) != value
+    }
+    if mismatched:
+        raise ValueError(
+            "OpenPI wrist background profile differs from the corrected "
+            f"10/40/50 final-mask contract: {mismatched}."
+        )
+    real_image_root = Path(str(raw.get("real_image_root") or "")).expanduser()
+    real_image_manifest = Path(
+        str(raw.get("real_image_manifest") or "")
+    ).expanduser()
+    if not real_image_root.is_absolute() or not real_image_manifest.is_absolute():
+        raise ValueError(
+            "Corrected wrist background real-image paths must be absolute."
+        )
+    return {
+        "background_provider": "mixed",
+        "mixed_original_prob": 0.1,
+        "real_image_prob": 0.4,
+        "mixed_black_prob": 0.0,
+        "wrist_pair_mode": "shared_scene_family",
+        "real_image_root": str(real_image_root),
+        "real_image_manifest": str(real_image_manifest),
+        "strict_media_integrity": True,
+    }
+
+
+def _explicit_openpi_weight_loader(
+    profile: Mapping[str, Any],
+    weight_loader: Any,
+    checkout: Path,
+) -> Any:
+    configured = str(
+        profile.get("openpi_weight_loader_params_path") or ""
+    ).strip()
+    if not configured:
+        return weight_loader
+    params_path = Path(configured).expanduser()
+    if not params_path.is_absolute():
+        params_path = checkout / params_path
+    params_path = params_path.resolve()
+    if not params_path.is_dir():
+        raise FileNotFoundError(
+            f"Pinned OpenPI base parameter directory is missing: {params_path}."
+        )
+    required = (
+        "_CHECKPOINT_METADATA",
+        "_METADATA",
+        "_sharding",
+        "commit_success.txt",
+        "manifest.ocdbt",
+    )
+    missing = [name for name in required if not (params_path / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Pinned OpenPI base parameter directory is incomplete: "
+            f"path={params_path} missing={missing}."
+        )
+    if not dataclasses.is_dataclass(weight_loader) or not hasattr(
+        weight_loader, "params_path"
+    ):
+        raise TypeError(
+            "openpi_weight_loader_params_path requires a dataclass weight "
+            "loader with params_path."
+        )
+    return dataclasses.replace(weight_loader, params_path=str(params_path))
+
+
+def _activate_openpi_checkout(profile: Mapping[str, Any]) -> Any:
+    checkout = Path(str(profile["openpi_checkout"])).expanduser().resolve()
+    source_root = checkout / "src"
+    if not (source_root / "openpi").is_dir():
+        raise FileNotFoundError(f"OpenPI checkout is missing: {checkout}.")
+
+    source_roots = (source_root,)
+    expected_revision = str(profile.get("openpi_source_revision") or "").strip()
+    if expected_revision:
+        identity_path = checkout / OPENPI_SOURCE_IDENTITY_FILENAME
+        if not identity_path.is_file():
+            raise FileNotFoundError(
+                f"Pinned OpenPI source identity is missing: {identity_path}."
+            )
+        identity_bytes = identity_path.read_bytes()
+        expected_identity_sha256 = str(
+            profile.get("openpi_source_identity_sha256") or ""
+        ).strip()
+        actual_identity_sha256 = hashlib.sha256(identity_bytes).hexdigest()
+        if actual_identity_sha256 != expected_identity_sha256:
+            raise ValueError(
+                "OpenPI source identity file hash differs from the training "
+                f"profile: {identity_path}."
+            )
+        identity = json.loads(identity_bytes)
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("schema") != "dexteleop.openpi_source_identity.v1"
+            or str(identity.get("revision") or "") != expected_revision
+        ):
+            raise ValueError(
+                "OpenPI source identity differs from the training profile: "
+                f"{identity_path}."
+            )
+        declared_config_sha256 = str(
+            identity.get("training_config_sha256") or ""
+        )
+        actual_config_sha256 = hashlib.sha256(
+            (source_root / "openpi/training/config.py").read_bytes()
+        ).hexdigest()
+        if declared_config_sha256 != actual_config_sha256:
+            raise ValueError(
+                "OpenPI training config content differs from its pinned "
+                f"source identity: {checkout}."
+            )
+
+        declared_source_roots = identity.get("workspace_source_roots")
+        if not isinstance(declared_source_roots, list) or not declared_source_roots:
+            raise ValueError(
+                "Pinned OpenPI source identity must declare workspace_source_roots."
+            )
+        resolved_source_roots: list[Path] = []
+        for value in declared_source_roots:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    "Pinned OpenPI workspace source roots must be non-empty strings."
+                )
+            resolved = (checkout / value).resolve()
+            if not resolved.is_relative_to(checkout) or not resolved.is_dir():
+                raise ValueError(
+                    "Pinned OpenPI workspace source root is invalid: "
+                    f"{value!r}."
+                )
+            resolved_source_roots.append(resolved)
+        if source_root not in resolved_source_roots:
+            raise ValueError(
+                "Pinned OpenPI workspace source roots must include src."
+            )
+        source_roots = tuple(resolved_source_roots)
+
+        client_contract = (
+            checkout
+            / "packages/openpi-client/src/openpi_client/history_state_contract.py"
+        )
+        declared_client_contract_sha256 = str(
+            identity.get("openpi_client_history_state_contract_sha256") or ""
+        )
+        if not client_contract.is_file() or declared_client_contract_sha256 != (
+            hashlib.sha256(client_contract.read_bytes()).hexdigest()
+        ):
+            raise ValueError(
+                "OpenPI client contract content differs from its pinned "
+                f"source identity: {checkout}."
+            )
+
+    for name, module in tuple(sys.modules.items()):
+        if not (
+            name in {"openpi", "openpi_client"}
+            or name.startswith(("openpi.", "openpi_client."))
+        ):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        if not Path(str(module_file)).resolve().is_relative_to(checkout):
+            raise RuntimeError(
+                "OpenPI was already imported from outside the profile checkout: "
+                f"{name}={module_file}. Start a fresh training process."
+            )
+
+    source_texts = tuple(str(path) for path in source_roots)
+    source_text_set = set(source_texts)
+    sys.path[:] = [
+        *source_texts,
+        *(
+            item
+            for item in sys.path
+            if str(Path(item or ".").resolve()) not in source_text_set
+        ),
+    ]
+    training_config = importlib.import_module("openpi.training.config")
+    module_file = Path(str(training_config.__file__)).resolve()
+    if not module_file.is_relative_to(checkout):
+        raise RuntimeError(
+            "OpenPI training config was imported from outside the profile "
+            f"checkout: {module_file}."
+        )
+    client_contract_module = importlib.import_module(
+        "openpi_client.history_state_contract"
+    )
+    client_module_file = Path(str(client_contract_module.__file__)).resolve()
+    if not client_module_file.is_relative_to(checkout):
+        raise RuntimeError(
+            "OpenPI client contract was imported from outside the profile "
+            f"checkout: {client_module_file}."
+        )
+    return training_config
 
 
 @dataclasses.dataclass(frozen=True)
@@ -296,6 +523,7 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             "openpi_training_mode must be standard_non_rtc_v1 when declared."
         )
+    _corrected_wrist_background_overrides(payload)
     if is_prompt_profile:
         raw_stages = payload.get("prompt_stages")
         if not isinstance(raw_stages, list) or len(raw_stages) < 2:
@@ -1345,9 +1573,7 @@ def _openpi_config(
     overwrite: bool,
 ) -> tuple[Any, Any, Path]:
     checkout = Path(str(profile["openpi_checkout"])).expanduser().resolve()
-    if not (checkout / "src/openpi").is_dir():
-        raise FileNotFoundError(f"OpenPI checkout is missing: {checkout}.")
-    import openpi.training.config as training_config
+    training_config = _activate_openpi_checkout(profile)
     from openpi.policies import dexteleop_v23_policy
 
     base = training_config.get_config(str(profile["openpi_base_config"]))
@@ -1400,6 +1626,12 @@ def _openpi_config(
             "OpenPI base config differs from the prepared h/camera/action contract."
         )
     source_values = binding_source_manifests(binding, binding_root)
+    corrected_background = _corrected_wrist_background_overrides(profile)
+    source_explicit_mask_keys = tuple(base.data.explicit_mask_keys)
+    if corrected_background:
+        source_explicit_mask_keys = tuple(
+            dexteleop_v23_policy.FINAL_KEEP_MASK_KEYS
+        )
     source_configs = tuple(
         dexteleop_v23_policy.DexTeleopV23DatasetSourceConfig(
             name=source_id,
@@ -1410,7 +1642,7 @@ def _openpi_config(
                 else 1
             ),
             front_occlusion_schedule=((0.0, 1.0),),
-            explicit_mask_keys=base.data.explicit_mask_keys,
+            explicit_mask_keys=source_explicit_mask_keys,
             episode_manifest=episode_manifest,
         )
         for source_id, source_root, episode_manifest in source_values
@@ -1452,6 +1684,18 @@ def _openpi_config(
         ),
         asset_id=str(profile["openpi_asset_id"]),
     )
+    data_overrides: dict[str, Any] = {"strict_media_integrity": True}
+    configured_final_mask_root = str(
+        profile.get("openpi_final_mask_root") or ""
+    ).strip()
+    if configured_final_mask_root:
+        final_mask_root_path = Path(configured_final_mask_root).expanduser()
+        if not final_mask_root_path.is_absolute():
+            final_mask_root_path = checkout / final_mask_root_path
+        data_overrides["final_mask_root"] = str(final_mask_root_path.resolve())
+    data_overrides.update(corrected_background)
+    if corrected_background:
+        data_overrides["explicit_mask_keys"] = source_explicit_mask_keys
     data = dataclasses.replace(
         base.data,
         assets=assets,
@@ -1462,14 +1706,41 @@ def _openpi_config(
         action_pose_mode=binding.action_pose_mode,
         last_action_pose_mode=binding.action_pose_mode,
         tail_policy="drop",
-        strict_media_integrity=True,
         state_augmentation=state_augmentation,
         dataset_sources=source_configs,
         default_prompt=str(
             profile.get("default_prompt", base.data.default_prompt)
         ),
+        **data_overrides,
     )
+    if corrected_background:
+        explicit_mask_keys = tuple(str(value) for value in data.explicit_mask_keys)
+        if (
+            explicit_mask_keys
+            != tuple(dexteleop_v23_policy.FINAL_KEEP_MASK_KEYS)
+            or "wrist_depth_mask_paths" in explicit_mask_keys
+            or not bool(data.strict_media_integrity)
+        ):
+            raise ValueError(
+                "Corrected wrist background training requires strict media, "
+                "final keep-mask input, and no raw depth-mask fallback."
+            )
     train_overrides: dict[str, Any] = {}
+    for profile_key, config_key in (
+        ("openpi_assets_base_dir", "assets_base_dir"),
+        ("openpi_checkpoint_base_dir", "checkpoint_base_dir"),
+    ):
+        configured_root = str(profile.get(profile_key) or "").strip()
+        if configured_root:
+            root_path = Path(configured_root).expanduser()
+            if not root_path.is_absolute():
+                root_path = checkout / root_path
+            train_overrides[config_key] = str(root_path.resolve())
+    train_overrides["weight_loader"] = _explicit_openpi_weight_loader(
+        profile,
+        base.weight_loader,
+        checkout,
+    )
     if "openpi_num_train_steps" in profile:
         train_steps = int(profile["openpi_num_train_steps"])
         save_interval = int(profile.get("openpi_save_interval", base.save_interval))
@@ -1584,12 +1855,144 @@ def _natural_mixing_metadata(
     return metadata
 
 
+def _source_partitioned_final_mask_roots(
+    profile: Mapping[str, Any],
+    binding: OpenPIPreparedSkillBinding | OpenPIPreparedPromptBinding,
+    binding_root: Path,
+) -> dict[Path, tuple[str, Path]]:
+    layout = str(profile.get("openpi_final_mask_root_layout") or "").strip()
+    if not layout:
+        return {}
+    if layout != "source_dataset_id_partitioned_v1":
+        raise ValueError(
+            "openpi_final_mask_root_layout must be "
+            "source_dataset_id_partitioned_v1 when declared."
+        )
+    configured_root = str(profile.get("openpi_final_mask_root") or "").strip()
+    if not configured_root:
+        raise ValueError(
+            "source-partitioned final masks require openpi_final_mask_root."
+        )
+    base_root = Path(configured_root).expanduser().resolve()
+    return {
+        source_root.resolve(): (source_id, (base_root / source_id).resolve())
+        for source_id, source_root, _episode_manifest in binding_source_manifests(
+            binding,
+            binding_root,
+        )
+    }
+
+
+def _final_mask_training_contract(
+    profile: Mapping[str, Any],
+    binding: OpenPIPreparedSkillBinding | OpenPIPreparedPromptBinding,
+    binding_root: Path,
+) -> dict[str, Any] | None:
+    roots = _source_partitioned_final_mask_roots(
+        profile,
+        binding,
+        binding_root,
+    )
+    if not roots:
+        return None
+    return {
+        "final_mask_root_layout": "source_dataset_id_partitioned_v1",
+        "final_mask_roots_by_source": {
+            source_id: str(final_root)
+            for source_id, final_root in roots.values()
+        },
+        "final_mask_semantics": (
+            "postprocessed_depth_keep_mask_or_table_geometry_keep_mask_v1"
+        ),
+        "wrist_depth_mask_paths_fallback_allowed": False,
+    }
+
+
+def _bind_source_partitioned_final_masks_to_dataset(
+    prepared: Any,
+    roots: Mapping[Path, tuple[str, Path]],
+) -> Any:
+    raw_dataset = getattr(prepared, "dataset", prepared)
+    children = tuple(getattr(raw_dataset, "_datasets", (raw_dataset,)))
+    seen: set[Path] = set()
+    for child in children:
+        source_root = Path(child.dataset_root).expanduser().resolve()
+        binding_value = roots.get(source_root)
+        if binding_value is None:
+            raise OpenPIPreparedSkillError(
+                "OpenPI mixed child is absent from the source-partitioned "
+                f"final-mask binding: {source_root}."
+            )
+        if getattr(child, "_masked_pipeline", None) is not None:
+            raise OpenPIPreparedSkillError(
+                "OpenPI final-mask root was bound after the masked pipeline "
+                f"was opened: {source_root}."
+            )
+        explicit_mask_keys = tuple(
+            str(value) for value in getattr(child, "explicit_mask_keys", ())
+        )
+        if "wrist_depth_mask_paths" in explicit_mask_keys:
+            raise OpenPIPreparedSkillError(
+                "Corrected Stage1 training forbids the raw "
+                "wrist_depth_mask_paths fallback."
+            )
+        _source_id, final_root = binding_value
+        child.final_mask_root = final_root
+        seen.add(source_root)
+    missing = sorted(str(path) for path in set(roots) - seen)
+    if missing:
+        raise OpenPIPreparedSkillError(
+            "OpenPI did not construct every source in the final-mask binding: "
+            f"{missing}."
+        )
+    return prepared
+
+
+@contextmanager
+def _source_partitioned_final_mask_binding(
+    profile: Mapping[str, Any],
+    binding: OpenPIPreparedSkillBinding | OpenPIPreparedPromptBinding,
+    binding_root: Path,
+) -> Iterator[None]:
+    """Bind every mixed child to a source-ID-partitioned final-mask root.
+
+    OpenPI v2.3 currently accepts one global ``final_mask_root`` when it
+    constructs a mixed dataset.  That path is ambiguous when two independent
+    sources share the same dataset basename.  Patch only the already-installed
+    Prepared dataset factory and assign each lazy child before any image or
+    mask pipeline is opened.
+    """
+
+    roots = _source_partitioned_final_mask_roots(
+        profile,
+        binding,
+        binding_root,
+    )
+    if not roots:
+        yield
+        return
+    from openpi.training import data_loader
+
+    original_create = data_loader.create_torch_dataset
+
+    def create_with_partitioned_final_masks(*args: Any, **kwargs: Any) -> Any:
+        prepared = original_create(*args, **kwargs)
+        return _bind_source_partitioned_final_masks_to_dataset(prepared, roots)
+
+    data_loader.create_torch_dataset = create_with_partitioned_final_masks
+    try:
+        yield
+    finally:
+        data_loader.create_torch_dataset = original_create
+
+
 def _correct_training_input_contract(
     config: Any,
     metadata: dict[str, Any],
     binding: OpenPIPreparedSkillBinding | OpenPIPreparedPromptBinding,
     *,
     state_only_bridge: OpenPIStateOnlyInputBridge | None = None,
+    final_mask_contract: Mapping[str, Any] | None = None,
 ) -> None:
     if "training_input_contract" not in metadata:
         return
@@ -1623,6 +2026,8 @@ def _correct_training_input_contract(
         contract["state_only_bridge_contract_hash"] = state_only_contract[
             "contract_hash"
         ]
+    elif final_mask_contract is not None:
+        contract.update(copy.deepcopy(dict(final_mask_contract)))
     contract.pop("contract_hash", None)
     canonical = json.dumps(
         contract,
@@ -1643,6 +2048,7 @@ def _prepared_metadata_binding(
     *,
     image_wire_training_contract: Mapping[str, Any] | None = None,
     state_only_bridge: OpenPIStateOnlyInputBridge | None = None,
+    final_mask_contract: Mapping[str, Any] | None = None,
 ) -> Iterator[None]:
     original = training_config.resolve_policy_metadata
 
@@ -1663,6 +2069,7 @@ def _prepared_metadata_binding(
             metadata,
             binding,
             state_only_bridge=state_only_bridge,
+            final_mask_contract=final_mask_contract,
         )
         if image_wire_training_contract is not None:
             _bind_metadata_value(
@@ -1806,9 +2213,7 @@ def _model_rtc_checkpoint_root(
     """Resolve the model-RTC run root without compiling a live data view."""
 
     checkout = Path(str(profile["openpi_checkout"])).expanduser().resolve()
-    if not (checkout / "src/openpi").is_dir():
-        raise FileNotFoundError(f"OpenPI checkout is missing: {checkout}.")
-    import openpi.training.config as training_config
+    training_config = _activate_openpi_checkout(profile)
 
     base = training_config.get_config(str(profile["openpi_base_config"]))
     effective_exp_name = str(
@@ -2104,6 +2509,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--stats-batch-size", type=int, default=256)
     parser.add_argument("--stats-num-workers", type=int, default=0)
+    parser.add_argument(
+        "--sample-load-images",
+        action="store_true",
+        help=(
+            "For sample-check, decode RGB and enforce the bound final "
+            "keep-mask path instead of checking numeric samples only."
+        ),
+    )
     parser.add_argument("--model-rtc-profile", type=Path, default=None)
     parser.add_argument("--model-rtc-adapter-debug", action="store_true")
     parser.add_argument("--num-train-steps", type=int, default=None)
@@ -2113,6 +2526,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.resume and args.overwrite:
         parser.error("--resume and --overwrite are mutually exclusive")
+    if args.sample_load_images and args.command != "sample-check":
+        parser.error("--sample-load-images is supported only by sample-check")
     if args.model_rtc_profile is None and (
         args.model_rtc_adapter_debug
         or args.num_train_steps is not None
@@ -2203,6 +2618,11 @@ def main(argv: list[str] | None = None) -> int:
         resume=args.resume,
         overwrite=args.overwrite,
     )
+    final_mask_contract = _final_mask_training_contract(
+        profile,
+        binding,
+        binding_root,
+    )
     state_only_bridge = OpenPIStateOnlyInputBridge.from_profile_value(
         profile.get("openpi_observation_mode"),
         image_keys=tuple(str(value) for value in config.model.image_keys),
@@ -2232,6 +2652,7 @@ def main(argv: list[str] | None = None) -> int:
             training_config,
             binding,
             image_wire_training_contract=image_wire_training_contract,
+            final_mask_contract=final_mask_contract,
         ):
             prepared_base = training_config.resolve_policy_metadata(config)
         adapted = adapt_prepared_skill_model_rtc_config(
@@ -2283,6 +2704,7 @@ def main(argv: list[str] | None = None) -> int:
                 training_config,
                 binding,
                 state_only_bridge=state_only_bridge,
+                final_mask_contract=final_mask_contract,
             ):
                 metadata_checked_config = (
                     training_config.resolve_policy_metadata(config)
@@ -2306,6 +2728,10 @@ def main(argv: list[str] | None = None) -> int:
             binding,
             post_identity_transform=post_identity_transform,
             load_images=False if state_only_bridge is not None else None,
+        ), _source_partitioned_final_mask_binding(
+            profile,
+            binding,
+            binding_root,
         ):
             data_config = config.data.create(config.assets_dirs, config.model)
             prompt_token_preflight = _prompt_family_token_preflight(
@@ -2317,7 +2743,7 @@ def main(argv: list[str] | None = None) -> int:
                 data_config,
                 config.model.action_horizon,
                 config.model,
-                load_images=False,
+                load_images=bool(args.sample_load_images),
             )
             if state_only_bridge is not None and data_config.norm_stats is None:
                 raise OpenPIPreparedSkillError(
@@ -2571,9 +2997,7 @@ def main(argv: list[str] | None = None) -> int:
                     if state_only_bridge is not None
                     else "configured_cameras"
                 ),
-                # sample-check always constructs the dataset with
-                # load_images=False above, regardless of observation mode.
-                "source_media_decoded": False,
+                "source_media_decoded": bool(args.sample_load_images),
                 "norm_stats_loaded": data_config.norm_stats is not None,
                 "norm_stats_asset_id": str(config.data.assets.asset_id),
                 "norm_stats_assets_dir": str(config.data.assets.assets_dir),
@@ -2630,6 +3054,10 @@ def main(argv: list[str] | None = None) -> int:
         binding,
         post_identity_transform=post_identity_transform,
         load_images=False if state_only_bridge is not None else None,
+    ), _source_partitioned_final_mask_binding(
+        profile,
+        binding,
+        binding_root,
     ):
         if args.command == "norm-stats":
             compute = _load_module(
@@ -2663,6 +3091,7 @@ def main(argv: list[str] | None = None) -> int:
                 binding,
                 image_wire_training_contract=image_wire_training_contract,
                 state_only_bridge=state_only_bridge,
+                final_mask_contract=final_mask_contract,
             )
         )
         receipt_import_binding = (

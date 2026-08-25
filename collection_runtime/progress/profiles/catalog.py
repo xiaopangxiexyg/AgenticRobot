@@ -26,8 +26,11 @@ from dataset_contracts.progress_stages import (
 
 
 _PROGRESS_SUFFIX = ".progress.json"
+_DETAILED_PROGRESS_SUFFIX = ".progress_detailed.json"
 _REFINEMENT_SUFFIX = ".refinement.json"
 _STAGES_SUFFIX = ".stages.json"
+_DETAILED_STAGES_SUFFIX = ".stages_detailed.json"
+DETAILED_PROFILE_SELECTION_SUFFIX = "_detailed"
 _TOPOLOGY_PACKAGES = {
     "LINEAR": "collection_runtime.progress.profiles.linear",
     "ROOTED_TREE": "collection_runtime.progress.profiles.tree",
@@ -49,10 +52,30 @@ class ManagedTaskProfile:
     progress_resource: str
     refinement_resource: str | None = None
     stage_resource: str | None = None
+    variant: str = "coarse"
 
     @property
     def profile_id(self) -> str:
         return self.progress_profile.profile_id
+
+    @property
+    def is_detailed(self) -> bool:
+        return self.variant == "detailed"
+
+    @property
+    def selection_id(self) -> str:
+        """Stable GUI/CLI selection ID for this catalog variant.
+
+        Detailed profiles intentionally keep the canonical progress profile ID
+        unchanged: the progress timeline and its hash are the same as the
+        coarse capture profile.  The variant suffix is therefore only a
+        selection-level namespace and never becomes a persisted Episode
+        profile ID.
+        """
+
+        if self.is_detailed:
+            return f"{self.profile_id}{DETAILED_PROFILE_SELECTION_SUFFIX}"
+        return self.profile_id
 
 
 def _mapping_from_text(text: str, *, source: str) -> Mapping[str, Any]:
@@ -223,7 +246,11 @@ def _load_resource_stages(
         ) from exc
 
 
-def _profiles_for_topology(topology_kind: str) -> tuple[ManagedTaskProfile, ...]:
+def _profiles_for_topology(
+    topology_kind: str,
+    *,
+    include_detailed: bool = False,
+) -> tuple[ManagedTaskProfile, ...]:
     topology = str(topology_kind).strip().upper()
     package_name = _TOPOLOGY_PACKAGES.get(topology)
     if package_name is None:
@@ -253,8 +280,20 @@ def _profiles_for_topology(topology_kind: str) -> tuple[ManagedTaskProfile, ...]
         for name in resources_by_name
         if name.endswith(_STAGES_SUFFIX)
     }
+    detailed_progress_names = {
+        name
+        for name in resources_by_name
+        if name.endswith(_DETAILED_PROGRESS_SUFFIX)
+    }
+    detailed_stage_names = {
+        name
+        for name in resources_by_name
+        if name.endswith(_DETAILED_STAGES_SUFFIX)
+    }
     expected_refinements: set[str] = set()
     expected_stages: set[str] = set()
+    expected_detailed_progress: set[str] = set()
+    expected_detailed_stages: set[str] = set()
     bundles: list[ManagedTaskProfile] = []
     for progress_name in progress_names:
         stem = progress_name[: -len(_PROGRESS_SUFFIX)]
@@ -304,6 +343,84 @@ def _profiles_for_topology(topology_kind: str) -> tuple[ManagedTaskProfile, ...]
                 ),
             )
         )
+        if include_detailed:
+            detailed_progress_name = (
+                f"{stem}{_DETAILED_PROGRESS_SUFFIX}"
+            )
+            detailed_stage_name = f"{stem}{_DETAILED_STAGES_SUFFIX}"
+            detailed_progress_resource = resources_by_name.get(
+                detailed_progress_name
+            )
+            detailed_stage_resource = resources_by_name.get(
+                detailed_stage_name
+            )
+            if (
+                detailed_progress_resource is None
+                and detailed_stage_resource is None
+            ):
+                continue
+            if (
+                detailed_progress_resource is None
+                or detailed_stage_resource is None
+            ):
+                missing = (
+                    detailed_progress_name
+                    if detailed_progress_resource is None
+                    else detailed_stage_name
+                )
+                present = (
+                    detailed_stage_name
+                    if detailed_progress_resource is None
+                    else detailed_progress_name
+                )
+                raise ProgressProfileCatalogError(
+                    "Managed detailed profile companion is incomplete: "
+                    f"{present} exists but {missing} is missing."
+                )
+            expected_detailed_progress.add(detailed_progress_name)
+            expected_detailed_stages.add(detailed_stage_name)
+            detailed_progress = _load_resource_profile(
+                detailed_progress_resource
+            )
+            if detailed_progress.topology_kind != topology:
+                raise ProgressProfileCatalogError(
+                    f"Managed detailed profile {detailed_progress.profile_id!r} "
+                    f"declares {detailed_progress.topology_kind}, but is "
+                    f"stored under {topology}."
+                )
+            if (
+                detailed_progress.semantic_content_hash
+                != progress_profile.semantic_content_hash
+            ):
+                raise ProgressProfileCatalogError(
+                    "Managed detailed profile must preserve the coarse "
+                    "progress timeline/hash: "
+                    f"{detailed_progress_name}."
+                )
+            detailed_stage = _load_resource_stages(
+                detailed_stage_resource,
+                progress_profile=detailed_progress,
+            )
+            bundles.append(
+                ManagedTaskProfile(
+                    progress_profile=detailed_progress,
+                    refinement_profile=refinement_profile,
+                    stage_profile=detailed_stage,
+                    topology_kind=topology,
+                    progress_resource=(
+                        f"{package_name}:{detailed_progress_name}"
+                    ),
+                    refinement_resource=(
+                        None
+                        if refinement_resource is None
+                        else f"{package_name}:{refinement_name}"
+                    ),
+                    stage_resource=(
+                        f"{package_name}:{detailed_stage_name}"
+                    ),
+                    variant="detailed",
+                )
+            )
     if orphaned := refinement_names - expected_refinements:
         raise ProgressProfileCatalogError(
             "Managed refinement profile has no same-name progress profile: "
@@ -314,14 +431,33 @@ def _profiles_for_topology(topology_kind: str) -> tuple[ManagedTaskProfile, ...]
             "Managed stage profile has no same-name progress profile: "
             f"{sorted(orphaned)}."
         )
+    if include_detailed:
+        if orphaned := detailed_progress_names - expected_detailed_progress:
+            raise ProgressProfileCatalogError(
+                "Managed detailed progress profile has no same-name coarse "
+                "progress profile: "
+                f"{sorted(orphaned)}."
+            )
+        if orphaned := detailed_stage_names - expected_detailed_stages:
+            raise ProgressProfileCatalogError(
+                "Managed detailed stage profile has no same-name detailed "
+                "progress profile: "
+                f"{sorted(orphaned)}."
+            )
     return tuple(bundles)
 
 
 def list_managed_task_profiles(
     *,
     topology_kind: str | None = None,
+    include_detailed: bool = False,
 ) -> tuple[ManagedTaskProfile, ...]:
-    """List validated catalog bundles in deterministic profile-ID order."""
+    """List validated catalog bundles in deterministic selection-ID order.
+
+    ``include_detailed`` is explicit so existing callers keep the original
+    coarse-only catalog and its selection semantics.  Detailed variants are
+    additive bundles selected with ``<profile_id>_detailed``.
+    """
 
     topologies = (
         tuple(_TOPOLOGY_PACKAGES)
@@ -331,30 +467,39 @@ def list_managed_task_profiles(
     bundles = tuple(
         bundle
         for topology in topologies
-        for bundle in _profiles_for_topology(topology)
+        for bundle in _profiles_for_topology(
+            topology,
+            include_detailed=include_detailed,
+        )
     )
-    ids = tuple(bundle.profile_id for bundle in bundles)
+    ids = tuple(bundle.selection_id for bundle in bundles)
     if len(ids) != len(set(ids)):
         raise ProgressProfileCatalogError(
-            "Managed task progress profile_id values must be globally unique."
+            "Managed task profile selection IDs must be globally unique."
         )
-    return tuple(sorted(bundles, key=lambda item: item.profile_id))
+    return tuple(sorted(bundles, key=lambda item: item.selection_id))
 
 
 def load_managed_task_profile(profile_id: str) -> ManagedTaskProfile:
-    """Resolve one exact managed task profile by canonical profile ID."""
+    """Resolve one exact managed profile by canonical or variant ID."""
 
     normalized = str(profile_id).strip()
     if not normalized:
         raise ProgressProfileCatalogError("profile_id must be non-empty.")
+    include_detailed = normalized.endswith(DETAILED_PROFILE_SELECTION_SUFFIX)
     matches = tuple(
         bundle
-        for bundle in list_managed_task_profiles()
-        if bundle.profile_id == normalized
+        for bundle in list_managed_task_profiles(
+            include_detailed=include_detailed,
+        )
+        if bundle.selection_id == normalized
     )
     if len(matches) != 1:
         available = tuple(
-            bundle.profile_id for bundle in list_managed_task_profiles()
+            bundle.selection_id
+            for bundle in list_managed_task_profiles(
+                include_detailed=include_detailed,
+            )
         )
         raise ProgressProfileCatalogError(
             f"Unknown managed task profile {normalized!r}; "
@@ -417,6 +562,7 @@ def resolve_task_stage_profile_reference(
 
 
 __all__ = [
+    "DETAILED_PROFILE_SELECTION_SUFFIX",
     "ManagedTaskProfile",
     "ProgressProfileCatalogError",
     "list_managed_task_profiles",

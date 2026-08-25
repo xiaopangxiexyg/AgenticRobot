@@ -1,0 +1,202 @@
+# State-only BC and simulation HITL plan
+
+## Objective and boundary
+
+The first mainline probe uses the low-dimensional state already recorded by
+`FormalCollection` rather than images or simulator-generated observations:
+
+```text
+state[16] = left TCP xyzquat[7] + right TCP xyzquat[7]
+             + left measured gripper scalar[1] + right measured gripper scalar[1]
+action[16] = left TCP xyzquat[7] + right TCP xyzquat[7]
+              + left/right absolute gripper targets[1]
+```
+
+The recorded pose frame is `desk_absolute`, the pose representation is
+`xyz_quat_xyzw`, the action mode is absolute, and the gripper values are
+`normalized_0_1`. `observation.arm.qpos` is audit-only and is not a learner
+input for this probe. This deliberately avoids a simulator dynamics gap for
+the policy input/output experiment; it does not claim that the learned policy
+is physically valid or ready for a robot.
+
+The change in this Task is limited to an offline learner, a MuJoCo observation
+and action adapter, and a source-lineage test seam. The existing
+`MujocoDeployRuntime` remains the only execution owner for admission, safety,
+IK, and dispatch. No new queue, authority, simulator entrypoint, device
+worker, GUI, or hardware path is introduced.
+
+## Dataset selector
+
+The selector names source directories explicitly and stores every excluded
+episode reason. It reads only `observation.state` and `action` from parquet;
+media, tactile streams, and qpos are not opened by the first trainer.
+
+The read-only inventory identified these candidates on
+`user@192.168.70.116:/home/user/zc/datasets/RealmanDMTAC/FormalCollection`:
+
+1. **Strict full-task day (recommended first selector):** the two
+   `2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage` directories.
+   They are one logical day split into two physical folders. The selector must
+   include both paths and the training manifest must retain their source paths;
+   a read-only identity/time non-overlap check is required before treating
+   them as one day.
+2. **Quality-first single-directory fallback:**
+   `2026-08-20_4_stage_writing_detail`. This is easier to attribute to one
+   source directory, but it is not the same task/profile as the 2026-08-07
+   full-task pair and therefore must be labelled as a different selector.
+3. `2026-08-21_4_stage_writing_detail` has more frames, but its task identity
+   and short-episode mix make it unsuitable as the default first benchmark.
+   The high-invalid-rate 2026-08-24 directory should not be the first fit.
+
+The remote policy I/O layout hash declared by `meta/info.json` is
+`sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16`.
+The checked-in v2.2 runtime layout currently derives
+`sha256:52e4bc42ad0a0e562c357e41da1ee2cbd827b4dc98643ffb73fe7acfeafc66ab`
+from the same named layout. Both are accepted as explicit aliases, while the
+simulator always binds the current checked-in layout and records the source
+hash. This is a compatibility gate, not permission to accept arbitrary layout
+hashes; a future layout change must add a new reviewed alias and tests.
+
+Before a real-data fit is admitted, the selected `meta/info.json` must still
+confirm the expected `pose_storage_frame=desk_absolute`,
+`arm_pose_action_mode=absolute`, state/action dimensions, and the shared
+policy I/O identity. Invalid episodes remain in the selection manifest rather
+than being silently deleted. The source parquet remains remote and read-only.
+For the bounded 2026-08-25 probe, explicit approval was used to copy only the
+manifest files and integrity-valid parquet files into an ephemeral `/tmp`
+staging tree. No `videos/`, `tactile/`, or wrist-depth paths were copied.
+
+### Completed 2026-08-07 offline probe
+
+The selected logical day was the pair of physical directories listed above.
+Remote read-only manifest evidence was:
+
+| item | result |
+| --- | --- |
+| physical source directories | 2 (129 + 202 episodes) |
+| complete episodes | 204 (83 + 121) |
+| excluded episodes | 127 (46 + 81; retained in the selection manifest) |
+| complete frames | 69,440 (29,714 + 39,726) |
+| valid parquet synchronized | 204 files, 366,949,962 bytes |
+| per-file transfer verification | 204/204 SHA-256 matches, 0 missing |
+| source layout hash | `sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16` |
+
+The remote `info.json` declares parquet features only for low-dimensional
+`action`, `observation.state`, `observation.arm.qpos` (audit-only), and
+`observation.last_action`; media and tactile streams are separate paths. The
+local loader opened only `observation.state` and `action`.
+
+The first deterministic fit used an episode-level 80/20 split, seed `0`, and
+ridge `1e-4`. It produced 55,343 training frames and 14,097 held-out frames.
+Held-out metrics were action MAE `0.00907047`, left/right pose-position RMSE
+`0.001598/0.002521 m`, pose-orientation MAE `0.007935 rad`, and left/right
+gripper MAE `0.05781/0.06542`. The self-contained artifact hash was
+`sha256:61ae3388e62dd8410b7e3cdbd5d2489bf3717eb85cc5e54c60ccc7a1cd1e85e0`;
+the artifact and staging tree are ephemeral and are not treated as a
+versioned model resource.
+
+## Reproducible offline flow
+
+```text
+remote metadata (read-only)
+        |
+explicit selector + integrity-valid episodes
+        |
+state/action columns only, split by episode
+        |
+linear ridge state BC artifact (.npz + manifest/hash)
+        |
+MuJoCo 38D DeploymentObservation
+        |  (explicit raw -> desk pose contract when needed)
+16D v2.2 state observation adapter
+        |
+16D absolute prediction -> v2.2 layout -> existing 26D q6 bridge
+        |
+MujocoDeployRuntime -> existing safety / IK / dispatch owner
+```
+
+The linear ridge model is a baseline for wiring and evidence, not the final
+algorithm. It gives a deterministic artifact, normalization, frame identity,
+and held-out episode metrics before a larger learner is introduced.
+
+## HITL validation contract
+
+HITL is tested as exclusive source selection, not action blending:
+
+- exactly one `policy`, `human`, or `rtc` source may execute an action at a
+  step;
+- every source switch emits `hold` followed by a fresh activation/emission;
+- standard policy inference is the nominal action source;
+- RTC inference receives the current state and nominal policy action, then
+  either emits one replacement action or returns `rtc_no_action`;
+- `rtc_no_action`, hold, and activation events never become policy-training
+  samples;
+- the trace records source, activation, inference mode, and action lineage;
+- lower runtime safety/IK/dispatch remains authoritative after the adapter.
+
+This is sufficient to compare ordinary teleoperation, takeover/handback, and
+RTC intervention in a deterministic mock trace. A later MuJoCo target test can
+feed the same normalized actions to `MujocoDeployRuntime`; it must not bypass
+that runtime with a parallel simulator control loop.
+
+## Evidence ceiling and next gate
+
+The current Task now proves the contracts, explicit 2026-08-07 selector,
+real-data state-only fit, self-contained artifact round trip, 16D-to-26D
+projection, frame-contract failure-closed behavior, and exclusive HITL
+lineage. The real-artifact adapter smoke was observation-only: it projected one
+recorded state through the existing bridge and produced a finite 26D action,
+without stepping physics. The real-artifact HITL trace exercised policy,
+human takeover/handback, RTC replacement, and RTC `no_action`; HOLD,
+activation, and `no_action` remained excluded from samples.
+
+This evidence still does **not** prove task success, causal recovery benefit,
+safety-envelope admission, or physical safety. It also does not start a real
+device, GUI, policy server, or motion.
+
+The supported development asset store is now linked into the Task worktree by
+the standard `dev_asset_store.py link-worktree` flow:
+
+```text
+Task/assets
+  -> /home/zc/HandMotion/Developing/AgenticRobot/assets
+```
+
+The link is ignored, read-mostly, and points at the reviewed main-checkout
+asset root; the main checkout itself was not changed. With that binding, a
+no-device MuJoCo smoke using
+`sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json` completed one
+`reset(seed=0)` and one zero-action `step`: observation shape `(28,)`, task
+action shape `(7,)`, reward `0.0`, and no termination. The same settled scene
+was captured through `MujocoDeploymentObservationAdapter` as a finite 38D
+deployment observation, then the real state-BC artifact produced a finite 16D
+model view and finite 26D normalized action.
+
+The current Cube-Lift task is nevertheless a right-arm 7D task interface,
+while the state-BC artifact is a bilateral 16D-to-26D deployment policy. The
+earlier reset/observation smoke therefore validated asset loading, scene
+observation, and the model adapter seam only; it did not by itself route the
+26D output through the bilateral pose-target runtime or claim task success.
+The bounded runtime seam is now covered by the optional test below. The next
+experiment gate is to compare ordinary policy, human takeover/handback, and RTC
+intervention on resettable episodes without introducing a parallel execution
+loop.
+
+### Completed bilateral runtime seam smoke
+
+The bounded optional test
+`tests/test_mujoco_state_policy_adapter.py::test_state_policy_output_reaches_existing_bimanual_mujoco_target`
+now exercises that next gate with the checked-in `rm65_right_cube_lift_rl_normal_v2`
+scene and `realtime_worker=False`. It captures both TCPs and grippers, converts
+the state-BC desk-frame output through the reviewed RM65 runtime pose contract,
+uses the existing `PolicyDeployRuntime` emission boundary, and submits the
+emission to `MujocoPolicySkillMotionTarget`. The target's existing component
+ingress, canonical safety, coupled IK, q-reference generation, and one manual
+MuJoCo physics tick complete with `dispatched` status and finite bilateral qpos
+measurement.
+
+This is an execution-path contract smoke, not a task-success or policy-quality
+claim. It uses a deterministic injected policy in the test, does not use the
+ephemeral real-data artifact, and does not evaluate cube lifting, recovery
+benefit, safety-envelope margins, or human/RTC source switching inside the
+authoritative target. Those remain the next experiment-level comparisons.

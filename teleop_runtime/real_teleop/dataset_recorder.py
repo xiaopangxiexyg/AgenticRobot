@@ -1009,8 +1009,14 @@ class RealTeleopDatasetRecorder:
     def select_progress_profile(
         self,
         profile: object,
+        *,
+        stage_profile: object | None = None,
     ) -> None:
-        """Apply one idle, validated selection without binding it yet."""
+        """Apply one idle, validated selection without binding it yet.
+
+        ``stage_profile`` is an explicit variant selection used by the detail
+        profile picker.  Omitting it preserves the legacy coarse auto-match.
+        """
 
         if self.is_recording or self.finalizing:
             raise RuntimeError(
@@ -1027,6 +1033,15 @@ class RealTeleopDatasetRecorder:
             self.dataset_root,
             requested_profile=selected,
         )
+        requested_stage_profile = resolve_real_teleop_task_stage_profile(
+            selected,
+            stage_profile if stage_profile is not None else None,
+        )
+        stage_admission = inspect_dataset_task_stage_profile(
+            self.dataset_root,
+            progress_profile=selected,
+            requested_profile=requested_stage_profile,
+        )
         buffer = self._sample_acceptance_receipt_buffer
         if buffer.capacity <= 0:
             raise RuntimeError(
@@ -1036,15 +1051,6 @@ class RealTeleopDatasetRecorder:
         buffer.reset()
         self.progress_profile = selected
         self.args.collection_progress_profile = selected
-        requested_stage_profile = resolve_real_teleop_task_stage_profile(
-            selected,
-            None,
-        )
-        stage_admission = inspect_dataset_task_stage_profile(
-            self.dataset_root,
-            progress_profile=selected,
-            requested_profile=requested_stage_profile,
-        )
         self.stage_profile = stage_admission.profile
         self.args.collection_stage_profile = self.stage_profile
         self._progress_profile_dataset_locked = bool(admission.locked)

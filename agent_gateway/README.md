@@ -347,12 +347,49 @@ motion action, or `--confirm`. The selected collision-scene profile is read only
 to derive fixed arm-base geometry for static camera poses; it does not construct
 or connect a robot backend.
 
+For a finite input-Skill acceptance run, use the purpose-built probe from a
+clean checkout. It fixes the camera config, registry, and collision-scene
+profile to the reviewed repository values and exposes no robot, motion,
+hardware-reset, or configuration-substitution argument:
+
+```bash
+"$(bash scripts/resolve_dev_python.sh)" \
+  -m agent_gateway.profiles.real.perception_probe \
+  --run-root /absolute/private/real-perception-probe-run
+```
+
+The probe starts the real camera-only application, requires the Unix server
+socket to be published, then uses one authenticated bound wire adapter to call
+`submit_read_only_skill_request` for `perception.capture_rgb` and
+`perception.capture_depth`. It downloads every output through `chunked_rpc`,
+checks immutable length/SHA-256 descriptors, decodes all three RGB JPEGs, and
+loads the front depth Artifact as a native-resolution 2-D float32 metric NPY.
+It always closes the application, cameras, executors, socket, and transient
+Artifact store. Success prints one `agentic_robot.real_perception_skill_probe.v1`
+JSON object and saves the same bounded evidence as
+`real_perception_skill_probe.json` under `--run-root`; raw image/depth bytes are
+not included in that JSON.
+
+This probe covers real Gateway startup, camera admission, both passive Skill
+executors, operation polling, and Artifact transfer/decoding. The Skill calls
+use the in-process bound wire adapter after a real server socket is established;
+an independent RPent AF_UNIX client remains a separate end-to-end acceptance
+boundary.
+
 The three perception flags are all-or-none. The checked-in deployment profile
 publishes RGB for `main`, `wrist_left`, and `wrist_right`, but publishes depth
 only for `main`. The front camera has a reviewed static camera-to-arm-base
 transform; wrist depth is deliberately unavailable because those cameras move
 with link 6 and the current registry does not provide the activation-time
 joint/FK pose needed by the depth result contract. Hardware reset is disabled.
+
+The reviewed front D435 deployment explicitly accepts near-zero RGB payloads
+because that installed stream is expected to be dark; those frames remain
+counted in camera diagnostics and are published instead of causing restart.
+Only that front entry enables two finite software-only startup retries. A retry
+stops and rebuilds the SDK pipeline with cancellable delay and never calls
+`hardware_reset()`. Wrist cameras and all older profiles retain the default
+near-zero-frame rejection/restart behavior and zero software startup retries.
 
 Both capture Routes are `inspection` / `read_only` / `t0_read_only`: invoking
 them needs no motion Grant and cannot call command admission, dispatch, or

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import numpy as np
+import pytest
 
 from teleop_runtime.sources.camera import realsense_rgb
 from teleop_runtime.sources.camera.realsense_rgb import (
@@ -476,6 +477,9 @@ def test_realsense_startup_reset_defaults_are_serialized() -> None:
     assert payload["startup_hardware_reset_reconnect_poll_sec"] == 0.25
     assert payload["restart_on_black_frames"] is True
     assert payload["restart_after_black_frames"] == 5
+    assert payload["accept_near_zero_frames"] is False
+    assert payload["startup_software_retry_attempts"] == 0
+    assert payload["startup_software_retry_sleep_sec"] == 0.5
     assert payload["require_complete_frameset"] is False
     assert payload["restart_on_incomplete_frameset"] is False
     assert payload["restart_after_incomplete_framesets"] == 5
@@ -513,6 +517,95 @@ def test_realsense_near_zero_frames_are_dropped_and_restart_pipeline() -> None:
     assert info["black_frame_count"] == 2
     assert info["consecutive_black_frame_count"] == 0
     assert info["last_sampled_max_value"] == 3
+
+
+def test_realsense_reviewed_near_zero_frames_are_published_without_error() -> None:
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            accept_near_zero_frames=True,
+            restart_after_black_frames=1,
+        )
+    )
+    black = np.zeros((48, 64, 3), dtype=np.uint8)
+
+    with patch.object(source, "_restart_pipeline") as restart:
+        assert source._handle_black_frame(black) is False
+
+    restart.assert_not_called()
+    info = source.device_info()
+    assert info["black_frame_count"] == 1
+    assert info["consecutive_black_frame_count"] == 1
+    assert info["last_sampled_max_value"] == 0
+    assert info["last_error"] is None
+
+
+def test_realsense_software_startup_retry_rebuilds_without_hardware_reset() -> None:
+    fake_rs = _FakeRealSense()
+    target_device = _FakeHardwareDevice("FRONT123")
+    fake_rs.devices = [target_device]
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")]
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=1,
+            startup_frame_grace_sec=1.0,
+            startup_wait_timeout_ms=1000,
+            startup_software_retry_attempts=1,
+            startup_software_retry_sleep_sec=0.25,
+            startup_hardware_reset_on_failure=False,
+        )
+    )
+
+    with patch.object(source._shutdown_event, "wait", return_value=False) as wait_mock:
+        pipeline, _ = source._start_pipeline(fake_rs)
+
+    assert pipeline is fake_rs.pipelines[1]
+    assert len(fake_rs.pipelines) == 2
+    assert fake_rs.pipelines[0].stop_calls == 1
+    assert target_device.hardware_reset_calls == 0
+    wait_mock.assert_called_once_with(0.25)
+
+
+def test_realsense_software_startup_retry_sleep_honours_shutdown() -> None:
+    fake_rs = _FakeRealSense()
+    fake_rs.wait_errors = [RuntimeError("Frame didn't arrive within 1000")]
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=1,
+            startup_frame_grace_sec=1.0,
+            startup_wait_timeout_ms=1000,
+            startup_software_retry_attempts=1,
+            startup_software_retry_sleep_sec=0.25,
+            startup_hardware_reset_on_failure=False,
+        )
+    )
+
+    with (
+        patch.object(source._shutdown_event, "wait", return_value=True),
+        pytest.raises(RuntimeError, match="startup_cancelled"),
+    ):
+        source._start_pipeline(fake_rs)
+
+    assert len(fake_rs.pipelines) == 1
+
+
+def test_agent_gateway_front_camera_explicitly_allows_reviewed_dark_frames() -> None:
+    configs = realsense_rgb.load_realsense_camera_config_map(
+        Path("teleop_runtime/configs/devices/agent_gateway_realsense.json")
+    )
+
+    assert configs["front"].accept_near_zero_frames is True
+    assert configs["front"].startup_software_retry_attempts == 2
+    assert configs["front"].startup_software_retry_sleep_sec == 0.5
+    assert configs["front"].startup_hardware_reset is False
+    assert configs["front"].startup_hardware_reset_on_failure is False
+    for camera_key in ("left_wrist", "right_wrist"):
+        assert configs[camera_key].accept_near_zero_frames is False
+        assert configs[camera_key].startup_software_retry_attempts == 0
 
 
 def test_realsense_frame_timeouts_mark_stale_and_request_restart() -> None:

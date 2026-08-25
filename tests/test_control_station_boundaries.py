@@ -276,6 +276,7 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         {"numpy", "scipy"},
     ) == {
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
+        "agent_gateway/profiles/real/perception_probe.py": ["numpy"],
         "agent_gateway/profiles/real/realsense_perception.py": ["numpy"],
     }
 

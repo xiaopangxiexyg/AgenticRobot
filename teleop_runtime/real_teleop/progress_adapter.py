@@ -28,8 +28,10 @@ from collection_runtime.progress import (
     UndoLastProgressAdvanceRequest,
 )
 from collection_runtime.progress.profiles import (
+    ManagedTaskProfile,
     ProgressProfileCatalogError,
     inspect_dataset_progress_profile,
+    inspect_dataset_task_stage_profile,
     list_managed_task_profiles,
     load_managed_task_profile,
     resolve_task_progress_profile_reference,
@@ -283,6 +285,94 @@ def list_real_teleop_managed_progress_profiles(
     return tuple(sorted(profiles, key=lambda item: item.profile_id))
 
 
+def list_real_teleop_managed_progress_profile_selections(
+    *,
+    collection_task_id: str | None = None,
+) -> tuple[ManagedTaskProfile, ...]:
+    """List coarse and explicit detailed GUI selections.
+
+    The original coarse-only list remains available to compatibility callers.
+    This variant is the only API used by the profile picker, so a detailed
+    stage profile can be selected without changing the canonical progress
+    profile identity stored in an Episode.
+    """
+
+    del collection_task_id
+    bundles = list_managed_task_profiles(
+        topology_kind="LINEAR",
+        include_detailed=True,
+    )
+    for bundle in bundles:
+        validate_real_teleop_initial_progress_profile(
+            bundle.progress_profile
+        )
+        if bundle.stage_profile is not None:
+            validate_task_stage_profile(
+                progress_profile=bundle.progress_profile,
+                stage_profile=bundle.stage_profile,
+            )
+    return tuple(bundles)
+
+
+def load_real_teleop_managed_progress_profile_selection(
+    profile_id: str,
+    *,
+    collection_task_id: str | None = None,
+) -> ManagedTaskProfile:
+    """Resolve a coarse or ``_detailed`` managed profile picker value."""
+
+    del collection_task_id
+    try:
+        bundle = load_managed_task_profile(profile_id)
+    except ProgressProfileCatalogError as exc:
+        raise ValueError(f"Invalid managed progress profile: {exc}") from exc
+    validate_real_teleop_initial_progress_profile(bundle.progress_profile)
+    if bundle.stage_profile is not None:
+        validate_task_stage_profile(
+            progress_profile=bundle.progress_profile,
+            stage_profile=bundle.stage_profile,
+        )
+    return bundle
+
+
+def real_teleop_managed_progress_selection_id(
+    progress_profile: TaskProgressProfileV1 | None,
+    stage_profile: TaskStageProfileV1 | None,
+) -> str | None:
+    """Return the picker ID matching an admitted progress/stage pair."""
+
+    if progress_profile is None:
+        return None
+    matches = tuple(
+        bundle
+        for bundle in list_real_teleop_managed_progress_profile_selections()
+        if (
+            bundle.progress_profile.semantic_content_hash
+            == progress_profile.semantic_content_hash
+            and (
+                (
+                    stage_profile is None
+                    and bundle.stage_profile is None
+                )
+                or (
+                    stage_profile is not None
+                    and bundle.stage_profile is not None
+                    and bundle.stage_profile.semantic_content_hash
+                    == stage_profile.semantic_content_hash
+                )
+            )
+        )
+    )
+    if len(matches) == 1:
+        return matches[0].selection_id
+    if len(matches) > 1:
+        raise ValueError(
+            "The admitted progress/stage pair matches multiple managed "
+            "profile selections."
+        )
+    return progress_profile.profile_id
+
+
 def load_real_teleop_managed_progress_profile(
     profile_id: str,
     *,
@@ -329,10 +419,12 @@ def select_real_teleop_managed_progress_profile(
 
     if not bool(getattr(args, "collection_progress_gui", False)):
         raise RuntimeError("collection progress GUI selection is disabled")
-    selected = load_real_teleop_managed_progress_profile(
+    selected_bundle = load_real_teleop_managed_progress_profile_selection(
         profile_id,
         collection_task_id=str(args.collection_task_id),
     )
+    selected = selected_bundle.progress_profile
+    selected_stage_profile = selected_bundle.stage_profile
     recorder_matches = _dataset_recorder_matches_progress_selection(
         args=args,
         dataset_recorder=dataset_recorder,
@@ -343,14 +435,31 @@ def select_real_teleop_managed_progress_profile(
             raise RuntimeError(
                 "The active dataset recorder cannot accept progress profile selection."
             )
-        selector(selected)
+        selector(
+            selected,
+            stage_profile=selected_stage_profile,
+        )
         args.collection_progress_profile = selected
+        args.collection_stage_profile = getattr(
+            dataset_recorder,
+            "stage_profile",
+            selected_stage_profile,
+        )
     else:
         inspect_dataset_progress_profile(
             Path(args.dataset_root),
             requested_profile=selected,
         )
+        stage_admission = inspect_dataset_task_stage_profile(
+            Path(args.dataset_root),
+            progress_profile=selected,
+            requested_profile=selected_stage_profile,
+        )
         args.collection_progress_profile = selected
+        args.collection_stage_profile = stage_admission.profile
+    args.collection_progress_profile_selection_id = (
+        selected_bundle.selection_id
+    )
     # Episode entry is a profile-local choice. A profile switch must not carry
     # a stale coarse/fine entry into the newly selected contract, even when two
     # profiles happen to reuse an ID.
@@ -888,7 +997,10 @@ __all__ = [
     "REAL_TELEOP_PROGRESS_REFERENCE_SCHEMA_V1",
     "REAL_TELEOP_PROGRESS_RELATIVE_ROOT",
     "RealTeleopProgressEpisode",
+    "list_real_teleop_managed_progress_profile_selections",
     "load_real_teleop_progress_profile",
+    "load_real_teleop_managed_progress_profile_selection",
+    "real_teleop_managed_progress_selection_id",
     "resolve_real_teleop_progress_profile",
     "resolve_real_teleop_default_progress_profile",
     "select_real_teleop_managed_progress_profile",

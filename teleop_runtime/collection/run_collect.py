@@ -140,10 +140,10 @@ from .calibration_profile import (
     qpos6_radians_look_suspicious as _qpos6_radians_look_suspicious,
 )
 from .gripper_policy_config import (
-    GRIPPER_POLICY_DEFAULTS,
+    GRIPPER_POLICY_DEFAULTS,  # noqa: F401 - preserve the historical public export.
     dmtac_tactile_enabled as _dmtac_tactile_enabled,
-    load_gripper_task_profile as _load_gripper_task_profile,
-    profile_value as _profile_value,
+    load_gripper_task_profile as _load_gripper_task_profile,  # noqa: F401 - compatibility export.
+    profile_value as _profile_value,  # noqa: F401 - compatibility export.
     resolved_gripper_policy as _resolved_gripper_policy,
 )
 from .diagnostics import (
