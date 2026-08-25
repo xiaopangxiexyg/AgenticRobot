@@ -401,6 +401,11 @@ from .replay import (
     load_dataset_replay_policy,
     skip_startup_replay_frames as _skip_startup_replay_frames,
 )
+from .replay_cli_validation import (
+    validate_debug_replay_chunk_size,
+    validate_debug_replay_window_and_sources,
+    validate_replay_prediction_mode,
+)
 from .rtc_cli_validation import validate_rtc_cli_args
 from .quest_paired_pose_capture import (
     QuestPairedPoseCaptureApplicationPort,
@@ -592,13 +597,7 @@ def validate_args(
             "--policy-prediction-mode threaded-prefetch is only valid for the "
             "legacy non-RTC action queue."
         )
-    if threaded_prediction and (
-        args.debug_replay_dataset is not None or args.debug_replay_parquet is not None
-    ):
-        raise ValueError(
-            "dataset replay owns prediction transactions and must use "
-            "--policy-prediction-mode synchronous."
-        )
+    validate_replay_prediction_mode(args, threaded_prediction=threaded_prediction)
     if (
         threaded_prediction
         and args.action_chunk_execution_steps is not None
@@ -1110,8 +1109,7 @@ def validate_args(
         )
     if not bool(args.arms_enabled) and not hands_enabled:
         raise ValueError("Enable at least one actuator family: arms or hands.")
-    if int(args.debug_replay_chunk_size) <= 0:
-        raise ValueError("--debug-replay-chunk-size must be positive.")
+    validate_debug_replay_chunk_size(args)
     if float(args.init_time_s) < 0.0:
         raise ValueError("--init-time-s must be non-negative.")
     if args.init_dataset and args.init_parquet:
@@ -1197,38 +1195,7 @@ def validate_args(
             "A single active arm has no authoritative passive-arm qpos/TCP, so the "
             "dual-arm model must fail closed rather than guess it."
         )
-    if args.debug_replay_end_index is not None and int(
-        args.debug_replay_end_index
-    ) <= int(args.debug_replay_start_index):
-        raise ValueError(
-            "--debug-replay-end-index must be greater than --debug-replay-start-index."
-        )
-    action_hz_start = (
-        args.debug_replay_start_index
-        if args.action_hz_start_index is None
-        else args.action_hz_start_index
-    )
-    action_hz_end = (
-        args.debug_replay_end_index
-        if args.action_hz_end_index is None
-        else args.action_hz_end_index
-    )
-    if action_hz_end is not None and int(action_hz_end) <= int(action_hz_start):
-        raise ValueError(
-            "--action-hz-end-index must be greater than --action-hz-start-index."
-        )
-    if args.debug_replay_dataset and args.debug_replay_parquet:
-        raise ValueError(
-            "Use only one of --debug-replay-dataset or --debug-replay-parquet."
-        )
-    if args.action_hz_dataset and args.action_hz_parquet:
-        raise ValueError("Use only one of --action-hz-dataset or --action-hz-parquet.")
-    if (args.debug_replay_dataset or args.debug_replay_parquet) and str(
-        args.policy_spec or "hold"
-    ).strip().lower() not in {"", "hold", "builtin:hold"}:
-        raise ValueError(
-            "--debug-replay-* replaces --policy; omit --policy in replay mode."
-        )
+    validate_debug_replay_window_and_sources(args)
     parse_tactile_regions(args.hand_tactile_regions)
     if bool(args.send_actions) and bool(args.arms_enabled):
         for side in active_sides:
