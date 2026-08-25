@@ -129,6 +129,23 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     )
 
 
+def _source_arm_action_specs(dataset_root: Path) -> dict[str, dict[str, Any]]:
+    """Carry the source dataset's validated arm action specs into the export."""
+
+    info_path = Path(dataset_root) / "meta" / "info.json"
+    payload = json.loads(info_path.read_text(encoding="utf-8"))
+    raw_specs = payload.get("arm_action_specs_by_side")
+    if not isinstance(raw_specs, Mapping):
+        raise TypeError(f"Source dataset is missing arm_action_specs_by_side: {info_path}")
+    specs: dict[str, dict[str, Any]] = {}
+    for side in ("left", "right"):
+        spec = raw_specs.get(side)
+        if not isinstance(spec, Mapping):
+            raise TypeError(f"Source dataset is missing {side} arm action spec: {info_path}")
+        specs[side] = dict(spec)
+    return specs
+
+
 def _required_row_pose(row: Mapping[str, Any], column: str) -> np.ndarray:
     value = row.get(column)
     pose = np.asarray(value, dtype=float).reshape(-1)
@@ -407,6 +424,7 @@ def _capture_frame(
         depth_images=depth_images,
         playback_time_sec=float(playback_time_sec),
         active_sides=("left", "right"),
+        action_pose_by_side=reference.pose_by_side,
         frame_metadata={
             "phase": str(phase),
             "action_source": str(action_source),
@@ -592,6 +610,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 urdf_path=control.scene.conversion.urdf_path,
                 mode="dual",
                 qpos_source="mujoco_actual",
+                pose_frame_contract=episode.pose_frame_contract.to_dict(),
+                pose_frame_contract_hash=episode.pose_frame_contract_hash,
+                policy_io_layout_hash=episode.policy_io_layout_hash,
+                arm_pose_action_mode="absolute",
+                arm_action_specs_by_side=_source_arm_action_specs(
+                    episode.episode.dataset_root
+                ),
+                # The canonical 26D compatibility layout stores each scalar
+                # gripper target in the first slot of its fixed q6 block.
+                gripper_command_dim=0,
                 write_wrist_depth_raw=bool(args.record_depth),
                 wrist_depth_camera_names=depth_cameras,
             ),

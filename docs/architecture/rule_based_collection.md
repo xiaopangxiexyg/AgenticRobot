@@ -119,7 +119,19 @@ MUJOCO_GL=egl PYTHONPATH=. python -m sim.mujoco.replay.rule_based_multistage_dem
 `start:end` spans are half-open and intentionally editable. The output keeps
 the normal simulation parquet/video layout and adds
 `rule_based_composition_manifest.json`; each row carries its phase in
-`sample_metadata_json`. The relative phase fails closed if the source group
-does not contain actual TCP history or if the source/boundary pose frames do
-not match. The optional passive viewer is MuJoCo-only (`--viewer`); rendered
-RGB/depth videos are also produced for headless verification.
+`sample_metadata_json`. For this composition demo the writer also carries the
+source canonical pose-frame contract and writes the action target in
+desk-absolute xyz-quat form, so the result can be checked with the existing
+UMI loader rather than being only a visualization artifact. The relative phase
+fails closed if the source group does not contain actual TCP history or if the
+source/boundary pose frames do not match. The optional passive viewer is
+MuJoCo-only (`--viewer`); rendered RGB/depth videos are also produced for
+headless verification.
+
+```bash
+PYTHONPATH=. python - <<'PY'
+from sim.mujoco.replay.umi_dataset import load_umi_replay_episode
+episode = load_umi_replay_episode("/tmp/rule_based_mujoco_demo", 0)
+print(episode.action_dim, len(episode.frames))
+PY
+```
