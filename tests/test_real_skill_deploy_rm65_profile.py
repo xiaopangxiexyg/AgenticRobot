@@ -11,11 +11,10 @@ import pytest
 
 from teleop_runtime.skill_deploy import rm65_profile as profile_module
 from teleop_runtime.skill_deploy.rm65_profile import (
-    ExclusiveRM65SkillDeploymentProfile,
     RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
+    ExclusiveRM65SkillDeploymentProfile,
     resolve_exclusive_rm65_skill_deployment_profile,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -71,11 +70,22 @@ def test_profile_resolves_existing_shared_inputs_without_device_construction(
     assert resolved.envelope_file_spec.profile_id.endswith("left-relative-tight-v1")
     assert resolved.position_profile.name == "rm65_bimanual_position_v1"
     assert set(resolved.scene_world_from_arm_base_by_side) == {"left", "right"}
+    np.testing.assert_allclose(
+        resolved.scene_world_from_canonical_station,
+        (
+            (-1.0, 0.0, 0.0, -0.472),
+            (0.0, -1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.01),
+            (0.0, 0.0, 0.0, 1.0),
+        ),
+        atol=1e-12,
+    )
     assert resolved.station_world_frame_id == RM65_SKILL_SCENE_WORLD_FRAME_ID_V1
     assert all(
         not value.flags.writeable
         for value in resolved.scene_world_from_arm_base_by_side.values()
     )
+    assert not resolved.scene_world_from_canonical_station.flags.writeable
     assert all(
         not value.flags.writeable
         for value in resolved.tool_tcp_pose_flange_m_rad_by_side.values()
@@ -144,6 +154,13 @@ def test_profile_uses_collision_scene_geometry_without_teleop_calibration(
         "load_world_from_arm_base_transforms",
         lambda scene_profile: expected,
     )
+    expected_station = np.eye(4, dtype=float)
+    expected_station[:3, :3] = np.diag((-1.0, -1.0, 1.0))
+    monkeypatch.setattr(
+        profile_module,
+        "load_world_from_fixed_link_transform",
+        lambda scene_profile, *, link_name: expected_station,
+    )
     monkeypatch.setattr(
         profile_module,
         "load_assignment",
@@ -163,6 +180,15 @@ def test_profile_uses_collision_scene_geometry_without_teleop_calibration(
             resolved.scene_world_from_arm_base_by_side[side],
             expected[side],
         )
+    np.testing.assert_allclose(
+        resolved.scene_world_from_canonical_station,
+        expected_station,
+    )
+    expected_station[0, 3] = 0.125
+    changed_station = resolve_exclusive_rm65_skill_deployment_profile(
+        _profile()
+    )
+    assert changed_station.semantic_content_hash != resolved.semantic_content_hash
 
 
 def test_legacy_rm65_ip_module_is_the_canonical_module_object() -> None:

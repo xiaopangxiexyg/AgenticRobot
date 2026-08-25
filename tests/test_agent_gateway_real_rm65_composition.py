@@ -9,17 +9,24 @@ import numpy as np
 import pytest
 
 from agent_gateway.profiles.real import rm65_composition as composition_module
-from agent_gateway.profiles.real.rm65_composition import (
-    RM65_SKILL_EXECUTION_FRAME_ID_V1,
-    RM65_SKILL_STATION_FRAME_ID_V1,
-    assemble_exclusive_rm65_agent_primitive_composition,
-)
 from agent_gateway.profiles.real.one_shot_authorization import (
     REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
 )
 from agent_gateway.profiles.real.realsense_perception import (
     ExclusiveRealPerceptionResources,
 )
+from agent_gateway.profiles.real.rm65_composition import (
+    RM65_SKILL_EXECUTION_FRAME_ID_V1,
+    RM65_SKILL_STATION_FRAME_ID_V1,
+    assemble_exclusive_rm65_agent_primitive_composition,
+)
+from dataset_contracts.pose_frames import load_pose_frame_contract
+from robot_motion.primitives import level_tcp_orientation
+from robot_motion.rm65 import (
+    build_rm65_dual_arm_scene_profile,
+    load_world_from_arm_base_transforms,
+)
+from sim.mujoco.deploy.target_config import DEFAULT_STATION_POSE_CONTRACT_PATH
 from teleop_runtime.interfaces import EffectorBackend
 from teleop_runtime.skill_deploy import rm65_profile as profile_module
 from teleop_runtime.skill_deploy.rm65_lower_assembly import (
@@ -29,7 +36,6 @@ from teleop_runtime.skill_deploy.rm65_profile import (
     ExclusiveRM65SkillDeploymentProfile,
     resolve_exclusive_rm65_skill_deployment_profile,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -206,6 +212,93 @@ def test_composition_binds_existing_gateway_to_one_lower_graph_without_start(
     assert all(backend.starts == 0 for backend in lower.arm_backends.values())
     assert guard.starts == 0
     assert not socket_path.exists()
+
+
+def test_composition_matches_mujoco_canonical_station_axes_and_pose(
+    monkeypatch,
+) -> None:
+    lower, _guard = _lower(monkeypatch)
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower,
+        socket_path=REPO_ROOT / "temp/test-real-rm65-frame-parity.sock",
+        authorized_side="right",
+        authorized_action="forward",
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test",
+        client_uid=1000,
+        runtime_session_id="real-rm65:frame-parity-test",
+        control_domain_id="exclusive-real-skill:frame-parity-test",
+        embodiment_instance_id="dual-rm65:frame-parity-test",
+    )
+    execution_from_station = composition.frame_graph.resolve(
+        RM65_SKILL_STATION_FRAME_ID_V1,
+        RM65_SKILL_EXECUTION_FRAME_ID_V1,
+    ).matrix_target_source
+    station_from_execution = composition.frame_graph.resolve(
+        RM65_SKILL_EXECUTION_FRAME_ID_V1,
+        RM65_SKILL_STATION_FRAME_ID_V1,
+    ).matrix_target_source
+    np.testing.assert_allclose(
+        station_from_execution,
+        np.linalg.inv(lower.profile.scene_world_from_canonical_station),
+        atol=1e-12,
+    )
+
+    sim_contract = load_pose_frame_contract(DEFAULT_STATION_POSE_CONTRACT_PATH)
+    scene = build_rm65_dual_arm_scene_profile(
+        lower.profile.collision_scene_profile
+    )
+    scene_world_from_base = load_world_from_arm_base_transforms(scene)
+    sim_station_from_base = (
+        sim_contract.source.effective_raw_to_canonical_desk_transform("right")
+    )
+    sim_world_from_station = (
+        scene_world_from_base["right"] @ np.linalg.inv(sim_station_from_base)
+    )
+
+    np.testing.assert_allclose(
+        execution_from_station,
+        sim_world_from_station,
+        atol=1e-12,
+    )
+    direction_by_name = {
+        "forward": ((1.0, 0.0, 0.0), (-1.0, 0.0, 0.0)),
+        "backward": ((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        "left": ((0.0, 1.0, 0.0), (0.0, -1.0, 0.0)),
+        "right": ((0.0, -1.0, 0.0), (0.0, 1.0, 0.0)),
+        "up": ((0.0, 0.0, 1.0), (0.0, 0.0, 1.0)),
+        "down": ((0.0, 0.0, -1.0), (0.0, 0.0, -1.0)),
+    }
+    for direction, (canonical_delta, expected_world_delta) in (
+        direction_by_name.items()
+    ):
+        np.testing.assert_allclose(
+            execution_from_station[:3, :3] @ canonical_delta,
+            expected_world_delta,
+            atol=1e-12,
+            err_msg=direction,
+        )
+        np.testing.assert_allclose(
+            sim_world_from_station[:3, :3] @ canonical_delta,
+            expected_world_delta,
+            atol=1e-12,
+            err_msg=direction,
+        )
+
+    station_frame = composition.frame_graph.frame_by_id[
+        RM65_SKILL_STATION_FRAME_ID_V1
+    ]
+    canonical_anchor = np.eye(4, dtype=float)
+    canonical_anchor[:3, 3] = (0.25, -0.10, 0.35)
+    fixed_heading = level_tcp_orientation("forward_left_30").apply(
+        canonical_anchor,
+        reference_frame_spec=station_frame,
+    ).target_pose
+    np.testing.assert_allclose(
+        execution_from_station @ fixed_heading,
+        sim_world_from_station @ fixed_heading,
+        atol=1e-12,
+    )
 
 
 def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_start(

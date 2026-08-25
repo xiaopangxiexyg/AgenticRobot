@@ -192,6 +192,7 @@ from .position_collision import (
     RM65PositionPlannerProtocol,
     RM65QposCollisionValidationResult,
     load_world_from_arm_base_transforms,
+    load_world_from_fixed_link_transform,
 )
 from .source_ik_selection import (
     RM65SourceIKPairSelection,
@@ -384,6 +385,7 @@ __all__ = [
     "joint_jump_metrics",
     "list_rm65_tool_profiles",
     "load_world_from_arm_base_transforms",
+    "load_world_from_fixed_link_transform",
     "load_qpos_target",
     "load_rm65_tool_profile",
     "normalize_rm65_arm_control_mode",

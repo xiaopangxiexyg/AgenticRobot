@@ -602,6 +602,114 @@ def _urdf_joint_origin(joint: ET.Element) -> np.ndarray:
     return pose6_to_matrix((*xyz, *rpy))
 
 
+def _load_urdf_kinematic_graph(
+    scene_profile_or_urdf: Any,
+) -> tuple[
+    dict[str, ET.Element],
+    frozenset[str],
+    dict[str, tuple[str, np.ndarray, str, str]],
+]:
+    urdf_value = getattr(scene_profile_or_urdf, "urdf_path", scene_profile_or_urdf)
+    urdf_path = Path(urdf_value).expanduser().resolve()
+    if not urdf_path.is_file():
+        raise FileNotFoundError(f"RM65 collision scene URDF does not exist: {urdf_path}")
+    root = ET.parse(urdf_path).getroot()
+    links = frozenset(
+        str(link.get("name") or "").strip()
+        for link in root.findall("link")
+        if str(link.get("name") or "").strip()
+    )
+    joints_by_name: dict[str, ET.Element] = {}
+    parent_joint_by_child: dict[str, tuple[str, np.ndarray, str, str]] = {}
+    for joint in root.findall("joint"):
+        name = str(joint.get("name") or "").strip()
+        if name:
+            if name in joints_by_name:
+                raise ValueError(f"URDF contains duplicate joint name {name!r}.")
+            joints_by_name[name] = joint
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is None or child is None:
+            continue
+        parent_link = str(parent.get("link") or "").strip()
+        child_link = str(child.get("link") or "").strip()
+        if not parent_link or not child_link:
+            continue
+        if child_link in parent_joint_by_child:
+            raise ValueError(f"URDF link {child_link!r} has multiple parent joints.")
+        joint_type = str(joint.get("type") or "").strip()
+        parent_joint_by_child[child_link] = (
+            parent_link,
+            (
+                _urdf_joint_origin(joint)
+                if joint_type == "fixed"
+                else np.eye(4, dtype=float)
+            ),
+            name,
+            joint_type,
+        )
+    return joints_by_name, links, parent_joint_by_child
+
+
+def _world_from_fixed_link(
+    link_name: str,
+    *,
+    links: frozenset[str],
+    parent_joint_by_child: Mapping[str, tuple[str, np.ndarray, str, str]],
+    cache: dict[str, np.ndarray],
+    stack: tuple[str, ...] = (),
+) -> np.ndarray:
+    if link_name not in links:
+        raise ValueError(f"Scene URDF is missing link {link_name!r}.")
+    if link_name in cache:
+        return cache[link_name].copy()
+    if link_name in stack:
+        raise ValueError(f"Cycle detected in fixed URDF chain: {(*stack, link_name)}")
+    edge = parent_joint_by_child.get(link_name)
+    if edge is None:
+        raise ValueError(
+            f"Cannot resolve world transform for link {link_name!r}; "
+            "its parent chain is missing."
+        )
+    parent_link, parent_from_child, joint_name, joint_type = edge
+    if joint_type != "fixed":
+        raise ValueError(
+            f"Cannot resolve world transform for link {link_name!r}; "
+            f"parent joint {joint_name!r} is not fixed."
+        )
+    pose = _world_from_fixed_link(
+        parent_link,
+        links=links,
+        parent_joint_by_child=parent_joint_by_child,
+        cache=cache,
+        stack=(*stack, link_name),
+    ) @ parent_from_child
+    pose = _pose_matrix(pose, name=f"world_from_link[{link_name}]")
+    cache[link_name] = pose.copy()
+    return pose
+
+
+def load_world_from_fixed_link_transform(
+    scene_profile_or_urdf: Any,
+    *,
+    link_name: str,
+) -> np.ndarray:
+    """Resolve ``T_world_link`` through one all-fixed scene-URDF chain."""
+
+    normalized_link = str(link_name).strip()
+    if not normalized_link:
+        raise ValueError("link_name must be non-empty.")
+    _joints, links, parent_joint_by_child = _load_urdf_kinematic_graph(
+        scene_profile_or_urdf
+    )
+    return _world_from_fixed_link(
+        normalized_link,
+        links=links,
+        parent_joint_by_child=parent_joint_by_child,
+        cache={"world": np.eye(4, dtype=float)},
+    )
+
+
 def load_world_from_arm_base_transforms(
     scene_profile_or_urdf: Any,
     *,
@@ -614,29 +722,9 @@ def load_world_from_arm_base_transforms(
     translation and are therefore deliberately not consulted here.
     """
 
-    urdf_value = getattr(scene_profile_or_urdf, "urdf_path", scene_profile_or_urdf)
-    urdf_path = Path(urdf_value).expanduser().resolve()
-    if not urdf_path.is_file():
-        raise FileNotFoundError(f"RM65 collision scene URDF does not exist: {urdf_path}")
-    root = ET.parse(urdf_path).getroot()
-    joints_by_name: dict[str, ET.Element] = {}
-    fixed_joint_by_child: dict[str, tuple[str, np.ndarray, str]] = {}
-    for joint in root.findall("joint"):
-        name = str(joint.get("name") or "").strip()
-        if name:
-            joints_by_name[name] = joint
-        parent = joint.find("parent")
-        child = joint.find("child")
-        if parent is None or child is None:
-            continue
-        parent_link = str(parent.get("link") or "").strip()
-        child_link = str(child.get("link") or "").strip()
-        if not parent_link or not child_link:
-            continue
-        if child_link in fixed_joint_by_child:
-            raise ValueError(f"URDF link {child_link!r} has multiple parent joints.")
-        if str(joint.get("type") or "").strip() == "fixed":
-            fixed_joint_by_child[child_link] = (parent_link, _urdf_joint_origin(joint), name)
+    joints_by_name, links, parent_joint_by_child = _load_urdf_kinematic_graph(
+        scene_profile_or_urdf
+    )
 
     requested = dict(_DEFAULT_MOUNT_JOINT_NAMES if mount_joint_names is None else mount_joint_names)
     normalized_mounts: dict[str, str] = {}
@@ -646,23 +734,6 @@ def load_world_from_arm_base_transforms(
         raise ValueError("mount_joint_names must contain left and right mount joints.")
 
     cache: dict[str, np.ndarray] = {"world": np.eye(4, dtype=float)}
-
-    def world_from_link(link_name: str, stack: tuple[str, ...] = ()) -> np.ndarray:
-        if link_name in cache:
-            return cache[link_name].copy()
-        if link_name in stack:
-            raise ValueError(f"Cycle detected in fixed URDF chain: {(*stack, link_name)}")
-        edge = fixed_joint_by_child.get(link_name)
-        if edge is None:
-            raise ValueError(
-                f"Cannot resolve world transform for link {link_name!r}; "
-                "its parent chain is missing or contains a non-fixed joint."
-            )
-        parent_link, parent_from_child, _joint_name = edge
-        pose = world_from_link(parent_link, (*stack, link_name)) @ parent_from_child
-        pose = _pose_matrix(pose, name=f"world_from_link[{link_name}]")
-        cache[link_name] = pose.copy()
-        return pose
 
     transforms: dict[str, np.ndarray] = {}
     for side in SIDES:
@@ -676,7 +747,12 @@ def load_world_from_arm_base_transforms(
         child_link = "" if child is None else str(child.get("link") or "").strip()
         if not child_link:
             raise ValueError(f"Scene mount joint {mount_name!r} has no child base link.")
-        transforms[side] = world_from_link(child_link)
+        transforms[side] = _world_from_fixed_link(
+            child_link,
+            links=links,
+            parent_joint_by_child=parent_joint_by_child,
+            cache=cache,
+        )
     return transforms
 
 
@@ -3288,5 +3364,6 @@ __all__ = [
     "RM65PositionCollisionPlanner",
     "RM65PositionCollisionPlannerConfig",
     "RM65PositionPlannerProtocol",
+    "load_world_from_fixed_link_transform",
     "load_world_from_arm_base_transforms",
 ]
