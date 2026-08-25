@@ -141,7 +141,10 @@ class StateBCHITLRunner:
     ) -> StateBCHITLTrace:
         if len(states) != len(requested_sources):
             raise ValueError("states and requested_sources must have the same length.")
-        if not states:
+        # ``states`` is a generic sequence and the real dataset loader passes
+        # a NumPy array.  Avoid NumPy's ambiguous truth-value semantics here;
+        # emptiness is the only property this guard needs.
+        if len(states) == 0:
             raise ValueError("HITL runner requires at least one step.")
         humans = {} if human_actions is None else dict(human_actions)
         events: list[StateBCHITLEvent] = []

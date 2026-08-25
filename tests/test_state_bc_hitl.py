@@ -37,3 +37,16 @@ def test_hitl_switching_is_exclusive_and_rtc_no_action_is_not_a_sample():
     assert all(event.executed_source is not None for event in trace.action_events)
     assert all(event.action is not None for event in trace.action_events)
     assert not any(sample["source"] == "rtc" and sample["step_index"] == 4 for sample in trace.samples)
+
+
+def test_hitl_runner_accepts_numpy_batch_sequences():
+    states = np.stack(
+        [np.full(16, float(index), dtype=np.float32) for index in range(3)],
+        axis=0,
+    )
+    trace = StateBCHITLRunner(
+        lambda state: np.asarray(state, dtype=np.float32),
+    ).run(states, ["policy", "policy", "policy"])
+
+    assert trace.source_sequence() == ("policy", "policy", "policy")
+    assert len(trace.samples) == 3

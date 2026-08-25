@@ -61,8 +61,39 @@ Before a real-data fit is admitted, the selected `meta/info.json` must still
 confirm the expected `pose_storage_frame=desk_absolute`,
 `arm_pose_action_mode=absolute`, state/action dimensions, and the shared
 policy I/O identity. Invalid episodes remain in the selection manifest rather
-than being silently deleted. The source parquet remains remote and read-only
-until an explicit data-transfer approval is given.
+than being silently deleted. The source parquet remains remote and read-only.
+For the bounded 2026-08-25 probe, explicit approval was used to copy only the
+manifest files and integrity-valid parquet files into an ephemeral `/tmp`
+staging tree. No `videos/`, `tactile/`, or wrist-depth paths were copied.
+
+### Completed 2026-08-07 offline probe
+
+The selected logical day was the pair of physical directories listed above.
+Remote read-only manifest evidence was:
+
+| item | result |
+| --- | --- |
+| physical source directories | 2 (129 + 202 episodes) |
+| complete episodes | 204 (83 + 121) |
+| excluded episodes | 127 (46 + 81; retained in the selection manifest) |
+| complete frames | 69,440 (29,714 + 39,726) |
+| valid parquet synchronized | 204 files, 366,949,962 bytes |
+| per-file transfer verification | 204/204 SHA-256 matches, 0 missing |
+| source layout hash | `sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16` |
+
+The remote `info.json` declares parquet features only for low-dimensional
+`action`, `observation.state`, `observation.arm.qpos` (audit-only), and
+`observation.last_action`; media and tactile streams are separate paths. The
+local loader opened only `observation.state` and `action`.
+
+The first deterministic fit used an episode-level 80/20 split, seed `0`, and
+ridge `1e-4`. It produced 55,343 training frames and 14,097 held-out frames.
+Held-out metrics were action MAE `0.00907047`, left/right pose-position RMSE
+`0.001598/0.002521 m`, pose-orientation MAE `0.007935 rad`, and left/right
+gripper MAE `0.05781/0.06542`. The self-contained artifact hash was
+`sha256:61ae3388e62dd8410b7e3cdbd5d2489bf3717eb85cc5e54c60ccc7a1cd1e85e0`;
+the artifact and staging tree are ephemeral and are not treated as a
+versioned model resource.
 
 ## Reproducible offline flow
 
@@ -110,15 +141,18 @@ that runtime with a parallel simulator control loop.
 
 ## Evidence ceiling and next gate
 
-The current Task proves contracts, fixture selection, a self-contained linear
-artifact round trip, 16D-to-26D projection, frame-contract failure-closed
-behavior, and exclusive HITL lineage. It does **not** yet prove a trained
-artifact on the remote parquet, task success, causal recovery benefit, or
-physical safety. It also does not start a real device, GUI, policy server, or
-motion.
+The current Task now proves the contracts, explicit 2026-08-07 selector,
+real-data state-only fit, self-contained artifact round trip, 16D-to-26D
+projection, frame-contract failure-closed behavior, and exclusive HITL
+lineage. The real-artifact adapter smoke was observation-only: it projected one
+recorded state through the existing bridge and produced a finite 26D action,
+without stepping physics. The real-artifact HITL trace exercised policy,
+human takeover/handback, RTC replacement, and RTC `no_action`; HOLD,
+activation, and `no_action` remained excluded from samples.
 
-The next bounded gate is a user-approved, read-only synchronization of the
-selected low-dimensional parquet plus metadata (no video/tactile copy),
-followed by the trainer CLI and a committed artifact manifest. Only after that
-offline evidence is available should the MuJoCo adapter be exercised against a
-resettable task and the three collection modes be compared.
+This evidence still does **not** prove task success, causal recovery benefit,
+simulator dynamics validity, safety-envelope admission, or physical safety. It
+also does not start a real device, GUI, policy server, or motion. The next
+bounded gate is a resettable MuJoCo task rollout that routes policy, human, and
+RTC actions through the existing authoritative runtime, followed by comparable
+metrics for ordinary policy, takeover/handback, and stream intervention.
