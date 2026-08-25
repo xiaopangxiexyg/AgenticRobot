@@ -8,12 +8,15 @@ example:
 initialization -> replay frames 10..24 -> custom action x3 -> replay frames 80..90
 ```
 
-Its implementation is `robot_motion.replay.rule_based`. It owns only:
+Its implementation is `robot_motion.replay.rule_based`. The collection-facing
+bridge is `teleop_runtime.collection.rule_based_adapter`; it owns only:
 
 - ordered declarative steps (`RuleBasedInitialize`, `RuleBasedReplay`, and
   `RuleBasedCustomAction`);
 - expansion of those steps into `RuleBasedCollectionDirective` values; and
-- per-step `RuleBasedCaptureSelection` intent.
+- per-step `RuleBasedCaptureSelection` intent; and
+- resolution of each directive into the existing `RobotAction` /
+  `TeleopCommand` boundary for a caller that already owns a collection loop.
 
 It deliberately reuses the existing `ReplayTrajectoryGroup`, qpos-init
 selection, replay action construction, and canonical `RobotAction` APIs.
@@ -28,14 +31,17 @@ The rule-based layer does not:
 - define or replace a dataset schema; or
 - create a second replay implementation.
 
-An existing collection/runtime adapter consumes each directive and applies its
-action through the normal lower runtime. The directive's capture selection is
-also an input to that adapter: an empty `stream_ids` allowlist means all
-already-bound streams, while a populated allowlist selects only those stream
-IDs. `enabled=False` is useful for initialization or other non-training
-segments. The existing sample builder and writer remain authoritative for
-causal cuts, validation, persistence, sealing, and commit.
+`RuleBasedCollectionAdapter` consumes each directive and resolves its action;
+the caller then applies the resulting command through the normal lower runtime
+and submits a sample only when `emission.recordable` is true. An empty
+`stream_ids` allowlist means all already-bound streams, while a populated
+allowlist exposes the requested stream selection to the caller. The adapter
+does not rewrite samples or writer jobs, so the existing sample builder and
+writer remain authoritative for causal cuts, validation, persistence, sealing,
+and commit.
 
 This module is a pure, default-off composition seam. Its unit tests use only
 synthetic trajectory arrays and canonical action objects; they are not evidence
-of robot readiness or production collection integration.
+of robot readiness or production collection integration. No existing CLI or
+GUI entrypoint is changed by this adapter; adoption is an explicit caller
+choice.
