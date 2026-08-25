@@ -133,6 +133,12 @@ from .collection_cli_validation import (
     validate_side_config as _assert_side_config_consistency,
     validate_tactile_visualization_config as _assert_tactile_visualization_config,
 )
+from .calibration_profile import (
+    calibration_profile_timestamp as _calibration_profile_timestamp,
+    latest_calibration_profile_path as _latest_calibration_profile_path,
+    qpos6_deg_to_rad as _qpos6_deg_to_rad,
+    qpos6_radians_look_suspicious as _qpos6_radians_look_suspicious,
+)
 from .gripper_policy_config import (
     GRIPPER_POLICY_DEFAULTS,
     dmtac_tactile_enabled as _dmtac_tactile_enabled,
@@ -182,7 +188,6 @@ from .writer_v21 import LeRobotV21Writer, LeRobotV21WriterConfig
 DEFAULT_CAMERA_CONFIG_PATH = _DEFAULT_CAMERA_CONFIG_PATH
 DEFAULT_CAMERA_REGISTRY_PATH = _DEFAULT_CAMERA_REGISTRY_PATH
 DEFAULT_DATASET_ROOT = _DEFAULT_DATASET_ROOT
-_CALIBRATION_PROFILE_TIMESTAMP_RE = re.compile(r"^(\d{8})_(\d{6})")
 def _collection_hand_action_specs(
     args: argparse.Namespace,
     active_sides: Sequence[str],
@@ -195,48 +200,6 @@ def _collection_hand_action_specs(
     if not dmtac_sides:
         return None
     return {side: HandActionSpec.dmtac_gripper(side) for side in dmtac_sides}
-
-
-def _calibration_profile_timestamp(path: Path) -> float | None:
-    match = _CALIBRATION_PROFILE_TIMESTAMP_RE.match(path.name)
-    if match is None:
-        return None
-    try:
-        return datetime.strptime("_".join(match.groups()), "%Y%m%d_%H%M%S").timestamp()
-    except ValueError:
-        return None
-
-
-def _latest_calibration_profile_path(
-    profile_dir: Path = DEFAULT_CALIBRATION_PROFILE_DIR,
-) -> Path | None:
-    if not profile_dir.exists():
-        return None
-    candidates = [path for path in profile_dir.glob("*.json") if path.is_file()]
-    if not candidates:
-        return None
-
-    def sort_key(path: Path) -> tuple[int, float, float, str]:
-        name_timestamp = _calibration_profile_timestamp(path)
-        try:
-            modified_at = path.stat().st_mtime
-        except OSError:
-            modified_at = 0.0
-        if name_timestamp is not None:
-            return (1, float(name_timestamp), float(modified_at), path.name)
-        return (0, float(modified_at), float(modified_at), path.name)
-
-    return max(candidates, key=sort_key)
-
-
-def _qpos6_deg_to_rad(values: Sequence[float]) -> tuple[float, ...]:
-    qpos_deg = np.asarray(values, dtype=float).reshape(6)
-    return tuple(float(value) for value in np.deg2rad(qpos_deg))
-
-
-def _qpos6_radians_look_suspicious(values: Sequence[float]) -> bool:
-    qpos = np.asarray(values, dtype=float).reshape(6)
-    return bool(np.max(np.abs(qpos)) > (2.0 * np.pi + 0.25))
 
 
 def _sanitize_task_name_for_path(task_name: str) -> str:
