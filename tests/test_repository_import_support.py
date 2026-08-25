@@ -100,6 +100,55 @@ importlib.import_module(module_name)
     assert dynamic_import_modules(path) == set()
 
 
+def test_repository_import_index_reaches_nested_statement_bodies(
+    tmp_path: Path,
+) -> None:
+    path = _source(
+        tmp_path,
+        """
+if enabled: import conditional.branch
+
+def nested_function():
+    import function.local
+
+class NestedType:
+    from class_local.module import value
+
+try:
+    while retrying:
+        from loop.local import value
+except RuntimeError:
+    import exception.local
+
+match payload:
+    case {"kind": kind}:
+        import match.local
+
+import semicolon.one; import semicolon.two
+""",
+    )
+
+    assert absolute_import_modules(path) == {
+        "conditional.branch",
+        "class_local.module",
+        "exception.local",
+        "function.local",
+        "loop.local",
+        "match.local",
+        "semicolon.one",
+        "semicolon.two",
+    }
+    assert absolute_import_roots(path) == {
+        "class_local",
+        "conditional",
+        "exception",
+        "function",
+        "loop",
+        "match",
+        "semicolon",
+    }
+
+
 def test_repository_import_index_returns_caller_owned_sets(tmp_path: Path) -> None:
     path = _source(tmp_path, "import stable.module\n")
 
