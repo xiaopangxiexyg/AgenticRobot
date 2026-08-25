@@ -48,7 +48,6 @@ from ..configs.dmtac_hardware import (
 )
 from ..configs.q6_hardware import load_latest_q6_ports
 from ..defaults import DEFAULT_TELEOP_POSITION_REFERENCE_HZ
-from ..hand_mapping import parse_tactile_regions
 from ..hand_tcp_alignment import (
     DEFAULT_VIVE_TRACKER_ALIGNMENT_CONFIG,
     tracker_hand_to_rm65_tcp_rotation,
@@ -126,12 +125,19 @@ from .collect_cli_parser import (
     DEFAULT_CAMERA_CONFIG_PATH as _DEFAULT_CAMERA_CONFIG_PATH,
     DEFAULT_CAMERA_REGISTRY_PATH as _DEFAULT_CAMERA_REGISTRY_PATH,
     DEFAULT_DATASET_ROOT as _DEFAULT_DATASET_ROOT,
-    HAND_BACKEND_CHOICES,
     HAND_BACKEND_DMTAC_GRIPPER,
     HAND_BACKEND_INSPIRE,
     HAND_BACKEND_NONE,
     build_collection_parser,
     normalize_qpos_option_argv as _normalize_qpos_option_argv,
+)
+from .collection_cli_validation import (
+    _active_side_value,  # noqa: F401 - preserve the historical private export.
+    hand_backend_mode as _hand_backend_mode,
+    hand_backend_mode_for_side as _hand_backend_mode_for_side,
+    parse_hand_tactile_regions as _parse_hand_tactile_regions,
+    validate_side_config as _assert_side_config_consistency,
+    validate_tactile_visualization_config as _assert_tactile_visualization_config,
 )
 from .diagnostics import (
     PhaseTimer,
@@ -250,10 +256,6 @@ def _qpos6_radians_look_suspicious(values: Sequence[float]) -> bool:
     return bool(np.max(np.abs(qpos)) > (2.0 * np.pi + 0.25))
 
 
-def _parse_hand_tactile_regions(value: object) -> tuple[str, ...]:
-    return parse_tactile_regions(value)
-
-
 def _sanitize_task_name_for_path(task_name: str) -> str:
     text = str(task_name).strip()
     if not text:
@@ -332,24 +334,6 @@ def _apply_default_q6_ports(
     for side, port in loaded_ports.items():
         if side in missing_sides and port:
             setattr(args, f"{side}_hand_port", str(port))
-
-
-def _hand_backend_mode(args: argparse.Namespace) -> str:
-    mode = str(getattr(args, "hand_backend", HAND_BACKEND_INSPIRE) or HAND_BACKEND_INSPIRE)
-    if mode not in HAND_BACKEND_CHOICES:
-        raise ValueError(f"Unsupported hand backend {mode!r}; expected one of {HAND_BACKEND_CHOICES}.")
-    return mode
-
-
-def _hand_backend_mode_for_side(args: argparse.Namespace, side: str) -> str:
-    side = str(side).strip().lower()
-    if side not in {"left", "right"}:
-        raise ValueError(f"Unsupported hand backend side {side!r}.")
-    override = getattr(args, f"{side}_hand_backend", None)
-    mode = _hand_backend_mode(args) if override in (None, "") else str(override)
-    if mode not in HAND_BACKEND_CHOICES:
-        raise ValueError(f"Unsupported {side} hand backend {mode!r}.")
-    return mode
 
 
 def _load_gripper_task_profile(args: argparse.Namespace) -> dict[str, Any]:
@@ -642,64 +626,6 @@ def _dmtac_backend_configs(
     setattr(args, "_dmtac_backend_configs", dict(resolved))
     setattr(args, "dmtac_config_loaded_sides", sorted(resolved))
     return dict(resolved)
-
-
-def _active_side_value(args: argparse.Namespace, side: str, suffix: str) -> str:
-    return str(getattr(args, f"{side}_{suffix}", "") or "")
-
-
-def _assert_side_config_consistency(args: argparse.Namespace, active_sides: tuple[str, ...]) -> None:
-    for side in ("left", "right"):
-        if side in active_sides:
-            if not _active_side_value(args, side, "arm_ip"):
-                raise ValueError(f"--{side}-arm-ip is required when active-sides includes '{side}'.")
-            continue
-        unexpected_values = {
-            "arm_ip": _active_side_value(args, side, "arm_ip"),
-            "hand_ip": _active_side_value(args, side, "hand_ip"),
-            "hand_port": _active_side_value(args, side, "hand_port"),
-            "gripper_port": _active_side_value(args, side, "gripper_port"),
-        }
-        present = [flag for flag, value in unexpected_values.items() if value]
-        if present:
-            raise ValueError(
-                f"Inactive side '{side}' received configuration for {present}; "
-                "either remove those flags or include the side in --active-sides."
-            )
-
-
-def _assert_tactile_visualization_config(
-    args: argparse.Namespace,
-    active_sides: tuple[str, ...],
-) -> None:
-    if not bool(args.visualize_tactile):
-        return
-    if not bool(args.with_tactile):
-        raise ValueError(
-            "--visualize-tactile requires tactile polling; remove --without-tactile."
-        )
-    if any(
-        _hand_backend_mode_for_side(args, side) == HAND_BACKEND_DMTAC_GRIPPER
-        for side in active_sides
-    ):
-        raise ValueError(
-            "--visualize-tactile currently supports InspireTac UV tactile only; "
-            "DMTAC tactile is recorded but needs a separate visualizer."
-        )
-    tactile_regions = _parse_hand_tactile_regions(args.hand_tactile_regions)
-    if not tactile_regions:
-        raise ValueError(
-            "--visualize-tactile requires non-empty --hand-tactile-regions, for example "
-            "'thumb_1,index_1,palm' or 'all'."
-        )
-    missing_ip_sides = [
-        side for side in active_sides if not str(getattr(args, f"{side}_hand_ip") or "")
-    ]
-    if missing_ip_sides:
-        raise ValueError(
-            "--visualize-tactile requires real InspireTac hand IPs for active sides; "
-            f"missing={missing_ip_sides}."
-        )
 
 
 def _fixed_arm_sides(args: argparse.Namespace, active_sides: tuple[str, ...]) -> tuple[str, ...]:
