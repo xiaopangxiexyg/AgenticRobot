@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -218,4 +219,38 @@ def test_real_perception_probe_closes_resources_when_skill_execution_fails(
         )
 
     assert not socket_path.exists()
+    assert [source.closed for source in sources.values()] == [1, 1, 1]
+
+
+def test_real_perception_probe_allocates_short_endpoint_outside_long_ambient_tmpdir(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    binding, sources = _source_binding()
+    _patch_probe_hardware(monkeypatch, binding, sources)
+    long_temp_root = tmp_path / ("harness-runner-slot-" + "x" * 140)
+    long_temp_root.mkdir()
+    monkeypatch.setattr(perception_probe.tempfile, "tempdir", str(long_temp_root))
+    captured: dict[str, Path] = {}
+
+    def reject_after_endpoint_allocation(**kwargs):
+        captured["socket_path"] = Path(kwargs["socket_path"])
+        raise RuntimeError("stop after endpoint allocation")
+
+    monkeypatch.setattr(
+        perception_probe,
+        "_assemble_composition",
+        reject_after_endpoint_allocation,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after endpoint allocation"):
+        perception_probe.run_probe(
+            run_root=tmp_path / "probe-long-runner-path",
+            client_id="rpent:perception-probe-test",
+            operation_timeout_sec=2.0,
+        )
+
+    socket_path = captured["socket_path"]
+    assert len(os.fsencode(socket_path)) <= 107
+    assert not socket_path.parent.exists()
     assert [source.closed for source in sources.values()] == [1, 1, 1]

@@ -25,6 +25,9 @@ from agent_gateway.protocol.contracts import (
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
 )
+from agent_gateway.transport.unix_endpoint import (
+    allocate_agent_gateway_unix_endpoint,
+)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.perception_artifacts import (
     DEPTH_FRAME_COMPRESSION_V1,
@@ -81,10 +84,24 @@ def _prepare_run_root(path: Path) -> Path:
     return root
 
 
-def _default_socket_path() -> Path:
-    return Path(tempfile.gettempdir()) / (
-        f"ar-perception-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+def _allocate_default_socket_path() -> tuple[Path, Path, Path]:
+    """Allocate one short private endpoint independent of ambient ``TMPDIR``."""
+
+    # Harness and other isolated runners intentionally use descriptive, deeply
+    # nested temporary roots.  AF_UNIX has a separate 107-byte pathname limit,
+    # so reserve a short private root explicitly instead of deriving the socket
+    # pathname from that ambient artifact namespace.
+    endpoint_root = Path(
+        tempfile.mkdtemp(prefix=f"ar-gw-{os.getuid()}-", dir="/tmp")
     )
+    try:
+        allocation = allocate_agent_gateway_unix_endpoint(
+            endpoint_root=endpoint_root,
+        )
+    except BaseException:
+        endpoint_root.rmdir()
+        raise
+    return allocation.socket_path, allocation.endpoint_dir, endpoint_root
 
 
 def _scene_geometry() -> tuple[Mapping[str, np.ndarray], str]:
@@ -472,7 +489,8 @@ def run_probe(
     timeout_sec = float(operation_timeout_sec)
     if not np.isfinite(timeout_sec) or timeout_sec <= 0.0:
         raise ValueError("--operation-timeout-sec must be positive and finite.")
-    endpoint = _default_socket_path() if socket_path is None else Path(socket_path)
+    endpoint = None if socket_path is None else Path(socket_path)
+    owned_endpoint_dirs: tuple[Path, Path] | None = None
     world_from_base, scene_geometry_hash = _scene_geometry()
     source_binding = _build_source_binding(
         camera_config_path=_CAMERA_CONFIG,
@@ -483,6 +501,9 @@ def run_probe(
     result = None
     started_at = time.time()
     try:
+        if endpoint is None:
+            endpoint, endpoint_dir, endpoint_root = _allocate_default_socket_path()
+            owned_endpoint_dirs = (endpoint_dir, endpoint_root)
         client_bindings = compile_agent_gateway_unix_client_bindings(
             primary_client_id=client_id,
             primary_client_uid=os.getuid(),
@@ -595,8 +616,12 @@ def run_probe(
                         + ";".join(close_errors)
                     )
         finally:
-            if endpoint.exists():
+            if endpoint is not None and endpoint.exists():
                 endpoint.unlink()
+            if owned_endpoint_dirs is not None:
+                endpoint_dir, endpoint_root = owned_endpoint_dirs
+                endpoint_dir.rmdir()
+                endpoint_root.rmdir()
     assert result is not None
     if composition.application.state.value != "closed":
         raise RuntimeError("camera-only perception application did not close cleanly.")
