@@ -41,13 +41,12 @@ def _python_files(root: Path) -> tuple[Path, ...]:
 
 
 def _violations(root: Path, forbidden_roots: set[str]) -> dict[str, list[str]]:
-    return {
-        path.relative_to(REPO_ROOT).as_posix(): sorted(
-            _absolute_import_roots(path) & forbidden_roots
-        )
-        for path in _python_files(root)
-        if _absolute_import_roots(path) & forbidden_roots
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(root):
+        forbidden = _absolute_import_roots(path) & forbidden_roots
+        if forbidden:
+            violations[path.relative_to(REPO_ROOT).as_posix()] = sorted(forbidden)
+    return violations
 
 
 def test_hardware_does_not_depend_on_application_runtime_or_model_layers() -> None:

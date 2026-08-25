@@ -53,13 +53,12 @@ def test_dataset_contracts_has_no_application_or_tooling_dependencies() -> None:
         "utils",
         "rm65_inspire_tac",
     }
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            {name.split(".", 1)[0] for name in _imported_modules(path)} & forbidden
-        )
-        for path in _python_files(REPO_ROOT / "dataset_contracts")
-        if {name.split(".", 1)[0] for name in _imported_modules(path)} & forbidden
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(REPO_ROOT / "dataset_contracts"):
+        imported_roots = {name.split(".", 1)[0] for name in _imported_modules(path)}
+        forbidden_imports = imported_roots & forbidden
+        if forbidden_imports:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden_imports)
     assert violations == {}
 
 
@@ -74,13 +73,12 @@ def test_dataset_interface_has_no_application_or_tooling_dependencies() -> None:
         "teleop_runtime",
         "utils",
     }
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            {name.split(".", 1)[0] for name in _imported_modules(path)} & forbidden
-        )
-        for path in _python_files(REPO_ROOT / "dataset_interface")
-        if {name.split(".", 1)[0] for name in _imported_modules(path)} & forbidden
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(REPO_ROOT / "dataset_interface"):
+        imported_roots = {name.split(".", 1)[0] for name in _imported_modules(path)}
+        forbidden_imports = imported_roots & forbidden
+        if forbidden_imports:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden_imports)
     assert violations == {}
 
 
@@ -93,28 +91,26 @@ def test_offline_postprocess_has_no_static_runtime_dependency() -> None:
         "sim",
         "rm65_inspire_tac",
     }
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(_absolute_import_roots(path) & forbidden)
-        for path in _python_files(REPO_ROOT / "utils/dataset_postprocess")
-        if not _is_declared_diagnostic_bridge(path)
-        and _absolute_import_roots(path) & forbidden
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(REPO_ROOT / "utils/dataset_postprocess"):
+        if _is_declared_diagnostic_bridge(path):
+            continue
+        forbidden_imports = _absolute_import_roots(path) & forbidden
+        if forbidden_imports:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden_imports)
     assert violations == {}
 
 
 def test_postprocess_runtime_bridge_is_explicit_and_limited_to_camera_smoke_cli() -> None:
-    dynamic_runtime_imports = {
-        str(path.relative_to(REPO_ROOT)): sorted(
+    dynamic_runtime_imports: dict[str, list[str]] = {}
+    for path in _python_files(REPO_ROOT / "utils/dataset_postprocess"):
+        runtime_imports = sorted(
             name
             for name in _dynamic_imports(path)
             if name.split(".", 1)[0] in {"teleop_runtime", "robot_motion"}
         )
-        for path in _python_files(REPO_ROOT / "utils/dataset_postprocess")
-        if any(
-            name.split(".", 1)[0] in {"teleop_runtime", "robot_motion"}
-            for name in _dynamic_imports(path)
-        )
-    }
+        if runtime_imports:
+            dynamic_runtime_imports[str(path.relative_to(REPO_ROOT))] = runtime_imports
     expected_path = "utils/dataset_postprocess/wrist_cam_adjust/smoke_wrist_depth_capture.py"
     assert dynamic_runtime_imports == {
         expected_path: ["teleop_runtime.sources.camera"],

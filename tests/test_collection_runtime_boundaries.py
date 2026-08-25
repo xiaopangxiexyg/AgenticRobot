@@ -51,13 +51,11 @@ def test_collection_runtime_does_not_reverse_depend_on_application_planes() -> N
         "teleop_runtime",
         "utils",
     }
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            _absolute_import_roots(path) & forbidden
-        )
-        for path in _python_files(COLLECTION_RUNTIME_ROOT)
-        if _absolute_import_roots(path) & forbidden
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(COLLECTION_RUNTIME_ROOT):
+        forbidden_imports = _absolute_import_roots(path) & forbidden
+        if forbidden_imports:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden_imports)
     assert violations == {}
 
 
@@ -113,14 +111,13 @@ def test_production_callers_use_capability_named_collection_runtime_modules() ->
             "v25p_sidecar",
         )
     }
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            _absolute_import_modules(path) & VERSIONED_RUNTIME_SHIMS
-        )
-        for path in _python_files(REPO_ROOT / "teleop_runtime")
-        if path not in allowed_compatibility_shims
-        and _absolute_import_modules(path) & VERSIONED_RUNTIME_SHIMS
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(REPO_ROOT / "teleop_runtime"):
+        if path in allowed_compatibility_shims:
+            continue
+        forbidden_imports = _absolute_import_modules(path) & VERSIONED_RUNTIME_SHIMS
+        if forbidden_imports:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden_imports)
     assert violations == {}
 
 

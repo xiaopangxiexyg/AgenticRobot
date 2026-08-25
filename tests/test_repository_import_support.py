@@ -59,6 +59,28 @@ __import__("dynamic.builtin")
     }
 
 
+def test_repository_import_index_resolves_dynamic_aliases_independent_of_source_order(
+    tmp_path: Path,
+) -> None:
+    path = _source(
+        tmp_path,
+        """
+loader.import_module("dynamic.loader")
+load("dynamic.alias")
+__import__("dynamic.builtin")
+
+import importlib as loader
+from importlib import import_module as load
+""",
+    )
+
+    assert dynamic_import_modules(path) == {
+        "dynamic.alias",
+        "dynamic.builtin",
+        "dynamic.loader",
+    }
+
+
 def test_repository_import_index_excludes_relative_and_nonliteral_imports(
     tmp_path: Path,
 ) -> None:

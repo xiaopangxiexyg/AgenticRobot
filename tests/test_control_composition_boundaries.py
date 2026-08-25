@@ -179,13 +179,11 @@ def test_control_composition_does_not_import_concrete_or_application_packages() 
         "sim",
         "teleop_runtime",
     }
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            _absolute_import_roots(path) & forbidden
-        )
-        for path in _python_files(PACKAGE_ROOT)
-        if _absolute_import_roots(path) & forbidden
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(PACKAGE_ROOT):
+        forbidden_imports = _absolute_import_roots(path) & forbidden
+        if forbidden_imports:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden_imports)
     assert violations == {}
 
 

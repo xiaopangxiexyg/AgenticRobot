@@ -26,11 +26,12 @@ def _violations(
     paths: tuple[Path, ...],
     forbidden_roots: set[str],
 ) -> dict[str, list[str]]:
-    return {
-        _relative(path): sorted(_absolute_import_roots(path) & forbidden_roots)
-        for path in paths
-        if _absolute_import_roots(path) & forbidden_roots
-    }
+    violations: dict[str, list[str]] = {}
+    for path in paths:
+        forbidden = _absolute_import_roots(path) & forbidden_roots
+        if forbidden:
+            violations[_relative(path)] = sorted(forbidden)
+    return violations
 
 
 def test_station_application_core_does_not_import_concrete_data_planes() -> None:

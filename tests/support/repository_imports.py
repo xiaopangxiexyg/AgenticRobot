@@ -36,6 +36,7 @@ def _import_summary(path: Path) -> _ImportSummary:
     absolute_modules: set[str] = set()
     importlib_names = {"importlib"}
     import_module_names: set[str] = set()
+    dynamic_calls: list[ast.Call] = []
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -50,11 +51,11 @@ def _import_summary(path: Path) -> _ImportSummary:
                 for alias in node.names:
                     if alias.name == "import_module":
                         import_module_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Call) and node.args:
+            dynamic_calls.append(node)
 
     dynamic_modules: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
+    for node in dynamic_calls:
         function = node.func
         is_import_module = (
             isinstance(function, ast.Attribute)

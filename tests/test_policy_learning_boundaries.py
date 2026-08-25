@@ -50,15 +50,13 @@ def test_experimental_policy_learning_has_a_narrow_dependency_surface() -> None:
         "sim",
         "teleop_runtime",
     }
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            _absolute_import_roots(path) & forbidden
-        )
-        for path in sorted(
-            (REPO_ROOT / "experiments" / "policy_learning").rglob("*.py")
-        )
-        if _absolute_import_roots(path) & forbidden
-    }
+    violations: dict[str, list[str]] = {}
+    for path in sorted(
+        (REPO_ROOT / "experiments" / "policy_learning").rglob("*.py")
+    ):
+        forbidden_imports = _absolute_import_roots(path) & forbidden
+        if forbidden_imports:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden_imports)
 
     assert violations == {}
 
@@ -77,16 +75,14 @@ def test_production_owners_do_not_import_experiments() -> None:
         "sim",
         "teleop_runtime",
     )
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            root
-            for root in _absolute_import_roots(path)
-            if root == "experiments"
-        )
-        for owner in production_owners
-        for path in sorted((REPO_ROOT / owner).rglob("*.py"))
-        if "experiments" in _absolute_import_roots(path)
-    }
+    violations: dict[str, list[str]] = {}
+    for owner in production_owners:
+        for path in sorted((REPO_ROOT / owner).rglob("*.py")):
+            imports = _absolute_import_roots(path)
+            if "experiments" in imports:
+                violations[str(path.relative_to(REPO_ROOT))] = sorted(
+                    root for root in imports if root == "experiments"
+                )
 
     assert violations == {}
 

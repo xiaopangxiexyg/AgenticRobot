@@ -178,13 +178,14 @@ def _violations(
     *,
     excluded: frozenset[Path] = frozenset(),
 ) -> dict[str, list[str]]:
-    return {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            _absolute_import_roots(path) & forbidden_roots
-        )
-        for path in _python_files(root)
-        if path not in excluded and _absolute_import_roots(path) & forbidden_roots
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(root):
+        if path in excluded:
+            continue
+        forbidden = _absolute_import_roots(path) & forbidden_roots
+        if forbidden:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden)
+    return violations
 
 
 def _loaded_control_composition_modules(module_name: str) -> set[str]:
@@ -712,31 +713,27 @@ def test_control_station_uses_explicit_mujoco_composition_port() -> None:
         "composition_strategy_control",
         "policy_topology",
     }
-    violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            _attribute_names(path) & legacy_runtime_views
-        )
-        for path in _python_files(REPO_ROOT / "control_station")
-        if _attribute_names(path) & legacy_runtime_views
-    }
+    violations: dict[str, list[str]] = {}
+    for path in _python_files(REPO_ROOT / "control_station"):
+        forbidden = _attribute_names(path) & legacy_runtime_views
+        if forbidden:
+            violations[str(path.relative_to(REPO_ROOT))] = sorted(forbidden)
 
     assert violations == {}
 
-    legacy_call_violations = {
-        str(path.relative_to(REPO_ROOT)): sorted(
-            _legacy_mujoco_composition_calls(path)
-        )
-        for path in _python_files(REPO_ROOT / "control_station")
-        if _legacy_mujoco_composition_calls(path)
-    }
+    legacy_call_violations: dict[str, list[str]] = {}
+    for path in _python_files(REPO_ROOT / "control_station"):
+        calls = _legacy_mujoco_composition_calls(path)
+        if calls:
+            legacy_call_violations[str(path.relative_to(REPO_ROOT))] = sorted(calls)
     assert legacy_call_violations == {}
 
 
 def test_control_station_does_not_reach_into_authoritative_runtime_core() -> None:
-    violations = {
-        str(path.relative_to(REPO_ROOT)): list(_runtime_core_access_lines(path))
-        for path in _python_files(REPO_ROOT / "control_station")
-        if _runtime_core_access_lines(path)
-    }
+    violations: dict[str, list[int]] = {}
+    for path in _python_files(REPO_ROOT / "control_station"):
+        lines = _runtime_core_access_lines(path)
+        if lines:
+            violations[str(path.relative_to(REPO_ROOT))] = list(lines)
 
     assert violations == {}
