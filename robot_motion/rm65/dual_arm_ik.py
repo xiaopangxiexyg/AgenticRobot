@@ -2033,21 +2033,6 @@ class MultiTaskIKSolver:
             "best_constrained_tracking": tracking,
         }
 
-    def _scan_loaded_min_collision_distance(self) -> float | None:
-        min_distance = float("inf")
-        for result in self.robot.collision_data.distanceResults:
-            distance_value = getattr(result, "min_distance", None)
-            if distance_value is None:
-                distance_value = getattr(result, "minimum_distance", None)
-            if distance_value is None:
-                continue
-            distance_float = float(distance_value)
-            if np.isfinite(distance_float):
-                min_distance = min(min_distance, distance_float)
-        if not np.isfinite(min_distance):
-            return None
-        return min_distance
-
     def _loaded_min_collision_distance_details(self) -> dict[str, Any]:
         """Describe the closest already-computed Pinocchio collision pair."""
 

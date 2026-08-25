@@ -4387,30 +4387,6 @@ class RM65BaseImpedanceController:
             if next_deadline < now_after_send:
                 next_deadline = now_after_send + period
 
-    def _apply_follow_qpos_smoothing(
-        self,
-        *,
-        command_pose: list[float],
-        command_joint: list[float],
-    ) -> tuple[list[float], list[float], dict[str, object]]:
-        metadata: dict[str, object] = {
-            "enabled": bool(self.config.canfd_follow),
-            "applied": False,
-            "stage": "final_command_passthrough",
-            "transport": self.config.pose_command_transport,
-            "alpha": float(self.config.follow_qpos_alpha),
-            "reason": "smoothing_moved_to_pre_interpolation_target",
-        }
-        if not self.config.canfd_follow or self.config.pose_command_transport != "joint":
-            return command_pose, command_joint, metadata
-        metadata.update(
-            {
-                "final_command_realized_from_joint": True,
-                "final_command_joint_deg": list(command_joint),
-            }
-        )
-        return self._forward_pose(command_joint), command_joint, metadata
-
     def _record_follow_stream_context(self, metadata: dict[str, object]) -> None:
         if self._latest_wrench_context is not None:
             self._latest_wrench_context["canfd_follow_stream"] = dict(metadata)

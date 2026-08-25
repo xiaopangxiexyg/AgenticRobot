@@ -657,21 +657,6 @@ class MujocoScheduledQposReferenceReceiver:
                 return segment
         raise RuntimeError("Reference segment is not admitted in this receiver.")
 
-    def _overlapping_live_segments(
-        self,
-        segment: ReferenceSegment,
-    ) -> tuple[ReferenceSegment, ...]:
-        terminal_ids = {item.reference_segment_id for item in self._terminals}
-        return tuple(
-            item
-            for item in self._segments
-            if item.reference_segment_id not in terminal_ids
-            and item.execution_epoch == segment.execution_epoch
-            and item.selection_group_id == segment.selection_group_id
-            and item.scheduled_from < segment.scheduled_until
-            and segment.scheduled_from < item.scheduled_until
-        )
-
     def _terminal_for_supersession(
         self,
         old: ReferenceSegment,

@@ -9333,19 +9333,6 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             for (side, local_index), direction in sorted(latches.items())
         }
 
-    def _joint_limit_escape_candidate_moves_outward(
-        self,
-        *,
-        item: _DualArmEvaluatedCandidate,
-        reference_full_q: np.ndarray,
-        latches: Mapping[tuple[str, int], int],
-    ) -> bool:
-        return self._joint_limit_escape_output_moves_outward(
-            output_q=item.output_qpos,
-            reference_full_q=reference_full_q,
-            directions=latches,
-        )
-
     def _joint_limit_escape_output_moves_outward(
         self,
         *,

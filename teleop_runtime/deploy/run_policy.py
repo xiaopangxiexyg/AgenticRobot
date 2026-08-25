@@ -1321,29 +1321,6 @@ def _resolve_runtime_pose_frame_contract(
     return None, "not_applicable"
 
 
-def _send_legacy_deployment_action_commands(
-    commands: Mapping[str, Any],
-    *,
-    arm_backends: Mapping[str, EffectorBackend],
-    hand_backends: Mapping[str, EffectorBackend],
-) -> None:
-    """Archived direct DeploymentAction command dispatcher.
-
-    The active deploy policy path now resolves NormalizedAction through
-    RobotAction/TeleopCommand in teleop_runtime.deploy.canonical_action.
-    """
-
-    for side in ALL_SIDES:
-        arm_command = commands.get(f"{side}_arm")
-        arm_backend = arm_backends.get(side)
-        if arm_command is not None and arm_backend is not None:
-            arm_backend.send_command(arm_command)
-        hand_command = commands.get(f"{side}_hand")
-        hand_backend = hand_backends.get(side)
-        if hand_command is not None and hand_backend is not None:
-            hand_backend.send_command(hand_command)
-
-
 def _validate_debug_replay_arm_control_mode(
     policy: Any,
     args: argparse.Namespace,
