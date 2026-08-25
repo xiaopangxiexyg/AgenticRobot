@@ -854,6 +854,7 @@ class SimReplayDatasetWriter:
         depth_images: Mapping[str, np.ndarray] | None = None,
         playback_time_sec: float,
         active_sides: Sequence[str],
+        frame_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         if self._closed:
             raise RuntimeError("Cannot record to a closed sim replay dataset writer.")
@@ -924,6 +925,9 @@ class SimReplayDatasetWriter:
                             "gripper_source_by_side": {}
                             if gripper_sample is None
                             else gripper_sample.source_by_side,
+                            "frame_metadata": {}
+                            if frame_metadata is None
+                            else _to_serializable(dict(frame_metadata)),
                             "camera_metadata": self.scene.camera_metadata(),
                         }
                     }

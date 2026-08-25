@@ -92,3 +92,34 @@ adoption is an explicit caller choice. The existing collection adapter still
 owns only command resolution; production runtime wiring for
 `next_runtime(...)`, boundary measurement, and dataset submission remains a
 separate integration step.
+
+## MuJoCo composition proof
+
+The simulation-only example
+`sim.mujoco.replay.rule_based_multistage_demo` exercises the same boundary
+without adding a second control or writer implementation. Its sequence is:
+
+```text
+initial alignment (not recorded)
+  -> absolute replay of --stage-a
+  -> right TCP circle in desk XY at constant desk Z
+  -> measured actual-TCP boundary
+  -> relative replay of --stage-b
+```
+
+Run it with an external canonical UMI dataset root:
+
+```bash
+MUJOCO_GL=egl PYTHONPATH=. python -m sim.mujoco.replay.rule_based_multistage_demo \
+  --dataset-root /path/to/dataset \
+  --episode 0 --stage-a 0:120 --stage-b 250:400 \
+  --output /tmp/rule_based_mujoco_demo --record-depth --no-sleep
+```
+
+`start:end` spans are half-open and intentionally editable. The output keeps
+the normal simulation parquet/video layout and adds
+`rule_based_composition_manifest.json`; each row carries its phase in
+`sample_metadata_json`. The relative phase fails closed if the source group
+does not contain actual TCP history or if the source/boundary pose frames do
+not match. The optional passive viewer is MuJoCo-only (`--viewer`); rendered
+RGB/depth videos are also produced for headless verification.
