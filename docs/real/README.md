@@ -14,6 +14,7 @@
 | [OPENPI](./OPENPI.md) | OpenPI 两进程部署 |
 | [UMI](./UMI.md) | UMI 配置、标定和数采 |
 | [离线评估报告](./reports/README.md) | 带日期、数据来源、验证边界和回退结论的历史结果 |
+| [Tracker-Hand 旧 RPY 判定退役记录](../legacy/reports/tracker_hand_legacy_predicate_retirement_20260825.md) | 全仓无调用的旧 canonical RPY 判定移除、保留的校准接口和验证边界 |
 | [共享实施计划](./plans/README.md) | 被当前报告或架构文档引用、但尚未完成的真实系统工作 |
 
 ## 执行模式边界
