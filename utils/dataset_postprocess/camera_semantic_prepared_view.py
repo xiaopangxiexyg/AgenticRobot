@@ -221,11 +221,38 @@ def _selected_source_files(
     files.discard(Path(CAMERA_SEMANTIC_MATERIALIZATION_RELATIVE_PATH))
     # Rewritten files are added back to the selected inventory so a stale plan
     # still detects changes to these source inputs.
-    for required in (
+    required_metadata = [
         Path("meta/episodes.jsonl"),
         Path("meta/info.json"),
-        Path("meta/devices/realsense.json"),
-    ):
+    ]
+    provenance_relative = Path("meta/provenance.jsonl")
+    provenance_path = root / provenance_relative
+    if provenance_path.is_file():
+        required_metadata.append(provenance_relative)
+        provenance = read_jsonl(provenance_path)
+        if not provenance:
+            raise CameraSemanticPreparedViewError(
+                f"Organized dataset camera provenance is empty: {provenance_path}"
+            )
+        for row_number, row in enumerate(provenance, start=1):
+            source_root_text = str(row.get("source_dataset_root") or "").strip()
+            if not source_root_text:
+                raise CameraSemanticPreparedViewError(
+                    f"Provenance row {row_number} in {provenance_path} has no "
+                    "source_dataset_root."
+                )
+            source_name = Path(source_root_text).expanduser().name
+            if not source_name:
+                raise CameraSemanticPreparedViewError(
+                    f"Provenance row {row_number} in {provenance_path} has an "
+                    "invalid source_dataset_root."
+                )
+            required_metadata.append(
+                Path("meta/source_devices") / source_name / "realsense.json"
+            )
+    else:
+        required_metadata.append(Path("meta/devices/realsense.json"))
+    for required in tuple(dict.fromkeys(required_metadata)):
         path = root / required
         if not path.is_file() or path.is_symlink():
             raise CameraSemanticPreparedViewError(

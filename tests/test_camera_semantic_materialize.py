@@ -256,6 +256,29 @@ def _duplicate_episode_zero_as_one(root: Path) -> None:
     info_path.write_text(json.dumps(info), encoding="utf-8")
 
 
+def _convert_to_organized_camera_provenance(root: Path) -> None:
+    source_name = "capture-source-a"
+    direct_snapshot = root / "meta/devices/realsense.json"
+    copied_snapshot = (
+        root / "meta/source_devices" / source_name / "realsense.json"
+    )
+    copied_snapshot.parent.mkdir(parents=True, exist_ok=True)
+    direct_snapshot.replace(copied_snapshot)
+    direct_snapshot.parent.rmdir()
+    (root / "meta/provenance.jsonl").write_text(
+        json.dumps(
+            {
+                "output_episode_index": 0,
+                "source_dataset_root": f"/offline/archive/{source_name}",
+                "source_episode_index": 17,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _add_detached_tactile_evidence(root: Path) -> tuple[Path, str]:
     episode_path = root / "meta/episodes.jsonl"
     episode = json.loads(episode_path.read_text(encoding="utf-8"))
@@ -395,6 +418,51 @@ def _add_equivalent_stale_scope_evidence(root: Path, inventory_hash: str) -> str
         json.dumps(receipt.to_dict()), encoding="utf-8"
     )
     return equivalent_hash
+
+
+@pytest.mark.optional
+def test_prepared_view_accepts_self_contained_organized_camera_provenance(
+    tmp_path: Path,
+) -> None:
+    pq = pytest.importorskip("pyarrow.parquet")
+    source = tmp_path / "organized-source"
+    source.mkdir()
+    _write_source_dataset(source)
+    _convert_to_organized_camera_provenance(source)
+    registry = tmp_path / "registry.json"
+    _write_registry(registry)
+    output = tmp_path / "prepared"
+
+    plan = plan_camera_semantic_prepared_view(source, output, registry)
+    assert plan.episode_count == 1
+    assert plan.tactile_reference_episode_count == 0
+    result = materialize_camera_semantic_prepared_view(
+        source,
+        output,
+        registry,
+        expected_plan_hash=plan.plan_hash,
+    )
+
+    assert result["validated_video_count"] == 2
+    load_camera_semantic_prepared_view(output, verify_payload_hashes=True)
+    assert (output / "meta/devices/realsense.json").is_file()
+    assert (output / "meta/provenance.jsonl").is_file()
+    assert (
+        output
+        / "meta/source_devices/capture-source-a/realsense.json"
+    ).is_file()
+    assert not (output / "tactile").exists()
+    output_episode = json.loads(
+        (output / "meta/episodes.jsonl").read_text(encoding="utf-8")
+    )
+    assert "tactile_paths" not in output_episode
+    table = pq.read_table(output / output_episode["parquet_path"])
+    assert not any("tactile" in name.lower() for name in table.column_names)
+    projection = json.loads(
+        (output / "meta/info.json").read_text(encoding="utf-8")
+    )["dexteleop_dataset_projection"]
+    assert projection["full_v23_dataset"] is False
+    assert projection["excluded_modalities"] == ["tactile"]
 
 
 @pytest.mark.optional

@@ -135,6 +135,16 @@ camera artifact 同时归一化，因此允许历史左右腕视频索引不同�
 调用者同时选择该输出根目录并显式传入 `--allow-camera-prepared-view` 才能训练。原
 `camera-semantics-materialize` 的完整克隆和触觉 retirement 门禁保持不变。
 
+`organize-episodes` 生成的物理合并源没有单一的
+`meta/devices/realsense.json`：每个输出 episode 通过
+`meta/provenance.jsonl` 绑定到
+`meta/source_devices/<source_dataset_name>/realsense.json`。prepared-view
+入口会要求这些复制后的 snapshot 全部存在、拒绝回退到外部源路径，并把 provenance 与每份
+snapshot 一起纳入冻结 inventory。这样同日多来源物理整理可以继续投影成严格的
+camera+numeric 视图，同时仍不遍历或复制 tactile payload。不要为通过检查而从多个来源中任选
+一份 RealSense snapshot 写成合并数据集的全局 snapshot；那会把不同采集会话的相机身份错误地
+统一。
+
 prepared view 也不会复制 `.lock` 等运行时文件；manifest 和严格 loader 都会拒绝这类文件。
 已经发布但不符合上述合同的试点目录不得继续放在默认可选目录中。先运行
 `camera-semantics-quarantine-invalid-view VIEW --audit-root AUDIT_ROOT` 生成冻结计划，随后携带
@@ -756,6 +766,14 @@ result = build_datasets("/abs/path/manifest.json", dataset_names=["example"])
   `artifact_materialization_policy` 物化进 staging，manifest 内部路径随 episode 一起重编号，随后
   输出成为自包含的兼容 external-tactile 数据集；`meta/info.json` 明确标记需要离线 full scan 后
   才能再次拆分。source core 与 source tactile bundle 始终只读且保持原绑定，可直接回退。
+- 对采用旧式 inventory/receipt 迁出布局、只在热目录保留 tactile manifest 的 source，不允许
+  依赖 storage ID 或目录名猜测 NAS 数据。manifest 必须同时显式指定
+  `retired_tactile_inventory_hash` 与指向该 inventory 精确目录的
+  `retired_tactile_artifact_root`。预检要求当前 independently-verified retirement receipt、源绑定、
+  archive `inventory.json`、精确 artifact 集合、所有尺寸与 SHA-256 全部一致，并拒绝 symlink、部分
+  hot 状态、额外文件、过期 inventory 或 native/legacy 双重绑定。验证通过后才可从 archive 直接
+  物化到 staging；源 core 和 NAS archive 始终只读。该入口默认关闭且仅对 manifest 中逐 source
+  显式钉死的旧数据生效。
 - 合并只重排物理 `episode_index` 和 artifact path；原 capture identity、progress fact、
   Attempt/Failure/annotation 语义保持不变。
 - manifest source 顺序是输出的规范顺序；同一 source 内按原 episode index 排序，从而能够
