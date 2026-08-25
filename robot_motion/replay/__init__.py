@@ -56,6 +56,12 @@ from .rule_based import (
     RuleBasedInitialize,
     RuleBasedReplay,
 )
+from .rule_based_relative import (
+    RULE_BASED_RELATIVE_REPLAY_SCHEMA_V1,
+    RuleBasedBoundaryState,
+    RuleBasedRelativeReplayError,
+    rebase_replay_action_at_boundary,
+)
 from .trajectory import (
     QPOS_INIT_AUTO,
     QPOS_INIT_OBSERVATION_ACTUAL_QPOS,
@@ -125,6 +131,9 @@ __all__ = [
     "RuleBasedCustomAction",
     "RuleBasedInitialize",
     "RuleBasedReplay",
+    "RULE_BASED_RELATIVE_REPLAY_SCHEMA_V1",
+    "RuleBasedBoundaryState",
+    "RuleBasedRelativeReplayError",
     "annotate_replay_command_metadata",
     "build_replay_source_frame_emission",
     "create_replay_source_frame_emission",
@@ -153,6 +162,7 @@ __all__ = [
     "replay_qpos_init_candidates_at_index",
     "replay_robot_action_at_index",
     "replay_teleop_command_at_index",
+    "rebase_replay_action_at_boundary",
     "resample_position_qpos_references",
     "select_replay_qpos_init_targets",
     "validate_replay_rate",

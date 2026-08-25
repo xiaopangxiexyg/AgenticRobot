@@ -40,6 +40,22 @@ does not rewrite samples or writer jobs, so the existing sample builder and
 writer remain authoritative for causal cuts, validation, persistence, sealing,
 and commit.
 
+## Relative replay at a segment boundary
+
+The pure boundary contract is `RuleBasedBoundaryState` together with
+`rebase_replay_action_at_boundary`. It uses the source trajectory's recorded
+actual TCP at `source_start_index` as the source anchor, converts each source
+pose target into a fixed relative delta, and applies that delta to the
+runtime-measured TCP in `RuleBasedBoundaryState`. The result is an absolute
+`RobotAction` in the already-validated per-side pose frames.
+
+This first seam is intentionally pose-only and fails closed when the source
+actual TCP history or per-side frame identity is missing. Joint-qpos replay is
+not treated as a relative pose replay. The current finite cursor still expands
+only static steps; a later step will pass a boundary state into the plan
+execution path so a collection segment can produce the state used by the next
+relative replay segment.
+
 This module is a pure, default-off composition seam. Its unit tests use only
 synthetic trajectory arrays and canonical action objects; they are not evidence
 of robot readiness or production collection integration. No existing CLI or
