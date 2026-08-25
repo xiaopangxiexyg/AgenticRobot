@@ -5,11 +5,17 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from robot_motion.action import RobotAction
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM
 from robot_motion.replay import (
     ReplayTrajectoryGroup,
     RuleBasedBoundaryState,
+    RuleBasedCaptureSelection,
+    RuleBasedCollectionCursor,
+    RuleBasedCollectionPlan,
+    RuleBasedCustomAction,
     RuleBasedRelativeReplayError,
+    RuleBasedReplay,
     rebase_replay_action_at_boundary,
 )
 
@@ -110,3 +116,71 @@ def test_relative_replay_fails_closed_without_matching_measured_anchor() -> None
                 pose_frame_by_side={"left": "canonical_desk"},
             ),
         )
+
+
+def test_cursor_resolves_relative_segment_only_after_boundary_is_published() -> None:
+    boundaries: dict[str, RuleBasedBoundaryState] = {}
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedReplay(
+                step_id="prelude",
+                group_key="next_segment",
+                start_index=0,
+                end_index=1,
+                capture=RuleBasedCaptureSelection(enabled=False),
+            ),
+            RuleBasedCustomAction(
+                step_id="collect",
+                action=RobotAction.bimanual_qpos(left_arm=np.zeros(6), source="rule"),
+                repeats=1,
+                capture=RuleBasedCaptureSelection(enabled=True),
+            ),
+            RuleBasedReplay(
+                step_id="postlude",
+                group_key="next_segment",
+                start_index=1,
+                end_index=3,
+                relative_to="capture_end",
+                capture=RuleBasedCaptureSelection(enabled=False),
+            ),
+        )
+    )
+    cursor = RuleBasedCollectionCursor(
+        plan,
+        {"next_segment": _group()},
+        boundary_provider=boundaries,
+    )
+
+    first = next(cursor)
+    collected = next(cursor)
+    assert first.step_id == "prelude"
+    assert collected.step_id == "collect"
+    assert collected.capture.enabled is True
+
+    boundaries["capture_end"] = _boundary()
+    rebased = list(cursor)
+
+    assert [item.step_id for item in rebased] == ["postlude", "postlude"]
+    np.testing.assert_allclose(rebased[0].action.arm_pose_by_side["left"], _pose(10.4))
+    np.testing.assert_allclose(rebased[0].action.arm_pose_by_side["right"], _pose(20.5, 1.0))
+    assert rebased[0].metadata["relative_to"] == "capture_end"
+
+
+def test_relative_plan_requires_a_boundary_provider_at_resolution_time() -> None:
+    cursor = RuleBasedCollectionCursor(
+        RuleBasedCollectionPlan(
+            steps=(
+                RuleBasedReplay(
+                    step_id="relative",
+                    group_key="next_segment",
+                    start_index=0,
+                    end_index=1,
+                    relative_to="capture_end",
+                ),
+            )
+        ),
+        {"next_segment": _group()},
+    )
+
+    with pytest.raises(ValueError, match="boundary_provider"):
+        next(cursor)

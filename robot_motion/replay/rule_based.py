@@ -9,7 +9,7 @@ streams belong in the dataset.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, TypeAlias
 
@@ -19,6 +19,10 @@ from robot_motion.action import RobotAction
 from robot_motion.action.schema import normalize_side
 
 from .action_frame import replay_robot_action_at_index
+from .rule_based_relative import (
+    RuleBasedBoundaryState,
+    rebase_replay_action_at_boundary,
+)
 from .trajectory import (
     QPOS_INIT_AUTO,
     QPOS_INIT_REPLAY_QPOS,
@@ -110,7 +114,7 @@ class RuleBasedInitialize:
 
 @dataclass(frozen=True)
 class RuleBasedReplay:
-    """Replay an explicit half-open frame range through existing replay helpers."""
+    """Replay an explicit range, optionally rebased at a runtime boundary."""
 
     step_id: str
     group_key: str
@@ -118,6 +122,8 @@ class RuleBasedReplay:
     end_index: int
     active_sides: tuple[str, ...] = ("left", "right")
     source: str = REPLAY_TRAJECTORY_ACTION_POSE
+    relative_to: str | None = None
+    source_start_index: int | None = None
     capture: RuleBasedCaptureSelection = field(default_factory=RuleBasedCaptureSelection)
 
     def __post_init__(self) -> None:
@@ -129,6 +135,19 @@ class RuleBasedReplay:
             raise ValueError("end_index must be greater than start_index.")
         object.__setattr__(self, "active_sides", _normalize_sides(self.active_sides))
         object.__setattr__(self, "source", normalize_replay_trajectory_source(self.source))
+        relative_to = self.relative_to
+        if relative_to is not None:
+            relative_to = _required_text(relative_to, name="relative_to")
+            if self.source != REPLAY_TRAJECTORY_ACTION_POSE:
+                raise ValueError("Relative replay currently supports pose actions only.")
+        object.__setattr__(self, "relative_to", relative_to)
+        source_start_index = self.source_start_index
+        if source_start_index is not None:
+            source_start_index = _non_negative_int(
+                source_start_index,
+                name="source_start_index",
+            )
+        object.__setattr__(self, "source_start_index", source_start_index)
         if not isinstance(self.capture, RuleBasedCaptureSelection):
             raise TypeError("capture must be RuleBasedCaptureSelection.")
 
@@ -152,6 +171,10 @@ class RuleBasedCustomAction:
 
 
 RuleBasedStep: TypeAlias = RuleBasedInitialize | RuleBasedReplay | RuleBasedCustomAction
+RuleBasedBoundaryProvider: TypeAlias = (
+    Mapping[str, RuleBasedBoundaryState]
+    | Callable[[str], RuleBasedBoundaryState]
+)
 
 
 @dataclass(frozen=True)
@@ -218,11 +241,14 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
         self,
         plan: RuleBasedCollectionPlan,
         trajectory_groups: Mapping[str, ReplayTrajectoryGroup],
+        *,
+        boundary_provider: RuleBasedBoundaryProvider | None = None,
     ) -> None:
         if not isinstance(plan, RuleBasedCollectionPlan):
             raise TypeError("plan must be RuleBasedCollectionPlan.")
         self.plan = plan
         self.trajectory_groups = dict(trajectory_groups)
+        self.boundary_provider = boundary_provider
         self._step_index = 0
         self._directive_index = 0
         self._pending: Iterator[RuleBasedCollectionDirective] = iter(())
@@ -320,6 +346,18 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                         "rule_based_schema": RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
                         "rule_based_step_index": int(step_index),
                         "replay_source": step.source,
+                        **(
+                            {
+                                "relative_to": step.relative_to,
+                                "source_start_index": int(
+                                    step.source_start_index
+                                    if step.source_start_index is not None
+                                    else step.start_index
+                                ),
+                            }
+                            if step.relative_to is not None
+                            else {}
+                        ),
                     },
                 )
             return
@@ -338,13 +376,43 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                 },
             )
 
-    @staticmethod
+    def _boundary_for(self, boundary_ref: str) -> RuleBasedBoundaryState:
+        provider = self.boundary_provider
+        if provider is None:
+            raise ValueError(
+                f"Relative replay requires boundary_provider for {boundary_ref!r}."
+            )
+        if callable(provider):
+            boundary = provider(str(boundary_ref))
+        else:
+            boundary = provider.get(str(boundary_ref))
+        if not isinstance(boundary, RuleBasedBoundaryState):
+            raise KeyError(
+                f"Boundary provider has no RuleBasedBoundaryState for {boundary_ref!r}."
+            )
+        return boundary
+
     def _replay_action(
+        self,
         group: ReplayTrajectoryGroup,
         step: RuleBasedReplay,
         *,
         frame_index: int,
     ) -> RobotAction:
+        if step.relative_to is not None:
+            boundary = self._boundary_for(step.relative_to)
+            return rebase_replay_action_at_boundary(
+                group,
+                step.active_sides,
+                index=frame_index,
+                source_start_index=(
+                    step.source_start_index
+                    if step.source_start_index is not None
+                    else step.start_index
+                ),
+                boundary=boundary,
+                source="rule_based_relative_replay",
+            )
         if step.source == REPLAY_TRAJECTORY_ACTION_POSE:
             return replay_robot_action_at_index(
                 group,
@@ -371,6 +439,7 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
 
 __all__ = [
     "RULE_BASED_COLLECTION_PLAN_SCHEMA_V1",
+    "RuleBasedBoundaryProvider",
     "RuleBasedCaptureSelection",
     "RuleBasedCollectionCursor",
     "RuleBasedCollectionDirective",
