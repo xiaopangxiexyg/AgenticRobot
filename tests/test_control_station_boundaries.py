@@ -278,6 +278,9 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         "agent_gateway/profiles/real/perception_probe.py": ["numpy"],
         "agent_gateway/profiles/real/realsense_perception.py": ["numpy"],
+        # Concrete RM65 application binding uses NumPy only to invert the
+        # reviewed scene-to-station transform.  Gateway core remains neutral.
+        "agent_gateway/profiles/real/rm65_composition.py": ["numpy"],
     }
 
 

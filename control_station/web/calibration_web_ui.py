@@ -860,7 +860,11 @@ class CalibrationWebUi:
                 del fmt, args
 
         self._server = ThreadingHTTPServer((self._host, self._port), Handler)
-        self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._server_thread = threading.Thread(
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
         self._server_thread.start()
         if self._open_browser:
             try:

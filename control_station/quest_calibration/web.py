@@ -267,6 +267,7 @@ class QuestCalibrationWebCoordinator:
             server.daemon_threads = True
             server_thread = threading.Thread(
                 target=server.serve_forever,
+                kwargs={"poll_interval": 0.05},
                 name="quest-calibration-web-server",
                 daemon=True,
             )

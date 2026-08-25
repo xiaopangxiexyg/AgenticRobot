@@ -175,7 +175,11 @@ def _start_server(
         max_frame_bytes=max_frame_bytes,
         socket_mode=socket_mode,
     )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
     thread.start()
     return server, thread, close_calls
 

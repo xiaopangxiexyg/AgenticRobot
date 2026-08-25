@@ -139,7 +139,11 @@ def _running_server(station, coordinator, event_log):
         authority_status_provider=station.authority_status_payload,
         port=0,
     )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
     thread.start()
     try:
         host, port = server.server_address[:2]

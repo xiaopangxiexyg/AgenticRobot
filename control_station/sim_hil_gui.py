@@ -2813,6 +2813,7 @@ class SimHILStatusServer:
         self._server = server
         self._thread = threading.Thread(
             target=server.serve_forever,
+            kwargs={"poll_interval": 0.05},
             name="control_station_sim_hil_status",
             daemon=True,
         )

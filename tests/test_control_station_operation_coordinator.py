@@ -322,7 +322,11 @@ def _running_server(
         operation_coordinator=coordinator,
         port=0,
     )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
     thread.start()
     try:
         host, port = server.server_address[:2]
@@ -457,4 +461,3 @@ def test_http_busy_rejection_occurs_before_runtime_admission() -> None:
     assert body["intent_admitted"] is False
     assert runtime.next_admission_sequence == sequence_before
     assert runtime.state.target_state == "configured"
-
