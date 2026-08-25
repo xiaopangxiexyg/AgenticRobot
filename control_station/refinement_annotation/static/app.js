@@ -515,23 +515,19 @@ async function ensureAnnotationsSealedBeforeTransition(targetLabel) {
   try {
     const coarseChanged = hasUnsavedCoarseDraftChanges();
     const detailChanged = hasUnsavedDetailDraftChanges();
-    if (coarseChanged && detailChanged) {
-      showToast(
-        "粗标注和详细补充同时有修改。请先封存粗标注，再重新打开并封存详细补充，避免详细 overlay 绑定到旧版本。",
-        "warning",
-        9000,
-      );
-      return false;
-    }
-    const report = detailChanged
-      ? await publishDetailAnnotations()
-      : await publishCurrentAnnotations();
+    const report = coarseChanged
+      ? await publishCurrentAnnotations()
+      : detailChanged
+        ? await publishDetailAnnotations()
+        : null;
     showToast(
-      report.draft_cache_warning
+      report?.draft_cache_warning
         ? `标注已封存，但工作缓存更新失败：${report.draft_cache_warning}`
-        : "当前修改已校验并封存，继续切换。",
-      report.draft_cache_warning ? "error" : "info",
-      report.draft_cache_warning ? 9000 : 4200,
+        : report?.pending_coarse
+          ? "详细草稿已保存；粗标注仍可独立编辑，继续切换。"
+          : "当前修改已校验并保存，继续切换。",
+      report?.draft_cache_warning ? "error" : "info",
+      report?.draft_cache_warning ? 9000 : 4200,
     );
     return true;
   } catch (error) {
@@ -1724,7 +1720,11 @@ function confirmDetailAnnotation() {
   overlay.confirmed = true;
   renderDetailAnnotation();
   updateEditButtonState();
-  showToast("详细时间轴已确认；请点击“封存详细补充”发布。", "info", 4200);
+  showToast(
+    "详细时间轴已确认；可直接保存详细草稿，或在粗标注版本确定后封存 detail。",
+    "info",
+    5200,
+  );
 }
 
 function renderDetailAnnotation() {
@@ -1741,10 +1741,26 @@ function renderDetailAnnotation() {
   if (!(available || previewAvailable)) return;
   const status = $("detail-annotation-status");
   const sealed = meta.resolution_level === "DETAIL_COMPLETE";
-  const confirmed = Boolean(overlay.confirmed);
+  const confirmed = Boolean(overlay?.confirmed);
+  const confirmButton = $("confirm-detail-annotation");
+  const publishButton = $("publish-detail-annotation");
+  $("detail-annotation-actions")?.classList.toggle(
+    "hidden",
+    !(available || previewAvailable),
+  );
+  confirmButton?.classList.toggle("hidden", !available);
+  publishButton?.classList.toggle("hidden", !available);
+  if (publishButton) {
+    publishButton.textContent = meta.base
+      ? "封存详细补充"
+      : "保存详细草稿";
+    publishButton.title = meta.base
+      ? "发布绑定当前粗标注版本的不可变 detail overlay"
+      : "先保存详细草稿；粗标注封存后再发布 detail overlay";
+  }
   status.textContent = previewAvailable
     ? [
-        "详细 profile 已匹配；粗粒度封存后生成可编辑的"
+        "详细 profile 已匹配；当前仅显示"
         + profileStages.length + "个子阶段预览",
         meta.profile?.target_progress_step_id
           ? "补充子任务：" + meta.profile.target_progress_step_id
@@ -1754,12 +1770,12 @@ function renderDetailAnnotation() {
     : [
         sealed ? "已发布详细 overlay" : "当前有效分析仍使用粗粒度 fallback",
         confirmed ? "当前详细草稿已确认" : "当前详细草稿未确认",
+        !meta.base ? "粗、细标注可独立编辑" : "",
         meta.profile?.target_progress_step_id
           ? "补充子任务：" + meta.profile.target_progress_step_id
           : "",
         meta.reason || "",
       ].filter(Boolean).join(" · ");
-  $("detail-annotation-actions")?.classList.toggle("hidden", !available);
   const track = $("detail-stage-track");
   track.replaceChildren();
   const values = detailSortedOccurrences();
@@ -1922,8 +1938,12 @@ function renderDetailAnnotation() {
     row.appendChild(select);
     failureEditors.appendChild(row);
   }
-  $("confirm-detail-annotation").disabled = !available || state.busy || confirmed;
-  $("publish-detail-annotation").disabled = !available || state.busy || !confirmed;
+  if (confirmButton) {
+    confirmButton.disabled = !available || state.busy || confirmed;
+  }
+  if (publishButton) {
+    publishButton.disabled = !available || state.busy || !confirmed;
+  }
   $("detail-stage-track").querySelectorAll(".playhead").forEach((node) => {
     node.style.left = timelineRatio(currentTimelineTime()) * 100 + "%";
   });
@@ -4080,6 +4100,43 @@ async function publishDetailAnnotations() {
   if (!overlay.confirmed) {
     throw new Error("请先确认详细时间轴，并为每个原始 Failure 选择失败子阶段。");
   }
+  if (!meta.base) {
+    const payload = await requestJsonWithProgress(
+      "/api/draft/" + encodeURIComponent(state.detail.episode_uuid),
+      {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(state.draft),
+      },
+      {
+        kind: "SAVE_DETAIL_DRAFT",
+        message: "正在保存详细草稿",
+        completeMessage: "详细草稿已保存",
+      },
+    );
+    state.draft = payload.draft;
+    const pendingMeta = {
+      ...meta,
+      draft_state: "EDITING_UNSEALED",
+      reason: (
+        "详细草稿已保存；粗标注可稍后独立封存，"
+        + "之后再发布 detail overlay。"
+      ),
+    };
+    state.detail.detail_annotation = pendingMeta;
+    state.detail.detail_annotation_complete = false;
+    state.detail.detail_annotation_state = "PENDING";
+    setSavedDraftSnapshot(state.draft);
+    renderTimeline();
+    renderEpisodeList({preserveViewport: true});
+    await loadEpisodes();
+    return {
+      pending_coarse: true,
+      draft: state.draft,
+      detail_annotation: pendingMeta,
+      draft_cache_warning: null,
+    };
+  }
   const payload = await requestJsonWithProgress(
     "/api/commit-detail/" + encodeURIComponent(state.detail.episode_uuid),
     {
@@ -4132,7 +4189,9 @@ async function commitDetailAnnotations() {
   try {
     const report = await publishDetailAnnotations();
     showToast(
-      report.draft_cache_warning
+      report.pending_coarse
+        ? "详细草稿已保存；粗标注仍可独立编辑，稍后封存粗标注后再发布 detail overlay。"
+        : report.draft_cache_warning
         ? "详细补充已封存，但工作缓存更新失败：" + report.draft_cache_warning
         : "详细补充校验通过，已发布不可变 detail overlay。",
       report.draft_cache_warning ? "error" : "info",
@@ -4150,11 +4209,6 @@ async function commitDetailAnnotations() {
 async function publishCurrentAnnotations() {
   if (!state.draft || !state.detail) {
     throw new Error("当前没有可封存的 Episode 标注。");
-  }
-  if (hasUnsavedDetailDraftChanges()) {
-    throw new Error(
-      "详细补充尚有未封存修改，请先点击“封存详细补充”；粗标注封存会生成新的 base 版本。",
-    );
   }
   const payload = await requestJsonWithProgress(
     `/api/commit/${encodeURIComponent(state.detail.episode_uuid)}`,

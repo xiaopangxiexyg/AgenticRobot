@@ -1251,16 +1251,57 @@ def test_detail_overlay_is_optional_until_explicitly_sealed(
         )
 
         initial = application.episode_detail(episode_uuid)
-        assert initial["detail_annotation"]["available"] is False
+        assert initial["detail_annotation"]["available"] is True
         assert initial["detail_annotation"]["draft_state"] == (
-            "PROFILE_PREVIEW"
+            "EDITING_UNSEALED"
         )
+        assert initial["detail_annotation"]["base"] is None
         assert [
             value["stage_id"]
             for value in initial["detail_annotation"]["profile"]["stages"]
         ] == ["a.start", "a.body", "a.finish"]
 
-        coarse_report = application.commit(episode_uuid, initial["draft"])
+        detail_first_draft = json.loads(json.dumps(initial["draft"]))
+        detail_first_meta = initial["detail_annotation"]
+        detail_first_failure = detail_first_meta["failure_attempts"][0]
+        detail_first_failure_id = detail_first_failure["attempt_id"]
+        detail_first_failure_fact_id = detail_first_failure["failure_fact_id"]
+        detail_first_overlay = detail_first_draft["detail_overlay"]
+        detail_first_overlay["occurrences"] = [
+            {
+                **value,
+                **(
+                    {
+                        "outcome": "FAILURE",
+                        "source_failure_fact_id": detail_first_failure_fact_id,
+                    }
+                    if (
+                        value["coarse_attempt_id"] == detail_first_failure_id
+                        and value["stage_id"] == "a.body"
+                    )
+                    else {}
+                ),
+            }
+            for value in detail_first_overlay["occurrences"]
+            if not (
+                value["coarse_attempt_id"] == detail_first_failure_id
+                and value["stage_id"] == "a.finish"
+            )
+        ]
+        detail_first_overlay["failure_stage_by_attempt"][
+            detail_first_failure_id
+        ] = "a.body"
+        detail_first_overlay["confirmed"] = True
+        pending_detail_report = application.commit_detail(
+            episode_uuid,
+            detail_first_draft,
+        )
+        assert pending_detail_report["pending_coarse"] is True
+
+        coarse_report = application.commit(
+            episode_uuid,
+            pending_detail_report["draft"],
+        )
         assert coarse_report["detail_annotation"]["available"] is True
         assert (
             coarse_report["detail_annotation"]["resolution_level"]
@@ -1415,9 +1456,11 @@ def test_coarse_writing_entry_can_receive_detail_overlay(
     )
     try:
         initial = application.episode_detail(episode_uuid)
+        assert initial["detail_annotation"]["available"] is True
         assert initial["detail_annotation"]["draft_state"] == (
-            "PROFILE_PREVIEW"
+            "EDITING_UNSEALED"
         )
+        assert initial["detail_annotation"]["base"] is None
         assert [
             value["stage_id"]
             for value in initial["detail_annotation"]["profile"]["stages"]

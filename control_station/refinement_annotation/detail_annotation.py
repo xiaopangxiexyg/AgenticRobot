@@ -419,11 +419,14 @@ class DetailAnnotationModule:
         target = selection.target_progress_step_id
         if not annotation_sets:
             return DetailAnnotationStatus(
-                state="WAITING_FOR_COARSE",
+                state="PENDING",
                 complete=False,
                 applicable=True,
                 target_progress_step_id=target,
-                reason="请先封存粗粒度标注。",
+                reason=(
+                    "详细 profile 已匹配；粗、细标注可以独立编辑，"
+                    "详细 overlay 会在粗标注版本确定后绑定。"
+                ),
             )
         base_annotation_set = annotation_sets[-1]
         if not any(
