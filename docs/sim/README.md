@@ -86,3 +86,9 @@ envelope 与当前 execution epoch，再开放 READY；普通 HOLD 只撤销本�
 reset 或重新完成物理初始化时，必须由下层先失效旧 reference，再提交新的 measured
 reference。最终 TCP-pose filter 位于 pose transform 之后、共享 IK 之前；Agent 只携带
 已审查 profile/envelope 的不透明身份，不拥有数值安全、HOLD、IK 或 dispatch 逻辑。
+
+## 5. robosuite mixed-control 实验组织
+
+面向流式混合控制算法的 robosuite 基准属于实验线，不是生产遥操或 canonical
+dataset 入口。其目录边界、三种采集模式和后续晋级条件见
+[robosuite mixed-control 组织说明](./plans/robosuite-mixed-control-organization.md)。

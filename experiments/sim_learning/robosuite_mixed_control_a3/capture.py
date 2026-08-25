@@ -20,8 +20,6 @@ from experiments.sim_learning.streaming_intervention.a2 import (
     A2_ACTION_DIMENSION,
     A2_COMPONENT_IDS,
     A2_POLICY_REQUEST_HASH_DOMAIN,
-    A2_POLICY_SOURCE_KIND_RTC,
-    A2_POLICY_SOURCE_KIND_STANDARD,
     PolicyInferenceSourceA2,
     StreamingInterventionControlFrameA2,
 )
@@ -41,25 +39,23 @@ from sim.robosuite.adapter import (
     ROBOSUITE_MIXED_CONTROL_MODE_RELATIVE_OVERLAY_A0,
 )
 
-A3_COLLECTION_MODE_ORDINARY_TELEOP = "ordinary_teleop"
-A3_COLLECTION_MODE_TAKEOVER_TELEOP = "takeover_teleop"
-A3_COLLECTION_MODE_STREAMING_MIXED_CONTROL = "streaming_mixed_control"
-A3_COLLECTION_MODES = frozenset(
-    {
-        A3_COLLECTION_MODE_ORDINARY_TELEOP,
-        A3_COLLECTION_MODE_TAKEOVER_TELEOP,
-        A3_COLLECTION_MODE_STREAMING_MIXED_CONTROL,
-    }
+from .contracts import (
+    A3_COLLECTION_MODE_ORDINARY_TELEOP,
+    A3_COLLECTION_MODE_STREAMING_MIXED_CONTROL,
+    A3_COLLECTION_MODE_TAKEOVER_TELEOP,
+    A3_COLLECTION_MODES,
+    A3_DATASET_HASH_DOMAIN,
+    A3_OBSERVATION_HASH_DOMAIN,
+    A3_POLICY_VARIANT_NONE,
+    A3_POLICY_VARIANT_RTC,
+    A3_POLICY_VARIANT_STANDARD,
+    A3_POLICY_VARIANTS,
+    A3_ROW_HASH_DOMAIN,
+    A3CollectionProfile,
+    policy_variant,
+    resolve_collection_profile,
+    validate_collection_frames,
 )
-A3_POLICY_VARIANT_NONE = "none"
-A3_POLICY_VARIANT_STANDARD = A2_POLICY_SOURCE_KIND_STANDARD
-A3_POLICY_VARIANT_RTC = A2_POLICY_SOURCE_KIND_RTC
-A3_POLICY_VARIANTS = frozenset(
-    {A3_POLICY_VARIANT_NONE, A3_POLICY_VARIANT_STANDARD, A3_POLICY_VARIANT_RTC}
-)
-A3_OBSERVATION_HASH_DOMAIN = "dexteleop.robosuite_mixed_control.observation.a3"
-A3_ROW_HASH_DOMAIN = "dexteleop.robosuite_mixed_control.row.a3"
-A3_DATASET_HASH_DOMAIN = "dexteleop.robosuite_mixed_control.dataset.a3"
 
 
 def _required(value: object, *, name: str) -> str:
@@ -122,15 +118,6 @@ def _snapshot_observation(
     if not observation:
         raise ValueError(f"{name} must not be empty.")
     return MappingProxyType(dict(observation))
-
-
-def _policy_variant(policy_source: PolicyInferenceSourceA2 | None) -> str:
-    if policy_source is None:
-        return A3_POLICY_VARIANT_NONE
-    source_kind = str(getattr(policy_source, "source_kind", "")).strip()
-    if source_kind not in {A3_POLICY_VARIANT_STANDARD, A3_POLICY_VARIANT_RTC}:
-        raise ValueError(f"unsupported policy source kind {source_kind!r}.")
-    return source_kind
 
 
 @dataclass(frozen=True)
@@ -558,7 +545,11 @@ class RobosuiteMixedControlCaptureRunnerA3:
             raise TypeError("manifest must be a RobosuiteResetManifest.")
         collection_mode = _required(collection_mode, name="collection_mode")
         frame_values = tuple(frames)
-        self._validate_mode(collection_mode, frame_values)
+        profile, frame_values = validate_collection_frames(
+            collection_mode=collection_mode,
+            frames=frame_values,
+            policy_source=self._policy_source,
+        )
         recording_factory = _RecordingBackendFactory(self._backend_factory)
         run_result = StreamingInterventionPolicyRunnerA2(
             composer=self._composer,
@@ -572,7 +563,7 @@ class RobosuiteMixedControlCaptureRunnerA3:
             raise RuntimeError(
                 "recorded observation trace does not match executed step count."
             )
-        variant = _policy_variant(self._policy_source)
+        variant = profile.policy_variant
         rows = tuple(
             self._row_from_step(
                 manifest=manifest,
@@ -596,66 +587,6 @@ class RobosuiteMixedControlCaptureRunnerA3:
             source_run_hash=run_result.semantic_content_hash,
             rows=rows,
         )
-
-    def _validate_mode(
-        self,
-        collection_mode: str,
-        frames: tuple[StreamingInterventionControlFrameA2, ...],
-    ) -> None:
-        if collection_mode not in A3_COLLECTION_MODES:
-            raise ValueError(f"Unsupported A3 collection mode {collection_mode!r}.")
-        if not frames:
-            raise ValueError("A3 capture requires at least one frame.")
-        if any(
-            not isinstance(frame, StreamingInterventionControlFrameA2)
-            for frame in frames
-        ):
-            raise TypeError(
-                "frames must contain StreamingInterventionControlFrameA2 values."
-            )
-        variant = _policy_variant(self._policy_source)
-        if collection_mode == A3_COLLECTION_MODE_ORDINARY_TELEOP:
-            if variant != A3_POLICY_VARIANT_NONE:
-                raise ValueError("ordinary teleop cannot install a policy source.")
-            for frame in frames:
-                if (
-                    frame.mode != ROBOSUITE_MIXED_CONTROL_MODE_BASE_ONLY_A0
-                    or not frame.has_human_intervention
-                    or frame.base_action is not None
-                ):
-                    raise ValueError(
-                        "ordinary teleop requires human-only base_only frames."
-                    )
-            return
-        if collection_mode == A3_COLLECTION_MODE_TAKEOVER_TELEOP:
-            if variant != A3_POLICY_VARIANT_STANDARD:
-                raise ValueError("takeover teleop requires a standard policy source.")
-            for frame in frames:
-                if (
-                    frame.mode != ROBOSUITE_MIXED_CONTROL_MODE_ABSOLUTE_OVERLAY_OWNER_A0
-                    or not frame.has_human_intervention
-                    or frame.human_component_ids != A2_COMPONENT_IDS
-                ):
-                    raise ValueError(
-                        "takeover teleop requires full-component absolute human takeover."
-                    )
-            return
-        if variant not in {A3_POLICY_VARIANT_STANDARD, A3_POLICY_VARIANT_RTC}:
-            raise ValueError("streaming mixed control requires standard or RTC policy.")
-        for frame in frames:
-            if frame.mode != ROBOSUITE_MIXED_CONTROL_MODE_RELATIVE_OVERLAY_A0:
-                raise ValueError(
-                    "streaming mixed control requires relative_overlay frames."
-                )
-            if (
-                variant == A3_POLICY_VARIANT_STANDARD
-                and not frame.has_human_intervention
-            ):
-                raise ValueError("standard streaming rows require human intervention.")
-            if variant == A3_POLICY_VARIANT_RTC and frame.has_human_intervention:
-                raise ValueError("RTC streaming rows cannot mix human intervention.")
-            if variant == A3_POLICY_VARIANT_RTC and frame.base_action is None:
-                raise ValueError("RTC streaming rows require a nominal base action.")
 
     @staticmethod
     def _row_from_step(
@@ -727,7 +658,11 @@ __all__ = [
     "A3_POLICY_VARIANT_RTC",
     "A3_POLICY_VARIANT_STANDARD",
     "A3_ROW_HASH_DOMAIN",
+    "A3CollectionProfile",
     "RobosuiteMixedControlCaptureRunnerA3",
     "RobosuiteMixedControlDatasetA3",
     "RobosuiteMixedControlRowA3",
+    "policy_variant",
+    "resolve_collection_profile",
+    "validate_collection_frames",
 ]
