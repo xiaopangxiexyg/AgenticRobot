@@ -103,7 +103,7 @@ class TactileRecompressTest(unittest.TestCase):
                 (
                     "python",
                     "-m",
-                    "teleop_runtime.collection.replay_dataset_sapien",
+                    "teleop_runtime.replay",
                 )
             )
         )

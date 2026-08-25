@@ -700,68 +700,13 @@ python -m utils.dataset_postprocess validate-v23 /path/to/dataset
 命令成功返回 `0`；任何 contract/hash、causal timestamp、pose 副本、计数或外置文件错误
 均返回 `1` 并输出 JSON 诊断，不会修改原数据。
 
-## 10. 历史兼容工具：SAPIEN 回放（冻结）
+## 10. 历史 SAPIEN 回放已归档
 
-这里不存在独立的“SAPIEN 数据集”格式。[replay_dataset_sapien.py](replay_dataset_sapien.py)
-读取的是普通 LeRobot 风格 dataset root、episode parquet、视频和触觉字段；SAPIEN 只用于历史
-关节状态预览。该入口为旧实验复现冻结保留，不属于当前数采、仿真或发布路线，不再新增功能、
-调用方或验证结论。新的数据验收使用第 9 节的 canonical validator；新的仿真回放使用 MuJoCo
-或 backend-neutral 工具。
-
-历史复现命令：
-
-```bash
-python -m teleop_runtime.collection.replay_dataset_sapien \
-  --dataset-root datasets/demo_bimanual_no_camera \
-  --episode 1
-```
-
-如果该 episode 含相机视频，可以同步打开采集视频窗口：
-
-```bash
-python -m teleop_runtime.collection.replay_dataset_sapien \
-  --dataset-root /path/to/dataset_root \
-  --episode 0 \
-  --video-mode window \
-  --video-camera-key front
-```
-
-如果只想检查 parquet 和触觉统计，不启动 SAPIEN：
-
-```bash
-python -m teleop_runtime.collection.replay_dataset_sapien \
-  --dataset-root datasets/demo_bimanual_no_camera \
-  --episode 1 \
-  --skip-renderer \
-  --no-sleep
-```
-
-常用参数：
-
-- `--arm-source action|observation`
-  默认 `action`，使用 `action.replay.<side>_arm_joint_target` 复刻当时发出的 replay target；缺失时回退到 observation qpos。
-- `--hand-source action|observation|teleop|open`
-  默认 `action`，使用 `action.replay.<side>_hand_joint_target` 渲染手；缺失时回退到 observation hand qpos。`teleop` 会读取 `teleop.action_source.<side>_hand_q6`，并按当前 collector 默认 invert 语义转成 InspireTac command convention。
-- `--print-every N`
-  每 N 帧打印一次 tactile sum，默认每帧打印。
-- `--max-frames N`
-  只回放前 N 帧，`0` 表示完整 episode。
-- `--headless`
-  不打开 SAPIEN viewer window，但仍创建 renderer。
-- `--skip-renderer`
-  完全不创建 SAPIEN，仅用于轻量数据检查。
-- `--video-mode auto|window|off`
-  控制采集视频回放。`auto` 会在数据集有视频且有显示环境时打开 OpenCV 窗口，`window` 强制打开，`off` 禁用。
-- `--video-camera-key front`
-  只回放指定 camera key；不传则回放该 episode 中所有视频。
-
-打印格式示例：
-
-```text
-[Tactile] replay_i=000000 frame=000000 t=0.000s left_sum=0.022 right_sum=0.242 total=0.264
-```
-
-脚本结束时还会打印当前回放范围内的累计 tactile sum。
+旧的 `replay_dataset_sapien.py` 没有生产或 import caller，且不属于当前采集、仿真或发布路线，
+已从活动包移到 [`legacy/teleop_runtime/collection/replay_dataset_sapien.py`](../../legacy/teleop_runtime/collection/replay_dataset_sapien.py)。
+归档源码仅用于保留旧实验复现证据，不再提供 `python -m teleop_runtime.collection...` 命令，
+也不应被生产代码导入。新的数据验收继续使用第 9 节的 canonical `validate-v23`；新的仿真回放
+使用 MuJoCo 或 backend-neutral 工具。
 
 ## 11. 推荐操作流程
 
@@ -855,8 +800,8 @@ collector 启动后会打印按键输入来源：
   已支持 RealSense RGB 后台采集与 nearest-frame buffer
 - [realsense.json](../configs/devices/realsense.json)
   已提供默认单相机配置
-- [replay_dataset_sapien.py](replay_dataset_sapien.py)
-  冻结保留的历史预览入口；读取普通 LeRobot 风格 dataset，不是当前开发或发布能力
+- `legacy/teleop_runtime/collection/replay_dataset_sapien.py`
+  仅保留历史 SAPIEN 回放源码；不是当前开发或发布能力
 
 当前还没有完全闭环验证的部分是：
 
@@ -878,8 +823,8 @@ collector 启动后会打印按键输入来源：
 5. writer discard 检查：
    - 已验证 active episode 丢弃后，下一次 `start_episode()` 会复用未保存的 episode index
 6. dataset replay 检查：
-   - 历史上已验证 `replay_dataset_sapien.py --skip-renderer` 可以读取
-     `demo_bimanual_no_camera` 的 parquet 并打印触觉总和；该结果不代表 SAPIEN 路线仍受支持
+   - 当前只对 canonical `validate-v23` 和 backend-neutral/MuJoCo 路线做验证；历史 SAPIEN 回放
+     仅作为 `legacy/` 证据保存，不属于活动检查
 
 这些检查只覆盖：
 
