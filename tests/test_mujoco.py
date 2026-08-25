@@ -29,6 +29,21 @@ CAD_DUAL_ARM_URDF = Path(
 )
 
 
+@pytest.fixture(scope="module")
+def canonical_mjcf_xml() -> str:
+    """Convert the immutable canonical URDF once for pure XML assertions.
+
+    The conversion is intentionally kept inside the test module rather than
+    cached in production: the converter accepts mutable model and scene
+    inputs, while these assertions only need one stable canonical output.
+    The dump-mjcf CLI test below still exercises the real writer path.
+    """
+
+    model = parse_urdf(URDF)
+    cameras = discover_camera_mounts(model)
+    return convert_urdf_to_mjcf_xml(model, camera_mounts=cameras)
+
+
 def test_canonical_mujoco_package_replaces_legacy_namespace() -> None:
     legacy_namespace = ".".join(("sim", "mujoco_" + "real2sim"))
 
@@ -50,12 +65,10 @@ def test_discovers_registry_cameras_from_explicit_urdf() -> None:
 
 
 @pytest.mark.integration
-def test_mjcf_conversion_promotes_camera_links_to_mujoco_cameras() -> None:
-    model = parse_urdf(URDF)
-    cameras = discover_camera_mounts(model)
-
-    xml_text = convert_urdf_to_mjcf_xml(model, camera_mounts=cameras)
-    root = ET.fromstring(xml_text)
+def test_mjcf_conversion_promotes_camera_links_to_mujoco_cameras(
+    canonical_mjcf_xml: str,
+) -> None:
+    root = ET.fromstring(canonical_mjcf_xml)
     camera_names = {element.attrib["name"] for element in root.findall(".//camera")}
     joint_names = {element.attrib["name"] for element in root.findall(".//joint")}
 
@@ -173,8 +186,10 @@ f 1 2 3
 
 
 @pytest.mark.integration
-def test_mjcf_conversion_preserves_v3_rm65_base_link_obj_mtl_colors() -> None:
-    root = ET.fromstring(convert_urdf_to_mjcf_xml(parse_urdf(URDF), camera_mounts=()))
+def test_mjcf_conversion_preserves_v3_rm65_base_link_obj_mtl_colors(
+    canonical_mjcf_xml: str,
+) -> None:
+    root = ET.fromstring(canonical_mjcf_xml)
     geoms = root.findall(".//geom[@name]")
     base_visuals = [
         geom
