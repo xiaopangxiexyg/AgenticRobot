@@ -135,6 +135,16 @@ camera artifact 同时归一化，因此允许历史左右腕视频索引不同�
 调用者同时选择该输出根目录并显式传入 `--allow-camera-prepared-view` 才能训练。原
 `camera-semantics-materialize` 的完整克隆和触觉 retirement 门禁保持不变。
 
+`organize-episodes` 生成的物理合并源没有单一的
+`meta/devices/realsense.json`：每个输出 episode 通过
+`meta/provenance.jsonl` 绑定到
+`meta/source_devices/<source_dataset_name>/realsense.json`。prepared-view
+入口会要求这些复制后的 snapshot 全部存在、拒绝回退到外部源路径，并把 provenance 与每份
+snapshot 一起纳入冻结 inventory。这样同日多来源物理整理可以继续投影成严格的
+camera+numeric 视图，同时仍不遍历或复制 tactile payload。不要为通过检查而从多个来源中任选
+一份 RealSense snapshot 写成合并数据集的全局 snapshot；那会把不同采集会话的相机身份错误地
+统一。
+
 prepared view 也不会复制 `.lock` 等运行时文件；manifest 和严格 loader 都会拒绝这类文件。
 已经发布但不符合上述合同的试点目录不得继续放在默认可选目录中。先运行
 `camera-semantics-quarantine-invalid-view VIEW --audit-root AUDIT_ROOT` 生成冻结计划，随后携带
