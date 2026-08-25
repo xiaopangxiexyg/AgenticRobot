@@ -12,6 +12,9 @@
     "depth_height": 480,
     "depth_fps": 15,
     "align_depth_to_color": true,
+    "accept_near_zero_frames": true,
+    "startup_software_retry_attempts": 2,
+    "startup_software_retry_sleep_sec": 0.5,
     "startup_hardware_reset": false,
     "startup_hardware_reset_on_failure": false,
     "metadata": {
