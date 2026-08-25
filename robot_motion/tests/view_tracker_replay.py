@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from sim.contracts.scene import DEFAULT_RM65_PHYSICS_URDF
 from sim.mujoco.config import default_camera_registry_path
 from sim.mujoco.scene import MujocoScene
 
@@ -21,12 +22,9 @@ from .tracker_replay import (
 
 SIDES = ("left", "right")
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# V3 is the canonical visualization model; collision avoidance remains a
-# separately selected robot_motion scene profile.
-DEFAULT_VIEWER_URDF = (
-    REPO_ROOT
-    / "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
-)
+# Keep the viewer aligned with the canonical MuJoCo task-physics model;
+# collision avoidance remains a separately selected robot_motion scene profile.
+DEFAULT_VIEWER_URDF = REPO_ROOT / DEFAULT_RM65_PHYSICS_URDF
 FALLBACK_VIEWER_URDF = DEFAULT_VIEWER_URDF
 
 
@@ -77,8 +75,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "URDF loaded by MuJoCo. Default: assets/rm65_inspire_gripper_v3/"
-            "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+            "URDF loaded by MuJoCo. Default: "
+            f"{DEFAULT_RM65_PHYSICS_URDF}"
         ),
     )
     parser.add_argument(

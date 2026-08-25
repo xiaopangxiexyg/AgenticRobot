@@ -23,6 +23,7 @@ from robot_motion.tests.view_tracker_replay import (
     _should_print,
 )
 from robot_motion.tests.write_tracker_replay_report import write_offline_tracker_gui
+from sim.contracts.scene import DEFAULT_RM65_PHYSICS_URDF
 
 
 def _frame(index: int) -> OfflineTrackerReplayFrame:
@@ -157,7 +158,12 @@ def test_offline_tracker_viewer_helpers_use_dual_rm65_defaults() -> None:
     assert _parse_active_sides("both") == ("left", "right")
     assert _parse_active_sides("right") == ("right",)
 
-    assert _resolve_viewer_urdf(None).name == "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+    expected = (Path(__file__).resolve().parents[1] / DEFAULT_RM65_PHYSICS_URDF).resolve()
+    resolved = _resolve_viewer_urdf(None)
+    assert resolved == expected
+    assert resolved.name == (
+        "rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf"
+    )
 
 
 def test_offline_tracker_viewer_progress_predicate_is_keyword_only() -> None:
