@@ -13,13 +13,6 @@ DEFAULT_TRACKER_TO_HAND_ROTATION = np.eye(3, dtype=float)
 TRACKER_OFFSET_CALIBRATION_VERSION = 1
 
 
-def canonical_hand_rpy_is_legacy(value: Any) -> bool:
-    if value is None:
-        return True
-    array = np.asarray(value, dtype=float).reshape(3)
-    return bool(np.allclose(array, LEGACY_CANONICAL_HAND_RPY_DEG, atol=1e-6))
-
-
 def canonical_hand_rpy_default() -> np.ndarray:
     return DEFAULT_CANONICAL_HAND_RPY_DEG.copy()
 
