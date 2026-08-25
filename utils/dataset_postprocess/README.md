@@ -303,9 +303,10 @@ apply 都不会跳过 cold-copy 校验、restore drill 和退役前全量复核�
 
 对已经完成过导出、且标准全量 reader/restore 复核因数据量过大而不可接受的历史数据，批处理
 probe 还提供显式的 `--sampled-revalidation` 回退配置。默认不带此参数时仍采用原来的全量复核；
-启用后只把重复的首尾帧解码和 restore drill 限定为固定的 `sampled_v1` 样本（当前为确定性的
-16 个 manifest group，覆盖左右侧、时间线和每侧最大 group）。以下安全条件仍然是全量的，绝不
-抽样：
+启用后只把重复的首尾帧解码、restore drill，以及未发布 partial 续传树的 proposal/preflight
+哈希限定为固定的 `sampled_v1` 样本（当前为确定性的 16 个 manifest group，覆盖左右侧、时间线
+和每侧最大 group）。partial 中所有路径、类型、link count 和 size 仍逐项检查；apply 会逐文件
+验证完整 partial 前缀或完整文件。以下安全条件仍然是全量的，绝不抽样：
 
 - 新导出或复用的 cold artifact graph 必须逐文件验证 SHA-256、大小和独立 inode；
 - 所有 manifest 与引用结构都必须完整合法；

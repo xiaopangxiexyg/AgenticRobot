@@ -1083,6 +1083,61 @@ def test_sampled_detach_aborts_when_source_stat_changes_after_export(
     )
 
 
+def test_sampled_partial_precheck_is_bounded_but_apply_rejects_corruption(
+    tmp_path: Path,
+    offline_validation: object,
+) -> None:
+    root = _multi_group_dataset(tmp_path / "dataset")
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    inventory = build_modality_artifact_inventory(root)
+    artifact_root = storage._cold_artifact_root(cold, inventory)
+    stage = storage._cold_partial_root(artifact_root)
+    _write_json(stage / "inventory.json", inventory.to_dict())
+    for artifact in inventory.artifacts:
+        source = root / artifact.logical_path
+        target = stage / artifact.logical_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+    sampled_paths = {
+        item.logical_path
+        for group in storage._sampled_manifest_groups(inventory)
+        for item in group
+    }
+    corrupt = next(
+        artifact
+        for artifact in inventory.artifacts
+        if artifact.role == "payload"
+        and artifact.logical_path not in sampled_paths
+    )
+    corrupt_path = stage / corrupt.logical_path
+    value = bytearray(corrupt_path.read_bytes())
+    value[0] ^= 0xFF
+    corrupt_path.write_bytes(value)
+
+    assert storage._partial_export_reusable_bytes(
+        stage,
+        inventory,
+        revalidation_profile=storage.SAMPLED_REVALIDATION_V1,
+    ) == inventory.total_bytes
+    with pytest.raises(
+        storage.ModalityStorageError,
+        match="completed cold artifact differs from inventory",
+    ):
+        storage._export_shadow(
+            root,
+            artifact_root,
+            inventory,
+            require_distinct_device=False,
+            source_storage_id="hot",
+            target_storage_id="cold",
+            revalidation_profile=storage.SAMPLED_REVALIDATION_V1,
+        )
+    assert (root / corrupt.logical_path).is_file()
+    assert not artifact_root.exists()
+
+
 def test_legacy_scan_detach_binds_actual_bytes_when_sealed_hash_is_stale(
     tmp_path: Path,
     offline_validation: object,

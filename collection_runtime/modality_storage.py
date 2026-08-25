@@ -868,9 +868,12 @@ def _cold_transfer_lock(
 def _partial_export_reusable_bytes(
     stage: Path,
     inventory: ModalityArtifactInventoryV1,
+    *,
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> int:
     """Validate one deterministic partial tree and report allocated bytes."""
 
+    profile = _normalize_revalidation_profile(revalidation_profile)
     if not stage.exists():
         return 0
     if stage.is_symlink() or not stage.is_dir():
@@ -891,6 +894,15 @@ def _partial_export_reusable_bytes(
     expected: dict[str, Any] = {
         artifact.logical_path: artifact for artifact in inventory.artifacts
     }
+    sampled_hash_paths = (
+        {
+            item.logical_path
+            for group in _sampled_manifest_groups(inventory)
+            for item in group
+        }
+        if profile == SAMPLED_REVALIDATION_V1
+        else set(expected)
+    )
     allowed = {"inventory.json"}
     for logical_path in expected:
         target = stage / logical_path
@@ -933,7 +945,10 @@ def _partial_export_reusable_bytes(
                 raise ModalityStorageError(
                     f"completed cold artifact has a short size: {candidate}"
                 )
-            if _sha256_file(candidate) != str(artifact.sha256):
+            if (
+                logical_path in sampled_hash_paths
+                and _sha256_file(candidate) != str(artifact.sha256)
+            ):
                 raise ModalityStorageError(
                     f"completed cold artifact differs from inventory: {candidate}"
                 )
@@ -944,6 +959,8 @@ def _partial_export_reusable_bytes(
 def _prepare_partial_export_stage(
     stage: Path,
     inventory: ModalityArtifactInventoryV1,
+    *,
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> None:
     if not stage.exists():
         stage.mkdir(parents=True)
@@ -954,7 +971,11 @@ def _prepare_partial_export_stage(
                 f"cold partial tree has no inventory binding: {stage}"
             )
         _atomic_write_json(inventory_path, inventory.to_dict())
-    _partial_export_reusable_bytes(stage, inventory)
+    _partial_export_reusable_bytes(
+        stage,
+        inventory,
+        revalidation_profile=revalidation_profile,
+    )
 
 
 def _payload_summary(
@@ -1278,6 +1299,7 @@ def _plan(
                 reusable_export_bytes = _partial_export_reusable_bytes(
                     partial_root,
                     inventory,
+                    revalidation_profile=profile,
                 )
         except Exception as exc:
             errors.append(f"cold artifact root is not reusable: {exc}")
@@ -1625,7 +1647,9 @@ def _export_shadow(
     allow_hardlinked_source: bool = False,
     publish_source_receipt: bool = True,
     cold_staging_namespace: str = "",
+    revalidation_profile: str = FULL_REVALIDATION,
 ) -> Path:
+    profile = _normalize_revalidation_profile(revalidation_profile)
     with _cold_transfer_lock(
         artifact_root,
         staging_namespace=cold_staging_namespace,
@@ -1649,11 +1673,19 @@ def _export_shadow(
                 require_distinct_device=require_distinct_device,
             )
             if stage.exists():
-                _partial_export_reusable_bytes(stage, inventory)
+                _partial_export_reusable_bytes(
+                    stage,
+                    inventory,
+                    revalidation_profile=profile,
+                )
                 shutil.rmtree(stage)
                 _fsync_directory(stage.parent)
         else:
-            _prepare_partial_export_stage(stage, inventory)
+            _prepare_partial_export_stage(
+                stage,
+                inventory,
+                revalidation_profile=profile,
+            )
             _copy_inventory_artifacts_resumable(
                 dataset_root,
                 stage,
@@ -2303,6 +2335,7 @@ def detach_modality(
                 source_storage_id=source_storage_id,
                 target_storage_id=target_storage_id,
                 allow_hardlinked_source=allow_legacy_hardlinked_source,
+                revalidation_profile=profile,
             )
         ]
         source_snapshot = (
