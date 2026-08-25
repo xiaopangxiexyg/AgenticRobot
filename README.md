@@ -1,12 +1,22 @@
 # DexTeleop
 
+## 1. 首先下载运行资产（必需）
+
+开始安装、测试或运行前，请先下载永久有效的
+[`assets.zip`](https://disk.pku.edu.cn/link/AACC5274EC91084D4FBF25786B5A9FCE36)，并解压到本机稳定目录。
+解压后，将包含所需 bundle 的 `assets/` 目录配置为本 clone 的共享资产根：
+
+```bash
+python scripts/dev_asset_store.py configure --asset-root /absolute/path/to/assets
+```
+
+不要为每个 linked worktree 重复复制约 3 GB 资产。配置一次后，`claim_worktree.py`
+会自动建立兼容映射并验证必需的 RM65 bundle；详细规则见
+[`CONTRIBUTING.md`](./CONTRIBUTING.md)。
+
 DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy deploy、replay、simulation
 和 dataset contracts。运行命令按领域统一维护在 [`docs/`](./docs/README.md)，不要从历史
 实验报告或日志中拼接参数。
-
-解压后不要为每个 linked worktree 复制约 3 GB 资产。按
-[`CONTRIBUTING.md`](./CONTRIBUTING.md) 用 `dev_asset_store.py configure` 记录一次本机资产根；
-以后 `claim_worktree.py` 会自动建立兼容映射并验证必需的 RM65 bundle。
 
 ## 从这里开始
 
