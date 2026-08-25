@@ -48,7 +48,7 @@ The read-only inventory identified these candidates on
    and short-episode mix make it unsuitable as the default first benchmark.
    The high-invalid-rate 2026-08-24 directory should not be the first fit.
 
-The remote manifest hash is
+The remote policy I/O layout hash declared by `meta/info.json` is
 `sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16`.
 The checked-in v2.2 runtime layout currently derives
 `sha256:52e4bc42ad0a0e562c357e41da1ee2cbd827b4dc98643ffb73fe7acfeafc66ab`
