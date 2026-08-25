@@ -68,7 +68,6 @@ from .sim_hil_profile.human import (
     _SimHILHumanAttachment,
     _bind_vive_coordinate_profile,
     _build_passive_single_vive_gripper_component_source,
-    _build_passive_vive_q6_component_source,
     _build_single_vive_gripper_component_source_spec,
     _file_sha256,
 )
