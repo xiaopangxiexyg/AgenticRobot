@@ -80,6 +80,8 @@ def test_state_policy_adapter_projects_16d_model_output_to_existing_26d_action()
     assert action.vector[14] == pytest.approx(0.3)
     assert action.vector[20] == pytest.approx(0.7)
     assert action.metadata["state_bc_model_artifact_hash"] == "sha256:fixture"
+    projected = adapter.project_model_action(prediction.model_action, source="fixture")
+    np.testing.assert_allclose(projected.vector, action.vector)
 
 
 def test_canonical_desk_mode_requires_an_explicit_pose_frame_contract():

@@ -36,6 +36,14 @@ from .hitl import (
     StateBCHITLTrace,
 )
 from .model import StateBCModel, fit_linear_state_bc
+from .stream import (
+    STREAM_RUNTIME_ACTION_DIM,
+    STREAM_RUNTIME_ACTION_LAYOUT,
+    STREAM_RUNTIME_ACTION_SPACE,
+    StateBCStreamEvent,
+    StateBCStreamTrace,
+    StateBCStreamingRunner,
+)
 
 __all__ = [
     "HITL_EVENT_ACTION",
@@ -63,6 +71,12 @@ __all__ = [
     "StateBCHITLEvent",
     "StateBCHITLRunner",
     "StateBCHITLTrace",
+    "StateBCStreamEvent",
+    "StateBCStreamTrace",
+    "StateBCStreamingRunner",
+    "STREAM_RUNTIME_ACTION_DIM",
+    "STREAM_RUNTIME_ACTION_LAYOUT",
+    "STREAM_RUNTIME_ACTION_SPACE",
     "fit_linear_state_bc",
     "validate_action_vector",
     "validate_state_vector",

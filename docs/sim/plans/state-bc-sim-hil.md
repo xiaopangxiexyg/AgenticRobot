@@ -25,6 +25,15 @@ and action adapter, and a source-lineage test seam. The existing
 IK, and dispatch. No new queue, authority, simulator entrypoint, device
 worker, GUI, or hardware path is introduced.
 
+The stream seam deliberately has two typed spaces. State-BC inference keeps the
+16D model state/action contract above, while every executable policy, human, or
+RTC replacement is normalized to the current 26D
+`deploy_action_vector.ee_pose_q6.v1` / `bimanual_ee_pose_v1` action boundary.
+`StatePolicyAdapter.project_model_action()` is the single 16D-to-26D bridge;
+the streaming runner records both representations and injects the resulting
+action into an execution callback. It does not own safety, IK, dispatch,
+episode reset, or a second control loop.
+
 ## Dataset selector
 
 The selector names source directories explicitly and stores every excluded
@@ -132,6 +141,10 @@ HITL is tested as exclusive source selection, not action blending:
 - `rtc_no_action`, hold, and activation events never become policy-training
   samples;
 - the trace records source, activation, inference mode, and action lineage;
+- `experiments/sim_learning/state_bc/stream.py` accepts a 26D human action,
+  runs ordinary policy inference, and gives RTC the 16D state plus nominal
+  16D/26D actions; RTC may return no action, a 26D runtime replacement, or a
+  16D replacement that uses the shared adapter bridge;
 - lower runtime safety/IK/dispatch remains authoritative after the adapter.
 
 This is sufficient to compare ordinary teleoperation, takeover/handback, and
@@ -144,7 +157,11 @@ that runtime with a parallel simulator control loop.
 The current Task now proves the contracts, explicit 2026-08-07 selector,
 real-data state-only fit, self-contained artifact round trip, 16D-to-26D
 projection, frame-contract failure-closed behavior, and exclusive HITL
-lineage. The real-artifact adapter smoke was observation-only: it projected one
+lineage. `tests/test_state_bc_stream.py` additionally proves the bounded
+streaming runner's ordinary policy, human takeover/handback, RTC replacement,
+RTC `no_action`, and exclusive 26D runtime action sink; the adapter test also
+checks that the reusable projection helper matches ordinary prediction. The
+real-artifact adapter smoke was observation-only: it projected one
 recorded state through the existing bridge and produced a finite 26D action,
 without stepping physics. The real-artifact HITL trace exercised policy,
 human takeover/handback, RTC replacement, and RTC `no_action`; HOLD,
