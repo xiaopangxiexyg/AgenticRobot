@@ -32,7 +32,7 @@ from robot_motion.frames import TOOL_TCP_FRAME
 from robot_motion.pose_smoothing import build_bimanual_pose_smoother
 from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
 from robot_motion.transforms import as_pose_matrix
-from robot_motion.rm65.ik_tuning import IKObjectiveWeights, load_ik_tuning_config
+from robot_motion.rm65.ik_tuning import load_ik_tuning_config
 from teleop_runtime.configs import load_default_pose_smoothing_config
 from teleop_runtime.retargeters.dual_arm_collision_aware import (
     DualArmCollisionAwareRetargeter,
