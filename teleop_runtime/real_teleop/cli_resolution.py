@@ -16,6 +16,11 @@ import sys
 
 import numpy as np
 
+from collection_runtime.progress.profiles import (
+    inspect_dataset_progress_profile,
+    inspect_dataset_task_stage_profile,
+)
+
 from .artifact_context import configure_real_teleop_artifact_paths
 from .hitl_cli import add_exclusive_hitl_arguments
 from .position_admittance_shadow import (
@@ -30,7 +35,7 @@ from .position_admittance_shadow import (
 from .progress_adapter import (
     resolve_real_teleop_default_progress_profile,
     resolve_real_teleop_progress_entry,
-    resolve_real_teleop_task_stage_profile,
+    resolve_real_teleop_stage_profile_for_admission,
     validate_real_teleop_initial_progress_profile,
 )
 
@@ -704,6 +709,10 @@ def _parse_real_teleop_args(
         print(f"WARNING: arm execution profile: {compatibility_warning}", file=sys.stderr)
     _apply_real_loop_timing_defaults(args, raw_argv=raw_argv)
     args._dataset_name_explicit = _argv_has_option(raw_argv, "--dataset-name")
+    args._collection_stage_profile_explicit = _argv_has_option(
+        raw_argv,
+        "--collection-stage-profile",
+    )
     try:
         _resolve_movement_multiple_args(args, raw_arg_set=raw_arg_set)
         _resolve_workspace_override_args(args)
@@ -745,10 +754,23 @@ def _parse_real_teleop_args(
         except (TypeError, ValueError) as exc:
             parser.error(str(exc))
         try:
-            stage_profile = resolve_real_teleop_task_stage_profile(
+            progress_admission = inspect_dataset_progress_profile(
+                Path(args.dataset_root),
+                requested_profile=progress_profile,
+            )
+            stage_profile = resolve_real_teleop_stage_profile_for_admission(
                 progress_profile,
                 getattr(args, "collection_stage_profile", ""),
+                dataset_progress_locked=bool(progress_admission.locked),
+                configured_stage_profile_explicit=bool(
+                    args._collection_stage_profile_explicit
+                ),
             )
+            stage_profile = inspect_dataset_task_stage_profile(
+                Path(args.dataset_root),
+                progress_profile=progress_profile,
+                requested_profile=stage_profile,
+            ).profile
             resolve_real_teleop_progress_entry(
                 progress_profile=progress_profile,
                 stage_profile=stage_profile,

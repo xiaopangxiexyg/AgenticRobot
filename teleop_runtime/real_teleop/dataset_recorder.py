@@ -129,6 +129,7 @@ from .movement import movement_multiple_value as _movement_multiple_value
 from .progress_adapter import (
     RealTeleopProgressEpisode,
     resolve_real_teleop_progress_profile,
+    resolve_real_teleop_stage_profile_for_admission,
     resolve_real_teleop_task_stage_profile,
 )
 from .progress_arm_control import strict_progress_arm_sample_rejection
@@ -373,9 +374,17 @@ class RealTeleopDatasetRecorder:
         # sidecar merely because the CLI option was omitted.
         if self.progress_profile is not None:
             self.args.collection_progress_profile = self.progress_profile
-            requested_stage_profile = resolve_real_teleop_task_stage_profile(
+            requested_stage_profile = resolve_real_teleop_stage_profile_for_admission(
                 self.progress_profile,
                 getattr(args, "collection_stage_profile", ""),
+                dataset_progress_locked=bool(progress_admission.locked),
+                configured_stage_profile_explicit=bool(
+                    getattr(
+                        args,
+                        "_collection_stage_profile_explicit",
+                        False,
+                    )
+                ),
             )
             stage_admission = inspect_dataset_task_stage_profile(
                 self.dataset_root,
@@ -903,10 +912,11 @@ class RealTeleopDatasetRecorder:
             getattr(self.args, "collection_progress_profile", None),
             collection_task_id=str(self.args.collection_task_id),
         )
-        desired_progress_profile = inspect_dataset_progress_profile(
+        desired_progress_admission = inspect_dataset_progress_profile(
             desired_root,
             requested_profile=requested_progress_profile,
-        ).profile
+        )
+        desired_progress_profile = desired_progress_admission.profile
         existing_progress_profile = getattr(self, "progress_profile", None)
         desired_stage_profile = (
             None
@@ -914,9 +924,17 @@ class RealTeleopDatasetRecorder:
             else inspect_dataset_task_stage_profile(
                 desired_root,
                 progress_profile=desired_progress_profile,
-                requested_profile=resolve_real_teleop_task_stage_profile(
+                requested_profile=resolve_real_teleop_stage_profile_for_admission(
                     desired_progress_profile,
                     getattr(self.args, "collection_stage_profile", ""),
+                    dataset_progress_locked=bool(desired_progress_admission.locked),
+                    configured_stage_profile_explicit=bool(
+                        getattr(
+                            self.args,
+                            "_collection_stage_profile_explicit",
+                            False,
+                        )
+                    ),
                 ),
             ).profile
         )

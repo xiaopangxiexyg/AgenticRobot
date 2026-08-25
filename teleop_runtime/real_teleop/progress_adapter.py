@@ -219,6 +219,36 @@ def resolve_real_teleop_task_stage_profile(
     return result
 
 
+def resolve_real_teleop_stage_profile_for_admission(
+    progress_profile: TaskProgressProfileV1 | None,
+    configured_stage_profile: object = None,
+    *,
+    dataset_progress_locked: bool,
+    configured_stage_profile_explicit: bool,
+) -> TaskStageProfileV1 | None:
+    """Choose the stage request without overriding a persisted dataset binding.
+
+    A managed coarse profile has a same-name stage profile, so the ordinary
+    resolver intentionally auto-selects that coarse variant when the option is
+    empty.  That is correct for a blank dataset, but it is unsafe on restart:
+    a dataset may already be immutably bound to the detailed variant.  In that
+    case an omitted stage option must leave the request empty so dataset
+    admission can return the exact persisted profile.  An explicitly supplied
+    stage option still goes through normal validation and is rejected when it
+    conflicts with the dataset binding.
+    """
+
+    if (
+        dataset_progress_locked
+        and not configured_stage_profile_explicit
+    ):
+        return None
+    return resolve_real_teleop_task_stage_profile(
+        progress_profile,
+        configured_stage_profile,
+    )
+
+
 def resolve_real_teleop_progress_entry(
     *,
     progress_profile: TaskProgressProfileV1,
@@ -1003,6 +1033,7 @@ __all__ = [
     "real_teleop_managed_progress_selection_id",
     "resolve_real_teleop_progress_profile",
     "resolve_real_teleop_default_progress_profile",
+    "resolve_real_teleop_stage_profile_for_admission",
     "select_real_teleop_managed_progress_profile",
     "select_real_teleop_progress_entry_step",
     "validate_real_teleop_initial_progress_profile",
