@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -139,6 +137,12 @@ from .calibration_profile import (
     qpos6_deg_to_rad as _qpos6_deg_to_rad,
     qpos6_radians_look_suspicious as _qpos6_radians_look_suspicious,
 )
+from .collection_layout import (
+    apply_collection_layout as _apply_collection_layout,
+    default_task_id_from_name as _default_task_id_from_name,
+    resolve_collection_layout as _resolve_collection_layout,
+    sanitize_task_name_for_path as _sanitize_task_name_for_path,
+)
 from .gripper_policy_config import (
     GRIPPER_POLICY_DEFAULTS,  # noqa: F401 - preserve the historical public export.
     dmtac_tactile_enabled as _dmtac_tactile_enabled,
@@ -200,53 +204,6 @@ def _collection_hand_action_specs(
     if not dmtac_sides:
         return None
     return {side: HandActionSpec.dmtac_gripper(side) for side in dmtac_sides}
-
-
-def _sanitize_task_name_for_path(task_name: str) -> str:
-    text = str(task_name).strip()
-    if not text:
-        return "task"
-    text = re.sub(r"[\\/]+", "-", text)
-    text = re.sub(r"\s+", "_", text)
-    text = re.sub(r"_+", "_", text)
-    text = text.strip("._-")
-    return text or "task"
-
-
-def _default_task_id_from_name(task_name: str) -> str:
-    slug = _sanitize_task_name_for_path(task_name).lower()
-    slug = re.sub(r"[^0-9a-z_-]+", "_", slug)
-    slug = re.sub(r"_+", "_", slug).strip("._-")
-    return slug or "task"
-
-
-def _resolve_collection_layout(args: argparse.Namespace) -> tuple[Path, str, str, str, str]:
-    legacy_task = str(getattr(args, "task", "")).strip()
-    task_name = str(getattr(args, "task_name", "")).strip() or legacy_task or "default"
-    task_id = (
-        str(getattr(args, "task_id", "")).strip()
-        or legacy_task
-        or _default_task_id_from_name(task_name)
-    )
-    task_description = str(getattr(args, "task_description", "")).strip() or task_name
-    date_prefix = datetime.now().strftime("%Y-%m-%d")
-    dataset_dir_name = f"{date_prefix}_{_sanitize_task_name_for_path(task_name)}"
-    dataset_root = Path(args.dataset_root).expanduser() / dataset_dir_name
-    dataset_name = str(getattr(args, "dataset_name", "")).strip() or dataset_dir_name
-    return dataset_root, task_name, task_id, task_description, dataset_name
-
-
-def _apply_collection_layout(args: argparse.Namespace) -> None:
-    dataset_base_root = Path(args.dataset_root).expanduser()
-    dataset_root, task_name, task_id, task_description, dataset_name = _resolve_collection_layout(args)
-    args.dataset_base_root = str(dataset_base_root)
-    args.dataset_root = str(dataset_root)
-    args.dataset_dir_name = dataset_root.name
-    args.task_name = task_name
-    args.task_id = task_id
-    args.task = task_id
-    args.task_description = task_description
-    args.dataset_name = dataset_name
 
 
 def _apply_default_q6_ports(
