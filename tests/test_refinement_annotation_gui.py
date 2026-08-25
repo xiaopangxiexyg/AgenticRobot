@@ -1526,6 +1526,14 @@ def test_detail_profile_selection_is_optional_and_survives_coarse_seal(
             badge["code"]
             for badge in reopened["annotation_status"]["badges"]
         }
+        coarse_summary = application.episode_annotation_summaries(
+            (episode_uuid,)
+        )["summaries"][0]
+        assert coarse_summary["detail_annotation_state"] == "NOT_APPLICABLE"
+        assert "DETAIL_PENDING" not in {
+            badge["code"]
+            for badge in coarse_summary["annotation_status"]["badges"]
+        }
 
         sealed = application.commit(episode_uuid, reopened["draft"])
         assert sealed["draft"]["detail_profile_selection_id"] == ""
@@ -1549,6 +1557,10 @@ def test_detail_profile_selection_is_optional_and_survives_coarse_seal(
         ] == selection_id
         assert with_detail["detail_annotation"]["available"] is True
         assert with_detail["draft"]["detail_overlay"] is not None
+        detailed_summary = application.episode_annotation_summaries(
+            (episode_uuid,)
+        )["summaries"][0]
+        assert detailed_summary["detail_annotation_state"] == "PENDING"
     finally:
         application.close()
 

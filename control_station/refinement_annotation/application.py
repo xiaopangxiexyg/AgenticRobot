@@ -6,6 +6,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import errno
+import json
 import math
 import os
 import threading
@@ -859,6 +860,40 @@ class RefinementAnnotationApplication:
         item: ProgressAnnotationWorkItem,
     ) -> tuple[tuple[DetailProfileSelection, ...], str | None]:
         return self._detail_annotations.profile_selections(item)
+
+    def _persisted_detail_profile_selection_id(
+        self,
+        item: ProgressAnnotationWorkItem,
+    ) -> str | None:
+        """Read the optional selector for sidebar status without an Episode lock.
+
+        The visible Episode summary is deliberately a read-only batch path and
+        cannot acquire an editing lock for every row.  Drafts are atomically
+        replaced by :class:`DatasetStageAnnotationWorkspace`, so reading this
+        small selector directly is safe and keeps the summary consistent with
+        an explicit coarse-only choice across process restarts.  A missing or
+        legacy/malformed draft preserves the historical ``None`` resolution.
+        """
+
+        try:
+            payload = json.loads(
+                self.workspace.draft_path(
+                    episode_uuid=item.episode_uuid,
+                ).read_text(encoding="utf-8")
+            )
+        except (
+            FileNotFoundError,
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+        ):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        value = payload.get("detail_profile_selection_id")
+        if value is None:
+            return None
+        return value.strip() if isinstance(value, str) else None
 
     def _current_detail_annotation_set(
         self,
@@ -2058,9 +2093,11 @@ class RefinementAnnotationApplication:
         if load_annotations and annotation_summary is not None:
             if annotation_sets is None:
                 annotation_sets = self._sealed_annotation_sets(item)
+            selection_id = self._persisted_detail_profile_selection_id(item)
             detail_status = self._detail_annotations.status(
                 item,
                 annotation_sets,
+                selection_id=selection_id,
             )
             detail_annotation_complete = detail_status.complete
             detail_annotation_state = detail_status.state
