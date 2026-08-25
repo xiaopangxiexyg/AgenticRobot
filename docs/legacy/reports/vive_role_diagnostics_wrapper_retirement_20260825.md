@@ -25,6 +25,10 @@ format, role mapping, or observation contract.
 - The root `legacy/` directory remains strictly local and untracked. This report
   is the versioned historical explanation under `docs/legacy/`.
 
+## Related retirement reports
+
+- [DMTAC duplicate gripper driver retirement](./dmtac_gripper_driver_legacy_retirement_20260825.md)
+
 ## Verification
 
 ```bash
