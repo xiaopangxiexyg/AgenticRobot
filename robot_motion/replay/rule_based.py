@@ -18,8 +18,13 @@ import numpy as np
 from robot_motion.action import RobotAction
 from robot_motion.action.schema import normalize_side
 from robot_motion.action.sources import RobotActionSource
+from robot_motion.relative_action import pose_matrix_to_xyzquat
 
 from .action_frame import replay_robot_action_at_index
+from .fixed_trajectory import (
+    build_fixed_trajectory_targets,
+    normalize_fixed_trajectory_direction,
+)
 from .rule_based_relative import (
     RuleBasedBoundaryState,
     rebase_replay_action_at_boundary,
@@ -35,6 +40,7 @@ from .trajectory import (
 )
 
 RULE_BASED_COLLECTION_PLAN_SCHEMA_V1 = "dexteleop.rule_based_collection_plan.v1"
+RULE_BASED_FIXED_TRAJECTORY_SCHEMA_V1 = "dexteleop.rule_based_fixed_trajectory.v1"
 
 
 def _required_text(value: object, *, name: str) -> str:
@@ -57,6 +63,13 @@ def _positive_int(value: object, *, name: str) -> int:
     normalized = _non_negative_int(value, name=name)
     if normalized <= 0:
         raise ValueError(f"{name} must be positive.")
+    return normalized
+
+
+def _positive_float(value: object, *, name: str) -> float:
+    normalized = float(value)
+    if not np.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"{name} must be finite and positive.")
     return normalized
 
 
@@ -172,6 +185,68 @@ class RuleBasedCustomAction:
 
 
 @dataclass(frozen=True)
+class RuleBasedFixedTrajectory:
+    """Replay one catalogued canonical-desk path from a measured boundary.
+
+    The trajectory provider is hardware-free. ``boundary_ref`` is resolved
+    through the cursor's existing boundary provider at expansion time, so a
+    caller can publish the actual end state of the preceding phase before the
+    next directive is requested.
+    """
+
+    step_id: str
+    trajectory_id: str
+    boundary_ref: str
+    scale_m: float
+    linear_speed_m_s: float
+    active_sides: tuple[str, ...] = ("left", "right")
+    side: str = "right"
+    direction: str = "up"
+    yaw_rad: float | None = None
+    catalog_path: str | None = None
+    capture: RuleBasedCaptureSelection = field(default_factory=RuleBasedCaptureSelection)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "step_id", _required_text(self.step_id, name="step_id"))
+        object.__setattr__(
+            self,
+            "trajectory_id",
+            _required_text(self.trajectory_id, name="trajectory_id"),
+        )
+        object.__setattr__(
+            self,
+            "boundary_ref",
+            _required_text(self.boundary_ref, name="boundary_ref"),
+        )
+        object.__setattr__(self, "scale_m", _positive_float(self.scale_m, name="scale_m"))
+        object.__setattr__(
+            self,
+            "linear_speed_m_s",
+            _positive_float(self.linear_speed_m_s, name="linear_speed_m_s"),
+        )
+        active_sides = _normalize_sides(self.active_sides)
+        object.__setattr__(self, "active_sides", active_sides)
+        side = normalize_side(str(self.side).strip().lower())
+        if side not in active_sides:
+            raise ValueError("side must be included in active_sides.")
+        object.__setattr__(self, "side", side)
+        object.__setattr__(
+            self,
+            "direction",
+            normalize_fixed_trajectory_direction(self.direction),
+        )
+        if self.yaw_rad is not None:
+            yaw_rad = float(self.yaw_rad)
+            if not np.isfinite(yaw_rad):
+                raise ValueError("yaw_rad must be finite.")
+            object.__setattr__(self, "yaw_rad", yaw_rad)
+        if self.catalog_path is not None:
+            object.__setattr__(self, "catalog_path", str(self.catalog_path))
+        if not isinstance(self.capture, RuleBasedCaptureSelection):
+            raise TypeError("capture must be RuleBasedCaptureSelection.")
+
+
+@dataclass(frozen=True)
 class RuleBasedSegmentContext:
     """Inputs supplied to a runtime rule-based segment stop predicate."""
 
@@ -251,6 +326,7 @@ RuleBasedStep: TypeAlias = (
     RuleBasedInitialize
     | RuleBasedReplay
     | RuleBasedCustomAction
+    | RuleBasedFixedTrajectory
     | RuleBasedActionSegment
 )
 RuleBasedBoundaryProvider: TypeAlias = (
@@ -276,6 +352,7 @@ class RuleBasedCollectionPlan:
                     RuleBasedInitialize,
                     RuleBasedReplay,
                     RuleBasedCustomAction,
+                    RuleBasedFixedTrajectory,
                     RuleBasedActionSegment,
                 ),
             )
@@ -305,7 +382,7 @@ class RuleBasedCollectionDirective:
     segment_stop_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in {"initialize", "replay", "custom_action"}:
+        if self.kind not in {"initialize", "replay", "custom_action", "fixed_trajectory"}:
             raise ValueError(f"Unsupported directive kind {self.kind!r}.")
         if not isinstance(self.capture, RuleBasedCaptureSelection):
             raise TypeError("capture must be RuleBasedCaptureSelection.")
@@ -605,6 +682,69 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
                     },
                 )
             return
+        if isinstance(step, RuleBasedFixedTrajectory):
+            boundary = self._boundary_for(step.boundary_ref)
+            missing_sides = sorted(set(step.active_sides) - set(boundary.tcp_pose_by_side))
+            if missing_sides:
+                raise ValueError(
+                    f"Fixed trajectory {step.step_id!r} boundary is missing side(s): "
+                    f"{missing_sides}"
+                )
+            noncanonical_frames = {
+                side: boundary.pose_frame_by_side[side]
+                for side in step.active_sides
+                if boundary.pose_frame_by_side.get(side) != "canonical_desk"
+            }
+            if noncanonical_frames:
+                raise ValueError(
+                    "Fixed trajectory requires canonical_desk boundary poses; "
+                    f"got {noncanonical_frames}"
+                )
+            targets = build_fixed_trajectory_targets(
+                boundary.tcp_pose_by_side,
+                step.trajectory_id,
+                scale_m=step.scale_m,
+                linear_speed_m_s=step.linear_speed_m_s,
+                side=step.side,
+                direction=step.direction,
+                yaw_rad=step.yaw_rad,
+                catalog_path=step.catalog_path,
+            )
+            for trajectory_index, target in enumerate(targets):
+                poses = {
+                    side: pose_matrix_to_xyzquat(target.pose_by_side[side])
+                    for side in step.active_sides
+                }
+                action = RobotAction.bimanual_ee_pose(
+                    left_arm=poses.get("left"),
+                    right_arm=poses.get("right"),
+                    timestamp=float(target.timestamp),
+                    source="rule_based_fixed_trajectory",
+                    metadata={
+                        **dict(target.metadata),
+                        "rule_based_schema": RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
+                        "fixed_trajectory_schema": RULE_BASED_FIXED_TRAJECTORY_SCHEMA_V1,
+                        "rule_based_step_index": int(step_index),
+                        "fixed_trajectory_index": int(trajectory_index),
+                        "fixed_trajectory_boundary_ref": step.boundary_ref,
+                    },
+                )
+                yield RuleBasedCollectionDirective(
+                    sequence_index=step_index,
+                    step_id=step.step_id,
+                    kind="fixed_trajectory",
+                    capture=step.capture,
+                    action=action,
+                    metadata={
+                        **dict(target.metadata),
+                        "rule_based_schema": RULE_BASED_COLLECTION_PLAN_SCHEMA_V1,
+                        "fixed_trajectory_schema": RULE_BASED_FIXED_TRAJECTORY_SCHEMA_V1,
+                        "rule_based_step_index": int(step_index),
+                        "fixed_trajectory_index": int(trajectory_index),
+                        "fixed_trajectory_boundary_ref": step.boundary_ref,
+                    },
+                )
+            return
         if isinstance(step, RuleBasedActionSegment):
             raise TypeError(
                 "Runtime action segments must be expanded with next_runtime()."
@@ -674,6 +814,7 @@ class RuleBasedCollectionCursor(Iterator[RuleBasedCollectionDirective]):
 
 __all__ = [
     "RULE_BASED_COLLECTION_PLAN_SCHEMA_V1",
+    "RULE_BASED_FIXED_TRAJECTORY_SCHEMA_V1",
     "RuleBasedActionSegment",
     "RuleBasedBoundaryProvider",
     "RuleBasedCaptureSelection",
@@ -681,6 +822,7 @@ __all__ = [
     "RuleBasedCollectionDirective",
     "RuleBasedCollectionPlan",
     "RuleBasedCustomAction",
+    "RuleBasedFixedTrajectory",
     "RuleBasedInitialize",
     "RuleBasedReplay",
     "RuleBasedSegmentContext",

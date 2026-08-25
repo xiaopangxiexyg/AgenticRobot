@@ -10,8 +10,10 @@ The default sequence is:
 
 1. move the simulated arms to the first frame of stage A without recording;
 2. record an absolute replay of stage A;
-3. record one right-TCP circle in the desk XY plane;
-4. measure the post-circle TCP boundary;
+3. record one right-TCP fixed trajectory in the desk XY plane (a circle by
+   default, or a catalogued one-stroke digit when ``--fixed-trajectory-id`` is
+   supplied);
+4. measure the post-fixed-trajectory TCP boundary;
 5. rebase stage B on that measured boundary and record the relative replay.
 
 Stage windows use half-open source-frame spans (``start:end``), so the
@@ -40,6 +42,10 @@ from robot_motion.position_control import (
     resample_motion_targets,
 )
 from robot_motion.relative_action import pose_matrix_to_xyzquat
+from robot_motion.replay.fixed_trajectory import (
+    FIXED_TRAJECTORY_DIRECTIONS,
+    build_fixed_trajectory_targets,
+)
 from robot_motion.replay.rule_based_relative import (
     RuleBasedBoundaryState,
     rebase_replay_action_at_boundary,
@@ -76,6 +82,8 @@ DEFAULT_CIRCLE_STEPS = 61
 DEFAULT_CIRCLE_RADIUS_M = 0.025
 DEFAULT_CIRCLE_HZ: float | None = None
 DEFAULT_CIRCLE_SPEED_SIDE = "right"
+DEFAULT_FIXED_TRAJECTORY_SCALE_M = 0.08
+DEFAULT_FIXED_TRAJECTORY_DIRECTION = "up"
 DEFAULT_REFERENCE_HZ = 60.0
 
 
@@ -563,8 +571,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "MuJoCo-only rule-based composition demo: initial alignment, absolute "
-            "stage replay, desk-plane TCP circle, measured-boundary relative replay, "
-            "and dataset/video capture."
+            "stage replay, desk-plane fixed trajectory, measured-boundary relative "
+            "replay, and dataset/video capture."
         )
     )
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
@@ -592,6 +600,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Explicit fixed circle waypoint rate compatibility override. "
             "Prefer --circle-speed-m-s for real/sim speed matching."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-trajectory-id",
+        default=None,
+        help=(
+            "Optional catalogued fixed trajectory, for example digit_1_v1. "
+            "When set, it replaces the default circle with one continuous "
+            "canonical-desk TCP path."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-trajectory-size-m",
+        "--fixed-trajectory-scale-m",
+        dest="fixed_trajectory_scale_m",
+        type=float,
+        default=DEFAULT_FIXED_TRAJECTORY_SCALE_M,
+        help=(
+            "Authored glyph height in canonical-desk meters. The scale alias "
+            "is retained for compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-trajectory-direction",
+        choices=FIXED_TRAJECTORY_DIRECTIONS,
+        default=DEFAULT_FIXED_TRAJECTORY_DIRECTION,
+        help=(
+            "Direction of the glyph-local +Y axis in canonical_desk: "
+            "up, right, down, or left."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-trajectory-speed-m-s",
+        type=float,
+        default=None,
+        help=(
+            "Explicit catalogued-trajectory speed. Default: average right-TCP "
+            "speed of the selected source replay spans."
         ),
     )
     parser.add_argument("--render-width", type=int, default=320)
@@ -629,6 +675,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--circle-speed-m-s must be positive when explicitly set")
     if args.circle_hz is not None and args.circle_speed_m_s is not None:
         parser.error("use either --circle-hz or --circle-speed-m-s, not both")
+    if args.fixed_trajectory_scale_m <= 0.0:
+        parser.error("--fixed-trajectory-size-m must be positive")
+    if args.fixed_trajectory_speed_m_s is not None and args.fixed_trajectory_speed_m_s <= 0.0:
+        parser.error("--fixed-trajectory-speed-m-s must be positive when explicitly set")
+    if args.fixed_trajectory_id is not None and (
+        args.circle_hz is not None or args.circle_speed_m_s is not None
+    ):
+        parser.error(
+            "circle speed options cannot be combined with --fixed-trajectory-id; "
+            "use --fixed-trajectory-speed-m-s"
+        )
     if args.render_width <= 0 or args.render_height <= 0:
         parser.error("render dimensions must be positive")
     if args.settle_seconds < 0.0:
@@ -675,8 +732,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     playback_time_sec = 0.0
     phase_counts: dict[str, int] = {}
     started = time.monotonic()
-    boundary_before_circle: dict[str, np.ndarray] | None = None
-    boundary_after_circle: dict[str, np.ndarray] | None = None
+    boundary_before_fixed: dict[str, np.ndarray] | None = None
+    boundary_after_fixed: dict[str, np.ndarray] | None = None
+    fixed_speed_plan: dict[str, Any] | None = None
+    fixed_phase = "rule_based_circle"
+    fixed_action_source = "rule_based_tcp_circle"
     viewer_context = (
         passive_viewer_handle(control.scene) if args.viewer else nullcontext(None)
     )
@@ -763,7 +823,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 root_dir=args.output,
                 dataset_name=args.output.name,
                 task_id="rule_based_multistage_mujoco_demo",
-                task_description="MuJoCo rule-based absolute replay + TCP circle + relative replay",
+                task_description=(
+                    "MuJoCo rule-based absolute replay + fixed trajectory + relative replay"
+                ),
                 nominal_fps=float(args.reference_hz),
                 source_dataset_root=episode.episode.dataset_root,
                 source_episode_id=episode.episode.episode_id,
@@ -819,60 +881,95 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
         )
 
-        boundary_before_circle = _actual_tcp_boundary(control)
-        circle_kwargs: dict[str, Any] = {
-            "radius_m": float(args.circle_radius_m),
-            "steps": int(args.circle_steps),
-        }
-        if args.circle_hz is not None:
-            circle_kwargs["hz"] = float(args.circle_hz)
-        else:
-            circle_kwargs["linear_speed_m_s"] = float(
-                args.circle_speed_m_s
-                if args.circle_speed_m_s is not None
-                else speed_reference_by_side[DEFAULT_CIRCLE_SPEED_SIDE][
-                    "average_linear_speed_m_s"
-                ]
+        boundary_before_fixed = _actual_tcp_boundary(control)
+        source_speed = speed_reference_by_side[DEFAULT_CIRCLE_SPEED_SIDE]
+        if args.fixed_trajectory_id is not None:
+            fixed_phase = "rule_based_fixed_trajectory"
+            fixed_action_source = "rule_based_fixed_trajectory"
+            fixed_speed = float(
+                args.fixed_trajectory_speed_m_s
+                if args.fixed_trajectory_speed_m_s is not None
+                else source_speed["average_linear_speed_m_s"]
             )
-        circle_targets = _circle_targets(boundary_before_circle, **circle_kwargs)
-        circle_target_metadata = dict(circle_targets[0].metadata)
-        circle_speed_plan = {
-            "reference_side": DEFAULT_CIRCLE_SPEED_SIDE,
-            "pose_frame": "canonical_desk",
-            "source_reference": speed_reference_by_side[DEFAULT_CIRCLE_SPEED_SIDE],
-            "target_linear_speed_m_s": circle_target_metadata["linear_speed_m_s"],
-            "target_path_length_m": circle_target_metadata["path_length_m"],
-            "target_duration_sec": circle_target_metadata["duration_sec"],
-            "speed_source": (
-                "explicit_circle_hz"
-                if args.circle_hz is not None
-                else (
-                    "explicit_linear_speed_m_s"
-                    if args.circle_speed_m_s is not None
+            fixed_targets = build_fixed_trajectory_targets(
+                boundary_before_fixed,
+                args.fixed_trajectory_id,
+                scale_m=float(args.fixed_trajectory_scale_m),
+                linear_speed_m_s=fixed_speed,
+                direction=args.fixed_trajectory_direction,
+            )
+            fixed_target_metadata = dict(fixed_targets[0].metadata)
+            fixed_speed_plan = {
+                "trajectory_id": str(args.fixed_trajectory_id),
+                "reference_side": DEFAULT_CIRCLE_SPEED_SIDE,
+                "pose_frame": "canonical_desk",
+                "source_reference": source_speed,
+                "target_linear_speed_m_s": fixed_target_metadata["linear_speed_m_s"],
+                "target_path_length_m": fixed_target_metadata["path_length_m"],
+                "target_duration_sec": fixed_target_metadata["duration_sec"],
+                "size_m": fixed_target_metadata["size_m"],
+                "scale_m": fixed_target_metadata["scale_m"],
+                "direction": fixed_target_metadata["direction"],
+                "direction_yaw_deg": fixed_target_metadata["direction_yaw_deg"],
+                "catalog_hash": fixed_target_metadata["catalog_hash"],
+                "speed_source": (
+                    "explicit_fixed_trajectory_speed_m_s"
+                    if args.fixed_trajectory_speed_m_s is not None
                     else "selected_source_right_tcp_average_speed"
+                ),
+            }
+        else:
+            circle_kwargs: dict[str, Any] = {
+                "radius_m": float(args.circle_radius_m),
+                "steps": int(args.circle_steps),
+            }
+            if args.circle_hz is not None:
+                circle_kwargs["hz"] = float(args.circle_hz)
+            else:
+                circle_kwargs["linear_speed_m_s"] = float(
+                    args.circle_speed_m_s
+                    if args.circle_speed_m_s is not None
+                    else source_speed["average_linear_speed_m_s"]
                 )
-            ),
-        }
-        circle_refs = resample_motion_targets(
-            circle_targets,
+            fixed_targets = _circle_targets(boundary_before_fixed, **circle_kwargs)
+            circle_target_metadata = dict(fixed_targets[0].metadata)
+            fixed_speed_plan = {
+                "reference_side": DEFAULT_CIRCLE_SPEED_SIDE,
+                "pose_frame": "canonical_desk",
+                "source_reference": source_speed,
+                "target_linear_speed_m_s": circle_target_metadata["linear_speed_m_s"],
+                "target_path_length_m": circle_target_metadata["path_length_m"],
+                "target_duration_sec": circle_target_metadata["duration_sec"],
+                "speed_source": (
+                    "explicit_circle_hz"
+                    if args.circle_hz is not None
+                    else (
+                        "explicit_linear_speed_m_s"
+                        if args.circle_speed_m_s is not None
+                        else "selected_source_right_tcp_average_speed"
+                    )
+                ),
+            }
+        fixed_refs = resample_motion_targets(
+            fixed_targets,
             reference_hz=float(args.reference_hz),
             include_final=True,
         )
         run_phase(
-            "rule_based_circle",
-            circle_refs,
+            fixed_phase,
+            fixed_refs,
             lambda _reference: dict(initial_grippers),
-            action_source="rule_based_tcp_circle",
+            action_source=fixed_action_source,
             source_index_fn=lambda _reference: (-1,),
         )
-        boundary_after_circle = _actual_tcp_boundary(control)
+        boundary_after_fixed = _actual_tcp_boundary(control)
         boundary = RuleBasedBoundaryState(
-            tcp_pose_by_side=boundary_after_circle,
+            tcp_pose_by_side=boundary_after_fixed,
             pose_frame_by_side={"left": "canonical_desk", "right": "canonical_desk"},
-            source="mujoco_actual_tcp_after_rule_based_circle",
+            source=f"mujoco_actual_tcp_after_{fixed_phase}",
             timestamp=float(control.scene.data.time),
             metadata={
-                "phase": "rule_based_circle_boundary",
+                "phase": f"{fixed_phase}_boundary",
                 "plane": "desk_xy",
                 "measurement": "retargeter_fk_from_mujoco_qpos",
             },
@@ -949,23 +1046,51 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "composition": {
             "initial_alignment": {"capture": False, "target": "stage_a.first_frame"},
             "absolute_stage_a": stage_a_span.to_dict(),
-            "rule_based_circle": {
+            fixed_phase: {
                 "capture": True,
                 "tcp_side": "right",
                 "plane": "desk_xy",
                 "constant_axis": "desk_z",
-                "radius_m": float(args.circle_radius_m),
-                "steps": int(args.circle_steps),
+                "trajectory_type": (
+                    "catalogued_one_stroke"
+                    if args.fixed_trajectory_id is not None
+                    else "circle"
+                ),
+                "fixed_trajectory_id": args.fixed_trajectory_id,
+                "radius_m": (
+                    None
+                    if args.fixed_trajectory_id is not None
+                    else float(args.circle_radius_m)
+                ),
+                "size_m": (
+                    float(args.fixed_trajectory_scale_m)
+                    if args.fixed_trajectory_id is not None
+                    else None
+                ),
+                "direction": (
+                    str(args.fixed_trajectory_direction)
+                    if args.fixed_trajectory_id is not None
+                    else None
+                ),
+                "steps": len(fixed_targets),
                 "hz": None if args.circle_hz is None else float(args.circle_hz),
-                "speed": circle_speed_plan,
-                "boundary_before_circle": boundary_before_circle,
-                "boundary_after_circle": boundary_after_circle,
+                "speed": fixed_speed_plan,
+                "boundary_before_fixed": boundary_before_fixed,
+                "boundary_after_fixed": boundary_after_fixed,
+                **(
+                    {
+                        "boundary_before_circle": boundary_before_fixed,
+                        "boundary_after_circle": boundary_after_fixed,
+                    }
+                    if fixed_phase == "rule_based_circle"
+                    else {}
+                ),
             },
             "relative_stage_b": {
                 **stage_b_span.to_dict(),
                 "capture": True,
                 "source_start_index": 0,
-                "anchor": "mujoco_actual_tcp_after_rule_based_circle",
+                "anchor": f"mujoco_actual_tcp_after_{fixed_phase}",
                 "pose_frame": "canonical_desk",
             },
         },
