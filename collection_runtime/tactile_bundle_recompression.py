@@ -53,6 +53,9 @@ class NativeTactileBundleRecompressionError(RuntimeError):
     """Raised when a native bundle cannot be safely revised in idle time."""
 
 
+DEFAULT_IDLE_NATIVE_MAX_EPISODES = 1
+
+
 def _load_identity(core_root: Path) -> TactileBundleDatasetIdentityV1:
     path = core_root / core_dataset_identity_relative_path()
     if not path.is_file():
@@ -378,11 +381,24 @@ def recompress_native_tactile_bundle_zstd_in_place(
     backend: str = "auto",
     cancel_requested: Callable[[], bool] | None = None,
     require_distinct_device: bool = False,
+    max_episodes: int | None = None,
+    verify_historical_payload_hashes: bool = True,
 ) -> dict[str, Any]:
-    """Recompress one native bundle while both roots are quiesced."""
+    """Recompress one native bundle while both roots are quiesced.
+
+    Direct/offline callers keep the historical full-payload validation default.
+    The live idle worker passes a bounded episode count and disables repeated
+    historical payload reads: all identities, manifest hashes, frame alignment,
+    ownership, and artifact sizes are still checked for the whole attachment,
+    while the raw/updated episode payload bytes are fully hashed before their
+    own commit. This keeps the runtime Home boundary from re-reading every
+    previously sealed tactile stream after each new Episode.
+    """
 
     if int(chunk_frames) <= 0:
         raise ValueError("chunk_frames must be positive")
+    if max_episodes is not None and int(max_episodes) <= 0:
+        raise ValueError("max_episodes must be positive when provided")
     core_root = Path(core_dataset_root).expanduser().resolve()
     storage_root = Path(tactile_storage_root).expanduser().resolve()
     bundle_root = resolve_native_bundle_dataset_root(
@@ -391,11 +407,14 @@ def recompress_native_tactile_bundle_zstd_in_place(
         require_distinct_device=bool(require_distinct_device),
     )
     # This validates the complete pre-maintenance graph, including the UUID,
-    # mirrored commits, component hashes, and frame alignment.
+    # mirrored commits, component hashes, manifest hashes, frame alignment,
+    # ownership, and artifact sizes.  Historical payload bytes are optionally
+    # skipped for the bounded live-idle path and are verified below only for
+    # the episode(s) that will be mutated.
     attached = attach_tactile_bundle(
         core_root,
         storage_root,
-        verify_payload_hashes=True,
+        verify_payload_hashes=bool(verify_historical_payload_hashes),
     )
     components = tuple(
         episode.tactile_component
@@ -422,6 +441,13 @@ def recompress_native_tactile_bundle_zstd_in_place(
     removed_total = 0
     updated_episodes = 0
 
+    episode_work: dict[
+        int,
+        tuple[
+            list[tuple[Path, dict[str, Any], list[tuple[str, dict[str, Any], Path]]]],
+            list[tuple[Path, dict[str, Any], str, dict[str, Any], Path]],
+        ],
+    ] = {}
     for attached_episode in sorted(
         attached.episodes.values(), key=lambda item: item.legacy_episode_index
     ):
@@ -437,6 +463,25 @@ def recompress_native_tactile_bundle_zstd_in_place(
         ]
         if not raw_entries:
             continue
+        episode_work[attached_episode.legacy_episode_index] = (
+            manifests,
+            raw_entries,
+        )
+        if max_episodes is not None and len(episode_work) >= int(max_episodes):
+            break
+
+    if not verify_historical_payload_hashes and episode_work:
+        attached.verify_payload_hashes_for_episodes(episode_work)
+
+    for attached_episode in sorted(
+        (attached.episodes[index] for index in episode_work),
+        key=lambda item: item.legacy_episode_index,
+    ):
+        manifests, raw_entries = episode_work[attached_episode.legacy_episode_index]
+        if cancel_requested is not None and cancel_requested():
+            raise TactileRecompressionCancelled(
+                "native tactile recompression cancelled before the next episode"
+            )
         if codec is None:
             codec = _ZstdCodec(level=int(level), backend=backend)
         required = sum(
@@ -602,12 +647,19 @@ def recompress_native_tactile_bundle_zstd_in_place(
                 )
                 _atomic_write_bytes(catalog_path, updated_catalog)
                 # Re-attach before deleting raw bytes.  This proves both commit
-                # halves and all new payload hashes are coherent.
-                attach_tactile_bundle(
+                # halves and the updated episode's new payload hashes are
+                # coherent.  The idle path deliberately avoids re-reading
+                # historical payload bytes here; direct/offline callers retain
+                # the full validation default.
+                committed_attachment = attach_tactile_bundle(
                     core_root,
                     storage_root,
-                    verify_payload_hashes=True,
+                    verify_payload_hashes=bool(verify_historical_payload_hashes),
                 )
+                if not verify_historical_payload_hashes:
+                    committed_attachment.verify_payload_hashes_for_episodes(
+                        (attached_episode.legacy_episode_index,)
+                    )
                 metadata_committed = True
             except BaseException:
                 _atomic_write_bytes(tactile_component_path, original_component)
@@ -648,6 +700,8 @@ def recompress_native_tactile_bundle_zstd_in_place(
         "uncommitted_artifacts_removed": int(orphan_count),
         "compression": "zstd",
         "profile": LOSSLESS_PROFILE_V1,
+        "max_episodes": None if max_episodes is None else int(max_episodes),
+        "historical_payload_hashes_verified": bool(verify_historical_payload_hashes),
     }
 
 
@@ -680,11 +734,14 @@ def run_idle_native_tactile_recompression_worker(
         backend="auto",
         cancel_requested=stop_event.is_set,
         require_distinct_device=bool(require_distinct_device),
+        max_episodes=DEFAULT_IDLE_NATIVE_MAX_EPISODES,
+        verify_historical_payload_hashes=False,
     )
     return result
 
 
 __all__ = [
+    "DEFAULT_IDLE_NATIVE_MAX_EPISODES",
     "NativeTactileBundleRecompressionError",
     "recompress_native_tactile_bundle_zstd_in_place",
     "resolve_native_bundle_dataset_root",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import hashlib
 import json
@@ -282,6 +283,57 @@ class AttachedTactileBundle:
             self._artifact_by_logical_path[path]
             for path in sorted(self._artifact_by_logical_path)
         )
+
+    def verify_payload_hashes_for_episodes(
+        self,
+        episode_indices: Iterable[int] | None = None,
+    ) -> tuple[int, ...]:
+        """Verify payload bytes for a bounded set of already-attached episodes.
+
+        Attachment always validates identities, manifest hashes, frame
+        alignment, artifact sizes, and payload ownership.  Callers that use a
+        metadata-only attachment can use this method to re-read only the
+        payload bytes they are about to mutate or publish.  The default
+        ``attach_tactile_bundle(..., verify_payload_hashes=True)`` path remains
+        the full historical payload validation contract.
+        """
+
+        if episode_indices is None:
+            selected = tuple(sorted(self.episodes))
+        else:
+            selected = tuple(sorted({int(index) for index in episode_indices}))
+        missing = tuple(index for index in selected if index not in self.episodes)
+        if missing:
+            raise TactileBundleAttachmentError(
+                "cannot verify payload hashes for unknown tactile episodes: "
+                f"{list(missing)}"
+            )
+        for index in selected:
+            episode = self.episodes[index]
+            for artifact in episode.tactile_component.artifacts:
+                if artifact.role != "payload":
+                    continue
+                path = _safe_path(
+                    self.bundle_dataset_root,
+                    artifact.logical_path,
+                    tactile_only=True,
+                )
+                try:
+                    size_bytes = int(path.stat().st_size)
+                except OSError as exc:
+                    raise TactileBundleAttachmentError(
+                        f"tactile payload is unavailable: {artifact.logical_path}"
+                    ) from exc
+                if size_bytes != int(artifact.size_bytes):
+                    raise TactileBundleAttachmentError(
+                        f"tactile artifact is missing or has wrong size: "
+                        f"{artifact.logical_path}"
+                    )
+                if _sha256_file(path) != artifact.sha256:
+                    raise TactileBundleAttachmentError(
+                        f"tactile artifact hash mismatch: {artifact.logical_path}"
+                    )
+        return selected
 
     def resolve(self, logical_path: str) -> Path:
         try:

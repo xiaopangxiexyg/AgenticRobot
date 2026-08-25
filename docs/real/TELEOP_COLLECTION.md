@@ -487,8 +487,13 @@ Episode 或 writer。删除/禁用插件不会改变 progress 合同；`collecti
 
 开始 runtime Home 时先发出协作停止请求，已有 2 秒准备期用于完成当前小块；Home、快速
 单臂切换或正式 Episode 真正开始前，还必须确认子进程已经退出并完成文件系统写入屏障。
-切换 dataset recorder 和退出程序使用同一屏障。压缩按 manifest 原子提交，提交前会完整
-解码并校验原始 SHA；只有 manifest 验证成功后才删除原始流。
+切换 dataset recorder 和退出程序使用同一屏障。idle worker 每个 catalog revision
+最多转换一个待压缩 Episode，避免在“开始遥操”的同步边界上重新读取整个历史 tactile
+payload。历史 Episode 仍会做 identity、commit、manifest、frame alignment、ownership
+和文件大小校验；正在转换或刚提交的 Episode 会完整校验 payload SHA。普通
+`attach_tactile_bundle(..., verify_payload_hashes=True)` 和离线全量验证合同不变。
+压缩按 manifest 原子提交，提交前会完整解码并校验当前 Episode 的原始 SHA；只有 manifest
+验证成功后才删除原始流。
 
 完整回退无需迁移数据：不传该参数即可保持历史行为；也可在命令最后追加
 `"${NO_IDLE_TACTILE_COMPRESSION_ARGS[@]}"`。已经无损转换的 Episode 继续由既有 reader
