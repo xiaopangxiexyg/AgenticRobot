@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import agent_gateway.profiles.mujoco.motion_deployment as deployment
+import agent_gateway.profiles.mujoco.observation as observation_module
 from agent_gateway.profiles.motion_primitive_resolution import (
     MotionPrimitiveTargetResolution,
     resolve_level_tcp_orientation_primitive_target,
@@ -46,6 +47,9 @@ from agent_gateway.profiles.mujoco.motion_primitive_profiles import (
 from agent_gateway.profiles.mujoco.motion_skill import (
     MujocoAgentTcpPoseSkillLifecycle,
     mujoco_agent_skill_hold_evidence_from_transition,
+)
+from agent_gateway.profiles.mujoco.observation import (
+    MujocoAgentObservationProducer,
 )
 from agent_gateway.protocol.contracts import (
     AgentObservationSnapshot,
@@ -282,6 +286,122 @@ def test_fixed_orientation_is_defined_in_station_then_returned_in_arm_base() -> 
     assert resolution.target_pose[:3] == pytest.approx((1.0, 0.0, 0.5))
     assert target_in_station[:3, :3] == pytest.approx(
         primitive.target_rotation_reference
+    )
+
+
+def test_absolute_station_target_is_converted_only_at_execution_boundary() -> None:
+    graph, station = _rotated_station_graph()
+    _, action_schema = _profile_and_schema()
+    execution_frame = graph.frame_by_id["right_arm_base"]
+    motion_profile = MujocoAgentTcpPoseMotionProfile(
+        reference_frame_id=station.frame_id,
+        reference_frame_spec_hash=station.semantic_content_hash,
+        execution_reference_frame_id=execution_frame.frame_id,
+        execution_reference_frame_spec_hash=execution_frame.semantic_content_hash,
+        frame_graph_hash=graph.semantic_content_hash,
+        tool_config_hash="tool-config:fixture",
+        calibration_hash="calibration:fixture",
+        stable_measurement_count=2,
+        max_control_cycles=4,
+        physics_ticks_per_control_cycle=3,
+    )
+    route, binding, evaluation_plan = _contracts(motion_profile)
+    public_start = (0.18, 0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    public_target = (0.20, 0.10, 0.50, 0.0, 0.0, 0.0, 1.0)
+    application, calls = _fake_application(
+        action_schema,
+        start_pose=public_start,
+        target_pose=public_target,
+    )
+    application.target_frame_profile = SimpleNamespace(frame_graph=graph)
+    execution_start = application.transform_tcp_pose_xyzquat(
+        public_start,
+        source_frame_id=station.frame_id,
+        target_frame_id=execution_frame.frame_id,
+    )
+    execution_target = application.transform_tcp_pose_xyzquat(
+        public_target,
+        source_frame_id=station.frame_id,
+        target_frame_id=execution_frame.frame_id,
+    )
+    poses = [execution_start, execution_target, execution_target, execution_target]
+    application.capture_tcp_pose_by_component = lambda: {
+        "right_arm": poses.pop(0)
+    }
+    request, operation = _request_and_operation(
+        route,
+        binding,
+        motion_profile,
+        public_target,
+    )
+
+    lifecycle = MujocoAgentTcpPoseSkillLifecycle(
+        application=application,
+        route=route,
+        deployment_binding=binding,
+        evaluation_plan=evaluation_plan,
+        motion_profile=motion_profile,
+        request=request,
+        operation=operation,
+        clock=lambda: 12.0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert lifecycle.public_target_pose == pytest.approx(public_target)
+    assert lifecycle.target_pose == pytest.approx(execution_target)
+    assert lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    ).succeeded
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    assert completion.succeeded
+    submitted = calls["submit"][0]["action"].values_by_component[
+        "right_arm"
+    ].values
+    assert submitted == pytest.approx(execution_target)
+
+
+def test_tcp_observation_transforms_raw_arm_base_pose_before_publication(
+    monkeypatch,
+) -> None:
+    graph, station = _rotated_station_graph()
+    application = object.__new__(MujocoAgentSkillMotionApplication)
+    application.target_frame_profile = SimpleNamespace(frame_graph=graph)
+    application.task_config = SimpleNamespace()
+    raw_execution_pose = (1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0)
+    raw_execution_matrix = xyzquat_to_pose_matrix(
+        raw_execution_pose,
+        name="raw_execution_pose",
+    )
+    monkeypatch.setattr(
+        observation_module,
+        "capture_mujoco_sim_hil_tool_tcp_pose_by_side",
+        lambda _scene, _task_config: {"right": raw_execution_matrix},
+    )
+    producer = object.__new__(MujocoAgentObservationProducer)
+    producer.application = application
+    producer.execution_reference_frame_id = "right_arm_base"
+    producer.reference_frame_id = station.frame_id
+
+    projection = producer._capture_scene(
+        SimpleNamespace(state_is_finite=lambda: True)
+    )
+
+    expected = application.transform_tcp_pose_xyzquat(
+        raw_execution_pose,
+        source_frame_id="right_arm_base",
+        target_frame_id=station.frame_id,
+    )
+    assert projection["pose_xyz_quat_xyzw_by_component"][
+        "right_arm"
+    ] == pytest.approx(expected)
+    assert projection["pose_xyz_quat_xyzw_by_component"]["right_arm"] != (
+        pytest.approx(raw_execution_pose)
     )
 
 
@@ -1428,6 +1548,11 @@ def test_no_model_contract_bundle_exposes_exact_motion_and_state_routes(
         "sim.mujoco.rm65.agent_skill_tcp_cardinal_step"
     )
     assert bundle.cardinal_step_profile.reference_frame_id == (
+        "mujoco_sim_hil/station"
+    )
+    assert bundle.motion_profile.reference_frame_id == "mujoco_sim_hil/station"
+    assert bundle.motion_profile.execution_reference_frame_id == "right_arm_base"
+    assert bundle.state_deployment_binding.reference_frame_id == (
         "mujoco_sim_hil/station"
     )
     assert bundle.cardinal_step_profile.execution_reference_frame_id == (

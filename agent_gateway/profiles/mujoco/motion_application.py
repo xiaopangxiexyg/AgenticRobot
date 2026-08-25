@@ -17,7 +17,7 @@ from control_station.sim_hil_profile.application import (
     MujocoSimHILPassiveApplicationCut,
 )
 from robot_motion.action import ComponentAction
-from robot_motion.deploy.schema import pose_matrix_to_xyzquat
+from robot_motion.deploy.schema import pose_matrix_to_xyzquat, xyzquat_to_pose_matrix
 from robot_motion.target_safety import (
     TCPPoseEnvelopeActivationReceipt,
     TCPPoseEnvelopeLifecycleError,
@@ -367,6 +367,41 @@ class MujocoAgentSkillMotionApplication:
 
             return self.runtime.rig.capture_scene(capture)
 
+    def transform_tcp_pose_xyzquat(
+        self,
+        pose: object,
+        *,
+        source_frame_id: str,
+        target_frame_id: str,
+    ) -> tuple[float, ...]:
+        """Transform one tool pose through the deployment-bound frame graph.
+
+        MuJoCo's lower action and FK owners keep using their component arm-base
+        frame.  Agent-visible state and absolute targets use the canonical
+        Station frame, so the concrete application profile is the sole seam
+        that may translate between those two identities.
+        """
+
+        source = _required(source_frame_id, field_name="source_frame_id")
+        target = _required(target_frame_id, field_name="target_frame_id")
+        matrix = xyzquat_to_pose_matrix(pose)
+        if matrix is None:
+            raise ValueError("TCP pose must be finite normalized xyz+quat_xyzw.")
+        if source == target:
+            vector = pose_matrix_to_xyzquat(matrix)
+            if vector is None:  # pragma: no cover - validated above
+                raise RuntimeError("TCP pose is not representable.")
+            return tuple(float(item) for item in vector)
+        transform = self.target_frame_profile.frame_graph.resolve(source, target)
+        transformed = transform.matrix_target_source @ matrix
+        vector = pose_matrix_to_xyzquat(transformed)
+        if vector is None:
+            raise RuntimeError("Transformed TCP pose is not representable.")
+        values = tuple(float(item) for item in vector)
+        if len(values) != 7 or not all(math.isfinite(item) for item in values):
+            raise RuntimeError("Transformed TCP pose is invalid.")
+        return values
+
     def visual_source_catalog(self) -> tuple[Mapping[str, object], ...]:
         """Describe every current RGB source without rendering a frame."""
 
@@ -530,7 +565,7 @@ class MujocoAgentSkillMotionApplication:
         for source in snapshot_sources:
             try:
                 source.close()
-            except Exception as exc:  # noqa: BLE001  # pragma: no cover - backend cleanup
+            except Exception as exc:  # pragma: no cover - backend cleanup
                 if first_error is None:
                     first_error = exc
         if first_error is not None:

@@ -9,10 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 import agent_gateway.profiles.mujoco.motion_deployment as deployment
-from collection_runtime.source_observation_history import (
-    SourceObservationHistoryBinding,
-    SQLiteSourceObservationHistoryStore,
-)
 from agent_gateway.profiles.mujoco.motion_application import (
     MujocoAgentSkillMotionApplication,
 )
@@ -25,6 +21,10 @@ from agent_gateway.profiles.mujoco.motion_factory import (
 )
 from agent_gateway.profiles.mujoco.motion_gateway_session import (
     assemble_mujoco_agent_tcp_pose_gateway_session,
+)
+from collection_runtime.source_observation_history import (
+    SourceObservationHistoryBinding,
+    SQLiteSourceObservationHistoryStore,
 )
 from control_station.sim_hil_profile.application import (
     MujocoSimHILPassiveApplicationCut,
@@ -297,7 +297,7 @@ def test_history_is_opt_in_exactly_bound_and_default_off(
         state["pose"][0] = 0.2
         parameters = {
             "component_ids": ["right_arm"],
-            "reference_frame_id": "right_arm_base",
+            "reference_frame_id": "mujoco_sim_hil/station",
             "controlled_frame_id": "tool_tcp",
             "history_window_ms": 5_000,
             "max_samples": 4,
@@ -308,6 +308,10 @@ def test_history_is_opt_in_exactly_bound_and_default_off(
         )
         result = history_read.execution_result
         assert result is not None and result["sample_count"] == 2
+        assert result["reference_frame_id"] == "mujoco_sim_hil/station"
+        assert bundle.history_source_binding.source_contract[
+            "reference_frame_id"
+        ] == "mujoco_sim_hil/station"
         assert [
             sample["pose_by_component"]["right_arm"][0] for sample in result["samples"]
         ] == pytest.approx([0.1, 0.2])
@@ -362,7 +366,7 @@ def test_installed_rpent_toolkit_reads_exactly_bound_history(
         )
         parameters = {
             "component_ids": ["right_arm"],
-            "reference_frame_id": "right_arm_base",
+            "reference_frame_id": "mujoco_sim_hil/station",
             "controlled_frame_id": "tool_tcp",
             "history_window_ms": 5_000,
             "max_samples": 4,

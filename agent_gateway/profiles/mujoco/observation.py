@@ -14,10 +14,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from collection_runtime.source_observation_history import (
-    SourceObservationRecord,
-    SourceObservationHistoryBinding,
-)
 from agent_gateway.protocol.contracts import AgentObservationSnapshot
 from agent_gateway.protocol.state_schemas import (
     validate_agent_state_result_v1,
@@ -29,10 +25,18 @@ from agent_gateway.runtime.service import (
 from agent_gateway.runtime.station_revision import (
     AgentStationRevisionTracker,
 )
+from collection_runtime.source_observation_history import (
+    SourceObservationHistoryBinding,
+    SourceObservationRecord,
+)
+from control_station.sim_hil_profile.application import (
+    MujocoSimHILPassiveApplicationCut,
+)
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.action.execution_observation import (
     ExecutionMeasurementObservation,
 )
+from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.deploy.schema import pose_matrix_to_xyzquat
 from robot_motion.runtime.observation_cut import (
     ObservationCutRecord,
@@ -42,9 +46,6 @@ from sim.mujoco.deploy.target_measurement import (
     capture_mujoco_sim_hil_tool_tcp_pose_by_side,
 )
 
-from control_station.sim_hil_profile.application import (
-    MujocoSimHILPassiveApplicationCut,
-)
 from .observation_binding import MujocoAgentObservationSourceBinding
 
 MUJOCO_AGENT_TCP_POSE_SUMMARY_SCHEMA_V1 = (
@@ -240,11 +241,22 @@ class MujocoAgentObservationProducer:
         )
         if "right_arm" not in reference_frame_by_component:
             raise ValueError("Target profile lacks the right_arm reference frame.")
-        reference_frame_id = _required(
+        execution_reference_frame_id = _required(
             reference_frame_by_component["right_arm"],
-            field_name="right_arm reference frame",
+            field_name="right_arm execution reference frame",
+        )
+        reference_frame_id = _required(
+            getattr(target_profile, "canonical_reference_frame_id", None),
+            field_name="canonical Station reference frame",
         )
         frame_spec = getattr(frame_graph, "frame_by_id", {}).get(reference_frame_id)
+        if getattr(frame_spec, "semantic_parameters", {}).get("axis_contract") != (
+            STATION_RETARGET_FRAME_CONTRACT_V1
+        ):
+            raise ValueError(
+                "Observation producer requires the canonical Station axis contract."
+            )
+        frame_graph.resolve(execution_reference_frame_id, reference_frame_id)
         reference_frame_spec_hash = _required(
             getattr(frame_spec, "semantic_content_hash", None),
             field_name="right_arm reference frame spec hash",
@@ -268,6 +280,7 @@ class MujocoAgentObservationProducer:
         self.clock_domain_id = clock_domain_id
         self.observation_binding_id = observation_binding_id
         self.pose_schema_hash = pose_schema_hash
+        self.execution_reference_frame_id = execution_reference_frame_id
         self.reference_frame_id = reference_frame_id
         self.reference_frame_spec_hash = reference_frame_spec_hash
         self.source_binding = source_binding
@@ -310,7 +323,16 @@ class MujocoAgentObservationProducer:
                 scene,
                 self.application.task_config,
             )
-            vector = pose_matrix_to_xyzquat(pose_by_side["right"])
+            raw_vector = pose_matrix_to_xyzquat(pose_by_side["right"])
+            vector = (
+                None
+                if raw_vector is None
+                else self.application.transform_tcp_pose_xyzquat(
+                    raw_vector,
+                    source_frame_id=self.execution_reference_frame_id,
+                    target_frame_id=self.reference_frame_id,
+                )
+            )
             if vector is not None:
                 values = [float(item) for item in vector]
                 if len(values) == 7 and all(math.isfinite(item) for item in values):

@@ -7,11 +7,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from collection_runtime.source_observation_history import (
-    SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1,
-    SourceObservationHistoryBinding,
-    SourceObservationHistoryStoreLimits,
-)
 from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
     SkillEvaluatorSpec,
@@ -60,6 +55,11 @@ from agent_gateway.skills.motion.schemas import (
     tcp_pose_target_schema_entry_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
+)
+from collection_runtime.source_observation_history import (
+    SOURCE_OBSERVATION_HISTORY_SAMPLING_POLICIES_V1,
+    SourceObservationHistoryBinding,
+    SourceObservationHistoryStoreLimits,
 )
 from control_station.contracts import (
     ControlStationRunManifest,
@@ -189,6 +189,8 @@ class MujocoAgentTcpPoseMotionProfile:
     frame_graph_hash: str
     tool_config_hash: str
     calibration_hash: str
+    execution_reference_frame_id: str | None = None
+    execution_reference_frame_spec_hash: str | None = None
     profile_id: str = MUJOCO_AGENT_TCP_POSE_PARAMETER_PROFILE_ID_V1
     component_id: str = "right_arm"
     workspace_bounds: tuple[float, float, float, float, float, float] = (
@@ -221,6 +223,32 @@ class MujocoAgentTcpPoseMotionProfile:
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
+        execution_reference_frame_id = (
+            self.reference_frame_id
+            if self.execution_reference_frame_id is None
+            else _required(
+                self.execution_reference_frame_id,
+                field_name="execution_reference_frame_id",
+            )
+        )
+        execution_reference_frame_spec_hash = (
+            self.reference_frame_spec_hash
+            if self.execution_reference_frame_spec_hash is None
+            else _required(
+                self.execution_reference_frame_spec_hash,
+                field_name="execution_reference_frame_spec_hash",
+            )
+        )
+        object.__setattr__(
+            self,
+            "execution_reference_frame_id",
+            execution_reference_frame_id,
+        )
+        object.__setattr__(
+            self,
+            "execution_reference_frame_spec_hash",
+            execution_reference_frame_spec_hash,
+        )
         if self.component_id not in {"left_arm", "right_arm"}:
             raise ValueError("component_id must be left_arm or right_arm.")
         bounds = tuple(
@@ -262,6 +290,12 @@ class MujocoAgentTcpPoseMotionProfile:
                 "controlled_frame_id": "tool_tcp",
                 "reference_frame_id": self.reference_frame_id,
                 "reference_frame_spec_hash": self.reference_frame_spec_hash,
+                "execution_reference_frame_id": (
+                    self.execution_reference_frame_id
+                ),
+                "execution_reference_frame_spec_hash": (
+                    self.execution_reference_frame_spec_hash
+                ),
                 "frame_graph_hash": self.frame_graph_hash,
                 "tool_config_hash": self.tool_config_hash,
                 "calibration_hash": self.calibration_hash,
@@ -720,7 +754,7 @@ class MujocoAgentTcpPoseContractBundle:
         ):
             raise ValueError("Cardinal-step Route uses another evaluation plan.")
         if self.cardinal_step_profile.execution_reference_frame_id != (
-            self.motion_profile.reference_frame_id
+            self.motion_profile.execution_reference_frame_id
         ):
             raise ValueError(
                 "Cardinal-step execution frame and motion profile disagree."
@@ -780,7 +814,7 @@ class MujocoAgentTcpPoseContractBundle:
                     "Fixed-orientation deployment uses another motion profile."
                 )
             if item.profile.execution_reference_frame_id != (
-                item.motion_profile.reference_frame_id
+                item.motion_profile.execution_reference_frame_id
             ):
                 raise ValueError(
                     "Fixed-orientation execution frame and motion profile disagree."
@@ -1642,8 +1676,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         )
     )
     profile = MujocoAgentTcpPoseMotionProfile(
-        reference_frame_id=exact["reference_frame_id"],
-        reference_frame_spec_hash=exact["reference_frame_spec_hash"],
+        reference_frame_id=exact["primitive_reference_frame_id"],
+        reference_frame_spec_hash=exact["primitive_reference_frame_spec_hash"],
+        execution_reference_frame_id=exact["reference_frame_id"],
+        execution_reference_frame_spec_hash=exact["reference_frame_spec_hash"],
         frame_graph_hash=exact["frame_graph_hash"],
         tool_config_hash=exact["tool_config_hash"],
         calibration_hash=exact["calibration_hash"],
@@ -1655,8 +1691,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         reference_frame_spec_hash=(
             exact["primitive_reference_frame_spec_hash"]
         ),
-        execution_reference_frame_id=profile.reference_frame_id,
-        execution_reference_frame_spec_hash=profile.reference_frame_spec_hash,
+        execution_reference_frame_id=profile.execution_reference_frame_id,
+        execution_reference_frame_spec_hash=(
+            profile.execution_reference_frame_spec_hash
+        ),
         frame_graph_hash=profile.frame_graph_hash,
         tool_config_hash=profile.tool_config_hash,
         calibration_hash=profile.calibration_hash,
@@ -1862,6 +1900,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
     orientation_motion_profile = MujocoAgentTcpPoseMotionProfile(
         reference_frame_id=profile.reference_frame_id,
         reference_frame_spec_hash=profile.reference_frame_spec_hash,
+        execution_reference_frame_id=profile.execution_reference_frame_id,
+        execution_reference_frame_spec_hash=(
+            profile.execution_reference_frame_spec_hash
+        ),
         frame_graph_hash=profile.frame_graph_hash,
         tool_config_hash=profile.tool_config_hash,
         calibration_hash=profile.calibration_hash,
@@ -1899,8 +1941,10 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             reference_frame_spec_hash=(
                 exact["primitive_reference_frame_spec_hash"]
             ),
-            execution_reference_frame_id=profile.reference_frame_id,
-            execution_reference_frame_spec_hash=profile.reference_frame_spec_hash,
+            execution_reference_frame_id=profile.execution_reference_frame_id,
+            execution_reference_frame_spec_hash=(
+                profile.execution_reference_frame_spec_hash
+            ),
             frame_graph_hash=profile.frame_graph_hash,
             tool_config_hash=profile.tool_config_hash,
             calibration_hash=profile.calibration_hash,
@@ -2541,8 +2585,8 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
                 "pose_schema_hash_by_component": {
                     "right_arm": exact["pose_schema_hash"]
                 },
-                "reference_frame_id": exact["reference_frame_id"],
-                "reference_frame_spec_hash": exact["reference_frame_spec_hash"],
+                "reference_frame_id": profile.reference_frame_id,
+                "reference_frame_spec_hash": profile.reference_frame_spec_hash,
                 "controlled_frame_id": "tool_tcp",
                 "frame_graph_hash": exact["frame_graph_hash"],
                 "tool_config_hash": exact["tool_config_hash"],

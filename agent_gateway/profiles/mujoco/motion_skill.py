@@ -10,6 +10,13 @@ from typing import Any
 
 import numpy as np
 
+from agent_gateway.profiles.motion_primitive_resolution import (
+    MotionPrimitiveTargetResolution as MujocoAgentTcpTargetResolution,
+)
+from agent_gateway.profiles.motion_primitive_resolution import (
+    resolve_level_tcp_orientation_primitive_target,
+    resolve_tcp_displacement_primitive_target,
+)
 from agent_gateway.protocol.contracts import (
     AgentSkillOperation,
     AgentSkillRequest,
@@ -20,11 +27,6 @@ from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationReceipt,
 )
 from agent_gateway.protocol.skill_catalog import SkillExecutionRoute
-from agent_gateway.profiles.motion_primitive_resolution import (
-    MotionPrimitiveTargetResolution as MujocoAgentTcpTargetResolution,
-    resolve_level_tcp_orientation_primitive_target,
-    resolve_tcp_displacement_primitive_target,
-)
 from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleActivationEvidence,
     StationLifecycleControlEvidence,
@@ -419,12 +421,22 @@ class MujocoAgentTcpPoseSkillLifecycle:
             else float(max_measured_translation_excursion_m)
         )
         self.parameter_lineage = lineage
-        self.target_pose: tuple[float, ...] | None = (
+        requested_target_pose: tuple[float, ...] | None = (
             None
             if target_resolver is not None
             else _pose(
                 poses[component_id],
                 field_name=f"pose_targets_by_component.{component_id}",
+            )
+        )
+        self.public_target_pose = requested_target_pose
+        self.target_pose: tuple[float, ...] | None = (
+            None
+            if requested_target_pose is None
+            else application.transform_tcp_pose_xyzquat(
+                requested_target_pose,
+                source_frame_id=motion_profile.reference_frame_id,
+                target_frame_id=motion_profile.execution_reference_frame_id,
             )
         )
         self.action: ComponentAction | None = (
@@ -559,6 +571,11 @@ class MujocoAgentTcpPoseSkillLifecycle:
             if not isinstance(resolution, MujocoAgentTcpTargetResolution):
                 raise TypeError("target_resolver returned an invalid resolution.")
             self.target_pose = resolution.target_pose
+            self.public_target_pose = self.application.transform_tcp_pose_xyzquat(
+                self.target_pose,
+                source_frame_id=self.motion_profile.execution_reference_frame_id,
+                target_frame_id=self.motion_profile.reference_frame_id,
+            )
             self.action = ComponentAction(
                 action_schema=self.application.runtime.action_schema,
                 values_by_component={
@@ -938,13 +955,18 @@ class MujocoAgentTcpPoseSkillLifecycle:
         final_pose: tuple[float, ...],
     ) -> StationLifecycleExecutionCompletion:
         measured_at = float(self.clock())
+        public_final_pose = self.application.transform_tcp_pose_xyzquat(
+            final_pose,
+            source_frame_id=self.motion_profile.execution_reference_frame_id,
+            target_frame_id=self.motion_profile.reference_frame_id,
+        )
         final_state_hash = canonical_content_hash(
             {
                 "runtime_session_id": request.runtime_session_id,
                 "control_domain_id": self.deployment_binding.control_domain_id,
                 "operation_id": operation.operation_id,
                 "component_id": self.component_id,
-                "pose_xyz_quat_xyzw": final_pose,
+                "pose_xyz_quat_xyzw": public_final_pose,
                 "measured_at": measured_at,
                 "reference_frame_id": self.motion_profile.reference_frame_id,
                 "controlled_frame_id": "tool_tcp",
