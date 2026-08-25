@@ -28,6 +28,7 @@ format, role mapping, or observation contract.
 ## Related retirement reports
 
 - [DMTAC duplicate gripper driver retirement](./dmtac_gripper_driver_legacy_retirement_20260825.md)
+- [DexHand unused report helper retirement](./dexhand_report_helper_retirement_20260825.md)
 
 ## Verification
 
