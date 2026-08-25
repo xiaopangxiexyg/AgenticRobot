@@ -28,7 +28,10 @@ def _args(**overrides: object) -> SimpleNamespace:
 
 
 def test_run_policy_uses_the_extracted_validator() -> None:
-    assert run_policy.validate_camera_cli_args is camera_cli_validation.validate_camera_cli_args
+    assert (
+        run_policy.validate_camera_cli_args
+        is camera_cli_validation.validate_camera_cli_args
+    )
 
 
 def test_none_mode_without_preview_is_valid() -> None:

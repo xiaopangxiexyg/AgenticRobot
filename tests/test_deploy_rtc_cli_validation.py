@@ -75,7 +75,9 @@ def test_off_profile_defaults_debug_level_and_rejects_overrides() -> None:
 
 def test_debug_level_requires_debug_and_an_enabled_profile() -> None:
     with pytest.raises(ValueError, match="requires --debug"):
-        _validate(_args(rtc_debug_level="summary"), profile_id="rtc", profile_enabled=True)
+        _validate(
+            _args(rtc_debug_level="summary"), profile_id="rtc", profile_enabled=True
+        )
 
     with pytest.raises(ValueError, match="requires an RTC profile"):
         _validate(_args(debug=True, rtc_debug_level="summary"))
