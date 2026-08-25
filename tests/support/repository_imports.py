@@ -21,6 +21,14 @@ class _ImportSummary:
     dynamic_modules: frozenset[str]
 
 
+_STATIC_IMPORT_CONTAINERS = (
+    ast.stmt,
+    ast.ExceptHandler,
+    ast.match_case,
+    ast.Module,
+)
+
+
 @lru_cache(maxsize=None)
 def python_files(root: Path) -> tuple[Path, ...]:
     """Return a stable, sorted Python source inventory below ``root``."""
@@ -30,50 +38,76 @@ def python_files(root: Path) -> tuple[Path, ...]:
     )
 
 
-@lru_cache(maxsize=None)
-def _import_summary(path: Path) -> _ImportSummary:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+def _collect_static_imports(
+    tree: ast.Module,
+) -> tuple[set[str], set[str], set[str]]:
+    """Index static imports without walking expression subtrees.
+
+    Python imports are statements.  Once an AST has been built, recursively
+    visiting only statement-bearing containers reaches module, function, class,
+    control-flow, exception, and ``match`` bodies while skipping the much larger
+    expression subtrees that cannot contain an import statement.  Return the
+    aliases needed to recognize supported dynamic-import calls as well, so the
+    full AST walk can be avoided for files that do not mention those forms.
+    """
+
     absolute_modules: set[str] = set()
     importlib_names = {"importlib"}
     import_module_names: set[str] = set()
-    dynamic_calls: list[ast.Call] = []
-
-    for node in ast.walk(tree):
+    pending = [tree]
+    while pending:
+        node = pending.pop()
         if isinstance(node, ast.Import):
             absolute_modules.update(alias.name for alias in node.names)
             for alias in node.names:
                 if alias.name == "importlib":
                     importlib_names.add(alias.asname or alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            if node.level == 0 and node.module:
-                absolute_modules.add(node.module)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            absolute_modules.add(node.module)
             if node.module == "importlib":
                 for alias in node.names:
                     if alias.name == "import_module":
                         import_module_names.add(alias.asname or alias.name)
-        elif isinstance(node, ast.Call) and node.args:
-            dynamic_calls.append(node)
+        pending.extend(
+            child
+            for child in ast.iter_child_nodes(node)
+            if isinstance(child, _STATIC_IMPORT_CONTAINERS)
+        )
+    return absolute_modules, importlib_names, import_module_names
 
+
+@lru_cache(maxsize=None)
+def _import_summary(path: Path) -> _ImportSummary:
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    (
+        absolute_modules,
+        importlib_names,
+        import_module_names,
+    ) = _collect_static_imports(tree)
     dynamic_modules: set[str] = set()
-    for node in dynamic_calls:
-        function = node.func
-        is_import_module = (
-            isinstance(function, ast.Attribute)
-            and isinstance(function.value, ast.Name)
-            and function.value.id in importlib_names
-            and function.attr == "import_module"
-        ) or (
-            isinstance(function, ast.Name)
-            and function.id in import_module_names
-        )
-        is_builtin_import = (
-            isinstance(function, ast.Name) and function.id == "__import__"
-        )
-        if not (is_import_module or is_builtin_import):
-            continue
-        module = node.args[0]
-        if isinstance(module, ast.Constant) and isinstance(module.value, str):
-            dynamic_modules.add(module.value)
+    if "importlib" in source or "__import__" in source:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function = node.func
+            is_import_module = (
+                isinstance(function, ast.Attribute)
+                and isinstance(function.value, ast.Name)
+                and function.value.id in importlib_names
+                and function.attr == "import_module"
+            ) or (
+                isinstance(function, ast.Name)
+                and function.id in import_module_names
+            )
+            is_builtin_import = (
+                isinstance(function, ast.Name) and function.id == "__import__"
+            )
+            if not (is_import_module or is_builtin_import):
+                continue
+            module = node.args[0]
+            if isinstance(module, ast.Constant) and isinstance(module.value, str):
+                dynamic_modules.add(module.value)
 
     return _ImportSummary(
         absolute_modules=frozenset(absolute_modules),
