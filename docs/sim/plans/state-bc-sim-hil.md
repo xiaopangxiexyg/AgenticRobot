@@ -151,15 +151,32 @@ human takeover/handback, RTC replacement, and RTC `no_action`; HOLD,
 activation, and `no_action` remained excluded from samples.
 
 This evidence still does **not** prove task success, causal recovery benefit,
-simulator dynamics validity, safety-envelope admission, or physical safety. It
-also does not start a real device, GUI, policy server, or motion. The next
-bounded gate is a resettable MuJoCo task rollout that routes policy, human, and
-RTC actions through the existing authoritative runtime, followed by comparable
-metrics for ordinary policy, takeover/handback, and stream intervention.
+safety-envelope admission, or physical safety. It also does not start a real
+device, GUI, policy server, or motion.
 
-The first no-device reset attempt reached the MuJoCo task constructor but was
-blocked by a missing checked-out asset:
-`assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf`.
-No asset download, symlink rebinding, or simulator workaround was performed.
-The physical-rollout gate therefore remains open only after the supported RM65
-asset store is explicitly made available and its identity is rechecked.
+The supported development asset store is now linked into the Task worktree by
+the standard `dev_asset_store.py link-worktree` flow:
+
+```text
+Task/assets
+  -> /home/zc/HandMotion/Developing/AgenticRobot/assets
+```
+
+The link is ignored, read-mostly, and points at the reviewed main-checkout
+asset root; the main checkout itself was not changed. With that binding, a
+no-device MuJoCo smoke using
+`sim/configs/tasks/rm65_right_cube_lift_rl_normal_v2.json` completed one
+`reset(seed=0)` and one zero-action `step`: observation shape `(28,)`, task
+action shape `(7,)`, reward `0.0`, and no termination. The same settled scene
+was captured through `MujocoDeploymentObservationAdapter` as a finite 38D
+deployment observation, then the real state-BC artifact produced a finite 16D
+model view and finite 26D normalized action.
+
+The current Cube-Lift task is nevertheless a right-arm 7D task interface,
+while the state-BC artifact is a bilateral 16D-to-26D deployment policy. The
+smoke therefore validates asset loading, scene observation, and the model
+adapter seam; it does not yet route the 26D output through the bilateral
+pose-target runtime or claim task success. The next bounded gate is to bind the
+existing authoritative bilateral MuJoCo pose/IK/safety runtime, then compare
+ordinary policy, human takeover/handback, and RTC intervention on resettable
+episodes without introducing a parallel execution loop.
