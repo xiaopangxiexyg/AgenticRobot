@@ -228,6 +228,103 @@ python -m utils.dataset_postprocess.wrist_cam_adjust dataset \
 当前默认 final mask 不使用 proxy，也不额外合并 painted body mask。需要只保留桌面时不要传
 `--left-body-mask` / `--right-body-mask`。
 
+## Stage1 多 Source 正式 Final Mask
+
+Stage1 all-valid profile 必须使用 Prepared binding 中的有效 episode，而不是按目录名
+猜测数据范围。正式流水线为：
+
+```text
+raw wrist_depth_mask_paths (只读)
+  -> 默认空间/时序 depth 后处理
+  -> OR table sampled-raycast geometry keep-mask
+  -> source_dataset_id 分区的 final_keep.bitpack.bin
+```
+
+训练只读取最后一层；`wrist_depth_mask_paths` 只是生成输入，不能作为训练时的静默
+fallback。同名数据集（例如来自不同根目录但 basename 相同的分片）按
+`source_dataset_id` 分区，输出布局为：
+
+Stage1 的训练 profile 还必须显式固定 corrected 背景契约：10% 保留原图、40%
+使用固定 real-image 资产、其余 50% 使用 procedural 背景，并以
+`shared_scene_family` 绑定同一条样本中的 wrist 背景族。这个替换只作用于
+`right_wrist`；`front` 不读取 wrist mask。real-image root/manifest 必须来自本次
+训练的独立资产快照，不能继续依赖可变的开发 checkout。
+正式 profile 同时固定 `openpi_checkout` 与 `openpi_source_revision`；启动器要求 checkout
+中的 `OPENPI_SOURCE_IDENTITY.json` 与 revision 一致，并拒绝进程中已从其他路径导入的
+`openpi` 包。
+
+```text
+<final-mask-root>/<source_dataset_id>/<dataset-name>/episode_XXXXXX/right_wrist/
+```
+
+先运行 `prepared_skill_launch prepare` 并记录其 `openpi_binding_root`，再执行：
+
+```bash
+python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline \
+  --profile deployments/openpi/configs/training/writing_stage1_all_valid_through_2026_08_21_front_right_wrist_h32_absolute_non_rtc_v1.json \
+  --binding-root /absolute/path/from/openpi_binding_root \
+  --urdf /absolute/pinned/assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf \
+  --jobs 4
+```
+
+物理整合集合不假定单一相机内参。流水线读取 `meta/build_audit.json` 的
+`source_root -> output_episode_index` 绑定，并逐 episode 使用
+`meta/source_devices/<source-name>/realsense.json`；保存副本必须与原 source 的
+内参文件 SHA-256 一致。
+
+如果早期 source 只保存 serial、没有保存数值内参，必须由 profile 的
+`right_wrist_intrinsics_overrides` 显式声明 donor source/camera 和 expected serial。
+流水线同时验证 target 与 donor serial，再把 donor 数值内参写入全新的
+`derived/calibration_overlays/<source_dataset_id>/realsense.json`；不能按 donor 的
+`left_wrist`/`right_wrist` 名字猜测，也不能回写 source metadata。
+
+depth 后处理按 manifest 声明帧数精确读取。完整的额外尾随帧会记录在 receipt 中，
+但不会进入派生结果；短流、半帧尾随、table 视频提前结束或额外可解码尾帧都会停止
+流水线。每个 bitpack episode 先写独立临时目录并原子发布，原始数据始终只读。
+receipt 位于：
+
+```text
+<workspace>/receipts/stage1_final_masks/<source_dataset_id>.json
+<workspace>/receipts/stage1_final_masks/summary.json
+```
+
+当 final root 位于 CIFS/NAS 时，可以把需要被 FFmpeg 复读的 table-geometry 与
+postprocessed 中间层固定到本机文件系统，final 与 receipt 仍写入全新的 NAS workspace：
+
+```bash
+python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline \
+  --profile <profile.json> \
+  --binding-root <binding-root> \
+  --urdf <pinned-urdf> \
+  --workspace-root <fresh-final-and-receipt-workspace> \
+  --intermediate-workspace-root <fresh-local-intermediate-workspace> \
+  --jobs 4
+```
+
+该选项不改变 mask 语义、source/episode 选择或 final 布局，只分离中间层存储。
+本机空间不足以同时保留全部 source 的中间层时，可再加
+`--remove-validated-intermediates`。流水线会逐 source 严格执行：完整生成 table/post/final，
+重新核对 post 与 final 的 episode、frame、bitpack 字节数，删除该 source 在独立本机
+workspace 下的 table/post 目录，最后原子发布包含验证摘要和清理状态的 source receipt。
+删除失败或进程中断时不会发布 receipt，续跑会重新生成并验证该 source；final 与 receipt
+始终保留在新 NAS workspace，raw source 和 calibration overlay 不会被删除。已发布清理
+receipt 的 source 在续跑时用其中的固定 post 验证摘要并重新读取、验证 final，不会静默
+跳过 final 验证。未使用该参数时，中间层必须保留到 full verify-only 完成。两种模式都
+不得绕过 decoder warning 或 strict-media 失败。
+
+两帧管线 smoke 必须使用独立 workspace，不能写入正式 final-mask root：
+
+```bash
+python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline \
+  --profile <profile.json> \
+  --binding-root <binding-root> \
+  --urdf <pinned-urdf> \
+  --workspace-root <fresh-smoke-workspace> \
+  --source-id <one-source-id> \
+  --max-frames 2 \
+  --jobs 1
+```
+
 ## 推荐大批量 Wrist Mask 路径
 
 ```bash

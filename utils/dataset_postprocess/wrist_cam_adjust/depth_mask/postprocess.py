@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -83,6 +86,10 @@ class DepthMaskPostprocessResult:
     input_frame_change_fraction_mean: float
     spatial_frame_change_fraction_mean: float
     output_frame_change_fraction_mean: float
+    source_declared_bytes: int
+    source_actual_bytes: int
+    source_trailing_bytes: int
+    rollback_dir: Path | None
     config: DepthMaskPostprocessConfig = field(repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -100,6 +107,10 @@ class DepthMaskPostprocessResult:
             "input_frame_change_fraction_mean": float(self.input_frame_change_fraction_mean),
             "spatial_frame_change_fraction_mean": float(self.spatial_frame_change_fraction_mean),
             "output_frame_change_fraction_mean": float(self.output_frame_change_fraction_mean),
+            "source_declared_bytes": int(self.source_declared_bytes),
+            "source_actual_bytes": int(self.source_actual_bytes),
+            "source_trailing_bytes": int(self.source_trailing_bytes),
+            "rollback_dir": None if self.rollback_dir is None else str(self.rollback_dir),
             "config": self.config.to_dict(),
         }
 
@@ -274,6 +285,10 @@ def _manifest_payload(
     frame_count: int,
     records: list[Mapping[str, Any]],
     config: DepthMaskPostprocessConfig,
+    source_declared_bytes: int,
+    source_actual_bytes: int,
+    source_trailing_bytes: int,
+    rollback_dir: Path | None,
 ) -> dict[str, Any]:
     source_manifest = None if stream.manifest_path is None else str(stream.manifest_path)
     source_stream = str(stream.stream_path)
@@ -303,6 +318,17 @@ def _manifest_payload(
             "stream_path": source_stream,
             "label": str(stream.label),
             "frame_count": int(stream.frame_count),
+            "integrity": {
+                "declared_bytes": int(source_declared_bytes),
+                "actual_bytes": int(source_actual_bytes),
+                "trailing_bytes": int(source_trailing_bytes),
+                "read_policy": "exact_declared_frames_v1",
+                "source_modified": False,
+            },
+        },
+        "publication": {
+            "mode": "atomic_directory_replace_v1",
+            "rollback_dir": None if rollback_dir is None else str(rollback_dir),
         },
         "postprocess": config.to_dict(),
         "frames": [dict(record) for record in records],
@@ -319,17 +345,43 @@ def process_mask_stream(
 ) -> DepthMaskPostprocessResult:
     cfg = config or DepthMaskPostprocessConfig()
     out_dir = Path(output_dir).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stream_path = out_dir / "mask_postprocessed.bitpack.bin"
-    manifest_path = out_dir / "manifest.json"
-    if not overwrite:
-        for path in (stream_path, manifest_path):
-            if path.exists():
-                raise FileExistsError(f"output exists; pass overwrite=True: {path}")
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    if out_dir.exists() and not overwrite:
+        raise FileExistsError(f"output exists; pass overwrite=True: {out_dir}")
+    transaction_id = uuid.uuid4().hex
+    staging_dir = out_dir.parent / f".{out_dir.name}.tmp-{transaction_id}"
+    staging_dir.mkdir(parents=False, exist_ok=False)
+    staging_stream_path = staging_dir / "mask_postprocessed.bitpack.bin"
+    staging_manifest_path = staging_dir / "manifest.json"
+    final_stream_path = out_dir / staging_stream_path.name
+    final_manifest_path = out_dir / staging_manifest_path.name
+    rollback_dir = (
+        out_dir.parent / f".{out_dir.name}.rollback-{transaction_id}"
+        if out_dir.exists()
+        else None
+    )
 
     frame_limit = int(stream.frame_count)
     if int(max_frames) > 0:
         frame_limit = min(frame_limit, int(max_frames))
+    source_declared_bytes = int(stream.frame_count) * int(
+        stream.packed_bytes_per_frame
+    )
+    source_actual_bytes = int(stream.stream_path.stat().st_size)
+    if source_actual_bytes < source_declared_bytes:
+        raise ValueError(
+            "source mask stream is shorter than its manifest contract: "
+            f"actual={source_actual_bytes} declared={source_declared_bytes} "
+            f"path={stream.stream_path}"
+        )
+    source_trailing_bytes = source_actual_bytes - source_declared_bytes
+    if source_trailing_bytes % int(stream.packed_bytes_per_frame):
+        raise ValueError(
+            "source mask stream has a partial trailing frame: "
+            f"trailing_bytes={source_trailing_bytes} "
+            f"packed_bytes_per_frame={stream.packed_bytes_per_frame} "
+            f"path={stream.stream_path}"
+        )
     input_fraction_sum = 0.0
     spatial_fraction_sum = 0.0
     output_fraction_sum = 0.0
@@ -347,6 +399,12 @@ def process_mask_stream(
         if 0 <= frame_index < len(stream.frames):
             source_record = dict(stream.frames[frame_index])
         source_records.append(source_record)
+    if len(input_frames) != frame_limit:
+        raise ValueError(
+            "source mask stream ended before the declared frame limit: "
+            f"actual={len(input_frames)} expected={frame_limit} "
+            f"path={stream.stream_path}"
+        )
 
     records: list[dict[str, Any]] = []
     if input_frames:
@@ -358,7 +416,7 @@ def process_mask_stream(
         spatial_stack = input_stack
         output_stack = input_stack
 
-    with stream_path.open("wb") as handle:
+    with staging_stream_path.open("wb") as handle:
         for frame_index in range(int(output_stack.shape[0])):
             input_binary = input_stack[frame_index]
             spatial_binary = spatial_stack[frame_index]
@@ -403,20 +461,44 @@ def process_mask_stream(
                     record[key] = source_record[key]
             records.append(record)
             handle.write(pack_binary_mask(output_binary))
+        handle.flush()
+        os.fsync(handle.fileno())
 
     frame_count = len(records)
     payload = _manifest_payload(
         stream=stream,
         output_dir=out_dir,
-        stream_path=stream_path,
+        stream_path=final_stream_path,
         frame_count=frame_count,
         records=records,
         config=cfg,
+        source_declared_bytes=source_declared_bytes,
+        source_actual_bytes=source_actual_bytes,
+        source_trailing_bytes=source_trailing_bytes,
+        rollback_dir=rollback_dir,
     )
-    manifest_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    expected_output_bytes = frame_count * int(stream.packed_bytes_per_frame)
+    actual_output_bytes = int(staging_stream_path.stat().st_size)
+    if actual_output_bytes != expected_output_bytes:
+        raise RuntimeError(
+            "postprocessed mask stream size differs from its frame contract: "
+            f"actual={actual_output_bytes} expected={expected_output_bytes}"
+        )
+    with staging_manifest_path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, ensure_ascii=True))
+        handle.flush()
+        os.fsync(handle.fileno())
+    if rollback_dir is not None:
+        os.replace(out_dir, rollback_dir)
+    try:
+        os.replace(staging_dir, out_dir)
+    except BaseException:
+        if rollback_dir is not None and rollback_dir.exists() and not out_dir.exists():
+            os.replace(rollback_dir, out_dir)
+        raise
     return DepthMaskPostprocessResult(
-        manifest_path=manifest_path,
-        stream_path=stream_path,
+        manifest_path=final_manifest_path,
+        stream_path=final_stream_path,
         frame_count=frame_count,
         height=int(stream.height),
         width=int(stream.width),
@@ -428,5 +510,9 @@ def process_mask_stream(
         input_frame_change_fraction_mean=_frame_change_fraction_mean(input_stack),
         spatial_frame_change_fraction_mean=_frame_change_fraction_mean(spatial_stack),
         output_frame_change_fraction_mean=_frame_change_fraction_mean(output_stack),
+        source_declared_bytes=source_declared_bytes,
+        source_actual_bytes=source_actual_bytes,
+        source_trailing_bytes=source_trailing_bytes,
+        rollback_dir=rollback_dir,
         config=cfg,
     )

@@ -92,44 +92,24 @@
       "raw_frame_count": 19691
     },
     {
-      "source_dataset_id": "fixed_middle_2026_08_07_part1",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_id": "fixed_middle_2026_08_07_physical",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage",
       "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
-      "source_dataset_fingerprint": "573765bec33b2acf1e790d48dc5d83d0b954df16c0a1f3776a883c251287259a",
+      "source_dataset_fingerprint": "5236d589b40b0b5ff71c2ab24e47505c197b88bbf8248e5b5765cd6a45b89794",
       "scenario_class": "fixed_middle",
       "task_scope": "full_writing_sequence",
-      "raw_episode_count": 129,
-      "raw_frame_count": 46153
+      "raw_episode_count": 331,
+      "raw_frame_count": 113517
     },
     {
-      "source_dataset_id": "fixed_middle_2026_08_07_part2",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage__part02",
+      "source_dataset_id": "fixed_middle_2026_08_10_physical",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-10_dmtac_rm65_bimanual_position_v2_writing_stage1_fixed_middle",
       "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
-      "source_dataset_fingerprint": "b550c759a694601f460006565d2dd0c7eca819f535f4c8bde5206431fd083562",
-      "scenario_class": "fixed_middle",
-      "task_scope": "full_writing_sequence",
-      "raw_episode_count": 202,
-      "raw_frame_count": 67364
-    },
-    {
-      "source_dataset_id": "fixed_middle_2026_08_10_part1",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-10_dmtac_rm65_bimanual_position_v2_writing_4_stage",
-      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
-      "source_dataset_fingerprint": "7ecb0a62daea2d2cbdfb0f9c1cd2a590395dd37931142d41edf43b71ac8ec562",
+      "source_dataset_fingerprint": "17510fa5f2ba7a9cd571f3f113d1e999caa43facf3e6cbdac5e2280a07db7130",
       "scenario_class": "fixed_middle",
       "task_scope": "stage1_capture",
-      "raw_episode_count": 53,
-      "raw_frame_count": 7743
-    },
-    {
-      "source_dataset_id": "fixed_middle_2026_08_10_part2",
-      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-10_dmtac_rm65_bimanual_position_v2_writing_4_stage_stable",
-      "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage_stable",
-      "source_dataset_fingerprint": "8830aceb4c87845f262fe3d331f8ba845c2728491efcdd71c8f094d7d2e4e427",
-      "scenario_class": "fixed_middle",
-      "task_scope": "stage1_capture",
-      "raw_episode_count": 296,
-      "raw_frame_count": 37657
+      "raw_episode_count": 349,
+      "raw_frame_count": 45400
     },
     {
       "source_dataset_id": "initial_multi_choice_2026_08_10_part1",
@@ -172,6 +152,19 @@
       "raw_frame_count": 37069
     },
     {
+      "source_dataset_id": "fixed_middle_detail_stage1_2026_08_19",
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/FormalCollection/2026-08-19_4_stage_writing_detail",
+      "source_task_id": "4_stage_writing_detail",
+      "source_task_id_aliases": [
+        "dmtac_rm65_bimanual_position_v1"
+      ],
+      "source_dataset_fingerprint": "67bf30d5dbd6d1b457395c28d0ee9daa117b9f62bf026a3b3054327e090613af",
+      "scenario_class": "fixed_middle",
+      "task_scope": "stage1_capture",
+      "raw_episode_count": 159,
+      "raw_frame_count": 32042
+    },
+    {
       "source_dataset_id": "fixed_middle_detail_stage1_2026_08_20_physical",
       "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-20_dmtac_rm65_bimanual_position_v2_writing_detail_stage1",
       "source_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
@@ -196,14 +189,14 @@
     }
   ],
   "totals": {
-    "source_count": 17,
-    "raw_episode_count": 3372,
-    "raw_frame_count": 843614,
+    "source_count": 16,
+    "raw_episode_count": 3531,
+    "raw_frame_count": 875656,
     "by_scenario_class": {
       "fixed_middle": {
-        "source_count": 13,
-        "raw_episode_count": 2654,
-        "raw_frame_count": 746810
+        "source_count": 12,
+        "raw_episode_count": 2813,
+        "raw_frame_count": 778852
       },
       "initial_multi_choice": {
         "source_count": 3,
@@ -217,5 +210,5 @@
       }
     }
   },
-  "semantic_content_hash": "e9251979671ae18a3aaeb583e90c73207206e35ad23c894590158b8b4ccb0bdf"
+  "semantic_content_hash": "e92b796d44cd3dc88ef39da40a42693d0e46f3d6932bd9f3c69cd88729cdb283"
 }
