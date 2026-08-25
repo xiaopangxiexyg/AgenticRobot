@@ -13,6 +13,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
@@ -32,8 +34,8 @@ from robot_motion.coordinate_frames import (
 )
 from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from teleop_runtime.skill_deploy import (
-    ExclusiveRM65SkillLowerAssembly,
     RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
+    ExclusiveRM65SkillLowerAssembly,
     RealAgentMotionPortConfig,
 )
 
@@ -291,8 +293,14 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "world_frame_id": profile.station_world_frame_id,
             "collision_scene_profile": profile.collision_scene_profile,
             "scene_mount_hash": scene_mount_hash,
+            "scene_world_from_canonical_station": (
+                profile.scene_world_from_canonical_station.tolist()
+            ),
         },
         domain="dexteleop.real_skill.rm65_station_geometry.v1",
+    )
+    canonical_station_from_execution = np.linalg.inv(
+        profile.scene_world_from_canonical_station
     )
 
     execution_frame = CoordinateFrameSpec(
@@ -302,7 +310,6 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "owner": "rm65_collision_scene",
             "collision_scene_profile": profile.collision_scene_profile,
             "scene_mount_hash": scene_mount_hash,
-            "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
         },
     )
     station_frame = CoordinateFrameSpec(
@@ -313,23 +320,18 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         },
     )
     frame_graph = CoordinateFrameGraph(
-        graph_id="exclusive-rm65-skill-station-v1",
-        graph_version="1",
+        graph_id="exclusive-rm65-skill-station-v2",
+        graph_version="2",
         frames=(execution_frame, station_frame),
         transforms=(
             RigidFrameTransformSpec(
-                transform_id="rm65-solver-world-to-canonical-station-v1",
-                transform_version="1",
+                transform_id="rm65-solver-world-to-canonical-station-v2",
+                transform_version="2",
                 source_frame_id=execution_frame.frame_id,
                 target_frame_id=station_frame.frame_id,
-                matrix_target_source=(
-                    (1.0, 0.0, 0.0, 0.0),
-                    (0.0, 1.0, 0.0, 0.0),
-                    (0.0, 0.0, 1.0, 0.0),
-                    (0.0, 0.0, 0.0, 1.0),
-                ),
+                matrix_target_source=canonical_station_from_execution,
                 semantic_parameters={
-                    "basis": "reviewed_scene_world_is_canonical_station",
+                    "basis": "inverse_collision_scene_urdf_fixed_joint_chain",
                     "collision_scene_profile": profile.collision_scene_profile,
                 },
             ),

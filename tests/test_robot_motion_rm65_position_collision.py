@@ -19,6 +19,7 @@ from robot_motion.rm65 import (
     RM65PositionCollisionPlannerConfig,
     build_rm65_dual_arm_scene_profile,
     load_world_from_arm_base_transforms,
+    load_world_from_fixed_link_transform,
 )
 from robot_motion.rm65.position_collision import _rm65_jacobian_metrics
 
@@ -378,6 +379,69 @@ def test_scene_urdf_base_transforms_include_mount_translation_and_rotation() -> 
         atol=1e-12,
     )
     assert not np.allclose(transforms["left"][:3, 3], profile.left_pose_transform[:3, 3])
+
+
+def test_scene_urdf_fixed_link_transform_resolves_exact_chain(tmp_path) -> None:
+    urdf = tmp_path / "fixed-chain.urdf"
+    urdf.write_text(
+        """<robot name="fixed-chain">
+  <link name="world"/><link name="table"/><link name="station"/>
+  <joint name="world_to_table" type="fixed">
+    <parent link="world"/><child link="table"/>
+    <origin xyz="1 2 3" rpy="0 0 0"/>
+  </joint>
+  <joint name="table_to_station" type="fixed">
+    <parent link="table"/><child link="station"/>
+    <origin xyz="0.5 0 0" rpy="0 0 3.141592653589793"/>
+  </joint>
+</robot>""",
+        encoding="utf-8",
+    )
+
+    world_from_station = load_world_from_fixed_link_transform(
+        urdf,
+        link_name="station",
+    )
+
+    np.testing.assert_allclose(world_from_station[:3, 3], [1.5, 2.0, 3.0])
+    np.testing.assert_allclose(
+        world_from_station[:3, :3],
+        R.from_euler("z", np.pi).as_matrix(),
+        atol=1e-12,
+    )
+
+
+def test_scene_urdf_fixed_link_transform_rejects_invalid_chains(tmp_path) -> None:
+    moving = tmp_path / "moving.urdf"
+    moving.write_text(
+        """<robot name="moving">
+  <link name="world"/><link name="station"/>
+  <joint name="moving_station" type="revolute">
+    <parent link="world"/><child link="station"/>
+  </joint>
+</robot>""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="is not fixed"):
+        load_world_from_fixed_link_transform(moving, link_name="station")
+    with pytest.raises(ValueError, match="missing link"):
+        load_world_from_fixed_link_transform(moving, link_name="absent")
+
+    cyclic = tmp_path / "cyclic.urdf"
+    cyclic.write_text(
+        """<robot name="cyclic">
+  <link name="world"/><link name="first"/><link name="second"/>
+  <joint name="second_to_first" type="fixed">
+    <parent link="second"/><child link="first"/>
+  </joint>
+  <joint name="first_to_second" type="fixed">
+    <parent link="first"/><child link="second"/>
+  </joint>
+</robot>""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Cycle detected"):
+        load_world_from_fixed_link_transform(cyclic, link_name="first")
 
 
 def test_collision_epsilon_cannot_remove_the_configured_minimum_margin() -> None:

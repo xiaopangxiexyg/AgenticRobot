@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
 
 import numpy as np
 
@@ -15,10 +15,12 @@ from robot_motion.rm65 import (
     build_rm65_dual_arm_scene_profile,
     load_rm65_tool_profile,
     load_world_from_arm_base_transforms,
+    load_world_from_fixed_link_transform,
     resolve_rm65_bimanual_position_profile,
     tool_tcp_pose_flange_m_rad,
 )
 from robot_motion.rm65.position_profile import RM65BimanualPositionProfile
+from robot_motion.transforms import validate_pose_matrix
 from teleop_runtime.hardware_config.rm65_arm_ips import (
     arm_ips_for_sides,
     load_assignment,
@@ -28,8 +30,8 @@ from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
     load_tcp_pose_envelope_file_spec,
 )
 
-
 _SIDES = ("left", "right")
+_CANONICAL_STATION_LINK_NAME = "workspace_near_boundary_frame"
 RM65_SKILL_SCENE_WORLD_FRAME_ID_V1 = "dual_arm_solver_world"
 
 
@@ -98,6 +100,7 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
     tool_profile_by_side: Mapping[str, Mapping[str, object]]
     tool_tcp_pose_flange_m_rad_by_side: Mapping[str, np.ndarray]
     scene_world_from_arm_base_by_side: Mapping[str, np.ndarray]
+    scene_world_from_canonical_station: np.ndarray
     station_world_frame_id: str
     envelope_file_spec: TCPPoseEnvelopeFileSpec
     position_profile: RM65BimanualPositionProfile
@@ -124,6 +127,10 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
                 self.scene_world_from_arm_base_by_side
             ).items()
         }
+        scene_world_from_station = np.asarray(
+            self.scene_world_from_canonical_station,
+            dtype=float,
+        ).reshape(4, 4).copy()
         for name, values in (
             ("arm_ip_by_side", ips),
             ("tool_profile_by_side", tools),
@@ -139,7 +146,19 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
             raise ValueError("tool TCP poses must contain finite values.")
         if any(not np.all(np.isfinite(value)) for value in scene_mounts.values()):
             raise ValueError("scene arm mounts must contain finite values.")
-        for value in (*tcp.values(), *scene_mounts.values()):
+        valid_station, station_reason = validate_pose_matrix(
+            scene_world_from_station
+        )
+        if not valid_station:
+            raise ValueError(
+                "scene_world_from_canonical_station is invalid: "
+                f"{station_reason}"
+            )
+        for value in (
+            *tcp.values(),
+            *scene_mounts.values(),
+            scene_world_from_station,
+        ):
             value.setflags(write=False)
         station_world_frame_id = str(self.station_world_frame_id).strip()
         if not station_world_frame_id:
@@ -160,6 +179,11 @@ class ResolvedExclusiveRM65SkillDeploymentProfile:
             self,
             "scene_world_from_arm_base_by_side",
             MappingProxyType(scene_mounts),
+        )
+        object.__setattr__(
+            self,
+            "scene_world_from_canonical_station",
+            scene_world_from_station,
         )
         object.__setattr__(
             self,
@@ -194,6 +218,10 @@ def resolve_exclusive_rm65_skill_deployment_profile(
         profile.collision_scene_profile
     )
     scene_mounts = load_world_from_arm_base_transforms(scene_profile)
+    scene_world_from_station = load_world_from_fixed_link_transform(
+        scene_profile,
+        link_name=_CANONICAL_STATION_LINK_NAME,
+    )
     assignment = load_assignment(arm_ip_assignment_path)
     arm_ips = arm_ips_for_sides(assignment, sides=_SIDES)
     if set(arm_ips) != set(_SIDES):
@@ -242,6 +270,10 @@ def resolve_exclusive_rm65_skill_deployment_profile(
                 "world_from_arm_base_by_side": {
                     side: scene_mounts[side].tolist() for side in _SIDES
                 },
+                "canonical_station_link_name": _CANONICAL_STATION_LINK_NAME,
+                "world_from_canonical_station": (
+                    scene_world_from_station.tolist()
+                ),
             },
         },
         domain="dexteleop.real_skill.rm65_deployment_profile.v2",
@@ -254,6 +286,7 @@ def resolve_exclusive_rm65_skill_deployment_profile(
         tool_profile_by_side=tool_profiles,
         tool_tcp_pose_flange_m_rad_by_side=tcp_by_side,
         scene_world_from_arm_base_by_side=scene_mounts,
+        scene_world_from_canonical_station=scene_world_from_station,
         station_world_frame_id=RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
         envelope_file_spec=envelope_spec,
         position_profile=position_profile,
