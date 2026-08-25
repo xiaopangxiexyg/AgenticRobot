@@ -80,6 +80,11 @@ def test_repository_local_resource_policy_matches_gitignore_and_tracking() -> No
     assert mujoco_log["tracked_policy"] == "none"
     assert mujoco_log["matched_rule"]["rule"] == "/MUJOCO_LOG.TXT"
 
+    legacy = locations["legacy"]
+    assert legacy["tracked_policy"] == "none"
+    assert legacy["tracked_count"] == 0
+    assert legacy["matched_rule"]["rule"] == "/legacy/"
+
 
 def test_only_development_assets_are_automatically_linkable(tmp_path: Path) -> None:
     tool = _load_tool()

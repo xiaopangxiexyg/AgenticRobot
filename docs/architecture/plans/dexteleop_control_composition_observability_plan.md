@@ -527,7 +527,8 @@ feedback 只消费 difference，不能成为第二 authority 或第二 dispatch 
 - sim 通过不等价于真机 motion readiness；
 - `send_actions=false`、shadow、debug 和 no-I/O profile 不得产生运动授权；
 - 新 carrier、field、metric 和 hash 必须 additive 或 profile-gated；
-- 旧代码迁移到 `legacy/` 前必须确认无 production/test/doc 调用，并记录替换与删除条件。
+- 旧代码从版本化树删除前必须确认无 production/test/doc 调用，并在 `docs/legacy/` 记录替代
+  关系；根 `legacy/` 只允许未跟踪的本地副本，不得作为版本化迁移目标。
 
 ---
 

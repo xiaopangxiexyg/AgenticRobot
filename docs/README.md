@@ -127,7 +127,8 @@ dry-run，再显式应用。
 
 - 新增当前运行方式：更新领域 `README.md`。
 - 参数、验收或安全语义变化：更新同领域专题文件。
-- 实验命令通过验收后再提升；旧说明迁入 `legacy/`，保留替代关系。
+- 实验命令通过验收后再提升；旧说明迁入 `docs/legacy/`，保留替代关系。根
+  `legacy/` 严格保持本地且不进入 Git。
 - 真机遥操参数数组只在 [`docs/real/teleop_args.sh`](./real/teleop_args.sh)维护。
 - 带日期、数据来源和源码哈希的评估结果放入所属领域的 `reports/`，不与当前运行入口并列。
 - 新增、移动或删除文档后运行 `python scripts/check_docs_navigation.py`；检查器只验证

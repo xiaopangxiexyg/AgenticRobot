@@ -338,7 +338,7 @@ characterization 已拆入独立 tail 文件，避免继续扩大原测试单体
   `StationProgressApplication`，依赖方向合理；
 - `teleop_runtime/real_teleop/gui_controls.py` 只是
   `control_station.real_teleop.control_availability` 的兼容 re-export，仍有稳定 import-path
-  合同测试，因此当前不能迁入 `legacy/`；
+  合同测试，因此当前不能从版本化树删除；
 - allowlist 中另外两个真实 lower→Station 依赖位于 UMI app/controller，应作为独立 P0-1C，
   不能为了缩小 allowlist 把 UMI 与 RealTeleop runtime 混改。
 

@@ -268,11 +268,12 @@ dataset_interface -X-> control_station / device-control runtime
 sim               -X-> teleop_runtime / real hardware
 lower packages    -X-> control_station / concrete agent_gateway profiles
 agent_gateway core-X-> upper Planner/Task/Memory or concrete application profile
-production code   -X-> tests / legacy / root todos
+production code   -X-> tests / root legacy / root todos
 ```
 
-`legacy/` 只能保存已确认归档内容；production 不得导入。root `todos/` 是 Git-ignored 本地
-规划状态；共享计划进入 owning `docs/**/plans/`。
+根 `legacy/` 是 Git-ignored 的本地副本目录，表示其中代码已从版本化树移除；任何内容都不得
+被 Git 跟踪或由 tracked source/test/docs 引用。版本化历史说明进入 `docs/legacy/`。root
+`todos/` 同样是 Git-ignored 本地规划状态；共享计划进入 owning `docs/**/plans/`。
 
 ## 11. 开发与发布口径
 

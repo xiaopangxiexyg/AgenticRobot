@@ -1,7 +1,9 @@
 # 历史命令与调试资料
 
-本目录保存已经被正式 profile、canonical entrypoint 或当前领域文档替代的命令说明。
-“Legacy”表示不再是当前默认入口，不表示内容可以删除。
+本目录是版本化历史说明的唯一 legacy 位置，保存已经被正式 profile、canonical entrypoint
+或当前领域文档替代的命令、退役原因和审计快照。“Legacy”表示不再是当前默认入口，不表示
+这些文档可以直接删除。仓库根 `legacy/` 与本目录语义不同：它严格被 Git 忽略，只能保存
+开发者本地的已移除代码副本，不能包含任何 tracked path。
 
 | 历史资料 | 内容 | 当前替代 |
 |---|---|---|
@@ -14,6 +16,7 @@
 | [2026-08-06 tests 整理记录](./reports/tests_reorganization_20260806.md) | marker、路径试点、兼容恢复和冻结区记录 | [当前 tests 规则](../../tests/README.md) |
 | [2026-07-21 RTC 研究备忘](./reports/rtc_research_memo_20260721.md) | 异步 action chunk、时间对齐和缓冲方案的早期调研 | [当前 RTC 计划](../architecture/plans/dexteleop_rtc_landing_plan.md) / [`DEPLOY_SCHEMA.md`](../../DEPLOY_SCHEMA.md) |
 | [2026-08-02 HITL 研究备忘](./reports/hitl_research_memo_20260802.md) | latched nominal chunk、residual、rebase 和 handback 的早期方案 | [当前 HITL 计划](../architecture/plans/hitl_chunk_relative_migration_plan.md) |
+| [SAPIEN collection replay 退役记录](./reports/sapien_collection_replay_retirement_20260825.md) | 已删除的历史 SAPIEN 数据回放入口及替代路径 | [遥操数采说明](../real/TELEOP_COLLECTION.md) / [仿真说明](../sim/README.md) |
 | [旧根 README 站点流程](./root/README_site_pipeline_2026-07-22.md) | 重组前 589 行设备、SAPIEN、真机短测、GUI 数采和回放流程 | [当前 docs 入口](../README.md) |
 | [v2.3 旧站点验收](./acceptance/ACCEPTANCE_V23_site_2026-07-22.md) | 固定主机/checkpoint/测试数量及含 auto-start 的历史 A/B 表 | [当前 v2.3 验收](../data/ACCEPTANCE_V23.md) |
 

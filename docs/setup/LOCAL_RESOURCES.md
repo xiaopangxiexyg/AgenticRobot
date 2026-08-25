@@ -20,7 +20,7 @@
 | `local-secret` | `.env*`、`local_paths.json`、设备本地配置 | 从 tracked example 或密钥管理重新创建，不进入迁移回执 |
 | `generated` | venv、cache、build、coverage、临时输出 | 在目标 worktree 重建，不迁移 |
 | `developer-private` | `.codex/`、`.agents/`、`todos/`、编辑器状态 | 保持个人本地，不得成为源码或运行依赖 |
-| `local-archive` | 根目录 `legacy/` 本地归档 | 仅在确需保留时做验证复制；版本化历史文档在 `docs/legacy/` |
+| `local-archive` | 根目录 `legacy/` 本地副本 | 严格忽略且不得 Git 跟踪；确需迁移时做验证复制，版本化历史说明只进入 `docs/legacy/` |
 
 软链接只解决“多个 worktree 使用同一个稳定、只读资源根”的路径兼容问题，不是隔离或只读
 证明。通过链接写入会直接修改共享目标。因此：
@@ -29,6 +29,8 @@
 - `runtime_artifacts/`、采集记录、日志和生成输出可能有并发 writer，不允许默认共享链接；
 - `teleop_records/`、`model/`、`hardware/VIVE/triad_openvr/` 是 mixed root，内部同时存在 tracked
   文件和 ignored 文件，绝不能整体替换成软链接；
+- 根 `legacy/` 不属于 mixed root，不允许 tracked 白名单或 `.gitignore` 例外；需要共享的退役
+  原因、替代关系和历史说明统一写入 `docs/legacy/`；
 - 数据集应优先放在 worktree 外并显式绑定，避免分支删除、worktree 清理或并发写入影响数据。
 
 ## 2. 日常只读检查

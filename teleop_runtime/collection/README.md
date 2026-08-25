@@ -700,13 +700,13 @@ python -m utils.dataset_postprocess validate-v23 /path/to/dataset
 命令成功返回 `0`；任何 contract/hash、causal timestamp、pose 副本、计数或外置文件错误
 均返回 `1` 并输出 JSON 诊断，不会修改原数据。
 
-## 10. 历史 SAPIEN 回放已归档
+## 10. 历史 SAPIEN 回放已移除
 
 旧的 `replay_dataset_sapien.py` 没有生产或 import caller，且不属于当前采集、仿真或发布路线，
-已从活动包移到 [`legacy/teleop_runtime/collection/replay_dataset_sapien.py`](../../legacy/teleop_runtime/collection/replay_dataset_sapien.py)。
-归档源码仅用于保留旧实验复现证据，不再提供 `python -m teleop_runtime.collection...` 命令，
-也不应被生产代码导入。新的数据验收继续使用第 9 节的 canonical `validate-v23`；新的仿真回放
-使用 MuJoCo 或 backend-neutral 工具。
+已从版本化源码树删除，不再提供 `python -m teleop_runtime.collection...` 命令。退役原因与替代
+路径记录在 [`docs/legacy`](../../docs/legacy/reports/sapien_collection_replay_retirement_20260825.md)；
+根 `legacy/` 仅允许保存被 Git 忽略的本地副本，不能成为共享源码或文档链接目标。新的数据验收
+继续使用第 9 节的 canonical `validate-v23`；新的仿真回放使用 MuJoCo 或 backend-neutral 工具。
 
 ## 11. 推荐操作流程
 
@@ -800,8 +800,8 @@ collector 启动后会打印按键输入来源：
   已支持 RealSense RGB 后台采集与 nearest-frame buffer
 - [realsense.json](../configs/devices/realsense.json)
   已提供默认单相机配置
-- `legacy/teleop_runtime/collection/replay_dataset_sapien.py`
-  仅保留历史 SAPIEN 回放源码；不是当前开发或发布能力
+- 历史 SAPIEN 回放源码已从版本化树删除；退役记录位于
+  [`docs/legacy`](../../docs/legacy/reports/sapien_collection_replay_retirement_20260825.md)
 
 当前还没有完全闭环验证的部分是：
 
@@ -824,7 +824,7 @@ collector 启动后会打印按键输入来源：
    - 已验证 active episode 丢弃后，下一次 `start_episode()` 会复用未保存的 episode index
 6. dataset replay 检查：
    - 当前只对 canonical `validate-v23` 和 backend-neutral/MuJoCo 路线做验证；历史 SAPIEN 回放
-     仅作为 `legacy/` 证据保存，不属于活动检查
+     源码已删除，退役说明保存在 `docs/legacy/`，不属于活动检查
 
 这些检查只覆盖：
 

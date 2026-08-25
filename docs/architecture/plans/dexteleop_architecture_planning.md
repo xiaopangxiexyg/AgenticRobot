@@ -350,7 +350,8 @@ schema、frame、unit、coordinate、resource claim、dependency 和 atomic grou
 - 唯一 payload-opaque production Arbiter；
 - human/replay/policy/composer 复用同一 buffer、cut、authority 和 dispatcher；
 - execution manifest/ControlTrace 绑定完整 activation action schema；
-- 已无调用的平行 shadow proposal/Arbiter 已归档到 `legacy/`。
+- 已无调用的平行 shadow proposal/Arbiter 已从版本化源码删除；需要保留的退役说明进入
+  `docs/legacy/`，根 `legacy/` 不承载版本化代码。
 
 现有 pose/qpos profile 在 lower compatibility edge 物化 v1 后沿用原 target、
 canonical safety、IK/reference 和 dispatch。新增 velocity/wrench/effort 等表示

@@ -71,7 +71,7 @@ sim/outputs/
 utils/random_background/generated/
 utils/random_background/samples/
 utils/random_background/real_images/
-# Ignore the root code archive without hiding versioned documentation under docs/legacy.
+# Root legacy is strictly local-only. Versioned historical notes belong under docs/legacy.
 /legacy/
 
 datasets_debug

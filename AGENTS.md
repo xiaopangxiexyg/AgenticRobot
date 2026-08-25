@@ -85,7 +85,10 @@ is experimental.
   Git submodule: its gitlink is the source-version boundary, it keeps its own
   Python/runtime environment, and AgenticRobot code must not treat it as the
   `model.openpi` package or vendor its generated/runtime assets.
-- `legacy/`: confirmed-archived code/docs only; production code must not import it.
+- `legacy/`: ignored local-only copies of code already removed from the versioned
+  tree. Nothing under this root may be Git-tracked, imported, or linked by
+  tracked source, tests, or documentation. Versioned historical explanations
+  belong under `docs/legacy/`.
 - `tests/`: verification, never runtime code. Root `todos/` is Git-ignored local planning state;
   tracked code, tests, and documentation must not import or link to it. Plans that require shared
   review belong under the owning `docs/**/plans/` directory.
@@ -253,7 +256,9 @@ and documentation changes do not require lock updates. Never hand-edit
 
 ## Legacy policy
 
-Move code to `legacy/` only after confirming there are no production, import,
-test, or documentation callers, a replacement exists, and a migration note
-records the reason, replacement, and deletion condition. Keep required
+Remove retired code from the versioned tree only after confirming there are no
+production, import, test, or documentation callers, a replacement exists, and
+a versioned note under `docs/legacy/` records the reason and replacement. Never
+move or force-add code or documentation into the root `legacy/`; it is a
+strictly ignored local archive with no tracked exceptions. Keep required
 compatibility shims in their active import paths.

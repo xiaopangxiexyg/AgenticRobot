@@ -726,7 +726,7 @@
       "resource_id": "local-code-archive",
       "classification": "local-archive",
       "migration": "verified-copy",
-      "summary": "The ignored root legacy code archive; versioned historical documentation remains under docs/legacy.",
+      "summary": "The strictly ignored local-only root for copies of removed code; it has no tracked exceptions and versioned historical documentation remains under docs/legacy.",
       "locations": [
         {
           "label": "local legacy archive",

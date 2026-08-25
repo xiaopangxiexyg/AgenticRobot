@@ -13,8 +13,9 @@ tree is checked for logical content, metadata, hard-link topology, xattrs, and
 sparse-file preservation before it is made visible at the final path.
 
 Use ``scripts/runtime_artifact_archive.py`` first when a retained, whole-root
-rollback snapshot under ``legacy/`` is required.  This command deliberately
-accepts one exact semantic source and one exact canonical target per plan.
+rollback snapshot under the ignored, local-only ``legacy/`` is required. Such
+a snapshot is never versioned. This command deliberately accepts one exact
+semantic source and one exact canonical target per plan.
 """
 
 from __future__ import annotations
