@@ -87,13 +87,6 @@ def _episode_tag(episode_index: int) -> str:
     return f"episode_{int(episode_index):06d}"
 
 
-def _chunk_and_episode_dir(relative_path: str) -> Path:
-    path = Path(relative_path)
-    if len(path.parts) < 2:
-        return Path("chunk-000") / path.stem
-    return Path(path.parts[-2]) / path.stem
-
-
 def _resolve_processed_depth_manifest(
     *,
     session_root: Path,
