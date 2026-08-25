@@ -13,6 +13,7 @@
 | [2026-07-22 命令清点](./reports/command_inventory_2026-07-22.md) | 重组前入口与散落来源快照 | [当前 docs 入口](../README.md) |
 | [2026-07-17 框架复核](./reports/framework_review_20260717.md) | 当时目录、入口、契约和迁移状态的只读快照 | [当前 docs 入口](../README.md) / 各 package README |
 | [2026-08-03 项目结构审计](./reports/project_structure_audit_20260803.md) | P0 实施前的规模、边界与问题快照 | [当前 P0 结构治理计划](../architecture/plans/dexteleop_p0_structure_remediation_plan_20260803.md) / [`AGENTS.md`](../../AGENTS.md) |
+| [旧 old_handeye 标定树退役](./reports/old_handeye_retirement_20260825.md) | 无引用的旧手眼标定脚本、样例和调试入口退役记录 | [腕部手眼标定](../../utils/hand_eye/README.md) / [工位手眼标定](../../utils/head_eye/README.md) |
 | [2026-08-06 tests 整理记录](./reports/tests_reorganization_20260806.md) | marker、路径试点、兼容恢复和冻结区记录 | [当前 tests 规则](../../tests/README.md) |
 | [2026-07-21 RTC 研究备忘](./reports/rtc_research_memo_20260721.md) | 异步 action chunk、时间对齐和缓冲方案的早期调研 | [当前 RTC 计划](../architecture/plans/dexteleop_rtc_landing_plan.md) / [`DEPLOY_SCHEMA.md`](../../DEPLOY_SCHEMA.md) |
 | [2026-08-02 HITL 研究备忘](./reports/hitl_research_memo_20260802.md) | latched nominal chunk、residual、rebase 和 handback 的早期方案 | [当前 HITL 计划](../architecture/plans/hitl_chunk_relative_migration_plan.md) |
