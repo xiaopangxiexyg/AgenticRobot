@@ -19,10 +19,13 @@ from typing import Any, Iterator, Mapping
 import numpy as np
 
 from dataset_interface.prepared_training import (
+    PreparedSkillEligibilityExclusion,
+    PreparedSkillEligibilityReport,
     PreparedSourceDataset,
     build_prepared_training_view,
     select_strict_successful_skill_episodes,
 )
+from dataset_interface.progress_annotation_jobs import list_progress_annotation_work_items
 from dataset_interface.progress_skill_projection import (
     SkillProjectionCatalog,
     load_builtin_writing_four_stage_subtasks_skill_projection_catalog,
@@ -1350,6 +1353,106 @@ def _prompt_family_token_preflight(
     }
 
 
+def _apply_complete_horizon_window_exclusions(
+    profile: Mapping[str, Any],
+    report: PreparedSkillEligibilityReport,
+    sources: tuple[PreparedSourceDataset, ...],
+) -> PreparedSkillEligibilityReport:
+    """Apply an explicit fixed-snapshot h32-complete-window filter."""
+
+    raw = profile.get("complete_horizon_window_exclusions", [])
+    if raw in (None, []):
+        return report
+    if not isinstance(raw, list):
+        raise ValueError("complete_horizon_window_exclusions must be a list.")
+    horizon = int(profile.get("action_horizon", 0))
+    if horizon <= 0:
+        raise ValueError("action_horizon must be positive before horizon filtering.")
+    expected_reason = f"NO_COMPLETE_H{horizon}_SKILL_WINDOW"
+    requested: dict[str, tuple[str, int, int, str]] = {}
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ValueError("Each complete horizon exclusion must be an object.")
+        identity = str(item.get("episode_capture_identity_hash", "")).strip()
+        source_id = str(item.get("source_dataset_id", "")).strip()
+        source_index = int(item.get("source_episode_index", -1))
+        max_length = int(item.get("max_skill_interval_length", 0))
+        reason = str(item.get("reason", "")).strip()
+        if (
+            len(identity) != 64
+            or not source_id
+            or source_index < 0
+            or max_length < 0
+            or max_length >= horizon
+            or reason != expected_reason
+            or identity in requested
+        ):
+            raise ValueError(
+                "Invalid complete horizon exclusion; it must identify one "
+                f"episode with max interval < h{horizon}."
+            )
+        requested[identity] = (source_id, source_index, max_length, reason)
+
+    source_by_identity: dict[str, tuple[str, int]] = {}
+    for source in sources:
+        for item in list_progress_annotation_work_items(source.dataset_root):
+            identity = str(item.episode_identity_hash)
+            if identity in source_by_identity:
+                raise ValueError(
+                    "Horizon exclusion source inventory contains duplicate "
+                    f"Episode identity: {identity}."
+                )
+            source_by_identity[identity] = (
+                source.source_dataset_id,
+                int(item.episode_index),
+            )
+    included = set(report.included_episode_identities)
+    missing = sorted(set(requested) - included)
+    if missing:
+        raise ValueError(
+            "A pinned complete-horizon exclusion is not currently eligible: "
+            f"{missing}."
+        )
+    selected_annotations = dict(report.selected_annotation_sets)
+    for identity, (source_id, source_index, _max_length, _reason) in requested.items():
+        actual = source_by_identity.get(identity)
+        if actual != (source_id, source_index):
+            raise ValueError(
+                "Complete-horizon exclusion source binding differs from the "
+                f"fixed snapshot for Episode {identity}."
+            )
+        if identity not in selected_annotations:
+            raise ValueError(
+                "Complete-horizon exclusion lacks a selected sealed annotation: "
+                f"{identity}."
+            )
+    horizon_exclusions = tuple(
+        PreparedSkillEligibilityExclusion(
+            source_dataset_id=source_id,
+            source_episode_index=source_index,
+            episode_capture_identity_hash=identity,
+            reason=reason,
+        )
+        for identity, (source_id, source_index, _max_length, reason)
+        in sorted(requested.items())
+    )
+    return PreparedSkillEligibilityReport(
+        target_skill_id=report.target_skill_id,
+        included_episode_identities=tuple(
+            sorted(included - set(requested))
+        ),
+        selected_annotation_sets=tuple(
+            sorted(
+                (identity, annotation_id)
+                for identity, annotation_id in selected_annotations.items()
+                if identity not in requested
+            )
+        ),
+        exclusions=tuple((*report.exclusions, *horizon_exclusions)),
+        require_no_abnormal_intervals=report.require_no_abnormal_intervals,
+    )
+
+
 def prepare_profile(
     profile: Mapping[str, Any],
     *,
@@ -1393,6 +1496,9 @@ def prepare_profile(
         require_no_abnormal_intervals=bool(
             profile.get("require_no_abnormal_intervals", True)
         ),
+    )
+    report = _apply_complete_horizon_window_exclusions(
+        profile, report, sources
     )
     counts = _included_counts_by_source(report, sources)
     expected_counts = _source_expected_counts(profile)
@@ -1757,9 +1863,24 @@ def _openpi_config(
         if dataclasses.is_dataclass(lr_schedule) and hasattr(
             lr_schedule, "decay_steps"
         ):
-            lr_schedule = dataclasses.replace(
-                lr_schedule,
-                decay_steps=train_steps,
+            schedule_overrides: dict[str, Any] = {"decay_steps": train_steps}
+            if "openpi_lr_warmup_steps" in profile:
+                warmup_steps = int(profile["openpi_lr_warmup_steps"])
+                if warmup_steps < 0 or warmup_steps >= train_steps:
+                    raise ValueError(
+                        "openpi_lr_warmup_steps must be non-negative and smaller "
+                        "than openpi_num_train_steps."
+                    )
+                if not hasattr(lr_schedule, "warmup_steps"):
+                    raise ValueError(
+                        "The selected OpenPI learning-rate schedule does not "
+                        "support openpi_lr_warmup_steps."
+                    )
+                schedule_overrides["warmup_steps"] = warmup_steps
+            lr_schedule = dataclasses.replace(lr_schedule, **schedule_overrides)
+        elif "openpi_lr_warmup_steps" in profile:
+            raise ValueError(
+                "openpi_lr_warmup_steps requires a dataclass learning-rate schedule."
             )
         train_overrides.update(
             num_train_steps=train_steps,
