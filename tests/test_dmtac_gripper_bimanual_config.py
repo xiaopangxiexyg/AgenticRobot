@@ -1216,6 +1216,7 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
         )
         backend._create_device = lambda: fake  # type: ignore[method-assign]
         backend._create_gripper = _FakeGripper  # type: ignore[method-assign]
+        self.addCleanup(backend.close)
 
         backend.start()
         self.assertTrue(backend.send_fixed_joint_pos(np.asarray([0.5], dtype=np.float32)))
