@@ -7,9 +7,9 @@ feedback, and delegates every command to the normal RealTeleop safety path.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-import math
 from typing import Any
 
 import numpy as np
@@ -38,7 +38,6 @@ from .pose_frame_runtime import (
     resolve_runtime_pose_frame_contract,
 )
 from .runtime_extension import RealTeleopDatasetSampleAdmission
-
 
 RULE_BASED_REAL_TELEOP_SCHEMA_V1 = "dexteleop.rule_based_real_teleop.v1"
 
