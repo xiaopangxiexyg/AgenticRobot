@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -20,7 +21,6 @@ from .hitl import (
     HITL_SOURCE_POLICY,
     HITL_SOURCE_RTC,
 )
-
 
 STREAM_RUNTIME_ACTION_DIM = DEPLOY_ACTION_DIM
 STREAM_RUNTIME_ACTION_SPACE = "bimanual_ee_pose_v1"
