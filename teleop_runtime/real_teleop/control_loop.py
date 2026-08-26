@@ -42,6 +42,7 @@ from ..target_safety.tcp_pose_envelope_runtime import (
     TCPPoseEnvelopeRuntimeError,
 )
 from .defaults import runtime_home_fresh_data_timeout_sec
+from .runtime_extension import runtime_extension_dataset_sample_admission
 
 _POSITION_ADMITTANCE_CONTROL_PLANE_REARM_THRESHOLD_SEC = 0.05
 
@@ -4249,7 +4250,33 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 and dataset_recorder.can_record_samples
                 and sample_due
             ):
+                try:
+                    sample_admission = runtime_extension_dataset_sample_admission(
+                        runtime_extension,
+                        step_result=step_result,
+                        now=loop_start,
+                    )
+                except Exception as exc:  # noqa: BLE001 - capture must fail closed.
+                    message = (
+                        "runtime extension dataset sample admission failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    _log("Dataset", message, now=loop_start)
+                    clutch_input.request_hold(
+                        reason="runtime_extension_dataset_admission_error"
+                    )
+                    pause_recording(
+                        loop_start,
+                        reason="runtime_extension_dataset_admission_error",
+                    )
+                    continue
+                sample_allowed = bool(sample_admission.allowed)
                 collection_metadata_extra = {
+                    **(
+                        {}
+                        if not sample_allowed
+                        else dict(sample_admission.metadata)
+                    ),
                     "collection_continuity_segment_index": int(
                         dataset_recorder.continuity_segment_index
                     )
@@ -4262,7 +4289,9 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         ],
                         "loop_elapsed_before_record_s": loop_phase_timer.elapsed_sec(),
                     })
-                if position_reference_enabled:
+                if not sample_allowed:
+                    dataset_step_result = None
+                elif position_reference_enabled:
                     dataset_step_result = replace(
                         collection_step_result,
                         # ``collection_step_result.timestamp`` is T0: the

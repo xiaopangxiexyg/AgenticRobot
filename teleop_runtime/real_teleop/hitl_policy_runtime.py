@@ -24,13 +24,10 @@ from robot_motion.deploy import (
     PolicyEmissionSourcePort,
     require_policy_emission_source,
 )
-from robot_motion.pose_frame_profiles import (
-    default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
-)
-
 from ..command_override import TeleopCommandOverride
 from ..schemas import TeleopCommand, TeleopObservation
 from .policy_observation import RealTeleopPolicyObservationCapture
+from .pose_frame_runtime import resolve_runtime_pose_frame_contract
 from .single_source_composition import ExclusiveSingleSourceComposer
 
 
@@ -42,34 +39,9 @@ HITL_POLICY_MODES = (HITL_POLICY_MODE_NORMAL, HITL_POLICY_MODE_RTC)
 def resolve_hitl_runtime_pose_frame_contract(
     collection_pose_frame_contract: PoseFrameContract,
 ) -> PoseFrameContract:
-    """Project collection storage identity onto raw policy-observation input.
+    """Compatibility name for the shared RealTeleop frame projection."""
 
-    RealTeleop's formal recorder owns ``desk_absolute`` storage, while the
-    shared arm-state poller exposes measured tool poses in each RM65 raw base
-    frame.  Policy deployment therefore needs a distinct ``raw_absolute``
-    contract with the same source/extrinsics.  Keeping those two bindings
-    separate prevents a desk-storage contract from being misapplied to raw
-    runtime observations.
-    """
-
-    if not isinstance(collection_pose_frame_contract, PoseFrameContract):
-        raise TypeError(
-            "collection_pose_frame_contract must be a PoseFrameContract."
-        )
-    if collection_pose_frame_contract.is_raw_storage:
-        return collection_pose_frame_contract
-
-    default_runtime = (
-        default_rm65_workspace_near_boundary_runtime_pose_frame_contract()
-    )
-    if (
-        collection_pose_frame_contract.source.config_hash
-        == default_runtime.source.config_hash
-    ):
-        return default_runtime
-    return PoseFrameContract.v23_forced_raw(
-        collection_pose_frame_contract.source
-    )
+    return resolve_runtime_pose_frame_contract(collection_pose_frame_contract)
 
 
 def preflight_normal_hitl_policy_source(
