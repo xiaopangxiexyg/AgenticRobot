@@ -7,10 +7,12 @@ from robot_motion.action import RobotAction
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM
 from robot_motion.replay import (
     ReplayTrajectoryGroup,
+    RuleBasedBoundaryState,
     RuleBasedCaptureSelection,
     RuleBasedCollectionCursor,
     RuleBasedCollectionPlan,
     RuleBasedCustomAction,
+    RuleBasedFixedTrajectory,
     RuleBasedInitialize,
     RuleBasedReplay,
 )
@@ -134,3 +136,50 @@ def test_rule_based_plan_fails_closed_for_missing_groups_and_invalid_ranges() ->
 def test_capture_selection_rejects_duplicate_streams() -> None:
     with pytest.raises(ValueError, match="duplicates"):
         RuleBasedCaptureSelection(stream_ids=("state.left", "state.left"))
+
+
+def test_plan_expands_fixed_trajectory_from_canonical_boundary() -> None:
+    left = np.eye(4, dtype=float)
+    left[:3, 3] = [-0.1, 0.2, 0.3]
+    right = np.eye(4, dtype=float)
+    right[:3, 3] = [0.4, -0.2, 0.5]
+    boundary = RuleBasedBoundaryState(
+        tcp_pose_by_side={"left": left, "right": right},
+        pose_frame_by_side={"left": "canonical_desk", "right": "canonical_desk"},
+        source="test_actual_boundary",
+    )
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedFixedTrajectory(
+                step_id="digit_one",
+                trajectory_id="digit_1_v1",
+                boundary_ref="after_replay",
+                scale_m=0.08,
+                linear_speed_m_s=0.04,
+                direction="right",
+            ),
+        )
+    )
+
+    directives = list(
+        RuleBasedCollectionCursor(
+            plan,
+            {},
+            boundary_provider={"after_replay": boundary},
+        )
+    )
+
+    assert len(directives) == 3
+    assert {directive.kind for directive in directives} == {"fixed_trajectory"}
+    assert directives[0].action is not None
+    np.testing.assert_allclose(
+        directives[0].action.arm_pose_by_side["right"][:3],
+        right[:3, 3],
+    )
+    assert directives[0].metadata["trajectory_id"] == "digit_1_v1"
+    assert directives[0].metadata["direction"] == "right"
+    assert directives[0].metadata["size_m"] == pytest.approx(0.08)
+    assert directives[0].metadata["fixed_trajectory_schema"] == (
+        "dexteleop.rule_based_fixed_trajectory.v1"
+    )
+    assert directives[-1].metadata["fixed_trajectory_index"] == 2

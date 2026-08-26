@@ -97,6 +97,37 @@ def test_default_circle_speed_is_source_derived_and_station_contract_is_required
     args = parse_args(["--output", "/tmp/rule-based-test"])
     assert args.circle_hz is None
     assert args.circle_speed_m_s is None
+    assert args.fixed_trajectory_scale_m == pytest.approx(0.08)
+    assert args.fixed_trajectory_direction == "up"
+
+    digit_args = parse_args(
+        [
+            "--output",
+            "/tmp/rule-based-digit-test",
+            "--fixed-trajectory-id",
+            "digit_1_v1",
+            "--fixed-trajectory-size-m",
+            "0.12",
+            "--fixed-trajectory-direction",
+            "left",
+        ]
+    )
+    assert digit_args.fixed_trajectory_id == "digit_1_v1"
+    assert digit_args.fixed_trajectory_speed_m_s is None
+    assert digit_args.fixed_trajectory_scale_m == pytest.approx(0.12)
+    assert digit_args.fixed_trajectory_direction == "left"
+
+    scale_alias_args = parse_args(
+        [
+            "--output",
+            "/tmp/rule-based-digit-scale-alias-test",
+            "--fixed-trajectory-id",
+            "digit_1_v1",
+            "--fixed-trajectory-scale-m",
+            "0.06",
+        ]
+    )
+    assert scale_alias_args.fixed_trajectory_scale_m == pytest.approx(0.06)
 
     contract = load_pose_frame_contract(
         DEFAULT_RM65_DUAL_ARM_COLLECTION_POSE_FRAME_CONTRACT_PATH

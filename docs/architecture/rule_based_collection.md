@@ -102,7 +102,7 @@ without adding a second control or writer implementation. Its sequence is:
 ```text
 initial alignment (not recorded)
   -> absolute replay of --stage-a
-  -> right TCP circle in desk XY at constant desk Z
+  -> right TCP fixed trajectory in desk XY at constant desk Z
   -> measured actual-TCP boundary
   -> relative replay of --stage-b
 ```
@@ -135,6 +135,42 @@ compatibility override. The demo requires the source dataset contract hash to
 match the MuJoCo station pose contract, and records the calibrated
 `world_from_desk` mapping in `pose_frame_alignment`; it does not silently apply
 an additional raw-to-desk transform.
+
+The intermediate phase can instead use a checked-in one-stroke digit
+centerline. Its authored height is adjustable with
+`--fixed-trajectory-size-m` (the compatibility alias
+`--fixed-trajectory-scale-m` is also accepted), and its orientation is one of
+four named directions in `canonical_desk`:
+
+```text
+up     : glyph-local +Y -> canonical-desk +Y (0 deg)
+right  : glyph-local +Y -> canonical-desk +X (-90 deg)
+down   : glyph-local +Y -> canonical-desk -Y (180 deg)
+left   : glyph-local +Y -> canonical-desk -X (90 deg)
+```
+
+For example:
+
+```bash
+MUJOCO_GL=egl PYTHONPATH=. python -m sim.mujoco.replay.rule_based_multistage_demo \
+  --dataset-root /path/to/dataset --episode 0 \
+  --stage-a 0:120 --stage-b 250:400 \
+  --fixed-trajectory-id digit_1_v1 \
+  --fixed-trajectory-size-m 0.08 \
+  --fixed-trajectory-direction right \
+  --output /tmp/rule_based_digit_1_right --record-depth --no-sleep
+```
+
+`digit_1_v1` through `digit_9_v1` are nine independent one-stroke
+centerlines. The first point of each path is anchored to the measured TCP
+boundary after stage A; changing size or direction does not move that anchor.
+The path remains in `canonical_desk`, and the existing
+`DeskTcpPositionControl` performs the contract-checked desk-to-world mapping.
+The default digit speed is the selected source replay spans' right-TCP average
+speed, excluding the gap between spans. The resulting actual boundary is then
+used by the existing relative stage-B rebase. A future `1`-through-`9`
+sequence must be declared as nine such trajectory phases; it is not implicitly
+treated as one continuous stroke.
 
 ```bash
 PYTHONPATH=. python - <<'PY'
