@@ -14,7 +14,7 @@ Isaac Gym 单独看第 6 节；MuJoCo 和冻结保留的 SAPIEN 兼容依赖看�
 
 | 环境 | 用途 | 是否属于主环境 |
 | --- | --- | --- |
-| `dexteleop310` / Python 3.10 | 项目代码、测试、数据集、MuJoCo、冻结的 SAPIEN 历史兼容、OpenPI client、真机硬件 | 是 |
+| `dexteleop310` / Python 3.10 | 项目代码、测试、数据集、MuJoCo、冻结的 SAPIEN 历史兼容、OpenPI client、真机硬件（含按需安装的 reBotArm RS 依赖） | 是 |
 | `.venv-annotation` / Python 3.10 | 封存 Episode 的细粒度阶段标注；无设备、控制、仿真和训练能力 | 否，独立轻量环境 |
 | `isaacgym38` / Python 3.8 | Isaac Gym Preview 4 real2sim 检查 | 否，因上游 Python 限制独立 |
 | OpenPI server / GPU | 模型加载和 JAX/CUDA 推理服务 | 否，使用 OpenPI 自己的 `uv` 环境 |
@@ -205,6 +205,34 @@ bash scripts/install_conda_env.sh --env-name "$DEXTELEOP_ENV_NAME"
 extras 是生成锁文件和安装完整依赖时使用的依赖分组，不要求把 DexTeleop 打包或 editable
 安装。需要轻量后期标注时使用第 2 节的独立脚本；其余共享开发、复现和真机环境统一使用
 本章的 Conda 安装脚本，避免多个 worktree 争抢 editable 映射。
+
+### B601-RS/reBotArm 有线 CAN 依赖
+
+`reBotArm_control_py` 是独立的 reBotArm 源码/gitlink。它的 RS 配置使用 Python 3.10 和
+`motorbridge`；该依赖属于真机硬件附加项，不应让没有 reBotArm gitlink 的基础环境隐式初始化
+设备。当前按上游 `pyproject.toml` 的 `motorbridge>=0.4.9` 要求，在 `dexteleop310` 中验证的
+兼容版本为 `0.4.9`。上游已提交的 `uv.lock` 仍记录旧的 `0.4.6`，不能把该旧锁定值当作当前
+RS 依赖依据。
+
+当目标 worktree 已包含经审查的 `hardware/reBotArm_control_py` 提交，并且确实需要 RS 真机
+backend 时，在同一个主环境中执行：
+
+```bash
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python -m pip install --no-deps motorbridge==0.4.9
+```
+
+`--no-deps` 是为了复用本环境已有的 Python/NumPy/Pinocchio 基础层，避免 pip 改写项目锁定的
+数值栈；若以后把 reBotArm RS 依赖正式纳入 DexTeleop 主安装流程，应同时更新主项目
+`pyproject.toml`、重新生成 `uv.lock` 并由独立 Harness Task 验证，不能手工编辑锁文件。
+安装后的无动作 API 检查：
+
+```bash
+PYTHONNOUSERSITE=1 python -c \
+  'from motorbridge import CallError, Controller, Mode; print("motorbridge import ok", Controller, Mode.MIT, CallError)'
+```
+
+该检查不会创建 `Controller` 实例、打开 CAN 或发送电机命令。
 
 不要安装 pip 包 `pin`。`pip check` 可能报告 `pin-pink requires pin`，这是 `pin-pink` 上游 metadata
 与 conda-forge Pinocchio 命名不一致造成的已知例外；安装脚本已经刻意使用 `--no-deps`。
@@ -543,6 +571,24 @@ MJCF 用于 MuJoCo 检查，避免为了仿真破坏原始坐标定义。
 
 运行 GUI 遥操作前，先按 [硬件入口](./docs/hardware/README.md)检查 USB、相机、串口和配置。
 
+### B601-RS/CAN 只读预检
+
+reBotArm RS 当前配置的默认通道是 `can0`。以下命令只枚举主机状态，不改变接口、不打开
+电机、不发送 CAN 帧；执行前仍应确认没有其他控制进程占用设备：
+
+```bash
+lsusb
+ip -brief link
+ip -details link show type can
+find /dev/serial/by-id -maxdepth 1 -type l -ls 2>/dev/null
+find /dev -maxdepth 1 \( -name 'ttyUSB*' -o -name 'ttyACM*' -o -name 'can*' \) -ls 2>/dev/null
+```
+
+只有看到预期的 USB-CAN 适配器和 `can0`（或经过硬件负责人批准并在配置中明确的其他
+通道）后，才能进入 reBotArm 的 H1 反馈预检。缺少接口时不要执行
+`example/2_zero_and_read.py`、`example/3_mit_control.py` 或任何 `connect/enable/mode/send_*`
+路径；这些不是只读连接测试。
+
 如果提示权限不足，执行：
 
 ```bash
@@ -588,6 +634,7 @@ sudo -E "$CONDA_PREFIX/bin/python" \
 - MuJoCo import 失败：确认已激活 `dexteleop310`，然后重新执行 `bash scripts/install_conda_env.sh --update`。
 - MuJoCo viewer 无法打开：先确认当前会话有桌面显示权限；远程或无显示环境下优先做 import 和模型加载检查。
 - MuJoCo 直接加载 URDF 失败：保留 URDF 作为装配真值，单独生成 MJCF 检查文件，不要在 URDF 里混入 MuJoCo 专用 workaround。
+- `ModuleNotFoundError: motorbridge`：确认在 `dexteleop310` 中按第 4 节安装 `motorbridge==0.4.9`；这只解决 Python API 缺失，不代表 CAN 或电机已连接。
 - 串口不可读写：先运行 `configure_devices --fix-permissions`。
 - `/dev/ttyUSB*` 不出现或 `Driver=usbfs`：先运行 `configure_devices --fix-serial-conflicts`，重新拔插后再修权限。
 - GUI 卡顿且日志出现多个 DM-Tac reset：确认没有误加 `--dmtac-with-tactile` 或触觉可视化。
