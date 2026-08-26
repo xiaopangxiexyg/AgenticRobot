@@ -233,16 +233,44 @@ class StatePolicyAdapter:
     def reset(self) -> None:
         """Keep the adapter stateless; queue/cursor ownership stays lower."""
 
-    def predict(self, observation: DeploymentObservation) -> StatePolicyPrediction:
-        model_observation = self.observation_adapter.capture(observation)
-        model_state = model_observation.state
-        raw_action = self.model.predict(model_state)  # type: ignore[union-attr]
-        model_action = _normalize_pose_quaternion(
-            _finite_vector(raw_action, name="model_action", dim=STATE_BC_ACTION_DIM),
+    def capture_model_observation(
+        self,
+        observation: DeploymentObservation,
+    ) -> StatePolicyObservation:
+        """Project one deployment observation into the 16D model view.
+
+        The method is intentionally observation-only.  It gives an experiment
+        runner access to the same state projection used by :meth:`predict`
+        without exposing the observation adapter as a second public seam.
+        """
+
+        return self.observation_adapter.capture(observation)
+
+    def capture_model_state(self, observation: DeploymentObservation) -> np.ndarray:
+        """Return a copied 16D state for a source or RTC provider."""
+
+        return self.capture_model_observation(observation).state.copy()
+
+    def project_model_action(
+        self,
+        model_action: Any,
+        *,
+        source: str | None = None,
+    ) -> NormalizedAction:
+        """Project one 16D absolute action into the 26D runtime vector.
+
+        Policy, human-source adapters, and RTC providers must not implement
+        independent 16D-to-runtime conversions.  This helper exposes the
+        existing v2.2/q6 compatibility bridge for replacement actions while
+        keeping safety, IK, dispatch, and target ownership below this module.
+        """
+
+        normalized_model_action = _normalize_pose_quaternion(
+            _finite_vector(model_action, name="model_action", dim=STATE_BC_ACTION_DIM),
             name="model_action",
         )
         chunk = V22PolicyActionChunk(
-            actions=model_action.reshape(1, STATE_BC_ACTION_DIM),
+            actions=normalized_model_action.reshape(1, STATE_BC_ACTION_DIM),
             layout_hash=self.layout.layout_hash,
             metadata={
                 "state_bc_schema": "dexteleop.state_bc_experiment.v1",
@@ -250,28 +278,36 @@ class StatePolicyAdapter:
                 "policy_absolute_frame": self.config.policy_absolute_frame,
             },
         )
-        normalized_actions = self._v22.to_legacy_normalized_actions(
+        normalized = self._v22.to_legacy_normalized_actions(
             chunk,
-            source=self.config.source,
+            source=self.config.source if source is None else str(source),
+        )[0]
+        runtime_vector = convert_policy_absolute_vector_to_runtime_raw(
+            normalized.vector,
+            active_sides=self.config.active_sides,
+            policy_absolute_frame=self.config.policy_absolute_frame,
+            runtime_pose_frame_contract=self.config.runtime_pose_frame_contract,
         )
-        actions: list[NormalizedAction] = []
-        for normalized in normalized_actions:
-            runtime_vector = convert_policy_absolute_vector_to_runtime_raw(
-                normalized.vector,
-                active_sides=self.config.active_sides,
-                policy_absolute_frame=self.config.policy_absolute_frame,
-                runtime_pose_frame_contract=self.config.runtime_pose_frame_contract,
-            )
-            metadata = {
-                **dict(normalized.metadata),
-                "state_bc_schema": "dexteleop.state_bc_experiment.v1",
-                "state_bc_model_artifact_hash": self.artifact_hash,
-                "state_bc_model_state_dim": STATE_BC_STATE_DIM,
-                "state_bc_model_action_dim": STATE_BC_ACTION_DIM,
-                "policy_absolute_frame": self.config.policy_absolute_frame,
-                "action_pose_mode": "absolute",
-            }
-            actions.append(replace(normalized, vector=runtime_vector, metadata=metadata))
+        metadata = {
+            **dict(normalized.metadata),
+            "state_bc_schema": "dexteleop.state_bc_experiment.v1",
+            "state_bc_model_artifact_hash": self.artifact_hash,
+            "state_bc_model_state_dim": STATE_BC_STATE_DIM,
+            "state_bc_model_action_dim": STATE_BC_ACTION_DIM,
+            "policy_absolute_frame": self.config.policy_absolute_frame,
+            "action_pose_mode": "absolute",
+        }
+        return replace(normalized, vector=runtime_vector, metadata=metadata)
+
+    def predict(self, observation: DeploymentObservation) -> StatePolicyPrediction:
+        model_observation = self.capture_model_observation(observation)
+        model_state = model_observation.state
+        raw_action = self.model.predict(model_state)  # type: ignore[union-attr]
+        model_action = _normalize_pose_quaternion(
+            _finite_vector(raw_action, name="model_action", dim=STATE_BC_ACTION_DIM),
+            name="model_action",
+        )
+        actions = [self.project_model_action(model_action, source=self.config.source)]
         metadata = {
             **dict(self.config.metadata),
             "state_bc_schema": "dexteleop.state_bc_experiment.v1",
