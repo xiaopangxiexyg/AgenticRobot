@@ -9,6 +9,7 @@
 |---|---|---|
 | [2026-07 位控/力控 A/B](./position_control/test-7.11.md) | 15/40、15/60/120、IK、8×、inactive、singularity、数采性能演进 | [真实系统入口](../real/README.md) / [遥操数采说明](../real/TELEOP_COLLECTION.md) |
 | [DMTAC 旧命令分层](./dmtac/temp_dmtac.md) | 旧 75→150 Hz、debug overlay、旧 replay/deploy 组合 | [真实系统](../real/README.md)、[硬件](../hardware/README.md) |
+| [DMTAC 旧 gripper driver 退役记录](./reports/dmtac_gripper_driver_legacy_retirement_20260825.md) | 删除无生产调用的重复 legacy driver，保留当前 DMTAC 后端边界 | [DMTAC 旧命令分层](./dmtac/temp_dmtac.md) / [硬件](../hardware/README.md) |
 | [Position A/B report](./reports/position_ab_report.md) | 已有 capture 的离线分析结果 | [遥操数采说明](../real/TELEOP_COLLECTION.md) |
 | [2026-07-22 命令清点](./reports/command_inventory_2026-07-22.md) | 重组前入口与散落来源快照 | [当前 docs 入口](../README.md) |
 | [2026-07-17 框架复核](./reports/framework_review_20260717.md) | 当时目录、入口、契约和迁移状态的只读快照 | [当前 docs 入口](../README.md) / 各 package README |
