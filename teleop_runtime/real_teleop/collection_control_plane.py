@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import math
 import threading
 import time
 from typing import Any
@@ -78,6 +79,7 @@ class CollectionControlPlane:
         self._pending: _PendingOperation | None = None
         self._completed: CollectionControlOperationResult | None = None
         self._completed_discard: Callable[[Any], None] | None = None
+        self._worker: threading.Thread | None = None
         self._closed = False
 
     @property
@@ -124,13 +126,14 @@ class CollectionControlPlane:
                 discard_value=discard_value,
             )
             self._pending = pending
-        worker = threading.Thread(
-            target=self._run,
-            args=(pending, operation),
-            name=f"{self.name}:{normalized_kind}:{generation}",
-            daemon=True,
-        )
-        worker.start()
+            worker = threading.Thread(
+                target=self._run,
+                args=(pending, operation),
+                name=f"{self.name}:{normalized_kind}:{generation}",
+                daemon=True,
+            )
+            self._worker = worker
+            worker.start()
         return generation
 
     def active_kind_unlocked(self) -> str | None:
@@ -180,11 +183,15 @@ class CollectionControlPlane:
         )
         with self._lock:
             if self._pending is not pending:
+                if self._worker is threading.current_thread():
+                    self._worker = None
                 return
             self._pending = None
             if not self._closed:
                 self._completed = result
                 self._completed_discard = pending.discard_value
+            if self._worker is threading.current_thread():
+                self._worker = None
 
     def poll(
         self,
@@ -199,6 +206,41 @@ class CollectionControlPlane:
             self._completed = None
             self._completed_discard = None
             return result
+
+    def wait(
+        self,
+        generation: int,
+        *,
+        timeout_sec: float,
+    ) -> CollectionControlOperationResult | None:
+        """Wait at most *timeout_sec* and consume one exact completion."""
+
+        timeout = float(timeout_sec)
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError(
+                "collection control-plane wait timeout must be finite "
+                "and non-negative"
+            )
+        requested_generation = int(generation)
+        with self._lock:
+            completed = self._completed
+            if (
+                completed is not None
+                and completed.generation == requested_generation
+            ):
+                worker = None
+            elif (
+                self._pending is not None
+                and self._pending.generation == requested_generation
+            ):
+                worker = self._worker
+            else:
+                return None
+        if worker is not None:
+            if worker is threading.current_thread():
+                return None
+            worker.join(timeout=timeout)
+        return self.poll(requested_generation)
 
     def cancel(self, generation: int) -> bool:
         value_to_discard: Any | None = None
@@ -246,12 +288,26 @@ class CollectionControlPlane:
                         )
         return True
 
-    def close(self) -> None:
+    def close(self, *, timeout_sec: float = 5.0) -> bool:
+        """Cancel publication, discard owned output, and wait for the worker.
+
+        Running Python callables cannot be interrupted safely.  Closing is
+        therefore cooperative, but unlike :meth:`cancel` it is also a bounded
+        resource barrier: ``True`` means the submitted callable and its
+        cancellation cleanup have both returned.  A ``False`` result means
+        the caller must not treat dependencies used by that callable as fully
+        quiesced yet; a later call may finish draining the same closed plane.
+        """
+
+        timeout = float(timeout_sec)
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError(
+                "collection control-plane close timeout must be finite "
+                "and non-negative"
+            )
         value_to_discard: Any | None = None
         discard_value: Callable[[Any], None] | None = None
         with self._lock:
-            if self._closed:
-                return
             self._closed = True
             if self._pending is not None:
                 self._pending.cancelled = True
@@ -261,6 +317,7 @@ class CollectionControlPlane:
                     discard_value = self._completed_discard
                 self._completed = None
                 self._completed_discard = None
+            worker = self._worker
         if discard_value is not None:
             try:
                 discard_value(value_to_discard)
@@ -269,6 +326,12 @@ class CollectionControlPlane:
                 # deliberately best-effort here; cancel()/poll() retain cleanup
                 # failures when the runtime is still able to surface them.
                 pass
+        if worker is None:
+            return True
+        if worker is threading.current_thread():
+            return False
+        worker.join(timeout=timeout)
+        return not worker.is_alive()
 
 
 __all__ = [

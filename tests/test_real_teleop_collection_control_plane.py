@@ -132,12 +132,78 @@ def test_close_discards_unconsumed_success_and_rejects_new_work() -> None:
     while plane.busy and time.monotonic() < deadline:
         time.sleep(0.001)
 
-    plane.close()
+    assert plane.close()
 
     assert cleaned == [candidate]
     assert plane.poll(generation) is None
     with pytest.raises(RuntimeError, match="closed"):
         plane.submit("prepare", lambda: None)
+
+
+def test_close_waits_for_running_operation_and_its_discard_cleanup() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    cleaned: list[object] = []
+    candidate = object()
+    plane = CollectionControlPlane(name="unit-test")
+
+    def prepare() -> object:
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return candidate
+
+    plane.submit("prepare", prepare, discard_value=cleaned.append)
+    assert entered.wait(timeout=1.0)
+    releaser = threading.Timer(0.05, release.set)
+    releaser.start()
+    started_at = time.monotonic()
+    try:
+        assert plane.close(timeout_sec=1.0)
+    finally:
+        releaser.join(timeout=1.0)
+
+    assert time.monotonic() - started_at >= 0.04
+    assert cleaned == [candidate]
+    assert not plane.busy
+
+
+def test_close_timeout_is_bounded_and_a_later_close_can_finish_drain() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    cleaned: list[object] = []
+    plane = CollectionControlPlane(name="unit-test")
+
+    plane.submit(
+        "prepare",
+        lambda: (entered.set(), release.wait(timeout=1.0)),
+        discard_value=cleaned.append,
+    )
+    assert entered.wait(timeout=1.0)
+
+    started_at = time.monotonic()
+    assert not plane.close(timeout_sec=0.01)
+    assert time.monotonic() - started_at < 0.1
+    release.set()
+    assert plane.close(timeout_sec=1.0)
+    assert cleaned == [(None, True)]
+
+
+def test_wait_consumes_only_the_requested_completed_generation() -> None:
+    release = threading.Event()
+    plane = CollectionControlPlane(name="unit-test")
+    generation = plane.submit(
+        "prepare",
+        lambda: (release.wait(timeout=1.0), "ready")[1],
+    )
+
+    assert plane.wait(generation + 1, timeout_sec=0.0) is None
+    assert plane.wait(generation, timeout_sec=0.01) is None
+    release.set()
+    result = plane.wait(generation, timeout_sec=1.0)
+    assert result is not None
+    assert result.succeeded
+    assert result.value == "ready"
+    assert plane.poll(generation) is None
 
 
 class _CaptureModalityContract:
@@ -155,6 +221,7 @@ class _Clutch:
     def __init__(self) -> None:
         self.countdown_states: list[dict[str, object]] = []
         self.recording_states: list[dict[str, object]] = []
+        self.finalize_states: list[dict[str, object]] = []
         self.restore_calls = 0
         self.round_trip_advances = 0
         self.hold_reasons: list[str] = []
@@ -169,6 +236,9 @@ class _Clutch:
     def set_episode_recording_state(self, **state: object) -> None:
         self.recording_states.append(dict(state))
 
+    def set_episode_finalize_state(self, **state: object) -> None:
+        self.finalize_states.append(dict(state))
+
     def _restore_gripper_task_policy_for_collection(self) -> None:
         self.restore_calls += 1
 
@@ -181,6 +251,15 @@ class _Clutch:
     def begin_plus_curation_episode(self, episode_index: int) -> None:
         self.plus_episode_indices.append(int(episode_index))
 
+    def set_plus_curation_pending(
+        self,
+        *,
+        dataset_root: Path,
+        episode_index: int,
+    ) -> None:
+        del dataset_root
+        self.plus_episode_indices.append(int(episode_index))
+
 
 def _episode_runtime(
     *,
@@ -190,6 +269,7 @@ def _episode_runtime(
     clutch: _Clutch,
     transition_calls: list[str],
     publish_runtime_hardware_status=lambda: None,
+    bind_capture_modality_contract=lambda *_args, **_kwargs: None,
 ):
     logs: list[tuple[str, str]] = []
     episode_state = [None]
@@ -216,7 +296,7 @@ def _episode_runtime(
         "_log": lambda tag, message, **_kwargs: logs.append((tag, message)),
         "_start_episode_recording": lambda *_args, **_kwargs: None,
         "_stop_episode_recording": lambda *_args, **_kwargs: None,
-        "bind_capture_modality_contract": lambda *_args, **_kwargs: None,
+        "bind_capture_modality_contract": bind_capture_modality_contract,
     }
     args = SimpleNamespace(
         no_collection=False,
@@ -758,6 +838,10 @@ def test_dataset_selection_status_publish_failure_cannot_skip_old_retirement(
         def __init__(self, *, args: object, **_kwargs: object) -> None:
             self.args = args
             self.dataset_root = Path(args.dataset_root)
+            self.finalizing = False
+            self.is_recording = False
+            self.is_paused = False
+            self.frame_count = 0
             self.closed = False
             instances.append(self)
 
@@ -826,7 +910,7 @@ def test_dataset_selection_status_publish_failure_cannot_skip_old_retirement(
     runtime.close()
 
 
-def test_dataset_selection_is_single_flight_and_no_recorder_commits_inline(
+def test_dataset_selection_is_single_flight_and_no_recorder_prepares_async(
     tmp_path: Path,
 ) -> None:
     entered = threading.Event()
@@ -898,16 +982,25 @@ def test_dataset_selection_is_single_flight_and_no_recorder_commits_inline(
     assert instances[0].closed is True
 
     empty_slot: list[object | None] = [None]
+    empty_transition_calls: list[str] = []
+    inline_callbacks: list[str] = []
+    contract_entered = threading.Event()
+    contract_release = threading.Event()
+
+    def bind_contract(*_args: object, **_kwargs: object) -> None:
+        contract_entered.set()
+        assert contract_release.wait(timeout=1.0)
+
     empty_runtime, empty_args, _logs = _episode_runtime(
         tmp_path=tmp_path / "empty",
         recorder_type=Recorder,
         dataset_slot=empty_slot,
         clutch=_Clutch(),
-        transition_calls=[],
+        transition_calls=empty_transition_calls,
+        bind_capture_modality_contract=bind_contract,
     )
     inline_snapshot = dict(vars(empty_args))
     inline_snapshot["dataset_root"] = tmp_path / "inline"
-    inline_callbacks: list[str] = []
 
     def inline_commit(snapshot: dict[str, object]) -> None:
         vars(empty_args).clear()
@@ -916,14 +1009,31 @@ def test_dataset_selection_is_single_flight_and_no_recorder_commits_inline(
 
     assert empty_runtime.schedule_dataset_selection(
         inline_snapshot,
-        bind_dataset_contract=False,
+        bind_dataset_contract=True,
         on_commit=inline_commit,
         on_complete=lambda: inline_callbacks.append("complete"),
         on_failure=lambda exc: inline_callbacks.append(f"failure:{exc}"),
-    ) == "committed"
+    ) == "pending"
+    assert contract_entered.wait(timeout=1.0)
+    assert inline_callbacks == []
+    assert empty_args.dataset_root == tmp_path / "empty"
+    assert empty_slot[0] is None
+    assert len(instances) == 1
+
+    contract_release.set()
+    deadline = time.monotonic() + 1.0
+    while (
+        empty_runtime.collection_transition_active()
+        and time.monotonic() < deadline
+    ):
+        empty_runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
     assert inline_callbacks == ["commit", "complete"]
     assert empty_args.dataset_root == tmp_path / "inline"
     assert empty_slot[0] is None
+    assert empty_transition_calls == ["dataset_selection_reconfigure"]
+    assert len(instances) == 1
     empty_runtime.close()
 
 
@@ -980,7 +1090,20 @@ def test_cancelled_prepare_never_publishes_candidate(tmp_path: Path) -> None:
 def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
-    finalize_task = SimpleNamespace(episode_index=4, frame_count=17)
+    finalize_results: list[object] = []
+    finalize_task = SimpleNamespace(
+        episode_index=4,
+        frame_count=17,
+        queued_at=10.0,
+        started_at=10.1,
+        completed_at=10.2,
+        stage_timings_ms={},
+        success=True,
+        error="",
+        v25p_error="",
+        v25p_native_error="",
+        progress_error="",
+    )
 
     class Recorder:
         def __init__(self, **_kwargs: object) -> None:
@@ -993,7 +1116,9 @@ def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path)
         frame_count=17,
         dataset_root=tmp_path,
         collection_frequency_status=lambda: {"sample_hz": 15.0},
-        poll_finalize_tasks=lambda: [],
+        poll_finalize_tasks=(
+            lambda: [finalize_results.pop(0)] if finalize_results else []
+        ),
     )
 
     def stop_episode(**_kwargs: object):
@@ -1033,8 +1158,162 @@ def test_episode_stop_drain_is_nonblocking_and_committed_on_poll(tmp_path: Path)
 
     assert clutch.recording_states[-1]["event_status"] == "finalizing"
     assert clutch.recording_states[-1]["episode_index"] == 4
+    assert clutch.round_trip_advances == 0
+
+    finalize_results.append(finalize_task)
+    runtime.poll_dataset_finalize(time.time())
+    assert clutch.finalize_states[-1]["status"] == "saved"
     assert clutch.round_trip_advances == 1
-    runtime.close()
+    assert clutch.plus_episode_indices == [4]
+    assert runtime.close()
+
+
+def test_failed_finalize_does_not_advance_round_trip_task(tmp_path: Path) -> None:
+    failed_task = SimpleNamespace(
+        episode_index=5,
+        frame_count=11,
+        queued_at=10.0,
+        started_at=10.1,
+        completed_at=10.2,
+        stage_timings_ms={},
+        success=False,
+        error="parquet flush failed",
+        v25p_error="",
+        v25p_native_error="",
+        progress_error="",
+    )
+    finalize_results: list[object] = [failed_task]
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("finalize test must reuse the published recorder")
+
+    recorder = SimpleNamespace(
+        finalizing=True,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        dataset_root=tmp_path,
+        close=lambda: None,
+    )
+
+    def poll_failed_finalize_tasks() -> list[object]:
+        if not finalize_results:
+            recorder.finalizing = False
+            return []
+        recorder.finalizing = False
+        return [finalize_results.pop(0)]
+
+    recorder.poll_finalize_tasks = poll_failed_finalize_tasks
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, _args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+
+    runtime.poll_dataset_finalize(time.time())
+
+    assert clutch.finalize_states[-1]["status"] == "error"
+    assert clutch.round_trip_advances == 0
+    assert clutch.plus_episode_indices == []
+    assert runtime.close()
+
+
+def test_close_stops_and_publishes_an_active_episode_before_plane_shutdown(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    stop_calls: list[dict[str, object]] = []
+    finalize_task = SimpleNamespace(
+        episode_index=7,
+        frame_count=23,
+        queued_at=10.0,
+        started_at=10.1,
+        completed_at=10.2,
+        stage_timings_ms={},
+        success=True,
+        error="",
+        v25p_error="",
+        v25p_native_error="",
+        progress_error="",
+    )
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("shutdown test must reuse the published recorder")
+
+    finalize_results: list[object] = []
+    recorder = SimpleNamespace(
+        finalizing=False,
+        is_recording=True,
+        is_paused=False,
+        frame_count=23,
+        active_episode_index=7,
+        dataset_root=tmp_path,
+        collection_frequency_status=lambda: {"sample_hz": 15.0},
+    )
+
+    def poll_finalize_tasks() -> list[object]:
+        if not finalize_results:
+            return []
+        recorder.finalizing = False
+        return [finalize_results.pop(0)]
+
+    recorder.poll_finalize_tasks = poll_finalize_tasks
+
+    def stop_episode(**kwargs: object):
+        stop_calls.append(dict(kwargs))
+        entered.set()
+        assert release.wait(timeout=1.0)
+        recorder.is_recording = False
+        recorder.finalizing = True
+        finalize_results.append(finalize_task)
+        return finalize_task
+
+    recorder.stop_episode = stop_episode
+    recorder.close = lambda: None
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, _args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+    releaser = threading.Timer(0.05, release.set)
+    releaser.start()
+    try:
+        assert runtime.close(
+            now=123.0,
+            end_reason="shutdown",
+            summary={"reason": "finally"},
+            timeout_sec=1.0,
+        )
+    finally:
+        releaser.join(timeout=1.0)
+
+    assert entered.is_set()
+    assert stop_calls == [
+        {
+            "reason": "shutdown",
+            "step_index": 0,
+            "last_state": None,
+            "summary": {"reason": "finally"},
+            "defer_finalize_start": False,
+            "before_finalize": None,
+        }
+    ]
+    assert slot[0] is recorder
+    assert clutch.recording_states[-1]["event_status"] == "finalizing"
+    assert clutch.recording_states[-1]["episode_index"] == 7
+    assert clutch.finalize_states[-1]["status"] == "saved"
+    assert clutch.round_trip_advances == 1
 
 
 def test_failed_stop_isolated_recorder_and_allows_fresh_retry(tmp_path: Path) -> None:

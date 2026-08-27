@@ -1007,6 +1007,54 @@ def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
     ]
 
 
+def test_episode_recording_shutdown_commits_force_guard_reason_before_resources() -> None:
+    close_calls: list[dict[str, object]] = []
+
+    class Fault:
+        def to_dict(self) -> dict[str, object]:
+            return {"code": "joint_force_limit"}
+
+    episode_runtime = SimpleNamespace(
+        close=lambda **kwargs: close_calls.append(dict(kwargs)) or True
+    )
+    result = runtime._close_episode_recording_runtime_before_resources(
+        {
+            "args": SimpleNamespace(),
+            "episode_recording_runtime": episode_runtime,
+            "position_force_guard_monitor": SimpleNamespace(fault=Fault()),
+        },
+        terminal_error=RuntimeError("force guard"),
+        support={
+            "_arm_control_mode_arg": lambda _args: "position",
+            "_position_force_guard_collision_summary": (
+                lambda _fault: {"peak_force_n": 42.0}
+            ),
+            "_terminal_force_collision_summary": (
+                lambda *_args, **_kwargs: pytest.fail(
+                    "force-guard summary must remain authoritative"
+                )
+            ),
+            "time": SimpleNamespace(time=lambda: 123.5),
+        },
+    )
+
+    assert result is True
+    assert close_calls == [
+        {
+            "now": 123.5,
+            "end_reason": "position_force_guard",
+            "summary": {
+                "reason": "position_force_guard",
+                "position_force_guard_fault": {
+                    "code": "joint_force_limit"
+                },
+                "peak_force_n": 42.0,
+            },
+            "timeout_sec": 15.0,
+        }
+    ]
+
+
 def test_real_component_builder_preserves_legacy_wrapper_and_import_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2547,6 +2595,129 @@ def test_dataset_selection_owns_pending_contract_admission_without_ui_or_devices
     assert "control_station" not in selection_source
     assert "teleop_runtime.debug" not in selection_source
     assert "hardware" not in selection_source
+
+
+def test_teleop_running_projection_requires_an_actual_arm_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Gesture:
+        config = SimpleNamespace(enabled=False)
+
+        def reset_for_running(self) -> None:
+            return None
+
+        def mark_runtime_restarted(self) -> None:
+            return None
+
+    session_state = SimpleNamespace(value="ARMED")
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.components = SimpleNamespace(
+        active_sides=("left", "right"),
+        session=SimpleNamespace(
+            state_machine=SimpleNamespace(state=session_state),
+        ),
+    )
+    control.ui = None
+    control._hold_active = False
+    control._teleop_started = False
+    control._teleop_dispatch_confirmed = False
+    control._teleop_dispatch_projection = "idle"
+    control._gripper_control_enabled = False
+    control._last_calibration_started_from_hold = False
+    control._q6_hold_recalibration_gesture = Gesture()
+    control._dataset_selection_pending = False
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_has_q6_gripper_control",
+        lambda _components: True,
+    )
+
+    control.publish_teleop_running(home_ready=True)
+    assert control._teleop_started is True
+    assert control._teleop_dispatch_confirmed is False
+    assert control.gripper_control_enabled() is False
+    assert control.episode_start_admission() == (
+        False,
+        "机械臂命令尚未实际派发，不能开始数采。",
+    )
+
+    running_step = SimpleNamespace(
+        state=SimpleNamespace(value="RUNNING"),
+        command_dispatched=True,
+        command=SimpleNamespace(
+            commands={"left_arm": object(), "right_arm": object()},
+            metadata={},
+        ),
+        motion_hold_reason="",
+    )
+    assert control_loop._project_session_dispatch_state(
+        running_step,
+        clutch_input=control,
+    )
+    assert control._teleop_dispatch_confirmed is True
+    assert control.gripper_control_enabled() is True
+
+    frozen_step = SimpleNamespace(
+        state=SimpleNamespace(value="FROZEN"),
+        command_dispatched=False,
+        command=None,
+        motion_hold_reason="source timing fault",
+    )
+    assert not control_loop._project_session_dispatch_state(
+        frozen_step,
+        clutch_input=control,
+    )
+    assert control._teleop_dispatch_confirmed is False
+    assert control.gripper_control_enabled() is False
+
+
+def test_episode_lifecycle_state_is_authoritative_without_a_gui() -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.ui = None
+    control._episode_recording_ui_active = False
+    control._episode_recording_ui_paused = False
+    control._episode_countdown_ui_active = False
+    control._episode_finalizing_ui_active = False
+    control._episode_last_episode_index = None
+    control._episode_last_frame_count = None
+
+    control.set_episode_start_countdown_state(remaining_sec=2.0)
+    assert control._episode_countdown_ui_active is True
+    assert control._episode_recording_ui_active is False
+
+    control.set_episode_recording_state(
+        active=True,
+        frame_count=4,
+        event_status="recording",
+        episode_index=3,
+    )
+    assert control._episode_recording_ui_active is True
+    assert control._episode_countdown_ui_active is False
+    assert control._episode_last_episode_index == 3
+    assert control._episode_last_frame_count == 4
+
+    control.set_episode_recording_state(
+        active=False,
+        frame_count=9,
+        event_status="finalizing",
+        episode_index=3,
+    )
+    assert control._episode_finalizing_ui_active is True
+
+    control.set_episode_finalize_state(
+        status="saved",
+        message="saved",
+        episode_index=3,
+        frame_count=9,
+    )
+    assert control._episode_finalizing_ui_active is False
+    assert control._episode_recording_ui_active is False
+    assert control._episode_last_frame_count == 9
 
 
 def test_plus_curation_runtime_owns_request_and_writer_thread_lifecycle() -> None:

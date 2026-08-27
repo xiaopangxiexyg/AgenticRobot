@@ -274,6 +274,13 @@ class RealTeleopControlInput:
         self._gripper_control_before_fix_hold = False
         self._tracker_swap_locked = False
         self._teleop_started = False
+        # ``_teleop_started`` means the Session has been armed and therefore
+        # owns the ordinary Hold/re-Home lifecycle.  It does not prove that an
+        # arm command crossed the final Session dispatch boundary.  Keep that
+        # fact separate so the GUI, collection admission, and gripper control
+        # cannot report RUNNING while the Session is still ARMED or frozen.
+        self._teleop_dispatch_confirmed = False
+        self._teleop_dispatch_projection = "idle"
         # Exact-qpos maintenance before runtime Home is enabled only while the
         # real startup wait loop owns and services its dedicated dispatch path.
         # Keeping this explicit prevents a merely enabled browser control from
@@ -835,6 +842,18 @@ class RealTeleopControlInput:
     def _episode_busy(self) -> bool:
         return _gui_episode_busy(self._gui_control_state())
 
+    def _teleop_arm_dispatch_confirmed(self) -> bool:
+        """Return the production dispatch fact with thin-adapter compatibility."""
+
+        session = getattr(self.components, "session", None)
+        if getattr(session, "state_machine", None) is None:
+            # Historic offline/test adapters expose no Session state at all.
+            # They cannot project the authoritative dispatch boundary, so
+            # preserve their established armed-only contract.  The real
+            # runtime always has a state_machine and never takes this branch.
+            return bool(getattr(self, "_teleop_started", False))
+        return bool(getattr(self, "_teleop_dispatch_confirmed", False))
+
     def _episode_transition_busy(self) -> bool:
         state = self._gui_control_state()
         return bool(state.episode_countdown_active or state.episode_finalizing_active)
@@ -848,9 +867,11 @@ class RealTeleopControlInput:
         explicitly enabled the progress workflow for that Episode.
         """
         if bool(getattr(self, "_dataset_selection_pending", False)):
-            return False, "数据集任务/profile 正在切换，writer ready 后才能开始数采。"
+            return False, "数据集任务/profile 正在后台准备，完成后才能开始数采。"
         if not bool(getattr(self, "_teleop_started", False)):
             return False, "遥操尚未进入 RUNNING，不能开始数采。"
+        if not self._teleop_arm_dispatch_confirmed():
+            return False, "机械臂命令尚未实际派发，不能开始数采。"
         if bool(getattr(self, "_hold_active", False)):
             return False, "常规 Hold 期间不能开始数采；请先重采 runtime Home。"
         init_controller = getattr(self.components, "init_arm_controller", None)
@@ -3769,7 +3790,7 @@ class RealTeleopControlInput:
 
         if bool(getattr(self, "_dataset_selection_pending", False)):
             return reject(
-                "已有数据集任务/profile 切换正在等待 writer ready；"
+                "已有数据集任务/profile 切换正在等待后台准备完成；"
                 "本次选择未提交。"
             )
         if self._episode_busy():
@@ -3884,8 +3905,8 @@ class RealTeleopControlInput:
             if outcome == "pending" and self.ui is not None:
                 self.ui.append_message(
                     "Dataset",
-                    "正在后台准备所选数据集/profile 的 writer；"
-                    "旧配置保持有效，ready 后再原子切换。",
+                    "正在后台准备所选数据集/profile 的目录、契约及必要的 writer；"
+                    "旧配置保持有效，准备完成后再原子切换。",
                 )
                 self.ui.publish(
                     active_controls=self._current_active_controls(),
@@ -3963,6 +3984,8 @@ class RealTeleopControlInput:
         self._cancel_init_arm_qpos_sequence(reason=str(reason or "manual Hold"))
         self._hold_requested = True
         self._hold_active = True
+        self._teleop_dispatch_confirmed = False
+        self._teleop_dispatch_projection = "hold"
         self._gripper_control_enabled = False
         self._hold_request_reason = str(reason or "manual")
         self._q6_hold_recalibration_gesture.reset_for_hold()
@@ -4011,6 +4034,7 @@ class RealTeleopControlInput:
         elif not self._hold_active:
             self._gripper_control_enabled = bool(
                 self._gripper_control_before_fix_hold
+                and self._teleop_arm_dispatch_confirmed()
             )
         self._fix_hold_active = normalized
         if self.ui is not None:
@@ -4533,7 +4557,11 @@ class RealTeleopControlInput:
         )
 
     def gripper_control_enabled(self) -> bool:
-        return bool(self._gripper_control_enabled and _has_q6_gripper_control(self.components))
+        return bool(
+            self._gripper_control_enabled
+            and self._teleop_arm_dispatch_confirmed()
+            and _has_q6_gripper_control(self.components)
+        )
 
     def _poll_q6_hold_recalibration_gesture(self, *, now: float) -> None:
         gesture = self._q6_hold_recalibration_gesture
@@ -4612,13 +4640,13 @@ class RealTeleopControlInput:
             )
 
     def set_episode_start_countdown_state(self, *, remaining_sec: float, message: str | None = None) -> None:
-        if self.ui is None:
-            return
         remaining = max(0.0, float(remaining_sec))
         self._episode_countdown_ui_active = True
         self._episode_recording_ui_active = False
         self._episode_recording_ui_paused = False
         self._episode_finalizing_ui_active = False
+        if self.ui is None:
+            return
         self.ui.publish(
             active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
@@ -4654,8 +4682,6 @@ class RealTeleopControlInput:
         event_message: str | None = None,
         episode_index: int | None = None,
     ) -> None:
-        if self.ui is None:
-            return
         self._episode_recording_ui_active = bool(active)
         self._episode_recording_ui_paused = bool(
             active and str(event_status or "") in {"paused", "resume_pending"}
@@ -4666,6 +4692,8 @@ class RealTeleopControlInput:
             self._episode_last_episode_index = int(episode_index)
         if frame_count is not None:
             self._episode_last_frame_count = int(frame_count)
+        if self.ui is None:
+            return
         frequency_payload = dict(frequency_status or {})
         warning_payload = dict(frequency_payload.get("warning") or {})
         if not active:
@@ -4709,8 +4737,6 @@ class RealTeleopControlInput:
         episode_index: int | None = None,
         frame_count: int | None = None,
     ) -> None:
-        if self.ui is None:
-            return
         self._episode_recording_ui_active = False
         self._episode_recording_ui_paused = False
         self._episode_countdown_ui_active = False
@@ -4719,6 +4745,8 @@ class RealTeleopControlInput:
             self._episode_last_episode_index = int(episode_index)
         if frame_count is not None:
             self._episode_last_frame_count = int(frame_count)
+        if self.ui is None:
+            return
         self.ui.publish(
             active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
@@ -4880,28 +4908,58 @@ class RealTeleopControlInput:
         self._last_calibration_started_from_hold = False
         self._teleop_started = True
         self._hold_active = False
-        self._gripper_control_enabled = _has_q6_gripper_control(self.components)
+        state_machine = getattr(
+            getattr(self.components, "session", None),
+            "state_machine",
+            None,
+        )
+        session_state = getattr(state_machine, "state", None)
+        session_state_value = str(
+            getattr(session_state, "value", session_state) or ""
+        ).upper()
+        # Missing state_machine is retained as a compatibility case for thin
+        # offline adapters.  The production Session always exposes ARMED here
+        # and only transitions to RUNNING after its first real dispatch.
+        dispatch_confirmed = bool(
+            home_ready
+            and (not session_state_value or session_state_value == "RUNNING")
+        )
+        self._teleop_dispatch_confirmed = dispatch_confirmed
+        self._teleop_dispatch_projection = (
+            "running" if dispatch_confirmed else f"suspended:{session_state_value or 'HOME'}"
+        )
+        self._gripper_control_enabled = bool(
+            dispatch_confirmed and _has_q6_gripper_control(self.components)
+        )
         if was_hold_active or was_hold_restart:
             self._q6_hold_recalibration_gesture.mark_runtime_restarted()
         else:
             self._q6_hold_recalibration_gesture.reset_for_running()
         if self.ui is None:
             return
-        control_hint = "遥操已开始；Q6 夹爪控制会自动开启；Hold 只冻结机械臂，重采需再次点击开始。"
-        if self._q6_hold_recalibration_gesture.config.enabled:
+        control_hint = (
+            "遥操已开始；Q6 夹爪控制会自动开启；Hold 只冻结机械臂，重采需再次点击开始。"
+            if dispatch_confirmed
+            else "Session 已进入 ARMED；正在等待首条机械臂命令通过最终 admission，期间夹爪控制保持关闭。"
+        )
+        if dispatch_confirmed and self._q6_hold_recalibration_gesture.config.enabled:
             control_hint = (
                 "遥操已开始；Q6 手势模式已开启：双手后三维握紧 1 秒进入 Hold，"
                 "松开到释放区间 1 秒后再次握紧 1 秒会重采 runtime home。"
             )
         gripper_status = _build_gripper_status(self.components)
         self.ui.publish(
-            stage="RM65 真机遥操运行中",
+            stage=(
+                "RM65 真机遥操运行中"
+                if dispatch_confirmed
+                else "RM65 首帧命令验证中"
+            ),
             active_controls=self._current_active_controls(),
             control_hint=control_hint,
             home_ready=bool(home_ready),
             capture_stage="teleop",
             capture_phase="teleop",
-            teleop_running=True,
+            teleop_running=dispatch_confirmed,
             capturing=False,
             capture_samples=None,
             capture_left_samples=None,
@@ -4943,13 +5001,95 @@ class RealTeleopControlInput:
         )
         _log(
             "WebGUI",
-            f"teleop state published url={str(getattr(self.ui, 'url', '') or '<unknown>')} "
+            "teleop state published "
+            f"session_state={session_state_value or '<compat>'} "
+            f"dispatch_confirmed={dispatch_confirmed} "
+            f"url={str(getattr(self.ui, 'url', '') or '<unknown>')} "
             f"gripper_control={'on' if self.gripper_control_enabled() else 'off'} "
             f"q6_sides={[side for side in self.components.active_sides if _gripper_retargeter_for_side(self.components, side) is not None]}",
         )
-        self.ui.append_message("RealTeleop", message or "runtime home 完成，已进入真机遥操。")
+        self.ui.append_message(
+            "RealTeleop",
+            message
+            or (
+                "runtime home 完成，已进入真机遥操。"
+                if dispatch_confirmed
+                else "runtime home 完成，正在等待首条机械臂命令实际派发。"
+            ),
+        )
         self.publish_raw_tracker_pose_state(force=True)
         self.publish_gripper_status(force=True)
+
+    def publish_teleop_dispatch_running(self, *, message: str = "") -> bool:
+        """Project a Session-confirmed arm dispatch into application state."""
+
+        if not self._teleop_started or self._hold_active:
+            return False
+        changed = not bool(getattr(self, "_teleop_dispatch_confirmed", False))
+        self._teleop_dispatch_confirmed = True
+        self._teleop_dispatch_projection = "running"
+        self._gripper_control_enabled = _has_q6_gripper_control(self.components)
+        if self.ui is None or not changed:
+            return changed
+        control_hint = (
+            "首条机械臂命令已实际派发；遥操与 Q6 夹爪控制现在同步开放。"
+        )
+        self.ui.publish(
+            stage="RM65 真机遥操运行中",
+            active_controls=self._current_active_controls(),
+            control_hint=control_hint,
+            capture_stage="teleop",
+            capture_phase="teleop",
+            teleop_running=True,
+            gripper_control_enabled=self.gripper_control_enabled(),
+        )
+        self.ui.append_message("RealTeleop", message or control_hint)
+        self.publish_gripper_status(force=True)
+        return True
+
+    def publish_teleop_dispatch_suspended(
+        self,
+        *,
+        session_state: str,
+        reason: str = "",
+    ) -> bool:
+        """Remove the RUNNING projection when no arm command was dispatched."""
+
+        if not self._teleop_started or self._hold_active:
+            return False
+        normalized_state = str(session_state or "UNKNOWN").upper()
+        normalized_reason = str(reason or "").strip()
+        projection = f"suspended:{normalized_state}:{normalized_reason}"
+        changed = projection != getattr(self, "_teleop_dispatch_projection", "")
+        self._teleop_dispatch_confirmed = False
+        self._teleop_dispatch_projection = projection
+        self._gripper_control_enabled = False
+        if self.ui is None or not changed:
+            return changed
+        stage_by_state = {
+            "ARMED": "RM65 首帧命令验证中",
+            "FROZEN": "RM65 命令冻结 / 等待恢复",
+            "RECOVERING": "RM65 自动恢复中",
+            "FAULT": "RM65 控制故障",
+            "ESTOP": "RM65 急停",
+        }
+        state_label = stage_by_state.get(
+            normalized_state,
+            "RM65 命令暂未派发",
+        )
+        detail = normalized_reason or (
+            f"Session={normalized_state}，本控制帧没有实际派发机械臂命令；"
+            "夹爪控制同步保持关闭。"
+        )
+        self.ui.publish(
+            stage=state_label,
+            active_controls=self._current_active_controls(),
+            control_hint=detail,
+            teleop_running=False,
+            gripper_control_enabled=False,
+        )
+        self.ui.append_message("RealTeleop", detail)
+        return True
 
     def publish_calibration_waiting(self, message: str = "") -> None:
         self._calibration_requested = False
@@ -4976,6 +5116,8 @@ class RealTeleopControlInput:
         )
         if self._teleop_started:
             self._hold_active = True
+            self._teleop_dispatch_confirmed = False
+            self._teleop_dispatch_projection = "calibration_waiting"
             self._gripper_control_enabled = False
             self._q6_hold_recalibration_gesture.reset_for_hold()
         self._tracker_swap_locked = bool(self._teleop_started)

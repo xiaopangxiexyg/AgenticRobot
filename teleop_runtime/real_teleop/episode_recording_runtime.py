@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ class _PreparedDatasetRecorder:
 
 @dataclass(frozen=True)
 class _PreparedDatasetSelection:
-    recorder: Any
+    recorder: Any | None
     args_snapshot: Mapping[str, Any]
     previous_recorder: Any | None
 
@@ -67,7 +68,7 @@ class EpisodeRecordingRuntime:
     schedule_dataset_selection: Callable[..., str]
     countdown_deadline: Callable[[], float | None]
     collection_transition_active: Callable[[], bool]
-    close: Callable[[], None]
+    close: Callable[..., bool]
 
 
 def build_episode_recording_runtime(
@@ -211,6 +212,7 @@ def build_episode_recording_runtime(
     dataset_selection_cleanup_generation: int | None = None
     dataset_selection_cleanup_on_complete: Callable[[], None] | None = None
     dataset_selection_cleanup_kind = ""
+    finalize_failure_count = 0
 
     def start_position_episode_debug(
         episode_index: int,
@@ -620,10 +622,11 @@ def build_episode_recording_runtime(
     def discard_prepared_dataset_selection(value: Any) -> None:
         if not isinstance(value, _PreparedDatasetSelection):
             return
-        try:
-            value.recorder.close()
-        except BaseException:
-            pass
+        if value.recorder is not None:
+            try:
+                value.recorder.close()
+            except BaseException:
+                pass
         if runtime_closing and value.previous_recorder is not None:
             try:
                 value.previous_recorder.close()
@@ -712,40 +715,6 @@ def build_episode_recording_runtime(
         )
         existing_recorder = dataset_recorder
 
-        if existing_recorder is None:
-            try:
-                if bind_dataset_contract:
-                    bind_capture_modality_contract(
-                        selected_root,
-                        selected_modality_contract,
-                    )
-                on_commit(dict(vars(staged_args)))
-            except BaseException as exc:
-                try:
-                    on_failure(exc)
-                except BaseException:
-                    pass
-                raise
-            args.dataset_startup_error = ""
-            startup_device_errors.pop("dataset.writer", None)
-            try:
-                publish_runtime_hardware_status()
-            except BaseException as exc:
-                _log(
-                    "Dataset",
-                    "dataset selection committed but hardware-status refresh "
-                    f"failed: {type(exc).__name__}: {exc}",
-                )
-            try:
-                on_complete()
-            except BaseException as exc:
-                _log(
-                    "Dataset",
-                    "dataset selection committed but completion publication "
-                    f"failed: {type(exc).__name__}: {exc}",
-                )
-            return "committed"
-
         def prepare_selection() -> _PreparedDatasetSelection:
             try:
                 prepare_dataset_transition("dataset_selection_reconfigure")
@@ -754,9 +723,13 @@ def build_episode_recording_runtime(
                         selected_root,
                         selected_modality_contract,
                     )
-                candidate = construct_started_dataset_recorder(
-                    existing_recorder,
-                    args_override=staged_args,
+                candidate = (
+                    None
+                    if existing_recorder is None
+                    else construct_started_dataset_recorder(
+                        existing_recorder,
+                        args_override=staged_args,
+                    )
                 )
                 return _PreparedDatasetSelection(
                     recorder=candidate,
@@ -780,14 +753,16 @@ def build_episode_recording_runtime(
             prepare_selection,
             discard_value=discard_prepared_dataset_selection,
         )
-        # The old recorder remains recoverable but is no longer observable by
-        # finalize/progress/status consumers while the candidate owns the
-        # selection transaction.
+        # A live old recorder remains recoverable but is no longer observable
+        # by finalize/progress/status consumers while the candidate owns the
+        # selection transaction.  When there is no recorder, selection only
+        # prepares the dataset contract; writer construction stays lazy until
+        # the next formal episode start.
         set_dataset_recorder(None)
         dataset_recorder = None
         _log(
             "Dataset",
-            "dataset selection writer replacement submitted "
+            "dataset selection preparation submitted "
             f"generation={dataset_selection_generation}",
         )
         return "pending"
@@ -1583,44 +1558,50 @@ def build_episode_recording_runtime(
             if commit_callback is None:
                 raise RuntimeError("dataset selection commit callback is unavailable")
             commit_callback(prepared.args_snapshot)
-            # The recorder was constructed from a private staged namespace so
-            # its ready handshake could not expose draft configuration. Future
-            # consistency checks must observe the now-committed live namespace.
-            prepared.recorder.args = args
+            if prepared.recorder is not None:
+                # The recorder was constructed from a private staged namespace
+                # so its ready handshake could not expose draft configuration.
+                # Future consistency checks must observe the now-committed
+                # live namespace.
+                prepared.recorder.args = args
             dataset_recorder = prepared.recorder
             set_dataset_recorder(prepared.recorder)
         except BaseException as exc:
             publish_failure(exc)
-            try:
-                schedule_dataset_selection_cleanup(
-                    prepared.recorder,
-                    cleanup_kind="discard_selection_candidate",
-                    on_complete=None,
-                )
-            except BaseException as cleanup_submit_error:
-                _log(
-                    "Dataset",
-                    "failed to submit rejected selection candidate cleanup: "
-                    f"{type(cleanup_submit_error).__name__}: "
-                    f"{cleanup_submit_error}",
-                    now=now,
-                )
+            if prepared.recorder is not None:
+                try:
+                    schedule_dataset_selection_cleanup(
+                        prepared.recorder,
+                        cleanup_kind="discard_selection_candidate",
+                        on_complete=None,
+                    )
+                except BaseException as cleanup_submit_error:
+                    _log(
+                        "Dataset",
+                        "failed to submit rejected selection candidate cleanup: "
+                        f"{type(cleanup_submit_error).__name__}: "
+                        f"{cleanup_submit_error}",
+                        now=now,
+                    )
             return
 
-        args.dataset_startup_error = ""
-        startup_device_errors.pop("dataset.writer", None)
+        writer_ready = prepared.recorder is not None
+        if writer_ready:
+            args.dataset_startup_error = ""
+            startup_device_errors.pop("dataset.writer", None)
         try:
             publish_runtime_hardware_status()
         except Exception as exc:  # noqa: BLE001 - status is observational only.
             _log(
                 "Dataset",
-                "selected writer is active but hardware-status refresh failed: "
+                "selected dataset state is active but hardware-status refresh failed: "
                 f"{type(exc).__name__}: {exc}",
                 now=now,
             )
         _log(
             "DatasetTiming",
-            "dataset selection writer became ready outside the realtime loop "
+            "dataset selection preparation completed outside the realtime loop "
+            f"writer_ready={writer_ready} "
             f"elapsed={result.elapsed_sec * 1000.0:.1f}ms "
             f"generation={result.generation}",
             now=now,
@@ -1882,7 +1863,6 @@ def build_episode_recording_runtime(
                     )
                     stopped_episode_index = int(task.episode_index)
                     stopped_frame_count = int(task.frame_count)
-                    clutch_input.advance_round_trip_task_after_saved_episode()
                 _log("Dataset", event_message, now=now)
                 if control_ui is not None:
                     control_ui.append_message("Dataset", event_message)
@@ -1903,6 +1883,7 @@ def build_episode_recording_runtime(
         reset_gripper_warmup_probe(f"recording_stopped:{stopped_reason}")
 
     def poll_dataset_finalize(now: float) -> None:
+        nonlocal finalize_failure_count
         if dataset_selection_generation is not None:
             result = collection_control_plane.poll(dataset_selection_generation)
             if result is not None:
@@ -1957,6 +1938,7 @@ def build_episode_recording_runtime(
                     episode_index=int(task.episode_index),
                     frame_count=int(task.frame_count),
                 )
+                clutch_input.advance_round_trip_task_after_saved_episode()
                 clutch_input.set_plus_curation_pending(
                     dataset_root=dataset_recorder.dataset_root,
                     episode_index=int(task.episode_index),
@@ -1986,6 +1968,7 @@ def build_episode_recording_runtime(
                     if control_ui is not None:
                         control_ui.append_message("Dataset", progress_message)
             else:
+                finalize_failure_count += 1
                 message = f"正式数据集 episode {task.episode_index} 保存失败: {task.error}"
                 _log("Dataset", message, now=now)
                 if control_ui is not None:
@@ -2006,8 +1989,96 @@ def build_episode_recording_runtime(
             return float("inf")
         return episode_start_countdown_deadline
 
-    def close() -> None:
+    def close(
+        *,
+        now: float | None = None,
+        end_reason: str = "shutdown",
+        summary: Mapping[str, object] | None = None,
+        timeout_sec: float = 15.0,
+    ) -> bool:
         nonlocal runtime_closing
+        timeout = float(timeout_sec)
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError(
+                "episode recording shutdown timeout must be finite "
+                "and non-negative"
+            )
+        deadline = time.monotonic() + timeout
+        shutdown_now = time.time() if now is None else float(now)
+        shutdown_summary = {} if summary is None else dict(summary)
+        lifecycle_committed = True
+        finalize_failures_before = int(finalize_failure_count)
+
+        def remaining_sec() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        def wait_and_publish(
+            generation: int,
+            publish: Callable[..., None],
+        ) -> bool:
+            result = collection_control_plane.wait(
+                generation,
+                timeout_sec=remaining_sec(),
+            )
+            if result is None:
+                return False
+            publish(result, now=time.time())
+            return True
+
+        if not runtime_closing:
+            # An episode-open RPC may already have crossed the writer boundary
+            # when the operator exits.  Publish that exact completion first so
+            # a successfully opened episode is stopped through the normal
+            # drain/seal lifecycle rather than discarded as an unknown partial
+            # mutation.
+            if episode_open_generation is not None:
+                lifecycle_committed = wait_and_publish(
+                    episode_open_generation,
+                    publish_open_completion,
+                )
+            if lifecycle_committed and episode_stop_generation is not None:
+                lifecycle_committed = wait_and_publish(
+                    episode_stop_generation,
+                    publish_stop_completion,
+                )
+            if lifecycle_committed and recording_active():
+                lifecycle_committed = stop_recording(
+                    shutdown_now,
+                    end_reason=str(end_reason),
+                    summary=shutdown_summary,
+                )
+                if lifecycle_committed and episode_stop_generation is not None:
+                    lifecycle_committed = wait_and_publish(
+                        episode_stop_generation,
+                        publish_stop_completion,
+                    )
+            # stop_episode() only hands the sample drain to the writer's
+            # finalize lifecycle.  Shutdown is not complete until that task is
+            # published as saved/error; otherwise round-trip/progress/Plus
+            # state would be skipped even though generic recorder.close()
+            # later wrote the files successfully.
+            refresh_runtime_views()
+            while (
+                lifecycle_committed
+                and dataset_recorder is not None
+                and bool(getattr(dataset_recorder, "finalizing", False))
+                and remaining_sec() > 0.0
+            ):
+                poll_dataset_finalize(time.time())
+                refresh_runtime_views()
+                if (
+                    dataset_recorder is not None
+                    and bool(getattr(dataset_recorder, "finalizing", False))
+                ):
+                    time.sleep(min(0.01, remaining_sec()))
+            if (
+                dataset_recorder is not None
+                and bool(getattr(dataset_recorder, "finalizing", False))
+            ):
+                lifecycle_committed = False
+            if finalize_failure_count > finalize_failures_before:
+                lifecycle_committed = False
+
         runtime_closing = True
         if dataset_selection_generation is not None:
             collection_control_plane.cancel(dataset_selection_generation)
@@ -2017,11 +2088,29 @@ def build_episode_recording_runtime(
             collection_control_plane.cancel(episode_prepare_generation)
         if episode_open_generation is not None:
             collection_control_plane.cancel(episode_open_generation)
+        if episode_stop_generation is not None:
+            collection_control_plane.cancel(episode_stop_generation)
         # Prepare/open/stop detach their recorder before the worker mutates it.
         # Keep the outer shutdown path from reattaching or closing that private
-        # lifecycle concurrently; close() makes any eventual completion discard
-        # and clean its produced value.
-        collection_control_plane.close()
+        # lifecycle concurrently.  The bounded close barrier waits for its
+        # cancellation cleanup before lower camera/session teardown continues.
+        drained = collection_control_plane.close(timeout_sec=remaining_sec())
+        if not lifecycle_committed:
+            _log(
+                "Dataset",
+                "formal collection shutdown could not publish the normal "
+                "episode stop lifecycle within the bounded timeout; pending "
+                "work was cancelled and isolated",
+                now=shutdown_now,
+            )
+        if not drained:
+            _log(
+                "Dataset",
+                "collection control-plane worker did not drain before the "
+                f"{timeout:.3f}s shutdown deadline",
+                now=shutdown_now,
+            )
+        return bool(lifecycle_committed and drained)
 
     return EpisodeRecordingRuntime(
         recording_active=recording_active,

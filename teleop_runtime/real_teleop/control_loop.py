@@ -717,6 +717,8 @@ def _request_safety_hold_best_effort(
         "_hold_requested": True,
         "_hold_active": True,
         "_hold_request_reason": str(reason),
+        "_teleop_dispatch_confirmed": False,
+        "_teleop_dispatch_projection": "hold",
         "_gripper_control_enabled": False,
     }
     for attribute, value in fallback_values.items():
@@ -745,6 +747,57 @@ def _position_force_guard_fault_pending(
     """
 
     return fault is not None and not bool(handled)
+
+
+def _project_session_dispatch_state(
+    step_result: Any,
+    *,
+    clutch_input: Any,
+) -> bool:
+    """Publish actual arm-dispatch availability, not merely armed intent."""
+
+    session_state_value = str(
+        getattr(step_result.state, "value", step_result.state)
+    ).upper()
+    dispatched_arm_command = bool(
+        step_result.command_dispatched
+        and step_result.command is not None
+        and any(
+            name in step_result.command.commands
+            for name in ("left_arm", "right_arm")
+        )
+    )
+    if session_state_value == "RUNNING" and dispatched_arm_command:
+        publish_running = getattr(
+            clutch_input,
+            "publish_teleop_dispatch_running",
+            None,
+        )
+        if callable(publish_running):
+            publish_running()
+        return True
+
+    startup_projection = (
+        None
+        if step_result.command is None
+        else step_result.command.metadata.get("startup_home_continuity")
+    )
+    startup_reason = (
+        str(startup_projection.get("reason", "") or "")
+        if isinstance(startup_projection, Mapping)
+        else ""
+    )
+    publish_suspended = getattr(
+        clutch_input,
+        "publish_teleop_dispatch_suspended",
+        None,
+    )
+    if callable(publish_suspended):
+        publish_suspended(
+            session_state=session_state_value,
+            reason=str(step_result.motion_hold_reason or "") or startup_reason,
+        )
+    return False
 
 
 def _request_position_admittance_endpoint_hold(
@@ -3545,6 +3598,10 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             )
             clutch_input.request_hold(reason="tracker_loss_timeout")
             continue
+        _project_session_dispatch_state(
+            step_result,
+            clutch_input=clutch_input,
+        )
         gripper_command = None
         gripper_command_status: dict[str, dict[str, object]] = {}
         if step_result.motion_hold_mode in {
