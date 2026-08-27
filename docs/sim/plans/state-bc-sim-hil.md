@@ -135,6 +135,9 @@ HITL is tested as exclusive source selection, not action blending:
 - exactly one `policy`, `human`, or `rtc` source may execute an action at a
   step;
 - every source switch emits `hold` followed by a fresh activation/emission;
+- after the lower HOLD completes, the runner captures a new deployment
+  observation; activation, policy inference, human execution, and RTC
+  conditioning use that post-HOLD sample;
 - standard policy inference is the nominal action source;
 - RTC inference receives the current state and nominal policy action, then
   either emits one replacement action or returns `rtc_no_action`;
@@ -146,6 +149,18 @@ HITL is tested as exclusive source selection, not action blending:
   16D/26D actions; RTC may return no action, a 26D runtime replacement, or a
   16D replacement that uses the shared adapter bridge;
 - lower runtime safety/IK/dispatch remains authoritative after the adapter.
+
+`experiments/sim_learning/state_bc/mujoco_stream.py` is the bounded concrete
+bridge for this experiment. On a switch it clears only the existing
+`PolicyDeployRuntime` queue/schedule, requires a complete lower cancellation
+receipt, advances the existing single-producer authority epoch while fenced,
+and then establishes READY. It does not create policy/human/RTC producer
+authorities: the mutually selected upper source is serialized through the one
+existing policy-emission target. Each executable action is admitted through
+`PolicyDeployRuntime`, submitted to `MujocoPolicySkillMotionTarget`, and
+advanced by one authoritative decision; `rtc_no_action` does none of these.
+Target start/reset/close and every safety, IK, reference, and dispatch decision
+remain lower-owned.
 
 This is sufficient to compare ordinary teleoperation, takeover/handback, and
 RTC intervention in a deterministic mock trace. A later MuJoCo target test can
@@ -195,26 +210,37 @@ earlier reset/observation smoke therefore validated asset loading, scene
 observation, and the model adapter seam only; it did not by itself route the
 26D output through the bilateral pose-target runtime or claim task success.
 The bounded runtime seam is now covered by the optional test below. The next
-experiment gate is to compare ordinary policy, human takeover/handback, and RTC
-intervention on resettable episodes without introducing a parallel execution
-loop.
+experiment gate is repeated resettable episodes with task predicates and
+matched policy/human/RTC intervention schedules, without introducing a
+parallel execution loop.
 
 ### Completed bilateral runtime seam smoke
 
 The bounded optional test
 `tests/test_mujoco_state_policy_adapter.py::test_state_policy_output_reaches_existing_bimanual_mujoco_target`
-now exercises that next gate with the checked-in `rm65_right_cube_lift_rl_normal_v2`
-scene and `realtime_worker=False`. It captures both TCPs and grippers, converts
-the state-BC desk-frame output through the reviewed RM65 runtime pose contract,
-routes the streaming runner's 26D policy event through the existing
-`PolicyDeployRuntime` emission boundary, and submits the emission to
-`MujocoPolicySkillMotionTarget`. The target's existing component
-ingress, canonical safety, coupled IK, q-reference generation, and one manual
-MuJoCo physics tick complete with `dispatched` status and finite bilateral qpos
-measurement.
+now exercises that next gate with the checked-in
+`rm65_right_cube_lift_rl_normal_v2` scene and `realtime_worker=False`. It
+captures both TCPs and grippers, converts the state-BC desk-frame output through
+the reviewed RM65 runtime pose contract, and runs the sequence `policy -> human
+-> policy -> rtc(no_action) -> rtc(replacement)`. Every switch obtains a
+complete lower HOLD receipt, recaptures observation, advances the same lower
+policy authority while fenced, and establishes READY. The four executable 26D
+actions traverse the same `PolicyDeployRuntime` emission boundary and
+`MujocoPolicySkillMotionTarget`; the RTC no-action produces no emission. The
+target's existing component ingress, canonical safety, coupled IK, q-reference
+generation, and deterministic MuJoCo ticks complete with `dispatched` status
+and finite bilateral qpos measurement.
+
+The non-realtime test profile explicitly enables the existing bounded final
+keyframe window with `action_maximum_hold_sec=0.25` and
+`extend_final_keyframe_to_maximum_hold=True`. The bridge does not extend an
+action: after submission it requires an authoritative decision tick inside the
+emission's declared interval and fails closed otherwise. A deployment profile
+must choose and justify its own timing contract.
 
 This is an execution-path contract smoke, not a task-success or policy-quality
 claim. It uses a deterministic injected policy in the test, does not use the
 ephemeral real-data artifact, and does not evaluate cube lifting, recovery
-benefit, safety-envelope margins, or human/RTC source switching inside the
-authoritative target. Those remain the next experiment-level comparisons.
+benefit, safety-envelope margins, operator usability, or real-time latency.
+Those remain experiment-level comparisons; no device, GUI, hardware motion, or
+RTC Active deployment was started.

@@ -256,6 +256,25 @@ class StateBCStreamingRunner:
         self._activation_counter = 0
         self._activation_id: str | None = None
 
+    def _capture(self) -> tuple[DeploymentObservation, np.ndarray]:
+        observation = self.observation_source.capture()
+        if not isinstance(observation, DeploymentObservation):
+            raise TypeError(
+                "observation_source.capture() must return DeploymentObservation."
+            )
+        model_state = validate_state_vector(
+            self.policy_adapter.capture_model_state(observation),
+            name="stream.model_state",
+        )
+        return observation, model_state
+
+    def _reset_policy_source(self, source: str) -> None:
+        if source not in {HITL_SOURCE_POLICY, HITL_SOURCE_RTC}:
+            return
+        reset = getattr(self.policy_adapter, "reset", None)
+        if callable(reset):
+            reset()
+
     def _emit(
         self,
         event: StateBCStreamEvent,
@@ -307,27 +326,45 @@ class StateBCStreamingRunner:
         model_state: np.ndarray,
         observation: DeploymentObservation,
         events: list[StateBCStreamEvent],
-    ) -> None:
-        if self._active_source is not None:
-            self._event(
-                step_index=step_index, kind=HITL_EVENT_HOLD, source=source,
-                activation_id=self._activation_id, model_state=model_state,
-                metadata={"previous_source": self._active_source},
-                observation=observation, events=events,
-            )
-        self._active_source = source
+    ) -> tuple[DeploymentObservation, np.ndarray]:
+        previous_source = self._active_source
+        refreshed_after_hold = False
+        if previous_source is not None:
+            try:
+                self._event(
+                    step_index=step_index, kind=HITL_EVENT_HOLD, source=source,
+                    activation_id=self._activation_id, model_state=model_state,
+                    metadata={"previous_source": previous_source},
+                    observation=observation, events=events,
+                )
+            finally:
+                # A failed or incomplete lower HOLD must never leave the old
+                # source locally eligible for another action.
+                self._active_source = None
+                self._activation_id = None
+            self._reset_policy_source(source)
+            observation, model_state = self._capture()
+            refreshed_after_hold = True
+        else:
+            self._reset_policy_source(source)
+
         self._activation_counter += 1
-        self._activation_id = f"state-bc-stream-activation:{self._activation_counter}"
+        activation_id = f"state-bc-stream-activation:{self._activation_counter}"
         self._event(
             step_index=step_index, kind=HITL_EVENT_ACTIVATION, source=source,
-            activation_id=self._activation_id, model_state=model_state,
+            activation_id=activation_id, model_state=model_state,
             metadata={
                 "fresh_observation_required": True,
+                "post_hold_observation": refreshed_after_hold,
+                "previous_source": previous_source,
                 "runtime_action_dim": STREAM_RUNTIME_ACTION_DIM,
                 "runtime_action_space": STREAM_RUNTIME_ACTION_SPACE,
             },
             observation=observation, events=events,
         )
+        self._active_source = source
+        self._activation_id = activation_id
+        return observation, model_state
 
     def step(
         self,
@@ -337,16 +374,10 @@ class StateBCStreamingRunner:
         step_index: int | None = None,
     ) -> tuple[StateBCStreamEvent, ...]:
         source = _source(requested_source)
-        observation = self.observation_source.capture()
-        if not isinstance(observation, DeploymentObservation):
-            raise TypeError("observation_source.capture() must return DeploymentObservation.")
+        observation, model_state = self._capture()
         resolved_step = int(observation.step_index if step_index is None else step_index)
         if resolved_step < 0:
             raise ValueError("step_index must be non-negative.")
-        model_state = validate_state_vector(
-            self.policy_adapter.capture_model_state(observation),
-            name="stream.model_state",
-        )
         human_runtime_action = None
         if source == HITL_SOURCE_HUMAN:
             if human_action is None:
@@ -354,7 +385,7 @@ class StateBCStreamingRunner:
             human_runtime_action = _runtime_action(human_action, source=source)
         events: list[StateBCStreamEvent] = []
         if source != self._active_source:
-            self._activate(
+            observation, model_state = self._activate(
                 source=source,
                 step_index=resolved_step,
                 model_state=model_state,

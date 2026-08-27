@@ -36,6 +36,11 @@ from .hitl import (
     StateBCHITLTrace,
 )
 from .model import StateBCModel, fit_linear_state_bc
+from .mujoco_stream import (
+    StateBCMujocoActionReceipt,
+    StateBCMujocoStreamBridge,
+    StateBCMujocoTransitionReceipt,
+)
 from .stream import (
     STREAM_RUNTIME_ACTION_DIM,
     STREAM_RUNTIME_ACTION_LAYOUT,
@@ -66,6 +71,9 @@ __all__ = [
     "STATE_BC_STATE_DIM",
     "StateBCArtifactMetadata",
     "StateBCModel",
+    "StateBCMujocoActionReceipt",
+    "StateBCMujocoStreamBridge",
+    "StateBCMujocoTransitionReceipt",
     "StateBCNormalization",
     "StateBCSelector",
     "StateBCHITLEvent",

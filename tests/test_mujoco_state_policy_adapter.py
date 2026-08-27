@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from experiments.sim_learning.state_bc.contracts import StateBCArtifactMetadata
 from experiments.sim_learning.state_bc.model import fit_linear_state_bc
-from experiments.sim_learning.state_bc.stream import StateBCStreamingRunner
+from experiments.sim_learning.state_bc.mujoco_stream import (
+    StateBCMujocoStreamBridge,
+)
+from experiments.sim_learning.state_bc.stream import (
+    StateBCStreamEvent,
+    StateBCStreamingRunner,
+)
 from robot_motion.action import HandActionSpec
 from robot_motion.deploy import (
     DeploymentObservation,
@@ -64,6 +71,113 @@ class _DummyStatePolicy:
         return action
 
 
+class _IncrementingClock:
+    def __init__(self) -> None:
+        self.value = 10.0
+
+    def __call__(self) -> float:
+        self.value += 0.001
+        return self.value
+
+
+class _FakeMujocoRuntime:
+    def __init__(self) -> None:
+        self.gate = "ready"
+        self.transitions = []
+        self.submissions = []
+        self.dispatches = 0
+        self.authority_epoch = 0
+        self.authoritative_port = self
+        self.config = SimpleNamespace(initial_control_mode="policy")
+
+    def capture_execution_gate_snapshot(self, *, now=None):
+        return SimpleNamespace(status=self.gate, captured_at=now)
+
+    def transition_execution_gate(
+        self,
+        status,
+        *,
+        reason,
+        source_event_ids=(),
+        force_cancellation=False,
+    ):
+        self.gate = status
+        self.transitions.append((status, reason, tuple(source_event_ids)))
+        cancellation = SimpleNamespace(cancellation_id="cancel:fixture") if status == "hold" else None
+        receipt = (
+            SimpleNamespace(complete=True, requires_fault_escalation=False)
+            if status == "hold"
+            else None
+        )
+        validation = SimpleNamespace(accepted=True) if status == "hold" else None
+        return SimpleNamespace(
+            snapshot=SimpleNamespace(status=status),
+            cancellation=cancellation,
+            cancellation_receipt=receipt,
+            cancellation_dispatch_validation=validation,
+            lower_event_ids=(f"lower:{len(self.transitions)}",),
+        )
+
+    def capture_receiver_state(self):
+        return SimpleNamespace(current_authority_epoch=self.authority_epoch)
+
+    def admit_authority_event(self, *, event_type, control_mode, reason):
+        self.authority_epoch += 1
+        return SimpleNamespace(
+            event_id=f"authority:{self.authority_epoch}",
+            authority_epoch=self.authority_epoch,
+            event_type=event_type,
+            control_mode=control_mode,
+            reason=reason,
+        )
+
+    def submit_policy_action_emission(self, emission):
+        self.submissions.append(emission)
+        return SimpleNamespace(accepted=True, source_emission=emission)
+
+    def step(self, *, now=None, physics_ticks_after_dispatch=0):
+        self.dispatches += 1
+        return SimpleNamespace(
+            status="dispatched",
+            decided_at=now,
+            physics_ticks_after_dispatch=physics_ticks_after_dispatch,
+        )
+
+
+class _StaticObservationSource:
+    def __init__(self, observation):
+        self.observation = observation
+
+    def capture(self):
+        return self.observation
+
+
+def _fake_stream_bridge():
+    clock = _IncrementingClock()
+    target_runtime = _FakeMujocoRuntime()
+    policy_runtime = PolicyDeployRuntime(
+        PolicyDeployRuntimeConfig(
+            active_sides=("left", "right"),
+            hands_enabled=True,
+            policy_absolute_frame="runtime_raw",
+        ),
+        monotonic_clock=clock,
+    )
+    bridge = StateBCMujocoStreamBridge(
+        policy_runtime=policy_runtime,
+        target=SimpleNamespace(runtime=target_runtime),
+        preparer=DeployActionPreparer(
+            DeployRobotActionAdapter(
+                active_sides=("left", "right"),
+                arms_enabled=True,
+                hands_enabled=True,
+            )
+        ),
+        clock=clock,
+    )
+    return bridge, policy_runtime, target_runtime
+
+
 def test_state_policy_adapter_projects_16d_model_output_to_existing_26d_action():
     adapter = StatePolicyAdapter(
         model=_DummyStatePolicy(),
@@ -114,9 +228,88 @@ def test_state_policy_adapter_validates_the_serialized_artifact_hash(tmp_path):
     assert adapter.artifact_hash == model.artifact_hash
 
 
+def test_stream_bridge_routes_all_selected_sources_through_one_target():
+    bridge, policy_runtime, target_runtime = _fake_stream_bridge()
+    observation = _observation()
+    adapter = StatePolicyAdapter(
+        model=_DummyStatePolicy(),
+        config=StatePolicyAdapterConfig(policy_absolute_frame="runtime_raw"),
+    )
+    rtc_calls = 0
+
+    def rtc_policy(_state, nominal_model_action, _nominal_runtime_action):
+        nonlocal rtc_calls
+        rtc_calls += 1
+        return None if rtc_calls == 1 else nominal_model_action
+
+    human_action = adapter.predict(observation).actions[0]
+    trace = StateBCStreamingRunner(
+        observation_source=_StaticObservationSource(observation),
+        policy_adapter=adapter,
+        rtc_policy=rtc_policy,
+        transition=bridge.transition,
+        execute=bridge.execute,
+    ).run(
+        ["policy", "human", "policy", "rtc", "rtc"],
+        human_actions={1: human_action},
+    )
+
+    assert trace.source_sequence() == ("policy", "human", "policy", "rtc")
+    assert [event.execution_receipt.source for event in trace.action_events] == [
+        "policy",
+        "human",
+        "policy",
+        "rtc",
+    ]
+    assert len(target_runtime.submissions) == 4
+    assert target_runtime.dispatches == 4
+    assert [status for status, _, _ in target_runtime.transitions] == [
+        "ready",
+        "hold",
+        "ready",
+        "hold",
+        "ready",
+        "hold",
+        "ready",
+    ]
+    assert target_runtime.gate == "ready"
+    assert target_runtime.authority_epoch == 3
+    assert policy_runtime.action_queue_length() == 0
+
+
+def test_stream_bridge_rearms_a_retained_hold_before_retry_activation():
+    bridge, _policy_runtime, target_runtime = _fake_stream_bridge()
+    observation = _observation()
+    bridge.transition(
+        StateBCStreamEvent(
+            step_index=1,
+            event_kind="hold",
+            requested_source="human",
+            activation_id="activation:old",
+            metadata={"previous_source": "policy"},
+        ),
+        observation,
+    )
+
+    receipt = bridge.transition(
+        StateBCStreamEvent(
+            step_index=1,
+            event_kind="activation",
+            requested_source="human",
+            activation_id="activation:retry",
+            metadata={"post_hold_observation": False},
+        ),
+        observation,
+    )
+
+    assert receipt.authority_event is not None
+    assert target_runtime.authority_epoch == 1
+    assert target_runtime.gate == "ready"
+
+
 @pytest.mark.optional
 def test_state_policy_output_reaches_existing_bimanual_mujoco_target():
-    """Exercise existing adapter/profile/runtime seams without new control code."""
+    """Route policy, human and RTC through one authoritative MuJoCo target."""
 
     pytest.importorskip("mujoco")
 
@@ -221,40 +414,49 @@ def test_state_policy_output_reaches_existing_bimanual_mujoco_target():
                 policy_absolute_frame="runtime_raw",
                 policy_node_id=config.policy_node_id,
                 policy_clock_domain_id=config.clock_domain_id,
+                action_maximum_hold_sec=0.25,
+                extend_final_keyframe_to_maximum_hold=True,
             ),
             monotonic_clock=time.monotonic,
         )
         target.runtime.start()
-        class _StaticObservationSource:
-            def capture(self):
-                return observation
+        bridge = StateBCMujocoStreamBridge(
+            policy_runtime=policy_runtime,
+            target=target,
+            preparer=DeployActionPreparer(
+                DeployRobotActionAdapter(
+                    active_sides=("left", "right"),
+                    arms_enabled=True,
+                    hands_enabled=True,
+                )
+            ),
+            clock=time.monotonic,
+        )
+        rtc_calls = 0
 
-        class _FixedPolicy:
-            def __init__(self, action):
-                self.action = action
+        def rtc_policy(_state, nominal_model_action, _nominal_runtime_action):
+            nonlocal rtc_calls
+            rtc_calls += 1
+            return None if rtc_calls == 1 else nominal_model_action
 
-            def predict(self, _observation):
-                return self.action
-
-        def execute(action, _event, current_observation):
-            prediction_result = policy_runtime.predict_and_queue(
-                _FixedPolicy(action),
-                current_observation,
-                now=time.monotonic(),
-            )
-            assert prediction_result.accepted is True
-            prepared_result = policy_runtime.prepare_next_action(
-                current_observation,
-                preparer=DeployActionPreparer(
-                    DeployRobotActionAdapter(
-                        active_sides=("left", "right"),
-                        arms_enabled=True,
-                        hands_enabled=True,
-                    )
-                ),
-                policy_name="state_bc",
-            )
-            emission = prepared_result.emission
+        human_action = adapter.predict(observation).actions[0]
+        trace = StateBCStreamingRunner(
+            observation_source=_StaticObservationSource(observation),
+            policy_adapter=adapter,
+            rtc_policy=rtc_policy,
+            transition=bridge.transition,
+            execute=bridge.execute,
+        ).run(
+            ["policy", "human", "policy", "rtc", "rtc"],
+            human_actions={1: human_action},
+        )
+        assert trace.source_sequence() == ("policy", "human", "policy", "rtc")
+        for event in trace.action_events:
+            receipt = event.execution_receipt
+            assert receipt is not None
+            assert receipt.submission.accepted is True
+            assert receipt.dispatch.status == "dispatched"
+            emission = receipt.preparation.emission
             assert emission is not None
             assert emission.pre_safety_robot_action is not None
             assert set(emission.pre_safety_robot_action.active_effectors) == {
@@ -263,19 +465,6 @@ def test_state_policy_output_reaches_existing_bimanual_mujoco_target():
                 "left_hand",
                 "right_hand",
             }
-            return target.runtime.submit_policy_action_emission(emission)
-
-        trace = StateBCStreamingRunner(
-            observation_source=_StaticObservationSource(),
-            policy_adapter=adapter,
-            execute=execute,
-        ).run(["policy"])
-        assert trace.source_sequence() == ("policy",)
-        submission = trace.action_events[0].execution_receipt
-        assert submission is not None
-        result = target.runtime.step(physics_ticks_after_dispatch=1)
-        assert submission.accepted is True
-        assert result.status == "dispatched"
         assert set(target.runtime.capture_qpos_measurement().qpos_by_side) == {
             "left",
             "right",
