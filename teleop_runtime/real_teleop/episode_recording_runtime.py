@@ -8,6 +8,35 @@ from pathlib import Path
 import time
 from typing import Any
 
+from .collection_control_plane import (
+    CollectionControlOperationBusy,
+    CollectionControlOperationResult,
+    CollectionControlPlane,
+)
+
+
+@dataclass(frozen=True)
+class _PreparedDatasetRecorder:
+    recorder: Any
+    owned_candidate: bool
+
+
+@dataclass(frozen=True)
+class _DatasetOpenCompletion:
+    recorder: Any | None
+    episode_index: int | None
+    planned_episode_index: int | None
+    debug_started: bool
+
+
+@dataclass(frozen=True)
+class _DatasetStopCompletion:
+    recorder: Any | None
+    task: Any | None
+    formal_stopped: bool
+    debug_stopped: bool
+    frame_count: int
+
 
 @dataclass(frozen=True)
 class EpisodeRecordingRuntime:
@@ -28,6 +57,8 @@ class EpisodeRecordingRuntime:
     sync_fix_hold: Callable[[float], None]
     poll_dataset_finalize: Callable[[float], None]
     countdown_deadline: Callable[[], float | None]
+    collection_transition_active: Callable[[], bool]
+    close: Callable[[], None]
 
 
 def build_episode_recording_runtime(
@@ -46,6 +77,7 @@ def build_episode_recording_runtime(
     collection_startup_blockers: Callable[[], dict[str, str]],
     recording_warmup_status: Callable[..., tuple[bool, str]],
     reset_gripper_warmup_probe: Callable[[str], None],
+    prepare_dataset_transition: Callable[[str], None],
     dataset_recorder_provider: Callable[[], Any],
     set_dataset_recorder: Callable[[Any], None],
     camera_previewer_provider: Callable[[], Any],
@@ -74,7 +106,7 @@ def build_episode_recording_runtime(
     _stop_episode_recording = support["_stop_episode_recording"]
     bind_capture_modality_contract = support["bind_capture_modality_contract"]
 
-    def construct_started_dataset_recorder() -> Any:
+    def construct_started_dataset_recorder(previous: Any | None = None) -> Any:
         """Build one writer candidate and publish nothing until it is ready.
 
         A process-backed collection worker owns a one-shot
@@ -92,12 +124,31 @@ def build_episode_recording_runtime(
             camera_sources=camera_sources,
         )
         try:
+            if previous is not None:
+                previous_root = Path(previous.dataset_root).expanduser().resolve()
+                candidate_root = Path(candidate.dataset_root).expanduser().resolve()
+                trace_sink = getattr(previous, "control_trace_episode_sink", None)
+                v25p_store = getattr(previous, "v25p_sidecar_store", None)
+                if trace_sink is not None:
+                    if candidate_root != previous_root:
+                        raise RuntimeError(
+                            "Formal ControlTrace capture cannot move dataset_root within "
+                            "one runtime session; restart the frontend for the new root."
+                        )
+                    candidate.attach_control_trace_episode_sink(trace_sink)
+                if v25p_store is not None:
+                    if candidate_root != previous_root:
+                        raise RuntimeError(
+                            "v2.5-p sidecars cannot move dataset_root within one runtime "
+                            "session; restart the frontend for the new root."
+                        )
+                    candidate.attach_v25p_sidecar_store(v25p_store)
             ensure_started = getattr(candidate, "ensure_started", None)
             if callable(ensure_started):
                 ensure_started()
             else:
                 candidate.start()
-            candidate.write_camera_device_config()
+                candidate.write_camera_device_config()
         except BaseException:
             try:
                 candidate.close()
@@ -121,11 +172,33 @@ def build_episode_recording_runtime(
     episode_recording_pause_reason = ""
     episode_resume_warmup_ready_count = 0
     episode_resume_warmup_required_frames = 2
+    collection_control_plane = CollectionControlPlane(
+        name="real-teleop-collection-control"
+    )
+    runtime_closing = False
+    episode_prepare_generation: int | None = None
+    episode_prepare_reason = "manual_key_start"
+    episode_prepare_cancel_reason = ""
+    episode_prepare_previous: Any | None = None
+    episode_prepare_previous_retirement_started = False
+    episode_open_generation: int | None = None
+    episode_open_recorder: Any | None = None
+    episode_open_start_attempted = False
+    episode_open_formal_started = False
+    episode_open_start_reason = "manual_key_start"
+    episode_stop_generation: int | None = None
+    episode_stop_recorder: Any | None = None
+    episode_stop_frame_count = 0
+    episode_stop_reason = ""
 
-    def start_position_episode_debug(episode_index: int) -> bool:
+    def start_position_episode_debug(
+        episode_index: int,
+        *,
+        recorder: Any | None = None,
+    ) -> bool:
         return position_episode_debug_runtime.start(
             episode_index,
-            dataset_recorder=dataset_recorder,
+            dataset_recorder=(dataset_recorder if recorder is None else recorder),
         )
 
     stop_position_episode_debug = position_episode_debug_runtime.stop
@@ -137,8 +210,21 @@ def build_episode_recording_runtime(
         camera_previewer = camera_previewer_provider()
         episode_last_state = episode_last_state_provider()
         step_index = int(step_index_provider())
+
+    def collection_transition_active() -> bool:
+        return bool(
+            episode_prepare_generation is not None
+            or episode_open_generation is not None
+            or episode_stop_generation is not None
+        )
+
     def recording_active() -> bool:
         refresh_runtime_views()
+        if episode_open_generation is not None or episode_stop_generation is not None:
+            # Open/stop owns the episode mutation.  Do not let the control loop
+            # enqueue a sample or debug frame before that mutation has been
+            # published back on the control thread.
+            return False
         return bool(
             (dataset_recorder is not None and dataset_recorder.is_recording)
             or episode_recorder.is_recording
@@ -227,10 +313,15 @@ def build_episode_recording_runtime(
 
 
     def start_recording(now: float, *, start_reason: str) -> bool:
-        nonlocal episode_last_state, last_collection_frequency_debug_at, last_collection_frequency_warning_active
+        nonlocal episode_open_generation, episode_open_recorder
+        nonlocal episode_open_start_attempted, episode_open_formal_started
+        nonlocal episode_open_start_reason
         nonlocal episode_start_failure_message, dataset_recorder
         refresh_runtime_views()
         episode_start_failure_message = None
+        if collection_transition_active():
+            episode_start_failure_message = "数采 lifecycle 仍在过渡中。"
+            return False
         admitted, admission_message = clutch_input.episode_start_admission()
         if not admitted:
             episode_start_failure_message = admission_message
@@ -244,36 +335,15 @@ def build_episode_recording_runtime(
             dataset_recorder is None
             and not bool(getattr(args, "no_collection", False))
         ):
-            try:
-                candidate = construct_started_dataset_recorder()
-                dataset_recorder = candidate
-                set_dataset_recorder(candidate)
-                args.dataset_startup_error = ""
-                startup_device_errors.pop("dataset.writer", None)
-                publish_runtime_hardware_status()
-            except Exception as exc:  # noqa: BLE001 - keep GUI/runtime available.
-                dataset_recorder = None
-                try:
-                    set_dataset_recorder(None)
-                except Exception as detach_exc:  # noqa: BLE001 - preserve retry state.
-                    _log(
-                        "Dataset",
-                        "failed writer detach was not fully acknowledged by the "
-                        f"runtime provider: {type(detach_exc).__name__}: {detach_exc}",
-                        now=now,
-                    )
-                detail = f"{type(exc).__name__}: {exc}"
-                args.dataset_startup_error = detail
-                startup_device_errors["dataset.writer"] = detail
-                publish_runtime_hardware_status()
-                message = f"正式 dataset 当前不可用: {detail}"
-                episode_start_failure_message = message
-                _log("Dataset", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", message)
-                return False
-        last_collection_frequency_warning_active = False
-        last_collection_frequency_debug_at = 0.0
+            message = (
+                "正式 dataset writer 尚未完成异步预备；"
+                "请重新点击“开始数采”并等待预备完成。"
+            )
+            episode_start_failure_message = message
+            _log("Dataset", message, now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", message)
+            return False
         if (
             bool(getattr(args, "no_collection", False))
             and dataset_recorder is None
@@ -285,151 +355,254 @@ def build_episode_recording_runtime(
             if control_ui is not None:
                 control_ui.append_message("Dataset", message)
             return False
-        if dataset_recorder is not None:
+
+        formal_recorder = dataset_recorder
+        captured_step_index = int(step_index)
+        start_wall_time = float(now)
+
+        def open_episode_lifecycle() -> _DatasetOpenCompletion:
+            nonlocal episode_open_start_attempted, episode_open_formal_started
+            planned_episode_index: int | None = None
+            episode_index: int | None = None
+            position_debug_started = False
+            debug_started = False
             try:
-                # Reconfiguration belongs before warmup/countdown.  Never
-                # rebuild feedback pollers after readiness has passed.
-                dataset_recorder.require_configured_for_current_args()
-            except Exception as exc:  # noqa: BLE001
-                message = f"正式 dataset 配置在 warmup 后发生变化: {type(exc).__name__}: {exc}"
-                episode_start_failure_message = message
-                _log("Dataset", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", message)
-                return False
-            planned_episode_index = int(dataset_recorder.writer.next_episode_index)
-            # Attach before metadata is frozen and before the dataset starts
-            # accepting samples.  The recorded metadata therefore describes
-            # the actual sidecar state/path instead of only the request.
-            start_position_episode_debug(planned_episode_index)
-            metadata = _build_episode_metadata(
-                args,
-                components,
-                start_reason=start_reason,
-            )
-            metadata.update(
-                {
-                    "formal_dataset": True,
-                    "dataset_root": str(dataset_recorder.dataset_root),
-                    "dataset_base_root": str(getattr(args, "dataset_base_root", "")),
-                    "dataset_dir_name": str(getattr(args, "dataset_dir_name", "")),
-                    "dataset_name": str(args.dataset_name),
-                    "task_id": str(args.collection_task_id),
-                    "task_name": str(args.collection_task_name),
-                    "task_name_zh": str(getattr(args, "collection_task_name_zh", "")),
-                    "task_description": str(args.collection_task_description),
-                    "camera_keys": sorted(dataset_recorder.camera_sources),
-                    "camera_config_path": None if args.no_camera else str(args.camera_config),
-                    "write_video": bool(args.write_video and not args.no_camera),
-                    "tactile_storage": str(args.tactile_storage),
-                    "tactile_compression": str(getattr(args, "tactile_compression", "none")),
-                    "storage_queue_size": int(args.storage_queue_size),
-                    "storage_queue_backpressure_policy": str(
-                        getattr(args, "storage_queue_backpressure_policy", "block")
-                    ),
-                }
-            )
-            try:
-                episode_index = dataset_recorder.start_episode(metadata, now=now)
-            except Exception as exc:  # noqa: BLE001
-                if (
-                    position_episode_debug_runtime.current_recorder()
-                    is not None
-                ):
-                    audit_close = stop_position_episode_debug(
-                        reason="dataset_start_failed"
+                if formal_recorder is not None:
+                    # Configuration inspection and the process-writer
+                    # start_episode RPC may touch disk or wait for another
+                    # process.  The recorder is detached while this operation
+                    # owns it, so the realtime loop cannot observe a partially
+                    # opened episode.
+                    formal_recorder.require_configured_for_current_args()
+                    planned_episode_index = int(
+                        formal_recorder.writer.next_episode_index
                     )
-                    if audit_close is not None:
-                        start_position_episode_debug_close(audit_close)
-                if bool(args.control_debug_config.enabled):
-                    update_control_debug_runtime_metadata(
-                        episode_sidecar_error=(
-                            f"dataset_start_failed:{type(exc).__name__}: {exc}"
+                    position_debug_started = start_position_episode_debug(
+                        planned_episode_index,
+                        recorder=formal_recorder,
+                    )
+                    metadata = _build_episode_metadata(
+                        args,
+                        components,
+                        start_reason=start_reason,
+                    )
+                    metadata.update(
+                        {
+                            "formal_dataset": True,
+                            "dataset_root": str(formal_recorder.dataset_root),
+                            "dataset_base_root": str(
+                                getattr(args, "dataset_base_root", "")
+                            ),
+                            "dataset_dir_name": str(
+                                getattr(args, "dataset_dir_name", "")
+                            ),
+                            "dataset_name": str(args.dataset_name),
+                            "task_id": str(args.collection_task_id),
+                            "task_name": str(args.collection_task_name),
+                            "task_name_zh": str(
+                                getattr(args, "collection_task_name_zh", "")
+                            ),
+                            "task_description": str(
+                                args.collection_task_description
+                            ),
+                            "camera_keys": sorted(formal_recorder.camera_sources),
+                            "camera_config_path": (
+                                None
+                                if args.no_camera
+                                else str(args.camera_config)
+                            ),
+                            "write_video": bool(
+                                args.write_video and not args.no_camera
+                            ),
+                            "tactile_storage": str(args.tactile_storage),
+                            "tactile_compression": str(
+                                getattr(args, "tactile_compression", "none")
+                            ),
+                            "storage_queue_size": int(args.storage_queue_size),
+                            "storage_queue_backpressure_policy": str(
+                                getattr(
+                                    args,
+                                    "storage_queue_backpressure_policy",
+                                    "block",
+                                )
+                            ),
+                        }
+                    )
+                    episode_open_start_attempted = True
+                    episode_index = int(
+                        formal_recorder.start_episode(
+                            metadata,
+                            now=start_wall_time,
                         )
                     )
-                message = f"正式 dataset episode 启动失败: {type(exc).__name__}: {exc}"
-                episode_start_failure_message = message
-                _log("Dataset", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", message)
-                return False
-            try:
-                clutch_input.begin_plus_curation_episode(int(episode_index))
-            except (OSError, TypeError, ValueError, RuntimeError) as exc:
-                # Plus is deliberately subordinate to raw collection.  The
-                # dataset episode is already open at this point and must keep
-                # recording even if optional review state cannot initialize.
-                message = (
-                    "Plus episode 状态初始化失败；正式原始数采继续："
-                    f"{type(exc).__name__}: {exc}"
+                    episode_open_formal_started = True
+                if episode_recorder.config.enabled:
+                    episode_recorder.root_dir = _episode_root_dir(args, components)
+                    _start_episode_recording(
+                        episode_recorder,
+                        args,
+                        components,
+                        now=start_wall_time,
+                        start_reason=start_reason,
+                    )
+                    debug_started = True
+                return _DatasetOpenCompletion(
+                    recorder=formal_recorder,
+                    episode_index=episode_index,
+                    planned_episode_index=planned_episode_index,
+                    debug_started=debug_started,
                 )
-                _log("Plus", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Plus", message)
-            if int(episode_index) != planned_episode_index:
-                mismatch = (
-                    "dataset episode index changed after audit attachment: "
-                    f"planned={planned_episode_index} actual={int(episode_index)}"
-                )
-                update_control_debug_runtime_metadata(
-                    episode_sidecar_error=mismatch,
-                )
-                _log("ControlDebug", f"WARNING: {mismatch}", now=now)
-            _log(
-                "Dataset",
-                f"recording started episode={episode_index} root={dataset_recorder.dataset_root}",
-                now=now,
+            except BaseException:
+                if debug_started or episode_recorder.is_recording:
+                    try:
+                        _stop_episode_recording(
+                            episode_recorder,
+                            now=start_wall_time,
+                            end_reason="episode_open_failed",
+                            summary={},
+                        )
+                    except BaseException:
+                        pass
+                if formal_recorder is not None and (
+                    episode_open_start_attempted or runtime_closing
+                ):
+                    try:
+                        if formal_recorder.is_recording:
+                            formal_recorder.stop_episode(
+                                reason="episode_open_failed",
+                                step_index=captured_step_index,
+                                last_state=None,
+                                summary={},
+                            )
+                    except BaseException:
+                        pass
+                    try:
+                        formal_recorder.close()
+                    except BaseException:
+                        pass
+                if position_debug_started or (
+                    position_episode_debug_runtime.current_recorder() is not None
+                ):
+                    try:
+                        audit_close = stop_position_episode_debug(
+                            reason="dataset_start_failed"
+                        )
+                        if audit_close is not None:
+                            audit_close()
+                    except BaseException:
+                        pass
+                raise
+
+        def discard_open_completion(value: Any) -> None:
+            if not isinstance(value, _DatasetOpenCompletion):
+                return
+            if value.debug_started and episode_recorder.is_recording:
+                try:
+                    _stop_episode_recording(
+                        episode_recorder,
+                        now=start_wall_time,
+                        end_reason="episode_open_cancelled",
+                        summary={},
+                    )
+                except BaseException:
+                    pass
+            if value.recorder is not None:
+                if value.episode_index is not None:
+                    try:
+                        value.recorder.stop_episode(
+                            reason="episode_open_cancelled",
+                            step_index=captured_step_index,
+                            last_state=None,
+                            summary={},
+                        )
+                    except BaseException:
+                        pass
+                try:
+                    value.recorder.close()
+                except BaseException:
+                    pass
+
+        episode_open_recorder = formal_recorder
+        episode_open_start_attempted = False
+        episode_open_formal_started = False
+        episode_open_start_reason = str(start_reason)
+        try:
+            episode_open_generation = collection_control_plane.submit(
+                "open_episode",
+                open_episode_lifecycle,
+                discard_value=discard_open_completion,
             )
-            if control_ui is not None:
-                control_ui.append_message(
-                    "Dataset",
-                    f"正式数采开始：episode {episode_index} -> {dataset_recorder.dataset_root}",
-                )
-        if episode_recorder.config.enabled:
-            episode_recorder.root_dir = _episode_root_dir(args, components)
-            _start_episode_recording(
-                episode_recorder,
-                args,
-                components,
-                now=now,
-                start_reason=start_reason,
-            )
-        episode_last_state = None
-        set_episode_last_state(None)
+        except CollectionControlOperationBusy as exc:
+            episode_start_failure_message = str(exc)
+            return False
+        if formal_recorder is not None:
+            set_dataset_recorder(None)
+            dataset_recorder = None
+        message = "正在打开正式 dataset episode；遥操控制保持运行。"
         clutch_input.set_episode_recording_state(
-            active=True,
-            episode_dir=recording_path(),
-            frame_count=recording_frame_count(),
-            frequency_status=recording_frequency_status(),
-            event_status="recording",
-            event_message=(
-                "正式数采正在写入；结束前请确认图像、触觉和机械臂状态正常。"
-                if dataset_recorder is not None
-                else "Debug trajectory 正在写入。"
-            ),
-            episode_index=(
-                int(dataset_recorder.active_episode_index)
-                if dataset_recorder is not None
-                and getattr(dataset_recorder, "active_episode_index", None) is not None
-                else None
-            ),
+            active=False,
+            episode_dir="",
+            frame_count=0,
+            event_status="starting",
+            event_message=message,
         )
-        # The countdown probe is the admission gate for this episode.
-        # Preserve its ready state after opening the episode; resetting it
-        # here would make the first sample-health check move the grippers
-        # again and immediately pause collection.
+        _log(
+            "Dataset",
+            f"episode open submitted generation={episode_open_generation} "
+            f"reason={start_reason}",
+            now=now,
+        )
+        if control_ui is not None:
+            control_ui.append_message("Dataset", message)
         return True
 
 
-    def schedule_recording_countdown(now: float, *, start_reason: str) -> bool:
+    def begin_recording_countdown(now: float, *, start_reason: str) -> None:
         nonlocal episode_start_countdown_deadline, episode_start_countdown_reason
         nonlocal episode_start_warmup_ready_since, episode_start_warmup_last_message
-        nonlocal dataset_recorder
-        preparation_started_at = time.perf_counter()
+        clutch_input._restore_gripper_task_policy_for_collection()
+        countdown_sec = float(DEFAULT_EPISODE_START_COUNTDOWN_SEC)
+        episode_start_countdown_deadline = float(now) + countdown_sec
+        episode_start_countdown_reason = str(start_reason)
+        episode_start_warmup_ready_since = None
+        episode_start_warmup_last_message = None
+        reset_gripper_warmup_probe(f"countdown:{start_reason}")
+        message = (
+            f"准备开始数采：warmup 与 {countdown_sec:.1f} 秒倒计时同时进行；"
+            "两者都完成后开始写入。"
+        )
+        clutch_input.set_episode_start_countdown_state(
+            remaining_sec=countdown_sec,
+            message=message,
+        )
+        _log(
+            "Dataset",
+            f"recording warmup/countdown started delay={countdown_sec:.1f}s "
+            f"reason={start_reason}",
+            now=now,
+        )
+        if control_ui is not None:
+            control_ui.append_message("Dataset", message)
+
+    def discard_prepared_dataset_recorder(value: Any) -> None:
+        if not isinstance(value, _PreparedDatasetRecorder):
+            return
+        if not value.owned_candidate and not runtime_closing:
+            return
+        try:
+            value.recorder.close()
+        except BaseException:
+            pass
+
+    def schedule_recording_countdown(now: float, *, start_reason: str) -> bool:
+        nonlocal episode_prepare_generation, episode_prepare_reason
+        nonlocal episode_prepare_cancel_reason, episode_start_failure_message
+        nonlocal episode_prepare_previous
+        nonlocal episode_prepare_previous_retirement_started, dataset_recorder
         refresh_runtime_views()
         if recording_active():
             return False
-        if episode_start_countdown_deadline is not None:
+        if collection_transition_active() or episode_start_countdown_deadline is not None:
             return False
         admitted, admission_message = clutch_input.episode_start_admission()
         if not admitted:
@@ -460,130 +633,101 @@ def build_episode_recording_runtime(
                 event_message=message,
             )
             return False
-        if dataset_recorder is None and not episode_recorder.config.enabled:
+        if (
+            bool(getattr(args, "no_collection", False))
+            and not episode_recorder.config.enabled
+        ):
             message = "正式 dataset collection 和 debug trajectory recording 都不可用。"
             _log("Dataset", message, now=now)
             if control_ui is not None:
                 control_ui.append_message("Dataset", message)
             return False
-        if not bool(getattr(args, "no_collection", False)):
+        if bool(getattr(args, "no_collection", False)):
+            begin_recording_countdown(time.time(), start_reason=start_reason)
+            return True
+
+        existing_recorder = dataset_recorder
+        dataset_root = Path(args.dataset_root)
+        modality_contract = CaptureModalityContract(
+            ignored_camera_keys=tuple(getattr(args, "ignore_camera", ()) or ()),
+            ignored_tactile_keys=tuple(getattr(args, "ignore_tactile", ()) or ()),
+        )
+
+        def prepare_writer() -> _PreparedDatasetRecorder:
+            nonlocal episode_prepare_previous_retirement_started
             try:
-                bind_capture_modality_contract(
-                    Path(args.dataset_root),
-                    CaptureModalityContract(
-                        ignored_camera_keys=tuple(
-                            getattr(args, "ignore_camera", ()) or ()
-                        ),
-                        ignored_tactile_keys=tuple(
-                            getattr(args, "ignore_tactile", ()) or ()
-                        ),
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001
-                message = (
-                    "数采配置未通过数据集级忽视规则校验："
-                    f"{type(exc).__name__}: {exc}"
-                )
-                _log("Dataset", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", message)
-                clutch_input.set_episode_recording_state(
-                    active=False,
-                    episode_dir=recording_path(),
-                    frame_count=recording_frame_count(),
-                    event_status="error",
-                    event_message=message,
-                )
-                return False
-            try:
-                candidate_created = False
-                if dataset_recorder is None:
-                    candidate = construct_started_dataset_recorder()
-                    dataset_recorder = candidate
-                    set_dataset_recorder(candidate)
-                    candidate_created = True
-                else:
-                    # Task/root/modality changes rebuild the recorder and
-                    # therefore replace its actual-state poller.  Perform
-                    # that replacement before warmup so the countdown gate
-                    # observes the exact poller that will record the episode.
-                    dataset_recorder.reconfigure_for_current_args()
-                    ensure_started = getattr(dataset_recorder, "ensure_started", None)
-                    if callable(ensure_started):
-                        ensure_started()
-                    else:
-                        dataset_recorder.start()
-                if not candidate_created:
-                    dataset_recorder.write_camera_device_config()
-                args.dataset_startup_error = ""
-                startup_device_errors.pop("dataset.writer", None)
-                publish_runtime_hardware_status()
-            except Exception as exc:  # noqa: BLE001 - keep teleop available.
-                failed_recorder = dataset_recorder
-                dataset_recorder = None
-                try:
-                    set_dataset_recorder(None)
-                except Exception as detach_exc:  # noqa: BLE001 - preserve retry state.
-                    _log(
-                        "Dataset",
-                        "failed writer detach was not fully acknowledged by the "
-                        f"runtime provider: {type(detach_exc).__name__}: {detach_exc}",
-                        now=now,
-                    )
-                if failed_recorder is not None:
+                prepare_dataset_transition("formal_episode_start")
+                bind_capture_modality_contract(dataset_root, modality_contract)
+                if existing_recorder is not None:
+                    configured = bool(existing_recorder.configured_for_current_args())
+                    started = bool(getattr(existing_recorder, "writer_started", False))
+                    if configured and started:
+                        existing_recorder.write_camera_device_config()
+                        return _PreparedDatasetRecorder(
+                            recorder=existing_recorder,
+                            owned_candidate=False,
+                        )
+                candidate = construct_started_dataset_recorder(existing_recorder)
+                if existing_recorder is not None:
+                    # From this point the old recorder is no longer recoverable:
+                    # close() may partially release a one-shot process even when
+                    # it raises.  The control thread must not republish it on a
+                    # failed completion.
+                    episode_prepare_previous_retirement_started = True
                     try:
-                        failed_recorder.close()
-                    except Exception:
-                        pass
-                detail = f"{type(exc).__name__}: {exc}"
-                args.dataset_startup_error = detail
-                startup_device_errors["dataset.writer"] = detail
-                publish_runtime_hardware_status()
-                message = f"正式 dataset 预备失败: {detail}"
-                _log("Dataset", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", message)
-                clutch_input.set_episode_recording_state(
-                    active=False,
-                    episode_dir=recording_path(),
-                    frame_count=recording_frame_count(),
-                    event_status="error",
-                    event_message=message,
+                        existing_recorder.close()
+                    except BaseException:
+                        try:
+                            candidate.close()
+                        except BaseException:
+                            pass
+                        raise
+                return _PreparedDatasetRecorder(
+                    recorder=candidate,
+                    owned_candidate=True,
                 )
-                return False
-        clutch_input._restore_gripper_task_policy_for_collection()
-        countdown_started_at = time.time()
-        preparation_elapsed_sec = max(
-            0.0,
-            time.perf_counter() - preparation_started_at,
-        )
-        if preparation_elapsed_sec >= 0.05:
-            _log(
-                "DatasetTiming",
-                "recording countdown preparation delayed the control plane "
-                f"elapsed={preparation_elapsed_sec * 1000.0:.1f}ms; "
-                "the next control frame will refresh its causal timestamp",
-                now=countdown_started_at,
+            except BaseException:
+                if (
+                    runtime_closing
+                    and existing_recorder is not None
+                    and not episode_prepare_previous_retirement_started
+                ):
+                    try:
+                        existing_recorder.close()
+                    except BaseException:
+                        pass
+                raise
+
+        episode_prepare_reason = str(start_reason)
+        episode_prepare_cancel_reason = ""
+        episode_prepare_previous = existing_recorder
+        episode_prepare_previous_retirement_started = False
+        episode_start_failure_message = None
+        try:
+            episode_prepare_generation = collection_control_plane.submit(
+                "prepare_writer",
+                prepare_writer,
+                discard_value=discard_prepared_dataset_recorder,
             )
-        countdown_sec = float(DEFAULT_EPISODE_START_COUNTDOWN_SEC)
-        # The countdown begins only after synchronous preparation has
-        # completed.  Using the request timestamp here silently shortened the
-        # operator countdown by however long writer/filesystem preparation
-        # took.
-        episode_start_countdown_deadline = countdown_started_at + countdown_sec
-        episode_start_countdown_reason = str(start_reason)
-        episode_start_warmup_ready_since = None
-        episode_start_warmup_last_message = None
-        reset_gripper_warmup_probe(f"countdown:{start_reason}")
-        message = (
-            f"准备开始数采：warmup 与 {countdown_sec:.1f} 秒倒计时同时进行；"
-            "两者都完成后开始写入。"
+        except CollectionControlOperationBusy as exc:
+            _log("Dataset", str(exc), now=now)
+            return False
+        if existing_recorder is not None:
+            # The worker now has exclusive lifecycle ownership.  Detaching the
+            # provider prevents finalize/progress/status code from observing
+            # the recorder while it is checked, reused, or retired.
+            set_dataset_recorder(None)
+            dataset_recorder = None
+        message = "正在准备正式 dataset writer；遥操控制保持运行，ready 后开始倒计时。"
+        clutch_input.set_episode_start_countdown_state(
+            remaining_sec=0.0,
+            message=message,
         )
-        clutch_input.set_episode_start_countdown_state(remaining_sec=countdown_sec, message=message)
         _log(
             "Dataset",
-            f"recording warmup/countdown started delay={countdown_sec:.1f}s reason={start_reason}",
-            now=countdown_started_at,
+            f"writer preparation submitted generation={episode_prepare_generation} "
+            f"reason={start_reason}",
+            now=now,
         )
         if control_ui is not None:
             control_ui.append_message("Dataset", message)
@@ -593,7 +737,22 @@ def build_episode_recording_runtime(
     def cancel_recording_countdown(now: float, *, reason: str) -> bool:
         nonlocal episode_start_countdown_deadline, episode_start_warmup_ready_since
         nonlocal episode_start_warmup_last_message
+        nonlocal episode_prepare_cancel_reason
         refresh_runtime_views()
+        if episode_prepare_generation is not None:
+            episode_prepare_cancel_reason = str(reason)
+            collection_control_plane.cancel(episode_prepare_generation)
+            episode_start_warmup_ready_since = None
+            episode_start_warmup_last_message = None
+            message = f"数采 writer 预备正在取消并回收：{reason}。"
+            _log("Dataset", message, now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", message)
+            clutch_input.set_episode_start_countdown_state(
+                remaining_sec=0.0,
+                message=message,
+            )
+            return True
         if episode_start_countdown_deadline is None:
             return False
         episode_start_countdown_deadline = None
@@ -691,100 +850,141 @@ def build_episode_recording_runtime(
         *,
         end_reason: str,
         summary: Mapping[str, object] | None = None,
-    ) -> None:
-        nonlocal episode_last_state, last_collection_frequency_warning_active
-        nonlocal episode_recording_paused, episode_recording_pause_reason
-        nonlocal episode_resume_warmup_ready_count
+    ) -> bool:
+        nonlocal episode_stop_generation, episode_stop_recorder
+        nonlocal episode_stop_frame_count, episode_stop_reason, dataset_recorder
         refresh_runtime_views()
-        stopped_any = False
+        if collection_transition_active():
+            return False
+        formal_recorder = (
+            dataset_recorder
+            if dataset_recorder is not None and dataset_recorder.is_recording
+            else None
+        )
+        debug_was_recording = bool(episode_recorder.is_recording)
+        if formal_recorder is None and not debug_was_recording:
+            return False
         frame_count = recording_frame_count()
-        advance_round_trip_after_stop = False
-        if dataset_recorder is not None and dataset_recorder.is_recording:
+        audit_close = None
+        impedance_finalize_deferred_launch = False
+        if formal_recorder is not None:
             audit_close = stop_position_episode_debug(reason=end_reason)
             impedance_finalize_deferred_launch = _arm_control_mode_arg(args) == "impedance"
             if audit_close is not None and not impedance_finalize_deferred_launch:
                 # Preserve the prior position-mode ordering and behavior:
                 # diagnostic close remains independent of its writer path.
                 start_position_episode_debug_close(audit_close)
-            task = dataset_recorder.stop_episode(
-                reason=end_reason,
-                step_index=step_index,
-                last_state=episode_last_state,
-                summary=summary,
-                # In force/impedance mode, launch finalization after the
-                # stop-request control frame has produced its final normal
-                # command. The worker remains asynchronous: recording
-                # finalization must never hold tracker/IK updates.
-                defer_finalize_start=impedance_finalize_deferred_launch,
-                # Serializing the observational sidecar close with the
-                # writer prevents the two post-stop Python finalizers from
-                # competing with each other or the real-time loop.
-                before_finalize=(
-                    audit_close if impedance_finalize_deferred_launch else None
-                ),
-            )
-            if (
-                audit_close is not None
-                and task is None
-                and impedance_finalize_deferred_launch
-            ):
-                # Empty impedance episodes have no dataset task to own the
-                # detached audit close, so retain a small standalone close.
-                start_position_episode_debug_close(audit_close)
-            stopped_any = True
-            if task is None:
-                message = "正式数采已停止：当前 episode 没有样本，已丢弃。"
-            else:
-                message = (
-                    f"正式数采已停止：episode {task.episode_index} "
-                    f"{task.frame_count} 帧，正在后台收尾。"
-                )
-                advance_round_trip_after_stop = True
-            _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
-        if episode_recorder.is_recording:
-            _stop_episode_recording(
-                episode_recorder,
-                now=now,
-                end_reason=end_reason,
-                summary={} if summary is None else dict(summary),
-            )
-            stopped_any = True
-        if stopped_any:
-            event_status = "idle"
-            event_message = "数采已停止。"
-            stopped_episode_index: int | None = None
-            stopped_frame_count: int | None = frame_count
-            if dataset_recorder is not None:
-                if "task" in locals() and task is not None:
-                    event_status = "finalizing"
-                    event_message = (
-                        f"正式数采已停止：episode {task.episode_index} "
-                        f"{task.frame_count} 帧，正在后台保存。"
+
+        captured_last_state = episode_last_state
+        captured_step_index = int(step_index)
+        captured_summary = {} if summary is None else dict(summary)
+        stop_wall_time = float(now)
+
+        def stop_episode_lifecycle() -> _DatasetStopCompletion:
+            task = None
+            debug_stopped = False
+            try:
+                if formal_recorder is not None:
+                    task = formal_recorder.stop_episode(
+                        reason=end_reason,
+                        step_index=captured_step_index,
+                        last_state=captured_last_state,
+                        summary=captured_summary,
+                        defer_finalize_start=impedance_finalize_deferred_launch,
+                        before_finalize=(
+                            audit_close
+                            if impedance_finalize_deferred_launch
+                            else None
+                        ),
                     )
-                    stopped_episode_index = int(task.episode_index)
-                    stopped_frame_count = int(task.frame_count)
-                elif "task" in locals() and task is None:
-                    event_status = "discarded"
-                    event_message = "正式数采已停止：当前 episode 没有样本，已丢弃。"
-            clutch_input.set_episode_recording_state(
-                active=False,
-                episode_dir=recording_path(),
-                frame_count=stopped_frame_count,
-                event_status=event_status,
-                event_message=event_message,
-                episode_index=stopped_episode_index,
+                    if (
+                        audit_close is not None
+                        and task is None
+                        and impedance_finalize_deferred_launch
+                    ):
+                        audit_close()
+                if debug_was_recording:
+                    _stop_episode_recording(
+                        episode_recorder,
+                        now=stop_wall_time,
+                        end_reason=end_reason,
+                        summary=captured_summary,
+                    )
+                    debug_stopped = True
+                return _DatasetStopCompletion(
+                    recorder=formal_recorder,
+                    task=task,
+                    formal_stopped=formal_recorder is not None,
+                    debug_stopped=debug_stopped,
+                    frame_count=int(frame_count),
+                )
+            except BaseException:
+                if debug_was_recording and not debug_stopped:
+                    try:
+                        _stop_episode_recording(
+                            episode_recorder,
+                            now=stop_wall_time,
+                            end_reason=f"{end_reason}:formal_stop_error",
+                            summary=captured_summary,
+                        )
+                    except BaseException:
+                        pass
+                if formal_recorder is not None:
+                    try:
+                        formal_recorder.close()
+                    except BaseException:
+                        pass
+                raise
+
+        def discard_stop_completion(value: Any) -> None:
+            if not isinstance(value, _DatasetStopCompletion):
+                return
+            if value.recorder is not None:
+                try:
+                    value.recorder.close()
+                except BaseException:
+                    pass
+
+        try:
+            episode_stop_generation = collection_control_plane.submit(
+                "stop_episode",
+                stop_episode_lifecycle,
+                discard_value=discard_stop_completion,
             )
-            episode_last_state = None
-            set_episode_last_state(None)
-            last_collection_frequency_warning_active = False
-            episode_recording_paused = False
-            episode_recording_pause_reason = ""
-            episode_resume_warmup_ready_count = 0
-            reset_gripper_warmup_probe(f"recording_stopped:{end_reason}")
-            if advance_round_trip_after_stop:
-                clutch_input.advance_round_trip_task_after_saved_episode()
+        except CollectionControlOperationBusy:
+            return False
+        episode_stop_recorder = formal_recorder
+        episode_stop_frame_count = int(frame_count)
+        episode_stop_reason = str(end_reason)
+        if formal_recorder is not None:
+            # Stop now exclusively owns the recorder through async sample drain
+            # and episode mutation.  Detach it until completion publication so
+            # no finalize/progress/status caller races that lifecycle.
+            set_dataset_recorder(None)
+            dataset_recorder = None
+        message = "正在停止数采并排空最后一个已接纳样本；遥操控制保持运行。"
+        clutch_input.set_episode_recording_state(
+            active=True,
+            episode_dir=recording_path(),
+            frame_count=frame_count,
+            event_status="stopping",
+            event_message=message,
+            episode_index=(
+                int(formal_recorder.active_episode_index)
+                if formal_recorder is not None
+                and getattr(formal_recorder, "active_episode_index", None) is not None
+                else None
+            ),
+        )
+        _log(
+            "Dataset",
+            f"episode stop submitted generation={episode_stop_generation} "
+            f"reason={end_reason}",
+            now=now,
+        )
+        if control_ui is not None:
+            control_ui.append_message("Dataset", message)
+        return True
 
 
     def pause_recording(now: float, *, reason: str) -> bool:
@@ -1036,7 +1236,320 @@ def build_episode_recording_runtime(
             _log("FixHold", message, now=now)
 
 
+    def publish_prepare_completion(
+        result: CollectionControlOperationResult,
+        *,
+        now: float,
+    ) -> None:
+        nonlocal dataset_recorder, episode_prepare_generation
+        nonlocal episode_prepare_cancel_reason, episode_start_failure_message
+        nonlocal episode_prepare_previous
+        nonlocal episode_prepare_previous_retirement_started
+        previous_recorder = episode_prepare_previous
+        previous_recoverable = bool(
+            previous_recorder is not None
+            and not episode_prepare_previous_retirement_started
+        )
+        episode_prepare_generation = None
+        episode_prepare_previous = None
+        episode_prepare_previous_retirement_started = False
+        if result.cancelled:
+            if previous_recoverable:
+                dataset_recorder = previous_recorder
+                set_dataset_recorder(previous_recorder)
+            reason = episode_prepare_cancel_reason or "operator_cancelled"
+            episode_prepare_cancel_reason = ""
+            message = f"数采 writer 预备已取消：{reason}。"
+            _log("Dataset", message, now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", message)
+            clutch_input.set_episode_recording_state(
+                active=False,
+                episode_dir=recording_path(),
+                frame_count=recording_frame_count(),
+                event_status="idle",
+                event_message="writer 预备已取消；可重新开始数采。",
+            )
+            return
+        if not result.succeeded or not isinstance(
+            result.value,
+            _PreparedDatasetRecorder,
+        ):
+            failure = result.error or result.discard_error or RuntimeError(
+                "writer preparation returned an invalid completion"
+            )
+            if previous_recoverable:
+                dataset_recorder = previous_recorder
+                set_dataset_recorder(previous_recorder)
+            detail = f"{type(failure).__name__}: {failure}"
+            args.dataset_startup_error = detail
+            startup_device_errors["dataset.writer"] = detail
+            publish_runtime_hardware_status()
+            message = f"正式 dataset 预备失败: {detail}"
+            episode_start_failure_message = message
+            _log("Dataset", message, now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", message)
+            clutch_input.set_episode_recording_state(
+                active=False,
+                episode_dir=recording_path(),
+                frame_count=recording_frame_count(),
+                event_status="error",
+                event_message=message,
+            )
+            return
+
+        prepared = result.value
+        dataset_recorder = prepared.recorder
+        set_dataset_recorder(dataset_recorder)
+        args.dataset_startup_error = ""
+        startup_device_errors.pop("dataset.writer", None)
+        publish_runtime_hardware_status()
+        _log(
+            "DatasetTiming",
+            "writer preparation completed outside the realtime loop "
+            f"elapsed={result.elapsed_sec * 1000.0:.1f}ms "
+            f"generation={result.generation}",
+            now=now,
+        )
+        begin_recording_countdown(time.time(), start_reason=episode_prepare_reason)
+
+    def publish_open_completion(
+        result: CollectionControlOperationResult,
+        *,
+        now: float,
+    ) -> None:
+        nonlocal dataset_recorder, episode_open_generation, episode_open_recorder
+        nonlocal episode_open_start_attempted, episode_open_formal_started
+        nonlocal episode_start_failure_message, episode_last_state
+        nonlocal last_collection_frequency_debug_at
+        nonlocal last_collection_frequency_warning_active
+        opened_recorder = episode_open_recorder
+        start_attempted = bool(episode_open_start_attempted)
+        episode_open_generation = None
+        episode_open_recorder = None
+        episode_open_start_attempted = False
+        episode_open_formal_started = False
+
+        if not result.succeeded or not isinstance(
+            result.value,
+            _DatasetOpenCompletion,
+        ):
+            failure = result.error or result.discard_error or RuntimeError(
+                "episode open returned an invalid completion"
+            )
+            if opened_recorder is not None and not start_attempted:
+                # Configuration rejection happened before the process writer
+                # was asked to mutate episode state, so the ready recorder is
+                # still safe to reuse after the operator corrects the profile.
+                dataset_recorder = opened_recorder
+                set_dataset_recorder(opened_recorder)
+            else:
+                dataset_recorder = None
+            detail = f"{type(failure).__name__}: {failure}"
+            if opened_recorder is not None and start_attempted:
+                args.dataset_startup_error = detail
+                startup_device_errors["dataset.writer"] = detail
+                publish_runtime_hardware_status()
+            if bool(getattr(getattr(args, "control_debug_config", None), "enabled", False)):
+                update_control_debug_runtime_metadata(
+                    episode_sidecar_error=f"dataset_start_failed:{detail}"
+                )
+            message = f"正式 dataset episode 启动失败: {detail}"
+            episode_start_failure_message = message
+            _log("Dataset", message, now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", message)
+            clutch_input.set_episode_recording_state(
+                active=False,
+                episode_dir="",
+                frame_count=0,
+                event_status="error",
+                event_message=message,
+            )
+            return
+
+        completion = result.value
+        dataset_recorder = completion.recorder
+        if dataset_recorder is not None:
+            set_dataset_recorder(dataset_recorder)
+            args.dataset_startup_error = ""
+            startup_device_errors.pop("dataset.writer", None)
+            publish_runtime_hardware_status()
+            try:
+                clutch_input.begin_plus_curation_episode(
+                    int(completion.episode_index)
+                )
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                # Plus remains subordinate to raw collection.  The formal
+                # episode is already open and must keep recording.
+                message = (
+                    "Plus episode 状态初始化失败；正式原始数采继续："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _log("Plus", message, now=now)
+                if control_ui is not None:
+                    control_ui.append_message("Plus", message)
+            if completion.episode_index != completion.planned_episode_index:
+                mismatch = (
+                    "dataset episode index changed after audit attachment: "
+                    f"planned={completion.planned_episode_index} "
+                    f"actual={completion.episode_index}"
+                )
+                update_control_debug_runtime_metadata(
+                    episode_sidecar_error=mismatch,
+                )
+                _log("ControlDebug", f"WARNING: {mismatch}", now=now)
+            _log(
+                "Dataset",
+                "recording started "
+                f"episode={completion.episode_index} "
+                f"root={dataset_recorder.dataset_root}",
+                now=now,
+            )
+            if control_ui is not None:
+                control_ui.append_message(
+                    "Dataset",
+                    "正式数采开始："
+                    f"episode {completion.episode_index} -> "
+                    f"{dataset_recorder.dataset_root}",
+                )
+        last_collection_frequency_warning_active = False
+        last_collection_frequency_debug_at = 0.0
+        episode_last_state = None
+        set_episode_last_state(None)
+        clutch_input.set_episode_recording_state(
+            active=True,
+            episode_dir=recording_path(),
+            frame_count=recording_frame_count(),
+            frequency_status=recording_frequency_status(),
+            event_status="recording",
+            event_message=(
+                "正式数采正在写入；结束前请确认图像、触觉和机械臂状态正常。"
+                if dataset_recorder is not None
+                else "Debug trajectory 正在写入。"
+            ),
+            episode_index=(
+                int(completion.episode_index)
+                if completion.episode_index is not None
+                else None
+            ),
+        )
+        _log(
+            "DatasetTiming",
+            "episode open completed outside the realtime loop "
+            f"elapsed={result.elapsed_sec * 1000.0:.1f}ms "
+            f"generation={result.generation} "
+            f"reason={episode_open_start_reason}",
+            now=now,
+        )
+
+    def publish_stop_completion(
+        result: CollectionControlOperationResult,
+        *,
+        now: float,
+    ) -> None:
+        nonlocal dataset_recorder, episode_stop_generation, episode_stop_recorder
+        nonlocal episode_stop_frame_count, episode_stop_reason, episode_last_state
+        nonlocal last_collection_frequency_warning_active
+        nonlocal episode_recording_paused, episode_recording_pause_reason
+        nonlocal episode_resume_warmup_ready_count
+        stopped_recorder = episode_stop_recorder
+        stopped_frame_count = int(episode_stop_frame_count)
+        stopped_reason = str(episode_stop_reason or "control_plane_completion")
+        episode_stop_generation = None
+        episode_stop_recorder = None
+        episode_stop_frame_count = 0
+        episode_stop_reason = ""
+        if not result.succeeded or not isinstance(
+            result.value,
+            _DatasetStopCompletion,
+        ):
+            failure = result.error or result.discard_error or RuntimeError(
+                "episode stop returned an invalid completion"
+            )
+            dataset_recorder = None
+            detail = f"{type(failure).__name__}: {failure}"
+            args.dataset_startup_error = detail
+            startup_device_errors["dataset.writer"] = detail
+            publish_runtime_hardware_status()
+            message = (
+                "正式 dataset 停止/排空失败；已隔离该 recorder 并保持 Hold，"
+                f"下次开始将创建全新 writer：{detail}"
+            )
+            _log("Dataset", message, now=now)
+            if control_ui is not None:
+                control_ui.append_message("Dataset", message)
+            try:
+                clutch_input.request_hold(reason="dataset_stop_failure")
+            except BaseException:
+                pass
+            clutch_input.set_episode_recording_state(
+                active=False,
+                episode_dir="",
+                frame_count=stopped_frame_count,
+                event_status="error",
+                event_message=message,
+            )
+        else:
+            completion = result.value
+            if completion.recorder is not None:
+                dataset_recorder = completion.recorder
+                set_dataset_recorder(dataset_recorder)
+            task = completion.task
+            event_status = "idle"
+            event_message = "数采已停止。"
+            stopped_episode_index: int | None = None
+            if completion.formal_stopped:
+                if task is None:
+                    event_status = "discarded"
+                    event_message = "正式数采已停止：当前 episode 没有样本，已丢弃。"
+                else:
+                    event_status = "finalizing"
+                    event_message = (
+                        f"正式数采已停止：episode {task.episode_index} "
+                        f"{task.frame_count} 帧，正在后台保存。"
+                    )
+                    stopped_episode_index = int(task.episode_index)
+                    stopped_frame_count = int(task.frame_count)
+                    clutch_input.advance_round_trip_task_after_saved_episode()
+                _log("Dataset", event_message, now=now)
+                if control_ui is not None:
+                    control_ui.append_message("Dataset", event_message)
+            clutch_input.set_episode_recording_state(
+                active=False,
+                episode_dir=recording_path(),
+                frame_count=stopped_frame_count,
+                event_status=event_status,
+                event_message=event_message,
+                episode_index=stopped_episode_index,
+            )
+        episode_last_state = None
+        set_episode_last_state(None)
+        last_collection_frequency_warning_active = False
+        episode_recording_paused = False
+        episode_recording_pause_reason = ""
+        episode_resume_warmup_ready_count = 0
+        reset_gripper_warmup_probe(f"recording_stopped:{stopped_reason}")
+
     def poll_dataset_finalize(now: float) -> None:
+        if episode_prepare_generation is not None:
+            result = collection_control_plane.poll(episode_prepare_generation)
+            if result is not None:
+                publish_prepare_completion(result, now=now)
+        elif episode_open_generation is not None:
+            result = collection_control_plane.poll(episode_open_generation)
+            if result is not None:
+                publish_open_completion(result, now=now)
+        elif episode_stop_generation is not None:
+            result = collection_control_plane.poll(episode_stop_generation)
+            if result is not None:
+                publish_stop_completion(result, now=now)
+        if collection_transition_active():
+            # The active worker exclusively owns its detached recorder.  In
+            # particular, do not poll finalize/status state concurrently with
+            # prepare, episode open, or sample drain/stop.
+            return
         refresh_runtime_views()
         if dataset_recorder is None:
             return
@@ -1104,6 +1617,28 @@ def build_episode_recording_runtime(
                     frame_count=int(task.frame_count),
                 )
 
+    def countdown_deadline() -> float | None:
+        if collection_transition_active():
+            # Existing control/GUI gates already treat any non-None deadline as
+            # an episode transition.  Infinity preserves that contract without
+            # starting/shortening the real countdown or permitting dataset
+            # maintenance while prepare/stop owns the recorder.
+            return float("inf")
+        return episode_start_countdown_deadline
+
+    def close() -> None:
+        nonlocal runtime_closing
+        runtime_closing = True
+        if episode_prepare_generation is not None:
+            collection_control_plane.cancel(episode_prepare_generation)
+        if episode_open_generation is not None:
+            collection_control_plane.cancel(episode_open_generation)
+        # Prepare/open/stop detach their recorder before the worker mutates it.
+        # Keep the outer shutdown path from reattaching or closing that private
+        # lifecycle concurrently; close() makes any eventual completion discard
+        # and clean its produced value.
+        collection_control_plane.close()
+
     return EpisodeRecordingRuntime(
         recording_active=recording_active,
         recording_paused=recording_paused,
@@ -1121,7 +1656,9 @@ def build_episode_recording_runtime(
         resume_recording_if_ready=resume_recording_if_ready,
         sync_fix_hold=sync_fix_hold,
         poll_dataset_finalize=poll_dataset_finalize,
-        countdown_deadline=lambda: episode_start_countdown_deadline,
+        countdown_deadline=countdown_deadline,
+        collection_transition_active=collection_transition_active,
+        close=close,
     )
 
 

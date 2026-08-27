@@ -1330,6 +1330,7 @@ def test_episode_recording_runtime_refreshes_external_recorder_slot() -> None:
         collection_startup_blockers=lambda: {},
         recording_warmup_status=lambda *args, **kwargs: (True, "ready"),
         reset_gripper_warmup_probe=lambda reason: None,
+        prepare_dataset_transition=lambda reason: None,
         dataset_recorder_provider=lambda: dataset_slot[0],
         set_dataset_recorder=lambda value: dataset_slot.__setitem__(0, value),
         camera_previewer_provider=lambda: None,

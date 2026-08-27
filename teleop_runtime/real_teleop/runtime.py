@@ -1264,10 +1264,15 @@ def run_real_teleop(
         def current_dataset_recorder() -> object | None:
             return dataset_recorder
 
-        def set_current_dataset_recorder(value: object | None) -> None:
+        def assign_current_dataset_recorder(value: object | None) -> None:
+            """Publish a recorder after its background transition is complete."""
+
             nonlocal dataset_recorder
-            require_idle_tactile_quiesced("dataset_recorder_rebind")
             dataset_recorder = value
+
+        def set_current_dataset_recorder(value: object | None) -> None:
+            require_idle_tactile_quiesced("dataset_recorder_rebind")
+            assign_current_dataset_recorder(value)
 
         def reconfigure_dataset_recorder_for_selection() -> None:
             """Apply an idle task/root change to the live recorder immediately."""
@@ -2546,8 +2551,9 @@ def run_real_teleop(
             collection_startup_blockers=collection_startup_blockers,
             recording_warmup_status=recording_warmup_status,
             reset_gripper_warmup_probe=reset_gripper_warmup_probe,
+            prepare_dataset_transition=require_idle_tactile_quiesced,
             dataset_recorder_provider=current_dataset_recorder,
-            set_dataset_recorder=set_current_dataset_recorder,
+            set_dataset_recorder=assign_current_dataset_recorder,
             camera_previewer_provider=lambda: (
                 visualization_runtime.current_state()[0]
             ),
@@ -2661,6 +2667,9 @@ def run_real_teleop(
                     publish_collection_frequency_warning
                 ),
                 recording_active=recording_active,
+                collection_transition_active=(
+                    episode_recording_runtime.collection_transition_active
+                ),
                 recording_auto_stop_reason=recording_auto_stop_reason,
                 recording_frame_count=recording_frame_count,
                 recording_frequency_status=recording_frequency_status,
@@ -2692,6 +2701,9 @@ def run_real_teleop(
             )
         )
     finally:
+        episode_runtime_value = locals().get("episode_recording_runtime")
+        if episode_runtime_value is not None:
+            episode_runtime_value.close()
         shutdown_real_teleop_runtime(
             locals(),
             terminal_error=sys.exc_info()[1],

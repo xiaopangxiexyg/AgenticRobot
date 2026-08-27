@@ -934,6 +934,7 @@ class RealTeleopControlLoopContext:
     set_episode_last_state: Callable[[str | None], None]
     step_index: Callable[[], int]
     set_step_index: Callable[[int], None]
+    collection_transition_active: Callable[[], bool] = lambda: False
     runtime_extension: object | None = None
 
 
@@ -1313,6 +1314,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     def publish_progress_ui_state(*, now: float) -> None:
         """Publish display-only progress state without affecting control."""
 
+        if context.collection_transition_active():
+            return
         publisher = getattr(
             clutch_input,
             "publish_progress_application_state",
@@ -1502,6 +1505,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
         )
         for selection_intent in arm_mode_selection_intents:
             try:
+                if context.collection_transition_active():
+                    raise RuntimeError("Collection lifecycle transition is active")
                 if bool(
                     getattr(clutch_input, "_episode_busy", lambda: True)()
                 ):
@@ -1528,6 +1533,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     control_ui.append_message("Progress", message)
         for selection_intent in profile_selection_intents:
             try:
+                if context.collection_transition_active():
+                    raise RuntimeError("Collection lifecycle transition is active")
                 if not bool(
                     getattr(args, "collection_progress_gui", False)
                 ):
@@ -1573,6 +1580,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     control_ui.append_message("Progress", message)
         for selection_intent in entry_step_selection_intents:
             try:
+                if context.collection_transition_active():
+                    raise RuntimeError("Collection lifecycle transition is active")
                 if pending_progress_arm_transition is not None:
                     raise RuntimeError(
                         "A profile arm transition is already waiting for "
@@ -1613,7 +1622,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 if control_ui is not None:
                     control_ui.append_message("Progress", message)
         progress_enabled = bool(
-            dataset_recorder is not None
+            not context.collection_transition_active()
+            and dataset_recorder is not None
             and getattr(dataset_recorder, "progress_profile", None) is not None
         )
         if not progress_enabled:
@@ -2482,6 +2492,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     )
             if (
                 progress_workflow is not None
+                and not context.collection_transition_active()
                 and progress_failure_pending
                 and hold_reason == "progress_failure"
                 and application_hold_effective_at is not None
@@ -2834,6 +2845,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 if (
                     profile_home_pending.intent is not None
                     and progress_workflow is not None
+                    and not context.collection_transition_active()
                 ):
                     progress_result = progress_workflow.handle_command(
                         profile_home_pending.intent,
@@ -3580,6 +3592,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 clutch_input._two_pedal_mode_active()
                 or (
                     progress_workflow is not None
+                    and not context.collection_transition_active()
                     and str(
                         getattr(
                             args,
@@ -4183,7 +4196,10 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 )
         if recording_active() and recording_paused():
             resume_recording_if_ready(loop_start, step_result=step_result)
-        if progress_workflow is not None:
+        if (
+            progress_workflow is not None
+            and not context.collection_transition_active()
+        ):
             try:
                 resume_result = progress_workflow.observe_applied_resume(
                     now=loop_start,
