@@ -425,6 +425,74 @@ def test_motion_requires_urdf_limits_and_respects_velocity_envelope() -> None:
         )
 
 
+def test_position_dispatch_checks_position_limits_only_for_selected_joints() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    qpos = (0.1, 4.0, 0.1, 0.1, 0.1, 0.1)
+
+    receipt = backend.send_position_velocity(qpos, joint_names=("joint1",))
+
+    assert receipt.accepted is True
+    assert receipt.sent_joint_names == ("joint1",)
+    assert controller.motors[1].calls[-1] == ("send_pos_vel", (0.1, 10.0))
+    assert all(
+        not motor.calls
+        for index, motor in controller.motors.items()
+        if index != 1
+    )
+    with pytest.raises(ValueError, match=r"qpos_rad\[1\].*joint2"):
+        backend.send_position_velocity(qpos, joint_names=("joint2",))
+
+
+def test_mit_dispatch_checks_position_limits_only_for_selected_joints() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    reference = B601MitReference(
+        sequence=1,
+        source_timestamp_sec=1.0,
+        receive_timestamp_sec=1.0,
+        qpos_rad=(0.1, 4.0, 0.1, 0.1, 0.1, 0.1),
+    )
+
+    receipt = backend.send_mit(
+        reference,
+        kp=(1.0,) * 6,
+        kd=(1.0,) * 6,
+        tau_nm=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        joint_names=("joint1",),
+    )
+
+    assert receipt.accepted is True
+    assert receipt.sent_joint_names == ("joint1",)
+    assert controller.motors[1].calls[-1] == (
+        "send_mit",
+        (0.1, 0.0, 1.0, 1.0, 0.0),
+    )
+    assert all(
+        not motor.calls
+        for index, motor in controller.motors.items()
+        if index != 1
+    )
+    with pytest.raises(ValueError, match=r"reference\.qpos_rad\[1\].*joint2"):
+        backend.send_mit(
+            reference,
+            kp=(1.0,) * 6,
+            kd=(1.0,) * 6,
+            tau_nm=(0.0,) * 6,
+            torque_limits_nm=(1.0,) * 6,
+            joint_names=("joint2",),
+        )
+
+
 def test_position_dispatch_reports_all_sent_joints_and_no_hidden_partial_success() -> None:
     controller = _FakeController()
     backend = B601RSBackend(

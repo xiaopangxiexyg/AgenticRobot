@@ -633,6 +633,36 @@ class B601RSBackend:
             )
         return limits
 
+    @staticmethod
+    def _validate_selected_position_limits(
+        values: Sequence[float],
+        *,
+        joint_names: tuple[str, ...],
+        limits: tuple[tuple[float, float], ...],
+        field_name: str,
+    ) -> None:
+        """Validate only the references that the command will dispatch.
+
+        Command APIs accept a complete six-joint vector so the arm ordering
+        remains stable, while ``joint_names`` selects the motors that receive
+        the frame.  A non-selected joint may legitimately be outside the
+        configured envelope (for example, its current hardware pose can be
+        stale or intentionally parked elsewhere); it must not block a command
+        that does not address that joint.
+        """
+
+        selected = set(joint_names)
+        for index, (name, (lower, upper), value) in enumerate(
+            zip(B601_RS_ARM_JOINT_NAMES, limits, values)
+        ):
+            if name not in selected:
+                continue
+            if not lower <= value <= upper:
+                raise ValueError(
+                    f"{field_name}[{index}] is outside the configured position "
+                    f"limit for {name}: {value:.6f} not in [{lower:.6f}, {upper:.6f}]"
+                )
+
     def poll_feedback(self, *, request_feedback: bool = False) -> B601HardwareState:
         """Observe six joints, optionally requesting a fresh vendor snapshot.
 
@@ -1023,12 +1053,14 @@ class B601RSBackend:
         if frame_id != B601_RS_POSITION_FRAME:
             raise ValueError("position command frame_id is not the B601 position frame")
         names = self._resolve_joint_names(joint_names)
-        self._require_position_limits()
+        position_limits = self._require_position_limits()
         qpos = _six_finite(qpos_rad, name="qpos_rad")
-        if self.config.position_limits_rad is not None:
-            for index, (lower, upper) in enumerate(self.config.position_limits_rad):
-                if not lower <= qpos[index] <= upper:
-                    raise ValueError(f"qpos_rad[{index}] is outside the configured position limit")
+        self._validate_selected_position_limits(
+            qpos,
+            joint_names=names,
+            limits=position_limits,
+            field_name="qpos_rad",
+        )
         if velocity_limits_rad_s is None:
             velocity_limits = tuple(
                 joint.position_velocity_limit_rad_s for joint in self.config.joints
@@ -1091,11 +1123,12 @@ class B601RSBackend:
             raise ValueError("invalid MIT reference cannot be dispatched")
         names = self._resolve_joint_names(joint_names)
         position_limits = self._require_position_limits()
-        for index, (lower, upper) in enumerate(position_limits):
-            if not lower <= reference.qpos_rad[index] <= upper:
-                raise ValueError(
-                    f"reference.qpos_rad[{index}] is outside the configured position limit"
-                )
+        self._validate_selected_position_limits(
+            reference.qpos_rad,
+            joint_names=names,
+            limits=position_limits,
+            field_name="reference.qpos_rad",
+        )
         kp_values = _six_nonnegative(kp, name="kp")
         kd_values = _six_nonnegative(kd, name="kd")
         tau_values = _six_finite(tau_nm, name="tau_nm")
