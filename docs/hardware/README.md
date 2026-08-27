@@ -104,6 +104,10 @@ bash scripts/run_pytest.sh -q hardware/quest_dev/tests
 
 ## 7. B601-RS 力觉离线验收与真机验收计划
 
+本轮有线后端预检、反馈/计算/发送/力觉独立频率记录，以及真机分阶段操作边界见
+[`B601-RS hardware commissioning`](./rebot_b601_rs_hardware_commissioning.md)。该文档中的
+position probe 仍属于 M 级操作，只能由现场操作者在完成安全检查后显式运行。
+
 [`rebot_b601_rs_haptic_acceptance.md`](./rebot_b601_rs_haptic_acceptance.md) 给出无设备的
 数学/闭环效果验收命令，以及机械臂到货后从只读反馈、急停/watchdog、单关节 MIT、重力阻尼
 到低幅弹簧/虚拟墙的分阶段验收。当前只能执行 H0；H1–H8 均为 `NOT_RUN`，不构成真机运动
