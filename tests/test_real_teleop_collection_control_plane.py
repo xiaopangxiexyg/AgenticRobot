@@ -694,6 +694,95 @@ def test_episode_open_rpc_is_nonblocking_and_recorder_is_detached_until_publish(
     )
 
 
+def test_pending_episode_open_is_cancellable_and_never_becomes_sample_visible(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    stop_reasons: list[str] = []
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            self.dataset_root = tmp_path
+            self.writer = SimpleNamespace(next_episode_index=4)
+            self.writer_started = True
+            self.finalizing = False
+            self.is_recording = False
+            self.is_paused = False
+            self.frame_count = 0
+            self.active_episode_index = None
+            self.camera_sources = {}
+            self.closed = False
+
+        def require_configured_for_current_args(self) -> None:
+            return None
+
+        def start_episode(self, _metadata: object, *, now: float) -> int:
+            del now
+            entered.set()
+            assert release.wait(timeout=1.0)
+            self.active_episode_index = 4
+            self.is_recording = True
+            return 4
+
+        def stop_episode(self, *, reason: str, **_kwargs: object) -> None:
+            stop_reasons.append(str(reason))
+            self.active_episode_index = None
+            self.is_recording = False
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+        def collection_frequency_status(self) -> dict[str, object]:
+            return {}
+
+        def poll_finalize_tasks(self) -> list[object]:
+            return []
+
+    recorder = Recorder()
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+
+    assert runtime.start_recording(time.time(), start_reason="unit")
+    assert entered.wait(timeout=1.0)
+    assert slot[0] is None
+    assert runtime.countdown_deadline() == float("inf")
+    assert clutch.countdown_states[-1]["remaining_sec"] == 0.0
+    assert "正在打开" in str(clutch.countdown_states[-1]["message"])
+
+    assert runtime.cancel_recording_countdown(
+        time.time(),
+        reason="unit_hold",
+    )
+    assert "正在取消" in str(clutch.countdown_states[-1]["message"])
+    release.set()
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert not runtime.collection_transition_active()
+    assert slot[0] is None
+    assert recorder.closed
+    assert stop_reasons == ["episode_open_cancelled"]
+    assert not runtime.recording_active()
+    assert clutch.plus_episode_indices == []
+    assert clutch.recording_states[-1]["event_status"] == "idle"
+    assert "未向控制循环发布可采样 Episode" in str(
+        clutch.recording_states[-1]["event_message"]
+    )
+    assert args.dataset_startup_error == ""
+    assert runtime.close()
+
+
 def test_debug_trajectory_start_failure_does_not_close_formal_episode(
     tmp_path: Path,
 ) -> None:

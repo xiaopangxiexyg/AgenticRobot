@@ -207,6 +207,7 @@ def build_episode_recording_runtime(
     episode_open_start_attempted = False
     episode_open_formal_started = False
     episode_open_start_reason = "manual_key_start"
+    episode_open_cancel_reason = ""
     episode_stop_generation: int | None = None
     episode_stop_recorder: Any | None = None
     episode_stop_frame_count = 0
@@ -656,7 +657,7 @@ def build_episode_recording_runtime(
     def start_recording(now: float, *, start_reason: str) -> bool:
         nonlocal episode_open_generation, episode_open_recorder
         nonlocal episode_open_start_attempted, episode_open_formal_started
-        nonlocal episode_open_start_reason
+        nonlocal episode_open_start_reason, episode_open_cancel_reason
         nonlocal episode_start_failure_message, dataset_recorder
         refresh_runtime_views()
         episode_start_failure_message = None
@@ -911,6 +912,7 @@ def build_episode_recording_runtime(
         episode_open_start_attempted = False
         episode_open_formal_started = False
         episode_open_start_reason = str(start_reason)
+        episode_open_cancel_reason = ""
         try:
             episode_open_generation = collection_control_plane.submit(
                 "open_episode",
@@ -939,12 +941,13 @@ def build_episode_recording_runtime(
             set_dataset_recorder(None)
             dataset_recorder = None
         message = "正在打开正式 dataset episode；遥操控制保持运行。"
-        clutch_input.set_episode_recording_state(
-            active=False,
-            episode_dir="",
-            frame_count=0,
-            event_status="starting",
-            event_message=message,
+        # Writer ``start_episode`` is still part of the cancellable start
+        # transaction.  Keep the application busy until that mutation is
+        # published; otherwise GUI/manual Hold can expose a second start or
+        # dataset reconfiguration while the detached recorder is opening.
+        clutch_input.set_episode_start_countdown_state(
+            remaining_sec=0.0,
+            message=message,
         )
         _log(
             "Dataset",
@@ -1413,6 +1416,7 @@ def build_episode_recording_runtime(
         nonlocal episode_start_countdown_deadline, episode_start_warmup_ready_since
         nonlocal episode_start_warmup_last_message
         nonlocal episode_prepare_cancel_reason
+        nonlocal episode_open_cancel_reason
         refresh_runtime_views()
         if episode_prepare_generation is not None:
             episode_prepare_cancel_reason = str(reason)
@@ -1425,6 +1429,29 @@ def build_episode_recording_runtime(
                 "Dataset",
                 message,
                 context="writer preparation cancellation",
+                now=now,
+            )
+            clutch_input.set_episode_start_countdown_state(
+                remaining_sec=0.0,
+                message=message,
+            )
+            return True
+        if episode_open_generation is not None:
+            # Countdown completion does not end start ownership: the detached
+            # writer may still be blocked in start_episode().  Hold, safety, and
+            # the operator stop button must be able to revoke that pending
+            # admission before the completion is made sample-visible.
+            if not episode_open_cancel_reason:
+                episode_open_cancel_reason = str(reason)
+            collection_control_plane.cancel(episode_open_generation)
+            episode_start_warmup_ready_since = None
+            episode_start_warmup_last_message = None
+            message = f"数采 Episode 正在取消并安全回收：{reason}。"
+            _log("Dataset", message, now=now)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="episode open cancellation",
                 now=now,
             )
             clutch_input.set_episode_start_countdown_state(
@@ -2418,15 +2445,52 @@ def build_episode_recording_runtime(
     ) -> None:
         nonlocal dataset_recorder, episode_open_generation, episode_open_recorder
         nonlocal episode_open_start_attempted, episode_open_formal_started
+        nonlocal episode_open_cancel_reason
         nonlocal episode_start_failure_message, episode_last_state
         nonlocal last_collection_frequency_debug_at
         nonlocal last_collection_frequency_warning_active
         opened_recorder = episode_open_recorder
         start_attempted = bool(episode_open_start_attempted)
+        cancel_reason = str(episode_open_cancel_reason or "")
         episode_open_generation = None
         episode_open_recorder = None
         episode_open_start_attempted = False
         episode_open_formal_started = False
+        episode_open_cancel_reason = ""
+
+        if result.cancelled:
+            if opened_recorder is not None and not start_attempted:
+                # The worker failed or was cancelled before mutating the writer.
+                # Its ready process remains reusable because no cancellation
+                # discard owned a successful open completion.
+                dataset_recorder = opened_recorder
+                set_dataset_recorder(opened_recorder)
+            else:
+                # A successful open completion is stopped/closed by the control
+                # plane's discard callback before this cancelled result becomes
+                # observable.  Never republish that one-shot recorder.
+                dataset_recorder = None
+            reason = cancel_reason or "operator_cancelled"
+            message = (
+                f"数采 Episode 启动已取消：{reason}；"
+                "未向控制循环发布可采样 Episode。"
+            )
+            episode_start_failure_message = None
+            _log("Dataset", message, now=now)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="episode open cancelled",
+                now=now,
+            )
+            clutch_input.set_episode_recording_state(
+                active=False,
+                episode_dir=recording_path(),
+                frame_count=recording_frame_count(),
+                event_status="idle",
+                event_message=message,
+            )
+            return
 
         if not result.succeeded or not isinstance(
             result.value,
@@ -2476,6 +2540,37 @@ def build_episode_recording_runtime(
             return
 
         completion = result.value
+        if cancel_reason:
+            # Cancellation can race an already-completed open when the control
+            # plane cannot start its asynchronous discard worker.  Publish the
+            # exact opened recorder only long enough to transfer it into the
+            # normal stop/drain lifecycle; it is never exposed as recording or
+            # admitted for sampling.
+            dataset_recorder = completion.recorder
+            if dataset_recorder is not None:
+                set_dataset_recorder(dataset_recorder)
+            stopped = stop_recording(
+                now,
+                end_reason=f"episode_open_cancelled:{cancel_reason}",
+                summary={"episode_open_cancel_reason": cancel_reason},
+            )
+            if not stopped:
+                message = (
+                    f"数采 Episode 启动取消竞态未能提交停止：{cancel_reason}；"
+                    "已保留原 recorder 并保持暂停，等待人工重试停止。"
+                )
+                episode_start_failure_message = message
+                _log("Dataset", message, now=now)
+                publish_control_ui_message(
+                    "Dataset",
+                    message,
+                    context="episode open cancellation stop failure",
+                    now=now,
+                )
+                # stop_recording() already published the authoritative
+                # active-but-paused state on submission failure.  Do not hide
+                # that still-owned Episode behind an idle/error projection.
+            return
         dataset_recorder = completion.recorder
         if dataset_recorder is not None:
             set_dataset_recorder(dataset_recorder)
