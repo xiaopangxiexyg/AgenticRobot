@@ -271,7 +271,6 @@ class RealTeleopControlInput:
         self._two_pedal_alert_level = ""
         self._two_pedal_alert_message = ""
         self._two_pedal_alert_expires_at = 0.0
-        self._gripper_control_before_fix_hold = False
         self._tracker_swap_locked = False
         self._teleop_started = False
         # ``_teleop_started`` means the Session has been armed and therefore
@@ -301,6 +300,7 @@ class RealTeleopControlInput:
         self._ik_debug_logging_active = False
         self._ik_debug_log_path = ""
         self._gripper_control_enabled = False
+        self._gripper_control_before_fix_hold = False
         self._hold_request_reason = "manual"
         # The dual-arm Init operation is deliberately only an orchestration
         # layer over the existing single-arm exact-qpos lifecycle.  It never
@@ -4283,22 +4283,36 @@ class RealTeleopControlInput:
         if normalized == self._fix_hold_active:
             return
         if normalized:
-            self._gripper_control_before_fix_hold = bool(self._gripper_control_enabled)
+            self._gripper_control_before_fix_hold = bool(
+                self._gripper_control_enabled
+            )
+            self._teleop_dispatch_confirmed = False
+            self._teleop_dispatch_projection = "fix_hold"
             self._gripper_control_enabled = False
         elif not self._hold_active:
+            # Releasing Fix-Hold changes command ownership, but it does not
+            # prove that the next tracker-derived arm command was dispatched.
+            # Keep both gates closed until the per-frame Session receipt
+            # republishes normal teleop availability.
+            self._teleop_dispatch_confirmed = False
+            self._teleop_dispatch_projection = "fix_hold_released_waiting_dispatch"
             self._gripper_control_enabled = bool(
                 self._gripper_control_before_fix_hold
-                and self._teleop_arm_dispatch_confirmed()
             )
         self._fix_hold_active = normalized
         if self.ui is not None:
             self._publish_ui_observation(
                 context="Fix-Hold state",
-                stage="Fix-Hold / 双侧特殊固定" if normalized else "遥操运行",
+                stage=(
+                    "Fix-Hold / 双侧特殊固定"
+                    if normalized
+                    else "RM65 命令恢复验证中"
+                ),
                 fix_hold_active=normalized,
                 active_controls=self._current_active_controls(),
                 control_hint=message,
-                gripper_control_enabled=bool(self._gripper_control_enabled),
+                teleop_running=False,
+                gripper_control_enabled=False,
             )
             if message:
                 self._append_ui_message_observation(
@@ -4827,6 +4841,7 @@ class RealTeleopControlInput:
         return bool(
             self._gripper_control_enabled
             and self._teleop_arm_dispatch_confirmed()
+            and not bool(getattr(self, "_fix_hold_active", False))
             and _has_q6_gripper_control(self.components)
         )
 
@@ -5308,7 +5323,15 @@ class RealTeleopControlInput:
     def publish_teleop_dispatch_running(self, *, message: str = "") -> bool:
         """Project a Session-confirmed arm dispatch into application state."""
 
-        if not self._teleop_started or self._hold_active:
+        if (
+            not self._teleop_started
+            or self._hold_active
+            or bool(getattr(self, "_fix_hold_active", False))
+        ):
+            if bool(getattr(self, "_fix_hold_active", False)):
+                self._teleop_dispatch_confirmed = False
+                self._teleop_dispatch_projection = "fix_hold"
+                self._gripper_control_enabled = False
             return False
         changed = not bool(getattr(self, "_teleop_dispatch_confirmed", False))
         self._teleop_dispatch_confirmed = True

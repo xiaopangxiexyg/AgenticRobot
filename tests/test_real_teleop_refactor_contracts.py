@@ -3209,6 +3209,7 @@ def test_teleop_running_projection_requires_an_actual_arm_dispatch(
     )
     control.ui = None
     control._hold_active = False
+    control._fix_hold_active = False
     control._teleop_started = False
     control._teleop_dispatch_confirmed = False
     control._teleop_dispatch_projection = "idle"
@@ -3247,6 +3248,16 @@ def test_teleop_running_projection_requires_an_actual_arm_dispatch(
     )
     assert control._teleop_dispatch_confirmed is True
     assert control.gripper_control_enabled() is True
+
+    control._fix_hold_active = True
+    assert not control_loop._project_session_dispatch_state(
+        running_step,
+        clutch_input=control,
+    )
+    assert control._teleop_dispatch_confirmed is False
+    assert control._teleop_dispatch_projection.startswith("suspended:RUNNING:")
+    assert "Fix-Hold" in control._teleop_dispatch_projection
+    assert control.gripper_control_enabled() is False
 
     frozen_step = SimpleNamespace(
         state=SimpleNamespace(value="FROZEN"),
@@ -3473,11 +3484,24 @@ def test_control_lifecycle_state_survives_ui_transport_failure(
     control._hold_active = False
     control.set_fix_hold_active(True, message="both sides fixed-like")
     assert control._fix_hold_active is True
+    assert control._teleop_dispatch_confirmed is False
+    assert control._teleop_dispatch_projection == "fix_hold"
     assert control._gripper_control_enabled is False
 
-    control._fix_hold_active = False
-    control._teleop_dispatch_confirmed = False
-    control._teleop_dispatch_projection = "armed"
+    assert not control.publish_teleop_dispatch_running()
+    assert control._teleop_dispatch_confirmed is False
+    assert control._teleop_dispatch_projection == "fix_hold"
+    assert control.gripper_control_enabled() is False
+
+    control.set_fix_hold_active(False, message="one side released")
+    assert control._fix_hold_active is False
+    assert control._teleop_dispatch_confirmed is False
+    assert (
+        control._teleop_dispatch_projection
+        == "fix_hold_released_waiting_dispatch"
+    )
+    assert control._gripper_control_enabled is False
+    assert control.gripper_control_enabled() is False
     assert control.publish_teleop_dispatch_running()
     assert control._teleop_dispatch_confirmed is True
     assert control._gripper_control_enabled is True

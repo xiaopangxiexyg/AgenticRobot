@@ -856,13 +856,27 @@ def _project_session_dispatch_state(
     *,
     clutch_input: Any,
 ) -> bool:
-    """Publish actual arm-dispatch availability, not merely armed intent."""
+    """Publish operator arm-control availability, not merely transport work.
+
+    A dual-side Fix-Hold deliberately continues dispatching fixed joint
+    commands so the lower position stream remains well defined. Those
+    receipts are not evidence that live tracker control is available and must
+    not reopen the gripper or formal-capture gates.
+    """
 
     session_state_value = str(
         getattr(step_result.state, "value", step_result.state)
     ).upper()
     dispatched_arm_command = session_step_arm_dispatch_confirmed(step_result)
-    if session_state_value == "RUNNING" and dispatched_arm_command:
+    fix_hold_state = getattr(clutch_input, "fix_hold_active", False)
+    fix_hold_active = bool(
+        fix_hold_state() if callable(fix_hold_state) else fix_hold_state
+    )
+    if (
+        session_state_value == "RUNNING"
+        and dispatched_arm_command
+        and not fix_hold_active
+    ):
         publish_running = getattr(
             clutch_input,
             "publish_teleop_dispatch_running",
@@ -890,7 +904,12 @@ def _project_session_dispatch_state(
     if callable(publish_suspended):
         publish_suspended(
             session_state=session_state_value,
-            reason=str(step_result.motion_hold_reason or "") or startup_reason,
+            reason=(
+                "dual-side Fix-Hold owns fixed arm commands; live tracker and "
+                "gripper control remain suspended"
+                if fix_hold_active
+                else str(step_result.motion_hold_reason or "") or startup_reason
+            ),
         )
     return False
 
