@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Measure B601-RS feedback/bus timing without sending CAN commands.
+
+The default ``read-only`` mode opens a passive SocketCAN receive socket only.
+It does not construct MotorBridge, request feedback, enable a motor, or send a
+position/MIT frame.  ``offline`` provides deterministic smoke evidence.  The
+``position`` mode is an explicit human-run handoff for a later commissioning
+stage and is fail-closed behind several command-line confirmations; it is not
+executed by the repository tests or by this development task.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import socket
+import struct
+import sys
+import time
+from collections import Counter, defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+# ``python scripts/hardware/...`` places the script directory, rather than the
+# repository root, on ``sys.path``.  Keep the documented direct invocation
+# working without requiring an editable package install.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from hardware.rebot_b601_rs import (
+    B601_RS_ARM_JOINT_NAMES,
+    B601HardwareError,
+    B601RSBackend,
+    B601RSBackendConfig,
+    FrequencyLedger,
+    summarize_timestamps,
+)
+
+_CAN_RAW = getattr(socket, "CAN_RAW", 1)
+_CAN_FRAME = struct.Struct("=IB3x8s")
+_CAN_EFF_FLAG = 0x80000000
+_CAN_EFF_MASK = 0x1FFFFFFF
+_CAN_SFF_MASK = 0x000007FF
+
+
+class FrequencyProbeError(RuntimeError):
+    """A probe precondition or transport operation failed."""
+
+
+@dataclass(frozen=True)
+class DecodedFrame:
+    arbitration_id: int
+    data_length: int
+    extended: bool
+
+
+def decode_can_frame(frame: bytes) -> DecodedFrame:
+    """Decode a classic 16-byte SocketCAN frame without touching the bus."""
+
+    if len(frame) < _CAN_FRAME.size:
+        raise ValueError(f"SocketCAN frame is too short: {len(frame)} bytes")
+    can_id, data_length, _data = _CAN_FRAME.unpack(frame[: _CAN_FRAME.size])
+    if data_length > 8:
+        raise ValueError(f"classic CAN data length is invalid: {data_length}")
+    extended = bool(can_id & _CAN_EFF_FLAG)
+    arbitration_id = can_id & (_CAN_EFF_MASK if extended else _CAN_SFF_MASK)
+    return DecodedFrame(
+        arbitration_id=arbitration_id,
+        data_length=int(data_length),
+        extended=extended,
+    )
+
+
+def _per_id_summary(
+    timestamps_by_id: dict[int, list[float]],
+) -> dict[str, dict[str, object]]:
+    return {
+        f"0x{arbitration_id:x}": summarize_timestamps("feedback", timestamps)
+        .as_dict()
+        for arbitration_id, timestamps in sorted(timestamps_by_id.items())
+    }
+
+
+def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
+    if not channel.strip():
+        raise ValueError("channel must not be empty")
+    if not math.isfinite(duration_sec) or duration_sec <= 0.0:
+        raise ValueError("duration_sec must be positive")
+    ledger = FrequencyLedger()
+    timestamps_by_id: dict[int, list[float]] = defaultdict(list)
+    counts: Counter[int] = Counter()
+    extended_count = 0
+    standard_count = 0
+    malformed_count = 0
+    started = time.monotonic()
+    deadline = started + duration_sec
+    try:
+        receiver = socket.socket(socket.AF_CAN, socket.SOCK_RAW, _CAN_RAW)
+        receiver.bind((channel,))
+        receiver.settimeout(min(0.2, max(0.01, duration_sec)))
+    except OSError as exc:
+        raise FrequencyProbeError(f"cannot open passive SocketCAN receiver on {channel}: {exc}") from exc
+    with receiver:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            receiver.settimeout(min(0.2, remaining))
+            try:
+                raw = receiver.recv(72)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                raise FrequencyProbeError(f"SocketCAN receive failed on {channel}: {exc}") from exc
+            received_at = time.monotonic()
+            try:
+                decoded = decode_can_frame(raw)
+            except ValueError:
+                malformed_count += 1
+                continue
+            ledger.mark("feedback", received_at)
+            timestamps_by_id[decoded.arbitration_id].append(received_at)
+            counts[decoded.arbitration_id] += 1
+            if decoded.extended:
+                extended_count += 1
+            else:
+                standard_count += 1
+    ended = time.monotonic()
+    feedback_stats = ledger.summarize()["feedback"].as_dict()
+    return {
+        "mode": "read-only",
+        "channel": channel,
+        "duration_sec": ended - started,
+        "transport": "socketcan_passive_receive_only",
+        "motion_commands_sent": False,
+        "feedback": feedback_stats,
+        "frame_count": sum(counts.values()),
+        "unique_arbitration_ids": len(counts),
+        "frames_by_arbitration_id": {
+            f"0x{arbitration_id:x}": count
+            for arbitration_id, count in sorted(counts.items())
+        },
+        "per_id_feedback": _per_id_summary(dict(timestamps_by_id)),
+        "extended_frame_count": extended_count,
+        "standard_frame_count": standard_count,
+        "malformed_frame_count": malformed_count,
+        "freshness_verified": False,
+        "freshness_semantics": "socket_receive_time_only; vendor_payload_not_decoded",
+        "notes": [
+            "This measures received CAN frame timing, not command, compute, or haptic rate.",
+            "MotorBridge 0.4.9 does not expose a source timestamp/sequence for MotorState.",
+        ],
+    }
+
+
+def _offline_capture(duration_sec: float, target_hz: float) -> dict[str, object]:
+    if not math.isfinite(duration_sec) or duration_sec <= 0.0:
+        raise ValueError("duration_sec must be positive")
+    if not math.isfinite(target_hz) or target_hz <= 0.0:
+        raise ValueError("target_hz must be positive")
+    period = 1.0 / target_hz
+    sample_count = max(2, int(round(duration_sec * target_hz)) + 1)
+    timestamps = [index * period for index in range(sample_count)]
+    stats = summarize_timestamps("feedback", timestamps, target_hz=target_hz).as_dict()
+    return {
+        "mode": "offline",
+        "duration_sec": duration_sec,
+        "transport": "synthetic_clock",
+        "motion_commands_sent": False,
+        "feedback": stats,
+        "frame_count": 0,
+        "unique_arbitration_ids": 0,
+        "frames_by_arbitration_id": {},
+        "per_id_feedback": {},
+        "extended_frame_count": 0,
+        "standard_frame_count": 0,
+        "malformed_frame_count": 0,
+        "freshness_verified": True,
+        "freshness_semantics": "synthetic_only",
+        "notes": ["Offline timing is not hardware or CAN evidence."],
+    }
+
+
+def _parse_joint_names(values: Sequence[str] | None) -> tuple[str, ...]:
+    if not values:
+        return B601_RS_ARM_JOINT_NAMES
+    names: list[str] = []
+    for value in values:
+        names.extend(part.strip() for part in str(value).split(",") if part.strip())
+    resolved = tuple(names)
+    if not resolved or len(set(resolved)) != len(resolved):
+        raise ValueError("--joint must contain unique joint names")
+    unknown = set(resolved).difference(B601_RS_ARM_JOINT_NAMES)
+    if unknown:
+        raise ValueError(f"unknown B601-RS joint names: {sorted(unknown)}")
+    return resolved
+
+
+def _resolve_position_limits(
+    config_path: Path,
+    source_root: Path | None,
+) -> tuple[tuple[float, float], ...]:
+    """Resolve six arm limits from the pinned URDF before enabling motors."""
+
+    root = (
+        config_path.parent.parent
+        if source_root is None
+        else source_root.expanduser().resolve(strict=True)
+    )
+    try:
+        from robot_motion.rebot_b601_rs import B601PinocchioModel
+
+        model = B601PinocchioModel.from_rebot_source_root(root)
+        lower, upper = model.arm_position_limits()
+    except Exception as exc:
+        raise FrequencyProbeError(
+            "cannot resolve finite B601-RS URDF position limits before motion: "
+            f"{exc}"
+        ) from exc
+    limits = tuple(
+        (float(lower_value), float(upper_value))
+        for lower_value, upper_value in zip(lower, upper)
+    )
+    if len(limits) != 6 or any(
+        not math.isfinite(lower_value)
+        or not math.isfinite(upper_value)
+        or lower_value >= upper_value
+        for lower_value, upper_value in limits
+    ):
+        raise FrequencyProbeError("B601-RS URDF returned invalid arm position limits")
+    return limits
+
+
+def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
+    if not args.allow_motion:
+        raise FrequencyProbeError("position mode requires --allow-motion")
+    if args.confirmation != "B601_RS_POSITION_FREQUENCY":
+        raise FrequencyProbeError(
+            "position mode requires --confirmation B601_RS_POSITION_FREQUENCY"
+        )
+    if not args.enable:
+        raise FrequencyProbeError("position mode requires explicit --enable")
+    if not args.auto_disable:
+        raise FrequencyProbeError("position mode requires explicit --auto-disable")
+    if not args.config:
+        raise FrequencyProbeError("position mode requires --config pointing to rebotarm_rs.yaml")
+    if not math.isfinite(args.duration_sec) or args.duration_sec <= 0.0:
+        raise ValueError("duration_sec must be positive")
+    if not math.isfinite(args.warmup_sec) or args.warmup_sec <= 0.0:
+        raise ValueError("warmup_sec must be positive")
+    selected = _parse_joint_names(args.joint)
+    config_path = Path(args.config).expanduser().resolve(strict=True)
+    position_limits = _resolve_position_limits(
+        config_path,
+        args.rebot_source_root,
+    )
+    config = B601RSBackendConfig.from_rs_yaml(
+        config_path,
+        allow_motion=True,
+        position_limits_rad=position_limits,
+    )
+    backend = B601RSBackend(config)
+    ledger = FrequencyLedger()
+    enable_attempted = False
+    commands_sent = 0
+    stop_reason: str | None = None
+    cleanup_errors: list[str] = []
+    cleanup_receipt: dict[str, object] | None = None
+    primary_error: Exception | None = None
+    try:
+        backend.connect()
+        warmup_deadline = time.monotonic() + args.warmup_sec
+        state = None
+        while time.monotonic() < warmup_deadline:
+            state = backend.poll_feedback()
+            ledger.mark("feedback", state.receive_timestamp_sec)
+            if state.valid and state.positions_rad is not None:
+                break
+            time.sleep(0.005)
+        if state is None or not state.valid or state.positions_rad is None:
+            raise FrequencyProbeError(
+                "no complete valid feedback snapshot arrived during warmup"
+            )
+        mode_receipt = backend.prepare_position_velocity_mode(joint_names=selected)
+        if not mode_receipt.completed:
+            raise FrequencyProbeError("POS_VEL setup failed: " + "; ".join(mode_receipt.errors))
+        enable_attempted = True
+        enable_receipt = backend.enable(joint_names=selected)
+        if not enable_receipt.completed:
+            raise FrequencyProbeError("motor enable failed: " + "; ".join(enable_receipt.errors))
+        target_hz = float(args.target_hz)
+        if target_hz <= 0.0:
+            raise ValueError("target_hz must be positive")
+        period = 1.0 / target_hz
+        started = time.monotonic()
+        next_deadline = started
+        while time.monotonic() - started < args.duration_sec:
+            now = time.monotonic()
+            if now < next_deadline:
+                time.sleep(next_deadline - now)
+            state = backend.poll_feedback()
+            ledger.mark("feedback", state.receive_timestamp_sec)
+            if not state.valid or state.positions_rad is None:
+                stop_reason = state.fault_reason or "invalid feedback"
+                break
+            ledger.mark("compute")
+            receipt = backend.send_position_velocity(
+                state.positions_rad,
+                joint_names=selected,
+                source_sequence=state.sequence,
+            )
+            if not receipt.accepted:
+                stop_reason = "; ".join(receipt.errors) or "partial position dispatch"
+                break
+            ledger.mark("tx", receipt.completed_at_sec)
+            commands_sent += 1
+            next_deadline += period
+    except Exception as exc:  # noqa: BLE001 - always reach fail-safe cleanup
+        primary_error = exc
+    finally:
+        if enable_attempted:
+            try:
+                stop_receipt = backend.safe_stop(joint_names=selected)
+                cleanup_receipt = {
+                    "operation": stop_receipt.operation,
+                    "requested_joint_names": stop_receipt.requested_joint_names,
+                    "completed_joint_names": stop_receipt.completed_joint_names,
+                    "failed_joint_names": stop_receipt.failed_joint_names,
+                    "errors": stop_receipt.errors,
+                    "completed": stop_receipt.completed,
+                }
+                if not stop_receipt.completed:
+                    cleanup_errors.extend(
+                        f"safe_stop: {error}" for error in stop_receipt.errors
+                    )
+                    if not stop_receipt.errors:
+                        cleanup_errors.append(
+                            "safe_stop: incomplete without vendor error"
+                        )
+            except Exception as exc:  # noqa: BLE001 - report vendor cleanup failure
+                cleanup_errors.append(f"safe_stop: {exc}")
+        try:
+            backend.close()
+        except Exception as exc:  # noqa: BLE001 - report vendor cleanup failure
+            cleanup_errors.append(f"close: {exc}")
+        if cleanup_errors and stop_reason is None:
+            stop_reason = "; ".join(cleanup_errors)
+    if primary_error is not None:
+        detail = str(primary_error)
+        if cleanup_errors:
+            detail += "; cleanup: " + "; ".join(cleanup_errors)
+        raise FrequencyProbeError(detail) from primary_error
+    result: dict[str, object] = {
+        "mode": "position",
+        "channel": config.channel,
+        "config_path": str(config_path),
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "rebot_source_root": str(
+            config_path.parent.parent
+            if args.rebot_source_root is None
+            else args.rebot_source_root.expanduser().resolve(strict=True)
+        ),
+        "duration_sec": args.duration_sec,
+        "target_hz": args.target_hz,
+        "transport": "motorbridge_wired_local",
+        "motion_commands_sent": True,
+        "commands_sent": commands_sent,
+        "stop_reason": stop_reason,
+        "freshness_verified": False,
+        "freshness_semantics": "motorbridge_vendor_cache_unverified",
+        "frequency": ledger.as_dict(target_hz=args.target_hz),
+        "notes": [
+            "Human-run commissioning handoff only; this mode is never executed by automated tests.",
+            "It holds the latest observed position and does not request feedback frames.",
+        ],
+    }
+    if cleanup_receipt is not None:
+        result["cleanup_receipt"] = cleanup_receipt
+    if cleanup_errors:
+        result["cleanup_errors"] = tuple(cleanup_errors)
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="B601-RS passive CAN timing probe; position mode is explicitly guarded."
+    )
+    parser.add_argument("--mode", choices=("read-only", "offline", "position"), default="read-only")
+    parser.add_argument("--channel", default="can0")
+    parser.add_argument("--duration-sec", "--duration", type=float, default=3.0)
+    parser.add_argument("--target-hz", type=float, default=500.0)
+    parser.add_argument("--config", help="explicit rebotarm_rs.yaml for guarded position mode")
+    parser.add_argument(
+        "--rebot-source-root",
+        type=Path,
+        help=(
+            "reBotArm source root containing the pinned URDF; defaults to "
+            "two parents above --config"
+        ),
+    )
+    parser.add_argument("--joint", action="append", help="joint name or comma-separated names")
+    parser.add_argument("--warmup-sec", type=float, default=2.0)
+    parser.add_argument("--allow-motion", action="store_true")
+    parser.add_argument("--confirmation", default="")
+    parser.add_argument("--enable", action="store_true")
+    parser.add_argument("--auto-disable", action="store_true")
+    parser.add_argument("--output", type=Path, help="write JSON outside the source worktree")
+    parser.add_argument("--json", action="store_true", help="retain machine-readable JSON output (default)")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if not math.isfinite(args.duration_sec) or args.duration_sec <= 0.0:
+            raise ValueError("duration_sec must be positive")
+        if args.mode == "read-only":
+            payload = _read_only_capture(args.channel, args.duration_sec)
+        elif args.mode == "offline":
+            payload = _offline_capture(args.duration_sec, args.target_hz)
+        else:
+            payload = _run_position_probe(args)
+    except (B601HardwareError, FrequencyProbeError, OSError, ValueError) as exc:
+        payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
+        print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
+        return 2
+    payload = {"status": "OK", **payload}
+    encoded = json.dumps(payload, indent=2, sort_keys=True)
+    print(encoded)
+    if args.output is not None:
+        args.output.expanduser().resolve().write_text(encoded + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
