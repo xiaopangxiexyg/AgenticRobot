@@ -689,8 +689,8 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 449
-    assert sum(len(action.option_strings) for action in parser._actions) == 509
+    assert len(parser._actions) == 450
+    assert sum(len(action.option_strings) for action in parser._actions) == 510
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
     assert parser.parse_args([]).artifact_layout == "legacy"
@@ -698,6 +698,9 @@ def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary
     assert parser.parse_args([]).v25p_native_storage_layout == "record_cjson_v1"
     assert parser.parse_args([]).tactile_bundle_root == ""
     assert parser.parse_args([]).tactile_bundle_min_free_gb == 0.0
+    assert parser.parse_args([]).collection_process_startup_timeout_sec == (
+        defaults.DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC
+    )
     assert parser.parse_args([]).storage_queue_backpressure_policy == "block"
     assert parser.parse_args([]).position_ik_branch_continuity_anchor is False
     assert parser.parse_args([]).position_joint_limit_guard_mode == "legacy"

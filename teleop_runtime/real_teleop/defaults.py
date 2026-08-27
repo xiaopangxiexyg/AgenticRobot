@@ -24,6 +24,13 @@ DEFAULT_INIT_ARM_QPOS_SPEED_SCALE = 5.0
 DEFAULT_POSITION_MAX_ACCELERATION_RAD_S2 = (7.0, 7.0, 9.0, 15.0, 15.0, 20.0)
 DEFAULT_REAL_TELEOP_MAX_TRACKER_TRANSLATION_JUMP_M = 0.45
 DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG = 160.0
+# Process-mode collection discovers the append position from persisted dataset
+# metadata before it can report ready.  That scan is intentionally outside the
+# realtime loop, but populated/removable storage can still take longer than the
+# generic process worker's ten-second default.  Keep a real-teleop-specific
+# bound so a genuine hang remains finite while normal dataset preparation does
+# not fail merely because the dataset has grown.
+DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC = 60.0
 # Entering real teleoperation is a bounded safety transaction. This hard cap
 # applies to the pre-Home fresh Tracker admission and to any interval during
 # runtime Home in which a required Tracker timestamp stops advancing. It is
@@ -45,6 +52,7 @@ def runtime_home_fresh_data_timeout_sec(configured_timeout_sec: float) -> float:
 
 __all__ = [
     "DEFAULT_CAMERA_CONFIG_PATH",
+    "DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC",
     "DEFAULT_DATASET_ROOT",
     "DEFAULT_INIT_ARM_PROFILE_PATH",
     "DEFAULT_INIT_ARM_QPOS_SPEED_SCALE",

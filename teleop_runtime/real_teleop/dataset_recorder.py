@@ -115,6 +115,7 @@ from .control_profile import (
 )
 from .dataset_finalize import RealDatasetFinalizeTask
 from .debug_timing import debug_timing_metadata as _debug_timing_metadata
+from .defaults import DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC
 from .gripper_policy import (
     current_gripper_force_dataset_contract as _current_gripper_force_dataset_contract,
     gripper_force_dataset_contract_from_args as _gripper_force_dataset_contract_from_args,
@@ -453,6 +454,13 @@ class RealTeleopDatasetRecorder:
         # failed ready handshake this recorder must never be started again.
         # Callers create a fresh candidate for retry/reconfiguration.
         self._lifecycle_closed = False
+        collection_process_startup_timeout_sec = float(
+            getattr(
+                args,
+                "collection_process_startup_timeout_sec",
+                DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC,
+            )
+        )
         self.collector_components = CollectorComponents(
             session=components.session,
             sources=_collection_sources_from_components(components, self.camera_sources),
@@ -481,6 +489,9 @@ class RealTeleopDatasetRecorder:
                 ),
                 "collection_process_extra_array_mb": int(
                     getattr(args, "collection_process_extra_array_mb", 8)
+                ),
+                "collection_process_startup_timeout_sec": (
+                    collection_process_startup_timeout_sec
                 ),
                 "impedance_teleop_control_hz": (
                     _effective_outer_control_hz(args)
@@ -600,6 +611,7 @@ class RealTeleopDatasetRecorder:
                             * 1024
                         ),
                     ),
+                    startup_timeout_sec=collection_process_startup_timeout_sec,
                     worker_cpus=tuple(
                         int(cpu)
                         for cpu in (

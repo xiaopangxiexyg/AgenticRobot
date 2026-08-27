@@ -89,6 +89,7 @@ from .cli_value_parsers import (
 from .debug_recorders import DEFAULT_ACTION_DEBUG_LOG_ROOT
 from .defaults import (
     DEFAULT_CAMERA_CONFIG_PATH,
+    DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC,
     DEFAULT_DATASET_ROOT,
     DEFAULT_INIT_ARM_PROFILE_PATH,
     DEFAULT_INIT_ARM_QPOS_SPEED_SCALE,
@@ -2559,6 +2560,17 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Extra bytes per shared slot, in MiB, for tactile and other nested ndarray "
             "payloads. These arrays bypass multiprocessing.Queue pickle."
+        ),
+    )
+    parser.add_argument(
+        "--collection-process-startup-timeout-sec",
+        type=_positive_float,
+        default=DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC,
+        help=(
+            "Maximum ready-handshake time for a process-isolated formal "
+            "collection writer, including validation and persisted-dataset "
+            "metadata discovery. Writer preparation remains outside the "
+            "realtime control loop."
         ),
     )
     parser.add_argument(

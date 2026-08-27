@@ -3,6 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
+import pytest
+
+from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
+from teleop_runtime.real_teleop.defaults import (
+    DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC,
+)
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPOSITORY_ROOT / "scripts" / "run_formal_60hz_writing_collection.sh"
@@ -16,6 +23,22 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     )
+
+
+def test_real_teleop_process_writer_startup_timeout_is_bounded_and_tunable() -> None:
+    parser = build_real_teleop_argument_parser()
+
+    defaults = parser.parse_args([])
+    tuned = parser.parse_args(
+        ["--collection-process-startup-timeout-sec", "90"]
+    )
+
+    assert defaults.collection_process_startup_timeout_sec == (
+        DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC
+    )
+    assert tuned.collection_process_startup_timeout_sec == 90.0
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--collection-process-startup-timeout-sec", "0"])
 
 
 def test_launcher_help_documents_two_terminal_commands() -> None:
