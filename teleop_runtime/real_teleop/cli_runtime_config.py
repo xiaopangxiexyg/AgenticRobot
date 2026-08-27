@@ -81,7 +81,8 @@ def _apply_default_q6_ports(
         message = f"Failed to load hand Q6 assignment {getattr(args, 'q6_config', 'latest')!r}: {exc}"
         if _gui_capability_admission(args):
             args.q6_startup_error = message
-            args.gripper_input_source = "angle_trigger"
+            if not _explicit_q6_gripper_input_requested(args):
+                args.gripper_input_source = "angle_trigger"
             _log(
                 "GripperInput",
                 "WARNING: Q6 assignment loading was isolated from GUI startup; "
@@ -154,7 +155,8 @@ def _run_gui_device_preflight(
             # the reconnectable Q6 source absent.  The runtime retry path can
             # then atomically promote this fallback to Q6 after the operator
             # reconnects the devices.
-            args.gripper_input_source = "angle_trigger"
+            if not _explicit_q6_gripper_input_requested(args):
+                args.gripper_input_source = "angle_trigger"
             _log(
                 "DevicePreflight",
                 "WARNING: Q6 preflight failure was isolated from GUI startup; "
@@ -182,15 +184,50 @@ def _gui_capability_admission(args: argparse.Namespace) -> bool:
     ) == "capability"
 
 
+def _explicit_q6_gripper_input_requested(args: argparse.Namespace) -> bool:
+    """Return whether the operator explicitly selected Q6 at the CLI."""
+
+    return str(
+        getattr(args, "_gripper_input_source_request", "") or ""
+    ).strip().lower() == "q6"
+
+
 def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> None:
     """Prefer usable Q6 input; fall back to the calibrated angle triggers."""
     args.q6_startup_error = ""
+
+    # Keep the original request separate from the resolved source.  The
+    # resolver is called again by a few retry paths; treating a prior fallback
+    # result as a new explicit request would otherwise disable the historical
+    # automatic Q6 re-scan on retry.
+    request_marker = "_gripper_input_source_request"
+    if not hasattr(args, request_marker):
+        requested = getattr(args, "gripper_input_source", None)
+        requested = None if requested is None else str(requested).strip().lower()
+        legacy_angle_trigger = bool(getattr(args, "gripper_angle_trigger", False))
+        if legacy_angle_trigger and requested not in (None, "", "angle_trigger"):
+            raise ValueError(
+                "--gripper-angle-trigger and --gripper-input-source select "
+                "conflicting gripper inputs"
+            )
+        if requested in (None, ""):
+            requested = "angle_trigger" if legacy_angle_trigger else None
+        elif requested not in {"q6", "angle_trigger"}:
+            raise ValueError(
+                "gripper_input_source must be q6 or angle_trigger"
+            )
+        setattr(args, request_marker, requested)
+    requested = getattr(args, request_marker, None)
+
     if not _dmtac_sides(args, active_sides):
         args.gripper_input_source = "none"
         return
-    if bool(getattr(args, "gripper_angle_trigger", False)):
+
+    if requested == "angle_trigger":
         args.gripper_input_source = "angle_trigger"
         return
+
+    explicit_q6 = requested == "q6"
     try:
         from hardware.teleop_hand.q6_assignment import scan_q6_devices
 
@@ -202,6 +239,8 @@ def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[
         # Preserve the historical strict behavior for scanner validation
         # errors, while allowing GUI capability admission to surface the
         # fault and keep the manual retry control alive.
+        if explicit_q6 and not _gui_capability_admission(args):
+            raise
         if isinstance(exc, ValueError) and not _gui_capability_admission(args):
             raise
         args.q6_startup_error = f"{type(exc).__name__}: {exc}"
@@ -210,7 +249,7 @@ def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[
             "Q6 probe unavailable; GUI will remain available and the runtime "
             f"will try angle trigger until manual Q6 reconnect: {args.q6_startup_error}",
         )
-        args.gripper_input_source = "angle_trigger"
+        args.gripper_input_source = "q6" if explicit_q6 else "angle_trigger"
         return
 
     expected = len(active_sides)
@@ -219,7 +258,7 @@ def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[
         args.gripper_input_source = "q6"
         return
     detail = f"Detected only {detected} Q6 device(s), expected {expected}."
-    if detected and not _gui_capability_admission(args):
+    if (explicit_q6 or detected) and not _gui_capability_admission(args):
         raise ValueError(detail)
     args.q6_startup_error = f"Q6UnavailableError: {detail}"
     _log(
@@ -227,7 +266,7 @@ def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[
         "Q6 input is unavailable at startup; GUI will remain available "
         f"for manual reconnect: {detail}",
     )
-    args.gripper_input_source = "angle_trigger"
+    args.gripper_input_source = "q6" if explicit_q6 else "angle_trigger"
 
 
 def _argv_has_option(raw_argv: Sequence[str], option: str) -> bool:
