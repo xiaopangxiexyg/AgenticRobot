@@ -239,44 +239,68 @@ class DMTacGripperDevice:
         self._distributed_force_denoiser = DistributedForceDenoiser(self.tactile_config.denoise_config)
 
     def connect(self) -> "DMTacGripperDevice":
-        if self.connect_gripper and self.gripper is None:
-            cfg = self.gripper_config
-            self.gripper = InspireGripper(
-                port=cfg.port,
-                gripper_id=cfg.gripper_id,
-                baudrate=cfg.baudrate,
-                timeout=cfg.timeout,
-                max_open_mm=cfg.max_open_mm,
-                reconnect_on_error=cfg.reconnect_on_error,
-                reconnect_attempts=cfg.reconnect_attempts,
-                reconnect_delay=cfg.reconnect_delay,
-                inter_command_delay=cfg.inter_command_delay,
-                use_write_multiple_registers=cfg.use_write_multiple_registers,
-                debug=cfg.debug,
-            )
-
-        if self.connect_tactile and self.tactile is None:
-            dev_ids = list(self.tactile_config.dev_ids or discover_device_ids()[:2])
-            if not dev_ids:
-                raise RuntimeError(
-                    "No DM-Tac tactile device was discovered. Check USB with `lsusb`, "
-                    "or pass explicit ids with TactileConfig(dev_ids=[...])."
+        try:
+            if self.connect_gripper and self.gripper is None:
+                cfg = self.gripper_config
+                self.gripper = InspireGripper(
+                    port=cfg.port,
+                    gripper_id=cfg.gripper_id,
+                    baudrate=cfg.baudrate,
+                    timeout=cfg.timeout,
+                    max_open_mm=cfg.max_open_mm,
+                    reconnect_on_error=cfg.reconnect_on_error,
+                    reconnect_attempts=cfg.reconnect_attempts,
+                    reconnect_delay=cfg.reconnect_delay,
+                    inter_command_delay=cfg.inter_command_delay,
+                    use_write_multiple_registers=cfg.use_write_multiple_registers,
+                    debug=cfg.debug,
                 )
-            configs = [tactile_device_config(dev_id, self.tactile_config) for dev_id in dev_ids]
-            self.tactile = DMTacMultiDevice(configs).connect()
-            if self.apply_tactile_calibration_on_connect:
-                self.apply_fixed_tactile_calibration()
-            self.reset_tactile_filter()
+
+            if self.connect_tactile and self.tactile is None:
+                dev_ids = list(self.tactile_config.dev_ids or discover_device_ids()[:2])
+                if not dev_ids:
+                    raise RuntimeError(
+                        "No DM-Tac tactile device was discovered. Check USB with `lsusb`, "
+                        "or pass explicit ids with TactileConfig(dev_ids=[...])."
+                    )
+                configs = [
+                    tactile_device_config(dev_id, self.tactile_config)
+                    for dev_id in dev_ids
+                ]
+                tactile = DMTacMultiDevice(configs)
+                self.tactile = tactile
+                tactile.connect()
+                if self.apply_tactile_calibration_on_connect:
+                    self.apply_fixed_tactile_calibration()
+                self.reset_tactile_filter()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
 
         return self
 
     def close(self) -> None:
-        if self.tactile is not None:
-            self.tactile.close()
-            self.tactile = None
-        if self.gripper is not None:
-            self.gripper.close()
-            self.gripper = None
+        first_error: BaseException | None = None
+        tactile = self.tactile
+        self.tactile = None
+        if tactile is not None:
+            try:
+                tactile.close()
+            except BaseException as exc:  # Close every owned resource before surfacing.
+                first_error = exc
+        gripper = self.gripper
+        self.gripper = None
+        if gripper is not None:
+            try:
+                gripper.close()
+            except BaseException as exc:  # Close every owned resource before surfacing.
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def __enter__(self) -> "DMTacGripperDevice":
         return self.connect()
