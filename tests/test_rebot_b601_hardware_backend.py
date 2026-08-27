@@ -436,6 +436,7 @@ def _position_probe_args(config_path: Path) -> SimpleNamespace:
         joint=("joint1", "joint2"),
         rebot_source_root=None,
         target_hz=125.0,
+        velocity_limit_rad_s=0.1,
     )
 
 
@@ -451,7 +452,15 @@ def _install_position_probe_fakes(
     monkeypatch.setattr(
         frequency_probe.B601RSBackendConfig,
         "from_rs_yaml",
-        staticmethod(lambda _path, **_kwargs: SimpleNamespace(channel="can0")),
+        staticmethod(
+            lambda _path, **_kwargs: SimpleNamespace(
+                channel="can0",
+                joints=tuple(
+                    SimpleNamespace(position_velocity_limit_rad_s=10.0)
+                    for _ in range(6)
+                ),
+            )
+        ),
     )
     monkeypatch.setattr(frequency_probe, "B601RSBackend", lambda _config: backend)
 

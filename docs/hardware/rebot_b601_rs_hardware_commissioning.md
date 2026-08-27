@@ -109,6 +109,7 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
   --config "$REBOT_RS_CONFIG" \
   --target-hz 125 \
   --duration 10 \
+  --velocity-limit-rad-s 0.1 \
   --joint joint1 \
   --allow-motion \
   --confirmation B601_RS_POSITION_FREQUENCY \
@@ -119,7 +120,9 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 
 `--joint` 可用逗号分隔的六个 arm 名称；脚本默认从 config 的上两级目录寻找 pinned URDF，
 也可显式传入 `--rebot-source-root`。没有通过上一档频率和硬件负责人复核，不得直接提高到
-250/500 Hz。该命令的 `motion_commands_sent=true` 仅表示发送尝试发生，不能
+250/500 Hz。`--velocity-limit-rad-s` 是本次 POS_VEL 参考的保守速度上限（默认
+`0.1 rad/s`），最终还会取不高于 YAML 中每关节 `vlim` 的值；它不是频率参数。该命令的
+`motion_commands_sent=true` 仅表示发送尝试发生，不能
 替代现场运动观察或 `HARDWARE_PASS` 收据。
 
 ## 通过记录最小字段

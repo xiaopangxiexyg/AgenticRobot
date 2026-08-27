@@ -254,6 +254,9 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
     target_hz = float(args.target_hz)
     if not math.isfinite(target_hz) or target_hz <= 0.0:
         raise ValueError("target_hz must be positive")
+    velocity_limit_rad_s = float(args.velocity_limit_rad_s)
+    if not math.isfinite(velocity_limit_rad_s) or velocity_limit_rad_s <= 0.0:
+        raise ValueError("velocity_limit_rad_s must be positive")
     selected = _parse_joint_names(args.joint)
     config_path = Path(args.config).expanduser().resolve(strict=True)
     position_limits = _resolve_position_limits(
@@ -264,6 +267,10 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         config_path,
         allow_motion=True,
         position_limits_rad=position_limits,
+    )
+    effective_velocity_limits = tuple(
+        min(velocity_limit_rad_s, joint.position_velocity_limit_rad_s)
+        for joint in config.joints
     )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
@@ -309,6 +316,7 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             ledger.mark("compute")
             receipt = backend.send_position_velocity(
                 state.positions_rad,
+                velocity_limits_rad_s=effective_velocity_limits,
                 joint_names=selected,
                 source_sequence=state.sequence,
             )
@@ -365,6 +373,8 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         ),
         "duration_sec": args.duration_sec,
         "target_hz": target_hz,
+        "requested_velocity_limit_rad_s": velocity_limit_rad_s,
+        "effective_velocity_limits_rad_s": effective_velocity_limits,
         "transport": "motorbridge_wired_local",
         "motion_commands_sent": True,
         "commands_sent": commands_sent,
@@ -375,6 +385,7 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         "notes": [
             "Human-run commissioning handoff only; this mode is never executed by automated tests.",
             "It holds the latest observed position and does not request feedback frames.",
+            "The position command is capped by --velocity-limit-rad-s and the YAML per-joint limits.",
         ],
     }
     if cleanup_receipt is not None:
@@ -392,6 +403,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel", default="can0")
     parser.add_argument("--duration-sec", "--duration", type=float, default=3.0)
     parser.add_argument("--target-hz", type=float, default=500.0)
+    parser.add_argument(
+        "--velocity-limit-rad-s",
+        type=float,
+        default=0.1,
+        help="maximum POS_VEL command speed; defaults to the conservative 0.1 rad/s",
+    )
     parser.add_argument("--config", help="explicit rebotarm_rs.yaml for guarded position mode")
     parser.add_argument(
         "--rebot-source-root",
