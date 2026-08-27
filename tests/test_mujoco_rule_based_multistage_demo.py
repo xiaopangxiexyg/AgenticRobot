@@ -6,12 +6,14 @@ import numpy as np
 import pytest
 
 from dataset_contracts.pose_frames import load_pose_frame_contract
+from robot_motion.position_control import ResampledMotionReference
 from robot_motion.pose_frame_profiles import (
     DEFAULT_RM65_DUAL_ARM_COLLECTION_POSE_FRAME_CONTRACT_PATH,
     DEFAULT_RM65_DUAL_ARM_RUNTIME_POSE_FRAME_CONTRACT_PATH,
 )
 from sim.mujoco.replay.rule_based_multistage_demo import (
     DETAIL_PHASE_IDS,
+    _align_to_initial_target,
     _grippers_for_reference,
     _load_detail_writing_selection,
     _require_left_hold_state,
@@ -301,3 +303,59 @@ def test_detail_left_hold_is_constant_and_stage_targets_keep_it_fixed() -> None:
         hold_by_side={"left": hold_gripper},
     )
     assert grippers["left"] == pytest.approx(0.25)
+
+
+def test_initial_alignment_reuses_dispatch_loop_without_capture() -> None:
+    class _FakeControl:
+        contract = SimpleNamespace(
+            timing=SimpleNamespace(physics_timestep_sec=0.01),
+        )
+
+        def __init__(self) -> None:
+            self.scene = SimpleNamespace(data=SimpleNamespace(time=0.0))
+            self.rig = SimpleNamespace(sync_viewer=lambda _viewer: None)
+            self.calls = []
+
+        def solve_and_dispatch(self, reference, *, gripper_close_by_side) -> None:
+            self.calls.append((reference, dict(gripper_close_by_side)))
+
+        def step_physics(self) -> None:
+            self.scene.data.time += 0.01
+
+    pose = np.eye(4)
+    reference = ResampledMotionReference(
+        sequence=0,
+        timestamp=0.0,
+        left_source_index=0,
+        right_source_index=0,
+        left_source_timestamp=0.0,
+        right_source_timestamp=0.0,
+        interpolation_alpha=0.0,
+        pose_by_side={"left": pose, "right": pose},
+        metadata={"source": "first_replay_reference"},
+    )
+    control = _FakeControl()
+
+    count = _align_to_initial_target(
+        control,
+        reference,
+        {"left": 0.1, "right": 0.2},
+        duration_sec=0.05,
+        reference_hz=60.0,
+        viewer_handle=None,
+        no_sleep=True,
+    )
+
+    assert count == len(control.calls) == 3
+    assert [call[0].metadata["phase"] for call in control.calls] == [
+        "initial_alignment",
+        "initial_alignment",
+        "initial_alignment",
+    ]
+    assert all(call[0].metadata["capture"] is False for call in control.calls)
+    assert [call[0].sequence for call in control.calls] == [0, 1, 2]
+    assert [call[1] for call in control.calls] == [
+        {"left": 0.1, "right": 0.2},
+        {"left": 0.1, "right": 0.2},
+        {"left": 0.1, "right": 0.2},
+    ]

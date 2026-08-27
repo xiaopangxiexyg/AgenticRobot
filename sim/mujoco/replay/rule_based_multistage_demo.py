@@ -66,6 +66,7 @@ from robot_motion.position_control import (
     TimestampedMotionTarget,
     resample_motion_targets,
 )
+from robot_motion.pose import pose_delta_metrics
 from robot_motion.relative_action import pose_matrix_to_xyzquat
 from robot_motion.replay.fixed_trajectory import (
     FIXED_TRAJECTORY_DIRECTIONS,
@@ -742,6 +743,94 @@ def _reference_from_pose(
     )
 
 
+def _pose_error_by_side(
+    actual_pose_by_side: Mapping[str, Any],
+    target_pose_by_side: Mapping[str, Any],
+) -> dict[str, dict[str, float]]:
+    """Measure a canonical-desk TCP target against the actual MuJoCo TCP."""
+
+    errors: dict[str, dict[str, float]] = {}
+    for side in ("left", "right"):
+        translation_m, rotation_deg = pose_delta_metrics(
+            np.asarray(actual_pose_by_side[side], dtype=float).reshape(4, 4),
+            np.asarray(target_pose_by_side[side], dtype=float).reshape(4, 4),
+        )
+        errors[side] = {
+            "translation_m": float(translation_m),
+            "rotation_deg": float(rotation_deg),
+        }
+    return errors
+
+
+def _align_to_initial_target(
+    control: DeskTcpPositionControl,
+    reference: ResampledMotionReference,
+    grippers: Mapping[str, float],
+    *,
+    duration_sec: float,
+    reference_hz: float,
+    viewer_handle: Any,
+    no_sleep: bool,
+) -> int:
+    """Repeatedly dispatch one target while MuJoCo advances to its initial pose.
+
+    ``DeskTcpPositionControl.solve_and_dispatch`` intentionally admits one
+    bounded qref step per call.  A single call therefore cannot mean "move to
+    the target".  This small pre-capture loop owns only the initial alignment;
+    it reuses the normal IK, dispatch, actuation, physics, and viewer seams and
+    never writes a dataset frame.
+    """
+
+    duration = float(duration_sec)
+    hz = float(reference_hz)
+    if not np.isfinite(duration) or duration < 0.0:
+        raise ValueError("initial alignment duration must be finite and >= 0")
+    if not np.isfinite(hz) or hz <= 0.0:
+        raise ValueError("initial alignment reference_hz must be finite and positive")
+    physics_dt = float(control.contract.timing.physics_timestep_sec)
+    if not np.isfinite(physics_dt) or physics_dt <= 0.0:
+        raise ValueError("initial alignment requires a positive physics timestep")
+
+    start_time = float(control.scene.data.time)
+    end_time = start_time + duration
+    dispatch_period = 1.0 / hz
+    next_dispatch_time = start_time
+    dispatch_count = 0
+
+    while True:
+        now = float(control.scene.data.time)
+        if now + 0.5 * physics_dt >= next_dispatch_time:
+            runtime_reference = replace(
+                reference,
+                sequence=int(dispatch_count),
+                timestamp=now,
+                metadata={
+                    **dict(reference.metadata),
+                    "phase": "initial_alignment",
+                    "capture": False,
+                },
+            )
+            control.solve_and_dispatch(
+                runtime_reference,
+                gripper_close_by_side=grippers,
+            )
+            dispatch_count += 1
+            next_dispatch_time = now + dispatch_period
+
+        if now + 0.5 * physics_dt >= end_time:
+            return dispatch_count
+        if viewer_handle is not None and not viewer_handle.is_running():
+            return -1
+
+        tick_started = time.monotonic()
+        control.step_physics()
+        control.rig.sync_viewer(viewer_handle)
+        if not no_sleep:
+            remaining = physics_dt - (time.monotonic() - tick_started)
+            if remaining > 0.0:
+                time.sleep(remaining)
+
+
 def _circle_targets(
     boundary_pose_by_side: Mapping[str, np.ndarray],
     *,
@@ -1151,6 +1240,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         left_hold_pose_by_side = {}
         left_hold_gripper = None
         left_hold_source_index = None
+    record_hold_sides = ("left",) if detail_selection is not None else ()
     _stage_a_group, stage_a_frames = _stage_group(
         episode,
         rows,
@@ -1213,6 +1303,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     fixed_phase = "rule_based_circle"
     fixed_action_source = "rule_based_tcp_circle"
     left_actual_qpos_samples: list[np.ndarray] = []
+    initial_alignment_dispatch_count = 0
+    initial_alignment_error_by_side: dict[str, dict[str, float]] | None = None
+    initial_alignment_actual_qpos_by_side: dict[str, np.ndarray] | None = None
+    initial_alignment_verified: bool | None = None
+    initial_alignment_tolerance: dict[str, float] | None = None
     viewer_context = (
         passive_viewer_handle(control.scene) if args.viewer else nullcontext(None)
     )
@@ -1242,6 +1337,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             [ResampledMotionReference], Mapping[str, Sequence[int]]
         ]
         | None = None,
+        hold_sides: Sequence[str] = (),
     ) -> None:
         nonlocal capture_frame_index, playback_time_sec
         phase_start = float(control.scene.data.time)
@@ -1263,7 +1359,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 metadata={**dict(reference.metadata), "phase": str(phase)},
             )
             grippers = gripper_fn(reference)
-            control.solve_and_dispatch(runtime_reference, gripper_close_by_side=grippers)
+            control.solve_and_dispatch(
+                runtime_reference,
+                gripper_close_by_side=grippers,
+                hold_sides=hold_sides,
+            )
             control.step_physics()
             control.rig.sync_viewer(viewer_handle)
             capture_time = playback_time_sec + max(0.0, local_timestamp)
@@ -1363,25 +1463,55 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ).reshape(4, 4).copy()
             for side in ("left", "right")
         }
-        initial_reference = _reference_from_pose(
-            initial_pose,
-            timestamp=float(control.scene.data.time),
+        initial_reference = replace(
+            stage_a_refs[0],
             sequence=0,
-            source_index=0,
-            metadata={"phase": "initial_alignment", "capture": False},
+            timestamp=float(control.scene.data.time),
+            metadata={
+                **dict(stage_a_refs[0].metadata),
+                "phase": "initial_alignment",
+                "capture": False,
+            },
         )
         initial_grippers = dict(stage_a_frames[0].gripper_close_by_side)
         if left_hold_gripper is not None:
             initial_grippers["left"] = float(left_hold_gripper)
-        control.solve_and_dispatch(initial_reference, gripper_close_by_side=initial_grippers)
-        control.step_physics()
-        control.rig.sync_viewer(viewer_handle)
-        _advance_to(
+        initial_alignment_dispatch_count = _align_to_initial_target(
             control,
-            float(control.scene.data.time) + float(args.settle_seconds),
+            initial_reference,
+            initial_grippers,
+            duration_sec=float(args.settle_seconds),
+            reference_hz=float(args.reference_hz),
             viewer_handle=viewer_handle,
             no_sleep=bool(args.no_sleep),
         )
+        if initial_alignment_dispatch_count < 0:
+            raise RuntimeError("MuJoCo viewer closed during initial alignment")
+        actual_initial_pose = _actual_tcp_boundary(control)
+        initial_alignment_error_by_side = _pose_error_by_side(
+            actual_initial_pose,
+            initial_pose,
+        )
+        target_tolerance = control.retargeter.ik_safety_profile.target_tolerance
+        initial_alignment_tolerance = {
+            "translation_m": float(target_tolerance.position_m),
+            "rotation_deg": float(target_tolerance.orientation_deg),
+        }
+        initial_alignment_verified = all(
+            error["translation_m"] <= initial_alignment_tolerance["translation_m"]
+            and error["rotation_deg"] <= initial_alignment_tolerance["rotation_deg"]
+            for error in initial_alignment_error_by_side.values()
+        )
+        if not initial_alignment_verified:
+            raise RuntimeError(
+                "initial alignment did not reach the first replay target within "
+                f"the shared IK target tolerance: errors={initial_alignment_error_by_side} "
+                f"tolerance={initial_alignment_tolerance}; increase --settle-seconds"
+            )
+        initial_alignment_actual_qpos_by_side = {
+            side: control.scene.get_arm_qpos(side).copy()
+            for side in ("left", "right")
+        }
 
         run_phase(
             "right_write.pen_down" if detail_selection is not None else "absolute_stage_a",
@@ -1418,6 +1548,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ],
                 }
             ),
+            hold_sides=record_hold_sides,
         )
 
         boundary_before_fixed = _actual_tcp_boundary(control)
@@ -1532,6 +1663,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "right": [-1],
                 }
             ),
+            hold_sides=record_hold_sides,
         )
         boundary_after_fixed = _actual_tcp_boundary(control)
         boundary_tcp_pose_by_side = (
@@ -1627,6 +1759,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ],
                 }
             ),
+            hold_sides=record_hold_sides,
         )
         control_snapshot = control.snapshot()
     finally:
@@ -1699,6 +1832,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "capture": False,
                 "target": "right_write.pen_down.first_frame",
                 "left_hold": True,
+                "dispatch_count": int(initial_alignment_dispatch_count),
+                "settle_seconds": float(args.settle_seconds),
+                "error_by_side": initial_alignment_error_by_side,
+                "target_tolerance": initial_alignment_tolerance,
+                "verified": initial_alignment_verified,
             },
             "right_write.pen_down": {
                 **detail_phase_payload["right_write.pen_down"],
@@ -1724,13 +1862,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "source_frame_index": left_hold_source_index,
                 "target_pose_desk": left_hold_pose_by_side["left"],
                 "target_gripper_close": left_hold_gripper,
+                "aligned_qpos_by_side": initial_alignment_actual_qpos_by_side,
                 "actual_qpos_span_rad": left_actual_qpos_span,
             },
         }
     else:
         composition = {
             "mode": "legacy_stage_a_rule_based_relative_stage_b",
-            "initial_alignment": {"capture": False, "target": "stage_a.first_frame"},
+            "initial_alignment": {
+                "capture": False,
+                "target": "stage_a.first_frame",
+                "dispatch_count": int(initial_alignment_dispatch_count),
+                "settle_seconds": float(args.settle_seconds),
+                "error_by_side": initial_alignment_error_by_side,
+                "target_tolerance": initial_alignment_tolerance,
+                "verified": initial_alignment_verified,
+            },
             "absolute_stage_a": stage_a_span.to_dict(),
             fixed_phase: fixed_phase_payload,
             "relative_stage_b": {
