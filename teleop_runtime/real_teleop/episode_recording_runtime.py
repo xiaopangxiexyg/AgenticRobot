@@ -1609,7 +1609,15 @@ def build_episode_recording_runtime(
 
         args.dataset_startup_error = ""
         startup_device_errors.pop("dataset.writer", None)
-        publish_runtime_hardware_status()
+        try:
+            publish_runtime_hardware_status()
+        except Exception as exc:  # noqa: BLE001 - status is observational only.
+            _log(
+                "Dataset",
+                "selected writer is active but hardware-status refresh failed: "
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
         _log(
             "DatasetTiming",
             "dataset selection writer became ready outside the realtime loop "
