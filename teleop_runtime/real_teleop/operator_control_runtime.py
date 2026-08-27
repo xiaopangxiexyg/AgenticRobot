@@ -2229,9 +2229,16 @@ class RealTeleopControlInput:
         }
         if control_hint:
             updates["control_hint"] = control_hint
-        self.ui.publish(**updates)
+        self._publish_ui_observation(
+            context="FixArm state",
+            **updates,
+        )
         if message:
-            self.ui.append_message("FixArm", message)
+            self._append_ui_message_observation(
+                "FixArm",
+                message,
+                context="FixArm state",
+            )
 
     def _set_fix_arm_side_from_gui(self, side: str) -> None:
         controller = getattr(self.components, "fix_arm_controller", None)
@@ -2257,9 +2264,16 @@ class RealTeleopControlInput:
         }
         if control_hint:
             updates["control_hint"] = control_hint
-        self.ui.publish(**updates)
+        self._publish_ui_observation(
+            context="InitArm state",
+            **updates,
+        )
         if message:
-            self.ui.append_message("InitArm", message)
+            self._append_ui_message_observation(
+                "InitArm",
+                message,
+                context="InitArm state",
+            )
 
     def _init_qpos_sequence_ui_state(self) -> dict[str, object]:
         return {
@@ -3539,7 +3553,8 @@ class RealTeleopControlInput:
             self._gripper_control_enabled = False
             self._tracker_swap_locked = True
             if self.ui is not None:
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="runtime Home request admission",
                     active_controls=["q"],
                     control_hint=(
                         "已确认开始，VIVE tracker 左右映射已锁定；"
@@ -5070,7 +5085,8 @@ class RealTeleopControlInput:
         while True:
             remaining = max(0.0, deadline - time.time())
             if self.ui is not None:
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="runtime Home preparation",
                     stage="即将开始 runtime home",
                     active_controls=["q"],
                     control_hint=f"请松开按键并保持姿态，{remaining:.1f}s 后开始。",
@@ -5093,7 +5109,17 @@ class RealTeleopControlInput:
             self.terminal.consume_episode_start_request()
             self.terminal.consume_episode_stop_request()
             if self.ui is not None:
-                for event in self.ui.consume_events():
+                try:
+                    ui_events = tuple(self.ui.consume_events())
+                except Exception as exc:  # noqa: BLE001 - terminal input remains available.
+                    _log(
+                        "WebGUI",
+                        "runtime Home preparation event poll failed; continuing with "
+                        "terminal input: "
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    ui_events = ()
+                for event in ui_events:
                     if event == "q":
                         self.should_quit = True
             if self.should_quit:
@@ -5103,7 +5129,8 @@ class RealTeleopControlInput:
         if not self._final_tracker_side_home_admission():
             return False
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="runtime Home capture start",
                 stage="采集 runtime home",
                 active_controls=["q"],
                 control_hint="正在采集当前 tracker 和机械臂 home，请保持静止。",
@@ -5139,7 +5166,8 @@ class RealTeleopControlInput:
         elapsed = max(0.0, float(elapsed_sec))
         remaining = max(0.0, total - elapsed)
         side_text = "/".join(str(side) for side in active_sides) or "arm"
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="force-control warmup progress",
             stage="预热 RM65 力控",
             active_controls=["q"],
             control_hint=(
@@ -5203,7 +5231,8 @@ class RealTeleopControlInput:
                 "松开到释放区间 1 秒后再次握紧 1 秒会重采 runtime home。"
             )
         gripper_status = _build_gripper_status(self.components)
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="teleop admission state",
             stage=(
                 "RM65 真机遥操运行中"
                 if dispatch_confirmed
@@ -5263,7 +5292,7 @@ class RealTeleopControlInput:
             f"gripper_control={'on' if self.gripper_control_enabled() else 'off'} "
             f"q6_sides={[side for side in self.components.active_sides if _gripper_retargeter_for_side(self.components, side) is not None]}",
         )
-        self.ui.append_message(
+        self._append_ui_message_observation(
             "RealTeleop",
             message
             or (
@@ -5271,6 +5300,7 @@ class RealTeleopControlInput:
                 if dispatch_confirmed
                 else "runtime home 完成，正在等待首条机械臂命令实际派发。"
             ),
+            context="teleop admission state",
         )
         self.publish_raw_tracker_pose_state(force=True)
         self.publish_gripper_status(force=True)
@@ -5389,8 +5419,13 @@ class RealTeleopControlInput:
         if self.ui is None:
             return
         if message:
-            self.ui.append_message("Calibration", message)
-        self.ui.publish(
+            self._append_ui_message_observation(
+                "Calibration",
+                message,
+                context="calibration waiting state",
+            )
+        self._publish_ui_observation(
+            context="calibration waiting state",
             stage="RM65 真机遥操准备" if not self._teleop_started else "Hold / 停臂保持",
             active_controls=self._current_active_controls(),
             control_hint=(
@@ -5459,7 +5494,8 @@ class RealTeleopControlInput:
         single_count = None
         if len(self.components.active_sides) == 1:
             single_count = int(sample_counts.get(self.components.active_sides[0], 0))
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="runtime Home capture progress",
             stage="采集 runtime home",
             capture_stage="runtime_home",
             capture_phase="capturing",

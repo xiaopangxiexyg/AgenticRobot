@@ -93,6 +93,54 @@ def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
     ) == pytest.approx(10.0)
 
 
+def test_safety_hold_latches_before_a_failing_session_hold() -> None:
+    events: list[tuple[object, ...]] = []
+
+    class Session:
+        def hold_hardware(
+            self,
+            message: str,
+            *,
+            require_home_recalibration: bool,
+        ) -> bool:
+            events.append(
+                ("hardware", message, require_home_recalibration)
+            )
+            raise RuntimeError("baseline reset failed")
+
+    class Clutch:
+        _hold_requested = False
+        _hold_active = False
+        _gripper_control_enabled = True
+        _hold_request_reason = ""
+
+        def request_hold(self, *, reason: str) -> None:
+            events.append(("application", reason))
+            # Model the real pre-admission no-op. The helper must still force
+            # the local latch before calling the fallible Session operation.
+
+    clutch = Clutch()
+    logs: list[str] = []
+    assert not control_loop._latch_safety_hold_and_hold_hardware_best_effort(
+        SimpleNamespace(session=Session()),
+        clutch,
+        message="active modifier failed",
+        reason="active_modifier_failed",
+        log=lambda _tag, message, **_kwargs: logs.append(message),
+        now=10.0,
+    )
+
+    assert events == [
+        ("application", "active_modifier_failed"),
+        ("hardware", "active modifier failed", True),
+    ]
+    assert clutch._hold_requested is True
+    assert clutch._hold_active is True
+    assert clutch._gripper_control_enabled is False
+    assert clutch._hold_request_reason == "active_modifier_failed"
+    assert any("safety hardware Hold failed" in message for message in logs)
+
+
 def test_unreceipted_progress_failure_latches_distinct_fail_closed_hold() -> None:
     events: list[tuple[str, str]] = []
 
@@ -1852,6 +1900,30 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
     assert "from ..debug" not in source
 
 
+def test_startup_qpos_hold_failure_is_contained_after_ownership_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs: list[str] = []
+    monkeypatch.setattr(
+        startup_runtime,
+        "_log",
+        lambda _tag, message, **_kwargs: logs.append(str(message)),
+    )
+
+    assert not startup_runtime._hold_startup_qpos_session_best_effort(
+        SimpleNamespace(
+            session=SimpleNamespace(
+                hold_hardware=lambda _message: (_ for _ in ()).throw(
+                    RuntimeError("baseline reset failed")
+                )
+            )
+        ),
+        message="startup qpos dispatch failed",
+        now=1.0,
+    )
+    assert any("baseline reset failed" in message for message in logs)
+
+
 def test_tcp_pose_envelope_home_rebind_precedes_real_hardware_arm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2023,7 +2095,7 @@ def test_startup_home_continuity_failure_returns_negative_arm_receipt(
     )
 
     assert admitted is False
-    assert events == ["continuity_failed", "hold_hardware", "waiting"]
+    assert events == ["continuity_failed", "waiting", "hold_hardware"]
 
 
 def test_session_arm_admission_failure_returns_to_hold(
@@ -2070,8 +2142,8 @@ def test_session_arm_admission_failure_returns_to_hold(
         "debug_passed",
         "force_enable",
         "arm_attempt",
-        "hold_hardware",
         "waiting",
+        "hold_hardware",
     ]
 
 
@@ -2118,8 +2190,8 @@ def test_application_projection_failure_reholds_armed_session(
     assert events[-4:] == [
         "arm_hardware",
         "projection_attempt",
-        "hold_hardware",
         "waiting",
+        "hold_hardware",
     ]
 
 
@@ -2163,7 +2235,7 @@ def test_relative_tcp_pose_envelope_refuses_arm_without_runtime_home(
         home_captured=False,
     )
 
-    assert events == ["hold_hardware", "waiting"]
+    assert events == ["waiting", "hold_hardware"]
     assert admitted is False
 
 
@@ -2340,6 +2412,93 @@ def test_two_pedal_home_requires_arm_receipt_before_success() -> None:
     success_index = fast_home.index("success=True", failure_index)
     assert arm_index < failure_index < success_index
     assert "continue" in fast_home[failure_index:success_index]
+    calibration_failure = fast_home[
+        fast_home.index("except Exception as exc:") : arm_index
+    ]
+    assert "_latch_safety_hold_and_hold_hardware_best_effort(" in calibration_failure
+
+
+def test_arm_admission_rejection_latches_application_before_session_hold() -> None:
+    source = inspect.getsource(startup_runtime._arm_after_start_calibration)
+    rejection = source[
+        source.index("def reject_arm_admission(") :
+        source.index("if home_captured:")
+    ]
+
+    waiting_index = rejection.index("clutch_input.publish_calibration_waiting(")
+    session_hold_index = rejection.index("components.session.hold_hardware(")
+    assert waiting_index < session_hold_index
+    assert "if not hold_applied:" in rejection
+    assert "except Exception as hold_exc:" in rejection
+
+
+def test_runtime_home_requires_a_positive_precalibration_hold_receipt() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    explicit_home = source[
+        source.index("if clutch_input.consume_calibration_request():") :
+        source.index(
+            "episode_delete_index =",
+            source.index("if clutch_input.consume_calibration_request():"),
+        )
+    ]
+
+    hold_index = explicit_home.index("runtime_home_hold_applied = bool(")
+    receipt_index = explicit_home.index("if not runtime_home_hold_applied:")
+    calibration_index = explicit_home.index("_runtime_home_calibration(")
+    assert hold_index < receipt_index < calibration_index
+    failure_path = explicit_home[receipt_index:calibration_index]
+    assert "_request_safety_hold_best_effort(" in failure_path
+    assert "continue" in failure_path
+
+
+def test_active_admittance_receipts_gate_home_and_recording_transitions() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    fast_home = source[
+        source.index("fast_two_pedal_fixed_side =") :
+        source.index("if clutch_input.consume_calibration_request():")
+    ]
+    explicit_home = source[
+        source.index("if clutch_input.consume_calibration_request():") :
+        source.index(
+            "episode_delete_index =",
+            source.index("if clutch_input.consume_calibration_request():"),
+        )
+    ]
+    episode_start = source[
+        source.index("if clutch_input.consume_episode_start_request():") :
+        source.index('mark_loop_phase("loop.keys")')
+    ]
+    episode_open = source[
+        source.index("countdown_control_plane_started_at =") :
+        source.index(
+            "dataset_recorder = context.dataset_recorder()",
+            source.index("countdown_control_plane_started_at ="),
+        )
+    ]
+
+    for home_transition in (fast_home, explicit_home):
+        reset_gate = home_transition.index(
+            "if not reset_position_admittance_shadow("
+        )
+        assert "continue" in home_transition[reset_gate:]
+    assert fast_home.index("if not reset_position_admittance_shadow(") < fast_home.index(
+        "success=True"
+    )
+    assert explicit_home.index(
+        "if not reset_position_admittance_shadow("
+    ) < explicit_home.index("progress_workflow.handle_command(")
+
+    assert "admittance_rearm_ready = True" in episode_start
+    assert "if not admittance_rearm_ready:" in episode_start
+    assert "_cancel_recording_countdown_for_hold_best_effort(" in episode_start
+    assert "continue" in episode_start[
+        episode_start.index("if not admittance_rearm_ready:") :
+    ]
+
+    assert "if not rearm_position_admittance_after_control_plane_pause(" in episode_open
+    assert "_cancel_recording_countdown_for_hold_best_effort(" in episode_open
+    assert "_stop_recording_best_effort(" in episode_open
+    assert "continue" in episode_open
 
 
 def test_active_tcp_pose_envelope_fault_has_explicit_pre_dispatch_hold_path() -> None:
@@ -3208,7 +3367,10 @@ def test_control_lifecycle_state_survives_ui_transport_failure(
     control.plus_curation = SimpleNamespace(ui_state=lambda: {})
     control._cancel_init_arm_qpos_sequence = lambda *, reason: None
     control._q6_hold_recalibration_gesture = SimpleNamespace(
-        reset_for_hold=lambda: None
+        config=SimpleNamespace(enabled=False),
+        reset_for_hold=lambda: None,
+        reset_for_running=lambda: None,
+        mark_runtime_restarted=lambda: None,
     )
     control.publish_gripper_status = lambda **_kwargs: None
     control._teleop_started = True
@@ -3227,6 +3389,29 @@ def test_control_lifecycle_state_survives_ui_transport_failure(
     control._episode_finalizing_ui_active = False
     control._episode_last_episode_index = None
     control._episode_last_frame_count = None
+    control._last_calibration_started_from_hold = False
+    control._calibration_requested = False
+    control._calibration_request_from_hold = False
+    control._tracker_side_confirmation_pending = False
+    control._tracker_side_confirmation_from_hold = False
+    control._tracker_side_confirmation_request_kind = "normal"
+    control._tracker_side_request_pending = False
+    control._tracker_side_request_from_hold = False
+    control._tracker_side_request_source = ""
+    control._tracker_side_request_kind = "normal"
+    control._tracker_side_request_deadline = 0.0
+    control._tracker_side_guard_request_active = False
+    control._tracker_side_override_granted = False
+    control._two_pedal_fast_home_requested = False
+    control._two_pedal_fast_home_deadline = 0.0
+    control._two_pedal_fast_home_timeout_sec = 1.0
+    control._tracker_side_check = {}
+    control._tracker_swap_locked = True
+    control._camera_visualization_available = lambda: False
+    control._tactile_visualization_available = lambda: False
+    control._camera_visualization_active = False
+    control._tactile_visualization_active = False
+    control.publish_raw_tracker_pose_state = lambda **_kwargs: None
 
     monkeypatch.setattr(
         operator_control_runtime,
@@ -3257,6 +3442,26 @@ def test_control_lifecycle_state_survives_ui_transport_failure(
         operator_control_runtime,
         "_movement_multiple_ui_state",
         lambda _args: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_vive_calibration_profile_ui_state",
+        lambda _args, _components: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_build_gripper_status",
+        lambda _components: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_build_tactile_camera_status",
+        lambda _status: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_gripper_gui_available",
+        lambda _components: False,
     )
 
     control.request_hold(reason="unit_test")
@@ -3302,6 +3507,24 @@ def test_control_lifecycle_state_survives_ui_transport_failure(
     assert control._episode_recording_ui_active is False
     assert control._episode_finalizing_ui_active is False
     assert control._episode_last_frame_count == 9
+
+    control._hold_active = False
+    control._teleop_started = False
+    control.components.session = SimpleNamespace(
+        state_machine=SimpleNamespace(state=SimpleNamespace(value="ARMED"))
+    )
+    control.components.left_gripper_retargeter = None
+    control.components.right_gripper_retargeter = None
+    control.publish_teleop_running(home_ready=True)
+    assert control._teleop_started is True
+    assert control._hold_active is False
+    assert control._teleop_dispatch_confirmed is False
+
+    control.publish_calibration_waiting("runtime Home rejected")
+    assert control._hold_active is True
+    assert control._teleop_dispatch_confirmed is False
+    assert control._teleop_dispatch_projection == "calibration_waiting"
+    assert control._gripper_control_enabled is False
     assert any(
         tag == "WebGUI" and "authoritative state is retained" in message
         for tag, message in logs

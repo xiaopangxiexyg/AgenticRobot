@@ -431,6 +431,34 @@ def _startup_gui_qpos_seed_command(
     return command
 
 
+def _hold_startup_qpos_session_best_effort(
+    components: RealTeleopComponents,
+    *,
+    message: str,
+    now: float,
+) -> bool:
+    """Retain startup/Hold qpos ownership even if Session cleanup is partial."""
+
+    try:
+        hold_applied = bool(components.session.hold_hardware(message))
+    except Exception as exc:  # noqa: BLE001 - qpos dispatch is already disabled.
+        _log(
+            "InitArmQpos",
+            "startup qpos Session Hold failed after command ownership was stopped: "
+            f"{type(exc).__name__}: {exc}",
+            now=now,
+        )
+        return False
+    if not hold_applied:
+        _log(
+            "InitArmQpos",
+            "startup qpos Session Hold returned without a positive receipt; "
+            "qpos command ownership remains disabled",
+            now=now,
+        )
+    return hold_applied
+
+
 def _finish_startup_gui_qpos_terminal(
     *,
     components: RealTeleopComponents,
@@ -511,7 +539,11 @@ def _finish_startup_gui_qpos_terminal(
 
     if release_errors:
         message = f"{maintenance_label}结束，但控制权释放失败：" + "；".join(release_errors)
-        components.session.hold_hardware(message)
+        _hold_startup_qpos_session_best_effort(
+            components,
+            message=message,
+            now=now,
+        )
     elif status == "completed":
         if sequence_was_active:
             message = str(
@@ -527,7 +559,11 @@ def _finish_startup_gui_qpos_terminal(
     else:
         detail = str(terminal.get("message", "归位失败") or "归位失败")
         message = f"{maintenance_label}失败：{detail}；机械臂保持停止，未采集 tracker Home。"
-        components.session.hold_hardware(message)
+        _hold_startup_qpos_session_best_effort(
+            components,
+            message=message,
+            now=now,
+        )
 
     _log("InitArmQpos", message, now=now)
     clutch_input._publish_init_arm_state(message=message, control_hint=message)
@@ -562,7 +598,11 @@ def _advance_startup_gui_qpos_maintenance(
         message = f"启动前归位下发失败：{type(exc).__name__}: {exc}"
         _log("InitArmQpos", message, now=now)
         try:
-            components.session.hold_hardware(message)
+            _hold_startup_qpos_session_best_effort(
+                components,
+                message=message,
+                now=now,
+            )
         finally:
             _cancel_special_arm_modes_for_hold(
                 components,
@@ -829,22 +869,33 @@ def _arm_after_start_calibration(
         """Keep motion blocked when a post-Home admission step fails."""
 
         _log(tag, message)
-        try:
-            components.session.hold_hardware(message)
-        except Exception as hold_exc:  # noqa: BLE001 - preserve the admission cause.
-            _log(
-                tag,
-                "arm-admission Hold failed after the original error: "
-                f"{type(hold_exc).__name__}: {hold_exc}",
-            )
+        # Application admission is independent of the Session/rig lifecycle.
+        # Re-latch it first because Session Hold performs subordinate baseline
+        # and retargeter resets that may fail before reaching the hardware.
         try:
             clutch_input.publish_calibration_waiting(message)
-        except Exception as publish_exc:  # noqa: BLE001 - UI cannot reopen motion.
+        except Exception as publish_exc:  # noqa: BLE001 - state mutates before UI.
             _log(
                 tag,
-                "arm-admission failure UI publish failed: "
+                "arm-admission failure UI publish failed after the application "
+                "returned to calibration waiting: "
                 f"{type(publish_exc).__name__}: {publish_exc}",
             )
+        try:
+            hold_applied = bool(components.session.hold_hardware(message))
+        except Exception as hold_exc:  # noqa: BLE001 - preserve the application stop.
+            _log(
+                tag,
+                "arm-admission Session Hold failed after the application stop was latched: "
+                f"{type(hold_exc).__name__}: {hold_exc}",
+            )
+        else:
+            if not hold_applied:
+                _log(
+                    tag,
+                    "arm-admission Session Hold returned without a positive receipt; "
+                    "application remains in calibration waiting",
+                )
         return False
 
     if home_captured:
@@ -867,11 +918,10 @@ def _arm_after_start_calibration(
                 "位控受力急停后的 runtime Home 复位失败，保持停臂："
                 f"{type(exc).__name__}: {exc}"
             )
-            _log("PositionForceGuard", message)
-            clutch_input.publish_calibration_waiting(
-                message + " 请检查机械臂状态后重试。"
+            return reject_arm_admission(
+                "PositionForceGuard",
+                message + " 请检查机械臂状态后重试。",
             )
-            return False
         reset_elapsed_ms = (time.perf_counter() - reset_start) * 1000.0
         _log("Calibration", f"runtime restart motion state reset from live real qpos synced={synced}")
         startup_continuity_gate = getattr(
@@ -889,10 +939,7 @@ def _arm_after_start_calibration(
                     "runtime Home 首帧连续性闸门建立失败，保持停臂："
                     f"{type(exc).__name__}: {exc}"
                 )
-                _log("StartupHomeContinuity", message)
-                components.session.hold_hardware(message)
-                clutch_input.publish_calibration_waiting(message)
-                return False
+                return reject_arm_admission("StartupHomeContinuity", message)
             _log(
                 "StartupHomeContinuity",
                 f"armed receipt={continuity_snapshot}",
@@ -934,15 +981,10 @@ def _arm_after_start_calibration(
                         "位控受力急停仍保持锁存，不能恢复遥操："
                         f"{type(exc).__name__}: {exc}"
                     )
-                    _log("PositionForceGuard", message)
-                    try:
-                        components.session.hold_hardware(message)
-                    except Exception as hold_exc:  # noqa: BLE001 - preserve first cause.
-                        message += f"；Hold 下发失败: {type(hold_exc).__name__}: {hold_exc}"
-                    clutch_input.publish_calibration_waiting(
-                        message + " 请检查急停确认/机械臂状态后再重试。"
+                    return reject_arm_admission(
+                        "PositionForceGuard",
+                        message + " 请检查急停确认/机械臂状态后再重试。",
                     )
-                    return False
     state_machine_start = time.perf_counter()
     reference_epoch: int | None = None
     if components.position_reference_publisher is not None:
@@ -1000,10 +1042,7 @@ def _arm_after_start_calibration(
                         "TCP Pose 安全运行区间绑定 runtime Home 失败，保持停臂："
                         f"{type(exc).__name__}: {exc}"
                     )
-                    _log("TCPPoseEnvelope", message)
-                    components.session.hold_hardware(message)
-                    clutch_input.publish_calibration_waiting(message)
-                    return False
+                    return reject_arm_admission("TCPPoseEnvelope", message)
                 _log(
                     "TCPPoseEnvelope",
                     "Shadow runtime Home binding failed; observation remains "
@@ -1033,10 +1072,7 @@ def _arm_after_start_calibration(
             "TCP Pose 相对安全运行区间需要本次运行的 runtime Home；"
             "当前未捕获 Home，拒绝真机 arm。"
         )
-        _log("TCPPoseEnvelope", message)
-        components.session.hold_hardware(message)
-        clutch_input.publish_calibration_waiting(message)
-        return False
+        return reject_arm_admission("TCPPoseEnvelope", message)
     try:
         components.session.set_calibration_ready()
         components.session.mark_debug_passed()
@@ -1086,10 +1122,10 @@ def _arm_after_start_calibration(
                 else "runtime home 未就绪，未进入正常真机遥操。"
             ),
         )
-    except Exception as exc:  # noqa: BLE001 - application projection is required.
+    except Exception as exc:  # noqa: BLE001 - application admission must complete.
         return reject_arm_admission(
             "WebGUI",
-            "Session 已 arm 但应用遥操状态发布失败，已重新 Hold："
+            "Session 已 arm 但应用遥操状态转换失败，已重新 Hold："
             f"{type(exc).__name__}: {exc}",
         )
     publish_elapsed_ms = (time.perf_counter() - publish_start) * 1000.0
