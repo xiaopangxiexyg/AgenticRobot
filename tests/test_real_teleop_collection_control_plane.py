@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from teleop_runtime.real_teleop import collection_control_plane as control_plane_module
 from teleop_runtime.real_teleop.collection_control_plane import (
     CollectionControlOperationBusy,
     CollectionControlPlane,
@@ -73,6 +74,34 @@ def test_single_flight_rejects_overlapping_operation() -> None:
 
     release.set()
     assert _wait_for_result(plane, generation).succeeded
+
+
+def test_submit_thread_start_failure_does_not_wedge_single_flight(
+    monkeypatch,
+) -> None:
+    plane = CollectionControlPlane(name="unit-test")
+    original_start = control_plane_module.threading.Thread.start
+
+    def fail_start(_thread) -> None:
+        raise RuntimeError("simulated control-plane thread exhaustion")
+
+    monkeypatch.setattr(control_plane_module.threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="simulated control-plane thread exhaustion"):
+        plane.submit("prepare", lambda: "unreachable")
+
+    assert not plane.busy
+    assert plane.active_kind is None
+    assert plane.poll() is None
+
+    monkeypatch.setattr(
+        control_plane_module.threading.Thread,
+        "start",
+        original_start,
+    )
+    generation = plane.submit("retry", lambda: "ready")
+    result = _wait_for_result(plane, generation)
+    assert result.succeeded
+    assert result.value == "ready"
 
 
 def test_worker_failure_is_polled_without_escaping_worker_thread() -> None:
@@ -1433,6 +1462,169 @@ def test_formal_pause_failure_stops_the_episode_without_escaping_control(
         and "simulated sample drain failure" in message
         for tag, message in logs
     )
+    assert runtime.close()
+
+
+def test_stop_submission_failure_keeps_recorder_owned_paused_and_retryable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("test must reuse the published recorder")
+
+    stop_calls = 0
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True,
+        finalizing=False,
+        is_recording=True,
+        is_paused=False,
+        pause_reason="",
+        frame_count=12,
+        active_episode_index=4,
+        camera_sources={},
+        collection_frequency_status=lambda: {},
+        poll_finalize_tasks=lambda: [],
+        close=lambda: None,
+    )
+
+    def stop_episode(**_kwargs: object) -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        recorder.is_recording = False
+        recorder.active_episode_index = None
+        return None
+
+    recorder.stop_episode = stop_episode
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, _args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+    original_start = control_plane_module.threading.Thread.start
+
+    def fail_start(_thread) -> None:
+        raise RuntimeError("simulated stop thread exhaustion")
+
+    monkeypatch.setattr(control_plane_module.threading.Thread, "start", fail_start)
+    assert not runtime.stop_recording(time.time(), end_reason="manual_key_stop")
+
+    assert slot[0] is recorder
+    assert recorder.is_recording
+    assert not runtime.collection_transition_active()
+    assert runtime.recording_paused()
+    assert stop_calls == 0
+    assert clutch.recording_states[-1]["event_status"] == "paused"
+    assert "保留重试能力" in str(
+        clutch.recording_states[-1]["event_message"]
+    )
+    assert any(
+        tag == "Dataset" and "simulated stop thread exhaustion" in message
+        for tag, message in logs
+    )
+
+    monkeypatch.setattr(
+        control_plane_module.threading.Thread,
+        "start",
+        original_start,
+    )
+    assert runtime.stop_recording(time.time(), end_reason="manual_key_stop_retry")
+    assert slot[0] is None
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert slot[0] is recorder
+    assert recorder.is_recording is False
+    assert stop_calls == 1
+    assert not runtime.recording_paused()
+    assert runtime.close()
+
+
+def test_writer_prepare_submission_failure_keeps_existing_recorder_retryable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("ready recorder must be reused")
+
+    config_writes = 0
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer_started=True,
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        active_episode_index=None,
+        configured_for_current_args=lambda: True,
+        poll_finalize_tasks=lambda: [],
+        close=lambda: None,
+    )
+
+    def write_camera_device_config() -> None:
+        nonlocal config_writes
+        config_writes += 1
+
+    recorder.write_camera_device_config = write_camera_device_config
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    transition_calls: list[str] = []
+    runtime, _args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=transition_calls,
+    )
+    original_start = control_plane_module.threading.Thread.start
+
+    def fail_start(_thread) -> None:
+        raise RuntimeError("simulated prepare thread exhaustion")
+
+    monkeypatch.setattr(control_plane_module.threading.Thread, "start", fail_start)
+    assert not runtime.schedule_recording_countdown(
+        time.time(),
+        start_reason="unit",
+    )
+
+    assert slot[0] is recorder
+    assert not runtime.collection_transition_active()
+    assert runtime.countdown_deadline() is None
+    assert config_writes == 0
+    assert clutch.recording_states[-1]["event_status"] == "error"
+    assert any(
+        tag == "Dataset" and "simulated prepare thread exhaustion" in message
+        for tag, message in logs
+    )
+
+    monkeypatch.setattr(
+        control_plane_module.threading.Thread,
+        "start",
+        original_start,
+    )
+    assert runtime.schedule_recording_countdown(
+        time.time(),
+        start_reason="unit_retry",
+    )
+    assert slot[0] is None
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert slot[0] is recorder
+    assert config_writes == 1
+    assert runtime.countdown_deadline() is not None
+    assert transition_calls == ["formal_episode_start"]
     assert runtime.close()
 
 

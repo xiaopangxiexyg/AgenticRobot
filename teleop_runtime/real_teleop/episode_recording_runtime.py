@@ -913,6 +913,21 @@ def build_episode_recording_runtime(
         except CollectionControlOperationBusy as exc:
             episode_start_failure_message = str(exc)
             return False
+        except Exception as exc:  # noqa: BLE001 - recorder ownership was not transferred.
+            message = (
+                "正式 dataset episode 后台打开任务未能启动；"
+                "writer 仍保持当前所有权，可重试："
+                f"{type(exc).__name__}: {exc}"
+            )
+            episode_start_failure_message = message
+            _log("Dataset", message, now=now)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="episode open submission failure",
+                now=now,
+            )
+            return False
         if formal_recorder is not None:
             set_dataset_recorder(None)
             dataset_recorder = None
@@ -1289,6 +1304,28 @@ def build_episode_recording_runtime(
         except CollectionControlOperationBusy as exc:
             _log("Dataset", str(exc), now=now)
             return False
+        except Exception as exc:  # noqa: BLE001 - existing recorder remains published.
+            message = (
+                "正式 dataset writer 后台预备任务未能启动；"
+                "未转移现有 writer 所有权，可重试："
+                f"{type(exc).__name__}: {exc}"
+            )
+            episode_start_failure_message = message
+            _log("Dataset", message, now=now)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="writer preparation submission failure",
+                now=now,
+            )
+            clutch_input.set_episode_recording_state(
+                active=False,
+                episode_dir=recording_path(),
+                frame_count=recording_frame_count(),
+                event_status="error",
+                event_message=message,
+            )
+            return False
         if existing_recorder is not None:
             # The worker now has exclusive lifecycle ownership.  Detaching the
             # provider prevents finalize/progress/status code from observing
@@ -1446,6 +1483,7 @@ def build_episode_recording_runtime(
     ) -> bool:
         nonlocal episode_stop_generation, episode_stop_recorder
         nonlocal episode_stop_frame_count, episode_stop_reason, dataset_recorder
+        nonlocal episode_recording_paused, episode_recording_pause_reason
         refresh_runtime_views()
         if collection_transition_active():
             return False
@@ -1570,6 +1608,39 @@ def build_episode_recording_runtime(
                 discard_value=discard_stop_completion,
             )
         except CollectionControlOperationBusy:
+            return False
+        except Exception as exc:  # noqa: BLE001 - keep recorder owned and data paused.
+            episode_recording_paused = True
+            episode_recording_pause_reason = (
+                f"stop_submission_failure:{end_reason}"
+            )
+            message = (
+                "数采停止后台任务未能启动；"
+                "recorder 所有权未转移，已禁止新样本并保留重试能力："
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log("Dataset", message, now=now)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="episode stop submission failure",
+                now=now,
+            )
+            clutch_input.set_episode_recording_state(
+                active=True,
+                episode_dir=recording_path(),
+                frame_count=frame_count,
+                frequency_status=recording_frequency_status(),
+                event_status="paused",
+                event_message=message,
+                episode_index=(
+                    int(formal_recorder.active_episode_index)
+                    if formal_recorder is not None
+                    and getattr(formal_recorder, "active_episode_index", None)
+                    is not None
+                    else None
+                ),
+            )
             return False
         episode_stop_recorder = formal_recorder
         episode_stop_frame_count = int(frame_count)

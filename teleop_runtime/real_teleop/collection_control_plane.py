@@ -126,14 +126,22 @@ class CollectionControlPlane:
                 discard_value=discard_value,
             )
             self._pending = pending
-            worker = threading.Thread(
-                target=self._run,
-                args=(pending, operation),
-                name=f"{self.name}:{normalized_kind}:{generation}",
-                daemon=True,
-            )
-            self._worker = worker
-            worker.start()
+            try:
+                worker = threading.Thread(
+                    target=self._run,
+                    args=(pending, operation),
+                    name=f"{self.name}:{normalized_kind}:{generation}",
+                    daemon=True,
+                )
+                self._worker = worker
+                worker.start()
+            except BaseException:
+                # Thread construction/start is part of submission, not the
+                # operation.  No worker owns ``pending`` when it fails, so
+                # retaining it would wedge this single-flight plane forever.
+                self._pending = None
+                self._worker = None
+                raise
         return generation
 
     def active_kind_unlocked(self) -> str | None:
