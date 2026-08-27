@@ -39,6 +39,36 @@ DEFAULT_TASKS_CONFIG_PATH = (
 )
 
 
+class _GripperInputSourceAction(argparse.Action):
+    """Accept the new source selector while keeping the legacy flag shape."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | None,
+        option_string: str | None = None,
+    ) -> None:
+        option = str(option_string or "")
+        if option == "--gripper-input-source" and values is None:
+            parser.error("--gripper-input-source requires q6 or angle_trigger")
+        source = "angle_trigger" if values is None else str(values)
+        previous = getattr(namespace, "gripper_input_source", None)
+        if previous not in (None, source):
+            parser.error(
+                "--gripper-angle-trigger and --gripper-input-source select "
+                "conflicting gripper inputs"
+            )
+        setattr(namespace, "gripper_input_source", source)
+        # Preserve the boolean attribute consumed by older callers that build
+        # an argparse namespace before the source is resolved.
+        setattr(
+            namespace,
+            "gripper_angle_trigger",
+            bool(option == "--gripper-angle-trigger" and values is None),
+        )
+
+
 def add_hand_backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--hand-backend",
@@ -84,9 +114,22 @@ def add_hand_backend_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--gripper-angle-trigger",
-        action="store_true",
-        help="Use calibrated hardware.angle_trigger input directly instead of Q6 discovery.",
+        "--gripper-input-source",
+        dest="gripper_input_source",
+        nargs="?",
+        choices=("q6", "angle_trigger"),
+        metavar="{q6,angle_trigger}",
+        default=None,
+        action=_GripperInputSourceAction,
+        help=(
+            "Select the DMTAC gripper input explicitly: q6 or angle_trigger. "
+            "The legacy bare --gripper-angle-trigger selects angle_trigger; "
+            "omit both options to preserve automatic Q6/AngleTrigger discovery."
+        ),
     )
+    # Keep the legacy boolean namespace field present when neither selector is
+    # supplied; older callers read it before the resolver runs.
+    parser.set_defaults(gripper_angle_trigger=False)
     parser.add_argument(
         "--gripper-angle-trigger-config-root",
         type=Path,

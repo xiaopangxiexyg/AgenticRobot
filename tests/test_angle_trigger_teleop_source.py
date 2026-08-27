@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import inspect
 import time
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from teleop_runtime.retargeters import ScalarToGripperRetargeter, ScalarToGrippe
 from teleop_runtime.schemas import ObservationChannel, TeleopObservation
 from teleop_runtime.sources.hand import AngleTriggerSource
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
+from teleop_runtime.real_teleop import hand_cli
 from teleop_runtime.real_teleop import cli_runtime_config
 from teleop_runtime.real_teleop.device_retry_runtime import (
     build_device_retry_runtime,
@@ -252,6 +254,94 @@ def test_gripper_input_selection_prefers_q6_and_falls_back_to_angle_trigger() ->
     args.gripper_angle_trigger = True
     real_teleop._resolve_gripper_input_source(args, ("left", "right"))
     assert args.gripper_input_source == "angle_trigger"
+
+
+def test_gripper_input_source_cli_selector_preserves_legacy_flag_and_default() -> None:
+    parser = argparse.ArgumentParser()
+    hand_cli.add_hand_backend_arguments(parser)
+
+    default_args = parser.parse_args([])
+    assert default_args.gripper_input_source is None
+    assert default_args.gripper_angle_trigger is False
+
+    angle_args = parser.parse_args(
+        ["--gripper-input-source", "angle_trigger"]
+    )
+    assert angle_args.gripper_input_source == "angle_trigger"
+    assert angle_args.gripper_angle_trigger is False
+
+    q6_args = parser.parse_args(["--gripper-input-source", "q6"])
+    assert q6_args.gripper_input_source == "q6"
+    assert q6_args.gripper_angle_trigger is False
+
+    legacy_args = parser.parse_args(["--gripper-angle-trigger"])
+    assert legacy_args.gripper_input_source == "angle_trigger"
+    assert legacy_args.gripper_angle_trigger is True
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--gripper-input-source"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--gripper-input-source", "q6", "--gripper-angle-trigger"]
+        )
+
+
+def test_explicit_angle_trigger_selection_skips_q6_probe() -> None:
+    args = SimpleNamespace(
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="angle_trigger",
+        gripper_angle_trigger=False,
+    )
+    with patch(
+        "hardware.teleop_hand.q6_assignment.scan_q6_devices",
+        side_effect=pytest.fail,
+    ):
+        real_teleop._resolve_gripper_input_source(args, ("left", "right"))
+
+    assert args.gripper_input_source == "angle_trigger"
+    assert args._gripper_input_source_request == "angle_trigger"
+
+
+def test_explicit_q6_selection_fails_closed_when_q6_is_missing() -> None:
+    args = SimpleNamespace(
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="q6",
+        gripper_angle_trigger=False,
+        gui_requested=False,
+        hardware_admission_mode="strict",
+    )
+    with (
+        patch(
+            "hardware.teleop_hand.q6_assignment.scan_q6_devices",
+            return_value={"q6_devices": []},
+        ),
+        pytest.raises(ValueError, match="Detected only 0 Q6"),
+    ):
+        real_teleop._resolve_gripper_input_source(args, ("left", "right"))
+
+
+def test_explicit_q6_selection_stays_q6_for_gui_retry() -> None:
+    args = SimpleNamespace(
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="q6",
+        gripper_angle_trigger=False,
+        gui_requested=True,
+        hardware_admission_mode="capability",
+    )
+    with patch(
+        "hardware.teleop_hand.q6_assignment.scan_q6_devices",
+        return_value={"q6_devices": []},
+    ):
+        real_teleop._resolve_gripper_input_source(args, ("left", "right"))
+
+    assert args.gripper_input_source == "q6"
+    assert "detected only 0 q6" in args.q6_startup_error.lower()
 
 
 def test_partial_q6_isolated_for_gui_capability_admission() -> None:
