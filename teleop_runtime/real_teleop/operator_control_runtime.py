@@ -859,6 +859,19 @@ class RealTeleopControlInput:
         state = self._gui_control_state()
         return bool(state.episode_countdown_active or state.episode_finalizing_active)
 
+    def _dataset_configuration_transition_active(self) -> bool:
+        """Return whether one dataset/profile writer transaction owns config."""
+
+        return bool(getattr(self, "_dataset_selection_pending", False))
+
+    def _progress_configuration_selection_enabled(self) -> bool:
+        """Keep progress configuration on the same idle transaction boundary."""
+
+        return bool(
+            not self._episode_busy()
+            and not self._dataset_configuration_transition_active()
+        )
+
     def episode_start_admission(self) -> tuple[bool, str]:
         """Apply one start gate to GUI, browser shortcuts, and terminal input.
 
@@ -867,7 +880,7 @@ class RealTeleopControlInput:
         failure; a selected profile is consumed only when the operator has
         explicitly enabled the progress workflow for that Episode.
         """
-        if bool(getattr(self, "_dataset_selection_pending", False)):
+        if self._dataset_configuration_transition_active():
             return False, "数据集任务/profile 正在后台准备，完成后才能开始数采。"
         if not bool(getattr(self, "_teleop_started", False)):
             return False, "遥操尚未进入 RUNNING，不能开始数采。"
@@ -3854,6 +3867,7 @@ class RealTeleopControlInput:
                 self.ui.publish(
                     **_collection_task_ui_state(self.args),
                     active_controls=self._current_active_controls(),
+                    dataset_configuration_transition_active=False,
                     dataset_modality_contract=CaptureModalityContract(
                         ignored_camera_keys=tuple(
                             getattr(self.args, "ignore_camera", ()) or ()
@@ -3865,11 +3879,22 @@ class RealTeleopControlInput:
                 )
             return False
 
-        if bool(getattr(self, "_dataset_selection_pending", False)):
-            return reject(
+        if self._dataset_configuration_transition_active():
+            # This request did not create the in-flight transaction, so it
+            # must not execute that transaction's rollback path or clear its
+            # ownership flag.  The original completion callbacks remain the
+            # only authority that can commit or roll back the pending draft.
+            message = (
                 "已有数据集任务/profile 切换正在等待后台准备完成；"
                 "本次选择未提交。"
             )
+            if self.ui is not None:
+                self.ui.append_message("Dataset", message)
+                self.ui.publish(
+                    active_controls=self._current_active_controls(),
+                    dataset_configuration_transition_active=True,
+                )
+            return False
         if self._episode_busy():
             return reject(
                 "数采录制、暂停、倒计时或保存中不能切换任务、数据目录或忽视模态；"
@@ -3925,6 +3950,7 @@ class RealTeleopControlInput:
                 self.ui.publish(
                     **_collection_task_ui_state(self.args),
                     **self.plus_curation.ui_state(),
+                    dataset_configuration_transition_active=False,
                     dataset_modality_contract={
                         "schema_version": "dexteleop.capture_modalities.v1",
                         "scope": "dataset",
@@ -4004,6 +4030,17 @@ class RealTeleopControlInput:
         return True
 
     def _toggle_round_trip_collection_task(self, *, source: str) -> bool:
+        if self._dataset_configuration_transition_active():
+            if self.ui is not None:
+                self.ui.append_message(
+                    "Dataset",
+                    "数据集任务/profile 正在后台准备，当前不切换 in/out。",
+                )
+                self.ui.publish(
+                    **_collection_task_ui_state(self.args),
+                    dataset_configuration_transition_active=True,
+                )
+            return False
         if self._episode_busy():
             if self.ui is not None:
                 self.ui.append_message("Dataset", "数采录制、暂停、倒计时或保存中不切换 in/out；请先停止当前 episode。")
@@ -4236,7 +4273,9 @@ class RealTeleopControlInput:
                 promotable_hold_pause=promotable_hold_pause,
                 application_held=self.hold_active(),
                 arm_transition_pending=arm_transition_pending,
-                profile_selection_enabled=not self._episode_busy(),
+                profile_selection_enabled=(
+                    self._progress_configuration_selection_enabled()
+                ),
             )
         )
         self.publish_progress_control_availability(
@@ -4349,6 +4388,8 @@ class RealTeleopControlInput:
             raise TypeError(
                 "command must be ProgressProfileSelectionCommand."
             )
+        if self._dataset_configuration_transition_active():
+            return False
         if self._progress_profile_selection_intents:
             return False
         self._progress_profile_selection_intents.append(command)
@@ -4385,6 +4426,8 @@ class RealTeleopControlInput:
             raise TypeError(
                 "command must be ProgressArmControlModeSelectionCommand."
             )
+        if self._dataset_configuration_transition_active():
+            return False
         pending = getattr(
             self,
             "_progress_arm_control_mode_selection_intents",
@@ -4415,6 +4458,8 @@ class RealTeleopControlInput:
             raise TypeError(
                 "command must be ProgressEntryStepSelectionCommand."
             )
+        if self._dataset_configuration_transition_active():
+            return False
         pending = getattr(
             self,
             "_progress_entry_step_selection_intents",

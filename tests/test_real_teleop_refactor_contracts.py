@@ -246,6 +246,17 @@ def test_transactional_dataset_selection_defers_live_state_and_start_request(
     assert control._episode_start_requested is False
     assert callbacks["bind_dataset_contract"] is True
 
+    first_snapshot = callbacks["snapshot"]
+    assert not control._apply_episode_start_payload("{}")
+    assert callbacks["snapshot"] is first_snapshot
+    assert args.collection_task_id == "old-id"
+    assert args.dataset_root == "/tmp/old-dataset"
+    assert control._dataset_selection_pending is True
+    assert control._episode_start_requested is False
+    assert control.ui.published[-1][
+        "dataset_configuration_transition_active"
+    ] is True
+
     callbacks["on_commit"](callbacks["snapshot"])
     assert args.collection_task_id == "new-id"
     assert args.dataset_root == "/tmp/new-dataset"
@@ -257,6 +268,9 @@ def test_transactional_dataset_selection_defers_live_state_and_start_request(
     callbacks["on_complete"]()
     assert control._dataset_selection_pending is False
     assert control._episode_start_requested is True
+    assert control.ui.published[-1][
+        "dataset_configuration_transition_active"
+    ] is False
     assert any(
         "数采任务已更新" in message
         for title, message in control.ui.messages
@@ -344,7 +358,47 @@ def test_transactional_dataset_selection_rolls_back_side_effects_on_failure(
     assert plus.variant_id == "old-variant"
     assert policy_calls == ["new-id", "old-id"]
     assert control._dataset_selection_pending is False
+    assert ui.published[-1]["dataset_configuration_transition_active"] is False
     assert any("原配置保持不变" in message for _title, message in ui.messages)
+
+
+def test_pending_dataset_selection_rejects_progress_configuration_intents() -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control._dataset_selection_pending = True
+    control._progress_profile_selection_intents = __import__("collections").deque()
+    control._progress_arm_control_mode_selection_intents = (
+        __import__("collections").deque()
+    )
+    control._progress_entry_step_selection_intents = (
+        __import__("collections").deque()
+    )
+    control._progress_ui_payload = {}
+    control._progress_ui_controls = ()
+    control._progress_ui_transport_revision = 0
+
+    assert not control.submit_progress_profile_selection_intent(
+        operator_control_runtime.ProgressProfileSelectionCommand(
+            command_id="profile",
+            profile_id="detail",
+        )
+    )
+    assert not control.submit_progress_arm_control_mode_selection_intent(
+        operator_control_runtime.ProgressArmControlModeSelectionCommand(
+            command_id="mode",
+            mode="profile",
+        )
+    )
+    assert not control.submit_progress_entry_step_selection_intent(
+        operator_control_runtime.ProgressEntryStepSelectionCommand(
+            command_id="entry",
+            progress_step_id="write",
+        )
+    )
+    assert not control._progress_profile_selection_intents
+    assert not control._progress_arm_control_mode_selection_intents
+    assert not control._progress_entry_step_selection_intents
 
 
 def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
@@ -1370,9 +1424,10 @@ def test_device_retry_runtime_immediately_refreshes_camera_projection() -> None:
     assert published[-1]["hardware_status"]["camera.front"]["status_level"] == "ok"
 
 
-def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> None:
+def test_generic_device_retry_never_starts_or_reuses_dataset_writer() -> None:
     errors = {"dataset.writer": "initial writer startup failure"}
     published: list[dict[str, object]] = []
+    messages: list[tuple[str, str]] = []
 
     class FailedRecorder:
         def __init__(self) -> None:
@@ -1390,27 +1445,10 @@ def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> 
     current_recorder: dict[str, object | None] = {"value": failed_recorder}
 
     class Recorder:
-        instances: list[Recorder] = []
-
         def __init__(self, **_kwargs: object) -> None:
-            self.instance_index = len(self.instances)
-            self.start_calls = 0
-            self.config_writes = 0
-            self.closed = False
-            self.instances.append(self)
-
-        def start(self) -> None:
-            self.start_calls += 1
-            if self.start_calls > 1:
-                raise AssertionError("cannot start a process twice")
-            if self.instance_index < 2:
-                raise RuntimeError(f"retry {self.instance_index} failed")
-
-        def write_camera_device_config(self) -> None:
-            self.config_writes += 1
-
-        def close(self) -> None:
-            self.closed = True
+            raise AssertionError(
+                "generic device retry must not construct a dataset writer"
+            )
 
     clutch = SimpleNamespace(
         _current_active_controls=lambda: ("device_retry",),
@@ -1435,7 +1473,7 @@ def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> 
         components=components,
         control_ui=SimpleNamespace(
             publish=lambda **kwargs: published.append(kwargs),
-            append_message=lambda *_args: None,
+            append_message=lambda tag, message: messages.append((tag, message)),
         ),
         clutch_input=clutch,
         camera_sources={},
@@ -1461,22 +1499,16 @@ def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> 
     )
 
     runtime.retry_failed_devices()
-    assert "retry 0 failed" in errors["dataset.writer"]
-    assert current_recorder["value"] is None
-    assert failed_recorder.closed is True
+    assert errors == {"dataset.writer": "initial writer startup failure"}
+    assert current_recorder["value"] is failed_recorder
+    assert failed_recorder.closed is False
     assert failed_recorder.start_calls == 0
-
-    runtime.retry_failed_devices()
-    assert "retry 1 failed" in errors["dataset.writer"]
-    assert current_recorder["value"] is None
-
-    runtime.retry_failed_devices()
-    assert "dataset.writer" not in errors
-    assert current_recorder["value"] is Recorder.instances[2]
-    assert [item.start_calls for item in Recorder.instances] == [1, 1, 1]
-    assert [item.closed for item in Recorder.instances] == [True, True, False]
-    assert [item.config_writes for item in Recorder.instances] == [0, 0, 1]
-    assert published[-1]["hardware_status"]["dataset.writer"]["status_level"] == "ok"
+    assert messages[-1][0] == "Dataset"
+    assert "再次点击“开始数采”" in messages[-1][1]
+    writer_status = published[-1]["hardware_status"]["dataset.writer"]
+    assert writer_status["status_level"] == "error"
+    assert writer_status["status_label"] == "writer 准备失败"
+    assert "全新 writer" in writer_status["error"]
 
 
 def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -> None:
