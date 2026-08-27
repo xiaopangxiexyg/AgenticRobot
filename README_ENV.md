@@ -103,15 +103,17 @@ python scripts/check_annotation_projection.py
 需要生成可直接复制发布的源码目录时，为每次发布选择一个新的空目录：
 
 ```bash
+annotation_release_dir=dist/refinement_annotation_20260827_candidate_01
 python scripts/export_annotation_projection.py \
-  --output release/refinement_annotation
+  --output "$annotation_release_dir"
 python scripts/export_annotation_projection.py \
-  --verify release/refinement_annotation
+  --verify "$annotation_release_dir"
 ```
 
 导出器按清单保留原项目结构，并生成代码文件摘要 receipt；摘要仅用于验证发布代码完整性，
 不参与数据集、Episode 或频繁变化配置的准入判断。输出目录已存在时导出器会拒绝覆盖，更新
-时应使用新的版本目录，验证后再替换部署指向。
+时应在已忽略的 `dist/` 下使用新的空目录，验证后再替换部署指向。需要版本化的发布快照
+必须使用带日期和 source hash 的目录名，并提交自验证 receipt。
 
 ## 3. 创建、更新与重建主环境
 
