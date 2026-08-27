@@ -630,7 +630,9 @@ dynamic slack。当前没有整体优于 V4 的选择。
 - `rm65_official_all_ik_probe.py`：核查官方全解、全部候选、SDK/URDF FK、求解延迟、
   60 Hz closed-loop 和共享 Cartesian alpha governor；
 - `rm65_official_branch_anchor_probe.py`：核查 soft Pink anchor、source-rate 全解路径、
-  60 Hz 中间帧投影、已有 qcmd planner 和官方连续遥操 IK。
+  60 Hz 中间帧投影、已有 qcmd planner 和官方连续遥操 IK。该一次性研究探针已于
+  2026-08-28 从版本化源码树退役；本报告继续保存其完整结果、被否决路线和结论，当前
+  可执行替代见 [退役说明](../../legacy/reports/rm65_official_branch_anchor_probe_retirement_20260828.md)。
 
 两者均只初始化空 handle 的算法库，不连接机械臂、不枚举设备、不 dispatch，也不拥有
 任何 control authority。SDK 算法版本为 `1.6.0-8a02e510`。默认 deploy、Pose replay
