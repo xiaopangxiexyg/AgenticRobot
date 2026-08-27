@@ -93,6 +93,49 @@ def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
     ) == pytest.approx(10.0)
 
 
+def test_unreceipted_progress_failure_latches_distinct_fail_closed_hold() -> None:
+    events: list[tuple[str, str]] = []
+
+    class Clutch:
+        _hold_requested = False
+        _hold_active = False
+
+        def hold_active(self) -> bool:
+            return self._hold_active
+
+        def request_hold(self, *, reason: str) -> None:
+            events.append(("hold", reason))
+            self._hold_requested = True
+            self._hold_active = True
+
+    clutch = Clutch()
+    assert control_loop._latch_unreceipted_progress_failure_hold(
+        progress_failure_pending=True,
+        clutch_input=clutch,
+        pause_recording=(
+            lambda _now, *, reason: events.append(("pause", reason))
+        ),
+        log=lambda *_args, **_kwargs: None,
+        now=10.0,
+    )
+
+    assert events == [
+        ("hold", "progress_failure_receipt_unavailable"),
+        ("pause", "progress_failure_receipt_unavailable"),
+    ]
+    assert all(reason != "progress_failure" for _kind, reason in events)
+
+    assert not control_loop._latch_unreceipted_progress_failure_hold(
+        progress_failure_pending=True,
+        clutch_input=clutch,
+        pause_recording=lambda *_args, **_kwargs: pytest.fail(
+            "already-held failure must not issue another pause"
+        ),
+        log=lambda *_args, **_kwargs: None,
+        now=11.0,
+    )
+
+
 def test_real_teleop_start_and_resume_separate_freshness_from_overall_timeout() -> None:
     assert defaults.runtime_home_fresh_data_timeout_sec(0.25) == pytest.approx(0.25)
     assert defaults.runtime_home_fresh_data_timeout_sec(1.0) == pytest.approx(1.0)

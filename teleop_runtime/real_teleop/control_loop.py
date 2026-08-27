@@ -750,6 +750,55 @@ def _position_force_guard_fault_pending(
     return fault is not None and not bool(handled)
 
 
+def _latch_unreceipted_progress_failure_hold(
+    *,
+    progress_failure_pending: bool,
+    clutch_input: Any,
+    pause_recording: Callable[..., Any],
+    log: Callable[..., Any],
+    now: float,
+) -> bool:
+    """Keep an unresolved durable Failure aligned with application Hold.
+
+    A promoted Failure can survive process restart while the exact historical
+    Hold/Pause receipt it refers to is unavailable.  The progress reducer must
+    remain ``AWAITING_HOLD_RECEIPT`` in that case; a new Hold must never be
+    recorded as if it were the missing historical receipt.  It must still
+    revoke live arm/gripper dispatch, however, otherwise the control loop's
+    fail-closed early return leaves the previous RUNNING UI projection stale.
+
+    The distinct reason below deliberately does not match ``progress_failure``
+    in the receipt-recording branch.  It is a present-time safety/application
+    Hold only, not evidence for the old promoted cut.
+    """
+
+    if not bool(progress_failure_pending):
+        return False
+    if bool(getattr(clutch_input, "_hold_requested", False)) or bool(
+        clutch_input.hold_active()
+    ):
+        return False
+    _request_safety_hold_best_effort(
+        clutch_input,
+        reason="progress_failure_receipt_unavailable",
+        log=log,
+        now=now,
+    )
+    try:
+        pause_recording(
+            now,
+            reason="progress_failure_receipt_unavailable",
+        )
+    except Exception as exc:  # noqa: BLE001 - the Hold remains authoritative.
+        log(
+            "Progress",
+            "unreceipted Failure Hold was latched but formal capture pause "
+            f"refresh failed: {type(exc).__name__}: {exc}",
+            now=now,
+        )
+    return True
+
+
 def _project_session_dispatch_state(
     step_result: Any,
     *,
@@ -2012,6 +2061,13 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 clutch_input.request_hold(reason="progress_workflow_error")
                 pause_recording(loop_start, reason="progress_workflow_error")
                 progress_failure_pending = True
+        _latch_unreceipted_progress_failure_hold(
+            progress_failure_pending=progress_failure_pending,
+            clutch_input=clutch_input,
+            pause_recording=pause_recording,
+            log=_log,
+            now=loop_start,
+        )
         publish_progress_ui_state(now=loop_start)
         if bool(
             getattr(
