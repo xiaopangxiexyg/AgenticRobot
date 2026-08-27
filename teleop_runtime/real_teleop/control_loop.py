@@ -378,7 +378,7 @@ def _consume_joint_hard_limit_dispatch(
         "joint_hard_limit_detected": True,
         "joint_hard_limit_event": event,
     }
-    _cancel_safety_recording_countdown_best_effort(
+    _cancel_recording_countdown_for_hold_best_effort(
         cancel_recording_countdown,
         now=now,
         reason="joint_hard_limit",
@@ -521,7 +521,7 @@ def _consume_joint_horizon_certification_dispatch(
         "joint_horizon_certification_marker": str(context["marker"]),
         "message": " <- ".join(exception_chain),
     }
-    _cancel_safety_recording_countdown_best_effort(
+    _cancel_recording_countdown_for_hold_best_effort(
         cancel_recording_countdown,
         now=now,
         reason="joint_horizon_certification",
@@ -883,21 +883,21 @@ def _request_position_admittance_endpoint_hold(
     return True
 
 
-def _cancel_safety_recording_countdown_best_effort(
+def _cancel_recording_countdown_for_hold_best_effort(
     cancel_recording_countdown: Callable[..., Any],
     *,
     now: float,
     reason: str,
     log: Callable[..., Any],
 ) -> None:
-    """Cancel a pending recording start without escaping a safety path."""
+    """Cancel a pending recording start without interrupting a Hold."""
 
     try:
         cancel_recording_countdown(now, reason=reason)
     except Exception as exc:  # noqa: BLE001 - Hold/stop remains authoritative.
         log(
             "Dataset",
-            "safety recording countdown cancellation failed; "
+            "recording countdown cancellation failed during Hold; "
             f"continuing with motion blocked: {type(exc).__name__}: {exc}",
             now=now,
         )
@@ -1457,7 +1457,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             )
             return False
         force_guard_fault_handled = True
-        _cancel_safety_recording_countdown_best_effort(
+        _cancel_recording_countdown_for_hold_best_effort(
             cancel_recording_countdown,
             now=now,
             reason="position_force_guard",
@@ -2224,7 +2224,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         now=loop_start,
                     )
             emergency_stop_sent = True
-            _cancel_safety_recording_countdown_best_effort(
+            _cancel_recording_countdown_for_hold_best_effort(
                 cancel_recording_countdown,
                 now=loop_start,
                 reason="quit_requested",
@@ -2283,14 +2283,20 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 dataset_recorder is not None
                 and dataset_recorder.is_paused
             )
-            safety_hold = hold_reason in {
+            # Preserve the Session's historical manual-Hold contract while
+            # marking hardware/safety cuts as requiring an explicit new Home.
+            # Error containment below applies to every Hold independently of
+            # this narrower Session lifecycle distinction.
+            requires_session_home_recalibration = hold_reason in {
                 "position_force_guard_collision",
                 "position_force_guard_fault",
                 "impedance_force_collision",
                 "emergency_stop_latched",
+                "joint_hard_limit",
                 "joint_horizon_certification",
                 "position_admittance_endpoint_limit",
             }
+            hold_pause_error: Exception | None = None
             fix_hold_escalation = fix_hold_coordinator.escalate_to_regular_hold()
             if fix_hold_escalation.changed:
                 try:
@@ -2301,12 +2307,10 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                             "特殊固定状态将清除，之后必须重采双臂 Home。"
                         ),
                     )
-                except Exception as exc:  # noqa: BLE001 - safety Hold remains fail-closed.
-                    if not safety_hold:
-                        raise
+                except Exception as exc:  # noqa: BLE001 - Hold remains fail-closed.
                     _log(
                         "Hold",
-                        "Fix-Hold UI transition failed during safety Hold: "
+                        "Fix-Hold UI transition failed during Hold: "
                         f"{type(exc).__name__}: {exc}",
                         now=loop_start,
                     )
@@ -2324,11 +2328,9 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                             timestamp=loop_start,
                         )
                     except Exception as exc:  # noqa: BLE001 - diagnostics cannot reopen motion.
-                        if not safety_hold:
-                            raise
                         _log(
                             "Hold",
-                            "Fix-Hold episode event failed during safety Hold: "
+                            "Fix-Hold episode event failed during Hold: "
                             f"{type(exc).__name__}: {exc}",
                             now=loop_start,
                         )
@@ -2361,6 +2363,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     "joint horizon candidate could not be certified; "
                     "runtime home recalibration required"
                 )
+            elif hold_reason == "joint_hard_limit":
+                hold_hardware_reason = (
+                    "RM65 joint hard limit rejected the command; "
+                    "runtime home recalibration required"
+                )
             elif hold_reason == "position_admittance_endpoint_limit":
                 hold_hardware_reason = (
                     "position admittance endpoint envelope reached; "
@@ -2385,20 +2392,24 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     }
                     else "Init qpos operation failed; safe Hold and runtime home recalibration required"
                 )
-            else:
+            elif hold_reason in {"", "manual", "two_pedal_b", "two_pedal_c"}:
                 hold_hardware_reason = "gui hold requested"
+            else:
+                hold_hardware_reason = (
+                    f"runtime Hold requested ({hold_reason}); "
+                    "runtime home recalibration required"
+                )
             if recording_active():
                 try:
                     pause_recording(
                         loop_start,
                         reason=_hold_requested_pause_reason(hold_reason),
                     )
-                except Exception as exc:  # noqa: BLE001 - safety Hold must still complete.
-                    if not safety_hold:
-                        raise
+                except Exception as exc:  # noqa: BLE001 - Hold must still complete.
+                    hold_pause_error = exc
                     _log(
                         "Dataset",
-                        "safety Hold could not pause the active episode; "
+                        "Hold could not pause the active episode; "
                         f"continuing with arm stop: {type(exc).__name__}: {exc}",
                         now=loop_start,
                     )
@@ -2406,7 +2417,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         try:
                             control_ui.append_message(
                                 "Dataset",
-                                "碰撞/急停后的数采暂停失败；机械臂保持停机，请检查数据目录。",
+                                "Hold 时数采暂停失败；机械臂仍将停机，当前 episode 将按失败收尾。",
                             )
                         except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
                             _log(
@@ -2429,63 +2440,53 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         and pending_progress_arm_transition is not None
                     ),
                 )
-            except Exception as exc:  # noqa: BLE001 - safety Hold remains fail-closed.
-                if not safety_hold:
-                    raise
+            except Exception as exc:  # noqa: BLE001 - Hold remains fail-closed.
                 special_cancel_messages = [
                     "特殊控制模式释放异常，已保持停机"
                 ]
                 _log(
                     "Hold",
-                    "special arm mode cancellation failed during safety Hold; "
+                    "special arm mode cancellation failed during Hold; "
                     f"motion remains blocked: {type(exc).__name__}: {exc}",
                     now=loop_start,
                 )
-            if safety_hold:
-                _cancel_safety_recording_countdown_best_effort(
-                    cancel_recording_countdown,
-                    now=loop_start,
-                    reason="hold_requested",
-                    log=_log,
-                )
-            else:
-                cancel_recording_countdown(loop_start, reason="hold_requested")
+            _cancel_recording_countdown_for_hold_best_effort(
+                cancel_recording_countdown,
+                now=loop_start,
+                reason="hold_requested",
+                log=_log,
+            )
             recovery_plan = None
             if not components.session.home_recalibration_required:
-                if safety_hold:
-                    try:
-                        hold_applied = components.session.hold_hardware(
-                            hold_hardware_reason,
-                            require_home_recalibration=True,
-                        )
-                        if hold_applied:
-                            application_hold_effective_at = time.time()
-                    except Exception as exc:  # noqa: BLE001 - stay fail-closed in GUI.
-                        _log(
-                            "Hold",
-                            "safety Hold hardware transition failed; motion remains blocked: "
-                            f"{type(exc).__name__}: {exc}",
-                            now=loop_start,
-                        )
-                        if control_ui is not None:
-                            try:
-                                control_ui.append_message(
-                                    "Hold",
-                                    "急停后的 Hold 下发存在异常；已禁止继续运动，请检查设备并重启。",
-                                )
-                            except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
-                                _log(
-                                    "Hold",
-                                    "safety Hold failure message could not be published: "
-                                    f"{type(ui_exc).__name__}: {ui_exc}",
-                                    now=loop_start,
-                                )
-                else:
+                try:
                     hold_applied = components.session.hold_hardware(
-                        hold_hardware_reason
+                        hold_hardware_reason,
+                        require_home_recalibration=(
+                            requires_session_home_recalibration
+                        ),
                     )
                     if hold_applied:
                         application_hold_effective_at = time.time()
+                except Exception as exc:  # noqa: BLE001 - stay fail-closed in GUI.
+                    _log(
+                        "Hold",
+                        "Hold hardware transition failed; local dispatch remains blocked: "
+                        f"{type(exc).__name__}: {exc}",
+                        now=loop_start,
+                    )
+                    if control_ui is not None:
+                        try:
+                            control_ui.append_message(
+                                "Hold",
+                                "Hold 下发存在异常；已禁止继续遥操，请检查机械臂状态并重启后再恢复。",
+                            )
+                        except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
+                            _log(
+                                "Hold",
+                                "Hold failure message could not be published: "
+                                f"{type(ui_exc).__name__}: {ui_exc}",
+                                now=loop_start,
+                            )
             else:
                 # A prior authoritative Hold has already moved the Session out
                 # of RUNNING and required a new Home calibration.
@@ -2496,12 +2497,10 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     now=loop_start,
                     reason=hold_hardware_reason,
                 )
-            except Exception as exc:  # noqa: BLE001 - safety Hold remains fail-closed.
-                if not safety_hold:
-                    raise
+            except Exception as exc:  # noqa: BLE001 - Hold remains fail-closed.
                 _log(
                     "Hold",
-                    "safety Hold position-stream disengage failed; "
+                    "Hold position-stream disengage failed; "
                     f"motion remains blocked: {type(exc).__name__}: {exc}",
                     now=loop_start,
                 )
@@ -2509,7 +2508,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     try:
                         control_ui.append_message(
                             "Hold",
-                            "急停后的控制流释放存在异常；已禁止继续运动，请检查设备并重启。",
+                            "Hold 控制流释放存在异常；已禁止继续遥操，请检查设备并重启。",
                         )
                     except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
                         _log(
@@ -2518,6 +2517,29 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                             f"{type(ui_exc).__name__}: {ui_exc}",
                             now=loop_start,
                         )
+            if hold_pause_error is not None:
+                _stop_recording_best_effort(
+                    recording_active=recording_active,
+                    stop_recording=stop_recording,
+                    now=loop_start,
+                    end_reason="hold_pause_failure",
+                    summary={
+                        "last_step_index": int(step_index),
+                        "last_state": episode_last_state,
+                        "hold_reason": str(hold_reason),
+                        "pause_error": (
+                            f"{type(hold_pause_error).__name__}: "
+                            f"{hold_pause_error}"
+                        ),
+                    },
+                    log=_log,
+                    control_ui=control_ui,
+                    ui_tag="Dataset",
+                    ui_failure_message=(
+                        "Hold 时暂停与停止当前 episode 均失败；机械臂保持停机，"
+                        "请检查 writer 和数据目录后重启。"
+                    ),
+                )
             _log(
                 "Hold",
                 f"{hold_hardware_reason}; waiting for explicit runtime home calibration",
@@ -2548,6 +2570,11 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         "检测到急停与控制帧竞态，当前数采已结束并进入 Hold；"
                         "请检查机械臂后重新采集 runtime Home。"
                     )
+                elif hold_reason == "joint_hard_limit":
+                    message = (
+                        "机械臂关节硬限位门禁已拒绝命令并急停双臂；当前数采已停止。"
+                        "请人工检查并调整机械臂后重新采集 runtime Home。"
+                    )
                 elif hold_reason == "position_admittance_endpoint_limit":
                     message = (
                         "力控末端已到达位移或旋转包络，已保持最后安全位置；"
@@ -2575,7 +2602,10 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         else "Init qpos 未安全完成，已进入 Hold；请检查提示和机械臂状态，确认后重新采集 runtime Home。"
                     )
                 else:
-                    message = "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 runtime home。"
+                    message = (
+                        "机械臂已进入保持状态；点击“开始遥操”后才会重新采集 "
+                        f"runtime home。原因：{hold_reason or 'manual'}。"
+                    )
                 try:
                     control_ui.append_message("Hold", message)
                     if special_cancel_messages:
@@ -2585,11 +2615,9 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                             + "；重新采集 runtime home 后恢复普通遥操。",
                         )
                 except Exception as exc:  # noqa: BLE001 - UI cannot change safety state.
-                    if not safety_hold:
-                        raise
                     _log(
                         "Hold",
-                        "safety Hold message could not be published: "
+                        "Hold message could not be published: "
                         f"{type(exc).__name__}: {exc}",
                         now=loop_start,
                     )
@@ -3176,7 +3204,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     "message": str(reason),
                 },
             }
-            _cancel_safety_recording_countdown_best_effort(
+            _cancel_recording_countdown_for_hold_best_effort(
                 cancel_recording_countdown,
                 now=loop_start,
                 reason="force_collision",
@@ -3270,7 +3298,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
         def consume_latched_safety_dispatch(error: BaseException) -> None:
             """Close an episode after a backend rejected a raced command."""
 
-            _cancel_safety_recording_countdown_best_effort(
+            _cancel_recording_countdown_for_hold_best_effort(
                 cancel_recording_countdown,
                 now=loop_start,
                 reason="emergency_stop_latched",

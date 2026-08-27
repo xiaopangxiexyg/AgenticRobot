@@ -1345,6 +1345,43 @@ def test_safety_dispatch_recovery_uses_bound_teleop_admission_state() -> None:
     )
 
 
+def test_every_hold_contains_subordinate_failures_before_motion_stays_blocked() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+
+    # A Hold is the authoritative motion boundary regardless of whether its
+    # trigger was a GUI action, a progress transition, or a hardware fault.
+    # Dataset/UI/special-mode cleanup must never re-raise before the Session
+    # and position streams have been told to stop.
+    assert "safety_hold =" not in source
+    assert "if not safety_hold" not in source
+    assert "hold_pause_error: Exception | None = None" in source
+    assert 'end_reason="hold_pause_failure"' in source
+    assert '"joint_hard_limit",' in source
+    assert 'elif hold_reason == "joint_hard_limit"' in source
+
+
+def test_hold_countdown_cancellation_failure_is_observational() -> None:
+    logs: list[tuple[str, str]] = []
+
+    control_loop._cancel_recording_countdown_for_hold_best_effort(
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("countdown state unavailable")
+        ),
+        now=10.0,
+        reason="manual_hold",
+        log=lambda tag, message, **_kwargs: logs.append((tag, message)),
+    )
+
+    assert logs == [
+        (
+            "Dataset",
+            "recording countdown cancellation failed during Hold; "
+            "continuing with motion blocked: RuntimeError: "
+            "countdown state unavailable",
+        )
+    ]
+
+
 def test_device_retry_runtime_keeps_optional_foot_pad_status_dynamic() -> None:
     errors = {"foot_pad": "offline", "camera.overhead": "camera failed"}
     foot_pad_slot = [None]
