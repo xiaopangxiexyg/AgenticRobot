@@ -677,13 +677,139 @@ def _safe_filename(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._") or "policy"
 
 
-def _source_profile_pairs(profile: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
-    return tuple(
-        (
-            str(item.get("source_dataset_id") or "").strip(),
-            str(Path(str(item.get("dataset_root") or "")).expanduser().resolve()),
+def _canonical_source_pairs(
+    sources: Sequence[object],
+    *,
+    source_id_key: str,
+    root_key: str,
+    expected_source_ids: Sequence[str] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return source bindings in their canonical, order-independent form.
+
+    A prepared binding serializes source records in the order produced by the
+    dataset adapter, while a profile may keep the order in which sources were
+    selected.  The order is not part of the source identity contract; the
+    source id and resolved root are.  Canonicalizing here accepts that
+    serialization difference without accepting missing, duplicate, or
+    substituted sources.
+    """
+
+    pairs: list[tuple[str, str]] = []
+    for item in sources:
+        if not isinstance(item, Mapping):
+            raise ValueError("Source binding entries must be mappings.")
+        source_id = str(item.get(source_id_key) or "").strip()
+        dataset_root = str(item.get(root_key) or "").strip()
+        if not source_id or not dataset_root:
+            raise ValueError("Source bindings require an id and dataset root.")
+        pairs.append(
+            (
+                source_id,
+                str(Path(dataset_root).expanduser().resolve()),
+            )
         )
-        for item in profile["sources"]
+    source_ids = tuple(source_id for source_id, _root in pairs)
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("Source bindings must not contain duplicate source ids.")
+    if expected_source_ids is not None:
+        expected = tuple(str(value).strip() for value in expected_source_ids)
+        if len(expected) != len(set(expected)) or set(source_ids) != set(expected):
+            raise ValueError("Source bindings do not match the expected sources.")
+    return tuple(sorted(pairs))
+
+
+def _canonical_repeat_weights(
+    weights: Sequence[object],
+    *,
+    source_id_key: str,
+    weight_key: str,
+    expected_source_ids: Sequence[str],
+) -> tuple[tuple[str, int], ...]:
+    """Normalize repeat-weight records while retaining exact source coverage."""
+
+    normalized: list[tuple[str, int]] = []
+    for item in weights:
+        if not isinstance(item, Mapping):
+            raise ValueError("Repeat-weight entries must be mappings.")
+        source_id = str(item.get(source_id_key) or "").strip()
+        if not source_id:
+            raise ValueError("Repeat-weight entries require a source id.")
+        try:
+            repeat_weight = int(item.get(weight_key, 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Repeat weights must be integers.") from exc
+        if repeat_weight <= 0:
+            raise ValueError("Repeat weights must be positive.")
+        normalized.append((source_id, repeat_weight))
+    source_ids = tuple(source_id for source_id, _weight in normalized)
+    expected = tuple(str(value).strip() for value in expected_source_ids)
+    if (
+        len(source_ids) != len(set(source_ids))
+        or len(expected) != len(set(expected))
+        or set(source_ids) != set(expected)
+    ):
+        raise ValueError("Repeat weights must bind every source exactly once.")
+    return tuple(sorted(normalized))
+
+
+def _canonical_source_weight_map(
+    value: object,
+    *,
+    expected_source_ids: Sequence[str],
+) -> dict[str, int]:
+    """Normalize a source-id -> repeat-weight mapping with exact coverage."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("Source repeat weights must be a mapping.")
+    normalized: dict[str, int] = {}
+    for source_id, weight in value.items():
+        normalized_id = str(source_id).strip()
+        if not normalized_id:
+            raise ValueError("Source repeat weights require non-empty ids.")
+        try:
+            normalized_weight = int(weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Source repeat weights must be integers.") from exc
+        if normalized_weight <= 0:
+            raise ValueError("Source repeat weights must be positive.")
+        if normalized_id in normalized:
+            raise ValueError("Source repeat weights contain duplicate ids.")
+        normalized[normalized_id] = normalized_weight
+    expected = tuple(str(source_id).strip() for source_id in expected_source_ids)
+    if set(normalized) != set(expected) or len(normalized) != len(expected):
+        raise ValueError("Source repeat weights must bind every source exactly once.")
+    return {source_id: normalized[source_id] for source_id in sorted(normalized)}
+
+
+def _canonical_source_order(
+    value: object,
+    *,
+    expected_source_ids: Sequence[str],
+) -> tuple[str, ...]:
+    """Validate and canonicalize a serialized source order."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError("Source order must be a sequence.")
+    source_order = tuple(str(item).strip() for item in value)
+    expected = tuple(str(source_id).strip() for source_id in expected_source_ids)
+    if (
+        len(source_order) != len(set(source_order))
+        or set(source_order) != set(expected)
+        or any(not source_id for source_id in source_order)
+    ):
+        raise ValueError("Source order must bind every source exactly once.")
+    return tuple(sorted(source_order))
+
+
+def _canonical_source_profile_ids(profile: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(source_id for source_id, _root in _source_profile_pairs(profile))
+
+
+def _source_profile_pairs(profile: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    return _canonical_source_pairs(
+        profile["sources"],
+        source_id_key="source_dataset_id",
+        root_key="dataset_root",
     )
 
 
@@ -903,20 +1029,18 @@ def _validate_checkpoint_training_metadata(
                 "Checkpoint prepared Stage1 scenario binding lacks "
                 "source_repeat_weights."
             )
-        actual_repeat_weights = tuple(
-            (
-                str(item.get("source_dataset_id") or ""),
-                int(item.get("repeat_weight", 0)),
-            )
-            for item in raw_repeat_weights
-            if isinstance(item, Mapping)
+        expected_source_ids = _canonical_source_profile_ids(profile)
+        actual_repeat_weights = _canonical_repeat_weights(
+            raw_repeat_weights,
+            source_id_key="source_dataset_id",
+            weight_key="repeat_weight",
+            expected_source_ids=expected_source_ids,
         )
-        expected_repeat_weights = tuple(
-            (
-                str(item["source_dataset_id"]),
-                int(item["repeat_weight"]),
-            )
-            for item in profile["sources"]
+        expected_repeat_weights = _canonical_repeat_weights(
+            profile["sources"],
+            source_id_key="source_dataset_id",
+            weight_key="repeat_weight",
+            expected_source_ids=expected_source_ids,
         )
         expected_prepared.update(
             schema="dexteleop.openpi_prepared_skill_binding.v2",
@@ -967,50 +1091,45 @@ def _validate_checkpoint_training_metadata(
     sources = mixing.get("sources")
     if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
         raise ValueError("Checkpoint dataset_mixing.sources must be a sequence.")
-    actual_source_pairs = tuple(
-        (
-            str(item.get("name") or "").strip(),
-            str(Path(str(item.get("dataset_root") or "")).expanduser().resolve()),
-        )
-        for item in sources
-        if isinstance(item, Mapping)
+    expected_source_ids = _canonical_source_profile_ids(profile)
+    actual_source_pairs = _canonical_source_pairs(
+        sources,
+        source_id_key="name",
+        root_key="dataset_root",
+        expected_source_ids=expected_source_ids,
     )
     if actual_source_pairs != _source_profile_pairs(profile):
         raise ValueError(
             "Checkpoint dataset mixing sources disagree with the training profile."
         )
     if stage1_scenario_profile:
-        expected_source_order = tuple(
-            str(item["source_dataset_id"]) for item in profile["sources"]
+        expected_source_order = tuple(sorted(expected_source_ids))
+        expected_repeat_weight_pairs = _canonical_repeat_weights(
+            profile["sources"],
+            source_id_key="source_dataset_id",
+            weight_key="repeat_weight",
+            expected_source_ids=expected_source_ids,
         )
-        expected_repeat_weight_map = {
-            str(item["source_dataset_id"]): int(item["repeat_weight"])
-            for item in profile["sources"]
-        }
-        actual_repeat_weight_map = mixing.get("source_repeat_weights")
-        if not isinstance(actual_repeat_weight_map, Mapping):
-            raise ValueError(
-                "Checkpoint Stage1 scenario mixing lacks source_repeat_weights."
-            )
-        actual_source_weights = tuple(
-            (
-                str(item.get("name") or "").strip(),
-                int(item.get("sample_weight", 0)),
-            )
-            for item in sources
-            if isinstance(item, Mapping)
+        expected_repeat_weight_map = dict(expected_repeat_weight_pairs)
+        expected_source_weights = expected_repeat_weight_pairs
+        actual_repeat_weight_map = _canonical_source_weight_map(
+            mixing.get("source_repeat_weights"),
+            expected_source_ids=expected_source_ids,
         )
-        expected_source_weights = tuple(
-            (source_id, expected_repeat_weight_map[source_id])
-            for source_id in expected_source_order
+        actual_source_weights = _canonical_repeat_weights(
+            sources,
+            source_id_key="name",
+            weight_key="sample_weight",
+            expected_source_ids=expected_source_ids,
         )
         actual_scenario_mixing = {
             "schema": str(mixing.get("schema") or ""),
             "source_mixing_policy": str(
                 mixing.get("source_mixing_policy") or ""
             ),
-            "source_order": tuple(
-                str(value) for value in mixing.get("source_order", ())
+            "source_order": _canonical_source_order(
+                mixing.get("source_order", ()),
+                expected_source_ids=expected_source_ids,
             ),
             "each_quality_valid_window_once_per_epoch": bool(
                 mixing.get("each_quality_valid_window_once_per_epoch", True)
@@ -1021,10 +1140,7 @@ def _validate_checkpoint_training_metadata(
                     False,
                 )
             ),
-            "source_repeat_weights": {
-                str(key): int(value)
-                for key, value in actual_repeat_weight_map.items()
-            },
+            "source_repeat_weights": actual_repeat_weight_map,
             "source_weights": actual_source_weights,
         }
         expected_scenario_mixing = {

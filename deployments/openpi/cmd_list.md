@@ -65,6 +65,8 @@
 | `writing-stage1-0804-0805-front-h16-absolute-prepared-v1` | v2.3 严格第一阶段，absolute，32D / 16D，h16，自然合并 0804/0805 | front (`base_0_rgb`) | `30000, 60000, 90000, 120000, 150000`（`-b1-nw4-meta-v2` 实验） | checkpoint-bound prepared wrapper |
 | `writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-prepared-v1` | v2.3 Stage1 三类场景，absolute，32D / 16D，h16，13 来源按 1:4:6 重复 | front (`base_0_rgb`) | `30000, 60000`（`-b1-nw4-v1` 实验，2026-08-13 快照） | checkpoint-bound prepared wrapper；第 19 节 |
 | `writing-stage2-0804-0805-front-h16-absolute-prepared-v1` | v2.3 严格第二阶段，absolute，32D / 16D，h16，自然合并 0804/0805 | front (`base_0_rgb`) | `30000, 60000, 90000, 120000, 150000`（`-b1-nw4-meta-v1` 实验） | checkpoint-bound prepared wrapper |
+| `writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared` | 0803–0807 完整四阶段 prompt-family，absolute，h32，非 RTC | front + right_wrist | `156211`（2026-08-27 训练快照；使用前复核是否有更新） | 单 checkpoint checkpoint-bound prompt-family wrapper；第 21 节 |
+| `writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-v1` | 08-03–08-21 Stage1 all-valid，3,458 eligible Episode，absolute，h32，非 RTC | front + right_wrist | `120000`（`-b1-nw1-v1`） | checkpoint-bound prepared wrapper；第 22 节 |
 | `dual_rm65_dmgripper` | 老 v1，26D action，h50 | front + left/right wrist | registry 固定 `99999` | legacy registry |
 
 对应的推荐 checkpoint 路径如下：
@@ -1755,3 +1757,241 @@ export DISCONNECTED_GRIPPER_STATE=0.0
 
 允许值为 `left/right/both`；不设置或设为空即保持默认双夹爪在线。以上命令没有启用 RTC、
 `async_c2`、`auto-start` 或跳过 ready confirm；其他安全和控制结构与第 9 节一致。
+
+## 21. 当前 all-four-stage prompt-family 模型（front + right_wrist，h32）
+
+本节是当前四阶段联合训练结果的唯一部署入口。它是一个 checkpoint 对应四个文本阶段的
+prompt-family 模型，不是第 20 节的四个独立 checkpoint，也不是 model-RTC。训练和部署契约
+固定为：`base_0_rgb=front`、`right_wrist_0_rgb=right_wrist`、`action_horizon=32`、
+`action_pose_mode=absolute`、`openpi_training_mode=standard_non_rtc_v1`。右腕背景处理必须
+使用 `wrist_final_keep_mask_paths`；`wrist_depth_mask_paths` 不得作为回退输入，且
+`strict_media_integrity=true`。部署时只允许把 server 和 client 绑定到同一 profile 与同一
+数字 checkpoint。
+
+截至本次审计，远端 `/home/user/zc/checkpoints/openpi` 下已观察到训练快照 `156211`：
+
+```text
+/home/user/zc/checkpoints/openpi/
+  writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/
+  writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/
+  156211/
+```
+
+该 step 的 `policy_artifact.json`、`params/` 和 `assets/` 均存在；训练继续产生新 step 时，
+不要从目录名推断最新值，应重新列目录并复核 artifact/profile/hash。下列命令中的
+`CKPT_STEP=156211` 只是本次冻结的站点快照。
+
+### 21.1 先做无硬件 contract/config 检查
+
+新 profile 必须先同步到远端 `/home/user/zc/DexTeleop`，并确认同步后的 Git 身份和 Task
+receipt；不要把训练运行目录中的临时 profile 直接当成部署源码。下面两条命令只读取
+checkpoint/profile，不加载模型、不监听端口、不连接相机、夹爪或机械臂：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export CKPT_STEP=156211
+export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
+export PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json
+
+python -u -m deployments.openpi.client.real \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --contract-check-only
+
+source /home/user/zc/openpi/.venv/bin/activate
+python -u -m deployments.openpi.server \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --openpi-root /home/user/zc/openpi \
+  --prepared-config-check-only
+```
+
+`--contract-check-only` 应通过 artifact/profile、h32、absolute、front/right_wrist、四个
+stage prompt allowlist、norm-stats 和 final keep-mask binding；`--prepared-config-check-only`
+还应通过动态 OpenPI config 恢复。任一条失败都不得用 `--config`、raw depth mask 或旧
+profile 绕过。
+
+### 21.2 终端 A：同一 checkpoint 的 OpenPI server
+
+通过 21.1 后，在独立终端执行。server 只加载模型并占用 GPU，不连接真实设备；更换 step 或
+profile 前先由原进程 owner 用 `Ctrl+C` 正常停止并确认端口/GPU 已释放：
+
+```bash
+cd /home/user/zc/DexTeleop
+source /home/user/zc/openpi/.venv/bin/activate
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+export CKPT_STEP=156211
+export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
+export PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json
+
+python -u -m deployments.openpi.server \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --openpi-root /home/user/zc/openpi \
+  --host 0.0.0.0 \
+  --port 8078
+```
+
+启动后先从终端 B 读取 `/healthz` 和 `/metadata`，确认 metadata 中的 profile、checkpoint、
+camera slots、action horizon/mode、final-mask contract 与 21.1 完全一致。四个阶段共用该
+server；每次只在 client 侧选择一个 `--prompt-stage stage1|stage2|stage3|stage4`。
+
+### 21.3 终端 B：prompt-stage no-action 检查
+
+下列命令会连接 server、相机和状态 backend，但没有 `--send-actions`，因此不应派发策略动作；
+这仍然不是无硬件检查。先执行不连接设备的 21.1，再执行本段的 100-step no-action：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export CKPT_STEP=156211
+export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
+export PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json
+export PROMPT_STAGE=stage1
+
+python -u -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --prompt-stage "$PROMPT_STAGE" \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  --policy-qpos-init-dataset /home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage \
+  --policy-qpos-init-episode 0 \
+  --policy-qpos-init-frame 0 \
+  --policy-qpos-init-source auto \
+  --policy-qpos-init-collision-check \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --max-steps 100 \
+  --debug
+```
+
+这里的 `--prompt-stage` 可改为 `stage2`、`stage3` 或 `stage4`，但不要在同一 client 进程中
+动态切换；每个阶段重新启动 client，并在切换前确认动作已经停止。四阶段 prompt 使用同一
+模型和相同相机/action contract；Stage2–4 的连续姿态和人工 ready 流程仍需现场单独确认。
+只有在额外完成设备安全授权后，才可从本命令复制参数并显式加入 `--send-actions`；本 Task
+不启动真机、不启动 RTC、不自动放行动作。
+
+## 22. 历史 Stage1 all-valid（截至 08-21，front + right_wrist，h32）
+
+本节是上一次 Stage1 训练的部署入口，与第 21 节的四阶段联合模型严格分离。它绑定
+`writing_stage1_all_valid_through_2026_08_21_front_right_wrist_h32_absolute_non_rtc_v1.json`、
+3,458 个有效 Episode、08-21 的 457 raw Episode 由 latest-annotation selector 得出的有效
+集合，以及同一 corrected wrist final keep-mask contract。历史 checkpoint 的本次可用快照为
+`120000`：
+
+```text
+/home/user/zc/checkpoints/openpi/
+  writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-v1/
+  writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-b1-nw1-v1/
+  120000/
+```
+
+由于该 checkpoint 的 prepared source records 可能按 source id 的规范顺序序列化，而 profile
+保留了原始选择顺序，部署校验只忽略记录顺序，仍严格核对每一个 source id、resolved dataset
+root、repeat weight、episode/window 计数、mask、h32/absolute 和 camera routing。不要把第 21
+节的联合 checkpoint 与本 profile 交叉组合。
+
+### 22.1 无硬件检查和 server
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export CKPT_STEP=120000
+export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-v1/writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-b1-nw1-v1/$CKPT_STEP
+export PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_all_valid_through_2026_08_21_front_right_wrist_h32_absolute_non_rtc_v1.json
+
+python -u -m deployments.openpi.client.real \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --contract-check-only
+
+source /home/user/zc/openpi/.venv/bin/activate
+export JAX_PLATFORMS=cuda
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
+python -u -m deployments.openpi.server \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --openpi-root /home/user/zc/openpi \
+  --prepared-config-check-only
+```
+
+动态检查通过后才启动正式 server：
+
+```bash
+python -u -m deployments.openpi.server \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --openpi-root /home/user/zc/openpi \
+  --host 0.0.0.0 \
+  --port 8078
+```
+
+### 22.2 Stage1 no-action client
+
+server 已通过 `/healthz`、`/metadata` 且现场明确授权连接 observation/backend 后，先运行下列
+不含 `--send-actions` 的 100-step 检查。它使用 profile 的默认 Stage1 prompt 和 dataset-frame
+qpos-init；该命令仍可能连接相机、夹爪和机械臂状态 backend：
+
+```bash
+cd /home/user/zc/DexTeleop
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+python -u -m deployments.openpi.client.real \
+  --host 127.0.0.1 \
+  --port 8078 \
+  --checkpoint-dir "$OPENPI_CKPT" \
+  --prepared-training-profile "$PROFILE" \
+  --deployment-profile rm65_bimanual_dmtac \
+  --arm-execution-profile position_15_60_120hz \
+  --arm-control-mode position \
+  --position-control-profile rm65_bimanual_position_v1 \
+  --position-qref-acceleration-profile comfort_75_v1 \
+  --position-continuous-waypoint-profile formal_third_order \
+  --action-hz 15 \
+  --policy-qpos-init-dataset /home/user/zc/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage \
+  --policy-qpos-init-episode 0 \
+  --policy-qpos-init-frame 0 \
+  --policy-qpos-init-source auto \
+  --policy-qpos-init-collision-check \
+  --action-queue-policy replace \
+  --min-action-queue 0 \
+  --camera-keep-last 4 \
+  --camera-frame-max-age-sec 0.2 \
+  --position-force-guard \
+  --position-force-guard-source tool \
+  --position-force-guard-max-force-n 30 \
+  --position-force-guard-max-torque-nm 5 \
+  --position-force-guard-hz 20 \
+  --position-force-guard-consecutive-samples 1 \
+  --position-force-guard-max-read-errors 3 \
+  --position-force-guard-stale-sec 0.4 \
+  --position-force-guard-startup-timeout-sec 2 \
+  --max-steps 100 \
+  --debug
+```
+
+只有通过 contract/config、server metadata、no-action、现场急停/工作区/力限检查并获得新的
+硬件授权后，才可以在同一条命令末尾显式加入 `--send-actions`。本节不授权真实运动，也不
+允许用 `--no-init-qpos`、`--disable-camera-semantic-resolution` 或 raw mask 作为故障绕过。

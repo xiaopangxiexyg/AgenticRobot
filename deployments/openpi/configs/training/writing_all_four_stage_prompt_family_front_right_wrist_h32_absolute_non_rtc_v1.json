@@ -1,0 +1,229 @@
+{
+  "action_horizon": 32,
+  "action_pose_mode": "absolute",
+  "camera_selection": [
+    "front",
+    "right_wrist"
+  ],
+  "camera_slot_to_dataset_key": {
+    "base_0_rgb": "front",
+    "right_wrist_0_rgb": "right_wrist"
+  },
+  "canonical_prompt_percent": 80,
+  "default_exp_name": "writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260826-nw4",
+  "expected_effective_epoch_window_count": 4700,
+  "expected_policy_io_layout_hash": "sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16",
+  "expected_task_id": "dmtac_rm65_bimanual_position_v2_writing_4_stage",
+  "expected_total_window_count": 241436,
+  "expected_union_episode_count": 1402,
+  "logical_task_dataset_manifest": "../../dataset_interface/logical_task_manifests/writing_all_four_stage_fulltask_2026_08_03_through_08_07_v1.json",
+  "max_full_token_length": 160,
+  "openpi_asset_id": "writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1",
+  "openpi_assets_base_dir": "/home/user/zc/openpi_all4_stage_runs/20260826T2349_front_right_h32_all4/assets",
+  "openpi_base_config": "writing-stage1-front-right-wrist-h32-absolute-standard-v1",
+  "openpi_checkout": "/home/user/zc/openpi_all4_stage_runs/20260826T2349_front_right_h32_all4/code-openpi-97b37205/openpi",
+  "openpi_checkpoint_base_dir": "/home/user/zc/checkpoints/openpi",
+  "openpi_config_name": "writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared",
+  "openpi_final_mask_root": "/mnt/nas2/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/workspace-mask-retry2/derived/final_keep_masks",
+  "openpi_final_mask_root_layout": "source_dataset_id_partitioned_v1",
+  "openpi_keep_period": 30000,
+  "openpi_num_train_steps": 600000,
+  "openpi_num_workers": 4,
+  "openpi_save_interval": 30000,
+  "openpi_source_identity_sha256": "f8fb5abdca2a92463685cabb0c0e4795971f39c70329945a1a3cb5416eafdff0",
+  "openpi_source_revision": "97b3720515b18e94697573ba55caa6c1bc28af69",
+  "openpi_state_augmentation_from_config": "writing-stage1-front-right-wrist-h32-absolute-standard-v1",
+  "openpi_training_mode": "standard_non_rtc_v1",
+  "openpi_weight_loader_params_path": "/home/user/zc/AgenticRobot/model/openpi/pi05_base_para/params",
+  "openpi_wrist_background_augmentation": {
+    "black_probability": 0.0,
+    "mask_source": "wrist_final_keep_mask_paths",
+    "original_probability": 0.1,
+    "procedural_probability": 0.5,
+    "provider": "mixed",
+    "real_image_manifest": "/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/inputs-background-corrected-v1/openimages_v7_validation/real_background_manifest_corrected_v1.json",
+    "real_image_probability": 0.4,
+    "real_image_root": "/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/inputs-background-corrected-v1/openimages_v7_validation/images",
+    "schema": "dexteleop.corrected_wrist_background.v1",
+    "strict_media_integrity": true,
+    "wrist_depth_mask_paths_fallback_allowed": false,
+    "wrist_pair_mode": "shared_scene_family"
+  },
+  "organized_dataset_root": "/home/user/zc/openpi_all4_stage_runs/prepared/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1",
+  "profile_id": "writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1",
+  "prompt_family_sampling_policy": "canonical_80_train_variants_20_stratified_v1",
+  "prompt_family_sampling_seed": 20260812,
+  "prompt_stage_sampling_policy": "balanced_min_windows_rotate_v1",
+  "prompt_stage_sampling_seed": 20260811,
+  "prompt_stages": [
+    {
+      "canonical_prompt": "Pick up the capped brush with the right gripper and present it to the left gripper for uncapping.",
+      "expected_child_binding_hash": "140e3876685f30592405d0e37ced1988a9ab4acf3d09819a2b4ecb8ffd671942",
+      "expected_openpi_window_count": 53649,
+      "expected_window_count": 62791,
+      "held_out_prompt_variants": [
+        "Retrieve the still-capped brush with the right gripper and offer it to the left gripper for uncapping.",
+        "Let the right gripper lift the capped brush and hold it where the left gripper can remove the cap.",
+        "Acquire the capped brush on the right and present its capped end to the left gripper.",
+        "Bring the capped brush up in the right gripper so the left gripper can uncap it."
+      ],
+      "profile": "writing_all_four_stage_stage1_front_right_wrist_h32_absolute_non_rtc_v1.json",
+      "skill_id": "writing.bimanual_acquire_brush_and_present_for_cap_removal",
+      "stage_id": "stage1",
+      "training_prompt_variants": [
+        "Use the right gripper to pick up the capped brush and hold it out for the left gripper to remove the cap.",
+        "Grasp the capped brush with the right gripper, lift it, and present it to the left gripper for uncapping.",
+        "With the right gripper, collect the capped brush and offer it to the left gripper so the cap can be removed.",
+        "Take the capped brush in the right gripper and position it for the left gripper to uncap.",
+        "Lift the capped brush using the right gripper and present the cap end to the left gripper.",
+        "Pick up the brush while it is capped with the right gripper, then hold it ready for left-gripper uncapping.",
+        "Secure the capped brush in the right gripper and bring it to the left gripper for cap removal.",
+        "The right gripper should acquire the capped brush and present it for the left gripper to take off the cap.",
+        "Reach for and grasp the capped brush with the right gripper, then offer it to the left gripper for uncapping.",
+        "Hold the capped brush in the right gripper and move it into position for the left gripper to remove its cap.",
+        "Use the right hand to acquire the capped brush and present it steadily to the left hand for uncapping.",
+        "Pick and lift the capped brush with the right gripper, presenting it within reach of the left gripper for cap removal."
+      ]
+    },
+    {
+      "canonical_prompt": "Remove the brush cap with the left gripper and return it to its place while the right gripper holds the brush steady.",
+      "expected_child_binding_hash": "fd5bb48b1687711dd17ba2344e3e340e3308fb47ae4e8b3086467e488ee55b30",
+      "expected_openpi_window_count": 39218,
+      "expected_window_count": 42079,
+      "held_out_prompt_variants": [
+        "Using the left gripper, remove the cap and return it to its spot while the right gripper anchors the brush.",
+        "Let the left gripper uncap the right-held brush and place the cap back in its designated location.",
+        "Maintain a steady right-gripper hold as the left gripper takes off the cap and returns it.",
+        "Remove and store the brush cap with the left gripper while the right gripper keeps the brush motionless."
+      ],
+      "profile": "writing_all_four_stage_stage2_front_right_wrist_h32_absolute_non_rtc_v1.json",
+      "skill_id": "writing.remove_brush_cap_and_return_cap",
+      "stage_id": "stage2",
+      "training_prompt_variants": [
+        "Keep the brush steady in the right gripper while the left gripper removes the cap and puts it back in its place.",
+        "Use the left gripper to uncap the brush and return the cap to its location as the right gripper holds the brush still.",
+        "While the right gripper stabilizes the brush, take off the cap with the left gripper and place the cap back where it belongs.",
+        "Hold the brush motionless with the right gripper; remove and return the cap using the left gripper.",
+        "The left gripper should pull off the brush cap and restore it to its place while the right gripper steadies the brush.",
+        "Uncap the brush with the left gripper, put the cap in its designated spot, and keep the brush fixed in the right gripper.",
+        "With the right gripper holding the brush securely, use the left gripper to remove the cap and return it to storage.",
+        "Take the cap off with the left gripper and set it back in place without moving the brush held by the right gripper.",
+        "Stabilize the brush in the right gripper as the left gripper removes its cap and returns the cap to the holder.",
+        "Use the left hand to remove and replace the brush cap in its location while the right hand keeps the brush steady.",
+        "Pull the cap from the brush with the left gripper, return the cap to its assigned place, and maintain the right-gripper hold.",
+        "Keep holding the brush steady on the right while the left gripper uncaps it and puts the cap away."
+      ]
+    },
+    {
+      "canonical_prompt": "Write with the uncapped brush using the right gripper while keeping the left arm and gripper still.",
+      "expected_child_binding_hash": "3b40bf9b89e3dfff2adf079c349af103c7c957105e95c3678abfe3e782bcf988",
+      "expected_openpi_window_count": 59009,
+      "expected_window_count": 77439,
+      "held_out_prompt_variants": [
+        "Write using the uncapped brush on the right while holding the left arm and gripper completely steady.",
+        "Let the right gripper carry out the writing motion and do not move the left arm or its gripper.",
+        "Use the right-held uncapped brush to make the writing marks while the left side remains stationary.",
+        "Complete the writing action with the right gripper, keeping both the left arm and left gripper still."
+      ],
+      "profile": "writing_all_four_stage_stage3_front_right_wrist_h32_absolute_non_rtc_v1.json",
+      "skill_id": "writing.write_with_brush",
+      "stage_id": "stage3",
+      "training_prompt_variants": [
+        "Use the right gripper to write with the uncapped brush and keep the left arm and gripper motionless.",
+        "Write using the uncapped brush in the right gripper while the entire left side remains still.",
+        "Make the writing strokes with the right-held uncapped brush without moving the left arm or left gripper.",
+        "Keep the left arm and gripper fixed as the right gripper writes with the uncapped brush.",
+        "With the uncapped brush held on the right, perform the writing motion and leave the left arm and gripper stationary.",
+        "Write with the brush in the right gripper, ensuring that the left arm and its gripper do not move.",
+        "Use only the right gripper and uncapped brush for writing; hold the left arm and gripper still.",
+        "Guide the uncapped brush with the right gripper to write while maintaining a stationary left arm and gripper.",
+        "Perform the writing task with the right-held brush and keep all left-arm and left-gripper motion stopped.",
+        "Move the uncapped brush in the right gripper through the writing strokes while the left side stays still.",
+        "The right gripper should write with the uncapped brush as the left arm and left gripper remain motionless.",
+        "Complete the writing strokes using the right gripper and brush, with no movement from the left arm or gripper."
+      ]
+    },
+    {
+      "canonical_prompt": "Return the brush to storage with the right gripper while keeping the left arm and gripper still.",
+      "expected_child_binding_hash": "423bccc5a520b6dcfdbc7cafa673af131b575bcc5e3d746d2c3e49069d75df23",
+      "expected_openpi_window_count": 1177,
+      "expected_window_count": 59127,
+      "held_out_prompt_variants": [
+        "Stow the brush with the right gripper while keeping the left arm and gripper completely still.",
+        "Let the right gripper return the brush to its holder without moving the left side.",
+        "Place the brush in its storage position on the right and maintain a motionless left arm and gripper.",
+        "Use the right gripper to put the brush away as the left arm and left gripper stay stationary."
+      ],
+      "profile": "writing_all_four_stage_stage4_front_right_wrist_h32_absolute_non_rtc_v1.json",
+      "skill_id": "writing.return_brush",
+      "stage_id": "stage4",
+      "training_prompt_variants": [
+        "Use the right gripper to put the brush back in storage and keep the left arm and gripper motionless.",
+        "Return the brush to its storage place with the right gripper while the left arm and left gripper remain still.",
+        "Place the brush back in its holder using the right gripper without moving the left arm or gripper.",
+        "Keep the left side stationary as the right gripper returns the brush to storage.",
+        "With the right gripper, restore the brush to its storage location and leave the left arm and gripper still.",
+        "Put away the brush using the right gripper, ensuring that the left arm and its gripper do not move.",
+        "Move the brush back to its designated storage spot with the right gripper while holding the left side fixed.",
+        "Use only the right gripper to return the brush to the holder; keep the left arm and gripper motionless.",
+        "The right gripper should place the brush back in storage while the left arm and left gripper stay still.",
+        "Return the right-held brush to its assigned storage location without any left-arm or left-gripper movement.",
+        "Guide the brush into its storage place with the right gripper and maintain a stationary left arm and gripper.",
+        "Finish by putting the brush back with the right gripper while the left arm and gripper remain fixed."
+      ]
+    }
+  ],
+  "prompt_state_dimension": 16,
+  "right_wrist_intrinsics_overrides": {
+    "fixed_middle_2026_08_03_part1": {
+      "donor_camera_key": "left_wrist",
+      "donor_source_dataset_id": "fixed_middle_2026_08_04",
+      "expected_serial": "261122273924",
+      "target_camera_key": "right_wrist"
+    },
+    "fixed_middle_2026_08_03_part2": {
+      "donor_camera_key": "left_wrist",
+      "donor_source_dataset_id": "fixed_middle_2026_08_04",
+      "expected_serial": "261122273924",
+      "target_camera_key": "right_wrist"
+    }
+  },
+  "schema": "dexteleop.openpi_prepared_prompt_family_training_profile.v2",
+  "source_mixing_policy": "natural_concat_shuffle_v1",
+  "sources": [
+    {
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop/datasets/2026-08-03_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_id": "fixed_middle_2026_08_03_part1"
+    },
+    {
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-03_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_id": "fixed_middle_2026_08_03_part2"
+    },
+    {
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-04_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_id": "fixed_middle_2026_08_04"
+    },
+    {
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-05_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_id": "fixed_middle_2026_08_05"
+    },
+    {
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_id": "fixed_middle_2026_08_06_part1"
+    },
+    {
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_1453",
+      "source_dataset_id": "fixed_middle_2026_08_06_part2"
+    },
+    {
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop_0803/datasets/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage_stable",
+      "source_dataset_id": "fixed_middle_2026_08_06_part3"
+    },
+    {
+      "dataset_root": "/home/user/zc/datasets/RealmanDMTAC/PhysicalCollections/2026-08-07_dmtac_rm65_bimanual_position_v2_writing_4_stage",
+      "source_dataset_id": "fixed_middle_2026_08_07_physical"
+    }
+  ],
+  "tail_policy": "drop",
+  "training_variant_prompt_percent": 20
+}

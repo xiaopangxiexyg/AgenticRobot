@@ -1585,6 +1585,27 @@ def test_stage1_scenario_checkpoint_metadata_is_bound_exactly() -> None:
     }
     prepared_deployment._validate_checkpoint_training_metadata(payload, profile)
 
+    # The prepared binding canonicalizes source records by source id.  A
+    # checkpoint produced by an adapter may therefore serialize the same
+    # sources in a different order than the profile, which must not change
+    # the deployment identity.
+    reordered = json.loads(json.dumps(payload))
+    reordered["prepared_skill_training_binding"]["source_repeat_weights"] = list(
+        reversed(
+            reordered["prepared_skill_training_binding"]["source_repeat_weights"]
+        )
+    )
+    reordered["dataset_mixing"]["source_order"] = list(
+        reversed(reordered["dataset_mixing"]["source_order"])
+    )
+    reordered["dataset_mixing"]["sources"] = list(
+        reversed(reordered["dataset_mixing"]["sources"])
+    )
+    prepared_deployment._validate_checkpoint_training_metadata(
+        reordered,
+        profile,
+    )
+
     drifted_binding = json.loads(json.dumps(payload))
     drifted_binding["prepared_skill_training_binding"][
         "source_repeat_weights"
