@@ -1293,7 +1293,12 @@ class RealTeleopDatasetRecorder:
 
     @property
     def finalizing(self) -> bool:
-        return any(not task.done for task in self.finalize_tasks)
+        # A completed task remains part of the authoritative finalize
+        # lifecycle until the owner consumes it through poll_finalize_tasks().
+        # Reporting False as soon as the worker marks ``done`` creates a race:
+        # shutdown may skip the final poll and therefore lose the saved/error
+        # application receipt even though the writer already committed it.
+        return bool(self.finalize_tasks)
 
     def _writer_lifecycle(self) -> Any:
         """Return the shared writer runtime while preserving old observer seams."""

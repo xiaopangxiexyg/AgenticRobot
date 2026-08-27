@@ -11,6 +11,7 @@ from teleop_runtime.real_teleop.collection_control_plane import (
     CollectionControlOperationBusy,
     CollectionControlPlane,
 )
+from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
 from teleop_runtime.real_teleop.episode_recording_runtime import (
     build_episode_recording_runtime,
 )
@@ -87,6 +88,72 @@ def test_worker_failure_is_polled_without_escaping_worker_thread() -> None:
     assert isinstance(result.error, RuntimeError)
     assert str(result.error) == "writer ready timeout"
     assert plane.poll(generation) is None
+
+
+def test_completed_finalize_remains_owned_until_result_is_polled() -> None:
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    completed = SimpleNamespace(done=True, thread=None, success=True)
+    recorder.finalize_tasks = [completed]
+    recorder.saved_episodes = 0
+
+    # Worker completion alone is not the application receipt.  Shutdown and
+    # episode admission must continue to see this lifecycle as outstanding
+    # until the owner consumes the task exactly once.
+    assert recorder.finalizing
+    assert recorder.poll_finalize_tasks() == [completed]
+    assert recorder.saved_episodes == 1
+    assert not recorder.finalizing
+    assert recorder.poll_finalize_tasks() == []
+
+
+def test_shutdown_publishes_finalize_that_completed_before_close_poll(
+    tmp_path: Path,
+) -> None:
+    task = SimpleNamespace(
+        done=True,
+        thread=None,
+        success=True,
+        episode_index=8,
+        frame_count=21,
+        queued_at=10.0,
+        started_at=10.1,
+        completed_at=10.2,
+        stage_timings_ms={},
+        error="",
+        v25p_error="",
+        v25p_native_error="",
+        progress_error="",
+    )
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    recorder.active_episode_index = None
+    recorder._pause_started_at = None
+    recorder.finalize_tasks = [task]
+    recorder.saved_episodes = 0
+    recorder.dataset_root = tmp_path
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, _args, _logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=lambda **_kwargs: None,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+
+    assert runtime.close(timeout_sec=0.2)
+    assert recorder.saved_episodes == 1
+    assert recorder.finalize_tasks == []
+    assert clutch.finalize_states[-1] == {
+        "status": "saved",
+        "message": clutch.finalize_states[-1]["message"],
+        "episode_index": 8,
+        "frame_count": 21,
+    }
+    assert "正式数据集 episode 8 已保存" in str(
+        clutch.finalize_states[-1]["message"]
+    )
+    assert clutch.round_trip_advances == 1
+    assert clutch.plus_episode_indices == [8]
 
 
 def test_cancelled_result_is_cleaned_before_completion_is_published() -> None:
