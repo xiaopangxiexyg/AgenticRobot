@@ -26,6 +26,7 @@ import numpy as np
 import osqp
 import pyarrow.parquet as pq
 from scipy import sparse
+from scipy.spatial.transform import Rotation
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -55,19 +56,32 @@ from robot_motion.position_control import (
     JointHorizonState,
     plan_jerk_limited_joint_horizon,
 )
-from scripts.probes.rm65_official_all_ik_probe import (
-    _LEFT_TOOL,
-    _RIGHT_TOOL,
-    _pose_error,
-)
 
 
 _SIDES = ("left", "right")
+_LEFT_TOOL = "hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json"
+_RIGHT_TOOL = "hardware/rm65/utils/configs/calibrations/rm65_right_DMTAC_M.json"
 _EPISODE_PATTERN = re.compile(r"episode_(\d+)\.parquet$")
 _SOURCE_HZ = 15.0
 _COMMAND_HZ = 120.0
 _COMMANDS_PER_SOURCE_INTERVAL = int(_COMMAND_HZ / _SOURCE_HZ)
 _QP_BOUND_GUARD = 0.999
+
+
+def _pose_error(actual: np.ndarray, target: np.ndarray) -> tuple[float, float]:
+    actual_pose = np.asarray(actual, dtype=float).reshape(4, 4)
+    target_pose = np.asarray(target, dtype=float).reshape(4, 4)
+    translation_m = float(
+        np.linalg.norm(actual_pose[:3, 3] - target_pose[:3, 3])
+    )
+    rotation_deg = float(
+        np.degrees(
+            Rotation.from_matrix(
+                actual_pose[:3, :3].T @ target_pose[:3, :3]
+            ).magnitude()
+        )
+    )
+    return translation_m, rotation_deg
 
 
 def _as_matrix(column: Any) -> np.ndarray:

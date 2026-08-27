@@ -627,8 +627,10 @@ dynamic slack。当前没有整体优于 V4 的选择。
 在 V4–V11 的局部 Pink 路线没有得到整体支配解后，新增了两个 `scripts/probes/` 下的
 纯离线探针：
 
-- `rm65_official_all_ik_probe.py`：核查官方全解、全部候选、SDK/URDF FK、求解延迟、
-  60 Hz closed-loop 和共享 Cartesian alpha governor；
+- `rm65_official_all_ik_probe.py`：曾用于核查官方全解、全部候选、SDK/URDF FK、求解
+  延迟、60 Hz closed-loop 和共享 Cartesian alpha governor。该一次性研究探针已于
+  2026-08-28 从版本化源码树退役；本报告继续保存其完整结果，现行实现与历史复现边界
+  见 [退役说明](../../legacy/reports/rm65_official_all_ik_probe_retirement_20260828.md)；
 - `rm65_official_branch_anchor_probe.py`：核查 soft Pink anchor、source-rate 全解路径、
   60 Hz 中间帧投影、已有 qcmd planner 和官方连续遥操 IK。该一次性研究探针已于
   2026-08-28 从版本化源码树退役；本报告继续保存其完整结果、被否决路线和结论，当前
