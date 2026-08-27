@@ -57,6 +57,29 @@ _CAN_EFF_FLAG = 0x80000000
 _CAN_EFF_MASK = 0x1FFFFFFF
 _CAN_SFF_MASK = 0x000007FF
 
+_ROBSTRIDE_COMMUNICATION_TYPE_NAMES = {
+    0: "get_device_id",
+    1: "operation_control",
+    2: "operation_status",
+    3: "enable",
+    4: "disable",
+    6: "set_zero_position",
+    7: "set_device_id",
+    17: "read_parameter",
+    18: "write_parameter",
+    21: "fault_report",
+    22: "save_parameters",
+    23: "set_baudrate",
+    24: "active_report",
+    25: "set_protocol",
+}
+_ROBSTRIDE_OPERATION_STATUS = 2
+_ROBSTRIDE_ACTIVE_REPORT = 24
+_ROBSTRIDE_STREAM_TYPES = (
+    _ROBSTRIDE_OPERATION_STATUS,
+    _ROBSTRIDE_ACTIVE_REPORT,
+)
+
 
 class FrequencyProbeError(RuntimeError):
     """A probe precondition or transport operation failed."""
@@ -67,6 +90,22 @@ class DecodedFrame:
     arbitration_id: int
     data_length: int
     extended: bool
+
+
+@dataclass(frozen=True)
+class RobStrideExtendedId:
+    """Protocol fields carried by a candidate RobStride private-protocol ID."""
+
+    communication_type: int
+    communication_name: str
+    extra_data: int
+    node_id: int
+
+    @property
+    def stream_device_id(self) -> int | None:
+        if self.communication_type not in _ROBSTRIDE_STREAM_TYPES:
+            return None
+        return self.extra_data & 0xFF
 
 
 def decode_can_frame(frame: bytes) -> DecodedFrame:
@@ -84,6 +123,100 @@ def decode_can_frame(frame: bytes) -> DecodedFrame:
         data_length=int(data_length),
         extended=extended,
     )
+
+
+def decode_robstride_extended_id(frame: DecodedFrame) -> RobStrideExtendedId:
+    """Classify a 29-bit ID without interpreting its vendor payload as state."""
+
+    if not frame.extended:
+        raise ValueError("RobStride private protocol requires an extended CAN frame")
+    communication_type = (frame.arbitration_id >> 24) & 0x1F
+    return RobStrideExtendedId(
+        communication_type=communication_type,
+        communication_name=_ROBSTRIDE_COMMUNICATION_TYPE_NAMES.get(
+            communication_type,
+            "unknown",
+        ),
+        extra_data=(frame.arbitration_id >> 8) & 0xFFFF,
+        node_id=frame.arbitration_id & 0xFF,
+    )
+
+
+def _communication_type_key(communication_type: int) -> str:
+    name = _ROBSTRIDE_COMMUNICATION_TYPE_NAMES.get(communication_type, "unknown")
+    return f"{communication_type}:{name}"
+
+
+def _robstride_candidate_summary(
+    communication_type_counts: Counter[int],
+    stream_timestamps_by_type_and_device: dict[
+        int,
+        dict[int, list[float]],
+    ],
+    stream_host_id_counts_by_type: dict[int, Counter[int]],
+    *,
+    short_stream_frame_counts: Counter[int],
+) -> dict[str, object]:
+    unknown_count = sum(
+        count
+        for communication_type, count in communication_type_counts.items()
+        if communication_type not in _ROBSTRIDE_COMMUNICATION_TYPE_NAMES
+    )
+    result: dict[str, object] = {
+        "robstride_extended_candidate_frame_count": sum(
+            communication_type_counts.values()
+        ),
+        "frames_by_robstride_communication_type": {
+            _communication_type_key(communication_type): count
+            for communication_type, count in sorted(communication_type_counts.items())
+        },
+        "robstride_unknown_communication_type_frame_count": unknown_count,
+    }
+    stream_frame_counts: dict[int, int] = {}
+    for communication_type, label in (
+        (_ROBSTRIDE_OPERATION_STATUS, "operation_status"),
+        (_ROBSTRIDE_ACTIVE_REPORT, "active_report"),
+    ):
+        timestamps_by_device_id = stream_timestamps_by_type_and_device.get(
+            communication_type,
+            {},
+        )
+        host_id_counts = stream_host_id_counts_by_type.get(
+            communication_type,
+            Counter(),
+        )
+        stream_frame_count = sum(
+            len(timestamps) for timestamps in timestamps_by_device_id.values()
+        )
+        stream_frame_counts[communication_type] = stream_frame_count
+        result[f"robstride_{label}_frame_count"] = stream_frame_count
+        result[f"robstride_short_{label}_frame_count"] = short_stream_frame_counts[
+            communication_type
+        ]
+        result[f"robstride_{label}_frames_by_device_id"] = {
+            str(device_id): len(timestamps)
+            for device_id, timestamps in sorted(timestamps_by_device_id.items())
+        }
+        result[f"robstride_{label}_frames_by_host_id"] = {
+            f"0x{host_id:02x}": count
+            for host_id, count in sorted(host_id_counts.items())
+        }
+        result[f"robstride_{label}_per_device_feedback"] = {
+            str(device_id): summarize_timestamps("feedback", timestamps).as_dict()
+            for device_id, timestamps in sorted(timestamps_by_device_id.items())
+        }
+    operation_status_observed = bool(stream_frame_counts[_ROBSTRIDE_OPERATION_STATUS])
+    active_report_observed = bool(stream_frame_counts[_ROBSTRIDE_ACTIVE_REPORT])
+    if operation_status_observed and active_report_observed:
+        classification = "ROBSTRIDE_OPERATION_STATUS_AND_ACTIVE_REPORT_CANDIDATES_OBSERVED"
+    elif operation_status_observed:
+        classification = "ROBSTRIDE_OPERATION_STATUS_CANDIDATE_OBSERVED"
+    elif active_report_observed:
+        classification = "ROBSTRIDE_ACTIVE_REPORT_CANDIDATE_OBSERVED"
+    else:
+        classification = "NO_DECODABLE_ROBSTRIDE_STREAM_CANDIDATE_OBSERVED"
+    result["feedback_path_classification"] = classification
+    return result
 
 
 def _per_id_summary(
@@ -107,6 +240,19 @@ def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
     extended_count = 0
     standard_count = 0
     malformed_count = 0
+    communication_type_counts: Counter[int] = Counter()
+    stream_timestamps_by_type_and_device: dict[
+        int,
+        dict[int, list[float]],
+    ] = {
+        communication_type: defaultdict(list)
+        for communication_type in _ROBSTRIDE_STREAM_TYPES
+    }
+    stream_host_id_counts_by_type: dict[int, Counter[int]] = {
+        communication_type: Counter()
+        for communication_type in _ROBSTRIDE_STREAM_TYPES
+    }
+    short_stream_frame_counts: Counter[int] = Counter()
     started = time.monotonic()
     deadline = started + duration_sec
     try:
@@ -138,11 +284,25 @@ def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
             counts[decoded.arbitration_id] += 1
             if decoded.extended:
                 extended_count += 1
+                identity = decode_robstride_extended_id(decoded)
+                communication_type_counts[identity.communication_type] += 1
+                if identity.communication_type in _ROBSTRIDE_STREAM_TYPES:
+                    if decoded.data_length == 8:
+                        device_id = identity.stream_device_id
+                        assert device_id is not None
+                        stream_timestamps_by_type_and_device[
+                            identity.communication_type
+                        ][device_id].append(received_at)
+                        stream_host_id_counts_by_type[
+                            identity.communication_type
+                        ][identity.node_id] += 1
+                    else:
+                        short_stream_frame_counts[identity.communication_type] += 1
             else:
                 standard_count += 1
     ended = time.monotonic()
     feedback_stats = ledger.summarize()["feedback"].as_dict()
-    return {
+    result = {
         "mode": "read-only",
         "channel": channel,
         "duration_sec": ended - started,
@@ -160,12 +320,32 @@ def _read_only_capture(channel: str, duration_sec: float) -> dict[str, object]:
         "standard_frame_count": standard_count,
         "malformed_frame_count": malformed_count,
         "freshness_verified": False,
-        "freshness_semantics": "socket_receive_time_only; vendor_payload_not_decoded",
+        "freshness_semantics": (
+            "socket_receive_time_only; robstride_stream_payload_not_decoded; "
+            "source_sequence_unavailable"
+        ),
         "notes": [
             "This measures received CAN frame timing, not command, compute, or haptic rate.",
+            "Communication types are classified from candidate RobStride 29-bit IDs; payload values are not decoded as joint state.",
+            "Type-2 operation-status and type-24 active-report candidates are timed separately; neither is promoted to joint state.",
+            "A stream candidate establishes per-device receive cadence only, not source freshness or MotorBridge cache freshness.",
             "MotorBridge 0.4.9 does not expose a source timestamp/sequence for MotorState.",
         ],
     }
+    result.update(
+        _robstride_candidate_summary(
+            communication_type_counts,
+            {
+                communication_type: dict(timestamps_by_device_id)
+                for communication_type, timestamps_by_device_id in (
+                    stream_timestamps_by_type_and_device.items()
+                )
+            },
+            stream_host_id_counts_by_type,
+            short_stream_frame_counts=short_stream_frame_counts,
+        )
+    )
+    return result
 
 
 def _offline_capture(duration_sec: float, target_hz: float) -> dict[str, object]:
@@ -190,6 +370,20 @@ def _offline_capture(duration_sec: float, target_hz: float) -> dict[str, object]
         "extended_frame_count": 0,
         "standard_frame_count": 0,
         "malformed_frame_count": 0,
+        "robstride_extended_candidate_frame_count": 0,
+        "frames_by_robstride_communication_type": {},
+        "robstride_unknown_communication_type_frame_count": 0,
+        "robstride_operation_status_frame_count": 0,
+        "robstride_short_operation_status_frame_count": 0,
+        "robstride_operation_status_frames_by_device_id": {},
+        "robstride_operation_status_frames_by_host_id": {},
+        "robstride_operation_status_per_device_feedback": {},
+        "robstride_active_report_frame_count": 0,
+        "robstride_short_active_report_frame_count": 0,
+        "robstride_active_report_frames_by_device_id": {},
+        "robstride_active_report_frames_by_host_id": {},
+        "robstride_active_report_per_device_feedback": {},
+        "feedback_path_classification": "NOT_APPLICABLE_SYNTHETIC",
         "freshness_verified": True,
         "freshness_semantics": "synthetic_only",
         "notes": ["Offline timing is not hardware or CAN evidence."],

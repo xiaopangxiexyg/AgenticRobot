@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,16 +8,16 @@ import pytest
 
 from hardware.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
+    B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID,
+    B601_RS_POS_VEL_POS_KP_PARAM_ID,
+    B601_RS_POS_VEL_VEL_KI_PARAM_ID,
+    B601_RS_POS_VEL_VEL_KP_PARAM_ID,
     B601HardwareError,
     B601JointConfig,
     B601ModeReceipt,
     B601MotionAuthorizationError,
     B601RSBackend,
     B601RSBackendConfig,
-    B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID,
-    B601_RS_POS_VEL_POS_KP_PARAM_ID,
-    B601_RS_POS_VEL_VEL_KI_PARAM_ID,
-    B601_RS_POS_VEL_VEL_KP_PARAM_ID,
     FrequencyLedger,
     evaluate_frequency_target,
 )
@@ -162,6 +163,86 @@ def _populate_states(controller: _FakeController) -> None:
             torq=0.0,
         )
         motor.position_param = 0.1 * index
+
+
+def _socketcan_frame(arbitration_id: int, *, data_length: int = 8) -> bytes:
+    return frequency_probe._CAN_FRAME.pack(
+        arbitration_id,
+        data_length,
+        b"\x00" * 8,
+    )
+
+
+def test_passive_probe_classifies_robstride_operation_status_id_without_payload_decode() -> None:
+    arbitration_id = (2 << 24) | (0x0003 << 8) | 0xFD
+    decoded = frequency_probe.decode_can_frame(
+        _socketcan_frame(arbitration_id | frequency_probe._CAN_EFF_FLAG)
+    )
+
+    identity = frequency_probe.decode_robstride_extended_id(decoded)
+
+    assert decoded.arbitration_id == arbitration_id
+    assert decoded.extended is True
+    assert decoded.data_length == 8
+    assert identity.communication_type == 2
+    assert identity.communication_name == "operation_status"
+    assert identity.extra_data == 3
+    assert identity.node_id == 0xFD
+    assert identity.stream_device_id == 3
+
+
+def test_passive_probe_rejects_standard_frame_as_robstride_private_id() -> None:
+    decoded = frequency_probe.decode_can_frame(_socketcan_frame(0x123))
+
+    with pytest.raises(ValueError, match="requires an extended CAN frame"):
+        frequency_probe.decode_robstride_extended_id(decoded)
+
+
+def test_passive_probe_rejects_short_or_invalid_classic_can_frame() -> None:
+    with pytest.raises(ValueError, match="too short"):
+        frequency_probe.decode_can_frame(b"\x00" * 15)
+    with pytest.raises(ValueError, match="data length is invalid"):
+        frequency_probe.decode_can_frame(_socketcan_frame(0x123, data_length=9))
+
+
+def test_passive_summary_keeps_status_timing_fail_closed() -> None:
+    summary = frequency_probe._robstride_candidate_summary(
+        Counter({2: 4, 24: 1, 31: 2}),
+        {
+            2: {1: [0.0, 0.01], 2: [0.0, 0.02]},
+            24: {7: [0.0]},
+        },
+        {
+            2: Counter({0xFD: 4}),
+            24: Counter({0xFD: 1}),
+        },
+        short_stream_frame_counts=Counter({2: 1}),
+    )
+
+    assert summary["robstride_extended_candidate_frame_count"] == 7
+    assert summary["frames_by_robstride_communication_type"] == {
+        "2:operation_status": 4,
+        "24:active_report": 1,
+        "31:unknown": 2,
+    }
+    assert summary["robstride_unknown_communication_type_frame_count"] == 2
+    assert summary["robstride_operation_status_frame_count"] == 4
+    assert summary["robstride_short_operation_status_frame_count"] == 1
+    assert summary["robstride_operation_status_frames_by_device_id"] == {
+        "1": 2,
+        "2": 2,
+    }
+    assert summary["robstride_operation_status_frames_by_host_id"] == {"0xfd": 4}
+    assert summary["robstride_operation_status_per_device_feedback"]["1"][
+        "observed_hz"
+    ] == pytest.approx(100.0)
+    assert summary["robstride_active_report_frame_count"] == 1
+    assert summary["robstride_short_active_report_frame_count"] == 0
+    assert summary["robstride_active_report_frames_by_device_id"] == {"7": 1}
+    assert summary["robstride_active_report_frames_by_host_id"] == {"0xfd": 1}
+    assert summary["feedback_path_classification"] == (
+        "ROBSTRIDE_OPERATION_STATUS_AND_ACTIVE_REPORT_CANDIDATES_OBSERVED"
+    )
 
 
 def test_config_parser_keeps_explicit_arm_order_and_excludes_gripper() -> None:
