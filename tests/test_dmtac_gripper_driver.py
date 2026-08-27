@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,7 +11,13 @@ DMTAC_ROOT = ROOT / "hardware" / "DMTAC_gripper"
 if str(DMTAC_ROOT) not in sys.path:
     sys.path.insert(0, str(DMTAC_ROOT))
 
+from portable_dmtac_gripper import device as dmtac_device  # noqa: E402
 from portable_dmtac_gripper import gripper_driver  # noqa: E402
+from portable_dmtac_gripper.device import (  # noqa: E402
+    DMTacGripperDevice,
+    GripperConfig,
+    TactileConfig,
+)
 from portable_dmtac_gripper.gripper_driver import (  # noqa: E402
     GripperError,
     InspireGripper,
@@ -148,6 +155,90 @@ class DMTacGripperDriverTest(unittest.TestCase):
         self.assertEqual(InspireGripper._decode_opening_register(0xFFFE), 0)
         self.assertEqual(InspireGripper._decode_opening_register(0), 0)
         self.assertEqual(InspireGripper._decode_opening_register(1000), 1000)
+
+    def test_modbus_requests_process_exclusive_serial_ownership(self) -> None:
+        old_serial = gripper_driver.serial.Serial
+        _ScriptedSerial.scripts = []
+        _ScriptedSerial.instances = []
+        gripper_driver.serial.Serial = _ScriptedSerial
+        try:
+            mb = InspireGripperModbus(
+                port="/dev/fake-exclusive",
+                slave_id=1,
+                reconnect_on_error=False,
+            )
+            mb.close()
+        finally:
+            gripper_driver.serial.Serial = old_serial
+
+        self.assertEqual(len(_ScriptedSerial.instances), 1)
+        self.assertIs(_ScriptedSerial.instances[0].kwargs.get("exclusive"), True)
+
+    def test_composite_connect_rolls_back_gripper_when_tactile_discovery_fails(
+        self,
+    ) -> None:
+        class _FakeGripper:
+            def __init__(self, **_kwargs: object) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        fake_gripper = _FakeGripper()
+        device = DMTacGripperDevice(
+            gripper=GripperConfig(port="/dev/fake0"),
+            tactile=TactileConfig(dev_ids=None),
+        )
+
+        with (
+            patch.object(dmtac_device, "InspireGripper", return_value=fake_gripper),
+            patch.object(dmtac_device, "discover_device_ids", return_value=[]),
+            self.assertRaisesRegex(RuntimeError, "No DM-Tac tactile device"),
+        ):
+            device.connect()
+
+        self.assertTrue(fake_gripper.closed)
+        self.assertIsNone(device.gripper)
+        self.assertIsNone(device.tactile)
+
+    def test_composite_connect_closes_partially_connected_tactile_candidate(
+        self,
+    ) -> None:
+        class _FakeGripper:
+            def __init__(self, **_kwargs: object) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _FailingTactile:
+            def __init__(self, _configs: object) -> None:
+                self.closed = False
+
+            def connect(self):  # noqa: ANN201
+                raise RuntimeError("tactile connect failed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        fake_gripper = _FakeGripper()
+        fake_tactile = _FailingTactile([])
+        device = DMTacGripperDevice(
+            gripper=GripperConfig(port="/dev/fake0"),
+            tactile=TactileConfig(dev_ids=["fake-tactile"]),
+        )
+
+        with (
+            patch.object(dmtac_device, "InspireGripper", return_value=fake_gripper),
+            patch.object(dmtac_device, "DMTacMultiDevice", return_value=fake_tactile),
+            self.assertRaisesRegex(RuntimeError, "tactile connect failed"),
+        ):
+            device.connect()
+
+        self.assertTrue(fake_tactile.closed)
+        self.assertTrue(fake_gripper.closed)
+        self.assertIsNone(device.gripper)
+        self.assertIsNone(device.tactile)
 
     def test_opening_register_still_rejects_values_outside_signed_physical_range(
         self,

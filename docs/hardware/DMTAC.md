@@ -173,6 +173,36 @@ python hardware/DMTAC_gripper/run_gripper.py configure-usb \
 
 这些命令仍会占用设备。运行前必须停止 GUI、collection、UMI、deploy 和 replay。
 
+### 4.2.1 串口占用与运行时故障恢复
+
+夹爪串口以进程独占方式打开。同一个物理串口已经被 GUI、collection、deploy、replay
+或另一条维护命令占用时，新进程应在打开阶段直接失败，而不应与现有进程交错消费
+Modbus 响应。不要在正式遥操运行中并行执行 `verify-gripper`。尤其不要用易漂移的
+`/dev/ttyUSB*` 猜测左右夹爪；读取验证应使用 `--config latest --side left/right`，让命令
+复用 assignment 中的稳定 by-path、ID、baudrate 和 timeout。
+
+正式遥操中的夹爪恢复遵循以下边界：
+
+- 控制循环不会等待正在进行的夹爪 I/O；锁忙时该次夹爪命令直接记为 `io_busy`，机械臂
+  控制循环继续运行；
+- 串口读写失败后，当前夹爪连接立即隔离，该次命令失败且不会在控制线程内重发；
+- 后台 telemetry 按 `reconnect_cooldown_sec` 重试打开连接。只有重新读取到与配置 ID
+  一致的完整状态后，才清除连接错误并增加 `reconnect_count`；
+- 若夹爪在首次 `backend.start()` 时就未就绪，应使用 GUI 的“重试失败设备”重新执行启动
+  admission；自动 telemetry 重连只负责已经成功启动、随后在运行中掉线的连接；
+- 串口连接一旦被隔离，旧连接上的命令去重和限频缓存同时失效。重连验证成功后的下一条
+  控制目标会重新下发，即使它与断电前最后一个目标相同，也不会把物理复位误判成“目标未变”；
+- 重连后若设备仍报告非零 `gripper_error_code`，命令继续按硬件故障拒绝，不会因“串口
+  已重新打开”而绕过故障门；
+- 夹爪断电重启期间不需要退出整个遥操终端。恢复前夹爪命令保持 fail-closed，状态可从
+  `gripper_is_connected`、`telemetry_error`、`gripper_last_reconnect_error` 和
+  `reconnect_count`
+  判断。
+
+若电源恢复后仍长期出现 `Unexpected slave id`，应先停止所有可能占用该串口的进程，
+再核对 assignment 的稳定路径和 `gripper_id`。该错误表示响应身份与当前配置不一致，
+不能通过盲目重发或放宽校验处理。
+
 ### 4.3 只重新确认左右 gripper，保留 tactile
 
 推荐交互流程会对可达夹爪进行逐个 micro-jog；每次确认前必须清空运动范围：

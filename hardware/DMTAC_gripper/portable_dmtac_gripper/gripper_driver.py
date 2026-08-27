@@ -146,11 +146,14 @@ class InspireGripperModbus:
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
+            exclusive=True,
         )
 
     def close(self) -> None:
-        if self.ser and self.ser.is_open:
-            self.ser.close()
+        with self._port_lock:
+            with self._io_lock:
+                if self.ser and self.ser.is_open:
+                    self.ser.close()
 
     def _reopen_serial_locked(self) -> None:
         try:
