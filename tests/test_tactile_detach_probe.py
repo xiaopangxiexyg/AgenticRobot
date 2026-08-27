@@ -260,3 +260,57 @@ def test_apply_can_delegate_dynamic_disjoint_collection_proof(
     assert probe.main() == 0
     assert detach_kwargs["allow_disjoint_active_collection"] is True
     assert detach_kwargs["active_collection_dataset_roots"] == ()
+
+
+def test_sampled_revalidation_is_forwarded_to_plan_and_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    cold_root = tmp_path / "cold"
+    dataset_root.mkdir()
+    cold_root.mkdir()
+    plan_path = tmp_path / "relocation.json"
+    plan_path.write_text(
+        json.dumps({"entries": [{"target": str(dataset_root)}]}),
+        encoding="utf-8",
+    )
+    proposal = SimpleNamespace(
+        ready=True,
+        errors=(),
+        plan_hash="plan",
+        dataset_fingerprint="fingerprint",
+    )
+    plan_kwargs: dict[str, object] = {}
+    detach_kwargs: dict[str, object] = {}
+
+    def plan(*args: object, **kwargs: object) -> object:
+        plan_kwargs.update(kwargs)
+        return proposal
+
+    def detach(*args: object, **kwargs: object) -> object:
+        detach_kwargs.update(kwargs)
+        return SimpleNamespace(to_dict=lambda: {"status": "complete"})
+
+    monkeypatch.setattr(probe, "plan_modality_detach", plan)
+    monkeypatch.setattr(probe, "detach_modality", detach)
+    monkeypatch.setattr(
+        probe.sys,
+        "argv",
+        [
+            "detach_verified_realman_tactile.py",
+            "--plan",
+            str(plan_path),
+            "--entry-index",
+            "0",
+            "--cold-root",
+            str(cold_root),
+            "--sampled-revalidation",
+            "--apply",
+            "--confirm-legacy-hardlink-detach",
+            "--allow-disjoint-active-collection",
+        ],
+    )
+
+    assert probe.main() == 0
+    assert plan_kwargs["revalidation_profile"] == "sampled_v1"
+    assert detach_kwargs["revalidation_profile"] == "sampled_v1"

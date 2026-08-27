@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from collection_runtime.modality_storage import (
+    SAMPLED_REVALIDATION_V1,
     ModalityStorageError,
     active_collection_dataset_roots_for_date,
     detach_modality,
@@ -203,6 +204,15 @@ def main() -> int:
     parser.add_argument("--predecessor-wait-timeout-sec", type=float, default=216000.0)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument(
+        "--sampled-revalidation",
+        action="store_true",
+        help=(
+            "Keep exact full-file copy/hash verification, but bound expensive "
+            "reader tail-decode and restore-drill groups using the fixed "
+            "sampled_v1 profile. Default remains full revalidation."
+        ),
+    )
+    parser.add_argument(
         "--confirm-legacy-hardlink-detach",
         action="store_true",
         help="Required with --apply; only this dataset's paths are retired.",
@@ -212,6 +222,9 @@ def main() -> int:
     root = _dataset_root(plan_path, int(args.entry_index))
     cold_root = args.cold_root.expanduser().resolve(strict=True)
     min_free_bytes = int(float(args.min_free_gb) * 1024**3)
+    revalidation_profile = (
+        SAMPLED_REVALIDATION_V1 if args.sampled_revalidation else "full"
+    )
     if args.wait_for_no_active_collection and args.exclude_active_collection_date:
         raise ValueError(
             "--wait-for-no-active-collection cannot be combined with "
@@ -261,6 +274,7 @@ def main() -> int:
             cold_root,
             min_free_bytes=min_free_bytes,
             allow_legacy_hardlinked_source=True,
+            revalidation_profile=revalidation_profile,
         )
         print(json.dumps(proposal.to_dict(), ensure_ascii=False, sort_keys=True))
         return 0 if proposal.ready else 2
@@ -285,6 +299,7 @@ def main() -> int:
             cold_root,
             min_free_bytes=min_free_bytes,
             allow_legacy_hardlinked_source=True,
+            revalidation_profile=revalidation_profile,
         )
         if not proposal.ready:
             raise RuntimeError(
@@ -305,6 +320,7 @@ def main() -> int:
                     bool(active_roots) or bool(args.allow_disjoint_active_collection)
                 ),
                 active_collection_dataset_roots=active_roots,
+                revalidation_profile=revalidation_profile,
             )
             break
         except ModalityStorageError as exc:

@@ -311,6 +311,25 @@ apply 都不会跳过 cold-copy 校验、restore drill 和退役前全量复核�
 采集期参数应从新数据集 Episode 0 开始启用；已有未封存 tactile 历史的数据集不会在采集中自动
 回填 manifest，而是在 writer 创建前拒绝该参数，避免每次封口重复扫描全部历史 payload。
 
+对已经完成过导出、且标准全量 reader/restore 复核因数据量过大而不可接受的历史数据，批处理
+probe 还提供显式的 `--sampled-revalidation` 回退配置。默认不带此参数时仍采用原来的全量复核；
+启用后只把重复的首尾帧解码、restore drill，以及未发布 partial 续传树的 proposal/preflight
+哈希限定为固定的 `sampled_v1` 样本（当前为确定性的 16 个 manifest group，覆盖左右侧、时间线
+和每侧最大 group）。partial 中所有路径、类型、link count 和 size 仍逐项检查，所有 manifest
+仍校验 hash；partial payload 的完整 hash 明确延后到 apply，由 apply 逐文件验证完整 partial
+前缀或完整文件，并在发布前再次全量 hash。以下安全条件仍然是全量的，绝不抽样：
+
+- 新导出或复用的 cold artifact graph 必须逐文件验证 SHA-256、大小和独立 inode；
+- 所有 manifest 与引用结构都必须完整合法；
+- 退役前必须重新构建相同 inventory，并逐个核对源 artifact 的 device、inode、link count、
+  size、mtime 和 ctime 快照；
+- quiescence、plan hash、dataset fingerprint、journal/quarantine 和 durable receipt 合同不变。
+
+sampled receipt 的 operation ID 会显式包含 `sampled_v1`，便于审计。它不能用于活动采集目录，
+不能绕过 reader/collector 静止检查，也不能把损坏的未抽中 cold payload 直接退役：apply 的独立
+副本验证仍会在退役前读取并哈希全部 cold payload。要完整回退，只需省略
+`--sampled-revalidation`，不涉及数据格式或 schema 迁移。
+
 ```bash
 python -m utils.dataset_postprocess modality-detach DATASET_ROOT \
   --cold-root COLD_ROOT \
