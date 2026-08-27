@@ -723,9 +723,16 @@ def build_episode_recording_runtime(
                         selected_root,
                         selected_modality_contract,
                     )
+                # Global startup deliberately leaves the formal writer
+                # unconstructed.  An explicit dataset/profile selection is
+                # nevertheless a writer-preparation boundary: initialize a
+                # fresh private candidate even when there is no previous
+                # recorder, then publish it only after the ready handshake.
+                # ``--no-collection`` remains configuration-only and must not
+                # create a formal writer as a side effect of task selection.
                 candidate = (
                     None
-                    if existing_recorder is None
+                    if bool(getattr(staged_args, "no_collection", False))
                     else construct_started_dataset_recorder(
                         existing_recorder,
                         args_override=staged_args,
@@ -755,9 +762,9 @@ def build_episode_recording_runtime(
         )
         # A live old recorder remains recoverable but is no longer observable
         # by finalize/progress/status consumers while the candidate owns the
-        # selection transaction.  When there is no recorder, selection only
-        # prepares the dataset contract; writer construction stays lazy until
-        # the next formal episode start.
+        # selection transaction.  Global startup remains lazy, while this
+        # explicit selection prepares the selected formal writer off the
+        # realtime loop so episode start can reuse an already-ready recorder.
         set_dataset_recorder(None)
         dataset_recorder = None
         _log(

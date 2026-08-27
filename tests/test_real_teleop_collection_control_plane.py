@@ -910,7 +910,7 @@ def test_dataset_selection_status_publish_failure_cannot_skip_old_retirement(
     runtime.close()
 
 
-def test_dataset_selection_is_single_flight_and_no_recorder_prepares_async(
+def test_dataset_selection_is_single_flight_and_no_recorder_prepares_writer_async(
     tmp_path: Path,
 ) -> None:
     entered = threading.Event()
@@ -922,6 +922,11 @@ def test_dataset_selection_is_single_flight_and_no_recorder_prepares_async(
             self.args = args
             self.dataset_root = Path(args.dataset_root)
             self.closed = False
+            self.is_recording = False
+            self.finalizing = False
+            self.frame_count = 0
+            self.writer_started = True
+            self.device_config_writes = 0
             instances.append(self)
 
         def ensure_started(self) -> None:
@@ -930,6 +935,15 @@ def test_dataset_selection_is_single_flight_and_no_recorder_prepares_async(
 
         def close(self) -> None:
             self.closed = True
+
+        def poll_finalize_tasks(self) -> list[object]:
+            return []
+
+        def configured_for_current_args(self) -> bool:
+            return True
+
+        def write_camera_device_config(self) -> None:
+            self.device_config_writes += 1
 
     old_recorder = SimpleNamespace(
         finalizing=False,
@@ -1031,10 +1045,77 @@ def test_dataset_selection_is_single_flight_and_no_recorder_prepares_async(
 
     assert inline_callbacks == ["commit", "complete"]
     assert empty_args.dataset_root == tmp_path / "inline"
-    assert empty_slot[0] is None
+    assert empty_slot[0] is instances[1]
+    assert instances[1].args is empty_args
+    assert instances[1].dataset_root == tmp_path / "inline"
     assert empty_transition_calls == ["dataset_selection_reconfigure"]
-    assert len(instances) == 1
+    assert len(instances) == 2
+
+    assert empty_runtime.schedule_recording_countdown(
+        time.time(),
+        start_reason="unit_after_selection",
+    )
+    deadline = time.monotonic() + 1.0
+    while empty_runtime.collection_transition_active() and time.monotonic() < deadline:
+        empty_runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+    assert empty_slot[0] is instances[1]
+    assert len(instances) == 2
+    assert instances[1].device_config_writes == 1
+
     empty_runtime.close()
+    # EpisodeRecordingRuntime closes only detached/in-flight candidates.  The
+    # published idle recorder remains owned by the outer real-teleop runtime,
+    # whose ordered shutdown closes it after the collection plane drains.
+    assert instances[1].closed is False
+    instances[1].close()
+    assert instances[1].closed is True
+
+
+def test_dataset_selection_without_formal_collection_remains_contract_only(
+    tmp_path: Path,
+) -> None:
+    instances: list[object] = []
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            instances.append(self)
+
+    slot: list[object | None] = [None]
+    runtime, args, _logs = _episode_runtime(
+        tmp_path=tmp_path / "initial",
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=_Clutch(),
+        transition_calls=[],
+    )
+    args.no_collection = True
+    selected_args = dict(vars(args))
+    selected_args["dataset_root"] = tmp_path / "selected"
+    callbacks: list[str] = []
+
+    def commit(snapshot: dict[str, object]) -> None:
+        vars(args).clear()
+        vars(args).update(snapshot)
+        callbacks.append("commit")
+
+    assert runtime.schedule_dataset_selection(
+        selected_args,
+        bind_dataset_contract=False,
+        on_commit=commit,
+        on_complete=lambda: callbacks.append("complete"),
+        on_failure=lambda exc: callbacks.append(f"failure:{exc}"),
+    ) == "pending"
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert callbacks == ["commit", "complete"]
+    assert args.dataset_root == tmp_path / "selected"
+    assert slot[0] is None
+    assert instances == []
+    runtime.close()
 
 
 def test_cancelled_prepare_never_publishes_candidate(tmp_path: Path) -> None:
