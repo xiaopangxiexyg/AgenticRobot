@@ -1811,6 +1811,218 @@ def test_dataset_selection_replacement_is_transactional_and_nonblocking(
     runtime.close()
 
 
+def test_dataset_selection_retirement_start_failure_is_retained_and_retried(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    instances: list[object] = []
+
+    class Recorder:
+        def __init__(self, *, args: object, **_kwargs: object) -> None:
+            self.args = args
+            self.dataset_root = Path(args.dataset_root)
+            self.finalizing = False
+            self.is_recording = False
+            self.is_paused = False
+            self.frame_count = 0
+            self.writer_started = False
+            self.closed = False
+            instances.append(self)
+
+        def ensure_started(self) -> None:
+            self.writer_started = True
+
+        def poll_finalize_tasks(self) -> list[object]:
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    old_recorder = SimpleNamespace(
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        dataset_root=tmp_path / "old",
+        writer_started=True,
+        control_trace_episode_sink=None,
+        v25p_sidecar_store=None,
+        closed=False,
+        poll_finalize_tasks=list,
+    )
+    old_recorder.close = lambda: setattr(old_recorder, "closed", True)
+    slot: list[object | None] = [old_recorder]
+    clutch = _Clutch()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=old_recorder.dataset_root,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+    selected_args = dict(vars(args))
+    selected_args["dataset_root"] = tmp_path / "selected"
+    callbacks: list[str] = []
+    original_start = control_plane_module.threading.Thread.start
+    start_attempts = 0
+
+    def fail_retirement_once(thread) -> None:
+        nonlocal start_attempts
+        start_attempts += 1
+        if start_attempts == 2:
+            raise RuntimeError("simulated retirement thread exhaustion")
+        original_start(thread)
+
+    monkeypatch.setattr(
+        control_plane_module.threading.Thread,
+        "start",
+        fail_retirement_once,
+    )
+
+    def commit_selected_state(snapshot) -> None:
+        callbacks.append("commit")
+        vars(args).clear()
+        vars(args).update(snapshot)
+
+    assert runtime.schedule_dataset_selection(
+        selected_args,
+        bind_dataset_contract=False,
+        on_commit=commit_selected_state,
+        on_complete=lambda: callbacks.append("complete"),
+        on_failure=lambda exc: callbacks.append(f"failure:{exc}"),
+    ) == "pending"
+
+    deadline = time.monotonic() + 1.0
+    while callbacks != ["commit"] and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert callbacks == ["commit"]
+    assert slot[0] is instances[0]
+    assert not old_recorder.closed
+    assert runtime.collection_transition_active()
+    assert any(
+        tag == "Dataset"
+        and "retirement is retained for retry" in message
+        and "simulated retirement thread exhaustion" in message
+        for tag, message in logs
+    )
+
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.005)
+
+    assert callbacks == ["commit", "complete"]
+    assert old_recorder.closed
+    assert not runtime.collection_transition_active()
+    assert start_attempts == 3
+    assert runtime.close()
+
+
+def test_dataset_selection_retirement_close_failure_keeps_owned_retry(
+    tmp_path: Path,
+) -> None:
+    instances: list[object] = []
+
+    class Recorder:
+        def __init__(self, *, args: object, **_kwargs: object) -> None:
+            self.args = args
+            self.dataset_root = Path(args.dataset_root)
+            self.finalizing = False
+            self.is_recording = False
+            self.is_paused = False
+            self.frame_count = 0
+            self.writer_started = False
+            self.closed = False
+            instances.append(self)
+
+        def ensure_started(self) -> None:
+            self.writer_started = True
+
+        def poll_finalize_tasks(self) -> list[object]:
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    old_recorder = SimpleNamespace(
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        dataset_root=tmp_path / "old",
+        writer_started=True,
+        control_trace_episode_sink=None,
+        v25p_sidecar_store=None,
+        closed=False,
+        close_calls=0,
+        poll_finalize_tasks=list,
+    )
+
+    def close_old_recorder() -> None:
+        old_recorder.close_calls += 1
+        if old_recorder.close_calls == 1:
+            raise RuntimeError("simulated transient Queue teardown failure")
+        old_recorder.closed = True
+
+    old_recorder.close = close_old_recorder
+    slot: list[object | None] = [old_recorder]
+    clutch = _Clutch()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=old_recorder.dataset_root,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+    selected_args = dict(vars(args))
+    selected_args["dataset_root"] = tmp_path / "selected"
+    callbacks: list[str] = []
+
+    def commit_selected_state(snapshot) -> None:
+        callbacks.append("commit")
+        vars(args).clear()
+        vars(args).update(snapshot)
+
+    assert runtime.schedule_dataset_selection(
+        selected_args,
+        bind_dataset_contract=False,
+        on_commit=commit_selected_state,
+        on_complete=lambda: callbacks.append("complete"),
+        on_failure=lambda exc: callbacks.append(f"failure:{exc}"),
+    ) == "pending"
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        if any(
+            tag == "Dataset"
+            and "old recorder remains owned" in message
+            and "simulated transient Queue teardown failure" in message
+            for tag, message in logs
+        ):
+            break
+        time.sleep(0.001)
+
+    assert callbacks == ["commit"]
+    assert slot[0] is instances[0]
+    assert old_recorder.close_calls == 1
+    assert not old_recorder.closed
+    assert runtime.collection_transition_active()
+
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.005)
+
+    assert callbacks == ["commit", "complete"]
+    assert old_recorder.close_calls == 2
+    assert old_recorder.closed
+    assert not runtime.collection_transition_active()
+    assert runtime.close()
+
+
 def test_failed_dataset_selection_republishes_old_recorder_and_keeps_args(
     tmp_path: Path,
 ) -> None:
