@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from hardware.rebot_b601_rs import (
+    B601_RS_ARM_JOINT_NAMES,
     B601HardwareError,
     B601JointConfig,
+    B601ModeReceipt,
     B601MotionAuthorizationError,
     B601RSBackend,
     B601RSBackendConfig,
-    B601_RS_ARM_JOINT_NAMES,
     FrequencyLedger,
 )
-from robot_motion.rebot_b601_rs import B601MitReference, B601_RS_JOINT_MIT_FRAME
+from robot_motion.rebot_b601_rs import B601_RS_JOINT_MIT_FRAME, B601MitReference
+from scripts.hardware import rebot_b601_rs_frequency_probe as frequency_probe
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
@@ -358,3 +361,173 @@ def test_frequency_ledger_keeps_feedback_compute_tx_and_haptic_separate() -> Non
     assert summary["tx"]["sample_count"] == 1
     assert summary["haptic"]["sample_count"] == 0
     assert summary["haptic"]["observed_hz"] is None
+
+
+class _FakePositionProbeBackend:
+    def __init__(
+        self,
+        *,
+        enable_receipt: B601ModeReceipt,
+        stop_receipt: B601ModeReceipt,
+    ) -> None:
+        self.enable_receipt = enable_receipt
+        self.stop_receipt = stop_receipt
+        self.calls: list[str] = []
+        self.sequence = 0
+
+    def connect(self) -> None:
+        self.calls.append("connect")
+
+    def poll_feedback(self) -> object:
+        self.calls.append("poll_feedback")
+        self.sequence += 1
+        return SimpleNamespace(
+            valid=True,
+            positions_rad=(0.0,) * 6,
+            receive_timestamp_sec=float(self.sequence),
+            sequence=self.sequence,
+            fault_reason=None,
+        )
+
+    def prepare_position_velocity_mode(self, *, joint_names: object) -> B601ModeReceipt:
+        del joint_names
+        self.calls.append("prepare")
+        return B601ModeReceipt(
+            "prepare_position_velocity_mode",
+            ("joint1", "joint2"),
+            ("joint1", "joint2"),
+            (),
+            (),
+            True,
+        )
+
+    def enable(self, *, joint_names: object) -> B601ModeReceipt:
+        del joint_names
+        self.calls.append("enable")
+        return self.enable_receipt
+
+    def send_position_velocity(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        self.calls.append("send")
+        return SimpleNamespace(
+            accepted=True,
+            errors=(),
+            completed_at_sec=1.0,
+        )
+
+    def safe_stop(self, *, joint_names: object) -> B601ModeReceipt:
+        del joint_names
+        self.calls.append("safe_stop")
+        return self.stop_receipt
+
+    def close(self) -> None:
+        self.calls.append("close")
+
+
+def _position_probe_args(config_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        allow_motion=True,
+        confirmation="B601_RS_POSITION_FREQUENCY",
+        enable=True,
+        auto_disable=True,
+        config=str(config_path),
+        duration_sec=1e-9,
+        warmup_sec=0.01,
+        joint=("joint1", "joint2"),
+        rebot_source_root=None,
+        target_hz=125.0,
+    )
+
+
+def _install_position_probe_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: _FakePositionProbeBackend,
+) -> None:
+    monkeypatch.setattr(
+        frequency_probe,
+        "_resolve_position_limits",
+        lambda _config_path, _source_root: ((-1.0, 1.0),) * 6,
+    )
+    monkeypatch.setattr(
+        frequency_probe.B601RSBackendConfig,
+        "from_rs_yaml",
+        staticmethod(lambda _path, **_kwargs: SimpleNamespace(channel="can0")),
+    )
+    monkeypatch.setattr(frequency_probe, "B601RSBackend", lambda _config: backend)
+
+
+def test_position_probe_stops_all_selected_joints_after_partial_enable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("test: true\n", encoding="utf-8")
+    backend = _FakePositionProbeBackend(
+        enable_receipt=B601ModeReceipt(
+            "enable",
+            ("joint1", "joint2"),
+            ("joint1",),
+            ("joint2",),
+            ("joint2: synthetic enable failure",),
+            False,
+        ),
+        stop_receipt=B601ModeReceipt(
+            "safe_stop",
+            ("joint1", "joint2"),
+            ("joint1", "joint2"),
+            (),
+            (),
+            True,
+        ),
+    )
+    _install_position_probe_fakes(monkeypatch, backend)
+
+    with pytest.raises(
+        frequency_probe.FrequencyProbeError,
+        match="motor enable failed",
+    ):
+        frequency_probe._run_position_probe(_position_probe_args(config_path))
+
+    assert backend.calls[-2:] == ["safe_stop", "close"]
+
+
+def test_position_probe_reports_incomplete_safe_stop_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("test: true\n", encoding="utf-8")
+    backend = _FakePositionProbeBackend(
+        enable_receipt=B601ModeReceipt(
+            "enable",
+            ("joint1", "joint2"),
+            ("joint1", "joint2"),
+            (),
+            (),
+            True,
+        ),
+        stop_receipt=B601ModeReceipt(
+            "safe_stop",
+            ("joint1", "joint2"),
+            ("joint1",),
+            ("joint2",),
+            ("joint2: synthetic disable failure",),
+            False,
+        ),
+    )
+    _install_position_probe_fakes(monkeypatch, backend)
+
+    result = frequency_probe._run_position_probe(_position_probe_args(config_path))
+
+    assert result["cleanup_receipt"] == {
+        "operation": "safe_stop",
+        "requested_joint_names": ("joint1", "joint2"),
+        "completed_joint_names": ("joint1",),
+        "failed_joint_names": ("joint2",),
+        "errors": ("joint2: synthetic disable failure",),
+        "completed": False,
+    }
+    assert result["cleanup_errors"] == (
+        "safe_stop: joint2: synthetic disable failure",
+    )
+    assert result["stop_reason"] == "safe_stop: joint2: synthetic disable failure"

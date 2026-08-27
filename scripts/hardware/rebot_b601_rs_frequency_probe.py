@@ -31,10 +31,10 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from hardware.rebot_b601_rs import (
+    B601_RS_ARM_JOINT_NAMES,
+    B601HardwareError,
     B601RSBackend,
     B601RSBackendConfig,
-    B601HardwareError,
-    B601_RS_ARM_JOINT_NAMES,
     FrequencyLedger,
     summarize_timestamps,
 )
@@ -264,10 +264,12 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
     )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
-    enabled = False
+    enable_attempted = False
     commands_sent = 0
     stop_reason: str | None = None
     cleanup_errors: list[str] = []
+    cleanup_receipt: dict[str, object] | None = None
+    primary_error: Exception | None = None
     try:
         backend.connect()
         warmup_deadline = time.monotonic() + args.warmup_sec
@@ -285,10 +287,10 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         mode_receipt = backend.prepare_position_velocity_mode(joint_names=selected)
         if not mode_receipt.completed:
             raise FrequencyProbeError("POS_VEL setup failed: " + "; ".join(mode_receipt.errors))
+        enable_attempted = True
         enable_receipt = backend.enable(joint_names=selected)
         if not enable_receipt.completed:
             raise FrequencyProbeError("motor enable failed: " + "; ".join(enable_receipt.errors))
-        enabled = True
         target_hz = float(args.target_hz)
         if target_hz <= 0.0:
             raise ValueError("target_hz must be positive")
@@ -316,18 +318,41 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             ledger.mark("tx", receipt.completed_at_sec)
             commands_sent += 1
             next_deadline += period
+    except Exception as exc:  # noqa: BLE001 - always reach fail-safe cleanup
+        primary_error = exc
     finally:
-        if enabled:
+        if enable_attempted:
             try:
-                backend.disable(joint_names=selected)
-            except Exception as exc:
-                cleanup_errors.append(f"disable: {exc}")
+                stop_receipt = backend.safe_stop(joint_names=selected)
+                cleanup_receipt = {
+                    "operation": stop_receipt.operation,
+                    "requested_joint_names": stop_receipt.requested_joint_names,
+                    "completed_joint_names": stop_receipt.completed_joint_names,
+                    "failed_joint_names": stop_receipt.failed_joint_names,
+                    "errors": stop_receipt.errors,
+                    "completed": stop_receipt.completed,
+                }
+                if not stop_receipt.completed:
+                    cleanup_errors.extend(
+                        f"safe_stop: {error}" for error in stop_receipt.errors
+                    )
+                    if not stop_receipt.errors:
+                        cleanup_errors.append(
+                            "safe_stop: incomplete without vendor error"
+                        )
+            except Exception as exc:  # noqa: BLE001 - report vendor cleanup failure
+                cleanup_errors.append(f"safe_stop: {exc}")
         try:
             backend.close()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - report vendor cleanup failure
             cleanup_errors.append(f"close: {exc}")
         if cleanup_errors and stop_reason is None:
             stop_reason = "; ".join(cleanup_errors)
+    if primary_error is not None:
+        detail = str(primary_error)
+        if cleanup_errors:
+            detail += "; cleanup: " + "; ".join(cleanup_errors)
+        raise FrequencyProbeError(detail) from primary_error
     result: dict[str, object] = {
         "mode": "position",
         "channel": config.channel,
@@ -352,6 +377,8 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             "It holds the latest observed position and does not request feedback frames.",
         ],
     }
+    if cleanup_receipt is not None:
+        result["cleanup_receipt"] = cleanup_receipt
     if cleanup_errors:
         result["cleanup_errors"] = tuple(cleanup_errors)
     return result
