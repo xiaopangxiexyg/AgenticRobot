@@ -477,9 +477,9 @@ class RealTeleopProgressWorkflow:
         available_at: float,
     ) -> ProgressWorkflowResult:
         episode = self._episode()
-        receipts = tuple(self.recorder.drain_accepted_sample_receipts())
         if episode is None:
             return ProgressWorkflowResult(False, "ABSENT")
+        receipts = tuple(self.recorder.drain_accepted_sample_receipts())
         if episode.state.phase != "RESUME_RECEIVED":
             return ProgressWorkflowResult(False, episode.state.phase)
         resume_fact_id = episode.state.resume_receipt_fact_id

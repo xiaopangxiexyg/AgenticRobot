@@ -450,14 +450,15 @@ def prepare_dataset_capture_writable(
             stacklevel=2,
         )
         return result
-    try:
-        assert_dataset_capture_writable(
-            root,
-            tactile_bundle_root=tactile_bundle_root,
-        )
-    except UnownedTactileFilesError:
-        pass
-    else:
+
+    # Native tactile admission validates every committed Episode against the
+    # external bundle.  On a populated dataset that is intentionally O(number
+    # of Episodes), so do not perform the same full attachment once before and
+    # once after taking the recovery lock.  The lock-scoped check remains the
+    # authoritative admission and therefore preserves the fail-closed
+    # revalidation immediately before abandoned-tail inspection.
+    native_identity = root / "meta/tactile_bundle_v1/dataset_identity.cjson"
+    if native_identity.is_file():
         with _recovery_lock(root):
             assert_dataset_capture_writable(
                 root,
@@ -483,6 +484,16 @@ def prepare_dataset_capture_writable(
             stacklevel=2,
         )
         return result
+
+    try:
+        assert_dataset_capture_writable(
+            root,
+            tactile_bundle_root=tactile_bundle_root,
+        )
+    except UnownedTactileFilesError:
+        pass
+    else:
+        return DatasetCaptureRecoveryResult(recovered=False)
     with _recovery_lock(root):
         if journal.is_file():
             result = _apply_transaction(root, _read_json(journal))
