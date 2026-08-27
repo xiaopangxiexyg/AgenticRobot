@@ -120,8 +120,32 @@ def _safe_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "policy"
 
 
-def _pythonpath_with_project(project_root: Path, current: str | None) -> str:
+def _pythonpath_with_project(
+    project_root: Path,
+    current: str | None,
+    *,
+    openpi_root: Path | None = None,
+) -> str:
+    """Build an exec-time path with the pinned OpenPI sources first.
+
+    The OpenPI virtual environment may expose a different checkout through
+    site configuration (for example ``/home/user/zc/openpi/src``).  A
+    prepared profile, however, binds the server to one exact checkout.  Put
+    that checkout's source roots before the inherited path so the registry
+    and dataclass definitions used by the exec'd server are the same ones
+    used to prepare the checkpoint.  The project root remains first because
+    the prepared server runtime belongs to AgenticRobot.
+    """
+
     entries = [str(project_root.resolve())]
+    if openpi_root is not None:
+        resolved_openpi_root = openpi_root.expanduser().resolve()
+        for source_root in (
+            resolved_openpi_root / "src",
+            resolved_openpi_root / "packages" / "openpi-client" / "src",
+        ):
+            if source_root.is_dir():
+                entries.append(str(source_root))
     entries.extend(
         value
         for value in str(current or "").split(os.pathsep)
@@ -537,6 +561,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_pythonpath = _pythonpath_with_project(
         project_root,
         os.environ.get("PYTHONPATH"),
+        openpi_root=openpi_root,
     )
     if args.dry_run:
         print(

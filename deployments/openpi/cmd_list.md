@@ -1783,16 +1783,20 @@ prompt-family 模型，不是第 20 节的四个独立 checkpoint，也不是 mo
 
 ### 21.1 先做无硬件 contract/config 检查
 
-新 profile 必须先同步到远端 `/home/user/zc/DexTeleop`，并确认同步后的 Git 身份和 Task
-receipt；不要把训练运行目录中的临时 profile 直接当成部署源码。下面两条命令只读取
+新 profile 必须先同步到远端隔离快照
+`/home/user/zc/openpi_deployment_worktrees/AR-20260828-openpi-h32-deployment-r0`，并确认同步
+后的 Git 身份和 Task receipt；不要把训练运行目录中的临时 profile 或共享的脏 checkout 直接
+当成部署源码。下面两条命令只读取
 checkpoint/profile，不加载模型、不监听端口、不连接相机、夹爪或机械臂：
 
 ```bash
-cd /home/user/zc/DexTeleop
+export DEPLOY_ROOT=/home/user/zc/openpi_deployment_worktrees/AR-20260828-openpi-h32-deployment-r0
+export OPENPI_ROOT=/home/user/zc/openpi_all4_stage_runs/20260826T2349_front_right_h32_all4/code-openpi-97b37205/openpi
+cd "$DEPLOY_ROOT"
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 export CKPT_STEP=156211
 export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
-export PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json
+export PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json"
 
 python -u -m deployments.openpi.client.real \
   --checkpoint-dir "$OPENPI_CKPT" \
@@ -1803,7 +1807,7 @@ source /home/user/zc/openpi/.venv/bin/activate
 python -u -m deployments.openpi.server \
   --checkpoint-dir "$OPENPI_CKPT" \
   --prepared-training-profile "$PROFILE" \
-  --openpi-root /home/user/zc/openpi \
+  --openpi-root "$OPENPI_ROOT" \
   --prepared-config-check-only
 ```
 
@@ -1818,19 +1822,21 @@ profile 绕过。
 profile 前先由原进程 owner 用 `Ctrl+C` 正常停止并确认端口/GPU 已释放：
 
 ```bash
-cd /home/user/zc/DexTeleop
+export DEPLOY_ROOT=/home/user/zc/openpi_deployment_worktrees/AR-20260828-openpi-h32-deployment-r0
+export OPENPI_ROOT=/home/user/zc/openpi_all4_stage_runs/20260826T2349_front_right_h32_all4/code-openpi-97b37205/openpi
+cd "$DEPLOY_ROOT"
 source /home/user/zc/openpi/.venv/bin/activate
 export JAX_PLATFORMS=cuda
 export CUDA_VISIBLE_DEVICES=0
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
 export CKPT_STEP=156211
 export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
-export PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json
+export PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json"
 
 python -u -m deployments.openpi.server \
   --checkpoint-dir "$OPENPI_CKPT" \
   --prepared-training-profile "$PROFILE" \
-  --openpi-root /home/user/zc/openpi \
+  --openpi-root "$OPENPI_ROOT" \
   --host 0.0.0.0 \
   --port 8078
 ```
@@ -1845,11 +1851,12 @@ server；每次只在 client 侧选择一个 `--prompt-stage stage1|stage2|stage
 这仍然不是无硬件检查。先执行不连接设备的 21.1，再执行本段的 100-step no-action：
 
 ```bash
-cd /home/user/zc/DexTeleop
+export DEPLOY_ROOT=/home/user/zc/openpi_deployment_worktrees/AR-20260828-openpi-h32-deployment-r0
+cd "$DEPLOY_ROOT"
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 export CKPT_STEP=156211
 export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
-export PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json
+export PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json"
 export PROMPT_STAGE=stage1
 
 python -u -m deployments.openpi.client.real \
@@ -1916,11 +1923,13 @@ root、repeat weight、episode/window 计数、mask、h32/absolute 和 camera ro
 ### 22.1 无硬件检查和 server
 
 ```bash
-cd /home/user/zc/DexTeleop
+export DEPLOY_ROOT=/home/user/zc/openpi_deployment_worktrees/AR-20260828-openpi-h32-deployment-r0
+export OPENPI_ROOT=/home/user/zc/stage1_openpi_runs/20260824T0709_snapshot_v1/code-final10/AgenticRobot/model/openpi
+cd "$DEPLOY_ROOT"
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 export CKPT_STEP=120000
 export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-v1/writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-b1-nw1-v1/$CKPT_STEP
-export PROFILE=/home/user/zc/DexTeleop/deployments/openpi/configs/training/writing_stage1_all_valid_through_2026_08_21_front_right_wrist_h32_absolute_non_rtc_v1.json
+export PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/training/writing_stage1_all_valid_through_2026_08_21_front_right_wrist_h32_absolute_non_rtc_v1.json"
 
 python -u -m deployments.openpi.client.real \
   --checkpoint-dir "$OPENPI_CKPT" \
@@ -1934,7 +1943,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
 python -u -m deployments.openpi.server \
   --checkpoint-dir "$OPENPI_CKPT" \
   --prepared-training-profile "$PROFILE" \
-  --openpi-root /home/user/zc/openpi \
+  --openpi-root "$OPENPI_ROOT" \
   --prepared-config-check-only
 ```
 
@@ -1944,7 +1953,7 @@ python -u -m deployments.openpi.server \
 python -u -m deployments.openpi.server \
   --checkpoint-dir "$OPENPI_CKPT" \
   --prepared-training-profile "$PROFILE" \
-  --openpi-root /home/user/zc/openpi \
+  --openpi-root "$OPENPI_ROOT" \
   --host 0.0.0.0 \
   --port 8078
 ```
@@ -1956,8 +1965,12 @@ server 已通过 `/healthz`、`/metadata` 且现场明确授权连接 observatio
 qpos-init；该命令仍可能连接相机、夹爪和机械臂状态 backend：
 
 ```bash
-cd /home/user/zc/DexTeleop
+export DEPLOY_ROOT=/home/user/zc/openpi_deployment_worktrees/AR-20260828-openpi-h32-deployment-r0
+cd "$DEPLOY_ROOT"
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export CKPT_STEP=120000
+export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-v1/writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-b1-nw1-v1/$CKPT_STEP
+export PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/training/writing_stage1_all_valid_through_2026_08_21_front_right_wrist_h32_absolute_non_rtc_v1.json"
 python -u -m deployments.openpi.client.real \
   --host 127.0.0.1 \
   --port 8078 \
