@@ -1,8 +1,10 @@
 """Wired B601-RS adapter and commissioning measurements.
 
-The package is safe to import without ``motorbridge`` and does not open CAN or
-send a device command until an explicitly motion-authorized caller invokes one
-of the backend command methods.
+The package is safe to import without ``motorbridge`` and does not open CAN
+until an explicit ``connect()`` call.  The default feedback observation is
+receive-only; an active caller may explicitly request vendor feedback through
+``poll_feedback(request_feedback=True)``.  Motion commands still require an
+explicitly motion-authorized backend.
 """
 
 from .backend import (
@@ -21,6 +23,7 @@ from .backend import (
     B601_RS_DEFAULT_RATE_HZ,
     B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC,
     B601_RS_FEEDBACK_FRAME,
+    B601_RS_MECH_POS_PARAM_ID,
     B601_RS_POSITION_FRAME,
 )
 from robot_motion.rebot_b601_rs import B601_RS_ARM_JOINT_NAMES
@@ -43,6 +46,7 @@ __all__ = [
     "B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC",
     "B601_RS_ARM_JOINT_NAMES",
     "B601_RS_FEEDBACK_FRAME",
+    "B601_RS_MECH_POS_PARAM_ID",
     "B601_RS_POSITION_FRAME",
     "FrequencyLedger",
     "FrequencyStats",

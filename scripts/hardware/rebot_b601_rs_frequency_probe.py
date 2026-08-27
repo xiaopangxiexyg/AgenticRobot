@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Measure B601-RS feedback/bus timing without sending CAN commands.
+"""Measure B601-RS feedback/bus timing with a guarded active path.
 
 The default ``read-only`` mode opens a passive SocketCAN receive socket only.
 It does not construct MotorBridge, request feedback, enable a motor, or send a
 position/MIT frame.  ``offline`` provides deterministic smoke evidence.  The
 ``position`` mode is an explicit human-run handoff for a later commissioning
 stage and is fail-closed behind several command-line confirmations; it is not
-executed by the repository tests or by this development task.
+executed by the repository tests or by this development task.  Its feedback
+polls explicitly request one vendor snapshot per configured arm joint before
+consuming the receive queue; motion is still gated separately by the position
+mode confirmations.
 """
 
 from __future__ import annotations
@@ -285,14 +288,20 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         warmup_deadline = time.monotonic() + args.warmup_sec
         state = None
         while time.monotonic() < warmup_deadline:
-            state = backend.poll_feedback()
+            state = backend.poll_feedback(request_feedback=True)
             ledger.mark("feedback", state.receive_timestamp_sec)
             if state.valid and state.positions_rad is not None:
                 break
             time.sleep(0.005)
         if state is None or not state.valid or state.positions_rad is None:
+            fault_reason = (
+                "no feedback observation"
+                if state is None
+                else state.fault_reason or "snapshot did not contain six valid positions"
+            )
             raise FrequencyProbeError(
-                "no complete valid feedback snapshot arrived during warmup"
+                "no complete valid feedback snapshot arrived during warmup; "
+                f"last_fault={fault_reason}"
             )
         mode_receipt = backend.prepare_position_velocity_mode(joint_names=selected)
         if not mode_receipt.completed:
@@ -308,7 +317,7 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             now = time.monotonic()
             if now < next_deadline:
                 time.sleep(next_deadline - now)
-            state = backend.poll_feedback()
+            state = backend.poll_feedback(request_feedback=True)
             ledger.mark("feedback", state.receive_timestamp_sec)
             if not state.valid or state.positions_rad is None:
                 stop_reason = state.fault_reason or "invalid feedback"
@@ -384,7 +393,7 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         "frequency": ledger.as_dict(target_hz=target_hz),
         "notes": [
             "Human-run commissioning handoff only; this mode is never executed by automated tests.",
-            "It holds the latest observed position and does not request feedback frames.",
+            "It requests one vendor feedback snapshot per arm joint before each active poll and holds the latest valid position.",
             "The position command is capped by --velocity-limit-rad-s and the YAML per-joint limits.",
         ],
     }
@@ -397,7 +406,9 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="B601-RS passive CAN timing probe; position mode is explicitly guarded."
+        description=(
+            "B601-RS CAN timing probe; read-only by default, position mode is explicitly guarded."
+        )
     )
     parser.add_argument("--mode", choices=("read-only", "offline", "position"), default="read-only")
     parser.add_argument("--channel", default="can0")

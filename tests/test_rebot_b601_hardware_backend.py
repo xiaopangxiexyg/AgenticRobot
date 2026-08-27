@@ -72,6 +72,7 @@ class _FakeMotor:
     def __init__(self, motor_id: int, *, state: object | None = None) -> None:
         self.motor_id = motor_id
         self.state = state
+        self.position_param: float | None = None
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.fail_method: str | None = None
 
@@ -83,6 +84,15 @@ class _FakeMotor:
     def get_state(self) -> object | None:
         self._call("get_state")
         return self.state
+
+    def request_feedback(self) -> None:
+        self._call("request_feedback")
+
+    def robstride_get_param_f32(self, *args: object) -> float:
+        self._call("robstride_get_param_f32", *args)
+        if self.position_param is None:
+            raise RuntimeError("synthetic position parameter unavailable")
+        return self.position_param
 
     def ensure_mode(self, *args: object) -> None:
         self._call("ensure_mode", *args)
@@ -129,6 +139,7 @@ def _populate_states(controller: _FakeController) -> None:
             vel=0.0,
             torq=0.0,
         )
+        motor.position_param = 0.1 * index
 
 
 def test_config_parser_keeps_explicit_arm_order_and_excludes_gripper() -> None:
@@ -160,6 +171,64 @@ def test_connect_and_poll_do_not_request_feedback_or_enable() -> None:
     assert state.freshness_semantics == "poll_observation_unverified"
     assert state.positions_rad == pytest.approx(tuple(0.1 * index for index in range(1, 7)))
     assert all(call[0] == "get_state" for motor in controller.motors.values() for call in motor.calls)
+
+
+def test_active_feedback_poll_requests_each_configured_arm_joint() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+
+    backend.connect()
+    _populate_states(controller)
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is True
+    assert controller.calls == [f"add:{index}" for index in range(1, 7)] + [
+        "poll_feedback_once"
+    ]
+    assert all(
+        motor.calls == [
+            ("request_feedback", ()),
+            ("get_state", ()),
+            ("robstride_get_param_f32", (0x7019, 100)),
+        ]
+        for motor in controller.motors.values()
+    )
+
+
+def test_active_feedback_poll_uses_mech_pos_when_motor_state_cache_is_empty() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+
+    backend.connect()
+    for index, motor in controller.motors.items():
+        motor.position_param = 0.1 * index
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is True
+    assert state.positions_rad == pytest.approx(tuple(0.1 * index for index in range(1, 7)))
+    assert state.velocities_reported is None
+    assert all(
+        joint.position_source == "robstride_mech_pos_parameter"
+        for joint in state.joints
+    )
+
+
+def test_active_feedback_request_failure_is_invalid_and_fail_closed() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+
+    backend.connect()
+    _populate_states(controller)
+    controller.motors[2].fail_method = "request_feedback"
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is False
+    assert state.stale is True
+    assert "joint2.request_feedback: synthetic request_feedback failure" in (
+        state.fault_reason or ""
+    )
 
 
 def test_empty_feedback_is_invalid_and_never_silently_zero_filled() -> None:
@@ -378,7 +447,9 @@ class _FakePositionProbeBackend:
     def connect(self) -> None:
         self.calls.append("connect")
 
-    def poll_feedback(self) -> object:
+    def poll_feedback(self, *, request_feedback: bool = False) -> object:
+        if request_feedback:
+            self.calls.append("request_feedback")
         self.calls.append("poll_feedback")
         self.sequence += 1
         return SimpleNamespace(

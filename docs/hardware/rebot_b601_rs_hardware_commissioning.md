@@ -11,8 +11,12 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
 - 从显式的 `rebotarm_rs.yaml` 读取 `can0`、六个 arm 电机 ID、反馈 ID、型号和 POS_VEL
   默认速度上限；夹爪 ID7 不在第一版 arm backend 内；
 - `connect()` 只打开本地 controller 并注册 RS 电机，不请求反馈、不切模式、不使能；
-- `poll_feedback()` 只调用 `poll_feedback_once()` 消费已有接收队列，缺失/错误 ID/非零
-  vendor status/非有限值会生成 `invalid/stale` 状态，绝不补成零；
+- `poll_feedback()` 默认只调用 `poll_feedback_once()` 消费已有接收队列；显式传入
+  `request_feedback=True` 的 active commissioning loop 会先对六个 arm 电机各发送一次
+  `request_feedback()`，再消费接收队列，并读取 RobStride `mechPos` 参数 `0x7019`（该
+  firmware 的紧凑 type-0x18 位置流不由 MotorBridge 0.4.9 解码）。两条路径对缺失/错误
+  ID/非零 vendor status/非有限值都生成 `invalid/stale` 状态，绝不补成零；active position
+  fallback 可能没有 velocity/torque 字段，力控调用必须单独检查对应字段存在；
 - MotorBridge 0.4.9 的 `MotorState` 没有源时间戳或接收序号，所以反馈状态明确标为
   `freshness_verified=false`、`poll_observation_unverified`，报告的 `vel/torq` 也保留
   `vendor_reported_unverified` 语义；
@@ -57,8 +61,8 @@ misses。被动 CAN 探针还会按 arbitration ID 报告帧数和间隔，但�
    总线状态、每 ID 帧率、错误/丢包和时间间隔。任何第二个控制 owner、未知发送源、帧
    解释不清或急停不可用都停止。
 3. **P2 backend 只读**：使用明确 RS YAML 构造 backend，确认六个 arm ID 顺序、位置符号、
-   空反馈/错误 status 的 fail-closed 行为；此阶段不调用 request_feedback、mode、enable
-   或 send。
+   空反馈/错误 status 的 fail-closed 行为；默认 `poll_feedback()` 不调用
+   `request_feedback`、mode、enable 或 send。
 4. **P3 高频 POS_VEL**：仅由操作者运行下方 guarded command。先 125 Hz，再 250 Hz，
    最后才评估 500 Hz；每档均须机械支撑、物理急停、唯一控制 owner、`--auto-disable`，
    并保存 `feedback/compute/tx` 三个 event 的独立统计。只保持启动时反馈位置，不引入
@@ -99,8 +103,9 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 
 这是 P3 的 motion-capable handoff，必须由操作者在同一有线主机上运行。先把
 `REBOT_RS_CONFIG` 指向已审查的 `rebotarm_rs.yaml`，并确认现场支撑/急停/唯一 owner；命令
-会设置 POS_VEL、使能所选 arm 电机、发送保持当前位置的命令，并在退出时显式失能。它不
-请求反馈帧，但由于 MotorBridge 缺少源序号，输出仍会标记 feedback freshness 未验证。
+会在每次 active poll 前对六个 arm 电机请求反馈并读取 `mechPos (0x7019)`，设置 POS_VEL、
+使能所选 arm 电机、发送保持当前位置的命令，并在退出时显式失能。反馈/参数读取不是运动
+命令；由于 MotorBridge 缺少源序号，输出仍会标记 feedback freshness 未验证。
 
 ```bash
 export REBOT_RS_CONFIG=/path/to/reBotArm_control_py/config/rebotarm_rs.yaml
