@@ -2208,7 +2208,7 @@ def run_real_teleop(
                 "TCP",
                 "legacy --tcp-mode rm_eef was requested; runtime now uses tool_tcp actions.",
             )
-        _arm_after_start_calibration(
+        startup_arm_admitted = _arm_after_start_calibration(
             args,
             components,
             clutch_input,
@@ -2220,6 +2220,12 @@ def run_real_teleop(
                 else None
             ),
         )
+        if not startup_arm_admitted:
+            _log(
+                "Calibration",
+                "runtime Home did not produce an arm-admission receipt; "
+                "entering the control loop in Hold with dispatch disabled.",
+            )
         position_admittance_active = bool(
             getattr(args, "position_admittance_active", False)
         )

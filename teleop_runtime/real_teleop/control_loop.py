@@ -965,6 +965,67 @@ def _reconcile_idle_progress_entry_arm_control(
     return plan, None, False
 
 
+def _apply_pending_progress_arm_target_after_home(
+    *,
+    components: Any,
+    pending: PendingProgressArmTransition,
+    now: float,
+) -> tuple[bool, str]:
+    """Stage the profile's exact Fix authority while the Session is held.
+
+    The preceding Hold deliberately removes active Fix authority, but retains
+    the last accepted command/channel snapshots for a profile transition.  A
+    target of no fixed sides is just as meaningful as a single fixed side and
+    must be verified explicitly before the progress mutation can commit.
+    """
+
+    controller = getattr(components, "fix_arm_controller", None)
+    if controller is None:
+        return False, "FixArm controller unavailable"
+    target_fixed = tuple(pending.plan.target_fixed_sides)
+    actual_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
+    if actual_fixed == target_fixed:
+        return True, "target Fix authority already staged"
+
+    cancel_active = getattr(controller, "cancel_active", None)
+    if actual_fixed:
+        if not callable(cancel_active):
+            return False, "FixArm controller cannot clear prior authority"
+        transition = cancel_active(
+            now=now,
+            reason="progress arm target replacement",
+            clear_snapshots=False,
+        )
+        if not bool(getattr(transition, "ok", False)):
+            return False, str(
+                getattr(transition, "message", "prior Fix authority release failed")
+            )
+
+    if not target_fixed:
+        actual_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
+        if actual_fixed:
+            return False, f"expected live/live but fixed_sides={actual_fixed!r}"
+        return True, "live/live authority staged"
+    if len(target_fixed) != 1:
+        return False, f"unsupported target fixed_sides={target_fixed!r}"
+
+    select_side = getattr(controller, "select_side", None)
+    freeze_selected = getattr(controller, "freeze_selected", None)
+    if not callable(select_side) or not callable(freeze_selected):
+        return False, "FixArm controller cannot establish target authority"
+    transition = select_side(target_fixed[0])
+    if bool(getattr(transition, "ok", False)):
+        transition = freeze_selected(now=now)
+    if not bool(getattr(transition, "ok", False)):
+        return False, str(getattr(transition, "message", "target Fix failed"))
+    actual_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
+    if actual_fixed != target_fixed:
+        return False, (
+            f"expected fixed_sides={target_fixed!r} but actual={actual_fixed!r}"
+        )
+    return True, "target Fix authority staged"
+
+
 @dataclass(frozen=True)
 class RealTeleopControlLoopContext:
     action_debug_log_recorder: Any
@@ -1717,12 +1778,12 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 _log("Progress", message, now=loop_start)
                 if control_ui is not None:
                     control_ui.append_message("Progress", message)
-        progress_enabled = bool(
-            not context.collection_transition_active()
-            and dataset_recorder is not None
+        collection_transition_pending = context.collection_transition_active()
+        progress_configured = bool(
+            dataset_recorder is not None
             and getattr(dataset_recorder, "progress_profile", None) is not None
         )
-        if not progress_enabled:
+        if not progress_configured:
             progress_workflow = None
             progress_workflow_recorder = None
             promotable_hold_pause = None
@@ -1730,23 +1791,29 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             progress_arm_entry_snapshot_wait_step_id = ""
             progress_arm_entry_episode_hash = ""
         elif progress_workflow_recorder is not dataset_recorder:
-            build_workflow = getattr(
-                clutch_input,
-                "build_progress_workflow",
-                None,
-            )
-            if not callable(build_workflow):
-                raise RuntimeError(
-                    "Progress application workflow binding is unavailable."
-                )
-            progress_workflow = build_workflow(dataset_recorder)
-            progress_workflow_recorder = dataset_recorder
+            # A recorder identity change invalidates the old workflow and its
+            # pending arm transaction.  Build the new binding only after the
+            # collection control-plane has published a stable recorder.
+            progress_workflow = None
+            progress_workflow_recorder = None
             promotable_hold_pause = None
             pending_progress_arm_transition = None
             progress_arm_entry_snapshot_wait_step_id = ""
             progress_arm_entry_episode_hash = ""
+            if not collection_transition_pending:
+                build_workflow = getattr(
+                    clutch_input,
+                    "build_progress_workflow",
+                    None,
+                )
+                if not callable(build_workflow):
+                    raise RuntimeError(
+                        "Progress application workflow binding is unavailable."
+                    )
+                progress_workflow = build_workflow(dataset_recorder)
+                progress_workflow_recorder = dataset_recorder
         progress_failure_pending = False
-        if progress_workflow is not None:
+        if progress_workflow is not None and not collection_transition_pending:
             progress_callbacks = {
                 "request_application_hold": (
                     lambda reason: clutch_input.request_hold(reason=reason)
@@ -2776,7 +2843,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             clutch_input._two_pedal_transition_target_fixed_side = (
                 fast_two_pedal_fixed_side
             )
-            _arm_after_start_calibration(
+            arm_admitted = _arm_after_start_calibration(
                 args,
                 components,
                 clutch_input,
@@ -2793,6 +2860,16 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     else None
                 ),
             )
+            if not arm_admitted:
+                clutch_input.finish_two_pedal_fast_home(
+                    success=False,
+                    now=loop_start,
+                    message=(
+                        "双踏板快速 Home 已采集，但机械臂安全接入未完成；"
+                        "保持 Hold，未提交目标遥操状态，请检查提示后重试。"
+                    ),
+                )
+                continue
             reset_position_admittance_shadow(
                 sides=(
                     (fast_two_pedal_fixed_side,)
@@ -2823,6 +2900,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 components,
                 now=loop_start,
                 reason="runtime_recalibration_requested",
+                clear_fix_snapshots=profile_home_pending is None,
             )
             cancel_recording_countdown(loop_start, reason="runtime_recalibration_requested")
             recovery_plan = None
@@ -2903,50 +2981,61 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     )
                 continue
             if profile_home_pending is not None:
-                if profile_home_pending.plan.target_fixed_sides:
-                    target_fixed = (
-                        profile_home_pending.plan.target_fixed_sides
+                progress_transaction_blocker = (
+                    "collection lifecycle transition active"
+                    if context.collection_transition_active()
+                    else (
+                        "progress workflow unavailable"
+                        if (
+                            profile_home_pending.intent is not None
+                            and progress_workflow is None
+                        )
+                        else ""
                     )
-                    fix_controller = getattr(
-                        components,
-                        "fix_arm_controller",
-                        None,
+                )
+                if progress_transaction_blocker:
+                    message = (
+                        "目标活动臂 Home 已采集，但 progress mutation 当前不可提交；"
+                        "保持原 progress 与 Hold/Pause："
+                        f"{progress_transaction_blocker}。"
                     )
-                    transition = None
-                    if fix_controller is not None and len(target_fixed) == 1:
-                        transition = fix_controller.select_side(
-                            target_fixed[0]
-                        )
-                        if transition.ok:
-                            transition = fix_controller.freeze_selected(
-                                now=loop_start
-                            )
-                    if (
-                        transition is None
-                        or not transition.ok
-                        or tuple(
-                            getattr(fix_controller, "fixed_sides", ()) or ()
-                        )
-                        != target_fixed
-                    ):
-                        message = (
-                            "目标子任务 Home 完成后无法从 Hold 边界快照建立精确 "
-                            "arm+end-effector Fix；保持旧子任务与 Hold/Pause："
-                            + (
-                                str(getattr(transition, "message", ""))
-                                if transition is not None
-                                else "FixArm controller unavailable"
-                            )
-                        )
-                        _log("Progress", message, now=loop_start)
-                        if control_ui is not None:
+                    _log("Progress", message, now=loop_start)
+                    if control_ui is not None:
+                        try:
                             control_ui.append_message("Progress", message)
-                        clutch_input.request_hold(
-                            reason="progress_arm_profile_transition"
-                        )
-                        continue
+                        except Exception as exc:  # noqa: BLE001 - UI is observational.
+                            _log(
+                                "Progress",
+                                "progress transaction blocker UI publish failed: "
+                                f"{type(exc).__name__}: {exc}",
+                                now=loop_start,
+                            )
+                    clutch_input.request_hold(
+                        reason="progress_arm_profile_transition"
+                    )
+                    continue
+                arm_target_ready, arm_target_detail = (
+                    _apply_pending_progress_arm_target_after_home(
+                        components=components,
+                        pending=profile_home_pending,
+                        now=loop_start,
+                    )
+                )
+                if not arm_target_ready:
+                    message = (
+                        "目标子任务 Home 完成后无法从 Hold 边界快照建立精确 "
+                        "arm+end-effector 权限；保持原 progress 与 Hold/Pause："
+                        f"{arm_target_detail}"
+                    )
+                    _log("Progress", message, now=loop_start)
+                    if control_ui is not None:
+                        control_ui.append_message("Progress", message)
+                    clutch_input.request_hold(
+                        reason="progress_arm_profile_transition"
+                    )
+                    continue
             _emit_home_alignment_logs(components)
-            _arm_after_start_calibration(
+            arm_admitted = _arm_after_start_calibration(
                 args,
                 components,
                 clutch_input,
@@ -2963,6 +3052,19 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     else None
                 ),
             )
+            if not arm_admitted:
+                if profile_home_pending is not None:
+                    message = (
+                        "目标活动臂 Home 已采集，但机械臂安全接入未完成；"
+                        "保持原 progress 与 Hold/Pause，本次切换未提交。"
+                    )
+                    _log("Progress", message, now=loop_start)
+                    if control_ui is not None:
+                        control_ui.append_message("Progress", message)
+                    clutch_input.request_hold(
+                        reason="progress_arm_profile_transition"
+                    )
+                continue
             reset_position_admittance_shadow(
                 sides=(
                     profile_home_pending.capture_sides
@@ -2973,29 +3075,78 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 now=loop_start,
             )
             if profile_home_pending is not None:
-                if (
-                    profile_home_pending.intent is not None
-                    and progress_workflow is not None
-                    and not context.collection_transition_active()
-                ):
-                    progress_result = progress_workflow.handle_command(
-                        profile_home_pending.intent,
-                        now=time.time(),
-                        application_held=False,
-                        promotable_hold_pause=None,
-                        **progress_callbacks,
-                    )
+                if profile_home_pending.intent is not None:
+                    assert progress_workflow is not None
+                    try:
+                        progress_result = progress_workflow.handle_command(
+                            profile_home_pending.intent,
+                            now=time.time(),
+                            application_held=False,
+                            promotable_hold_pause=None,
+                            **progress_callbacks,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - idempotent intent remains pending.
+                        message = (
+                            "目标机械臂权限已建立，但 progress mutation 未获得提交回执；"
+                            "重新进入 Hold/Pause 并保留同一 intent："
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        _log("Progress", message, now=loop_start)
+                        if control_ui is not None:
+                            try:
+                                control_ui.append_message("Progress", message)
+                            except Exception as ui_exc:  # noqa: BLE001 - preserve transaction failure.
+                                _log(
+                                    "Progress",
+                                    "progress failure UI publish failed: "
+                                    f"{type(ui_exc).__name__}: {ui_exc}",
+                                    now=loop_start,
+                                )
+                        clutch_input.request_hold(
+                            reason="progress_arm_profile_transition"
+                        )
+                        continue
+                    if not bool(progress_result.handled):
+                        message = (
+                            "目标机械臂权限已建立，但 progress workflow 未确认处理；"
+                            "保持同一 intent 与 Hold/Pause，本次切换未提交："
+                            f"phase={progress_result.phase} "
+                            f"message={progress_result.message}"
+                        )
+                        _log("Progress", message, now=loop_start)
+                        if control_ui is not None:
+                            try:
+                                control_ui.append_message("Progress", message)
+                            except Exception as exc:  # noqa: BLE001 - UI is observational.
+                                _log(
+                                    "Progress",
+                                    "unhandled progress receipt UI publish failed: "
+                                    f"{type(exc).__name__}: {exc}",
+                                    now=loop_start,
+                                )
+                        clutch_input.request_hold(
+                            reason="progress_arm_profile_transition"
+                        )
+                        continue
                     if control_ui is not None:
                         target_label = (
                             "目标 arm+end-effector Fix 与活动臂 Home"
                             if profile_home_pending.plan.target_fixed_sides
                             else "目标活动臂 Home"
                         )
-                        control_ui.append_message(
-                            "Progress",
-                            f"{target_label}已建立，子任务切换已提交："
-                            f"{progress_result.phase}。",
-                        )
+                        try:
+                            control_ui.append_message(
+                                "Progress",
+                                f"{target_label}已建立，子任务切换已提交："
+                                f"{progress_result.phase}。",
+                            )
+                        except Exception as exc:  # noqa: BLE001 - commit is authoritative.
+                            _log(
+                                "Progress",
+                                "committed progress UI publish failed: "
+                                f"{type(exc).__name__}: {exc}",
+                                now=loop_start,
+                            )
                 active_episode = getattr(
                     dataset_recorder,
                     "active_progress_episode",

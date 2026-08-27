@@ -1899,7 +1899,7 @@ def test_tcp_pose_envelope_home_rebind_precedes_real_hardware_arm(
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
 
-    startup_runtime._arm_after_start_calibration(
+    admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
         components,
         clutch,
@@ -1913,6 +1913,7 @@ def test_tcp_pose_envelope_home_rebind_precedes_real_hardware_arm(
     assert events.index("rebind:4") < events.index("arm_hardware")
     assert "hold_hardware" not in events
     assert events[-1] == "teleop_running"
+    assert admitted is True
 
 
 def test_startup_home_continuity_gate_arms_before_real_hardware(
@@ -1958,7 +1959,7 @@ def test_startup_home_continuity_gate_arms_before_real_hardware(
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
 
-    startup_runtime._arm_after_start_calibration(
+    admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
         components,
         clutch,
@@ -1968,6 +1969,158 @@ def test_startup_home_continuity_gate_arms_before_real_hardware(
 
     assert events.index("continuity_armed") < events.index("arm_hardware")
     assert "hold_hardware" not in events
+    assert admitted is True
+
+
+def test_startup_home_continuity_failure_returns_negative_arm_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    home_qpos = {"left": np.zeros(6), "right": np.zeros(6)}
+    monkeypatch.setattr(
+        startup_runtime,
+        "_reset_runtime_motion_state_from_real_qpos",
+        lambda *args, **kwargs: {"left": True, "right": True},
+    )
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: events.append("force_enable"),
+    )
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+
+    class FailingContinuityGate:
+        def arm_from_home(self, qpos_by_side):
+            assert qpos_by_side is home_qpos
+            events.append("continuity_failed")
+            raise RuntimeError("candidate discontinuity")
+
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        dual_arm_retargeter=None,
+        position_reference_publisher=SimpleNamespace(reset_epoch=lambda: 8),
+        position_admittance_endpoint_guard=None,
+        startup_home_continuity_gate=FailingContinuityGate(),
+        session=SimpleNamespace(
+            hold_hardware=lambda reason: events.append("hold_hardware"),
+            mark_home_recalibrated=lambda reason: events.append("mark_home"),
+            set_calibration_ready=lambda: events.append("calibration_ready"),
+            mark_debug_passed=lambda: events.append("debug_passed"),
+            arm_hardware=lambda: events.append("arm_hardware"),
+        ),
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
+    )
+
+    admitted = startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=True,
+        runtime_home_qpos_snapshot=home_qpos,
+    )
+
+    assert admitted is False
+    assert events == ["continuity_failed", "hold_hardware", "waiting"]
+
+
+def test_session_arm_admission_failure_returns_to_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: events.append("force_enable"),
+    )
+
+    def fail_arm() -> None:
+        events.append("arm_attempt")
+        raise RuntimeError("rig not ready")
+
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        dual_arm_retargeter=None,
+        position_reference_publisher=None,
+        session=SimpleNamespace(
+            set_calibration_ready=lambda: events.append("calibration_ready"),
+            mark_debug_passed=lambda: events.append("debug_passed"),
+            arm_hardware=fail_arm,
+            hold_hardware=lambda reason: events.append("hold_hardware"),
+        ),
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
+    )
+
+    admitted = startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=False,
+    )
+
+    assert admitted is False
+    assert events == [
+        "calibration_ready",
+        "debug_passed",
+        "force_enable",
+        "arm_attempt",
+        "hold_hardware",
+        "waiting",
+    ]
+
+
+def test_application_projection_failure_reholds_armed_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: None,
+    )
+
+    def fail_projection(**kwargs) -> None:
+        del kwargs
+        events.append("projection_attempt")
+        raise RuntimeError("station disconnected")
+
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        dual_arm_retargeter=None,
+        position_reference_publisher=None,
+        session=SimpleNamespace(
+            set_calibration_ready=lambda: events.append("calibration_ready"),
+            mark_debug_passed=lambda: events.append("debug_passed"),
+            arm_hardware=lambda: events.append("arm_hardware"),
+            hold_hardware=lambda reason: events.append("hold_hardware"),
+        ),
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=fail_projection,
+    )
+
+    admitted = startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=False,
+    )
+
+    assert admitted is False
+    assert events[-4:] == [
+        "arm_hardware",
+        "projection_attempt",
+        "hold_hardware",
+        "waiting",
+    ]
 
 
 def test_relative_tcp_pose_envelope_refuses_arm_without_runtime_home(
@@ -2003,7 +2156,7 @@ def test_relative_tcp_pose_envelope_refuses_arm_without_runtime_home(
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
 
-    startup_runtime._arm_after_start_calibration(
+    admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
         components,
         clutch,
@@ -2011,6 +2164,7 @@ def test_relative_tcp_pose_envelope_refuses_arm_without_runtime_home(
     )
 
     assert events == ["hold_hardware", "waiting"]
+    assert admitted is False
 
 
 def test_shadow_relative_tcp_pose_envelope_never_blocks_arm_without_home(
@@ -2046,7 +2200,7 @@ def test_shadow_relative_tcp_pose_envelope_never_blocks_arm_without_home(
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
 
-    startup_runtime._arm_after_start_calibration(
+    admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
         components,
         clutch,
@@ -2062,6 +2216,130 @@ def test_shadow_relative_tcp_pose_envelope_never_blocks_arm_without_home(
         "arm_hardware",
         "teleop_running",
     ]
+    assert admitted is True
+
+
+class _ProgressArmTargetController:
+    def __init__(self, fixed_sides: tuple[str, ...]) -> None:
+        self.fixed_sides = fixed_sides
+        self.selected_side = ""
+        self.cancel_clear_snapshots: list[bool] = []
+
+    def cancel_active(self, *, now: float, reason: str, clear_snapshots: bool):
+        del now, reason
+        self.cancel_clear_snapshots.append(clear_snapshots)
+        was_fixed = bool(self.fixed_sides)
+        self.fixed_sides = ()
+        return SimpleNamespace(ok=was_fixed, message="released")
+
+    def select_side(self, side: str):
+        self.selected_side = side
+        return SimpleNamespace(ok=True, message="selected")
+
+    def freeze_selected(self, *, now: float):
+        del now
+        self.fixed_sides = (self.selected_side,)
+        return SimpleNamespace(ok=True, message="fixed")
+
+
+@pytest.mark.parametrize(
+    ("initial_fixed", "target_fixed"),
+    [
+        (("left",), ()),
+        ((), ("right",)),
+        (("left",), ("right",)),
+    ],
+)
+def test_progress_arm_target_after_home_reaches_exact_authority(
+    initial_fixed: tuple[str, ...],
+    target_fixed: tuple[str, ...],
+) -> None:
+    controller = _ProgressArmTargetController(initial_fixed)
+    pending = SimpleNamespace(
+        plan=SimpleNamespace(target_fixed_sides=target_fixed)
+    )
+
+    ready, detail = control_loop._apply_pending_progress_arm_target_after_home(
+        components=SimpleNamespace(fix_arm_controller=controller),
+        pending=pending,
+        now=12.0,
+    )
+
+    assert ready is True, detail
+    assert controller.fixed_sides == target_fixed
+    assert controller.cancel_clear_snapshots in ([], [False])
+
+
+def test_progress_home_arm_receipt_precedes_progress_commit() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    explicit_home = source[
+        source.index("if clutch_input.consume_calibration_request():") :
+        source.index("episode_delete_index =", source.index("if clutch_input.consume_calibration_request():"))
+    ]
+
+    target_index = explicit_home.index(
+        "_apply_pending_progress_arm_target_after_home("
+    )
+    arm_index = explicit_home.index(
+        "arm_admitted = _arm_after_start_calibration("
+    )
+    negative_receipt_index = explicit_home.index("if not arm_admitted:")
+    progress_commit_index = explicit_home.index("progress_workflow.handle_command(")
+    handled_receipt_index = explicit_home.index(
+        "if not bool(progress_result.handled):"
+    )
+    clear_pending_index = explicit_home.index(
+        "pending_progress_arm_transition = None"
+    )
+
+    assert target_index < arm_index < negative_receipt_index
+    assert (
+        negative_receipt_index
+        < progress_commit_index
+        < handled_receipt_index
+        < clear_pending_index
+    )
+    assert "clear_fix_snapshots=profile_home_pending is None" in explicit_home
+    assert 'reason="progress_arm_profile_transition"' in explicit_home[
+        negative_receipt_index:progress_commit_index
+    ]
+    assert "progress transaction blocker" in explicit_home
+
+
+def test_collection_transition_suspends_progress_without_clearing_same_binding() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    binding = source[
+        source.index("collection_transition_pending =") :
+        source.index("_latch_unreceipted_progress_failure_hold(")
+    ]
+
+    assert "progress_configured = bool(" in binding
+    assert "not context.collection_transition_active()" not in binding[
+        : binding.index("if not progress_configured:")
+    ]
+    assert (
+        "if progress_workflow is not None and not collection_transition_pending:"
+        in binding
+    )
+    recorder_change = binding[
+        binding.index("elif progress_workflow_recorder is not dataset_recorder:") :
+        binding.index("progress_failure_pending = False")
+    ]
+    assert "if not collection_transition_pending:" in recorder_change
+
+
+def test_two_pedal_home_requires_arm_receipt_before_success() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    fast_home = source[
+        source.index("fast_two_pedal_fixed_side =") :
+        source.index("if clutch_input.consume_calibration_request():")
+    ]
+
+    arm_index = fast_home.index("arm_admitted = _arm_after_start_calibration(")
+    failure_index = fast_home.index("if not arm_admitted:", arm_index)
+    success_index = fast_home.index("success=True", failure_index)
+    assert arm_index < failure_index < success_index
+    assert "continue" in fast_home[failure_index:success_index]
 
 
 def test_active_tcp_pose_envelope_fault_has_explicit_pre_dispatch_hold_path() -> None:

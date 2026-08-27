@@ -812,9 +812,41 @@ def _arm_after_start_calibration(
     position_force_guard_monitor: object | None = None,
     runtime_home_qpos_snapshot: Mapping[str, np.ndarray] | None = None,
     runtime_home_capture_sides: tuple[str, ...] | None = None,
-) -> None:
+) -> bool:
+    """Try to admit real-arm control after Home and report the outcome.
+
+    ``home_captured`` only describes the calibration input.  A ``True``
+    receipt additionally means every pre-arm continuity/safety gate completed,
+    the Session reached ARMED, and the application projection was published.
+    Failures that are deliberately consumed here return ``False`` after
+    keeping the runtime in Hold; callers must not commit a profile/progress
+    transition from the Home receipt alone.
+    """
     arm_after_start = time.perf_counter()
     reset_elapsed_ms = 0.0
+
+    def reject_arm_admission(tag: str, message: str) -> bool:
+        """Keep motion blocked when a post-Home admission step fails."""
+
+        _log(tag, message)
+        try:
+            components.session.hold_hardware(message)
+        except Exception as hold_exc:  # noqa: BLE001 - preserve the admission cause.
+            _log(
+                tag,
+                "arm-admission Hold failed after the original error: "
+                f"{type(hold_exc).__name__}: {hold_exc}",
+            )
+        try:
+            clutch_input.publish_calibration_waiting(message)
+        except Exception as publish_exc:  # noqa: BLE001 - UI cannot reopen motion.
+            _log(
+                tag,
+                "arm-admission failure UI publish failed: "
+                f"{type(publish_exc).__name__}: {publish_exc}",
+            )
+        return False
+
     if home_captured:
         reset_start = time.perf_counter()
         try:
@@ -839,7 +871,7 @@ def _arm_after_start_calibration(
             clutch_input.publish_calibration_waiting(
                 message + " 请检查机械臂状态后重试。"
             )
-            return
+            return False
         reset_elapsed_ms = (time.perf_counter() - reset_start) * 1000.0
         _log("Calibration", f"runtime restart motion state reset from live real qpos synced={synced}")
         startup_continuity_gate = getattr(
@@ -860,7 +892,7 @@ def _arm_after_start_calibration(
                 _log("StartupHomeContinuity", message)
                 components.session.hold_hardware(message)
                 clutch_input.publish_calibration_waiting(message)
-                return
+                return False
             _log(
                 "StartupHomeContinuity",
                 f"armed receipt={continuity_snapshot}",
@@ -871,9 +903,17 @@ def _arm_after_start_calibration(
             None,
         )
         if endpoint_guard is not None:
-            endpoint_guard_snapshot = endpoint_guard.reset_anchor_from_qpos(
-                runtime_home_qpos_snapshot
-            )
+            try:
+                endpoint_guard_snapshot = endpoint_guard.reset_anchor_from_qpos(
+                    runtime_home_qpos_snapshot
+                )
+            except Exception as exc:  # noqa: BLE001 - Active guard fails closed.
+                return reject_arm_admission(
+                    "PositionAdmittance",
+                    "Active endpoint excursion guard 无法绑定 runtime Home，"
+                    "保持停臂："
+                    f"{type(exc).__name__}: {exc}",
+                )
             _log(
                 "PositionAdmittance",
                 "Active endpoint excursion guard armed from runtime Home: "
@@ -902,11 +942,18 @@ def _arm_after_start_calibration(
                     clutch_input.publish_calibration_waiting(
                         message + " 请检查急停确认/机械臂状态后再重试。"
                     )
-                    return
+                    return False
     state_machine_start = time.perf_counter()
     reference_epoch: int | None = None
     if components.position_reference_publisher is not None:
-        reference_epoch = components.position_reference_publisher.reset_epoch()
+        try:
+            reference_epoch = components.position_reference_publisher.reset_epoch()
+        except Exception as exc:  # noqa: BLE001 - reference reset is authoritative.
+            return reject_arm_admission(
+                "PositionReference",
+                "runtime Home 后位置参考 epoch 复位失败，保持停臂："
+                f"{type(exc).__name__}: {exc}",
+            )
     retargeter = getattr(components, "dual_arm_retargeter", None)
     safety_filter = (
         None
@@ -956,7 +1003,7 @@ def _arm_after_start_calibration(
                     _log("TCPPoseEnvelope", message)
                     components.session.hold_hardware(message)
                     clutch_input.publish_calibration_waiting(message)
-                    return
+                    return False
                 _log(
                     "TCPPoseEnvelope",
                     "Shadow runtime Home binding failed; observation remains "
@@ -971,7 +1018,16 @@ def _arm_after_start_calibration(
                 f"sides={list(runtime_home_capture_sides or components.active_sides)} "
                 f"anchor_hash={None if anchor is None else anchor.semantic_content_hash}",
             )
-        components.session.mark_home_recalibrated("RM65 runtime home captured")
+        try:
+            components.session.mark_home_recalibrated(
+                "RM65 runtime home captured"
+            )
+        except Exception as exc:  # noqa: BLE001 - Session must own the receipt.
+            return reject_arm_admission(
+                "Calibration",
+                "runtime Home 无法写入 Session 校准回执，保持停臂："
+                f"{type(exc).__name__}: {exc}",
+            )
     elif anchor_required_sides and safety_filter_active:
         message = (
             "TCP Pose 相对安全运行区间需要本次运行的 runtime Home；"
@@ -980,34 +1036,62 @@ def _arm_after_start_calibration(
         _log("TCPPoseEnvelope", message)
         components.session.hold_hardware(message)
         clutch_input.publish_calibration_waiting(message)
-        return
-    components.session.set_calibration_ready()
-    components.session.mark_debug_passed()
+        return False
+    try:
+        components.session.set_calibration_ready()
+        components.session.mark_debug_passed()
+    except Exception as exc:  # noqa: BLE001 - invalid lifecycle cannot arm.
+        return reject_arm_admission(
+            "Calibration",
+            "runtime Home 后 Session 校准状态迁移失败，保持停臂："
+            f"{type(exc).__name__}: {exc}",
+        )
     state_machine_elapsed_ms = (time.perf_counter() - state_machine_start) * 1000.0
     force_control_start = time.perf_counter()
-    _enable_impedance_force_control_after_runtime_home(
-        args,
-        components,
-        home_captured=home_captured,
-    )
+    try:
+        _enable_impedance_force_control_after_runtime_home(
+            args,
+            components,
+            home_captured=home_captured,
+        )
+    except Exception as exc:  # noqa: BLE001 - partial force admission stays held.
+        return reject_arm_admission(
+            "ForceControl",
+            "runtime Home 后力控接入失败，保持停臂："
+            f"{type(exc).__name__}: {exc}",
+        )
     force_control_elapsed_ms = (time.perf_counter() - force_control_start) * 1000.0
     arm_hardware_start = time.perf_counter()
-    components.session.arm_hardware()
+    try:
+        components.session.arm_hardware()
+    except Exception as exc:  # noqa: BLE001 - rig/Session admission is recoverable Hold.
+        return reject_arm_admission(
+            "Calibration",
+            "runtime Home 已完成但机械臂未通过 Session arm admission，保持停臂："
+            f"{type(exc).__name__}: {exc}",
+        )
     arm_hardware_elapsed_ms = (time.perf_counter() - arm_hardware_start) * 1000.0
     publish_start = time.perf_counter()
-    clutch_input.publish_teleop_running(
-        home_ready=home_captured,
-        message=(
-            (
-                "runtime home 完成，正在验证首帧连续性；通过前保持不下发机械臂命令。"
-                if getattr(components, "startup_home_continuity_gate", None)
-                is not None
-                else "runtime home 完成，已进入真机遥操。"
-            )
-            if home_captured
-            else "runtime home 未就绪，未进入正常真机遥操。"
-        ),
-    )
+    try:
+        clutch_input.publish_teleop_running(
+            home_ready=home_captured,
+            message=(
+                (
+                    "runtime home 完成，正在验证首帧连续性；通过前保持不下发机械臂命令。"
+                    if getattr(components, "startup_home_continuity_gate", None)
+                    is not None
+                    else "runtime home 完成，已进入真机遥操。"
+                )
+                if home_captured
+                else "runtime home 未就绪，未进入正常真机遥操。"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - application projection is required.
+        return reject_arm_admission(
+            "WebGUI",
+            "Session 已 arm 但应用遥操状态发布失败，已重新 Hold："
+            f"{type(exc).__name__}: {exc}",
+        )
     publish_elapsed_ms = (time.perf_counter() - publish_start) * 1000.0
     _log(
         "CalibrationTiming",
@@ -1018,6 +1102,7 @@ def _arm_after_start_calibration(
         f"arm_hardware={arm_hardware_elapsed_ms:.1f}ms "
         f"publish_gui={publish_elapsed_ms:.1f}ms",
     )
+    return True
 
 
 def _update_init_arm_arrival_from_hardware(
