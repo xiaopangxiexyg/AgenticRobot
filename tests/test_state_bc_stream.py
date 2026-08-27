@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from experiments.sim_learning.state_bc.stream import (
     STREAM_RUNTIME_ACTION_DIM,
@@ -65,6 +66,43 @@ class _DummyStatePolicy:
         value[14] = 0.3
         value[15] = 0.7
         return value
+
+
+class _ResetTrackingAdapter:
+    def __init__(self, delegate):
+        self.delegate = delegate
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
+        self.delegate.reset()
+
+    def capture_model_state(self, observation):
+        return self.delegate.capture_model_state(observation)
+
+    def predict(self, observation):
+        return self.delegate.predict(observation)
+
+    def project_model_action(self, model_action, *, source=None):
+        return self.delegate.project_model_action(model_action, source=source)
+
+
+class _ChangingObservationSource:
+    def __init__(self, observation: DeploymentObservation) -> None:
+        self.observation = observation
+        self.count = 0
+
+    def capture(self) -> DeploymentObservation:
+        state = self.observation.state.copy()
+        state[6] = 0.10 + self.count
+        result = replace(
+            self.observation,
+            step_index=self.count,
+            state=state,
+            state_valid=np.isfinite(state),
+        )
+        self.count += 1
+        return result
 
 
 def test_stream_runner_uses_26d_runtime_actions_and_exclusive_sources():
@@ -189,3 +227,95 @@ def test_stream_runner_accepts_explicit_normalized_rtc_replacement():
     assert event.metadata["rtc_output_space"] == "runtime_26d"
     assert event.runtime_action is not None
     np.testing.assert_allclose(event.runtime_action.vector, replacement)
+
+
+def test_source_switch_holds_then_uses_a_fresh_observation_and_resets_policy():
+    adapter = _ResetTrackingAdapter(
+        StatePolicyAdapter(
+            model=_DummyStatePolicy(),
+            config=StatePolicyAdapterConfig(policy_absolute_frame="runtime_raw"),
+        )
+    )
+    source = _ChangingObservationSource(_observation())
+    transitions: list[tuple[str, float, bool]] = []
+    executions: list[tuple[str, float]] = []
+
+    def transition(event, observation):
+        transitions.append(
+            (
+                event.event_kind,
+                float(observation.state[6]),
+                bool(event.metadata.get("post_hold_observation", False)),
+            )
+        )
+
+    def execute(_action, event, observation):
+        executions.append((str(event.executed_source), float(observation.state[6])))
+
+    human_action = adapter.predict(_observation()).actions[0]
+    trace = StateBCStreamingRunner(
+        observation_source=source,
+        policy_adapter=adapter,
+        transition=transition,
+        execute=execute,
+    ).run(
+        ["policy", "human", "policy"],
+        human_actions={1: human_action},
+    )
+
+    assert source.count == 5
+    assert [kind for kind, _, _ in transitions] == [
+        "activation",
+        "hold",
+        "activation",
+        "hold",
+        "activation",
+    ]
+    assert [value for _, value, _ in transitions] == pytest.approx(
+        [0.10, 1.10, 2.10, 3.10, 4.10]
+    )
+    assert [fresh for _, _, fresh in transitions] == [False, False, True, False, True]
+    assert [source_name for source_name, _ in executions] == [
+        "policy",
+        "human",
+        "policy",
+    ]
+    assert [value for _, value in executions] == pytest.approx([0.10, 2.10, 4.10])
+    assert trace.action_events[-1].model_state is not None
+    assert trace.action_events[-1].model_state[0] == pytest.approx(4.10)
+    assert adapter.reset_calls == 2
+
+
+def test_failed_lower_hold_never_activates_or_executes_the_requested_source():
+    adapter = StatePolicyAdapter(
+        model=_DummyStatePolicy(),
+        config=StatePolicyAdapterConfig(policy_absolute_frame="runtime_raw"),
+    )
+    source = _ChangingObservationSource(_observation())
+    transitions: list[str] = []
+    executions: list[str] = []
+
+    def transition(event, _observation):
+        transitions.append(event.event_kind)
+        if event.event_kind == "hold":
+            raise RuntimeError("lower hold failed")
+
+    runner = StateBCStreamingRunner(
+        observation_source=source,
+        policy_adapter=adapter,
+        transition=transition,
+        execute=lambda _action, event, _observation: executions.append(
+            str(event.executed_source)
+        ),
+    )
+    runner.step("policy")
+
+    with pytest.raises(RuntimeError, match="lower hold failed"):
+        runner.step(
+            "human",
+            human_action=adapter.predict(_observation()).actions[0],
+        )
+
+    assert transitions == ["activation", "hold"]
+    assert executions == ["policy"]
+    assert source.count == 2
