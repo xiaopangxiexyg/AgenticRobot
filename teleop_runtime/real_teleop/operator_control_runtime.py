@@ -419,6 +419,56 @@ class RealTeleopControlInput:
             movement_multiple_events=tuple(MOVEMENT_MULTIPLE_GUI_EVENTS),
         )
 
+    def _publish_ui_observation(
+        self,
+        *,
+        context: str,
+        **state: object,
+    ) -> bool:
+        """Publish a rebuildable UI projection without vetoing owned state.
+
+        The control input owns Hold, Fix-Hold, dispatch admission, and the
+        application-side episode flags.  Browser transport is only an
+        observer of those facts: once the owned state is committed, a broken
+        client must not unwind it or prevent the caller from performing the
+        next safety/data lifecycle effect.
+        """
+
+        if self.ui is None:
+            return False
+        try:
+            self.ui.publish(**state)
+        except Exception as exc:  # noqa: BLE001 - UI transport is observational.
+            _log(
+                "WebGUI",
+                f"{context} projection failed; authoritative state is retained: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+        return True
+
+    def _append_ui_message_observation(
+        self,
+        title: str,
+        message: str,
+        *,
+        context: str,
+    ) -> bool:
+        """Append an operator message without changing lifecycle outcomes."""
+
+        if self.ui is None:
+            return False
+        try:
+            self.ui.append_message(str(title), str(message))
+        except Exception as exc:  # noqa: BLE001 - UI transport is observational.
+            _log(
+                "WebGUI",
+                f"{context} message failed; authoritative state is retained: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+        return True
+
     def bind_application_ports(
         self,
         *,
@@ -746,12 +796,16 @@ class RealTeleopControlInput:
             variant_id=self.plus_curation.variant_id or None,
         )
         if self.ui is not None:
-            self.ui.publish(**self.plus_curation.ui_state())
+            self._publish_ui_observation(
+                context="Plus episode state",
+                **self.plus_curation.ui_state(),
+            )
 
     def set_plus_curation_pending(self, *, dataset_root: str | Path, episode_index: int) -> None:
         self.plus_curation.mark_pending(dataset_root=dataset_root, episode_index=int(episode_index))
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="Plus pending state",
                 **self.plus_curation.ui_state(),
                 active_controls=self._current_active_controls(),
             )
@@ -759,7 +813,8 @@ class RealTeleopControlInput:
     def clear_plus_curation_pending(self, *, message: str = "") -> None:
         self.plus_curation.clear_pending(message=message)
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="Plus cleared state",
                 **self.plus_curation.ui_state(),
                 active_controls=self._current_active_controls(),
             )
@@ -799,7 +854,8 @@ class RealTeleopControlInput:
 
         def publish_state() -> None:
             if self.ui is not None:
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="Plus save state",
                     **self.plus_curation.ui_state(),
                     dataset_configuration_blocked_reason=(
                         self._dataset_configuration_blocked_reason()
@@ -813,18 +869,15 @@ class RealTeleopControlInput:
             disposition=disposition,
             reason_code=reason_code,
             on_state_changed=publish_state,
-            on_failure=lambda message: (
-                self.ui.append_message("Plus", message)
-                if self.ui is not None
-                else None
+            on_failure=lambda message: self._append_ui_message_observation(
+                "Plus",
+                message,
+                context="Plus save failure",
             ),
-            on_success=lambda record: (
-                self.ui.append_message(
-                    "Plus",
-                    f"已写入 Plus sidecar: {record.annotation_episode_id}",
-                )
-                if self.ui is not None
-                else None
+            on_success=lambda record: self._append_ui_message_observation(
+                "Plus",
+                f"已写入 Plus sidecar: {record.annotation_episode_id}",
+                context="Plus save success",
             ),
         )
 
@@ -921,8 +974,13 @@ class RealTeleopControlInput:
     def _publish_episode_start_rejection(self, message: str) -> None:
         if self.ui is None:
             return
-        self.ui.append_message("Dataset", message)
-        self.ui.publish(
+        self._append_ui_message_observation(
+            "Dataset",
+            message,
+            context="episode start rejection",
+        )
+        self._publish_ui_observation(
+            context="episode start rejection",
             active_controls=self._current_active_controls(),
             control_hint=message,
         )
@@ -3827,7 +3885,11 @@ class RealTeleopControlInput:
         message = f"数采开始前已恢复任务夹爪力度配置（临时设置: {previous}）。"
         _log("GripperForce", message)
         if self.ui is not None:
-            self.ui.append_message("GripperForce", message)
+            self._append_ui_message_observation(
+                "GripperForce",
+                message,
+                context="collection gripper policy restore",
+            )
 
     def _apply_episode_start_payload(
         self,
@@ -3863,8 +3925,13 @@ class RealTeleopControlInput:
             restore_original_state()
             failure_reported = True
             if self.ui is not None:
-                self.ui.append_message("Dataset", message)
-                self.ui.publish(
+                self._append_ui_message_observation(
+                    "Dataset",
+                    message,
+                    context="dataset selection rejection",
+                )
+                self._publish_ui_observation(
+                    context="dataset selection rejection",
                     **_collection_task_ui_state(self.args),
                     active_controls=self._current_active_controls(),
                     dataset_configuration_transition_active=False,
@@ -3889,8 +3956,13 @@ class RealTeleopControlInput:
                 "本次选择未提交。"
             )
             if self.ui is not None:
-                self.ui.append_message("Dataset", message)
-                self.ui.publish(
+                self._append_ui_message_observation(
+                    "Dataset",
+                    message,
+                    context="dataset selection already pending",
+                )
+                self._publish_ui_observation(
+                    context="dataset selection already pending",
                     active_controls=self._current_active_controls(),
                     dataset_configuration_transition_active=True,
                 )
@@ -3947,7 +4019,8 @@ class RealTeleopControlInput:
             if start_after_commit:
                 self._episode_start_requested = True
             if self.ui is not None:
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="dataset selection committed",
                     **_collection_task_ui_state(self.args),
                     **self.plus_curation.ui_state(),
                     dataset_configuration_transition_active=False,
@@ -3964,13 +4037,14 @@ class RealTeleopControlInput:
                         },
                     },
                 )
-                self.ui.append_message(
+                self._append_ui_message_observation(
                     "Dataset",
                     (
                         f"数采任务已更新: {self.args.collection_task_name} "
                         f"({self.args.collection_task_id}) -> "
                         f"{self.args.dataset_root}"
                     ),
+                    context="dataset selection committed",
                 )
 
         def publish_selection_failure(exc: BaseException) -> None:
@@ -4006,12 +4080,14 @@ class RealTeleopControlInput:
                     f"{outcome!r}"
                 )
             if outcome == "pending" and self.ui is not None:
-                self.ui.append_message(
+                self._append_ui_message_observation(
                     "Dataset",
                     "正在后台准备所选数据集/profile 的目录、契约及必要的 writer；"
                     "旧配置保持有效，准备完成后再原子切换。",
+                    context="dataset selection pending",
                 )
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="dataset selection pending",
                     active_controls=self._current_active_controls(),
                     dataset_configuration_transition_active=True,
                 )
@@ -4032,29 +4108,66 @@ class RealTeleopControlInput:
     def _toggle_round_trip_collection_task(self, *, source: str) -> bool:
         if self._dataset_configuration_transition_active():
             if self.ui is not None:
-                self.ui.append_message(
+                self._append_ui_message_observation(
                     "Dataset",
                     "数据集任务/profile 正在后台准备，当前不切换 in/out。",
+                    context="round-trip switch rejection",
                 )
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="round-trip switch rejection",
                     **_collection_task_ui_state(self.args),
                     dataset_configuration_transition_active=True,
                 )
             return False
         if self._episode_busy():
             if self.ui is not None:
-                self.ui.append_message("Dataset", "数采录制、暂停、倒计时或保存中不切换 in/out；请先停止当前 episode。")
-                self.ui.publish(**_collection_task_ui_state(self.args))
+                self._append_ui_message_observation(
+                    "Dataset",
+                    "数采录制、暂停、倒计时或保存中不切换 in/out；请先停止当前 episode。",
+                    context="round-trip switch rejection",
+                )
+                self._publish_ui_observation(
+                    context="round-trip switch rejection",
+                    **_collection_task_ui_state(self.args),
+                )
             return False
         if (
             gui_collection_tasks.normalize_task_type(getattr(self.args, "collection_task_type", ""))
             != gui_collection_tasks.ROUND_TRIP_TASK_TYPE
         ):
             if self.ui is not None:
-                self.ui.append_message("Dataset", "当前是一般类任务，不需要切换 in/out。")
-                self.ui.publish(**_collection_task_ui_state(self.args))
+                self._append_ui_message_observation(
+                    "Dataset",
+                    "当前是一般类任务，不需要切换 in/out。",
+                    context="round-trip switch rejection",
+                )
+                self._publish_ui_observation(
+                    context="round-trip switch rejection",
+                    **_collection_task_ui_state(self.args),
+                )
             return False
-        if not _toggle_collection_round_trip_phase(self.args):
+        args_snapshot = dict(vars(self.args))
+        try:
+            toggled = bool(_toggle_collection_round_trip_phase(self.args))
+        except Exception as exc:  # noqa: BLE001 - restore the application draft.
+            vars(self.args).clear()
+            vars(self.args).update(args_snapshot)
+            message = (
+                "来回任务 in/out 切换失败，已保留原配置："
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log("Dataset", message)
+            self._append_ui_message_observation(
+                "Dataset",
+                message,
+                context="round-trip switch failure",
+            )
+            self._publish_ui_observation(
+                context="round-trip switch failure",
+                **_collection_task_ui_state(self.args),
+            )
+            return False
+        if not toggled:
             return False
         phase = str(getattr(self.args, "collection_round_trip_phase", "") or "")
         label = "自动" if source == "auto_after_episode" else "手动"
@@ -4064,8 +4177,15 @@ class RealTeleopControlInput:
         )
         _log("Dataset", message)
         if self.ui is not None:
-            self.ui.publish(**_collection_task_ui_state(self.args))
-            self.ui.append_message("Dataset", message)
+            self._publish_ui_observation(
+                context="round-trip switch committed",
+                **_collection_task_ui_state(self.args),
+            )
+            self._append_ui_message_observation(
+                "Dataset",
+                message,
+                context="round-trip switch committed",
+            )
         return True
 
     def advance_round_trip_task_after_saved_episode(self) -> bool:
@@ -4105,7 +4225,8 @@ class RealTeleopControlInput:
         self._q6_hold_recalibration_gesture.reset_for_hold()
         is_q6_gesture = self._hold_request_reason == "q6_gesture"
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="Hold state",
                 stage="Hold / 停臂保持",
                 active_controls=self._current_active_controls(),
                 control_hint=(
@@ -4136,7 +4257,11 @@ class RealTeleopControlInput:
                 if is_q6_gesture
                 else "已请求冻结机械臂；不会自动重采 runtime home。"
             )
-            self.ui.append_message("Hold", message)
+            self._append_ui_message_observation(
+                "Hold",
+                message,
+                context="Hold state",
+            )
 
     def set_fix_hold_active(self, active: bool, *, message: str = "") -> None:
         normalized = bool(active)
@@ -4152,7 +4277,8 @@ class RealTeleopControlInput:
             )
         self._fix_hold_active = normalized
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="Fix-Hold state",
                 stage="Fix-Hold / 双侧特殊固定" if normalized else "遥操运行",
                 fix_hold_active=normalized,
                 active_controls=self._current_active_controls(),
@@ -4160,7 +4286,11 @@ class RealTeleopControlInput:
                 gripper_control_enabled=bool(self._gripper_control_enabled),
             )
             if message:
-                self.ui.append_message("FixHold", message)
+                self._append_ui_message_observation(
+                    "FixHold",
+                    message,
+                    context="Fix-Hold state",
+                )
 
     def fix_hold_active(self) -> bool:
         return bool(self._fix_hold_active)
@@ -4769,7 +4899,8 @@ class RealTeleopControlInput:
         self._episode_finalizing_ui_active = False
         if self.ui is None:
             return
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="episode countdown state",
             active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=False,
@@ -4822,7 +4953,8 @@ class RealTeleopControlInput:
             warning_payload = {"active": False, "message": ""}
         tactile_write_hz_payload = dict(frequency_payload.get("tactile_write_hz") or {})
         tactile_frame_counts_payload = dict(frequency_payload.get("tactile_frame_counts") or {})
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="episode recording state",
             active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=bool(active),
@@ -4869,7 +5001,8 @@ class RealTeleopControlInput:
             self._episode_last_frame_count = int(frame_count)
         if self.ui is None:
             return
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="episode finalize state",
             active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=False,
@@ -5156,7 +5289,8 @@ class RealTeleopControlInput:
         control_hint = (
             "首条机械臂命令已实际派发；遥操与 Q6 夹爪控制现在同步开放。"
         )
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="teleop dispatch running state",
             stage="RM65 真机遥操运行中",
             active_controls=self._current_active_controls(),
             control_hint=control_hint,
@@ -5165,7 +5299,11 @@ class RealTeleopControlInput:
             teleop_running=True,
             gripper_control_enabled=self.gripper_control_enabled(),
         )
-        self.ui.append_message("RealTeleop", message or control_hint)
+        self._append_ui_message_observation(
+            "RealTeleop",
+            message or control_hint,
+            context="teleop dispatch running state",
+        )
         self.publish_gripper_status(force=True)
         return True
 
@@ -5203,14 +5341,19 @@ class RealTeleopControlInput:
             f"Session={normalized_state}，本控制帧没有实际派发机械臂命令；"
             "夹爪控制同步保持关闭。"
         )
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="teleop dispatch suspended state",
             stage=state_label,
             active_controls=self._current_active_controls(),
             control_hint=detail,
             teleop_running=False,
             gripper_control_enabled=False,
         )
-        self.ui.append_message("RealTeleop", detail)
+        self._append_ui_message_observation(
+            "RealTeleop",
+            detail,
+            context="teleop dispatch suspended state",
+        )
         return True
 
     def publish_calibration_waiting(self, message: str = "") -> None:
@@ -5683,7 +5826,8 @@ class RealTeleopControlInput:
             command_status=command_status,
             now=current_time,
         )
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="gripper status",
             gripper_control_available=_gripper_gui_available(self.components),
             gripper_q6_available=_has_q6_gripper_control(self.components),
             gripper_control_enabled=self.gripper_control_enabled(),
@@ -5806,12 +5950,20 @@ class RealTeleopControlInput:
                     ),
                 )
             )
-        _publish_raw_tracker_pose_state(
-            self.ui,
-            channels,
-            active_sides=self.components.active_sides,
-            now=current_time,
-        )
+        try:
+            _publish_raw_tracker_pose_state(
+                self.ui,
+                channels,
+                active_sides=self.components.active_sides,
+                now=current_time,
+            )
+        except Exception as exc:  # noqa: BLE001 - pose UI is observational.
+            _log(
+                "WebGUI",
+                "raw tracker pose projection failed; tracker admission state is "
+                f"retained: {type(exc).__name__}: {exc}",
+                now=current_time,
+            )
         self._last_raw_pose_publish_at = current_time
 
     def _control_hint(self) -> str:

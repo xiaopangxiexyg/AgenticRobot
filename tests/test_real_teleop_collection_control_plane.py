@@ -261,6 +261,14 @@ class _Clutch:
         self.plus_episode_indices.append(int(episode_index))
 
 
+class _FailingUi:
+    def publish(self, **_state: object) -> None:
+        raise RuntimeError("ui publish unavailable")
+
+    def append_message(self, _title: str, _message: str) -> None:
+        raise RuntimeError("ui message unavailable")
+
+
 def _episode_runtime(
     *,
     tmp_path: Path,
@@ -268,13 +276,16 @@ def _episode_runtime(
     dataset_slot: list[object | None],
     clutch: _Clutch,
     transition_calls: list[str],
+    control_ui: object | None = None,
+    debug_episode_enabled: bool = False,
+    start_episode_recording=lambda *_args, **_kwargs: None,
     publish_runtime_hardware_status=lambda: None,
     bind_capture_modality_contract=lambda *_args, **_kwargs: None,
 ):
     logs: list[tuple[str, str]] = []
     episode_state = [None]
     episode_recorder = SimpleNamespace(
-        config=SimpleNamespace(enabled=False),
+        config=SimpleNamespace(enabled=bool(debug_episode_enabled)),
         is_recording=False,
         frame_count=0,
         episode_dir=None,
@@ -294,7 +305,7 @@ def _episode_runtime(
             lambda now, deadline: max(0.0, deadline - now)
         ),
         "_log": lambda tag, message, **_kwargs: logs.append((tag, message)),
-        "_start_episode_recording": lambda *_args, **_kwargs: None,
+        "_start_episode_recording": start_episode_recording,
         "_stop_episode_recording": lambda *_args, **_kwargs: None,
         "bind_capture_modality_contract": bind_capture_modality_contract,
     }
@@ -327,7 +338,7 @@ def _episode_runtime(
         clutch_input=clutch,
         episode_recorder=episode_recorder,
         camera_sources={},
-        control_ui=None,
+        control_ui=control_ui,
         startup_device_errors={},
         fix_hold_coordinator=SimpleNamespace(),
         position_episode_debug_runtime=SimpleNamespace(
@@ -351,6 +362,105 @@ def _episode_runtime(
         support=support,
     )
     return runtime, args, logs
+
+
+def test_episode_open_stop_and_finalize_ignore_ui_transport_failure(
+    tmp_path: Path,
+) -> None:
+    finalize_ready = False
+    finalize_consumed = False
+    finalize_task = SimpleNamespace(
+        episode_index=4,
+        frame_count=12,
+        queued_at=10.0,
+        started_at=10.1,
+        completed_at=10.2,
+        stage_timings_ms={},
+        success=True,
+        error="",
+        v25p_error="",
+        v25p_native_error="",
+        progress_error="",
+    )
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("test must reuse the published recorder")
+
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True,
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        active_episode_index=None,
+        camera_sources={},
+        require_configured_for_current_args=lambda: None,
+        collection_frequency_status=lambda: {"sample_hz": 15.0},
+        close=lambda: None,
+    )
+
+    def start_episode(_metadata: object, *, now: float) -> int:
+        del now
+        recorder.is_recording = True
+        recorder.active_episode_index = 4
+        return 4
+
+    def stop_episode(**_kwargs: object) -> object:
+        recorder.is_recording = False
+        recorder.finalizing = True
+        return finalize_task
+
+    def poll_finalize_tasks() -> list[object]:
+        nonlocal finalize_consumed
+        if not finalize_ready or finalize_consumed:
+            return []
+        finalize_consumed = True
+        recorder.finalizing = False
+        return [finalize_task]
+
+    recorder.start_episode = start_episode
+    recorder.stop_episode = stop_episode
+    recorder.poll_finalize_tasks = poll_finalize_tasks
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, _args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        control_ui=_FailingUi(),
+    )
+
+    assert runtime.start_recording(time.time(), start_reason="unit")
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert recorder.is_recording
+    assert clutch.recording_states[-1]["event_status"] == "recording"
+    assert runtime.stop_recording(time.time(), end_reason="unit")
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert clutch.recording_states[-1]["event_status"] == "finalizing"
+    finalize_ready = True
+    runtime.poll_dataset_finalize(time.time())
+
+    assert clutch.finalize_states[-1]["status"] == "saved"
+    assert clutch.round_trip_advances == 1
+    assert clutch.plus_episode_indices == [4, 4]
+    assert any(
+        tag == "WebGUI" and "collection lifecycle is retained" in message
+        for tag, message in logs
+    )
+    assert runtime.close()
 
 
 def test_episode_open_rpc_is_nonblocking_and_recorder_is_detached_until_publish(
@@ -428,6 +538,75 @@ def test_episode_open_rpc_is_nonblocking_and_recorder_is_detached_until_publish(
         tag == "Dataset" and "hardware-status refresh failed" in message
         for tag, message in logs
     )
+
+
+def test_debug_trajectory_start_failure_does_not_close_formal_episode(
+    tmp_path: Path,
+) -> None:
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("test must reuse the published recorder")
+
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True,
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        active_episode_index=None,
+        camera_sources={},
+        require_configured_for_current_args=lambda: None,
+        collection_frequency_status=lambda: {},
+        poll_finalize_tasks=lambda: [],
+        close=lambda: None,
+    )
+
+    def start_episode(_metadata: object, *, now: float) -> int:
+        del now
+        recorder.is_recording = True
+        recorder.active_episode_index = 4
+        return 4
+
+    def stop_episode(**_kwargs: object) -> None:
+        recorder.is_recording = False
+        recorder.active_episode_index = None
+        return None
+
+    recorder.start_episode = start_episode
+    recorder.stop_episode = stop_episode
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        debug_episode_enabled=True,
+        start_episode_recording=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("debug trajectory disk unavailable")
+        ),
+    )
+
+    assert runtime.start_recording(time.time(), start_reason="unit")
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert slot[0] is recorder
+    assert recorder.is_recording
+    assert args.dataset_startup_error == ""
+    assert clutch.recording_states[-1]["event_status"] == "recording"
+    assert any(
+        tag == "Episode"
+        and "formal dataset episode remains active" in message
+        and "debug trajectory disk unavailable" in message
+        for tag, message in logs
+    )
+    assert runtime.close()
 
 
 def test_episode_open_configuration_failure_republishes_unmutated_recorder(

@@ -3183,6 +3183,206 @@ def test_episode_lifecycle_state_is_authoritative_without_a_gui() -> None:
     assert control._episode_last_frame_count == 9
 
 
+def test_control_lifecycle_state_survives_ui_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs: list[tuple[str, str]] = []
+
+    class FailingUi:
+        def publish(self, **_state: object) -> None:
+            raise RuntimeError("ui publish unavailable")
+
+        def append_message(self, _title: str, _message: str) -> None:
+            raise RuntimeError("ui message unavailable")
+
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.ui = FailingUi()
+    control.args = SimpleNamespace(collection_warning_hz=15.0)
+    control.components = SimpleNamespace(active_sides=("left", "right"))
+    control._current_active_controls = lambda: ("p",)
+    control._episode_recording_available = lambda: True
+    control._pose_snapshot_ui_state = lambda: {}
+    control.ik_debug_timing_enabled = lambda: False
+    control.plus_curation = SimpleNamespace(ui_state=lambda: {})
+    control._cancel_init_arm_qpos_sequence = lambda *, reason: None
+    control._q6_hold_recalibration_gesture = SimpleNamespace(
+        reset_for_hold=lambda: None
+    )
+    control.publish_gripper_status = lambda **_kwargs: None
+    control._teleop_started = True
+    control._hold_requested = False
+    control._hold_active = False
+    control._fix_hold_active = False
+    control._teleop_dispatch_confirmed = True
+    control._teleop_dispatch_projection = "running"
+    control._gripper_control_enabled = True
+    control._gripper_control_before_fix_hold = False
+    control._ik_debug_logging_active = False
+    control._ik_debug_log_path = ""
+    control._episode_recording_ui_active = False
+    control._episode_recording_ui_paused = False
+    control._episode_countdown_ui_active = False
+    control._episode_finalizing_ui_active = False
+    control._episode_last_episode_index = None
+    control._episode_last_frame_count = None
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_log",
+        lambda tag, message, **_kwargs: logs.append((str(tag), str(message))),
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_has_q6_gripper_control",
+        lambda _components: True,
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_collection_task_ui_state",
+        lambda _args: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_fix_arm_ui_state",
+        lambda _components: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_init_arm_ui_state",
+        lambda _components: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_movement_multiple_ui_state",
+        lambda _args: {},
+    )
+
+    control.request_hold(reason="unit_test")
+    assert control._hold_requested is True
+    assert control._hold_active is True
+    assert control._teleop_dispatch_confirmed is False
+    assert control._gripper_control_enabled is False
+
+    control._hold_active = False
+    control.set_fix_hold_active(True, message="both sides fixed-like")
+    assert control._fix_hold_active is True
+    assert control._gripper_control_enabled is False
+
+    control._fix_hold_active = False
+    control._teleop_dispatch_confirmed = False
+    control._teleop_dispatch_projection = "armed"
+    assert control.publish_teleop_dispatch_running()
+    assert control._teleop_dispatch_confirmed is True
+    assert control._gripper_control_enabled is True
+    assert control.publish_teleop_dispatch_suspended(
+        session_state="FROZEN",
+        reason="source timing fault",
+    )
+    assert control._teleop_dispatch_confirmed is False
+    assert control._gripper_control_enabled is False
+
+    control.set_episode_start_countdown_state(remaining_sec=2.0)
+    assert control._episode_countdown_ui_active is True
+    control.set_episode_recording_state(
+        active=True,
+        frame_count=4,
+        event_status="paused",
+        episode_index=3,
+    )
+    assert control._episode_recording_ui_active is True
+    assert control._episode_recording_ui_paused is True
+    control.set_episode_finalize_state(
+        status="saved",
+        message="saved",
+        episode_index=3,
+        frame_count=9,
+    )
+    assert control._episode_recording_ui_active is False
+    assert control._episode_finalizing_ui_active is False
+    assert control._episode_last_frame_count == 9
+    assert any(
+        tag == "WebGUI" and "authoritative state is retained" in message
+        for tag, message in logs
+    )
+
+
+def test_round_trip_switch_is_transactional_and_ui_observational(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingUi:
+        def publish(self, **_state: object) -> None:
+            raise RuntimeError("ui publish unavailable")
+
+        def append_message(self, _title: str, _message: str) -> None:
+            raise RuntimeError("ui message unavailable")
+
+    args = SimpleNamespace(
+        collection_task_type="round_trip",
+        collection_round_trip_phase="in",
+        collection_task_name="round-trip_in",
+        collection_task_id="round-trip-in",
+        dataset_root="/tmp/round-trip-in",
+    )
+    original = dict(vars(args))
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.args = args
+    control.ui = FailingUi()
+    control._dataset_configuration_transition_active = lambda: False
+    control._episode_busy = lambda: False
+    control._current_active_controls = tuple
+    logs: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_collection_task_ui_state",
+        lambda selected_args: {
+            "collection_round_trip_phase": selected_args.collection_round_trip_phase,
+            "dataset_root": selected_args.dataset_root,
+        },
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_log",
+        lambda tag, message, **_kwargs: logs.append((str(tag), str(message))),
+    )
+
+    def fail_after_partial_mutation(selected_args: object) -> bool:
+        selected_args.collection_round_trip_phase = "out"
+        selected_args.dataset_root = "/tmp/round-trip-out"
+        raise OSError("layout refresh failed")
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_toggle_collection_round_trip_phase",
+        fail_after_partial_mutation,
+    )
+
+    assert not control.advance_round_trip_task_after_saved_episode()
+    assert vars(args) == original
+    assert any("layout refresh failed" in message for _tag, message in logs)
+
+    def commit_switch(selected_args: object) -> bool:
+        selected_args.collection_round_trip_phase = "out"
+        selected_args.collection_task_name = "round-trip_out"
+        selected_args.collection_task_id = "round-trip-out"
+        selected_args.dataset_root = "/tmp/round-trip-out"
+        return True
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_toggle_collection_round_trip_phase",
+        commit_switch,
+    )
+
+    assert control.advance_round_trip_task_after_saved_episode()
+    assert args.collection_round_trip_phase == "out"
+    assert args.dataset_root == "/tmp/round-trip-out"
+
+
 def test_plus_curation_runtime_owns_request_and_writer_thread_lifecycle() -> None:
     runtime_source = (
         ROOT / "teleop_runtime/real_teleop/plus_curation_runtime.py"

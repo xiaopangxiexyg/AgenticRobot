@@ -36,6 +36,7 @@ class _DatasetOpenCompletion:
     episode_index: int | None
     planned_episode_index: int | None
     debug_started: bool
+    debug_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +235,51 @@ def build_episode_recording_runtime(
         episode_last_state = episode_last_state_provider()
         step_index = int(step_index_provider())
 
+    def publish_control_ui_message(
+        title: str,
+        message: str,
+        *,
+        context: str,
+        now: float,
+    ) -> bool:
+        """Project a lifecycle message without changing its committed result."""
+
+        if control_ui is None:
+            return False
+        try:
+            control_ui.append_message(str(title), str(message))
+        except Exception as exc:  # noqa: BLE001 - UI transport is observational.
+            _log(
+                "WebGUI",
+                f"{context} message failed; collection lifecycle is retained: "
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
+            return False
+        return True
+
+    def publish_control_ui_state(
+        *,
+        context: str,
+        now: float,
+        **state: object,
+    ) -> bool:
+        """Project rebuildable UI state without vetoing writer ownership."""
+
+        if control_ui is None:
+            return False
+        try:
+            control_ui.publish(**state)
+        except Exception as exc:  # noqa: BLE001 - UI transport is observational.
+            _log(
+                "WebGUI",
+                f"{context} projection failed; collection lifecycle is retained: "
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
+            return False
+        return True
+
     def collection_transition_active() -> bool:
         return bool(
             episode_prepare_generation is not None
@@ -318,8 +364,12 @@ def build_episode_recording_runtime(
         if warning_active and not last_collection_frequency_warning_active:
             message = str(warning_payload.get("message") or "WARNING: 数采实际频率低于目标 15 Hz。")
             _log("DatasetFreq", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("DatasetFreq", message)
+            publish_control_ui_message(
+                "DatasetFreq",
+                message,
+                context="collection frequency warning",
+                now=now,
+            )
         if should_emit_debug:
             assert dataset_recorder is not None
             last_collection_frequency_debug_at = float(now)
@@ -366,8 +416,12 @@ def build_episode_recording_runtime(
             )
             episode_start_failure_message = message
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="writer unavailable rejection",
+                now=now,
+            )
             return False
         if (
             bool(getattr(args, "no_collection", False))
@@ -377,8 +431,12 @@ def build_episode_recording_runtime(
             message = "正式 dataset collection 和 debug trajectory recording 都不可用。"
             episode_start_failure_message = message
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="recording unavailable rejection",
+                now=now,
+            )
             return False
 
         formal_recorder = dataset_recorder
@@ -391,6 +449,7 @@ def build_episode_recording_runtime(
             episode_index: int | None = None
             position_debug_started = False
             debug_started = False
+            debug_error: str | None = None
             try:
                 if formal_recorder is not None:
                     # Configuration inspection and the process-writer
@@ -462,20 +521,46 @@ def build_episode_recording_runtime(
                     )
                     episode_open_formal_started = True
                 if episode_recorder.config.enabled:
-                    episode_recorder.root_dir = _episode_root_dir(args, components)
-                    _start_episode_recording(
-                        episode_recorder,
-                        args,
-                        components,
-                        now=start_wall_time,
-                        start_reason=start_reason,
-                    )
-                    debug_started = True
+                    try:
+                        episode_recorder.root_dir = _episode_root_dir(args, components)
+                        _start_episode_recording(
+                            episode_recorder,
+                            args,
+                            components,
+                            now=start_wall_time,
+                            start_reason=start_reason,
+                        )
+                        debug_started = True
+                    except Exception as exc:  # noqa: BLE001 - debug is subordinate.
+                        if formal_recorder is None:
+                            # In --no-collection mode the lightweight episode is
+                            # the only requested recording product, so failure is
+                            # still an episode-open failure.
+                            raise
+                        debug_error = f"{type(exc).__name__}: {exc}"
+                        if episode_recorder.is_recording:
+                            try:
+                                _stop_episode_recording(
+                                    episode_recorder,
+                                    now=start_wall_time,
+                                    end_reason="debug_episode_open_failed",
+                                    summary={},
+                                )
+                            except BaseException:
+                                pass
+                        _log(
+                            "Episode",
+                            "WARNING: lightweight debug trajectory start failed; "
+                            "formal dataset episode remains active: "
+                            f"{debug_error}",
+                            now=start_wall_time,
+                        )
                 return _DatasetOpenCompletion(
                     recorder=formal_recorder,
                     episode_index=episode_index,
                     planned_episode_index=planned_episode_index,
                     debug_started=debug_started,
+                    debug_error=debug_error,
                 )
             except BaseException:
                 if debug_started or episode_recorder.is_recording:
@@ -577,8 +662,12 @@ def build_episode_recording_runtime(
             f"reason={start_reason}",
             now=now,
         )
-        if control_ui is not None:
-            control_ui.append_message("Dataset", message)
+        publish_control_ui_message(
+            "Dataset",
+            message,
+            context="episode open submitted",
+            now=now,
+        )
         return True
 
 
@@ -606,8 +695,12 @@ def build_episode_recording_runtime(
             f"reason={start_reason}",
             now=now,
         )
-        if control_ui is not None:
-            control_ui.append_message("Dataset", message)
+        publish_control_ui_message(
+            "Dataset",
+            message,
+            context="recording countdown started",
+            now=now,
+        )
 
     def publish_hardware_status_observation(
         *,
@@ -816,8 +909,12 @@ def build_episode_recording_runtime(
         if dataset_recorder is not None and dataset_recorder.finalizing:
             message = "上一个正式 dataset episode 仍在后台保存，暂不开始新的数采。"
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="finalize admission rejection",
+                now=now,
+            )
             return False
         hardware_blockers = collection_startup_blockers()
         if hardware_blockers:
@@ -827,8 +924,12 @@ def build_episode_recording_runtime(
                 + "。请重连，或仅对允许缺失的 camera/tactile 先设置数据集级忽视规则。"
             )
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="hardware admission rejection",
+                now=now,
+            )
             clutch_input.set_episode_recording_state(
                 active=False,
                 episode_dir=recording_path(),
@@ -843,8 +944,12 @@ def build_episode_recording_runtime(
         ):
             message = "正式 dataset collection 和 debug trajectory recording 都不可用。"
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="countdown unavailable rejection",
+                now=now,
+            )
             return False
         if bool(getattr(args, "no_collection", False)):
             begin_recording_countdown(time.time(), start_reason=start_reason)
@@ -933,8 +1038,12 @@ def build_episode_recording_runtime(
             f"reason={start_reason}",
             now=now,
         )
-        if control_ui is not None:
-            control_ui.append_message("Dataset", message)
+        publish_control_ui_message(
+            "Dataset",
+            message,
+            context="writer preparation submitted",
+            now=now,
+        )
         return True
 
 
@@ -950,8 +1059,12 @@ def build_episode_recording_runtime(
             episode_start_warmup_last_message = None
             message = f"数采 writer 预备正在取消并回收：{reason}。"
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="writer preparation cancellation",
+                now=now,
+            )
             clutch_input.set_episode_start_countdown_state(
                 remaining_sec=0.0,
                 message=message,
@@ -965,8 +1078,12 @@ def build_episode_recording_runtime(
         reset_gripper_warmup_probe(f"countdown_cancelled:{reason}")
         message = f"数采倒计时已取消：{reason}。"
         _log("Dataset", message, now=now)
-        if control_ui is not None:
-            control_ui.append_message("Dataset", message)
+        publish_control_ui_message(
+            "Dataset",
+            message,
+            context="recording countdown cancellation",
+            now=now,
+        )
         clutch_input.set_episode_recording_state(
             active=False,
             episode_dir=recording_path(),
@@ -1034,8 +1151,12 @@ def build_episode_recording_runtime(
         episode_start_warmup_ready_since = None
         episode_start_warmup_last_message = None
         _log("Dataset", "recording warmup finished; starting collection", now=now)
-        if control_ui is not None:
-            control_ui.append_message("Dataset", "warmup 完成，正式开始数采写入。")
+        publish_control_ui_message(
+            "Dataset",
+            "warmup 完成，正式开始数采写入。",
+            context="recording warmup completion",
+            now=now,
+        )
         if not start_recording(now, start_reason=start_reason):
             clutch_input.set_episode_recording_state(
                 active=False,
@@ -1186,8 +1307,12 @@ def build_episode_recording_runtime(
             f"reason={end_reason}",
             now=now,
         )
-        if control_ui is not None:
-            control_ui.append_message("Dataset", message)
+        publish_control_ui_message(
+            "Dataset",
+            message,
+            context="episode stop submitted",
+            now=now,
+        )
         return True
 
 
@@ -1234,8 +1359,12 @@ def build_episode_recording_runtime(
         )
         if newly_paused:
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="recording paused",
+                now=now,
+            )
         clutch_input.set_episode_recording_state(
             active=True,
             episode_dir=recording_path(),
@@ -1250,10 +1379,11 @@ def build_episode_recording_runtime(
                 else None
             ),
         )
-        if control_ui is not None:
-            control_ui.publish(
-                active_controls=clutch_input._current_active_controls()
-            )
+        publish_control_ui_state(
+            context="recording pause controls",
+            now=now,
+            active_controls=clutch_input._current_active_controls(),
+        )
         return True
 
 
@@ -1330,8 +1460,12 @@ def build_episode_recording_runtime(
                     f"{type(exc).__name__}: {exc}"
                 )
                 _log("Dataset", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", message)
+                publish_control_ui_message(
+                    "Dataset",
+                    message,
+                    context="recording resume rejection",
+                    now=now,
+                )
                 clutch_input.set_episode_recording_state(
                     active=True,
                     episode_dir=recording_path(),
@@ -1366,8 +1500,12 @@ def build_episode_recording_runtime(
             episode_resume_warmup_ready_count = 0
             message = "数采已恢复：遥操 RUNNING 且输入/相机 warmup 已稳定，继续写入同一个 episode。"
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="recording resumed",
+                now=now,
+            )
         clutch_input.set_episode_recording_state(
             active=True,
             episode_dir=recording_path(),
@@ -1465,8 +1603,12 @@ def build_episode_recording_runtime(
             episode_prepare_cancel_reason = ""
             message = f"数采 writer 预备已取消：{reason}。"
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="writer preparation cancelled",
+                now=now,
+            )
             clutch_input.set_episode_recording_state(
                 active=False,
                 episode_dir=recording_path(),
@@ -1495,8 +1637,12 @@ def build_episode_recording_runtime(
             message = f"正式 dataset 预备失败: {detail}"
             episode_start_failure_message = message
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="writer preparation failure",
+                now=now,
+            )
             clutch_input.set_episode_recording_state(
                 active=False,
                 episode_dir=recording_path(),
@@ -1687,8 +1833,12 @@ def build_episode_recording_runtime(
                 f"{type(failure).__name__}: {failure}"
             )
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="dataset selection cleanup failure",
+                now=now,
+            )
         if completion_callback is not None:
             try:
                 completion_callback()
@@ -1747,8 +1897,12 @@ def build_episode_recording_runtime(
             message = f"正式 dataset episode 启动失败: {detail}"
             episode_start_failure_message = message
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="episode open failure",
+                now=now,
+            )
             clutch_input.set_episode_recording_state(
                 active=False,
                 episode_dir="",
@@ -1780,8 +1934,12 @@ def build_episode_recording_runtime(
                     f"{type(exc).__name__}: {exc}"
                 )
                 _log("Plus", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Plus", message)
+                publish_control_ui_message(
+                    "Plus",
+                    message,
+                    context="Plus episode initialization failure",
+                    now=now,
+                )
             if completion.episode_index != completion.planned_episode_index:
                 mismatch = (
                     "dataset episode index changed after audit attachment: "
@@ -1799,12 +1957,25 @@ def build_episode_recording_runtime(
                 f"root={dataset_recorder.dataset_root}",
                 now=now,
             )
-            if control_ui is not None:
-                control_ui.append_message(
-                    "Dataset",
-                    "正式数采开始："
-                    f"episode {completion.episode_index} -> "
-                    f"{dataset_recorder.dataset_root}",
+            publish_control_ui_message(
+                "Dataset",
+                "正式数采开始："
+                f"episode {completion.episode_index} -> "
+                f"{dataset_recorder.dataset_root}",
+                context="episode open completion",
+                now=now,
+            )
+            if completion.debug_error:
+                message = (
+                    "lightweight debug trajectory 启动失败；"
+                    "正式 LeRobot 数采仍在继续："
+                    f"{completion.debug_error}"
+                )
+                publish_control_ui_message(
+                    "Episode",
+                    message,
+                    context="debug trajectory start failure",
+                    now=now,
                 )
         last_collection_frequency_warning_active = False
         last_collection_frequency_debug_at = 0.0
@@ -1873,8 +2044,12 @@ def build_episode_recording_runtime(
                 f"下次开始将创建全新 writer：{detail}"
             )
             _log("Dataset", message, now=now)
-            if control_ui is not None:
-                control_ui.append_message("Dataset", message)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="episode stop failure",
+                now=now,
+            )
             try:
                 clutch_input.request_hold(reason="dataset_stop_failure")
             except BaseException:
@@ -1908,8 +2083,12 @@ def build_episode_recording_runtime(
                     stopped_episode_index = int(task.episode_index)
                     stopped_frame_count = int(task.frame_count)
                 _log("Dataset", event_message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", event_message)
+                publish_control_ui_message(
+                    "Dataset",
+                    event_message,
+                    context="episode stop completion",
+                    now=now,
+                )
             clutch_input.set_episode_recording_state(
                 active=False,
                 episode_dir=recording_path(),
@@ -1974,8 +2153,12 @@ def build_episode_recording_runtime(
                     f"{('，' + stage_text) if stage_text else ''})。"
                 )
                 _log("Dataset", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", message)
+                publish_control_ui_message(
+                    "Dataset",
+                    message,
+                    context="episode finalize success",
+                    now=now,
+                )
                 clutch_input.set_episode_finalize_state(
                     status="saved",
                     message=message,
@@ -1993,30 +2176,46 @@ def build_episode_recording_runtime(
                         f"v2.5-p sidecar 未完成：{task.v25p_error}"
                     )
                     _log("Dataset", sidecar_message, now=now)
-                    if control_ui is not None:
-                        control_ui.append_message("Dataset", sidecar_message)
+                    publish_control_ui_message(
+                        "Dataset",
+                        sidecar_message,
+                        context="episode sidecar warning",
+                        now=now,
+                    )
                 if task.v25p_native_error:
                     native_message = (
                         f"episode {task.episode_index} 的旧格式数据已保存，但 "
                         f"v2.5-p native shadow 未完成：{task.v25p_native_error}"
                     )
                     _log("Dataset", native_message, now=now)
-                    if control_ui is not None:
-                        control_ui.append_message("Dataset", native_message)
+                    publish_control_ui_message(
+                        "Dataset",
+                        native_message,
+                        context="episode native shadow warning",
+                        now=now,
+                    )
                 if task.progress_error:
                     progress_message = (
                         f"episode {task.episode_index} 的正式数据已保存，但 "
                         f"collection progress 未完整封存：{task.progress_error}"
                     )
                     _log("Dataset", progress_message, now=now)
-                    if control_ui is not None:
-                        control_ui.append_message("Dataset", progress_message)
+                    publish_control_ui_message(
+                        "Dataset",
+                        progress_message,
+                        context="episode progress warning",
+                        now=now,
+                    )
             else:
                 finalize_failure_count += 1
                 message = f"正式数据集 episode {task.episode_index} 保存失败: {task.error}"
                 _log("Dataset", message, now=now)
-                if control_ui is not None:
-                    control_ui.append_message("Dataset", message)
+                publish_control_ui_message(
+                    "Dataset",
+                    message,
+                    context="episode finalize failure",
+                    now=now,
+                )
                 clutch_input.set_episode_finalize_state(
                     status="error",
                     message=message,
