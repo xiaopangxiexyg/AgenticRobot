@@ -6,6 +6,7 @@ import time
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from agent_gateway.profiles.mujoco.observation import (
@@ -55,6 +56,7 @@ from control_station.sim_hil_profile.application import (
     MujocoSimHILPassiveApplicationCut,
 )
 from robot_motion.action import BIMANUAL_EE_POSE_V1
+from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
 from robot_motion.runtime.control_admission import ControlCut
 
 RUNTIME_SESSION_ID = "sim-hil:agent-skill-deployment-test:1"
@@ -207,12 +209,22 @@ def _application() -> SimpleNamespace:
         execution_difference_observer=SimpleNamespace(),
         target_frame_profile=SimpleNamespace(
             semantic_content_hash="target-frame-profile:test",
+            canonical_reference_frame_id="mujoco_sim_hil/station",
             reference_frame_by_component={"right_arm": "right_arm_base"},
             frame_graph=SimpleNamespace(
                 semantic_content_hash="frame-graph:test",
                 frame_by_id={
-                    "right_arm_base": _hashed("right-arm-base-spec:test")
+                    "right_arm_base": _hashed("right-arm-base-spec:test"),
+                    "mujoco_sim_hil/station": SimpleNamespace(
+                        semantic_content_hash="station-spec:test",
+                        semantic_parameters={
+                            "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
+                        },
+                    ),
                 },
+                resolve=lambda *_args: SimpleNamespace(
+                    matrix_target_source=np.eye(4, dtype=float)
+                ),
             ),
         ),
         tool_frame_profile=SimpleNamespace(
@@ -275,6 +287,9 @@ def test_contract_bundle_uses_only_exact_lower_graph_identities(monkeypatch) -> 
     assert binding.policy_checkpoint_hash == "checkpoint-hash:test"
     assert binding.observation_plan_hash == "observation-plan:test"
     assert binding.frame_graph_hash == "frame-graph:test"
+    assert bundle.state_deployment_binding.reference_frame_id == (
+        "mujoco_sim_hil/station"
+    )
     assert binding.tool_config_hash == "tool-frame-profile:test"
     assert binding.execution_domain_binding_hash == (
         bundle.station_manifest.execution_binding.semantic_content_hash
@@ -1046,7 +1061,7 @@ def test_session_repeats_passive_tcp_pose_reads_without_consuming_motion_worker(
     state_tool = next(name for name in specs if "state_read_tcp_pose" in name)
     parameters = {
         "component_ids": ["right_arm"],
-        "reference_frame_id": "right_arm_base",
+        "reference_frame_id": "mujoco_sim_hil/station",
         "controlled_frame_id": "tool_tcp",
         "max_measurement_age_ms": 100,
     }

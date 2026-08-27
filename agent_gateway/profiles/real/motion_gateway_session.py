@@ -181,6 +181,29 @@ class RealAgentPrimitiveObservationProducer:
         attachment = self.contract_bundle.attachment
         profile = self.contract_bundle.cardinal_profile
         config = self.port.config
+        attachment_checks = {
+            "public reference_frame_id": profile.reference_frame_id,
+            "public reference_frame_spec_hash": profile.reference_frame_spec_hash,
+            "execution reference_frame_id": profile.execution_reference_frame_id,
+            "execution reference_frame_spec_hash": (
+                profile.execution_reference_frame_spec_hash
+            ),
+        }
+        attachment_values = {
+            "public reference_frame_id": attachment.reference_frame_id,
+            "public reference_frame_spec_hash": (
+                attachment.reference_frame_spec_hash
+            ),
+            "execution reference_frame_id": (
+                attachment.execution_reference_frame_id
+            ),
+            "execution reference_frame_spec_hash": (
+                attachment.execution_reference_frame_spec_hash
+            ),
+        }
+        for field_name, expected in attachment_checks.items():
+            if attachment_values[field_name] != expected:
+                raise ValueError(f"Real observation {field_name} mismatch.")
         checks = {
             "execution_frame_id": profile.execution_reference_frame_id,
             "execution_frame_spec_hash": (
@@ -220,16 +243,32 @@ class RealAgentPrimitiveObservationProducer:
         if available_at > now:
             raise RuntimeError("Lower real observation inputs are not yet available.")
         attachment = self.contract_bundle.attachment
-        poses = {
-            component_id: [
+        if set(cut.pose_world_by_component) != set(attachment.component_ids):
+            raise ValueError(
+                "Lower measured TCP-pose cut does not match the attached components."
+            )
+        poses: dict[str, list[float]] = {}
+        frame_resolution_hashes: dict[str, str] = {}
+        for component_id, execution_pose in cut.pose_world_by_component.items():
+            public_pose, resolution = (
+                self.contract_bundle.frame_graph.transform_pose_matrix(
+                    execution_pose,
+                    source_reference_frame_id=(
+                        attachment.execution_reference_frame_id
+                    ),
+                    target_reference_frame_id=attachment.reference_frame_id,
+                )
+            )
+            poses[component_id] = [
                 float(value)
                 for value in pose_matrix_to_xyzquat(
-                    pose,
-                    name=f"real_agent_observation.{component_id}",
+                    public_pose,
+                    name=f"real_agent_public_observation.{component_id}",
                 )
             ]
-            for component_id, pose in cut.pose_world_by_component.items()
-        }
+            frame_resolution_hashes[component_id] = (
+                resolution.semantic_content_hash
+            )
         station_revision = self._observe_control_state()
         snapshot_hash = canonical_content_hash(
             {
@@ -239,6 +278,8 @@ class RealAgentPrimitiveObservationProducer:
                 "measured_cut_hash": cut.semantic_content_hash,
                 "active_operation_id": active_operation_id,
                 "measurement_freshness_ms": age_ms,
+                "public_pose_xyz_quat_xyzw_by_component": poses,
+                "frame_resolution_hash_by_component": frame_resolution_hashes,
             },
             domain="dexteleop.real_agent_motion.observation_snapshot_id.v1",
         )
@@ -272,6 +313,13 @@ class RealAgentPrimitiveObservationProducer:
                 "pose_xyz_quat_xyzw_by_component": poses,
                 "reference_frame_id": attachment.reference_frame_id,
                 "reference_frame_spec_hash": attachment.reference_frame_spec_hash,
+                "execution_reference_frame_id": (
+                    attachment.execution_reference_frame_id
+                ),
+                "execution_reference_frame_spec_hash": (
+                    attachment.execution_reference_frame_spec_hash
+                ),
+                "frame_resolution_hash_by_component": frame_resolution_hashes,
             },
             measurement_freshness_ms=age_ms,
             measurement_valid=True,
@@ -279,7 +327,18 @@ class RealAgentPrimitiveObservationProducer:
         return (
             snapshot,
             cut.semantic_content_hash,
-            tuple(sorted((*owner.evidence_refs, *cut.evidence_refs))),
+            tuple(
+                sorted(
+                    {
+                        *owner.evidence_refs,
+                        *cut.evidence_refs,
+                        *(
+                            "real-agent-observation-frame-resolution:" + value
+                            for value in frame_resolution_hashes.values()
+                        ),
+                    }
+                )
+            ),
             now,
         )
 

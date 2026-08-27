@@ -14,6 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_gateway.profiles.mujoco.skills.cube_lift.sim_route import (
+    CubeLiftSimDeploymentBinding,
+    CubeLiftTerminalEvaluatorConfig,
+    cube_lift_evaluation_plan_v1,
+    cube_lift_payload_validator_set_v1,
+    cube_lift_sim_route_v1,
+)
 from agent_gateway.protocol.evaluation_contracts import (
     SkillEvaluationPlan,
 )
@@ -33,20 +40,13 @@ from agent_gateway.protocol.state_schemas import (
 from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorRegistry,
 )
-from control_station.composition.mujoco_sim_hil import (
-    build_mujoco_sim_hil_agent_skill_execution_manifest,
-    build_mujoco_sim_hil_agent_skill_station_manifest,
-)
 from agent_gateway.skills.cube_lift.definition import (
     cube_lift_schema_entry_v1,
     cube_lift_skill_definition_v1,
 )
-from agent_gateway.profiles.mujoco.skills.cube_lift.sim_route import (
-    CubeLiftSimDeploymentBinding,
-    CubeLiftTerminalEvaluatorConfig,
-    cube_lift_evaluation_plan_v1,
-    cube_lift_payload_validator_set_v1,
-    cube_lift_sim_route_v1,
+from control_station.composition.mujoco_sim_hil import (
+    build_mujoco_sim_hil_agent_skill_execution_manifest,
+    build_mujoco_sim_hil_agent_skill_station_manifest,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
@@ -403,12 +403,9 @@ def _validate_exact_application(
         getattr(target_profile, "frame_graph", None),
         field_name="target frame graph hash",
     )
-    reference_frame_by_component = dict(
-        getattr(target_profile, "reference_frame_by_component", {})
-    )
     reference_frame_id = _required(
-        reference_frame_by_component.get("right_arm"),
-        field_name="right_arm reference frame",
+        getattr(target_profile, "canonical_reference_frame_id", None),
+        field_name="canonical Station reference frame",
     )
     reference_frame_spec_hash = _hash(
         getattr(
