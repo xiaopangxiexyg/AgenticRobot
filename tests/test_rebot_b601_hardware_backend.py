@@ -13,7 +13,12 @@ from hardware.rebot_b601_rs import (
     B601MotionAuthorizationError,
     B601RSBackend,
     B601RSBackendConfig,
+    B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID,
+    B601_RS_POS_VEL_POS_KP_PARAM_ID,
+    B601_RS_POS_VEL_VEL_KI_PARAM_ID,
+    B601_RS_POS_VEL_VEL_KP_PARAM_ID,
     FrequencyLedger,
+    evaluate_frequency_target,
 )
 from robot_motion.rebot_b601_rs import B601_RS_JOINT_MIT_FRAME, B601MitReference
 from scripts.hardware import rebot_b601_rs_frequency_probe as frequency_probe
@@ -22,6 +27,8 @@ pytestmark = [pytest.mark.unit, pytest.mark.contract]
 
 
 def _joint_configs() -> tuple[B601JointConfig, ...]:
+    velocity_kp = (12.0, 14.0, 14.0, 5.0, 4.0, 4.0)
+    position_kp = (13.0, 16.0, 14.0, 20.0, 10.0, 10.0)
     return tuple(
         B601JointConfig(
             name=name,
@@ -31,6 +38,10 @@ def _joint_configs() -> tuple[B601JointConfig, ...]:
             mit_kp=50.0,
             mit_kd=3.0,
             position_velocity_limit_rad_s=10.0,
+            position_velocity_kp=velocity_kp[index - 1],
+            position_velocity_ki=0.1,
+            position_kp=position_kp[index - 1],
+            position_ki=0.0,
         )
         for index, name in enumerate(B601_RS_ARM_JOINT_NAMES, start=1)
     )
@@ -47,6 +58,8 @@ def _config(*, allow_motion: bool = False) -> B601RSBackendConfig:
 
 
 def _yaml_mapping() -> dict[str, object]:
+    velocity_kp = (12.0, 14.0, 14.0, 5.0, 4.0, 4.0)
+    position_kp = (13.0, 16.0, 14.0, 20.0, 10.0, 10.0)
     joints = []
     for index, name in enumerate(B601_RS_ARM_JOINT_NAMES, start=1):
         joints.append(
@@ -57,7 +70,13 @@ def _yaml_mapping() -> dict[str, object]:
                 "model": "rs-06" if index <= 3 else "rs-00",
                 "vendor": "robstride",
                 "MIT": {"kp": 50.0, "kd": 3.0},
-                "POS_VEL": {"vlim": 10.0},
+                "POS_VEL": {
+                    "vel_kp": velocity_kp[index - 1],
+                    "vel_ki": 0.1,
+                    "pos_kp": position_kp[index - 1],
+                    "pos_ki": 0.0,
+                    "vlim": 10.0,
+                },
             }
         )
     return {
@@ -72,6 +91,7 @@ class _FakeMotor:
     def __init__(self, motor_id: int, *, state: object | None = None) -> None:
         self.motor_id = motor_id
         self.state = state
+        self.position_param: float | None = None
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.fail_method: str | None = None
 
@@ -83,6 +103,18 @@ class _FakeMotor:
     def get_state(self) -> object | None:
         self._call("get_state")
         return self.state
+
+    def request_feedback(self) -> None:
+        self._call("request_feedback")
+
+    def robstride_get_param_f32(self, *args: object) -> float:
+        self._call("robstride_get_param_f32", *args)
+        if self.position_param is None:
+            raise RuntimeError("synthetic position parameter unavailable")
+        return self.position_param
+
+    def robstride_write_param_f32(self, *args: object) -> None:
+        self._call("robstride_write_param_f32", *args)
 
     def ensure_mode(self, *args: object) -> None:
         self._call("ensure_mode", *args)
@@ -129,6 +161,7 @@ def _populate_states(controller: _FakeController) -> None:
             vel=0.0,
             torq=0.0,
         )
+        motor.position_param = 0.1 * index
 
 
 def test_config_parser_keeps_explicit_arm_order_and_excludes_gripper() -> None:
@@ -139,7 +172,56 @@ def test_config_parser_keeps_explicit_arm_order_and_excludes_gripper() -> None:
     assert tuple(joint.name for joint in config.joints) == B601_RS_ARM_JOINT_NAMES
     assert config.joints[0].motor_id == 1
     assert config.joints[-1].motor_id == 6
+    assert config.joints[0].position_velocity_kp == pytest.approx(12.0)
+    assert config.joints[0].position_velocity_ki == pytest.approx(0.1)
+    assert config.joints[0].position_kp == pytest.approx(13.0)
+    assert config.joints[0].position_ki == pytest.approx(0.0)
     assert config.allow_motion is False
+
+
+def test_prepare_position_velocity_mode_mirrors_rebot_parameter_order() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+        sleeper=lambda _seconds: None,
+    )
+
+    backend.connect()
+    receipt = backend.prepare_position_velocity_mode(
+        joint_names=("joint1",),
+        velocity_limits_rad_s=(0.1,) * 6,
+    )
+
+    assert receipt.completed is True
+    assert receipt.completed_joint_names == ("joint1",)
+    assert controller.motors[1].calls == [
+        ("robstride_write_param_f32", (B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID, 0.1)),
+        ("robstride_write_param_f32", (B601_RS_POS_VEL_VEL_KP_PARAM_ID, 12.0)),
+        ("robstride_write_param_f32", (B601_RS_POS_VEL_VEL_KI_PARAM_ID, 0.1)),
+        ("robstride_write_param_f32", (B601_RS_POS_VEL_POS_KP_PARAM_ID, 13.0)),
+        ("ensure_mode", (2, 1000)),
+    ]
+    assert all(not motor.calls for index, motor in controller.motors.items() if index != 1)
+
+
+def test_prepare_position_velocity_mode_fails_closed_on_parameter_write() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+        sleeper=lambda _seconds: None,
+    )
+
+    backend.connect()
+    controller.motors[1].fail_method = "robstride_write_param_f32"
+
+    receipt = backend.prepare_position_velocity_mode(joint_names=("joint1",))
+
+    assert receipt.completed is False
+    assert receipt.failed_joint_names == ("joint1",)
+    assert "joint1: synthetic robstride_write_param_f32 failure" in receipt.errors
+    assert all(call[0] != "ensure_mode" for call in controller.motors[1].calls)
 
 
 def test_connect_and_poll_do_not_request_feedback_or_enable() -> None:
@@ -160,6 +242,64 @@ def test_connect_and_poll_do_not_request_feedback_or_enable() -> None:
     assert state.freshness_semantics == "poll_observation_unverified"
     assert state.positions_rad == pytest.approx(tuple(0.1 * index for index in range(1, 7)))
     assert all(call[0] == "get_state" for motor in controller.motors.values() for call in motor.calls)
+
+
+def test_active_feedback_poll_requests_each_configured_arm_joint() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+
+    backend.connect()
+    _populate_states(controller)
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is True
+    assert controller.calls == [f"add:{index}" for index in range(1, 7)] + [
+        "poll_feedback_once"
+    ]
+    assert all(
+        motor.calls == [
+            ("request_feedback", ()),
+            ("get_state", ()),
+            ("robstride_get_param_f32", (0x7019, 100)),
+        ]
+        for motor in controller.motors.values()
+    )
+
+
+def test_active_feedback_poll_uses_mech_pos_when_motor_state_cache_is_empty() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+
+    backend.connect()
+    for index, motor in controller.motors.items():
+        motor.position_param = 0.1 * index
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is True
+    assert state.positions_rad == pytest.approx(tuple(0.1 * index for index in range(1, 7)))
+    assert state.velocities_reported is None
+    assert all(
+        joint.position_source == "robstride_mech_pos_parameter"
+        for joint in state.joints
+    )
+
+
+def test_active_feedback_request_failure_is_invalid_and_fail_closed() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+
+    backend.connect()
+    _populate_states(controller)
+    controller.motors[2].fail_method = "request_feedback"
+
+    state = backend.poll_feedback(request_feedback=True)
+
+    assert state.valid is False
+    assert state.stale is True
+    assert "joint2.request_feedback: synthetic request_feedback failure" in (
+        state.fault_reason or ""
+    )
 
 
 def test_empty_feedback_is_invalid_and_never_silently_zero_filled() -> None:
@@ -286,6 +426,74 @@ def test_motion_requires_urdf_limits_and_respects_velocity_envelope() -> None:
         )
 
 
+def test_position_dispatch_checks_position_limits_only_for_selected_joints() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    qpos = (0.1, 4.0, 0.1, 0.1, 0.1, 0.1)
+
+    receipt = backend.send_position_velocity(qpos, joint_names=("joint1",))
+
+    assert receipt.accepted is True
+    assert receipt.sent_joint_names == ("joint1",)
+    assert controller.motors[1].calls[-1] == ("send_pos_vel", (0.1, 10.0))
+    assert all(
+        not motor.calls
+        for index, motor in controller.motors.items()
+        if index != 1
+    )
+    with pytest.raises(ValueError, match=r"qpos_rad\[1\].*joint2"):
+        backend.send_position_velocity(qpos, joint_names=("joint2",))
+
+
+def test_mit_dispatch_checks_position_limits_only_for_selected_joints() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    reference = B601MitReference(
+        sequence=1,
+        source_timestamp_sec=1.0,
+        receive_timestamp_sec=1.0,
+        qpos_rad=(0.1, 4.0, 0.1, 0.1, 0.1, 0.1),
+    )
+
+    receipt = backend.send_mit(
+        reference,
+        kp=(1.0,) * 6,
+        kd=(1.0,) * 6,
+        tau_nm=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        joint_names=("joint1",),
+    )
+
+    assert receipt.accepted is True
+    assert receipt.sent_joint_names == ("joint1",)
+    assert controller.motors[1].calls[-1] == (
+        "send_mit",
+        (0.1, 0.0, 1.0, 1.0, 0.0),
+    )
+    assert all(
+        not motor.calls
+        for index, motor in controller.motors.items()
+        if index != 1
+    )
+    with pytest.raises(ValueError, match=r"reference\.qpos_rad\[1\].*joint2"):
+        backend.send_mit(
+            reference,
+            kp=(1.0,) * 6,
+            kd=(1.0,) * 6,
+            tau_nm=(0.0,) * 6,
+            torque_limits_nm=(1.0,) * 6,
+            joint_names=("joint2",),
+        )
+
+
 def test_position_dispatch_reports_all_sent_joints_and_no_hidden_partial_success() -> None:
     controller = _FakeController()
     backend = B601RSBackend(
@@ -363,6 +571,35 @@ def test_frequency_ledger_keeps_feedback_compute_tx_and_haptic_separate() -> Non
     assert summary["haptic"]["observed_hz"] is None
 
 
+def test_frequency_acceptance_distinguishes_completion_from_target_pass() -> None:
+    ledger = FrequencyLedger()
+    for timestamp in (0.0, 0.05, 0.10):
+        ledger.mark("tx", timestamp)
+
+    acceptance = evaluate_frequency_target(
+        ledger.summarize(target_hz=125.0)["tx"]
+    )
+
+    assert acceptance.passed is False
+    assert acceptance.observed_hz == pytest.approx(20.0)
+    assert acceptance.minimum_observed_hz == pytest.approx(118.75)
+    assert acceptance.deadline_miss_ratio == pytest.approx(1.0)
+    assert len(acceptance.reasons) == 2
+
+
+def test_frequency_acceptance_passes_explicit_rate_and_deadline_limits() -> None:
+    ledger = FrequencyLedger()
+    for timestamp in (0.0, 0.008, 0.016, 0.024):
+        ledger.mark("tx", timestamp)
+
+    acceptance = evaluate_frequency_target(
+        ledger.summarize(target_hz=125.0)["tx"]
+    )
+
+    assert acceptance.passed is True
+    assert acceptance.reasons == ()
+
+
 class _FakePositionProbeBackend:
     def __init__(
         self,
@@ -374,11 +611,15 @@ class _FakePositionProbeBackend:
         self.stop_receipt = stop_receipt
         self.calls: list[str] = []
         self.sequence = 0
+        self.send_sequence = 0
+        self.prepare_velocity_limits: object = None
 
     def connect(self) -> None:
         self.calls.append("connect")
 
-    def poll_feedback(self) -> object:
+    def poll_feedback(self, *, request_feedback: bool = False) -> object:
+        if request_feedback:
+            self.calls.append("request_feedback")
         self.calls.append("poll_feedback")
         self.sequence += 1
         return SimpleNamespace(
@@ -389,8 +630,14 @@ class _FakePositionProbeBackend:
             fault_reason=None,
         )
 
-    def prepare_position_velocity_mode(self, *, joint_names: object) -> B601ModeReceipt:
+    def prepare_position_velocity_mode(
+        self,
+        *,
+        joint_names: object,
+        velocity_limits_rad_s: object = None,
+    ) -> B601ModeReceipt:
         del joint_names
+        self.prepare_velocity_limits = velocity_limits_rad_s
         self.calls.append("prepare")
         return B601ModeReceipt(
             "prepare_position_velocity_mode",
@@ -409,10 +656,11 @@ class _FakePositionProbeBackend:
     def send_position_velocity(self, *args: object, **kwargs: object) -> object:
         del args, kwargs
         self.calls.append("send")
+        self.send_sequence += 1
         return SimpleNamespace(
             accepted=True,
             errors=(),
-            completed_at_sec=1.0,
+            completed_at_sec=float(self.send_sequence),
         )
 
     def safe_stop(self, *, joint_names: object) -> B601ModeReceipt:
@@ -426,6 +674,7 @@ class _FakePositionProbeBackend:
 
 def _position_probe_args(config_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
+        mode="position",
         allow_motion=True,
         confirmation="B601_RS_POSITION_FREQUENCY",
         enable=True,
@@ -436,6 +685,9 @@ def _position_probe_args(config_path: Path) -> SimpleNamespace:
         joint=("joint1", "joint2"),
         rebot_source_root=None,
         target_hz=125.0,
+        velocity_limit_rad_s=0.1,
+        minimum_rate_ratio=0.95,
+        maximum_deadline_miss_ratio=0.01,
     )
 
 
@@ -451,7 +703,15 @@ def _install_position_probe_fakes(
     monkeypatch.setattr(
         frequency_probe.B601RSBackendConfig,
         "from_rs_yaml",
-        staticmethod(lambda _path, **_kwargs: SimpleNamespace(channel="can0")),
+        staticmethod(
+            lambda _path, **_kwargs: SimpleNamespace(
+                channel="can0",
+                joints=tuple(
+                    SimpleNamespace(position_velocity_limit_rad_s=10.0)
+                    for _ in range(6)
+                ),
+            )
+        ),
     )
     monkeypatch.setattr(frequency_probe, "B601RSBackend", lambda _config: backend)
 
@@ -489,6 +749,7 @@ def test_position_probe_stops_all_selected_joints_after_partial_enable(
         frequency_probe._run_position_probe(_position_probe_args(config_path))
 
     assert backend.calls[-2:] == ["safe_stop", "close"]
+    assert backend.prepare_velocity_limits == (0.1,) * 6
 
 
 def test_position_probe_reports_incomplete_safe_stop_receipt(
@@ -531,3 +792,92 @@ def test_position_probe_reports_incomplete_safe_stop_receipt(
         "safe_stop: joint2: synthetic disable failure",
     )
     assert result["stop_reason"] == "safe_stop: joint2: synthetic disable failure"
+    assert backend.prepare_velocity_limits == (0.1,) * 6
+
+
+def test_disabled_tx_probe_never_enables_or_polls_feedback_after_warmup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("test: true\n", encoding="utf-8")
+    backend = _FakePositionProbeBackend(
+        enable_receipt=B601ModeReceipt(
+            "enable", ("joint1", "joint2"), ("joint1", "joint2"), (), (), True
+        ),
+        stop_receipt=B601ModeReceipt(
+            "safe_stop",
+            ("joint1", "joint2"),
+            ("joint1", "joint2"),
+            (),
+            (),
+            True,
+        ),
+    )
+    _install_position_probe_fakes(monkeypatch, backend)
+    args = _position_probe_args(config_path)
+    args.mode = "position-tx-disabled"
+    args.enable = False
+    args.confirmation = "B601_RS_DISABLED_TX_FREQUENCY"
+    args.duration_sec = 0.02
+
+    result = frequency_probe._run_position_probe(args)
+
+    assert "enable" not in backend.calls
+    assert backend.calls.count("request_feedback") == 1
+    assert backend.calls.count("poll_feedback") == 1
+    assert backend.calls.count("safe_stop") == 2
+    assert backend.calls.index("safe_stop") < backend.calls.index("prepare")
+    assert backend.calls[-2:] == ["safe_stop", "close"]
+    assert backend.send_sequence >= 2
+    assert result["motors_enabled_by_probe"] is False
+    assert result["freshness_semantics"] == (
+        "initial_vendor_snapshot_only; no_runtime_feedback"
+    )
+    assert result["acceptance"]["required_events"] == ("compute", "tx")
+
+
+def test_probe_main_returns_nonzero_for_completed_frequency_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        frequency_probe,
+        "_run_position_probe",
+        lambda _args: {
+            "mode": "position",
+            "execution_status": "COMPLETED",
+            "acceptance_status": "FAIL",
+        },
+    )
+
+    return_code = frequency_probe.main(["--mode", "position"])
+
+    assert return_code == 1
+    assert '"status": "FAIL"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("target_hz", (0.0, float("nan"), float("inf")))
+def test_position_probe_rejects_nonfinite_or_nonpositive_target_before_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_hz: float,
+) -> None:
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("test: true\n", encoding="utf-8")
+    backend = _FakePositionProbeBackend(
+        enable_receipt=B601ModeReceipt(
+            "enable", ("joint1", "joint2"), ("joint1", "joint2"), (), (), True
+        ),
+        stop_receipt=B601ModeReceipt(
+            "safe_stop", ("joint1", "joint2"), ("joint1", "joint2"), (), (), True
+        ),
+    )
+    _install_position_probe_fakes(monkeypatch, backend)
+    args = _position_probe_args(config_path)
+    args.target_hz = target_hz
+
+    with pytest.raises(ValueError, match="target_hz must be positive"):
+        frequency_probe._run_position_probe(args)
+
+    assert backend.calls == []

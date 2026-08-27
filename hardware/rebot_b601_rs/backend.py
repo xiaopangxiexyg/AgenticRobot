@@ -7,11 +7,18 @@ the module is side-effect free.  A controller is opened only by an explicit
 call to :meth:`B601RSBackend.connect`, and every command path is disabled
 unless the caller constructed the backend with ``allow_motion=True``.
 
-The first version intentionally uses the vendor cache as a *poll observation*.
-MotorBridge 0.4.9 does not expose the source timestamp or a receive sequence
-for a RobStride frame, so this adapter does not claim verified per-frame
-freshness.  The distinction is part of the public state contract and must be
-closed before hardware haptic acceptance.
+The default feedback path intentionally uses the vendor cache as a *poll
+observation*.  An active caller may opt in to an explicit vendor feedback
+request before polling; this is needed by the commissioning loop because a
+RobStride bus does not necessarily populate the cache until a request frame is
+sent.  On the pinned firmware the resulting compact type-0x18 position stream
+is not decoded by MotorBridge 0.4.9, so an active caller also reads
+``mechPos`` (0x7019) through the vendor parameter API.  This position-only
+fallback is explicit in each observation; velocity/torque consumers must still
+require their corresponding fields.  MotorBridge 0.4.9 does not expose the
+source timestamp or a receive sequence for a RobStride frame, so neither path
+claims verified per-frame freshness.  The distinction is part of the public
+state contract and must be closed before hardware haptic acceptance.
 """
 
 from __future__ import annotations
@@ -35,6 +42,15 @@ B601_RS_DEFAULT_CHANNEL = "can0"
 B601_RS_DEFAULT_RATE_HZ = 500.0
 B601_RS_DEFAULT_FEEDBACK_TIMEOUT_SEC = 0.10
 B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC = 0.10
+B601_RS_MECH_POS_PARAM_ID = 0x7019
+# RobStride POS_VEL parameter IDs used by the pinned reBotArm
+# ``JointGroup._write_pv_params`` implementation.  Keep these explicit so a
+# future vendor/runtime update cannot silently turn mode preparation into a
+# different register sequence.
+B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID = 0x7017
+B601_RS_POS_VEL_VEL_KP_PARAM_ID = 0x701F
+B601_RS_POS_VEL_VEL_KI_PARAM_ID = 0x7020
+B601_RS_POS_VEL_POS_KP_PARAM_ID = 0x701E
 
 
 class B601HardwareError(RuntimeError):
@@ -115,6 +131,10 @@ class B601JointConfig:
     mit_kp: float = 0.0
     mit_kd: float = 0.0
     position_velocity_limit_rad_s: float = 0.0
+    position_velocity_kp: float = 0.0
+    position_velocity_ki: float = 0.0
+    position_kp: float = 0.0
+    position_ki: float = 0.0
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
@@ -150,6 +170,16 @@ class B601JointConfig:
                 name="position_velocity_limit_rad_s",
             ),
         )
+        for field_name in (
+            "position_velocity_kp",
+            "position_velocity_ki",
+            "position_kp",
+            "position_ki",
+        ):
+            value = _finite_float(getattr(self, field_name), name=field_name)
+            if value < 0.0:
+                raise ValueError(f"{field_name} must be non-negative")
+            object.__setattr__(self, field_name, value)
         if self.mit_kp < 0.0 or self.mit_kd < 0.0:
             raise ValueError("mit gains must be non-negative")
 
@@ -162,10 +192,11 @@ class B601RSBackendConfig:
     the URDF position limits.  A motion-capable caller should supply limits
     obtained from the same pinned URDF before invoking a command method.
 
-    ``feedback_timeout_sec`` and ``watchdog_timeout_sec`` are retained as
-    explicit configuration declarations for the later guarded control loop.
-    This passive adapter does not infer freshness from MotorBridge's cached
-    state and does not run an automatic watchdog or safe-stop thread.
+    ``feedback_timeout_sec`` bounds the active RobStride ``mechPos`` parameter
+    read, while both timeout values remain explicit configuration declarations
+    for the later guarded control loop.  This adapter does not infer freshness
+    from MotorBridge's cached state and does not run an automatic watchdog or
+    safe-stop thread.
     """
 
     channel: str = B601_RS_DEFAULT_CHANNEL
@@ -301,6 +332,22 @@ class B601RSBackendConfig:
                     position_velocity_limit_rad_s=_positive_float(
                         pos_vel.get("vlim"), name=f"{name}.POS_VEL.vlim"
                     ),
+                    position_velocity_kp=_finite_float(
+                        pos_vel.get("vel_kp", 0.0),
+                        name=f"{name}.POS_VEL.vel_kp",
+                    ),
+                    position_velocity_ki=_finite_float(
+                        pos_vel.get("vel_ki", 0.0),
+                        name=f"{name}.POS_VEL.vel_ki",
+                    ),
+                    position_kp=_finite_float(
+                        pos_vel.get("pos_kp", 0.0),
+                        name=f"{name}.POS_VEL.pos_kp",
+                    ),
+                    position_ki=_finite_float(
+                        pos_vel.get("pos_ki", 0.0),
+                        name=f"{name}.POS_VEL.pos_ki",
+                    ),
                 )
             )
         return cls(
@@ -315,7 +362,7 @@ class B601RSBackendConfig:
 
 @dataclass(frozen=True)
 class B601JointState:
-    """One poll observation from the vendor's cached ``MotorState``."""
+    """One poll observation from cache or an explicit RobStride position read."""
 
     name: str
     motor_id: int
@@ -331,6 +378,7 @@ class B601JointState:
     stale: bool
     error: str | None = None
     frame_id: str = B601_RS_FEEDBACK_FRAME
+    position_source: str = "vendor_motor_state_cache"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", str(self.name).strip())
@@ -359,6 +407,7 @@ class B601JointState:
         if not isinstance(self.valid, bool) or not isinstance(self.stale, bool):
             raise TypeError("valid and stale must be bools")
         object.__setattr__(self, "error", None if self.error is None else str(self.error))
+        object.__setattr__(self, "position_source", str(self.position_source))
 
 
 @dataclass(frozen=True)
@@ -465,12 +514,16 @@ class B601RSBackend:
         *,
         controller_factory: Callable[[str], object] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if not isinstance(config, B601RSBackendConfig):
             raise TypeError("config must be a B601RSBackendConfig")
         self.config = config
         self._controller_factory = controller_factory
         self._clock = clock
+        if not callable(sleeper):
+            raise TypeError("sleeper must be callable")
+        self._sleeper = sleeper
         self._controller: object | None = None
         self._motors: dict[str, object] = {}
         self._state_sequence = 0
@@ -580,12 +633,65 @@ class B601RSBackend:
             )
         return limits
 
-    def poll_feedback(self) -> B601HardwareState:
-        """Consume queued feedback only; never issue a feedback request frame."""
+    @staticmethod
+    def _validate_selected_position_limits(
+        values: Sequence[float],
+        *,
+        joint_names: tuple[str, ...],
+        limits: tuple[tuple[float, float], ...],
+        field_name: str,
+    ) -> None:
+        """Validate only the references that the command will dispatch.
+
+        Command APIs accept a complete six-joint vector so the arm ordering
+        remains stable, while ``joint_names`` selects the motors that receive
+        the frame.  A non-selected joint may legitimately be outside the
+        configured envelope (for example, its current hardware pose can be
+        stale or intentionally parked elsewhere); it must not block a command
+        that does not address that joint.
+        """
+
+        selected = set(joint_names)
+        for index, (name, (lower, upper), value) in enumerate(
+            zip(B601_RS_ARM_JOINT_NAMES, limits, values)
+        ):
+            if name not in selected:
+                continue
+            if not lower <= value <= upper:
+                raise ValueError(
+                    f"{field_name}[{index}] is outside the configured position "
+                    f"limit for {name}: {value:.6f} not in [{lower:.6f}, {upper:.6f}]"
+                )
+
+    def poll_feedback(self, *, request_feedback: bool = False) -> B601HardwareState:
+        """Observe six joints, optionally requesting a fresh vendor snapshot.
+
+        The default is deliberately receive-only: it consumes the MotorBridge
+        cache and never sends a CAN frame.  A motion-capable commissioning
+        loop can pass ``request_feedback=True`` to issue one explicit
+        ``Motor.request_feedback()`` per configured arm joint before calling
+        ``Controller.poll_feedback_once()``.  For RobStride, the active path
+        then reads ``mechPos`` (0x7019), because MotorBridge 0.4.9 does not
+        decode the firmware's compact type-0x18 position stream.  This remains
+        an observation request, not a motion command, and the returned state
+        still reports ``freshness_verified=False`` because MotorBridge 0.4.9
+        exposes neither a source timestamp nor a receive sequence.
+        """
+
+        if not isinstance(request_feedback, bool):
+            raise TypeError("request_feedback must be a bool")
 
         controller = self._require_connected()
         now = _finite_float(self._clock(), name="clock")
         self._state_sequence += 1
+        request_errors: list[str] = []
+        if request_feedback:
+            for joint in self.config.joints:
+                try:
+                    request = getattr(self._motors[joint.name], "request_feedback")
+                    request()
+                except Exception as exc:  # vendor errors become an invalid snapshot
+                    request_errors.append(f"{joint.name}.request_feedback: {exc}")
         poll_error: str | None = None
         try:
             poll = getattr(controller, "poll_feedback_once")
@@ -594,14 +700,47 @@ class B601RSBackend:
             poll_error = f"poll_feedback_once: {exc}"
 
         observations: list[B601JointState] = []
-        errors: list[str] = [poll_error] if poll_error else []
+        errors: list[str] = [*request_errors]
+        if poll_error:
+            errors.append(poll_error)
         for joint in self.config.joints:
             motor = self._motors[joint.name]
+            raw_state_error: str | None = None
             try:
                 raw_state = getattr(motor, "get_state")()
             except Exception as exc:
                 raw_state = None
-                error = f"{joint.name}.get_state: {exc}"
+                raw_state_error = f"{joint.name}.get_state: {exc}"
+
+            # RobStride firmware may emit compact type-0x18 position reports
+            # that MotorBridge 0.4.9 does not decode into MotorState.  The
+            # pinned reBotArm implementation therefore reads mechPos (0x7019)
+            # explicitly.  Keep this extra request opt-in so the default
+            # backend observation remains receive-only.
+            live_position: float | None = None
+            position_error: str | None = None
+            if request_feedback and joint.vendor == "robstride":
+                try:
+                    read_position = getattr(motor, "robstride_get_param_f32")
+                    timeout_ms = max(
+                        1,
+                        int(round(self.config.feedback_timeout_sec * 1000.0)),
+                    )
+                    live_position = _finite_float(
+                        read_position(B601_RS_MECH_POS_PARAM_ID, timeout_ms),
+                        name=f"{joint.name}.mechPos",
+                    )
+                except Exception as exc:  # vendor errors become an invalid snapshot
+                    position_error = (
+                        f"{joint.name}.mechPos(0x{B601_RS_MECH_POS_PARAM_ID:x}): {exc}"
+                    )
+
+            if raw_state is None and live_position is None:
+                error = (
+                    position_error
+                    or raw_state_error
+                    or f"{joint.name}: feedback cache is empty"
+                )
                 errors.append(error)
                 observations.append(
                     B601JointState(
@@ -622,8 +761,11 @@ class B601RSBackend:
                 )
                 continue
             if raw_state is None:
-                error = f"{joint.name}: feedback cache is empty"
-                errors.append(error)
+                errors.extend(
+                    error
+                    for error in (raw_state_error, poll_error)
+                    if error and error not in errors
+                )
                 observations.append(
                     B601JointState(
                         name=joint.name,
@@ -631,14 +773,17 @@ class B601RSBackend:
                         feedback_id=joint.feedback_id,
                         arbitration_id=None,
                         status_code=None,
-                        position_rad=None,
+                        position_rad=live_position,
                         velocity_reported=None,
                         torque_reported_nm=None,
                         observed_at_sec=now,
                         sample_sequence=self._state_sequence,
-                        valid=False,
-                        stale=True,
-                        error=error,
+                        valid=not request_errors and poll_error is None,
+                        stale=bool(
+                            request_errors or poll_error
+                        ),
+                        error=poll_error,
+                        position_source="robstride_mech_pos_parameter",
                     )
                 )
                 continue
@@ -646,7 +791,10 @@ class B601RSBackend:
                 can_id = int(getattr(raw_state, "can_id"))
                 arbitration_id = int(getattr(raw_state, "arbitration_id"))
                 status_code = int(getattr(raw_state, "status_code"))
-                position = _finite_float(getattr(raw_state, "pos"), name=f"{joint.name}.pos")
+                cached_position = _finite_float(
+                    getattr(raw_state, "pos"), name=f"{joint.name}.pos"
+                )
+                position = cached_position if live_position is None else live_position
                 velocity = _finite_float(getattr(raw_state, "vel"), name=f"{joint.name}.vel")
                 torque = _finite_float(getattr(raw_state, "torq"), name=f"{joint.name}.torq")
                 state_error: str | None = None
@@ -656,6 +804,10 @@ class B601RSBackend:
                     state_error = f"{joint.name}: vendor status_code={status_code}"
                 if state_error:
                     errors.append(state_error)
+                if position_error:
+                    errors.append(position_error)
+                if raw_state_error:
+                    errors.append(raw_state_error)
                 observations.append(
                     B601JointState(
                         name=joint.name,
@@ -668,9 +820,24 @@ class B601RSBackend:
                         torque_reported_nm=torque,
                         observed_at_sec=now,
                         sample_sequence=self._state_sequence,
-                        valid=state_error is None and poll_error is None,
-                        stale=state_error is not None or poll_error is not None,
-                        error=state_error or poll_error,
+                        valid=(
+                            state_error is None
+                            and position_error is None
+                            and poll_error is None
+                            and not request_errors
+                        ),
+                        stale=bool(
+                            state_error
+                            or position_error
+                            or poll_error
+                            or request_errors
+                        ),
+                        error=state_error or position_error or poll_error,
+                        position_source=(
+                            "robstride_mech_pos_parameter"
+                            if live_position is not None
+                            else "vendor_motor_state_cache"
+                        ),
                     )
                 )
             except (AttributeError, TypeError, ValueError) as exc:
@@ -745,9 +912,17 @@ class B601RSBackend:
         self,
         *,
         joint_names: Sequence[str] | None = None,
+        velocity_limits_rad_s: Sequence[float] | None = None,
         timeout_ms: int = 1000,
     ) -> B601ModeReceipt:
-        """Explicitly set POS_VEL once; never call this from a high-rate loop."""
+        """Apply reBotArm POS_VEL parameters and set the mode once.
+
+        The pinned reBotArm source writes RobStride ``limit_spd`` and the
+        velocity/position-loop gains before calling ``ensure_mode``.  Keep the
+        whole sequence outside the high-rate command loop, and fail closed if
+        any parameter write fails so stale vendor gains are never reported as
+        a completed setup.
+        """
 
         self._require_motion_authorized()
         names = self._resolve_joint_names(joint_names)
@@ -761,16 +936,67 @@ class B601RSBackend:
             mode = getattr(import_module("motorbridge"), "Mode").POS_VEL
         except (ModuleNotFoundError, AttributeError) as exc:
             raise B601HardwareDependencyError("motorbridge.Mode.POS_VEL is unavailable") from exc
+        if velocity_limits_rad_s is None:
+            velocity_limits = tuple(
+                joint.position_velocity_limit_rad_s for joint in self.config.joints
+            )
+        else:
+            velocity_limits = _six_nonnegative(
+                velocity_limits_rad_s,
+                name="velocity_limits_rad_s",
+            )
+            configured_velocity_limits = tuple(
+                joint.position_velocity_limit_rad_s for joint in self.config.joints
+            )
+            if any(
+                velocity_limits[index] > configured_velocity_limits[index]
+                for index in range(6)
+            ):
+                raise ValueError(
+                    "velocity_limits_rad_s exceeds the configured per-joint limit"
+                )
+        index_by_name = {
+            joint.name: index for index, joint in enumerate(self.config.joints)
+        }
         completed: list[str] = []
         failed: list[str] = []
         errors: list[str] = []
         for name in names:
             try:
+                joint = self.config.joints[index_by_name[name]]
+                write_param = getattr(self._motors[name], "robstride_write_param_f32")
+                # This order and the short settling delays mirror the pinned
+                # reBotArm ``JointGroup._write_pv_params`` implementation.
+                write_param(
+                    B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID,
+                    float(velocity_limits[index_by_name[name]]),
+                )
+                self._sleeper(0.01)
+                write_param(
+                    B601_RS_POS_VEL_VEL_KP_PARAM_ID,
+                    float(joint.position_velocity_kp),
+                )
+                self._sleeper(0.01)
+                write_param(
+                    B601_RS_POS_VEL_VEL_KI_PARAM_ID,
+                    float(joint.position_velocity_ki),
+                )
+                self._sleeper(0.01)
+                write_param(
+                    B601_RS_POS_VEL_POS_KP_PARAM_ID,
+                    float(joint.position_kp),
+                )
+                self._sleeper(0.02)
                 getattr(self._motors[name], "ensure_mode")(mode, int(timeout_ms))
+                self._sleeper(0.05)
                 completed.append(name)
             except Exception as exc:
                 failed.append(name)
                 errors.append(f"{name}: {exc}")
+        # JointGroup.mode_pos_vel() waits after the per-joint transition before
+        # returning control to the caller.  This is still one-time setup, never
+        # part of the 125/250/500 Hz reference loop.
+        self._sleeper(0.2)
         return B601ModeReceipt("prepare_position_velocity_mode", names, tuple(completed), tuple(failed), tuple(errors), not failed)
 
     def enable(self, *, joint_names: Sequence[str] | None = None) -> B601ModeReceipt:
@@ -827,12 +1053,14 @@ class B601RSBackend:
         if frame_id != B601_RS_POSITION_FRAME:
             raise ValueError("position command frame_id is not the B601 position frame")
         names = self._resolve_joint_names(joint_names)
-        self._require_position_limits()
+        position_limits = self._require_position_limits()
         qpos = _six_finite(qpos_rad, name="qpos_rad")
-        if self.config.position_limits_rad is not None:
-            for index, (lower, upper) in enumerate(self.config.position_limits_rad):
-                if not lower <= qpos[index] <= upper:
-                    raise ValueError(f"qpos_rad[{index}] is outside the configured position limit")
+        self._validate_selected_position_limits(
+            qpos,
+            joint_names=names,
+            limits=position_limits,
+            field_name="qpos_rad",
+        )
         if velocity_limits_rad_s is None:
             velocity_limits = tuple(
                 joint.position_velocity_limit_rad_s for joint in self.config.joints
@@ -895,11 +1123,12 @@ class B601RSBackend:
             raise ValueError("invalid MIT reference cannot be dispatched")
         names = self._resolve_joint_names(joint_names)
         position_limits = self._require_position_limits()
-        for index, (lower, upper) in enumerate(position_limits):
-            if not lower <= reference.qpos_rad[index] <= upper:
-                raise ValueError(
-                    f"reference.qpos_rad[{index}] is outside the configured position limit"
-                )
+        self._validate_selected_position_limits(
+            reference.qpos_rad,
+            joint_names=names,
+            limits=position_limits,
+            field_name="reference.qpos_rad",
+        )
         kp_values = _six_nonnegative(kp, name="kp")
         kd_values = _six_nonnegative(kd, name="kd")
         tau_values = _six_finite(tau_nm, name="tau_nm")
@@ -961,5 +1190,10 @@ __all__ = [
     "B601_RS_DEFAULT_RATE_HZ",
     "B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC",
     "B601_RS_FEEDBACK_FRAME",
+    "B601_RS_MECH_POS_PARAM_ID",
+    "B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID",
+    "B601_RS_POS_VEL_VEL_KP_PARAM_ID",
+    "B601_RS_POS_VEL_VEL_KI_PARAM_ID",
+    "B601_RS_POS_VEL_POS_KP_PARAM_ID",
     "B601_RS_POSITION_FRAME",
 ]
