@@ -6,6 +6,7 @@
 | 专题 | 用途 |
 |---|---|
 | [TELEOP_COLLECTION](./TELEOP_COLLECTION.md) | 启动顺序、正式 profile 参数、数采验收和回退 |
+| [IK 抖动诊断](./DEBUG_IK_0827.md) | 显式启用的被动诊断记录、输出边界和回退方式 |
 | [原生触觉分离存储](./NATIVE_TACTILE_BUNDLE.md) | 采集期双根写入、可迁移身份、校验附着与原子恢复 |
 | [长程 Progress Profile](./TELEOP_COLLECTION.md#38-可选长程进度语义与独立-gui) | GUI 选择、数据集唯一绑定、Failure/Retry 和回退方式 |
 | [长程细粒度阶段标注](./LONG_HORIZON_STAGE_ANNOTATION.md) | 已封存 Episode 的视频时间轴、Failure/stage 标注和训练排除 |
