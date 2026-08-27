@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
 import json
 import multiprocessing
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -23,7 +26,10 @@ from collection_runtime.progress.profiles import (
     DATASET_PROGRESS_PROFILE_RELATIVE_PATH,
     DatasetProgressProfileBindingError,
     bind_dataset_progress_profile,
+    bind_dataset_task_stage_profile,
     read_dataset_progress_profile,
+    inspect_dataset_progress_profile,
+    inspect_dataset_task_stage_profile,
 )
 from collection_runtime.sample_acceptance import (
     SampleAcceptanceReceiptBuffer,
@@ -58,6 +64,7 @@ from teleop_runtime.collection.writer_v21 import (
     LeRobotV21Writer,
     LeRobotV21WriterConfig,
 )
+from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
 from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
 from teleop_runtime.real_teleop.dataset_finalize import RealDatasetFinalizeTask
 from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
@@ -65,9 +72,11 @@ from teleop_runtime.real_teleop.progress_adapter import (
     DEFAULT_REAL_TELEOP_MANAGED_PROGRESS_PROFILE_ID,
     RealTeleopProgressEpisode,
     load_real_teleop_managed_progress_profile,
+    load_real_teleop_managed_progress_profile_selection,
     load_real_teleop_progress_profile,
     resolve_real_teleop_progress_entry,
     resolve_real_teleop_default_progress_profile,
+    resolve_real_teleop_stage_profile_for_admission,
     resolve_real_teleop_task_stage_profile,
     select_real_teleop_managed_progress_profile,
     select_real_teleop_progress_entry_step,
@@ -340,6 +349,52 @@ def test_formal_profile_is_explicitly_opted_in_by_cli() -> None:
     )
     assert catalog.collection_progress_profile == (
         enabled.collection_progress_profile
+    )
+
+
+def test_cli_restart_adopts_bound_detailed_stage_before_writer_start(
+    tmp_path: Path,
+) -> None:
+    coarse = load_real_teleop_managed_progress_profile_selection(
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress"
+    )
+    detailed = load_real_teleop_managed_progress_profile_selection(
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+    )
+    assert detailed.stage_profile is not None
+    dataset_base = tmp_path / "datasets"
+    dataset_root = dataset_base / (
+        f"{datetime.now().strftime('%Y-%m-%d')}_vive_rm65_real_teleop"
+    )
+    bind_dataset_progress_profile(dataset_root, coarse.progress_profile)
+    bind_dataset_task_stage_profile(
+        dataset_root,
+        progress_profile=coarse.progress_profile,
+        stage_profile=detailed.stage_profile,
+    )
+
+    argv = [
+        "prog",
+        "--no-device-preflight",
+        "--dataset-root",
+        str(dataset_base),
+        "--collection-progress-profile",
+        "catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress",
+        "--collection-progress-entry-step",
+        "right_write",
+    ]
+    with patch.object(sys, "argv", argv):
+        args = real_teleop.parse_args()
+
+    assert args._collection_stage_profile_explicit is False
+    assert args.collection_stage_profile is not None
+    assert tuple(
+        stage.stage_id
+        for stage in args.collection_stage_profile.stages_for_step("right_write")
+    ) == (
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
     )
 
 
@@ -1214,6 +1269,68 @@ def test_idle_recorder_accepts_explicit_detailed_stage_variant(
     assert recorder.progress_profile == detail_profile
     assert recorder.stage_profile == detail_stages
     assert recorder.args.collection_stage_profile == detail_stages
+
+
+def test_restart_admission_preserves_bound_detailed_stage_profile(
+    tmp_path: Path,
+) -> None:
+    coarse = load_real_teleop_managed_progress_profile_selection(
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress"
+    )
+    detailed = load_real_teleop_managed_progress_profile_selection(
+        "dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+    )
+    assert coarse.stage_profile is not None
+    assert detailed.stage_profile is not None
+
+    bind_dataset_progress_profile(tmp_path, coarse.progress_profile)
+    bind_dataset_task_stage_profile(
+        tmp_path,
+        progress_profile=coarse.progress_profile,
+        stage_profile=detailed.stage_profile,
+    )
+
+    progress_admission = inspect_dataset_progress_profile(
+        tmp_path,
+        requested_profile=coarse.progress_profile,
+    )
+    requested_stage = resolve_real_teleop_stage_profile_for_admission(
+        coarse.progress_profile,
+        "",
+        dataset_progress_locked=progress_admission.locked,
+        configured_stage_profile_explicit=False,
+    )
+    assert requested_stage is None
+    stage_admission = inspect_dataset_task_stage_profile(
+        tmp_path,
+        progress_profile=coarse.progress_profile,
+        requested_profile=requested_stage,
+    )
+    assert stage_admission.profile == detailed.stage_profile
+    assert tuple(
+        stage.stage_id
+        for stage in stage_admission.profile.stages_for_step("right_write")
+    ) == (
+        "right_write.pen_down",
+        "right_write.write",
+        "right_write.pen_up",
+    )
+
+    explicit_coarse_stage = resolve_real_teleop_stage_profile_for_admission(
+        coarse.progress_profile,
+        coarse.stage_profile,
+        dataset_progress_locked=progress_admission.locked,
+        configured_stage_profile_explicit=True,
+    )
+    with pytest.raises(
+        DatasetProgressProfileBindingError,
+        match="Requested task stage profile differs",
+    ):
+        inspect_dataset_task_stage_profile(
+            tmp_path,
+            progress_profile=coarse.progress_profile,
+            requested_profile=explicit_coarse_stage,
+        )
 
 
 def test_profileless_episode_locks_optional_profile_selector_after_start(

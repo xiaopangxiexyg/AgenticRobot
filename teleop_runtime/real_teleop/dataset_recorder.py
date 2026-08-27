@@ -129,6 +129,7 @@ from .movement import movement_multiple_value as _movement_multiple_value
 from .progress_adapter import (
     RealTeleopProgressEpisode,
     resolve_real_teleop_progress_profile,
+    resolve_real_teleop_stage_profile_for_admission,
     resolve_real_teleop_task_stage_profile,
 )
 from .progress_arm_control import strict_progress_arm_sample_rejection
@@ -373,9 +374,17 @@ class RealTeleopDatasetRecorder:
         # sidecar merely because the CLI option was omitted.
         if self.progress_profile is not None:
             self.args.collection_progress_profile = self.progress_profile
-            requested_stage_profile = resolve_real_teleop_task_stage_profile(
+            requested_stage_profile = resolve_real_teleop_stage_profile_for_admission(
                 self.progress_profile,
                 getattr(args, "collection_stage_profile", ""),
+                dataset_progress_locked=bool(progress_admission.locked),
+                configured_stage_profile_explicit=bool(
+                    getattr(
+                        args,
+                        "_collection_stage_profile_explicit",
+                        False,
+                    )
+                ),
             )
             stage_admission = inspect_dataset_task_stage_profile(
                 self.dataset_root,
@@ -439,6 +448,11 @@ class RealTeleopDatasetRecorder:
         self.writer_pool: AsyncWriterPool | None = None
         self.writer_runtime: CollectionWriterRuntime | None = None
         self.writer_observer: Any | None = None
+        # A recorder owns one writer lifecycle.  In process mode the child is
+        # backed by a one-shot ``multiprocessing.Process``; after close or a
+        # failed ready handshake this recorder must never be started again.
+        # Callers create a fresh candidate for retry/reconfiguration.
+        self._lifecycle_closed = False
         self.collector_components = CollectorComponents(
             session=components.session,
             sources=_collection_sources_from_components(components, self.camera_sources),
@@ -825,7 +839,7 @@ class RealTeleopDatasetRecorder:
             return {}
         return self.arm_state_poller.latest_by_side(sample_timestamp=float(sample_timestamp))
 
-    def reconfigure_for_current_args(self) -> None:
+    def reconfigure_for_current_args(self, *, force: bool = False) -> None:
         desired_root = Path(self.args.dataset_root)
         desired_contract = CaptureModalityContract(
             ignored_camera_keys=tuple(getattr(self.args, "ignore_camera", ()) or ()),
@@ -844,7 +858,7 @@ class RealTeleopDatasetRecorder:
                     f"expected={desired_force_contract.to_dict()}, "
                     f"current={None if current_force_contract is None else current_force_contract.to_dict()}"
                 )
-        if self.configured_for_current_args():
+        if not force and self.configured_for_current_args():
             # The live writer is the authoritative owner of episode/sample
             # counters for this process.  Re-scanning the complete finalized
             # dataset here used to put filesystem/process-RPC work directly in
@@ -903,10 +917,11 @@ class RealTeleopDatasetRecorder:
             getattr(self.args, "collection_progress_profile", None),
             collection_task_id=str(self.args.collection_task_id),
         )
-        desired_progress_profile = inspect_dataset_progress_profile(
+        desired_progress_admission = inspect_dataset_progress_profile(
             desired_root,
             requested_profile=requested_progress_profile,
-        ).profile
+        )
+        desired_progress_profile = desired_progress_admission.profile
         existing_progress_profile = getattr(self, "progress_profile", None)
         desired_stage_profile = (
             None
@@ -914,9 +929,17 @@ class RealTeleopDatasetRecorder:
             else inspect_dataset_task_stage_profile(
                 desired_root,
                 progress_profile=desired_progress_profile,
-                requested_profile=resolve_real_teleop_task_stage_profile(
+                requested_profile=resolve_real_teleop_stage_profile_for_admission(
                     desired_progress_profile,
                     getattr(self.args, "collection_stage_profile", ""),
+                    dataset_progress_locked=bool(desired_progress_admission.locked),
+                    configured_stage_profile_explicit=bool(
+                        getattr(
+                            self.args,
+                            "_collection_stage_profile_explicit",
+                            False,
+                        )
+                    ),
                 ),
             ).profile
         )
@@ -1274,10 +1297,54 @@ class RealTeleopDatasetRecorder:
         # without making the shared runtime depend on the GUI entrypoint.
         return observer
 
+    @property
+    def writer_started(self) -> bool:
+        """Whether this recorder's writer lifecycle completed its start gate."""
+
+        lifecycle = self._writer_lifecycle()
+        if lifecycle is None:
+            return False
+        if getattr(self, "collection_worker_mode", "thread") == "process":
+            return bool(
+                getattr(lifecycle, "started", False)
+                and getattr(
+                    getattr(lifecycle, "_process", None),
+                    "is_alive",
+                    lambda: False,
+                )()
+            )
+        pool = getattr(self, "writer_pool", None)
+        if pool is None:
+            return False
+        return bool(
+            getattr(pool, "started", False)
+            or getattr(pool, "_started", False)
+        )
+
+    def ensure_started(self) -> None:
+        """Start the writer exactly once and publish its device config.
+
+        This is intentionally called at collection preparation time rather
+        than during global GUI/device startup.  A failed candidate is closed
+        and remains unusable; the episode runtime will discard it and build a
+        new candidate on the next attempt.
+        """
+
+        if self.writer_started:
+            return
+        self.start()
+        self.write_camera_device_config()
+
     def start(self) -> None:
+        if bool(getattr(self, "_lifecycle_closed", False)):
+            raise RuntimeError(
+                "formal collection recorder is closed; construct a fresh recorder"
+            )
         writer_lifecycle = self._writer_lifecycle()
         if writer_lifecycle is None:
             raise RuntimeError("formal collection writer lifecycle is unavailable")
+        if self.writer_started:
+            return
         rollback_steps = [("writer_runtime", lambda: writer_lifecycle.close(flush=False))]
         try:
             writer_lifecycle.start()
@@ -2311,6 +2378,8 @@ class RealTeleopDatasetRecorder:
     def collection_worker_ready_status(self) -> tuple[bool, str]:
         if getattr(self, "process_worker", None) is None:
             return True, "thread collection writer ready"
+        if not bool(getattr(self.process_worker, "started", False)):
+            return False, "数采子进程尚未启动；将在开始数采时执行 ready 握手。"
         status = self.process_worker.quick_status()
         error = status.get("worker_error")
         if error:
@@ -2887,6 +2956,7 @@ class RealTeleopDatasetRecorder:
             self.poll_finalize_tasks()
 
     def close(self) -> None:
+        self._lifecycle_closed = True
         steps = []
         if getattr(self, "_sample_executor", None) is not None:
             steps.extend(

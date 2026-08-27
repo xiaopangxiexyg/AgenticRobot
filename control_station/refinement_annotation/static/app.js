@@ -515,23 +515,19 @@ async function ensureAnnotationsSealedBeforeTransition(targetLabel) {
   try {
     const coarseChanged = hasUnsavedCoarseDraftChanges();
     const detailChanged = hasUnsavedDetailDraftChanges();
-    if (coarseChanged && detailChanged) {
-      showToast(
-        "粗标注和详细补充同时有修改。请先封存粗标注，再重新打开并封存详细补充，避免详细 overlay 绑定到旧版本。",
-        "warning",
-        9000,
-      );
-      return false;
-    }
-    const report = detailChanged
-      ? await publishDetailAnnotations()
-      : await publishCurrentAnnotations();
+    const report = coarseChanged
+      ? await publishCurrentAnnotations()
+      : detailChanged
+        ? await publishDetailAnnotations()
+        : null;
     showToast(
-      report.draft_cache_warning
+      report?.draft_cache_warning
         ? `标注已封存，但工作缓存更新失败：${report.draft_cache_warning}`
-        : "当前修改已校验并封存，继续切换。",
-      report.draft_cache_warning ? "error" : "info",
-      report.draft_cache_warning ? 9000 : 4200,
+        : report?.pending_coarse
+          ? "详细草稿已保存；粗标注仍可独立编辑，继续切换。"
+          : "当前修改已校验并保存，继续切换。",
+      report?.draft_cache_warning ? "error" : "info",
+      report?.draft_cache_warning ? 9000 : 4200,
     );
     return true;
   } catch (error) {
@@ -1598,6 +1594,27 @@ function detailAnnotationMeta() {
   return state.detail?.detail_annotation || null;
 }
 
+function detailProfileOptions() {
+  const values = detailAnnotationMeta()?.profile_options;
+  return Array.isArray(values) ? values : [];
+}
+
+function selectedDetailProfileSelectionId() {
+  const draft = state.draft;
+  const meta = detailAnnotationMeta();
+  if (draft && Object.prototype.hasOwnProperty.call(
+    draft,
+    "detail_profile_selection_id",
+  )) {
+    if (typeof draft.detail_profile_selection_id === "string") {
+      return draft.detail_profile_selection_id;
+    }
+  }
+  return typeof meta?.selected_profile_selection_id === "string"
+    ? meta.selected_profile_selection_id
+    : "";
+}
+
 function detailOverlayDraft() {
   return state.draft?.detail_overlay || null;
 }
@@ -1724,7 +1741,109 @@ function confirmDetailAnnotation() {
   overlay.confirmed = true;
   renderDetailAnnotation();
   updateEditButtonState();
-  showToast("详细时间轴已确认；请点击“封存详细补充”发布。", "info", 4200);
+  showToast(
+    "详细时间轴已确认；可直接保存详细草稿，或在粗标注版本确定后封存 detail。",
+    "info",
+    5200,
+  );
+}
+
+function applyCurrentEpisodePayload(episode) {
+  cancelPendingSeek();
+  state.detail = episode;
+  state.draft = structuredClone(episode.draft);
+  setSavedDraftSnapshot(
+    episode.draft_requires_seal ? null : state.draft,
+  );
+  state.selectedDetailOccurrenceId = null;
+  state.abnormalStart = null;
+  clearRecoverableFailureCapture({clearNote: true});
+  state.privilegedBaseline = null;
+  state.timelineMap = null;
+  state.numericSampleTimestamps = null;
+  state.deletionHistory = structuredClone(
+    state.draft.deletion_history || [],
+  );
+  const selectedIndex = state.episodes.findIndex(
+    (value) => value.episode_uuid === episode.episode_uuid,
+  );
+  if (selectedIndex >= 0) {
+    state.episodes[selectedIndex] = {
+      ...state.episodes[selectedIndex],
+      annotation_set_count: episode.annotation_set_count,
+      needs_second_review: episode.needs_second_review,
+      review_state: episode.review_state,
+      latest_annotation_mode: episode.latest_annotation_mode,
+      whole_episode_abnormal: episode.whole_episode_abnormal,
+      whole_episode_abnormal_reason: episode.whole_episode_abnormal_reason,
+      detail_annotation_complete:
+        episode.detail_annotation_complete === true
+        || episode.detail_annotation?.resolution_level === "DETAIL_COMPLETE",
+      detail_annotation_state: episode.detail_annotation_state,
+      annotation_status: episode.annotation_status,
+      annotation_summary_loaded: true,
+      annotation_summary_error: null,
+    };
+    state.episodeRenderLimit = Math.max(
+      state.episodeRenderLimit,
+      selectedIndex + 1,
+    );
+    episodeSummaryRefreshedAt.set(episode.episode_uuid, Date.now());
+  }
+  buildTimelineMap();
+  renderEpisodeList({preserveViewport: true});
+  renderEditor();
+}
+
+async function changeDetailProfileSelection(event) {
+  const select = event.target;
+  const nextSelectionId = String(select.value || "");
+  const previousSelectionId = selectedDetailProfileSelectionId();
+  if (!state.detail || !state.draft || state.busy) {
+    select.value = previousSelectionId;
+    return;
+  }
+  if (nextSelectionId === previousSelectionId) return;
+  const draft = structuredClone(state.draft);
+  draft.detail_profile_selection_id = nextSelectionId;
+  // A detail draft is bound to the selected projected profile.  Switching the
+  // choice therefore starts a fresh optional overlay, while the coarse draft
+  // and its capture facts remain untouched.
+  draft.detail_overlay = null;
+  state.busy = true;
+  try {
+    await requestJsonWithProgress(
+      "/api/draft/" + encodeURIComponent(state.detail.episode_uuid),
+      {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(draft),
+      },
+      {
+        kind: "SAVE_DETAIL_PROFILE_SELECTION",
+        message: "正在保存详细标注 profile 选择",
+        completeMessage: "详细标注 profile 已切换",
+      },
+    );
+    const payload = await requestJson(
+      "/api/episode/" + encodeURIComponent(state.detail.episode_uuid),
+    );
+    applyCurrentEpisodePayload(payload.episode);
+    showToast(
+      nextSelectionId
+        ? "已选择详细标注 profile；粗粒度采集事实和时间轴保持不变。"
+        : "已关闭详细补充；当前只使用粗粒度标注。",
+      "info",
+      5200,
+    );
+  } catch (error) {
+    select.value = previousSelectionId;
+    showToast(`切换详细标注 profile 失败：${error.message}`, "error", 8500);
+  } finally {
+    state.busy = false;
+    renderDetailAnnotation();
+    updateTimelinePointCaptureState();
+  }
 }
 
 function renderDetailAnnotation() {
@@ -1732,19 +1851,90 @@ function renderDetailAnnotation() {
   if (!panel) return;
   const meta = detailAnnotationMeta();
   const overlay = detailOverlayDraft();
+  const options = detailProfileOptions();
+  const selectedSelectionId = selectedDetailProfileSelectionId();
   const profileStages = Array.isArray(meta?.profile?.stages)
     ? meta.profile.stages
     : [];
   const available = Boolean(meta?.available && overlay);
-  const previewAvailable = Boolean(!available && profileStages.length);
-  panel.classList.toggle("hidden", !(available || previewAvailable));
-  if (!(available || previewAvailable)) return;
+  const previewAvailable = Boolean(!available && meta?.profile && profileStages.length);
+  const hasProfileChoice = options.length > 0;
+  const canRenderDetail = available || previewAvailable;
+  panel.classList.toggle(
+    "hidden",
+    !(canRenderDetail || hasProfileChoice),
+  );
+  if (!(canRenderDetail || hasProfileChoice)) return;
+  const profileSelect = $("detail-profile-select");
+  if (profileSelect) {
+    profileSelect.replaceChildren();
+    const coarseOption = document.createElement("option");
+    coarseOption.value = "";
+    coarseOption.textContent = "仅粗粒度标注（不启用 detail）";
+    profileSelect.appendChild(coarseOption);
+    for (const optionValue of options) {
+      const option = document.createElement("option");
+      option.value = optionValue.selection_id;
+      const stageNames = (optionValue.stages || [])
+        .map((stage) => stage.display_name || stage.stage_id)
+        .join(" → ");
+      option.textContent = [
+        optionValue.target_progress_step_id,
+        `${optionValue.profile_id}@${optionValue.profile_version}`,
+        stageNames,
+      ].filter(Boolean).join(" · ");
+      profileSelect.appendChild(option);
+    }
+    profileSelect.value = options.some(
+      (value) => value.selection_id === selectedSelectionId,
+    ) ? selectedSelectionId : "";
+    profileSelect.disabled = state.busy || !state.detail || !state.draft;
+  }
+  const selectionNote = $("detail-profile-selection-note");
+  if (selectionNote) {
+    selectionNote.textContent = hasProfileChoice
+      ? selectedSelectionId && meta?.profile
+        ? "当前已选择该详细 profile；切换选择会重新生成独立 detail 草稿，粗粒度标注不会被替换。"
+        : "当前仅使用粗粒度标注；选择一个 profile 后即可直接补充详细阶段，不要求先封存粗标注。"
+      : "当前 Episode 没有可兼容的详细标注 profile；粗粒度标注仍可正常使用。";
+  }
+  if (!meta?.profile) {
+    const status = $("detail-annotation-status");
+    if (status) {
+      status.textContent = hasProfileChoice
+        ? `${options.length} 个详细标注 profile 可选；当前仍只使用粗粒度标注。`
+        : (meta?.reason || "没有匹配的详细 profile。");
+    }
+    $("detail-annotation-actions")?.classList.add("hidden");
+    $("confirm-detail-annotation")?.classList.add("hidden");
+    $("publish-detail-annotation")?.classList.add("hidden");
+    $("detail-stage-track")?.replaceChildren();
+    $("detail-failure-editors")?.replaceChildren();
+    $("detail-stage-descriptions")?.replaceChildren();
+    return;
+  }
   const status = $("detail-annotation-status");
   const sealed = meta.resolution_level === "DETAIL_COMPLETE";
-  const confirmed = Boolean(overlay.confirmed);
+  const confirmed = Boolean(overlay?.confirmed);
+  const confirmButton = $("confirm-detail-annotation");
+  const publishButton = $("publish-detail-annotation");
+  $("detail-annotation-actions")?.classList.toggle(
+    "hidden",
+    !canRenderDetail,
+  );
+  confirmButton?.classList.toggle("hidden", !available);
+  publishButton?.classList.toggle("hidden", !available);
+  if (publishButton) {
+    publishButton.textContent = meta.base
+      ? "封存详细补充"
+      : "保存详细草稿";
+    publishButton.title = meta.base
+      ? "发布绑定当前粗标注版本的不可变 detail overlay"
+      : "先保存详细草稿；粗标注封存后再发布 detail overlay";
+  }
   status.textContent = previewAvailable
     ? [
-        "详细 profile 已匹配；粗粒度封存后生成可编辑的"
+        "详细 profile 已匹配；当前仅显示"
         + profileStages.length + "个子阶段预览",
         meta.profile?.target_progress_step_id
           ? "补充子任务：" + meta.profile.target_progress_step_id
@@ -1754,12 +1944,12 @@ function renderDetailAnnotation() {
     : [
         sealed ? "已发布详细 overlay" : "当前有效分析仍使用粗粒度 fallback",
         confirmed ? "当前详细草稿已确认" : "当前详细草稿未确认",
+        !meta.base ? "粗、细标注可独立编辑" : "",
         meta.profile?.target_progress_step_id
           ? "补充子任务：" + meta.profile.target_progress_step_id
           : "",
         meta.reason || "",
       ].filter(Boolean).join(" · ");
-  $("detail-annotation-actions")?.classList.toggle("hidden", !available);
   const track = $("detail-stage-track");
   track.replaceChildren();
   const values = detailSortedOccurrences();
@@ -1922,8 +2112,12 @@ function renderDetailAnnotation() {
     row.appendChild(select);
     failureEditors.appendChild(row);
   }
-  $("confirm-detail-annotation").disabled = !available || state.busy || confirmed;
-  $("publish-detail-annotation").disabled = !available || state.busy || !confirmed;
+  if (confirmButton) {
+    confirmButton.disabled = !available || state.busy || confirmed;
+  }
+  if (publishButton) {
+    publishButton.disabled = !available || state.busy || !confirmed;
+  }
   $("detail-stage-track").querySelectorAll(".playhead").forEach((node) => {
     node.style.left = timelineRatio(currentTimelineTime()) * 100 + "%";
   });
@@ -4080,6 +4274,43 @@ async function publishDetailAnnotations() {
   if (!overlay.confirmed) {
     throw new Error("请先确认详细时间轴，并为每个原始 Failure 选择失败子阶段。");
   }
+  if (!meta.base) {
+    const payload = await requestJsonWithProgress(
+      "/api/draft/" + encodeURIComponent(state.detail.episode_uuid),
+      {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(state.draft),
+      },
+      {
+        kind: "SAVE_DETAIL_DRAFT",
+        message: "正在保存详细草稿",
+        completeMessage: "详细草稿已保存",
+      },
+    );
+    state.draft = payload.draft;
+    const pendingMeta = {
+      ...meta,
+      draft_state: "EDITING_UNSEALED",
+      reason: (
+        "详细草稿已保存；粗标注可稍后独立封存，"
+        + "之后再发布 detail overlay。"
+      ),
+    };
+    state.detail.detail_annotation = pendingMeta;
+    state.detail.detail_annotation_complete = false;
+    state.detail.detail_annotation_state = "PENDING";
+    setSavedDraftSnapshot(state.draft);
+    renderTimeline();
+    renderEpisodeList({preserveViewport: true});
+    await loadEpisodes();
+    return {
+      pending_coarse: true,
+      draft: state.draft,
+      detail_annotation: pendingMeta,
+      draft_cache_warning: null,
+    };
+  }
   const payload = await requestJsonWithProgress(
     "/api/commit-detail/" + encodeURIComponent(state.detail.episode_uuid),
     {
@@ -4132,7 +4363,9 @@ async function commitDetailAnnotations() {
   try {
     const report = await publishDetailAnnotations();
     showToast(
-      report.draft_cache_warning
+      report.pending_coarse
+        ? "详细草稿已保存；粗标注仍可独立编辑，稍后封存粗标注后再发布 detail overlay。"
+        : report.draft_cache_warning
         ? "详细补充已封存，但工作缓存更新失败：" + report.draft_cache_warning
         : "详细补充校验通过，已发布不可变 detail overlay。",
       report.draft_cache_warning ? "error" : "info",
@@ -4150,11 +4383,6 @@ async function commitDetailAnnotations() {
 async function publishCurrentAnnotations() {
   if (!state.draft || !state.detail) {
     throw new Error("当前没有可封存的 Episode 标注。");
-  }
-  if (hasUnsavedDetailDraftChanges()) {
-    throw new Error(
-      "详细补充尚有未封存修改，请先点击“封存详细补充”；粗标注封存会生成新的 base 版本。",
-    );
   }
   const payload = await requestJsonWithProgress(
     `/api/commit/${encodeURIComponent(state.detail.episode_uuid)}`,
@@ -4382,6 +4610,10 @@ $("commit-annotations").addEventListener("click", commitAnnotations);
 $("confirm-detail-annotation").addEventListener(
   "click",
   confirmDetailAnnotation,
+);
+$("detail-profile-select").addEventListener(
+  "change",
+  changeDetailProfileSelection,
 );
 $("publish-detail-annotation").addEventListener(
   "click",

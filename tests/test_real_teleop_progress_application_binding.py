@@ -187,6 +187,52 @@ def test_station_progress_application_caches_stable_unmatched_dataset_admission(
     ]
 
 
+def test_station_startup_projection_reuses_unmatched_dataset_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspect_calls: list[Path] = []
+
+    def inspect_dataset_progress_profile(
+        dataset_root: str | Path,
+        *,
+        requested_profile: object | None = None,
+    ) -> object:
+        del requested_profile
+        inspect_calls.append(Path(dataset_root).resolve())
+        return SimpleNamespace(
+            profile=None,
+            locked=False,
+            source="blank_dataset",
+        )
+
+    monkeypatch.setattr(
+        real_teleop_application,
+        "inspect_dataset_progress_profile",
+        inspect_dataset_progress_profile,
+    )
+    args = SimpleNamespace(
+        dataset_root=tmp_path,
+        collection_progress_profile=None,
+        collection_task_id="fixture-task-without-managed-profile",
+        collection_progress_gui=True,
+        collection_progress_arm_control_mode="profile",
+        collection_progress_entry_step="",
+    )
+    application = build_real_teleop_progress_application(args)
+
+    application.build_startup_progress_ui_payload(
+        dataset_recorder=None,
+        profile_selection_enabled=True,
+    )
+    application.build_startup_progress_ui_payload(
+        dataset_recorder=None,
+        profile_selection_enabled=True,
+    )
+
+    assert inspect_calls == [tmp_path.resolve()]
+
+
 @pytest.mark.parametrize("mode", RUNTIME_ARM_CONTROL_MODES)
 def test_station_and_runtime_arm_control_vocabulary_stays_compatible(
     mode: str,

@@ -76,6 +76,27 @@ def build_device_retry_runtime(
     def hardware_status_item(key: str) -> dict[str, object]:
         detail = str(startup_device_errors.get(key, "") or "")
         if not detail:
+            if key == "dataset.writer":
+                recorder = dataset_recorder_provider()
+                if recorder is None:
+                    return {
+                        "online": False,
+                        "health": "deferred",
+                        "status_level": "info",
+                        "status_label": "等待开始数采",
+                        "requirement": hardware_requirement(key),
+                        "error": "writer 将在开始数采时按当前数据集/profile 初始化。",
+                    }
+                writer_started = getattr(recorder, "writer_started", None)
+                if writer_started is False:
+                    return {
+                        "online": False,
+                        "health": "waiting",
+                        "status_level": "info",
+                        "status_label": "等待 writer 握手",
+                        "requirement": hardware_requirement(key),
+                        "error": "writer 尚未完成 ready 握手。",
+                    }
             return {
                 "online": True,
                 "health": "online",
@@ -320,9 +341,17 @@ def build_device_retry_runtime(
                     # after the writer ready handshake succeeds.
                     previous_recorder = dataset_recorder
                     if previous_recorder is not None:
-                        set_dataset_recorder(None)
                         dataset_recorder = None
-                        previous_recorder.close()
+                        try:
+                            set_dataset_recorder(None)
+                        except Exception as detach_exc:  # noqa: BLE001 - continue with fresh candidate.
+                            _log(
+                                "Dataset",
+                                "failed writer detach was not fully acknowledged; "
+                                f"continuing with a fresh candidate: {type(detach_exc).__name__}: {detach_exc}",
+                            )
+                        finally:
+                            previous_recorder.close()
                     replacement_recorder = None
                     try:
                         replacement_recorder = RealTeleopDatasetRecorder(
@@ -330,9 +359,18 @@ def build_device_retry_runtime(
                             components=components,
                             camera_sources=camera_sources,
                         )
-                        replacement_recorder.start()
-                        replacement_recorder.write_camera_device_config()
+                        ensure_started = getattr(
+                            replacement_recorder,
+                            "ensure_started",
+                            None,
+                        )
+                        if callable(ensure_started):
+                            ensure_started()
+                        else:
+                            replacement_recorder.start()
+                            replacement_recorder.write_camera_device_config()
                         set_dataset_recorder(replacement_recorder)
+                        args.dataset_startup_error = ""
                     except BaseException:  # noqa: BLE001 - discard one-shot candidate.
                         if replacement_recorder is not None:
                             try:
@@ -477,9 +515,14 @@ def build_device_retry_runtime(
                 else:
                     continue
             except Exception as exc:  # noqa: BLE001 - keep the failed status visible.
-                startup_device_errors[key] = f"{type(exc).__name__}: {exc}"
+                detail = f"{type(exc).__name__}: {exc}"
+                startup_device_errors[key] = detail
+                if key == "dataset.writer":
+                    args.dataset_startup_error = detail
                 continue
             startup_device_errors.pop(key, None)
+            if key == "dataset.writer":
+                args.dataset_startup_error = ""
             if control_ui is not None:
                 control_ui.append_message("Device", f"{key} 重连成功。")
         if camera_retry_attempted and publish_camera_status is not None:

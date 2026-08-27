@@ -75,6 +75,38 @@ def test_collection_dry_run_fixes_control_progress_and_tactile_contract(
     assert "--no-gripper-warmup-probe" in output
 
 
+def test_collection_environment_selects_task_name_and_detailed_profile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+    monkeypatch.setenv("COLLECTION_TASK_NAME", "3_stage_writing_detail")
+    monkeypatch.setenv(
+        "COLLECTION_PROGRESS_PROFILE",
+        "catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed",
+    )
+
+    result = _run(
+        "collect",
+        "--dry-run",
+        "--tactile-bundle-root",
+        str(tactile_root),
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = result.stdout
+    assert "--collection-task-name 3_stage_writing_detail" in output
+    assert (
+        "--collection-progress-profile "
+        "catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress"
+    ) in output
+    assert (
+        "--collection-stage-profile "
+        "catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed"
+    ) in output
+
+
 def test_collection_can_explicitly_enable_gripper_motion_probe(
     tmp_path: Path,
 ) -> None:

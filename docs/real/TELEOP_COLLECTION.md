@@ -254,6 +254,16 @@ RealTeleop 的 coarse progress/Failure 语义和 Control Station 操作面均为
 --collection-progress-gui
 ```
 
+固定 launcher 也支持在不改默认四阶段命令的前提下切换 profile：使用
+`--progress-profile REF` / `--stage-profile REF`，或设置
+`COLLECTION_PROGRESS_PROFILE` / `COLLECTION_STAGE_PROFILE`。直接传
+`catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress_detailed` 时，launcher
+会自动展开为 coarse progress profile 加对应的 `--collection-stage-profile`，从而在新数据集
+上直接采集 `pen_down / write / pen_up` 三个 fine stage。`COLLECTION_TASK_NAME` 只改变正式
+dataset 的任务名/目录名，不会替换 progress profile；例如
+`COLLECTION_TASK_NAME="${COLLECTION_TASK_NAME:-3_stage_writing_detail}"` 在当前 shell 已有
+旧值时会保留旧值，需强制改名时直接传 `--task-name` 或显式赋值。
+
 如果希望由数采员在 GUI 中从已有 managed profile 选择，只增加：
 
 ```bash
@@ -315,13 +325,14 @@ GUI 列出当前真机 adapter 已准入的全部 LINEAR managed profile，不�
 它仍不代表 DMTAC 的真实任务语义。需要真实三阶段任务时，应创建语义正确的 managed
 profile，而不是依赖正式 dataset task/name 自动推断。
 
-已有 coarse 四阶段 writing Episode 不需要重采集才能补 detail。先按普通 coarse profile
-完成并封存该 Episode 的阶段标注，后处理 annotation GUI 会按同名
-`.progress_detailed.json` / `.stages_detailed.json` 自动匹配 writing detail，显示三个
-书写 fine stage，并把它们作为独立 additive overlay 封存；原始 Episode、Parquet、视频和
-coarse annotation set 都不会被改写。若一个 dataset 已绑定 coarse `.stages.json`，不能在
-同一 dataset 内再切换到 `_detailed` 采集 variant，因为 dataset-wide stage hash 必须保持
-唯一；后续 detail 采集应使用新的空 dataset 根目录。
+已有 coarse 四阶段 writing Episode 不需要重采集才能补 detail。进入标准 annotation GUI
+后即可选择同名 `.progress_detailed.json` / `.stages_detailed.json`，显示三个书写 fine
+stage；不必先封存 coarse，详细草稿会先保持未绑定，之后再按 coarse 版本独立封存 additive
+overlay。原始 Episode、Parquet、视频和 coarse annotation set 都不会被改写。若一个
+dataset 已绑定 coarse `.stages.json`，不能在同一 dataset 内再切换到 `_detailed` 采集
+variant，因为 dataset-wide stage hash 必须保持唯一；后续 detail 采集应使用新的空 dataset
+根目录。`_detailed` 采集 variant 本身仍是正常 capture profile：writer、机械臂控制、
+progress manifest 和 Episode stage binding 都走既有采集路径，不会被后标注选择替换。
 
 两个开关的责任如下：
 
@@ -487,8 +498,13 @@ Episode 或 writer。删除/禁用插件不会改变 progress 合同；`collecti
 
 开始 runtime Home 时先发出协作停止请求，已有 2 秒准备期用于完成当前小块；Home、快速
 单臂切换或正式 Episode 真正开始前，还必须确认子进程已经退出并完成文件系统写入屏障。
-切换 dataset recorder 和退出程序使用同一屏障。压缩按 manifest 原子提交，提交前会完整
-解码并校验原始 SHA；只有 manifest 验证成功后才删除原始流。
+切换 dataset recorder 和退出程序使用同一屏障。idle worker 每个 catalog revision
+最多转换一个待压缩 Episode，避免在“开始遥操”的同步边界上重新读取整个历史 tactile
+payload。历史 Episode 仍会做 identity、commit、manifest、frame alignment、ownership
+和文件大小校验；正在转换或刚提交的 Episode 会完整校验 payload SHA。普通
+`attach_tactile_bundle(..., verify_payload_hashes=True)` 和离线全量验证合同不变。
+压缩按 manifest 原子提交，提交前会完整解码并校验当前 Episode 的原始 SHA；只有 manifest
+验证成功后才删除原始流。
 
 完整回退无需迁移数据：不传该参数即可保持历史行为；也可在命令最后追加
 `"${NO_IDLE_TACTILE_COMPRESSION_ARGS[@]}"`。已经无损转换的 Episode 继续由既有 reader

@@ -53,6 +53,13 @@ class _AliveProcess:
         return True
 
 
+class _ExitedAfterStartProcess(_AliveProcess):
+    exitcode = 17
+
+    def is_alive(self) -> bool:
+        return False
+
+
 class _WorkerErrorAckQueue:
     def __init__(self) -> None:
         self._messages = [
@@ -139,6 +146,32 @@ def test_process_worker_timeout_reports_last_startup_phase() -> None:
         worker.start()
 
     assert close_calls == [True]
+
+
+def test_closed_process_worker_requires_a_fresh_candidate_for_retry() -> None:
+    worker = object.__new__(ProcessCollectionWorker)
+    worker._started = False
+    worker._closed = True
+    worker._process = _AliveProcess()
+
+    with pytest.raises(
+        RuntimeError,
+        match="closed; construct a fresh worker for retry",
+    ):
+        worker.start()
+
+
+def test_exited_process_worker_requires_a_fresh_candidate_for_retry() -> None:
+    worker = object.__new__(ProcessCollectionWorker)
+    worker._started = True
+    worker._closed = False
+    worker._process = _ExitedAfterStartProcess()
+
+    with pytest.raises(
+        RuntimeError,
+        match="already started but exited; construct a fresh worker for retry",
+    ):
+        worker.start()
 
 
 def test_process_worker_retains_and_prints_sample_traceback(capsys) -> None:

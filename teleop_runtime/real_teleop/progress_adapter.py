@@ -219,6 +219,36 @@ def resolve_real_teleop_task_stage_profile(
     return result
 
 
+def resolve_real_teleop_stage_profile_for_admission(
+    progress_profile: TaskProgressProfileV1 | None,
+    configured_stage_profile: object = None,
+    *,
+    dataset_progress_locked: bool,
+    configured_stage_profile_explicit: bool,
+) -> TaskStageProfileV1 | None:
+    """Choose the stage request without overriding a persisted dataset binding.
+
+    A managed coarse profile has a same-name stage profile, so the ordinary
+    resolver intentionally auto-selects that coarse variant when the option is
+    empty.  That is correct for a blank dataset, but it is unsafe on restart:
+    a dataset may already be immutably bound to the detailed variant.  In that
+    case an omitted stage option must leave the request empty so dataset
+    admission can return the exact persisted profile.  An explicitly supplied
+    stage option still goes through normal validation and is rejected when it
+    conflicts with the dataset binding.
+    """
+
+    if (
+        dataset_progress_locked
+        and not configured_stage_profile_explicit
+    ):
+        return None
+    return resolve_real_teleop_task_stage_profile(
+        progress_profile,
+        configured_stage_profile,
+    )
+
+
 def resolve_real_teleop_progress_entry(
     *,
     progress_profile: TaskProgressProfileV1,
@@ -293,8 +323,11 @@ def list_real_teleop_managed_progress_profile_selections(
 
     The original coarse-only list remains available to compatibility callers.
     This variant is the only API used by the profile picker, so a detailed
-    stage profile can be selected without changing the canonical progress
-    profile identity stored in an Episode.
+    stage profile can be selected as the actual capture-time stage profile.
+    The canonical progress profile identity remains the shared progress
+    contract, while the selected stage-profile binding/hash is persisted by
+    the normal Episode path.  A later annotation overlay is a separate,
+    optional post-capture concern.
     """
 
     del collection_task_id
@@ -378,7 +411,7 @@ def load_real_teleop_managed_progress_profile(
     *,
     collection_task_id: str | None = None,
 ) -> TaskProgressProfileV1:
-    """Resolve one GUI selection without changing formal task identity."""
+    """Resolve one GUI selection without changing formal progress identity."""
 
     del collection_task_id
 
@@ -1003,6 +1036,7 @@ __all__ = [
     "real_teleop_managed_progress_selection_id",
     "resolve_real_teleop_progress_profile",
     "resolve_real_teleop_default_progress_profile",
+    "resolve_real_teleop_stage_profile_for_admission",
     "select_real_teleop_managed_progress_profile",
     "select_real_teleop_progress_entry_step",
     "validate_real_teleop_initial_progress_profile",

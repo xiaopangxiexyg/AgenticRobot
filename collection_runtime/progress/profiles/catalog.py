@@ -66,11 +66,13 @@ class ManagedTaskProfile:
     def selection_id(self) -> str:
         """Stable GUI/CLI selection ID for this catalog variant.
 
-        Detailed profiles intentionally keep the canonical progress profile ID
-        unchanged: the progress timeline and its hash are the same as the
-        coarse capture profile.  The variant suffix is therefore only a
-        selection-level namespace and never becomes a persisted Episode
-        profile ID.
+        Detailed profiles intentionally keep the canonical progress-profile
+        ID unchanged: the ordered progress timeline and its progress hash are
+        shared with the coarse variant.  The selected stage profile is still
+        the real capture-time profile and is persisted through the existing
+        stage-profile binding/hash fields.  The suffix is only a GUI/CLI
+        selection namespace; it must not be mistaken for a second progress
+        schema or a post-capture annotation overlay.
         """
 
         if self.is_detailed:

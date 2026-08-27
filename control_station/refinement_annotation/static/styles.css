@@ -854,6 +854,20 @@ video { width: 100%; height: min(57vw, 620px); min-height: 400px; display: block
 }
 .detail-annotation-heading h3 { margin: 0 0 4px; }
 .detail-annotation-actions { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+.detail-profile-selection {
+  display: grid;
+  grid-template-columns: max-content minmax(240px, 1fr);
+  align-items: center;
+  gap: 5px 10px;
+  margin: 10px 0 9px;
+  padding: 9px 11px;
+  border: 1px solid rgba(72, 202, 210, .26);
+  border-radius: 7px;
+  background: rgba(0, 0, 0, .12);
+}
+.detail-profile-selection label { color: var(--text); font-size: 11px; font-weight: 600; }
+.detail-profile-selection select { width: 100%; min-width: 0; }
+.detail-profile-selection .panel-note { grid-column: 1 / -1; margin: 0; }
 .detail-annotation-note {
   margin: 0 0 9px;
   color: var(--muted);

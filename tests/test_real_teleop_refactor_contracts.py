@@ -110,6 +110,16 @@ def test_real_teleop_start_and_resume_separate_freshness_from_overall_timeout() 
     assert freshness_call in control_loop_source
 
 
+def test_formal_writer_ready_handshake_is_not_global_startup_work() -> None:
+    runtime_source = (ROOT / "teleop_runtime/real_teleop/runtime.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "prepare_startup_dataset_recorder(" not in runtime_source
+    assert "formal dataset writer deferred until collection start" in runtime_source
+    assert "正在启动隔离 writer 并等待 ready 握手" not in runtime_source
+
+
 def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

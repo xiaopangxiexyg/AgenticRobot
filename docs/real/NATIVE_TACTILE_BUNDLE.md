@@ -80,8 +80,13 @@ preserves the established self-contained writer.
 Native separation forces artifact integrity sealing. Keep collection-path
 compression at `none` when using `--idle-tactile-compression`; the idle worker
 resolves the UUID-addressed external bundle and performs verified lossless Zstd
-conversion during Hold or other recorder-idle gaps. Inline `zstd`/`lz4` remains
-available when idle compression is not requested.
+conversion during Hold or other recorder-idle gaps. Each idle catalog revision
+converts at most one raw Episode and revalidates its payload bytes; historical
+payload bytes are not re-read on every revision, while the full attachment
+identity/manifest/alignment/size contract remains enforced. The normal
+`attach_tactile_bundle(..., verify_payload_hashes=True)` path remains the full
+historical payload validation boundary. Inline `zstd`/`lz4` remains available
+when idle compression is not requested.
 
 An idle conversion publishes the updated external manifest and tactile component,
 mirrors the new episode commit to both roots, updates the core catalog binding,

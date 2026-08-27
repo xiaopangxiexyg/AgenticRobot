@@ -1763,7 +1763,16 @@ class ProcessCollectionWorker:
 
     def start(self) -> None:
         if self._started:
-            return
+            if self._process.is_alive():
+                return
+            raise RuntimeError(
+                "collection worker already started but exited; "
+                "construct a fresh worker for retry"
+            )
+        if bool(getattr(self, "_closed", False)):
+            raise RuntimeError(
+                "collection worker is closed; construct a fresh worker for retry"
+            )
         try:
             self._process.start()
         except BaseException:  # noqa: BLE001 - release preallocated shared memory.
@@ -1822,6 +1831,12 @@ class ProcessCollectionWorker:
         self.next_sample_index = int(ready.get("next_sample_index", 0))
         self.process_status = dict(ready.get("process") or {})
         self._started = True
+
+    @property
+    def started(self) -> bool:
+        """Whether the one-shot child passed its ready handshake."""
+
+        return bool(self._started)
 
     def _drain_acks(self) -> None:
         while True:

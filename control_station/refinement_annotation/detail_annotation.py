@@ -28,6 +28,7 @@ from dataset_contracts.progress_detail_annotations import (
     validate_detail_stage_annotation_set,
     validate_detail_stage_profile_compatibility,
 )
+from dataset_contracts.progress_stages import TaskStageProfileV1
 from dataset_interface.progress_annotation_jobs import ProgressAnnotationWorkItem
 from dataset_interface.progress_detail_annotation_artifacts import (
     DETAIL_STAGE_ANNOTATION_RELATIVE_ROOT,
@@ -45,6 +46,7 @@ _PROFILE_INVENTORY_PROBE_INTERVAL_SEC = 5.0
 class DetailProfileSelection:
     """One unambiguous detail profile bound to a coarse stage profile."""
 
+    selection_id: str
     stage_profile: Any
     target_progress_step_id: str
     progress_profile_path: Path
@@ -90,7 +92,7 @@ class DetailAnnotationModule:
         self._profile_inventory_error: str | None = None
         self._profile_selection_cache: OrderedDict[
             tuple[str, tuple[object, ...]],
-            tuple[DetailProfileSelection | None, str | None],
+            tuple[tuple[DetailProfileSelection, ...], str | None],
         ] = OrderedDict()
         self._status_cache: OrderedDict[
             str,
@@ -205,20 +207,27 @@ class DetailAnnotationModule:
                 self._profile_inventory_checked_at = now
                 return inventory_pairs, fingerprint, error
 
-    def profile_selection(
+    def profile_selections(
         self,
         item: ProgressAnnotationWorkItem,
-    ) -> tuple[DetailProfileSelection | None, str | None]:
-        """Find one additive detail profile for a loaded coarse profile."""
+    ) -> tuple[tuple[DetailProfileSelection, ...], str | None]:
+        """Find every compatible additive detail target.
+
+        A detail source may refine more than one coarse step.  The annotation
+        contract still publishes one target per immutable overlay, so each
+        changed step is projected into an independent selection.  This keeps
+        target status and user choice independent without changing the
+        collection profile or the existing V1 overlay contract.
+        """
 
         base_stage_profile = item.progress.stage_profile
         if base_stage_profile is None:
-            return None, "当前 Episode 没有可用的粗粒度 stage profile。"
+            return (), "当前 Episode 没有可用的粗粒度 stage profile。"
         pairs, inventory_fingerprint, inventory_error = (
             self._profile_inventory()
         )
         if inventory_error is not None:
-            return None, inventory_error
+            return (), inventory_error
         cache_key = (
             base_stage_profile.semantic_content_hash,
             inventory_fingerprint,
@@ -259,43 +268,66 @@ class DetailAnnotationModule:
                     if base_stage_profile.stages_for_step(step_id)
                     != detail_stage_profile.stages_for_step(step_id)
                 )
-                if len(changed_steps) != 1:
+                if not changed_steps:
                     errors.append(
-                        f"{stage_path.name}: 详细 profile 必须只改变一个子任务"
+                        f"{stage_path.name}: 详细 profile 没有可补充的粗阶段"
                     )
                     continue
-                target_step_id = changed_steps[0]
-                validate_detail_stage_profile_compatibility(
-                    base_stage_profile=base_stage_profile,
-                    detail_stage_profile=detail_stage_profile,
-                    target_progress_step_id=target_step_id,
-                )
-                candidates.append(
-                    DetailProfileSelection(
-                        stage_profile=detail_stage_profile,
-                        target_progress_step_id=target_step_id,
-                        progress_profile_path=progress_path,
-                        stage_profile_path=stage_path,
+                relative_progress = progress_path.relative_to(
+                    self.profile_root
+                ).as_posix()
+                for target_step_id in changed_steps:
+                    # Keep the current V1 overlay contract (one target per
+                    # artifact) while allowing one source profile to expose
+                    # multiple independent targets.  Non-target steps remain
+                    # byte-for-byte equivalent to the coarse profile.
+                    projected_stages = tuple(
+                        stage
+                        for step_id in sorted(base_step_ids)
+                        for stage in (
+                            detail_stage_profile.stages_for_step(step_id)
+                            if step_id == target_step_id
+                            else base_stage_profile.stages_for_step(step_id)
+                        )
                     )
-                )
+                    projected_profile = TaskStageProfileV1(
+                        profile_id=detail_stage_profile.profile_id,
+                        profile_version=detail_stage_profile.profile_version,
+                        task_progress_profile_hash=(
+                            detail_stage_profile.task_progress_profile_hash
+                        ),
+                        stages=projected_stages,
+                    )
+                    validate_detail_stage_profile_compatibility(
+                        base_stage_profile=base_stage_profile,
+                        detail_stage_profile=projected_profile,
+                        target_progress_step_id=target_step_id,
+                    )
+                    candidates.append(
+                        DetailProfileSelection(
+                            selection_id=(
+                                f"detail:{relative_progress}:"
+                                f"{target_step_id}"
+                            ),
+                            stage_profile=projected_profile,
+                            target_progress_step_id=target_step_id,
+                            progress_profile_path=progress_path,
+                            stage_profile_path=stage_path,
+                        )
+                    )
             except (OSError, TypeError, ValueError) as exc:
                 errors.append(f"{stage_path.name}: {exc}")
 
-        if len(candidates) == 1:
-            result: tuple[DetailProfileSelection | None, str | None] = (
-                candidates[0],
+        if candidates:
+            result: tuple[tuple[DetailProfileSelection, ...], str | None] = (
+                tuple(candidates),
                 None,
-            )
-        elif len(candidates) > 1:
-            result = (
-                None,
-                "当前粗 profile 匹配到多个详细 profile，已停用详细标注以避免歧义。",
             )
         elif errors:
-            result = (None, errors[0])
+            result = ((), errors[0])
         else:
             result = (
-                None,
+                (),
                 "当前数据集没有匹配的详细 stage profile；继续使用粗粒度标注。",
             )
         with self._lock:
@@ -307,6 +339,28 @@ class DetailAnnotationModule:
             ):
                 self._profile_selection_cache.popitem(last=False)
         return result
+
+    def profile_selection(
+        self,
+        item: ProgressAnnotationWorkItem,
+        selection_id: str | None = None,
+    ) -> tuple[DetailProfileSelection | None, str | None]:
+        """Resolve one selected target while keeping legacy single-candidate behavior."""
+
+        candidates, reason = self.profile_selections(item)
+        if selection_id is not None:
+            normalized = str(selection_id).strip()
+            if not normalized:
+                return None, None
+            for candidate in candidates:
+                if candidate.selection_id == normalized:
+                    return candidate, None
+            return None, "所选详细 profile 与当前 Episode 不兼容。"
+        if len(candidates) == 1:
+            return candidates[0], reason
+        if len(candidates) > 1:
+            return None, "当前 Episode 有多个可用详细 profile，请先选择。"
+        return None, reason
 
     def annotation_root(self, item: ProgressAnnotationWorkItem) -> Path:
         return (
@@ -405,25 +459,37 @@ class DetailAnnotationModule:
         self,
         item: ProgressAnnotationWorkItem,
         annotation_sets: Sequence[LoadedStageAnnotationSet],
+        *,
+        selection_id: str | None = None,
     ) -> DetailAnnotationStatus:
         """Resolve a user-facing state without changing coarse fallback."""
 
-        selection, profile_reason = self.profile_selection(item)
+        selection, profile_reason = self.profile_selection(
+            item,
+            selection_id=selection_id,
+        )
         if selection is None:
             return DetailAnnotationStatus(
                 state="NOT_APPLICABLE",
                 complete=False,
                 applicable=False,
-                reason=profile_reason,
+                reason=(
+                    "当前仅使用粗粒度标注（已关闭详细补充）。"
+                    if selection_id == ""
+                    else profile_reason
+                ),
             )
         target = selection.target_progress_step_id
         if not annotation_sets:
             return DetailAnnotationStatus(
-                state="WAITING_FOR_COARSE",
+                state="PENDING",
                 complete=False,
                 applicable=True,
                 target_progress_step_id=target,
-                reason="请先封存粗粒度标注。",
+                reason=(
+                    "详细 profile 已匹配；粗、细标注可以独立编辑，"
+                    "详细 overlay 会在粗标注版本确定后绑定。"
+                ),
             )
         base_annotation_set = annotation_sets[-1]
         if not any(
@@ -445,6 +511,7 @@ class DetailAnnotationModule:
             base_annotation_set.manifest.semantic_content_hash,
             selection.stage_profile.semantic_content_hash,
             target,
+            selection.selection_id,
         )
         with self._lock:
             cached = self._status_cache.get(item.episode_uuid)
