@@ -513,8 +513,15 @@ class ActionDebugLogRecorder:
 
 
 class IkDebugLogRecorder:
-    def __init__(self, *, root_dir: Path | str | None = None, max_queue_size: int = 256) -> None:
+    def __init__(
+        self,
+        *,
+        root_dir: Path | str | None = None,
+        max_queue_size: int = 256,
+        filename_prefix: str = "ik_debug",
+    ) -> None:
         self.root_dir = Path(root_dir) if root_dir is not None else DEFAULT_IK_DEBUG_LOG_ROOT
+        self.filename_prefix = str(filename_prefix or "ik_debug")
         self.path: Path | None = None
         self._queue: queue.Queue[Mapping[str, object] | None] | None = None
         self._writer_thread: threading.Thread | None = None
@@ -535,7 +542,7 @@ class IkDebugLogRecorder:
             + f"_{int((timestamp_time % 1.0) * 1000):03d}"
         )
         self.root_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.root_dir / f"ik_debug_{timestamp}.jsonl"
+        self.path = self.root_dir / f"{self.filename_prefix}_{timestamp}.jsonl"
         log_file = self.path.open("a", encoding="utf-8")
         log_queue: queue.Queue[Mapping[str, object] | None] = queue.Queue(maxsize=self._max_queue_size)
         self._queue = log_queue
