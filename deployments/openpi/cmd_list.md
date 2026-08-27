@@ -65,7 +65,7 @@
 | `writing-stage1-0804-0805-front-h16-absolute-prepared-v1` | v2.3 严格第一阶段，absolute，32D / 16D，h16，自然合并 0804/0805 | front (`base_0_rgb`) | `30000, 60000, 90000, 120000, 150000`（`-b1-nw4-meta-v2` 实验） | checkpoint-bound prepared wrapper |
 | `writing-stage1-scenarios-0804-0811-front-h16-absolute-repeat146-prepared-v1` | v2.3 Stage1 三类场景，absolute，32D / 16D，h16，13 来源按 1:4:6 重复 | front (`base_0_rgb`) | `30000, 60000`（`-b1-nw4-v1` 实验，2026-08-13 快照） | checkpoint-bound prepared wrapper；第 19 节 |
 | `writing-stage2-0804-0805-front-h16-absolute-prepared-v1` | v2.3 严格第二阶段，absolute，32D / 16D，h16，自然合并 0804/0805 | front (`base_0_rgb`) | `30000, 60000, 90000, 120000, 150000`（`-b1-nw4-meta-v1` 实验） | checkpoint-bound prepared wrapper |
-| `writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared` | 0803–0807 完整四阶段 prompt-family，absolute，h32，非 RTC | front + right_wrist | `156211`（2026-08-27 训练快照；使用前复核是否有更新） | 单 checkpoint checkpoint-bound prompt-family wrapper；第 21 节 |
+| `writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared` | 0803–0807 完整四阶段 prompt-family，absolute，h32，非 RTC | front + right_wrist | `180000`（2026-08-28 当前观察快照；使用前复核是否有更新） | 单 checkpoint checkpoint-bound prompt-family wrapper；第 21 节 |
 | `writing-stage1-all-valid-through-2026-08-21-front-right-wrist-h32-absolute-standard-v1` | 08-03–08-21 Stage1 all-valid，3,458 eligible Episode，absolute，h32，非 RTC | front + right_wrist | `120000`（`-b1-nw1-v1`） | checkpoint-bound prepared wrapper；第 22 节 |
 | `dual_rm65_dmgripper` | 老 v1，26D action，h50 | front + left/right wrist | registry 固定 `99999` | legacy registry |
 
@@ -1768,18 +1768,18 @@ prompt-family 模型，不是第 20 节的四个独立 checkpoint，也不是 mo
 `strict_media_integrity=true`。部署时只允许把 server 和 client 绑定到同一 profile 与同一
 数字 checkpoint。
 
-截至本次审计，远端 `/home/user/zc/checkpoints/openpi` 下已观察到训练快照 `156211`：
+截至本次审计，远端 `/home/user/zc/checkpoints/openpi` 下已观察到训练快照 `180000`：
 
 ```text
 /home/user/zc/checkpoints/openpi/
   writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/
   writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/
-  156211/
+  180000/
 ```
 
 该 step 的 `policy_artifact.json`、`params/` 和 `assets/` 均存在；训练继续产生新 step 时，
 不要从目录名推断最新值，应重新列目录并复核 artifact/profile/hash。下列命令中的
-`CKPT_STEP=156211` 只是本次冻结的站点快照。
+`CKPT_STEP=180000` 只是本次冻结的站点快照。
 
 ### 21.1 先做无硬件 contract/config 检查
 
@@ -1794,7 +1794,7 @@ export DEPLOY_ROOT=/home/user/zc/openpi_deployment_worktrees/AR-20260828-openpi-
 export OPENPI_ROOT=/home/user/zc/openpi_all4_stage_runs/20260826T2349_front_right_h32_all4/code-openpi-97b37205/openpi
 cd "$DEPLOY_ROOT"
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
-export CKPT_STEP=156211
+export CKPT_STEP=180000
 export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
 export PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json"
 
@@ -1829,7 +1829,7 @@ source /home/user/zc/openpi/.venv/bin/activate
 export JAX_PLATFORMS=cuda
 export CUDA_VISIBLE_DEVICES=0
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
-export CKPT_STEP=156211
+export CKPT_STEP=180000
 export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
 export PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json"
 
