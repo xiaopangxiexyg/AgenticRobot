@@ -5,6 +5,8 @@ set -euo pipefail
 # goes through run_pytest.sh, which owns the Python selection and basetemp.
 # This wrapper only owns the concurrency, per-child pytest cache, report
 # paths, and the temporary shared assets link needed by a clean worktree.
+# DEXTELEOP_FAST_FEEDBACK_RUN_ROOT may name a new absolute directory when a
+# caller such as Harness needs the logs and JUnit reports under its Run root.
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -21,12 +23,35 @@ for argument in "$@"; do
   esac
 done
 
-RUN_ROOT="$(mktemp -d "/tmp/dt-fast-feedback-${UID:-user}-XXXXXX")"
+RUN_ROOT=""
 ASSET_LINK="$REPO_ROOT/assets"
 ASSET_ROOT=""
 ASSET_LINK_CREATED=0
 UNIT_PID=""
 INTEGRATION_PID=""
+
+prepare_run_root() {
+  local requested_root="${DEXTELEOP_FAST_FEEDBACK_RUN_ROOT:-}"
+  local parent
+
+  if [[ -z "$requested_root" ]]; then
+    RUN_ROOT="$(mktemp -d "/tmp/dt-fast-feedback-${UID:-user}-XXXXXX")"
+    return
+  fi
+  case "$requested_root" in
+    /*) ;;
+    *) die "DEXTELEOP_FAST_FEEDBACK_RUN_ROOT must be an absolute path: $requested_root" ;;
+  esac
+  if [[ -e "$requested_root" || -L "$requested_root" ]]; then
+    die "DEXTELEOP_FAST_FEEDBACK_RUN_ROOT must not already exist: $requested_root"
+  fi
+  parent="$(dirname -- "$requested_root")"
+  [[ -d "$parent" ]] || die \
+    "DEXTELEOP_FAST_FEEDBACK_RUN_ROOT parent is not a directory: $parent"
+  mkdir -- "$requested_root" || die \
+    "cannot create DEXTELEOP_FAST_FEEDBACK_RUN_ROOT: $requested_root"
+  RUN_ROOT="$requested_root"
+}
 
 prepare_asset_compat_link() {
   local requested_root="${DEXTELEOP_ASSET_ROOT:-}"
@@ -88,7 +113,9 @@ cleanup() {
       status=1
     fi
   fi
-  echo "[dexteleop-fast-feedback] artifacts: $RUN_ROOT"
+  if [[ -n "$RUN_ROOT" ]]; then
+    echo "[dexteleop-fast-feedback] artifacts: $RUN_ROOT"
+  fi
   exit "$status"
 }
 
@@ -106,6 +133,8 @@ run_tier() {
   local marker="$2"
   shift 2
   PYTHONNOUSERSITE=1 \
+  PYTHONPYCACHEPREFIX="$RUN_ROOT/${name}-python-bytecode" \
+  SIM_MUJOCO_CACHE_DIR="$RUN_ROOT/${name}-mujoco-cache" \
   "$REPO_ROOT/scripts/run_pytest.sh" \
     -m "$marker" \
     -q \
@@ -116,6 +145,7 @@ run_tier() {
 }
 
 trap cleanup EXIT
+prepare_run_root
 prepare_asset_compat_link
 trap on_signal INT TERM
 
