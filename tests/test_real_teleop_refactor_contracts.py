@@ -57,6 +57,7 @@ from teleop_runtime.real_teleop import (
     hand_runtime,
     impedance_force_runtime,
     movement,
+    operator_control_runtime,
     position_force_guard,
     position_episode_debug,
     position_tuning,
@@ -146,6 +147,204 @@ def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
     recorder.reconfigure_for_current_args()
 
     assert calls == []
+
+
+def test_transactional_dataset_selection_defers_live_state_and_start_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Ui:
+        def __init__(self) -> None:
+            self.published: list[dict[str, object]] = []
+            self.messages: list[tuple[str, str]] = []
+
+        def publish(self, **state: object) -> None:
+            self.published.append(dict(state))
+
+        def append_message(self, title: str, message: str) -> None:
+            self.messages.append((title, message))
+
+    args = SimpleNamespace(
+        collection_task_name="old",
+        collection_task_id="old-id",
+        collection_task_name_zh="旧任务",
+        dataset_root="/tmp/old-dataset",
+        ignore_camera=[],
+        ignore_tactile=[],
+    )
+    plus = SimpleNamespace(
+        enabled=True,
+        variant_id="old-variant",
+        task_profile=SimpleNamespace(
+            require_variant=lambda value: (
+                value
+                if value == "new-variant"
+                else (_ for _ in ()).throw(ValueError(value))
+            )
+        ),
+    )
+    plus.set_variant = lambda value: setattr(plus, "variant_id", str(value))
+    plus.ui_state = lambda: {"plus_curation_variant_id": plus.variant_id}
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.args = args
+    control.ui = Ui()
+    control.components = SimpleNamespace(active_sides=(), gripper_policy={})
+    control.plus_curation = plus
+    control._dataset_selection_pending = False
+    control._episode_start_requested = False
+    control._dataset_reconfigure_transactional = True
+    control._episode_busy = lambda: False
+    control._current_active_controls = list
+    policy_calls: list[str] = []
+    control._apply_current_gripper_task_policy = lambda: policy_calls.append(
+        str(args.collection_task_id)
+    )
+    callbacks: dict[str, object] = {}
+
+    def apply_selection(selected_args: object, _text: str, **kwargs: object):
+        assert kwargs["bind_dataset_contract"] is False
+        selected_args.collection_task_name = "new"
+        selected_args.collection_task_id = "new-id"
+        selected_args.collection_task_name_zh = "新任务"
+        selected_args.dataset_root = "/tmp/new-dataset"
+        return {"plus_variant_id": "new-variant"}
+
+    def schedule_selection(
+        snapshot: dict[str, object],
+        **kwargs: object,
+    ) -> str:
+        callbacks["snapshot"] = snapshot
+        callbacks.update(kwargs)
+        return "pending"
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "apply_real_teleop_dataset_selection",
+        apply_selection,
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_collection_task_ui_state",
+        lambda selected_args: {
+            "collection_task_id": selected_args.collection_task_id,
+            "dataset_root": str(selected_args.dataset_root),
+        },
+    )
+    control._dataset_reconfigure_callback = schedule_selection
+
+    assert control._apply_episode_start_payload(
+        "{}",
+        bind_dataset_contract=True,
+        start_after_commit=True,
+    )
+    assert args.collection_task_id == "old-id"
+    assert args.dataset_root == "/tmp/old-dataset"
+    assert plus.variant_id == "old-variant"
+    assert policy_calls == []
+    assert control._dataset_selection_pending is True
+    assert control._episode_start_requested is False
+    assert callbacks["bind_dataset_contract"] is True
+
+    callbacks["on_commit"](callbacks["snapshot"])
+    assert args.collection_task_id == "new-id"
+    assert args.dataset_root == "/tmp/new-dataset"
+    assert plus.variant_id == "new-variant"
+    assert policy_calls == ["new-id"]
+    assert control._dataset_selection_pending is True
+    assert control._episode_start_requested is False
+
+    callbacks["on_complete"]()
+    assert control._dataset_selection_pending is False
+    assert control._episode_start_requested is True
+    assert any(
+        "数采任务已更新" in message
+        for title, message in control.ui.messages
+        if title == "Dataset"
+    )
+
+
+def test_transactional_dataset_selection_rolls_back_side_effects_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = SimpleNamespace(
+        collection_task_name="old",
+        collection_task_id="old-id",
+        collection_task_name_zh="旧任务",
+        dataset_root="/tmp/old-dataset",
+        ignore_camera=[],
+        ignore_tactile=[],
+    )
+    ui = SimpleNamespace(
+        messages=[],
+        published=[],
+    )
+    ui.append_message = lambda title, message: ui.messages.append((title, message))
+    ui.publish = lambda **state: ui.published.append(dict(state))
+    plus = SimpleNamespace(
+        enabled=True,
+        variant_id="old-variant",
+        task_profile=SimpleNamespace(require_variant=lambda value: value),
+    )
+    plus.set_variant = lambda value: setattr(plus, "variant_id", str(value))
+    plus.ui_state = lambda: {"plus_curation_variant_id": plus.variant_id}
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.args = args
+    control.ui = ui
+    control.components = SimpleNamespace(active_sides=(), gripper_policy={})
+    control.plus_curation = plus
+    control._dataset_selection_pending = False
+    control._episode_start_requested = False
+    control._dataset_reconfigure_transactional = True
+    control._episode_busy = lambda: False
+    control._current_active_controls = list
+    policy_calls: list[str] = []
+    control._apply_current_gripper_task_policy = lambda: policy_calls.append(
+        str(args.collection_task_id)
+    )
+    callbacks: dict[str, object] = {}
+
+    def apply_selection(selected_args: object, _text: str, **_kwargs: object):
+        selected_args.collection_task_name = "new"
+        selected_args.collection_task_id = "new-id"
+        selected_args.dataset_root = "/tmp/new-dataset"
+        return {"plus_variant_id": "new-variant"}
+
+    def schedule_selection(
+        snapshot: dict[str, object],
+        **kwargs: object,
+    ) -> str:
+        callbacks["snapshot"] = snapshot
+        callbacks.update(kwargs)
+        return "pending"
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "apply_real_teleop_dataset_selection",
+        apply_selection,
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_collection_task_ui_state",
+        lambda selected_args: {
+            "collection_task_id": selected_args.collection_task_id,
+            "dataset_root": str(selected_args.dataset_root),
+        },
+    )
+    control._dataset_reconfigure_callback = schedule_selection
+
+    assert control._apply_episode_start_payload("{}")
+    callbacks["on_commit"](callbacks["snapshot"])
+    callbacks["on_failure"](RuntimeError("publish failed"))
+
+    assert args.collection_task_id == "old-id"
+    assert args.dataset_root == "/tmp/old-dataset"
+    assert plus.variant_id == "old-variant"
+    assert policy_calls == ["new-id", "old-id"]
+    assert control._dataset_selection_pending is False
+    assert any("原配置保持不变" in message for _title, message in ui.messages)
 
 
 def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:

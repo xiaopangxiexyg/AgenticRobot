@@ -1270,55 +1270,6 @@ def run_real_teleop(
             nonlocal dataset_recorder
             dataset_recorder = value
 
-        def set_current_dataset_recorder(value: object | None) -> None:
-            require_idle_tactile_quiesced("dataset_recorder_rebind")
-            assign_current_dataset_recorder(value)
-
-        def reconfigure_dataset_recorder_for_selection() -> None:
-            """Apply an idle task/root change to the live recorder immediately."""
-
-            nonlocal dataset_recorder
-            current = dataset_recorder
-            if current is None:
-                return
-            require_idle_tactile_quiesced("dataset_selection_reconfigure")
-            try:
-                current.reconfigure_for_current_args()
-            except BaseException:
-                # ``reconfigure_for_current_args`` may already have closed
-                # the old recorder before a new candidate fails its ready
-                # handshake.  Do not leave that one-shot object published for
-                # a later retry.
-                process_worker = getattr(current, "process_worker", None)
-                writer_pool = getattr(current, "writer_pool", None)
-                candidate_is_unusable = bool(
-                    getattr(current, "_lifecycle_closed", False)
-                    or getattr(process_worker, "_closed", False)
-                    or getattr(writer_pool, "_closed", False)
-                )
-                if candidate_is_unusable:
-                    dataset_recorder = None
-                    try:
-                        set_current_dataset_recorder(None)
-                    except BaseException:
-                        pass
-                    try:
-                        current.close()
-                    except BaseException:
-                        pass
-                raise
-            args.dataset_startup_error = ""
-            startup_device_errors.pop("dataset.writer", None)
-            publish_runtime_hardware_status()
-
-        bind_reconfigure = getattr(
-            clutch_input,
-            "bind_dataset_reconfigure_callback",
-            None,
-        )
-        if callable(bind_reconfigure):
-            bind_reconfigure(reconfigure_dataset_recorder_for_selection)
-
         def current_foot_pad_input() -> object | None:
             return foot_pad_input
 
@@ -2562,6 +2513,16 @@ def run_real_teleop(
             step_index_provider=current_step_index,
             support=globals(),
         )
+        bind_reconfigure = getattr(
+            clutch_input,
+            "bind_dataset_reconfigure_callback",
+            None,
+        )
+        if callable(bind_reconfigure):
+            bind_reconfigure(
+                episode_recording_runtime.schedule_dataset_selection,
+                transactional=True,
+            )
         recording_active = episode_recording_runtime.recording_active
         recording_paused = episode_recording_runtime.recording_paused
         recording_pause_reason = episode_recording_runtime.recording_pause_reason

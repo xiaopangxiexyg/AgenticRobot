@@ -322,7 +322,9 @@ class RealTeleopControlInput:
         self._camera_depth_monitor = WristDepthFreshnessMonitor()
         self._episode_start_requested = False
         self._episode_stop_requested = False
-        self._dataset_reconfigure_callback: Callable[[], None] | None = None
+        self._dataset_reconfigure_callback: Callable[..., object] | None = None
+        self._dataset_reconfigure_transactional = False
+        self._dataset_selection_pending = False
         self._progress_operator_intents: deque[ProgressMutationCommand] = deque()
         self._progress_profile_selection_intents: deque[
             ProgressProfileSelectionCommand
@@ -845,6 +847,8 @@ class RealTeleopControlInput:
         failure; a selected profile is consumed only when the operator has
         explicitly enabled the progress workflow for that Episode.
         """
+        if bool(getattr(self, "_dataset_selection_pending", False)):
+            return False, "数据集任务/profile 正在切换，writer ready 后才能开始数采。"
         if not bool(getattr(self, "_teleop_started", False)):
             return False, "遥操尚未进入 RUNNING，不能开始数采。"
         if bool(getattr(self, "_hold_active", False)):
@@ -1421,8 +1425,9 @@ class RealTeleopControlInput:
                             payload_applied = self._apply_episode_start_payload(
                                 event.split(":", 1)[1],
                                 bind_dataset_contract=True,
+                                start_after_commit=True,
                             )
-                        if payload_applied:
+                        if payload_applied and not self._dataset_selection_pending:
                             self._episode_start_requested = True
                 elif event.startswith("task_select:"):
                     blocker = self.plus_curation.persisted_binding_lock_reason()
@@ -3718,12 +3723,34 @@ class RealTeleopControlInput:
         text: str,
         *,
         bind_dataset_contract: bool = False,
+        start_after_commit: bool = False,
     ) -> bool:
         args_snapshot = dict(vars(self.args))
+        plus_variant_snapshot = str(self.plus_curation.variant_id or "")
+        side_effects_started = False
+        failure_reported = False
 
-        def reject(message: str) -> bool:
+        def restore_original_state() -> None:
+            nonlocal side_effects_started
             vars(self.args).clear()
             vars(self.args).update(args_snapshot)
+            self.plus_curation.variant_id = plus_variant_snapshot
+            if side_effects_started:
+                try:
+                    self._apply_current_gripper_task_policy()
+                except BaseException as exc:
+                    _log(
+                        "Dataset",
+                        "failed to restore gripper task policy after dataset "
+                        f"selection rollback: {type(exc).__name__}: {exc}",
+                    )
+            side_effects_started = False
+            self._dataset_selection_pending = False
+
+        def reject(message: str) -> bool:
+            nonlocal failure_reported
+            restore_original_state()
+            failure_reported = True
             if self.ui is not None:
                 self.ui.append_message("Dataset", message)
                 self.ui.publish(
@@ -3740,16 +3767,27 @@ class RealTeleopControlInput:
                 )
             return False
 
+        if bool(getattr(self, "_dataset_selection_pending", False)):
+            return reject(
+                "已有数据集任务/profile 切换正在等待 writer ready；"
+                "本次选择未提交。"
+            )
         if self._episode_busy():
             return reject(
                 "数采录制、暂停、倒计时或保存中不能切换任务、数据目录或忽视模态；"
                 "请先停止当前 episode。"
             )
         try:
+            transactional_reconfigure = bool(
+                self._dataset_reconfigure_callback is not None
+                and getattr(self, "_dataset_reconfigure_transactional", False)
+            )
             payload = apply_real_teleop_dataset_selection(
                 self.args,
                 text,
-                bind_dataset_contract=bind_dataset_contract,
+                bind_dataset_contract=(
+                    bind_dataset_contract and not transactional_reconfigure
+                ),
                 task_definition_for_key=_task_definition_for_key,
                 refresh_formal_dataset_layout=_refresh_formal_dataset_layout,
                 expand_cli_path=_expand_cli_path,
@@ -3760,42 +3798,111 @@ class RealTeleopControlInput:
         plus_variant_id = str(payload.get("plus_variant_id", "") or "").strip()
         if self.plus_curation.enabled and "plus_variant_id" in payload:
             try:
-                self.plus_curation.set_variant(plus_variant_id)
+                if plus_variant_id:
+                    profile = self.plus_curation.task_profile
+                    if profile is None:
+                        raise ValueError(
+                            "Plus variant selection requires a task profile"
+                        )
+                    plus_variant_id = profile.require_variant(plus_variant_id)
             except ValueError as exc:
                 return reject(f"Plus 变体选择无效：{exc}")
-        self._apply_current_gripper_task_policy()
+
+        selected_args_snapshot = dict(vars(self.args))
+
+        def commit_selected_state(snapshot: Mapping[str, object]) -> None:
+            nonlocal side_effects_started
+            side_effects_started = True
+            vars(self.args).clear()
+            vars(self.args).update(dict(snapshot))
+            if self.plus_curation.enabled and "plus_variant_id" in payload:
+                self.plus_curation.set_variant(plus_variant_id)
+            self._apply_current_gripper_task_policy()
+
+        def publish_committed_state() -> None:
+            self._dataset_selection_pending = False
+            if start_after_commit:
+                self._episode_start_requested = True
+            if self.ui is not None:
+                self.ui.publish(
+                    **_collection_task_ui_state(self.args),
+                    **self.plus_curation.ui_state(),
+                    dataset_modality_contract={
+                        "schema_version": "dexteleop.capture_modalities.v1",
+                        "scope": "dataset",
+                        "ignored_modalities": {
+                            "camera": list(
+                                getattr(self.args, "ignore_camera", ()) or ()
+                            ),
+                            "tactile": list(
+                                getattr(self.args, "ignore_tactile", ()) or ()
+                            ),
+                        },
+                    },
+                )
+                self.ui.append_message(
+                    "Dataset",
+                    (
+                        f"数采任务已更新: {self.args.collection_task_name} "
+                        f"({self.args.collection_task_id}) -> "
+                        f"{self.args.dataset_root}"
+                    ),
+                )
+
+        def publish_selection_failure(exc: BaseException) -> None:
+            reject(
+                "数据集 writer 未能按新配置重建，原配置保持不变："
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if transactional_reconfigure:
+            # Keep the canonical namespace and all application-side effects on
+            # the old selection until the private writer candidate is ready.
+            vars(self.args).clear()
+            vars(self.args).update(args_snapshot)
+            self._dataset_selection_pending = True
+            try:
+                outcome = self._dataset_reconfigure_callback(
+                    selected_args_snapshot,
+                    bind_dataset_contract=bind_dataset_contract,
+                    on_commit=commit_selected_state,
+                    on_complete=publish_committed_state,
+                    on_failure=publish_selection_failure,
+                )
+            except Exception as exc:  # noqa: BLE001 - restore the full draft.
+                if not failure_reported:
+                    return reject(
+                        "数据集 writer 未能按新配置重建，原配置保持不变："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                return False
+            if outcome not in {"pending", "committed"}:
+                return reject(
+                    "数据集 writer 重建返回了无效事务状态，原配置保持不变："
+                    f"{outcome!r}"
+                )
+            if outcome == "pending" and self.ui is not None:
+                self.ui.append_message(
+                    "Dataset",
+                    "正在后台准备所选数据集/profile 的 writer；"
+                    "旧配置保持有效，ready 后再原子切换。",
+                )
+                self.ui.publish(
+                    active_controls=self._current_active_controls(),
+                    dataset_configuration_transition_active=True,
+                )
+            return True
+
+        commit_selected_state(selected_args_snapshot)
         if self._dataset_reconfigure_callback is not None:
             try:
-                # Dataset/task selection is admitted while idle.  If a live
-                # recorder exists, rebuild it now so the next countdown sees
-                # the selected path/modality contract rather than deferring a
-                # stale writer until the operator presses Start again.
                 self._dataset_reconfigure_callback()
             except Exception as exc:  # noqa: BLE001 - restore the full draft.
                 return reject(
                     "数据集 writer 未能按新配置重建，原配置保持不变："
                     f"{type(exc).__name__}: {exc}"
                 )
-        if self.ui is not None:
-            self.ui.publish(
-                **_collection_task_ui_state(self.args),
-                **self.plus_curation.ui_state(),
-                dataset_modality_contract={
-                    "schema_version": "dexteleop.capture_modalities.v1",
-                    "scope": "dataset",
-                    "ignored_modalities": {
-                        "camera": list(getattr(self.args, "ignore_camera", ()) or ()),
-                        "tactile": list(getattr(self.args, "ignore_tactile", ()) or ()),
-                    },
-                },
-            )
-            self.ui.append_message(
-                "Dataset",
-                (
-                    f"数采任务已更新: {self.args.collection_task_name} "
-                    f"({self.args.collection_task_id}) -> {self.args.dataset_root}"
-                ),
-            )
+        publish_committed_state()
         return True
 
     def _toggle_round_trip_collection_task(self, *, source: str) -> bool:
@@ -3955,13 +4062,18 @@ class RealTeleopControlInput:
 
     def bind_dataset_reconfigure_callback(
         self,
-        callback: Callable[[], None] | None,
+        callback: Callable[..., object] | None,
+        *,
+        transactional: bool = False,
     ) -> None:
         """Bind the runtime-owned idle dataset/profile reconfiguration hook."""
 
         if callback is not None and not callable(callback):
             raise TypeError("dataset reconfigure callback must be callable or None")
         self._dataset_reconfigure_callback = callback
+        self._dataset_reconfigure_transactional = bool(
+            callback is not None and transactional
+        )
 
     def build_progress_workflow(
         self,

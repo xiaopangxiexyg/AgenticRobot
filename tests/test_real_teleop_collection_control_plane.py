@@ -565,6 +565,290 @@ def test_failed_replacement_keeps_published_recorder_and_discards_candidate(
     runtime.close()
 
 
+def test_dataset_selection_replacement_is_transactional_and_nonblocking(
+    tmp_path: Path,
+) -> None:
+    candidate_entered = threading.Event()
+    release_candidate = threading.Event()
+    retirement_entered = threading.Event()
+    release_retirement = threading.Event()
+    instances: list[object] = []
+
+    class Recorder:
+        def __init__(self, *, args: object, **_kwargs: object) -> None:
+            self.args = args
+            self.finalizing = False
+            self.is_recording = False
+            self.is_paused = False
+            self.frame_count = 0
+            self.dataset_root = Path(args.dataset_root)
+            self.writer_started = False
+            self.closed = False
+            instances.append(self)
+
+        def ensure_started(self) -> None:
+            candidate_entered.set()
+            assert release_candidate.wait(timeout=1.0)
+            self.writer_started = True
+
+        def poll_finalize_tasks(self) -> list[object]:
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    old_root = tmp_path / "old"
+    selected_root = tmp_path / "selected"
+    old_recorder = SimpleNamespace(
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        dataset_root=old_root,
+        writer_started=True,
+        control_trace_episode_sink=None,
+        v25p_sidecar_store=None,
+        poll_finalize_tasks=list,
+    )
+
+    def retire_old() -> None:
+        retirement_entered.set()
+        assert release_retirement.wait(timeout=1.0)
+        old_recorder.closed = True
+
+    old_recorder.closed = False
+    old_recorder.close = retire_old
+    slot: list[object | None] = [old_recorder]
+    clutch = _Clutch()
+    transition_calls: list[str] = []
+    runtime, args, _logs = _episode_runtime(
+        tmp_path=old_root,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=transition_calls,
+    )
+    selected_args = dict(vars(args))
+    selected_args["dataset_root"] = selected_root
+    callbacks: list[str] = []
+
+    def commit_selection(snapshot: dict[str, object]) -> None:
+        callbacks.append("commit")
+        vars(args).clear()
+        vars(args).update(snapshot)
+
+    started_at = time.perf_counter()
+    outcome = runtime.schedule_dataset_selection(
+        selected_args,
+        bind_dataset_contract=False,
+        on_commit=commit_selection,
+        on_complete=lambda: callbacks.append("complete"),
+        on_failure=lambda exc: callbacks.append(f"failure:{exc}"),
+    )
+
+    assert outcome == "pending"
+    assert time.perf_counter() - started_at < 0.05
+    assert candidate_entered.wait(timeout=1.0)
+    assert slot[0] is None
+    assert args.dataset_root == old_root
+    assert callbacks == []
+    assert runtime.collection_transition_active()
+
+    release_candidate.set()
+    deadline = time.monotonic() + 1.0
+    while not retirement_entered.is_set() and time.monotonic() < deadline:
+        poll_started_at = time.perf_counter()
+        runtime.poll_dataset_finalize(time.time())
+        assert time.perf_counter() - poll_started_at < 0.05
+        time.sleep(0.001)
+
+    assert retirement_entered.is_set()
+    assert slot[0] is instances[0]
+    assert instances[0].args is args
+    assert args.dataset_root == selected_root
+    assert callbacks == ["commit"]
+    assert runtime.collection_transition_active()
+    assert old_recorder.closed is False
+
+    release_retirement.set()
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert callbacks == ["commit", "complete"]
+    assert old_recorder.closed is True
+    assert transition_calls == ["dataset_selection_reconfigure"]
+    runtime.close()
+
+
+def test_failed_dataset_selection_republishes_old_recorder_and_keeps_args(
+    tmp_path: Path,
+) -> None:
+    instances: list[object] = []
+
+    class Recorder:
+        def __init__(self, *, args: object, **_kwargs: object) -> None:
+            self.args = args
+            self.dataset_root = Path(args.dataset_root)
+            self.closed = False
+            instances.append(self)
+
+        def ensure_started(self) -> None:
+            raise RuntimeError("selection writer ready timeout")
+
+        def close(self) -> None:
+            self.closed = True
+
+    old_recorder = SimpleNamespace(
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        dataset_root=tmp_path / "old",
+        writer_started=True,
+        control_trace_episode_sink=None,
+        v25p_sidecar_store=None,
+        closed=False,
+        poll_finalize_tasks=list,
+    )
+    old_recorder.close = lambda: setattr(old_recorder, "closed", True)
+    slot: list[object | None] = [old_recorder]
+    runtime, args, _logs = _episode_runtime(
+        tmp_path=tmp_path / "old",
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=_Clutch(),
+        transition_calls=[],
+    )
+    old_args = dict(vars(args))
+    selected_args = dict(old_args)
+    selected_args["dataset_root"] = tmp_path / "selected"
+    failures: list[BaseException] = []
+
+    assert runtime.schedule_dataset_selection(
+        selected_args,
+        bind_dataset_contract=False,
+        on_commit=lambda _snapshot: pytest.fail("failed candidate committed"),
+        on_complete=lambda: pytest.fail("failed selection completed"),
+        on_failure=failures.append,
+    ) == "pending"
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert slot[0] is old_recorder
+    assert vars(args) == old_args
+    assert old_recorder.closed is False
+    assert len(instances) == 1
+    assert instances[0].closed is True
+    assert len(failures) == 1
+    assert str(failures[0]) == "selection writer ready timeout"
+    runtime.close()
+
+
+def test_dataset_selection_is_single_flight_and_no_recorder_commits_inline(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    instances: list[object] = []
+
+    class Recorder:
+        def __init__(self, *, args: object, **_kwargs: object) -> None:
+            self.args = args
+            self.dataset_root = Path(args.dataset_root)
+            self.closed = False
+            instances.append(self)
+
+        def ensure_started(self) -> None:
+            entered.set()
+            assert release.wait(timeout=1.0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    old_recorder = SimpleNamespace(
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        dataset_root=tmp_path / "old",
+        writer_started=True,
+        control_trace_episode_sink=None,
+        v25p_sidecar_store=None,
+        closed=False,
+        poll_finalize_tasks=list,
+    )
+    old_recorder.close = lambda: setattr(old_recorder, "closed", True)
+    slot: list[object | None] = [old_recorder]
+    runtime, args, _logs = _episode_runtime(
+        tmp_path=tmp_path / "old",
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=_Clutch(),
+        transition_calls=[],
+    )
+    selected_args = dict(vars(args))
+    selected_args["dataset_root"] = tmp_path / "selected"
+    assert runtime.schedule_dataset_selection(
+        selected_args,
+        bind_dataset_contract=False,
+        on_commit=lambda _snapshot: None,
+        on_complete=lambda: None,
+        on_failure=lambda _exc: None,
+    ) == "pending"
+    assert entered.wait(timeout=1.0)
+    with pytest.raises(CollectionControlOperationBusy, match="prepare_selection"):
+        runtime.schedule_dataset_selection(
+            selected_args,
+            bind_dataset_contract=False,
+            on_commit=lambda _snapshot: None,
+            on_complete=lambda: None,
+            on_failure=lambda _exc: None,
+        )
+    runtime.close()
+    release.set()
+    deadline = time.monotonic() + 1.0
+    while (
+        (not old_recorder.closed or not instances[0].closed)
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert old_recorder.closed is True
+    assert instances[0].closed is True
+
+    empty_slot: list[object | None] = [None]
+    empty_runtime, empty_args, _logs = _episode_runtime(
+        tmp_path=tmp_path / "empty",
+        recorder_type=Recorder,
+        dataset_slot=empty_slot,
+        clutch=_Clutch(),
+        transition_calls=[],
+    )
+    inline_snapshot = dict(vars(empty_args))
+    inline_snapshot["dataset_root"] = tmp_path / "inline"
+    inline_callbacks: list[str] = []
+
+    def inline_commit(snapshot: dict[str, object]) -> None:
+        vars(empty_args).clear()
+        vars(empty_args).update(snapshot)
+        inline_callbacks.append("commit")
+
+    assert empty_runtime.schedule_dataset_selection(
+        inline_snapshot,
+        bind_dataset_contract=False,
+        on_commit=inline_commit,
+        on_complete=lambda: inline_callbacks.append("complete"),
+        on_failure=lambda exc: inline_callbacks.append(f"failure:{exc}"),
+    ) == "committed"
+    assert inline_callbacks == ["commit", "complete"]
+    assert empty_args.dataset_root == tmp_path / "inline"
+    assert empty_slot[0] is None
+    empty_runtime.close()
+
+
 def test_cancelled_prepare_never_publishes_candidate(tmp_path: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
