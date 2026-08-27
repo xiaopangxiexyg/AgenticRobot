@@ -191,6 +191,8 @@ def build_episode_recording_runtime(
     episode_recording_pause_reason = ""
     episode_resume_warmup_ready_count = 0
     episode_resume_warmup_required_frames = 2
+    episode_resume_failure_message = ""
+    episode_pause_failure_message = ""
     collection_control_plane = CollectionControlPlane(
         name="real-teleop-collection-control"
     )
@@ -1611,41 +1613,100 @@ def build_episode_recording_runtime(
         nonlocal episode_recording_paused, episode_recording_pause_reason
         nonlocal last_collection_frequency_warning_active
         nonlocal episode_resume_warmup_ready_count
+        nonlocal episode_resume_failure_message
+        nonlocal episode_pause_failure_message
         refresh_runtime_views()
         if not recording_active():
             return False
         episode_resume_warmup_ready_count = 0
+        episode_resume_failure_message = ""
         # A runtime Hold must not restart the episode-start motion probe.
         # Modality health is rechecked while resuming, using the probe's
         # existing ready/error result.
-        newly_paused = False
+        already_paused = recording_paused()
+        local_gate_was_paused = bool(episode_recording_paused)
+        # This application gate is authoritative for sample admission even if
+        # the recorder-side drain/reset raises before setting ``is_paused``.
+        # The control loop must never infer that a failed pause call means it
+        # may keep appending to the same continuity segment.
+        episode_recording_paused = True
+        episode_recording_pause_reason = str(reason)
+        newly_paused = not already_paused
+
+        def abort_episode_after_pause_failure(
+            operation: str,
+            exc: BaseException,
+        ) -> bool:
+            nonlocal episode_pause_failure_message
+            message = (
+                f"数采暂停边界建立失败 ({operation})；"
+                "已禁止继续写入当前 continuity segment，"
+                "并开始异步停止该 episode："
+                f"{type(exc).__name__}: {exc}"
+            )
+            episode_pause_failure_message = message
+            _log("Dataset", message, now=now)
+            publish_control_ui_message(
+                "Dataset",
+                message,
+                context="recording pause failure",
+                now=now,
+            )
+            stop_submitted = stop_recording(
+                now,
+                end_reason=f"pause_failure:{operation}:{reason}",
+                summary={
+                    "pause_failure_operation": str(operation),
+                    "pause_failure": f"{type(exc).__name__}: {exc}",
+                    "pause_reason": str(reason),
+                },
+            )
+            if not stop_submitted:
+                clutch_input.set_episode_recording_state(
+                    active=True,
+                    episode_dir=recording_path(),
+                    frame_count=recording_frame_count(),
+                    frequency_status=recording_frequency_status(),
+                    event_status="error",
+                    event_message=message,
+                    episode_index=(
+                        int(dataset_recorder.active_episode_index)
+                        if dataset_recorder is not None
+                        and getattr(dataset_recorder, "active_episode_index", None)
+                        is not None
+                        else None
+                    ),
+                )
+            return False
+
         if dataset_recorder is not None and dataset_recorder.is_recording:
-            newly_paused = bool(
-                dataset_recorder.pause_episode(
+            try:
+                recorder_paused = dataset_recorder.pause_episode(
                     reason=reason,
                     now=now,
                     step_index=step_index,
                     last_state=episode_last_state,
                 )
-            ) or newly_paused
-        if episode_recorder.is_recording and not episode_recording_paused:
-            # The local pause gate owns whether further debug frames are
-            # admitted.  Commit it before writing the optional event so a
-            # sidecar IO failure cannot leave that stream running or veto the
-            # already-committed formal writer pause.
-            episode_recording_paused = True
-            episode_recording_pause_reason = str(reason)
-            newly_paused = True
-            record_debug_event(
-                "recording_paused",
-                payload={
-                    "reason": str(reason),
-                    "step_index": int(step_index),
-                    "last_state": episode_last_state,
-                    "frame_count": int(episode_recorder.frame_count),
-                },
-                now=now,
-            )
+            except Exception as exc:  # noqa: BLE001 - fail collection closed.
+                return abort_episode_after_pause_failure("formal_writer", exc)
+            newly_paused = bool(recorder_paused) or newly_paused
+        if episode_recorder.is_recording and not local_gate_was_paused:
+            # Commit the local gate before writing this event.  In formal mode
+            # the trajectory is subordinate; in debug-only mode an event
+            # failure stops the faulty episode without stopping teleoperation.
+            try:
+                record_debug_event(
+                    "recording_paused",
+                    payload={
+                        "reason": str(reason),
+                        "step_index": int(step_index),
+                        "last_state": episode_last_state,
+                        "frame_count": int(episode_recorder.frame_count),
+                    },
+                    now=now,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep control loop alive.
+                return abort_episode_after_pause_failure("debug_trajectory", exc)
         if not recording_paused():
             return False
         last_collection_frequency_warning_active = False
@@ -1689,9 +1750,21 @@ def build_episode_recording_runtime(
     ) -> bool:
         nonlocal episode_recording_paused, episode_recording_pause_reason
         nonlocal episode_resume_warmup_ready_count
+        nonlocal episode_resume_failure_message
+        nonlocal episode_pause_failure_message
         refresh_runtime_views()
         if not recording_paused():
             return True
+        if episode_pause_failure_message:
+            # A failed pause cannot be healed by clearing only the application
+            # gate.  Retry the asynchronous stop if its first submission was
+            # unavailable, and otherwise keep the episode fail-closed.
+            stop_recording(
+                now,
+                end_reason="pause_failure_retry",
+                summary={"pause_failure": episode_pause_failure_message},
+            )
+            return False
         if fix_hold_coordinator.active:
             episode_resume_warmup_ready_count = 0
             return False
@@ -1743,7 +1816,7 @@ def build_episode_recording_runtime(
         pause_reason = recording_pause_reason()
         if dataset_recorder is not None and dataset_recorder.is_paused:
             try:
-                dataset_resumed = dataset_recorder.resume_episode(
+                dataset_recorder.resume_episode(
                     reason="runtime_running_warmup_ready",
                     now=now,
                     step_index=step_index,
@@ -1754,13 +1827,15 @@ def build_episode_recording_runtime(
                     "数采时序 segment 重置失败，为避免跨暂停窗口已保持暂停："
                     f"{type(exc).__name__}: {exc}"
                 )
-                _log("Dataset", message, now=now)
-                publish_control_ui_message(
-                    "Dataset",
-                    message,
-                    context="recording resume rejection",
-                    now=now,
-                )
+                if message != episode_resume_failure_message:
+                    _log("Dataset", message, now=now)
+                    publish_control_ui_message(
+                        "Dataset",
+                        message,
+                        context="recording resume rejection",
+                        now=now,
+                    )
+                episode_resume_failure_message = message
                 clutch_input.set_episode_recording_state(
                     active=True,
                     episode_dir=recording_path(),
@@ -1775,7 +1850,36 @@ def build_episode_recording_runtime(
                     ),
                 )
                 return False
-            resumed_any = bool(dataset_resumed) or resumed_any
+            if dataset_recorder.is_paused:
+                episode_resume_warmup_ready_count = 0
+                message = (
+                    "正式 Writer 未确认解除暂停；为避免跨暂停窗口，"
+                    "数采和 debug 轨迹继续保持暂停。"
+                )
+                if message != episode_resume_failure_message:
+                    _log("Dataset", message, now=now)
+                    publish_control_ui_message(
+                        "Dataset",
+                        message,
+                        context="recording resume not acknowledged",
+                        now=now,
+                    )
+                episode_resume_failure_message = message
+                clutch_input.set_episode_recording_state(
+                    active=True,
+                    episode_dir=recording_path(),
+                    frame_count=recording_frame_count(),
+                    frequency_status=recording_frequency_status(),
+                    event_status="resume_pending",
+                    event_message=message,
+                    episode_index=(
+                        int(dataset_recorder.active_episode_index)
+                        if dataset_recorder.active_episode_index is not None
+                        else None
+                    ),
+                )
+                return False
+            resumed_any = True
         if episode_recording_paused:
             # Clear the local gate before the optional event projection.  A
             # missing debug event must not undo the formal resume or create a
@@ -1796,6 +1900,7 @@ def build_episode_recording_runtime(
             )
         if resumed_any:
             episode_resume_warmup_ready_count = 0
+            episode_resume_failure_message = ""
             message = "数采已恢复：遥操 RUNNING 且输入/相机 warmup 已稳定，继续写入同一个 episode。"
             _log("Dataset", message, now=now)
             publish_control_ui_message(
@@ -2318,7 +2423,8 @@ def build_episode_recording_runtime(
         nonlocal episode_stop_frame_count, episode_stop_reason, episode_last_state
         nonlocal last_collection_frequency_warning_active
         nonlocal episode_recording_paused, episode_recording_pause_reason
-        nonlocal episode_resume_warmup_ready_count, debug_episode_quarantined
+        nonlocal episode_resume_warmup_ready_count, episode_resume_failure_message
+        nonlocal episode_pause_failure_message, debug_episode_quarantined
         stopped_recorder = episode_stop_recorder
         stopped_frame_count = int(episode_stop_frame_count)
         stopped_reason = str(episode_stop_reason or "control_plane_completion")
@@ -2417,6 +2523,8 @@ def build_episode_recording_runtime(
         episode_recording_paused = False
         episode_recording_pause_reason = ""
         episode_resume_warmup_ready_count = 0
+        episode_resume_failure_message = ""
+        episode_pause_failure_message = ""
         reset_gripper_warmup_probe(f"recording_stopped:{stopped_reason}")
 
     def poll_dataset_finalize(now: float) -> None:

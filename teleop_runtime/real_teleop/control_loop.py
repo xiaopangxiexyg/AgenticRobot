@@ -4754,6 +4754,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 dataset_recorder is not None
                 and dataset_recorder.is_recording
                 and dataset_recorder.can_record_samples
+                and not recording_paused()
                 and sample_due
             ):
                 try:
