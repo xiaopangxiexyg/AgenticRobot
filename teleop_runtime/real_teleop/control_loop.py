@@ -959,6 +959,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     fix_hold_coordinator = context.fix_hold_coordinator
     gripper_warmup_probe_running = context.gripper_warmup_probe_running
     ik_debug_log_recorder = context.ik_debug_log_recorder
+    debug_ik_0827_enabled = bool(getattr(args, "debug_ik_0827", False))
     ik_debug_profile_base_enabled = context.ik_debug_profile_base_enabled
     idle_tactile_compression_tick = context.idle_tactile_compression_tick
     begin_idle_tactile_quiesce = context.begin_idle_tactile_quiesce
@@ -4323,7 +4324,14 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 if dataset_step_result is not None:
                     sample_accepted = dataset_recorder.record_step_async(
                         dataset_step_result,
-                        include_debug_metadata=bool(ik_debug_log_recorder.active),
+                        # --debug-ik-0827 is a standalone investigation log.
+                        # Do not route its opt-in rows into formal dataset
+                        # metadata; the historical GUI toggle retains its
+                        # existing include-debug-metadata behavior.
+                        include_debug_metadata=bool(
+                            ik_debug_log_recorder.active
+                            and not debug_ik_0827_enabled
+                        ),
                         include_action_debug_metadata=bool(getattr(args, "debug_action", False)),
                         metadata_extra=collection_metadata_extra,
                     )
@@ -4593,6 +4601,13 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     left_clutch=left_clutch,
                     right_clutch=right_clutch,
                     full=bool(getattr(args, "ik_debug_log_full", False)),
+                    diagnostic_profile=(
+                        "ik-0827" if debug_ik_0827_enabled else None
+                    ),
+                    camera_sources=(camera_sources if debug_ik_0827_enabled else None),
+                    preview_camera_sources=(
+                        preview_camera_sources if debug_ik_0827_enabled else None
+                    ),
                     loop_phases=(
                         loop_phase_timer.phases
                         if loop_phase_timer is not None

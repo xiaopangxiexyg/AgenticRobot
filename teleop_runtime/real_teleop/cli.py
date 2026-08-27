@@ -1607,6 +1607,17 @@ def build_real_teleop_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--debug-ik-0827",
+        action="store_true",
+        help=(
+            "Explicitly opt in to the 2026-08-27 IK/jitter investigation log. "
+            "The runtime writes an additional bounded asynchronous JSONL control-chain "
+            "record (including loop phases, VIVE channel ages, IK timing, and RM65 "
+            "backend/CANFD timing) without changing the default control, safety, "
+            "writer, progress, or formal-collection behavior."
+        ),
+    )
+    parser.add_argument(
         "--debug-timing-watchdog",
         action="store_true",
         help="Enable the background main-loop stall watchdog without enabling other timing logs.",

@@ -71,6 +71,9 @@ def _build_ik_debug_log_frame(
     left_clutch: bool,
     right_clutch: bool,
     full: bool = False,
+    diagnostic_profile: str | None = None,
+    camera_sources: Mapping[str, RealSenseRGBSource] | None = None,
+    preview_camera_sources: Mapping[str, RealSenseRGBSource] | None = None,
     loop_phases: Sequence[tuple[str, float]] | None = None,
     loop_elapsed_sec: float | None = None,
 ) -> dict[str, object]:
@@ -92,6 +95,20 @@ def _build_ik_debug_log_frame(
         "target_step_scale": float(target_step_scale),
         "ik_timing": dict(ik_timing_payload or {}),
     }
+    if diagnostic_profile:
+        # The 0827 investigation deliberately extends the existing compact
+        # IK frame with read-only timing/observation snapshots.  Keep this
+        # branch opt-in so historical GUI logging and its payload shape stay
+        # unchanged when no investigation profile is requested.
+        base["recording_profile"] = str(diagnostic_profile)
+        base["latency"] = _latency_log_payload(step_result, now=loop_start)
+        base["channels"] = _channels_log_payload(step_result, now=loop_start)
+        base["camera_status"] = _camera_status_log_payload(
+            camera_sources,
+            preview_camera_sources=preview_camera_sources,
+            camera_previewer=None,
+            now=loop_start,
+        )
     if loop_elapsed_sec is not None or loop_phases:
         base["outer_loop_timing"] = {
             "elapsed_ms": (

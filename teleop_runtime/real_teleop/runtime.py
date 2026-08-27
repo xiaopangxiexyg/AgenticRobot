@@ -1795,11 +1795,71 @@ def run_real_teleop(
             console_writer=debug_timing_console_writer,
         )
         ik_debug_profile_base_enabled = bool(debug_timing_modules.ik_profile)
+        debug_ik_0827_enabled = bool(getattr(args, "debug_ik_0827", False))
         ik_debug_log_recorder = IkDebugLogRecorder(
             root_dir=(
                 getattr(args, "_runtime_artifact_ik_debug_root", "") or None
-            )
+            ),
+            filename_prefix=(
+                "ik_debug_0827" if debug_ik_0827_enabled else "ik_debug"
+            ),
         )
+        if debug_ik_0827_enabled:
+            if bool(getattr(args, "no_debug_disk_write", False)):
+                _log(
+                    "DebugIK0827",
+                    "extra IK investigation log disabled by --no-debug-disk-write",
+                )
+            else:
+                try:
+                    ik_debug_0827_path = ik_debug_log_recorder.start(now=time.time())
+                    if (
+                        components.dual_arm_retargeter is not None
+                        and len(components.active_sides) > 1
+                    ):
+                        # The existing solver profile is read-only timing
+                        # instrumentation.  Enable it only for this explicit
+                        # investigation run; the normal CLI default remains
+                        # untouched and the GUI toggle can still restore its
+                        # original setting.
+                        components.dual_arm_retargeter.config.debug_profile = True
+                        components.dual_arm_retargeter.ik_solver.debug_profile = True
+                    ik_debug_log_recorder.write_event(
+                        "config",
+                        {
+                            "recording_profile": "ik-0827",
+                            "source": "--debug-ik-0827",
+                            "auto_started": True,
+                            "log_mode": (
+                                "full"
+                                if bool(getattr(args, "ik_debug_log_full", False))
+                                else "compact"
+                            ),
+                            "outer_control_hz": float(_effective_outer_control_hz(args)),
+                            "arm_control_hz": float(_effective_arm_control_hz(args)),
+                            "ik_profile_enabled": True,
+                            "formal_dataset_debug_metadata": False,
+                        },
+                        now=time.time(),
+                    )
+                    clutch_input.set_ik_debug_logging_state(
+                        active=True,
+                        path=str(ik_debug_0827_path),
+                    )
+                    _log(
+                        "DebugIK0827",
+                        f"extra control-chain log started path={ik_debug_0827_path}",
+                    )
+                except Exception as exc:  # noqa: BLE001 - diagnostics must not block teleop.
+                    if ik_debug_log_recorder.active:
+                        ik_debug_log_recorder.stop(
+                            reason="debug_ik_0827_start_failed",
+                            now=time.time(),
+                        )
+                    _log(
+                        "DebugIK0827",
+                        f"extra log disabled: {type(exc).__name__}: {exc}",
+                    )
         debug_timing_log_recorder = DebugTimingLogRecorder(
             root_dir=(
                 getattr(args, "_runtime_artifact_debug_timing_root", "")
