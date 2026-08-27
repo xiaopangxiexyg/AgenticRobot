@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from teleop_runtime.debug import run_vive_rm65_real_teleop as legacy_entrypoint
 from teleop_runtime.real_teleop.cli import build_real_teleop_argument_parser
 from teleop_runtime.real_teleop.debug_recorders import IkDebugLogRecorder
 from teleop_runtime.real_teleop.debug_timing import debug_timing_modules
@@ -60,6 +61,15 @@ def test_debug_ik_0827_recorder_uses_a_distinct_opt_in_filename(tmp_path) -> Non
     assert rows[1]["payload"]["recording_profile"] == "ik-0827"
     assert rows[2]["recording_profile"] == "ik-0827"
     assert rows[-1]["payload"]["reason"] == "test"
+
+
+def test_legacy_recorder_wrapper_accepts_the_runtime_prefix_assignment(tmp_path) -> None:
+    recorder = legacy_entrypoint.IkDebugLogRecorder(root_dir=tmp_path)
+    recorder.filename_prefix = "ik_debug_0827"
+    path = recorder.start(now=1_700_000_000.125)
+    recorder.stop(reason="test", now=1_700_000_000.5)
+
+    assert path.name.startswith("ik_debug_0827_")
 
 
 def test_no_debug_disk_write_can_coexist_with_the_opt_in_flag() -> None:

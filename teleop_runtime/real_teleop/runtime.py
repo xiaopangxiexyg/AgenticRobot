@@ -1800,9 +1800,6 @@ def run_real_teleop(
             root_dir=(
                 getattr(args, "_runtime_artifact_ik_debug_root", "") or None
             ),
-            filename_prefix=(
-                "ik_debug_0827" if debug_ik_0827_enabled else "ik_debug"
-            ),
         )
         if debug_ik_0827_enabled:
             if bool(getattr(args, "no_debug_disk_write", False)):
@@ -1812,6 +1809,13 @@ def run_real_teleop(
                 )
             else:
                 try:
+                    # The canonical runtime still receives the historical
+                    # control_station compatibility wrapper, whose
+                    # constructor intentionally has the old public signature.
+                    # Set this optional recorder-only prefix after construction
+                    # so that wrapper and legacy callers remain source-
+                    # compatible while the opt-in file is clearly identified.
+                    ik_debug_log_recorder.filename_prefix = "ik_debug_0827"
                     ik_debug_0827_path = ik_debug_log_recorder.start(now=time.time())
                     if (
                         components.dual_arm_retargeter is not None
