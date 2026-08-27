@@ -999,6 +999,56 @@ class B601RSBackend:
         self._sleeper(0.2)
         return B601ModeReceipt("prepare_position_velocity_mode", names, tuple(completed), tuple(failed), tuple(errors), not failed)
 
+    def prepare_mit_mode(
+        self,
+        *,
+        joint_names: Sequence[str] | None = None,
+        timeout_ms: int = 1000,
+    ) -> B601ModeReceipt:
+        """Set RobStride MIT mode once, outside the high-rate send loop.
+
+        This mirrors the pinned reBotArm ``JointGroup.mode_mit()`` transition:
+        one ``ensure_mode(Mode.MIT)`` call per selected joint, the same
+        per-joint settling delay, and the same final group delay.  It does not
+        enable a motor or select operational gains; callers pass MIT gains and
+        feedforward torque explicitly to :meth:`send_mit`.
+        """
+
+        self._require_motion_authorized()
+        names = self._resolve_joint_names(joint_names)
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or timeout_ms <= 0
+        ):
+            raise ValueError("timeout_ms must be a positive integer")
+        try:
+            mode = getattr(import_module("motorbridge"), "Mode").MIT
+        except (ModuleNotFoundError, AttributeError) as exc:
+            raise B601HardwareDependencyError(
+                "motorbridge.Mode.MIT is unavailable"
+            ) from exc
+        completed: list[str] = []
+        failed: list[str] = []
+        errors: list[str] = []
+        for name in names:
+            try:
+                getattr(self._motors[name], "ensure_mode")(mode, int(timeout_ms))
+                self._sleeper(0.05)
+                completed.append(name)
+            except Exception as exc:
+                failed.append(name)
+                errors.append(f"{name}: {exc}")
+        self._sleeper(0.2)
+        return B601ModeReceipt(
+            "prepare_mit_mode",
+            names,
+            tuple(completed),
+            tuple(failed),
+            tuple(errors),
+            not failed,
+        )
+
     def enable(self, *, joint_names: Sequence[str] | None = None) -> B601ModeReceipt:
         self._require_motion_authorized()
         names = self._resolve_joint_names(joint_names)

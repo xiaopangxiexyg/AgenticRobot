@@ -26,6 +26,10 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   因而不会只限制软件命令而留下更宽的驱动器内部限幅；
   YAML 中的 `pos_ki` 仅按上游 `JointCfg` 保留以保持配置语义，不自行映射到 RobStride
   未被 reBotArm `_write_pv_params` 使用的寄存器；
+- `prepare_mit_mode()` 对照同一 upstream `JointGroup.mode_mit()`，只在高频循环外逐关节调用
+  `ensure_mode(MIT)` 并保留相同 settling delay；它不使能电机，也不选择运行增益。当前
+  backend 的 `send_mit()` 参数顺序与 upstream 一致，均为
+  `(position, velocity, kp, kd, feedforward_tau)`；
 - MotorBridge 0.4.9 的 `MotorState` 没有源时间戳或接收序号，所以反馈状态明确标为
   `freshness_verified=false`、`poll_observation_unverified`，报告的 `vel/torq` 也保留
   `vendor_reported_unverified` 语义；
@@ -46,6 +50,13 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   拒绝 `--enable`，循环内不读取反馈，退出时再次 `safe_stop`。它用于把约 50 ms 的六关节
   同步 `mechPos` 参数读取与 TX 上限分开，仍会发送位置命令帧，必须由操作者运行；它不证明
   电机已运动、线上 CAN 帧率、闭环状态 freshness 或 enabled control frequency。
+- `mit-tx-disabled` 在 warmup 后先失能，切到 MIT mode 后再次失能，再以固定 warmup q
+  发送 `qvel=kp=kd=tau=0`；退出时第三次 `safe_stop`。该模式只测 MotorBridge MIT 调用
+  上限，不发送驱动力矩、不调用 `enable()`，也不证明实际 CAN 帧、MIT 扭矩、重力补偿或
+  阻尼控制有效；
+- `gravity-offline` 复用 `B601PinocchioModel.arm_generalized_gravity()` 与
+  `compute_b601_mit_torque()` 的 zero-PD 路径，验证固定合法 q 下 `requested_tau == g(q)`
+  并测量 compute tick。它不构造硬件 backend，不打开 CAN。
 
 数学、重力和 haptic 组合仍由 `robot_motion.rebot_b601_rs` 负责，仿真 effort backend
 仍由 `sim.mujoco.rebot_b601_rs` 负责；本模块不复制 Pinocchio 或 MuJoCo 实现。
@@ -87,14 +98,18 @@ required event 的 observed rate 不低于目标的 95%，且超过 `2 * period`
 4. **P2.5 失能 TX 上限**：仅由操作者运行 `position-tx-disabled`。确认 preflight/final
    `safe_stop` 均完整、`motors_enabled_by_probe=false`，再检查 `compute/tx` 是否通过；该
    阶段不要求 warmup `feedback` 达到目标，也不构成运动或闭环通过。
-5. **P3 高频 POS_VEL**：仅由操作者运行下方 enabled guarded command。先 125 Hz，再 250 Hz，
+5. **P2.6 离线重力与失能 MIT TX**：先离线运行 `gravity-offline`，再仅由操作者运行
+   `mit-tx-disabled`。后者必须同时具有 preflight、post-mode 和 final 三份完整
+   `safe_stop` receipt、`motors_enabled_by_probe=false`，且命令语义必须保持
+   `qvel=kp=kd=tau=0`。这仍不构成已使能 MIT/重力/阻尼通过。
+6. **P3 高频 POS_VEL**：仅由操作者运行下方 enabled guarded command。先 125 Hz，再 250 Hz，
    最后才评估 500 Hz；每档均须机械支撑、物理急停、唯一控制 owner、`--auto-disable`，
    并保存 `feedback/compute/tx` 三个 event 的独立统计。只保持启动时反馈位置，不引入
    trajectory 或 haptic overlay。
-6. **P4 单关节 MIT/重力阻尼**：由硬件负责人另行批准，先单关节、低幅、当前 q 参考和零
+7. **P4 单关节 MIT/重力阻尼**：由硬件负责人另行批准，先单关节、低幅、当前 q 参考和零
    overlay；确认重力方向、阻尼耗散、最终 torque/slew limit 和 stop receipt 后才扩大到
    多关节。P3 的位置频率通过不等于 P4 的力控通过。
-7. **P5 haptic 频率**：接入 `compute_b601_mit_torque()` 与 `J.T @ wrench` 后，单独记录
+8. **P5 haptic 频率**：接入 `compute_b601_mit_torque()` 与 `J.T @ wrench` 后，单独记录
    `haptic`，并用低幅 virtual spring/wall 或已审查的 synthetic follower wrench 验证
    frame、功率不变量、反馈延迟和限幅。只有 `feedback/compute/tx/haptic` 全部可对齐，
    才能讨论 500 Hz 目标；不能用 aggregate bus rate 代替。
@@ -111,6 +126,11 @@ frame、watchdog 超时、日志/commit/config 身份缺失，立即停止该阶
 bash scripts/run_pytest.sh -q tests/test_rebot_b601_hardware_backend.py
 python scripts/hardware/rebot_b601_rs_frequency_probe.py \
   --mode offline --duration 0.2 --target-hz 500
+python scripts/hardware/rebot_b601_rs_frequency_probe.py \
+  --mode gravity-offline \
+  --rebot-source-root /path/to/reBotArm_control_py \
+  --duration 0.2 \
+  --target-hz 500
 ```
 
 被动硬件检查只接收，不发送 CAN 帧，也不构造 MotorBridge：
@@ -147,6 +167,44 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 预期结构条件是 `preflight_disable_receipt.completed=true`、
 `cleanup_receipt.completed=true`、`motors_enabled_by_probe=false`，然后才读取
 `acceptance.events.compute/tx`。这里的 PASS 仅表示 host-to-vendor 调用时钟达标。
+
+## 操作者手动失能 MIT TX 频率入口（本轮不执行）
+
+该入口不调用 `enable()`，并在 MIT mode 前后都确认所选电机已失能；循环中仅发送
+`qvel=kp=kd=tau=0` 的 MIT frame。即使输出 PASS，也只能说明 host-to-vendor MIT 调用
+时钟达到目标，不能解释为电机侧力控、重力补偿或阻尼已验收：
+
+```bash
+python scripts/hardware/rebot_b601_rs_frequency_probe.py \
+  --mode mit-tx-disabled \
+  --config "$REBOT_RS_CONFIG" \
+  --rebot-source-root /path/to/reBotArm_control_py \
+  --target-hz 125 \
+  --duration 3 \
+  --joint joint1 \
+  --allow-motion \
+  --confirmation B601_RS_DISABLED_MIT_TX_FREQUENCY \
+  --auto-disable \
+  --output /path/to/operator-log/b601_mit_tx_disabled_125hz.json
+```
+
+只有 `preflight_disable_receipt.completed=true`、
+`post_mode_disable_receipt.completed=true`、`cleanup_receipt.completed=true`、
+`motors_enabled_by_probe=false` 和 `mit_command_semantics.final_commanded_effort_nm` 全零时，
+才检查 `acceptance.events.compute/tx`。
+
+## 已使能力控仍然阻塞的契约
+
+当前实测的六关节同步 `mechPos (0x7019)` 反馈约为 20 Hz，而且 MotorBridge 缓存没有源
+序号/时间戳；upstream 还记录了当前固件 `mechVel (0x701A)` 量纲和符号不可信，需要从
+位置差分得到速度。因此现在不能用该反馈直接闭合 125 Hz 的重力/阻尼控制。
+
+另外，`compute_b601_mit_torque()` 已经在软件中组合 position、damping、gravity 和 overlay；
+若把该总力矩作为 `tau` 发送，同时给驱动器非零 `kp/kd`，会重复计算 PD。反过来，若使用
+upstream 的驱动器 PD 加 `g(q)` 前馈，当前 backend 仅能限制前馈 `tau`，不能证明驱动器
+内部 PD 与前馈相加后的最终总力矩满足项目的 final-output bound。进入 P4 前必须先确定并
+实现唯一的一种 torque ownership，并取得高频、可验证 freshness 的 q 与差分 dq，再补齐
+watchdog、最终 torque/slew 限制和单关节安全验收。本文不提供已使能 MIT 命令。
 
 ## 操作者手动 enabled 位置频率入口（本轮不执行）
 
