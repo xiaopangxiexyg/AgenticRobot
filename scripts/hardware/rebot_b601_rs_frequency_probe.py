@@ -3,13 +3,11 @@
 
 The default ``read-only`` mode opens a passive SocketCAN receive socket only.
 It does not construct MotorBridge, request feedback, enable a motor, or send a
-position/MIT frame.  ``offline`` provides deterministic smoke evidence.  The
-``position`` mode is an explicit human-run handoff for a later commissioning
-stage and is fail-closed behind several command-line confirmations; it is not
-executed by the repository tests or by this development task.  Its feedback
-polls explicitly request one vendor snapshot per configured arm joint before
-consuming the receive queue; motion is still gated separately by the position
-mode confirmations.
+position/MIT frame.  ``offline`` provides deterministic smoke evidence.
+``position-tx-disabled`` measures only the POS_VEL dispatch clock after an
+explicit successful disable and never enables a motor.  ``position`` is the
+separately confirmed enabled commissioning path.  Neither active mode is run
+by automated tests or by this development task.
 """
 
 from __future__ import annotations
@@ -36,9 +34,11 @@ if __package__ in (None, ""):
 from hardware.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
     B601HardwareError,
+    B601ModeReceipt,
     B601RSBackend,
     B601RSBackendConfig,
     FrequencyLedger,
+    evaluate_frequency_target,
     summarize_timestamps,
 )
 
@@ -202,6 +202,17 @@ def _parse_joint_names(values: Sequence[str] | None) -> tuple[str, ...]:
     return resolved
 
 
+def _mode_receipt_payload(receipt: B601ModeReceipt) -> dict[str, object]:
+    return {
+        "operation": receipt.operation,
+        "requested_joint_names": receipt.requested_joint_names,
+        "completed_joint_names": receipt.completed_joint_names,
+        "failed_joint_names": receipt.failed_joint_names,
+        "errors": receipt.errors,
+        "completed": receipt.completed,
+    }
+
+
 def _resolve_position_limits(
     config_path: Path,
     source_root: Path | None,
@@ -238,18 +249,30 @@ def _resolve_position_limits(
 
 
 def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
+    mode = str(args.mode)
+    if mode not in ("position", "position-tx-disabled"):
+        raise ValueError("active position probe received an unsupported mode")
     if not args.allow_motion:
-        raise FrequencyProbeError("position mode requires --allow-motion")
-    if args.confirmation != "B601_RS_POSITION_FREQUENCY":
+        raise FrequencyProbeError(f"{mode} mode requires --allow-motion")
+    required_confirmation = (
+        "B601_RS_POSITION_FREQUENCY"
+        if mode == "position"
+        else "B601_RS_DISABLED_TX_FREQUENCY"
+    )
+    if args.confirmation != required_confirmation:
         raise FrequencyProbeError(
-            "position mode requires --confirmation B601_RS_POSITION_FREQUENCY"
+            f"{mode} mode requires --confirmation {required_confirmation}"
         )
-    if not args.enable:
+    if mode == "position" and not args.enable:
         raise FrequencyProbeError("position mode requires explicit --enable")
+    if mode == "position-tx-disabled" and args.enable:
+        raise FrequencyProbeError("position-tx-disabled mode rejects --enable")
     if not args.auto_disable:
-        raise FrequencyProbeError("position mode requires explicit --auto-disable")
+        raise FrequencyProbeError(f"{mode} mode requires explicit --auto-disable")
     if not args.config:
-        raise FrequencyProbeError("position mode requires --config pointing to rebotarm_rs.yaml")
+        raise FrequencyProbeError(
+            f"{mode} mode requires --config pointing to rebotarm_rs.yaml"
+        )
     if not math.isfinite(args.duration_sec) or args.duration_sec <= 0.0:
         raise ValueError("duration_sec must be positive")
     if not math.isfinite(args.warmup_sec) or args.warmup_sec <= 0.0:
@@ -260,6 +283,18 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
     velocity_limit_rad_s = float(args.velocity_limit_rad_s)
     if not math.isfinite(velocity_limit_rad_s) or velocity_limit_rad_s <= 0.0:
         raise ValueError("velocity_limit_rad_s must be positive")
+    minimum_rate_ratio = float(args.minimum_rate_ratio)
+    if (
+        not math.isfinite(minimum_rate_ratio)
+        or not 0.0 < minimum_rate_ratio <= 1.0
+    ):
+        raise ValueError("minimum_rate_ratio must be in (0, 1]")
+    maximum_deadline_miss_ratio = float(args.maximum_deadline_miss_ratio)
+    if (
+        not math.isfinite(maximum_deadline_miss_ratio)
+        or not 0.0 <= maximum_deadline_miss_ratio <= 1.0
+    ):
+        raise ValueError("maximum_deadline_miss_ratio must be in [0, 1]")
     selected = _parse_joint_names(args.joint)
     config_path = Path(args.config).expanduser().resolve(strict=True)
     position_limits = _resolve_position_limits(
@@ -277,11 +312,13 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
     )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
-    enable_attempted = False
+    cleanup_required = False
     commands_sent = 0
+    schedule_overruns = 0
     stop_reason: str | None = None
     cleanup_errors: list[str] = []
     cleanup_receipt: dict[str, object] | None = None
+    preflight_disable_receipt: dict[str, object] | None = None
     primary_error: Exception | None = None
     try:
         backend.connect()
@@ -303,16 +340,29 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
                 "no complete valid feedback snapshot arrived during warmup; "
                 f"last_fault={fault_reason}"
             )
+        initial_positions = state.positions_rad
+        initial_sequence = state.sequence
+        if mode == "position-tx-disabled":
+            cleanup_required = True
+            disable_receipt = backend.safe_stop(joint_names=selected)
+            preflight_disable_receipt = _mode_receipt_payload(disable_receipt)
+            if not disable_receipt.completed:
+                raise FrequencyProbeError(
+                    "preflight disable failed: " + "; ".join(disable_receipt.errors)
+                )
         mode_receipt = backend.prepare_position_velocity_mode(
             joint_names=selected,
             velocity_limits_rad_s=effective_velocity_limits,
         )
         if not mode_receipt.completed:
             raise FrequencyProbeError("POS_VEL setup failed: " + "; ".join(mode_receipt.errors))
-        enable_attempted = True
-        enable_receipt = backend.enable(joint_names=selected)
-        if not enable_receipt.completed:
-            raise FrequencyProbeError("motor enable failed: " + "; ".join(enable_receipt.errors))
+        if mode == "position":
+            cleanup_required = True
+            enable_receipt = backend.enable(joint_names=selected)
+            if not enable_receipt.completed:
+                raise FrequencyProbeError(
+                    "motor enable failed: " + "; ".join(enable_receipt.errors)
+                )
         period = 1.0 / target_hz
         started = time.monotonic()
         next_deadline = started
@@ -320,17 +370,23 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             now = time.monotonic()
             if now < next_deadline:
                 time.sleep(next_deadline - now)
-            state = backend.poll_feedback(request_feedback=True)
-            ledger.mark("feedback", state.receive_timestamp_sec)
-            if not state.valid or state.positions_rad is None:
-                stop_reason = state.fault_reason or "invalid feedback"
-                break
+            if mode == "position":
+                state = backend.poll_feedback(request_feedback=True)
+                ledger.mark("feedback", state.receive_timestamp_sec)
+                if not state.valid or state.positions_rad is None:
+                    stop_reason = state.fault_reason or "invalid feedback"
+                    break
+                reference_positions = state.positions_rad
+                source_sequence = state.sequence
+            else:
+                reference_positions = initial_positions
+                source_sequence = initial_sequence
             ledger.mark("compute")
             receipt = backend.send_position_velocity(
-                state.positions_rad,
+                reference_positions,
                 velocity_limits_rad_s=effective_velocity_limits,
                 joint_names=selected,
-                source_sequence=state.sequence,
+                source_sequence=source_sequence,
             )
             if not receipt.accepted:
                 stop_reason = "; ".join(receipt.errors) or "partial position dispatch"
@@ -338,20 +394,17 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             ledger.mark("tx", receipt.completed_at_sec)
             commands_sent += 1
             next_deadline += period
+            completed_at = time.monotonic()
+            if completed_at > next_deadline:
+                schedule_overruns += 1
+                next_deadline = completed_at
     except Exception as exc:  # noqa: BLE001 - always reach fail-safe cleanup
         primary_error = exc
     finally:
-        if enable_attempted:
+        if cleanup_required:
             try:
                 stop_receipt = backend.safe_stop(joint_names=selected)
-                cleanup_receipt = {
-                    "operation": stop_receipt.operation,
-                    "requested_joint_names": stop_receipt.requested_joint_names,
-                    "completed_joint_names": stop_receipt.completed_joint_names,
-                    "failed_joint_names": stop_receipt.failed_joint_names,
-                    "errors": stop_receipt.errors,
-                    "completed": stop_receipt.completed,
-                }
+                cleanup_receipt = _mode_receipt_payload(stop_receipt)
                 if not stop_receipt.completed:
                     cleanup_errors.extend(
                         f"safe_stop: {error}" for error in stop_receipt.errors
@@ -373,8 +426,25 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         if cleanup_errors:
             detail += "; cleanup: " + "; ".join(cleanup_errors)
         raise FrequencyProbeError(detail) from primary_error
+    frequency_stats = ledger.summarize(target_hz=target_hz)
+    required_events = (
+        ("feedback", "compute", "tx")
+        if mode == "position"
+        else ("compute", "tx")
+    )
+    event_acceptance = {
+        event: evaluate_frequency_target(
+            frequency_stats[event],
+            minimum_rate_ratio=minimum_rate_ratio,
+            maximum_deadline_miss_ratio=maximum_deadline_miss_ratio,
+        )
+        for event in required_events
+    }
+    acceptance_passed = stop_reason is None and all(
+        acceptance.passed for acceptance in event_acceptance.values()
+    )
     result: dict[str, object] = {
-        "mode": "position",
+        "mode": mode,
         "channel": config.channel,
         "config_path": str(config_path),
         "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
@@ -388,18 +458,43 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         "requested_velocity_limit_rad_s": velocity_limit_rad_s,
         "effective_velocity_limits_rad_s": effective_velocity_limits,
         "transport": "motorbridge_wired_local",
-        "motion_commands_sent": True,
+        "motion_commands_sent": commands_sent > 0,
+        "motors_enabled_by_probe": mode == "position",
         "commands_sent": commands_sent,
+        "schedule_overruns": schedule_overruns,
         "stop_reason": stop_reason,
+        "execution_status": "COMPLETED",
+        "acceptance_status": "PASS" if acceptance_passed else "FAIL",
+        "acceptance": {
+            "required_events": required_events,
+            "minimum_rate_ratio": minimum_rate_ratio,
+            "maximum_deadline_miss_ratio": maximum_deadline_miss_ratio,
+            "events": {
+                event: acceptance.as_dict()
+                for event, acceptance in event_acceptance.items()
+            },
+        },
         "freshness_verified": False,
-        "freshness_semantics": "motorbridge_vendor_cache_unverified",
-        "frequency": ledger.as_dict(target_hz=target_hz),
+        "freshness_semantics": (
+            "motorbridge_vendor_cache_unverified"
+            if mode == "position"
+            else "initial_vendor_snapshot_only; no_runtime_feedback"
+        ),
+        "frequency": {
+            event: stats.as_dict() for event, stats in frequency_stats.items()
+        },
         "notes": [
             "Human-run commissioning handoff only; this mode is never executed by automated tests.",
-            "It requests one vendor feedback snapshot per arm joint before each active poll and holds the latest valid position.",
+            (
+                "It requests one vendor feedback snapshot per arm joint before each active poll and holds the latest valid position."
+                if mode == "position"
+                else "It verifies disable, then measures host-to-vendor POS_VEL dispatch while holding the warmup reference without runtime feedback."
+            ),
             "The position command is capped by --velocity-limit-rad-s and the YAML per-joint limits.",
         ],
     }
+    if preflight_disable_receipt is not None:
+        result["preflight_disable_receipt"] = preflight_disable_receipt
     if cleanup_receipt is not None:
         result["cleanup_receipt"] = cleanup_receipt
     if cleanup_errors:
@@ -413,10 +508,26 @@ def build_parser() -> argparse.ArgumentParser:
             "B601-RS CAN timing probe; read-only by default, position mode is explicitly guarded."
         )
     )
-    parser.add_argument("--mode", choices=("read-only", "offline", "position"), default="read-only")
+    parser.add_argument(
+        "--mode",
+        choices=("read-only", "offline", "position-tx-disabled", "position"),
+        default="read-only",
+    )
     parser.add_argument("--channel", default="can0")
     parser.add_argument("--duration-sec", "--duration", type=float, default=3.0)
     parser.add_argument("--target-hz", type=float, default=500.0)
+    parser.add_argument(
+        "--minimum-rate-ratio",
+        type=float,
+        default=0.95,
+        help="minimum observed/target rate ratio required for a position PASS",
+    )
+    parser.add_argument(
+        "--maximum-deadline-miss-ratio",
+        type=float,
+        default=0.01,
+        help="maximum fraction of intervals allowed beyond the 2x-period deadline",
+    )
     parser.add_argument(
         "--velocity-limit-rad-s",
         type=float,
@@ -458,12 +569,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
         print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
         return 2
-    payload = {"status": "OK", **payload}
+    exit_code = 0
+    status = "OK"
+    if payload.get("acceptance_status") == "FAIL":
+        status = "FAIL"
+        exit_code = 1
+    payload = {"status": status, **payload}
     encoded = json.dumps(payload, indent=2, sort_keys=True)
     print(encoded)
     if args.output is not None:
         args.output.expanduser().resolve().write_text(encoded + "\n", encoding="utf-8")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

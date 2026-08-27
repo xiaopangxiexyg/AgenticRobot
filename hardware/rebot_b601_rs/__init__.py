@@ -31,7 +31,13 @@ from .backend import (
     B601_RS_POSITION_FRAME,
 )
 from robot_motion.rebot_b601_rs import B601_RS_ARM_JOINT_NAMES
-from .frequency import FrequencyLedger, FrequencyStats, summarize_timestamps
+from .frequency import (
+    FrequencyAcceptance,
+    FrequencyLedger,
+    FrequencyStats,
+    evaluate_frequency_target,
+    summarize_timestamps,
+)
 
 __all__ = [
     "B601CommandReceipt",
@@ -56,7 +62,9 @@ __all__ = [
     "B601_RS_POS_VEL_VEL_KI_PARAM_ID",
     "B601_RS_POS_VEL_VEL_KP_PARAM_ID",
     "B601_RS_POSITION_FRAME",
+    "FrequencyAcceptance",
     "FrequencyLedger",
     "FrequencyStats",
+    "evaluate_frequency_target",
     "summarize_timestamps",
 ]

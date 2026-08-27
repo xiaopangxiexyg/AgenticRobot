@@ -18,6 +18,7 @@ from hardware.rebot_b601_rs import (
     B601_RS_POS_VEL_VEL_KI_PARAM_ID,
     B601_RS_POS_VEL_VEL_KP_PARAM_ID,
     FrequencyLedger,
+    evaluate_frequency_target,
 )
 from robot_motion.rebot_b601_rs import B601_RS_JOINT_MIT_FRAME, B601MitReference
 from scripts.hardware import rebot_b601_rs_frequency_probe as frequency_probe
@@ -570,6 +571,35 @@ def test_frequency_ledger_keeps_feedback_compute_tx_and_haptic_separate() -> Non
     assert summary["haptic"]["observed_hz"] is None
 
 
+def test_frequency_acceptance_distinguishes_completion_from_target_pass() -> None:
+    ledger = FrequencyLedger()
+    for timestamp in (0.0, 0.05, 0.10):
+        ledger.mark("tx", timestamp)
+
+    acceptance = evaluate_frequency_target(
+        ledger.summarize(target_hz=125.0)["tx"]
+    )
+
+    assert acceptance.passed is False
+    assert acceptance.observed_hz == pytest.approx(20.0)
+    assert acceptance.minimum_observed_hz == pytest.approx(118.75)
+    assert acceptance.deadline_miss_ratio == pytest.approx(1.0)
+    assert len(acceptance.reasons) == 2
+
+
+def test_frequency_acceptance_passes_explicit_rate_and_deadline_limits() -> None:
+    ledger = FrequencyLedger()
+    for timestamp in (0.0, 0.008, 0.016, 0.024):
+        ledger.mark("tx", timestamp)
+
+    acceptance = evaluate_frequency_target(
+        ledger.summarize(target_hz=125.0)["tx"]
+    )
+
+    assert acceptance.passed is True
+    assert acceptance.reasons == ()
+
+
 class _FakePositionProbeBackend:
     def __init__(
         self,
@@ -581,6 +611,7 @@ class _FakePositionProbeBackend:
         self.stop_receipt = stop_receipt
         self.calls: list[str] = []
         self.sequence = 0
+        self.send_sequence = 0
         self.prepare_velocity_limits: object = None
 
     def connect(self) -> None:
@@ -625,10 +656,11 @@ class _FakePositionProbeBackend:
     def send_position_velocity(self, *args: object, **kwargs: object) -> object:
         del args, kwargs
         self.calls.append("send")
+        self.send_sequence += 1
         return SimpleNamespace(
             accepted=True,
             errors=(),
-            completed_at_sec=1.0,
+            completed_at_sec=float(self.send_sequence),
         )
 
     def safe_stop(self, *, joint_names: object) -> B601ModeReceipt:
@@ -642,6 +674,7 @@ class _FakePositionProbeBackend:
 
 def _position_probe_args(config_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
+        mode="position",
         allow_motion=True,
         confirmation="B601_RS_POSITION_FREQUENCY",
         enable=True,
@@ -653,6 +686,8 @@ def _position_probe_args(config_path: Path) -> SimpleNamespace:
         rebot_source_root=None,
         target_hz=125.0,
         velocity_limit_rad_s=0.1,
+        minimum_rate_ratio=0.95,
+        maximum_deadline_miss_ratio=0.01,
     )
 
 
@@ -758,6 +793,68 @@ def test_position_probe_reports_incomplete_safe_stop_receipt(
     )
     assert result["stop_reason"] == "safe_stop: joint2: synthetic disable failure"
     assert backend.prepare_velocity_limits == (0.1,) * 6
+
+
+def test_disabled_tx_probe_never_enables_or_polls_feedback_after_warmup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("test: true\n", encoding="utf-8")
+    backend = _FakePositionProbeBackend(
+        enable_receipt=B601ModeReceipt(
+            "enable", ("joint1", "joint2"), ("joint1", "joint2"), (), (), True
+        ),
+        stop_receipt=B601ModeReceipt(
+            "safe_stop",
+            ("joint1", "joint2"),
+            ("joint1", "joint2"),
+            (),
+            (),
+            True,
+        ),
+    )
+    _install_position_probe_fakes(monkeypatch, backend)
+    args = _position_probe_args(config_path)
+    args.mode = "position-tx-disabled"
+    args.enable = False
+    args.confirmation = "B601_RS_DISABLED_TX_FREQUENCY"
+    args.duration_sec = 0.02
+
+    result = frequency_probe._run_position_probe(args)
+
+    assert "enable" not in backend.calls
+    assert backend.calls.count("request_feedback") == 1
+    assert backend.calls.count("poll_feedback") == 1
+    assert backend.calls.count("safe_stop") == 2
+    assert backend.calls.index("safe_stop") < backend.calls.index("prepare")
+    assert backend.calls[-2:] == ["safe_stop", "close"]
+    assert backend.send_sequence >= 2
+    assert result["motors_enabled_by_probe"] is False
+    assert result["freshness_semantics"] == (
+        "initial_vendor_snapshot_only; no_runtime_feedback"
+    )
+    assert result["acceptance"]["required_events"] == ("compute", "tx")
+
+
+def test_probe_main_returns_nonzero_for_completed_frequency_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        frequency_probe,
+        "_run_position_probe",
+        lambda _args: {
+            "mode": "position",
+            "execution_status": "COMPLETED",
+            "acceptance_status": "FAIL",
+        },
+    )
+
+    return_code = frequency_probe.main(["--mode", "position"])
+
+    assert return_code == 1
+    assert '"status": "FAIL"' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("target_hz", (0.0, float("nan"), float("inf")))

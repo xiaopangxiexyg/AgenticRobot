@@ -76,6 +76,113 @@ class FrequencyStats:
         }
 
 
+@dataclass(frozen=True)
+class FrequencyAcceptance:
+    """Explicit pass/fail result for one required event clock."""
+
+    event: str
+    passed: bool
+    sample_count: int
+    interval_count: int
+    observed_hz: float | None
+    target_hz: float
+    minimum_observed_hz: float
+    deadline_misses: int
+    deadline_miss_ratio: float | None
+    maximum_deadline_miss_ratio: float
+    reasons: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "event": self.event,
+            "passed": self.passed,
+            "sample_count": self.sample_count,
+            "interval_count": self.interval_count,
+            "observed_hz": self.observed_hz,
+            "target_hz": self.target_hz,
+            "minimum_observed_hz": self.minimum_observed_hz,
+            "deadline_misses": self.deadline_misses,
+            "deadline_miss_ratio": self.deadline_miss_ratio,
+            "maximum_deadline_miss_ratio": self.maximum_deadline_miss_ratio,
+            "reasons": self.reasons,
+        }
+
+
+def evaluate_frequency_target(
+    stats: FrequencyStats,
+    *,
+    minimum_rate_ratio: float = 0.95,
+    maximum_deadline_miss_ratio: float = 0.01,
+    minimum_sample_count: int = 2,
+) -> FrequencyAcceptance:
+    """Evaluate one event clock against explicit, reported limits.
+
+    A completed transport operation is not automatically a frequency pass.
+    The default gate requires at least 95% of the requested aggregate rate and
+    permits at most 1% of measured intervals to exceed the stats' configured
+    deadline.
+    """
+
+    if not isinstance(stats, FrequencyStats):
+        raise TypeError("stats must be a FrequencyStats")
+    minimum_rate_ratio = _finite(minimum_rate_ratio, name="minimum_rate_ratio")
+    if not 0.0 < minimum_rate_ratio <= 1.0:
+        raise ValueError("minimum_rate_ratio must be in (0, 1]")
+    maximum_deadline_miss_ratio = _finite(
+        maximum_deadline_miss_ratio,
+        name="maximum_deadline_miss_ratio",
+    )
+    if not 0.0 <= maximum_deadline_miss_ratio <= 1.0:
+        raise ValueError("maximum_deadline_miss_ratio must be in [0, 1]")
+    if isinstance(minimum_sample_count, bool) or not isinstance(
+        minimum_sample_count, int
+    ):
+        raise TypeError("minimum_sample_count must be an integer")
+    if minimum_sample_count < 2:
+        raise ValueError("minimum_sample_count must be at least 2")
+    if stats.target_hz is None:
+        raise ValueError("frequency acceptance requires stats.target_hz")
+
+    target_hz = stats.target_hz
+    minimum_observed_hz = target_hz * minimum_rate_ratio
+    interval_count = max(0, stats.sample_count - 1)
+    deadline_miss_ratio = (
+        stats.deadline_misses / interval_count if interval_count else None
+    )
+    reasons: list[str] = []
+    if stats.sample_count < minimum_sample_count:
+        reasons.append(
+            f"sample_count={stats.sample_count} is below {minimum_sample_count}"
+        )
+    if stats.observed_hz is None:
+        reasons.append("observed_hz is unavailable")
+    elif stats.observed_hz < minimum_observed_hz:
+        reasons.append(
+            f"observed_hz={stats.observed_hz:.6f} is below "
+            f"minimum_observed_hz={minimum_observed_hz:.6f}"
+        )
+    if deadline_miss_ratio is None:
+        reasons.append("deadline_miss_ratio is unavailable")
+    elif deadline_miss_ratio > maximum_deadline_miss_ratio:
+        reasons.append(
+            f"deadline_miss_ratio={deadline_miss_ratio:.6f} exceeds "
+            f"maximum_deadline_miss_ratio={maximum_deadline_miss_ratio:.6f}"
+        )
+    return FrequencyAcceptance(
+        event=stats.event,
+        passed=not reasons,
+        sample_count=stats.sample_count,
+        interval_count=interval_count,
+        observed_hz=stats.observed_hz,
+        target_hz=target_hz,
+        minimum_observed_hz=minimum_observed_hz,
+        deadline_misses=stats.deadline_misses,
+        deadline_miss_ratio=deadline_miss_ratio,
+        maximum_deadline_miss_ratio=maximum_deadline_miss_ratio,
+        reasons=tuple(reasons),
+    )
+
+
 def summarize_timestamps(
     event: str,
     timestamps_sec: Iterable[float],
@@ -180,4 +287,10 @@ class FrequencyLedger:
         }
 
 
-__all__ = ["FrequencyLedger", "FrequencyStats", "summarize_timestamps"]
+__all__ = [
+    "FrequencyAcceptance",
+    "FrequencyLedger",
+    "FrequencyStats",
+    "evaluate_frequency_target",
+    "summarize_timestamps",
+]
