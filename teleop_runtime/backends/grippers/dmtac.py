@@ -728,6 +728,14 @@ class DMTacGripperBackend(EffectorBackend):
         self._applied_torque = None
         self._applied_continuous_grasp = None
 
+    def _invalidate_gripper_connection_state_locked(self) -> None:
+        """Discard command caches that are valid only for one serial session."""
+
+        self._reset_applied_motion_config_locked()
+        self._last_sent_command = None
+        self._last_sent_command_timestamp = None
+        self._last_sent_command_completed_timestamp = None
+
     def _apply_gripper_start_config_locked(self, *, open_on_start: bool) -> None:
         if (
             self.config.observation_only
@@ -749,7 +757,7 @@ class DMTacGripperBackend(EffectorBackend):
     def _close_gripper_locked(self) -> None:
         device = self.device
         if device is None:
-            self._reset_applied_motion_config_locked()
+            self._invalidate_gripper_connection_state_locked()
             return
         gripper = getattr(device, "gripper", None)
         if gripper is not None:
@@ -762,12 +770,12 @@ class DMTacGripperBackend(EffectorBackend):
                     setattr(device, "gripper", None)
                 except Exception:
                     self.device = None
-        self._reset_applied_motion_config_locked()
+        self._invalidate_gripper_connection_state_locked()
 
     def _close_device_locked(self) -> None:
         device = self.device
         self.device = None
-        self._reset_applied_motion_config_locked()
+        self._invalidate_gripper_connection_state_locked()
         if device is not None:
             device.close()
 
@@ -2127,6 +2135,7 @@ class DMTacGripperBackend(EffectorBackend):
                 with self._lock:
                     device = self.device
                     self.device = None
+                    self._invalidate_gripper_connection_state_locked()
                 if device is not None:
                     device.close()
             finally:
