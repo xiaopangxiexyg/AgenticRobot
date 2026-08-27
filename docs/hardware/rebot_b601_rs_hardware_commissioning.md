@@ -11,10 +11,11 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
 - 从显式的 `rebotarm_rs.yaml` 读取 `can0`、六个 arm 电机 ID、反馈 ID、型号和 POS_VEL
   默认速度上限；夹爪 ID7 不在第一版 arm backend 内；
 - `connect()` 只打开本地 controller 并注册 RS 电机，不请求反馈、不切模式、不使能；
-- `poll_feedback()` 默认只调用 `poll_feedback_once()` 消费已有接收队列；显式传入
-  `request_feedback=True` 的 active commissioning loop 会先对六个 arm 电机各发送一次
-  `request_feedback()`，再消费接收队列，并读取 RobStride `mechPos` 参数 `0x7019`（该
-  firmware 的紧凑 type-0x18 位置流不由 MotorBridge 0.4.9 解码）。两条路径对缺失/错误
+- `poll_feedback()` 默认只调用 `poll_feedback_once()` 消费已有接收队列；MotorBridge 0.4.9
+  对 RobStride 的通用 `request_feedback()` 是 no-op。显式传入 `request_feedback=True` 的
+  active commissioning loop 仍会调用该兼容入口，然后消费接收队列，并对六个 arm 电机
+  串行读取 RobStride `mechPos` 参数 `0x7019`。MotorBridge 的连续状态路径要求另行启用
+  active report；本 backend 当前不会隐式改变该设备配置。两条路径对缺失/错误
   ID/非零 vendor status/非有限值都生成 `invalid/stale` 状态，绝不补成零；active position
   fallback 可能没有 velocity/torque 字段，力控调用必须单独检查对应字段存在；
 - `prepare_position_velocity_mode()` 对照 pinned reBotArm 的
@@ -74,9 +75,14 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
 | `haptic` | haptic wrench/torque 计算完成 |
 
 每个 event 独立输出 sample count、observed Hz、p50/p95/p99/max interval 和 deadline
-misses。被动 CAN 探针还会按 arbitration ID 报告帧数和间隔，但不会声称 command 或 haptic
-频率。当前 MotorBridge 缺少源时间戳/序号，故被动或 backend 反馈频率只能作为接收时间
-证据；要关闭 freshness 缺口，需要后续 raw SocketCAN 解码/接口扩展并保持同一时钟域。
+misses。被动 CAN 探针还会按 arbitration ID、RobStride communication type 分别统计 type-2
+`operation_status` 与 type-24 `active_report` 候选的 device/host ID 和接收间隔，但不会解码
+payload，也不会声称 command 或 haptic 频率。MotorBridge 以 type 24 切换 active report，
+不同 firmware 的周期流实际可能表现为 type 2 或 type 24；两者必须分别观察。当前
+MotorBridge 缺少源时间戳/序号，故被动或 backend 反馈频率只能作为接收时间证据；即使观察
+到周期流，`freshness_verified` 仍为 false。要关闭 freshness 缺口，需要 vendor 层为实际
+firmware 的周期帧提供解码、接收序号/时间戳并保持同一时钟域，而不是在应用层复制一套状态
+payload 解码器。
 
 active probe 还会输出独立的 `execution_status` 和 `acceptance_status`。默认频率门要求每个
 required event 的 observed rate 不低于目标的 95%，且超过 `2 * period` 的 interval 不多于
@@ -137,11 +143,23 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 
 ```bash
 python scripts/hardware/rebot_b601_rs_frequency_probe.py \
-  --mode read-only --channel can0 --duration 3
+  --mode read-only --channel can0 --duration 3 \
+  --output /tmp/b601-rs-commissioning/b601_passive_feedback.json
 ```
 
 运行前仍须确认 CAN 上没有其他控制 owner；监听输出是 `NOT_RUN`/只读证据，不是硬件运动
-验收。输出建议写入 Task/Run 外的操作者日志目录，不要写回源 worktree。
+验收。输出建议写入 Task/Run 外的操作者日志目录，不要写回源 worktree。重点检查：
+
+- `frames_by_robstride_communication_type` 中 type 2/type 24 的实际分布；
+- 对应的 `*_frames_by_device_id` 是否覆盖预期 arm ID 1--6（ID7 是夹爪）；
+- `robstride_short_operation_status_frame_count` 和
+  `robstride_short_active_report_frame_count` 是否为零；
+- 对应 `*_per_device_feedback` 的 `observed_hz`，以及 host ID 是否与配置的 `0xFD` 一致。
+
+没有 type 2/type 24 周期候选只表示监听期间没有观察到对应帧，可能是 active report 尚未
+启用或总线上没有生产者，不能推断硬件不支持该路径。任一类型计数非零也只建立 host 接收
+节拍；在检查周期性、ID 方向和 payload 契约前不能区分一次性切换命令与连续设备上报，更
+不能证明源端新鲜度或 MotorBridge cache 新鲜度。
 
 ## 操作者手动失能 TX 频率入口（本轮不执行）
 
@@ -196,8 +214,10 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 ## 已使能力控仍然阻塞的契约
 
 当前实测的六关节同步 `mechPos (0x7019)` 反馈约为 20 Hz，而且 MotorBridge 缓存没有源
-序号/时间戳；upstream 还记录了当前固件 `mechVel (0x701A)` 量纲和符号不可信，需要从
-位置差分得到速度。因此现在不能用该反馈直接闭合 125 Hz 的重力/阻尼控制。
+序号/时间戳。MotorBridge 参数表明确 `0x701A` 是滤波电流 `iqf`，真正的 `mechVel` 是
+`0x701B`；因此既有把 `0x701A` 当速度得到的量纲/符号观察无效，不能据此评价速度反馈。
+在 `0x701B` 的真实设备量纲、符号和 freshness 经独立验证前，控制侧仍应使用新鲜位置的
+有界差分速度。当前不能用约 20 Hz 的同步参数读取直接闭合 125 Hz 重力/阻尼控制。
 
 另外，`compute_b601_mit_torque()` 已经在软件中组合 position、damping、gravity 和 overlay；
 若把该总力矩作为 `tau` 发送，同时给驱动器非零 `kp/kd`，会重复计算 PD。反过来，若使用
