@@ -694,7 +694,9 @@ def test_successful_q6_retry_clears_recoverable_input_failures() -> None:
     assert args.angle_trigger_startup_error == ""
     assert clutch._gripper_control_enabled is False
     assert any("Q6 reconnected" in message for message in messages)
-    assert published[-1]["hardware_status"]["dataset.writer"]["online"] is True
+    dataset_writer_status = published[-1]["hardware_status"]["dataset.writer"]
+    assert dataset_writer_status["online"] is False
+    assert dataset_writer_status["health"] == "deferred"
 
 
 def test_manual_foot_pad_retry_updates_status_provider_atomically() -> None:
