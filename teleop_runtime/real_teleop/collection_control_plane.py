@@ -193,6 +193,49 @@ class CollectionControlPlane:
             if self._worker is threading.current_thread():
                 self._worker = None
 
+    def _discard_completed_after_cancel(
+        self,
+        pending: _PendingOperation,
+        result: CollectionControlOperationResult,
+        value: Any,
+        discard_value: Callable[[Any], None],
+    ) -> None:
+        """Retire an unconsumed completed value without blocking its caller.
+
+        Cancellation can race the control thread's next poll: the blocking
+        operation may already have published a ready writer candidate while
+        the operator is requesting Hold.  Closing that process-backed value
+        in :meth:`cancel` would put Queue/process teardown back onto the
+        realtime thread.  Keep the original generation single-flight until
+        cleanup has returned, then publish the cancelled completion.
+        """
+
+        discard_error: BaseException | None = None
+        try:
+            discard_value(value)
+        except BaseException as exc:  # cleanup evidence belongs to completion
+            discard_error = exc
+        cancelled_result = CollectionControlOperationResult(
+            generation=result.generation,
+            kind=result.kind,
+            started_at=result.started_at,
+            completed_at=float(self._clock()),
+            error=result.error,
+            cancelled=True,
+            discard_error=discard_error,
+        )
+        with self._lock:
+            if self._pending is not pending:
+                if self._worker is threading.current_thread():
+                    self._worker = None
+                return
+            self._pending = None
+            if not self._closed:
+                self._completed = cancelled_result
+                self._completed_discard = None
+            if self._worker is threading.current_thread():
+                self._worker = None
+
     def poll(
         self,
         generation: int | None = None,
@@ -243,8 +286,6 @@ class CollectionControlPlane:
         return self.poll(requested_generation)
 
     def cancel(self, generation: int) -> bool:
-        value_to_discard: Any | None = None
-        discard_value: Callable[[Any], None] | None = None
         with self._lock:
             if (
                 self._pending is not None
@@ -259,33 +300,43 @@ class CollectionControlPlane:
                 return False
             if result.cancelled:
                 return False
-            value_to_discard = result.value
             discard_value = self._completed_discard
-            self._completed = CollectionControlOperationResult(
+            if result.error is not None or discard_value is None:
+                self._completed = CollectionControlOperationResult(
+                    generation=result.generation,
+                    kind=result.kind,
+                    started_at=result.started_at,
+                    completed_at=result.completed_at,
+                    error=result.error,
+                    cancelled=True,
+                )
+                self._completed_discard = None
+                return True
+
+            pending = _PendingOperation(
                 generation=result.generation,
                 kind=result.kind,
-                started_at=result.started_at,
-                completed_at=result.completed_at,
-                error=result.error,
+                discard_value=None,
                 cancelled=True,
             )
+            worker = threading.Thread(
+                target=self._discard_completed_after_cancel,
+                args=(pending, result, result.value, discard_value),
+                name=f"{self.name}:{result.kind}:cancel:{result.generation}",
+                daemon=True,
+            )
+            self._completed = None
             self._completed_discard = None
-        if result.error is None and discard_value is not None:
             try:
-                discard_value(value_to_discard)
-            except BaseException as exc:
-                with self._lock:
-                    current = self._completed
-                    if current is not None and current.generation == int(generation):
-                        self._completed = CollectionControlOperationResult(
-                            generation=current.generation,
-                            kind=current.kind,
-                            started_at=current.started_at,
-                            completed_at=current.completed_at,
-                            error=current.error,
-                            cancelled=True,
-                            discard_error=exc,
-                        )
+                self._pending = pending
+                self._worker = worker
+                worker.start()
+            except BaseException:
+                self._pending = None
+                self._worker = None
+                self._completed = result
+                self._completed_discard = discard_value
+                return False
         return True
 
     def close(self, *, timeout_sec: float = 5.0) -> bool:

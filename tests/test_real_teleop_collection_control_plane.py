@@ -119,6 +119,48 @@ def test_cancelled_result_is_cleaned_before_completion_is_published() -> None:
     assert not plane.busy
 
 
+def test_cancel_of_completed_value_keeps_cleanup_off_the_caller_and_single_flight() -> None:
+    cleanup_entered = threading.Event()
+    cleanup_release = threading.Event()
+    candidate = object()
+    plane = CollectionControlPlane(name="unit-test")
+
+    def discard(value: object) -> None:
+        assert value is candidate
+        cleanup_entered.set()
+        assert cleanup_release.wait(timeout=1.0)
+
+    generation = plane.submit(
+        "prepare",
+        lambda: candidate,
+        discard_value=discard,
+    )
+    deadline = time.monotonic() + 1.0
+    while plane.busy and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert not plane.busy
+    assert plane.active_kind == "prepare"
+
+    started_at = time.perf_counter()
+    assert plane.cancel(generation)
+    cancel_elapsed = time.perf_counter() - started_at
+
+    assert cancel_elapsed < 0.05
+    assert cleanup_entered.wait(timeout=1.0)
+    assert plane.busy
+    assert plane.poll(generation) is None
+    with pytest.raises(CollectionControlOperationBusy, match="prepare"):
+        plane.submit("next", lambda: None)
+
+    cleanup_release.set()
+    result = _wait_for_result(plane, generation)
+    assert result.cancelled
+    assert not result.succeeded
+    assert result.value is None
+    assert result.discard_error is None
+    assert not plane.busy
+
+
 def test_close_discards_unconsumed_success_and_rejects_new_work() -> None:
     cleaned: list[object] = []
     candidate = object()
@@ -260,6 +302,9 @@ class _Clutch:
         del dataset_root
         self.plus_episode_indices.append(int(episode_index))
 
+    def _current_active_controls(self) -> list[str]:
+        return []
+
 
 class _FailingUi:
     def publish(self, **_state: object) -> None:
@@ -279,16 +324,23 @@ def _episode_runtime(
     control_ui: object | None = None,
     debug_episode_enabled: bool = False,
     start_episode_recording=lambda *_args, **_kwargs: None,
+    stop_episode_recording=lambda *_args, **_kwargs: None,
+    episode_recorder_override: object | None = None,
     publish_runtime_hardware_status=lambda: None,
     bind_capture_modality_contract=lambda *_args, **_kwargs: None,
 ):
     logs: list[tuple[str, str]] = []
     episode_state = [None]
-    episode_recorder = SimpleNamespace(
-        config=SimpleNamespace(enabled=bool(debug_episode_enabled)),
-        is_recording=False,
-        frame_count=0,
-        episode_dir=None,
+    episode_recorder = (
+        SimpleNamespace(
+            config=SimpleNamespace(enabled=bool(debug_episode_enabled)),
+            is_recording=False,
+            frame_count=0,
+            episode_dir=None,
+            record_event=lambda *_args, **_kwargs: None,
+        )
+        if episode_recorder_override is None
+        else episode_recorder_override
     )
     support = {
         "CaptureModalityContract": _CaptureModalityContract,
@@ -306,7 +358,7 @@ def _episode_runtime(
         ),
         "_log": lambda tag, message, **_kwargs: logs.append((tag, message)),
         "_start_episode_recording": start_episode_recording,
-        "_stop_episode_recording": lambda *_args, **_kwargs: None,
+        "_stop_episode_recording": stop_episode_recording,
         "bind_capture_modality_contract": bind_capture_modality_contract,
     }
     args = SimpleNamespace(
@@ -340,7 +392,7 @@ def _episode_runtime(
         camera_sources={},
         control_ui=control_ui,
         startup_device_errors={},
-        fix_hold_coordinator=SimpleNamespace(),
+        fix_hold_coordinator=SimpleNamespace(active=False),
         position_episode_debug_runtime=SimpleNamespace(
             start=lambda *_args, **_kwargs: False,
             stop=lambda *_args, **_kwargs: None,
@@ -771,6 +823,177 @@ def test_episode_writer_prepare_is_nonblocking_and_published_only_after_ready(
     assert transition_calls == ["formal_episode_start"]
     assert clutch.restore_calls == 1
     runtime.close()
+
+
+def test_debug_trajectory_stop_failure_does_not_invalidate_formal_stop(
+    tmp_path: Path,
+) -> None:
+    stop_attempts = 0
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("test must reuse the published recorder")
+
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True,
+        finalizing=False,
+        is_recording=True,
+        is_paused=False,
+        pause_reason="",
+        frame_count=12,
+        active_episode_index=4,
+        camera_sources={},
+        collection_frequency_status=lambda: {},
+        poll_finalize_tasks=lambda: [],
+        close=lambda: pytest.fail("formal recorder must remain reusable"),
+    )
+
+    def stop_episode(**_kwargs: object) -> None:
+        recorder.is_recording = False
+        recorder.active_episode_index = None
+        return None
+
+    recorder.stop_episode = stop_episode
+    debug_recorder = SimpleNamespace(
+        config=SimpleNamespace(enabled=True),
+        is_recording=True,
+        frame_count=3,
+        episode_dir=tmp_path / "debug",
+        record_event=lambda *_args, **_kwargs: None,
+    )
+
+    def stop_debug(recorder_arg: object, **_kwargs: object) -> None:
+        nonlocal stop_attempts
+        assert recorder_arg is debug_recorder
+        stop_attempts += 1
+        if stop_attempts == 1:
+            raise RuntimeError("debug trailer unavailable")
+        debug_recorder.is_recording = False
+
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        debug_episode_enabled=True,
+        stop_episode_recording=stop_debug,
+        episode_recorder_override=debug_recorder,
+    )
+
+    assert runtime.stop_recording(time.time(), end_reason="unit")
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert slot[0] is recorder
+    assert recorder.is_recording is False
+    assert args.dataset_startup_error == ""
+    assert clutch.recording_states[-1]["event_status"] == "discarded"
+    assert any(
+        tag == "Episode" and "formal dataset stop remains committed" in message
+        for tag, message in logs
+    )
+    assert runtime.recording_active() is False
+    assert runtime.close()
+    assert stop_attempts == 1
+
+
+def test_debug_pause_resume_event_failure_cannot_veto_formal_continuity(
+    tmp_path: Path,
+) -> None:
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("test must reuse the published recorder")
+
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True,
+        finalizing=False,
+        is_recording=True,
+        is_paused=False,
+        frame_count=12,
+        active_episode_index=4,
+        camera_sources={},
+        collection_frequency_status=lambda: {},
+        poll_finalize_tasks=lambda: [],
+        close=lambda: None,
+    )
+
+    def pause_episode(**_kwargs: object) -> bool:
+        recorder.is_paused = True
+        recorder.pause_reason = "unit_hold"
+        return True
+
+    def resume_episode(**_kwargs: object) -> bool:
+        recorder.is_paused = False
+        recorder.pause_reason = ""
+        return True
+
+    def stop_episode(**_kwargs: object) -> None:
+        recorder.is_recording = False
+        recorder.active_episode_index = None
+        return None
+
+    recorder.pause_episode = pause_episode
+    recorder.resume_episode = resume_episode
+    recorder.stop_episode = stop_episode
+    debug_recorder = SimpleNamespace(
+        config=SimpleNamespace(enabled=True),
+        is_recording=True,
+        frame_count=3,
+        episode_dir=tmp_path / "debug",
+        record_event=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("debug event unavailable")
+        ),
+    )
+
+    def stop_debug(recorder_arg: object, **_kwargs: object) -> None:
+        assert recorder_arg is debug_recorder
+        debug_recorder.is_recording = False
+
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, _args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        debug_episode_enabled=True,
+        stop_episode_recording=stop_debug,
+        episode_recorder_override=debug_recorder,
+    )
+
+    assert runtime.pause_recording(time.time(), reason="unit_hold")
+    assert recorder.is_paused
+    assert runtime.recording_paused()
+
+    running_step = SimpleNamespace(state=SimpleNamespace(value="RUNNING"))
+    assert not runtime.resume_recording_if_ready(
+        time.time(),
+        step_result=running_step,
+    )
+    assert runtime.resume_recording_if_ready(
+        time.time(),
+        step_result=running_step,
+    )
+    assert recorder.is_paused is False
+    assert runtime.recording_paused() is False
+    quarantine_messages = [
+        message
+        for tag, message in logs
+        if tag == "Episode" and "已隔离" in message
+    ]
+    assert len(quarantine_messages) == 1
+    assert "operation=event:recording_paused" in quarantine_messages[0]
+    assert runtime.close()
 
 
 def test_failed_replacement_keeps_published_recorder_and_discards_candidate(
@@ -1563,6 +1786,82 @@ def test_failed_finalize_does_not_advance_round_trip_task(tmp_path: Path) -> Non
     assert clutch.finalize_states[-1]["status"] == "error"
     assert clutch.round_trip_advances == 0
     assert clutch.plus_episode_indices == []
+    assert runtime.close()
+
+
+def test_saved_finalize_consumers_fail_independently_without_rewriting_writer_result(
+    tmp_path: Path,
+) -> None:
+    finalize_task = SimpleNamespace(
+        episode_index=6,
+        frame_count=19,
+        queued_at=10.0,
+        started_at=10.1,
+        completed_at=10.2,
+        stage_timings_ms={},
+        success=True,
+        error="",
+        v25p_error="",
+        v25p_native_error="",
+        progress_error="",
+    )
+    finalize_results: list[object] = [finalize_task]
+    recorder = SimpleNamespace(
+        finalizing=True,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        dataset_root=tmp_path,
+        close=lambda: None,
+    )
+
+    def poll_finalize_tasks() -> list[object]:
+        recorder.finalizing = False
+        return [finalize_results.pop(0)] if finalize_results else []
+
+    recorder.poll_finalize_tasks = poll_finalize_tasks
+
+    class FailingFinalizeConsumers(_Clutch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.consumer_calls: list[str] = []
+
+        def set_episode_finalize_state(self, **state: object) -> None:
+            self.consumer_calls.append(f"ui:{state['status']}")
+            raise RuntimeError("finalize projection unavailable")
+
+        def advance_round_trip_task_after_saved_episode(self) -> None:
+            self.consumer_calls.append("round_trip")
+            raise RuntimeError("round-trip state unavailable")
+
+        def set_plus_curation_pending(
+            self,
+            *,
+            dataset_root: Path,
+            episode_index: int,
+        ) -> None:
+            assert dataset_root == tmp_path
+            assert episode_index == 6
+            self.consumer_calls.append("plus")
+            raise RuntimeError("Plus state unavailable")
+
+    clutch = FailingFinalizeConsumers()
+    slot: list[object | None] = [recorder]
+    runtime, _args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=lambda **_kwargs: None,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+    )
+
+    runtime.poll_dataset_finalize(time.time())
+
+    assert clutch.consumer_calls == ["ui:saved", "round_trip", "plus"]
+    assert sum("Writer 结果保持不变" in message for _tag, message in logs) == 3
+    assert any("正式数据集 episode 6 已保存" in message for _tag, message in logs)
+    # No finalize failure was fabricated from an application-side consumer,
+    # so orderly shutdown still reports the writer lifecycle as successful.
     assert runtime.close()
 
 

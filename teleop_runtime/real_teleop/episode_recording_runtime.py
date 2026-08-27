@@ -46,6 +46,7 @@ class _DatasetStopCompletion:
     formal_stopped: bool
     debug_stopped: bool
     frame_count: int
+    debug_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,8 @@ class EpisodeRecordingRuntime:
     recording_path: Callable[[], str]
     recording_frequency_status: Callable[[], dict[str, object]]
     publish_collection_frequency_warning: Callable[..., None]
+    record_debug_event: Callable[..., bool]
+    record_debug_frame: Callable[..., bool]
     start_recording: Callable[..., bool]
     schedule_recording_countdown: Callable[..., bool]
     cancel_recording_countdown: Callable[..., bool]
@@ -214,6 +217,7 @@ def build_episode_recording_runtime(
     dataset_selection_cleanup_on_complete: Callable[[], None] | None = None
     dataset_selection_cleanup_kind = ""
     finalize_failure_count = 0
+    debug_episode_quarantined = False
 
     def start_position_episode_debug(
         episode_index: int,
@@ -280,6 +284,34 @@ def build_episode_recording_runtime(
             return False
         return True
 
+    def publish_finalize_consumer_failure(
+        *,
+        episode_index: int,
+        consumer: str,
+        exc: BaseException,
+        now: float,
+    ) -> None:
+        """Report a post-finalize consumer failure without rewriting writer fact.
+
+        ``poll_finalize_tasks()`` transfers an already completed and consumed
+        writer result.  Application projections and optional follow-up state
+        cannot make that durable result fail, and one consumer must not prevent
+        the remaining consumers from observing it.
+        """
+
+        warning = (
+            f"episode {episode_index} 的正式数据结果已确定，但 {consumer} 更新失败；"
+            "Writer 结果保持不变，其他后置状态继续处理："
+            f"{type(exc).__name__}: {exc}"
+        )
+        _log("Dataset", warning, now=now)
+        publish_control_ui_message(
+            "Dataset",
+            warning,
+            context=f"episode finalize {consumer} failure",
+            now=now,
+        )
+
     def collection_transition_active() -> bool:
         return bool(
             episode_prepare_generation is not None
@@ -298,8 +330,89 @@ def build_episode_recording_runtime(
             return False
         return bool(
             (dataset_recorder is not None and dataset_recorder.is_recording)
-            or episode_recorder.is_recording
+            or (
+                episode_recorder.is_recording
+                and not debug_episode_quarantined
+            )
         )
+
+    def quarantine_debug_episode(
+        *,
+        operation: str,
+        error: BaseException,
+        now: float,
+    ) -> bool:
+        """Detach a failed optional trajectory from formal collection state."""
+
+        nonlocal debug_episode_quarantined
+        formal_active = bool(
+            dataset_recorder is not None
+            and dataset_recorder.is_recording
+        )
+        if not formal_active:
+            return False
+        debug_episode_quarantined = True
+        message = (
+            "lightweight debug trajectory 已隔离；正式 dataset 继续："
+            f"operation={operation} {type(error).__name__}: {error}"
+        )
+        _log("Episode", message, now=now)
+        publish_control_ui_message(
+            "Episode",
+            message,
+            context="debug trajectory quarantine",
+            now=now,
+        )
+        return True
+
+    def record_debug_event(
+        event_type: str,
+        *,
+        payload: Mapping[str, Any] | None,
+        now: float,
+    ) -> bool:
+        """Write an optional trajectory event without vetoing formal data."""
+
+        refresh_runtime_views()
+        if debug_episode_quarantined or not episode_recorder.is_recording:
+            return False
+        try:
+            episode_recorder.record_event(
+                str(event_type),
+                payload={} if payload is None else dict(payload),
+                timestamp=float(now),
+            )
+        except Exception as exc:
+            if quarantine_debug_episode(
+                operation=f"event:{event_type}",
+                error=exc,
+                now=float(now),
+            ):
+                return False
+            raise
+        return True
+
+    def record_debug_frame(
+        frame: Mapping[str, Any],
+        *,
+        now: float,
+    ) -> bool:
+        """Write an optional trajectory frame without vetoing formal data."""
+
+        refresh_runtime_views()
+        if debug_episode_quarantined or not episode_recorder.is_recording:
+            return False
+        try:
+            episode_recorder.record_frame(dict(frame), timestamp=float(now))
+        except Exception as exc:
+            if quarantine_debug_episode(
+                operation="frame",
+                error=exc,
+                now=float(now),
+            ):
+                return False
+            raise
+        return True
 
 
     def recording_paused() -> bool:
@@ -520,7 +633,10 @@ def build_episode_recording_runtime(
                         )
                     )
                     episode_open_formal_started = True
-                if episode_recorder.config.enabled:
+                if (
+                    episode_recorder.config.enabled
+                    and not debug_episode_quarantined
+                ):
                     try:
                         episode_recorder.root_dir = _episode_root_dir(args, components)
                         _start_episode_recording(
@@ -1208,6 +1324,7 @@ def build_episode_recording_runtime(
         def stop_episode_lifecycle() -> _DatasetStopCompletion:
             task = None
             debug_stopped = False
+            debug_error: str | None = None
             try:
                 if formal_recorder is not None:
                     task = formal_recorder.stop_episode(
@@ -1229,19 +1346,34 @@ def build_episode_recording_runtime(
                     ):
                         audit_close()
                 if debug_was_recording:
-                    _stop_episode_recording(
-                        episode_recorder,
-                        now=stop_wall_time,
-                        end_reason=end_reason,
-                        summary=captured_summary,
-                    )
-                    debug_stopped = True
+                    try:
+                        _stop_episode_recording(
+                            episode_recorder,
+                            now=stop_wall_time,
+                            end_reason=end_reason,
+                            summary=captured_summary,
+                        )
+                        debug_stopped = True
+                    except Exception as exc:  # noqa: BLE001 - debug is subordinate.
+                        if formal_recorder is None:
+                            # In --no-collection mode this trajectory is the
+                            # only requested product and remains authoritative.
+                            raise
+                        debug_error = f"{type(exc).__name__}: {exc}"
+                        _log(
+                            "Episode",
+                            "WARNING: lightweight debug trajectory stop failed; "
+                            "formal dataset stop remains committed: "
+                            f"{debug_error}",
+                            now=stop_wall_time,
+                        )
                 return _DatasetStopCompletion(
                     recorder=formal_recorder,
                     task=task,
                     formal_stopped=formal_recorder is not None,
                     debug_stopped=debug_stopped,
                     frame_count=int(frame_count),
+                    debug_error=debug_error,
                 )
             except BaseException:
                 if debug_was_recording and not debug_stopped:
@@ -1338,7 +1470,14 @@ def build_episode_recording_runtime(
                 )
             ) or newly_paused
         if episode_recorder.is_recording and not episode_recording_paused:
-            episode_recorder.record_event(
+            # The local pause gate owns whether further debug frames are
+            # admitted.  Commit it before writing the optional event so a
+            # sidecar IO failure cannot leave that stream running or veto the
+            # already-committed formal writer pause.
+            episode_recording_paused = True
+            episode_recording_pause_reason = str(reason)
+            newly_paused = True
+            record_debug_event(
                 "recording_paused",
                 payload={
                     "reason": str(reason),
@@ -1346,11 +1485,8 @@ def build_episode_recording_runtime(
                     "last_state": episode_last_state,
                     "frame_count": int(episode_recorder.frame_count),
                 },
-                timestamp=now,
+                now=now,
             )
-            episode_recording_paused = True
-            episode_recording_pause_reason = str(reason)
-            newly_paused = True
         if not recording_paused():
             return False
         last_collection_frequency_warning_active = False
@@ -1482,7 +1618,13 @@ def build_episode_recording_runtime(
                 return False
             resumed_any = bool(dataset_resumed) or resumed_any
         if episode_recording_paused:
-            episode_recorder.record_event(
+            # Clear the local gate before the optional event projection.  A
+            # missing debug event must not undo the formal resume or create a
+            # per-frame resume retry storm.
+            episode_recording_paused = False
+            episode_recording_pause_reason = ""
+            resumed_any = True
+            record_debug_event(
                 "recording_resumed",
                 payload={
                     "reason": "runtime_running_warmup_ready",
@@ -1491,11 +1633,8 @@ def build_episode_recording_runtime(
                     "state": step_result.state.value,
                     "frame_count": int(episode_recorder.frame_count),
                 },
-                timestamp=now,
+                now=now,
             )
-            episode_recording_paused = False
-            episode_recording_pause_reason = ""
-            resumed_any = True
         if resumed_any:
             episode_resume_warmup_ready_count = 0
             message = "数采已恢复：遥操 RUNNING 且输入/相机 warmup 已稳定，继续写入同一个 episode。"
@@ -1549,14 +1688,14 @@ def build_episode_recording_runtime(
             )
             pause_recording(now, reason="fix_hold:both_sides_fixed_like")
             if episode_recorder.is_recording:
-                episode_recorder.record_event(
+                record_debug_event(
                     "fix_hold_started",
                     payload={
                         "step_index": int(step_index),
                         "locked_sides": list(transition.locked_sides),
                         "source_by_side": dict(transition.source_by_side),
                     },
-                    timestamp=now,
+                    now=now,
                 )
             _log("FixHold", message, now=now)
         elif transition.exited:
@@ -1566,14 +1705,14 @@ def build_episode_recording_runtime(
             )
             clutch_input.set_fix_hold_active(False, message=message)
             if episode_recorder.is_recording:
-                episode_recorder.record_event(
+                record_debug_event(
                     "fix_hold_released",
                     payload={
                         "step_index": int(step_index),
                         "remaining_locked_sides": list(transition.locked_sides),
                         "source_by_side": dict(transition.source_by_side),
                     },
-                    timestamp=now,
+                    now=now,
                 )
             _log("FixHold", message, now=now)
 
@@ -2016,7 +2155,7 @@ def build_episode_recording_runtime(
         nonlocal episode_stop_frame_count, episode_stop_reason, episode_last_state
         nonlocal last_collection_frequency_warning_active
         nonlocal episode_recording_paused, episode_recording_pause_reason
-        nonlocal episode_resume_warmup_ready_count
+        nonlocal episode_resume_warmup_ready_count, debug_episode_quarantined
         stopped_recorder = episode_stop_recorder
         stopped_frame_count = int(episode_stop_frame_count)
         stopped_reason = str(episode_stop_reason or "control_plane_completion")
@@ -2089,6 +2228,18 @@ def build_episode_recording_runtime(
                     context="episode stop completion",
                     now=now,
                 )
+            if completion.debug_error:
+                debug_episode_quarantined = True
+                debug_message = (
+                    "lightweight debug trajectory 停止失败；正式 dataset 停止/"
+                    f"保存流程不受影响：{completion.debug_error}"
+                )
+                publish_control_ui_message(
+                    "Episode",
+                    debug_message,
+                    context="debug trajectory stop failure",
+                    now=now,
+                )
             clutch_input.set_episode_recording_state(
                 active=False,
                 episode_dir=recording_path(),
@@ -2146,9 +2297,11 @@ def build_episode_recording_runtime(
                 for name, elapsed_ms in sorted(task.stage_timings_ms.items())
             )
             if task.success:
+                episode_index = int(task.episode_index)
+                frame_count = int(task.frame_count)
                 message = (
-                    f"正式数据集 episode {task.episode_index} 已保存 "
-                    f"({task.frame_count} 帧，后台收尾 {elapsed:.2f}s，"
+                    f"正式数据集 episode {episode_index} 已保存 "
+                    f"({frame_count} 帧，后台收尾 {elapsed:.2f}s，"
                     f"启动延后 {queue_delay:.3f}s"
                     f"{('，' + stage_text) if stage_text else ''})。"
                 )
@@ -2159,17 +2312,41 @@ def build_episode_recording_runtime(
                     context="episode finalize success",
                     now=now,
                 )
-                clutch_input.set_episode_finalize_state(
-                    status="saved",
-                    message=message,
-                    episode_index=int(task.episode_index),
-                    frame_count=int(task.frame_count),
-                )
-                clutch_input.advance_round_trip_task_after_saved_episode()
-                clutch_input.set_plus_curation_pending(
-                    dataset_root=dataset_recorder.dataset_root,
-                    episode_index=int(task.episode_index),
-                )
+                try:
+                    clutch_input.set_episode_finalize_state(
+                        status="saved",
+                        message=message,
+                        episode_index=episode_index,
+                        frame_count=frame_count,
+                    )
+                except Exception as exc:  # noqa: BLE001 - writer result is final.
+                    publish_finalize_consumer_failure(
+                        episode_index=episode_index,
+                        consumer="finalize UI/application state",
+                        exc=exc,
+                        now=now,
+                    )
+                try:
+                    clutch_input.advance_round_trip_task_after_saved_episode()
+                except Exception as exc:  # noqa: BLE001 - saved data is immutable.
+                    publish_finalize_consumer_failure(
+                        episode_index=episode_index,
+                        consumer="round-trip profile state",
+                        exc=exc,
+                        now=now,
+                    )
+                try:
+                    clutch_input.set_plus_curation_pending(
+                        dataset_root=dataset_recorder.dataset_root,
+                        episode_index=episode_index,
+                    )
+                except Exception as exc:  # noqa: BLE001 - Plus is subordinate.
+                    publish_finalize_consumer_failure(
+                        episode_index=episode_index,
+                        consumer="Plus curation state",
+                        exc=exc,
+                        now=now,
+                    )
                 if task.v25p_error:
                     sidecar_message = (
                         f"episode {task.episode_index} 的旧格式数据已保存，但 "
@@ -2208,7 +2385,9 @@ def build_episode_recording_runtime(
                     )
             else:
                 finalize_failure_count += 1
-                message = f"正式数据集 episode {task.episode_index} 保存失败: {task.error}"
+                episode_index = int(task.episode_index)
+                frame_count = int(task.frame_count)
+                message = f"正式数据集 episode {episode_index} 保存失败: {task.error}"
                 _log("Dataset", message, now=now)
                 publish_control_ui_message(
                     "Dataset",
@@ -2216,12 +2395,20 @@ def build_episode_recording_runtime(
                     context="episode finalize failure",
                     now=now,
                 )
-                clutch_input.set_episode_finalize_state(
-                    status="error",
-                    message=message,
-                    episode_index=int(task.episode_index),
-                    frame_count=int(task.frame_count),
-                )
+                try:
+                    clutch_input.set_episode_finalize_state(
+                        status="error",
+                        message=message,
+                        episode_index=episode_index,
+                        frame_count=frame_count,
+                    )
+                except Exception as exc:  # noqa: BLE001 - failure fact is final.
+                    publish_finalize_consumer_failure(
+                        episode_index=episode_index,
+                        consumer="finalize failure UI/application state",
+                        exc=exc,
+                        now=now,
+                    )
 
     def countdown_deadline() -> float | None:
         if collection_transition_active():
@@ -2363,6 +2550,8 @@ def build_episode_recording_runtime(
         recording_path=recording_path,
         recording_frequency_status=recording_frequency_status,
         publish_collection_frequency_warning=publish_collection_frequency_warning,
+        record_debug_event=record_debug_event,
+        record_debug_frame=record_debug_frame,
         start_recording=start_recording,
         schedule_recording_countdown=schedule_recording_countdown,
         cancel_recording_countdown=cancel_recording_countdown,

@@ -2601,6 +2601,8 @@ def run_real_teleop(
         publish_collection_frequency_warning = (
             episode_recording_runtime.publish_collection_frequency_warning
         )
+        record_debug_event = episode_recording_runtime.record_debug_event
+        record_debug_frame = episode_recording_runtime.record_debug_frame
         start_recording = episode_recording_runtime.start_recording
         schedule_recording_countdown = (
             episode_recording_runtime.schedule_recording_countdown
@@ -2694,6 +2696,8 @@ def run_real_teleop(
                 publish_collection_frequency_warning=(
                     publish_collection_frequency_warning
                 ),
+                record_debug_event=record_debug_event,
+                record_debug_frame=record_debug_frame,
                 recording_active=recording_active,
                 collection_transition_active=(
                     episode_recording_runtime.collection_transition_active

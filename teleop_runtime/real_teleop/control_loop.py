@@ -1117,6 +1117,8 @@ class RealTeleopControlLoopContext:
     position_admittance_shadow: Any
     preview_camera_sources: Mapping[str, Any]
     publish_collection_frequency_warning: Callable[..., None]
+    record_debug_event: Callable[..., bool]
+    record_debug_frame: Callable[..., bool]
     recording_active: Callable[[], bool]
     recording_auto_stop_reason: Callable[[Any], str | None]
     recording_frame_count: Callable[[], int]
@@ -1187,6 +1189,8 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     position_admittance_shadow = context.position_admittance_shadow
     preview_camera_sources = context.preview_camera_sources
     publish_collection_frequency_warning = context.publish_collection_frequency_warning
+    record_debug_event = context.record_debug_event
+    record_debug_frame = context.record_debug_frame
     recording_active = context.recording_active
     recording_auto_stop_reason = context.recording_auto_stop_reason
     recording_frame_count = context.recording_frame_count
@@ -2463,7 +2467,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     )
                 if episode_recorder.is_recording:
                     try:
-                        episode_recorder.record_event(
+                        record_debug_event(
                             "fix_hold_escalated_to_regular_hold",
                             payload={
                                 "step_index": int(step_index),
@@ -2472,7 +2476,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                                     fix_hold_escalation.source_by_side
                                 ),
                             },
-                            timestamp=loop_start,
+                            now=loop_start,
                         )
                     except Exception as exc:  # noqa: BLE001 - diagnostics cannot reopen motion.
                         _log(
@@ -4736,13 +4740,13 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             episode_last_state = context.episode_last_state()
             if episode_last_state != step_result.state.value:
                 if episode_recorder.is_recording:
-                    episode_recorder.record_event(
+                    record_debug_event(
                         "state_change",
                         payload={
                             "old_state": episode_last_state,
                             "new_state": step_result.state.value,
                         },
-                        timestamp=loop_start,
+                        now=loop_start,
                     )
                 episode_last_state = step_result.state.value
                 context.set_episode_last_state(episode_last_state)
@@ -4869,7 +4873,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 and sample_due
                 and (position_reference_enabled or last_dispatched_main_command is not None)
             ):
-                episode_recorder.record_frame(
+                record_debug_frame(
                     _build_episode_frame(
                         components,
                         step_index=step_index,
@@ -4884,7 +4888,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         left_clutch=left_clutch,
                         right_clutch=right_clutch,
                     ),
-                    timestamp=loop_start,
+                    now=loop_start,
                 )
             paused_now = recording_paused()
             clutch_input.set_episode_recording_state(
