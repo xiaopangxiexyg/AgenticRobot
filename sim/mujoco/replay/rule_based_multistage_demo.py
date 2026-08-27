@@ -6,7 +6,7 @@ existing desk-TCP position-control chain, the existing relative replay
 boundary function, and the existing simulation dataset writer.  It does not
 import ``teleop_runtime`` and it never opens a real hardware resource.
 
-The default sequence is:
+The legacy sequence is:
 
 1. move the simulated arms to the first frame of stage A without recording;
 2. record an absolute replay of stage A;
@@ -20,6 +20,22 @@ Stage windows use half-open source-frame spans (``start:end``), so the
 composition is editable without changing the runtime owners.  The output is a
 normal ``SimReplayDatasetWriter`` dataset plus a composition manifest that
 labels every recorded row by phase and records the relative-replay boundary.
+
+When ``--detail-annotation-dir`` is supplied, the detail overlay is the
+composition boundary:
+
+1. move to ``right_write.pen_down``'s first frame without recording;
+2. record absolute ``pen_down`` replay;
+3. replace the annotated ``write`` interval with the existing rule-based
+   circle or one-stroke trajectory at the selected source-derived speed;
+4. measure the actual right TCP boundary and relative-replay ``pen_up``;
+5. hold the first ``pen_down`` left pose and gripper target throughout all
+   recorded phases.
+
+The detail reader is deliberately read-only and validates the exact sealed
+progress Episode, coarse annotation manifest, clock, and successful phase
+sequence.  It does not import the collection application or recreate its
+annotation lifecycle.
 """
 
 from __future__ import annotations
@@ -35,6 +51,15 @@ from typing import Any
 
 import numpy as np
 
+from dataset_interface.progress_detail_annotation_artifacts import (
+    LoadedDetailStageAnnotationSet,
+    load_detail_stage_annotation_set,
+)
+from dataset_interface.progress_artifacts import load_sealed_progress_episode
+from dataset_interface.progress_stage_annotation_artifacts import (
+    LoadedStageAnnotationSet,
+    load_stage_annotation_set,
+)
 from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM
 from robot_motion.position_control import (
     ResampledMotionReference,
@@ -85,6 +110,12 @@ DEFAULT_CIRCLE_SPEED_SIDE = "right"
 DEFAULT_FIXED_TRAJECTORY_SCALE_M = 0.08
 DEFAULT_FIXED_TRAJECTORY_DIRECTION = "up"
 DEFAULT_REFERENCE_HZ = 60.0
+DETAIL_PROGRESS_STEP_ID = "right_write"
+DETAIL_PHASE_IDS = (
+    "right_write.pen_down",
+    "right_write.write",
+    "right_write.pen_up",
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +137,92 @@ class StageSpan:
         return {"start": int(self.start), "end": int(self.end), "frame_count": self.frame_count}
 
 
+@dataclass(frozen=True)
+class DetailPhaseSelection:
+    """One immutable detail annotation mapped to source frame indices."""
+
+    stage_id: str
+    span: StageSpan
+    start_at: float
+    end_at: float
+    annotation_id: str
+    coarse_attempt_id: str
+    outcome: str
+    clock_domain_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage_id": str(self.stage_id),
+            "source_span": self.span.to_dict(),
+            "start_at": float(self.start_at),
+            "end_at": float(self.end_at),
+            "annotation_id": str(self.annotation_id),
+            "coarse_attempt_id": str(self.coarse_attempt_id),
+            "outcome": str(self.outcome),
+            "clock_domain_id": str(self.clock_domain_id),
+        }
+
+
+@dataclass(frozen=True)
+class DetailWritingSelection:
+    """The validated detail overlay and its three source-frame windows."""
+
+    episode_uuid: str
+    annotation_set_id: str
+    base_annotation_set_id: str
+    target_progress_step_id: str
+    bound_clock_domain_id: str
+    detail_task_stage_profile_hash: str
+    coarse_attempt_id: str
+    episode_capture_identity_hash: str
+    source_progress_manifest_hash: str
+    base_annotation_manifest_hash: str
+    detail_annotation_bundle_hash: str
+    detail_annotation_manifest_hash: str
+    phases: Mapping[str, DetailPhaseSelection]
+
+    def __post_init__(self) -> None:
+        phases = dict(self.phases)
+        if set(phases) != set(DETAIL_PHASE_IDS):
+            raise ValueError(
+                "detail writing selection must contain exactly the phases "
+                f"{DETAIL_PHASE_IDS!r}"
+            )
+        object.__setattr__(self, "phases", phases)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "episode_uuid": str(self.episode_uuid),
+            "annotation_set_id": str(self.annotation_set_id),
+            "base_annotation_set_id": str(self.base_annotation_set_id),
+            "target_progress_step_id": str(self.target_progress_step_id),
+            "bound_clock_domain_id": str(self.bound_clock_domain_id),
+            "detail_task_stage_profile_hash": str(
+                self.detail_task_stage_profile_hash
+            ),
+            "coarse_attempt_id": str(self.coarse_attempt_id),
+            "episode_capture_identity_hash": str(
+                self.episode_capture_identity_hash
+            ),
+            "source_progress_manifest_hash": str(
+                self.source_progress_manifest_hash
+            ),
+            "base_annotation_manifest_hash": str(
+                self.base_annotation_manifest_hash
+            ),
+            "detail_annotation_bundle_hash": str(
+                self.detail_annotation_bundle_hash
+            ),
+            "detail_annotation_manifest_hash": str(
+                self.detail_annotation_manifest_hash
+            ),
+            "phases": {
+                stage_id: self.phases[stage_id].to_dict()
+                for stage_id in DETAIL_PHASE_IDS
+            },
+        }
+
+
 def parse_stage_span(text: str, *, total_frames: int) -> StageSpan:
     """Parse and validate an editable ``start:end`` source-frame span."""
 
@@ -118,6 +235,212 @@ def parse_stage_span(text: str, *, total_frames: int) -> StageSpan:
             f"stage span {text!r} exceeds source frame count {int(total_frames)}"
         )
     return span
+
+
+def _progress_episode_uuid(episode: UmiReplayEpisode) -> str:
+    """Read the immutable progress-Episode reference from the source record."""
+
+    record = episode.episode.record
+    if not isinstance(record, Mapping):
+        raise ValueError(
+            "detail replay requires an episodes.jsonl record containing the "
+            "progress_episode reference; an explicit parquet path is not enough"
+        )
+    candidates: list[object] = [record]
+    metadata = record.get("metadata")
+    if isinstance(metadata, Mapping):
+        candidates.append(metadata)
+    for container in candidates:
+        reference = container.get("progress_episode")
+        if not isinstance(reference, Mapping):
+            continue
+        value = str(reference.get("episode_uuid", "")).strip()
+        if value and Path(value).name == value and value not in {".", ".."}:
+            return value
+    raise ValueError(
+        "detail replay source record is missing metadata.progress_episode.episode_uuid"
+    )
+
+
+def _load_detail_base_annotation_set(
+    dataset_root: Path,
+    *,
+    episode_uuid: str,
+    base_annotation_set_id: str,
+) -> LoadedStageAnnotationSet:
+    """Load the exact coarse annotation set referenced by a detail overlay."""
+
+    if Path(base_annotation_set_id).name != base_annotation_set_id:
+        raise ValueError("detail binding contains an unsafe base annotation ID")
+    annotation_dir = (
+        Path(dataset_root).expanduser().resolve()
+        / "meta"
+        / "progress"
+        / "stage_annotations"
+        / str(episode_uuid)
+        / str(base_annotation_set_id)
+    )
+    try:
+        return load_stage_annotation_set(annotation_dir)
+    except Exception as exc:
+        raise ValueError(
+            "cannot load the exact coarse annotation set referenced by the "
+            f"detail overlay: {annotation_dir}: {exc}"
+        ) from exc
+
+
+def _load_detail_writing_selection(
+    episode: UmiReplayEpisode,
+    rows: Sequence[Mapping[str, Any]],
+    annotation_dir: str | Path,
+) -> DetailWritingSelection:
+    """Resolve one immutable three-phase detail overlay to half-open rows.
+
+    This adapter intentionally validates the source identity and annotation
+    lifecycle seams that the simulation needs.  It does not import the
+    collection application or regenerate a detail profile.  The profile hash
+    carried by the immutable overlay remains provenance, including when an
+    older dataset was annotated with a profile version no longer present in
+    the current checkout.
+    """
+
+    detail: LoadedDetailStageAnnotationSet = load_detail_stage_annotation_set(
+        annotation_dir
+    )
+    episode_uuid = _progress_episode_uuid(episode)
+    sealed = load_sealed_progress_episode(
+        Path(episode.episode.dataset_root)
+        / "meta"
+        / "progress"
+        / "episodes"
+        / episode_uuid
+    )
+    binding = detail.binding
+    if binding.episode_capture_identity_hash != sealed.binding.episode_capture_identity_hash:
+        raise ValueError("detail overlay and source progress Episode identity differ")
+    if binding.source_progress_manifest_hash != sealed.manifest.semantic_content_hash:
+        raise ValueError("detail overlay does not bind the source progress manifest")
+    if binding.bound_clock_domain_id != sealed.binding.bound_clock_domain_id:
+        raise ValueError("detail overlay and source Episode use different clocks")
+    if binding.target_progress_step_id != DETAIL_PROGRESS_STEP_ID:
+        raise ValueError(
+            "detail replay currently requires target progress step "
+            f"{DETAIL_PROGRESS_STEP_ID!r}, got {binding.target_progress_step_id!r}"
+        )
+
+    base = _load_detail_base_annotation_set(
+        Path(episode.episode.dataset_root),
+        episode_uuid=episode_uuid,
+        base_annotation_set_id=binding.base_annotation_set_id,
+    )
+    if base.binding.annotation_set_id != binding.base_annotation_set_id:
+        raise ValueError("detail binding resolved to a different base annotation ID")
+    if base.binding.episode_capture_identity_hash != binding.episode_capture_identity_hash:
+        raise ValueError("base annotation and detail overlay identity differ")
+    if base.binding.source_progress_manifest_hash != binding.source_progress_manifest_hash:
+        raise ValueError("base annotation and detail overlay manifest differ")
+    if base.binding.task_stage_profile_hash != binding.base_task_stage_profile_hash:
+        raise ValueError("detail binding and base annotation profile differ")
+    if base.manifest.semantic_content_hash != binding.base_annotation_set_manifest_hash:
+        raise ValueError("detail binding does not reference the exact base manifest")
+    if base.binding.bound_clock_domain_id != binding.bound_clock_domain_id:
+        raise ValueError("base annotation and detail overlay use different clocks")
+
+    occurrences = tuple(
+        occurrence
+        for occurrence in detail.bundle.occurrences
+        if occurrence.progress_step_id == DETAIL_PROGRESS_STEP_ID
+    )
+    if len(occurrences) != len(detail.bundle.occurrences):
+        raise ValueError("detail overlay contains an occurrence outside right_write")
+    by_attempt: dict[str, list[Any]] = {}
+    for occurrence in occurrences:
+        by_attempt.setdefault(occurrence.coarse_attempt_id, []).append(occurrence)
+    if len(by_attempt) != 1:
+        raise ValueError(
+            "detail replay requires exactly one successful right_write attempt; "
+            f"got {sorted(by_attempt)}"
+        )
+    coarse_attempt_id, attempt_occurrences = next(iter(by_attempt.items()))
+    if any(occurrence.outcome != "SUCCESS" for occurrence in attempt_occurrences):
+        raise ValueError("detail replay requires SUCCESS occurrences for all three phases")
+    ordered = tuple(
+        sorted(
+            attempt_occurrences,
+            key=lambda occurrence: (
+                int(occurrence.occurrence_index_in_attempt),
+                float(occurrence.start_at),
+            ),
+        )
+    )
+    if tuple(occurrence.stage_id for occurrence in ordered) != DETAIL_PHASE_IDS:
+        raise ValueError(
+            "detail overlay must contain ordered phases "
+            f"{DETAIL_PHASE_IDS!r}"
+        )
+    if tuple(int(occurrence.occurrence_index_in_attempt) for occurrence in ordered) != (1, 2, 3):
+        raise ValueError("detail phase occurrence indices must be 1, 2, 3")
+    if any(
+        occurrence.clock_domain_id != binding.bound_clock_domain_id
+        for occurrence in ordered
+    ):
+        raise ValueError("detail phase clock does not match the bound Episode clock")
+    if any(
+        float(current.start_at) < float(previous.end_at)
+        for previous, current in zip(ordered, ordered[1:])
+    ):
+        raise ValueError("detail phase intervals overlap")
+
+    timestamps = np.asarray(
+        [float(frame.timestamp) for frame in episode.frames],
+        dtype=float,
+    )
+    if timestamps.size != len(rows):
+        raise ValueError("detail annotation source rows do not match UMI frames")
+    phases: dict[str, DetailPhaseSelection] = {}
+    for occurrence in ordered:
+        start_at = float(occurrence.start_at)
+        end_at = float(occurrence.end_at)
+        if start_at > float(timestamps[-1]) or end_at < float(timestamps[0]):
+            raise ValueError(
+                f"detail phase {occurrence.stage_id!r} is outside source timestamps"
+            )
+        start = int(np.searchsorted(timestamps, start_at, side="left"))
+        end = int(np.searchsorted(timestamps, end_at, side="left"))
+        end = min(end, int(timestamps.size))
+        span = StageSpan(start=start, end=end)
+        phases[occurrence.stage_id] = DetailPhaseSelection(
+            stage_id=str(occurrence.stage_id),
+            span=span,
+            start_at=start_at,
+            end_at=end_at,
+            annotation_id=str(occurrence.annotation_id),
+            coarse_attempt_id=str(occurrence.coarse_attempt_id),
+            outcome=str(occurrence.outcome),
+            clock_domain_id=str(occurrence.clock_domain_id),
+        )
+    for previous_stage, current_stage in zip(DETAIL_PHASE_IDS, DETAIL_PHASE_IDS[1:]):
+        previous_span = phases[previous_stage].span
+        current_span = phases[current_stage].span
+        if previous_span.end > current_span.start:
+            raise ValueError(
+                f"mapped detail spans overlap: {previous_stage} and {current_stage}"
+            )
+    return DetailWritingSelection(
+        episode_uuid=episode_uuid,
+        annotation_set_id=str(binding.annotation_set_id),
+        base_annotation_set_id=str(binding.base_annotation_set_id),
+        target_progress_step_id=str(binding.target_progress_step_id),
+        bound_clock_domain_id=str(binding.bound_clock_domain_id),
+        detail_task_stage_profile_hash=str(binding.detail_task_stage_profile_hash),
+        coarse_attempt_id=str(coarse_attempt_id),
+        episode_capture_identity_hash=str(binding.episode_capture_identity_hash),
+        source_progress_manifest_hash=str(binding.source_progress_manifest_hash),
+        base_annotation_manifest_hash=str(binding.base_annotation_set_manifest_hash),
+        detail_annotation_bundle_hash=str(detail.bundle.semantic_content_hash),
+        detail_annotation_manifest_hash=str(detail.manifest.semantic_content_hash),
+        phases=phases,
+    )
 
 
 def _trajectory_tcp_speed_summary(
@@ -168,6 +491,46 @@ def _trajectory_tcp_speed_summary(
         "average_linear_speed_m_s": float(path_length_m / duration_sec),
         "interval_count": int(interval_count),
     }
+
+
+def _require_left_hold_state(
+    rows: Sequence[Mapping[str, Any]],
+    frames: Sequence[UmiReplayFrame],
+    span: StageSpan,
+) -> tuple[dict[str, np.ndarray], float, int]:
+    """Extract one immutable left-arm hold target for the composed run."""
+
+    selected_rows = tuple(rows[span.start : span.end])
+    selected_frames = tuple(frames[span.start : span.end])
+    if len(selected_rows) != span.frame_count or len(selected_frames) != span.frame_count:
+        raise ValueError("left hold span does not align with source rows and frames")
+    labels = [str(row.get("teleop.arm_mode.left.label", "")).strip() for row in selected_rows]
+    if any(label != "fixed_hold" for label in labels):
+        unexpected = sorted({label for label in labels if label != "fixed_hold"})
+        raise ValueError(
+            "detail replay requires fixed_hold for the left arm over the entire "
+            f"composed interval; got {unexpected or ['missing']}"
+        )
+    hold_pose = np.asarray(
+        selected_frames[0].pose_desk_by_side["left"],
+        dtype=float,
+    ).reshape(4, 4).copy()
+    hold_gripper = float(selected_frames[0].gripper_close_by_side["left"])
+    gripper_values = np.asarray(
+        [frame.gripper_close_by_side["left"] for frame in selected_frames],
+        dtype=float,
+    )
+    if not np.all(np.isfinite(gripper_values)) or not np.allclose(
+        gripper_values,
+        hold_gripper,
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        raise ValueError(
+            "detail replay requires a constant left gripper target over the "
+            "pen-down/write/pen-up interval"
+        )
+    return {"left": hold_pose}, hold_gripper, int(selected_frames[0].frame_index)
 
 
 def _json_default(value: object) -> object:
@@ -297,34 +660,63 @@ def _stage_group(
     return group, selected_frames
 
 
-def _stage_targets(frames: Sequence[UmiReplayFrame], *, phase: str) -> list[TimestampedMotionTarget]:
+def _stage_targets(
+    frames: Sequence[UmiReplayFrame],
+    *,
+    phase: str,
+    hold_pose_by_side: Mapping[str, Any] | None = None,
+) -> list[TimestampedMotionTarget]:
     if not frames:
         raise ValueError(f"phase {phase!r} has no source frames")
     first_timestamp = float(frames[0].timestamp)
-    return [
-        TimestampedMotionTarget(
-            timestamp=float(frame.timestamp) - first_timestamp,
-            available_timestamp=float(frame.timestamp) - first_timestamp,
-            source_index=index,
-            pose_by_side=frame.pose_desk_by_side,
-            metadata={
-                "phase": str(phase),
-                "source_frame_index": int(frame.frame_index),
-                "pose_frame": "desk",
-            },
+    hold = {
+        str(side): np.asarray(pose, dtype=float).reshape(4, 4).copy()
+        for side, pose in (hold_pose_by_side or {}).items()
+    }
+    targets: list[TimestampedMotionTarget] = []
+    for index, frame in enumerate(frames):
+        pose_by_side = {
+            side: np.asarray(
+                hold.get(side, frame.pose_desk_by_side[side]),
+                dtype=float,
+            ).reshape(4, 4).copy()
+            for side in ("left", "right")
+        }
+        targets.append(
+            TimestampedMotionTarget(
+                timestamp=float(frame.timestamp) - first_timestamp,
+                available_timestamp=float(frame.timestamp) - first_timestamp,
+                source_index=index,
+                pose_by_side=pose_by_side,
+                metadata={
+                    "phase": str(phase),
+                    "source_frame_index": int(frame.frame_index),
+                    "pose_frame": "desk",
+                    **(
+                        {"held_sides": sorted(hold)}
+                        if hold
+                        else {}
+                    ),
+                },
+            )
         )
-        for index, frame in enumerate(frames)
-    ]
+    return targets
 
 
 def _grippers_for_reference(
-    frames: Sequence[UmiReplayFrame], reference: ResampledMotionReference
+    frames: Sequence[UmiReplayFrame],
+    reference: ResampledMotionReference,
+    *,
+    hold_by_side: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
     left = frames[int(reference.left_source_index)].gripper_close_by_side
     right = frames[int(reference.right_source_index)].gripper_close_by_side
     alpha = float(reference.interpolation_alpha)
+    held = {str(side): float(value) for side, value in (hold_by_side or {}).items()}
     return {
-        side: float((1.0 - alpha) * left[side] + alpha * right[side])
+        side: held[side]
+        if side in held
+        else float((1.0 - alpha) * left[side] + alpha * right[side])
         for side in ("left", "right")
     }
 
@@ -481,15 +873,22 @@ def _writer_gripper_sample(
     *,
     frame_index: int,
     playback_time_sec: float,
+    source_by_side: Mapping[str, str] | None = None,
 ) -> GripperReplaySample:
     close_by_name: dict[str, float] = {}
     source_by_name: dict[str, str] = {}
-    source_by_side: dict[str, str] = {}
+    resolved_source_by_side = {
+        side: str(value)
+        for side, value in (source_by_side or {}).items()
+    }
     for name, spec in control.scene.gripper_specs.items():
         close_by_name[str(name)] = float(close_by_side[spec.side])
-        source_by_name[str(name)] = "composed_rule_based_target"
+        source_by_name[str(name)] = resolved_source_by_side.get(
+            spec.side,
+            "composed_rule_based_target",
+        )
     for side in ("left", "right"):
-        source_by_side[side] = "composed_rule_based_target"
+        resolved_source_by_side.setdefault(side, "composed_rule_based_target")
     return GripperReplaySample(
         frame_index=int(frame_index),
         timestamp=float(playback_time_sec),
@@ -497,7 +896,7 @@ def _writer_gripper_sample(
         close_by_name=close_by_name,
         close_by_side={side: float(close_by_side[side]) for side in ("left", "right")},
         source_by_name=source_by_name,
-        source_by_side=source_by_side,
+        source_by_side=resolved_source_by_side,
     )
 
 
@@ -515,18 +914,35 @@ def _capture_frame(
     phase: str,
     action_source: str,
     source_frame_indices: Sequence[int],
+    action_source_by_side: Mapping[str, str] | None = None,
+    source_frame_indices_by_side: Mapping[str, Sequence[int]] | None = None,
 ) -> None:
     images = renderer.render_all(camera_names)
     depth_images = (
         renderer.render_all_depth(depth_camera_names) if depth_camera_names else {}
     )
     qpos = control.scene.arm_qpos_by_side()
+    resolved_action_source_by_side = {
+        side: str(value)
+        for side, value in (action_source_by_side or {}).items()
+    }
+    for side in ("left", "right"):
+        resolved_action_source_by_side.setdefault(side, str(action_source))
+    resolved_source_frame_indices_by_side = {
+        side: [int(value) for value in values]
+        for side, values in (source_frame_indices_by_side or {}).items()
+    }
+    if not resolved_source_frame_indices_by_side:
+        resolved_source_frame_indices_by_side = {
+            side: [int(value) for value in source_frame_indices]
+            for side in ("left", "right")
+        }
     sample = QposSample(
         frame_index=int(frame_index),
         timestamp=float(playback_time_sec),
         relative_time_sec=float(playback_time_sec),
         qpos_by_side={side: np.asarray(values, dtype=float) for side, values in qpos.items()},
-        source_by_side={side: str(action_source) for side in ("left", "right")},
+        source_by_side=resolved_action_source_by_side,
     )
     writer.record_frame(
         sample=sample,
@@ -536,6 +952,7 @@ def _capture_frame(
             grippers,
             frame_index=int(frame_index),
             playback_time_sec=float(playback_time_sec),
+            source_by_side=resolved_action_source_by_side,
         ),
         gripper_result=grippers,
         images=images,
@@ -546,7 +963,9 @@ def _capture_frame(
         frame_metadata={
             "phase": str(phase),
             "action_source": str(action_source),
+            "action_source_by_side": resolved_action_source_by_side,
             "source_frame_indices": [int(value) for value in source_frame_indices],
+            "source_frame_indices_by_side": resolved_source_frame_indices_by_side,
             "target_pose_desk_by_side": {
                 side: pose_matrix_to_xyzquat(reference.pose_by_side[side])
                 for side in ("left", "right")
@@ -571,12 +990,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "MuJoCo-only rule-based composition demo: initial alignment, absolute "
-            "stage replay, desk-plane fixed trajectory, measured-boundary relative "
-            "replay, and dataset/video capture."
+            "replay, desk-plane fixed trajectory, measured-boundary relative replay, "
+            "and dataset/video capture. Use --detail-annotation-dir for the "
+            "pen-down -> rule-based write -> pen-up composition."
         )
     )
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--episode", default="0")
+    parser.add_argument(
+        "--detail-annotation-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Immutable detail-stage annotation directory. When supplied, the "
+            "source spans are derived from right_write.pen_down/write/pen_up "
+            "timestamps; write is replaced by the selected rule-based trajectory, "
+            "and pen_up is rebased from its measured endpoint."
+        ),
+    )
     parser.add_argument("--stage-a", default=DEFAULT_STAGE_A, help="absolute replay span start:end")
     parser.add_argument("--stage-b", default=DEFAULT_STAGE_B, help="relative replay span start:end")
     parser.add_argument("--output", type=Path, required=True)
@@ -698,13 +1129,49 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     rows = read_parquet_rows(episode.episode.parquet_path)
     if len(rows) != len(episode.frames):
         raise ValueError("canonical UMI frame count does not match source parquet rows")
-    stage_a_span = parse_stage_span(args.stage_a, total_frames=len(episode.frames))
-    stage_b_span = parse_stage_span(args.stage_b, total_frames=len(episode.frames))
+    detail_selection: DetailWritingSelection | None = None
+    if args.detail_annotation_dir is not None:
+        detail_selection = _load_detail_writing_selection(
+            episode,
+            rows,
+            args.detail_annotation_dir,
+        )
+        stage_a_span = detail_selection.phases["right_write.pen_down"].span
+        stage_b_span = detail_selection.phases["right_write.pen_up"].span
+        detail_hold_span = StageSpan(
+            start=stage_a_span.start,
+            end=stage_b_span.end,
+        )
+        left_hold_pose_by_side, left_hold_gripper, left_hold_source_index = (
+            _require_left_hold_state(rows, episode.frames, detail_hold_span)
+        )
+    else:
+        stage_a_span = parse_stage_span(args.stage_a, total_frames=len(episode.frames))
+        stage_b_span = parse_stage_span(args.stage_b, total_frames=len(episode.frames))
+        left_hold_pose_by_side = {}
+        left_hold_gripper = None
+        left_hold_source_index = None
     _stage_a_group, stage_a_frames = _stage_group(
-        episode, rows, stage_a_span, key="a", label="absolute_stage_a"
+        episode,
+        rows,
+        stage_a_span,
+        key="a",
+        label=(
+            "right_write.pen_down"
+            if detail_selection is not None
+            else "absolute_stage_a"
+        ),
     )
     stage_b_group, stage_b_frames = _stage_group(
-        episode, rows, stage_b_span, key="b", label="relative_stage_b"
+        episode,
+        rows,
+        stage_b_span,
+        key="b",
+        label=(
+            "right_write.pen_up"
+            if detail_selection is not None
+            else "relative_stage_b"
+        ),
     )
     speed_reference_by_side = {
         side: _trajectory_tcp_speed_summary(
@@ -714,7 +1181,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for side in ("left", "right")
     }
     stage_a_refs = resample_motion_targets(
-        _stage_targets(stage_a_frames, phase="absolute_stage_a"),
+        _stage_targets(
+            stage_a_frames,
+            phase=(
+                "right_write.pen_down"
+                if detail_selection is not None
+                else "absolute_stage_a"
+            ),
+            hold_pose_by_side=left_hold_pose_by_side or None,
+        ),
         reference_hz=float(args.reference_hz),
         include_final=True,
     )
@@ -737,6 +1212,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     fixed_speed_plan: dict[str, Any] | None = None
     fixed_phase = "rule_based_circle"
     fixed_action_source = "rule_based_tcp_circle"
+    left_actual_qpos_samples: list[np.ndarray] = []
     viewer_context = (
         passive_viewer_handle(control.scene) if args.viewer else nullcontext(None)
     )
@@ -758,6 +1234,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         *,
         action_source: str,
         source_index_fn: Callable[[ResampledMotionReference], Sequence[int]],
+        action_source_by_side_fn: Callable[
+            [ResampledMotionReference], Mapping[str, str]
+        ]
+        | None = None,
+        source_frame_indices_by_side_fn: Callable[
+            [ResampledMotionReference], Mapping[str, Sequence[int]]
+        ]
+        | None = None,
     ) -> None:
         nonlocal capture_frame_index, playback_time_sec
         phase_start = float(control.scene.data.time)
@@ -783,6 +1267,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             control.step_physics()
             control.rig.sync_viewer(viewer_handle)
             capture_time = playback_time_sec + max(0.0, local_timestamp)
+            source_frame_indices = tuple(source_index_fn(reference))
             _capture_frame(
                 control=control,
                 renderer=renderer,
@@ -795,7 +1280,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 grippers=grippers,
                 phase=phase,
                 action_source=action_source,
-                source_frame_indices=source_index_fn(reference),
+                source_frame_indices=source_frame_indices,
+                action_source_by_side=(
+                    None
+                    if action_source_by_side_fn is None
+                    else action_source_by_side_fn(reference)
+                ),
+                source_frame_indices_by_side=(
+                    None
+                    if source_frame_indices_by_side_fn is None
+                    else source_frame_indices_by_side_fn(reference)
+                ),
+            )
+            left_actual_qpos_samples.append(
+                control.scene.get_arm_qpos("left").copy()
             )
             capture_frame_index += 1
             completed += 1
@@ -822,9 +1320,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             SimReplayDatasetWriterConfig(
                 root_dir=args.output,
                 dataset_name=args.output.name,
-                task_id="rule_based_multistage_mujoco_demo",
+                task_id=(
+                    "rule_based_detail_phase_mujoco_demo"
+                    if detail_selection is not None
+                    else "rule_based_multistage_mujoco_demo"
+                ),
                 task_description=(
-                    "MuJoCo rule-based absolute replay + fixed trajectory + relative replay"
+                    "MuJoCo rule-based detail pen-down replay + fixed writing + "
+                    "relative pen-up replay"
+                    if detail_selection is not None
+                    else "MuJoCo rule-based absolute replay + fixed trajectory + relative replay"
                 ),
                 nominal_fps=float(args.reference_hz),
                 source_dataset_root=episode.episode.dataset_root,
@@ -849,7 +1354,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             camera_names=requested_cameras,
         )
         initial_pose = {
-            side: np.asarray(stage_a_frames[0].pose_desk_by_side[side], dtype=float)
+            side: np.asarray(
+                left_hold_pose_by_side.get(
+                    side,
+                    stage_a_frames[0].pose_desk_by_side[side],
+                ),
+                dtype=float,
+            ).reshape(4, 4).copy()
             for side in ("left", "right")
         }
         initial_reference = _reference_from_pose(
@@ -860,6 +1371,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             metadata={"phase": "initial_alignment", "capture": False},
         )
         initial_grippers = dict(stage_a_frames[0].gripper_close_by_side)
+        if left_hold_gripper is not None:
+            initial_grippers["left"] = float(left_hold_gripper)
         control.solve_and_dispatch(initial_reference, gripper_close_by_side=initial_grippers)
         control.step_physics()
         control.rig.sync_viewer(viewer_handle)
@@ -871,20 +1384,59 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         run_phase(
-            "absolute_stage_a",
+            "right_write.pen_down" if detail_selection is not None else "absolute_stage_a",
             stage_a_refs,
-            lambda reference: _grippers_for_reference(stage_a_frames, reference),
+            lambda reference: _grippers_for_reference(
+                stage_a_frames,
+                reference,
+                hold_by_side=(
+                    None
+                    if left_hold_gripper is None
+                    else {"left": float(left_hold_gripper)}
+                ),
+            ),
             action_source="dataset_absolute_replay",
             source_index_fn=lambda reference: (
                 int(stage_a_frames[reference.left_source_index].frame_index),
                 int(stage_a_frames[reference.right_source_index].frame_index),
             ),
+            action_source_by_side_fn=(
+                None
+                if detail_selection is None
+                else lambda _reference: {
+                    "left": "dataset_fixed_hold",
+                    "right": "dataset_absolute_replay",
+                }
+            ),
+            source_frame_indices_by_side_fn=(
+                None
+                if detail_selection is None
+                else lambda reference: {
+                    "left": [int(left_hold_source_index)],
+                    "right": [
+                        int(stage_a_frames[reference.right_source_index].frame_index)
+                    ],
+                }
+            ),
         )
 
         boundary_before_fixed = _actual_tcp_boundary(control)
+        fixed_target_boundary = {
+            side: np.asarray(pose, dtype=float).reshape(4, 4).copy()
+            for side, pose in boundary_before_fixed.items()
+        }
+        if detail_selection is not None:
+            # The measured left TCP is diagnostic only.  The fixed writing
+            # rule receives the dataset hold target so it cannot turn the
+            # left arm into an accidental second writing source.
+            fixed_target_boundary["left"] = left_hold_pose_by_side["left"].copy()
         source_speed = speed_reference_by_side[DEFAULT_CIRCLE_SPEED_SIDE]
         if args.fixed_trajectory_id is not None:
-            fixed_phase = "rule_based_fixed_trajectory"
+            fixed_phase = (
+                "right_write.write"
+                if detail_selection is not None
+                else "rule_based_fixed_trajectory"
+            )
             fixed_action_source = "rule_based_fixed_trajectory"
             fixed_speed = float(
                 args.fixed_trajectory_speed_m_s
@@ -892,7 +1444,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 else source_speed["average_linear_speed_m_s"]
             )
             fixed_targets = build_fixed_trajectory_targets(
-                boundary_before_fixed,
+                fixed_target_boundary,
                 args.fixed_trajectory_id,
                 scale_m=float(args.fixed_trajectory_scale_m),
                 linear_speed_m_s=fixed_speed,
@@ -919,6 +1471,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             }
         else:
+            if detail_selection is not None:
+                fixed_phase = "right_write.write"
+                fixed_action_source = "rule_based_tcp_circle"
             circle_kwargs: dict[str, Any] = {
                 "radius_m": float(args.circle_radius_m),
                 "steps": int(args.circle_steps),
@@ -931,7 +1486,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     if args.circle_speed_m_s is not None
                     else source_speed["average_linear_speed_m_s"]
                 )
-            fixed_targets = _circle_targets(boundary_before_fixed, **circle_kwargs)
+            fixed_targets = _circle_targets(fixed_target_boundary, **circle_kwargs)
             circle_target_metadata = dict(fixed_targets[0].metadata)
             fixed_speed_plan = {
                 "reference_side": DEFAULT_CIRCLE_SPEED_SIDE,
@@ -961,11 +1516,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             lambda _reference: dict(initial_grippers),
             action_source=fixed_action_source,
             source_index_fn=lambda _reference: (-1,),
+            action_source_by_side_fn=(
+                None
+                if detail_selection is None
+                else lambda _reference: {
+                    "left": "dataset_fixed_hold",
+                    "right": fixed_action_source,
+                }
+            ),
+            source_frame_indices_by_side_fn=(
+                None
+                if detail_selection is None
+                else lambda _reference: {
+                    "left": [int(left_hold_source_index)],
+                    "right": [-1],
+                }
+            ),
         )
         boundary_after_fixed = _actual_tcp_boundary(control)
+        boundary_tcp_pose_by_side = (
+            {"right": boundary_after_fixed["right"]}
+            if detail_selection is not None
+            else boundary_after_fixed
+        )
         boundary = RuleBasedBoundaryState(
-            tcp_pose_by_side=boundary_after_fixed,
-            pose_frame_by_side={"left": "canonical_desk", "right": "canonical_desk"},
+            tcp_pose_by_side=boundary_tcp_pose_by_side,
+            pose_frame_by_side={
+                side: "canonical_desk" for side in boundary_tcp_pose_by_side
+            },
             source=f"mujoco_actual_tcp_after_{fixed_phase}",
             timestamp=float(control.scene.data.time),
             metadata={
@@ -979,22 +1557,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for index in range(stage_b_group.frame_count):
             action = rebase_replay_action_at_boundary(
                 stage_b_group,
-                ("left", "right"),
+                ("right",) if detail_selection is not None else ("left", "right"),
                 index=index,
                 boundary=boundary,
                 source_start_index=0,
                 include_end_effectors=False,
                 source="rule_based_relative_replay",
             )
+            rebased_pose_by_side = {
+                side: np.asarray(pose, dtype=float).copy()
+                for side, pose in action.arm_pose_by_side.items()
+            }
+            if detail_selection is not None:
+                rebased_pose_by_side["left"] = left_hold_pose_by_side["left"].copy()
             rebased_targets.append(
                 TimestampedMotionTarget(
                     timestamp=stage_b_group.relative_time_sec(index),
                     available_timestamp=stage_b_group.relative_time_sec(index),
                     source_index=index,
-                    pose_by_side=action.arm_pose_by_side,
+                    pose_by_side=rebased_pose_by_side,
                     metadata={
                         **dict(action.metadata),
-                        "phase": "relative_stage_b",
+                        "phase": (
+                            "right_write.pen_up"
+                            if detail_selection is not None
+                            else "relative_stage_b"
+                        ),
                         "source_frame_index": int(stage_b_frames[index].frame_index),
                     },
                 )
@@ -1005,13 +1593,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             include_final=True,
         )
         run_phase(
-            "relative_stage_b",
+            "right_write.pen_up" if detail_selection is not None else "relative_stage_b",
             relative_refs,
-            lambda reference: _grippers_for_reference(stage_b_frames, reference),
+            lambda reference: _grippers_for_reference(
+                stage_b_frames,
+                reference,
+                hold_by_side=(
+                    None
+                    if left_hold_gripper is None
+                    else {"left": float(left_hold_gripper)}
+                ),
+            ),
             action_source="rule_based_relative_replay",
             source_index_fn=lambda reference: (
                 int(stage_b_frames[reference.left_source_index].frame_index),
                 int(stage_b_frames[reference.right_source_index].frame_index),
+            ),
+            action_source_by_side_fn=(
+                None
+                if detail_selection is None
+                else lambda _reference: {
+                    "left": "dataset_fixed_hold",
+                    "right": "rule_based_relative_replay",
+                }
+            ),
+            source_frame_indices_by_side_fn=(
+                None
+                if detail_selection is None
+                else lambda reference: {
+                    "left": [int(left_hold_source_index)],
+                    "right": [
+                        int(stage_b_frames[reference.right_source_index].frame_index)
+                    ],
+                }
             ),
         )
         control_snapshot = control.snapshot()
@@ -1028,64 +1642,97 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             renderer.close()
         control.close()
 
-    summary: dict[str, Any] = {
-        "schema": "dexteleop.sim.mujoco.rule_based_multistage_summary.v1",
-        "simulation_only": True,
-        "real_hardware_access": False,
-        "source": {
-            "dataset_root": str(episode.episode.dataset_root),
-            "episode_id": episode.episode.episode_id,
-            "remote_dataset_root": "/home/user/zc/datasets/RealmanDMTAC/DexTeleop/datasets/2026-08-03_dmtac_rm65_bimanual_position_v2_writing_4_stage",
-            "source_parquet_path": str(episode.episode.parquet_path),
-            "source_frame_count": len(episode.frames),
-            "action_dim": int(episode.action_dim),
-            "nominal_hz": float(episode.nominal_hz),
-            "pose_storage_frame": episode.pose_frame_contract.pose_storage_frame,
-        },
-        "pose_frame_alignment": pose_frame_alignment,
-        "composition": {
+    left_actual_qpos_span = None
+    if left_actual_qpos_samples:
+        left_actual_qpos_span = np.ptp(
+            np.stack(left_actual_qpos_samples, axis=0),
+            axis=0,
+        )
+    fixed_phase_payload: dict[str, Any] = {
+        "capture": True,
+        "tcp_side": "right",
+        "plane": "desk_xy",
+        "constant_axis": "desk_z",
+        "trajectory_type": (
+            "catalogued_one_stroke"
+            if args.fixed_trajectory_id is not None
+            else "circle"
+        ),
+        "fixed_trajectory_id": args.fixed_trajectory_id,
+        "radius_m": (
+            None
+            if args.fixed_trajectory_id is not None
+            else float(args.circle_radius_m)
+        ),
+        "size_m": (
+            float(args.fixed_trajectory_scale_m)
+            if args.fixed_trajectory_id is not None
+            else None
+        ),
+        "direction": (
+            str(args.fixed_trajectory_direction)
+            if args.fixed_trajectory_id is not None
+            else None
+        ),
+        "steps": len(fixed_targets),
+        "hz": None if args.circle_hz is None else float(args.circle_hz),
+        "speed": fixed_speed_plan,
+        "boundary_before_fixed": boundary_before_fixed,
+        "boundary_after_fixed": boundary_after_fixed,
+        **(
+            {
+                "boundary_before_circle": boundary_before_fixed,
+                "boundary_after_circle": boundary_after_fixed,
+            }
+            if fixed_phase == "rule_based_circle"
+            else {}
+        ),
+    }
+    if detail_selection is not None:
+        detail_phase_payload = {
+            phase_id: detail_selection.phases[phase_id].to_dict()
+            for phase_id in DETAIL_PHASE_IDS
+        }
+        composition: dict[str, Any] = {
+            "mode": "detail_pen_down_rule_based_write_relative_pen_up",
+            "initial_alignment": {
+                "capture": False,
+                "target": "right_write.pen_down.first_frame",
+                "left_hold": True,
+            },
+            "right_write.pen_down": {
+                **detail_phase_payload["right_write.pen_down"],
+                "capture": True,
+                "execution": "absolute_dataset_replay",
+            },
+            "right_write.write": {
+                **detail_phase_payload["right_write.write"],
+                **fixed_phase_payload,
+                "source_replay": "replaced_by_rule_based_trajectory",
+            },
+            "right_write.pen_up": {
+                **detail_phase_payload["right_write.pen_up"],
+                "capture": True,
+                "execution": "relative_dataset_replay",
+                "source_start_index": 0,
+                "anchor": f"mujoco_actual_tcp_after_{fixed_phase}",
+                "pose_frame": "canonical_desk",
+            },
+            "left_hold": {
+                "capture_active": True,
+                "control_source": "dataset_fixed_hold",
+                "source_frame_index": left_hold_source_index,
+                "target_pose_desk": left_hold_pose_by_side["left"],
+                "target_gripper_close": left_hold_gripper,
+                "actual_qpos_span_rad": left_actual_qpos_span,
+            },
+        }
+    else:
+        composition = {
+            "mode": "legacy_stage_a_rule_based_relative_stage_b",
             "initial_alignment": {"capture": False, "target": "stage_a.first_frame"},
             "absolute_stage_a": stage_a_span.to_dict(),
-            fixed_phase: {
-                "capture": True,
-                "tcp_side": "right",
-                "plane": "desk_xy",
-                "constant_axis": "desk_z",
-                "trajectory_type": (
-                    "catalogued_one_stroke"
-                    if args.fixed_trajectory_id is not None
-                    else "circle"
-                ),
-                "fixed_trajectory_id": args.fixed_trajectory_id,
-                "radius_m": (
-                    None
-                    if args.fixed_trajectory_id is not None
-                    else float(args.circle_radius_m)
-                ),
-                "size_m": (
-                    float(args.fixed_trajectory_scale_m)
-                    if args.fixed_trajectory_id is not None
-                    else None
-                ),
-                "direction": (
-                    str(args.fixed_trajectory_direction)
-                    if args.fixed_trajectory_id is not None
-                    else None
-                ),
-                "steps": len(fixed_targets),
-                "hz": None if args.circle_hz is None else float(args.circle_hz),
-                "speed": fixed_speed_plan,
-                "boundary_before_fixed": boundary_before_fixed,
-                "boundary_after_fixed": boundary_after_fixed,
-                **(
-                    {
-                        "boundary_before_circle": boundary_before_fixed,
-                        "boundary_after_circle": boundary_after_fixed,
-                    }
-                    if fixed_phase == "rule_based_circle"
-                    else {}
-                ),
-            },
+            fixed_phase: fixed_phase_payload,
             "relative_stage_b": {
                 **stage_b_span.to_dict(),
                 "capture": True,
@@ -1093,14 +1740,50 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "anchor": f"mujoco_actual_tcp_after_{fixed_phase}",
                 "pose_frame": "canonical_desk",
             },
+        }
+    summary: dict[str, Any] = {
+        "schema": "dexteleop.sim.mujoco.rule_based_multistage_summary.v2",
+        "simulation_only": True,
+        "real_hardware_access": False,
+        "source": {
+            "dataset_root": str(episode.episode.dataset_root),
+            "episode_id": episode.episode.episode_id,
+            "progress_episode_uuid": (
+                None
+                if detail_selection is None
+                else detail_selection.episode_uuid
+            ),
+            "source_parquet_path": str(episode.episode.parquet_path),
+            "source_frame_count": len(episode.frames),
+            "action_dim": int(episode.action_dim),
+            "nominal_hz": float(episode.nominal_hz),
+            "pose_storage_frame": episode.pose_frame_contract.pose_storage_frame,
+            "detail_annotation": (
+                None
+                if detail_selection is None
+                else {
+                    "directory": str(args.detail_annotation_dir),
+                    "annotation_set_id": detail_selection.annotation_set_id,
+                    "base_annotation_set_id": detail_selection.base_annotation_set_id,
+                    "base_annotation_manifest_hash": detail_selection.base_annotation_manifest_hash,
+                    "detail_annotation_bundle_hash": detail_selection.detail_annotation_bundle_hash,
+                    "detail_annotation_manifest_hash": detail_selection.detail_annotation_manifest_hash,
+                    "detail_task_stage_profile_hash": detail_selection.detail_task_stage_profile_hash,
+                    "resolution": "explicit_immutable_overlay_reader",
+                }
+            ),
         },
+        "pose_frame_alignment": pose_frame_alignment,
+        "composition": composition,
         "capture": {
             "output_root": str(args.output),
             "camera_names": list(requested_cameras),
             "depth_camera_names": list(depth_cameras),
             "recorded_frame_count": int(capture_frame_index),
             "phase_counts": dict(phase_counts),
+            "recorded_phases": list(phase_counts),
             "reference_hz": float(args.reference_hz),
+            "left_hold_actual_qpos_span_rad": left_actual_qpos_span,
         },
         "control": control_snapshot,
         "wall_time_sec": time.monotonic() - started,
