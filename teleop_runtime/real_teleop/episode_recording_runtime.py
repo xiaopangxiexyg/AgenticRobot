@@ -2036,23 +2036,53 @@ def build_episode_recording_runtime(
                 return False
             resumed_any = True
         if episode_recording_paused:
-            # Clear the local gate before the optional event projection.  A
-            # missing debug event must not undo the formal resume or create a
-            # per-frame resume retry storm.
+            # In formal mode the lightweight trajectory is subordinate and its
+            # writer is quarantined by record_debug_event().  In debug-only
+            # mode it is the sole requested product, so a missing resume marker
+            # means the continuity boundary cannot be represented: keep the
+            # local gate closed and stop that faulty Episode without escaping
+            # into the teleoperation loop.
+            try:
+                record_debug_event(
+                    "recording_resumed",
+                    payload={
+                        "reason": "runtime_running_warmup_ready",
+                        "pause_reason": pause_reason,
+                        "step_index": int(step_index),
+                        "state": step_result.state.value,
+                        "frame_count": int(episode_recorder.frame_count),
+                    },
+                    now=now,
+                )
+            except Exception as exc:  # noqa: BLE001 - contain debug-only writer failure.
+                message = (
+                    "Debug-only trajectory 无法写入恢复边界；"
+                    "已保持数采门关闭并开始异步停止该 Episode："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                episode_pause_failure_message = message
+                episode_resume_failure_message = message
+                _log("Episode", message, now=now)
+                publish_control_ui_message(
+                    "Episode",
+                    message,
+                    context="debug-only resume boundary failure",
+                    now=now,
+                )
+                stop_recording(
+                    now,
+                    end_reason="debug_resume_boundary_failure",
+                    summary={
+                        "debug_resume_boundary_failure": (
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                        "pause_reason": pause_reason,
+                    },
+                )
+                return False
             episode_recording_paused = False
             episode_recording_pause_reason = ""
             resumed_any = True
-            record_debug_event(
-                "recording_resumed",
-                payload={
-                    "reason": "runtime_running_warmup_ready",
-                    "pause_reason": pause_reason,
-                    "step_index": int(step_index),
-                    "state": step_result.state.value,
-                    "frame_count": int(episode_recorder.frame_count),
-                },
-                now=now,
-            )
         if resumed_any:
             episode_resume_warmup_ready_count = 0
             episode_resume_failure_message = ""
@@ -2692,29 +2722,47 @@ def build_episode_recording_runtime(
             failure = result.error or result.discard_error or RuntimeError(
                 "episode stop returned an invalid completion"
             )
-            dataset_recorder = None
             detail = f"{type(failure).__name__}: {failure}"
-            args.dataset_startup_error = detail
-            startup_device_errors["dataset.writer"] = detail
-            publish_hardware_status_observation(
-                context="episode stop failed and writer was isolated",
-                now=now,
-            )
-            message = (
-                "正式 dataset 停止/排空失败；已隔离该 recorder 并保持 Hold，"
-                f"下次开始将创建全新 writer：{detail}"
-            )
-            _log("Dataset", message, now=now)
-            publish_control_ui_message(
-                "Dataset",
-                message,
-                context="episode stop failure",
-                now=now,
-            )
-            try:
-                clutch_input.request_hold(reason="dataset_stop_failure")
-            except BaseException:
-                pass
+            if stopped_recorder is None:
+                # Debug-only capture has no formal Writer health fact.  Its
+                # failed stop must not poison dataset.writer recovery or force
+                # an unrelated robot Hold; quarantine the trajectory and leave
+                # generic EpisodeRecorder shutdown to reclaim its resource.
+                debug_episode_quarantined = True
+                message = (
+                    "Debug-only trajectory 停止失败，已隔离该记录器；"
+                    f"正式 dataset writer 状态不受影响：{detail}"
+                )
+                _log("Episode", message, now=now)
+                publish_control_ui_message(
+                    "Episode",
+                    message,
+                    context="debug-only episode stop failure",
+                    now=now,
+                )
+            else:
+                dataset_recorder = None
+                args.dataset_startup_error = detail
+                startup_device_errors["dataset.writer"] = detail
+                publish_hardware_status_observation(
+                    context="episode stop failed and writer was isolated",
+                    now=now,
+                )
+                message = (
+                    "正式 dataset 停止/排空失败；已隔离该 recorder 并保持 Hold，"
+                    f"下次开始将创建全新 writer：{detail}"
+                )
+                _log("Dataset", message, now=now)
+                publish_control_ui_message(
+                    "Dataset",
+                    message,
+                    context="episode stop failure",
+                    now=now,
+                )
+                try:
+                    clutch_input.request_hold(reason="dataset_stop_failure")
+                except BaseException:
+                    pass
             clutch_input.set_episode_recording_state(
                 active=False,
                 episode_dir="",

@@ -8,11 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from teleop_runtime.real_teleop import collection_control_plane as control_plane_module
+from teleop_runtime.real_teleop import dataset_recorder as dataset_recorder_module
 from teleop_runtime.real_teleop.collection_control_plane import (
     CollectionControlOperationBusy,
     CollectionControlPlane,
 )
 from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
+from teleop_runtime.real_teleop.dataset_finalize import RealDatasetFinalizeTask
 from teleop_runtime.real_teleop.episode_recording_runtime import (
     build_episode_recording_runtime,
 )
@@ -117,6 +119,64 @@ def test_worker_failure_is_polled_without_escaping_worker_thread() -> None:
     assert isinstance(result.error, RuntimeError)
     assert str(result.error) == "writer ready timeout"
     assert plane.poll(generation) is None
+
+
+def test_finalize_thread_start_failure_publishes_one_joinable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    task = RealDatasetFinalizeTask(
+        episode_index=4,
+        frame_count=17,
+        reason="unit",
+        queued_at=time.time(),
+    )
+    recorder.finalize_tasks = [task]
+
+    def fail_start(_thread: threading.Thread) -> None:
+        raise RuntimeError("simulated finalize thread exhaustion")
+
+    monkeypatch.setattr(
+        dataset_recorder_module.threading.Thread,
+        "start",
+        fail_start,
+    )
+
+    assert not recorder._start_finalize_task(task)
+    assert task.done
+    assert not task.success
+    assert task.thread is None
+    assert "simulated finalize thread exhaustion" in task.error
+    assert recorder.poll_finalize_tasks() == [task]
+    assert recorder.finalize_tasks == []
+
+
+def test_finalize_thread_construction_failure_is_a_consumable_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    task = RealDatasetFinalizeTask(
+        episode_index=5,
+        frame_count=9,
+        reason="unit",
+        queued_at=time.time(),
+    )
+    recorder.finalize_tasks = [task]
+
+    def fail_thread_construction(**_kwargs: object) -> threading.Thread:
+        raise RuntimeError("simulated finalize thread construction failure")
+
+    monkeypatch.setattr(
+        dataset_recorder_module.threading,
+        "Thread",
+        fail_thread_construction,
+    )
+
+    assert not recorder._start_finalize_task(task)
+    assert task.done
+    assert task.thread is None
+    assert "thread construction failure" in task.error
+    assert recorder.poll_finalize_tasks() == [task]
 
 
 def test_completed_finalize_remains_owned_until_result_is_polled() -> None:
@@ -1376,6 +1436,125 @@ def test_debug_pause_resume_event_failure_cannot_veto_formal_continuity(
     ]
     assert len(quarantine_messages) == 1
     assert "operation=event:recording_paused" in quarantine_messages[0]
+    assert runtime.close()
+
+
+def test_debug_only_resume_boundary_failure_stops_episode_without_escaping(
+    tmp_path: Path,
+) -> None:
+    debug_events: list[str] = []
+    stop_reasons: list[str] = []
+
+    def record_event(event_type: str, **_kwargs: object) -> None:
+        debug_events.append(str(event_type))
+        if event_type == "recording_resumed":
+            raise RuntimeError("debug resume marker unavailable")
+
+    debug_recorder = SimpleNamespace(
+        config=SimpleNamespace(enabled=True),
+        is_recording=True,
+        frame_count=3,
+        episode_dir=tmp_path / "debug",
+        record_event=record_event,
+    )
+
+    def stop_debug(recorder_arg: object, *, end_reason: str, **_kwargs: object) -> None:
+        assert recorder_arg is debug_recorder
+        stop_reasons.append(str(end_reason))
+        debug_recorder.is_recording = False
+
+    slot: list[object | None] = [None]
+    clutch = _Clutch()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=lambda **_kwargs: None,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        debug_episode_enabled=True,
+        stop_episode_recording=stop_debug,
+        episode_recorder_override=debug_recorder,
+    )
+
+    assert runtime.pause_recording(time.time(), reason="unit_hold")
+    running_step = SimpleNamespace(state=SimpleNamespace(value="RUNNING"))
+    assert not runtime.resume_recording_if_ready(
+        time.time(),
+        step_result=running_step,
+    )
+    assert not runtime.resume_recording_if_ready(
+        time.time(),
+        step_result=running_step,
+    )
+    assert runtime.collection_transition_active()
+
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert debug_events == ["recording_paused", "recording_resumed"]
+    assert stop_reasons == ["debug_resume_boundary_failure"]
+    assert not debug_recorder.is_recording
+    assert not runtime.recording_active()
+    assert not runtime.recording_paused()
+    assert args.dataset_startup_error == ""
+    assert clutch.hold_reasons == []
+    assert any(
+        tag == "Episode" and "无法写入恢复边界" in message
+        for tag, message in logs
+    )
+    assert runtime.close()
+
+
+def test_debug_only_stop_failure_does_not_poison_formal_writer_health(
+    tmp_path: Path,
+) -> None:
+    debug_recorder = SimpleNamespace(
+        config=SimpleNamespace(enabled=True),
+        is_recording=True,
+        frame_count=3,
+        episode_dir=tmp_path / "debug",
+        record_event=lambda *_args, **_kwargs: None,
+    )
+    stop_attempts = 0
+
+    def fail_stop_debug(*_args: object, **_kwargs: object) -> None:
+        nonlocal stop_attempts
+        stop_attempts += 1
+        raise RuntimeError("debug writer close unavailable")
+
+    slot: list[object | None] = [None]
+    clutch = _Clutch()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=lambda **_kwargs: None,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        debug_episode_enabled=True,
+        stop_episode_recording=fail_stop_debug,
+        episode_recorder_override=debug_recorder,
+    )
+
+    assert runtime.stop_recording(time.time(), end_reason="unit")
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert stop_attempts == 2
+    assert not runtime.recording_active()
+    assert args.dataset_startup_error == ""
+    assert clutch.hold_reasons == []
+    assert clutch.recording_states[-1]["event_status"] == "error"
+    assert "正式 dataset writer 状态不受影响" in str(
+        clutch.recording_states[-1]["event_message"]
+    )
+    assert any(
+        tag == "Episode" and "已隔离该记录器" in message
+        for tag, message in logs
+    )
     assert runtime.close()
 
 

@@ -2763,16 +2763,22 @@ class RealTeleopDatasetRecorder:
         if task.done or task.thread is not None:
             return False
         task.mark_started()
-        thread = threading.Thread(
-            target=self._run_finalize_task,
-            name=f"real_dataset_finalize_{task.episode_index}",
-            args=(task,),
-            daemon=True,
-        )
-        task.thread = thread
         try:
+            thread = threading.Thread(
+                target=self._run_finalize_task,
+                name=f"real_dataset_finalize_{task.episode_index}",
+                args=(task,),
+                daemon=True,
+            )
+            task.thread = thread
             thread.start()
         except BaseException as exc:  # noqa: BLE001 - preserve task completion semantics.
+            # A Thread object that failed start() cannot be joined.  Leaving it
+            # attached makes poll_finalize_tasks() raise ``cannot join thread
+            # before it is started`` and hides the actual finalize scheduling
+            # failure from the application receipt.  Construction failure has
+            # the same ownership semantics: no worker owns this task.
+            task.thread = None
             task.mark_done(success=False, error=f"thread_start {type(exc).__name__}: {exc}")
             return False
         return True
