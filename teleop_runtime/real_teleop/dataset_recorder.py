@@ -79,6 +79,7 @@ from collection_runtime.dataset_capture_recovery import (
     prepare_dataset_capture_writable,
 )
 from collection_runtime.progress.profiles import (
+    DatasetProgressProfileBindingError,
     bind_dataset_progress_profile,
     bind_dataset_task_stage_profile,
     inspect_dataset_progress_profile,
@@ -1057,17 +1058,41 @@ class RealTeleopDatasetRecorder:
         profile picker.  Omitting it preserves the legacy coarse auto-match.
         """
 
-        if self.is_recording or self.finalizing:
-            raise RuntimeError(
-                "Cannot select a collection progress profile while an "
-                "Episode is recording or finalizing."
-            )
         selected = resolve_real_teleop_progress_profile(
             profile,
             collection_task_id=str(self.args.collection_task_id),
         )
         if selected is None:
             raise ValueError("A selected progress profile must not be empty.")
+        if self.progress_profile_selection_locked:
+            existing = getattr(self, "progress_profile", None)
+            if existing is None:
+                raise DatasetProgressProfileBindingError(
+                    "Cannot add a collection progress profile to a populated "
+                    "profile-less dataset; create/select a new dataset root."
+                )
+            if (
+                selected.semantic_content_hash
+                != existing.semantic_content_hash
+            ):
+                # The immutable dataset fact is stronger than a transient
+                # recording/finalize busy state and can be rejected from the
+                # already-committed in-memory binding.  Do not read profile
+                # artifacts concurrently with an unconsumed finalize receipt.
+                raise DatasetProgressProfileBindingError(
+                    "Requested collection progress profile differs from the "
+                    "profile already used by this dataset: "
+                    f"existing={existing.profile_id}@{existing.profile_version}"
+                    f"/{existing.semantic_content_hash}, "
+                    f"requested={selected.profile_id}@"
+                    f"{selected.profile_version}/"
+                    f"{selected.semantic_content_hash}."
+                )
+        if self.is_recording or self.finalizing:
+            raise RuntimeError(
+                "Cannot select a collection progress profile while an "
+                "Episode is recording or finalizing."
+            )
         admission = inspect_dataset_progress_profile(
             self.dataset_root,
             requested_profile=selected,
