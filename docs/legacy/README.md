@@ -11,6 +11,7 @@
 | [DMTAC 旧命令分层](./dmtac/temp_dmtac.md) | 旧 75→150 Hz、debug overlay、旧 replay/deploy 组合 | [真实系统](../real/README.md)、[硬件](../hardware/README.md) |
 | [DMTAC 旧 gripper driver 退役记录](./reports/dmtac_gripper_driver_legacy_retirement_20260825.md) | 删除无生产调用的重复 legacy driver，保留当前 DMTAC 后端边界 | [DMTAC 旧命令分层](./dmtac/temp_dmtac.md) / [硬件](../hardware/README.md) |
 | [Position A/B report](./reports/position_ab_report.md) | 已有 capture 的离线分析结果 | [遥操数采说明](../real/TELEOP_COLLECTION.md) |
+| [Position A/B 分析器退役](./reports/position_ab_analyzer_retirement_20260827.md) | 删除零调用的旧多层离线分析入口，保留已有报告与现行分项评估器 | [历史报告](./reports/position_ab_report.md) / [当前 replay 评估](../real/REPLAY.md) |
 | [2026-07-22 命令清点](./reports/command_inventory_2026-07-22.md) | 重组前入口与散落来源快照 | [当前 docs 入口](../README.md) |
 | [2026-07-17 框架复核](./reports/framework_review_20260717.md) | 当时目录、入口、契约和迁移状态的只读快照 | [当前 docs 入口](../README.md) / 各 package README |
 | [2026-08-03 项目结构审计](./reports/project_structure_audit_20260803.md) | P0 实施前的规模、边界与问题快照 | [当前 P0 结构治理计划](../architecture/plans/dexteleop_p0_structure_remediation_plan_20260803.md) / [`AGENTS.md`](../../AGENTS.md) |
