@@ -29,6 +29,15 @@ class RealTeleopPlusCurationRuntime:
         self._pending_request: dict[str, object] | None = None
         self._save_thread: threading.Thread | None = None
 
+    @staticmethod
+    def _notify(callback: Callable[..., None], *args: object) -> None:
+        """Keep optional UI/message observers outside the save lifecycle."""
+
+        try:
+            callback(*args)
+        except Exception:  # noqa: BLE001 - callbacks are observational only.
+            pass
+
     def submit_request_text(
         self,
         text: str,
@@ -52,13 +61,13 @@ class RealTeleopPlusCurationRuntime:
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             self.session.status = "error"
             self.session.message = f"Plus 整理参数无效: {exc}"
-            on_state_changed()
+            self._notify(on_state_changed)
             return False
 
         self._pending_request = request
         self.session.status = "saving"
         self.session.message = "Plus 整理提交已接收。"
-        on_state_changed()
+        self._notify(on_state_changed)
         return True
 
     def consume_request(self) -> dict[str, object] | None:
@@ -103,7 +112,7 @@ class RealTeleopPlusCurationRuntime:
             self.session.message = (
                 "Plus 整理请求已过期：当前待整理 episode 已变化。"
             )
-            on_state_changed()
+            self._notify(on_state_changed)
             return None
         try:
             self.session.set_review(
@@ -113,7 +122,7 @@ class RealTeleopPlusCurationRuntime:
         except ValueError as exc:
             self.session.status = "error"
             self.session.message = f"Plus 整理参数无效: {exc}"
-            on_state_changed()
+            self._notify(on_state_changed)
             return None
 
         request_episode_index = self.session.pending_episode_index
@@ -122,7 +131,7 @@ class RealTeleopPlusCurationRuntime:
         request_variant_id = self.session.variant_id
         self.session.status = "saving"
         self.session.message = "Plus sidecar 正在后台写入。"
-        on_state_changed()
+        self._notify(on_state_changed)
 
         def write_sidecar() -> None:
             try:
@@ -143,19 +152,37 @@ class RealTeleopPlusCurationRuntime:
                 ):
                     self.session.status = "error"
                     self.session.message = message
-                on_failure(message)
+                self._notify(on_failure, message)
             else:
-                on_success(record)
+                self._notify(on_success, record)
             finally:
-                on_state_changed()
+                self._notify(on_state_changed)
 
-        self._save_thread = threading.Thread(
-            target=write_sidecar,
-            name="plus-episode-curation-save",
-            daemon=True,
-        )
-        self._save_thread.start()
-        return self._save_thread
+        try:
+            save_thread = threading.Thread(
+                target=write_sidecar,
+                name="plus-episode-curation-save",
+                daemon=True,
+            )
+            self._save_thread = save_thread
+            save_thread.start()
+        except Exception as exc:  # noqa: BLE001 - optional sidecar is non-fatal.
+            self._save_thread = None
+            message = (
+                "Plus sidecar 后台任务启动失败: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if (
+                self.session.pending_episode_index == request_episode_index
+                and self.session.pending_dataset_root == request_dataset_root
+                and self.session.pending_token == request_pending_token
+            ):
+                self.session.status = "error"
+                self.session.message = message
+            self._notify(on_failure, message)
+            self._notify(on_state_changed)
+            return None
+        return save_thread
 
 
 __all__ = ["RealTeleopPlusCurationRuntime"]

@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
+from teleop_runtime.real_teleop import plus_curation_runtime as plus_runtime_module
 from teleop_runtime.real_teleop.plus_curation_runtime import (
     RealTeleopPlusCurationRuntime,
 )
@@ -175,3 +176,94 @@ def test_plus_curation_stale_token_is_rejected_without_starting_a_thread() -> No
     assert session.status == "error"
     assert "已过期" in session.message
     assert states == ["error"]
+
+
+def test_plus_curation_thread_start_failure_is_retryable_and_non_fatal(
+    monkeypatch,
+) -> None:
+    session = _FakeSession()
+    runtime = RealTeleopPlusCurationRuntime(session)  # type: ignore[arg-type]
+    original_start = plus_runtime_module.threading.Thread.start
+    failures: list[str] = []
+    states: list[str] = []
+
+    def fail_start(_thread) -> None:
+        raise RuntimeError("simulated thread exhaustion")
+
+    monkeypatch.setattr(plus_runtime_module.threading.Thread, "start", fail_start)
+    assert runtime.start_save(
+        episode_index=4,
+        pending_token="token-4",
+        disposition="include",
+        reason_code="success",
+        on_state_changed=lambda: states.append(session.status),
+        on_failure=failures.append,
+        on_success=lambda _record: None,
+    ) is None
+
+    assert session.status == "error"
+    assert "后台任务启动失败" in session.message
+    assert "simulated thread exhaustion" in session.message
+    assert session.pending_episode_index == 4
+    assert session.pending_token == "token-4"
+    assert session.review == ("include", "success")
+    assert not runtime.save_in_flight()
+    assert runtime._save_thread is None
+    assert states == ["saving", "error"]
+    assert failures == [session.message]
+
+    def save_after_retry(**_kwargs):
+        session.status = "saved"
+        session.pending_episode_index = None
+        session.pending_dataset_root = None
+        session.pending_token = ""
+        return SimpleNamespace(annotation_episode_id="annotation:4")
+
+    session.save_impl = save_after_retry
+    monkeypatch.setattr(
+        plus_runtime_module.threading.Thread,
+        "start",
+        original_start,
+    )
+    thread = runtime.start_save(
+        episode_index=4,
+        pending_token="token-4",
+        disposition="include",
+        reason_code="success",
+        on_state_changed=lambda: None,
+        on_failure=failures.append,
+        on_success=lambda _record: None,
+    )
+    assert thread is not None
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert session.status == "saved"
+    assert session.pending_episode_index is None
+    assert len(failures) == 1
+
+
+def test_plus_curation_observer_failures_do_not_veto_the_owned_save() -> None:
+    session = _FakeSession()
+    runtime = RealTeleopPlusCurationRuntime(session)  # type: ignore[arg-type]
+
+    def fail_observer(*_args) -> None:
+        raise RuntimeError("simulated broken UI")
+
+    session.save_impl = lambda **_kwargs: (
+        setattr(session, "status", "saved")
+        or SimpleNamespace(annotation_episode_id="annotation:4")
+    )
+    thread = runtime.start_save(
+        episode_index=4,
+        pending_token="token-4",
+        disposition="include",
+        reason_code="success",
+        on_state_changed=fail_observer,
+        on_failure=fail_observer,
+        on_success=fail_observer,
+    )
+
+    assert thread is not None
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert session.status == "saved"
