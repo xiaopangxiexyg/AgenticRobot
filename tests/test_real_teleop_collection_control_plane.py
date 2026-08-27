@@ -394,12 +394,15 @@ def test_episode_open_rpc_is_nonblocking_and_recorder_is_detached_until_publish(
     recorder = Recorder()
     slot: list[object | None] = [recorder]
     clutch = _Clutch()
-    runtime, _args, _logs = _episode_runtime(
+    runtime, _args, logs = _episode_runtime(
         tmp_path=tmp_path,
         recorder_type=Recorder,
         dataset_slot=slot,
         clutch=clutch,
         transition_calls=[],
+        publish_runtime_hardware_status=lambda: (_ for _ in ()).throw(
+            RuntimeError("status transport unavailable")
+        ),
     )
 
     started_at = time.perf_counter()
@@ -421,6 +424,10 @@ def test_episode_open_rpc_is_nonblocking_and_recorder_is_detached_until_publish(
     assert runtime.recording_active()
     assert clutch.plus_episode_indices == [4]
     assert clutch.recording_states[-1]["event_status"] == "recording"
+    assert any(
+        tag == "Dataset" and "hardware-status refresh failed" in message
+        for tag, message in logs
+    )
 
 
 def test_episode_open_configuration_failure_republishes_unmutated_recorder(
@@ -623,12 +630,15 @@ def test_failed_replacement_keeps_published_recorder_and_discards_candidate(
     existing.close = lambda: setattr(existing, "closed", True)
     slot: list[object | None] = [existing]
     clutch = _Clutch()
-    runtime, args, _logs = _episode_runtime(
+    runtime, args, logs = _episode_runtime(
         tmp_path=tmp_path,
         recorder_type=Recorder,
         dataset_slot=slot,
         clutch=clutch,
         transition_calls=[],
+        publish_runtime_hardware_status=lambda: (_ for _ in ()).throw(
+            RuntimeError("status transport unavailable")
+        ),
     )
 
     assert runtime.schedule_recording_countdown(time.time(), start_reason="unit")
@@ -643,6 +653,10 @@ def test_failed_replacement_keeps_published_recorder_and_discards_candidate(
     assert candidate_instances[0].closed is True
     assert args.dataset_startup_error == "RuntimeError: writer ready timeout"
     assert clutch.recording_states[-1]["event_status"] == "error"
+    assert any(
+        tag == "Dataset" and "hardware-status refresh failed" in message
+        for tag, message in logs
+    )
     runtime.close()
 
 
@@ -905,6 +919,75 @@ def test_dataset_selection_status_publish_failure_cannot_skip_old_retirement(
     assert not runtime.collection_transition_active()
     assert any(
         tag == "Dataset" and "hardware-status refresh failed" in message
+        for tag, message in logs
+    )
+    runtime.close()
+
+
+def test_first_dataset_selection_completion_callback_failure_is_observational(
+    tmp_path: Path,
+) -> None:
+    instances: list[object] = []
+
+    class Recorder:
+        def __init__(self, *, args: object, **_kwargs: object) -> None:
+            self.args = args
+            self.dataset_root = Path(args.dataset_root)
+            self.finalizing = False
+            self.is_recording = False
+            self.is_paused = False
+            self.frame_count = 0
+            self.closed = False
+            instances.append(self)
+
+        def ensure_started(self) -> None:
+            return None
+
+        def poll_finalize_tasks(self) -> list[object]:
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    slot: list[object | None] = [None]
+    runtime, args, logs = _episode_runtime(
+        tmp_path=tmp_path / "old",
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=_Clutch(),
+        transition_calls=[],
+    )
+    selected_args = dict(vars(args))
+    selected_args["dataset_root"] = tmp_path / "selected"
+    callbacks: list[str] = []
+
+    def commit(snapshot: dict[str, object]) -> None:
+        vars(args).clear()
+        vars(args).update(snapshot)
+        callbacks.append("commit")
+
+    def fail_after_commit() -> None:
+        callbacks.append("complete")
+        raise RuntimeError("ui publication unavailable")
+
+    assert runtime.schedule_dataset_selection(
+        selected_args,
+        bind_dataset_contract=False,
+        on_commit=commit,
+        on_complete=fail_after_commit,
+        on_failure=lambda exc: callbacks.append(f"failure:{exc}"),
+    ) == "pending"
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert callbacks == ["commit", "complete"]
+    assert slot[0] is instances[0]
+    assert args.dataset_root == tmp_path / "selected"
+    assert not runtime.collection_transition_active()
+    assert any(
+        tag == "Dataset" and "completion callback failed" in message
         for tag, message in logs
     )
     runtime.close()

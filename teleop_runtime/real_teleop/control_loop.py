@@ -3357,7 +3357,17 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     + " <- ".join(exception_text)
                 )
                 return True
-            if teleop_active and _consume_joint_hard_limit_dispatch(
+            # Hard-limit/horizon rejections are recoverable application Hold
+            # transitions only after the operator has completed the initial
+            # real-teleop admission.  Before that boundary, keep surfacing the
+            # underlying startup/calibration failure.  This predicate used to
+            # be assigned in the force-guard branch; keeping it local to the
+            # dispatch classifier prevents the exceptional path from referring
+            # to stale or unbound per-frame state.
+            teleop_admitted = bool(
+                getattr(clutch_input, "_teleop_started", False)
+            )
+            if teleop_admitted and _consume_joint_hard_limit_dispatch(
                 error,
                 components=components,
                 clutch_input=clutch_input,
@@ -3372,7 +3382,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 control_ui=control_ui,
             ):
                 return True
-            if teleop_active and _consume_joint_horizon_certification_dispatch(
+            if teleop_admitted and _consume_joint_horizon_certification_dispatch(
                 error,
                 clutch_input=clutch_input,
                 recording_active=recording_active,

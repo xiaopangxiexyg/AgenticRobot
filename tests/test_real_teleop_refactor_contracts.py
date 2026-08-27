@@ -162,6 +162,10 @@ def test_formal_writer_ready_handshake_is_not_global_startup_work() -> None:
     assert "prepare_startup_dataset_recorder(" not in runtime_source
     assert "formal dataset writer deferred until collection start" in runtime_source
     assert "正在启动隔离 writer 并等待 ready 握手" not in runtime_source
+    assert runtime_source.count(
+        "set_dataset_recorder=assign_current_dataset_recorder"
+    ) == 2
+    assert "set_current_dataset_recorder" not in runtime_source
 
 
 def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
@@ -1327,6 +1331,18 @@ def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
         "estop:quit_requested",
         "countdown.cancel:quit_requested",
     ]
+
+
+def test_safety_dispatch_recovery_uses_bound_teleop_admission_state() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+
+    assert "teleop_active" not in source
+    assert 'getattr(clutch_input, "_teleop_started", False)' in source
+    assert "teleop_admitted and _consume_joint_hard_limit_dispatch" in source
+    assert (
+        "teleop_admitted and _consume_joint_horizon_certification_dispatch"
+        in source
+    )
 
 
 def test_device_retry_runtime_keeps_optional_foot_pad_status_dynamic() -> None:

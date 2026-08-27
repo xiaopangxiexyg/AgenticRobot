@@ -1361,7 +1361,7 @@ def run_real_teleop(
             startup_device_errors=startup_device_errors,
             position_force_guard_requested=position_force_guard_requested,
             dataset_recorder_provider=current_dataset_recorder,
-            set_dataset_recorder=set_current_dataset_recorder,
+            set_dataset_recorder=assign_current_dataset_recorder,
             foot_pad_input_provider=current_foot_pad_input,
             set_foot_pad_input=set_current_foot_pad_input,
             dataset_recorder_type=RealTeleopDatasetRecorder,

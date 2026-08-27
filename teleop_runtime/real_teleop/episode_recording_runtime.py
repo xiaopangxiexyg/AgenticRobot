@@ -609,6 +609,30 @@ def build_episode_recording_runtime(
         if control_ui is not None:
             control_ui.append_message("Dataset", message)
 
+    def publish_hardware_status_observation(
+        *,
+        context: str,
+        now: float,
+    ) -> None:
+        """Refresh observational status without changing lifecycle outcomes.
+
+        Writer preparation, episode open/stop, and dataset selection have
+        already committed their authoritative result before this projection is
+        requested.  A UI/status transport failure must therefore remain a
+        diagnostic event instead of escaping the control loop or hiding the
+        writer lifecycle result from the operator.
+        """
+
+        try:
+            publish_runtime_hardware_status()
+        except Exception as exc:  # noqa: BLE001 - status is observational only.
+            _log(
+                "Dataset",
+                f"{context}; hardware-status refresh failed: "
+                f"{type(exc).__name__}: {exc}",
+                now=now,
+            )
+
     def discard_prepared_dataset_recorder(value: Any) -> None:
         if not isinstance(value, _PreparedDatasetRecorder):
             return
@@ -1464,7 +1488,10 @@ def build_episode_recording_runtime(
             detail = f"{type(failure).__name__}: {failure}"
             args.dataset_startup_error = detail
             startup_device_errors["dataset.writer"] = detail
-            publish_runtime_hardware_status()
+            publish_hardware_status_observation(
+                context="writer preparation failed",
+                now=now,
+            )
             message = f"正式 dataset 预备失败: {detail}"
             episode_start_failure_message = message
             _log("Dataset", message, now=now)
@@ -1484,15 +1511,10 @@ def build_episode_recording_runtime(
         set_dataset_recorder(dataset_recorder)
         args.dataset_startup_error = ""
         startup_device_errors.pop("dataset.writer", None)
-        try:
-            publish_runtime_hardware_status()
-        except BaseException as exc:
-            _log(
-                "Dataset",
-                "selected writer is active but hardware-status refresh failed: "
-                f"{type(exc).__name__}: {exc}",
-                now=now,
-            )
+        publish_hardware_status_observation(
+            context="selected writer is active",
+            now=now,
+        )
         _log(
             "DatasetTiming",
             "writer preparation completed outside the realtime loop "
@@ -1546,6 +1568,19 @@ def build_episode_recording_runtime(
                 now=now,
             )
 
+        def publish_completion_callback() -> None:
+            if complete_callback is None:
+                return
+            try:
+                complete_callback()
+            except Exception as exc:  # noqa: BLE001 - selection is committed.
+                _log(
+                    "Dataset",
+                    "dataset selection completion callback failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    now=now,
+                )
+
         if result.cancelled:
             publish_failure(RuntimeError("dataset selection was cancelled"))
             return
@@ -1596,15 +1631,10 @@ def build_episode_recording_runtime(
         if writer_ready:
             args.dataset_startup_error = ""
             startup_device_errors.pop("dataset.writer", None)
-        try:
-            publish_runtime_hardware_status()
-        except Exception as exc:  # noqa: BLE001 - status is observational only.
-            _log(
-                "Dataset",
-                "selected dataset state is active but hardware-status refresh failed: "
-                f"{type(exc).__name__}: {exc}",
-                now=now,
-            )
+        publish_hardware_status_observation(
+            context="selected dataset state is active",
+            now=now,
+        )
         _log(
             "DatasetTiming",
             "dataset selection preparation completed outside the realtime loop "
@@ -1614,8 +1644,7 @@ def build_episode_recording_runtime(
             now=now,
         )
         if previous_recorder is None:
-            if complete_callback is not None:
-                complete_callback()
+            publish_completion_callback()
             return
         try:
             schedule_dataset_selection_cleanup(
@@ -1633,8 +1662,7 @@ def build_episode_recording_runtime(
                 f"could not be submitted: {type(exc).__name__}: {exc}",
                 now=now,
             )
-            if complete_callback is not None:
-                complete_callback()
+            publish_completion_callback()
 
     def publish_dataset_selection_cleanup(
         result: CollectionControlOperationResult,
@@ -1664,7 +1692,7 @@ def build_episode_recording_runtime(
         if completion_callback is not None:
             try:
                 completion_callback()
-            except BaseException as exc:
+            except Exception as exc:  # noqa: BLE001 - selection is committed.
                 _log(
                     "Dataset",
                     "dataset selection completion callback failed: "
@@ -1708,7 +1736,10 @@ def build_episode_recording_runtime(
             if opened_recorder is not None and start_attempted:
                 args.dataset_startup_error = detail
                 startup_device_errors["dataset.writer"] = detail
-                publish_runtime_hardware_status()
+                publish_hardware_status_observation(
+                    context="episode open failed after writer mutation",
+                    now=now,
+                )
             if bool(getattr(getattr(args, "control_debug_config", None), "enabled", False)):
                 update_control_debug_runtime_metadata(
                     episode_sidecar_error=f"dataset_start_failed:{detail}"
@@ -1733,7 +1764,10 @@ def build_episode_recording_runtime(
             set_dataset_recorder(dataset_recorder)
             args.dataset_startup_error = ""
             startup_device_errors.pop("dataset.writer", None)
-            publish_runtime_hardware_status()
+            publish_hardware_status_observation(
+                context="episode is open and writer is active",
+                now=now,
+            )
             try:
                 clutch_input.begin_plus_curation_episode(
                     int(completion.episode_index)
@@ -1830,7 +1864,10 @@ def build_episode_recording_runtime(
             detail = f"{type(failure).__name__}: {failure}"
             args.dataset_startup_error = detail
             startup_device_errors["dataset.writer"] = detail
-            publish_runtime_hardware_status()
+            publish_hardware_status_observation(
+                context="episode stop failed and writer was isolated",
+                now=now,
+            )
             message = (
                 "正式 dataset 停止/排空失败；已隔离该 recorder 并保持 Hold，"
                 f"下次开始将创建全新 writer：{detail}"
