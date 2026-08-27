@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -458,11 +458,30 @@ class DeskTcpPositionControl:
         reference: ResampledMotionReference,
         *,
         gripper_close_by_side: Mapping[str, float],
+        hold_sides: Sequence[str] = (),
     ) -> BimanualIKResult:
+        """Solve one desk-TCP reference and queue its atomic qref.
+
+        ``hold_sides`` is an explicit simulation/replay composition boundary.
+        Held sides remain in the atomic bimanual command, but the shared
+        ``BimanualPoseTarget`` solver treats them as hard-held inactive sides.
+        This reuses the existing solver authority and avoids making a second
+        direct-qpos control path for composed replay.
+        """
+
         if set(reference.pose_by_side) != {"left", "right"}:
             raise ValueError("desk TCP reference must contain left and right poses")
         if set(gripper_close_by_side) != {"left", "right"}:
             raise ValueError("gripper targets must contain left and right")
+        held_sides = tuple(str(side).strip().lower() for side in hold_sides)
+        if (
+            len(held_sides) != len(set(held_sides))
+            or any(side not in {"left", "right"} for side in held_sides)
+        ):
+            raise ValueError("hold_sides must be a unique subset of ('left', 'right')")
+        active_sides = tuple(
+            side for side in ("left", "right") if side not in set(held_sides)
+        )
 
         accepted = self.rig.accepted_qcmd_by_side()
         self.retargeter.set_current_qpos_pair(
@@ -512,6 +531,8 @@ class DeskTcpPositionControl:
             BimanualPoseTarget(
                 timestamp=float(reference.timestamp),
                 target_pose_by_side=solver_targets,
+                active_sides=active_sides,
+                hard_hold_inactive_sides=bool(held_sides),
                 world_to_base_by_side=self.world_to_base_by_side,
                 source_by_side=source_by_side,
                 target_smoothing_metadata={
