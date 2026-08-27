@@ -531,3 +531,29 @@ def test_position_probe_reports_incomplete_safe_stop_receipt(
         "safe_stop: joint2: synthetic disable failure",
     )
     assert result["stop_reason"] == "safe_stop: joint2: synthetic disable failure"
+
+
+@pytest.mark.parametrize("target_hz", (0.0, float("nan"), float("inf")))
+def test_position_probe_rejects_nonfinite_or_nonpositive_target_before_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_hz: float,
+) -> None:
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("test: true\n", encoding="utf-8")
+    backend = _FakePositionProbeBackend(
+        enable_receipt=B601ModeReceipt(
+            "enable", ("joint1", "joint2"), ("joint1", "joint2"), (), (), True
+        ),
+        stop_receipt=B601ModeReceipt(
+            "safe_stop", ("joint1", "joint2"), ("joint1", "joint2"), (), (), True
+        ),
+    )
+    _install_position_probe_fakes(monkeypatch, backend)
+    args = _position_probe_args(config_path)
+    args.target_hz = target_hz
+
+    with pytest.raises(ValueError, match="target_hz must be positive"):
+        frequency_probe._run_position_probe(args)
+
+    assert backend.calls == []

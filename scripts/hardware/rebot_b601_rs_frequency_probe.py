@@ -251,6 +251,9 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("duration_sec must be positive")
     if not math.isfinite(args.warmup_sec) or args.warmup_sec <= 0.0:
         raise ValueError("warmup_sec must be positive")
+    target_hz = float(args.target_hz)
+    if not math.isfinite(target_hz) or target_hz <= 0.0:
+        raise ValueError("target_hz must be positive")
     selected = _parse_joint_names(args.joint)
     config_path = Path(args.config).expanduser().resolve(strict=True)
     position_limits = _resolve_position_limits(
@@ -291,9 +294,6 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
         enable_receipt = backend.enable(joint_names=selected)
         if not enable_receipt.completed:
             raise FrequencyProbeError("motor enable failed: " + "; ".join(enable_receipt.errors))
-        target_hz = float(args.target_hz)
-        if target_hz <= 0.0:
-            raise ValueError("target_hz must be positive")
         period = 1.0 / target_hz
         started = time.monotonic()
         next_deadline = started
@@ -364,14 +364,14 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             else args.rebot_source_root.expanduser().resolve(strict=True)
         ),
         "duration_sec": args.duration_sec,
-        "target_hz": args.target_hz,
+        "target_hz": target_hz,
         "transport": "motorbridge_wired_local",
         "motion_commands_sent": True,
         "commands_sent": commands_sent,
         "stop_reason": stop_reason,
         "freshness_verified": False,
         "freshness_semantics": "motorbridge_vendor_cache_unverified",
-        "frequency": ledger.as_dict(target_hz=args.target_hz),
+        "frequency": ledger.as_dict(target_hz=target_hz),
         "notes": [
             "Human-run commissioning handoff only; this mode is never executed by automated tests.",
             "It holds the latest observed position and does not request feedback frames.",
