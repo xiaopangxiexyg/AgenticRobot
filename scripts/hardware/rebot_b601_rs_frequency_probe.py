@@ -303,7 +303,10 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
                 "no complete valid feedback snapshot arrived during warmup; "
                 f"last_fault={fault_reason}"
             )
-        mode_receipt = backend.prepare_position_velocity_mode(joint_names=selected)
+        mode_receipt = backend.prepare_position_velocity_mode(
+            joint_names=selected,
+            velocity_limits_rad_s=effective_velocity_limits,
+        )
         if not mode_receipt.completed:
             raise FrequencyProbeError("POS_VEL setup failed: " + "; ".join(mode_receipt.errors))
         enable_attempted = True

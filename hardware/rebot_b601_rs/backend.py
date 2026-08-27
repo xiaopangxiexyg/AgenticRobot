@@ -43,6 +43,14 @@ B601_RS_DEFAULT_RATE_HZ = 500.0
 B601_RS_DEFAULT_FEEDBACK_TIMEOUT_SEC = 0.10
 B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC = 0.10
 B601_RS_MECH_POS_PARAM_ID = 0x7019
+# RobStride POS_VEL parameter IDs used by the pinned reBotArm
+# ``JointGroup._write_pv_params`` implementation.  Keep these explicit so a
+# future vendor/runtime update cannot silently turn mode preparation into a
+# different register sequence.
+B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID = 0x7017
+B601_RS_POS_VEL_VEL_KP_PARAM_ID = 0x701F
+B601_RS_POS_VEL_VEL_KI_PARAM_ID = 0x7020
+B601_RS_POS_VEL_POS_KP_PARAM_ID = 0x701E
 
 
 class B601HardwareError(RuntimeError):
@@ -123,6 +131,10 @@ class B601JointConfig:
     mit_kp: float = 0.0
     mit_kd: float = 0.0
     position_velocity_limit_rad_s: float = 0.0
+    position_velocity_kp: float = 0.0
+    position_velocity_ki: float = 0.0
+    position_kp: float = 0.0
+    position_ki: float = 0.0
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
@@ -158,6 +170,16 @@ class B601JointConfig:
                 name="position_velocity_limit_rad_s",
             ),
         )
+        for field_name in (
+            "position_velocity_kp",
+            "position_velocity_ki",
+            "position_kp",
+            "position_ki",
+        ):
+            value = _finite_float(getattr(self, field_name), name=field_name)
+            if value < 0.0:
+                raise ValueError(f"{field_name} must be non-negative")
+            object.__setattr__(self, field_name, value)
         if self.mit_kp < 0.0 or self.mit_kd < 0.0:
             raise ValueError("mit gains must be non-negative")
 
@@ -170,10 +192,11 @@ class B601RSBackendConfig:
     the URDF position limits.  A motion-capable caller should supply limits
     obtained from the same pinned URDF before invoking a command method.
 
-    ``feedback_timeout_sec`` and ``watchdog_timeout_sec`` are retained as
-    explicit configuration declarations for the later guarded control loop.
-    This passive adapter does not infer freshness from MotorBridge's cached
-    state and does not run an automatic watchdog or safe-stop thread.
+    ``feedback_timeout_sec`` bounds the active RobStride ``mechPos`` parameter
+    read, while both timeout values remain explicit configuration declarations
+    for the later guarded control loop.  This adapter does not infer freshness
+    from MotorBridge's cached state and does not run an automatic watchdog or
+    safe-stop thread.
     """
 
     channel: str = B601_RS_DEFAULT_CHANNEL
@@ -308,6 +331,22 @@ class B601RSBackendConfig:
                     mit_kd=_finite_float(mit.get("kd", 0.0), name=f"{name}.MIT.kd"),
                     position_velocity_limit_rad_s=_positive_float(
                         pos_vel.get("vlim"), name=f"{name}.POS_VEL.vlim"
+                    ),
+                    position_velocity_kp=_finite_float(
+                        pos_vel.get("vel_kp", 0.0),
+                        name=f"{name}.POS_VEL.vel_kp",
+                    ),
+                    position_velocity_ki=_finite_float(
+                        pos_vel.get("vel_ki", 0.0),
+                        name=f"{name}.POS_VEL.vel_ki",
+                    ),
+                    position_kp=_finite_float(
+                        pos_vel.get("pos_kp", 0.0),
+                        name=f"{name}.POS_VEL.pos_kp",
+                    ),
+                    position_ki=_finite_float(
+                        pos_vel.get("pos_ki", 0.0),
+                        name=f"{name}.POS_VEL.pos_ki",
                     ),
                 )
             )
@@ -475,12 +514,16 @@ class B601RSBackend:
         *,
         controller_factory: Callable[[str], object] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if not isinstance(config, B601RSBackendConfig):
             raise TypeError("config must be a B601RSBackendConfig")
         self.config = config
         self._controller_factory = controller_factory
         self._clock = clock
+        if not callable(sleeper):
+            raise TypeError("sleeper must be callable")
+        self._sleeper = sleeper
         self._controller: object | None = None
         self._motors: dict[str, object] = {}
         self._state_sequence = 0
@@ -705,15 +748,11 @@ class B601RSBackend:
                         torque_reported_nm=None,
                         observed_at_sec=now,
                         sample_sequence=self._state_sequence,
-                        valid=(
-                            not request_errors
-                            and poll_error is None
-                            and raw_state_error is None
-                        ),
+                        valid=not request_errors and poll_error is None,
                         stale=bool(
-                            request_errors or poll_error or raw_state_error
+                            request_errors or poll_error
                         ),
-                        error=raw_state_error or poll_error,
+                        error=poll_error,
                         position_source="robstride_mech_pos_parameter",
                     )
                 )
@@ -843,9 +882,17 @@ class B601RSBackend:
         self,
         *,
         joint_names: Sequence[str] | None = None,
+        velocity_limits_rad_s: Sequence[float] | None = None,
         timeout_ms: int = 1000,
     ) -> B601ModeReceipt:
-        """Explicitly set POS_VEL once; never call this from a high-rate loop."""
+        """Apply reBotArm POS_VEL parameters and set the mode once.
+
+        The pinned reBotArm source writes RobStride ``limit_spd`` and the
+        velocity/position-loop gains before calling ``ensure_mode``.  Keep the
+        whole sequence outside the high-rate command loop, and fail closed if
+        any parameter write fails so stale vendor gains are never reported as
+        a completed setup.
+        """
 
         self._require_motion_authorized()
         names = self._resolve_joint_names(joint_names)
@@ -859,16 +906,67 @@ class B601RSBackend:
             mode = getattr(import_module("motorbridge"), "Mode").POS_VEL
         except (ModuleNotFoundError, AttributeError) as exc:
             raise B601HardwareDependencyError("motorbridge.Mode.POS_VEL is unavailable") from exc
+        if velocity_limits_rad_s is None:
+            velocity_limits = tuple(
+                joint.position_velocity_limit_rad_s for joint in self.config.joints
+            )
+        else:
+            velocity_limits = _six_nonnegative(
+                velocity_limits_rad_s,
+                name="velocity_limits_rad_s",
+            )
+            configured_velocity_limits = tuple(
+                joint.position_velocity_limit_rad_s for joint in self.config.joints
+            )
+            if any(
+                velocity_limits[index] > configured_velocity_limits[index]
+                for index in range(6)
+            ):
+                raise ValueError(
+                    "velocity_limits_rad_s exceeds the configured per-joint limit"
+                )
+        index_by_name = {
+            joint.name: index for index, joint in enumerate(self.config.joints)
+        }
         completed: list[str] = []
         failed: list[str] = []
         errors: list[str] = []
         for name in names:
             try:
+                joint = self.config.joints[index_by_name[name]]
+                write_param = getattr(self._motors[name], "robstride_write_param_f32")
+                # This order and the short settling delays mirror the pinned
+                # reBotArm ``JointGroup._write_pv_params`` implementation.
+                write_param(
+                    B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID,
+                    float(velocity_limits[index_by_name[name]]),
+                )
+                self._sleeper(0.01)
+                write_param(
+                    B601_RS_POS_VEL_VEL_KP_PARAM_ID,
+                    float(joint.position_velocity_kp),
+                )
+                self._sleeper(0.01)
+                write_param(
+                    B601_RS_POS_VEL_VEL_KI_PARAM_ID,
+                    float(joint.position_velocity_ki),
+                )
+                self._sleeper(0.01)
+                write_param(
+                    B601_RS_POS_VEL_POS_KP_PARAM_ID,
+                    float(joint.position_kp),
+                )
+                self._sleeper(0.02)
                 getattr(self._motors[name], "ensure_mode")(mode, int(timeout_ms))
+                self._sleeper(0.05)
                 completed.append(name)
             except Exception as exc:
                 failed.append(name)
                 errors.append(f"{name}: {exc}")
+        # JointGroup.mode_pos_vel() waits after the per-joint transition before
+        # returning control to the caller.  This is still one-time setup, never
+        # part of the 125/250/500 Hz reference loop.
+        self._sleeper(0.2)
         return B601ModeReceipt("prepare_position_velocity_mode", names, tuple(completed), tuple(failed), tuple(errors), not failed)
 
     def enable(self, *, joint_names: Sequence[str] | None = None) -> B601ModeReceipt:
@@ -1060,5 +1158,9 @@ __all__ = [
     "B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC",
     "B601_RS_FEEDBACK_FRAME",
     "B601_RS_MECH_POS_PARAM_ID",
+    "B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID",
+    "B601_RS_POS_VEL_VEL_KP_PARAM_ID",
+    "B601_RS_POS_VEL_VEL_KI_PARAM_ID",
+    "B601_RS_POS_VEL_POS_KP_PARAM_ID",
     "B601_RS_POSITION_FRAME",
 ]

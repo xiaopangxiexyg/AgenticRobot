@@ -17,6 +17,15 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   firmware 的紧凑 type-0x18 位置流不由 MotorBridge 0.4.9 解码）。两条路径对缺失/错误
   ID/非零 vendor status/非有限值都生成 `invalid/stale` 状态，绝不补成零；active position
   fallback 可能没有 velocity/torque 字段，力控调用必须单独检查对应字段存在；
+- `prepare_position_velocity_mode()` 对照 pinned reBotArm 的
+  `JointGroup.mode_pos_vel()`，在进入发送循环前按 `0x7017`（limit_spd）、`0x701F`
+  （速度环 Kp）、`0x7020`（速度环 Ki）、`0x701E`（位置环 Kp）的顺序写入 YAML 中的
+  POS_VEL 参数，并保留上游的短暂 settling delay 后再调用 `ensure_mode(POS_VEL)`；若任一
+  参数写入或模式切换失败，receipt 为 incomplete，probe 不会继续使能。POS_VEL 参数写入只
+  发生在一次性 setup，不在高频循环内重复；本次 probe 的有效速度上限同时写入 `0x7017`，
+  因而不会只限制软件命令而留下更宽的驱动器内部限幅；
+  YAML 中的 `pos_ki` 仅按上游 `JointCfg` 保留以保持配置语义，不自行映射到 RobStride
+  未被 reBotArm `_write_pv_params` 使用的寄存器；
 - MotorBridge 0.4.9 的 `MotorState` 没有源时间戳或接收序号，所以反馈状态明确标为
   `freshness_verified=false`、`poll_observation_unverified`，报告的 `vel/torq` 也保留
   `vendor_reported_unverified` 语义；
