@@ -13,7 +13,7 @@ from sim.mujoco.mjcf import convert_urdf_to_mjcf_xml
 from sim.mujoco.modeling.obj_materials import obj_material_mesh_parts
 from sim.mujoco.run_control import build_arg_parser, run
 from sim.mujoco.scene import MujocoScene
-from sim.mujoco.urdf import discover_camera_mounts, parse_urdf
+from sim.mujoco.urdf import URDFModel, discover_camera_mounts, parse_urdf
 from teleop_runtime.schemas import EffectorCommand
 
 
@@ -30,7 +30,24 @@ CAD_DUAL_ARM_URDF = Path(
 
 
 @pytest.fixture(scope="module")
-def canonical_mjcf_xml() -> str:
+def canonical_urdf_model() -> URDFModel:
+    """Parse the immutable canonical URDF once for this test module."""
+
+    return parse_urdf(URDF)
+
+
+@pytest.fixture(scope="module")
+def canonical_camera_mounts(canonical_urdf_model: URDFModel) -> tuple[CameraMount, ...]:
+    """Resolve the canonical camera registry once for all XML assertions."""
+
+    return discover_camera_mounts(canonical_urdf_model)
+
+
+@pytest.fixture(scope="module")
+def canonical_mjcf_xml(
+    canonical_urdf_model: URDFModel,
+    canonical_camera_mounts: tuple[CameraMount, ...],
+) -> str:
     """Convert the immutable canonical URDF once for pure XML assertions.
 
     The conversion is intentionally kept inside the test module rather than
@@ -39,9 +56,10 @@ def canonical_mjcf_xml() -> str:
     The dump-mjcf CLI test below still exercises the real writer path.
     """
 
-    model = parse_urdf(URDF)
-    cameras = discover_camera_mounts(model)
-    return convert_urdf_to_mjcf_xml(model, camera_mounts=cameras)
+    return convert_urdf_to_mjcf_xml(
+        canonical_urdf_model,
+        camera_mounts=canonical_camera_mounts,
+    )
 
 
 def test_canonical_mujoco_package_replaces_legacy_namespace() -> None:
@@ -52,12 +70,10 @@ def test_canonical_mujoco_package_replaces_legacy_namespace() -> None:
 
 
 @pytest.mark.integration
-def test_discovers_registry_cameras_from_explicit_urdf() -> None:
-    model = parse_urdf(URDF)
-
-    cameras = discover_camera_mounts(model)
-
-    assert [(camera.name, camera.link_name) for camera in cameras] == [
+def test_discovers_registry_cameras_from_explicit_urdf(
+    canonical_camera_mounts: tuple[CameraMount, ...],
+) -> None:
+    assert [(camera.name, camera.link_name) for camera in canonical_camera_mounts] == [
         ("front", "head_camera_frame"),
         ("left_wrist", "left_camera_rgb"),
         ("right_wrist", "right_camera_rgb"),
@@ -306,6 +322,25 @@ def test_dump_mjcf_only_does_not_require_mujoco_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This assertion covers the CLI's no-runtime plumbing.  The canonical
+    # asset conversion is exercised by ``canonical_mjcf_xml`` above; using it
+    # here as well would repeat its mesh/material walk without adding coverage
+    # for the dump-only branch.
+    urdf_path = tmp_path / "dump_only.urdf"
+    urdf_path.write_text(
+        """\
+<robot name="dump_only">
+  <link name="base"/>
+  <link name="right_arm"/>
+  <joint name="right_arm_joint6" type="revolute">
+    <parent link="base"/>
+    <child link="right_arm"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+</robot>
+""",
+        encoding="utf-8",
+    )
     mjcf_out = tmp_path / "scene.xml"
 
     def fail_scene_load(*args, **kwargs):
@@ -315,7 +350,7 @@ def test_dump_mjcf_only_does_not_require_mujoco_runtime(
     args = build_arg_parser().parse_args(
         [
             "--urdf",
-            str(URDF),
+            str(urdf_path),
             "--dump-mjcf-only",
             "--mjcf-out",
             str(mjcf_out),
