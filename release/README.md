@@ -26,6 +26,9 @@ Retained snapshots:
 - [`refinement_annotation_20260807_39895a67ef52`](./refinement_annotation_20260807_39895a67ef52/ANNOTATION_RELEASE.md):
   prior generated source projection retained for rollback and receipt
   verification.
-- [`refinement_annotation`](./refinement_annotation/ANNOTATION_RELEASE.md):
-  immutable 2026-08-07 15:57 snapshot retained for rollback and receipt
-  verification. It is not the current bundle and must not be overwritten.
+
+The former undated `refinement_annotation/` snapshot was retired because its
+tracked contents no longer matched its receipt. See the
+[retirement record](../docs/legacy/reports/refinement_annotation_undated_bundle_retirement_20260827.md).
+Generate disposable handoff candidates under the ignored `dist/` root, and use
+a dated, source-hash-qualified name for any newly reviewed tracked snapshot.
