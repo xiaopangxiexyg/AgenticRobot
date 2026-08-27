@@ -2488,12 +2488,13 @@ def test_active_admittance_receipts_gate_home_and_recording_transitions() -> Non
         "if not reset_position_admittance_shadow("
     ) < explicit_home.index("progress_workflow.handle_command(")
 
-    assert "admittance_rearm_ready = True" in episode_start
-    assert "if not admittance_rearm_ready:" in episode_start
-    assert "_cancel_recording_countdown_for_hold_best_effort(" in episode_start
-    assert "continue" in episode_start[
-        episode_start.index("if not admittance_rearm_ready:") :
-    ]
+    # Episode start is a realtime-loop submission boundary.  Tactile
+    # maintenance quiesce and writer preparation are owned by the asynchronous
+    # collection control plane, so this block must not synchronously wait and
+    # then compensate Active admittance clocks for its own pause.
+    assert "schedule_recording_countdown(" in episode_start
+    assert "require_idle_tactile_quiesced(" not in episode_start
+    assert "rearm_position_admittance_after_control_plane_pause(" not in episode_start
 
     assert "if not rearm_position_admittance_after_control_plane_pause(" in episode_open
     assert "_cancel_recording_countdown_for_hold_best_effort(" in episode_open

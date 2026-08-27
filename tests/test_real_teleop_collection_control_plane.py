@@ -179,6 +179,271 @@ def test_finalize_thread_construction_failure_is_a_consumable_result(
     assert recorder.poll_finalize_tasks() == [task]
 
 
+def test_thread_writer_pause_never_waits_for_inflight_sample_and_resume_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PendingSample:
+        settled = False
+        result_calls = 0
+
+        def done(self) -> bool:
+            return bool(self.settled)
+
+        def result(self) -> bool:
+            self.result_calls += 1
+            if not self.settled:
+                raise AssertionError("pause must not wait for the sample")
+            return True
+
+    pending = PendingSample()
+    temporal_resets: list[str] = []
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    recorder.collection_worker_mode = "thread"
+    recorder.active_episode_index = 3
+    recorder.sample_builder = SimpleNamespace(
+        frame_index=11,
+        reset_temporal_history=lambda: temporal_resets.append("reset"),
+    )
+    recorder._sample_future = pending
+    recorder._sample_overload_reason = None
+    recorder._sample_modality_reason = None
+    recorder._collection_integrity_reasons = []
+    recorder._pause_started_at = None
+    recorder._pause_started_monotonic = None
+    recorder._pause_reason = None
+    recorder._pause_reasons = []
+    recorder._pause_started_frame_index = None
+    recorder._pause_started_step_index = None
+    recorder._pause_started_last_state = None
+    recorder._pause_segments = []
+    recorder._paused_accumulated_sec = 0.0
+    recorder._record_timestamps = []
+    recorder._continuity_segment_index = 0
+
+    monotonic_calls = iter((10.0, 10.1, 10.2))
+    monkeypatch.setattr(dataset_recorder_module.time, "monotonic", lambda: next(monotonic_calls))
+
+    assert recorder.pause_episode(
+        reason="hold_requested",
+        now=100.0,
+        step_index=21,
+        last_state="RUNNING",
+    )
+    assert recorder.is_paused
+    assert recorder._sample_future is pending
+    assert pending.result_calls == 0
+
+    assert not recorder.resume_episode(
+        reason="runtime_running_warmup_ready",
+        now=101.0,
+        step_index=22,
+    )
+    assert recorder.is_paused
+    assert temporal_resets == []
+    assert pending.result_calls == 0
+
+    pending.settled = True
+    recorder.sample_builder.frame_index = 12
+    assert recorder.resume_episode(
+        reason="runtime_running_warmup_ready",
+        now=102.0,
+        step_index=23,
+    )
+    assert not recorder.is_paused
+    assert recorder._sample_future is None
+    assert pending.result_calls == 1
+    assert temporal_resets == ["reset"]
+    assert recorder.continuity_segment_index == 1
+    assert recorder._pause_segments[-1]["start_frame_index"] == 12
+
+
+def test_thread_writer_resume_stays_paused_after_inflight_sample_failure() -> None:
+    class FailedSample:
+        def done(self) -> bool:
+            return True
+
+        def result(self) -> None:
+            raise RuntimeError("writer queue failed")
+
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    recorder.collection_worker_mode = "thread"
+    recorder.active_episode_index = 3
+    recorder.sample_builder = SimpleNamespace(
+        frame_index=11,
+        reset_temporal_history=lambda: None,
+    )
+    recorder._sample_future = FailedSample()
+    recorder._sample_overload_reason = None
+    recorder._sample_modality_reason = None
+    recorder._collection_integrity_reasons = []
+    recorder._pause_started_at = 100.0
+    recorder._pause_started_monotonic = time.monotonic()
+    recorder._pause_reason = "hold_requested"
+    recorder._pause_reasons = ["hold_requested"]
+    recorder._pause_started_frame_index = 11
+    recorder._pause_started_step_index = 21
+    recorder._pause_started_last_state = "RUNNING"
+    recorder._pause_segments = []
+    recorder._paused_accumulated_sec = 0.0
+    recorder._record_timestamps = []
+    recorder._continuity_segment_index = 0
+
+    with pytest.raises(RuntimeError, match="uncommitted sample worker failure"):
+        recorder.resume_episode(
+            reason="runtime_running_warmup_ready",
+            now=101.0,
+            step_index=22,
+        )
+
+    assert recorder.is_paused
+    assert recorder._sample_future is None
+    assert recorder.collection_overload_reason.startswith(
+        "collection_sample_drain_error:RuntimeError:writer queue failed"
+    )
+    assert recorder.continuity_segment_index == 0
+
+
+def test_process_writer_resume_orders_snapshot_before_temporal_reset() -> None:
+    class PendingSnapshot:
+        settled = False
+        result_calls = 0
+
+        def done(self) -> bool:
+            return bool(self.settled)
+
+        def result(self) -> bool:
+            self.result_calls += 1
+            if not self.settled:
+                raise AssertionError("resume must not wait for snapshot submission")
+            return True
+
+    pending = PendingSnapshot()
+    ordered_events: list[str] = []
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    recorder.collection_worker_mode = "process"
+    recorder.active_episode_index = 3
+    recorder._process_episode_submitted_count = 11
+    recorder.process_worker = SimpleNamespace(
+        reset_temporal_history=lambda: ordered_events.append("reset")
+    )
+    recorder._sample_future = pending
+    recorder._sample_overload_reason = None
+    recorder._sample_modality_reason = None
+    recorder._collection_integrity_reasons = []
+    recorder._pause_started_at = 100.0
+    recorder._pause_started_monotonic = time.monotonic()
+    recorder._pause_reason = "hold_requested"
+    recorder._pause_reasons = ["hold_requested"]
+    recorder._pause_started_frame_index = 11
+    recorder._pause_started_step_index = 21
+    recorder._pause_started_last_state = "RUNNING"
+    recorder._pause_segments = []
+    recorder._paused_accumulated_sec = 0.0
+    recorder._record_timestamps = []
+    recorder._continuity_segment_index = 0
+
+    assert not recorder.resume_episode(
+        reason="runtime_running_warmup_ready",
+        now=101.0,
+        step_index=22,
+    )
+    assert ordered_events == []
+    assert pending.result_calls == 0
+
+    pending.settled = True
+    recorder._process_episode_submitted_count = 12
+    assert recorder.resume_episode(
+        reason="runtime_running_warmup_ready",
+        now=102.0,
+        step_index=23,
+    )
+    assert pending.result_calls == 1
+    assert ordered_events == ["reset"]
+    assert not recorder.is_paused
+    assert recorder._pause_segments[-1]["start_frame_index"] == 12
+
+
+def test_sample_executor_submission_failure_is_contained_as_overload() -> None:
+    class FailedExecutor:
+        def submit(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("executor unavailable")
+
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    recorder.collection_worker_mode = "thread"
+    recorder.active_episode_index = 2
+    recorder.args = SimpleNamespace(collection_progress_arm_control_mode="profile")
+    recorder._async_sample_enabled = True
+    recorder._sample_future = None
+    recorder._sample_executor = FailedExecutor()
+    recorder._sample_overload_reason = None
+    recorder._sample_modality_reason = None
+    recorder._collection_integrity_reasons = []
+    recorder._pause_started_at = None
+
+    assert not recorder.record_step_async(SimpleNamespace())
+    assert recorder._sample_future is None
+    assert recorder.collection_overload_reason == (
+        "collection_sample_submit_error:RuntimeError:executor unavailable"
+    )
+    assert recorder._collection_integrity_reasons == [
+        "collection_sample_submit_error:RuntimeError:executor unavailable"
+    ]
+
+    recorder._sample_executor = None
+    recorder._sample_overload_reason = None
+    assert not recorder.record_step_async(SimpleNamespace())
+    assert recorder.collection_overload_reason == (
+        "collection_sample_submit_error:"
+        "RuntimeError:teleop sample executor is not available"
+    )
+
+
+def test_thread_writer_live_frequency_status_never_reads_writer_io_lock() -> None:
+    writer_calls: list[int] = []
+
+    def tactile_frame_counts(episode_index: int) -> dict[str, int]:
+        writer_calls.append(int(episode_index))
+        return {"left": 9}
+
+    recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
+    recorder.collection_worker_mode = "thread"
+    recorder.active_episode_index = 4
+    recorder.sample_builder = SimpleNamespace(
+        frame_index=12,
+        last_camera_rejection=None,
+        last_camera_frame_age_sec_by_key={},
+    )
+    recorder.writer = SimpleNamespace(tactile_frame_counts=tactile_frame_counts)
+    recorder.writer_observer = None
+    recorder.process_worker = None
+    recorder._tactile_frame_counts_cache = {4: {"left": 7}}
+    recorder._record_timestamps = []
+    recorder._episode_start_monotonic = time.monotonic() - 1.0
+    recorder._pause_started_at = None
+    recorder._pause_started_monotonic = None
+    recorder._paused_accumulated_sec = 0.0
+    recorder.frequency_warning_hz = 15.0
+    recorder.frequency_window_sec = 3.0
+    recorder.frequency_min_elapsed_sec = 2.0
+    recorder._async_sample_enabled = True
+    recorder._sample_async_skipped_busy = 0
+    recorder._sample_process_rejected_busy = 0
+    recorder._sample_overload_reason = None
+    recorder._collection_integrity_reasons = []
+
+    live_status = recorder.collection_frequency_status()
+
+    assert writer_calls == []
+    assert live_status["tactile_frame_counts"] == {"left": 7}
+
+    assert recorder._refresh_tactile_frame_counts() == {"left": 9}
+    finalize_status = recorder.collection_frequency_status()
+
+    assert writer_calls == [4]
+    assert finalize_status["tactile_frame_counts"] == {"left": 9}
+    assert recorder._tactile_frame_counts_cache == {4: {"left": 9}}
+
+
 def test_completed_finalize_remains_owned_until_result_is_polled() -> None:
     recorder = RealTeleopDatasetRecorder.__new__(RealTeleopDatasetRecorder)
     completed = SimpleNamespace(done=True, thread=None, success=True)

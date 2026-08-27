@@ -3399,39 +3399,16 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                     if control_ui is not None:
                         control_ui.append_message("Progress", message)
                     continue
-                control_plane_pause_started_at = time.perf_counter()
-                admittance_rearm_ready = True
-                try:
-                    require_idle_tactile_quiesced("formal_episode_start")
-                except Exception as exc:  # noqa: BLE001 - deny start, keep Hold/runtime.
-                    message = (
-                        "数采开始被拒绝：触觉后台压缩未能安全停止："
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    _log("TactileCompression", message, now=loop_start)
-                    if control_ui is not None:
-                        control_ui.append_message("Dataset", message)
-                else:
-                    schedule_recording_countdown(
-                        loop_start,
-                        start_reason="manual_key_start",
-                    )
-                finally:
-                    admittance_rearm_ready = (
-                        rearm_position_admittance_after_control_plane_pause(
-                            started_at=control_plane_pause_started_at,
-                            reason="formal_episode_start",
-                            now=loop_start,
-                        )
-                    )
-                if not admittance_rearm_ready:
-                    _cancel_recording_countdown_for_hold_best_effort(
-                        cancel_recording_countdown,
-                        now=loop_start,
-                        reason="position_admittance_control_plane_rearm_failed",
-                        log=_log,
-                    )
-                    continue
+                # schedule_recording_countdown() transfers the authoritative
+                # tactile-maintenance quiesce, dataset contract check, and
+                # writer ready handshake to the collection control plane.
+                # The former duplicate synchronous quiesce waited for that
+                # process from the realtime arm loop before the same check ran
+                # again in prepare_writer().
+                schedule_recording_countdown(
+                    loop_start,
+                    start_reason="manual_key_start",
+                )
         mark_loop_phase("loop.keys")
 
         # Control-plane work above may legitimately wait for a writer RPC,

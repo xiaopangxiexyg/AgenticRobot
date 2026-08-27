@@ -733,6 +733,10 @@ class RealTeleopDatasetRecorder:
         self._sample_modality_reason: str | None = None
         self._process_episode_submitted_count = 0
         self._collection_integrity_reasons: list[str] = []
+        # Thread-mode writer counters are protected by the same lock as
+        # video/tactile disk writes.  The realtime status path must never wait
+        # on that lock; an off-loop lifecycle boundary refreshes this cache.
+        self._tactile_frame_counts_cache: dict[int, dict[str, int]] = {}
 
     def _plan_thread_write_jobs(
         self,
@@ -1692,6 +1696,10 @@ class RealTeleopDatasetRecorder:
         self._sample_overload_reason = None
         self._sample_modality_reason = None
         self._collection_integrity_reasons = []
+        getattr(self, "_tactile_frame_counts_cache", {}).pop(
+            int(episode_index),
+            None,
+        )
         self.active_episode_index = int(episode_index)
         self.active_started_at = float(now)
         self._active_control_trace_preparation = trace_preparation
@@ -1843,11 +1851,13 @@ class RealTeleopDatasetRecorder:
             if normalized_reason and normalized_reason not in self._pause_reasons:
                 self._pause_reasons.append(normalized_reason)
             return False
-        # Process mode pauses must never wait on the snapshot thread from the
-        # 60 Hz control loop.  At most the already accepted causal sample may
-        # complete after this boundary; stop/finalize still performs a drain.
-        if getattr(self, "collection_worker_mode", "thread") == "thread":
-            self._drain_async_sample()
+        # Pause is called from the realtime control loop for Hold, dispatch,
+        # modality, and safety boundaries.  The one already accepted causal
+        # sample may still be owned by the sample executor, but waiting for it
+        # here would put writer/storage latency back onto the arm loop.  Close
+        # the admission gate immediately for both worker modes.  Resume below
+        # will not reset temporal state until that old sample has settled, and
+        # stop/finalize performs the authoritative blocking drain off-loop.
         if not hasattr(self, "_pause_segments"):
             self._pause_segments = []
         self._pause_started_at = float(now)
@@ -1915,6 +1925,38 @@ class RealTeleopDatasetRecorder:
     ) -> bool:
         if not self.is_paused:
             return False
+        # The pause gate may have closed while the sole accepted sample was
+        # still assembling.  In thread mode it may be writing through the
+        # shared builder; in process mode it may not yet have submitted its
+        # snapshot ahead of the ordered reset RPC.  Never reset either
+        # temporal owner concurrently with that task, and never wait for it
+        # from the realtime loop.  A completed Future can be consumed without
+        # blocking before the reset.
+        pending_sample = getattr(self, "_sample_future", None)
+        if pending_sample is not None:
+            if not pending_sample.done():
+                return False
+            self._drain_async_sample()
+            # The Future's causal cut predates pause admission even if its
+            # frame counter became visible afterward.  Advance the segment's
+            # frame cut so diagnostics do not report that accepted sample as
+            # having been written inside the paused interval.
+            if self._pause_started_frame_index is not None:
+                self._pause_started_frame_index = int(self.frame_count)
+        terminal_sample_error_prefixes = (
+            "collection_sample_drain_error:",
+            "collection_sample_submit_error:",
+            "collection_writer_error:",
+            "collection_process_error:",
+        )
+        terminal_sample_error = str(
+            getattr(self, "_sample_overload_reason", None) or ""
+        )
+        if terminal_sample_error.startswith(terminal_sample_error_prefixes):
+            raise RuntimeError(
+                "cannot resume after an uncommitted sample worker failure: "
+                + terminal_sample_error
+            )
         # Reset model-temporal state while the recorder is still paused.  If
         # the process worker cannot acknowledge the ordered reset, fail closed
         # and leave the episode paused instead of reopening a mixed segment.
@@ -1963,6 +2005,27 @@ class RealTeleopDatasetRecorder:
             "recording_wall_duration_sec": wall_elapsed_sec,
         }
 
+    def _refresh_tactile_frame_counts(self) -> dict[str, int]:
+        """Refresh writer-owned counts from an explicitly off-loop caller."""
+
+        if self.active_episode_index is None:
+            return {}
+        episode_index = int(self.active_episode_index)
+        cache = getattr(self, "_tactile_frame_counts_cache", None)
+        if cache is None:
+            cache = {}
+            self._tactile_frame_counts_cache = cache
+        try:
+            tactile_frame_counts = self.writer.tactile_frame_counts(episode_index)
+        except Exception:  # noqa: BLE001 - diagnostics remain observational.
+            return dict(cache.get(episode_index, {}))
+        normalized = {
+            str(side): int(count)
+            for side, count in tactile_frame_counts.items()
+        }
+        cache[episode_index] = dict(normalized)
+        return normalized
+
     def collection_frequency_status(self) -> dict[str, Any]:
         frame_count = int(self.frame_count)
         current_time = time.monotonic()
@@ -2009,10 +2072,20 @@ class RealTeleopDatasetRecorder:
         tactile_frame_counts: dict[str, int] = {}
         tactile_write_hz: dict[str, float] = {}
         if self.active_episode_index is not None:
-            try:
-                tactile_frame_counts = self.writer.tactile_frame_counts(self.active_episode_index)
-            except Exception:  # noqa: BLE001
-                tactile_frame_counts = {}
+            episode_index = int(self.active_episode_index)
+            cache = getattr(self, "_tactile_frame_counts_cache", None)
+            if cache is None:
+                cache = {}
+                self._tactile_frame_counts_cache = cache
+            if getattr(self, "collection_worker_mode", "thread") == "process":
+                # Process counters drain only the parent's nonblocking ACK
+                # queue and never acquire the child writer's disk-I/O lock.
+                tactile_frame_counts = self._refresh_tactile_frame_counts()
+            else:
+                # In thread mode tactile_frame_counts() takes the writer's
+                # disk-I/O lock.  Live status runs on the arm loop and may
+                # only read the last off-loop snapshot.
+                tactile_frame_counts = dict(cache.get(episode_index, {}))
         if elapsed_sec > 0.0:
             tactile_write_hz = {
                 side: float(count) / elapsed_sec
@@ -2338,16 +2411,30 @@ class RealTeleopDatasetRecorder:
                 return False
         executor = getattr(self, "_sample_executor", None)
         if executor is None:
-            raise RuntimeError("teleop sample executor is not available")
-        self._sample_future = executor.submit(
-            self.record_step,
-            step_result,
-            include_debug_metadata=include_debug_metadata,
-            include_action_debug_metadata=include_action_debug_metadata,
-            phase_recorder=None,
-            metadata_extra=None if metadata_extra is None else dict(metadata_extra),
-            strict_progress_step_id=strict_progress_step_id,
-        )
+            self._sample_overload_reason = (
+                "collection_sample_submit_error:"
+                "RuntimeError:teleop sample executor is not available"
+            )
+            self._mark_collection_integrity_issue(self._sample_overload_reason)
+            return False
+        try:
+            self._sample_future = executor.submit(
+                self.record_step,
+                step_result,
+                include_debug_metadata=include_debug_metadata,
+                include_action_debug_metadata=include_action_debug_metadata,
+                phase_recorder=None,
+                metadata_extra=None if metadata_extra is None else dict(metadata_extra),
+                strict_progress_step_id=strict_progress_step_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate collection from control.
+            self._sample_future = None
+            self._sample_overload_reason = (
+                "collection_sample_submit_error:"
+                f"{type(exc).__name__}:{exc}"
+            )
+            self._mark_collection_integrity_issue(self._sample_overload_reason)
+            return False
         return True
 
     @property
@@ -2821,6 +2908,10 @@ class RealTeleopDatasetRecorder:
             )
         episode_index = int(self.active_episode_index)
         frame_count = int(self.frame_count)
+        # stop_episode() runs on the collection control plane.  It may safely
+        # wait for the thread writer's counter lock here so the durable
+        # finalize summary receives the latest exact tactile count.
+        self._refresh_tactile_frame_counts()
         frequency_status = self.collection_frequency_status()
         pause_summary = self.pause_summary()
         trace_sink = getattr(self, "control_trace_episode_sink", None)
