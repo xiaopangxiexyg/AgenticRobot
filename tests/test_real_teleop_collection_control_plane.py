@@ -395,6 +395,8 @@ def _episode_runtime(
     episode_recorder_override: object | None = None,
     publish_runtime_hardware_status=lambda: None,
     bind_capture_modality_contract=lambda *_args, **_kwargs: None,
+    position_episode_debug_runtime_override: object | None = None,
+    update_control_debug_runtime_metadata=lambda **_kwargs: None,
 ):
     logs: list[tuple[str, str]] = []
     episode_state = [None]
@@ -460,13 +462,17 @@ def _episode_runtime(
         control_ui=control_ui,
         startup_device_errors={},
         fix_hold_coordinator=SimpleNamespace(active=False),
-        position_episode_debug_runtime=SimpleNamespace(
-            start=lambda *_args, **_kwargs: False,
-            stop=lambda *_args, **_kwargs: None,
-            start_close=lambda _action: None,
-            current_recorder=lambda: None,
+        position_episode_debug_runtime=(
+            SimpleNamespace(
+                start=lambda *_args, **_kwargs: False,
+                stop=lambda *_args, **_kwargs: None,
+                start_close=lambda _action: None,
+                current_recorder=lambda: None,
+            )
+            if position_episode_debug_runtime_override is None
+            else position_episode_debug_runtime_override
         ),
-        update_control_debug_runtime_metadata=lambda **_kwargs: None,
+        update_control_debug_runtime_metadata=update_control_debug_runtime_metadata,
         publish_runtime_hardware_status=publish_runtime_hardware_status,
         collection_startup_blockers=lambda: {},
         recording_warmup_status=lambda *_args, **_kwargs: (True, "ready"),
@@ -723,6 +729,198 @@ def test_debug_trajectory_start_failure_does_not_close_formal_episode(
         tag == "Episode"
         and "formal dataset episode remains active" in message
         and "debug trajectory disk unavailable" in message
+        for tag, message in logs
+    )
+    assert runtime.close()
+
+
+def test_position_audit_start_and_metadata_failures_are_observational(
+    tmp_path: Path,
+) -> None:
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("test must reuse the published recorder")
+
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True,
+        finalizing=False,
+        is_recording=False,
+        is_paused=False,
+        frame_count=0,
+        active_episode_index=None,
+        camera_sources={},
+        require_configured_for_current_args=lambda: None,
+        collection_frequency_status=lambda: {},
+        poll_finalize_tasks=lambda: [],
+        close=lambda: None,
+    )
+
+    def start_episode(_metadata: object, *, now: float) -> int:
+        del now
+        recorder.is_recording = True
+        recorder.active_episode_index = 5
+        return 5
+
+    def stop_episode(**_kwargs: object) -> None:
+        recorder.is_recording = False
+        recorder.active_episode_index = None
+        return None
+
+    recorder.start_episode = start_episode
+    recorder.stop_episode = stop_episode
+    position_debug_runtime = SimpleNamespace(
+        start=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("audit attach metadata unavailable")
+        ),
+        stop=lambda *_args, **_kwargs: None,
+        start_close=lambda _action: None,
+        current_recorder=lambda: None,
+    )
+
+    class FailingPlus(_Clutch):
+        def begin_plus_curation_episode(self, episode_index: int) -> None:
+            del episode_index
+            raise LookupError("Plus projection unavailable")
+
+    slot: list[object | None] = [recorder]
+    clutch = FailingPlus()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        position_episode_debug_runtime_override=position_debug_runtime,
+        update_control_debug_runtime_metadata=lambda **_kwargs: (
+            _ for _ in ()
+        ).throw(RuntimeError("debug metadata store unavailable")),
+    )
+    args.control_debug_config.enabled = True
+
+    assert runtime.start_recording(time.time(), start_reason="unit")
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert slot[0] is recorder
+    assert recorder.is_recording
+    assert recorder.active_episode_index == 5
+    assert args.dataset_startup_error == ""
+    assert clutch.recording_states[-1]["event_status"] == "recording"
+    assert any(
+        tag == "ControlDebug"
+        and "formal dataset start continues" in message
+        and "audit attach metadata unavailable" in message
+        for tag, message in logs
+    )
+    assert any(
+        tag == "ControlDebug"
+        and "episode index mismatch metadata publication failed" in message
+        and "debug metadata store unavailable" in message
+        for tag, message in logs
+    )
+    assert any(
+        tag == "Plus"
+        and "正式原始数采继续" in message
+        and "Plus projection unavailable" in message
+        for tag, message in logs
+    )
+    assert runtime.close()
+
+
+def test_position_audit_detach_failure_cannot_veto_formal_stop(
+    tmp_path: Path,
+) -> None:
+    formal_stop_calls: list[dict[str, object]] = []
+    audit_close_timeouts: list[float] = []
+
+    class Recorder:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("test must reuse the published recorder")
+
+    recorder = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer=SimpleNamespace(next_episode_index=4),
+        writer_started=True,
+        finalizing=False,
+        is_recording=True,
+        is_paused=False,
+        frame_count=12,
+        active_episode_index=4,
+        camera_sources={},
+        collection_frequency_status=lambda: {},
+        poll_finalize_tasks=lambda: [],
+        close=lambda: None,
+    )
+
+    def stop_episode(**kwargs: object) -> None:
+        formal_stop_calls.append(dict(kwargs))
+        before_finalize = kwargs.get("before_finalize")
+        assert callable(before_finalize)
+        audit_result = before_finalize()
+        assert audit_result is not None
+        assert audit_result["recovered_after_stop_error"] is True
+        recorder.is_recording = False
+        recorder.active_episode_index = None
+        return None
+
+    recorder.stop_episode = stop_episode
+    audit_recorder = SimpleNamespace(
+        close=lambda *, timeout_sec: audit_close_timeouts.append(float(timeout_sec)),
+        snapshot=lambda: {"closed": True, "enqueue_drop_count": 0},
+    )
+    audit_slot: list[object | None] = [audit_recorder]
+
+    def stop_position_debug(*, reason: str) -> None:
+        assert reason == "unit"
+        audit_slot[0] = None
+        raise RuntimeError("audit detach metadata unavailable")
+
+    position_debug_runtime = SimpleNamespace(
+        start=lambda *_args, **_kwargs: False,
+        stop=stop_position_debug,
+        start_close=lambda _action: (_ for _ in ()).throw(
+            RuntimeError("audit close thread unavailable")
+        ),
+        current_recorder=lambda: audit_slot[0],
+    )
+    slot: list[object | None] = [recorder]
+    clutch = _Clutch()
+    runtime, args, logs = _episode_runtime(
+        tmp_path=tmp_path,
+        recorder_type=Recorder,
+        dataset_slot=slot,
+        clutch=clutch,
+        transition_calls=[],
+        position_episode_debug_runtime_override=position_debug_runtime,
+    )
+
+    assert runtime.stop_recording(time.time(), end_reason="unit")
+    deadline = time.monotonic() + 1.0
+    while runtime.collection_transition_active() and time.monotonic() < deadline:
+        runtime.poll_dataset_finalize(time.time())
+        time.sleep(0.001)
+
+    assert len(formal_stop_calls) == 1
+    assert formal_stop_calls[0]["defer_finalize_start"] is False
+    assert audit_close_timeouts == [5.0]
+    assert recorder.is_recording is False
+    assert slot[0] is recorder
+    assert args.dataset_startup_error == ""
+    assert clutch.recording_states[-1]["event_status"] == "discarded"
+    assert any(
+        tag == "ControlDebug"
+        and "episode audit stop failed" in message
+        and "audit detach metadata unavailable" in message
+        for tag, message in logs
+    )
+    assert any(
+        tag == "ControlDebug"
+        and "will be delegated to formal finalize" in message
+        and "audit close thread unavailable" in message
         for tag, message in logs
     )
     assert runtime.close()

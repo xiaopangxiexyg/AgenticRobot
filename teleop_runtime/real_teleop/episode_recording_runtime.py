@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -224,13 +225,156 @@ def build_episode_recording_runtime(
         *,
         recorder: Any | None = None,
     ) -> bool:
-        return position_episode_debug_runtime.start(
-            episode_index,
-            dataset_recorder=(dataset_recorder if recorder is None else recorder),
+        try:
+            return bool(
+                position_episode_debug_runtime.start(
+                    episode_index,
+                    dataset_recorder=(
+                        dataset_recorder if recorder is None else recorder
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - debug is subordinate.
+            _log(
+                "ControlDebug",
+                "WARNING: episode audit start failed outside its internal "
+                "best-effort boundary; formal dataset start continues: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+
+    def current_position_episode_debug_recorder() -> Any | None:
+        try:
+            return position_episode_debug_runtime.current_recorder()
+        except Exception as exc:  # noqa: BLE001 - debug is subordinate.
+            _log(
+                "ControlDebug",
+                "WARNING: episode audit ownership observation failed; formal "
+                f"dataset lifecycle continues: {type(exc).__name__}: {exc}",
+            )
+            return None
+
+    def guard_position_episode_debug_close(
+        close_recorder: Callable[[], Mapping[str, Any] | None],
+        *,
+        context: str,
+    ) -> Callable[[], Mapping[str, Any] | None]:
+        """Keep an optional audit close from changing formal writer outcome."""
+
+        close_lock = threading.Lock()
+        close_attempted = False
+        close_result: Mapping[str, Any] | None = None
+
+        def guarded_close() -> Mapping[str, Any] | None:
+            nonlocal close_attempted, close_result
+            with close_lock:
+                if close_attempted:
+                    return close_result
+                close_attempted = True
+                try:
+                    close_result = close_recorder()
+                except Exception as exc:  # noqa: BLE001 - debug is subordinate.
+                    error = f"{type(exc).__name__}: {exc}"
+                    _log(
+                        "ControlDebug",
+                        f"WARNING: episode audit close failed during {context}; "
+                        f"formal dataset lifecycle continues: {error}",
+                    )
+                    close_result = {"closed": False, "error": error}
+                return close_result
+
+        return guarded_close
+
+    def detached_position_episode_debug_close(
+        recorder: Any,
+        *,
+        reason: str,
+    ) -> Callable[[], Mapping[str, Any] | None]:
+        """Recover ownership when stop detached a sidecar before raising."""
+
+        def close_detached_recorder() -> Mapping[str, Any] | None:
+            recorder.close(timeout_sec=5.0)
+            snapshot_method = getattr(recorder, "snapshot", None)
+            snapshot = dict(snapshot_method()) if callable(snapshot_method) else {}
+            return {
+                "closed": bool(snapshot.get("closed", True)),
+                "enqueue_drop_count": int(
+                    snapshot.get("enqueue_drop_count", 0) or 0
+                ),
+                "writer_error": snapshot.get("writer_error"),
+                "recovered_after_stop_error": True,
+            }
+
+        return guard_position_episode_debug_close(
+            close_detached_recorder,
+            context=f"detached-stop recovery ({reason})",
         )
 
-    stop_position_episode_debug = position_episode_debug_runtime.stop
-    start_position_episode_debug_close = position_episode_debug_runtime.start_close
+    def stop_position_episode_debug(
+        *,
+        reason: str,
+    ) -> Callable[[], Mapping[str, Any] | None] | None:
+        recorder_before = current_position_episode_debug_recorder()
+        try:
+            close_recorder = position_episode_debug_runtime.stop(reason=reason)
+        except Exception as exc:  # noqa: BLE001 - debug is subordinate.
+            recorder_after = current_position_episode_debug_recorder()
+            _log(
+                "ControlDebug",
+                "WARNING: episode audit stop failed; formal dataset stop "
+                f"continues: {type(exc).__name__}: {exc}",
+            )
+            if recorder_before is not None and recorder_after is not recorder_before:
+                # The production stop path clears its authoritative slot before
+                # publishing optional metadata.  If metadata publication then
+                # raises, retain the detached recorder through an explicit
+                # close action instead of leaking it or vetoing formal stop.
+                return detached_position_episode_debug_close(
+                    recorder_before,
+                    reason=reason,
+                )
+            return None
+        if close_recorder is None:
+            return None
+        return guard_position_episode_debug_close(
+            close_recorder,
+            context=f"normal stop ({reason})",
+        )
+
+    def start_position_episode_debug_close(
+        close_recorder: Callable[[], Mapping[str, Any] | None],
+    ) -> bool:
+        try:
+            position_episode_debug_runtime.start_close(close_recorder)
+        except Exception as exc:  # noqa: BLE001 - debug is subordinate.
+            _log(
+                "ControlDebug",
+                "WARNING: episode audit close worker did not start; its close "
+                "will be delegated to formal finalize: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+        return True
+
+    def update_control_debug_metadata_observation(
+        *,
+        context: str,
+        now: float,
+        **updates: object,
+    ) -> bool:
+        """Publish optional debug metadata without becoming a lifecycle gate."""
+
+        try:
+            update_control_debug_runtime_metadata(**updates)
+        except Exception as exc:  # noqa: BLE001 - metadata is observational.
+            _log(
+                "ControlDebug",
+                f"WARNING: {context} metadata publication failed; formal "
+                f"dataset lifecycle is unchanged: {type(exc).__name__}: {exc}",
+                now=now,
+            )
+            return False
+        return True
 
     def refresh_runtime_views() -> None:
         nonlocal dataset_recorder, camera_previewer, episode_last_state, step_index
@@ -707,7 +851,7 @@ def build_episode_recording_runtime(
                     except BaseException:
                         pass
                 if position_debug_started or (
-                    position_episode_debug_runtime.current_recorder() is not None
+                    current_position_episode_debug_recorder() is not None
                 ):
                     try:
                         audit_close = stop_position_episode_debug(
@@ -747,6 +891,12 @@ def build_episode_recording_runtime(
                     value.recorder.close()
                 except BaseException:
                     pass
+            if current_position_episode_debug_recorder() is not None:
+                audit_close = stop_position_episode_debug(
+                    reason="episode_open_cancelled"
+                )
+                if audit_close is not None:
+                    audit_close()
 
         episode_open_recorder = formal_recorder
         episode_open_start_attempted = False
@@ -1308,13 +1458,16 @@ def build_episode_recording_runtime(
         frame_count = recording_frame_count()
         audit_close = None
         impedance_finalize_deferred_launch = False
+        audit_close_in_formal_finalize = False
         if formal_recorder is not None:
             audit_close = stop_position_episode_debug(reason=end_reason)
             impedance_finalize_deferred_launch = _arm_control_mode_arg(args) == "impedance"
             if audit_close is not None and not impedance_finalize_deferred_launch:
                 # Preserve the prior position-mode ordering and behavior:
                 # diagnostic close remains independent of its writer path.
-                start_position_episode_debug_close(audit_close)
+                audit_close_in_formal_finalize = not (
+                    start_position_episode_debug_close(audit_close)
+                )
 
         captured_last_state = episode_last_state
         captured_step_index = int(step_index)
@@ -1335,14 +1488,20 @@ def build_episode_recording_runtime(
                         defer_finalize_start=impedance_finalize_deferred_launch,
                         before_finalize=(
                             audit_close
-                            if impedance_finalize_deferred_launch
+                            if (
+                                impedance_finalize_deferred_launch
+                                or audit_close_in_formal_finalize
+                            )
                             else None
                         ),
                     )
                     if (
                         audit_close is not None
                         and task is None
-                        and impedance_finalize_deferred_launch
+                        and (
+                            impedance_finalize_deferred_launch
+                            or audit_close_in_formal_finalize
+                        )
                     ):
                         audit_close()
                 if debug_was_recording:
@@ -2030,7 +2189,9 @@ def build_episode_recording_runtime(
                     now=now,
                 )
             if bool(getattr(getattr(args, "control_debug_config", None), "enabled", False)):
-                update_control_debug_runtime_metadata(
+                update_control_debug_metadata_observation(
+                    context="dataset start failure",
+                    now=now,
                     episode_sidecar_error=f"dataset_start_failed:{detail}"
                 )
             message = f"正式 dataset episode 启动失败: {detail}"
@@ -2065,7 +2226,7 @@ def build_episode_recording_runtime(
                 clutch_input.begin_plus_curation_episode(
                     int(completion.episode_index)
                 )
-            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            except Exception as exc:  # noqa: BLE001 - Plus is subordinate.
                 # Plus remains subordinate to raw collection.  The formal
                 # episode is already open and must keep recording.
                 message = (
@@ -2085,7 +2246,9 @@ def build_episode_recording_runtime(
                     f"planned={completion.planned_episode_index} "
                     f"actual={completion.episode_index}"
                 )
-                update_control_debug_runtime_metadata(
+                update_control_debug_metadata_observation(
+                    context="episode index mismatch",
+                    now=now,
                     episode_sidecar_error=mismatch,
                 )
                 _log("ControlDebug", f"WARNING: {mismatch}", now=now)
