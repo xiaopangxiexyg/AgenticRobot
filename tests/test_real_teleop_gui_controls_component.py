@@ -123,6 +123,43 @@ def test_extracted_gui_controls_preserve_pre_home_and_running_control_order() ->
     assert "gripper_force_set" in pre_home_controls(no_recording, events)
 
 
+def test_armed_lifecycle_without_live_dispatch_exposes_only_recovery_controls() -> None:
+    state = GuiControlState(
+        teleop_started=True,
+        teleop_dispatch_confirmed=False,
+        episode_recording_available=True,
+        camera_visualization_available=True,
+        tactile_visualization_available=True,
+        fix_arm_available=True,
+        init_arm_available=True,
+        pose_snapshot_available=True,
+        foot_pad_available=True,
+        foot_pad_count=2,
+        active_side_count=2,
+    )
+
+    assert current_active_controls(state, GuiControlEvents()) == ["q", "d", "h"]
+
+
+def test_recording_without_live_dispatch_keeps_stop_and_hold_but_no_new_motion() -> None:
+    state = GuiControlState(
+        teleop_started=True,
+        teleop_dispatch_confirmed=False,
+        episode_recording_available=True,
+        episode_recording_active=True,
+        fix_arm_available=True,
+        init_arm_available=True,
+        pose_snapshot_available=True,
+        active_side_count=2,
+    )
+
+    controls = current_active_controls(state, GuiControlEvents())
+    assert controls == ["q", "d", "episode_stop", "h"]
+    assert "c" not in controls
+    assert "g" not in controls
+    assert "record_pose_snapshot" not in controls
+
+
 def test_pre_home_exact_qpos_controls_require_live_startup_executor() -> None:
     events = GuiControlEvents()
     unavailable = GuiControlState(

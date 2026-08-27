@@ -60,6 +60,7 @@ def collection_step_result(
     *,
     active_command: TeleopCommand | None,
     gripper_command: TeleopCommand | None,
+    active_command_dispatched: bool = False,
 ) -> SessionStepResult:
     command = active_command
     if gripper_command is not None:
@@ -84,8 +85,7 @@ def collection_step_result(
         if motion_hold_active
         else bool(
             step_result.command_dispatched
-            or active_command is not None
-            or gripper_command is not None
+            or (active_command is not None and active_command_dispatched)
         ),
         action_record=None,
         faults=list(step_result.faults),

@@ -2274,10 +2274,14 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         **common,
     ) == (False, "等待恢复，当前状态会自动停止数采：runtime_fault。")
 
+    running_command = SimpleNamespace(
+        commands={"left_arm": object()},
+    )
     running_step = SimpleNamespace(
         state=legacy_entrypoint.TeleopRunState.RUNNING,
         observation=object(),
-        command=object(),
+        command=running_command,
+        command_dispatched=True,
         channels={},
     )
     assert recording_admission.recording_warmup_status(
@@ -2285,6 +2289,21 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         step_result=running_step,
         **common,
     ) == (True, "warmup 输入稳定。")
+
+    running_step.command_dispatched = False
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (False, "等待机械臂命令通过最终 admission 并实际派发。")
+
+    running_step.command_dispatched = True
+    running_step.command = SimpleNamespace(commands={"left_hand": object()})
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (False, "等待机械臂命令通过最终 admission 并实际派发。")
 
 
 def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
@@ -2321,7 +2340,8 @@ def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
     running_step = SimpleNamespace(
         state=legacy_entrypoint.TeleopRunState.RUNNING,
         observation=object(),
-        command=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
         channels={},
     )
 
@@ -2672,6 +2692,40 @@ def test_teleop_running_projection_requires_an_actual_arm_dispatch(
     )
     assert control._teleop_dispatch_confirmed is False
     assert control.gripper_control_enabled() is False
+
+
+def test_two_pedal_transition_cannot_bypass_missing_dispatch_receipt() -> None:
+    transitions: list[str] = []
+    alerts: list[str] = []
+    controller = SimpleNamespace(
+        fixed_sides=(),
+        select_side=lambda side: transitions.append(str(side)),
+    )
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.components = SimpleNamespace(
+        session=SimpleNamespace(state_machine=SimpleNamespace()),
+        fix_arm_controller=controller,
+    )
+    control._teleop_started = True
+    control._teleop_dispatch_confirmed = False
+    control._hold_active = False
+    control._two_pedal_mode_active = lambda: True
+    control._manual_single_arm_switch_enabled = lambda: True
+    control._reject_two_pedal_switch_during_init = lambda *, now: False
+    control._publish_two_pedal_alert = (
+        lambda *, message, **_kwargs: alerts.append(str(message))
+    )
+
+    control._request_two_pedal_fixed_side(
+        "right",
+        now=10.0,
+        source="pedal_1",
+    )
+
+    assert transitions == []
+    assert alerts and "没有已确认的机械臂命令下发" in alerts[-1]
 
 
 def test_episode_lifecycle_state_is_authoritative_without_a_gui() -> None:

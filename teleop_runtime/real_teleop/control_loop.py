@@ -43,6 +43,7 @@ from ..target_safety.tcp_pose_envelope_runtime import (
 )
 from .defaults import runtime_home_fresh_data_timeout_sec
 from .runtime_extension import runtime_extension_dataset_sample_admission
+from .recording_admission import session_step_arm_dispatch_confirmed
 
 _POSITION_ADMITTANCE_CONTROL_PLANE_REARM_THRESHOLD_SEC = 0.05
 
@@ -759,14 +760,7 @@ def _project_session_dispatch_state(
     session_state_value = str(
         getattr(step_result.state, "value", step_result.state)
     ).upper()
-    dispatched_arm_command = bool(
-        step_result.command_dispatched
-        and step_result.command is not None
-        and any(
-            name in step_result.command.commands
-            for name in ("left_arm", "right_arm")
-        )
-    )
+    dispatched_arm_command = session_step_arm_dispatch_confirmed(step_result)
     if session_state_value == "RUNNING" and dispatched_arm_command:
         publish_running = getattr(
             clutch_input,
@@ -3598,10 +3592,19 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             )
             clutch_input.request_hold(reason="tracker_loss_timeout")
             continue
-        _project_session_dispatch_state(
+        arm_dispatch_confirmed = _project_session_dispatch_state(
             step_result,
             clutch_input=clutch_input,
         )
+        if (
+            not arm_dispatch_confirmed
+            and recording_active()
+            and not recording_paused()
+        ):
+            pause_recording(
+                loop_start,
+                reason="arm_dispatch_unavailable",
+            )
         gripper_command = None
         gripper_command_status: dict[str, dict[str, object]] = {}
         if step_result.motion_hold_mode in {
@@ -4059,6 +4062,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
             step_result,
             active_command=active_command,
             gripper_command=gripper_command,
+            active_command_dispatched=manual_recovery_command_dispatched,
         )
         if (
             position_admittance_shadow is not None
@@ -4261,7 +4265,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 resume_result = progress_workflow.observe_applied_resume(
                     now=loop_start,
                     application_running=bool(
-                        step_result.state == TeleopRunState.RUNNING
+                        arm_dispatch_confirmed
                         and not clutch_input.hold_active()
                     ),
                     formal_capture_paused=bool(
@@ -4549,6 +4553,9 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         step_result,
                         active_command=active_command,
                         gripper_command=gripper_command,
+                        active_command_dispatched=(
+                            manual_recovery_command_dispatched
+                        ),
                     ),
                     components=components,
                     record_wall_time=time.time(),
@@ -4616,7 +4623,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                         hand_command=hand_command,
                         gripper_command=gripper_command,
                         command_dispatched=bool(
-                            step_result.command_dispatched or active_command is not None
+                            collection_step_result.command_dispatched
                         ),
                         faults=step_result.faults,
                         fix_arm_state=_fix_arm_ui_state(components),

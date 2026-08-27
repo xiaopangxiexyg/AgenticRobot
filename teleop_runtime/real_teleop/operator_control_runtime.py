@@ -463,6 +463,7 @@ class RealTeleopControlInput:
         )
         return GuiControlState(
             teleop_started=bool(getattr(self, "_teleop_started", False)),
+            teleop_dispatch_confirmed=self._teleop_arm_dispatch_confirmed(),
             hold_active=bool(getattr(self, "_hold_active", False)),
             episode_recording_available=(
                 not bool(getattr(self.args, "no_collection", False))
@@ -917,8 +918,9 @@ class RealTeleopControlInput:
         return _gui_fix_init_allowed_in_controls(self._gui_control_state())
 
     def _current_active_controls(self) -> list[str]:
+        gui_state = self._gui_control_state()
         controls = list(_gui_current_active_controls(
-            self._gui_control_state(), self._gui_events()
+            gui_state, self._gui_events()
         ))
         if not self._manual_single_arm_switch_enabled():
             controls = [
@@ -943,6 +945,18 @@ class RealTeleopControlInput:
             if (
                 self._manual_single_arm_switch_enabled()
                 and not self._two_pedal_switch_blocked_by_init()
+                and (
+                    bool(getattr(gui_state, "hold_active", False))
+                    or bool(
+                        getattr(gui_state, "teleop_started", False)
+                        and getattr(
+                            gui_state,
+                            "teleop_dispatch_confirmed",
+                            None,
+                        )
+                        is not False
+                    )
+                )
             ):
                 controls.append("two_pedal_b")
             # C is the unconditional route to regular Hold, including while
@@ -1985,6 +1999,17 @@ class RealTeleopControlInput:
         controller = getattr(self.components, "fix_arm_controller", None)
         if controller is None or not self._teleop_started:
             return
+        if not self._teleop_arm_dispatch_confirmed():
+            self._publish_two_pedal_alert(
+                level="red",
+                message=(
+                    "2/5 踏板切换已拒绝：当前没有已确认的机械臂命令下发；"
+                    "请先进入 Hold，再通过快速 Home 恢复控制。"
+                ),
+                now=now,
+                duration_sec=3.0,
+            )
+            return
         current_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
         if current_fixed:
             transition = controller.start_two_pedal_transition(
@@ -2330,6 +2355,21 @@ class RealTeleopControlInput:
             return False
         if not self._teleop_started or self._hold_active:
             return False
+        active_special_operation = bool(
+            getattr(controller, "qpos_active", False)
+            or getattr(controller, "recapturing", False)
+            or getattr(controller, "active", False)
+        )
+        if (
+            not active_special_operation
+            and not self._teleop_arm_dispatch_confirmed()
+        ):
+            message = (
+                "Init 被拒绝：当前没有已确认的机械臂命令下发；"
+                "请先进入 Hold 并重新采集 runtime Home。"
+            )
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
         try:
             if bool(getattr(controller, "qpos_active", False)):
                 transition, release_errors = self._start_active_init_home_recapture(
@@ -2424,6 +2464,17 @@ class RealTeleopControlInput:
             message = "Hold 正在生效，尚未启动 Init qpos；请在停臂完成后重试。"
             self._publish_init_arm_state(message=message, control_hint=message)
             return True
+        if (
+            self._teleop_started
+            and not self._hold_active
+            and not self._teleop_arm_dispatch_confirmed()
+        ):
+            message = (
+                "Init qpos 未启动：当前没有已确认的机械臂命令下发；"
+                "请先进入 Hold 后再执行维护操作。"
+            )
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
         if self._hold_active and not hold_maintenance:
             return False
         if self._episode_transition_busy():
@@ -2472,6 +2523,17 @@ class RealTeleopControlInput:
             return False
         if self._hold_requested:
             message = "Hold 正在生效，尚未启动双臂顺序归位；请在停臂完成后重试。"
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
+        if (
+            self._teleop_started
+            and not self._hold_active
+            and not self._teleop_arm_dispatch_confirmed()
+        ):
+            message = (
+                "双臂顺序归位未启动：当前没有已确认的机械臂命令下发；"
+                "请先进入 Hold 后再执行维护操作。"
+            )
             self._publish_init_arm_state(message=message, control_hint=message)
             return True
         if self._hold_active and not hold_maintenance:
@@ -2647,6 +2709,17 @@ class RealTeleopControlInput:
                 if callable(getattr(controller, "is_fixed", None))
                 else controller.fixed and controller.fixed_side == selected_side
             )
+            if (
+                not selected_is_fixed
+                and not bool(getattr(controller, "recapturing", False))
+                and not self._teleop_arm_dispatch_confirmed()
+            ):
+                message = (
+                    "Fix 被拒绝：当前没有已确认的机械臂命令下发，"
+                    "不能从旧命令快照建立新的固定状态；请先进入 Hold 并重新采集 runtime Home。"
+                )
+                self._publish_fix_arm_state(message=message, control_hint=message)
+                return True
             if selected_is_fixed:
                 transition = controller.start_recalibration(
                     now=now,
@@ -2757,8 +2830,12 @@ class RealTeleopControlInput:
             message = "Pose 抽帧与正式数采互斥；请先停止数采或取消倒计时。"
             self.set_pose_snapshot_state(status=message, append_message=True)
             return
-        if not self._teleop_started or self._hold_active:
-            message = "Pose 抽帧只能在遥操运行中执行。"
+        if (
+            not self._teleop_started
+            or self._hold_active
+            or not self._teleop_arm_dispatch_confirmed()
+        ):
+            message = "Pose 抽帧只能在机械臂命令已实际派发的遥操帧中执行。"
             self.set_pose_snapshot_state(status=message, append_message=True)
             return
         self._pose_snapshot_requested = True
@@ -2945,7 +3022,7 @@ class RealTeleopControlInput:
                 self.ui.publish(
                     active_controls=self._current_active_controls(),
                     control_hint=message,
-                    teleop_running=True,
+                    teleop_running=self._teleop_arm_dispatch_confirmed(),
                     gripper_control_enabled=self.gripper_control_enabled(),
                 )
             return
@@ -3380,7 +3457,7 @@ class RealTeleopControlInput:
                     self.ui.publish(
                         active_controls=self._current_active_controls(),
                         control_hint="运行中重采前请先点击 Hold / 冻结；Hold 只停臂，不会自动重采。",
-                        teleop_running=True,
+                        teleop_running=self._teleop_arm_dispatch_confirmed(),
                         gripper_control_enabled=self.gripper_control_enabled(),
                     )
                 return False

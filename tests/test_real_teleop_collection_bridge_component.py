@@ -100,3 +100,38 @@ def test_collection_sample_uses_a_deep_copy_of_the_latest_dispatched_command() -
     assert sampled.command.timestamp == 1.0
     assert list(sampled.command.commands["left_arm"].value) == [0.1] * 6
     assert copied is not dispatched
+
+
+def test_collection_bridge_never_infers_dispatch_from_command_presence() -> None:
+    command = TeleopCommand(timestamp=3.0)
+    command.add_command(
+        EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=[0.2] * 6,
+        )
+    )
+    inhibited = SessionStepResult(
+        timestamp=3.0,
+        state=TeleopRunState.RUNNING,
+        control_hz=120.0,
+        command=command,
+        command_dispatched=False,
+    )
+
+    copied = collection_step_result(
+        inhibited,
+        active_command=command,
+        gripper_command=TeleopCommand(timestamp=3.0),
+    )
+    assert copied.command is not None
+    assert copied.command_dispatched is False
+
+    recovered = collection_step_result(
+        inhibited,
+        active_command=command,
+        gripper_command=None,
+        active_command_dispatched=True,
+    )
+    assert recovered.command_dispatched is True
