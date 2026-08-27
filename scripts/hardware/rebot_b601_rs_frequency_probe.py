@@ -4,10 +4,13 @@
 The default ``read-only`` mode opens a passive SocketCAN receive socket only.
 It does not construct MotorBridge, request feedback, enable a motor, or send a
 position/MIT frame.  ``offline`` provides deterministic smoke evidence.
+``gravity-offline`` measures the existing Pinocchio gravity plus MIT torque
+composition path without opening CAN.
 ``position-tx-disabled`` measures only the POS_VEL dispatch clock after an
-explicit successful disable and never enables a motor.  ``position`` is the
-separately confirmed enabled commissioning path.  Neither active mode is run
-by automated tests or by this development task.
+explicit successful disable and never enables a motor.  ``mit-tx-disabled``
+adds only zero-gain, zero-torque MIT dispatch after two successful disable
+receipts.  ``position`` is the separately confirmed enabled commissioning
+path.  No active mode is run by automated tests or by this development task.
 """
 
 from __future__ import annotations
@@ -40,6 +43,12 @@ from hardware.rebot_b601_rs import (
     FrequencyLedger,
     evaluate_frequency_target,
     summarize_timestamps,
+)
+from robot_motion.rebot_b601_rs import (
+    B601MitControlProfile,
+    B601MitReference,
+    B601PinocchioModel,
+    compute_b601_mit_torque,
 )
 
 _CAN_RAW = getattr(socket, "CAN_RAW", 1)
@@ -187,6 +196,132 @@ def _offline_capture(duration_sec: float, target_hz: float) -> dict[str, object]
     }
 
 
+def _gravity_offline_capture(
+    duration_sec: float,
+    target_hz: float,
+    source_root: Path | None,
+    *,
+    minimum_rate_ratio: float = 0.95,
+    maximum_deadline_miss_ratio: float = 0.01,
+) -> dict[str, object]:
+    """Measure the existing gravity/composition path without hardware I/O."""
+
+    if not math.isfinite(duration_sec) or duration_sec <= 0.0:
+        raise ValueError("duration_sec must be positive")
+    if not math.isfinite(target_hz) or target_hz <= 0.0:
+        raise ValueError("target_hz must be positive")
+    if source_root is None:
+        raise FrequencyProbeError("gravity-offline mode requires --rebot-source-root")
+    root = source_root.expanduser().resolve(strict=True)
+    try:
+        model = B601PinocchioModel.from_rebot_source_root(root)
+    except Exception as exc:
+        raise FrequencyProbeError(
+            f"cannot construct B601-RS gravity model: {exc}"
+        ) from exc
+
+    lower, upper = model.arm_position_limits()
+    qpos = tuple(
+        0.0 if float(lo) <= 0.0 <= float(hi) else 0.5 * (float(lo) + float(hi))
+        for lo, hi in zip(lower, upper)
+    )
+    zero = (0.0,) * 6
+    reference = B601MitReference(
+        sequence=0,
+        source_timestamp_sec=0.0,
+        receive_timestamp_sec=0.0,
+        qpos_rad=qpos,
+        qvel_rad_s=zero,
+    )
+    profile = B601MitControlProfile(
+        name="gravity-offline-zero-pd",
+        position_kp_nm_per_rad=zero,
+        damping_kd_nm_s_per_rad=zero,
+        max_abs_torque_nm=(1.0e6,) * 6,
+        max_torque_rate_nm_s=(1.0e9,) * 6,
+    )
+    ledger = FrequencyLedger()
+    schedule_overruns = 0
+    iterations = 0
+    last_gravity: tuple[float, ...] | None = None
+    last_requested: tuple[float, ...] | None = None
+    period = 1.0 / target_hz
+    started = time.monotonic()
+    next_deadline = started
+    while iterations == 0 or time.monotonic() - started < duration_sec:
+        now = time.monotonic()
+        if now < next_deadline:
+            time.sleep(next_deadline - now)
+        try:
+            gravity = tuple(
+                float(value) for value in model.arm_generalized_gravity(qpos)
+            )
+            breakdown = compute_b601_mit_torque(
+                reference,
+                profile,
+                measured_qpos_rad=qpos,
+                measured_qvel_rad_s=zero,
+                gravity_torque_nm=gravity,
+            )
+        except Exception as exc:
+            raise FrequencyProbeError(
+                f"offline gravity/torque computation failed: {exc}"
+            ) from exc
+        if breakdown.requested_torque_nm != gravity:
+            raise FrequencyProbeError(
+                "zero-PD offline composition did not preserve gravity torque"
+            )
+        ledger.mark("compute")
+        iterations += 1
+        last_gravity = gravity
+        last_requested = breakdown.requested_torque_nm
+        next_deadline += period
+        completed_at = time.monotonic()
+        if completed_at > next_deadline:
+            schedule_overruns += 1
+            next_deadline = completed_at
+
+    stats = ledger.summarize(target_hz=target_hz)
+    acceptance = evaluate_frequency_target(
+        stats["compute"],
+        minimum_rate_ratio=minimum_rate_ratio,
+        maximum_deadline_miss_ratio=maximum_deadline_miss_ratio,
+    )
+    return {
+        "mode": "gravity-offline",
+        "duration_sec": duration_sec,
+        "target_hz": target_hz,
+        "rebot_source_root": str(root),
+        "urdf_path": str(model.urdf_path),
+        "transport": "none_offline_pinocchio",
+        "motion_commands_sent": False,
+        "motors_enabled_by_probe": False,
+        "iterations": iterations,
+        "schedule_overruns": schedule_overruns,
+        "qpos_rad": qpos,
+        "auxiliary_joint_positions": "pinocchio_neutral",
+        "last_gravity_torque_nm": last_gravity,
+        "last_requested_torque_nm": last_requested,
+        "mit_command_semantics": "software_zero_pd_plus_pinocchio_gravity",
+        "execution_status": "COMPLETED",
+        "acceptance_status": "PASS" if acceptance.passed else "FAIL",
+        "acceptance": {
+            "required_events": ("compute",),
+            "minimum_rate_ratio": minimum_rate_ratio,
+            "maximum_deadline_miss_ratio": maximum_deadline_miss_ratio,
+            "events": {"compute": acceptance.as_dict()},
+        },
+        "frequency": {event: value.as_dict() for event, value in stats.items()},
+        "freshness_verified": False,
+        "freshness_semantics": "not_applicable_offline_fixed_state",
+        "notes": [
+            "Offline compute evidence only; no CAN socket, MotorBridge controller, mode transition, enable, or command send is used.",
+            "The measured path reuses B601PinocchioModel.arm_generalized_gravity and compute_b601_mit_torque with zero position/damping gains.",
+            "This does not validate feedback freshness, motor torque sign/scale, damping, friction, or enabled-loop stability.",
+        ],
+    }
+
+
 def _parse_joint_names(values: Sequence[str] | None) -> tuple[str, ...]:
     if not values:
         return B601_RS_ARM_JOINT_NAMES
@@ -250,23 +385,23 @@ def _resolve_position_limits(
 
 def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
     mode = str(args.mode)
-    if mode not in ("position", "position-tx-disabled"):
-        raise ValueError("active position probe received an unsupported mode")
+    if mode not in ("position", "position-tx-disabled", "mit-tx-disabled"):
+        raise ValueError("active TX probe received an unsupported mode")
     if not args.allow_motion:
         raise FrequencyProbeError(f"{mode} mode requires --allow-motion")
-    required_confirmation = (
-        "B601_RS_POSITION_FREQUENCY"
-        if mode == "position"
-        else "B601_RS_DISABLED_TX_FREQUENCY"
-    )
+    required_confirmation = {
+        "position": "B601_RS_POSITION_FREQUENCY",
+        "position-tx-disabled": "B601_RS_DISABLED_TX_FREQUENCY",
+        "mit-tx-disabled": "B601_RS_DISABLED_MIT_TX_FREQUENCY",
+    }[mode]
     if args.confirmation != required_confirmation:
         raise FrequencyProbeError(
             f"{mode} mode requires --confirmation {required_confirmation}"
         )
     if mode == "position" and not args.enable:
         raise FrequencyProbeError("position mode requires explicit --enable")
-    if mode == "position-tx-disabled" and args.enable:
-        raise FrequencyProbeError("position-tx-disabled mode rejects --enable")
+    if mode != "position" and args.enable:
+        raise FrequencyProbeError(f"{mode} mode rejects --enable")
     if not args.auto_disable:
         raise FrequencyProbeError(f"{mode} mode requires explicit --auto-disable")
     if not args.config:
@@ -319,6 +454,8 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
     cleanup_errors: list[str] = []
     cleanup_receipt: dict[str, object] | None = None
     preflight_disable_receipt: dict[str, object] | None = None
+    post_mode_disable_receipt: dict[str, object] | None = None
+    mit_reference: B601MitReference | None = None
     primary_error: Exception | None = None
     try:
         backend.connect()
@@ -342,7 +479,14 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             )
         initial_positions = state.positions_rad
         initial_sequence = state.sequence
-        if mode == "position-tx-disabled":
+        if mode == "mit-tx-disabled":
+            mit_reference = B601MitReference(
+                sequence=initial_sequence,
+                source_timestamp_sec=state.receive_timestamp_sec,
+                receive_timestamp_sec=state.receive_timestamp_sec,
+                qpos_rad=initial_positions,
+            )
+        if mode != "position":
             cleanup_required = True
             disable_receipt = backend.safe_stop(joint_names=selected)
             preflight_disable_receipt = _mode_receipt_payload(disable_receipt)
@@ -350,12 +494,26 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
                 raise FrequencyProbeError(
                     "preflight disable failed: " + "; ".join(disable_receipt.errors)
                 )
-        mode_receipt = backend.prepare_position_velocity_mode(
-            joint_names=selected,
-            velocity_limits_rad_s=effective_velocity_limits,
-        )
+        if mode == "mit-tx-disabled":
+            mode_receipt = backend.prepare_mit_mode(joint_names=selected)
+        else:
+            mode_receipt = backend.prepare_position_velocity_mode(
+                joint_names=selected,
+                velocity_limits_rad_s=effective_velocity_limits,
+            )
         if not mode_receipt.completed:
-            raise FrequencyProbeError("POS_VEL setup failed: " + "; ".join(mode_receipt.errors))
+            mode_name = "MIT" if mode == "mit-tx-disabled" else "POS_VEL"
+            raise FrequencyProbeError(
+                f"{mode_name} setup failed: " + "; ".join(mode_receipt.errors)
+            )
+        if mode == "mit-tx-disabled":
+            disable_receipt = backend.safe_stop(joint_names=selected)
+            post_mode_disable_receipt = _mode_receipt_payload(disable_receipt)
+            if not disable_receipt.completed:
+                raise FrequencyProbeError(
+                    "post-MIT-mode disable failed: "
+                    + "; ".join(disable_receipt.errors)
+                )
         if mode == "position":
             cleanup_required = True
             enable_receipt = backend.enable(joint_names=selected)
@@ -382,14 +540,29 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
                 reference_positions = initial_positions
                 source_sequence = initial_sequence
             ledger.mark("compute")
-            receipt = backend.send_position_velocity(
-                reference_positions,
-                velocity_limits_rad_s=effective_velocity_limits,
-                joint_names=selected,
-                source_sequence=source_sequence,
-            )
+            if mode == "mit-tx-disabled":
+                if mit_reference is None:
+                    raise FrequencyProbeError("MIT reference was not initialized")
+                receipt = backend.send_mit(
+                    mit_reference,
+                    kp=(0.0,) * 6,
+                    kd=(0.0,) * 6,
+                    tau_nm=(0.0,) * 6,
+                    torque_limits_nm=(0.0,) * 6,
+                    joint_names=selected,
+                )
+            else:
+                receipt = backend.send_position_velocity(
+                    reference_positions,
+                    velocity_limits_rad_s=effective_velocity_limits,
+                    joint_names=selected,
+                    source_sequence=source_sequence,
+                )
             if not receipt.accepted:
-                stop_reason = "; ".join(receipt.errors) or "partial position dispatch"
+                command_name = "MIT" if mode == "mit-tx-disabled" else "position"
+                stop_reason = (
+                    "; ".join(receipt.errors) or f"partial {command_name} dispatch"
+                )
                 break
             ledger.mark("tx", receipt.completed_at_sec)
             commands_sent += 1
@@ -488,13 +661,33 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
             (
                 "It requests one vendor feedback snapshot per arm joint before each active poll and holds the latest valid position."
                 if mode == "position"
-                else "It verifies disable, then measures host-to-vendor POS_VEL dispatch while holding the warmup reference without runtime feedback."
+                else (
+                    "It verifies disable, then measures host-to-vendor POS_VEL dispatch while holding the warmup reference without runtime feedback."
+                    if mode == "position-tx-disabled"
+                    else "It verifies disable before and after MIT mode setup, then dispatches only the warmup position with qvel=kp=kd=tau=0 while the selected motor remains disabled."
+                )
             ),
-            "The position command is capped by --velocity-limit-rad-s and the YAML per-joint limits.",
+            (
+                "The position command is capped by --velocity-limit-rad-s and the YAML per-joint limits."
+                if mode != "mit-tx-disabled"
+                else "Zero MIT gains and zero feedforward make the commanded effort exactly zero; this is a transport ceiling probe, not gravity or damping control."
+            ),
         ],
     }
+    if mode == "mit-tx-disabled":
+        result["mit_command_semantics"] = {
+            "qpos": "warmup_snapshot",
+            "qvel_rad_s": (0.0,) * 6,
+            "kp": (0.0,) * 6,
+            "kd": (0.0,) * 6,
+            "tau_nm": (0.0,) * 6,
+            "torque_limits_nm": (0.0,) * 6,
+            "final_commanded_effort_nm": (0.0,) * 6,
+        }
     if preflight_disable_receipt is not None:
         result["preflight_disable_receipt"] = preflight_disable_receipt
+    if post_mode_disable_receipt is not None:
+        result["post_mode_disable_receipt"] = post_mode_disable_receipt
     if cleanup_receipt is not None:
         result["cleanup_receipt"] = cleanup_receipt
     if cleanup_errors:
@@ -505,12 +698,19 @@ def _run_position_probe(args: argparse.Namespace) -> dict[str, object]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "B601-RS CAN timing probe; read-only by default, position mode is explicitly guarded."
+            "B601-RS timing probe; read-only by default, active TX modes are explicitly guarded."
         )
     )
     parser.add_argument(
         "--mode",
-        choices=("read-only", "offline", "position-tx-disabled", "position"),
+        choices=(
+            "read-only",
+            "offline",
+            "gravity-offline",
+            "position-tx-disabled",
+            "mit-tx-disabled",
+            "position",
+        ),
         default="read-only",
     )
     parser.add_argument("--channel", default="can0")
@@ -534,7 +734,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.1,
         help="maximum POS_VEL command speed; defaults to the conservative 0.1 rad/s",
     )
-    parser.add_argument("--config", help="explicit rebotarm_rs.yaml for guarded position mode")
+    parser.add_argument(
+        "--config", help="explicit rebotarm_rs.yaml for guarded active mode"
+    )
     parser.add_argument(
         "--rebot-source-root",
         type=Path,
@@ -563,6 +765,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = _read_only_capture(args.channel, args.duration_sec)
         elif args.mode == "offline":
             payload = _offline_capture(args.duration_sec, args.target_hz)
+        elif args.mode == "gravity-offline":
+            payload = _gravity_offline_capture(
+                args.duration_sec,
+                args.target_hz,
+                args.rebot_source_root,
+                minimum_rate_ratio=args.minimum_rate_ratio,
+                maximum_deadline_miss_ratio=args.maximum_deadline_miss_ratio,
+            )
         else:
             payload = _run_position_probe(args)
     except (B601HardwareError, FrequencyProbeError, OSError, ValueError) as exc:

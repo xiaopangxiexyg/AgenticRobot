@@ -224,6 +224,31 @@ def test_prepare_position_velocity_mode_fails_closed_on_parameter_write() -> Non
     assert all(call[0] != "ensure_mode" for call in controller.motors[1].calls)
 
 
+def test_prepare_mit_mode_mirrors_rebot_transition_and_never_enables() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+        sleeper=lambda _seconds: None,
+    )
+
+    backend.connect()
+    receipt = backend.prepare_mit_mode(joint_names=("joint1",))
+
+    assert receipt.completed is True
+    assert receipt.operation == "prepare_mit_mode"
+    assert receipt.completed_joint_names == ("joint1",)
+    assert controller.motors[1].calls == [("ensure_mode", (1, 1000))]
+    assert all(
+        not motor.calls for index, motor in controller.motors.items() if index != 1
+    )
+    assert all(
+        call[0] != "enable"
+        for motor in controller.motors.values()
+        for call in motor.calls
+    )
+
+
 def test_connect_and_poll_do_not_request_feedback_or_enable() -> None:
     controller = _FakeController()
     backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
@@ -612,6 +637,7 @@ class _FakePositionProbeBackend:
         self.calls: list[str] = []
         self.sequence = 0
         self.send_sequence = 0
+        self.mit_send_sequence = 0
         self.prepare_velocity_limits: object = None
 
     def connect(self) -> None:
@@ -648,6 +674,18 @@ class _FakePositionProbeBackend:
             True,
         )
 
+    def prepare_mit_mode(self, *, joint_names: object) -> B601ModeReceipt:
+        del joint_names
+        self.calls.append("prepare_mit")
+        return B601ModeReceipt(
+            "prepare_mit_mode",
+            ("joint1", "joint2"),
+            ("joint1", "joint2"),
+            (),
+            (),
+            True,
+        )
+
     def enable(self, *, joint_names: object) -> B601ModeReceipt:
         del joint_names
         self.calls.append("enable")
@@ -661,6 +699,20 @@ class _FakePositionProbeBackend:
             accepted=True,
             errors=(),
             completed_at_sec=float(self.send_sequence),
+        )
+
+    def send_mit(self, *args: object, **kwargs: object) -> object:
+        del args
+        self.calls.append("send_mit")
+        assert kwargs["kp"] == (0.0,) * 6
+        assert kwargs["kd"] == (0.0,) * 6
+        assert kwargs["tau_nm"] == (0.0,) * 6
+        assert kwargs["torque_limits_nm"] == (0.0,) * 6
+        self.mit_send_sequence += 1
+        return SimpleNamespace(
+            accepted=True,
+            errors=(),
+            completed_at_sec=float(self.mit_send_sequence),
         )
 
     def safe_stop(self, *, joint_names: object) -> B601ModeReceipt:
@@ -835,6 +887,84 @@ def test_disabled_tx_probe_never_enables_or_polls_feedback_after_warmup(
         "initial_vendor_snapshot_only; no_runtime_feedback"
     )
     assert result["acceptance"]["required_events"] == ("compute", "tx")
+
+
+def test_disabled_mit_tx_probe_double_disables_and_sends_zero_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("test: true\n", encoding="utf-8")
+    backend = _FakePositionProbeBackend(
+        enable_receipt=B601ModeReceipt(
+            "enable", ("joint1", "joint2"), ("joint1", "joint2"), (), (), True
+        ),
+        stop_receipt=B601ModeReceipt(
+            "safe_stop", ("joint1", "joint2"), ("joint1", "joint2"), (), (), True
+        ),
+    )
+    _install_position_probe_fakes(monkeypatch, backend)
+    args = _position_probe_args(config_path)
+    args.mode = "mit-tx-disabled"
+    args.enable = False
+    args.confirmation = "B601_RS_DISABLED_MIT_TX_FREQUENCY"
+    args.duration_sec = 0.02
+
+    result = frequency_probe._run_position_probe(args)
+
+    assert "enable" not in backend.calls
+    assert backend.calls.count("request_feedback") == 1
+    assert backend.calls.count("poll_feedback") == 1
+    assert backend.calls.count("safe_stop") == 3
+    assert backend.calls.index("safe_stop") < backend.calls.index("prepare_mit")
+    assert backend.calls.index("prepare_mit") < backend.calls.index(
+        "safe_stop", backend.calls.index("prepare_mit")
+    )
+    assert backend.calls[-2:] == ["safe_stop", "close"]
+    assert backend.mit_send_sequence >= 2
+    assert result["motors_enabled_by_probe"] is False
+    assert result["post_mode_disable_receipt"]["completed"] is True
+    assert result["mit_command_semantics"]["final_commanded_effort_nm"] == (
+        0.0,
+    ) * 6
+    assert result["acceptance"]["required_events"] == ("compute", "tx")
+
+
+def test_gravity_offline_probe_reuses_model_and_zero_pd_composition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeGravityModel:
+        urdf_path = tmp_path / "robot.urdf"
+
+        def arm_position_limits(self) -> tuple[tuple[float, ...], tuple[float, ...]]:
+            return (-1.0,) * 6, (1.0,) * 6
+
+        def arm_generalized_gravity(self, qpos: object) -> tuple[float, ...]:
+            assert qpos == (0.0,) * 6
+            return (1.0, -2.0, 3.0, -4.0, 5.0, -6.0)
+
+    monkeypatch.setattr(
+        frequency_probe.B601PinocchioModel,
+        "from_rebot_source_root",
+        staticmethod(lambda _root: _FakeGravityModel()),
+    )
+
+    result = frequency_probe._gravity_offline_capture(1e-9, 125.0, tmp_path)
+
+    assert result["motion_commands_sent"] is False
+    assert result["motors_enabled_by_probe"] is False
+    assert result["iterations"] == 1
+    assert result["last_gravity_torque_nm"] == (
+        1.0,
+        -2.0,
+        3.0,
+        -4.0,
+        5.0,
+        -6.0,
+    )
+    assert result["last_requested_torque_nm"] == result["last_gravity_torque_nm"]
+    assert result["acceptance"]["required_events"] == ("compute",)
 
 
 def test_probe_main_returns_nonzero_for_completed_frequency_failure(
