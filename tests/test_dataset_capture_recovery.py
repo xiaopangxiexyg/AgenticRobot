@@ -273,6 +273,95 @@ def test_prepare_recovers_interrupted_first_episode_with_empty_catalog(
     assert_dataset_capture_writable(root)
 
 
+def test_native_prepare_runs_full_admission_once_without_recovery(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "dataset"
+    identity = root / "meta/tactile_bundle_v1/dataset_identity.cjson"
+    identity.parent.mkdir(parents=True)
+    identity.write_bytes(b"native-identity-fixture")
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+
+    with (
+        mock.patch.object(
+            recovery,
+            "assert_dataset_capture_writable",
+        ) as admission,
+        mock.patch.object(
+            recovery,
+            "_plan_native_tactile_core_tail",
+            return_value=None,
+        ) as plan_tail,
+    ):
+        result = recovery.prepare_dataset_capture_writable(
+            root,
+            tactile_bundle_root=tactile_root,
+        )
+
+    assert result.recovered is False
+    admission.assert_called_once_with(
+        root.resolve(),
+        tactile_bundle_root=tactile_root,
+    )
+    plan_tail.assert_called_once_with(
+        root.resolve(),
+        tactile_bundle_root=tactile_root,
+    )
+
+
+def test_native_prepare_revalidates_after_tail_recovery(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    identity = root / "meta/tactile_bundle_v1/dataset_identity.cjson"
+    identity.parent.mkdir(parents=True)
+    identity.write_bytes(b"native-identity-fixture")
+    tactile_root = tmp_path / "tactile"
+    tactile_root.mkdir()
+    transaction = {"schema": recovery.CAPTURE_RECOVERY_SCHEMA_V1}
+    recovered = recovery.DatasetCaptureRecoveryResult(
+        recovered=True,
+        episode_index=7,
+        quarantine_root=str(root / "meta/capture_recovery/abandoned_episodes/fixture"),
+    )
+
+    with (
+        mock.patch.object(
+            recovery,
+            "assert_dataset_capture_writable",
+        ) as admission,
+        mock.patch.object(
+            recovery,
+            "_plan_native_tactile_core_tail",
+            return_value=transaction,
+        ),
+        mock.patch.object(recovery, "_atomic_write_json") as write_journal,
+        mock.patch.object(
+            recovery,
+            "_apply_transaction",
+            return_value=recovered,
+        ) as apply_transaction,
+        pytest.warns(RuntimeWarning, match="native-tactile core Episode"),
+    ):
+        result = recovery.prepare_dataset_capture_writable(
+            root,
+            tactile_bundle_root=tactile_root,
+        )
+
+    assert result == recovered
+    assert admission.call_count == 2
+    assert admission.call_args_list == [
+        mock.call(root.resolve(), tactile_bundle_root=tactile_root),
+        mock.call(root.resolve(), tactile_bundle_root=tactile_root),
+    ]
+    write_journal.assert_called_once_with(
+        root.resolve()
+        / recovery.CAPTURE_RECOVERY_RELATIVE_ROOT
+        / "active_transaction.json",
+        transaction,
+    )
+    apply_transaction.assert_called_once_with(root.resolve(), transaction)
+
+
 def test_legacy_writer_startup_uses_recovery_before_reusing_episode_index(
     tmp_path: Path,
 ) -> None:

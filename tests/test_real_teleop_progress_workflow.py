@@ -68,6 +68,17 @@ class _Recorder:
         return values
 
 
+class _DetachedRecorder:
+    active_progress_episode = None
+
+    def drain_accepted_sample_receipts(
+        self,
+    ) -> tuple[AcceptedSampleReceipt, ...]:
+        raise AssertionError(
+            "detached progress workflow must not access recorder queues"
+        )
+
+
 def _episode(tmp_path: Path) -> RealTeleopProgressEpisode:
     identity = EpisodeCaptureIdentity(
         episode_uuid="workflow-episode",
@@ -83,6 +94,15 @@ def _episode(tmp_path: Path) -> RealTeleopProgressEpisode:
     )
     episode.bind(started_at=10.0)
     return episode
+
+
+def test_sample_acceptance_does_not_access_detached_recorder_queue() -> None:
+    workflow = RealTeleopProgressWorkflow(recorder=_DetachedRecorder())
+
+    result = workflow.consume_sample_acceptance(available_at=1.0)
+
+    assert not result.handled
+    assert result.phase == "ABSENT"
 
 
 def test_multi_step_advance_and_fresh_online_undo(tmp_path: Path) -> None:
