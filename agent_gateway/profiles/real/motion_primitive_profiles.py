@@ -1,4 +1,4 @@
-"""Exact real-Robot Routes and bindings for the reviewed 6+3 TCP primitives.
+"""Exact real-Robot Routes and bindings for reviewed TCP motion Skills.
 
 Construction is pure and default-off.  It requires an existing real-observe
 attachment, lower motion-port binding, exact frame graph, and at least one
@@ -38,15 +38,18 @@ from agent_gateway.skills.motion.definition import (
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
+    TCP_POSE_TARGET_SKILL_ID_V1,
     cardinal_tcp_step_skill_definition_v1,
     fixed_cardinal_tcp_step_skill_definition_v1,
     fixed_level_tcp_orientation_skill_definition_v1,
+    tcp_pose_target_skill_definition_v1,
 )
 from agent_gateway.skills.motion.schemas import (
     CARDINAL_TCP_STEP_DIRECTIONS_V1,
     cardinal_tcp_step_schema_entry_v1,
     fixed_cardinal_tcp_step_schema_entry_v1,
     fixed_level_tcp_orientation_schema_entry_v1,
+    tcp_pose_target_schema_entry_v1,
     validate_agent_motion_parameters_v1,
     validate_agent_motion_route_schema_v1,
 )
@@ -71,6 +74,13 @@ from .perception_deployment import RealPerceptionCaptureRegistration
 
 REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1 = (
     "real.rm65.agent_skill_tcp_cardinal_step"
+)
+REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 = "real.rm65.agent_skill_tcp_pose_target"
+REAL_AGENT_TCP_POSE_TARGET_EXECUTOR_ID_V1 = (
+    "control-station.real-agent-tcp-pose-target.v1"
+)
+REAL_AGENT_TCP_POSE_TARGET_PARAMETER_PROFILE_ID_V1 = (
+    "real-tool-tcp-absolute-grasp-pose-v1"
 )
 REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1 = (
     "control-station.real-agent-tcp-cardinal-step.v1"
@@ -137,6 +147,21 @@ REAL_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1 = {
     )
     for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
 }
+
+
+def real_agent_motion_route_ids_v1() -> tuple[str, ...]:
+    """Return the single authoritative real-motion Route allowlist."""
+
+    return tuple(
+        sorted(
+            {
+                REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1,
+                REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+                *REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values(),
+                *REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values(),
+            }
+        )
+    )
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -265,6 +290,82 @@ class RealAgentTcpCardinalStepProfile:
             if item.semantic_content_hash == selected.semantic_content_hash:
                 return item
         raise ValueError("Direction is absent from the exact primitive profile.")
+
+
+@dataclass(frozen=True)
+class RealAgentTcpPoseTargetProfile:
+    """Exact real absolute tool-TCP target profile for grasp-pose proposals."""
+
+    component_id: str
+    side: str
+    reference_frame_id: str
+    reference_frame_spec_hash: str
+    execution_reference_frame_id: str
+    execution_reference_frame_spec_hash: str
+    frame_graph_hash: str
+    tool_config_hash: str
+    calibration_hash: str
+    convergence_profile_hash: str
+    min_speed_scale: float = 0.05
+    max_speed_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "component_id",
+            "reference_frame_id",
+            "reference_frame_spec_hash",
+            "execution_reference_frame_id",
+            "execution_reference_frame_spec_hash",
+            "frame_graph_hash",
+            "tool_config_hash",
+            "calibration_hash",
+            "convergence_profile_hash",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), field_name=field_name),
+            )
+        side = str(self.side).strip().lower()
+        if side not in {"left", "right"}:
+            raise ValueError("side must be left or right.")
+        object.__setattr__(self, "side", side)
+        minimum = float(self.min_speed_scale)
+        maximum = float(self.max_speed_scale)
+        if (
+            not math.isfinite(minimum)
+            or not math.isfinite(maximum)
+            or not 0.0 < minimum <= maximum <= 1.0
+        ):
+            raise ValueError("speed scales must satisfy 0 < min <= max <= 1.")
+        object.__setattr__(self, "min_speed_scale", minimum)
+        object.__setattr__(self, "max_speed_scale", maximum)
+
+    @property
+    def skill_id(self) -> str:
+        return TCP_POSE_TARGET_SKILL_ID_V1
+
+    @property
+    def parameter_profile_id(self) -> str:
+        return REAL_AGENT_TCP_POSE_TARGET_PARAMETER_PROFILE_ID_V1
+
+    @property
+    def speed_scale_bounds(self) -> tuple[float, float]:
+        return (self.min_speed_scale, self.max_speed_scale)
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                **self.__dict__,
+                "profile_id": self.parameter_profile_id,
+                "controlled_frame_id": "tool_tcp",
+                "target_semantics": "absolute_pose_in_public_reference_frame",
+                "execution_transform": "single_frame_graph_projection_at_activation",
+                "speed_semantics": "fraction_of_lower_reviewed_trajectory_limits",
+            },
+            domain="dexteleop.agent_skill.real_tcp_pose_target_profile.v1",
+        )
 
 
 @dataclass(frozen=True)
@@ -442,6 +543,7 @@ class RealAgentPrimitiveContractBundle:
     route_manifest: SkillRouteManifest
     io_catalog: SkillIOCatalog
     cardinal_profile: RealAgentTcpCardinalStepProfile
+    pose_target_profile: RealAgentTcpPoseTargetProfile | None
     orientation_profiles: tuple[RealAgentTcpFixedOrientationProfile, ...]
     deployment_bindings: tuple[RealAgentPrimitiveDeploymentBinding, ...]
     convergence_profile: RealAgentPrimitiveConvergenceProfile
@@ -459,13 +561,15 @@ class RealAgentPrimitiveContractBundle:
             io_catalog=self.io_catalog,
         )
         self.payload_validators.validate_manifest(self.route_manifest)
-        if (
-            len(self.orientation_profiles) != 3
-            or len(self.deployment_bindings) != 10
-        ):
+        pose_target_enabled = self.pose_target_profile is not None
+        expected_binding_count = 11 if pose_target_enabled else 10
+        if len(self.orientation_profiles) != 3 or len(
+            self.deployment_bindings
+        ) != expected_binding_count:
             raise ValueError(
                 "Real primitive bundle requires one generic cardinal, six "
-                "fixed-cardinal and three orientation bindings."
+                "fixed-cardinal and three orientation bindings, plus exactly one "
+                "absolute-pose binding when its lower envelope authorizes it."
             )
         for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1:
             self.route_manifest.route(skill_id, "1")
@@ -496,6 +600,19 @@ class RealAgentPrimitiveContractBundle:
         )
         if execution_frame != profile_execution_frame:
             raise ValueError("Real primitive lower execution-frame binding mismatch.")
+        if self.pose_target_profile is not None and (
+            (
+                self.pose_target_profile.reference_frame_id,
+                self.pose_target_profile.reference_frame_spec_hash,
+            )
+            != public_frame
+            or (
+                self.pose_target_profile.execution_reference_frame_id,
+                self.pose_target_profile.execution_reference_frame_spec_hash,
+            )
+            != execution_frame
+        ):
+            raise ValueError("Real absolute-pose profile frame bindings disagree.")
         if any(
             (
                 profile.reference_frame_id,
@@ -512,7 +629,7 @@ class RealAgentPrimitiveContractBundle:
             raise ValueError("Real primitive profile frame bindings disagree.")
         if self.attachment.frame_graph_hash != self.frame_graph.semantic_content_hash:
             raise ValueError("Real primitive attachment frame graph mismatch.")
-        expected_route_count = 11 + (
+        expected_route_count = (12 if pose_target_enabled else 11) + (
             2 if self.perception_capture is not None else 0
         )
         if len(self.route_manifest.skill_routes) != expected_route_count:
@@ -538,10 +655,13 @@ class RealAgentPrimitiveContractBundle:
 def _payload_validator(
     *,
     route: SkillExecutionRoute,
-    profile: RealAgentTcpCardinalStepProfile | RealAgentTcpFixedOrientationProfile,
+    profile: RealAgentTcpCardinalStepProfile
+    | RealAgentTcpFixedOrientationProfile
+    | RealAgentTcpPoseTargetProfile,
     fixed_cardinal_direction: str | None = None,
 ) -> AgentSkillPayloadValidatorSet:
     cardinal = isinstance(profile, RealAgentTcpCardinalStepProfile)
+    pose_target = isinstance(profile, RealAgentTcpPoseTargetProfile)
     parameter_fields = (
         {
             "component_id",
@@ -555,7 +675,18 @@ def _payload_validator(
             "primitive_catalog_hash",
         }
         if cardinal
-        else {
+        else (
+            {
+                "pose_targets_by_component",
+                "reference_frame_id",
+                "reference_frame_spec_hash",
+                "controlled_frame_id",
+                "frame_graph_hash",
+                "tool_config_hash",
+                "calibration_hash",
+            }
+            if pose_target
+            else {
             "component_id",
             "reference_frame_id",
             "reference_frame_spec_hash",
@@ -564,17 +695,31 @@ def _payload_validator(
             "tool_config_hash",
             "calibration_hash",
             "primitive_hash",
-        }
+            }
+        )
     )
 
     def validate_parameters(payload: Mapping[str, Any]) -> None:
-        if not isinstance(payload, Mapping) or set(payload) != parameter_fields:
+        payload_fields = set(payload) if isinstance(payload, Mapping) else set()
+        allowed_parameter_fields = (
+            parameter_fields | {"speed_scale"}
+            if pose_target
+            else parameter_fields
+        )
+        if (
+            not isinstance(payload, Mapping)
+            or not parameter_fields <= payload_fields <= allowed_parameter_fields
+        ):
             raise ValueError("Real primitive parameters do not match the exact schema.")
         validation_kwargs: dict[str, Any] = {
             "schema_kind": (
                 "cardinal_tcp_step"
                 if cardinal
-                else "fixed_level_tcp_orientation"
+                else (
+                    "tcp_pose_target"
+                    if pose_target
+                    else "fixed_level_tcp_orientation"
+                )
             ),
             "parameters": payload,
             "allowed_component_ids": (profile.component_id,),
@@ -585,26 +730,37 @@ def _payload_validator(
                 if fixed_cardinal_direction is None
                 else (fixed_cardinal_direction,)
             )
+        elif isinstance(profile, RealAgentTcpPoseTargetProfile):
+            validation_kwargs["speed_scale_bounds"] = profile.speed_scale_bounds
         validate_agent_motion_parameters_v1(**validation_kwargs)
         exact = {
-            "component_id": profile.component_id,
             "reference_frame_id": profile.reference_frame_id,
             "reference_frame_spec_hash": profile.reference_frame_spec_hash,
             "controlled_frame_id": "tool_tcp",
             "frame_graph_hash": profile.frame_graph_hash,
             "tool_config_hash": profile.tool_config_hash,
             "calibration_hash": profile.calibration_hash,
-            (
+        }
+        if not pose_target:
+            exact["component_id"] = profile.component_id
+            exact[
                 "primitive_catalog_hash" if cardinal else "primitive_hash"
-            ): (
+            ] = (
                 profile.primitive_catalog_hash
                 if cardinal
                 else profile.primitive.semantic_content_hash
-            ),
-        }
+            )
         for field_name, expected in exact.items():
             if payload[field_name] != expected:
                 raise ValueError(f"Real primitive {field_name} mismatch.")
+        if pose_target:
+            targets = payload["pose_targets_by_component"]
+            if not isinstance(targets, Mapping) or set(targets) != {
+                profile.component_id
+            }:
+                raise ValueError(
+                    "Real absolute-pose target must select exactly the bound component."
+                )
         if cardinal:
             profile.primitive(str(payload["direction"]))
             if (
@@ -804,6 +960,31 @@ def build_real_agent_primitive_contract_bundle(
         calibration_hash=attachment.calibration_hash,
         convergence_profile_hash=convergence.semantic_content_hash,
     )
+    pose_target_profile = RealAgentTcpPoseTargetProfile(
+        component_id=component_id,
+        side=side,
+        reference_frame_id=primitive_frame.frame_id,
+        reference_frame_spec_hash=primitive_frame.semantic_content_hash,
+        execution_reference_frame_id=port_config.execution_frame_id,
+        execution_reference_frame_spec_hash=port_config.execution_frame_spec_hash,
+        frame_graph_hash=frame_graph.semantic_content_hash,
+        tool_config_hash=attachment.tool_config_hash,
+        calibration_hash=attachment.calibration_hash,
+        convergence_profile_hash=convergence.semantic_content_hash,
+    )
+    pose_target_definition = tcp_pose_target_skill_definition_v1(
+        controlled_component_ids=(component_id,),
+    )
+    pose_target_schema = tcp_pose_target_schema_entry_v1(
+        skill_definition_hash=pose_target_definition.semantic_content_hash,
+        parameter_profile_id=pose_target_profile.parameter_profile_id,
+        parameter_profile_hash=pose_target_profile.semantic_content_hash,
+        allowed_component_ids=(component_id,),
+        allowed_reference_frame_ids=(pose_target_profile.reference_frame_id,),
+        max_requested_duration_ms=None,
+        min_speed_scale=pose_target_profile.min_speed_scale,
+        max_speed_scale=pose_target_profile.max_speed_scale,
+    )
     cardinal_definition = cardinal_tcp_step_skill_definition_v1(
         controlled_component_ids=(component_id,),
     )
@@ -895,6 +1076,7 @@ def build_real_agent_primitive_contract_bundle(
         definition: Any,
         schema: Any,
         route_id: str,
+        max_operation_duration_ms: int = 10_000,
     ) -> SkillExecutionRoute:
         route = SkillExecutionRoute(
             skill_id=definition.skill_id,
@@ -914,7 +1096,7 @@ def build_real_agent_primitive_contract_bundle(
             may_open_publication=False,
             requires_operator_confirmation=True,
             requires_deadman=False,
-            max_operation_duration_ms=10_000,
+            max_operation_duration_ms=max_operation_duration_ms,
             cancellation_policy="hold_on_cancel_disconnect_or_timeout",
             requires_task_evaluation=False,
         )
@@ -925,6 +1107,16 @@ def build_real_agent_primitive_contract_bundle(
         definition=cardinal_definition,
         schema=cardinal_schema,
         route_id=REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
+    )
+    pose_target_route = route_for(
+        definition=pose_target_definition,
+        schema=pose_target_schema,
+        route_id=REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1,
+        max_operation_duration_ms=30_000,
+    )
+    pose_target_enabled = any(
+        REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 in ref.allowed_route_ids
+        for ref in refs
     )
     fixed_cardinal_routes = tuple(
         route_for(
@@ -958,10 +1150,16 @@ def build_real_agent_primitive_contract_bundle(
         )
     )
     all_routes = (
+        *((pose_target_route,) if pose_target_enabled else ()),
         cardinal_route,
         *fixed_cardinal_routes,
         *orientation_routes,
     )
+    expected_route_ids = set(real_agent_motion_route_ids_v1())
+    if not pose_target_enabled:
+        expected_route_ids.remove(REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1)
+    if {route.route_id for route in all_routes} != expected_route_ids:
+        raise RuntimeError("Real motion Route construction and safety allowlist drifted.")
     for route in all_routes:
         if not any(route.route_id in ref.allowed_route_ids for ref in refs):
             raise ValueError(
@@ -981,6 +1179,11 @@ def build_real_agent_primitive_contract_bundle(
         domain="dexteleop.real_agent_motion.port_binding.v1",
     )
     profile_by_route_hash = {
+        **(
+            {pose_target_route.semantic_content_hash: pose_target_profile}
+            if pose_target_enabled
+            else {}
+        ),
         cardinal_route.semantic_content_hash: cardinal_profile,
         **{
             route.semantic_content_hash: cardinal_profile
@@ -996,6 +1199,15 @@ def build_real_agent_primitive_contract_bundle(
         },
     }
     executor_by_route_hash = {
+        **(
+            {
+                pose_target_route.semantic_content_hash: (
+                    REAL_AGENT_TCP_POSE_TARGET_EXECUTOR_ID_V1
+                )
+            }
+            if pose_target_enabled
+            else {}
+        ),
         cardinal_route.semantic_content_hash: REAL_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
         **{
             route.semantic_content_hash: (
@@ -1066,6 +1278,7 @@ def build_real_agent_primitive_contract_bundle(
         catalog_version="1",
         skill_definitions=(
             tcp_pose_definition,
+            *((pose_target_definition,) if pose_target_enabled else ()),
             cardinal_definition,
             *fixed_cardinal_definitions,
             *orientation_definitions,
@@ -1077,6 +1290,7 @@ def build_real_agent_primitive_contract_bundle(
         catalog_version="1",
         schema_entries=(
             tcp_pose_schema,
+            *((pose_target_schema,) if pose_target_enabled else ()),
             cardinal_schema,
             *fixed_cardinal_schemas,
             *orientation_schemas,
@@ -1191,6 +1405,16 @@ def build_real_agent_primitive_contract_bundle(
             tcp_pose_observe.payload_validators.validator_for(
                 tcp_pose_entry.route
             ),
+            *(
+                (
+                    _payload_validator(
+                        route=pose_target_route,
+                        profile=pose_target_profile,
+                    ),
+                )
+                if pose_target_enabled
+                else ()
+            ),
             _payload_validator(route=cardinal_route, profile=cardinal_profile),
             *tuple(
                 _payload_validator(
@@ -1225,6 +1449,7 @@ def build_real_agent_primitive_contract_bundle(
         route_manifest=manifest,
         io_catalog=io_catalog,
         cardinal_profile=cardinal_profile,
+        pose_target_profile=(pose_target_profile if pose_target_enabled else None),
         orientation_profiles=orientation_profiles,
         deployment_bindings=bindings,
         convergence_profile=convergence,
@@ -1250,10 +1475,15 @@ __all__ = [
     "REAL_AGENT_TCP_LEVEL_FORWARD_LEFT_30_ROUTE_ID_V1",
     "REAL_AGENT_TCP_LEVEL_FORWARD_RIGHT_30_ROUTE_ID_V1",
     "REAL_AGENT_TCP_LEVEL_FORWARD_ROUTE_ID_V1",
+    "REAL_AGENT_TCP_POSE_TARGET_EXECUTOR_ID_V1",
+    "REAL_AGENT_TCP_POSE_TARGET_PARAMETER_PROFILE_ID_V1",
+    "REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1",
     "RealAgentPrimitiveContractBundle",
     "RealAgentPrimitiveConvergenceProfile",
     "RealAgentPrimitiveDeploymentBinding",
     "RealAgentTcpCardinalStepProfile",
     "RealAgentTcpFixedOrientationProfile",
+    "RealAgentTcpPoseTargetProfile",
     "build_real_agent_primitive_contract_bundle",
+    "real_agent_motion_route_ids_v1",
 ]

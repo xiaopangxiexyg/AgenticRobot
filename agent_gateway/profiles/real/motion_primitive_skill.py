@@ -22,6 +22,7 @@ from robot_motion.relative_action import (
     pose_matrix_to_xyzquat,
     xyzquat_to_pose_matrix,
 )
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionActivation,
     RealAgentMotionPhase,
@@ -33,6 +34,7 @@ from .motion_primitive_profiles import (
     RealAgentPrimitiveDeploymentBinding,
     RealAgentTcpCardinalStepProfile,
     RealAgentTcpFixedOrientationProfile,
+    RealAgentTcpPoseTargetProfile,
 )
 
 
@@ -75,7 +77,8 @@ class RealAgentPrimitiveSkillLifecycle:
         route: SkillExecutionRoute,
         binding: RealAgentPrimitiveDeploymentBinding,
         profile: RealAgentTcpCardinalStepProfile
-        | RealAgentTcpFixedOrientationProfile,
+        | RealAgentTcpFixedOrientationProfile
+        | RealAgentTcpPoseTargetProfile,
         request: AgentSkillRequest,
         operation: AgentSkillOperation,
         clock: Callable[[], float] = time.time,
@@ -91,7 +94,11 @@ class RealAgentPrimitiveSkillLifecycle:
             raise TypeError("binding must be typed.")
         if not isinstance(
             profile,
-            (RealAgentTcpCardinalStepProfile, RealAgentTcpFixedOrientationProfile),
+            (
+                RealAgentTcpCardinalStepProfile,
+                RealAgentTcpFixedOrientationProfile,
+                RealAgentTcpPoseTargetProfile,
+            ),
         ):
             raise TypeError("profile must be a real primitive profile.")
         if not callable(clock) or not callable(sleep):
@@ -118,7 +125,13 @@ class RealAgentPrimitiveSkillLifecycle:
             raise ValueError("Real primitive runtime session mismatch.")
         if profile.component_id != binding.component_id or profile.side != binding.side:
             raise ValueError("Real primitive component/side binding mismatch.")
-        if request.parameters.get("component_id") != profile.component_id:
+        if isinstance(profile, RealAgentTcpPoseTargetProfile):
+            targets = request.parameters.get("pose_targets_by_component")
+            if not isinstance(targets, Mapping) or set(targets) != {
+                profile.component_id
+            }:
+                raise ValueError("Real absolute-pose request component mismatch.")
+        elif request.parameters.get("component_id") != profile.component_id:
             raise ValueError("Real primitive request component mismatch.")
 
         self.executor_id = binding.executor_id
@@ -163,6 +176,53 @@ class RealAgentPrimitiveSkillLifecycle:
         str,
         str,
     ]:
+        if isinstance(self.profile, RealAgentTcpPoseTargetProfile):
+            parameters = self.request.parameters
+            targets = parameters.get("pose_targets_by_component")
+            assert isinstance(targets, Mapping)
+            public_pose = xyzquat_to_pose_matrix(
+                targets[self.profile.component_id],
+                name="real_agent_absolute_tool_tcp_target",
+            )
+            execution_pose, frame_resolution = (
+                self.contract_bundle.frame_graph.transform_pose_matrix(
+                    public_pose,
+                    source_reference_frame_id=self.profile.reference_frame_id,
+                    target_reference_frame_id=(
+                        self.profile.execution_reference_frame_id
+                    ),
+                )
+            )
+            target_hash = canonical_content_hash(
+                {
+                    "profile_hash": self.profile.semantic_content_hash,
+                    "component_id": self.profile.component_id,
+                    "public_target_pose": tuple(
+                        float(value)
+                        for value in pose_matrix_to_xyzquat(
+                            public_pose,
+                            name="real_agent_absolute_public_target",
+                        )
+                    ),
+                    "frame_resolution_hash": frame_resolution.semantic_content_hash,
+                },
+                domain="dexteleop.real_agent_motion.absolute_tcp_target.v1",
+            )
+            resolution = MotionPrimitiveTargetResolution(
+                target_pose=tuple(
+                    float(value)
+                    for value in pose_matrix_to_xyzquat(
+                        execution_pose,
+                        name="real_agent_absolute_execution_target",
+                    )
+                ),
+                evidence_refs=(
+                    "tcp-pose-target:" + target_hash,
+                    "tcp-pose-target-frame-resolution:"
+                    + frame_resolution.semantic_content_hash,
+                ),
+            )
+            return resolution, self.profile.skill_id + "@1", target_hash
         reference_frame = self.contract_bundle.frame_graph.frame_by_id[
             self.profile.reference_frame_id
         ]
@@ -251,6 +311,11 @@ class RealAgentPrimitiveSkillLifecycle:
             measured_state_hash=cut.semantic_content_hash,
             submitted_at=now,
             expires_at=operation.deadline_at,
+            speed_scale=(
+                float(self.request.parameters.get("speed_scale", 1.0))
+                if isinstance(self.profile, RealAgentTcpPoseTargetProfile)
+                else 1.0
+            ),
         )
         snapshot = self.port.submit_activation(activation)
         self.target_resolution = resolution

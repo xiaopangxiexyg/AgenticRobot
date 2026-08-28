@@ -48,9 +48,7 @@ from .exclusive_factory import (
     assemble_exclusive_rm65_agent_primitive_deployment,
 )
 from .motion_primitive_profiles import (
-    REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
-    REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
+    real_agent_motion_route_ids_v1,
 )
 from .observation_gateway import RealTcpPoseObserveAttachmentSpec
 from .one_shot_authorization import (
@@ -99,15 +97,7 @@ def _public_tool_profiles(lower: ExclusiveRM65SkillLowerAssembly) -> dict[str, o
 
 
 def _route_ids() -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            {
-                REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-                *REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1.values(),
-                *REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1.values(),
-            }
-        )
-    )
+    return real_agent_motion_route_ids_v1()
 
 
 @dataclass(frozen=True)
