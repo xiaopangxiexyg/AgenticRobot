@@ -207,6 +207,39 @@ verifies wiring and source lineage, not task success, policy quality, latency
 guarantees, safety-envelope acceptance, or physical readiness. No real device,
 policy server, or actuator is started by the automated tests.
 
+### State-BC GUI runbook
+
+With `--control-gui`, the existing loopback Control Station page is the
+operator surface for the complete Sim-HIL run. The separate MuJoCo viewer is
+the passive scene view; the browser owns only typed acceptance intents and
+status presentation. Before a target is constructed, the page's **策略运行时**
+card already identifies the selected `state_bc` backend, the artifact file,
+the `16D state → 16D action → 26D runtime` contract, bilateral state
+observation, and right-side-only execution. After construction it updates the
+same card from the live policy-source status and keeps the artifact/layout
+diagnostics in the read-only panel.
+
+The intended operator sequence is:
+
+1. Start the command above and open the printed loopback URL (or use
+   `--open-browser`). Confirm the state-BC card and the separate MuJoCo viewer
+   are visible before selecting a source.
+2. In the **直接接管** source cards, choose **以 state-BC 启动**. The page
+   keeps VIVE setup visible but does not block policy-only startup on Human
+   readiness.
+3. When the policy source is running, press `H` or click the Human card to
+   request takeover. The page shows the HOLD/Runtime Home transition and the
+   resulting Human owner; it never writes an action directly from JavaScript.
+4. Press `P` or click the state-BC card to hand control back. The page reports
+   the fresh post-HOLD state-BC emission and keeps the single lower execution
+   owner visible. `Esc` remains the immediate typed HOLD action.
+5. Use the visible HOLD/rearm controls for a controlled pause, and expand
+   **结束、保存与重建** only when finalizing, resetting, or exiting the run.
+
+The browser cannot select a different artifact at runtime: the CLI path is
+the immutable source binding for this session. This prevents an operator GUI
+choice from silently changing model identity or the state/action contract.
+
 ## Evidence ceiling and next gate
 
 The current Task now proves the contracts, explicit 2026-08-07 selector,

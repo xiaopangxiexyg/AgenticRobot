@@ -118,6 +118,10 @@ _HTML = """<!doctype html>
     .setup-facts { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; margin-top: 12px; }
     .setup-fact { padding: 8px 10px; border-radius: 9px; background: rgba(17,24,39,.72); color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .setup-fact strong { display: block; margin-bottom: 2px; color: var(--text); }
+    .policy-runtime-panel { border-color: rgba(115,183,255,.42); background: linear-gradient(135deg, rgba(21,43,71,.58), rgba(10,15,28,.58)); }
+    .policy-runtime-panel .setup-facts { grid-template-columns: repeat(4, minmax(0,1fr)); }
+    .policy-runtime-contract, .policy-runtime-artifact { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .policy-runtime-note { margin-top: 10px; color: var(--muted); font-size: 12px; }
     .acceptance-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
     .journey { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 1px; margin: 14px 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--line); }
     .journey-step { min-width: 0; padding: 10px 12px; color: var(--muted); background: rgba(10,15,28,.78); }
@@ -253,7 +257,7 @@ _HTML = """<!doctype html>
       <p id="acceptance-description">正在读取所选控制方案。</p>
       <nav id="operator-journey" class="journey" aria-label="操作阶段">
         <div id="journey-prepare" class="journey-step active"><strong><span class="journey-index">1</span>准备输入</strong><span>设备与坐标</span></div>
-        <div id="journey-source" class="journey-step"><strong><span class="journey-index">2</span>选择来源</strong><span>Policy / Human</span></div>
+        <div id="journey-source" class="journey-step"><strong><span class="journey-index">2</span>选择来源</strong><span id="journey-source-detail">Policy / Human</span></div>
         <div id="journey-run" class="journey-step"><strong><span class="journey-index">3</span>运行控制</strong><span>切换、保持、恢复</span></div>
         <div id="journey-finish" class="journey-step"><strong><span class="journey-index">4</span>结束收尾</strong><span>封存或退出</span></div>
       </nav>
@@ -283,6 +287,22 @@ _HTML = """<!doctype html>
         </div>
         <p id="control-profile-help" class="subtle">启动前可切换；Runtime 构造后需先结束并重建，避免跨 profile 隐式继承 authority、Home 或历史状态。</p>
         <p id="sim-collision-stop-help" class="subtle">该选择只影响 Sim pose planner；关闭时 MuJoCo 物理接触仍存在，但碰撞不会终止回合。</p>
+      </section>
+      <section id="policy-runtime-panel" class="setup-panel policy-runtime-panel" hidden>
+        <div class="setup-head">
+          <div>
+            <h2>策略运行时</h2>
+            <p id="policy-runtime-help">等待策略来源状态。</p>
+          </div>
+          <span id="policy-runtime-state" class="setup-state">—</span>
+        </div>
+        <div class="setup-facts">
+          <div class="setup-fact"><strong>后端</strong><span id="policy-runtime-backend">—</span></div>
+          <div class="setup-fact"><strong>模型契约</strong><span id="policy-runtime-contract" class="policy-runtime-contract">—</span></div>
+          <div class="setup-fact"><strong>当前输出</strong><span id="policy-runtime-output">—</span></div>
+          <div class="setup-fact"><strong>模型文件</strong><span id="policy-runtime-artifact" class="policy-runtime-artifact">—</span></div>
+        </div>
+        <p id="policy-runtime-note" class="policy-runtime-note">该面板只显示来源和维度，不直接修改动作或执行权。</p>
       </section>
       <section id="operator-guidance" class="operator-guidance warning" hidden>
         <div class="operator-guidance-head">
@@ -355,8 +375,8 @@ _HTML = """<!doctype html>
         </div>
         <div class="source-module-grid">
           <section id="exclusive-policy-module" class="source-module">
-            <div class="source-module-head"><h3>Policy 输入</h3><span id="exclusive-policy-badge" class="source-module-badge">检查中</span></div>
-            <p>模型输出进入流式分配；Human 不参与当前动作。</p>
+            <div class="source-module-head"><h3 id="exclusive-policy-title">Policy 输入</h3><span id="exclusive-policy-badge" class="source-module-badge">检查中</span></div>
+            <p id="exclusive-policy-description">模型输出进入流式分配；Human 不参与当前动作。</p>
             <div id="exclusive-policy-module-state" class="source-module-state">正在检查策略。</div>
             <div class="controls"><button id="start-exclusive-policy-runtime" class="primary">以 Policy 启动</button></div>
             <div id="exclusive-policy-action-reason" class="source-module-action-reason">等待策略状态。</div>
@@ -456,7 +476,7 @@ _HTML = """<!doctype html>
         <label>人类输入超时回退
           <select id="human-timeout-fallback">
             <option value="hold">静止</option>
-            <option value="policy">切换到 PPO</option>
+            <option id="human-timeout-policy-option" value="policy">切换到 PPO</option>
           </select>
         </label>
         <button id="apply-human-timeout-fallback">应用输入回退</button>
@@ -522,7 +542,7 @@ _HTML = """<!doctype html>
         <div class="card-head"><h2>输入来源</h2><span class="label">不显示原始动作值</span></div>
         <!-- no raw action values (presentation label retained for old checks) -->
         <div class="source-grid">
-          <div class="source"><h3>临时 PPO 策略</h3><dl id="policy-rows"></dl></div>
+          <div class="source"><h3 id="policy-source-title">临时 PPO 策略</h3><dl id="policy-rows"></dl></div>
           <div class="source"><h3>被动 VIVE + 当前夹爪输入</h3><dl id="human-rows"></dl></div>
         </div>
       </article>
@@ -582,6 +602,13 @@ _HTML = """<!doctype html>
       'real arm motion': '真机机械臂运动', 'owner': '执行所有者',
       'status schema': '状态协议', 'MuJoCo viewer': 'MuJoCo 窗口',
       'viewer frames': '窗口帧数', 'viewer error': '窗口错误',
+      'backend': '策略后端', 'artifact': '模型文件', 'artifact path': '模型文件',
+      'artifact status': '模型文件状态', 'artifact schema': '模型契约',
+      'layout hash': '布局哈希', 'model state dim': '模型状态维度',
+      'model action dim': '模型动作维度',
+      'model observation sides': '模型观察侧', 'output active sides': '执行输出侧',
+      'state only capability': '仅状态输入',
+      'full bimanual execution': '双臂完整执行', 'projection': '动作投影',
       'compose skipped cycles': '跳过的混合周期',
       'last compose overrun': '最近混合超时', 'overrun handling': '超时处理',
       'cycle total': '最近完整周期', 'composition + execution': '混合与执行处理',
@@ -796,6 +823,106 @@ _HTML = """<!doctype html>
       ppo_only: '纯 PPO',
       proportional_blend: '比例融合',
     };
+    function policyPresentation(policy) {
+      const backend = String(policy?.backend || 'temp_ppo');
+      if (backend === 'state_bc') {
+        return {
+          backend,
+          short: 'state-BC',
+          name: 'state-BC 策略',
+          pure: '纯 state-BC',
+          source: 'state-BC 输入',
+          output: 'state-BC → 26D runtime（当前右侧执行）',
+          description: '38D MuJoCo state → 16D state-BC → 16D action → 26D runtime；当前只执行右臂与右夹爪。',
+        };
+      }
+      if (backend === 'openpi_state') {
+        return {
+          backend,
+          short: 'OpenPI state',
+          name: 'OpenPI state 策略',
+          pure: '纯 OpenPI state',
+          source: 'OpenPI state 输入',
+          output: 'OpenPI state → runtime（当前右侧执行）',
+          description: 'state-only OpenPI 输入经过现有 deployment/runtime 边界；当前只执行右侧输出。',
+        };
+      }
+      return {
+        backend: 'temp_ppo',
+        short: 'PPO',
+        name: '临时 PPO 策略',
+        pure: '纯 PPO',
+        source: 'PPO 输入',
+        output: 'PPO → runtime（当前右侧执行）',
+        description: '模型输出进入流式分配；Human 不参与当前动作。',
+      };
+    }
+    function policyArtifact(policy) {
+      return policy?.artifact_path || policy?.policy_artifact
+        || policy?.checkpoint || null;
+    }
+    function policyArtifactLabel(policy) {
+      const value = policyArtifact(policy);
+      if (!value) return '未配置';
+      const normalized = String(value).replace(/\\/g, '/');
+      return normalized.split('/').pop() || normalized;
+    }
+    function policyDimension(policy, index, fallback = null) {
+      const dimensions = Array.isArray(policy?.policy_dimensions)
+        ? policy.policy_dimensions : [];
+      const direct = index === 0
+        ? policy?.model_state_dim ?? policy?.state_dim
+        : policy?.model_action_dim ?? policy?.action_dim;
+      const value = direct ?? dimensions[index] ?? fallback;
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+    function policyModeLabel(modeId, presentation) {
+      return modeId === 'ppo_only'
+        ? presentation.pure : controlModeNames[modeId] || uiValue(modeId);
+    }
+    function renderPolicyRuntime(value, humanDemonstration) {
+      const panel = $('policy-runtime-panel');
+      const policy = value.policy || {};
+      const presentation = policyPresentation(policy);
+      panel.hidden = Boolean(humanDemonstration);
+      if (humanDemonstration) return presentation;
+      const stateDim = policyDimension(policy, 0);
+      const actionDim = policyDimension(policy, 1);
+      const runtimeDim = Number(policy.runtime_action_dim || (
+        presentation.backend === 'state_bc' ? 26 : NaN
+      ));
+      const dimensions = stateDim !== null && actionDim !== null
+        ? `${stateDim}D state → ${actionDim}D action`
+        : '等待模型维度';
+      const contract = Number.isFinite(runtimeDim)
+        ? `${dimensions} → ${runtimeDim}D runtime` : dimensions;
+      const outputSides = Array.isArray(policy.output_active_sides)
+        ? policy.output_active_sides.join(' / ') : null;
+      const state = policy.started
+        ? policy.ready ? '运行中' : '故障'
+        : policy.artifact_status === 'not_found'
+        ? '模型文件不存在'
+        : policyArtifact(policy) ? '已配置 · 待启动' : '未配置';
+      $('policy-runtime-state').textContent = state;
+      $('policy-runtime-state').className = `setup-state ${
+        policy.ready || (!policy.started && policyArtifact(policy)
+          && policy.artifact_status !== 'not_found') ? 'ready' : ''
+      }`;
+      $('policy-runtime-backend').textContent = presentation.short;
+      $('policy-runtime-contract').textContent = contract;
+      $('policy-runtime-output').textContent = outputSides
+        ? `${outputSides} · ${presentation.backend === 'state_bc' ? '右侧执行' : '当前配置'}`
+        : presentation.output;
+      $('policy-runtime-artifact').textContent = policyArtifactLabel(policy);
+      $('policy-runtime-artifact').title = policyArtifact(policy)
+        ? String(policyArtifact(policy)) : '';
+      $('policy-runtime-help').textContent = presentation.description;
+      $('policy-runtime-note').textContent = presentation.backend === 'state_bc'
+        ? 'state-BC 只读取 MuJoCo 状态；模型契约是 16D → 16D，运行时仍由现有 26D deployment/runtime 接管。右侧输出不代表双臂执行。'
+        : '该面板只显示来源和维度，不直接修改动作或执行权。';
+      return presentation;
+    }
     const controlModeDescriptions = {
       human_teleop: '仅使用人类 pose / 末端 qpos；启动前必须接纳 Human 输入。',
       ppo_only: '仅使用策略动作；可在 VIVE 尚未就绪时独立启动。',
@@ -1112,6 +1239,8 @@ _HTML = """<!doctype html>
       const calibration = setup.calibration || {};
       const humanDemonstration = acceptance.capture_profile
         === 'human_demonstration';
+      const policyUi = renderPolicyRuntime(value, humanDemonstration);
+      $('journey-source-detail').textContent = `${policyUi.short} / Human`;
       renderOperatorJourney(value);
       const simPreviewReady = Boolean(acceptance.sim_preview_ready);
       const executionTarget = value.execution_target;
@@ -1168,7 +1297,7 @@ _HTML = """<!doctype html>
       setupState.textContent = simPreviewReady
         ? (humanRuntimeLaunchReady ? '预览中 · Human 可接入' : '预览中 · 等待 Human')
         : deferredHumanSetup
-        ? (humanRuntimeLaunchReady ? 'Human 可以接入' : 'PPO 运行中')
+        ? (humanRuntimeLaunchReady ? 'Human 可以接入' : `${policyUi.short} 运行中`)
         : runtimeConstructed
         ? '运行中'
         : humanRuntimeLaunchReady ? 'Human 可以启动' : '需要设置';
@@ -1180,7 +1309,7 @@ _HTML = """<!doctype html>
       $('vive-setup-title').textContent = simPreviewReady
         ? '仿真预览中 · Human 输入尚未接入执行链路'
         : deferredHumanSetup
-        ? 'PPO 已运行 · Human 输入按需接入'
+        ? `${policyUi.short} 已运行 · Human 输入按需接入`
         : runtimeConstructed
         ? 'VIVE 配置已交接给 Sim-HIL'
         : 'VIVE 输入与坐标配置';
@@ -1191,7 +1320,7 @@ _HTML = """<!doctype html>
         : deferredHumanSetup
         ? (calibration.message || inputPreflight.message
           ? uiValue(calibration.message || inputPreflight.message)
-          : '纯 PPO 不使用 VIVE；切换到遥操或混合模式时才检查并接入。')
+          : `${policyUi.pure} 不使用 VIVE；切换到遥操或混合模式时才检查并接入。`)
         : runtimeConstructed
         ? '标定接收器已关闭；当前运行时持有唯一 VIVE 接收器。'
         : (calibration.message || inputPreflight.message
@@ -1284,6 +1413,8 @@ _HTML = """<!doctype html>
         $('vive-setup-title').textContent =
           'Human 输入模块 · VIVE、触发器与坐标配置';
       }
+      $('exclusive-policy-title').textContent = `${policyUi.name}输入`;
+      $('exclusive-policy-description').textContent = policyUi.description;
       // Exclusive takeover uses the allocation streaming backend internally,
       // but remains a restricted two-button application profile. Do not expose
       // the generic automatic/relative allocation controls in that UI.
@@ -1302,10 +1433,14 @@ _HTML = """<!doctype html>
       $('page-summary').textContent = humanDemonstration
         ? '先调整静态仿真视角，再一次性开始 Human-only 遥操与记录；封存完成即自动保存。'
         : allocationProfile
+        ? policyUi.backend === 'temp_ppo'
         ? '动态分配以策略基线启动；VIVE 与夹爪只在首次进入 Human 模式时接入。'
+        : `动态分配以 ${policyUi.short} 基线启动；VIVE 与夹爪只在首次进入 Human 模式时接入。`
         : exclusiveProfile
-        ? '策略与 Human 通过两个显式触发器整段切换；不执行比例融合。'
-        : '可选择纯 PPO、纯遥操或固定比例融合；纯 PPO 不要求 VIVE 先就绪。';
+        ? `${policyUi.short} 与 Human 通过两个显式触发器整段切换；不执行比例融合。`
+        : policyUi.backend === 'temp_ppo'
+        ? '可选择纯 PPO、纯遥操或固定比例融合；纯 PPO 不要求 VIVE 先就绪。'
+        : `可选择纯 ${policyUi.short}、纯遥操或固定比例融合；纯 ${policyUi.short} 不要求 VIVE 先就绪。`;
       $('page-title').textContent = humanDemonstration
         ? 'Human Demo 采集 · MuJoCo'
         : '仿真在环控制与 VIVE 标定';
@@ -1313,14 +1448,14 @@ _HTML = """<!doctype html>
         ? '本次轨迹'
         : '操作区 · Sim-HIL 正式控制';
       $('acceptance-description').textContent = humanDemonstration
-        ? 'PPO、比例融合、动态分配和策略超时回退均被当前采集配置禁止。'
+        ? `${policyUi.short}、比例融合、动态分配和策略超时回退均被当前采集配置禁止。`
         : allocationProfile
         ? (allocationSupportsAbsolute
           ? '可在策略基线、自动分配、人类相对修正和人类绝对接管之间切换。'
           : '可在策略基线、自动分配和人类相对修正之间切换；当前方案不提供绝对接管。')
         : exclusiveProfile
-        ? 'Human 接管前自动 HOLD/Home；交还策略时清空旧动作并从当前状态重新开始。'
-        : '启动后可切换纯遥操、纯 PPO 和比例融合；切换到 Human 相关模式时才接纳 VIVE。';
+        ? `Human 接管前自动 HOLD/Home；交还 ${policyUi.short} 时清空旧动作并从当前状态重新开始。`
+        : `启动后可切换纯遥操、纯 ${policyUi.short} 和比例融合；切换到 Human 相关模式时才接纳 VIVE。`;
       $('acceptance-description').hidden = humanDemonstration;
       target.hidden = allocationProfile || exclusiveProfile || humanDemonstration;
       $('human-demo-workflow').hidden = !humanDemonstration;
@@ -1400,7 +1535,7 @@ _HTML = """<!doctype html>
           const modeCard = document.createElement('div');
           modeCard.className = 'mode-card';
           const title = document.createElement('h3');
-          title.textContent = controlModeNames[modeId];
+          title.textContent = policyModeLabel(modeId, policyUi);
           const description = document.createElement('p');
           description.textContent = controlModeDescriptions[modeId];
           const state = document.createElement('div');
@@ -1411,7 +1546,7 @@ _HTML = """<!doctype html>
           const button = document.createElement('button');
           button.textContent = !modeLaunchReady
             ? (modeId === 'ppo_only'
-              ? '策略运行时尚未就绪'
+              ? `${policyUi.short} 运行时尚未就绪`
               : '等待 VIVE / 坐标配置')
             : activeMode === modeId
             ? '当前模式'
@@ -1475,8 +1610,10 @@ _HTML = """<!doctype html>
           ? `未就绪：${uiValue(policyError)}`
           : policyRuntimeLaunchReady
           ? (runtimeStarted
-            ? (policyActive ? '当前动作由 Policy 下发' : '待命；Human 控制周期不会同步等待模型')
-            : '已就绪，可作为启动来源')
+            ? (policyActive
+              ? `当前动作由 ${policyUi.short} 下发`
+              : `待命；Human 控制周期不会同步等待 ${policyUi.short}`)
+            : `已就绪，可作为 ${policyUi.short} 启动来源`)
           : '策略模型尚未就绪';
         $('exclusive-human-module-state').textContent = humanError
           && !humanRuntimeLaunchReady
@@ -1504,10 +1641,10 @@ _HTML = """<!doctype html>
         humanButton.setAttribute('aria-pressed', String(humanActive));
         policyButton.textContent = acceptanceBusy
           ? '操作处理中…'
-          : policyActive ? 'Policy 正在控制'
-          : !policyRuntimeLaunchReady ? 'Policy 未就绪'
-          : runtimeStarted && held ? '从 HOLD 恢复到 Policy'
-          : runtimeStarted ? '切换到 Policy' : '以 Policy 启动';
+          : policyActive ? `${policyUi.short} 正在控制`
+          : !policyRuntimeLaunchReady ? `${policyUi.short} 未就绪`
+          : runtimeStarted && held ? `从 HOLD 恢复到 ${policyUi.short}`
+          : runtimeStarted ? `切换到 ${policyUi.short}` : `以 ${policyUi.short} 启动`;
         humanButton.textContent = acceptanceBusy
           ? '操作处理中…'
           : humanActive ? 'Human 正在控制'
@@ -1521,13 +1658,13 @@ _HTML = """<!doctype html>
         const generalSourceReason = busyReason || (episodeEnded
           ? '当前回合已经结束，只能执行收尾。' : '');
         const policyActionReason = generalSourceReason || (policyActive
-          ? 'Policy 已经是当前控制来源。'
-          : !policyRuntimeLaunchReady ? '等待策略模型产生可接纳输出。'
+          ? `${policyUi.short} 已经是当前控制来源。`
+          : !policyRuntimeLaunchReady ? `等待 ${policyUi.short} 模型产生可接纳输出。`
           : held
-          ? '保持不会先被解除；事务会重建 lower HOLD 证据、清空旧计划，并仅在新 Policy 目标被接纳后恢复。'
+          ? `保持不会先被解除；事务会重建 lower HOLD 证据、清空旧计划，并仅在新 ${policyUi.short} 目标被接纳后恢复。`
           : runtimeStarted
-          ? '切换会先 HOLD、清空旧计划，再从当前状态恢复 Policy。'
-          : '启动时 Human 不参与动作。');
+          ? `切换会先 HOLD、清空旧计划，再从当前状态恢复 ${policyUi.short}。`
+          : `启动时 Human 不参与 ${policyUi.short} 动作。`);
         const humanActionReason = generalSourceReason || (humanActive
           ? 'Human 已经是当前控制来源。'
           : !humanRuntimeLaunchReady
@@ -1547,14 +1684,15 @@ _HTML = """<!doctype html>
           humanButton,
           humanActionReason,
         );
-        const ownerName = humanActive ? 'Human' : policyActive ? 'Policy' : '尚未启动';
+        const ownerName = humanActive
+          ? 'Human' : policyActive ? policyUi.short : '尚未启动';
         $('exclusive-current-owner').textContent = held && runtimeStarted
           ? `当前控制：HOLD（保留 ${ownerName} 选择）`
           : `当前控制：${ownerName}`;
         const switchDurationMs = Number(switchEvidence.completed_at)
           - Number(switchEvidence.requested_at);
         $('exclusive-source-transition').textContent = switchEvidence.status
-          ? `最近切换：${switchEvidence.target_source === 'human' ? '转入 Human' : '交还 Policy'} · ${
+          ? `最近切换：${switchEvidence.target_source === 'human' ? '转入 Human' : `交还 ${policyUi.short}`} · ${
               uiValue(switchEvidence.status)
             }${Number.isFinite(switchDurationMs) ? ` · ${(1000 * switchDurationMs).toFixed(0)} ms` : ''}`
           : runtimeStarted ? '尚未进行运行中来源切换。' : '任选一个已就绪来源启动。';
@@ -1590,7 +1728,7 @@ _HTML = """<!doctype html>
       const allocationUnavailable = acceptanceBusy
         || !runtimeStarted || episodeEnded || Boolean(value.held);
       $('start-allocation-runtime').hidden = runtimeStarted;
-      $('start-allocation-runtime').textContent = '以策略基线启动动态分配';
+      $('start-allocation-runtime').textContent = `以 ${policyUi.short} 基线启动动态分配`;
       $('start-allocation-runtime').disabled = acceptanceBusy
         || !allocationProfile || runtimeStarted || episodeEnded
         || !policyRuntimeLaunchReady;
@@ -1723,9 +1861,10 @@ _HTML = """<!doctype html>
         acceptanceBusy || !runtimeStarted;
       const humanTimeoutLast = humanTimeoutFallback.last_activation || {};
       const timeoutSec = humanTimeoutFallback.timeout_sec || 5;
+      $('human-timeout-policy-option').textContent = `切换到 ${policyUi.short}`;
       $('human-timeout-fallback-status').textContent =
         humanTimeoutFallback.latched
-          ? '人类输入已超时，已锁存到 PPO；恢复人类模式需人工切换。'
+          ? `人类输入已超时，已锁存到 ${policyUi.short}；恢复人类模式需人工切换。`
           : humanTimeoutLast.status === 'hold_selected'
           ? `人类输入超过 ${timeoutSec} 秒未更新，已保持静止。`
           : `超过 ${timeoutSec} 秒无新的人类输出时触发；默认静止。`;
@@ -1787,10 +1926,10 @@ _HTML = """<!doctype html>
         ? '代理安全间隙保护已终止当前 episode；这不代表已发生物理接触。来源切换、重采 Home 和 rearm 均不可用，只能 Reset 仿真。'
         : runtimeHeld
         ? (deferredHumanSetup
-          ? '当前为纯 PPO 保持状态；Human 输入接入后才可采集 Runtime Home。'
+          ? `当前为${policyUi.pure}保持状态；Human 输入接入后才可采集 Runtime Home。`
           : '当前已保持；VIVE 仍在低频被动刷新。可采集当前 Runtime Home，再恢复运行。')
         : (deferredHumanSetup
-          ? '纯 PPO 正在运行；VIVE 与坐标配置不会阻塞策略执行。'
+          ? `${policyUi.pure}正在运行；VIVE 与坐标配置不会阻塞策略执行。`
           : 'Runtime Home 已绑定；需要重采时先保持输出。完整重建会结束当前 MuJoCo 仿真。');
       $('rebuild-runtime').disabled = acceptanceBusy || !runtimeAvailable;
       $('rebuild-runtime').hidden = !runtimeConstructed
@@ -1836,13 +1975,13 @@ _HTML = """<!doctype html>
         : allocationProfile
         ? '动态分配待启动'
         : activeMode
-        ? `当前：${controlModeNames[activeMode] || uiValue(activeMode)}`
+        ? `当前：${policyModeLabel(activeMode, policyUi)}`
         : exclusiveProfile && humanRuntimeLaunchReady && policyRuntimeLaunchReady
-        ? 'Policy / Human 均可启动'
+        ? `${policyUi.short} / Human 均可启动`
         : exclusiveProfile && humanRuntimeLaunchReady
         ? 'Human 可以启动'
         : policyRuntimeLaunchReady
-        ? '纯 PPO 可以启动'
+        ? `${policyUi.pure} 可以启动`
         : '等待策略运行时';
       rows($('capture-rows'), [
         ['记录状态', capture.status], ['Trace 会话', capture.trace_session_id],
@@ -2384,10 +2523,24 @@ _HTML = """<!doctype html>
       renderChecks(readiness);
       renderAcceptance(value);
       const policy = value.policy || {};
+      const policyUi = policyPresentation(policy);
       const policyEmission = policy.last_emission || {};
+      $('policy-source-title').textContent = policyUi.name;
       rows($('policy-rows'), [
         ['state', policy.started ? (policy.ready ? 'ready' : 'fault') : 'stopped'],
         ['refresh', policy.refresh_state],
+        ['backend', policy.backend],
+        ['artifact', policyArtifact(policy)],
+        ['artifact status', policy.artifact_status],
+        ['artifact schema', policy.artifact_schema],
+        ['layout hash', policy.layout_hash],
+        ['model state dim', policy.model_state_dim ?? policy.state_dim],
+        ['model action dim', policy.model_action_dim ?? policy.action_dim],
+        ['model observation sides', policy.model_observation_sides],
+        ['output active sides', policy.output_active_sides],
+        ['state only capability', policy.state_only_capability],
+        ['full bimanual execution', policy.full_bimanual_execution],
+        ['projection', policy.projection],
         ['checkpoint', policy.checkpoint], ['queue', policy.queue_length],
         ['last emission', policyEmission.emission_id],
         ['emission hash', policyEmission.semantic_content_hash],

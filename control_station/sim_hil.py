@@ -1192,6 +1192,91 @@ def _build_sim_hil_vive_setup_controller(
     return controller
 
 
+def _sim_hil_policy_bootstrap_status(
+    config: MujocoSimHILApplicationConfig,
+) -> dict[str, Any]:
+    """Describe the selected policy before a MuJoCo application exists.
+
+    The acceptance GUI is intentionally available while the Station is still
+    in VIVE setup.  At that point the application has not loaded the policy
+    source yet, so its status cannot be used to identify the artifact or model
+    contract.  Keep this projection resource-free while sharing the concrete
+    state-BC constants with the actual binding.
+    """
+
+    backend = str(config.policy_backend)
+    artifact_path = None
+    checkpoint = None
+    metadata: dict[str, Any] = {
+        "backend": backend,
+        "checkpoint": None,
+        "policy_artifact": None,
+        "artifact_path": None,
+        "artifact_status": "not_configured",
+        "artifact_schema": None,
+        "layout_hash": None,
+        "policy_dimensions": None,
+        "model_state_dim": None,
+        "model_action_dim": None,
+        "model_observation_sides": None,
+        "output_active_sides": None,
+        "state_only_capability": None,
+        "full_bimanual_execution": None,
+        "projection": None,
+    }
+    if backend == "temp_ppo":
+        checkpoint = str(config.checkpoint_path)
+        metadata.update(
+            checkpoint=checkpoint,
+            artifact_status="checkpoint_configured",
+        )
+    elif backend == "openpi_state":
+        artifact_path = config.openpi_policy_artifact_path
+        if artifact_path is not None:
+            metadata.update(
+                artifact_status=(
+                    "configured" if artifact_path.is_file() else "not_found"
+                ),
+                policy_artifact=str(artifact_path),
+                artifact_path=str(artifact_path),
+            )
+    elif backend == "state_bc":
+        # Import only the pure contract constants.  This does not construct a
+        # scene, load the artifact, start a worker, or contact a policy server.
+        from sim.mujoco.deploy.state_policy_adapter import (
+            STATE_BC_ACTION_DIM,
+            STATE_BC_LAYOUT_HASH_V1,
+            STATE_BC_MODEL_SCHEMA_V1,
+            STATE_BC_STATE_DIM,
+        )
+
+        artifact_path = config.state_bc_artifact_path
+        metadata.update(
+            artifact_status=(
+                "configured"
+                if artifact_path is not None and artifact_path.is_file()
+                else "not_found"
+                if artifact_path is not None
+                else "not_configured"
+            ),
+            policy_artifact=(
+                None if artifact_path is None else str(artifact_path)
+            ),
+            artifact_path=(None if artifact_path is None else str(artifact_path)),
+            artifact_schema=STATE_BC_MODEL_SCHEMA_V1,
+            layout_hash=STATE_BC_LAYOUT_HASH_V1,
+            policy_dimensions=[STATE_BC_STATE_DIM, STATE_BC_ACTION_DIM],
+            model_state_dim=STATE_BC_STATE_DIM,
+            model_action_dim=STATE_BC_ACTION_DIM,
+            model_observation_sides=["left", "right"],
+            output_active_sides=["right"],
+            state_only_capability=True,
+            full_bimanual_execution=False,
+            projection="bimanual_state_bc_to_right_arm_and_gripper_contributor",
+        )
+    return metadata
+
+
 def _sim_hil_bootstrap_status(
     config: MujocoSimHILApplicationConfig,
     *,
@@ -1219,6 +1304,13 @@ def _sim_hil_bootstrap_status(
         vive_status.get("vive_receiver", {})
         if isinstance(vive_status.get("vive_receiver", {}), Mapping)
         else {}
+    )
+    policy_status = _sim_hil_policy_bootstrap_status(config)
+    policy_status.update(
+        started=False,
+        ready=False,
+        refresh_state="not_constructed",
+        last_emission={},
     )
     return {
         "schema": SIM_HIL_STATUS_SCHEMA_V1,
@@ -1305,23 +1397,7 @@ def _sim_hil_bootstrap_status(
             "status": "not_constructed",
             "reason": "waiting_for_vive_setup",
         },
-        "policy": {
-            "started": False,
-            "ready": False,
-            "refresh_state": "not_constructed",
-            "backend": config.policy_backend,
-            "checkpoint": (
-                str(config.checkpoint_path)
-                if config.policy_backend == "temp_ppo"
-                else None
-            ),
-            "policy_artifact": (
-                None
-                if config.openpi_policy_artifact_path is None
-                else str(config.openpi_policy_artifact_path)
-            ),
-            "last_emission": {},
-        },
+        "policy": policy_status,
         "human": {
             "session_state": "VIVE_SETUP",
             "source_started": bool(
