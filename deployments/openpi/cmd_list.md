@@ -1854,7 +1854,7 @@ server；每次只在 client 侧选择一个 `--prompt-stage stage1|stage2|stage
 export DEPLOY_ROOT=/home/user/zc/openpi_deployment_worktrees/AR-20260828-openpi-h32-deployment-r0
 cd "$DEPLOY_ROOT"
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
-export CKPT_STEP=156211
+export CKPT_STEP=180000
 export OPENPI_CKPT=/home/user/zc/checkpoints/openpi/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-v1-prepared/writing-all-four-stage-prompt-family-front-right-wrist-h32-absolute-non-rtc-20260827-nw4/$CKPT_STEP
 export PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/training/writing_all_four_stage_prompt_family_front_right_wrist_h32_absolute_non_rtc_v1.json"
 export PROMPT_STAGE=stage1
