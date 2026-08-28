@@ -1,0 +1,20 @@
+{
+  "arm_ip_by_side": {
+    "left": "192.168.101.21",
+    "right": "192.168.1.20"
+  },
+  "assignments": {
+    "left": {
+      "arm_ip": "192.168.101.21"
+    },
+    "right": {
+      "arm_ip": "192.168.1.20"
+    }
+  },
+  "created_at": "2026-06-30T17:21:50+08:00",
+  "hostname": "1",
+  "left_arm_ip": "192.168.101.21",
+  "right_arm_ip": "192.168.1.20",
+  "saved_at": "2026-08-27T18:29:31+08:00",
+  "schema_version": "rm65_arm_ip_assignment.v1"
+}

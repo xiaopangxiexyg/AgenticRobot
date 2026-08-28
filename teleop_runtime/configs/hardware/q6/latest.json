@@ -5,8 +5,8 @@
       "enabled": true,
       "identity": {
         "description": "USB Single Serial",
-        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=3-1:1.0",
-        "location": "3-1:1.0",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=7-1.4:1.0",
+        "location": "7-1.4:1.0",
         "product": "USB Single Serial",
         "serial_number": "5B7A137621"
       },
@@ -14,19 +14,19 @@
       "port_aliases": [
         "/dev/ttyACM1",
         "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
-        "/dev/serial/by-path/pci-0000:00:14.0-usb-0:1:1.0"
+        "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.4:1.0"
       ],
       "probe": {
         "error": null,
         "latest_angles_deg": [
-          170.86,
-          200.74,
-          190.11,
-          181.23,
-          172.62,
-          172.35
+          175.08,
+          200.13,
+          189.49,
+          181.93,
+          173.23,
+          173.32
         ],
-        "probe_elapsed_s": 0.002953,
+        "probe_elapsed_s": 0.005934,
         "reachable": true,
         "valid_frames": 1
       },
@@ -45,8 +45,8 @@
       "enabled": true,
       "identity": {
         "description": "USB Single Serial",
-        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=3-2:1.0",
-        "location": "3-2:1.0",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=7-1.2:1.0",
+        "location": "7-1.2:1.0",
         "product": "USB Single Serial",
         "serial_number": "5B7A137618"
       },
@@ -54,19 +54,19 @@
       "port_aliases": [
         "/dev/ttyACM0",
         "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
-        "/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0"
+        "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.2:1.0"
       ],
       "probe": {
         "error": null,
         "latest_angles_deg": [
-          168.31,
-          165.67,
-          174.55,
-          183.96,
+          167.96,
+          167.87,
           172.18,
-          174.64
+          178.51,
+          171.3,
+          174.99
         ],
-        "probe_elapsed_s": 0.000697,
+        "probe_elapsed_s": 0.023422,
         "reachable": true,
         "valid_frames": 1
       },
@@ -81,40 +81,40 @@
       "timeout": 0.05
     }
   },
-  "created_at": "2026-06-28T12:24:50+08:00",
+  "created_at": "2026-07-08T16:13:17+08:00",
   "devices_seen": {
     "baudrate": 115200,
-    "hostname": "1",
+    "hostname": "user-B650M-AORUS-PRO-AX",
     "probe_timeout_s": 1.5,
     "q6_devices": [
       {
         "description": "USB Single Serial",
         "device": "/dev/ttyACM1",
-        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=3-1:1.0",
-        "index": 32,
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=7-1.4:1.0",
+        "index": 34,
         "interface": null,
-        "location": "3-1:1.0",
+        "location": "7-1.4:1.0",
         "manufacturer": null,
         "name": "ttyACM1",
         "port": "/dev/ttyACM1",
         "port_aliases": [
           "/dev/ttyACM1",
           "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
-          "/dev/serial/by-path/pci-0000:00:14.0-usb-0:1:1.0"
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.4:1.0"
         ],
         "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
         "probable_q6_serial": true,
         "probe": {
           "error": null,
           "latest_angles_deg": [
-            170.86,
-            200.74,
-            190.11,
-            181.23,
-            172.62,
-            172.35
+            175.08,
+            200.13,
+            189.49,
+            181.93,
+            173.23,
+            173.32
           ],
-          "probe_elapsed_s": 0.002953,
+          "probe_elapsed_s": 0.005934,
           "reachable": true,
           "valid_frames": 1
         },
@@ -126,31 +126,31 @@
       {
         "description": "USB Single Serial",
         "device": "/dev/ttyACM0",
-        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=3-2:1.0",
-        "index": 33,
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=7-1.2:1.0",
+        "index": 35,
         "interface": null,
-        "location": "3-2:1.0",
+        "location": "7-1.2:1.0",
         "manufacturer": null,
         "name": "ttyACM0",
         "port": "/dev/ttyACM0",
         "port_aliases": [
           "/dev/ttyACM0",
           "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
-          "/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0"
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.2:1.0"
         ],
         "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
         "probable_q6_serial": true,
         "probe": {
           "error": null,
           "latest_angles_deg": [
-            168.31,
-            165.67,
-            174.55,
-            183.96,
+            167.96,
+            167.87,
             172.18,
-            174.64
+            178.51,
+            171.3,
+            174.99
           ],
-          "probe_elapsed_s": 0.000697,
+          "probe_elapsed_s": 0.023422,
           "reachable": true,
           "valid_frames": 1
         },
@@ -160,7 +160,7 @@
         "serial_number": "5B7A137618"
       }
     ],
-    "scanned_at": "2026-06-28T12:24:25+08:00",
+    "scanned_at": "2026-07-08T16:12:29+08:00",
     "schema_version": "hand_q6_scan.v1",
     "serial_ports": [
       {
@@ -178,8 +178,14 @@
         ],
         "preferred_port": "/dev/ttyS31",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 6.3e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -198,8 +204,14 @@
         ],
         "preferred_port": "/dev/ttyS30",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.6e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -218,8 +230,14 @@
         ],
         "preferred_port": "/dev/ttyS29",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.3e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -238,8 +256,14 @@
         ],
         "preferred_port": "/dev/ttyS28",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.4e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -258,8 +282,14 @@
         ],
         "preferred_port": "/dev/ttyS27",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 3e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -278,8 +308,14 @@
         ],
         "preferred_port": "/dev/ttyS26",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.5e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -298,8 +334,14 @@
         ],
         "preferred_port": "/dev/ttyS25",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.2e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -318,8 +360,14 @@
         ],
         "preferred_port": "/dev/ttyS24",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -338,8 +386,14 @@
         ],
         "preferred_port": "/dev/ttyS23",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -358,8 +412,14 @@
         ],
         "preferred_port": "/dev/ttyS22",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -378,8 +438,14 @@
         ],
         "preferred_port": "/dev/ttyS21",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -398,8 +464,14 @@
         ],
         "preferred_port": "/dev/ttyS20",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -418,8 +490,14 @@
         ],
         "preferred_port": "/dev/ttyS19",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.2e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -438,8 +516,14 @@
         ],
         "preferred_port": "/dev/ttyS18",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.2e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -458,8 +542,14 @@
         ],
         "preferred_port": "/dev/ttyS17",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 6e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -478,8 +568,14 @@
         ],
         "preferred_port": "/dev/ttyS16",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.5e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -498,8 +594,14 @@
         ],
         "preferred_port": "/dev/ttyS15",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.3e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -518,8 +620,14 @@
         ],
         "preferred_port": "/dev/ttyS14",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -538,8 +646,14 @@
         ],
         "preferred_port": "/dev/ttyS13",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -558,8 +672,14 @@
         ],
         "preferred_port": "/dev/ttyS12",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -578,8 +698,14 @@
         ],
         "preferred_port": "/dev/ttyS11",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -598,8 +724,14 @@
         ],
         "preferred_port": "/dev/ttyS10",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -618,8 +750,14 @@
         ],
         "preferred_port": "/dev/ttyS9",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -638,8 +776,14 @@
         ],
         "preferred_port": "/dev/ttyS8",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -658,8 +802,14 @@
         ],
         "preferred_port": "/dev/ttyS7",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -678,8 +828,14 @@
         ],
         "preferred_port": "/dev/ttyS6",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -698,8 +854,14 @@
         ],
         "preferred_port": "/dev/ttyS5",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -718,8 +880,14 @@
         ],
         "preferred_port": "/dev/ttyS4",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 9e-06,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -738,8 +906,14 @@
         ],
         "preferred_port": "/dev/ttyS3",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 9e-06,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -758,8 +932,14 @@
         ],
         "preferred_port": "/dev/ttyS2",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.1e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -778,8 +958,14 @@
         ],
         "preferred_port": "/dev/ttyS1",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "SerialException: Could not configure port: (5, 'Input/output error')",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.3e-05,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
         "serial_number": null
       },
@@ -798,39 +984,100 @@
         ],
         "preferred_port": "/dev/ttyS0",
         "probable_q6_serial": false,
-        "probe": null,
-        "probe_attempted": false,
+        "probe": {
+          "error": "no ANGLES frame observed",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.502837,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
         "product": null,
+        "serial_number": null
+      },
+      {
+        "description": "USB Serial",
+        "device": "/dev/ttyUSB1",
+        "hwid": "USB VID:PID=1A86:7523 LOCATION=1-4.1.4.4",
+        "index": 32,
+        "interface": null,
+        "location": "1-4.1.4.4",
+        "manufacturer": null,
+        "name": "ttyUSB1",
+        "port": "/dev/ttyUSB1",
+        "port_aliases": [
+          "/dev/ttyUSB1",
+          "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.1.4.4:1.0-port0"
+        ],
+        "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+        "probable_q6_serial": false,
+        "probe": {
+          "error": "no ANGLES frame observed",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.50326,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
+        "product": "USB Serial",
+        "serial_number": null
+      },
+      {
+        "description": "USB Serial",
+        "device": "/dev/ttyUSB0",
+        "hwid": "USB VID:PID=1A86:7523 LOCATION=5-2.4.4",
+        "index": 33,
+        "interface": null,
+        "location": "5-2.4.4",
+        "manufacturer": null,
+        "name": "ttyUSB0",
+        "port": "/dev/ttyUSB0",
+        "port_aliases": [
+          "/dev/ttyUSB0",
+          "/dev/serial/by-path/pci-0000:10:00.4-usb-0:2.4.4:1.0-port0"
+        ],
+        "preferred_port": "/dev/serial/by-path/pci-0000:10:00.4-usb-0:2.4.4:1.0-port0",
+        "probable_q6_serial": false,
+        "probe": {
+          "error": "no ANGLES frame observed",
+          "latest_angles_deg": null,
+          "probe_elapsed_s": 1.516181,
+          "reachable": false,
+          "valid_frames": 0
+        },
+        "probe_attempted": true,
+        "product": "USB Serial",
         "serial_number": null
       },
       {
         "description": "USB Single Serial",
         "device": "/dev/ttyACM1",
-        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=3-1:1.0",
-        "index": 32,
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=7-1.4:1.0",
+        "index": 34,
         "interface": null,
-        "location": "3-1:1.0",
+        "location": "7-1.4:1.0",
         "manufacturer": null,
         "name": "ttyACM1",
         "port": "/dev/ttyACM1",
         "port_aliases": [
           "/dev/ttyACM1",
           "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
-          "/dev/serial/by-path/pci-0000:00:14.0-usb-0:1:1.0"
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.4:1.0"
         ],
         "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
         "probable_q6_serial": true,
         "probe": {
           "error": null,
           "latest_angles_deg": [
-            170.86,
-            200.74,
-            190.11,
-            181.23,
-            172.62,
-            172.35
+            175.08,
+            200.13,
+            189.49,
+            181.93,
+            173.23,
+            173.32
           ],
-          "probe_elapsed_s": 0.002953,
+          "probe_elapsed_s": 0.005934,
           "reachable": true,
           "valid_frames": 1
         },
@@ -841,31 +1088,31 @@
       {
         "description": "USB Single Serial",
         "device": "/dev/ttyACM0",
-        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=3-2:1.0",
-        "index": 33,
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=7-1.2:1.0",
+        "index": 35,
         "interface": null,
-        "location": "3-2:1.0",
+        "location": "7-1.2:1.0",
         "manufacturer": null,
         "name": "ttyACM0",
         "port": "/dev/ttyACM0",
         "port_aliases": [
           "/dev/ttyACM0",
           "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
-          "/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0"
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.2:1.0"
         ],
         "preferred_port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
         "probable_q6_serial": true,
         "probe": {
           "error": null,
           "latest_angles_deg": [
-            168.31,
-            165.67,
-            174.55,
-            183.96,
+            167.96,
+            167.87,
             172.18,
-            174.64
+            178.51,
+            171.3,
+            174.99
           ],
-          "probe_elapsed_s": 0.000697,
+          "probe_elapsed_s": 0.023422,
           "reachable": true,
           "valid_frames": 1
         },
@@ -876,8 +1123,7 @@
     ],
     "timeout": 0.05
   },
-  "hostname": "1",
-  "saved_at": "2026-06-28T12:24:50+08:00",
-  "schema_version": "hand_q6_assignment.v1",
-  "source_config_path": "/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/configs/hardware/q6/20260628_122450_hand_q6_assignment.json"
+  "hostname": "user-B650M-AORUS-PRO-AX",
+  "saved_at": "2026-07-08T16:13:17+08:00",
+  "schema_version": "hand_q6_assignment.v1"
 }

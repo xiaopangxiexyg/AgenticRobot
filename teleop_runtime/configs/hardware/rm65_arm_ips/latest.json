@@ -1,5 +1,4 @@
 {
-  "_config_path": "/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/configs/hardware/rm65_arm_ips/latest.json",
   "arm_ip_by_side": {
     "left": "192.168.101.21",
     "right": "192.168.1.20"
@@ -16,7 +15,6 @@
   "hostname": "1",
   "left_arm_ip": "192.168.101.21",
   "right_arm_ip": "192.168.1.20",
-  "saved_at": "2026-08-09T00:30:39+08:00",
-  "schema_version": "rm65_arm_ip_assignment.v1",
-  "source_config_path": "/home/zc/HandMotion/Developing/DexTeleop/teleop_runtime/configs/hardware/rm65_arm_ips/20260809_003039_rm65_arm_ip_assignment.json"
+  "saved_at": "2026-08-27T18:59:48+08:00",
+  "schema_version": "rm65_arm_ip_assignment.v1"
 }

@@ -1,0 +1,1558 @@
+{
+  "assignments": {
+    "left": {
+      "gripper": {
+        "baudrate": 115200,
+        "enabled": true,
+        "gripper_id": 1,
+        "identity": {
+          "description": "USB Serial",
+          "hwid": "USB VID:PID=1A86:7523 LOCATION=1-4.3.4",
+          "location": "1-4.3.4",
+          "product": "USB Serial"
+        },
+        "port": "/dev/ttyUSB1",
+        "port_aliases": [
+          "/dev/ttyUSB0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.3.4:1.0-port0"
+        ],
+        "probe": {
+          "attempted_baudrates": [
+            115200
+          ],
+          "attempted_gripper_id_count": 1,
+          "attempted_gripper_ids": [
+            1
+          ],
+          "attempted_setting_count": 1,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "detected_baudrate": 115200,
+          "detected_gripper_id": 1,
+          "error": null,
+          "gripper_id": 1,
+          "id_autodetected": false,
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 0.011441,
+          "reachable": true,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": {
+            "commanded_joint_pos": null,
+            "commanded_speed": null,
+            "commanded_torque": null,
+            "current": 0,
+            "current_raw": 0,
+            "error_code": 0,
+            "is_moving": false,
+            "joint_pos": 0.0,
+            "opening_mm": 70.0,
+            "opening_raw": 1000,
+            "status_code": 1,
+            "status_text": "张开侧空闲/停止",
+            "temperature_c": 34,
+            "timestamp": 1784711690.8460512
+          },
+          "timeout": 0.03
+        },
+        "timeout": 0.03
+      },
+      "tactile": {
+        "inner": {
+          "dev_id": "M26190173",
+          "enabled": true,
+          "identity": {
+            "dev_id": "M26190173",
+            "device_index": 6,
+            "serial": "M26190173"
+          },
+          "slot": "inner"
+        },
+        "outer": {
+          "dev_id": "M26190034",
+          "enabled": true,
+          "identity": {
+            "dev_id": "M26190034",
+            "device_index": 8,
+            "serial": "M26190034"
+          },
+          "slot": "outer"
+        }
+      }
+    },
+    "right": {
+      "gripper": {
+        "baudrate": 115200,
+        "enabled": true,
+        "gripper_id": 1,
+        "identity": {
+          "description": "USB Serial",
+          "hwid": "USB VID:PID=1A86:7523 LOCATION=1-4.4.4.4",
+          "location": "1-4.4.4.4",
+          "product": "USB Serial"
+        },
+        "port": "/dev/ttyUSB0",
+        "port_aliases": [
+          "/dev/ttyUSB1",
+          "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.4.4.4:1.0-port0"
+        ],
+        "probe": {
+          "attempted_baudrates": [
+            115200
+          ],
+          "attempted_gripper_id_count": 1,
+          "attempted_gripper_ids": [
+            1
+          ],
+          "attempted_setting_count": 1,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "detected_baudrate": 115200,
+          "detected_gripper_id": 1,
+          "error": null,
+          "gripper_id": 1,
+          "id_autodetected": false,
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 0.012032,
+          "reachable": true,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": {
+            "commanded_joint_pos": null,
+            "commanded_speed": null,
+            "commanded_torque": null,
+            "current": 0,
+            "current_raw": 0,
+            "error_code": 0,
+            "is_moving": false,
+            "joint_pos": 0.0,
+            "opening_mm": 70.0,
+            "opening_raw": 1000,
+            "status_code": 1,
+            "status_text": "张开侧空闲/停止",
+            "temperature_c": 34,
+            "timestamp": 1784711690.833978
+          },
+          "timeout": 0.03
+        },
+        "timeout": 0.03
+      },
+      "tactile": {
+        "inner": {
+          "dev_id": "M26190023",
+          "enabled": true,
+          "identity": {
+            "dev_id": "M26190023",
+            "device_index": 16,
+            "serial": "M26190023"
+          },
+          "slot": "inner"
+        },
+        "outer": {
+          "dev_id": "M26190018",
+          "enabled": true,
+          "identity": {
+            "dev_id": "M26190018",
+            "device_index": 18,
+            "serial": "M26190018"
+          },
+          "slot": "outer"
+        }
+      }
+    }
+  },
+  "created_at": "2026-07-22T17:17:00+08:00",
+  "devices_seen": {
+    "gripper_probe_attempted_count": 2,
+    "gripper_probe_limit": 2,
+    "gripper_probe_reachable_count": 2,
+    "gripper_probe_stopped_early": false,
+    "grippers": [
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS31",
+        "hwid": "n/a",
+        "index": 0,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS31",
+        "port_aliases": [
+          "/dev/ttyS31"
+        ],
+        "preferred_port": "/dev/ttyS31",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS30",
+        "hwid": "n/a",
+        "index": 1,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS30",
+        "port_aliases": [
+          "/dev/ttyS30"
+        ],
+        "preferred_port": "/dev/ttyS30",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS29",
+        "hwid": "n/a",
+        "index": 2,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS29",
+        "port_aliases": [
+          "/dev/ttyS29"
+        ],
+        "preferred_port": "/dev/ttyS29",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS28",
+        "hwid": "n/a",
+        "index": 3,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS28",
+        "port_aliases": [
+          "/dev/ttyS28"
+        ],
+        "preferred_port": "/dev/ttyS28",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS27",
+        "hwid": "n/a",
+        "index": 4,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS27",
+        "port_aliases": [
+          "/dev/ttyS27"
+        ],
+        "preferred_port": "/dev/ttyS27",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS26",
+        "hwid": "n/a",
+        "index": 5,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS26",
+        "port_aliases": [
+          "/dev/ttyS26"
+        ],
+        "preferred_port": "/dev/ttyS26",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS25",
+        "hwid": "n/a",
+        "index": 6,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS25",
+        "port_aliases": [
+          "/dev/ttyS25"
+        ],
+        "preferred_port": "/dev/ttyS25",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS24",
+        "hwid": "n/a",
+        "index": 7,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS24",
+        "port_aliases": [
+          "/dev/ttyS24"
+        ],
+        "preferred_port": "/dev/ttyS24",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS23",
+        "hwid": "n/a",
+        "index": 8,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS23",
+        "port_aliases": [
+          "/dev/ttyS23"
+        ],
+        "preferred_port": "/dev/ttyS23",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS22",
+        "hwid": "n/a",
+        "index": 9,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS22",
+        "port_aliases": [
+          "/dev/ttyS22"
+        ],
+        "preferred_port": "/dev/ttyS22",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS21",
+        "hwid": "n/a",
+        "index": 10,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS21",
+        "port_aliases": [
+          "/dev/ttyS21"
+        ],
+        "preferred_port": "/dev/ttyS21",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS20",
+        "hwid": "n/a",
+        "index": 11,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS20",
+        "port_aliases": [
+          "/dev/ttyS20"
+        ],
+        "preferred_port": "/dev/ttyS20",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS19",
+        "hwid": "n/a",
+        "index": 12,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS19",
+        "port_aliases": [
+          "/dev/ttyS19"
+        ],
+        "preferred_port": "/dev/ttyS19",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS18",
+        "hwid": "n/a",
+        "index": 13,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS18",
+        "port_aliases": [
+          "/dev/ttyS18"
+        ],
+        "preferred_port": "/dev/ttyS18",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS17",
+        "hwid": "n/a",
+        "index": 14,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS17",
+        "port_aliases": [
+          "/dev/ttyS17"
+        ],
+        "preferred_port": "/dev/ttyS17",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS16",
+        "hwid": "n/a",
+        "index": 15,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS16",
+        "port_aliases": [
+          "/dev/ttyS16"
+        ],
+        "preferred_port": "/dev/ttyS16",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS15",
+        "hwid": "n/a",
+        "index": 16,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS15",
+        "port_aliases": [
+          "/dev/ttyS15"
+        ],
+        "preferred_port": "/dev/ttyS15",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS14",
+        "hwid": "n/a",
+        "index": 17,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS14",
+        "port_aliases": [
+          "/dev/ttyS14"
+        ],
+        "preferred_port": "/dev/ttyS14",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS13",
+        "hwid": "n/a",
+        "index": 18,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS13",
+        "port_aliases": [
+          "/dev/ttyS13"
+        ],
+        "preferred_port": "/dev/ttyS13",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS12",
+        "hwid": "n/a",
+        "index": 19,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS12",
+        "port_aliases": [
+          "/dev/ttyS12"
+        ],
+        "preferred_port": "/dev/ttyS12",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS11",
+        "hwid": "n/a",
+        "index": 20,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS11",
+        "port_aliases": [
+          "/dev/ttyS11"
+        ],
+        "preferred_port": "/dev/ttyS11",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS10",
+        "hwid": "n/a",
+        "index": 21,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS10",
+        "port_aliases": [
+          "/dev/ttyS10"
+        ],
+        "preferred_port": "/dev/ttyS10",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS9",
+        "hwid": "n/a",
+        "index": 22,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS9",
+        "port_aliases": [
+          "/dev/ttyS9"
+        ],
+        "preferred_port": "/dev/ttyS9",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS8",
+        "hwid": "n/a",
+        "index": 23,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS8",
+        "port_aliases": [
+          "/dev/ttyS8"
+        ],
+        "preferred_port": "/dev/ttyS8",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS7",
+        "hwid": "n/a",
+        "index": 24,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS7",
+        "port_aliases": [
+          "/dev/ttyS7"
+        ],
+        "preferred_port": "/dev/ttyS7",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS6",
+        "hwid": "n/a",
+        "index": 25,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS6",
+        "port_aliases": [
+          "/dev/ttyS6"
+        ],
+        "preferred_port": "/dev/ttyS6",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS5",
+        "hwid": "n/a",
+        "index": 26,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS5",
+        "port_aliases": [
+          "/dev/ttyS5"
+        ],
+        "preferred_port": "/dev/ttyS5",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS4",
+        "hwid": "n/a",
+        "index": 27,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS4",
+        "port_aliases": [
+          "/dev/ttyS4"
+        ],
+        "preferred_port": "/dev/ttyS4",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS3",
+        "hwid": "n/a",
+        "index": 28,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS3",
+        "port_aliases": [
+          "/dev/ttyS3"
+        ],
+        "preferred_port": "/dev/ttyS3",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS2",
+        "hwid": "n/a",
+        "index": 29,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS2",
+        "port_aliases": [
+          "/dev/ttyS2"
+        ],
+        "preferred_port": "/dev/ttyS2",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS1",
+        "hwid": "n/a",
+        "index": 30,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS1",
+        "port_aliases": [
+          "/dev/ttyS1"
+        ],
+        "preferred_port": "/dev/ttyS1",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "n/a",
+        "device": "/dev/ttyS0",
+        "hwid": "n/a",
+        "index": 31,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": null,
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": null,
+        "port": "/dev/ttyS0",
+        "port_aliases": [
+          "/dev/ttyS0"
+        ],
+        "preferred_port": "/dev/ttyS0",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": null,
+        "serial_number": null,
+        "system_tty": true,
+        "usb_aliases": [],
+        "vid": null
+      },
+      {
+        "description": "USB Serial",
+        "device": "/dev/ttyUSB1",
+        "hwid": "USB VID:PID=1A86:7523 LOCATION=1-4.4.4.4",
+        "index": 32,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": "1-4.4.4.4",
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": 29987,
+        "port": "/dev/ttyUSB1",
+        "port_aliases": [
+          "/dev/ttyUSB1",
+          "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.4.4.4:1.0-port0"
+        ],
+        "preferred_port": "/dev/ttyUSB1",
+        "probable_gripper_serial": true,
+        "probe": {
+          "attempted_baudrates": [
+            115200
+          ],
+          "attempted_gripper_id_count": 1,
+          "attempted_gripper_ids": [
+            1
+          ],
+          "attempted_setting_count": 1,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "detected_baudrate": 115200,
+          "detected_gripper_id": 1,
+          "error": null,
+          "gripper_id": 1,
+          "id_autodetected": false,
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 0.012032,
+          "reachable": true,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": {
+            "commanded_joint_pos": null,
+            "commanded_speed": null,
+            "commanded_torque": null,
+            "current": 0,
+            "current_raw": 0,
+            "error_code": 0,
+            "is_moving": false,
+            "joint_pos": 0.0,
+            "opening_mm": 70.0,
+            "opening_raw": 1000,
+            "status_code": 1,
+            "status_text": "张开侧空闲/停止",
+            "temperature_c": 34,
+            "timestamp": 1784711690.833978
+          },
+          "timeout": 0.03
+        },
+        "probe_attempted": true,
+        "probe_skipped_reason": null,
+        "product": "USB Serial",
+        "serial_number": null,
+        "system_tty": false,
+        "usb_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.4.4.4:1.0-port0"
+        ],
+        "vid": 6790
+      },
+      {
+        "description": "USB Serial",
+        "device": "/dev/ttyUSB0",
+        "hwid": "USB VID:PID=1A86:7523 LOCATION=1-4.3.4",
+        "index": 33,
+        "interface": null,
+        "known_q6_serial": false,
+        "location": "1-4.3.4",
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": 29987,
+        "port": "/dev/ttyUSB0",
+        "port_aliases": [
+          "/dev/ttyUSB0",
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.3.4:1.0-port0"
+        ],
+        "preferred_port": "/dev/ttyUSB0",
+        "probable_gripper_serial": true,
+        "probe": {
+          "attempted_baudrates": [
+            115200
+          ],
+          "attempted_gripper_id_count": 1,
+          "attempted_gripper_ids": [
+            1
+          ],
+          "attempted_setting_count": 1,
+          "attempted_settings": [
+            {
+              "baudrate": 115200,
+              "gripper_id": 1
+            }
+          ],
+          "baudrate": 115200,
+          "baudrate_scan_enabled": false,
+          "detected_baudrate": 115200,
+          "detected_gripper_id": 1,
+          "error": null,
+          "gripper_id": 1,
+          "id_autodetected": false,
+          "id_scan_enabled": true,
+          "probe_elapsed_s": 0.011441,
+          "reachable": true,
+          "requested_baudrate": 115200,
+          "requested_gripper_id": 1,
+          "state": {
+            "commanded_joint_pos": null,
+            "commanded_speed": null,
+            "commanded_torque": null,
+            "current": 0,
+            "current_raw": 0,
+            "error_code": 0,
+            "is_moving": false,
+            "joint_pos": 0.0,
+            "opening_mm": 70.0,
+            "opening_raw": 1000,
+            "status_code": 1,
+            "status_text": "张开侧空闲/停止",
+            "temperature_c": 34,
+            "timestamp": 1784711690.8460512
+          },
+          "timeout": 0.03
+        },
+        "probe_attempted": true,
+        "probe_skipped_reason": null,
+        "product": "USB Serial",
+        "serial_number": null,
+        "system_tty": false,
+        "usb_aliases": [
+          "/dev/serial/by-path/pci-0000:0e:00.0-usb-0:4.3.4:1.0-port0"
+        ],
+        "vid": 6790
+      },
+      {
+        "description": "USB Single Serial",
+        "device": "/dev/ttyACM0",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137621 LOCATION=7-1.3.4.4:1.0",
+        "index": 34,
+        "interface": null,
+        "known_q6_serial": true,
+        "location": "7-1.3.4.4:1.0",
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": 21971,
+        "port": "/dev/ttyACM0",
+        "port_aliases": [
+          "/dev/ttyACM0",
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.3.4.4:1.0"
+        ],
+        "preferred_port": "/dev/ttyACM0",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": "USB Single Serial",
+        "serial_number": "5B7A137621",
+        "system_tty": false,
+        "usb_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137621-if00",
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.3.4.4:1.0"
+        ],
+        "vid": 6790
+      },
+      {
+        "description": "USB Single Serial",
+        "device": "/dev/ttyACM1",
+        "hwid": "USB VID:PID=1A86:55D3 SER=5B7A137618 LOCATION=7-1.2:1.0",
+        "index": 35,
+        "interface": null,
+        "known_q6_serial": true,
+        "location": "7-1.2:1.0",
+        "manufacturer": null,
+        "permissions": {
+          "gid": 20,
+          "mode": "0o660",
+          "readable": true,
+          "uid": 0,
+          "writable": true
+        },
+        "pid": 21971,
+        "port": "/dev/ttyACM1",
+        "port_aliases": [
+          "/dev/ttyACM1",
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.2:1.0"
+        ],
+        "preferred_port": "/dev/ttyACM1",
+        "probable_gripper_serial": false,
+        "probe": null,
+        "probe_attempted": false,
+        "probe_skipped_reason": null,
+        "product": "USB Single Serial",
+        "serial_number": "5B7A137618",
+        "system_tty": false,
+        "usb_aliases": [
+          "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7A137618-if00",
+          "/dev/serial/by-path/pci-0000:11:00.0-usb-0:1.2:1.0"
+        ],
+        "vid": 6790
+      }
+    ],
+    "hostname": "user-B650M-AORUS-PRO-AX",
+    "scanned_at": "2026-07-22T17:14:51+08:00",
+    "schema_version": "dmtac_usb_scan.v1",
+    "tactile": [
+      {
+        "dev_id": "M26190173",
+        "device_index": 6,
+        "index": 0,
+        "serial": "M26190173"
+      },
+      {
+        "dev_id": "M26190034",
+        "device_index": 8,
+        "index": 1,
+        "serial": "M26190034"
+      },
+      {
+        "dev_id": "M26190023",
+        "device_index": 16,
+        "index": 2,
+        "serial": "M26190023"
+      },
+      {
+        "dev_id": "M26190018",
+        "device_index": 18,
+        "index": 3,
+        "serial": "M26190018"
+      }
+    ],
+    "tactile_candidates": [
+      {
+        "device_node": "/dev/video6",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190173",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video7",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190173",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video8",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190034",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video9",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190034",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video16",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190023",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video17",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190023",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video18",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190018",
+        "writable": true
+      },
+      {
+        "device_node": "/dev/video19",
+        "exists": true,
+        "model": "N160MU2",
+        "product": "N160MU2: N160MU2",
+        "readable": true,
+        "reason": "ok",
+        "serial": "M26190018",
+        "writable": true
+      }
+    ]
+  },
+  "hostname": "user-B650M-AORUS-PRO-AX",
+  "saved_at": "2026-08-19T11:51:19+08:00",
+  "schema_version": "dmtac_usb_assignment.v1"
+}
