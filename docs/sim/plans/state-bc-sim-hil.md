@@ -244,3 +244,30 @@ ephemeral real-data artifact, and does not evaluate cube lifting, recovery
 benefit, safety-envelope margins, operator usability, or real-time latency.
 Those remain experiment-level comparisons; no device, GUI, hardware motion, or
 RTC Active deployment was started.
+
+### Matched episode evaluation organization
+
+`experiments/sim_learning/state_bc/evaluation.py` now defines the next
+experiment-only organization boundary.  A panel contains exactly three
+equal-horizon conditions: policy-only, policy with human takeover/handback, and
+policy with RTC intervention.  For every seed, the caller must return a reset
+receipt with the same `initial_state_id` for all three conditions.  A fresh
+streaming runner is then constructed after each reset, so source and bridge
+state cannot leak across episodes.
+
+The evaluator records the existing exclusive stream trace and one typed task
+assessment (`success`, `failure`, or `unknown`).  `unknown` requires a reason
+and makes aggregate success rate unavailable instead of being silently counted
+as failure or success.  The evaluator does not define a cube-lift predicate,
+reset the simulator, construct the MuJoCo target, load a model artifact, or own
+any execution lifecycle; those remain injected experiment dependencies.  This
+keeps task predicates and reset manifests explicit while preventing a second
+control or dispatch loop.
+
+The optional MuJoCo panel test constructs a fresh existing policy target for
+each condition, hashes the initial simulator `qpos+qvel` as the matched reset
+identity, and runs a five-step schedule.  All executable actions traverse the
+existing emission, safety, coupled-IK, reference, and dispatch path; the first
+RTC intervention is `rtc_no_action` and therefore emits nothing.  A cube-height
+predicate reports all three hold-current fixture episodes as `failure`, which
+is the expected negative result rather than a task-success claim.
