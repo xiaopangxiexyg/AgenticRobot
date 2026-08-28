@@ -41,7 +41,6 @@ from rm65_teleop_smoothing_probe import (  # noqa: E402
     Candidate,
     _BOUND_GUARD,
     _COMMAND_HZ,
-    _FORMAL_ACTION_HZ,
     _HORIZON_TICKS,
     _REFERENCE_HZ,
     _aggregate,
