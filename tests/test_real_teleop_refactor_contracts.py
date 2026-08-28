@@ -57,6 +57,7 @@ from teleop_runtime.real_teleop import (
     hand_runtime,
     impedance_force_runtime,
     movement,
+    operator_control_runtime,
     position_force_guard,
     position_episode_debug,
     position_tuning,
@@ -92,6 +93,97 @@ def test_control_step_timestamp_refreshes_after_control_plane_stall() -> None:
     ) == pytest.approx(10.0)
 
 
+def test_safety_hold_latches_before_a_failing_session_hold() -> None:
+    events: list[tuple[object, ...]] = []
+
+    class Session:
+        def hold_hardware(
+            self,
+            message: str,
+            *,
+            require_home_recalibration: bool,
+        ) -> bool:
+            events.append(
+                ("hardware", message, require_home_recalibration)
+            )
+            raise RuntimeError("baseline reset failed")
+
+    class Clutch:
+        _hold_requested = False
+        _hold_active = False
+        _gripper_control_enabled = True
+        _hold_request_reason = ""
+
+        def request_hold(self, *, reason: str) -> None:
+            events.append(("application", reason))
+            # Model the real pre-admission no-op. The helper must still force
+            # the local latch before calling the fallible Session operation.
+
+    clutch = Clutch()
+    logs: list[str] = []
+    assert not control_loop._latch_safety_hold_and_hold_hardware_best_effort(
+        SimpleNamespace(session=Session()),
+        clutch,
+        message="active modifier failed",
+        reason="active_modifier_failed",
+        log=lambda _tag, message, **_kwargs: logs.append(message),
+        now=10.0,
+    )
+
+    assert events == [
+        ("application", "active_modifier_failed"),
+        ("hardware", "active modifier failed", True),
+    ]
+    assert clutch._hold_requested is True
+    assert clutch._hold_active is True
+    assert clutch._gripper_control_enabled is False
+    assert clutch._hold_request_reason == "active_modifier_failed"
+    assert any("safety hardware Hold failed" in message for message in logs)
+
+
+def test_unreceipted_progress_failure_latches_distinct_fail_closed_hold() -> None:
+    events: list[tuple[str, str]] = []
+
+    class Clutch:
+        _hold_requested = False
+        _hold_active = False
+
+        def hold_active(self) -> bool:
+            return self._hold_active
+
+        def request_hold(self, *, reason: str) -> None:
+            events.append(("hold", reason))
+            self._hold_requested = True
+            self._hold_active = True
+
+    clutch = Clutch()
+    assert control_loop._latch_unreceipted_progress_failure_hold(
+        progress_failure_pending=True,
+        clutch_input=clutch,
+        pause_recording=(
+            lambda _now, *, reason: events.append(("pause", reason))
+        ),
+        log=lambda *_args, **_kwargs: None,
+        now=10.0,
+    )
+
+    assert events == [
+        ("hold", "progress_failure_receipt_unavailable"),
+        ("pause", "progress_failure_receipt_unavailable"),
+    ]
+    assert all(reason != "progress_failure" for _kind, reason in events)
+
+    assert not control_loop._latch_unreceipted_progress_failure_hold(
+        progress_failure_pending=True,
+        clutch_input=clutch,
+        pause_recording=lambda *_args, **_kwargs: pytest.fail(
+            "already-held failure must not issue another pause"
+        ),
+        log=lambda *_args, **_kwargs: None,
+        now=11.0,
+    )
+
+
 def test_real_teleop_start_and_resume_separate_freshness_from_overall_timeout() -> None:
     assert defaults.runtime_home_fresh_data_timeout_sec(0.25) == pytest.approx(0.25)
     assert defaults.runtime_home_fresh_data_timeout_sec(1.0) == pytest.approx(1.0)
@@ -118,6 +210,10 @@ def test_formal_writer_ready_handshake_is_not_global_startup_work() -> None:
     assert "prepare_startup_dataset_recorder(" not in runtime_source
     assert "formal dataset writer deferred until collection start" in runtime_source
     assert "正在启动隔离 writer 并等待 ready 握手" not in runtime_source
+    assert runtime_source.count(
+        "set_dataset_recorder=assign_current_dataset_recorder"
+    ) == 2
+    assert "set_current_dataset_recorder" not in runtime_source
 
 
 def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
@@ -146,6 +242,258 @@ def test_unchanged_dataset_reconfigure_does_not_rescan_finalized_data(
     recorder.reconfigure_for_current_args()
 
     assert calls == []
+
+
+def test_transactional_dataset_selection_defers_live_state_and_start_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Ui:
+        def __init__(self) -> None:
+            self.published: list[dict[str, object]] = []
+            self.messages: list[tuple[str, str]] = []
+
+        def publish(self, **state: object) -> None:
+            self.published.append(dict(state))
+
+        def append_message(self, title: str, message: str) -> None:
+            self.messages.append((title, message))
+
+    args = SimpleNamespace(
+        collection_task_name="old",
+        collection_task_id="old-id",
+        collection_task_name_zh="旧任务",
+        dataset_root="/tmp/old-dataset",
+        ignore_camera=[],
+        ignore_tactile=[],
+    )
+    plus = SimpleNamespace(
+        enabled=True,
+        variant_id="old-variant",
+        task_profile=SimpleNamespace(
+            require_variant=lambda value: (
+                value
+                if value == "new-variant"
+                else (_ for _ in ()).throw(ValueError(value))
+            )
+        ),
+    )
+    plus.set_variant = lambda value: setattr(plus, "variant_id", str(value))
+    plus.ui_state = lambda: {"plus_curation_variant_id": plus.variant_id}
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.args = args
+    control.ui = Ui()
+    control.components = SimpleNamespace(active_sides=(), gripper_policy={})
+    control.plus_curation = plus
+    control._dataset_selection_pending = False
+    control._episode_start_requested = False
+    control._dataset_reconfigure_transactional = True
+    control._episode_busy = lambda: False
+    control._current_active_controls = list
+    policy_calls: list[str] = []
+    control._apply_current_gripper_task_policy = lambda: policy_calls.append(
+        str(args.collection_task_id)
+    )
+    callbacks: dict[str, object] = {}
+
+    def apply_selection(selected_args: object, _text: str, **kwargs: object):
+        assert kwargs["bind_dataset_contract"] is False
+        selected_args.collection_task_name = "new"
+        selected_args.collection_task_id = "new-id"
+        selected_args.collection_task_name_zh = "新任务"
+        selected_args.dataset_root = "/tmp/new-dataset"
+        return {"plus_variant_id": "new-variant"}
+
+    def schedule_selection(
+        snapshot: dict[str, object],
+        **kwargs: object,
+    ) -> str:
+        callbacks["snapshot"] = snapshot
+        callbacks.update(kwargs)
+        return "pending"
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "apply_real_teleop_dataset_selection",
+        apply_selection,
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_collection_task_ui_state",
+        lambda selected_args: {
+            "collection_task_id": selected_args.collection_task_id,
+            "dataset_root": str(selected_args.dataset_root),
+        },
+    )
+    control._dataset_reconfigure_callback = schedule_selection
+
+    assert control._apply_episode_start_payload(
+        "{}",
+        bind_dataset_contract=True,
+        start_after_commit=True,
+    )
+    assert args.collection_task_id == "old-id"
+    assert args.dataset_root == "/tmp/old-dataset"
+    assert plus.variant_id == "old-variant"
+    assert policy_calls == []
+    assert control._dataset_selection_pending is True
+    assert control._episode_start_requested is False
+    assert callbacks["bind_dataset_contract"] is True
+
+    first_snapshot = callbacks["snapshot"]
+    assert not control._apply_episode_start_payload("{}")
+    assert callbacks["snapshot"] is first_snapshot
+    assert args.collection_task_id == "old-id"
+    assert args.dataset_root == "/tmp/old-dataset"
+    assert control._dataset_selection_pending is True
+    assert control._episode_start_requested is False
+    assert control.ui.published[-1][
+        "dataset_configuration_transition_active"
+    ] is True
+
+    callbacks["on_commit"](callbacks["snapshot"])
+    assert args.collection_task_id == "new-id"
+    assert args.dataset_root == "/tmp/new-dataset"
+    assert plus.variant_id == "new-variant"
+    assert policy_calls == ["new-id"]
+    assert control._dataset_selection_pending is True
+    assert control._episode_start_requested is False
+
+    callbacks["on_complete"]()
+    assert control._dataset_selection_pending is False
+    assert control._episode_start_requested is True
+    assert control.ui.published[-1][
+        "dataset_configuration_transition_active"
+    ] is False
+    assert any(
+        "数采任务已更新" in message
+        for title, message in control.ui.messages
+        if title == "Dataset"
+    )
+
+
+def test_transactional_dataset_selection_rolls_back_side_effects_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = SimpleNamespace(
+        collection_task_name="old",
+        collection_task_id="old-id",
+        collection_task_name_zh="旧任务",
+        dataset_root="/tmp/old-dataset",
+        ignore_camera=[],
+        ignore_tactile=[],
+    )
+    ui = SimpleNamespace(
+        messages=[],
+        published=[],
+    )
+    ui.append_message = lambda title, message: ui.messages.append((title, message))
+    ui.publish = lambda **state: ui.published.append(dict(state))
+    plus = SimpleNamespace(
+        enabled=True,
+        variant_id="old-variant",
+        task_profile=SimpleNamespace(require_variant=lambda value: value),
+    )
+    plus.set_variant = lambda value: setattr(plus, "variant_id", str(value))
+    plus.ui_state = lambda: {"plus_curation_variant_id": plus.variant_id}
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.args = args
+    control.ui = ui
+    control.components = SimpleNamespace(active_sides=(), gripper_policy={})
+    control.plus_curation = plus
+    control._dataset_selection_pending = False
+    control._episode_start_requested = False
+    control._dataset_reconfigure_transactional = True
+    control._episode_busy = lambda: False
+    control._current_active_controls = list
+    policy_calls: list[str] = []
+    control._apply_current_gripper_task_policy = lambda: policy_calls.append(
+        str(args.collection_task_id)
+    )
+    callbacks: dict[str, object] = {}
+
+    def apply_selection(selected_args: object, _text: str, **_kwargs: object):
+        selected_args.collection_task_name = "new"
+        selected_args.collection_task_id = "new-id"
+        selected_args.dataset_root = "/tmp/new-dataset"
+        return {"plus_variant_id": "new-variant"}
+
+    def schedule_selection(
+        snapshot: dict[str, object],
+        **kwargs: object,
+    ) -> str:
+        callbacks["snapshot"] = snapshot
+        callbacks.update(kwargs)
+        return "pending"
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "apply_real_teleop_dataset_selection",
+        apply_selection,
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_collection_task_ui_state",
+        lambda selected_args: {
+            "collection_task_id": selected_args.collection_task_id,
+            "dataset_root": str(selected_args.dataset_root),
+        },
+    )
+    control._dataset_reconfigure_callback = schedule_selection
+
+    assert control._apply_episode_start_payload("{}")
+    callbacks["on_commit"](callbacks["snapshot"])
+    callbacks["on_failure"](RuntimeError("publish failed"))
+
+    assert args.collection_task_id == "old-id"
+    assert args.dataset_root == "/tmp/old-dataset"
+    assert plus.variant_id == "old-variant"
+    assert policy_calls == ["new-id", "old-id"]
+    assert control._dataset_selection_pending is False
+    assert ui.published[-1]["dataset_configuration_transition_active"] is False
+    assert any("原配置保持不变" in message for _title, message in ui.messages)
+
+
+def test_pending_dataset_selection_rejects_progress_configuration_intents() -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control._dataset_selection_pending = True
+    control._progress_profile_selection_intents = __import__("collections").deque()
+    control._progress_arm_control_mode_selection_intents = (
+        __import__("collections").deque()
+    )
+    control._progress_entry_step_selection_intents = (
+        __import__("collections").deque()
+    )
+    control._progress_ui_payload = {}
+    control._progress_ui_controls = ()
+    control._progress_ui_transport_revision = 0
+
+    assert not control.submit_progress_profile_selection_intent(
+        operator_control_runtime.ProgressProfileSelectionCommand(
+            command_id="profile",
+            profile_id="detail",
+        )
+    )
+    assert not control.submit_progress_arm_control_mode_selection_intent(
+        operator_control_runtime.ProgressArmControlModeSelectionCommand(
+            command_id="mode",
+            mode="profile",
+        )
+    )
+    assert not control.submit_progress_entry_step_selection_intent(
+        operator_control_runtime.ProgressEntryStepSelectionCommand(
+            command_id="entry",
+            progress_step_id="write",
+        )
+    )
+    assert not control._progress_profile_selection_intents
+    assert not control._progress_arm_control_mode_selection_intents
+    assert not control._progress_entry_step_selection_intents
 
 
 def test_gui_and_headless_frontends_share_writer_runtime_boundary() -> None:
@@ -490,8 +838,8 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
 
 def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary() -> None:
     parser = cli.build_real_teleop_argument_parser()
-    assert len(parser._actions) == 449
-    assert sum(len(action.option_strings) for action in parser._actions) == 509
+    assert len(parser._actions) == 450
+    assert sum(len(action.option_strings) for action in parser._actions) == 510
     assert parser._actions[0].dest == "help"
     assert parser._actions[-1].dest == "human_action_shadow_wal_max_mb"
     assert parser.parse_args([]).artifact_layout == "legacy"
@@ -499,6 +847,9 @@ def test_real_teleop_parser_builder_preserves_registration_contract_and_boundary
     assert parser.parse_args([]).v25p_native_storage_layout == "record_cjson_v1"
     assert parser.parse_args([]).tactile_bundle_root == ""
     assert parser.parse_args([]).tactile_bundle_min_free_gb == 0.0
+    assert parser.parse_args([]).collection_process_startup_timeout_sec == (
+        defaults.DEFAULT_COLLECTION_PROCESS_STARTUP_TIMEOUT_SEC
+    )
     assert parser.parse_args([]).storage_queue_backpressure_policy == "block"
     assert parser.parse_args([]).position_ik_branch_continuity_anchor is False
     assert parser.parse_args([]).position_joint_limit_guard_mode == "legacy"
@@ -808,6 +1159,54 @@ def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
     ]
 
 
+def test_episode_recording_shutdown_commits_force_guard_reason_before_resources() -> None:
+    close_calls: list[dict[str, object]] = []
+
+    class Fault:
+        def to_dict(self) -> dict[str, object]:
+            return {"code": "joint_force_limit"}
+
+    episode_runtime = SimpleNamespace(
+        close=lambda **kwargs: close_calls.append(dict(kwargs)) or True
+    )
+    result = runtime._close_episode_recording_runtime_before_resources(
+        {
+            "args": SimpleNamespace(),
+            "episode_recording_runtime": episode_runtime,
+            "position_force_guard_monitor": SimpleNamespace(fault=Fault()),
+        },
+        terminal_error=RuntimeError("force guard"),
+        support={
+            "_arm_control_mode_arg": lambda _args: "position",
+            "_position_force_guard_collision_summary": (
+                lambda _fault: {"peak_force_n": 42.0}
+            ),
+            "_terminal_force_collision_summary": (
+                lambda *_args, **_kwargs: pytest.fail(
+                    "force-guard summary must remain authoritative"
+                )
+            ),
+            "time": SimpleNamespace(time=lambda: 123.5),
+        },
+    )
+
+    assert result is True
+    assert close_calls == [
+        {
+            "now": 123.5,
+            "end_reason": "position_force_guard",
+            "summary": {
+                "reason": "position_force_guard",
+                "position_force_guard_fault": {
+                    "code": "joint_force_limit"
+                },
+                "peak_force_n": 42.0,
+            },
+            "timeout_sec": 15.0,
+        }
+    ]
+
+
 def test_real_component_builder_preserves_legacy_wrapper_and_import_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -982,6 +1381,55 @@ def test_extracted_control_loop_preserves_quit_frame_order_without_hardware(
     ]
 
 
+def test_safety_dispatch_recovery_uses_bound_teleop_admission_state() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+
+    assert "teleop_active" not in source
+    assert 'getattr(clutch_input, "_teleop_started", False)' in source
+    assert "teleop_admitted and _consume_joint_hard_limit_dispatch" in source
+    assert (
+        "teleop_admitted and _consume_joint_horizon_certification_dispatch"
+        in source
+    )
+
+
+def test_every_hold_contains_subordinate_failures_before_motion_stays_blocked() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+
+    # A Hold is the authoritative motion boundary regardless of whether its
+    # trigger was a GUI action, a progress transition, or a hardware fault.
+    # Dataset/UI/special-mode cleanup must never re-raise before the Session
+    # and position streams have been told to stop.
+    assert "safety_hold =" not in source
+    assert "if not safety_hold" not in source
+    assert "hold_pause_error: Exception | None = None" in source
+    assert 'end_reason="hold_pause_failure"' in source
+    assert '"joint_hard_limit",' in source
+    assert 'elif hold_reason == "joint_hard_limit"' in source
+
+
+def test_hold_countdown_cancellation_failure_is_observational() -> None:
+    logs: list[tuple[str, str]] = []
+
+    control_loop._cancel_recording_countdown_for_hold_best_effort(
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("countdown state unavailable")
+        ),
+        now=10.0,
+        reason="manual_hold",
+        log=lambda tag, message, **_kwargs: logs.append((tag, message)),
+    )
+
+    assert logs == [
+        (
+            "Dataset",
+            "recording countdown cancellation failed during Hold; "
+            "continuing with motion blocked: RuntimeError: "
+            "countdown state unavailable",
+        )
+    ]
+
+
 def test_device_retry_runtime_keeps_optional_foot_pad_status_dynamic() -> None:
     errors = {"foot_pad": "offline", "camera.overhead": "camera failed"}
     foot_pad_slot = [None]
@@ -1120,9 +1568,10 @@ def test_device_retry_runtime_immediately_refreshes_camera_projection() -> None:
     assert published[-1]["hardware_status"]["camera.front"]["status_level"] == "ok"
 
 
-def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> None:
+def test_generic_device_retry_never_starts_or_reuses_dataset_writer() -> None:
     errors = {"dataset.writer": "initial writer startup failure"}
     published: list[dict[str, object]] = []
+    messages: list[tuple[str, str]] = []
 
     class FailedRecorder:
         def __init__(self) -> None:
@@ -1140,27 +1589,10 @@ def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> 
     current_recorder: dict[str, object | None] = {"value": failed_recorder}
 
     class Recorder:
-        instances: list[Recorder] = []
-
         def __init__(self, **_kwargs: object) -> None:
-            self.instance_index = len(self.instances)
-            self.start_calls = 0
-            self.config_writes = 0
-            self.closed = False
-            self.instances.append(self)
-
-        def start(self) -> None:
-            self.start_calls += 1
-            if self.start_calls > 1:
-                raise AssertionError("cannot start a process twice")
-            if self.instance_index < 2:
-                raise RuntimeError(f"retry {self.instance_index} failed")
-
-        def write_camera_device_config(self) -> None:
-            self.config_writes += 1
-
-        def close(self) -> None:
-            self.closed = True
+            raise AssertionError(
+                "generic device retry must not construct a dataset writer"
+            )
 
     clutch = SimpleNamespace(
         _current_active_controls=lambda: ("device_retry",),
@@ -1185,7 +1617,7 @@ def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> 
         components=components,
         control_ui=SimpleNamespace(
             publish=lambda **kwargs: published.append(kwargs),
-            append_message=lambda *_args: None,
+            append_message=lambda tag, message: messages.append((tag, message)),
         ),
         clutch_input=clutch,
         camera_sources={},
@@ -1211,22 +1643,16 @@ def test_dataset_writer_retry_rebuilds_one_shot_process_after_each_failure() -> 
     )
 
     runtime.retry_failed_devices()
-    assert "retry 0 failed" in errors["dataset.writer"]
-    assert current_recorder["value"] is None
-    assert failed_recorder.closed is True
+    assert errors == {"dataset.writer": "initial writer startup failure"}
+    assert current_recorder["value"] is failed_recorder
+    assert failed_recorder.closed is False
     assert failed_recorder.start_calls == 0
-
-    runtime.retry_failed_devices()
-    assert "retry 1 failed" in errors["dataset.writer"]
-    assert current_recorder["value"] is None
-
-    runtime.retry_failed_devices()
-    assert "dataset.writer" not in errors
-    assert current_recorder["value"] is Recorder.instances[2]
-    assert [item.start_calls for item in Recorder.instances] == [1, 1, 1]
-    assert [item.closed for item in Recorder.instances] == [True, True, False]
-    assert [item.config_writes for item in Recorder.instances] == [0, 0, 1]
-    assert published[-1]["hardware_status"]["dataset.writer"]["status_level"] == "ok"
+    assert messages[-1][0] == "Dataset"
+    assert "再次点击“开始数采”" in messages[-1][1]
+    writer_status = published[-1]["hardware_status"]["dataset.writer"]
+    assert writer_status["status_level"] == "error"
+    assert writer_status["status_label"] == "writer 准备失败"
+    assert "全新 writer" in writer_status["error"]
 
 
 def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -> None:
@@ -1330,6 +1756,7 @@ def test_episode_recording_runtime_refreshes_external_recorder_slot() -> None:
         collection_startup_blockers=lambda: {},
         recording_warmup_status=lambda *args, **kwargs: (True, "ready"),
         reset_gripper_warmup_probe=lambda reason: None,
+        prepare_dataset_transition=lambda reason: None,
         dataset_recorder_provider=lambda: dataset_slot[0],
         set_dataset_recorder=lambda value: dataset_slot.__setitem__(0, value),
         camera_previewer_provider=lambda: None,
@@ -1473,6 +1900,30 @@ def test_startup_runtime_preserves_entrypoint_functions_and_patch_seams(
     assert "from ..debug" not in source
 
 
+def test_startup_qpos_hold_failure_is_contained_after_ownership_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs: list[str] = []
+    monkeypatch.setattr(
+        startup_runtime,
+        "_log",
+        lambda _tag, message, **_kwargs: logs.append(str(message)),
+    )
+
+    assert not startup_runtime._hold_startup_qpos_session_best_effort(
+        SimpleNamespace(
+            session=SimpleNamespace(
+                hold_hardware=lambda _message: (_ for _ in ()).throw(
+                    RuntimeError("baseline reset failed")
+                )
+            )
+        ),
+        message="startup qpos dispatch failed",
+        now=1.0,
+    )
+    assert any("baseline reset failed" in message for message in logs)
+
+
 def test_tcp_pose_envelope_home_rebind_precedes_real_hardware_arm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1520,7 +1971,7 @@ def test_tcp_pose_envelope_home_rebind_precedes_real_hardware_arm(
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
 
-    startup_runtime._arm_after_start_calibration(
+    admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
         components,
         clutch,
@@ -1534,6 +1985,7 @@ def test_tcp_pose_envelope_home_rebind_precedes_real_hardware_arm(
     assert events.index("rebind:4") < events.index("arm_hardware")
     assert "hold_hardware" not in events
     assert events[-1] == "teleop_running"
+    assert admitted is True
 
 
 def test_startup_home_continuity_gate_arms_before_real_hardware(
@@ -1579,7 +2031,7 @@ def test_startup_home_continuity_gate_arms_before_real_hardware(
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
 
-    startup_runtime._arm_after_start_calibration(
+    admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
         components,
         clutch,
@@ -1589,6 +2041,158 @@ def test_startup_home_continuity_gate_arms_before_real_hardware(
 
     assert events.index("continuity_armed") < events.index("arm_hardware")
     assert "hold_hardware" not in events
+    assert admitted is True
+
+
+def test_startup_home_continuity_failure_returns_negative_arm_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    home_qpos = {"left": np.zeros(6), "right": np.zeros(6)}
+    monkeypatch.setattr(
+        startup_runtime,
+        "_reset_runtime_motion_state_from_real_qpos",
+        lambda *args, **kwargs: {"left": True, "right": True},
+    )
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: events.append("force_enable"),
+    )
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+
+    class FailingContinuityGate:
+        def arm_from_home(self, qpos_by_side):
+            assert qpos_by_side is home_qpos
+            events.append("continuity_failed")
+            raise RuntimeError("candidate discontinuity")
+
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        dual_arm_retargeter=None,
+        position_reference_publisher=SimpleNamespace(reset_epoch=lambda: 8),
+        position_admittance_endpoint_guard=None,
+        startup_home_continuity_gate=FailingContinuityGate(),
+        session=SimpleNamespace(
+            hold_hardware=lambda reason: events.append("hold_hardware"),
+            mark_home_recalibrated=lambda reason: events.append("mark_home"),
+            set_calibration_ready=lambda: events.append("calibration_ready"),
+            mark_debug_passed=lambda: events.append("debug_passed"),
+            arm_hardware=lambda: events.append("arm_hardware"),
+        ),
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
+    )
+
+    admitted = startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=True,
+        runtime_home_qpos_snapshot=home_qpos,
+    )
+
+    assert admitted is False
+    assert events == ["continuity_failed", "waiting", "hold_hardware"]
+
+
+def test_session_arm_admission_failure_returns_to_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: events.append("force_enable"),
+    )
+
+    def fail_arm() -> None:
+        events.append("arm_attempt")
+        raise RuntimeError("rig not ready")
+
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        dual_arm_retargeter=None,
+        position_reference_publisher=None,
+        session=SimpleNamespace(
+            set_calibration_ready=lambda: events.append("calibration_ready"),
+            mark_debug_passed=lambda: events.append("debug_passed"),
+            arm_hardware=fail_arm,
+            hold_hardware=lambda reason: events.append("hold_hardware"),
+        ),
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
+    )
+
+    admitted = startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=False,
+    )
+
+    assert admitted is False
+    assert events == [
+        "calibration_ready",
+        "debug_passed",
+        "force_enable",
+        "arm_attempt",
+        "waiting",
+        "hold_hardware",
+    ]
+
+
+def test_application_projection_failure_reholds_armed_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(startup_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        startup_runtime,
+        "_enable_impedance_force_control_after_runtime_home",
+        lambda *args, **kwargs: None,
+    )
+
+    def fail_projection(**kwargs) -> None:
+        del kwargs
+        events.append("projection_attempt")
+        raise RuntimeError("station disconnected")
+
+    components = SimpleNamespace(
+        active_sides=("left", "right"),
+        dual_arm_retargeter=None,
+        position_reference_publisher=None,
+        session=SimpleNamespace(
+            set_calibration_ready=lambda: events.append("calibration_ready"),
+            mark_debug_passed=lambda: events.append("debug_passed"),
+            arm_hardware=lambda: events.append("arm_hardware"),
+            hold_hardware=lambda reason: events.append("hold_hardware"),
+        ),
+    )
+    clutch = SimpleNamespace(
+        publish_calibration_waiting=lambda message: events.append("waiting"),
+        publish_teleop_running=fail_projection,
+    )
+
+    admitted = startup_runtime._arm_after_start_calibration(
+        SimpleNamespace(),
+        components,
+        clutch,
+        home_captured=False,
+    )
+
+    assert admitted is False
+    assert events[-4:] == [
+        "arm_hardware",
+        "projection_attempt",
+        "waiting",
+        "hold_hardware",
+    ]
 
 
 def test_relative_tcp_pose_envelope_refuses_arm_without_runtime_home(
@@ -1624,14 +2228,15 @@ def test_relative_tcp_pose_envelope_refuses_arm_without_runtime_home(
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
 
-    startup_runtime._arm_after_start_calibration(
+    admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
         components,
         clutch,
         home_captured=False,
     )
 
-    assert events == ["hold_hardware", "waiting"]
+    assert events == ["waiting", "hold_hardware"]
+    assert admitted is False
 
 
 def test_shadow_relative_tcp_pose_envelope_never_blocks_arm_without_home(
@@ -1667,7 +2272,7 @@ def test_shadow_relative_tcp_pose_envelope_never_blocks_arm_without_home(
         publish_teleop_running=lambda **kwargs: events.append("teleop_running"),
     )
 
-    startup_runtime._arm_after_start_calibration(
+    admitted = startup_runtime._arm_after_start_calibration(
         SimpleNamespace(),
         components,
         clutch,
@@ -1683,6 +2288,218 @@ def test_shadow_relative_tcp_pose_envelope_never_blocks_arm_without_home(
         "arm_hardware",
         "teleop_running",
     ]
+    assert admitted is True
+
+
+class _ProgressArmTargetController:
+    def __init__(self, fixed_sides: tuple[str, ...]) -> None:
+        self.fixed_sides = fixed_sides
+        self.selected_side = ""
+        self.cancel_clear_snapshots: list[bool] = []
+
+    def cancel_active(self, *, now: float, reason: str, clear_snapshots: bool):
+        del now, reason
+        self.cancel_clear_snapshots.append(clear_snapshots)
+        was_fixed = bool(self.fixed_sides)
+        self.fixed_sides = ()
+        return SimpleNamespace(ok=was_fixed, message="released")
+
+    def select_side(self, side: str):
+        self.selected_side = side
+        return SimpleNamespace(ok=True, message="selected")
+
+    def freeze_selected(self, *, now: float):
+        del now
+        self.fixed_sides = (self.selected_side,)
+        return SimpleNamespace(ok=True, message="fixed")
+
+
+@pytest.mark.parametrize(
+    ("initial_fixed", "target_fixed"),
+    [
+        (("left",), ()),
+        ((), ("right",)),
+        (("left",), ("right",)),
+    ],
+)
+def test_progress_arm_target_after_home_reaches_exact_authority(
+    initial_fixed: tuple[str, ...],
+    target_fixed: tuple[str, ...],
+) -> None:
+    controller = _ProgressArmTargetController(initial_fixed)
+    pending = SimpleNamespace(
+        plan=SimpleNamespace(target_fixed_sides=target_fixed)
+    )
+
+    ready, detail = control_loop._apply_pending_progress_arm_target_after_home(
+        components=SimpleNamespace(fix_arm_controller=controller),
+        pending=pending,
+        now=12.0,
+    )
+
+    assert ready is True, detail
+    assert controller.fixed_sides == target_fixed
+    assert controller.cancel_clear_snapshots in ([], [False])
+
+
+def test_progress_home_arm_receipt_precedes_progress_commit() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    explicit_home = source[
+        source.index("if clutch_input.consume_calibration_request():") :
+        source.index("episode_delete_index =", source.index("if clutch_input.consume_calibration_request():"))
+    ]
+
+    target_index = explicit_home.index(
+        "_apply_pending_progress_arm_target_after_home("
+    )
+    arm_index = explicit_home.index(
+        "arm_admitted = _arm_after_start_calibration("
+    )
+    negative_receipt_index = explicit_home.index("if not arm_admitted:")
+    progress_commit_index = explicit_home.index("progress_workflow.handle_command(")
+    handled_receipt_index = explicit_home.index(
+        "if not bool(progress_result.handled):"
+    )
+    clear_pending_index = explicit_home.index(
+        "pending_progress_arm_transition = None"
+    )
+
+    assert target_index < arm_index < negative_receipt_index
+    assert (
+        negative_receipt_index
+        < progress_commit_index
+        < handled_receipt_index
+        < clear_pending_index
+    )
+    assert "clear_fix_snapshots=profile_home_pending is None" in explicit_home
+    assert 'reason="progress_arm_profile_transition"' in explicit_home[
+        negative_receipt_index:progress_commit_index
+    ]
+    assert "progress transaction blocker" in explicit_home
+
+
+def test_collection_transition_suspends_progress_without_clearing_same_binding() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    binding = source[
+        source.index("collection_transition_pending =") :
+        source.index("_latch_unreceipted_progress_failure_hold(")
+    ]
+
+    assert "progress_configured = bool(" in binding
+    assert "not context.collection_transition_active()" not in binding[
+        : binding.index("if not progress_configured:")
+    ]
+    assert (
+        "if progress_workflow is not None and not collection_transition_pending:"
+        in binding
+    )
+    recorder_change = binding[
+        binding.index("elif progress_workflow_recorder is not dataset_recorder:") :
+        binding.index("progress_failure_pending = False")
+    ]
+    assert "if not collection_transition_pending:" in recorder_change
+
+
+def test_two_pedal_home_requires_arm_receipt_before_success() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    fast_home = source[
+        source.index("fast_two_pedal_fixed_side =") :
+        source.index("if clutch_input.consume_calibration_request():")
+    ]
+
+    arm_index = fast_home.index("arm_admitted = _arm_after_start_calibration(")
+    failure_index = fast_home.index("if not arm_admitted:", arm_index)
+    success_index = fast_home.index("success=True", failure_index)
+    assert arm_index < failure_index < success_index
+    assert "continue" in fast_home[failure_index:success_index]
+    calibration_failure = fast_home[
+        fast_home.index("except Exception as exc:") : arm_index
+    ]
+    assert "_latch_safety_hold_and_hold_hardware_best_effort(" in calibration_failure
+
+
+def test_arm_admission_rejection_latches_application_before_session_hold() -> None:
+    source = inspect.getsource(startup_runtime._arm_after_start_calibration)
+    rejection = source[
+        source.index("def reject_arm_admission(") :
+        source.index("if home_captured:")
+    ]
+
+    waiting_index = rejection.index("clutch_input.publish_calibration_waiting(")
+    session_hold_index = rejection.index("components.session.hold_hardware(")
+    assert waiting_index < session_hold_index
+    assert "if not hold_applied:" in rejection
+    assert "except Exception as hold_exc:" in rejection
+
+
+def test_runtime_home_requires_a_positive_precalibration_hold_receipt() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    explicit_home = source[
+        source.index("if clutch_input.consume_calibration_request():") :
+        source.index(
+            "episode_delete_index =",
+            source.index("if clutch_input.consume_calibration_request():"),
+        )
+    ]
+
+    hold_index = explicit_home.index("runtime_home_hold_applied = bool(")
+    receipt_index = explicit_home.index("if not runtime_home_hold_applied:")
+    calibration_index = explicit_home.index("_runtime_home_calibration(")
+    assert hold_index < receipt_index < calibration_index
+    failure_path = explicit_home[receipt_index:calibration_index]
+    assert "_request_safety_hold_best_effort(" in failure_path
+    assert "continue" in failure_path
+
+
+def test_active_admittance_receipts_gate_home_and_recording_transitions() -> None:
+    source = inspect.getsource(control_loop.run_real_teleop_control_loop)
+    fast_home = source[
+        source.index("fast_two_pedal_fixed_side =") :
+        source.index("if clutch_input.consume_calibration_request():")
+    ]
+    explicit_home = source[
+        source.index("if clutch_input.consume_calibration_request():") :
+        source.index(
+            "episode_delete_index =",
+            source.index("if clutch_input.consume_calibration_request():"),
+        )
+    ]
+    episode_start = source[
+        source.index("if clutch_input.consume_episode_start_request():") :
+        source.index('mark_loop_phase("loop.keys")')
+    ]
+    episode_open = source[
+        source.index("countdown_control_plane_started_at =") :
+        source.index(
+            "dataset_recorder = context.dataset_recorder()",
+            source.index("countdown_control_plane_started_at ="),
+        )
+    ]
+
+    for home_transition in (fast_home, explicit_home):
+        reset_gate = home_transition.index(
+            "if not reset_position_admittance_shadow("
+        )
+        assert "continue" in home_transition[reset_gate:]
+    assert fast_home.index("if not reset_position_admittance_shadow(") < fast_home.index(
+        "success=True"
+    )
+    assert explicit_home.index(
+        "if not reset_position_admittance_shadow("
+    ) < explicit_home.index("progress_workflow.handle_command(")
+
+    # Episode start is a realtime-loop submission boundary.  Tactile
+    # maintenance quiesce and writer preparation are owned by the asynchronous
+    # collection control plane, so this block must not synchronously wait and
+    # then compensate Active admittance clocks for its own pause.
+    assert "schedule_recording_countdown(" in episode_start
+    assert "require_idle_tactile_quiesced(" not in episode_start
+    assert "rearm_position_admittance_after_control_plane_pause(" not in episode_start
+
+    assert "if not rearm_position_admittance_after_control_plane_pause(" in episode_open
+    assert "_cancel_recording_countdown_for_hold_best_effort(" in episode_open
+    assert "_stop_recording_best_effort(" in episode_open
+    assert "continue" in episode_open
 
 
 def test_active_tcp_pose_envelope_fault_has_explicit_pre_dispatch_hold_path() -> None:
@@ -2026,10 +2843,14 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         **common,
     ) == (False, "等待恢复，当前状态会自动停止数采：runtime_fault。")
 
+    running_command = SimpleNamespace(
+        commands={"left_arm": object()},
+    )
     running_step = SimpleNamespace(
         state=legacy_entrypoint.TeleopRunState.RUNNING,
         observation=object(),
-        command=object(),
+        command=running_command,
+        command_dispatched=True,
         channels={},
     )
     assert recording_admission.recording_warmup_status(
@@ -2037,6 +2858,21 @@ def test_recording_admission_keeps_fail_closed_check_order() -> None:
         step_result=running_step,
         **common,
     ) == (True, "warmup 输入稳定。")
+
+    running_step.command_dispatched = False
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (False, "等待机械臂命令通过最终 admission 并实际派发。")
+
+    running_step.command_dispatched = True
+    running_step.command = SimpleNamespace(commands={"left_hand": object()})
+    assert recording_admission.recording_warmup_status(
+        10.0,
+        step_result=running_step,
+        **common,
+    ) == (False, "等待机械臂命令通过最终 admission 并实际派发。")
 
 
 def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
@@ -2073,7 +2909,8 @@ def test_recording_admission_blocks_nonzero_dmtac_hardware_fault() -> None:
     running_step = SimpleNamespace(
         state=legacy_entrypoint.TeleopRunState.RUNNING,
         observation=object(),
-        command=object(),
+        command=SimpleNamespace(commands={"right_arm": object()}),
+        command_dispatched=True,
         channels={},
     )
 
@@ -2347,6 +3184,451 @@ def test_dataset_selection_owns_pending_contract_admission_without_ui_or_devices
     assert "control_station" not in selection_source
     assert "teleop_runtime.debug" not in selection_source
     assert "hardware" not in selection_source
+
+
+def test_teleop_running_projection_requires_an_actual_arm_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Gesture:
+        config = SimpleNamespace(enabled=False)
+
+        def reset_for_running(self) -> None:
+            return None
+
+        def mark_runtime_restarted(self) -> None:
+            return None
+
+    session_state = SimpleNamespace(value="ARMED")
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.components = SimpleNamespace(
+        active_sides=("left", "right"),
+        session=SimpleNamespace(
+            state_machine=SimpleNamespace(state=session_state),
+        ),
+    )
+    control.ui = None
+    control._hold_active = False
+    control._fix_hold_active = False
+    control._teleop_started = False
+    control._teleop_dispatch_confirmed = False
+    control._teleop_dispatch_projection = "idle"
+    control._gripper_control_enabled = False
+    control._last_calibration_started_from_hold = False
+    control._q6_hold_recalibration_gesture = Gesture()
+    control._dataset_selection_pending = False
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_has_q6_gripper_control",
+        lambda _components: True,
+    )
+
+    control.publish_teleop_running(home_ready=True)
+    assert control._teleop_started is True
+    assert control._teleop_dispatch_confirmed is False
+    assert control.gripper_control_enabled() is False
+    assert control.episode_start_admission() == (
+        False,
+        "机械臂命令尚未实际派发，不能开始数采。",
+    )
+
+    running_step = SimpleNamespace(
+        state=SimpleNamespace(value="RUNNING"),
+        command_dispatched=True,
+        command=SimpleNamespace(
+            commands={"left_arm": object(), "right_arm": object()},
+            metadata={},
+        ),
+        motion_hold_reason="",
+    )
+    assert control_loop._project_session_dispatch_state(
+        running_step,
+        clutch_input=control,
+    )
+    assert control._teleop_dispatch_confirmed is True
+    assert control.gripper_control_enabled() is True
+
+    control._fix_hold_active = True
+    assert not control_loop._project_session_dispatch_state(
+        running_step,
+        clutch_input=control,
+    )
+    assert control._teleop_dispatch_confirmed is False
+    assert control._teleop_dispatch_projection.startswith("suspended:RUNNING:")
+    assert "Fix-Hold" in control._teleop_dispatch_projection
+    assert control.gripper_control_enabled() is False
+
+    frozen_step = SimpleNamespace(
+        state=SimpleNamespace(value="FROZEN"),
+        command_dispatched=False,
+        command=None,
+        motion_hold_reason="source timing fault",
+    )
+    assert not control_loop._project_session_dispatch_state(
+        frozen_step,
+        clutch_input=control,
+    )
+    assert control._teleop_dispatch_confirmed is False
+    assert control.gripper_control_enabled() is False
+
+
+def test_two_pedal_transition_cannot_bypass_missing_dispatch_receipt() -> None:
+    transitions: list[str] = []
+    alerts: list[str] = []
+    controller = SimpleNamespace(
+        fixed_sides=(),
+        select_side=lambda side: transitions.append(str(side)),
+    )
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.components = SimpleNamespace(
+        session=SimpleNamespace(state_machine=SimpleNamespace()),
+        fix_arm_controller=controller,
+    )
+    control._teleop_started = True
+    control._teleop_dispatch_confirmed = False
+    control._hold_active = False
+    control._two_pedal_mode_active = lambda: True
+    control._manual_single_arm_switch_enabled = lambda: True
+    control._reject_two_pedal_switch_during_init = lambda *, now: False
+    control._publish_two_pedal_alert = (
+        lambda *, message, **_kwargs: alerts.append(str(message))
+    )
+
+    control._request_two_pedal_fixed_side(
+        "right",
+        now=10.0,
+        source="pedal_1",
+    )
+
+    assert transitions == []
+    assert alerts and "没有已确认的机械臂命令下发" in alerts[-1]
+
+
+def test_episode_lifecycle_state_is_authoritative_without_a_gui() -> None:
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.ui = None
+    control._episode_recording_ui_active = False
+    control._episode_recording_ui_paused = False
+    control._episode_countdown_ui_active = False
+    control._episode_finalizing_ui_active = False
+    control._episode_last_episode_index = None
+    control._episode_last_frame_count = None
+
+    control.set_episode_start_countdown_state(remaining_sec=2.0)
+    assert control._episode_countdown_ui_active is True
+    assert control._episode_recording_ui_active is False
+
+    control.set_episode_recording_state(
+        active=True,
+        frame_count=4,
+        event_status="recording",
+        episode_index=3,
+    )
+    assert control._episode_recording_ui_active is True
+    assert control._episode_countdown_ui_active is False
+    assert control._episode_last_episode_index == 3
+    assert control._episode_last_frame_count == 4
+
+    control.set_episode_recording_state(
+        active=False,
+        frame_count=9,
+        event_status="finalizing",
+        episode_index=3,
+    )
+    assert control._episode_finalizing_ui_active is True
+
+    control.set_episode_finalize_state(
+        status="saved",
+        message="saved",
+        episode_index=3,
+        frame_count=9,
+    )
+    assert control._episode_finalizing_ui_active is False
+    assert control._episode_recording_ui_active is False
+    assert control._episode_last_frame_count == 9
+
+
+def test_control_lifecycle_state_survives_ui_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs: list[tuple[str, str]] = []
+
+    class FailingUi:
+        def publish(self, **_state: object) -> None:
+            raise RuntimeError("ui publish unavailable")
+
+        def append_message(self, _title: str, _message: str) -> None:
+            raise RuntimeError("ui message unavailable")
+
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.ui = FailingUi()
+    control.args = SimpleNamespace(collection_warning_hz=15.0)
+    control.components = SimpleNamespace(active_sides=("left", "right"))
+    control._current_active_controls = lambda: ("p",)
+    control._episode_recording_available = lambda: True
+    control._pose_snapshot_ui_state = lambda: {}
+    control.ik_debug_timing_enabled = lambda: False
+    control.plus_curation = SimpleNamespace(ui_state=lambda: {})
+    control._cancel_init_arm_qpos_sequence = lambda *, reason: None
+    control._q6_hold_recalibration_gesture = SimpleNamespace(
+        config=SimpleNamespace(enabled=False),
+        reset_for_hold=lambda: None,
+        reset_for_running=lambda: None,
+        mark_runtime_restarted=lambda: None,
+    )
+    control.publish_gripper_status = lambda **_kwargs: None
+    control._teleop_started = True
+    control._hold_requested = False
+    control._hold_active = False
+    control._fix_hold_active = False
+    control._teleop_dispatch_confirmed = True
+    control._teleop_dispatch_projection = "running"
+    control._gripper_control_enabled = True
+    control._gripper_control_before_fix_hold = False
+    control._ik_debug_logging_active = False
+    control._ik_debug_log_path = ""
+    control._episode_recording_ui_active = False
+    control._episode_recording_ui_paused = False
+    control._episode_countdown_ui_active = False
+    control._episode_finalizing_ui_active = False
+    control._episode_last_episode_index = None
+    control._episode_last_frame_count = None
+    control._last_calibration_started_from_hold = False
+    control._calibration_requested = False
+    control._calibration_request_from_hold = False
+    control._tracker_side_confirmation_pending = False
+    control._tracker_side_confirmation_from_hold = False
+    control._tracker_side_confirmation_request_kind = "normal"
+    control._tracker_side_request_pending = False
+    control._tracker_side_request_from_hold = False
+    control._tracker_side_request_source = ""
+    control._tracker_side_request_kind = "normal"
+    control._tracker_side_request_deadline = 0.0
+    control._tracker_side_guard_request_active = False
+    control._tracker_side_override_granted = False
+    control._two_pedal_fast_home_requested = False
+    control._two_pedal_fast_home_deadline = 0.0
+    control._two_pedal_fast_home_timeout_sec = 1.0
+    control._tracker_side_check = {}
+    control._tracker_swap_locked = True
+    control._camera_visualization_available = lambda: False
+    control._tactile_visualization_available = lambda: False
+    control._camera_visualization_active = False
+    control._tactile_visualization_active = False
+    control.publish_raw_tracker_pose_state = lambda **_kwargs: None
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_log",
+        lambda tag, message, **_kwargs: logs.append((str(tag), str(message))),
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_has_q6_gripper_control",
+        lambda _components: True,
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_collection_task_ui_state",
+        lambda _args: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_fix_arm_ui_state",
+        lambda _components: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_init_arm_ui_state",
+        lambda _components: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_movement_multiple_ui_state",
+        lambda _args: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_vive_calibration_profile_ui_state",
+        lambda _args, _components: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_build_gripper_status",
+        lambda _components: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_build_tactile_camera_status",
+        lambda _status: {},
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_gripper_gui_available",
+        lambda _components: False,
+    )
+
+    control.request_hold(reason="unit_test")
+    assert control._hold_requested is True
+    assert control._hold_active is True
+    assert control._teleop_dispatch_confirmed is False
+    assert control._gripper_control_enabled is False
+
+    control._hold_active = False
+    control.set_fix_hold_active(True, message="both sides fixed-like")
+    assert control._fix_hold_active is True
+    assert control._teleop_dispatch_confirmed is False
+    assert control._teleop_dispatch_projection == "fix_hold"
+    assert control._gripper_control_enabled is False
+
+    assert not control.publish_teleop_dispatch_running()
+    assert control._teleop_dispatch_confirmed is False
+    assert control._teleop_dispatch_projection == "fix_hold"
+    assert control.gripper_control_enabled() is False
+
+    control.set_fix_hold_active(False, message="one side released")
+    assert control._fix_hold_active is False
+    assert control._teleop_dispatch_confirmed is False
+    assert (
+        control._teleop_dispatch_projection
+        == "fix_hold_released_waiting_dispatch"
+    )
+    assert control._gripper_control_enabled is False
+    assert control.gripper_control_enabled() is False
+    assert control.publish_teleop_dispatch_running()
+    assert control._teleop_dispatch_confirmed is True
+    assert control._gripper_control_enabled is True
+    assert control.publish_teleop_dispatch_suspended(
+        session_state="FROZEN",
+        reason="source timing fault",
+    )
+    assert control._teleop_dispatch_confirmed is False
+    assert control._gripper_control_enabled is False
+
+    control.set_episode_start_countdown_state(remaining_sec=2.0)
+    assert control._episode_countdown_ui_active is True
+    control.set_episode_recording_state(
+        active=True,
+        frame_count=4,
+        event_status="paused",
+        episode_index=3,
+    )
+    assert control._episode_recording_ui_active is True
+    assert control._episode_recording_ui_paused is True
+    control.set_episode_finalize_state(
+        status="saved",
+        message="saved",
+        episode_index=3,
+        frame_count=9,
+    )
+    assert control._episode_recording_ui_active is False
+    assert control._episode_finalizing_ui_active is False
+    assert control._episode_last_frame_count == 9
+
+    control._hold_active = False
+    control._teleop_started = False
+    control.components.session = SimpleNamespace(
+        state_machine=SimpleNamespace(state=SimpleNamespace(value="ARMED"))
+    )
+    control.components.left_gripper_retargeter = None
+    control.components.right_gripper_retargeter = None
+    control.publish_teleop_running(home_ready=True)
+    assert control._teleop_started is True
+    assert control._hold_active is False
+    assert control._teleop_dispatch_confirmed is False
+
+    control.publish_calibration_waiting("runtime Home rejected")
+    assert control._hold_active is True
+    assert control._teleop_dispatch_confirmed is False
+    assert control._teleop_dispatch_projection == "calibration_waiting"
+    assert control._gripper_control_enabled is False
+    assert any(
+        tag == "WebGUI" and "authoritative state is retained" in message
+        for tag, message in logs
+    )
+
+
+def test_round_trip_switch_is_transactional_and_ui_observational(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingUi:
+        def publish(self, **_state: object) -> None:
+            raise RuntimeError("ui publish unavailable")
+
+        def append_message(self, _title: str, _message: str) -> None:
+            raise RuntimeError("ui message unavailable")
+
+    args = SimpleNamespace(
+        collection_task_type="round_trip",
+        collection_round_trip_phase="in",
+        collection_task_name="round-trip_in",
+        collection_task_id="round-trip-in",
+        dataset_root="/tmp/round-trip-in",
+    )
+    original = dict(vars(args))
+    control = operator_control_runtime.RealTeleopControlInput.__new__(
+        operator_control_runtime.RealTeleopControlInput
+    )
+    control.args = args
+    control.ui = FailingUi()
+    control._dataset_configuration_transition_active = lambda: False
+    control._episode_busy = lambda: False
+    control._current_active_controls = tuple
+    logs: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_collection_task_ui_state",
+        lambda selected_args: {
+            "collection_round_trip_phase": selected_args.collection_round_trip_phase,
+            "dataset_root": selected_args.dataset_root,
+        },
+    )
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_log",
+        lambda tag, message, **_kwargs: logs.append((str(tag), str(message))),
+    )
+
+    def fail_after_partial_mutation(selected_args: object) -> bool:
+        selected_args.collection_round_trip_phase = "out"
+        selected_args.dataset_root = "/tmp/round-trip-out"
+        raise OSError("layout refresh failed")
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_toggle_collection_round_trip_phase",
+        fail_after_partial_mutation,
+    )
+
+    assert not control.advance_round_trip_task_after_saved_episode()
+    assert vars(args) == original
+    assert any("layout refresh failed" in message for _tag, message in logs)
+
+    def commit_switch(selected_args: object) -> bool:
+        selected_args.collection_round_trip_phase = "out"
+        selected_args.collection_task_name = "round-trip_out"
+        selected_args.collection_task_id = "round-trip-out"
+        selected_args.dataset_root = "/tmp/round-trip-out"
+        return True
+
+    monkeypatch.setattr(
+        operator_control_runtime,
+        "_toggle_collection_round_trip_phase",
+        commit_switch,
+    )
+
+    assert control.advance_round_trip_task_after_saved_episode()
+    assert args.collection_round_trip_phase == "out"
+    assert args.dataset_root == "/tmp/round-trip-out"
 
 
 def test_plus_curation_runtime_owns_request_and_writer_thread_lifecycle() -> None:

@@ -362,6 +362,67 @@ def _tactile_storage_capacity_summary(args: argparse.Namespace) -> str | None:
     )
 
 
+def _close_episode_recording_runtime_before_resources(
+    runtime_state: Mapping[str, Any],
+    *,
+    terminal_error: BaseException | None,
+    support: Mapping[str, Any],
+) -> bool:
+    """Commit an active Episode before generic device/resource teardown."""
+
+    episode_recording_runtime = runtime_state.get("episode_recording_runtime")
+    if episode_recording_runtime is None:
+        return True
+    args = runtime_state["args"]
+    position_force_guard_monitor = runtime_state.get(
+        "position_force_guard_monitor"
+    )
+    position_force_guard_fault = (
+        None
+        if position_force_guard_monitor is None
+        else position_force_guard_monitor.fault
+    )
+    force_collision_summary = support[
+        "_position_force_guard_collision_summary"
+    ](position_force_guard_fault)
+    if not force_collision_summary:
+        force_collision_summary = support[
+            "_terminal_force_collision_summary"
+        ](
+            terminal_error,
+            control_mode=support["_arm_control_mode_arg"](args),
+        )
+    end_reason = (
+        "position_force_guard"
+        if position_force_guard_fault is not None
+        else "force_collision"
+        if force_collision_summary
+        else "shutdown"
+    )
+    summary: dict[str, object] = {
+        "reason": (
+            "position_force_guard"
+            if position_force_guard_fault is not None
+            else "force_collision"
+            if force_collision_summary
+            else "finally"
+        )
+    }
+    if position_force_guard_fault is not None:
+        summary["position_force_guard_fault"] = (
+            position_force_guard_fault.to_dict()
+        )
+    summary.update(force_collision_summary)
+    return bool(
+        episode_recording_runtime.close(
+            now=support["time"].time(),
+            end_reason=end_reason,
+            summary=summary,
+            timeout_sec=15.0,
+        )
+    )
+
+
 def run_real_teleop(
     args: argparse.Namespace,
     *,
@@ -1264,55 +1325,11 @@ def run_real_teleop(
         def current_dataset_recorder() -> object | None:
             return dataset_recorder
 
-        def set_current_dataset_recorder(value: object | None) -> None:
+        def assign_current_dataset_recorder(value: object | None) -> None:
+            """Publish a recorder after its background transition is complete."""
+
             nonlocal dataset_recorder
-            require_idle_tactile_quiesced("dataset_recorder_rebind")
             dataset_recorder = value
-
-        def reconfigure_dataset_recorder_for_selection() -> None:
-            """Apply an idle task/root change to the live recorder immediately."""
-
-            nonlocal dataset_recorder
-            current = dataset_recorder
-            if current is None:
-                return
-            require_idle_tactile_quiesced("dataset_selection_reconfigure")
-            try:
-                current.reconfigure_for_current_args()
-            except BaseException:
-                # ``reconfigure_for_current_args`` may already have closed
-                # the old recorder before a new candidate fails its ready
-                # handshake.  Do not leave that one-shot object published for
-                # a later retry.
-                process_worker = getattr(current, "process_worker", None)
-                writer_pool = getattr(current, "writer_pool", None)
-                candidate_is_unusable = bool(
-                    getattr(current, "_lifecycle_closed", False)
-                    or getattr(process_worker, "_closed", False)
-                    or getattr(writer_pool, "_closed", False)
-                )
-                if candidate_is_unusable:
-                    dataset_recorder = None
-                    try:
-                        set_current_dataset_recorder(None)
-                    except BaseException:
-                        pass
-                    try:
-                        current.close()
-                    except BaseException:
-                        pass
-                raise
-            args.dataset_startup_error = ""
-            startup_device_errors.pop("dataset.writer", None)
-            publish_runtime_hardware_status()
-
-        bind_reconfigure = getattr(
-            clutch_input,
-            "bind_dataset_reconfigure_callback",
-            None,
-        )
-        if callable(bind_reconfigure):
-            bind_reconfigure(reconfigure_dataset_recorder_for_selection)
 
         def current_foot_pad_input() -> object | None:
             return foot_pad_input
@@ -1344,7 +1361,7 @@ def run_real_teleop(
             startup_device_errors=startup_device_errors,
             position_force_guard_requested=position_force_guard_requested,
             dataset_recorder_provider=current_dataset_recorder,
-            set_dataset_recorder=set_current_dataset_recorder,
+            set_dataset_recorder=assign_current_dataset_recorder,
             foot_pad_input_provider=current_foot_pad_input,
             set_foot_pad_input=set_current_foot_pad_input,
             dataset_recorder_type=RealTeleopDatasetRecorder,
@@ -2191,7 +2208,7 @@ def run_real_teleop(
                 "TCP",
                 "legacy --tcp-mode rm_eef was requested; runtime now uses tool_tcp actions.",
             )
-        _arm_after_start_calibration(
+        startup_arm_admitted = _arm_after_start_calibration(
             args,
             components,
             clutch_input,
@@ -2203,6 +2220,12 @@ def run_real_teleop(
                 else None
             ),
         )
+        if not startup_arm_admitted:
+            _log(
+                "Calibration",
+                "runtime Home did not produce an arm-admission receipt; "
+                "entering the control loop in Hold with dispatch disabled.",
+            )
         position_admittance_active = bool(
             getattr(args, "position_admittance_active", False)
         )
@@ -2546,8 +2569,9 @@ def run_real_teleop(
             collection_startup_blockers=collection_startup_blockers,
             recording_warmup_status=recording_warmup_status,
             reset_gripper_warmup_probe=reset_gripper_warmup_probe,
+            prepare_dataset_transition=require_idle_tactile_quiesced,
             dataset_recorder_provider=current_dataset_recorder,
-            set_dataset_recorder=set_current_dataset_recorder,
+            set_dataset_recorder=assign_current_dataset_recorder,
             camera_previewer_provider=lambda: (
                 visualization_runtime.current_state()[0]
             ),
@@ -2556,6 +2580,16 @@ def run_real_teleop(
             step_index_provider=current_step_index,
             support=globals(),
         )
+        bind_reconfigure = getattr(
+            clutch_input,
+            "bind_dataset_reconfigure_callback",
+            None,
+        )
+        if callable(bind_reconfigure):
+            bind_reconfigure(
+                episode_recording_runtime.schedule_dataset_selection,
+                transactional=True,
+            )
         recording_active = episode_recording_runtime.recording_active
         recording_paused = episode_recording_runtime.recording_paused
         recording_pause_reason = episode_recording_runtime.recording_pause_reason
@@ -2567,6 +2601,8 @@ def run_real_teleop(
         publish_collection_frequency_warning = (
             episode_recording_runtime.publish_collection_frequency_warning
         )
+        record_debug_event = episode_recording_runtime.record_debug_event
+        record_debug_frame = episode_recording_runtime.record_debug_frame
         start_recording = episode_recording_runtime.start_recording
         schedule_recording_countdown = (
             episode_recording_runtime.schedule_recording_countdown
@@ -2660,7 +2696,12 @@ def run_real_teleop(
                 publish_collection_frequency_warning=(
                     publish_collection_frequency_warning
                 ),
+                record_debug_event=record_debug_event,
+                record_debug_frame=record_debug_frame,
                 recording_active=recording_active,
+                collection_transition_active=(
+                    episode_recording_runtime.collection_transition_active
+                ),
                 recording_auto_stop_reason=recording_auto_stop_reason,
                 recording_frame_count=recording_frame_count,
                 recording_frequency_status=recording_frequency_status,
@@ -2692,11 +2733,32 @@ def run_real_teleop(
             )
         )
     finally:
+        terminal_error = sys.exc_info()[1]
+        episode_shutdown_error: BaseException | None = None
+        try:
+            if not _close_episode_recording_runtime_before_resources(
+                locals(),
+                terminal_error=terminal_error,
+                support=globals(),
+            ):
+                raise RuntimeError(
+                    "formal collection lifecycle did not drain before "
+                    "generic real-teleop resource teardown"
+                )
+        except BaseException as exc:  # noqa: BLE001 - finish lower cleanup.
+            episode_shutdown_error = exc
+            _log(
+                "Shutdown",
+                "formal collection shutdown completed with a recoverable "
+                f"failure: {type(exc).__name__}: {exc}",
+            )
         shutdown_real_teleop_runtime(
             locals(),
-            terminal_error=sys.exc_info()[1],
+            terminal_error=terminal_error,
             support=globals(),
         )
+        if terminal_error is None and episode_shutdown_error is not None:
+            raise episode_shutdown_error
 
 __all__ = [
     "bind_legacy_support",

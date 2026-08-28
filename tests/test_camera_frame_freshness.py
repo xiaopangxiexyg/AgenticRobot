@@ -5,6 +5,7 @@ import pytest
 from types import SimpleNamespace
 
 from robot_motion.deploy.observation import build_deployment_observation
+from robot_motion.runtime import EffectorCommand, TeleopCommand
 from teleop_runtime.collection.build_collect_components import CollectorComponents
 from teleop_runtime.collection.sample_assembler import (
     CollectorSampleBuilder,
@@ -40,6 +41,26 @@ def _step(timestamp: float) -> SessionStepResult:
         state=TeleopRunState.RUNNING,
         control_hz=15.0,
         observation=TeleopObservation(timestamp=float(timestamp)),
+    )
+
+
+def _dispatched_arm_step(timestamp: float) -> SessionStepResult:
+    command = TeleopCommand(timestamp=float(timestamp))
+    command.add_command(
+        EffectorCommand(
+            effector_name="left_arm",
+            side="left",
+            command_type="joint_vector",
+            value=[0.0] * 6,
+        )
+    )
+    return SessionStepResult(
+        timestamp=float(timestamp),
+        state=TeleopRunState.RUNNING,
+        control_hz=15.0,
+        observation=TeleopObservation(timestamp=float(timestamp)),
+        command=command,
+        command_dispatched=True,
     )
 
 
@@ -102,14 +123,7 @@ def test_recording_resume_gate_uses_camera_availability_age() -> None:
         hold_active=lambda: False,
         publish_camera_status=lambda **_kwargs: {},
     )
-    step = _step(10.0)
-    step = SessionStepResult(
-        timestamp=step.timestamp,
-        state=step.state,
-        control_hz=step.control_hz,
-        observation=step.observation,
-        command=SimpleNamespace(timestamp=10.0),
-    )
+    step = _dispatched_arm_step(10.0)
 
     ready, message = recording_warmup_status(
         10.0,
@@ -136,13 +150,7 @@ def test_recording_resume_gate_rejects_future_availability_timestamp() -> None:
     buffer.push(_frame(9.99, frame_index=1, available_timestamp=10.10))
     source = SimpleNamespace(frame_buffer=lambda: buffer)
     args = SimpleNamespace(no_camera=False, ignore_camera=(), ignore_tactile=())
-    step = SessionStepResult(
-        timestamp=10.0,
-        state=TeleopRunState.RUNNING,
-        control_hz=15.0,
-        observation=TeleopObservation(timestamp=10.0),
-        command=SimpleNamespace(timestamp=10.0),
-    )
+    step = _dispatched_arm_step(10.0)
 
     ready, message = recording_warmup_status(
         10.0,

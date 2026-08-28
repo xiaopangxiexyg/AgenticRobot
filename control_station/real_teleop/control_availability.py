@@ -39,6 +39,10 @@ class GuiControlEvents:
 @dataclass(frozen=True)
 class GuiControlState:
     teleop_started: bool = False
+    # ``None`` preserves the historical policy contract for thin/offline
+    # callers that only model the armed lifecycle.  The production real-teleop
+    # adapter always supplies a strict per-frame dispatch projection.
+    teleop_dispatch_confirmed: bool | None = None
     hold_active: bool = False
     episode_recording_available: bool = False
     episode_delete_available: bool = True
@@ -71,6 +75,17 @@ def episode_busy(state: GuiControlState) -> bool:
         state.episode_recording_active
         or state.episode_countdown_active
         or state.episode_finalizing_active
+    )
+
+
+def teleop_dispatch_active(state: GuiControlState) -> bool:
+    """Separate armed lifecycle ownership from live arm-control availability."""
+
+    projected = state.teleop_dispatch_confirmed
+    return bool(
+        state.teleop_started
+        and (True if projected is None else projected)
+        and not state.hold_active
     )
 
 
@@ -167,17 +182,19 @@ def episode_controls(state: GuiControlState, events: GuiControlEvents) -> list[s
         return ["episode_stop"] if (
             state.episode_recording_active or state.episode_countdown_active
         ) else []
-    return [
+    controls = [
         event
         for event in events.episode_events
         if event != "episode_delete" or state.episode_delete_available
     ]
+    if not teleop_dispatch_active(state):
+        controls = [event for event in controls if event != "episode_start"]
+    return controls
 
 
 def fix_init_allowed_in_controls(state: GuiControlState) -> bool:
     return bool(
-        state.teleop_started
-        and not state.hold_active
+        teleop_dispatch_active(state)
         and not state.episode_countdown_active
         and not state.episode_finalizing_active
     )
@@ -249,7 +266,18 @@ def manual_init_arm_controls(state: GuiControlState) -> bool:
 
 
 def pose_snapshot_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
-    return [events.pose_snapshot_event] if state.pose_snapshot_available else []
+    return [events.pose_snapshot_event] if (
+        state.pose_snapshot_available and teleop_dispatch_active(state)
+    ) else []
+
+
+def teleop_suspended_controls(state: GuiControlState) -> list[str]:
+    """Expose only fail-safe lifecycle controls without a live arm dispatch."""
+
+    controls = ["q", "d", "h"]
+    if state.episode_recording_active or state.episode_countdown_active:
+        controls.append("episode_stop")
+    return _apply_foot_pad_test_controls(state, controls)
 
 
 def recording_controls(
@@ -341,6 +369,8 @@ def qpos_active_controls(state: GuiControlState) -> list[str]:
 
 
 def teleop_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
+    if not teleop_dispatch_active(state):
+        return teleop_suspended_controls(state)
     controls = ["q", "d", "h"]
     if (
         state.fix_arm_available
@@ -496,7 +526,9 @@ __all__ = [
     "pre_home_controls",
     "recording_controls",
     "single_arm_tracker_swap_allowed_in_hold",
+    "teleop_dispatch_active",
     "teleop_controls",
+    "teleop_suspended_controls",
     "vive_calibration_controls",
     "visualization_controls",
 ]

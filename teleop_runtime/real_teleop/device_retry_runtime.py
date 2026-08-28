@@ -45,7 +45,6 @@ def build_device_retry_runtime(
     log: Callable[..., None],
     publish_camera_status: Callable[[], None] | None = None,
 ) -> DeviceRetryRuntime:
-    RealTeleopDatasetRecorder = dataset_recorder_type
     DMTacGripperBackend = dmtac_gripper_backend_type
     FootPadSpecialArmInput = foot_pad_input_type
     SPECIAL_ARM_CONTROL_MODE_FOOT_PAD = foot_pad_control_mode
@@ -85,7 +84,10 @@ def build_device_retry_runtime(
                         "status_level": "info",
                         "status_label": "等待开始数采",
                         "requirement": hardware_requirement(key),
-                        "error": "writer 将在开始数采时按当前数据集/profile 初始化。",
+                        "error": (
+                            "writer 将在显式选择数据集/profile 或开始数采时，"
+                            "按当前配置异步初始化。"
+                        ),
                     }
                 writer_started = getattr(recorder, "writer_started", None)
                 if writer_started is False:
@@ -124,6 +126,17 @@ def build_device_retry_runtime(
                 "status_label": "Q6 未就绪（可选回退）",
                 "requirement": "optional_input",
                 "error": detail,
+            }
+        if key == "dataset.writer":
+            return {
+                "online": False,
+                "health": "error",
+                "status_level": "error",
+                "status_label": "writer 准备失败",
+                "requirement": hardware_requirement(key),
+                "error": (
+                    f"{detail}；再次开始数采会在后台创建全新 writer 并重试。"
+                ),
             }
         return {
             "online": False,
@@ -335,50 +348,21 @@ def build_device_retry_runtime(
                     camera.close()
                     camera.start()
                 elif key == "dataset.writer":
-                    # multiprocessing.Process instances are one-shot even when
-                    # startup fails.  Never retain or restart the failed
-                    # recorder: build a fresh candidate and publish it only
-                    # after the writer ready handshake succeeds.
-                    previous_recorder = dataset_recorder
-                    if previous_recorder is not None:
-                        dataset_recorder = None
-                        try:
-                            set_dataset_recorder(None)
-                        except Exception as detach_exc:  # noqa: BLE001 - continue with fresh candidate.
-                            _log(
-                                "Dataset",
-                                "failed writer detach was not fully acknowledged; "
-                                f"continuing with a fresh candidate: {type(detach_exc).__name__}: {detach_exc}",
-                            )
-                        finally:
-                            previous_recorder.close()
-                    replacement_recorder = None
-                    try:
-                        replacement_recorder = RealTeleopDatasetRecorder(
-                            args=args,
-                            components=components,
-                            camera_sources=camera_sources,
-                        )
-                        ensure_started = getattr(
-                            replacement_recorder,
-                            "ensure_started",
-                            None,
-                        )
-                        if callable(ensure_started):
-                            ensure_started()
-                        else:
-                            replacement_recorder.start()
-                            replacement_recorder.write_camera_device_config()
-                        set_dataset_recorder(replacement_recorder)
-                        args.dataset_startup_error = ""
-                    except BaseException:  # noqa: BLE001 - discard one-shot candidate.
-                        if replacement_recorder is not None:
-                            try:
-                                replacement_recorder.close()
-                            except Exception:
-                                pass
-                        raise
-                    dataset_recorder = replacement_recorder
+                    # A formal writer is a collection capability, not a
+                    # hardware connection.  Constructing it here would run its
+                    # ready handshake synchronously on the realtime/UI thread
+                    # and can stall arm command production while a populated
+                    # dataset is scanned.  The episode control plane already
+                    # owns fresh one-shot candidate construction and clears
+                    # this error after a successful async preparation.
+                    message = (
+                        "dataset.writer 不参与通用设备重连；请再次点击“开始数采”，"
+                        "系统会在后台创建全新 writer 并执行 ready 握手。"
+                    )
+                    _log("Dataset", message)
+                    if control_ui is not None:
+                        control_ui.append_message("Dataset", message)
+                    continue
                 elif key == "rig.session":
                     components.session.start()
                     if components.human_shadow_frontend is not None:

@@ -15,6 +15,23 @@ from .hand_config import HAND_BACKEND_NONE, hand_backend_mode_for_side
 from .hand_runtime import _gripper_backend_for_side, _hand_backend_for_side
 
 
+def session_step_arm_dispatch_confirmed(step_result: object) -> bool:
+    """Return whether this exact Session step dispatched an arm command.
+
+    ``TeleopRunState.RUNNING`` is a lifecycle state and can remain latched while
+    a command source or final admission gate temporarily inhibits dispatch.
+    Collection admission must therefore use the per-step dispatch receipt and
+    also reject hand-only commands.
+    """
+
+    command = getattr(step_result, "command", None)
+    commands = getattr(command, "commands", {}) if command is not None else {}
+    return bool(
+        getattr(step_result, "command_dispatched", False)
+        and any(name in commands for name in ("left_arm", "right_arm"))
+    )
+
+
 def recording_auto_stop_reason(state: TeleopRunState | str) -> str | None:
     state_value = str(getattr(state, "value", state)).upper()
     if state_value == TeleopRunState.FAULT.value:
@@ -58,6 +75,8 @@ def recording_warmup_status(
         return False, "等待 observation 可用。"
     if step_result.command is None:
         return False, "等待 action command 可用。"
+    if not session_step_arm_dispatch_confirmed(step_result):
+        return False, "等待机械臂命令通过最终 admission 并实际派发。"
     if dataset_recorder is not None:
         actual_ready, actual_message = dataset_recorder.actual_feedback_warmup_status(now)
         if not actual_ready:
@@ -219,4 +238,5 @@ def recording_warmup_status(
 __all__ = [
     "recording_auto_stop_reason",
     "recording_warmup_status",
+    "session_step_arm_dispatch_confirmed",
 ]

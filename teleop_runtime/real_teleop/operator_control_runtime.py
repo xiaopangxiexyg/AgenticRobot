@@ -271,9 +271,15 @@ class RealTeleopControlInput:
         self._two_pedal_alert_level = ""
         self._two_pedal_alert_message = ""
         self._two_pedal_alert_expires_at = 0.0
-        self._gripper_control_before_fix_hold = False
         self._tracker_swap_locked = False
         self._teleop_started = False
+        # ``_teleop_started`` means the Session has been armed and therefore
+        # owns the ordinary Hold/re-Home lifecycle.  It does not prove that an
+        # arm command crossed the final Session dispatch boundary.  Keep that
+        # fact separate so the GUI, collection admission, and gripper control
+        # cannot report RUNNING while the Session is still ARMED or frozen.
+        self._teleop_dispatch_confirmed = False
+        self._teleop_dispatch_projection = "idle"
         # Exact-qpos maintenance before runtime Home is enabled only while the
         # real startup wait loop owns and services its dedicated dispatch path.
         # Keeping this explicit prevents a merely enabled browser control from
@@ -294,6 +300,7 @@ class RealTeleopControlInput:
         self._ik_debug_logging_active = False
         self._ik_debug_log_path = ""
         self._gripper_control_enabled = False
+        self._gripper_control_before_fix_hold = False
         self._hold_request_reason = "manual"
         # The dual-arm Init operation is deliberately only an orchestration
         # layer over the existing single-arm exact-qpos lifecycle.  It never
@@ -322,7 +329,9 @@ class RealTeleopControlInput:
         self._camera_depth_monitor = WristDepthFreshnessMonitor()
         self._episode_start_requested = False
         self._episode_stop_requested = False
-        self._dataset_reconfigure_callback: Callable[[], None] | None = None
+        self._dataset_reconfigure_callback: Callable[..., object] | None = None
+        self._dataset_reconfigure_transactional = False
+        self._dataset_selection_pending = False
         self._progress_operator_intents: deque[ProgressMutationCommand] = deque()
         self._progress_profile_selection_intents: deque[
             ProgressProfileSelectionCommand
@@ -410,6 +419,56 @@ class RealTeleopControlInput:
             movement_multiple_events=tuple(MOVEMENT_MULTIPLE_GUI_EVENTS),
         )
 
+    def _publish_ui_observation(
+        self,
+        *,
+        context: str,
+        **state: object,
+    ) -> bool:
+        """Publish a rebuildable UI projection without vetoing owned state.
+
+        The control input owns Hold, Fix-Hold, dispatch admission, and the
+        application-side episode flags.  Browser transport is only an
+        observer of those facts: once the owned state is committed, a broken
+        client must not unwind it or prevent the caller from performing the
+        next safety/data lifecycle effect.
+        """
+
+        if self.ui is None:
+            return False
+        try:
+            self.ui.publish(**state)
+        except Exception as exc:  # noqa: BLE001 - UI transport is observational.
+            _log(
+                "WebGUI",
+                f"{context} projection failed; authoritative state is retained: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+        return True
+
+    def _append_ui_message_observation(
+        self,
+        title: str,
+        message: str,
+        *,
+        context: str,
+    ) -> bool:
+        """Append an operator message without changing lifecycle outcomes."""
+
+        if self.ui is None:
+            return False
+        try:
+            self.ui.append_message(str(title), str(message))
+        except Exception as exc:  # noqa: BLE001 - UI transport is observational.
+            _log(
+                "WebGUI",
+                f"{context} message failed; authoritative state is retained: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+        return True
+
     def bind_application_ports(
         self,
         *,
@@ -454,6 +513,7 @@ class RealTeleopControlInput:
         )
         return GuiControlState(
             teleop_started=bool(getattr(self, "_teleop_started", False)),
+            teleop_dispatch_confirmed=self._teleop_arm_dispatch_confirmed(),
             hold_active=bool(getattr(self, "_hold_active", False)),
             episode_recording_available=(
                 not bool(getattr(self.args, "no_collection", False))
@@ -736,12 +796,16 @@ class RealTeleopControlInput:
             variant_id=self.plus_curation.variant_id or None,
         )
         if self.ui is not None:
-            self.ui.publish(**self.plus_curation.ui_state())
+            self._publish_ui_observation(
+                context="Plus episode state",
+                **self.plus_curation.ui_state(),
+            )
 
     def set_plus_curation_pending(self, *, dataset_root: str | Path, episode_index: int) -> None:
         self.plus_curation.mark_pending(dataset_root=dataset_root, episode_index=int(episode_index))
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="Plus pending state",
                 **self.plus_curation.ui_state(),
                 active_controls=self._current_active_controls(),
             )
@@ -749,7 +813,8 @@ class RealTeleopControlInput:
     def clear_plus_curation_pending(self, *, message: str = "") -> None:
         self.plus_curation.clear_pending(message=message)
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="Plus cleared state",
                 **self.plus_curation.ui_state(),
                 active_controls=self._current_active_controls(),
             )
@@ -789,7 +854,8 @@ class RealTeleopControlInput:
 
         def publish_state() -> None:
             if self.ui is not None:
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="Plus save state",
                     **self.plus_curation.ui_state(),
                     dataset_configuration_blocked_reason=(
                         self._dataset_configuration_blocked_reason()
@@ -803,18 +869,15 @@ class RealTeleopControlInput:
             disposition=disposition,
             reason_code=reason_code,
             on_state_changed=publish_state,
-            on_failure=lambda message: (
-                self.ui.append_message("Plus", message)
-                if self.ui is not None
-                else None
+            on_failure=lambda message: self._append_ui_message_observation(
+                "Plus",
+                message,
+                context="Plus save failure",
             ),
-            on_success=lambda record: (
-                self.ui.append_message(
-                    "Plus",
-                    f"已写入 Plus sidecar: {record.annotation_episode_id}",
-                )
-                if self.ui is not None
-                else None
+            on_success=lambda record: self._append_ui_message_observation(
+                "Plus",
+                f"已写入 Plus sidecar: {record.annotation_episode_id}",
+                context="Plus save success",
             ),
         )
 
@@ -833,9 +896,34 @@ class RealTeleopControlInput:
     def _episode_busy(self) -> bool:
         return _gui_episode_busy(self._gui_control_state())
 
+    def _teleop_arm_dispatch_confirmed(self) -> bool:
+        """Return the production dispatch fact with thin-adapter compatibility."""
+
+        session = getattr(self.components, "session", None)
+        if getattr(session, "state_machine", None) is None:
+            # Historic offline/test adapters expose no Session state at all.
+            # They cannot project the authoritative dispatch boundary, so
+            # preserve their established armed-only contract.  The real
+            # runtime always has a state_machine and never takes this branch.
+            return bool(getattr(self, "_teleop_started", False))
+        return bool(getattr(self, "_teleop_dispatch_confirmed", False))
+
     def _episode_transition_busy(self) -> bool:
         state = self._gui_control_state()
         return bool(state.episode_countdown_active or state.episode_finalizing_active)
+
+    def _dataset_configuration_transition_active(self) -> bool:
+        """Return whether one dataset/profile writer transaction owns config."""
+
+        return bool(getattr(self, "_dataset_selection_pending", False))
+
+    def _progress_configuration_selection_enabled(self) -> bool:
+        """Keep progress configuration on the same idle transaction boundary."""
+
+        return bool(
+            not self._episode_busy()
+            and not self._dataset_configuration_transition_active()
+        )
 
     def episode_start_admission(self) -> tuple[bool, str]:
         """Apply one start gate to GUI, browser shortcuts, and terminal input.
@@ -845,8 +933,12 @@ class RealTeleopControlInput:
         failure; a selected profile is consumed only when the operator has
         explicitly enabled the progress workflow for that Episode.
         """
+        if self._dataset_configuration_transition_active():
+            return False, "数据集任务/profile 正在后台准备，完成后才能开始数采。"
         if not bool(getattr(self, "_teleop_started", False)):
             return False, "遥操尚未进入 RUNNING，不能开始数采。"
+        if not self._teleop_arm_dispatch_confirmed():
+            return False, "机械臂命令尚未实际派发，不能开始数采。"
         if bool(getattr(self, "_hold_active", False)):
             return False, "常规 Hold 期间不能开始数采；请先重采 runtime Home。"
         init_controller = getattr(self.components, "init_arm_controller", None)
@@ -882,8 +974,13 @@ class RealTeleopControlInput:
     def _publish_episode_start_rejection(self, message: str) -> None:
         if self.ui is None:
             return
-        self.ui.append_message("Dataset", message)
-        self.ui.publish(
+        self._append_ui_message_observation(
+            "Dataset",
+            message,
+            context="episode start rejection",
+        )
+        self._publish_ui_observation(
+            context="episode start rejection",
             active_controls=self._current_active_controls(),
             control_hint=message,
         )
@@ -892,8 +989,9 @@ class RealTeleopControlInput:
         return _gui_fix_init_allowed_in_controls(self._gui_control_state())
 
     def _current_active_controls(self) -> list[str]:
+        gui_state = self._gui_control_state()
         controls = list(_gui_current_active_controls(
-            self._gui_control_state(), self._gui_events()
+            gui_state, self._gui_events()
         ))
         if not self._manual_single_arm_switch_enabled():
             controls = [
@@ -918,6 +1016,18 @@ class RealTeleopControlInput:
             if (
                 self._manual_single_arm_switch_enabled()
                 and not self._two_pedal_switch_blocked_by_init()
+                and (
+                    bool(getattr(gui_state, "hold_active", False))
+                    or bool(
+                        getattr(gui_state, "teleop_started", False)
+                        and getattr(
+                            gui_state,
+                            "teleop_dispatch_confirmed",
+                            None,
+                        )
+                        is not False
+                    )
+                )
             ):
                 controls.append("two_pedal_b")
             # C is the unconditional route to regular Hold, including while
@@ -1421,8 +1531,9 @@ class RealTeleopControlInput:
                             payload_applied = self._apply_episode_start_payload(
                                 event.split(":", 1)[1],
                                 bind_dataset_contract=True,
+                                start_after_commit=True,
                             )
-                        if payload_applied:
+                        if payload_applied and not self._dataset_selection_pending:
                             self._episode_start_requested = True
                 elif event.startswith("task_select:"):
                     blocker = self.plus_curation.persisted_binding_lock_reason()
@@ -1959,6 +2070,17 @@ class RealTeleopControlInput:
         controller = getattr(self.components, "fix_arm_controller", None)
         if controller is None or not self._teleop_started:
             return
+        if not self._teleop_arm_dispatch_confirmed():
+            self._publish_two_pedal_alert(
+                level="red",
+                message=(
+                    "2/5 踏板切换已拒绝：当前没有已确认的机械臂命令下发；"
+                    "请先进入 Hold，再通过快速 Home 恢复控制。"
+                ),
+                now=now,
+                duration_sec=3.0,
+            )
+            return
         current_fixed = tuple(getattr(controller, "fixed_sides", ()) or ())
         if current_fixed:
             transition = controller.start_two_pedal_transition(
@@ -2107,9 +2229,16 @@ class RealTeleopControlInput:
         }
         if control_hint:
             updates["control_hint"] = control_hint
-        self.ui.publish(**updates)
+        self._publish_ui_observation(
+            context="FixArm state",
+            **updates,
+        )
         if message:
-            self.ui.append_message("FixArm", message)
+            self._append_ui_message_observation(
+                "FixArm",
+                message,
+                context="FixArm state",
+            )
 
     def _set_fix_arm_side_from_gui(self, side: str) -> None:
         controller = getattr(self.components, "fix_arm_controller", None)
@@ -2135,9 +2264,16 @@ class RealTeleopControlInput:
         }
         if control_hint:
             updates["control_hint"] = control_hint
-        self.ui.publish(**updates)
+        self._publish_ui_observation(
+            context="InitArm state",
+            **updates,
+        )
         if message:
-            self.ui.append_message("InitArm", message)
+            self._append_ui_message_observation(
+                "InitArm",
+                message,
+                context="InitArm state",
+            )
 
     def _init_qpos_sequence_ui_state(self) -> dict[str, object]:
         return {
@@ -2304,6 +2440,21 @@ class RealTeleopControlInput:
             return False
         if not self._teleop_started or self._hold_active:
             return False
+        active_special_operation = bool(
+            getattr(controller, "qpos_active", False)
+            or getattr(controller, "recapturing", False)
+            or getattr(controller, "active", False)
+        )
+        if (
+            not active_special_operation
+            and not self._teleop_arm_dispatch_confirmed()
+        ):
+            message = (
+                "Init 被拒绝：当前没有已确认的机械臂命令下发；"
+                "请先进入 Hold 并重新采集 runtime Home。"
+            )
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
         try:
             if bool(getattr(controller, "qpos_active", False)):
                 transition, release_errors = self._start_active_init_home_recapture(
@@ -2398,6 +2549,17 @@ class RealTeleopControlInput:
             message = "Hold 正在生效，尚未启动 Init qpos；请在停臂完成后重试。"
             self._publish_init_arm_state(message=message, control_hint=message)
             return True
+        if (
+            self._teleop_started
+            and not self._hold_active
+            and not self._teleop_arm_dispatch_confirmed()
+        ):
+            message = (
+                "Init qpos 未启动：当前没有已确认的机械臂命令下发；"
+                "请先进入 Hold 后再执行维护操作。"
+            )
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
         if self._hold_active and not hold_maintenance:
             return False
         if self._episode_transition_busy():
@@ -2446,6 +2608,17 @@ class RealTeleopControlInput:
             return False
         if self._hold_requested:
             message = "Hold 正在生效，尚未启动双臂顺序归位；请在停臂完成后重试。"
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
+        if (
+            self._teleop_started
+            and not self._hold_active
+            and not self._teleop_arm_dispatch_confirmed()
+        ):
+            message = (
+                "双臂顺序归位未启动：当前没有已确认的机械臂命令下发；"
+                "请先进入 Hold 后再执行维护操作。"
+            )
             self._publish_init_arm_state(message=message, control_hint=message)
             return True
         if self._hold_active and not hold_maintenance:
@@ -2621,6 +2794,17 @@ class RealTeleopControlInput:
                 if callable(getattr(controller, "is_fixed", None))
                 else controller.fixed and controller.fixed_side == selected_side
             )
+            if (
+                not selected_is_fixed
+                and not bool(getattr(controller, "recapturing", False))
+                and not self._teleop_arm_dispatch_confirmed()
+            ):
+                message = (
+                    "Fix 被拒绝：当前没有已确认的机械臂命令下发，"
+                    "不能从旧命令快照建立新的固定状态；请先进入 Hold 并重新采集 runtime Home。"
+                )
+                self._publish_fix_arm_state(message=message, control_hint=message)
+                return True
             if selected_is_fixed:
                 transition = controller.start_recalibration(
                     now=now,
@@ -2731,8 +2915,12 @@ class RealTeleopControlInput:
             message = "Pose 抽帧与正式数采互斥；请先停止数采或取消倒计时。"
             self.set_pose_snapshot_state(status=message, append_message=True)
             return
-        if not self._teleop_started or self._hold_active:
-            message = "Pose 抽帧只能在遥操运行中执行。"
+        if (
+            not self._teleop_started
+            or self._hold_active
+            or not self._teleop_arm_dispatch_confirmed()
+        ):
+            message = "Pose 抽帧只能在机械臂命令已实际派发的遥操帧中执行。"
             self.set_pose_snapshot_state(status=message, append_message=True)
             return
         self._pose_snapshot_requested = True
@@ -2919,7 +3107,7 @@ class RealTeleopControlInput:
                 self.ui.publish(
                     active_controls=self._current_active_controls(),
                     control_hint=message,
-                    teleop_running=True,
+                    teleop_running=self._teleop_arm_dispatch_confirmed(),
                     gripper_control_enabled=self.gripper_control_enabled(),
                 )
             return
@@ -3354,7 +3542,7 @@ class RealTeleopControlInput:
                     self.ui.publish(
                         active_controls=self._current_active_controls(),
                         control_hint="运行中重采前请先点击 Hold / 冻结；Hold 只停臂，不会自动重采。",
-                        teleop_running=True,
+                        teleop_running=self._teleop_arm_dispatch_confirmed(),
                         gripper_control_enabled=self.gripper_control_enabled(),
                     )
                 return False
@@ -3365,7 +3553,8 @@ class RealTeleopControlInput:
             self._gripper_control_enabled = False
             self._tracker_swap_locked = True
             if self.ui is not None:
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="runtime Home request admission",
                     active_controls=["q"],
                     control_hint=(
                         "已确认开始，VIVE tracker 左右映射已锁定；"
@@ -3711,24 +3900,56 @@ class RealTeleopControlInput:
         message = f"数采开始前已恢复任务夹爪力度配置（临时设置: {previous}）。"
         _log("GripperForce", message)
         if self.ui is not None:
-            self.ui.append_message("GripperForce", message)
+            self._append_ui_message_observation(
+                "GripperForce",
+                message,
+                context="collection gripper policy restore",
+            )
 
     def _apply_episode_start_payload(
         self,
         text: str,
         *,
         bind_dataset_contract: bool = False,
+        start_after_commit: bool = False,
     ) -> bool:
         args_snapshot = dict(vars(self.args))
+        plus_variant_snapshot = str(self.plus_curation.variant_id or "")
+        side_effects_started = False
+        failure_reported = False
 
-        def reject(message: str) -> bool:
+        def restore_original_state() -> None:
+            nonlocal side_effects_started
             vars(self.args).clear()
             vars(self.args).update(args_snapshot)
+            self.plus_curation.variant_id = plus_variant_snapshot
+            if side_effects_started:
+                try:
+                    self._apply_current_gripper_task_policy()
+                except BaseException as exc:
+                    _log(
+                        "Dataset",
+                        "failed to restore gripper task policy after dataset "
+                        f"selection rollback: {type(exc).__name__}: {exc}",
+                    )
+            side_effects_started = False
+            self._dataset_selection_pending = False
+
+        def reject(message: str) -> bool:
+            nonlocal failure_reported
+            restore_original_state()
+            failure_reported = True
             if self.ui is not None:
-                self.ui.append_message("Dataset", message)
-                self.ui.publish(
+                self._append_ui_message_observation(
+                    "Dataset",
+                    message,
+                    context="dataset selection rejection",
+                )
+                self._publish_ui_observation(
+                    context="dataset selection rejection",
                     **_collection_task_ui_state(self.args),
                     active_controls=self._current_active_controls(),
+                    dataset_configuration_transition_active=False,
                     dataset_modality_contract=CaptureModalityContract(
                         ignored_camera_keys=tuple(
                             getattr(self.args, "ignore_camera", ()) or ()
@@ -3740,16 +3961,43 @@ class RealTeleopControlInput:
                 )
             return False
 
+        if self._dataset_configuration_transition_active():
+            # This request did not create the in-flight transaction, so it
+            # must not execute that transaction's rollback path or clear its
+            # ownership flag.  The original completion callbacks remain the
+            # only authority that can commit or roll back the pending draft.
+            message = (
+                "已有数据集任务/profile 切换正在等待后台准备完成；"
+                "本次选择未提交。"
+            )
+            if self.ui is not None:
+                self._append_ui_message_observation(
+                    "Dataset",
+                    message,
+                    context="dataset selection already pending",
+                )
+                self._publish_ui_observation(
+                    context="dataset selection already pending",
+                    active_controls=self._current_active_controls(),
+                    dataset_configuration_transition_active=True,
+                )
+            return False
         if self._episode_busy():
             return reject(
                 "数采录制、暂停、倒计时或保存中不能切换任务、数据目录或忽视模态；"
                 "请先停止当前 episode。"
             )
         try:
+            transactional_reconfigure = bool(
+                self._dataset_reconfigure_callback is not None
+                and getattr(self, "_dataset_reconfigure_transactional", False)
+            )
             payload = apply_real_teleop_dataset_selection(
                 self.args,
                 text,
-                bind_dataset_contract=bind_dataset_contract,
+                bind_dataset_contract=(
+                    bind_dataset_contract and not transactional_reconfigure
+                ),
                 task_definition_for_key=_task_definition_for_key,
                 refresh_formal_dataset_layout=_refresh_formal_dataset_layout,
                 expand_cli_path=_expand_cli_path,
@@ -3760,59 +4008,181 @@ class RealTeleopControlInput:
         plus_variant_id = str(payload.get("plus_variant_id", "") or "").strip()
         if self.plus_curation.enabled and "plus_variant_id" in payload:
             try:
-                self.plus_curation.set_variant(plus_variant_id)
+                if plus_variant_id:
+                    profile = self.plus_curation.task_profile
+                    if profile is None:
+                        raise ValueError(
+                            "Plus variant selection requires a task profile"
+                        )
+                    plus_variant_id = profile.require_variant(plus_variant_id)
             except ValueError as exc:
                 return reject(f"Plus 变体选择无效：{exc}")
-        self._apply_current_gripper_task_policy()
+
+        selected_args_snapshot = dict(vars(self.args))
+
+        def commit_selected_state(snapshot: Mapping[str, object]) -> None:
+            nonlocal side_effects_started
+            side_effects_started = True
+            vars(self.args).clear()
+            vars(self.args).update(dict(snapshot))
+            if self.plus_curation.enabled and "plus_variant_id" in payload:
+                self.plus_curation.set_variant(plus_variant_id)
+            self._apply_current_gripper_task_policy()
+
+        def publish_committed_state() -> None:
+            self._dataset_selection_pending = False
+            if start_after_commit:
+                self._episode_start_requested = True
+            if self.ui is not None:
+                self._publish_ui_observation(
+                    context="dataset selection committed",
+                    **_collection_task_ui_state(self.args),
+                    **self.plus_curation.ui_state(),
+                    dataset_configuration_transition_active=False,
+                    dataset_modality_contract={
+                        "schema_version": "dexteleop.capture_modalities.v1",
+                        "scope": "dataset",
+                        "ignored_modalities": {
+                            "camera": list(
+                                getattr(self.args, "ignore_camera", ()) or ()
+                            ),
+                            "tactile": list(
+                                getattr(self.args, "ignore_tactile", ()) or ()
+                            ),
+                        },
+                    },
+                )
+                self._append_ui_message_observation(
+                    "Dataset",
+                    (
+                        f"数采任务已更新: {self.args.collection_task_name} "
+                        f"({self.args.collection_task_id}) -> "
+                        f"{self.args.dataset_root}"
+                    ),
+                    context="dataset selection committed",
+                )
+
+        def publish_selection_failure(exc: BaseException) -> None:
+            reject(
+                "数据集 writer 未能按新配置重建，原配置保持不变："
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if transactional_reconfigure:
+            # Keep the canonical namespace and all application-side effects on
+            # the old selection until the private writer candidate is ready.
+            vars(self.args).clear()
+            vars(self.args).update(args_snapshot)
+            self._dataset_selection_pending = True
+            try:
+                outcome = self._dataset_reconfigure_callback(
+                    selected_args_snapshot,
+                    bind_dataset_contract=bind_dataset_contract,
+                    on_commit=commit_selected_state,
+                    on_complete=publish_committed_state,
+                    on_failure=publish_selection_failure,
+                )
+            except Exception as exc:  # noqa: BLE001 - restore the full draft.
+                if not failure_reported:
+                    return reject(
+                        "数据集 writer 未能按新配置重建，原配置保持不变："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                return False
+            if outcome not in {"pending", "committed"}:
+                return reject(
+                    "数据集 writer 重建返回了无效事务状态，原配置保持不变："
+                    f"{outcome!r}"
+                )
+            if outcome == "pending" and self.ui is not None:
+                self._append_ui_message_observation(
+                    "Dataset",
+                    "正在后台准备所选数据集/profile 的目录、契约及必要的 writer；"
+                    "旧配置保持有效，准备完成后再原子切换。",
+                    context="dataset selection pending",
+                )
+                self._publish_ui_observation(
+                    context="dataset selection pending",
+                    active_controls=self._current_active_controls(),
+                    dataset_configuration_transition_active=True,
+                )
+            return True
+
+        commit_selected_state(selected_args_snapshot)
         if self._dataset_reconfigure_callback is not None:
             try:
-                # Dataset/task selection is admitted while idle.  If a live
-                # recorder exists, rebuild it now so the next countdown sees
-                # the selected path/modality contract rather than deferring a
-                # stale writer until the operator presses Start again.
                 self._dataset_reconfigure_callback()
             except Exception as exc:  # noqa: BLE001 - restore the full draft.
                 return reject(
                     "数据集 writer 未能按新配置重建，原配置保持不变："
                     f"{type(exc).__name__}: {exc}"
                 )
-        if self.ui is not None:
-            self.ui.publish(
-                **_collection_task_ui_state(self.args),
-                **self.plus_curation.ui_state(),
-                dataset_modality_contract={
-                    "schema_version": "dexteleop.capture_modalities.v1",
-                    "scope": "dataset",
-                    "ignored_modalities": {
-                        "camera": list(getattr(self.args, "ignore_camera", ()) or ()),
-                        "tactile": list(getattr(self.args, "ignore_tactile", ()) or ()),
-                    },
-                },
-            )
-            self.ui.append_message(
-                "Dataset",
-                (
-                    f"数采任务已更新: {self.args.collection_task_name} "
-                    f"({self.args.collection_task_id}) -> {self.args.dataset_root}"
-                ),
-            )
+        publish_committed_state()
         return True
 
     def _toggle_round_trip_collection_task(self, *, source: str) -> bool:
+        if self._dataset_configuration_transition_active():
+            if self.ui is not None:
+                self._append_ui_message_observation(
+                    "Dataset",
+                    "数据集任务/profile 正在后台准备，当前不切换 in/out。",
+                    context="round-trip switch rejection",
+                )
+                self._publish_ui_observation(
+                    context="round-trip switch rejection",
+                    **_collection_task_ui_state(self.args),
+                    dataset_configuration_transition_active=True,
+                )
+            return False
         if self._episode_busy():
             if self.ui is not None:
-                self.ui.append_message("Dataset", "数采录制、暂停、倒计时或保存中不切换 in/out；请先停止当前 episode。")
-                self.ui.publish(**_collection_task_ui_state(self.args))
+                self._append_ui_message_observation(
+                    "Dataset",
+                    "数采录制、暂停、倒计时或保存中不切换 in/out；请先停止当前 episode。",
+                    context="round-trip switch rejection",
+                )
+                self._publish_ui_observation(
+                    context="round-trip switch rejection",
+                    **_collection_task_ui_state(self.args),
+                )
             return False
         if (
             gui_collection_tasks.normalize_task_type(getattr(self.args, "collection_task_type", ""))
             != gui_collection_tasks.ROUND_TRIP_TASK_TYPE
         ):
             if self.ui is not None:
-                self.ui.append_message("Dataset", "当前是一般类任务，不需要切换 in/out。")
-                self.ui.publish(**_collection_task_ui_state(self.args))
+                self._append_ui_message_observation(
+                    "Dataset",
+                    "当前是一般类任务，不需要切换 in/out。",
+                    context="round-trip switch rejection",
+                )
+                self._publish_ui_observation(
+                    context="round-trip switch rejection",
+                    **_collection_task_ui_state(self.args),
+                )
             return False
-        if not _toggle_collection_round_trip_phase(self.args):
+        args_snapshot = dict(vars(self.args))
+        try:
+            toggled = bool(_toggle_collection_round_trip_phase(self.args))
+        except Exception as exc:  # noqa: BLE001 - restore the application draft.
+            vars(self.args).clear()
+            vars(self.args).update(args_snapshot)
+            message = (
+                "来回任务 in/out 切换失败，已保留原配置："
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log("Dataset", message)
+            self._append_ui_message_observation(
+                "Dataset",
+                message,
+                context="round-trip switch failure",
+            )
+            self._publish_ui_observation(
+                context="round-trip switch failure",
+                **_collection_task_ui_state(self.args),
+            )
+            return False
+        if not toggled:
             return False
         phase = str(getattr(self.args, "collection_round_trip_phase", "") or "")
         label = "自动" if source == "auto_after_episode" else "手动"
@@ -3822,8 +4192,15 @@ class RealTeleopControlInput:
         )
         _log("Dataset", message)
         if self.ui is not None:
-            self.ui.publish(**_collection_task_ui_state(self.args))
-            self.ui.append_message("Dataset", message)
+            self._publish_ui_observation(
+                context="round-trip switch committed",
+                **_collection_task_ui_state(self.args),
+            )
+            self._append_ui_message_observation(
+                "Dataset",
+                message,
+                context="round-trip switch committed",
+            )
         return True
 
     def advance_round_trip_task_after_saved_episode(self) -> bool:
@@ -3856,12 +4233,15 @@ class RealTeleopControlInput:
         self._cancel_init_arm_qpos_sequence(reason=str(reason or "manual Hold"))
         self._hold_requested = True
         self._hold_active = True
+        self._teleop_dispatch_confirmed = False
+        self._teleop_dispatch_projection = "hold"
         self._gripper_control_enabled = False
         self._hold_request_reason = str(reason or "manual")
         self._q6_hold_recalibration_gesture.reset_for_hold()
         is_q6_gesture = self._hold_request_reason == "q6_gesture"
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="Hold state",
                 stage="Hold / 停臂保持",
                 active_controls=self._current_active_controls(),
                 control_hint=(
@@ -3892,30 +4272,54 @@ class RealTeleopControlInput:
                 if is_q6_gesture
                 else "已请求冻结机械臂；不会自动重采 runtime home。"
             )
-            self.ui.append_message("Hold", message)
+            self._append_ui_message_observation(
+                "Hold",
+                message,
+                context="Hold state",
+            )
 
     def set_fix_hold_active(self, active: bool, *, message: str = "") -> None:
         normalized = bool(active)
         if normalized == self._fix_hold_active:
             return
         if normalized:
-            self._gripper_control_before_fix_hold = bool(self._gripper_control_enabled)
+            self._gripper_control_before_fix_hold = bool(
+                self._gripper_control_enabled
+            )
+            self._teleop_dispatch_confirmed = False
+            self._teleop_dispatch_projection = "fix_hold"
             self._gripper_control_enabled = False
         elif not self._hold_active:
+            # Releasing Fix-Hold changes command ownership, but it does not
+            # prove that the next tracker-derived arm command was dispatched.
+            # Keep both gates closed until the per-frame Session receipt
+            # republishes normal teleop availability.
+            self._teleop_dispatch_confirmed = False
+            self._teleop_dispatch_projection = "fix_hold_released_waiting_dispatch"
             self._gripper_control_enabled = bool(
                 self._gripper_control_before_fix_hold
             )
         self._fix_hold_active = normalized
         if self.ui is not None:
-            self.ui.publish(
-                stage="Fix-Hold / 双侧特殊固定" if normalized else "遥操运行",
+            self._publish_ui_observation(
+                context="Fix-Hold state",
+                stage=(
+                    "Fix-Hold / 双侧特殊固定"
+                    if normalized
+                    else "RM65 命令恢复验证中"
+                ),
                 fix_hold_active=normalized,
                 active_controls=self._current_active_controls(),
                 control_hint=message,
-                gripper_control_enabled=bool(self._gripper_control_enabled),
+                teleop_running=False,
+                gripper_control_enabled=False,
             )
             if message:
-                self.ui.append_message("FixHold", message)
+                self._append_ui_message_observation(
+                    "FixHold",
+                    message,
+                    context="Fix-Hold state",
+                )
 
     def fix_hold_active(self) -> bool:
         return bool(self._fix_hold_active)
@@ -3955,13 +4359,18 @@ class RealTeleopControlInput:
 
     def bind_dataset_reconfigure_callback(
         self,
-        callback: Callable[[], None] | None,
+        callback: Callable[..., object] | None,
+        *,
+        transactional: bool = False,
     ) -> None:
         """Bind the runtime-owned idle dataset/profile reconfiguration hook."""
 
         if callback is not None and not callable(callback):
             raise TypeError("dataset reconfigure callback must be callable or None")
         self._dataset_reconfigure_callback = callback
+        self._dataset_reconfigure_transactional = bool(
+            callback is not None and transactional
+        )
 
     def build_progress_workflow(
         self,
@@ -4023,7 +4432,9 @@ class RealTeleopControlInput:
                 promotable_hold_pause=promotable_hold_pause,
                 application_held=self.hold_active(),
                 arm_transition_pending=arm_transition_pending,
-                profile_selection_enabled=not self._episode_busy(),
+                profile_selection_enabled=(
+                    self._progress_configuration_selection_enabled()
+                ),
             )
         )
         self.publish_progress_control_availability(
@@ -4136,6 +4547,8 @@ class RealTeleopControlInput:
             raise TypeError(
                 "command must be ProgressProfileSelectionCommand."
             )
+        if self._dataset_configuration_transition_active():
+            return False
         if self._progress_profile_selection_intents:
             return False
         self._progress_profile_selection_intents.append(command)
@@ -4172,6 +4585,8 @@ class RealTeleopControlInput:
             raise TypeError(
                 "command must be ProgressArmControlModeSelectionCommand."
             )
+        if self._dataset_configuration_transition_active():
+            return False
         pending = getattr(
             self,
             "_progress_arm_control_mode_selection_intents",
@@ -4202,6 +4617,8 @@ class RealTeleopControlInput:
             raise TypeError(
                 "command must be ProgressEntryStepSelectionCommand."
             )
+        if self._dataset_configuration_transition_active():
+            return False
         pending = getattr(
             self,
             "_progress_entry_step_selection_intents",
@@ -4421,7 +4838,12 @@ class RealTeleopControlInput:
         )
 
     def gripper_control_enabled(self) -> bool:
-        return bool(self._gripper_control_enabled and _has_q6_gripper_control(self.components))
+        return bool(
+            self._gripper_control_enabled
+            and self._teleop_arm_dispatch_confirmed()
+            and not bool(getattr(self, "_fix_hold_active", False))
+            and _has_q6_gripper_control(self.components)
+        )
 
     def _poll_q6_hold_recalibration_gesture(self, *, now: float) -> None:
         gesture = self._q6_hold_recalibration_gesture
@@ -4500,14 +4922,15 @@ class RealTeleopControlInput:
             )
 
     def set_episode_start_countdown_state(self, *, remaining_sec: float, message: str | None = None) -> None:
-        if self.ui is None:
-            return
         remaining = max(0.0, float(remaining_sec))
         self._episode_countdown_ui_active = True
         self._episode_recording_ui_active = False
         self._episode_recording_ui_paused = False
         self._episode_finalizing_ui_active = False
-        self.ui.publish(
+        if self.ui is None:
+            return
+        self._publish_ui_observation(
+            context="episode countdown state",
             active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=False,
@@ -4542,8 +4965,6 @@ class RealTeleopControlInput:
         event_message: str | None = None,
         episode_index: int | None = None,
     ) -> None:
-        if self.ui is None:
-            return
         self._episode_recording_ui_active = bool(active)
         self._episode_recording_ui_paused = bool(
             active and str(event_status or "") in {"paused", "resume_pending"}
@@ -4554,13 +4975,16 @@ class RealTeleopControlInput:
             self._episode_last_episode_index = int(episode_index)
         if frame_count is not None:
             self._episode_last_frame_count = int(frame_count)
+        if self.ui is None:
+            return
         frequency_payload = dict(frequency_status or {})
         warning_payload = dict(frequency_payload.get("warning") or {})
         if not active:
             warning_payload = {"active": False, "message": ""}
         tactile_write_hz_payload = dict(frequency_payload.get("tactile_write_hz") or {})
         tactile_frame_counts_payload = dict(frequency_payload.get("tactile_frame_counts") or {})
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="episode recording state",
             active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=bool(active),
@@ -4597,8 +5021,6 @@ class RealTeleopControlInput:
         episode_index: int | None = None,
         frame_count: int | None = None,
     ) -> None:
-        if self.ui is None:
-            return
         self._episode_recording_ui_active = False
         self._episode_recording_ui_paused = False
         self._episode_countdown_ui_active = False
@@ -4607,7 +5029,10 @@ class RealTeleopControlInput:
             self._episode_last_episode_index = int(episode_index)
         if frame_count is not None:
             self._episode_last_frame_count = int(frame_count)
-        self.ui.publish(
+        if self.ui is None:
+            return
+        self._publish_ui_observation(
+            context="episode finalize state",
             active_controls=self._current_active_controls(),
             episode_recording_available=self._episode_recording_available(),
             episode_recording=False,
@@ -4675,7 +5100,8 @@ class RealTeleopControlInput:
         while True:
             remaining = max(0.0, deadline - time.time())
             if self.ui is not None:
-                self.ui.publish(
+                self._publish_ui_observation(
+                    context="runtime Home preparation",
                     stage="即将开始 runtime home",
                     active_controls=["q"],
                     control_hint=f"请松开按键并保持姿态，{remaining:.1f}s 后开始。",
@@ -4698,7 +5124,17 @@ class RealTeleopControlInput:
             self.terminal.consume_episode_start_request()
             self.terminal.consume_episode_stop_request()
             if self.ui is not None:
-                for event in self.ui.consume_events():
+                try:
+                    ui_events = tuple(self.ui.consume_events())
+                except Exception as exc:  # noqa: BLE001 - terminal input remains available.
+                    _log(
+                        "WebGUI",
+                        "runtime Home preparation event poll failed; continuing with "
+                        "terminal input: "
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    ui_events = ()
+                for event in ui_events:
                     if event == "q":
                         self.should_quit = True
             if self.should_quit:
@@ -4708,7 +5144,8 @@ class RealTeleopControlInput:
         if not self._final_tracker_side_home_admission():
             return False
         if self.ui is not None:
-            self.ui.publish(
+            self._publish_ui_observation(
+                context="runtime Home capture start",
                 stage="采集 runtime home",
                 active_controls=["q"],
                 control_hint="正在采集当前 tracker 和机械臂 home，请保持静止。",
@@ -4744,7 +5181,8 @@ class RealTeleopControlInput:
         elapsed = max(0.0, float(elapsed_sec))
         remaining = max(0.0, total - elapsed)
         side_text = "/".join(str(side) for side in active_sides) or "arm"
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="force-control warmup progress",
             stage="预热 RM65 力控",
             active_controls=["q"],
             control_hint=(
@@ -4768,28 +5206,59 @@ class RealTeleopControlInput:
         self._last_calibration_started_from_hold = False
         self._teleop_started = True
         self._hold_active = False
-        self._gripper_control_enabled = _has_q6_gripper_control(self.components)
+        state_machine = getattr(
+            getattr(self.components, "session", None),
+            "state_machine",
+            None,
+        )
+        session_state = getattr(state_machine, "state", None)
+        session_state_value = str(
+            getattr(session_state, "value", session_state) or ""
+        ).upper()
+        # Missing state_machine is retained as a compatibility case for thin
+        # offline adapters.  The production Session always exposes ARMED here
+        # and only transitions to RUNNING after its first real dispatch.
+        dispatch_confirmed = bool(
+            home_ready
+            and (not session_state_value or session_state_value == "RUNNING")
+        )
+        self._teleop_dispatch_confirmed = dispatch_confirmed
+        self._teleop_dispatch_projection = (
+            "running" if dispatch_confirmed else f"suspended:{session_state_value or 'HOME'}"
+        )
+        self._gripper_control_enabled = bool(
+            dispatch_confirmed and _has_q6_gripper_control(self.components)
+        )
         if was_hold_active or was_hold_restart:
             self._q6_hold_recalibration_gesture.mark_runtime_restarted()
         else:
             self._q6_hold_recalibration_gesture.reset_for_running()
         if self.ui is None:
             return
-        control_hint = "遥操已开始；Q6 夹爪控制会自动开启；Hold 只冻结机械臂，重采需再次点击开始。"
-        if self._q6_hold_recalibration_gesture.config.enabled:
+        control_hint = (
+            "遥操已开始；Q6 夹爪控制会自动开启；Hold 只冻结机械臂，重采需再次点击开始。"
+            if dispatch_confirmed
+            else "Session 已进入 ARMED；正在等待首条机械臂命令通过最终 admission，期间夹爪控制保持关闭。"
+        )
+        if dispatch_confirmed and self._q6_hold_recalibration_gesture.config.enabled:
             control_hint = (
                 "遥操已开始；Q6 手势模式已开启：双手后三维握紧 1 秒进入 Hold，"
                 "松开到释放区间 1 秒后再次握紧 1 秒会重采 runtime home。"
             )
         gripper_status = _build_gripper_status(self.components)
-        self.ui.publish(
-            stage="RM65 真机遥操运行中",
+        self._publish_ui_observation(
+            context="teleop admission state",
+            stage=(
+                "RM65 真机遥操运行中"
+                if dispatch_confirmed
+                else "RM65 首帧命令验证中"
+            ),
             active_controls=self._current_active_controls(),
             control_hint=control_hint,
             home_ready=bool(home_ready),
             capture_stage="teleop",
             capture_phase="teleop",
-            teleop_running=True,
+            teleop_running=dispatch_confirmed,
             capturing=False,
             capture_samples=None,
             capture_left_samples=None,
@@ -4831,13 +5300,114 @@ class RealTeleopControlInput:
         )
         _log(
             "WebGUI",
-            f"teleop state published url={str(getattr(self.ui, 'url', '') or '<unknown>')} "
+            "teleop state published "
+            f"session_state={session_state_value or '<compat>'} "
+            f"dispatch_confirmed={dispatch_confirmed} "
+            f"url={str(getattr(self.ui, 'url', '') or '<unknown>')} "
             f"gripper_control={'on' if self.gripper_control_enabled() else 'off'} "
             f"q6_sides={[side for side in self.components.active_sides if _gripper_retargeter_for_side(self.components, side) is not None]}",
         )
-        self.ui.append_message("RealTeleop", message or "runtime home 完成，已进入真机遥操。")
+        self._append_ui_message_observation(
+            "RealTeleop",
+            message
+            or (
+                "runtime home 完成，已进入真机遥操。"
+                if dispatch_confirmed
+                else "runtime home 完成，正在等待首条机械臂命令实际派发。"
+            ),
+            context="teleop admission state",
+        )
         self.publish_raw_tracker_pose_state(force=True)
         self.publish_gripper_status(force=True)
+
+    def publish_teleop_dispatch_running(self, *, message: str = "") -> bool:
+        """Project a Session-confirmed arm dispatch into application state."""
+
+        if (
+            not self._teleop_started
+            or self._hold_active
+            or bool(getattr(self, "_fix_hold_active", False))
+        ):
+            if bool(getattr(self, "_fix_hold_active", False)):
+                self._teleop_dispatch_confirmed = False
+                self._teleop_dispatch_projection = "fix_hold"
+                self._gripper_control_enabled = False
+            return False
+        changed = not bool(getattr(self, "_teleop_dispatch_confirmed", False))
+        self._teleop_dispatch_confirmed = True
+        self._teleop_dispatch_projection = "running"
+        self._gripper_control_enabled = _has_q6_gripper_control(self.components)
+        if self.ui is None or not changed:
+            return changed
+        control_hint = (
+            "首条机械臂命令已实际派发；遥操与 Q6 夹爪控制现在同步开放。"
+        )
+        self._publish_ui_observation(
+            context="teleop dispatch running state",
+            stage="RM65 真机遥操运行中",
+            active_controls=self._current_active_controls(),
+            control_hint=control_hint,
+            capture_stage="teleop",
+            capture_phase="teleop",
+            teleop_running=True,
+            gripper_control_enabled=self.gripper_control_enabled(),
+        )
+        self._append_ui_message_observation(
+            "RealTeleop",
+            message or control_hint,
+            context="teleop dispatch running state",
+        )
+        self.publish_gripper_status(force=True)
+        return True
+
+    def publish_teleop_dispatch_suspended(
+        self,
+        *,
+        session_state: str,
+        reason: str = "",
+    ) -> bool:
+        """Remove the RUNNING projection when no arm command was dispatched."""
+
+        if not self._teleop_started or self._hold_active:
+            return False
+        normalized_state = str(session_state or "UNKNOWN").upper()
+        normalized_reason = str(reason or "").strip()
+        projection = f"suspended:{normalized_state}:{normalized_reason}"
+        changed = projection != getattr(self, "_teleop_dispatch_projection", "")
+        self._teleop_dispatch_confirmed = False
+        self._teleop_dispatch_projection = projection
+        self._gripper_control_enabled = False
+        if self.ui is None or not changed:
+            return changed
+        stage_by_state = {
+            "ARMED": "RM65 首帧命令验证中",
+            "FROZEN": "RM65 命令冻结 / 等待恢复",
+            "RECOVERING": "RM65 自动恢复中",
+            "FAULT": "RM65 控制故障",
+            "ESTOP": "RM65 急停",
+        }
+        state_label = stage_by_state.get(
+            normalized_state,
+            "RM65 命令暂未派发",
+        )
+        detail = normalized_reason or (
+            f"Session={normalized_state}，本控制帧没有实际派发机械臂命令；"
+            "夹爪控制同步保持关闭。"
+        )
+        self._publish_ui_observation(
+            context="teleop dispatch suspended state",
+            stage=state_label,
+            active_controls=self._current_active_controls(),
+            control_hint=detail,
+            teleop_running=False,
+            gripper_control_enabled=False,
+        )
+        self._append_ui_message_observation(
+            "RealTeleop",
+            detail,
+            context="teleop dispatch suspended state",
+        )
+        return True
 
     def publish_calibration_waiting(self, message: str = "") -> None:
         self._calibration_requested = False
@@ -4864,14 +5434,21 @@ class RealTeleopControlInput:
         )
         if self._teleop_started:
             self._hold_active = True
+            self._teleop_dispatch_confirmed = False
+            self._teleop_dispatch_projection = "calibration_waiting"
             self._gripper_control_enabled = False
             self._q6_hold_recalibration_gesture.reset_for_hold()
         self._tracker_swap_locked = bool(self._teleop_started)
         if self.ui is None:
             return
         if message:
-            self.ui.append_message("Calibration", message)
-        self.ui.publish(
+            self._append_ui_message_observation(
+                "Calibration",
+                message,
+                context="calibration waiting state",
+            )
+        self._publish_ui_observation(
+            context="calibration waiting state",
             stage="RM65 真机遥操准备" if not self._teleop_started else "Hold / 停臂保持",
             active_controls=self._current_active_controls(),
             control_hint=(
@@ -4940,7 +5517,8 @@ class RealTeleopControlInput:
         single_count = None
         if len(self.components.active_sides) == 1:
             single_count = int(sample_counts.get(self.components.active_sides[0], 0))
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="runtime Home capture progress",
             stage="采集 runtime home",
             capture_stage="runtime_home",
             capture_phase="capturing",
@@ -5307,7 +5885,8 @@ class RealTeleopControlInput:
             command_status=command_status,
             now=current_time,
         )
-        self.ui.publish(
+        self._publish_ui_observation(
+            context="gripper status",
             gripper_control_available=_gripper_gui_available(self.components),
             gripper_q6_available=_has_q6_gripper_control(self.components),
             gripper_control_enabled=self.gripper_control_enabled(),
@@ -5430,12 +6009,20 @@ class RealTeleopControlInput:
                     ),
                 )
             )
-        _publish_raw_tracker_pose_state(
-            self.ui,
-            channels,
-            active_sides=self.components.active_sides,
-            now=current_time,
-        )
+        try:
+            _publish_raw_tracker_pose_state(
+                self.ui,
+                channels,
+                active_sides=self.components.active_sides,
+                now=current_time,
+            )
+        except Exception as exc:  # noqa: BLE001 - pose UI is observational.
+            _log(
+                "WebGUI",
+                "raw tracker pose projection failed; tracker admission state is "
+                f"retained: {type(exc).__name__}: {exc}",
+                now=current_time,
+            )
         self._last_raw_pose_publish_at = current_time
 
     def _control_hint(self) -> str:
