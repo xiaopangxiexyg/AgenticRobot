@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -597,6 +598,32 @@ def test_prepared_server_dry_run_uses_dynamic_runtime_and_explicit_normalization
     assert entry["config"] == profile["openpi_config_name"]
     assert entry["normalization_contract_status"] == "explicit"
     assert entry["normalization_hash"]
+
+
+def test_server_pythonpath_pins_profile_openpi_sources_before_inherited_path(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "agenticrobot"
+    openpi_root = tmp_path / "pinned-openpi"
+    (openpi_root / "src" / "openpi").mkdir(parents=True)
+    (openpi_root / "packages" / "openpi-client" / "src" / "openpi_client").mkdir(
+        parents=True
+    )
+    ambient_root = tmp_path / "ambient-openpi"
+    inherited = os.pathsep.join((str(ambient_root), str(project_root)))
+
+    runtime_path = openpi_server._pythonpath_with_project(
+        project_root,
+        inherited,
+        openpi_root=openpi_root,
+    )
+
+    assert runtime_path.split(os.pathsep) == [
+        str(project_root.resolve()),
+        str((openpi_root / "src").resolve()),
+        str((openpi_root / "packages" / "openpi-client" / "src").resolve()),
+        str(ambient_root),
+    ]
 
 
 def test_prepared_model_rtc_server_dry_run_binds_dynamic_output_config(
@@ -1584,6 +1611,27 @@ def test_stage1_scenario_checkpoint_metadata_is_bound_exactly() -> None:
         },
     }
     prepared_deployment._validate_checkpoint_training_metadata(payload, profile)
+
+    # The prepared binding canonicalizes source records by source id.  A
+    # checkpoint produced by an adapter may therefore serialize the same
+    # sources in a different order than the profile, which must not change
+    # the deployment identity.
+    reordered = json.loads(json.dumps(payload))
+    reordered["prepared_skill_training_binding"]["source_repeat_weights"] = list(
+        reversed(
+            reordered["prepared_skill_training_binding"]["source_repeat_weights"]
+        )
+    )
+    reordered["dataset_mixing"]["source_order"] = list(
+        reversed(reordered["dataset_mixing"]["source_order"])
+    )
+    reordered["dataset_mixing"]["sources"] = list(
+        reversed(reordered["dataset_mixing"]["sources"])
+    )
+    prepared_deployment._validate_checkpoint_training_metadata(
+        reordered,
+        profile,
+    )
 
     drifted_binding = json.loads(json.dumps(payload))
     drifted_binding["prepared_skill_training_binding"][
