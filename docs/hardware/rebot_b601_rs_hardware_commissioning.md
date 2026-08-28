@@ -282,8 +282,9 @@ printf '%s\n' 'shell remains active'
 ```
 
 本入口固定单一 torque owner：软件按
-`tau = gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq)` 组合重力前馈、低增益
-位置项和基于新鲜 `mechPos (0x7019)` 的有限差分阻尼，然后向 upstream
+`tau = gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
+低增益位置项、基于新鲜 `mechPos (0x7019)` 的有限差分阻尼和可选笛卡尔 overlay，
+然后向 upstream
 MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
 位置误差、非有限差分、部分发送或 cleanup 不完整会立即结束本次运行。由于当前
@@ -294,7 +295,8 @@ MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort cei
 
 运行前必须确认：机械臂处于可支撑的 clearance/L 姿态（建议 j2≈0.7、j3≈1.1），
 操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，现场没有第二个
-CAN 控制 owner，且本次只批准一个关节的低幅验证。不要在夹爪接触桌面或其他物体时
+CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；后述
+`cartesian-hold` 必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
 运行；`safe_stop` 失能后负载可能下落，停止过程中仍需保持支撑。下面命令使用
 状态分支和显式 status 打印，不使用会让交接终端提前退出的 `set -euo pipefail`；
 命令由操作者在目标 worktree 中运行，我们不在自动流程中代运行。版本化文档保留
@@ -398,6 +400,75 @@ printf '%s\n' 'shell remains active'
 立即按急停/支撑规程停止并保留 JSON；不得通过提高 `max-error`、放宽速度/力矩限幅、
 降低目标频率或重复运行来掩盖原因。
 
+### P4.2 当前 TCP 锚定的低增益平移阻抗（操作者手动运行）
+
+只有上面的 `hold` 和 joint1 `slow-step` 都通过后，才允许进入这一档。该模式复用已有
+`B601TranslationalVirtualSpring`、Pinocchio `LOCAL_WORLD_ALIGNED` Jacobian 和统一的
+`J^T F` 映射；锚点是六关节使能后第一份完整、合法、近静止反馈对应的
+`base_link_T_gripper_end` 平移，不读取或追踪任何预设绝对 pose。第一版不控制姿态/转动，
+因此必须 `--kp 0`，并显式使能全部六个 arm 关节；ID7 夹爪仍不参与。
+
+笛卡尔力先按轴限幅，再由 MIT profile 对 joint overlay 独立限幅，最后与重力和关节阻尼
+相加并通过总力矩绝对限幅和 slew-rate 限幅。每帧 JSON 记录 anchor、TCP displacement、
+linear velocity、raw/effective force、Jacobian translational singular values、overlay
+requested/effective torque 和 `F^T V == tau^T dq` 的 power error。TCP displacement norm
+超过阈值会触发异常 stop；它不会扩大工作空间或把当前测量位置重新设成新锚点。
+
+第一档只验证“使能后不触碰、保持 4 秒”，采用比默认值更小的参数。机械臂应持续由操作者
+支撑；这一步只能证明当前姿态的符号、限幅、重力/阻尼组合没有立即异常：
+
+```bash
+# 复用上面的 WT/PY/CFG/SRC/OUT_DIR；先确认 joint hold/slow-step 已完整 cleanup
+if cd "$WT"; then
+  if PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+      --mode cartesian-hold \
+      --config "$CFG" \
+      --rebot-source-root "$SRC" \
+      --duration-sec 4 \
+      --warmup-sec 2 \
+      --freeze-sec 1 \
+      --rate-hz 20 \
+      --joint joint1 \
+      --support-joint joint4 \
+      --support-joint joint5 \
+      --support-joint joint6 \
+      --kp 0 \
+      --kd 0.5 \
+      --gravity-scale 0.5 \
+      --torque-limit-scale 0.15 \
+      --torque-rise-time-sec 2.0 \
+      --velocity-abort-rad-s 0.05 \
+      --max-error-rad 0.15 \
+      --cartesian-stiffness-n-per-m 10 \
+      --cartesian-damping-n-s-per-m 0.5 \
+      --cartesian-max-force-n 1.0 \
+      --cartesian-max-displacement-m 0.01 \
+      --cartesian-overlay-limit-scale 0.10 \
+      --allow-motion \
+      --auto-disable \
+      --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
+      --fault-hold-max-age-sec 0.15 \
+      --fault-hold-max-velocity-rad-s 0.02 \
+      --fault-hold-max-rebase-rad 0.05 \
+      --output "$OUT_DIR/b601_cartesian_hold_no_touch.json"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  printf 'probe exit code: %s\n' "$STATUS"
+else
+  printf '%s\n' 'ERROR: worktree not found'
+fi
+printf '%s\n' 'shell remains active'
+```
+
+无触碰档通过后，才可用完全相同的小参数再运行一次，并以单指缓慢推动 TCP，位移严格小于
+`5 mm`，随后放手观察恢复方向。不要敲击、快速推拉、扭转末端或用夹爪接触环境。验收时除
+P4.1 的通用字段外，还应确认 `active_joint_names` 覆盖 joint1..joint6、
+`cartesian_impedance.anchor_source=fresh_post_enable_fk`、`position_tau_nm` 全程为零、
+`power_error_w` 接近数值零，且恢复力始终与 displacement 反向。20 Hz 下只能进行这种慢速
+commissioning；不得据此声明触觉带宽、接触稳定性或最终 impedance gains 已验收。
+
 ## 已使能力控仍然阻塞的契约
 
 当前实测的六关节同步 `mechPos (0x7019)` 反馈约为 20 Hz，而且 MotorBridge 缓存没有源
@@ -411,7 +482,8 @@ printf '%s\n' 'shell remains active'
 upstream 的驱动器 PD 加 `g(q)` 前馈，当前 backend 仅能限制前馈 `tau`，不能证明驱动器
 内部 PD 与前馈相加后的最终总力矩满足项目的 final-output bound。进入 P4 前必须先确定并
 实现唯一的一种 torque ownership，并取得高频、可验证 freshness 的 q 与差分 dq，再补齐
-watchdog、最终 torque/slew 限制和单关节安全验收。本文不提供已使能 MIT 命令。
+watchdog、最终 torque/slew 限制和单关节安全验收。P4.1/P4.2 的已使能 MIT 命令只用于
+现场低速 commissioning，不构成高频 haptic/force-control 验收入口。
 
 ## 操作者手动 enabled 位置频率入口（本轮不执行）
 

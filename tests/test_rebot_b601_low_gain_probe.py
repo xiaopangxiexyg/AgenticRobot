@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+
 from robot_motion.rebot_b601_rs import B601_RS_ARM_JOINT_NAMES
 from scripts.hardware import rebot_b601_rs_low_gain_probe as probe
 
@@ -46,6 +47,37 @@ def test_software_profile_has_single_torque_owner() -> None:
     assert profile.damping_kd_nm_s_per_rad == (0.5,) * 6
     assert profile.max_torque_rate_nm_s == (2.0,) * 6
     assert profile.metadata["torque_owner"] == "software_composed_tau; vendor_kp_kd_zero"
+
+
+def test_software_profile_can_bound_cartesian_overlay_independently() -> None:
+    profile = probe.build_software_profile(
+        kp=0.0,
+        kd=0.5,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=0.1,
+        overlay_limits_nm=(0.25,) * 6,
+    )
+
+    assert profile.max_abs_overlay_torque_nm == (0.25,) * 6
+
+
+def test_reference_carries_joint_torque_overlay() -> None:
+    reference = probe.build_reference(
+        sequence=1,
+        timestamp_sec=1.0,
+        qpos_rad=(0.0,) * 6,
+        joint_torque_overlay_nm=(0.1, -0.1, 0.2, -0.2, 0.3, -0.3),
+    )
+
+    assert reference.joint_torque_overlay_nm == (
+        0.1,
+        -0.1,
+        0.2,
+        -0.2,
+        0.3,
+        -0.3,
+    )
 
 
 def test_compute_software_torque_composes_gravity_pd_and_damping() -> None:
@@ -104,6 +136,120 @@ def test_hold_reference_never_moves_from_initial_pose() -> None:
     assert qref == q0
     assert qvel == (0.0,) * 6
     assert done is True
+
+
+def test_cartesian_hold_reference_never_adds_joint_motion() -> None:
+    q0 = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    qref, qvel, done = probe.plan_reference(
+        q0,
+        mode="cartesian-hold",
+        joint="joint1",
+        elapsed_sec=10.0,
+        step_rad=0.05,
+        step_speed_rad_s=0.02,
+        step_direction=1,
+        position_limits_rad=_fault_hold_limits(),
+    )
+
+    assert qref == q0
+    assert qvel == (0.0,) * 6
+    assert done is True
+
+
+def test_cartesian_impedance_overlay_restores_toward_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModel:
+        def forward_kinematics(self, qpos_rad: object) -> np.ndarray:
+            transform = np.eye(4)
+            transform[0, 3] = next(iter(qpos_rad))
+            return transform
+
+        def arm_jacobian(self, qpos_rad: object) -> np.ndarray:
+            assert len(tuple(qpos_rad)) == 6
+            return np.eye(6)
+
+    def fake_map(
+        model: object,
+        qpos_rad: object,
+        wrench: object,
+        *,
+        qvel_rad_s: object,
+    ) -> object:
+        assert isinstance(model, FakeModel)
+        assert len(tuple(qpos_rad)) == 6
+        force = tuple(wrench.force_n)
+        torque = (*force, 0.0, 0.0, 0.0)
+        qvel = tuple(qvel_rad_s)
+        power = sum(value * velocity for value, velocity in zip(torque, qvel, strict=True))
+        return type(
+            "Mapping",
+            (),
+            {
+                "joint_torque_nm": torque,
+                "cartesian_power_w": power,
+                "joint_power_w": power,
+            },
+        )()
+
+    monkeypatch.setattr(
+        probe,
+        "map_world_aligned_ee_wrench_to_joint_torque",
+        fake_map,
+    )
+    spring = probe.B601TranslationalVirtualSpring(
+        anchor_position_m=(0.0, 0.0, 0.0),
+        stiffness_n_per_m=(20.0, 20.0, 20.0),
+        damping_n_s_per_m=(1.0, 1.0, 1.0),
+        max_abs_force_n=(2.0, 2.0, 2.0),
+    )
+
+    overlay, audit = probe.compute_cartesian_impedance_overlay(
+        FakeModel(),
+        spring,
+        qpos_rad=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        qvel_rad_s=(0.0,) * 6,
+        max_displacement_m=0.02,
+    )
+
+    assert np.allclose(overlay, (-0.2, 0.0, 0.0, 0.0, 0.0, 0.0))
+    assert audit["displacement_norm_m"] == pytest.approx(0.01)
+    assert audit["force_n"] == pytest.approx((-0.2, 0.0, 0.0))
+    assert audit["power_error_w"] == pytest.approx(0.0)
+
+
+def test_cartesian_impedance_overlay_aborts_large_displacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModel:
+        def forward_kinematics(self, _qpos_rad: object) -> np.ndarray:
+            transform = np.eye(4)
+            transform[0, 3] = 0.021
+            return transform
+
+        def arm_jacobian(self, _qpos_rad: object) -> np.ndarray:
+            return np.eye(6)
+
+    monkeypatch.setattr(
+        probe,
+        "map_world_aligned_ee_wrench_to_joint_torque",
+        lambda *_args, **_kwargs: pytest.fail("mapping must not run after abort"),
+    )
+    spring = probe.B601TranslationalVirtualSpring(
+        anchor_position_m=(0.0, 0.0, 0.0),
+        stiffness_n_per_m=(20.0,) * 3,
+        damping_n_s_per_m=(1.0,) * 3,
+        max_abs_force_n=(2.0,) * 3,
+    )
+
+    with pytest.raises(probe.LowGainProbeError, match="displacement abort"):
+        probe.compute_cartesian_impedance_overlay(
+            FakeModel(),
+            spring,
+            qpos_rad=(0.0,) * 6,
+            qvel_rad_s=(0.0,) * 6,
+            max_displacement_m=0.02,
+        )
 
 
 def test_active_joint_resolution_keeps_joint2_joint3_support() -> None:
@@ -365,3 +511,60 @@ def test_parser_help_is_read_only() -> None:
     args = parser.parse_args(["--config", "config.yaml", "--rebot-source-root", "source"])
     assert args.joint == "joint1"
     assert tuple(args.support_joints) == ("joint2", "joint3")
+    assert args.cartesian_stiffness_n_per_m == 20.0
+    assert args.cartesian_max_displacement_m == 0.02
+
+
+def _parse_cartesian_args(*extra: str) -> object:
+    return probe.build_parser().parse_args(
+        [
+            "--mode",
+            "cartesian-hold",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--kp",
+            "0",
+            "--support-joint",
+            "joint4",
+            "--support-joint",
+            "joint5",
+            "--support-joint",
+            "joint6",
+            "--allow-motion",
+            "--auto-disable",
+            "--confirmation",
+            probe.CONFIRMATION,
+            *extra,
+        ]
+    )
+
+
+def test_cartesian_cli_requires_all_six_joints_and_zero_joint_stiffness() -> None:
+    args = _parse_cartesian_args()
+
+    probe._validate_cli(args)
+
+    incomplete = probe.build_parser().parse_args(
+        [
+            "--mode",
+            "cartesian-hold",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--kp",
+            "0",
+            "--allow-motion",
+            "--auto-disable",
+            "--confirmation",
+            probe.CONFIRMATION,
+        ]
+    )
+    with pytest.raises(ValueError, match="canonical joint1..joint6"):
+        probe._validate_cli(incomplete)
+
+    nonzero_kp = _parse_cartesian_args("--kp", "0.1")
+    with pytest.raises(ValueError, match="requires --kp 0"):
+        probe._validate_cli(nonzero_kp)

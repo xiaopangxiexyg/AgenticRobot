@@ -7,7 +7,13 @@ sensor, or a hardware-readiness claim.
 
 The software owns the complete low-gain torque composition:
 
-``tau = gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq)``
+``tau = gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq) + J.T F``
+
+``J.T F`` is zero in the joint ``hold`` and ``slow-step`` modes.  The guarded
+``cartesian-hold`` mode anchors the current ``gripper_end`` position after a
+fresh post-enable snapshot and uses the existing translational virtual spring
+and world-aligned wrench mapping.  It controls no absolute Cartesian pose and
+does not command orientation.
 
 The dispatched RobStride MIT ``kp`` and ``kd`` are always zero, so the final
 software torque is the only PD/derivative contribution that this probe owns.
@@ -55,8 +61,11 @@ from hardware.rebot_b601_rs import (
 from robot_motion.rebot_b601_rs import (
     B601MitControlProfile,
     B601MitReference,
+    B601MitTorqueBreakdown,
     B601PinocchioModel,
+    B601TranslationalVirtualSpring,
     compute_b601_mit_torque,
+    map_world_aligned_ee_wrench_to_joint_torque,
 )
 
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
@@ -82,6 +91,11 @@ _DEFAULT_MAX_ERROR_RAD = 0.15
 _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
 _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
 _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
+_DEFAULT_CARTESIAN_STIFFNESS_N_PER_M = 20.0
+_DEFAULT_CARTESIAN_DAMPING_N_S_PER_M = 1.0
+_DEFAULT_CARTESIAN_MAX_FORCE_N = 2.0
+_DEFAULT_CARTESIAN_MAX_DISPLACEMENT_M = 0.02
+_DEFAULT_CARTESIAN_OVERLAY_LIMIT_SCALE = 0.25
 
 
 class LowGainProbeError(RuntimeError):
@@ -367,8 +381,8 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise LowGainProbeError("low-gain mode requires --config")
     if not args.rebot_source_root:
         raise LowGainProbeError("low-gain mode requires --rebot-source-root")
-    if args.mode not in ("hold", "slow-step"):
-        raise ValueError("mode must be hold or slow-step")
+    if args.mode not in ("hold", "slow-step", "cartesian-hold"):
+        raise ValueError("mode must be hold, slow-step, or cartesian-hold")
     _bounded(args.rate_hz, name="rate_hz", lower=1.0, upper=40.0)
     _bounded(args.duration_sec, name="duration_sec", lower=0.1, upper=60.0)
     _bounded(args.warmup_sec, name="warmup_sec", lower=0.1, upper=15.0)
@@ -432,12 +446,68 @@ def _validate_cli(args: argparse.Namespace) -> None:
         upper=0.5,
         lower_inclusive=False,
     )
+    _bounded(
+        getattr(
+            args,
+            "cartesian_stiffness_n_per_m",
+            _DEFAULT_CARTESIAN_STIFFNESS_N_PER_M,
+        ),
+        name="cartesian_stiffness_n_per_m",
+        lower=0.0,
+        upper=100.0,
+    )
+    _bounded(
+        getattr(
+            args,
+            "cartesian_damping_n_s_per_m",
+            _DEFAULT_CARTESIAN_DAMPING_N_S_PER_M,
+        ),
+        name="cartesian_damping_n_s_per_m",
+        lower=0.0,
+        upper=10.0,
+    )
+    _bounded(
+        getattr(args, "cartesian_max_force_n", _DEFAULT_CARTESIAN_MAX_FORCE_N),
+        name="cartesian_max_force_n",
+        lower=0.1,
+        upper=5.0,
+    )
+    _bounded(
+        getattr(
+            args,
+            "cartesian_max_displacement_m",
+            _DEFAULT_CARTESIAN_MAX_DISPLACEMENT_M,
+        ),
+        name="cartesian_max_displacement_m",
+        lower=0.001,
+        upper=0.05,
+        lower_inclusive=False,
+    )
+    _bounded(
+        getattr(
+            args,
+            "cartesian_overlay_limit_scale",
+            _DEFAULT_CARTESIAN_OVERLAY_LIMIT_SCALE,
+        ),
+        name="cartesian_overlay_limit_scale",
+        lower=0.01,
+        upper=0.5,
+        lower_inclusive=False,
+    )
     if args.mode == "slow-step" and args.step_rad <= 0.0:
         raise ValueError("slow-step mode requires step_rad > 0")
-    resolve_active_joint_names(
+    active_joint_names = resolve_active_joint_names(
         args.joint,
         getattr(args, "support_joints", _FAULT_HOLD_JOINTS),
     )
+    if args.mode == "cartesian-hold":
+        if args.kp != 0.0:
+            raise ValueError("cartesian-hold requires --kp 0 to avoid joint-position stiffness")
+        if active_joint_names != _ALL_JOINTS:
+            raise ValueError(
+                "cartesian-hold requires the canonical joint1..joint6 active set; "
+                "use joint1 as target and add joint4, joint5, and joint6 as support joints"
+            )
 
 
 def _resolve_model_and_limits(
@@ -525,14 +595,18 @@ def build_software_profile(
     torque_limits_nm: Sequence[float],
     torque_rise_time_sec: float,
     velocity_limit_rad_s: float,
+    overlay_limits_nm: Sequence[float] = _ZERO_SIX,
 ) -> B601MitControlProfile:
     """Build the low-gain software composition profile used by the probe."""
 
     kp = _bounded(kp, name="kp", lower=0.0, upper=5.0)
     kd = _bounded(kd, name="kd", lower=0.0, upper=5.0)
     limits = _six(torque_limits_nm, name="torque_limits_nm")
+    overlay_limits = _six(overlay_limits_nm, name="overlay_limits_nm")
     if any(value <= 0.0 for value in limits):
         raise ValueError("torque_limits_nm must be positive")
+    if any(value < 0.0 for value in overlay_limits):
+        raise ValueError("overlay_limits_nm must be non-negative")
     rise_time = _positive(torque_rise_time_sec, name="torque_rise_time_sec")
     velocity_limit = _positive(velocity_limit_rad_s, name="velocity_limit_rad_s")
     return B601MitControlProfile(
@@ -541,7 +615,7 @@ def build_software_profile(
         damping_kd_nm_s_per_rad=(kd,) * 6,
         max_abs_torque_nm=limits,
         max_torque_rate_nm_s=tuple(value / rise_time for value in limits),
-        max_abs_overlay_torque_nm=_ZERO_SIX,
+        max_abs_overlay_torque_nm=overlay_limits,
         max_abs_reference_velocity_rad_s=(max(velocity_limit, 0.05),) * 6,
         max_abs_state_velocity_rad_s=(max(velocity_limit, 0.05),) * 6,
         metadata={
@@ -559,6 +633,7 @@ def build_reference(
     timestamp_sec: float,
     qpos_rad: Sequence[float],
     qvel_rad_s: Sequence[float] = _ZERO_SIX,
+    joint_torque_overlay_nm: Sequence[float] = _ZERO_SIX,
 ) -> B601MitReference:
     """Build a validated local-clock MIT reference."""
 
@@ -569,6 +644,35 @@ def build_reference(
         receive_timestamp_sec=timestamp,
         qpos_rad=_six(qpos_rad, name="qpos_rad"),
         qvel_rad_s=_six(qvel_rad_s, name="qvel_rad_s"),
+        joint_torque_overlay_nm=_six(
+            joint_torque_overlay_nm,
+            name="joint_torque_overlay_nm",
+        ),
+    )
+
+
+def compute_software_torque_breakdown(
+    model: B601PinocchioModel,
+    *,
+    reference: B601MitReference,
+    measured_qpos_rad: Sequence[float],
+    measured_qvel_rad_s: Sequence[float],
+    profile: B601MitControlProfile,
+    gravity_scale: float,
+) -> B601MitTorqueBreakdown:
+    """Compose gravity, joint PD, and bounded overlay torque in software."""
+
+    scale = _bounded(gravity_scale, name="gravity_scale", lower=0.0, upper=1.0)
+    gravity = tuple(
+        scale * float(value)
+        for value in model.arm_generalized_gravity(measured_qpos_rad)
+    )
+    return compute_b601_mit_torque(
+        reference,
+        profile,
+        measured_qpos_rad=measured_qpos_rad,
+        measured_qvel_rad_s=measured_qvel_rad_s,
+        gravity_torque_nm=gravity,
     )
 
 
@@ -581,21 +685,96 @@ def compute_software_torque(
     profile: B601MitControlProfile,
     gravity_scale: float,
 ) -> tuple[float, ...]:
-    """Compose gravity, low-gain position, and damping torque in software."""
+    """Compatibility wrapper returning only the requested total torque."""
 
-    scale = _bounded(gravity_scale, name="gravity_scale", lower=0.0, upper=1.0)
-    gravity = tuple(
-        scale * float(value)
-        for value in model.arm_generalized_gravity(measured_qpos_rad)
-    )
-    breakdown = compute_b601_mit_torque(
-        reference,
-        profile,
+    return compute_software_torque_breakdown(
+        model,
+        reference=reference,
         measured_qpos_rad=measured_qpos_rad,
         measured_qvel_rad_s=measured_qvel_rad_s,
-        gravity_torque_nm=gravity,
+        profile=profile,
+        gravity_scale=gravity_scale,
+    ).requested_torque_nm
+
+
+def compute_cartesian_impedance_overlay(
+    model: B601PinocchioModel,
+    spring: B601TranslationalVirtualSpring,
+    *,
+    qpos_rad: Sequence[float],
+    qvel_rad_s: Sequence[float],
+    max_displacement_m: float,
+) -> tuple[tuple[float, ...], dict[str, object]]:
+    """Evaluate one current-anchor translational impedance sample.
+
+    This helper reuses the model's LOCAL_WORLD_ALIGNED Jacobian and the shared
+    ``J.T @ wrench`` implementation.  It rejects excessive TCP displacement
+    before returning any torque overlay and verifies the twist/wrench power
+    identity whenever joint velocity is available.
+    """
+
+    qpos = _six(qpos_rad, name="qpos_rad")
+    qvel = _six(qvel_rad_s, name="qvel_rad_s")
+    displacement_limit = _bounded(
+        max_displacement_m,
+        name="cartesian_max_displacement_m",
+        lower=0.001,
+        upper=0.05,
+        lower_inclusive=False,
     )
-    return breakdown.requested_torque_nm
+    transform = np.asarray(model.forward_kinematics(qpos), dtype=float)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise LowGainProbeError("Cartesian impedance FK returned an invalid transform")
+    jacobian = np.asarray(model.arm_jacobian(qpos), dtype=float)
+    if jacobian.shape != (6, 6) or not np.all(np.isfinite(jacobian)):
+        raise LowGainProbeError("Cartesian impedance Jacobian is invalid")
+    translational_jacobian = jacobian[:3]
+    singular_values = np.linalg.svd(translational_jacobian, compute_uv=False)
+    if singular_values.shape != (3,) or not np.all(np.isfinite(singular_values)):
+        raise LowGainProbeError("Cartesian impedance singular values are invalid")
+    position = transform[:3, 3]
+    linear_velocity = translational_jacobian @ np.asarray(qvel, dtype=float)
+    spring_result = spring.evaluate(position, linear_velocity)
+    displacement_norm = float(np.linalg.norm(spring_result.displacement_m))
+    if displacement_norm > displacement_limit:
+        raise LowGainProbeError(
+            "Cartesian displacement abort: "
+            f"norm={displacement_norm:.6f} m > {displacement_limit:.6f} m"
+        )
+    mapping = map_world_aligned_ee_wrench_to_joint_torque(
+        model,
+        qpos,
+        spring_result.wrench,
+        qvel_rad_s=qvel,
+    )
+    if mapping.cartesian_power_w is None or mapping.joint_power_w is None:
+        raise LowGainProbeError("Cartesian impedance power evidence is unavailable")
+    power_error_w = abs(mapping.cartesian_power_w - mapping.joint_power_w)
+    power_tolerance_w = 1e-9 + 1e-9 * max(
+        abs(mapping.cartesian_power_w),
+        abs(mapping.joint_power_w),
+    )
+    if power_error_w > power_tolerance_w:
+        raise LowGainProbeError(
+            "Cartesian wrench mapping violated power invariance: "
+            f"error={power_error_w:.12g} W"
+        )
+    return mapping.joint_torque_nm, {
+        "frame_id": spring_result.wrench.frame_id,
+        "position_m": tuple(float(value) for value in position),
+        "linear_velocity_m_s": tuple(float(value) for value in linear_velocity),
+        "displacement_m": spring_result.displacement_m,
+        "displacement_norm_m": displacement_norm,
+        "force_n": spring_result.wrench.force_n,
+        "raw_force_n": spring_result.raw_force_n,
+        "force_limited": spring_result.force_limited,
+        "translational_jacobian_singular_values": tuple(
+            float(value) for value in singular_values
+        ),
+        "cartesian_power_w": mapping.cartesian_power_w,
+        "joint_power_w": mapping.joint_power_w,
+        "power_error_w": power_error_w,
+    }
 
 
 def plan_reference(
@@ -617,10 +796,10 @@ def plan_reference(
         raise ValueError("position_limits_rad must contain six pairs")
     if joint not in _ALL_JOINTS:
         raise ValueError(f"unknown B601-RS joint: {joint}")
-    if mode == "hold":
+    if mode in ("hold", "cartesian-hold"):
         return tuple(float(value) for value in initial), _ZERO_SIX, True
     if mode != "slow-step":
-        raise ValueError("mode must be hold or slow-step")
+        raise ValueError("mode must be hold, slow-step, or cartesian-hold")
     direction = 1 if int(step_direction) >= 0 else -1
     step = _bounded(step_rad, name="step_rad", lower=0.0, upper=0.2)
     speed = _bounded(step_speed_rad_s, name="step_speed_rad_s", lower=0.001, upper=0.05)
@@ -1031,12 +1210,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         model.urdf_path,
         scale=args.torque_limit_scale,
     )
+    overlay_limits = (
+        tuple(
+            value * args.cartesian_overlay_limit_scale
+            for value in torque_limits
+        )
+        if args.mode == "cartesian-hold"
+        else _ZERO_SIX
+    )
     profile = build_software_profile(
         kp=args.kp,
         kd=args.kd,
         torque_limits_nm=torque_limits,
         torque_rise_time_sec=args.torque_rise_time_sec,
         velocity_limit_rad_s=args.velocity_abort_rad_s,
+        overlay_limits_nm=overlay_limits,
     )
     config = B601RSBackendConfig.from_rs_yaml(
         config_path,
@@ -1058,6 +1246,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     previous_tau = _ZERO_SIX
     initial_q: tuple[float, ...] | None = None
     final_q: tuple[float, ...] | None = None
+    cartesian_anchor_position_m: tuple[float, ...] | None = None
+    cartesian_spring: B601TranslationalVirtualSpring | None = None
     fault_qpos_for_hold: tuple[float, ...] | None = None
     fault_qvel_for_hold: tuple[float, ...] | None = None
     last_safe_q: tuple[float, ...] | None = None
@@ -1068,6 +1258,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     schedule_overruns = 0
     torque_limit_count = 0
     slew_limit_count = 0
+    overlay_limit_count = 0
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
     primary_error: Exception | None = None
@@ -1210,6 +1401,27 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         last_safe_observed_at_sec = arming_observed_at_sec
         previous_q = arming_q
         previous_feedback_time = arming_state.receive_timestamp_sec
+        if args.mode == "cartesian-hold":
+            arming_transform = np.asarray(
+                model.forward_kinematics(arming_q),
+                dtype=float,
+            )
+            if (
+                arming_transform.shape != (4, 4)
+                or not np.all(np.isfinite(arming_transform))
+            ):
+                raise LowGainProbeError(
+                    "post-enable Cartesian anchor FK returned an invalid transform"
+                )
+            cartesian_anchor_position_m = tuple(
+                float(value) for value in arming_transform[:3, 3]
+            )
+            cartesian_spring = B601TranslationalVirtualSpring(
+                anchor_position_m=cartesian_anchor_position_m,
+                stiffness_n_per_m=(args.cartesian_stiffness_n_per_m,) * 3,
+                damping_n_s_per_m=(args.cartesian_damping_n_s_per_m,) * 3,
+                max_abs_force_n=(args.cartesian_max_force_n,) * 3,
+            )
         period = 1.0 / args.rate_hz
         started = time.monotonic()
         next_deadline = started
@@ -1315,13 +1527,30 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     f"> {args.max_error_rad:.6f} rad"
                 )
                 break
+            cartesian_audit: dict[str, object] | None = None
+            joint_torque_overlay_nm = _ZERO_SIX
+            if args.mode == "cartesian-hold":
+                if cartesian_spring is None:
+                    raise LowGainProbeError(
+                        "Cartesian impedance spring was not armed"
+                    )
+                joint_torque_overlay_nm, cartesian_audit = (
+                    compute_cartesian_impedance_overlay(
+                        model,
+                        cartesian_spring,
+                        qpos_rad=q,
+                        qvel_rad_s=qvel,
+                        max_displacement_m=args.cartesian_max_displacement_m,
+                    )
+                )
             reference = build_reference(
                 sequence=state.sequence,
                 timestamp_sec=state.receive_timestamp_sec,
                 qpos_rad=qref,
                 qvel_rad_s=qvel_ref,
+                joint_torque_overlay_nm=joint_torque_overlay_nm,
             )
-            requested_tau = compute_software_torque(
+            torque_breakdown = compute_software_torque_breakdown(
                 model,
                 reference=reference,
                 measured_qpos_rad=q,
@@ -1329,6 +1558,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 profile=profile,
                 gravity_scale=args.gravity_scale,
             )
+            requested_tau = torque_breakdown.requested_torque_nm
             conditioned_tau, torque_limited, slew_limited = condition_torque(
                 requested_tau,
                 previous_tau,
@@ -1356,6 +1586,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             commands_sent += 1
             torque_limit_count += int(torque_limited)
             slew_limit_count += int(slew_limited)
+            overlay_limit_count += int(torque_breakdown.overlay_limited)
             samples.append(
                 {
                     "sequence": state.sequence,
@@ -1365,11 +1596,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "qvel_fd_rad_s": qvel,
                     "qref_rad": qref,
                     "qvel_ref_rad_s": qvel_ref,
+                    "gravity_tau_nm": torque_breakdown.gravity_torque_nm,
+                    "position_tau_nm": torque_breakdown.position_torque_nm,
+                    "damping_tau_nm": torque_breakdown.damping_torque_nm,
+                    "overlay_requested_tau_nm": torque_breakdown.overlay_requested_nm,
+                    "overlay_effective_tau_nm": torque_breakdown.overlay_effective_nm,
+                    "overlay_limited": torque_breakdown.overlay_limited,
                     "requested_tau_nm": requested_tau,
                     "conditioned_tau_nm": conditioned_tau,
                     "torque_limited": torque_limited,
                     "slew_limited": slew_limited,
                     "step_done": step_done,
+                    "cartesian_impedance": cartesian_audit,
                     "freshness_verified": state.freshness_verified,
                     "freshness_semantics": state.freshness_semantics,
                 }
@@ -1598,12 +1836,26 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "torque_limits_nm": torque_limits,
             "torque_limit_scale": args.torque_limit_scale,
             "max_torque_rate_nm_s": profile.max_torque_rate_nm_s,
+            "max_abs_overlay_torque_nm": profile.max_abs_overlay_torque_nm,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
             "vendor_kd_nm_s_per_rad": _ZERO_SIX,
             "torque_owner": "software_composed_tau_only",
         },
+        "cartesian_impedance": {
+            "enabled": args.mode == "cartesian-hold",
+            "translation_only": True,
+            "anchor_source": "fresh_post_enable_fk",
+            "anchor_position_m": cartesian_anchor_position_m,
+            "stiffness_n_per_m": (args.cartesian_stiffness_n_per_m,) * 3,
+            "damping_n_s_per_m": (args.cartesian_damping_n_s_per_m,) * 3,
+            "max_abs_force_n": (args.cartesian_max_force_n,) * 3,
+            "max_displacement_m": args.cartesian_max_displacement_m,
+            "overlay_limit_scale": args.cartesian_overlay_limit_scale,
+            "requires_all_six_arm_joints": True,
+        },
         "torque_limit_count": torque_limit_count,
         "slew_limit_count": slew_limit_count,
+        "overlay_limit_count": overlay_limit_count,
         "max_abs_requested_tau_nm": max_abs_requested,
         "max_abs_conditioned_tau_nm": max_abs_conditioned,
         "frequency": {event: stats.as_dict() for event, stats in frequency.items()},
@@ -1624,7 +1876,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the warmup pose; slow-step uses a bounded relative step.",
-            "Software composes gravity, position, and finite-difference damping, then dispatches vendor MIT kp=kd=0.",
+            "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
+            "Software composes gravity, position, finite-difference damping, and an optional bounded J.T F overlay, then dispatches vendor MIT kp=kd=0.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
             "A PASS means the guarded software run and cleanup met their declared bounds. It is not a HARDWARE_PASS or force-sensor validation.",
@@ -1639,7 +1892,11 @@ def build_parser() -> argparse.ArgumentParser:
             "human-run only."
         )
     )
-    parser.add_argument("--mode", choices=("hold", "slow-step"), default="hold")
+    parser.add_argument(
+        "--mode",
+        choices=("hold", "slow-step", "cartesian-hold"),
+        default="hold",
+    )
     parser.add_argument("--config", required=True, help="explicit rebotarm_rs.yaml")
     parser.add_argument(
         "--rebot-source-root",
@@ -1708,6 +1965,36 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=_DEFAULT_FAULT_HOLD_MAX_REBASE_RAD,
         help="maximum joint2/joint3 fault-to-last-safe rebase distance",
+    )
+    parser.add_argument(
+        "--cartesian-stiffness-n-per-m",
+        type=float,
+        default=_DEFAULT_CARTESIAN_STIFFNESS_N_PER_M,
+        help="isotropic translational stiffness for cartesian-hold",
+    )
+    parser.add_argument(
+        "--cartesian-damping-n-s-per-m",
+        type=float,
+        default=_DEFAULT_CARTESIAN_DAMPING_N_S_PER_M,
+        help="isotropic translational damping for cartesian-hold",
+    )
+    parser.add_argument(
+        "--cartesian-max-force-n",
+        type=float,
+        default=_DEFAULT_CARTESIAN_MAX_FORCE_N,
+        help="per-axis Cartesian force cap for cartesian-hold",
+    )
+    parser.add_argument(
+        "--cartesian-max-displacement-m",
+        type=float,
+        default=_DEFAULT_CARTESIAN_MAX_DISPLACEMENT_M,
+        help="TCP displacement-norm abort threshold for cartesian-hold",
+    )
+    parser.add_argument(
+        "--cartesian-overlay-limit-scale",
+        type=float,
+        default=_DEFAULT_CARTESIAN_OVERLAY_LIMIT_SCALE,
+        help="fraction of the already-scaled total torque bound available to J.T F",
     )
     parser.add_argument("--allow-motion", action="store_true")
     parser.add_argument("--auto-disable", action="store_true")
