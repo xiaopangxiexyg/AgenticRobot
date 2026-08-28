@@ -93,6 +93,30 @@ The random stream is fixed by the JSON config. Increase `sample_count` for a
 longer offline soak test; do not replace deterministic CI coverage with an
 unbounded random loop.
 
+## Arbitrary grasp-pose reachability probe
+
+`rm65_random_grasp_pose_reachability_v1.json` defines a bounded Cartesian box,
+a PCG64 seed, and a Shoemake-uniform SO(3) sampler.  The probe emits exactly one
+pose per requested sample without rejection sampling, then records exactly one
+typed terminal endpoint result:
+
+- `reachable`: a residual-bounded endpoint IK candidate was found;
+- `kinematically_unreachable`: a conservative workspace exclusion proves the
+  target lies outside the configured outer envelope;
+- `ik_search_exhausted`: bounded multi-start IK found no accepted candidate,
+  which is not a mathematical unreachability claim;
+- `collision_blocked` or `collision_search_exhausted`: injected endpoint
+  collision checks proved every IK candidate blocked or exhausted their bounded
+  search;
+- `invalid_target` or `planner_error`: target/adapter failures were converted
+  to typed terminal evidence.
+
+An unreachable or collision-blocked sample is a valid scenario observation,
+not a failed scenario.  The receipt contains endpoint candidates, residuals,
+rejection reasons, proof scope, and collision metadata only.  It never contains
+an executable path or trajectory; the future obstacle/path planner owns that
+separate receipt layer.
+
 ## Adding scenarios
 
 1. Put reusable scenario code under `rm65/` or the relevant backend package.

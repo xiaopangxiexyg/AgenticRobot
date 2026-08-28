@@ -1,0 +1,18 @@
+{
+  "schema_version": "rm65.random_grasp_pose_reachability.v1",
+  "scenario": "rm65_random_grasp_pose_reachability",
+  "seed": 20260829,
+  "sample_count": 12,
+  "position_min_m": [-0.7, -0.8, -0.1],
+  "position_max_m": [0.7, 0.8, 1.2],
+  "orientation_sampler": "shoemake_uniform_so3",
+  "controlled_frame": "tool_tcp",
+  "max_ik_candidates": 6,
+  "ik_max_iterations": 250,
+  "ik_max_joint_step_rad": 0.1,
+  "ik_damping": 0.03,
+  "maximum_position_residual_m": 0.003,
+  "maximum_orientation_residual_deg": 1.0,
+  "conservative_workspace_origin_m": [0.0, 0.0, 0.0],
+  "conservative_workspace_maximum_radius_m": 1.25
+}
