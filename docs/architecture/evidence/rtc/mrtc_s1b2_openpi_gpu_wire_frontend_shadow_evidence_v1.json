@@ -101,6 +101,8 @@
     "production_profile_enabled": false,
     "motion_readiness_proven": false
   },
-  "probe": "todos/probes/mrtc_s1b2_openpi_gpu_shadow.py",
+  "probe": "retired: scripts/probes/mrtc_s1b2_openpi_gpu_shadow.py",
+  "probe_status": "retired_from_versioned_tree",
+  "retirement_report": "docs/legacy/reports/mrtc_s1b2_openpi_gpu_shadow_retirement_20260828.md",
   "next_gate": "real_observation_input_only_model_rtc_shadow_with_send_actions_false"
 }
