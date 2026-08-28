@@ -38,6 +38,10 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   命令返回逐关节 receipt；部分发送不会被报告成六关节成功；
 - `safe_stop()` 是单独的、可在未授权启动运动的 backend 上调用的逐关节失能入口；它仍然
   需要现场机械支撑和物理急停配合，`close()` 不隐式失能；
+- 低增益 probe 的 active set 默认是 `--joint` 指定的一个目标关节加
+  `joint2`/`joint3` 支撑关节；其余 arm 关节不会被使能。异常路径只有在
+  last-safe 快照通过新鲜度、限位、速度和小 rebase 检查后才锁存 J2/J3，否则直接全部
+  arm `safe_stop`。这个保护保持不包含 ID7 夹爪；
 - 任何 motion-capable caller 都必须先从同一 pinned URDF 提供六关节 position limits；本轮
   位置频率 probe 会在 enable 前从 `--rebot-source-root`（默认由 config 路径推导）解析并
   锁定这些 limits，解析失败则不允许进入位置命令循环；
@@ -215,9 +219,67 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 
 这是 P4 单关节 MIT/重力阻尼验证的 guarded 入口。它仍然是 motion-capable
 命令，只能由现场操作者运行；自动化测试不会打开 CAN、使能电机或发送 MIT 帧。
-探针使用六个 arm 关节作为受限控制对象，明确排除 ID7 夹爪；`hold` 从 warmup
-读取的当前姿态开始，不会跳到预设绝对姿态，`slow-step` 只在 hold 通过后以相对、
-有界步长运行。
+探针默认只把目标关节和强制支撑关节 `joint2`、`joint3` 放入 active set，明确排除
+ID7 夹爪以及未选中的 arm 关节；因此第一档应从 `--joint joint1` 开始，且必须为
+`joint2`/`joint3` 和未选中的腕部关节提供机械支撑。`hold` 从使能后的当前姿态开始，
+不会跳到预设绝对姿态，`slow-step` 只在 hold 通过后以相对、有界步长运行。
+
+### 异常时的 protective hold（锁存，不是普通回零）
+
+这条路径借鉴 reBot 官方的故障处置边界：通信异常不尝试回零而立即失能；普通退出才
+允许平滑回零。我们的特殊需求是在满足更严格的 admission 条件时，把 `joint2`/`joint3`
+锁在故障前最后一个安全姿态，同时把 `joint1`/`joint4`/`joint5`/`joint6` 失能。
+夹爪 ID7 不在当前 backend 的注册范围内，不能把下面的“全臂失能”理解成夹爪也已失能。
+
+状态转换固定为：
+
+```text
+ACTIVE
+  ├─ 正常结束 ──> active-set 短暂保持 ──> 全部 arm safe_stop
+  ├─ Ctrl+C/异常且 admission 通过
+  │                 └─> PROTECTIVE_HOLD（只发 joint2/joint3）
+  │                       ├─ SIGUSR1 ──> 全部 arm safe_stop
+  │                       └─ hold dispatch/非保持失能失败
+  │                                      └─> 全部 arm safe_stop
+  └─ 无法证明当前 q 新鲜/合法 ─────────────> 全部 arm safe_stop
+```
+
+进入 `PROTECTIVE_HOLD` 前，程序必须同时证明：
+
+1. `last_safe_q` 是六关节完整、有限、在 pinned URDF position limits 内的快照；
+2. 快照年龄是本进程单调时钟测得且不超过 `--fault-hold-max-age-sec`（默认
+   `0.15 s`）；MotorBridge 0.4.9 没有设备源时间戳，所以 JSON 仍明确标记
+   `freshness_verified=false`，不能把它宣传成 vendor freshness；
+3. 快照的六关节有限差分速度均不超过 `--fault-hold-max-velocity-rad-s`（默认
+   `0.02 rad/s`），保持参考的 `qvel` 永远是全零；
+4. 如果故障样本仍有完整 q，则故障样本本身也必须在 limits 内、速度不超过同一阈值，
+   且 joint2/joint3 相对 `last_safe_q` 的 rebase 不超过
+   `--fault-hold-max-rebase-rad`（默认 `0.05 rad`）。超出即禁止保持；
+5. 只有通过上述检查后才会发送第一帧；发送的是固定 `last_safe_q`、零 qvel、vendor
+   `kp=kd=0`，并继续经过软件 torque absolute limit 和 torque slew limit。q 绝不由
+   错误/陈旧样本补零，也不使用最后一次 command 代替最后一次合法状态。
+
+第一帧保持成功后，程序先对非保持 arm 关节发逐关节 `safe_stop`；该 receipt 不完整时
+立即回退到全部 arm `safe_stop`，不继续假设“部分失能”已经成立。之后每一个保持周期都会
+重新读取完整反馈：反馈不完整/失效、主机观测不再推进、任一关节超出 limits、有限差分速度
+超过阈值，或 joint2/joint3 偏离固定参考超过 `max-rebase`，都会停止继续发保持帧并回退到
+全部 arm `safe_stop`。通过监视时，固定参考仍是故障前的 `last_safe_q`；当前测量 q 只用于
+计算受限的重力/阻尼力矩，绝不用于更新参考。保持没有时间自动释放，也不会因为 EOF、普通
+cleanup 或 `close()` 释放；操作者必须在另一终端显式发送 `SIGUSR1`，并确认返回的
+`full_disable_receipt.completed=true`。如果没有可证明的新鲜安全 q，程序直接采用官方通信
+故障同类的“无回零立即失能”fallback。
+
+释放命令示例（不会让交接 shell 退出）：
+
+```bash
+PID=<probe 输出的 pid>
+if kill -USR1 "$PID"; then
+  printf 'full-disable requested: pid=%s\n' "$PID"
+else
+  printf 'ERROR: full-disable request failed: pid=%s\n' "$PID"
+fi
+printf '%s\n' 'shell remains active'
+```
 
 本入口固定单一 torque owner：软件按
 `tau = gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq)` 组合重力前馈、低增益
@@ -255,7 +317,7 @@ if cd "$WT"; then
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
-      --joint joint3 \
+      --joint joint1 \
       --kp 0.5 \
       --kd 0.5 \
       --gravity-scale 1.0 \
@@ -266,7 +328,10 @@ if cd "$WT"; then
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
-      --output "$OUT_DIR/b601_low_gain_hold_joint3.json"; then
+      --fault-hold-max-age-sec 0.15 \
+      --fault-hold-max-velocity-rad-s 0.02 \
+      --fault-hold-max-rebase-rad 0.05 \
+      --output "$OUT_DIR/b601_low_gain_hold_joint1.json"; then
     STATUS=0
   else
     STATUS=$?
@@ -278,7 +343,8 @@ fi
 printf '%s\n' 'shell remains active'
 ```
 
-第一档只验收 `hold`：观察 j3 是否保持、重力方向是否合理、阻尼是否耗散而非振荡，
+第一档只验收 `hold`：观察 j1 是否按当前状态工作、j2/j3 是否作为支撑保持、重力方向
+是否合理、阻尼是否耗散而非振荡，
 并在 JSON 中确认 `status=OK`、`acceptance_status=PASS`、
 `cleanup_receipt.completed=true`、`cleanup_errors=[]`、`stop_reason=null`，以及
 `frequency_acceptance.feedback/compute/tx.*.passed=true`。输出中的
@@ -286,7 +352,7 @@ printf '%s\n' 'shell remains active'
 记录，不是 `HARDWARE_PASS`。
 
 只有 hold 通过且机械支撑未改变，才可单独运行一档相对慢步；每次只批准一个命令，
-例如 j3 正方向 0.05 rad、0.02 rad/s：
+例如 j1 正方向 0.05 rad、0.02 rad/s：
 
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR 变量；先确认上一档已停止且 cleanup 完整
@@ -299,7 +365,7 @@ if cd "$WT"; then
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
-      --joint joint3 \
+      --joint joint1 \
       --step-direction 1 \
       --step-rad 0.05 \
       --step-speed-rad-s 0.02 \
@@ -313,7 +379,10 @@ if cd "$WT"; then
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
-      --output "$OUT_DIR/b601_low_gain_slow_step_joint3.json"; then
+      --fault-hold-max-age-sec 0.15 \
+      --fault-hold-max-velocity-rad-s 0.02 \
+      --fault-hold-max-rebase-rad 0.05 \
+      --output "$OUT_DIR/b601_low_gain_slow_step_joint1.json"; then
     STATUS=0
   else
     STATUS=$?

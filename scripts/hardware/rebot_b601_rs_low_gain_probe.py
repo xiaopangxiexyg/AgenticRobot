@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import signal
 import sys
 import time
@@ -43,6 +44,7 @@ if __package__ in (None, ""):
 
 from hardware.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
+    B601CommandReceipt,
     B601HardwareError,
     B601ModeReceipt,
     B601RSBackend,
@@ -60,6 +62,10 @@ from robot_motion.rebot_b601_rs import (
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
 _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
+_FAULT_HOLD_JOINTS = ("joint2", "joint3")
+_NON_FAULT_HOLD_JOINTS = tuple(
+    name for name in _ALL_JOINTS if name not in _FAULT_HOLD_JOINTS
+)
 _DEFAULT_RATE_HZ = 20.0
 _DEFAULT_DURATION_SEC = 8.0
 _DEFAULT_WARMUP_SEC = 2.0
@@ -73,6 +79,9 @@ _DEFAULT_STEP_RAD = 0.05
 _DEFAULT_STEP_SPEED_RAD_S = 0.02
 _DEFAULT_VELOCITY_ABORT_RAD_S = 0.10
 _DEFAULT_MAX_ERROR_RAD = 0.15
+_DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
+_DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
+_DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
 
 
 class LowGainProbeError(RuntimeError):
@@ -136,6 +145,215 @@ def _mode_receipt_payload(receipt: B601ModeReceipt | None) -> dict[str, object] 
     }
 
 
+def _command_receipt_payload(
+    receipt: B601CommandReceipt | None,
+) -> dict[str, object] | None:
+    if receipt is None:
+        return None
+    return {
+        "sequence": receipt.sequence,
+        "mode": receipt.mode,
+        "frame_id": receipt.frame_id,
+        "requested_at_sec": receipt.requested_at_sec,
+        "completed_at_sec": receipt.completed_at_sec,
+        "requested_joint_names": receipt.requested_joint_names,
+        "sent_joint_names": receipt.sent_joint_names,
+        "failed_joint_names": receipt.failed_joint_names,
+        "errors": receipt.errors,
+        "accepted": receipt.accepted,
+        "source_sequence": receipt.source_sequence,
+    }
+
+
+def _validate_fault_hold_snapshot(
+    qpos_rad: Sequence[float] | None,
+    *,
+    qvel_rad_s: Sequence[float] | None,
+    observed_age_sec: float,
+    position_limits_rad: Sequence[tuple[float, float]],
+    max_age_sec: float = _DEFAULT_FAULT_HOLD_MAX_AGE_SEC,
+    max_velocity_rad_s: float = _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S,
+    fault_qpos_rad: Sequence[float] | None = None,
+    fault_qvel_rad_s: Sequence[float] | None = None,
+    max_rebase_rad: float = _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD,
+) -> tuple[float, ...]:
+    """Admit only a fresh, stationary, in-limit snapshot for protective hold.
+
+    The returned tuple is the immutable q-reference for the joint2/joint3
+    latch.  A missing or invalid snapshot is never substituted with zeros or
+    with the most recent command.  ``observed_age_sec`` is measured by this
+    process's monotonic clock; it is deliberately not presented as vendor
+    source freshness because MotorBridge 0.4.9 provides no source timestamp.
+    """
+
+    if qpos_rad is None:
+        raise LowGainProbeError(
+            "fault hold requires a complete last-safe position snapshot"
+        )
+    if qvel_rad_s is None:
+        raise LowGainProbeError(
+            "fault hold requires a complete last-safe velocity observation"
+        )
+    q = _six(qpos_rad, name="fault_hold_qpos_rad")
+    qvel = _six(qvel_rad_s, name="fault_hold_qvel_rad_s")
+    limits = tuple(
+        (float(lower), float(upper)) for lower, upper in position_limits_rad
+    )
+    if len(limits) != 6 or any(
+        not math.isfinite(lower)
+        or not math.isfinite(upper)
+        or lower >= upper
+        for lower, upper in limits
+    ):
+        raise LowGainProbeError("fault hold received invalid position limits")
+    age = _finite(observed_age_sec, name="fault_hold_observed_age_sec")
+    max_age = _bounded(
+        max_age_sec,
+        name="fault_hold_max_age_sec",
+        lower=0.01,
+        upper=1.0,
+    )
+    if age < 0.0 or age > max_age:
+        raise LowGainProbeError(
+            "fault hold snapshot is stale: "
+            f"age={age:.6f}s > max={max_age:.6f}s"
+        )
+    max_velocity = _bounded(
+        max_velocity_rad_s,
+        name="fault_hold_max_velocity_rad_s",
+        lower=0.0001,
+        upper=0.5,
+        lower_inclusive=False,
+    )
+    observed_max_velocity = max(abs(value) for value in qvel)
+    if observed_max_velocity > max_velocity:
+        raise LowGainProbeError(
+            "fault hold snapshot is moving: "
+            f"max_abs_velocity={observed_max_velocity:.6f} rad/s > "
+            f"{max_velocity:.6f} rad/s"
+        )
+    for index, (value, (lower, upper)) in enumerate(zip(q, limits, strict=True)):
+        if not lower <= value <= upper:
+            raise LowGainProbeError(
+                f"fault hold qpos_rad[{index}]={value:.6f} is outside "
+                f"URDF limits [{lower:.6f}, {upper:.6f}]"
+            )
+    if fault_qpos_rad is not None:
+        fault_q = _six(fault_qpos_rad, name="fault_qpos_rad")
+        if fault_qvel_rad_s is None:
+            raise LowGainProbeError(
+                "fault snapshot velocity is unavailable; refusing protective rebase"
+            )
+        fault_qvel = _six(fault_qvel_rad_s, name="fault_qvel_rad_s")
+        fault_max_velocity = max(abs(value) for value in fault_qvel)
+        if fault_max_velocity > max_velocity:
+            raise LowGainProbeError(
+                "fault snapshot is moving too quickly for a safe rebase: "
+                f"max_abs_velocity={fault_max_velocity:.6f} rad/s > "
+                f"{max_velocity:.6f} rad/s"
+            )
+        for index, (value, (lower, upper)) in enumerate(
+            zip(fault_q, limits, strict=True)
+        ):
+            if not lower <= value <= upper:
+                raise LowGainProbeError(
+                    f"fault qpos_rad[{index}]={value:.6f} is outside URDF limits"
+                )
+        max_rebase = _bounded(
+            max_rebase_rad,
+            name="fault_hold_max_rebase_rad",
+            lower=0.001,
+            upper=0.5,
+            lower_inclusive=False,
+        )
+        for joint in _FAULT_HOLD_JOINTS:
+            index = _ALL_JOINTS.index(joint)
+            delta = abs(fault_q[index] - q[index])
+            if delta > max_rebase:
+                raise LowGainProbeError(
+                    f"fault hold rebase for {joint} is too large: "
+                    f"{delta:.6f} rad > {max_rebase:.6f} rad"
+                )
+    return q
+
+
+def _validate_protective_hold_feedback(
+    qpos_rad: Sequence[float] | None,
+    *,
+    qvel_rad_s: Sequence[float] | None,
+    hold_qpos_rad: Sequence[float],
+    observed_age_sec: float,
+    position_limits_rad: Sequence[tuple[float, float]],
+    max_age_sec: float = _DEFAULT_FAULT_HOLD_MAX_AGE_SEC,
+    max_velocity_rad_s: float = _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S,
+    max_rebase_rad: float = _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD,
+) -> tuple[float, ...]:
+    """Validate one complete feedback sample while the protective hold runs.
+
+    ``hold_qpos_rad`` is immutable: this helper never updates it.  Feedback
+    is used only as a measured state for damping and as a drift watchdog.  A
+    held joint that leaves the small admitted neighbourhood is escalated to
+    the caller's full-disable fallback rather than being silently rebased.
+    """
+
+    current = _validate_fault_hold_snapshot(
+        qpos_rad,
+        qvel_rad_s=qvel_rad_s,
+        observed_age_sec=observed_age_sec,
+        position_limits_rad=position_limits_rad,
+        max_age_sec=max_age_sec,
+        max_velocity_rad_s=max_velocity_rad_s,
+        max_rebase_rad=max_rebase_rad,
+    )
+    hold_q = _six(hold_qpos_rad, name="protective_hold_qpos_rad")
+    max_rebase = _bounded(
+        max_rebase_rad,
+        name="fault_hold_max_rebase_rad",
+        lower=0.001,
+        upper=0.5,
+        lower_inclusive=False,
+    )
+    for joint in _FAULT_HOLD_JOINTS:
+        index = _ALL_JOINTS.index(joint)
+        delta = abs(current[index] - hold_q[index])
+        if delta > max_rebase:
+            raise LowGainProbeError(
+                f"protective hold drift for {joint} is too large: "
+                f"{delta:.6f} rad > {max_rebase:.6f} rad"
+            )
+    return current
+
+
+def resolve_active_joint_names(
+    target_joint: str,
+    support_joints: Sequence[str] = _FAULT_HOLD_JOINTS,
+) -> tuple[str, ...]:
+    """Resolve the explicit command set for a low-gain probe.
+
+    The target is the only joint whose reference may change in ``slow-step``.
+    Joint2 and joint3 remain mandatory support joints so the first single-joint
+    check cannot accidentally enable a wrist-only subset.  The selected set is
+    still dispatched explicitly; ``--joint`` no longer implies six-joint TX.
+    """
+
+    target = str(target_joint).strip()
+    if target not in _ALL_JOINTS:
+        raise ValueError(f"unknown B601-RS joint: {target_joint}")
+    try:
+        support = tuple(str(name).strip() for name in support_joints)
+    except TypeError as exc:
+        raise ValueError("support_joints must be a sequence of joint names") from exc
+    if any(name not in _ALL_JOINTS for name in support):
+        unknown = sorted(set(support).difference(_ALL_JOINTS))
+        raise ValueError(f"unknown B601-RS support joints: {unknown}")
+    names = tuple(dict.fromkeys((target, *support)))
+    if not set(_FAULT_HOLD_JOINTS).issubset(names):
+        raise ValueError(
+            "joint2 and joint3 are mandatory support joints for the fault hold"
+        )
+    return names
+
+
 def _validate_cli(args: argparse.Namespace) -> None:
     if not args.allow_motion:
         raise LowGainProbeError("low-gain mode requires --allow-motion")
@@ -190,10 +408,36 @@ def _validate_cli(args: argparse.Namespace) -> None:
         lower=0.001,
         upper=0.05,
     )
+    _bounded(
+        getattr(args, "fault_hold_max_age_sec", _DEFAULT_FAULT_HOLD_MAX_AGE_SEC),
+        name="fault_hold_max_age_sec",
+        lower=0.01,
+        upper=1.0,
+    )
+    _bounded(
+        getattr(
+            args,
+            "fault_hold_max_velocity_rad_s",
+            _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S,
+        ),
+        name="fault_hold_max_velocity_rad_s",
+        lower=0.0001,
+        upper=0.5,
+        lower_inclusive=False,
+    )
+    _bounded(
+        getattr(args, "fault_hold_max_rebase_rad", _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD),
+        name="fault_hold_max_rebase_rad",
+        lower=0.001,
+        upper=0.5,
+        lower_inclusive=False,
+    )
     if args.mode == "slow-step" and args.step_rad <= 0.0:
         raise ValueError("slow-step mode requires step_rad > 0")
-    if args.joint not in _ALL_JOINTS:
-        raise ValueError(f"unknown B601-RS joint: {args.joint}")
+    resolve_active_joint_names(
+        args.joint,
+        getattr(args, "support_joints", _FAULT_HOLD_JOINTS),
+    )
 
 
 def _resolve_model_and_limits(
@@ -408,8 +652,12 @@ def _output_payload(payload: dict[str, object], output: Path | None) -> None:
     output_path.write_text(encoded + "\n", encoding="utf-8")
 
 
-def _signal_handler(stop: dict[str, bool], _signum: int, _frame: object) -> None:
+def _signal_handler(stop: dict[str, bool], signum: int, _frame: object) -> None:
+    """Latch a protective stop; SIGUSR1 is the explicit all-disable request."""
+
     stop["requested"] = True
+    if getattr(signal, "SIGUSR1", None) == signum:
+        stop["full_disable_requested"] = True
 
 
 def _freeze_and_stop(
@@ -423,8 +671,13 @@ def _freeze_and_stop(
     torque_limits_nm: tuple[float, ...],
     freeze_sec: float,
     rate_hz: float,
+    joint_names: Sequence[str] = _ALL_JOINTS,
 ) -> tuple[int, tuple[float, ...], list[str]]:
-    """Hold the last known pose briefly before the explicit safe stop."""
+    """Hold the last known pose briefly before the explicit safe stop.
+
+    joint_names is explicit so a single-joint commissioning run never
+    re-enables or dispatches a frame to an unselected motor during cleanup.
+    """
 
     if qpos_rad is None or freeze_sec <= 0.0:
         return 0, previous_tau, []
@@ -463,7 +716,7 @@ def _freeze_and_stop(
                 kd=_ZERO_SIX,
                 tau_nm=latest_tau,
                 torque_limits_nm=torque_limits_nm,
-                joint_names=_ALL_JOINTS,
+                joint_names=joint_names,
             )
             if not receipt.accepted:
                 errors.extend(receipt.errors or ("freeze MIT dispatch was incomplete",))
@@ -474,6 +727,297 @@ def _freeze_and_stop(
             errors.append(f"freeze: {exc}")
             break
     return count, latest_tau, errors
+
+
+def _send_fault_hold_command(
+    backend: B601RSBackend,
+    model: B601PinocchioModel,
+    *,
+    qpos_rad: tuple[float, ...],
+    measured_qpos_rad: tuple[float, ...],
+    measured_qvel_rad_s: tuple[float, ...],
+    profile: B601MitControlProfile,
+    gravity_scale: float,
+    previous_tau: tuple[float, ...],
+    torque_limits_nm: tuple[float, ...],
+    rate_hz: float,
+) -> tuple[B601CommandReceipt, tuple[float, ...]]:
+    """Send one bounded fixed-reference MIT frame to joint2 and joint3 only."""
+
+    period = 1.0 / _positive(rate_hz, name="rate_hz")
+    reference = build_reference(
+        sequence=0,
+        timestamp_sec=time.monotonic(),
+        qpos_rad=qpos_rad,
+        qvel_rad_s=_ZERO_SIX,
+    )
+    requested = compute_software_torque(
+        model,
+        reference=reference,
+        measured_qpos_rad=measured_qpos_rad,
+        measured_qvel_rad_s=measured_qvel_rad_s,
+        profile=profile,
+        gravity_scale=gravity_scale,
+    )
+    conditioned, _torque_limited, _slew_limited = condition_torque(
+        requested,
+        previous_tau,
+        absolute_limits_nm=torque_limits_nm,
+        max_rate_nm_s=profile.max_torque_rate_nm_s,
+        dt_sec=period,
+    )
+    receipt = backend.send_mit(
+        reference,
+        kp=_ZERO_SIX,
+        kd=_ZERO_SIX,
+        tau_nm=conditioned,
+        torque_limits_nm=torque_limits_nm,
+        joint_names=_FAULT_HOLD_JOINTS,
+    )
+    return receipt, conditioned
+
+
+def _run_latched_fault_hold(
+    backend: B601RSBackend,
+    model: B601PinocchioModel,
+    *,
+    qpos_rad: tuple[float, ...] | None,
+    qvel_rad_s: tuple[float, ...] | None,
+    observed_age_sec: float,
+    fault_qpos_rad: tuple[float, ...] | None,
+    fault_qvel_rad_s: tuple[float, ...] | None,
+    position_limits_rad: tuple[tuple[float, float], ...],
+    max_age_sec: float,
+    max_velocity_rad_s: float,
+    max_rebase_rad: float,
+    profile: B601MitControlProfile,
+    gravity_scale: float,
+    previous_tau: tuple[float, ...],
+    torque_limits_nm: tuple[float, ...],
+    rate_hz: float,
+    stop: dict[str, bool],
+    max_iterations: int | None = None,
+) -> tuple[
+    int,
+    tuple[float, ...],
+    B601CommandReceipt | None,
+    B601ModeReceipt | None,
+    B601ModeReceipt | None,
+    list[str],
+]:
+    """Latch joint2/joint3 at a fresh, stationary, validated pose until SIGUSR1.
+
+    The first hold frame is sent before the non-hold joints are disabled.  The
+    loop has no time-based release: only the explicit SIGUSR1 handler may
+    request safe_stop for all registered arm joints.  Each subsequent hold
+    cycle validates a complete feedback snapshot and the fixed-reference
+    drift before computing measured-state damping.  If a hold frame, feedback
+    sample, or initial reference is invalid, the fail-closed fallback is an
+    immediate all-arm safe_stop because a partial hold cannot be claimed as
+    safe.
+
+    max_iterations exists only for bounded offline tests; production calls
+    leave it as None and therefore remain latched until release.
+    """
+
+    errors: list[str] = []
+    latest_tau = previous_tau
+    hold_commands = 0
+    first_hold_receipt: B601CommandReceipt | None = None
+    non_hold_disable_receipt: B601ModeReceipt | None = None
+    full_disable_receipt: B601ModeReceipt | None = None
+
+    def full_disable_fallback() -> None:
+        nonlocal full_disable_receipt
+        try:
+            full_disable_receipt = backend.safe_stop(joint_names=_ALL_JOINTS)
+            if not full_disable_receipt.completed:
+                errors.extend(
+                    f"full safe_stop: {error}"
+                    for error in full_disable_receipt.errors
+                )
+                if not full_disable_receipt.errors:
+                    errors.append("full safe_stop incomplete without vendor error")
+        except Exception as exc:  # noqa: BLE001 - preserve safety evidence
+            errors.append(f"full safe_stop: {exc}")
+
+    try:
+        hold_q = _validate_fault_hold_snapshot(
+            qpos_rad,
+            qvel_rad_s=qvel_rad_s,
+            observed_age_sec=observed_age_sec,
+            position_limits_rad=position_limits_rad,
+            max_age_sec=max_age_sec,
+            max_velocity_rad_s=max_velocity_rad_s,
+            fault_qpos_rad=fault_qpos_rad,
+            fault_qvel_rad_s=fault_qvel_rad_s,
+            max_rebase_rad=max_rebase_rad,
+        )
+        measured_qpos = (
+            fault_qpos_rad if fault_qpos_rad is not None else hold_q
+        )
+        measured_qvel = (
+            fault_qvel_rad_s if fault_qvel_rad_s is not None else qvel_rad_s
+        )
+        first_hold_receipt, latest_tau = _send_fault_hold_command(
+            backend,
+            model,
+            qpos_rad=hold_q,
+            measured_qpos_rad=_six(measured_qpos, name="fault_measured_qpos_rad"),
+            measured_qvel_rad_s=_six(measured_qvel, name="fault_measured_qvel_rad_s"),
+            profile=profile,
+            gravity_scale=gravity_scale,
+            previous_tau=latest_tau,
+            torque_limits_nm=torque_limits_nm,
+            rate_hz=rate_hz,
+        )
+        if not first_hold_receipt.accepted:
+            errors.extend(
+                first_hold_receipt.errors
+                or ("fault hold MIT dispatch was incomplete",)
+            )
+            full_disable_fallback()
+            return (
+                hold_commands,
+                latest_tau,
+                first_hold_receipt,
+                non_hold_disable_receipt,
+                full_disable_receipt,
+                errors,
+            )
+        hold_commands = 1
+    except Exception as exc:  # noqa: BLE001 - preserve safety evidence
+        errors.append(f"fault hold: {exc}")
+        full_disable_fallback()
+        return (
+            hold_commands,
+            latest_tau,
+            first_hold_receipt,
+            non_hold_disable_receipt,
+            full_disable_receipt,
+            errors,
+        )
+
+    try:
+        non_hold_disable_receipt = backend.safe_stop(
+            joint_names=_NON_FAULT_HOLD_JOINTS,
+        )
+        if not non_hold_disable_receipt.completed:
+            errors.extend(
+                f"non-hold safe_stop: {error}"
+                for error in non_hold_disable_receipt.errors
+            )
+            if not non_hold_disable_receipt.errors:
+                errors.append("non-hold safe_stop incomplete without vendor error")
+            full_disable_fallback()
+            return (
+                hold_commands,
+                latest_tau,
+                first_hold_receipt,
+                non_hold_disable_receipt,
+                full_disable_receipt,
+                errors,
+            )
+    except Exception as exc:  # noqa: BLE001 - preserve safety evidence
+        errors.append(f"non-hold safe_stop: {exc}")
+        full_disable_fallback()
+        return (
+            hold_commands,
+            latest_tau,
+            first_hold_receipt,
+            non_hold_disable_receipt,
+            full_disable_receipt,
+            errors,
+        )
+
+    print(
+        "B601 protective hold latched: joint2/joint3 remain at the last valid "
+        "position; joint1/joint4/joint5/joint6 are disabled. "
+        f"pid={os.getpid()}; send SIGUSR1 to this process for explicit full disable.",
+        flush=True,
+    )
+    period = 1.0 / _positive(rate_hz, name="rate_hz")
+    monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
+    monitor_observed_at = time.monotonic() - max(0.0, observed_age_sec)
+    while not stop.get("full_disable_requested", False):
+        if max_iterations is not None and hold_commands >= max_iterations:
+            break
+        try:
+            state = backend.poll_feedback(request_feedback=True)
+            observed_at = time.monotonic()
+            if (
+                not state.valid
+                or getattr(state, "stale", False)
+                or state.positions_rad is None
+            ):
+                raise LowGainProbeError(
+                    "protective hold feedback is not complete and valid: "
+                    f"{state.fault_reason or 'unknown fault'}"
+                )
+            monitor_dt = observed_at - monitor_observed_at
+            if not math.isfinite(monitor_dt) or monitor_dt <= 0.0:
+                raise LowGainProbeError(
+                    "protective hold feedback timestamp did not advance"
+                )
+            monitor_qvel = tuple(
+                (current - previous) / monitor_dt
+                for current, previous in zip(
+                    state.positions_rad,
+                    monitor_q,
+                    strict=True,
+                )
+            )
+            measured_q = _validate_protective_hold_feedback(
+                state.positions_rad,
+                qvel_rad_s=monitor_qvel,
+                hold_qpos_rad=hold_q,
+                observed_age_sec=0.0,
+                position_limits_rad=position_limits_rad,
+                max_age_sec=max_age_sec,
+                max_velocity_rad_s=max_velocity_rad_s,
+                max_rebase_rad=max_rebase_rad,
+            )
+            if stop.get("full_disable_requested", False):
+                break
+            receipt, latest_tau = _send_fault_hold_command(
+                backend,
+                model,
+                qpos_rad=hold_q,
+                measured_qpos_rad=measured_q,
+                measured_qvel_rad_s=monitor_qvel,
+                profile=profile,
+                gravity_scale=gravity_scale,
+                previous_tau=latest_tau,
+                torque_limits_nm=torque_limits_nm,
+                rate_hz=rate_hz,
+            )
+            if not receipt.accepted:
+                errors.extend(
+                    receipt.errors or ("fault hold MIT dispatch was incomplete",)
+                )
+                full_disable_fallback()
+                break
+            hold_commands += 1
+            monitor_q = measured_q
+            monitor_observed_at = observed_at
+        except Exception as exc:  # noqa: BLE001 - preserve safety evidence
+            errors.append(f"fault hold: {exc}")
+            full_disable_fallback()
+            break
+        if max_iterations is not None and hold_commands >= max_iterations:
+            break
+        time.sleep(period)
+
+    if stop.get("full_disable_requested", False):
+        full_disable_fallback()
+    return (
+        hold_commands,
+        latest_tau,
+        first_hold_receipt,
+        non_hold_disable_receipt,
+        full_disable_receipt,
+        errors,
+    )
 
 
 def run_probe(args: argparse.Namespace) -> dict[str, object]:
@@ -501,12 +1045,24 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
-    stop = {"requested": False}
+    support_joint_names = tuple(
+        getattr(args, "support_joints", _FAULT_HOLD_JOINTS)
+    )
+    active_joint_names = resolve_active_joint_names(
+        args.joint,
+        support_joints=support_joint_names,
+    )
+    stop = {"requested": False, "full_disable_requested": False}
     previous_q: tuple[float, ...] | None = None
     previous_feedback_time: float | None = None
     previous_tau = _ZERO_SIX
     initial_q: tuple[float, ...] | None = None
     final_q: tuple[float, ...] | None = None
+    fault_qpos_for_hold: tuple[float, ...] | None = None
+    fault_qvel_for_hold: tuple[float, ...] | None = None
+    last_safe_q: tuple[float, ...] | None = None
+    last_safe_qvel: tuple[float, ...] | None = None
+    last_safe_observed_at_sec: float | None = None
     commands_sent = 0
     freeze_commands = 0
     schedule_overruns = 0
@@ -520,22 +1076,50 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     enable_receipt: B601ModeReceipt | None = None
     cleanup_receipt: B601ModeReceipt | None = None
     cleanup_errors: list[str] = []
-    enable_attempted = False
+    protective_hold_latched = False
+    protective_hold_commands = 0
+    protective_hold_admission_age_sec: float | None = None
+    protective_hold_first_receipt: B601CommandReceipt | None = None
+    protective_hold_non_hold_receipt: B601ModeReceipt | None = None
+    protective_hold_full_disable_receipt: B601ModeReceipt | None = None
+    connected = False
     enabled = False
     old_sigint = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, lambda signum, frame: _signal_handler(stop, signum, frame))
+    old_sigusr1 = signal.getsignal(signal.SIGUSR1)
+    signal.signal(
+        signal.SIGINT,
+        lambda signum, frame: _signal_handler(stop, signum, frame),
+    )
+    signal.signal(
+        signal.SIGUSR1,
+        lambda signum, frame: _signal_handler(stop, signum, frame),
+    )
     try:
         backend.connect()
+        connected = True
         warmup_deadline = time.monotonic() + args.warmup_sec
         warmup_state = None
+        warmup_observed_at_sec: float | None = None
         while time.monotonic() < warmup_deadline:
+            if stop["full_disable_requested"]:
+                raise LowGainProbeError(
+                    "explicit full disable requested before motor enable"
+                )
+            if stop["requested"]:
+                raise LowGainProbeError("operator interrupt before motor enable")
             warmup_state = backend.poll_feedback(request_feedback=True)
-            if warmup_state.valid and warmup_state.positions_rad is not None:
+            warmup_observed_at_sec = time.monotonic()
+            if (
+                warmup_state.valid
+                and not getattr(warmup_state, "stale", False)
+                and warmup_state.positions_rad is not None
+            ):
                 break
             time.sleep(0.01)
         if (
             warmup_state is None
             or not warmup_state.valid
+            or getattr(warmup_state, "stale", False)
             or warmup_state.positions_rad is None
         ):
             reason = (
@@ -547,15 +1131,23 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 "no complete valid feedback snapshot arrived during warmup; "
                 f"last_fault={reason}"
             )
-        initial_q = warmup_state.positions_rad
-        final_q = initial_q
-        for index, (value, (lower, upper)) in enumerate(
-            zip(initial_q, position_limits, strict=True)
-        ):
-            if not lower <= value <= upper:
-                raise LowGainProbeError(
-                    f"warmup qpos_rad[{index}]={value:.6f} is outside URDF limits"
-                )
+        warmup_q = _validate_fault_hold_snapshot(
+            warmup_state.positions_rad,
+            qvel_rad_s=_ZERO_SIX,
+            observed_age_sec=0.0,
+            position_limits_rad=position_limits,
+            max_age_sec=args.fault_hold_max_age_sec,
+            max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
+            max_rebase_rad=args.fault_hold_max_rebase_rad,
+        )
+        initial_q = warmup_q
+        final_q = warmup_q
+        if stop["full_disable_requested"]:
+            raise LowGainProbeError(
+                "explicit full disable requested before motor enable"
+            )
+        if stop["requested"]:
+            raise LowGainProbeError("operator interrupt before motor enable")
         # A preflight stop makes the subsequent mode transition explicit.  It
         # is intentionally done only after the warmup snapshot and requires
         # the operator's physical support/estop procedure from the handoff.
@@ -564,22 +1156,69 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             raise LowGainProbeError(
                 "preflight safe_stop failed: " + "; ".join(preflight_disable.errors)
             )
-        mode_receipt = backend.prepare_mit_mode(joint_names=_ALL_JOINTS)
+        mode_receipt = backend.prepare_mit_mode(joint_names=active_joint_names)
         if not mode_receipt.completed:
             raise LowGainProbeError(
                 "MIT mode setup failed: " + "; ".join(mode_receipt.errors)
             )
-        enable_attempted = True
-        enable_receipt = backend.enable(joint_names=_ALL_JOINTS)
+        if stop["full_disable_requested"]:
+            raise LowGainProbeError(
+                "explicit full disable requested before motor enable"
+            )
+        if stop["requested"]:
+            raise LowGainProbeError("operator interrupt before motor enable")
+        enable_receipt = backend.enable(joint_names=active_joint_names)
         if not enable_receipt.completed:
             raise LowGainProbeError(
                 "motor enable failed: " + "; ".join(enable_receipt.errors)
             )
         enabled = True
+        arming_state = backend.poll_feedback(request_feedback=True)
+        arming_observed_at_sec = time.monotonic()
+        if (
+            not arming_state.valid
+            or getattr(arming_state, "stale", False)
+            or arming_state.positions_rad is None
+        ):
+            raise LowGainProbeError(
+                "post-enable feedback snapshot was not complete and valid; "
+                f"last_fault={arming_state.fault_reason or 'unknown'}"
+            )
+        if warmup_observed_at_sec is None:
+            raise LowGainProbeError("missing warmup observation timestamp")
+        arm_dt = arming_observed_at_sec - warmup_observed_at_sec
+        if not math.isfinite(arm_dt) or arm_dt <= 0.0:
+            raise LowGainProbeError("non-positive warmup-to-enable observation interval")
+        arming_q = _six(arming_state.positions_rad, name="arming_qpos_rad")
+        arming_qvel = tuple(
+            (current - previous) / arm_dt
+            for current, previous in zip(arming_q, warmup_q, strict=True)
+        )
+        arming_q = _validate_fault_hold_snapshot(
+            arming_q,
+            qvel_rad_s=arming_qvel,
+            observed_age_sec=0.0,
+            position_limits_rad=position_limits,
+            max_age_sec=args.fault_hold_max_age_sec,
+            max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
+            max_rebase_rad=args.fault_hold_max_rebase_rad,
+        )
+        initial_q = arming_q
+        final_q = arming_q
+        last_safe_q = arming_q
+        last_safe_qvel = tuple(float(value) for value in arming_qvel)
+        last_safe_observed_at_sec = arming_observed_at_sec
+        previous_q = arming_q
+        previous_feedback_time = arming_state.receive_timestamp_sec
         period = 1.0 / args.rate_hz
         started = time.monotonic()
         next_deadline = started
         while time.monotonic() - started < args.duration_sec:
+            fault_qpos_for_hold = None
+            fault_qvel_for_hold = None
+            if stop["full_disable_requested"]:
+                stop_reason = "explicit_full_disable"
+                break
             if stop["requested"]:
                 stop_reason = "operator_interrupt"
                 break
@@ -587,12 +1226,33 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             if now < next_deadline:
                 time.sleep(next_deadline - now)
             state = backend.poll_feedback(request_feedback=True)
+            observed_at_sec = time.monotonic()
             ledger.mark("feedback", state.receive_timestamp_sec)
             if not state.valid or state.positions_rad is None:
                 stop_reason = state.fault_reason or "invalid feedback snapshot"
                 break
+            if getattr(state, "stale", False):
+                stop_reason = "stale feedback snapshot"
+                break
             q = state.positions_rad
             final_q = q
+            try:
+                q = _six(q, name="feedback_qpos_rad")
+            except (TypeError, ValueError) as exc:
+                stop_reason = f"invalid feedback position: {exc}"
+                break
+            fault_qpos_for_hold = q
+            for index, (value, (lower, upper)) in enumerate(
+                zip(q, position_limits, strict=True)
+            ):
+                if not lower <= value <= upper:
+                    stop_reason = (
+                        f"feedback qpos_rad[{index}]={value:.6f} is outside "
+                        f"URDF limits [{lower:.6f}, {upper:.6f}]"
+                    )
+                    break
+            if stop_reason is not None:
+                break
             if previous_q is None:
                 qvel = _ZERO_SIX
                 dt = period
@@ -607,6 +1267,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     (current - previous) / dt
                     for current, previous in zip(q, previous_q, strict=True)
                 )
+            fault_qvel_for_hold = tuple(float(value) for value in qvel)
             if any(not math.isfinite(value) for value in qvel):
                 stop_reason = "non-finite finite-difference velocity"
                 break
@@ -616,6 +1277,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     f"velocity abort: max_abs_fd_velocity={max_velocity:.6f} "
                     f"> {args.velocity_abort_rad_s:.6f} rad/s"
                 )
+                break
+            try:
+                safe_candidate_q = _validate_fault_hold_snapshot(
+                    q,
+                    qvel_rad_s=qvel,
+                    observed_age_sec=max(0.0, time.monotonic() - observed_at_sec),
+                    position_limits_rad=position_limits,
+                    max_age_sec=args.fault_hold_max_age_sec,
+                    max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
+                    max_rebase_rad=args.fault_hold_max_rebase_rad,
+                )
+            except LowGainProbeError as exc:
+                stop_reason = f"last-safe snapshot rejected: {exc}"
                 break
             elapsed = time.monotonic() - started
             qref, qvel_ref, step_done = plan_reference(
@@ -630,7 +1304,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             )
             max_error = max(
                 abs(current - reference)
-                for current, reference in zip(q, qref, strict=True)
+                for index, (current, reference) in enumerate(
+                    zip(q, qref, strict=True)
+                )
+                if _ALL_JOINTS[index] in active_joint_names
             )
             if max_error > args.max_error_rad:
                 stop_reason = (
@@ -670,7 +1347,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 kd=_ZERO_SIX,
                 tau_nm=conditioned_tau,
                 torque_limits_nm=torque_limits,
-                joint_names=_ALL_JOINTS,
+                joint_names=active_joint_names,
             )
             if not receipt.accepted:
                 stop_reason = "; ".join(receipt.errors) or "incomplete MIT dispatch"
@@ -700,6 +1377,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             previous_q = q
             previous_feedback_time = state.receive_timestamp_sec
             previous_tau = conditioned_tau
+            last_safe_q = safe_candidate_q
+            last_safe_qvel = tuple(float(value) for value in qvel)
+            last_safe_observed_at_sec = observed_at_sec
             next_deadline += period
             completed_at = time.monotonic()
             if completed_at > next_deadline:
@@ -712,20 +1392,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     except Exception as exc:  # noqa: BLE001 - report unexpected probe failure
         primary_error = exc
     finally:
-        if enable_attempted:
-            if enabled:
-                freeze_commands, previous_tau, freeze_errors = _freeze_and_stop(
-                    backend,
-                    model,
-                    qpos_rad=final_q,
-                    profile=profile,
-                    gravity_scale=args.gravity_scale,
-                    previous_tau=previous_tau,
-                    torque_limits_nm=torque_limits,
-                    freeze_sec=args.freeze_sec,
-                    rate_hz=args.rate_hz,
-                )
-                cleanup_errors.extend(freeze_errors)
+        full_stop_attempts = 0
+
+        def issue_full_safe_stop() -> None:
+            nonlocal cleanup_receipt, full_stop_attempts
+            if cleanup_receipt is not None and cleanup_receipt.completed:
+                return
+            if full_stop_attempts >= 2:
+                return
+            full_stop_attempts += 1
             try:
                 cleanup_receipt = backend.safe_stop(joint_names=_ALL_JOINTS)
                 if not cleanup_receipt.completed:
@@ -734,14 +1409,98 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         for error in cleanup_receipt.errors
                     )
                     if not cleanup_receipt.errors:
-                        cleanup_errors.append("safe_stop incomplete without vendor error")
+                        cleanup_errors.append(
+                            "safe_stop incomplete without vendor error"
+                        )
             except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
                 cleanup_errors.append(f"safe_stop: {exc}")
+
+        if connected:
+            exceptional_stop = primary_error is not None or stop_reason is not None
+            explicit_full_disable = stop.get("full_disable_requested", False)
+            if enabled and exceptional_stop and not explicit_full_disable:
+                # A communication/feedback fault without a complete current
+                # sample cannot safely rebase a hold; use the upstream-style
+                # immediate emergency disable fallback instead.
+                can_attempt_hold = (
+                    fault_qpos_for_hold is not None
+                    or stop_reason == "operator_interrupt"
+                )
+                if can_attempt_hold:
+                    if last_safe_observed_at_sec is None:
+                        safe_age_sec = math.inf
+                    else:
+                        safe_age_sec = max(
+                            0.0,
+                            time.monotonic() - last_safe_observed_at_sec,
+                        )
+                    protective_hold_admission_age_sec = safe_age_sec
+                    try:
+                        (
+                            protective_hold_commands,
+                            previous_tau,
+                            protective_hold_first_receipt,
+                            protective_hold_non_hold_receipt,
+                            protective_hold_full_disable_receipt,
+                            hold_errors,
+                        ) = _run_latched_fault_hold(
+                            backend,
+                            model,
+                            qpos_rad=last_safe_q,
+                            qvel_rad_s=last_safe_qvel,
+                            observed_age_sec=safe_age_sec,
+                            fault_qpos_rad=fault_qpos_for_hold,
+                            fault_qvel_rad_s=fault_qvel_for_hold,
+                            position_limits_rad=position_limits,
+                            max_age_sec=args.fault_hold_max_age_sec,
+                            max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
+                            max_rebase_rad=args.fault_hold_max_rebase_rad,
+                            profile=profile,
+                            gravity_scale=args.gravity_scale,
+                            previous_tau=previous_tau,
+                            torque_limits_nm=torque_limits,
+                            rate_hz=args.rate_hz,
+                            stop=stop,
+                        )
+                        cleanup_errors.extend(hold_errors)
+                        protective_hold_latched = (
+                            protective_hold_first_receipt is not None
+                            and protective_hold_non_hold_receipt is not None
+                            and protective_hold_non_hold_receipt.completed
+                            and protective_hold_commands > 0
+                        )
+                        if protective_hold_full_disable_receipt is not None:
+                            cleanup_receipt = protective_hold_full_disable_receipt
+                    except Exception as exc:  # noqa: BLE001 - preserve safety evidence
+                        cleanup_errors.append(f"protective hold: {exc}")
+                else:
+                    cleanup_errors.append(
+                        "protective hold refused: no complete current fault snapshot"
+                    )
+                issue_full_safe_stop()
+            elif enabled and not exceptional_stop:
+                freeze_commands, previous_tau, freeze_errors = _freeze_and_stop(
+                    backend,
+                    model,
+                    qpos_rad=last_safe_q,
+                    profile=profile,
+                    gravity_scale=args.gravity_scale,
+                    previous_tau=previous_tau,
+                    torque_limits_nm=torque_limits,
+                    freeze_sec=args.freeze_sec,
+                    rate_hz=args.rate_hz,
+                    joint_names=active_joint_names,
+                )
+                cleanup_errors.extend(freeze_errors)
+                issue_full_safe_stop()
+            else:
+                issue_full_safe_stop()
         try:
             backend.close()
         except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
             cleanup_errors.append(f"close: {exc}")
         signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGUSR1, old_sigusr1)
 
     if primary_error is not None:
         detail = str(primary_error)
@@ -786,6 +1545,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
         "transport": "motorbridge_wired_local",
         "joint_names": _ALL_JOINTS,
+        "active_joint_names": active_joint_names,
+        "support_joint_names": support_joint_names,
+        "fault_hold_joint_names": _FAULT_HOLD_JOINTS,
+        "fault_hold_non_hold_joint_names": _NON_FAULT_HOLD_JOINTS,
         "target_joint": args.joint,
         "motors_enabled_by_probe": enabled,
         "motion_commands_sent": commands_sent > 0,
@@ -799,6 +1562,33 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "mode_receipt": _mode_receipt_payload(mode_receipt),
         "enable_receipt": _mode_receipt_payload(enable_receipt),
         "cleanup_receipt": _mode_receipt_payload(cleanup_receipt),
+        "protective_hold": {
+            "latched": protective_hold_latched,
+            "command_count": protective_hold_commands,
+            "first_command_receipt": _command_receipt_payload(
+                protective_hold_first_receipt
+            ),
+            "non_hold_disable_receipt": _mode_receipt_payload(
+                protective_hold_non_hold_receipt
+            ),
+            "full_disable_receipt": _mode_receipt_payload(
+                protective_hold_full_disable_receipt
+            ),
+            "last_safe_qpos_rad": last_safe_q,
+            "last_safe_qvel_rad_s": last_safe_qvel,
+            "last_safe_age_sec": (
+                None
+                if last_safe_observed_at_sec is None
+                else max(0.0, time.monotonic() - last_safe_observed_at_sec)
+            ),
+            "admission_age_sec": protective_hold_admission_age_sec,
+            "max_age_sec": args.fault_hold_max_age_sec,
+            "max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
+            "max_rebase_rad": args.fault_hold_max_rebase_rad,
+            "vendor_kp_nm_per_rad": _ZERO_SIX,
+            "vendor_kd_nm_s_per_rad": _ZERO_SIX,
+            "reference_velocity_rad_s": _ZERO_SIX,
+        },
         "initial_qpos_rad": initial_q,
         "final_qpos_rad": final_q,
         "profile": {
@@ -828,7 +1618,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "samples": samples,
         "notes": [
             "Human-run commissioning only; automated tests never execute this active path.",
-            "All six arm motors are used as bounded support joints; gripper motor ID7 is excluded.",
+            "The active set is target joint plus mandatory joint2/joint3 support; unselected arm joints are never enabled or dispatched.",
+            "On an exceptional stop, only joint2/joint3 may be latched; joint1/joint4/joint5/joint6 are safe-stopped, and SIGUSR1 is required for full disable.",
+            "Protective hold admits only a host-fresh, in-limit, near-zero-velocity last-safe snapshot and a small fault rebase; otherwise it falls back to full safe_stop.",
+            "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
+            "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the warmup pose; slow-step uses a bounded relative step.",
             "Software composes gravity, position, and finite-difference damping, then dispatches vendor MIT kp=kd=0.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
@@ -857,7 +1651,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-sec", type=float, default=_DEFAULT_WARMUP_SEC)
     parser.add_argument("--freeze-sec", type=float, default=_DEFAULT_FREEZE_SEC)
     parser.add_argument("--rate-hz", type=float, default=_DEFAULT_RATE_HZ)
-    parser.add_argument("--joint", choices=_ALL_JOINTS, default="joint3")
+    parser.add_argument(
+        "--joint",
+        choices=_ALL_JOINTS,
+        default="joint1",
+        help="joint whose reference may change; joint2/joint3 remain support joints",
+    )
+    parser.add_argument(
+        "--support-joint",
+        dest="support_joints",
+        action="append",
+        default=list(_FAULT_HOLD_JOINTS),
+        help="additional support joint; joint2 and joint3 are always mandatory",
+    )
     parser.add_argument("--step-rad", type=float, default=_DEFAULT_STEP_RAD)
     parser.add_argument(
         "--step-speed-rad-s",
@@ -885,6 +1691,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_VELOCITY_ABORT_RAD_S,
     )
     parser.add_argument("--max-error-rad", type=float, default=_DEFAULT_MAX_ERROR_RAD)
+    parser.add_argument(
+        "--fault-hold-max-age-sec",
+        type=float,
+        default=_DEFAULT_FAULT_HOLD_MAX_AGE_SEC,
+        help="maximum host-observation age allowed for a protective hold",
+    )
+    parser.add_argument(
+        "--fault-hold-max-velocity-rad-s",
+        type=float,
+        default=_DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S,
+        help="maximum absolute observed velocity for a protective hold",
+    )
+    parser.add_argument(
+        "--fault-hold-max-rebase-rad",
+        type=float,
+        default=_DEFAULT_FAULT_HOLD_MAX_REBASE_RAD,
+        help="maximum joint2/joint3 fault-to-last-safe rebase distance",
+    )
     parser.add_argument("--allow-motion", action="store_true")
     parser.add_argument("--auto-disable", action="store_true")
     parser.add_argument("--confirmation", default="")
