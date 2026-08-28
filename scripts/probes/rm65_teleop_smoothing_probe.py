@@ -2407,11 +2407,9 @@ def _validate_collision_pair(
     result_by_side: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     from scripts.probes.rm65_qref_dynamics_probe import (  # noqa: PLC0415
-        _build_collision_planner,
-    )
-    from scripts.probes.rm65_official_all_ik_probe import (  # noqa: PLC0415
         _LEFT_TOOL,
         _RIGHT_TOOL,
+        _build_collision_planner,
     )
 
     command = {
