@@ -19,7 +19,7 @@ import math
 import os
 from pathlib import Path
 import statistics
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
