@@ -16,6 +16,37 @@ FULLY_ACTUATED_TASK_CONFIG = Path(
 )
 
 
+@pytest.mark.parametrize("parent_value", (None, "/parent/runtime/lib"))
+def test_worker_runtime_library_path_restores_parent_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    parent_value: str | None,
+) -> None:
+    import os
+    import sys
+
+    from sim.mujoco.runtime.cube_lift_vector import _worker_runtime_library_path
+
+    environment_root = tmp_path / "worker-environment"
+    runtime_lib = environment_root / "lib"
+    runtime_lib.mkdir(parents=True)
+    monkeypatch.setattr(sys, "prefix", str(environment_root))
+    if parent_value is None:
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    else:
+        monkeypatch.setenv("LD_LIBRARY_PATH", parent_value)
+
+    with _worker_runtime_library_path():
+        inherited = os.environ["LD_LIBRARY_PATH"].split(":")
+        assert inherited[0] == str(runtime_lib)
+        assert inherited[1:] == ([] if parent_value is None else [parent_value])
+
+    if parent_value is None:
+        assert "LD_LIBRARY_PATH" not in os.environ
+    else:
+        assert os.environ["LD_LIBRARY_PATH"] == parent_value
+
+
 def test_fast_kernel_matches_reference_action_trace(tmp_path: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("gymnasium")

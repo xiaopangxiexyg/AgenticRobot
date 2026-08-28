@@ -6,33 +6,47 @@ import multiprocessing as mp
 import os
 import sys
 import traceback
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from multiprocessing.connection import Connection
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 
 
-def _prepare_worker_runtime_library_path() -> None:
-    """Prefer the active Python environment's C++ runtime in spawned workers.
+@contextmanager
+def _worker_runtime_library_path() -> Iterator[None]:
+    """Prefer the active Python environment's C++ runtime while workers start.
 
     Pinocchio is optional for sim, but when it is available the canonical
     pose-to-qref planner should be used consistently by the parent and worker
     processes.  Some hosts prepend an older system ``libstdc++``; placing the
-    active environment's ``lib`` directory first fixes that loader mismatch
-    without changing the policy or actuator contract.  The pose-action module
-    still has a MuJoCo DLS fallback for genuinely unavailable optional wheels.
+    active environment's ``lib`` directory first while a worker inherits its
+    process environment fixes that loader mismatch without permanently changing
+    the parent process.  The pose-action module still has a MuJoCo DLS fallback
+    for genuinely unavailable optional wheels.
     """
 
     runtime_lib = Path(sys.prefix) / "lib"
     if not runtime_lib.is_dir():
+        yield
         return
+    had_previous = "LD_LIBRARY_PATH" in os.environ
+    previous = os.environ.get("LD_LIBRARY_PATH", "")
     current = [item for item in os.environ.get("LD_LIBRARY_PATH", "").split(":") if item]
     runtime_text = str(runtime_lib)
     if runtime_text in current:
         current.remove(runtime_text)
-    os.environ["LD_LIBRARY_PATH"] = ":".join((runtime_text, *current))
+    try:
+        os.environ["LD_LIBRARY_PATH"] = ":".join((runtime_text, *current))
+        yield
+    finally:
+        if had_previous:
+            os.environ["LD_LIBRARY_PATH"] = previous
+        else:
+            os.environ.pop("LD_LIBRARY_PATH", None)
 
 try:
     from gymnasium.vector import VectorEnv as _VectorEnvBase
@@ -204,7 +218,6 @@ class CubeLiftVectorExecutor:
             self._arrays[name].fill(0)
 
         context = mp.get_context(start_method)
-        _prepare_worker_runtime_library_path()
         self._connections: list[Connection] = []
         self._processes: list[mp.Process] = []
         names = {name: segment.name for name, segment in self._segments.items()}
@@ -227,7 +240,8 @@ class CubeLiftVectorExecutor:
                     name=f"cube-lift-worker-{env_id}",
                     daemon=True,
                 )
-                process.start()
+                with _worker_runtime_library_path():
+                    process.start()
                 child.close()
                 self._connections.append(parent)
                 self._processes.append(process)
