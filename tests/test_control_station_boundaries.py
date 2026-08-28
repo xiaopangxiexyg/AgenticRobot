@@ -226,6 +226,8 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
         "control_station/rm65_calibration_debug_application.py": ["sim"],
         "control_station/sim_hil_profile/factory.py": ["sim"],
         "control_station/sim_hil_profile/openpi_policy_source.py": ["sim"],
+        # Concrete state-BC Sim-HIL binding; the shared runtime remains neutral.
+        "control_station/sim_hil_profile/state_bc_policy_source.py": ["sim"],
     }
 
 

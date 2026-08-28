@@ -3,7 +3,7 @@
 The profile is deliberately narrow and default-off:
 
 * the default temporary MuJoCo PPO checkpoint contributes ``right_arm`` pose
-  plus ``right_hand`` qpos; an explicitly selected OpenPI source may instead
+  plus ``right_hand`` qpos; explicitly selected OpenPI and state-BC sources
   observe the bimanual state and contribute the same current right-side scope;
 * real VIVE and Q6 are constructed through the passive teleop builder and can
   only produce a human emission;
@@ -190,6 +190,15 @@ def _build_application(
         policy_source_builder = lambda context: (
             build_mujoco_openpi_state_policy_source(profile, context)
         )
+    elif config.policy_backend == "state_bc":
+        from control_station.sim_hil_profile.state_bc_policy_source import (
+            build_mujoco_state_bc_policy_source,
+        )
+
+        profile = _mujoco_state_bc_policy_source_profile(config)
+        policy_source_builder = lambda context: (
+            build_mujoco_state_bc_policy_source(profile, context)
+        )
     return _build_application_graph(
         config,
         trace_sink=trace_sink,
@@ -232,6 +241,32 @@ def _mujoco_openpi_state_policy_source_profile(
     )
 
 
+def _mujoco_state_bc_policy_source_profile(
+    config: MujocoSimHILApplicationConfig,
+) -> Any:
+    """Project Station CLI selection into the state-BC provider binding."""
+
+    from control_station.sim_hil_profile.state_bc_policy_source import (
+        MujocoStateBCPolicySourceProfile,
+    )
+
+    artifact_path = config.state_bc_artifact_path
+    if artifact_path is None:
+        raise ValueError(
+            "state_bc policy backend requires state_bc_artifact_path."
+        )
+    return MujocoStateBCPolicySourceProfile(
+        policy_artifact_path=artifact_path,
+        action_hz=config.state_bc_action_hz,
+        policy_hz=config.state_bc_policy_hz,
+        prediction_request_queue_threshold=(
+            config.state_bc_prediction_queue_threshold
+        ),
+        output_active_sides=("right",),
+        model_observation_sides=("left", "right"),
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m control_station sim-hil",
@@ -255,7 +290,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="temp_ppo",
         help=(
             "Policy contributor backend. temp_ppo preserves the existing path; "
-            "openpi_state consumes a prepared state-only OpenPI artifact."
+            "openpi_state consumes a prepared state-only OpenPI artifact; "
+            "state_bc consumes a serialized 16D state-BC artifact."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -286,6 +322,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Request the next chunk when this many admitted keyframes remain; "
             "the result is appended and cannot rewrite the current chunk."
+        ),
+    )
+    parser.add_argument(
+        "--state-bc-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Self-contained .npz state-BC artifact for --policy-backend "
+            "state_bc (16D state -> 16D desk_absolute action)."
+        ),
+    )
+    parser.add_argument("--state-bc-action-hz", type=float, default=15.0)
+    parser.add_argument("--state-bc-policy-hz", type=float, default=15.0)
+    parser.add_argument(
+        "--state-bc-prediction-queue-threshold",
+        type=int,
+        default=1,
+        help=(
+            "Request the next state-BC prediction when this many admitted "
+            "keyframes remain (default: 1)."
         ),
     )
     parser.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
@@ -619,6 +675,12 @@ def _config_from_args(args: argparse.Namespace) -> MujocoSimHILApplicationConfig
         openpi_prediction_queue_threshold=(
             args.openpi_prediction_queue_threshold
         ),
+        state_bc_artifact_path=args.state_bc_artifact,
+        state_bc_action_hz=args.state_bc_action_hz,
+        state_bc_policy_hz=args.state_bc_policy_hz,
+        state_bc_prediction_queue_threshold=(
+            args.state_bc_prediction_queue_threshold
+        ),
         task_config_path=args.task_config,
         calibration_profile_path=args.calibration_profile,
         vive_coordinate_profile_path=args.vive_coordinate_profile,
@@ -765,7 +827,7 @@ def _run_dry_run(
             "model_observation_sides": ["right"],
             "output_active_sides": ["right"],
         }
-    else:
+    elif config.policy_backend == "openpi_state":
         from control_station.sim_hil_profile.openpi_policy_source import (
             preflight_mujoco_openpi_state_policy_source,
         )
@@ -785,6 +847,30 @@ def _run_dry_run(
         }
         policy_dimensions = source_preflight["policy_dimensions"]
         artifact_path = config.openpi_policy_artifact_path
+        assert artifact_path is not None
+        policy_artifact_path = str(artifact_path)
+        policy_checkpoint_path = None
+        policy_topology = source_preflight["policy_topology"]
+    else:
+        from control_station.sim_hil_profile.state_bc_policy_source import (
+            preflight_mujoco_state_bc_policy_source,
+        )
+
+        source_preflight = preflight_mujoco_state_bc_policy_source(
+            _mujoco_state_bc_policy_source_profile(config)
+        )
+        compatibility = {
+            key: source_preflight[key]
+            for key in (
+                "prepared_artifact_required",
+                "state_only_capability",
+                "server_connection_checked",
+                "full_bimanual_execution",
+                "projection",
+            )
+        }
+        policy_dimensions = source_preflight["policy_dimensions"]
+        artifact_path = config.state_bc_artifact_path
         assert artifact_path is not None
         policy_artifact_path = str(artifact_path)
         policy_checkpoint_path = None
@@ -1106,6 +1192,91 @@ def _build_sim_hil_vive_setup_controller(
     return controller
 
 
+def _sim_hil_policy_bootstrap_status(
+    config: MujocoSimHILApplicationConfig,
+) -> dict[str, Any]:
+    """Describe the selected policy before a MuJoCo application exists.
+
+    The acceptance GUI is intentionally available while the Station is still
+    in VIVE setup.  At that point the application has not loaded the policy
+    source yet, so its status cannot be used to identify the artifact or model
+    contract.  Keep this projection resource-free while sharing the concrete
+    state-BC constants with the actual binding.
+    """
+
+    backend = str(config.policy_backend)
+    artifact_path = None
+    checkpoint = None
+    metadata: dict[str, Any] = {
+        "backend": backend,
+        "checkpoint": None,
+        "policy_artifact": None,
+        "artifact_path": None,
+        "artifact_status": "not_configured",
+        "artifact_schema": None,
+        "layout_hash": None,
+        "policy_dimensions": None,
+        "model_state_dim": None,
+        "model_action_dim": None,
+        "model_observation_sides": None,
+        "output_active_sides": None,
+        "state_only_capability": None,
+        "full_bimanual_execution": None,
+        "projection": None,
+    }
+    if backend == "temp_ppo":
+        checkpoint = str(config.checkpoint_path)
+        metadata.update(
+            checkpoint=checkpoint,
+            artifact_status="checkpoint_configured",
+        )
+    elif backend == "openpi_state":
+        artifact_path = config.openpi_policy_artifact_path
+        if artifact_path is not None:
+            metadata.update(
+                artifact_status=(
+                    "configured" if artifact_path.is_file() else "not_found"
+                ),
+                policy_artifact=str(artifact_path),
+                artifact_path=str(artifact_path),
+            )
+    elif backend == "state_bc":
+        # Import only the pure contract constants.  This does not construct a
+        # scene, load the artifact, start a worker, or contact a policy server.
+        from sim.mujoco.deploy.state_policy_adapter import (
+            STATE_BC_ACTION_DIM,
+            STATE_BC_LAYOUT_HASH_V1,
+            STATE_BC_MODEL_SCHEMA_V1,
+            STATE_BC_STATE_DIM,
+        )
+
+        artifact_path = config.state_bc_artifact_path
+        metadata.update(
+            artifact_status=(
+                "configured"
+                if artifact_path is not None and artifact_path.is_file()
+                else "not_found"
+                if artifact_path is not None
+                else "not_configured"
+            ),
+            policy_artifact=(
+                None if artifact_path is None else str(artifact_path)
+            ),
+            artifact_path=(None if artifact_path is None else str(artifact_path)),
+            artifact_schema=STATE_BC_MODEL_SCHEMA_V1,
+            layout_hash=STATE_BC_LAYOUT_HASH_V1,
+            policy_dimensions=[STATE_BC_STATE_DIM, STATE_BC_ACTION_DIM],
+            model_state_dim=STATE_BC_STATE_DIM,
+            model_action_dim=STATE_BC_ACTION_DIM,
+            model_observation_sides=["left", "right"],
+            output_active_sides=["right"],
+            state_only_capability=True,
+            full_bimanual_execution=False,
+            projection="bimanual_state_bc_to_right_arm_and_gripper_contributor",
+        )
+    return metadata
+
+
 def _sim_hil_bootstrap_status(
     config: MujocoSimHILApplicationConfig,
     *,
@@ -1133,6 +1304,13 @@ def _sim_hil_bootstrap_status(
         vive_status.get("vive_receiver", {})
         if isinstance(vive_status.get("vive_receiver", {}), Mapping)
         else {}
+    )
+    policy_status = _sim_hil_policy_bootstrap_status(config)
+    policy_status.update(
+        started=False,
+        ready=False,
+        refresh_state="not_constructed",
+        last_emission={},
     )
     return {
         "schema": SIM_HIL_STATUS_SCHEMA_V1,
@@ -1219,23 +1397,7 @@ def _sim_hil_bootstrap_status(
             "status": "not_constructed",
             "reason": "waiting_for_vive_setup",
         },
-        "policy": {
-            "started": False,
-            "ready": False,
-            "refresh_state": "not_constructed",
-            "backend": config.policy_backend,
-            "checkpoint": (
-                str(config.checkpoint_path)
-                if config.policy_backend == "temp_ppo"
-                else None
-            ),
-            "policy_artifact": (
-                None
-                if config.openpi_policy_artifact_path is None
-                else str(config.openpi_policy_artifact_path)
-            ),
-            "last_emission": {},
-        },
+        "policy": policy_status,
         "human": {
             "session_state": "VIVE_SETUP",
             "source_started": bool(
