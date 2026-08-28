@@ -17,7 +17,6 @@ import numpy as np
 
 from dataset_contracts.arm_mode import (
     ARM_MODE_IDS,
-    ARM_MODE_SCHEMA_V2,
     DEFAULT_ARM_HOLD_TRAINING_CONTRACT_V1,
     ArmHoldTrainingContract,
     ResolvedArmHoldTrainingContract,
