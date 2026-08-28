@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,26 @@ DEFAULT_CONFIG_PATH = (
     / "configs"
     / "rm65_random_grasp_pose_reachability_v1.json"
 )
+CONFIG_SCHEMA_VERSION = "rm65.random_grasp_pose_reachability.v1"
+SCENARIO_ID = "rm65_random_grasp_pose_reachability"
+DEFAULT_SAMPLER_ID = "pcg64_uniform_box_shoemake_so3_v1"
+DEFAULT_REFERENCE_FRAME_ID = "rm65.single_arm_urdf_model_base"
+DEFAULT_REFERENCE_FRAME_SPEC = {
+    "schema": "rm65.reference_frame.v1",
+    "reference_frame_id": DEFAULT_REFERENCE_FRAME_ID,
+    "origin": "single_arm_urdf_model_root",
+    "axes": "single_arm_urdf_model_coordinates",
+    "target_pose_semantics": "reference_from_controlled_frame",
+    "translation_unit": "m",
+}
+DEFAULT_REFERENCE_FRAME_SPEC_HASH = hashlib.sha256(
+    json.dumps(
+        DEFAULT_REFERENCE_FRAME_SPEC,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -35,8 +56,11 @@ class RM65RandomGraspPoseReachabilityConfig:
     sample_count: int = 12
     position_min_m: tuple[float, float, float] = (-0.70, -0.80, -0.10)
     position_max_m: tuple[float, float, float] = (0.70, 0.80, 1.20)
+    sampler_id: str = DEFAULT_SAMPLER_ID
     orientation_sampler: str = "shoemake_uniform_so3"
     controlled_frame: str = "tool_tcp"
+    reference_frame_id: str = DEFAULT_REFERENCE_FRAME_ID
+    reference_frame_spec_hash: str = DEFAULT_REFERENCE_FRAME_SPEC_HASH
     max_ik_candidates: int = 6
     ik_max_iterations: int = 250
     ik_max_joint_step_rad: float = 0.10
@@ -58,6 +82,21 @@ class RM65RandomGraspPoseReachabilityConfig:
             raise ValueError("Every position_min_m value must be below position_max_m.")
         if str(self.orientation_sampler) != "shoemake_uniform_so3":
             raise ValueError("orientation_sampler must be 'shoemake_uniform_so3'.")
+        if str(self.sampler_id) != DEFAULT_SAMPLER_ID:
+            raise ValueError(f"sampler_id must be {DEFAULT_SAMPLER_ID!r}.")
+        frame_id = str(self.reference_frame_id).strip()
+        frame_hash = str(self.reference_frame_spec_hash).strip().lower()
+        if not frame_id:
+            raise ValueError("reference_frame_id must not be empty.")
+        if not _is_sha256(frame_hash):
+            raise ValueError("reference_frame_spec_hash must be a lowercase SHA-256.")
+        if (
+            frame_id == DEFAULT_REFERENCE_FRAME_ID
+            and frame_hash != DEFAULT_REFERENCE_FRAME_SPEC_HASH
+        ):
+            raise ValueError(
+                "the canonical RM65 model-base frame requires its canonical spec hash"
+            )
         positive_fields = (
             "sample_count",
             "max_ik_candidates",
@@ -96,12 +135,24 @@ class RM65RandomGraspPoseReachabilityConfig:
         object.__setattr__(self, "position_max_m", maximum)
         object.__setattr__(self, "conservative_workspace_origin_m", origin)
         object.__setattr__(self, "controlled_frame", str(self.controlled_frame))
+        object.__setattr__(self, "sampler_id", str(self.sampler_id))
+        object.__setattr__(self, "reference_frame_id", frame_id)
+        object.__setattr__(self, "reference_frame_spec_hash", frame_hash)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "RM65RandomGraspPoseReachabilityConfig":
+        if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
+            raise ValueError(
+                f"schema_version must be exactly {CONFIG_SCHEMA_VERSION!r}; "
+                f"got {payload.get('schema_version')!r}."
+            )
+        if payload.get("scenario") != SCENARIO_ID:
+            raise ValueError(
+                f"scenario must be exactly {SCENARIO_ID!r}; got {payload.get('scenario')!r}."
+            )
         values = dict(payload)
-        values.pop("schema_version", None)
-        values.pop("scenario", None)
+        del values["schema_version"]
+        del values["scenario"]
         return cls(**values)
 
 
@@ -109,12 +160,37 @@ class RM65RandomGraspPoseReachabilityConfig:
 class RandomGraspPoseSample:
     sample_index: int
     target_pose: np.ndarray
+    sampler_id: str
+    seed: int
+    reference_frame_id: str
+    reference_frame_spec_hash: str
+    target_pose_content_hash: str
 
     def __post_init__(self) -> None:
         pose = np.asarray(self.target_pose, dtype=float).reshape(4, 4).copy()
         pose.setflags(write=False)
         object.__setattr__(self, "sample_index", int(self.sample_index))
         object.__setattr__(self, "target_pose", pose)
+        object.__setattr__(self, "sampler_id", str(self.sampler_id))
+        object.__setattr__(self, "seed", int(self.seed))
+        frame_id = str(self.reference_frame_id).strip()
+        frame_hash = str(self.reference_frame_spec_hash).strip().lower()
+        content_hash = str(self.target_pose_content_hash).strip().lower()
+        if not frame_id or not _is_sha256(frame_hash) or not _is_sha256(content_hash):
+            raise ValueError("sample frame identity and target pose hash must be valid.")
+        expected_hash = compute_target_pose_content_hash(
+            pose,
+            sampler_id=self.sampler_id,
+            seed=self.seed,
+            sample_index=self.sample_index,
+            reference_frame_id=frame_id,
+            reference_frame_spec_hash=frame_hash,
+        )
+        if content_hash != expected_hash:
+            raise ValueError("target_pose_content_hash does not match sample content.")
+        object.__setattr__(self, "reference_frame_id", frame_id)
+        object.__setattr__(self, "reference_frame_spec_hash", frame_hash)
+        object.__setattr__(self, "target_pose_content_hash", content_hash)
 
 
 def load_random_grasp_pose_reachability_config(
@@ -143,7 +219,25 @@ def generate_random_grasp_pose_samples(
         pose = np.eye(4, dtype=float)
         pose[:3, 3] = rng.uniform(lower, upper)
         pose[:3, :3] = _sample_shoemake_rotation_matrix(rng)
-        samples.append(RandomGraspPoseSample(sample_index=sample_index, target_pose=pose))
+        content_hash = compute_target_pose_content_hash(
+            pose,
+            sampler_id=config.sampler_id,
+            seed=config.seed,
+            sample_index=sample_index,
+            reference_frame_id=config.reference_frame_id,
+            reference_frame_spec_hash=config.reference_frame_spec_hash,
+        )
+        samples.append(
+            RandomGraspPoseSample(
+                sample_index=sample_index,
+                target_pose=pose,
+                sampler_id=config.sampler_id,
+                seed=config.seed,
+                reference_frame_id=config.reference_frame_id,
+                reference_frame_spec_hash=config.reference_frame_spec_hash,
+                target_pose_content_hash=content_hash,
+            )
+        )
     return tuple(samples)
 
 
@@ -223,6 +317,8 @@ def make_default_rm65_grasp_pose_evaluator(
         damping=config.ik_damping,
     )
     envelope = ConservativeWorkspaceEnvelope(
+        reference_frame_id=config.reference_frame_id,
+        reference_frame_spec_hash=config.reference_frame_spec_hash,
         origin_xyz_m=config.conservative_workspace_origin_m,
         maximum_radius_m=config.conservative_workspace_maximum_radius_m,
     )
@@ -230,6 +326,8 @@ def make_default_rm65_grasp_pose_evaluator(
     def evaluate(sample: RandomGraspPoseSample) -> GraspReachabilityReceipt:
         return evaluate_grasp_pose_reachability(
             sample.target_pose,
+            reference_frame_id=sample.reference_frame_id,
+            reference_frame_spec_hash=sample.reference_frame_spec_hash,
             candidate_provider=provider,
             max_candidates=config.max_ik_candidates,
             maximum_position_residual_m=config.maximum_position_residual_m,
@@ -237,6 +335,7 @@ def make_default_rm65_grasp_pose_evaluator(
                 config.maximum_orientation_residual_deg
             ),
             workspace_envelope=envelope,
+            target_pose_content_hash=sample.target_pose_content_hash,
         )
 
     return evaluate
@@ -259,14 +358,34 @@ def run_random_grasp_pose_reachability(
             receipt = resolved_evaluator(sample)
             if not isinstance(receipt, GraspReachabilityReceipt):
                 raise TypeError("evaluator must return GraspReachabilityReceipt")
+            if (
+                receipt.reference_frame_id != sample.reference_frame_id
+                or receipt.reference_frame_spec_hash != sample.reference_frame_spec_hash
+                or receipt.target_pose_content_hash != sample.target_pose_content_hash
+            ):
+                raise ValueError("evaluator receipt identity does not match random sample")
+            receipt_pose = (
+                None
+                if receipt.target_pose is None
+                else np.asarray(receipt.target_pose, dtype=float)
+            )
+            if (
+                receipt_pose is None
+                or receipt_pose.shape != (4, 4)
+                or not np.array_equal(receipt_pose, sample.target_pose)
+            ):
+                raise ValueError("evaluator receipt target pose does not match random sample")
         except Exception as exc:
             receipt = GraspReachabilityReceipt(
                 status=GraspReachabilityStatus.PLANNER_ERROR,
                 reason_code="scenario_evaluator_error",
                 proof_scope="scenario_adapter_failure",
+                reference_frame_id=sample.reference_frame_id,
+                reference_frame_spec_hash=sample.reference_frame_spec_hash,
                 target_pose=tuple(
                     tuple(float(value) for value in row) for row in sample.target_pose
                 ),
+                target_pose_content_hash=sample.target_pose_content_hash,
                 metadata={"error_type": type(exc).__name__, "error": str(exc)},
             )
         record = receipt.to_dict()
@@ -279,7 +398,7 @@ def run_random_grasp_pose_reachability(
         + counts[GraspReachabilityStatus.PLANNER_ERROR.value]
     )
     return SimRealScenarioResult(
-        scenario="rm65_random_grasp_pose_reachability",
+        scenario=SCENARIO_ID,
         passed=len(records) == int(cfg.sample_count) and system_failure_count == 0,
         metrics={
             "seed": int(cfg.seed),
@@ -312,11 +431,47 @@ def _sample_shoemake_rotation_matrix(rng: np.random.Generator) -> np.ndarray:
     return Rotation.from_quat(quaternion_xyzw).as_matrix()
 
 
+def compute_target_pose_content_hash(
+    target_pose: np.ndarray,
+    *,
+    sampler_id: str,
+    seed: int,
+    sample_index: int,
+    reference_frame_id: str,
+    reference_frame_spec_hash: str,
+) -> str:
+    pose = np.asarray(target_pose, dtype="<f8").reshape(4, 4)
+    payload = {
+        "schema": "rm65.random_grasp_pose.sample-content.v1",
+        "sampler_id": str(sampler_id),
+        "seed": int(seed),
+        "sample_index": int(sample_index),
+        "reference_frame_id": str(reference_frame_id),
+        "reference_frame_spec_hash": str(reference_frame_spec_hash),
+        "target_pose_float64_le_hex": pose.tobytes(order="C").hex(),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+            "ascii"
+        )
+    ).hexdigest()
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 __all__ = [
     "DEFAULT_CONFIG_PATH",
+    "CONFIG_SCHEMA_VERSION",
+    "DEFAULT_REFERENCE_FRAME_ID",
+    "DEFAULT_REFERENCE_FRAME_SPEC",
+    "DEFAULT_REFERENCE_FRAME_SPEC_HASH",
+    "DEFAULT_SAMPLER_ID",
     "RM65RandomGraspPoseReachabilityConfig",
     "RandomGraspPoseSample",
     "build_rm65_multistart_candidate_provider",
+    "compute_target_pose_content_hash",
     "generate_random_grasp_pose_samples",
     "load_random_grasp_pose_reachability_config",
     "make_default_rm65_grasp_pose_evaluator",

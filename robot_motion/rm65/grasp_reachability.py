@@ -36,11 +36,19 @@ class CollisionCandidateStatus(str, Enum):
 class ConservativeWorkspaceEnvelope:
     """A one-sided proof envelope; inside never proves reachability."""
 
+    reference_frame_id: str
+    reference_frame_spec_hash: str
     origin_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     maximum_radius_m: float = 1.25
     proof_label: str = "rm65_outer_radius_conservative_v1"
 
     def __post_init__(self) -> None:
+        frame_id = str(self.reference_frame_id).strip()
+        frame_hash = str(self.reference_frame_spec_hash).strip().lower()
+        if not frame_id:
+            raise ValueError("reference_frame_id must not be empty.")
+        if not _is_sha256(frame_hash):
+            raise ValueError("reference_frame_spec_hash must be a lowercase SHA-256.")
         origin = tuple(float(value) for value in self.origin_xyz_m)
         if len(origin) != 3 or not np.all(np.isfinite(origin)):
             raise ValueError("origin_xyz_m must contain 3 finite values.")
@@ -48,6 +56,8 @@ class ConservativeWorkspaceEnvelope:
         if not np.isfinite(radius) or radius <= 0.0:
             raise ValueError("maximum_radius_m must be finite and positive.")
         object.__setattr__(self, "origin_xyz_m", origin)
+        object.__setattr__(self, "reference_frame_id", frame_id)
+        object.__setattr__(self, "reference_frame_spec_hash", frame_hash)
         object.__setattr__(self, "maximum_radius_m", radius)
         object.__setattr__(self, "proof_label", str(self.proof_label))
 
@@ -155,7 +165,10 @@ class GraspReachabilityReceipt:
     status: GraspReachabilityStatus
     reason_code: str
     proof_scope: str
+    reference_frame_id: str
+    reference_frame_spec_hash: str
     target_pose: tuple[tuple[float, ...], ...] | None
+    target_pose_content_hash: str | None = None
     selected_candidate_index: int | None = None
     candidates: tuple[dict[str, Any], ...] = ()
     collision_assessments: tuple[dict[str, Any], ...] = ()
@@ -165,6 +178,14 @@ class GraspReachabilityReceipt:
         object.__setattr__(self, "status", GraspReachabilityStatus(self.status))
         object.__setattr__(self, "reason_code", str(self.reason_code))
         object.__setattr__(self, "proof_scope", str(self.proof_scope))
+        object.__setattr__(self, "reference_frame_id", str(self.reference_frame_id))
+        object.__setattr__(
+            self, "reference_frame_spec_hash", str(self.reference_frame_spec_hash)
+        )
+        if self.target_pose_content_hash is not None:
+            object.__setattr__(
+                self, "target_pose_content_hash", str(self.target_pose_content_hash)
+            )
         object.__setattr__(self, "candidates", tuple(dict(item) for item in self.candidates))
         object.__setattr__(
             self,
@@ -178,6 +199,9 @@ class GraspReachabilityReceipt:
             "status": self.status.value,
             "reason_code": self.reason_code,
             "proof_scope": self.proof_scope,
+            "reference_frame_id": self.reference_frame_id,
+            "reference_frame_spec_hash": self.reference_frame_spec_hash,
+            "target_pose_content_hash": self.target_pose_content_hash,
             "target_pose": (
                 None if self.target_pose is None else [list(row) for row in self.target_pose]
             ),
@@ -195,12 +219,15 @@ CollisionCandidateChecker = Callable[[IKCandidate, np.ndarray], CollisionCandida
 def evaluate_grasp_pose_reachability(
     target_pose: Any,
     *,
+    reference_frame_id: str,
+    reference_frame_spec_hash: str,
     candidate_provider: IKCandidateProvider,
     max_candidates: int,
     maximum_position_residual_m: float,
     maximum_orientation_residual_rad: float,
     workspace_envelope: ConservativeWorkspaceEnvelope | None = None,
     collision_checker: CollisionCandidateChecker | None = None,
+    target_pose_content_hash: str | None = None,
 ) -> GraspReachabilityReceipt:
     """Return one terminal endpoint classification for a bounded probe.
 
@@ -209,13 +236,30 @@ def evaluate_grasp_pose_reachability(
     for a configured one-sided conservative proof.
     """
 
+    frame_id = str(reference_frame_id).strip()
+    frame_hash = str(reference_frame_spec_hash).strip().lower()
+    frame_error = None
+    if not frame_id:
+        frame_error = "reference_frame_id_empty"
+    elif not _is_sha256(frame_hash):
+        frame_error = "reference_frame_spec_hash_invalid"
+    content_hash = (
+        None if target_pose_content_hash is None else str(target_pose_content_hash).strip().lower()
+    )
+    if frame_error is None and content_hash is not None and not _is_sha256(content_hash):
+        frame_error = "target_pose_content_hash_invalid"
+
     pose, target_error = _validated_target_pose(target_pose)
+    target_error = frame_error or target_error
     if target_error is not None:
         return GraspReachabilityReceipt(
             status=GraspReachabilityStatus.INVALID_TARGET,
             reason_code=target_error,
             proof_scope="rigid_target_validation",
+            reference_frame_id=frame_id,
+            reference_frame_spec_hash=frame_hash,
             target_pose=None,
+            target_pose_content_hash=content_hash,
         )
     assert pose is not None
     frozen_pose = tuple(tuple(float(value) for value in row) for row in pose)
@@ -228,10 +272,32 @@ def evaluate_grasp_pose_reachability(
             status=GraspReachabilityStatus.INVALID_TARGET,
             reason_code="invalid_probe_configuration",
             proof_scope="probe_configuration_validation",
+            reference_frame_id=frame_id,
+            reference_frame_spec_hash=frame_hash,
             target_pose=frozen_pose,
+            target_pose_content_hash=content_hash,
         )
 
     if workspace_envelope is not None:
+        if (
+            workspace_envelope.reference_frame_id != frame_id
+            or workspace_envelope.reference_frame_spec_hash != frame_hash
+        ):
+            return GraspReachabilityReceipt(
+                status=GraspReachabilityStatus.INVALID_TARGET,
+                reason_code="workspace_and_target_reference_frame_mismatch",
+                proof_scope="reference_frame_identity_validation",
+                reference_frame_id=frame_id,
+                reference_frame_spec_hash=frame_hash,
+                target_pose=frozen_pose,
+                target_pose_content_hash=content_hash,
+                metadata={
+                    "workspace_reference_frame_id": workspace_envelope.reference_frame_id,
+                    "workspace_reference_frame_spec_hash": (
+                        workspace_envelope.reference_frame_spec_hash
+                    ),
+                },
+            )
         outside = workspace_envelope.outside_reason(pose)
         if outside is not None:
             reason, proof_metadata = outside
@@ -239,7 +305,10 @@ def evaluate_grasp_pose_reachability(
                 status=GraspReachabilityStatus.KINEMATICALLY_UNREACHABLE,
                 reason_code=reason,
                 proof_scope="conservative_workspace_exclusion",
+                reference_frame_id=frame_id,
+                reference_frame_spec_hash=frame_hash,
                 target_pose=frozen_pose,
+                target_pose_content_hash=content_hash,
                 metadata=proof_metadata,
             )
 
@@ -287,7 +356,10 @@ def evaluate_grasp_pose_reachability(
                 status=GraspReachabilityStatus.REACHABLE,
                 reason_code="ik_candidate_within_residual_limits",
                 proof_scope="endpoint_kinematic_candidate_only",
+                reference_frame_id=frame_id,
+                reference_frame_spec_hash=frame_hash,
                 target_pose=frozen_pose,
+                target_pose_content_hash=content_hash,
                 selected_candidate_index=candidate.candidate_index,
                 candidates=tuple(candidate_records),
                 metadata={"collision_checked": False, "candidate_limit": candidate_limit},
@@ -310,7 +382,10 @@ def evaluate_grasp_pose_reachability(
                 status=GraspReachabilityStatus.REACHABLE,
                 reason_code="ik_and_endpoint_collision_candidate_accepted",
                 proof_scope="endpoint_ik_and_collision_candidate",
+                reference_frame_id=frame_id,
+                reference_frame_spec_hash=frame_hash,
                 target_pose=frozen_pose,
+                target_pose_content_hash=content_hash,
                 selected_candidate_index=candidate.candidate_index,
                 candidates=tuple(candidate_records),
                 collision_assessments=tuple(collision_records),
@@ -318,7 +393,10 @@ def evaluate_grasp_pose_reachability(
             )
 
     common = {
+        "reference_frame_id": frame_id,
+        "reference_frame_spec_hash": frame_hash,
         "target_pose": frozen_pose,
+        "target_pose_content_hash": content_hash,
         "candidates": tuple(candidate_records),
         "collision_assessments": tuple(collision_records),
         "metadata": {
@@ -331,11 +409,11 @@ def evaluate_grasp_pose_reachability(
         },
     }
     if eligible_candidates == 0:
-        if provider_errors == candidate_limit:
+        if provider_errors > 0:
             return GraspReachabilityReceipt(
                 status=GraspReachabilityStatus.PLANNER_ERROR,
-                reason_code="all_candidate_provider_calls_failed",
-                proof_scope="candidate_adapter_failure",
+                reason_code="candidate_search_incomplete_due_to_provider_error",
+                proof_scope="incomplete_candidate_adapter_search",
                 **common,
             )
         return GraspReachabilityReceipt(
@@ -345,6 +423,13 @@ def evaluate_grasp_pose_reachability(
             **common,
         )
 
+    if provider_errors > 0:
+        return GraspReachabilityReceipt(
+            status=GraspReachabilityStatus.PLANNER_ERROR,
+            reason_code="candidate_search_incomplete_due_to_provider_error",
+            proof_scope="incomplete_candidate_adapter_search",
+            **common,
+        )
     if collision_counts[CollisionCandidateStatus.BLOCKED] == eligible_candidates:
         return GraspReachabilityReceipt(
             status=GraspReachabilityStatus.COLLISION_BLOCKED,
@@ -388,6 +473,10 @@ def _validated_target_pose(target_pose: Any) -> tuple[np.ndarray | None, str | N
 
 def _finite_nonnegative(*values: float) -> bool:
     return all(np.isfinite(value) and value >= 0.0 for value in values)
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 def _candidate_rejection_reasons(

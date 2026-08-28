@@ -14,9 +14,12 @@ from robot_motion.rm65.grasp_reachability import (
     evaluate_grasp_pose_reachability,
 )
 from sim.sim_real_tests.rm65 import (
+    DEFAULT_REFERENCE_FRAME_ID,
+    DEFAULT_REFERENCE_FRAME_SPEC_HASH,
     RM65RandomGraspPoseReachabilityConfig,
     RandomGraspPoseSample,
     build_rm65_multistart_candidate_provider,
+    compute_target_pose_content_hash,
     generate_random_grasp_pose_samples,
     run_random_grasp_pose_reachability,
 )
@@ -48,15 +51,25 @@ def _evaluate(
     candidate_provider=_accepted_candidate,
     collision_checker=None,
     max_candidates: int = 2,
+    reference_frame_id: str = DEFAULT_REFERENCE_FRAME_ID,
+    reference_frame_spec_hash: str = DEFAULT_REFERENCE_FRAME_SPEC_HASH,
+    target_pose_content_hash: str | None = None,
 ):
     return evaluate_grasp_pose_reachability(
         target_pose,
+        reference_frame_id=reference_frame_id,
+        reference_frame_spec_hash=reference_frame_spec_hash,
         candidate_provider=candidate_provider,
         max_candidates=max_candidates,
         maximum_position_residual_m=0.003,
         maximum_orientation_residual_rad=np.deg2rad(1.0),
-        workspace_envelope=ConservativeWorkspaceEnvelope(maximum_radius_m=1.25),
+        workspace_envelope=ConservativeWorkspaceEnvelope(
+            reference_frame_id=DEFAULT_REFERENCE_FRAME_ID,
+            reference_frame_spec_hash=DEFAULT_REFERENCE_FRAME_SPEC_HASH,
+            maximum_radius_m=1.25,
+        ),
         collision_checker=collision_checker,
+        target_pose_content_hash=target_pose_content_hash,
     )
 
 
@@ -73,6 +86,42 @@ def test_pcg64_shoemake_generation_is_exactly_deterministic_without_rejection() 
         rotation = lhs.target_pose[:3, :3]
         np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-12)
         assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-12)
+        assert lhs.reference_frame_id == DEFAULT_REFERENCE_FRAME_ID
+        assert lhs.reference_frame_spec_hash == DEFAULT_REFERENCE_FRAME_SPEC_HASH
+        assert lhs.target_pose_content_hash == rhs.target_pose_content_hash
+        assert lhs.target_pose_content_hash == compute_target_pose_content_hash(
+            lhs.target_pose,
+            sampler_id=lhs.sampler_id,
+            seed=lhs.seed,
+            sample_index=lhs.sample_index,
+            reference_frame_id=lhs.reference_frame_id,
+            reference_frame_spec_hash=lhs.reference_frame_spec_hash,
+        )
+
+
+def test_target_pose_content_hash_binds_seed_index_sampler_and_frame() -> None:
+    sample = generate_random_grasp_pose_samples(
+        RM65RandomGraspPoseReachabilityConfig(seed=37, sample_count=1)
+    )[0]
+    baseline = sample.target_pose_content_hash
+
+    variants = (
+        {"seed": sample.seed + 1},
+        {"sample_index": sample.sample_index + 1},
+        {"sampler_id": "different-sampler"},
+        {"reference_frame_id": "different-frame"},
+        {"reference_frame_spec_hash": "1" * 64},
+    )
+    for variant in variants:
+        arguments = {
+            "sampler_id": sample.sampler_id,
+            "seed": sample.seed,
+            "sample_index": sample.sample_index,
+            "reference_frame_id": sample.reference_frame_id,
+            "reference_frame_spec_hash": sample.reference_frame_spec_hash,
+            **variant,
+        }
+        assert compute_target_pose_content_hash(sample.target_pose, **arguments) != baseline
 
 
 def test_bounded_multistart_exhaustion_is_not_reported_as_unreachable() -> None:
@@ -90,6 +139,26 @@ def test_bounded_multistart_exhaustion_is_not_reported_as_unreachable() -> None:
     assert receipt.status is GraspReachabilityStatus.IK_SEARCH_EXHAUSTED
     assert receipt.proof_scope == "bounded_multistart_search_only"
     assert len(receipt.candidates) == 3
+
+
+def test_mixed_provider_error_and_nonconvergence_is_incomplete_planner_error() -> None:
+    def mixed(candidate_index: int, _target: np.ndarray) -> IKCandidate:
+        if candidate_index == 0:
+            raise RuntimeError("synthetic infrastructure failure")
+        return IKCandidate(
+            candidate_index=candidate_index,
+            qpos_rad=(0.0,) * 6,
+            converged=False,
+            position_residual_m=0.2,
+            orientation_residual_rad=0.5,
+        )
+
+    receipt = _evaluate(_pose(), candidate_provider=mixed, max_candidates=3)
+
+    assert receipt.status is GraspReachabilityStatus.PLANNER_ERROR
+    assert receipt.reason_code == "candidate_search_incomplete_due_to_provider_error"
+    assert receipt.proof_scope == "incomplete_candidate_adapter_search"
+    assert receipt.metadata["provider_error_count"] == 1
 
 
 def test_valid_candidate_without_collision_checker_is_endpoint_reachable_only() -> None:
@@ -127,6 +196,17 @@ def test_clearly_outside_conservative_workspace_is_proven_unreachable() -> None:
     assert receipt.proof_scope == "conservative_workspace_exclusion"
     assert receipt.metadata["origin_distance_m"] == pytest.approx(3.0)
     assert not provider_called
+
+
+def test_workspace_exclusion_requires_exact_target_frame_identity() -> None:
+    receipt = _evaluate(
+        _pose((3.0, 0.0, 0.0)),
+        reference_frame_id="different.arm.base",
+    )
+
+    assert receipt.status is GraspReachabilityStatus.INVALID_TARGET
+    assert receipt.reason_code == "workspace_and_target_reference_frame_mismatch"
+    assert receipt.proof_scope == "reference_frame_identity_validation"
 
 
 def test_explicitly_blocked_candidates_project_to_collision_blocked() -> None:
@@ -167,12 +247,20 @@ def test_mixed_blocked_and_indeterminate_projects_to_collision_search_exhausted(
 
 
 def test_every_random_sample_yields_a_terminal_record_and_unreachable_is_not_failure() -> None:
-    config = RM65RandomGraspPoseReachabilityConfig(seed=11, sample_count=5)
+    config = RM65RandomGraspPoseReachabilityConfig(
+        seed=11,
+        sample_count=5,
+        position_min_m=(2.9, -0.1, -0.1),
+        position_max_m=(3.1, 0.1, 0.1),
+    )
 
     def evaluator(sample: RandomGraspPoseSample):
-        target = sample.target_pose.copy()
-        target[:3, 3] = (3.0, 0.0, 0.0)
-        return _evaluate(target)
+        return _evaluate(
+            sample.target_pose,
+            reference_frame_id=sample.reference_frame_id,
+            reference_frame_spec_hash=sample.reference_frame_spec_hash,
+            target_pose_content_hash=sample.target_pose_content_hash,
+        )
 
     result = run_random_grasp_pose_reachability(config, evaluator=evaluator)
 
@@ -180,6 +268,32 @@ def test_every_random_sample_yields_a_terminal_record_and_unreachable_is_not_fai
     assert result.metrics["terminal_records"] == 5
     assert result.metrics["status_kinematically_unreachable"] == 5
     assert len(result.records) == 5
+    assert all(
+        record["reference_frame_id"] == DEFAULT_REFERENCE_FRAME_ID
+        and record["reference_frame_spec_hash"] == DEFAULT_REFERENCE_FRAME_SPEC_HASH
+        and record["target_pose_content_hash"]
+        for record in result.records
+    )
+
+
+def test_scenario_rejects_receipt_hash_reused_for_a_different_target_pose() -> None:
+    config = RM65RandomGraspPoseReachabilityConfig(seed=11, sample_count=1)
+
+    def substituted_target(sample: RandomGraspPoseSample):
+        target = sample.target_pose.copy()
+        target[:3, 3] = (3.0, 0.0, 0.0)
+        return _evaluate(
+            target,
+            reference_frame_id=sample.reference_frame_id,
+            reference_frame_spec_hash=sample.reference_frame_spec_hash,
+            target_pose_content_hash=sample.target_pose_content_hash,
+        )
+
+    result = run_random_grasp_pose_reachability(config, evaluator=substituted_target)
+
+    assert not result.passed
+    assert result.metrics["status_planner_error"] == 1
+    assert result.records[0]["reason_code"] == "scenario_evaluator_error"
 
 
 def test_scenario_adapter_error_is_terminal_but_fails_the_scenario() -> None:
@@ -253,11 +367,17 @@ def test_known_rm65_fk_pose_is_reachable_from_its_generating_qpos() -> None:
 
     receipt = evaluate_grasp_pose_reachability(
         target_pose,
+        reference_frame_id=DEFAULT_REFERENCE_FRAME_ID,
+        reference_frame_spec_hash=DEFAULT_REFERENCE_FRAME_SPEC_HASH,
         candidate_provider=provider,
         max_candidates=1,
         maximum_position_residual_m=1e-8,
         maximum_orientation_residual_rad=1e-8,
-        workspace_envelope=ConservativeWorkspaceEnvelope(maximum_radius_m=1.25),
+        workspace_envelope=ConservativeWorkspaceEnvelope(
+            reference_frame_id=DEFAULT_REFERENCE_FRAME_ID,
+            reference_frame_spec_hash=DEFAULT_REFERENCE_FRAME_SPEC_HASH,
+            maximum_radius_m=1.25,
+        ),
     )
 
     assert receipt.status is GraspReachabilityStatus.REACHABLE

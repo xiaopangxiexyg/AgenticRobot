@@ -100,6 +100,16 @@ a PCG64 seed, and a Shoemake-uniform SO(3) sampler.  The probe emits exactly one
 pose per requested sample without rejection sampling, then records exactly one
 typed terminal endpoint result:
 
+The config, generated sample, endpoint receipt, and scenario record all carry
+the same `reference_frame_id` and `reference_frame_spec_hash`.  The default is
+the single-arm URDF solver's model/arm-base frame.  The target translation and
+the conservative workspace origin are interpreted in that exact frame; a frame
+ID or spec-hash mismatch is `invalid_target`, never an unreachability proof.
+Each sample also has a deterministic `target_pose_content_hash` over the
+sampler ID, PCG64 seed, sample index, frame identity, and exact little-endian
+float64 pose bytes.  Scenario projection verifies both that hash identity and
+the target matrix before accepting an evaluator receipt.
+
 - `reachable`: a residual-bounded endpoint IK candidate was found;
 - `kinematically_unreachable`: a conservative workspace exclusion proves the
   target lies outside the configured outer envelope;
@@ -110,6 +120,10 @@ typed terminal endpoint result:
   search;
 - `invalid_target` or `planner_error`: target/adapter failures were converted
   to typed terminal evidence.
+
+The JSON loader accepts only the exact
+`rm65.random_grasp_pose_reachability.v1` schema and scenario identifier; a
+missing or different version is rejected rather than silently interpreted.
 
 An unreachable or collision-blocked sample is a valid scenario observation,
 not a failed scenario.  The receipt contains endpoint candidates, residuals,
