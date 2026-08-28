@@ -89,6 +89,9 @@ def plan_collision_aware_joint_path(
     """
 
     cfg = config if config is not None else JointPathPlannerConfig()
+    resolved_scene_hash, scene_binding_metadata, scene_binding_error = (
+        _resolve_scene_binding(oracle=oracle, requested_scene_hash=scene_hash)
+    )
     try:
         start = _validated_mapping(start_qpos_by_component)
         target = _validated_mapping(target_qpos_by_component)
@@ -97,8 +100,9 @@ def plan_collision_aware_joint_path(
             start_qpos_by_component,
             target_qpos_by_component,
             movable_components,
-            scene_hash,
+            resolved_scene_hash,
             str(exc),
+            metadata=scene_binding_metadata,
         )
     movable = tuple(str(item) for item in movable_components)
     invalid_reason = _validate_request(start, target, movable)
@@ -120,10 +124,21 @@ def plan_collision_aware_joint_path(
             start,
             fallback_target,
             fallback_movable,
-            scene_hash,
+            resolved_scene_hash,
             invalid_reason,
+            scene_binding_metadata,
         )
     target = {component: target[component] for component in start}
+    if scene_binding_error is not None:
+        return _result(
+            JointPathStatus.INVALID_REQUEST,
+            start,
+            target,
+            movable,
+            resolved_scene_hash,
+            scene_binding_error,
+            scene_binding_metadata,
+        )
 
     order = tuple(start)
     shapes = {key: start[key].shape for key in order}
@@ -173,16 +188,17 @@ def plan_collision_aware_joint_path(
         "shortcut_attempts": cfg.shortcut_attempts,
         "collision_scope": "complete_configuration",
         "inactive_components_frozen": True,
+        **scene_binding_metadata,
     }
     if not start_check.collision_check_available:
-        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, scene_hash, "start_collision_check_unavailable", {**base_metadata, "start_check": start_check.to_dict()})
+        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "start_collision_check_unavailable", {**base_metadata, "start_check": start_check.to_dict()})
     if not start_check.safe:
-        return _result(JointPathStatus.START_BLOCKED, start, target, movable, scene_hash, "start_configuration_blocked", {**base_metadata, "start_check": start_check.to_dict()})
+        return _result(JointPathStatus.START_BLOCKED, start, target, movable, resolved_scene_hash, "start_configuration_blocked", {**base_metadata, "start_check": start_check.to_dict()})
     target_check = check(target_flat)
     if not target_check.collision_check_available:
-        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, scene_hash, "target_collision_check_unavailable", {**base_metadata, "start_check": start_check.to_dict(), "target_check": target_check.to_dict()})
+        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "target_collision_check_unavailable", {**base_metadata, "start_check": start_check.to_dict(), "target_check": target_check.to_dict()})
     if not target_check.safe:
-        return _result(JointPathStatus.TARGET_BLOCKED, start, target, movable, scene_hash, "target_configuration_blocked", {**base_metadata, "start_check": start_check.to_dict(), "target_check": target_check.to_dict()})
+        return _result(JointPathStatus.TARGET_BLOCKED, start, target, movable, resolved_scene_hash, "target_configuration_blocked", {**base_metadata, "start_check": start_check.to_dict(), "target_check": target_check.to_dict()})
 
     def edge_safe(a: np.ndarray, b: np.ndarray) -> _EdgeResult:
         delta = np.asarray(b, dtype=float) - np.asarray(a, dtype=float)
@@ -198,17 +214,17 @@ def plan_collision_aware_joint_path(
         return _EdgeResult(True, True)
 
     if np.array_equal(start_flat, target_flat):
-        return _result(JointPathStatus.PATH_FOUND, start, target, movable, scene_hash, "start_equals_target", {**base_metadata, "direct_path": True, "search_iterations": 0, "search_node_count": 1}, (expand(start_flat),))
+        return _result(JointPathStatus.PATH_FOUND, start, target, movable, resolved_scene_hash, "start_equals_target", {**base_metadata, "direct_path": True, "search_iterations": 0, "search_node_count": 1}, (expand(start_flat),))
     direct = edge_safe(start_flat, target_flat)
     if not direct.available:
-        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, scene_hash, "direct_edge_collision_check_unavailable", {**base_metadata, "last_rejected_edge": direct.rejection})
+        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "direct_edge_collision_check_unavailable", {**base_metadata, "last_rejected_edge": direct.rejection})
     if direct.safe:
-        return _result(JointPathStatus.PATH_FOUND, start, target, movable, scene_hash, "direct_path_clear", {**base_metadata, "direct_path": True, "search_iterations": 0, "search_node_count": 2}, (expand(start_flat), expand(target_flat)))
+        return _result(JointPathStatus.PATH_FOUND, start, target, movable, resolved_scene_hash, "direct_path_clear", {**base_metadata, "direct_path": True, "search_iterations": 0, "search_node_count": 2}, (expand(start_flat), expand(target_flat)))
 
     try:
         lower, upper = _search_bounds(start, target, movable, cfg, joint_lower_by_component, joint_upper_by_component)
     except (TypeError, ValueError) as exc:
-        return _result(JointPathStatus.INVALID_REQUEST, start, target, movable, scene_hash, str(exc), base_metadata)
+        return _result(JointPathStatus.INVALID_REQUEST, start, target, movable, resolved_scene_hash, str(exc), base_metadata)
     rng = np.random.default_rng(cfg.seed)
     start_tree = _Tree.rooted_at(start_flat)
     target_tree = _Tree.rooted_at(target_flat)
@@ -285,33 +301,80 @@ def plan_collision_aware_joint_path(
         "last_rejected_edge": last_rejection,
     }
     if unavailable_rejection is not None:
-        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, scene_hash, "search_collision_check_unavailable", search_metadata)
+        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "search_collision_check_unavailable", search_metadata)
     if found is None:
-        return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable, scene_hash, "bounded_search_exhausted", search_metadata)
+        return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable, resolved_scene_hash, "bounded_search_exhausted", search_metadata)
 
     shortened, shortcut_unavailable = _shortcut_path(found, edge_safe, rng, cfg.shortcut_attempts)
     if shortcut_unavailable is not None:
-        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, scene_hash, "shortcut_collision_check_unavailable", {**search_metadata, "last_rejected_edge": shortcut_unavailable})
+        return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "shortcut_collision_check_unavailable", {**search_metadata, "last_rejected_edge": shortcut_unavailable})
     final_rejection = None
     for left, right in zip(shortened, shortened[1:]):
         validation = edge_safe(left, right)
         if not validation.available:
-            return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, scene_hash, "final_path_collision_check_unavailable", {**search_metadata, "last_rejected_edge": validation.rejection})
+            return _result(JointPathStatus.COLLISION_CHECK_UNAVAILABLE, start, target, movable, resolved_scene_hash, "final_path_collision_check_unavailable", {**search_metadata, "last_rejected_edge": validation.rejection})
         if not validation.safe:
             final_rejection = validation.rejection
             break
     if final_rejection is not None:
-        return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable, scene_hash, "final_path_revalidation_failed", {**search_metadata, "last_rejected_edge": final_rejection})
+        return _result(JointPathStatus.PATH_SEARCH_EXHAUSTED, start, target, movable, resolved_scene_hash, "final_path_revalidation_failed", {**search_metadata, "last_rejected_edge": final_rejection})
     return _result(
         JointPathStatus.PATH_FOUND,
         start,
         target,
         movable,
-        scene_hash,
+        resolved_scene_hash,
         "bounded_search_found_path",
         {**search_metadata, "shortcut_revalidated": True, "unshortened_waypoint_count": len(found), "waypoint_count": len(shortened)},
         tuple(expand(item) for item in shortened),
     )
+
+
+def _resolve_scene_binding(
+    *,
+    oracle: JointConfigurationOracle,
+    requested_scene_hash: str | None,
+) -> tuple[str | None, dict[str, Any], str | None]:
+    """Bind receipts to the oracle's scene identity, never an unverified label."""
+
+    if requested_scene_hash is not None and not isinstance(requested_scene_hash, str):
+        return None, {"scene_binding": "invalid"}, "scene_hash must be a string when provided"
+    requested = requested_scene_hash
+    if requested is not None and (not requested or requested.strip() != requested):
+        return None, {"scene_binding": "invalid"}, "scene_hash must be a non-empty trimmed string"
+    missing = object()
+    try:
+        oracle_value = getattr(oracle, "scene_hash", missing)
+    except Exception as exc:
+        return None, {
+            "scene_binding": "invalid",
+            "scene_hash_error_type": type(exc).__name__,
+        }, "oracle scene_hash could not be read"
+    if oracle_value is missing:
+        metadata = {
+            "scene_binding": "unbound_oracle",
+            "requested_scene_hash": requested,
+        }
+        if requested is not None:
+            return None, metadata, "scene_hash cannot label an oracle without scene identity"
+        return None, metadata, None
+    if not isinstance(oracle_value, str):
+        return None, {
+            "scene_binding": "invalid",
+            "oracle_scene_hash_type": type(oracle_value).__name__,
+            "requested_scene_hash": requested,
+        }, "oracle scene_hash must be a string"
+    actual = oracle_value
+    metadata = {
+        "scene_binding": "oracle_bound",
+        "oracle_scene_hash": actual,
+        "requested_scene_hash": requested,
+    }
+    if not actual or actual.strip() != actual:
+        return None, metadata, "oracle scene_hash must be a non-empty trimmed string"
+    if requested is not None and requested != actual:
+        return actual, metadata, "requested scene_hash does not match oracle scene_hash"
+    return actual, metadata, None
 
 
 def _validate_request(start: Mapping[str, np.ndarray], target: Mapping[str, np.ndarray], movable: tuple[str, ...]) -> str | None:
@@ -402,13 +465,39 @@ def _result(
     )
 
 
-def _invalid_result(start: Mapping[str, Any], target: Mapping[str, Any], movable: Sequence[str], scene_hash: str | None, reason: str) -> JointPathPlanResult:
+def _invalid_result(
+    start: Mapping[str, Any],
+    target: Mapping[str, Any],
+    movable: Sequence[str],
+    scene_hash: str | None,
+    reason: str,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> JointPathPlanResult:
     fallback_start = _safe_fallback_mapping(start)
     fallback_target = _safe_fallback_mapping(target, fallback=fallback_start)
-    fallback_movable = tuple(str(item) for item in movable if str(item) in fallback_start)
-    if not fallback_movable:
+    try:
+        fallback_movable = tuple(
+            str(item) for item in movable if str(item) in fallback_start
+        )
+    except TypeError:
+        fallback_movable = ()
+    if not fallback_movable or len(set(fallback_movable)) != len(fallback_movable):
         fallback_movable = (next(iter(fallback_start)),)
-    return _result(JointPathStatus.INVALID_REQUEST, fallback_start, fallback_target, fallback_movable, scene_hash, reason)
+    if set(fallback_start) != set(fallback_target) or any(
+        fallback_start[key].shape != fallback_target[key].shape
+        for key in set(fallback_start).intersection(fallback_target)
+    ):
+        fallback_target = _copy_mapping(fallback_start)
+    return _result(
+        JointPathStatus.INVALID_REQUEST,
+        fallback_start,
+        fallback_target,
+        fallback_movable,
+        scene_hash,
+        reason,
+        metadata,
+    )
 
 
 def _safe_fallback_mapping(value: Mapping[str, Any], *, fallback: Mapping[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:

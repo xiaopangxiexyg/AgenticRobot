@@ -148,6 +148,16 @@ class RM65ObstacleCollisionOracle:
         expected_reference_frame_id: str | None = None,
         expected_reference_frame_spec_hash: str | None = None,
     ) -> "RM65ObstacleCollisionOracle":
+        if (
+            expected_reference_frame_id is None
+            or not str(expected_reference_frame_id).strip()
+            or expected_reference_frame_spec_hash is None
+            or not str(expected_reference_frame_spec_hash).strip()
+        ):
+            raise ValueError(
+                "from_solver requires expected_reference_frame_id and "
+                "expected_reference_frame_spec_hash from a reviewed frame contract."
+            )
         robot = getattr(solver, "robot", None)
         if robot is None:
             raise ValueError("solver does not expose robot model/collision_model.")

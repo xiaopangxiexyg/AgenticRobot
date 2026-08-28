@@ -15,8 +15,9 @@ from robot_motion.scene_obstacles import AxisAlignedBoxObstacle, ObstacleSceneSn
 
 
 class _PlanarBoxOracle:
-    def __init__(self) -> None:
+    def __init__(self, *, scene_hash: str = "scene") -> None:
         self.queries: list[dict[str, np.ndarray]] = []
+        self.scene_hash = scene_hash
 
     def check(self, qpos_by_component):
         query = {key: np.asarray(value, dtype=float).copy() for key, value in qpos_by_component.items()}
@@ -216,3 +217,60 @@ def test_component_mapping_order_is_not_part_of_request_semantics() -> None:
         oracle=_AlwaysClear(),
     )
     assert result.status is JointPathStatus.PATH_FOUND
+
+
+def test_scene_bound_oracle_owns_receipt_hash_and_rejects_stale_label() -> None:
+    obstacle = AxisAlignedBoxObstacle("box", (0.0, 0.0, 0.0), (0.2, 0.2, 0.2))
+    stale_scene = ObstacleSceneSnapshot("world", "world-v1", 1, (obstacle,))
+    current_scene = ObstacleSceneSnapshot("world", "world-v1", 2, (obstacle,))
+    oracle = _PlanarBoxOracle(scene_hash=current_scene.semantic_content_hash)
+    inherited = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-1.0, 0.7]},
+        target_qpos_by_component={"left": [1.0, 0.7]},
+        movable_components=("left",),
+        oracle=oracle,
+    )
+    assert inherited.status is JointPathStatus.PATH_FOUND
+    assert inherited.scene_hash == current_scene.semantic_content_hash
+    assert inherited.metadata["scene_binding"] == "oracle_bound"
+
+    query_count = len(oracle.queries)
+    mismatched = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [-1.0, 0.7]},
+        target_qpos_by_component={"left": [1.0, 0.7]},
+        movable_components=("left",),
+        oracle=oracle,
+        scene_hash=stale_scene.semantic_content_hash,
+    )
+    assert mismatched.status is JointPathStatus.INVALID_REQUEST
+    assert mismatched.scene_hash == current_scene.semantic_content_hash
+    assert mismatched.metadata["requested_scene_hash"] == stale_scene.semantic_content_hash
+    assert mismatched.metadata["oracle_scene_hash"] == current_scene.semantic_content_hash
+    assert len(oracle.queries) == query_count
+
+
+def test_unbound_oracle_cannot_be_labeled_with_an_unverified_scene_hash() -> None:
+    class _UnboundOracle:
+        def check(self, _qpos_by_component):
+            return JointConfigurationCheck(safe=True)
+
+    rejected = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [0.0]},
+        target_qpos_by_component={"left": [0.2]},
+        movable_components=("left",),
+        oracle=_UnboundOracle(),
+        scene_hash="unverified-label",
+    )
+    assert rejected.status is JointPathStatus.INVALID_REQUEST
+    assert rejected.scene_hash is None
+    assert rejected.metadata["scene_binding"] == "unbound_oracle"
+
+    accepted = plan_collision_aware_joint_path(
+        start_qpos_by_component={"left": [0.0]},
+        target_qpos_by_component={"left": [0.2]},
+        movable_components=("left",),
+        oracle=_UnboundOracle(),
+    )
+    assert accepted.status is JointPathStatus.PATH_FOUND
+    assert accepted.scene_hash is None
+    assert accepted.metadata["scene_binding"] == "unbound_oracle"

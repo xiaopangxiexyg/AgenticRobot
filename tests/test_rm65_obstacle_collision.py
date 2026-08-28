@@ -133,3 +133,75 @@ def test_invalid_query_and_missing_moving_geometry_fail_closed() -> None:
     unavailable = static_oracle.check({"arm": np.array([0.0])})
     assert unavailable.collision_check_available is False
     assert unavailable.reason == "collision_model_has_no_moving_geometry"
+
+
+def test_from_solver_requires_reviewed_frame_identity() -> None:
+    model, collision_model = _simple_prismatic_collision_model()
+
+    class _Solver:
+        current_q = np.zeros(model.nq)
+        robot = type(
+            "Robot",
+            (),
+            {"model": model, "collision_model": collision_model},
+        )()
+
+    with pytest.raises(ValueError, match="reviewed frame contract"):
+        RM65ObstacleCollisionOracle.from_solver(_Solver(), scene=_scene())
+    with pytest.raises(ValueError, match="reviewed frame contract"):
+        RM65ObstacleCollisionOracle.from_solver(
+            _Solver(),
+            scene=_scene(),
+            expected_reference_frame_id="world",
+        )
+    with pytest.raises(ValueError, match="reference_frame_id"):
+        RM65ObstacleCollisionOracle.from_solver(
+            _Solver(),
+            scene=_scene(),
+            expected_reference_frame_id="desk",
+            expected_reference_frame_spec_hash="world-v1",
+            qpos_indices_by_component={"arm": (0,)},
+        )
+
+
+def test_real_rm65_scene_profile_oracle_clones_live_model() -> None:
+    from robot_motion.rm65 import build_rm65_dual_arm_collision_ik_solver
+    from robot_motion.rm65.assets import RM65_ASSET_DIR
+
+    if not RM65_ASSET_DIR.exists():
+        pytest.skip("reviewed local RM65 motion-model assets are unavailable")
+
+    bundle = build_rm65_dual_arm_collision_ik_solver()
+    live_model = bundle.solver.robot.collision_model
+    geometry_count = len(live_model.geometryObjects)
+    pair_count = len(live_model.collisionPairs)
+    scene = ObstacleSceneSnapshot(
+        reference_frame_id="rm65_scene_world",
+        reference_frame_spec_hash="test-reviewed-rm65-scene-world-v1",
+        revision=1,
+        obstacles=(
+            AxisAlignedBoxObstacle(
+                obstacle_id="far_cube",
+                center_xyz_m=(10.0, 10.0, 10.0),
+                size_xyz_m=(0.1, 0.1, 0.1),
+            ),
+        ),
+    )
+    oracle = RM65ObstacleCollisionOracle.from_solver(
+        bundle.solver,
+        scene=scene,
+        solution_layout=bundle.scene_profile.solution_layout,
+        expected_reference_frame_id="rm65_scene_world",
+        expected_reference_frame_spec_hash="test-reviewed-rm65-scene-world-v1",
+    )
+    qpos = np.asarray(bundle.solver.current_q, dtype=float)
+    check = oracle.check({"left": qpos[:6], "right": qpos[6:12]})
+
+    assert oracle.scene_hash == scene.semantic_content_hash
+    assert check.collision_check_available is True
+    assert check.metadata["collision_model_is_independent"] is True
+    assert check.metadata["base_geometry_count"] == geometry_count
+    assert check.metadata["obstacle_geometry_count"] == 1
+    assert check.metadata["collision_pair_count"] > pair_count
+    assert len(live_model.geometryObjects) == geometry_count
+    assert len(live_model.collisionPairs) == pair_count
