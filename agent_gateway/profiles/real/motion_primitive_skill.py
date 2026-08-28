@@ -18,11 +18,11 @@ from agent_gateway.runtime.station_operation_worker import (
     StationLifecycleControlEvidence,
     StationLifecycleExecutionCompletion,
 )
+from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.relative_action import (
     pose_matrix_to_xyzquat,
     xyzquat_to_pose_matrix,
 )
-from dataset_contracts.canonical_encoding import canonical_content_hash
 from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionActivation,
     RealAgentMotionPhase,

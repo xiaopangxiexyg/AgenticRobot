@@ -47,8 +47,9 @@ class _Clock:
 
 
 class _TargetBuilder:
-    def __init__(self) -> None:
+    def __init__(self, *, include_inactive_command: bool = False) -> None:
         self.last_target = None
+        self.include_inactive_command = include_inactive_command
 
     def current_tool_tcp_world_targets(self):
         return {
@@ -76,6 +77,15 @@ class _TargetBuilder:
                 value=np.zeros(6, dtype=float),
             )
         )
+        if self.include_inactive_command:
+            command.add_command(
+                EffectorCommand(
+                    effector_name="left_arm",
+                    side="left",
+                    command_type="joint_vector",
+                    value=np.zeros(6, dtype=float),
+                )
+            )
         return command
 
     def tool_tcp_world_targets_for_qpos_pair(self, *, left_qpos, right_qpos):
@@ -94,7 +104,11 @@ class _OwnerSession:
         return True
 
 
-def _runtime_fixture(*, station_from_execution_x: float = 0.0):
+def _runtime_fixture(
+    *,
+    station_from_execution_x: float = 0.0,
+    include_inactive_command: bool = False,
+):
     execution_frame = CoordinateFrameSpec(frame_id="dual_arm_solver_world")
     station_frame = CoordinateFrameSpec(
         frame_id="canonical_station",
@@ -161,7 +175,7 @@ def _runtime_fixture(*, station_from_execution_x: float = 0.0):
         primitive_reference_frame_id=station_frame.frame_id,
         safety_envelope_refs=(envelope,),
     )
-    builder = _TargetBuilder()
+    builder = _TargetBuilder(include_inactive_command=include_inactive_command)
     port = RealAgentMotionPort(config=port_config, target_builder=builder)
     return bundle, port, builder
 
@@ -348,7 +362,10 @@ def test_real_lifecycle_resolves_dispatches_converges_and_confirms_hold() -> Non
 
 
 def test_absolute_tool_tcp_target_transforms_once_and_propagates_speed_scale() -> None:
-    bundle, port, builder = _runtime_fixture(station_from_execution_x=0.1)
+    bundle, port, builder = _runtime_fixture(
+        station_from_execution_x=0.1,
+        include_inactive_command=True,
+    )
     clock = _Clock()
     owner = _OwnerSession()
     request, operation, route, binding = _pose_request_and_operation(
@@ -405,6 +422,10 @@ def test_absolute_tool_tcp_target_transforms_once_and_propagates_speed_scale() -
     assert command.commands["right_arm"].metadata[
         REAL_AGENT_MOTION_COMMAND_METADATA_KEY
     ] == operation_metadata
+    assert (
+        REAL_AGENT_MOTION_COMMAND_METADATA_KEY
+        not in command.commands["left_arm"].metadata
+    )
     assert builder.last_target is not None
     np.testing.assert_allclose(
         builder.last_target.target_pose_by_side["right"][:3, 3],

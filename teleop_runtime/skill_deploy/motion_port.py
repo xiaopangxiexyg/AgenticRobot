@@ -1039,7 +1039,17 @@ class RealAgentMotionPort:
             command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = dict(
                 operation_metadata
             )
-            for effector in command.commands.values():
+            selected_effectors = tuple(
+                effector
+                for effector in command.commands.values()
+                if effector.side == activation.side
+            )
+            if len(selected_effectors) != 1:
+                raise RuntimeError(
+                    "coupled target command must contain exactly one selected-side "
+                    "effector."
+                )
+            for effector in selected_effectors:
                 effector.metadata = dict(effector.metadata or {})
                 effector.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = dict(
                     operation_metadata
