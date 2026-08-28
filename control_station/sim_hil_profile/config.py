@@ -99,7 +99,7 @@ DEFAULT_STATUS_PORT = 8787
 DEFAULT_SIM_HIL_COMPOSE_TARGET_HZ = 30.0
 SIM_HIL_BLEND_FAILURE_FALLBACKS = frozenset({"hold", "human", "policy"})
 SIM_HIL_HUMAN_TIMEOUT_FALLBACKS = frozenset({"hold", "policy"})
-SIM_HIL_POLICY_BACKENDS = frozenset({"temp_ppo", "openpi_state"})
+SIM_HIL_POLICY_BACKENDS = frozenset({"temp_ppo", "openpi_state", "state_bc"})
 _LOOPBACK_STATUS_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 
@@ -117,6 +117,10 @@ class MujocoSimHILApplicationConfig:
     openpi_policy_hz: float = 15.0
     openpi_action_chunk_execution_steps: int | None = None
     openpi_prediction_queue_threshold: int = 4
+    state_bc_artifact_path: Path | None = None
+    state_bc_action_hz: float = 15.0
+    state_bc_policy_hz: float = 15.0
+    state_bc_prediction_queue_threshold: int = 1
     task_config_path: Path = DEFAULT_TASK_CONFIG
     calibration_profile_path: Path = DEFAULT_CALIBRATION_PROFILE
     vive_coordinate_profile_path: Path | None = DEFAULT_VIVE_COORDINATE_PROFILE
@@ -189,7 +193,7 @@ class MujocoSimHILApplicationConfig:
         backend = str(self.policy_backend).strip().lower()
         if backend not in SIM_HIL_POLICY_BACKENDS:
             raise ValueError(
-                "policy_backend must be temp_ppo or openpi_state."
+                "policy_backend must be temp_ppo, openpi_state, or state_bc."
             )
         object.__setattr__(self, "policy_backend", backend)
         artifact_path = self.openpi_policy_artifact_path
@@ -199,6 +203,18 @@ class MujocoSimHILApplicationConfig:
         if backend == "openpi_state" and artifact_path is None:
             raise ValueError(
                 "openpi_state policy backend requires openpi_policy_artifact_path."
+            )
+        state_bc_artifact_path = self.state_bc_artifact_path
+        if state_bc_artifact_path is not None:
+            state_bc_artifact_path = Path(state_bc_artifact_path).expanduser()
+            object.__setattr__(
+                self,
+                "state_bc_artifact_path",
+                state_bc_artifact_path,
+            )
+        if backend == "state_bc" and state_bc_artifact_path is None:
+            raise ValueError(
+                "state_bc policy backend requires state_bc_artifact_path."
             )
         openpi_host = str(self.openpi_host).strip()
         openpi_port = int(self.openpi_port)
@@ -235,6 +251,24 @@ class MujocoSimHILApplicationConfig:
             self,
             "openpi_prediction_queue_threshold",
             queue_threshold,
+        )
+        for name in ("state_bc_action_hz", "state_bc_policy_hz"):
+            value = _finite(getattr(self, name), name=name)
+            if value <= 0.0:
+                raise ValueError(f"{name} must be positive.")
+            object.__setattr__(self, name, value)
+        state_bc_queue_threshold = int(self.state_bc_prediction_queue_threshold)
+        if (
+            state_bc_queue_threshold < 0
+            or state_bc_queue_threshold != self.state_bc_prediction_queue_threshold
+        ):
+            raise ValueError(
+                "state_bc_prediction_queue_threshold must be non-negative."
+            )
+        object.__setattr__(
+            self,
+            "state_bc_prediction_queue_threshold",
+            state_bc_queue_threshold,
         )
         for name in ("runtime_session_id", "control_domain_id"):
             value = str(getattr(self, name)).strip()

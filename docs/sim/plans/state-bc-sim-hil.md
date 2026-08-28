@@ -19,11 +19,11 @@ input for this probe. This deliberately avoids a simulator dynamics gap for
 the policy input/output experiment; it does not claim that the learned policy
 is physically valid or ready for a robot.
 
-The change in this Task is limited to an offline learner, a MuJoCo observation
-and action adapter, and a source-lineage test seam. The existing
-`MujocoDeployRuntime` remains the only execution owner for admission, safety,
-IK, and dispatch. No new queue, authority, simulator entrypoint, device
-worker, GUI, or hardware path is introduced.
+The live integration keeps the existing `MujocoDeployRuntime` as the only
+execution owner for admission, safety, IK, and dispatch. The Task adds only a
+state-BC provider binding, CLI selection, and keyboard aliases for the
+existing typed source intents; it does not add a second queue, authority,
+simulator control loop, or hardware path.
 
 The stream seam deliberately has two typed spaces. State-BC inference keeps the
 16D model state/action contract above, while every executable policy, human, or
@@ -166,6 +166,46 @@ This is sufficient to compare ordinary teleoperation, takeover/handback, and
 RTC intervention in a deterministic mock trace. A later MuJoCo target test can
 feed the same normalized actions to `MujocoDeployRuntime`; it must not bypass
 that runtime with a parallel simulator control loop.
+
+## Live state-BC Sim-HIL path
+
+The canonical interactive entrypoint is the existing Control Station command
+with an explicit state-BC artifact and the exclusive source-selection profile:
+
+```bash
+python -m control_station sim-hil \
+  --enable \
+  --policy-backend state_bc \
+  --state-bc-artifact /absolute/path/to/state_bc.npz \
+  --control-profile exclusive_truncated_hitl \
+  --control-gui
+```
+
+`--state-bc-artifact` is a self-contained `.npz` produced by the state-BC
+learner. Startup preflight verifies its schema, hash, accepted v2.2 layout,
+and `16 -> 16` model dimensions without contacting a server. At runtime the
+source captures both MuJoCo arms/grippers as a 38-D deployment observation,
+projects it to the 16-D desk-frame state, predicts one absolute 16-D action,
+and uses `StatePolicyAdapter` to produce the existing 26-D runtime action. The
+first binding contributes the right arm and right gripper components, matching
+the current Sim-HIL target; `full_bimanual_execution` remains explicitly
+false.
+
+The source uses `ThreadedPolicyEmissionSource`, so model inference stays off
+the Control Station cycle while queue admission and emission creation remain
+on the existing runtime boundary. `H` submits the typed Human takeover,
+`P` submits the typed Policy handback, and `Esc` submits the existing HOLD
+intent. Shortcuts are disabled while a form control is focused and are active
+only for the `exclusive_truncated_hitl` workflow. They never write actions or
+authority directly.
+
+The live smoke acceptance criterion is: a fresh artifact passes preflight; the
+MuJoCo target starts with Policy selected; a continuous VIVE stream can take
+over through the typed Human path; `HOLD -> fresh emission` is visible at the
+switch; and `P` returns to state-BC emissions through the same target. This
+verifies wiring and source lineage, not task success, policy quality, latency
+guarantees, safety-envelope acceptance, or physical readiness. No real device,
+policy server, or actuator is started by the automated tests.
 
 ## Evidence ceiling and next gate
 

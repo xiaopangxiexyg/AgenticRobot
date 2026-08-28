@@ -345,6 +345,7 @@ _HTML = """<!doctype html>
           <div>
             <h2>控制来源</h2>
             <p>同一组来源卡同时负责启动与运行中切换；绿色卡片是当前真正下发的来源。</p>
+            <p class="subtle">快捷键：H 接管 Human，P 放回 Policy，Esc 立即保持（输入框聚焦时不触发）。</p>
           </div>
           <span id="exclusive-source-selection-state" class="setup-state">未启动</span>
         </div>
@@ -2181,6 +2182,30 @@ _HTML = """<!doctype html>
           : 'request_policy_resume',
       );
     }
+    document.addEventListener('keydown', (event) => {
+      if (event.defaultPrevented || event.repeat) return;
+      const target = event.target;
+      if (target && (
+        target.tagName === 'INPUT'
+        || target.tagName === 'TEXTAREA'
+        || target.tagName === 'SELECT'
+        || target.isContentEditable
+      )) return;
+      if (!latestStatus?.acceptance || !controlToken) return;
+      const controlProfile = latestStatus.acceptance.selected_control_profile_id;
+      if (controlProfile !== 'exclusive_truncated_hitl') return;
+      const key = String(event.key || '').toLowerCase();
+      if (key === 'h') {
+        event.preventDefault();
+        selectExclusiveSource('human');
+      } else if (key === 'p') {
+        event.preventDefault();
+        selectExclusiveSource('policy');
+      } else if (event.key === 'Escape' && latestStatus.started && !latestStatus.held) {
+        event.preventDefault();
+        submitIntent('hold');
+      }
+    });
     $('start-exclusive-policy-runtime').addEventListener(
       'click',
       () => selectExclusiveSource('policy'),
