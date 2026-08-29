@@ -61,6 +61,7 @@ if __package__ in (None, ""):
 from hardware.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
     B601CommandReceipt,
+    B601DriverTorqueLimitReceipt,
     B601HardwareError,
     B601ModeReceipt,
     B601RSBackend,
@@ -80,6 +81,7 @@ from robot_motion.rebot_b601_rs import (
 
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
 FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
+DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = ("joint2", "joint3")
@@ -204,6 +206,27 @@ def _command_receipt_payload(
         "errors": receipt.errors,
         "accepted": receipt.accepted,
         "source_sequence": receipt.source_sequence,
+    }
+
+
+def _driver_torque_limit_receipt_payload(
+    receipt: B601DriverTorqueLimitReceipt | None,
+) -> dict[str, object] | None:
+    if receipt is None:
+        return None
+    return {
+        "operation": receipt.operation,
+        "requested_joint_names": receipt.requested_joint_names,
+        "target_limits_nm": receipt.target_limits_nm,
+        "prior_limits_nm": receipt.prior_limits_nm,
+        "verified_limits_nm": receipt.verified_limits_nm,
+        "applied_joint_names": receipt.applied_joint_names,
+        "restored_joint_names": receipt.restored_joint_names,
+        "failed_joint_names": receipt.failed_joint_names,
+        "errors": receipt.errors,
+        "completed": receipt.completed,
+        "rollback_attempted": receipt.rollback_attempted,
+        "rollback_completed": receipt.rollback_completed,
     }
 
 
@@ -494,6 +517,11 @@ def resolve_active_joint_names(
 
 def _validate_cli(args: argparse.Namespace) -> None:
     if args.mode == "feedback-stability":
+        if getattr(args, "apply_driver_torque_limits", False):
+            raise LowGainProbeError(
+                "feedback-stability rejects --apply-driver-torque-limits; "
+                "it is observation-only"
+            )
         if args.allow_motion:
             raise LowGainProbeError(
                 "feedback-stability rejects --allow-motion; it is observation-only"
@@ -519,6 +547,33 @@ def _validate_cli(args: argparse.Namespace) -> None:
             args.fault_hold_max_velocity_rad_s,
             name="fault_hold_max_velocity_rad_s",
             lower=0.0001,
+            upper=0.5,
+            lower_inclusive=False,
+        )
+        return
+    if args.mode == "driver-torque-limit-roundtrip":
+        if not args.allow_motion:
+            raise LowGainProbeError(
+                "driver-torque-limit-roundtrip requires --allow-motion"
+            )
+        if not args.auto_disable:
+            raise LowGainProbeError(
+                "driver-torque-limit-roundtrip requires explicit --auto-disable"
+            )
+        if args.confirmation != DRIVER_TORQUE_LIMIT_CONFIRMATION:
+            raise LowGainProbeError(
+                "driver-torque-limit-roundtrip requires --confirmation "
+                f"{DRIVER_TORQUE_LIMIT_CONFIRMATION}"
+            )
+        if getattr(args, "apply_driver_torque_limits", False):
+            raise LowGainProbeError(
+                "driver-torque-limit-roundtrip already performs the explicit "
+                "temporary write; omit --apply-driver-torque-limits"
+            )
+        _bounded(
+            args.torque_limit_scale,
+            name="torque_limit_scale",
+            lower=0.01,
             upper=0.5,
             lower_inclusive=False,
         )
@@ -925,6 +980,150 @@ def _run_feedback_stability_probe(
         ],
     }
     return payload
+
+
+def _run_driver_torque_limit_roundtrip_probe(
+    backend: B601RSBackend,
+    *,
+    config_path: Path,
+    source_root: Path,
+    model: B601PinocchioModel,
+    position_limits: tuple[tuple[float, float], ...],
+    target_joint: str,
+    torque_limits_nm: tuple[float, ...],
+) -> dict[str, object]:
+    """Verify one volatile ``0x700B`` apply/restore transaction while disabled."""
+
+    if target_joint not in _ALL_JOINTS:
+        raise ValueError(f"unknown B601-RS joint: {target_joint}")
+    target_names = (target_joint,)
+    connected = False
+    preflight_disable: B601ModeReceipt | None = None
+    cleanup_receipt: B601ModeReceipt | None = None
+    apply_receipt: B601DriverTorqueLimitReceipt | None = None
+    restore_receipt: B601DriverTorqueLimitReceipt | None = None
+    feedback_validated = False
+    errors: list[str] = []
+    try:
+        backend.connect()
+        connected = True
+        state = backend.poll_feedback(request_feedback=True)
+        if (
+            not state.valid
+            or getattr(state, "stale", False)
+            or state.positions_rad is None
+        ):
+            raise LowGainProbeError(
+                "driver torque-limit roundtrip requires one complete valid feedback "
+                f"snapshot; last_fault={state.fault_reason or 'unknown'}"
+            )
+        qpos = _six(state.positions_rad, name="driver_limit_feedback_qpos_rad")
+        for index, (value, (lower, upper)) in enumerate(
+            zip(qpos, position_limits, strict=True)
+        ):
+            if not lower <= value <= upper:
+                raise LowGainProbeError(
+                    f"driver limit feedback qpos_rad[{index}]={value:.6f} is "
+                    f"outside URDF limits [{lower:.6f}, {upper:.6f}]"
+                )
+        feedback_validated = True
+        preflight_disable = backend.safe_stop(joint_names=target_names)
+        if not preflight_disable.completed:
+            raise LowGainProbeError(
+                "preflight safe_stop failed: "
+                + "; ".join(preflight_disable.errors)
+            )
+        apply_receipt = backend.apply_temporary_driver_torque_limits(
+            torque_limits_nm,
+            joint_names=target_names,
+        )
+        if not apply_receipt.completed:
+            raise LowGainProbeError(
+                "temporary driver torque-limit apply failed: "
+                + "; ".join(apply_receipt.errors)
+            )
+    except (B601HardwareError, LowGainProbeError, OSError, TypeError, ValueError) as exc:
+        errors.append(str(exc))
+    except Exception as exc:  # noqa: BLE001 - preserve vendor failure evidence
+        errors.append(f"unexpected roundtrip failure: {exc}")
+    finally:
+        if connected:
+            try:
+                cleanup_receipt = backend.safe_stop(joint_names=target_names)
+                if not cleanup_receipt.completed:
+                    errors.extend(
+                        f"cleanup safe_stop: {error}"
+                        for error in cleanup_receipt.errors
+                    )
+                    if not cleanup_receipt.errors:
+                        errors.append(
+                            "cleanup safe_stop incomplete without vendor error"
+                        )
+            except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                errors.append(f"cleanup safe_stop: {exc}")
+            try:
+                restore_receipt = backend.restore_driver_torque_limits()
+                if not restore_receipt.completed:
+                    errors.extend(
+                        f"restore driver torque limit: {error}"
+                        for error in restore_receipt.errors
+                    )
+                    if not restore_receipt.errors:
+                        errors.append(
+                            "restore driver torque limit incomplete without vendor error"
+                        )
+            except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                errors.append(f"restore driver torque limit: {exc}")
+            try:
+                backend.close()
+            except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                errors.append(f"close: {exc}")
+
+    completed = (
+        feedback_validated
+        and preflight_disable is not None
+        and preflight_disable.completed
+        and apply_receipt is not None
+        and apply_receipt.completed
+        and cleanup_receipt is not None
+        and cleanup_receipt.completed
+        and restore_receipt is not None
+        and restore_receipt.completed
+        and not errors
+    )
+    return {
+        "status": "OK" if completed else "FAIL",
+        "mode": "driver-torque-limit-roundtrip",
+        "confirmation": DRIVER_TORQUE_LIMIT_CONFIRMATION,
+        "channel": backend.config.channel,
+        "config_path": str(config_path),
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "rebot_source_root": str(source_root),
+        "urdf_path": str(model.urdf_path),
+        "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+        "transport": "motorbridge_wired_local",
+        "target_joint": target_joint,
+        "target_limit_nm": torque_limits_nm[_ALL_JOINTS.index(target_joint)],
+        "parameter": "RobStride limit_torque 0x700B",
+        "parameter_persistence": "volatile_not_saved",
+        "feedback_validated": feedback_validated,
+        "motors_enabled_by_probe": False,
+        "motion_commands_sent": False,
+        "mode_transitions_sent": False,
+        "parameter_write_attempted": apply_receipt is not None,
+        "preflight_disable_receipt": _mode_receipt_payload(preflight_disable),
+        "apply_receipt": _driver_torque_limit_receipt_payload(apply_receipt),
+        "cleanup_receipt": _mode_receipt_payload(cleanup_receipt),
+        "restore_receipt": _driver_torque_limit_receipt_payload(restore_receipt),
+        "errors": tuple(errors),
+        "acceptance_status": "PASS" if completed else "FAIL",
+        "hardware_acceptance": "NOT_CLAIMED",
+        "notes": [
+            "This mode never changes control mode, enables a motor, or sends MIT/POS_VEL commands.",
+            "It writes only the selected arm motor's volatile RobStride limit_torque (0x700B), verifies readback, safe-stops again, and restores the exact observed original value with readback.",
+            "A PASS validates the guarded parameter transaction only; it is not a motion, force-control, or haptic acceptance result.",
+        ],
+    }
 
 
 def condition_torque(
@@ -1833,6 +2032,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         model.urdf_path,
         scale=args.torque_limit_scale,
     )
+    if args.mode == "driver-torque-limit-roundtrip":
+        config = B601RSBackendConfig.from_rs_yaml(
+            config_path,
+            allow_motion=True,
+            position_limits_rad=position_limits,
+        )
+        return _run_driver_torque_limit_roundtrip_probe(
+            B601RSBackend(config),
+            config_path=config_path,
+            source_root=source_root,
+            model=model,
+            position_limits=position_limits,
+            target_joint=args.joint,
+            torque_limits_nm=torque_limits,
+        )
     overlay_limits = (
         tuple(
             value * args.cartesian_overlay_limit_scale
@@ -1895,6 +2109,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     mode_receipt: B601ModeReceipt | None = None
     enable_receipt: B601ModeReceipt | None = None
     cleanup_receipt: B601ModeReceipt | None = None
+    driver_limit_apply_receipt: B601DriverTorqueLimitReceipt | None = None
+    driver_limit_restore_receipt: B601DriverTorqueLimitReceipt | None = None
     cleanup_errors: list[str] = []
     protective_hold_latched = False
     protective_hold_commands = 0
@@ -1982,6 +2198,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             raise LowGainProbeError(
                 "preflight safe_stop failed: " + "; ".join(preflight_disable.errors)
             )
+        if getattr(args, "apply_driver_torque_limits", False):
+            driver_limit_apply_receipt = (
+                backend.apply_temporary_driver_torque_limits(
+                    torque_limits,
+                    joint_names=(args.joint,),
+                )
+            )
+            if not driver_limit_apply_receipt.completed:
+                detail = "; ".join(driver_limit_apply_receipt.errors)
+                raise LowGainProbeError(
+                    "temporary driver torque-limit apply failed"
+                    + (f": {detail}" if detail else "")
+                )
         mode_receipt = backend.prepare_mit_mode(joint_names=active_joint_names)
         if not mode_receipt.completed:
             raise LowGainProbeError(
@@ -2467,6 +2696,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 issue_full_safe_stop()
             else:
                 issue_full_safe_stop()
+            if getattr(args, "apply_driver_torque_limits", False):
+                try:
+                    driver_limit_restore_receipt = (
+                        backend.restore_driver_torque_limits()
+                    )
+                    if not driver_limit_restore_receipt.completed:
+                        cleanup_errors.extend(
+                            f"restore driver torque limit: {error}"
+                            for error in driver_limit_restore_receipt.errors
+                        )
+                        if not driver_limit_restore_receipt.errors:
+                            cleanup_errors.append(
+                                "restore driver torque limit incomplete without vendor error"
+                            )
+                except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                    cleanup_errors.append(f"restore driver torque limit: {exc}")
         try:
             backend.close()
         except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
@@ -2490,7 +2735,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         )
         for event in required_events
     }
-    cleanup_ok = cleanup_receipt is not None and cleanup_receipt.completed and not cleanup_errors
+    driver_limit_cleanup_ok = (
+        not getattr(args, "apply_driver_torque_limits", False)
+        or (
+            driver_limit_restore_receipt is not None
+            and driver_limit_restore_receipt.completed
+        )
+    )
+    cleanup_ok = (
+        cleanup_receipt is not None
+        and cleanup_receipt.completed
+        and driver_limit_cleanup_ok
+        and not cleanup_errors
+    )
     control_passed = (
         stop_reason is None
         and commands_sent > 0
@@ -2554,6 +2811,20 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "mode_receipt": _mode_receipt_payload(mode_receipt),
         "enable_receipt": _mode_receipt_payload(enable_receipt),
         "cleanup_receipt": _mode_receipt_payload(cleanup_receipt),
+        "driver_torque_limits": {
+            "requested": bool(
+                getattr(args, "apply_driver_torque_limits", False)
+            ),
+            "source": "pinned_urdf_effort_scaled",
+            "requested_limits_nm": torque_limits,
+            "volatile_parameter": "RobStride limit_torque 0x700B",
+            "apply_receipt": _driver_torque_limit_receipt_payload(
+                driver_limit_apply_receipt
+            ),
+            "restore_receipt": _driver_torque_limit_receipt_payload(
+                driver_limit_restore_receipt
+            ),
+        },
         "protective_hold": {
             "latched": protective_hold_latched,
             "command_count": protective_hold_commands,
@@ -2645,6 +2916,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Before any torque command, the active path requires four consecutive complete feedback snapshots after enable; no torque command is sent during this arming-settle gate.",
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "Software composes gravity, position, finite-difference damping, and an optional bounded J.T F overlay, then dispatches vendor MIT kp=kd=0.",
+            "When explicitly requested, the probe temporarily mirrors the target joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies readback before enable, and restores the original value after full safe_stop.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
             "A slow-step PASS additionally requires a completed reference, correct-direction bounded target response, and bounded support-joint drift. It is not a HARDWARE_PASS or force-sensor validation.",
@@ -2661,7 +2933,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("hold", "slow-step", "cartesian-hold", "feedback-stability"),
+        choices=(
+            "hold",
+            "slow-step",
+            "cartesian-hold",
+            "feedback-stability",
+            "driver-torque-limit-roundtrip",
+        ),
         default="hold",
     )
     parser.add_argument("--config", required=True, help="explicit rebotarm_rs.yaml")
@@ -2713,6 +2991,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=_DEFAULT_TORQUE_LIMIT_SCALE,
         help="fraction of the pinned URDF effort ceiling; max 0.5 for this probe",
+    )
+    parser.add_argument(
+        "--apply-driver-torque-limits",
+        action="store_true",
+        help=(
+            "temporarily mirror the target joint's scaled URDF torque envelope "
+            "into volatile RobStride limit_torque (0x700B), with readback and "
+            "restoration"
+        ),
     )
     parser.add_argument(
         "--torque-rise-time-sec",

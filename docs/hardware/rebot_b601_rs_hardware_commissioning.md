@@ -31,6 +31,10 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   `ensure_mode(MIT)` 并保留相同 settling delay；它不使能电机，也不选择运行增益。当前
   backend 的 `send_mit()` 参数顺序与 upstream 一致，均为
   `(position, velocity, kp, kd, feedforward_tau)`；
+- backend 可显式读写 RobStride `limit_torque (0x700B)`，但只提供临时、易失事务：当前
+  session 必须先取得所选关节成功的 `disable/safe_stop` receipt，随后才会读取全部原值、
+  写入新值并逐项回读；任一失败会回滚全部已触碰关节。原值未全部恢复并回读前，`close()`
+  会拒绝释放 backend。该接口不写 flash、不替代软件总力矩/slew envelope，也不授权使能；
 - MotorBridge 0.4.9 的 `MotorState` 没有源时间戳或接收序号，所以反馈状态明确标为
   `freshness_verified=false`、`poll_observation_unverified`，报告的 `vel/torq` 也保留
   `vendor_reported_unverified` 语义；
@@ -351,6 +355,50 @@ run_logged() {
   } >>"$LOG"
   return "$STATUS"
 }
+```
+
+在任何新的 active J6 试验前，先单独验证驱动器临时总力矩限幅事务。下面模式只对 J6：
+读取一份完整合法反馈、`safe_stop`、把 scaled URDF effort 写入易失的 `0x700B` 并回读，
+再次 `safe_stop`，最后恢复本次运行实际读到的原值并回读。它不切模式、不调用 `enable()`、
+不发 MIT/POS_VEL 命令，因此不会显示 `[DRIVE]` 倒计时；但它会写驱动器参数，仍须前台运行、
+保持机械支撑和可触达急停：
+
+```bash
+# 复用上面的 WT/PY/CFG/SRC/OUT_DIR/LOG 和 run_logged
+mkdir -p "$OUT_DIR"
+if cd "$WT"; then
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" \
+      scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+      --mode driver-torque-limit-roundtrip \
+      --config "$CFG" \
+      --rebot-source-root "$SRC" \
+      --joint joint6 \
+      --torque-limit-scale 0.1 \
+      --allow-motion \
+      --auto-disable \
+      --confirmation B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP \
+      --output "$OUT_DIR/b601_driver_torque_limit_roundtrip_joint6.json"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  printf 'driver-limit roundtrip exit code: %s\n' "$STATUS"
+  printf 'command and output log: %s\n' "$LOG"
+else
+  printf '%s\n' 'ERROR: worktree not found'
+fi
+printf '%s\n' 'shell remains active'
+```
+
+只有 `status=OK`、两份 `safe_stop` receipt 完整、`apply_receipt.completed=true`、
+`restore_receipt.completed=true`，且 apply 的 `prior_limits_nm` 与 restore 的
+`verified_limits_nm` 一致，才允许在后续 active 命令中加入
+`--apply-driver-torque-limits`。active 路径也只会临时改写 `--joint` 指定的同一个目标关节，
+不会顺带改写支撑关节。这只验收 J6 参数事务，不证明电机会运动或力控有效。
+
+完成该往返验收后，active `hold` 命令如下。它仍会在前台显示 `[DRIVE] 3/2/1/ENABLE`：
+
+```bash
 
 mkdir -p "$OUT_DIR"
 if cd "$WT"; then
@@ -372,6 +420,7 @@ if cd "$WT"; then
       --target-kd 0.5 \
       --gravity-scale 0.1 \
       --torque-limit-scale 0.1 \
+      --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
       --velocity-abort-rad-s 0.05 \
       --max-error-rad 0.05 \
@@ -473,6 +522,7 @@ if cd "$WT"; then
       --target-kd 0.75 \
       --gravity-scale 0.1 \
       --torque-limit-scale 0.1 \
+      --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
       --velocity-abort-rad-s 0.05 \
       --max-error-rad 0.05 \
@@ -510,8 +560,10 @@ slow-step 的 `acceptance_status=PASS` 现在同时要求
 `kp=50.0, kd=4.0`；二者只是上游实现依据，不是本 commissioning 探针可直接照搬的安全
 参数。若后续引入非零驱动器内部增益，准入必须在发送前对每帧证明
 `|tau_ff| + kp*|q_ref-q| + kd*|dq_ref-dq|` 不超过探针最终力矩 envelope，同时保留当前位置
-锚定、速度/误差 abort、slew limit 和完整 cleanup；在该契约实现并离线验证前，继续保持
-当前单一软件力矩 owner，不运行更高增益真机试验。
+锚定、速度/误差 abort、slew limit 和完整 cleanup。新增的 `0x700B` 临时限幅可作为驱动器
+侧独立绝对上限，但它不提供软件 slew-rate 约束，也不能单独证明内部 PD 与前馈的精确合成
+语义；在非零驱动器 PD 契约实现并离线验证前，继续保持当前单一软件力矩 owner，不运行
+更高增益真机试验。
 
 任一方向出现反向、跳变、振荡、超速、超误差、非有限反馈或未完成 stop receipt，
 立即按急停/支撑规程停止并保留 JSON；不得通过提高 `max-error`、放宽速度/力矩限幅、
@@ -597,10 +649,10 @@ commissioning；不得据此声明触觉带宽、接触稳定性或最终 impeda
 
 另外，`compute_b601_mit_torque()` 已经在软件中组合 position、damping、gravity 和 overlay；
 若把该总力矩作为 `tau` 发送，同时给驱动器非零 `kp/kd`，会重复计算 PD。反过来，若使用
-upstream 的驱动器 PD 加 `g(q)` 前馈，当前 backend 仅能限制前馈 `tau`，不能证明驱动器
-内部 PD 与前馈相加后的最终总力矩满足项目的 final-output bound。进入 P4 前必须先确定并
-实现唯一的一种 torque ownership，并取得高频、可验证 freshness 的 q 与差分 dq，再补齐
-watchdog、最终 torque/slew 限制和单关节安全验收。P4.1/P4.2 的已使能 MIT 命令只用于
+upstream 的驱动器 PD 加 `g(q)` 前馈，`0x700B` 临时限幅能提供驱动器侧绝对上限，却不能
+单独证明内部 PD/前馈的精确合成、方向、动态或软件 slew envelope。进入非零驱动器 PD 前
+仍必须先确定并实现唯一 torque ownership，并取得高频、可验证 freshness 的 q 与差分 dq，
+再补齐 watchdog、最终 torque/slew 限制和单关节安全验收。P4.1/P4.2 的已使能 MIT 命令只用于
 现场低速 commissioning，不构成高频 haptic/force-control 验收入口。
 
 ## 操作者手动 enabled 位置频率入口（本轮不执行）

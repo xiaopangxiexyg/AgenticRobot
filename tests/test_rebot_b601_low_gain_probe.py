@@ -128,6 +128,112 @@ def test_feedback_stability_probe_never_enters_motion_path(tmp_path) -> None:
     assert backend.events == ["connect", "poll_feedback", "poll_feedback", "poll_feedback", "close"]
 
 
+def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -> None:
+    class FakeBackend:
+        config = SimpleNamespace(channel="can0")
+
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        def connect(self) -> None:
+            self.events.append("connect")
+
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            assert request_feedback is True
+            self.events.append("poll_feedback")
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=(0.0,) * 6,
+                fault_reason=None,
+            )
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> object:
+            assert joint_names == ("joint6",)
+            self.events.append("safe_stop")
+            return probe.B601ModeReceipt(
+                operation="safe_stop",
+                requested_joint_names=joint_names,
+                completed_joint_names=joint_names,
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+        def apply_temporary_driver_torque_limits(
+            self,
+            limits_nm: tuple[float, ...],
+            *,
+            joint_names: tuple[str, ...],
+        ) -> object:
+            assert limits_nm == (3.6, 3.6, 3.6, 1.4, 1.4, 1.4)
+            assert joint_names == ("joint6",)
+            self.events.append("apply")
+            return probe.B601DriverTorqueLimitReceipt(
+                operation="apply_temporary_driver_torque_limits",
+                requested_joint_names=joint_names,
+                target_limits_nm=(1.4,),
+                prior_limits_nm=(14.0,),
+                verified_limits_nm=(1.4,),
+                applied_joint_names=joint_names,
+                restored_joint_names=(),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+        def restore_driver_torque_limits(self) -> object:
+            self.events.append("restore")
+            return probe.B601DriverTorqueLimitReceipt(
+                operation="restore_driver_torque_limits",
+                requested_joint_names=("joint6",),
+                target_limits_nm=(14.0,),
+                prior_limits_nm=(1.4,),
+                verified_limits_nm=(14.0,),
+                applied_joint_names=(),
+                restored_joint_names=("joint6",),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+        def close(self) -> None:
+            self.events.append("close")
+
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("joints: []\n", encoding="utf-8")
+    urdf_path = tmp_path / "b601.urdf"
+    urdf_path.write_text("<robot name='b601'/>", encoding="utf-8")
+    backend = FakeBackend()
+
+    result = probe._run_driver_torque_limit_roundtrip_probe(
+        backend,
+        config_path=config_path,
+        source_root=tmp_path,
+        model=SimpleNamespace(urdf_path=urdf_path),
+        position_limits=((-1.0, 1.0),) * 6,
+        target_joint="joint6",
+        torque_limits_nm=(3.6, 3.6, 3.6, 1.4, 1.4, 1.4),
+    )
+
+    assert result["status"] == "OK"
+    assert result["motors_enabled_by_probe"] is False
+    assert result["motion_commands_sent"] is False
+    assert result["mode_transitions_sent"] is False
+    assert result["target_limit_nm"] == 1.4
+    assert result["apply_receipt"]["prior_limits_nm"] == (14.0,)
+    assert result["restore_receipt"]["verified_limits_nm"] == (14.0,)
+    assert backend.events == [
+        "connect",
+        "poll_feedback",
+        "safe_stop",
+        "apply",
+        "safe_stop",
+        "restore",
+        "close",
+    ]
+
+
 def test_software_profile_has_single_torque_owner() -> None:
     profile = probe.build_software_profile(
         kp=0.5,
@@ -705,6 +811,36 @@ def test_drive_enable_countdown_interrupts_before_enable(tmp_path) -> None:
     assert "ENABLE" not in log_stream.getvalue()
 
 
+def test_driver_torque_limit_receipt_payload_preserves_transaction_evidence() -> None:
+    receipt = probe.B601DriverTorqueLimitReceipt(
+        operation="apply_temporary_driver_torque_limits",
+        requested_joint_names=("joint6",),
+        target_limits_nm=(1.4,),
+        prior_limits_nm=(14.0,),
+        verified_limits_nm=(1.4,),
+        applied_joint_names=("joint6",),
+        restored_joint_names=(),
+        failed_joint_names=(),
+        errors=(),
+        completed=True,
+    )
+
+    assert probe._driver_torque_limit_receipt_payload(receipt) == {
+        "operation": "apply_temporary_driver_torque_limits",
+        "requested_joint_names": ("joint6",),
+        "target_limits_nm": (1.4,),
+        "prior_limits_nm": (14.0,),
+        "verified_limits_nm": (1.4,),
+        "applied_joint_names": ("joint6",),
+        "restored_joint_names": (),
+        "failed_joint_names": (),
+        "errors": (),
+        "completed": True,
+        "rollback_attempted": False,
+        "rollback_completed": None,
+    }
+
+
 def test_slow_step_is_relative_and_bounded() -> None:
     q0 = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
     limits = ((-2.8, 2.8), (0.0, 3.14), (0.0, 3.14), (-1.57, 1.57), (-1.57, 1.57), (-3.14, 3.14))
@@ -897,6 +1033,7 @@ def test_parser_help_is_read_only() -> None:
     assert tuple(args.support_joints) == ("joint2", "joint3")
     assert args.target_kp is None
     assert args.target_kd is None
+    assert args.apply_driver_torque_limits is False
     assert args.cartesian_stiffness_n_per_m == 20.0
     assert args.cartesian_max_displacement_m == 0.02
 
@@ -932,6 +1069,50 @@ def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
     )
     with pytest.raises(probe.LowGainProbeError, match="observation-only"):
         probe._validate_cli(motion_args)
+
+    driver_write_args = parser.parse_args(
+        [
+            "--mode",
+            "feedback-stability",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--apply-driver-torque-limits",
+            "--confirmation",
+            probe.FEEDBACK_STABILITY_CONFIRMATION,
+        ]
+    )
+    with pytest.raises(probe.LowGainProbeError, match="observation-only"):
+        probe._validate_cli(driver_write_args)
+
+
+def test_driver_torque_limit_roundtrip_cli_requires_explicit_authority() -> None:
+    parser = probe.build_parser()
+    base = [
+        "--mode",
+        "driver-torque-limit-roundtrip",
+        "--config",
+        "config.yaml",
+        "--rebot-source-root",
+        "source",
+        "--joint",
+        "joint6",
+    ]
+
+    with pytest.raises(probe.LowGainProbeError, match="requires --allow-motion"):
+        probe._validate_cli(parser.parse_args(base))
+
+    args = parser.parse_args(
+        [
+            *base,
+            "--allow-motion",
+            "--auto-disable",
+            "--confirmation",
+            probe.DRIVER_TORQUE_LIMIT_CONFIRMATION,
+        ]
+    )
+    probe._validate_cli(args)
 
 
 def _parse_cartesian_args(*extra: str) -> object:
