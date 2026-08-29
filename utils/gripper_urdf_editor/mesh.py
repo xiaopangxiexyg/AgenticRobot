@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import math
 import struct
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .core import GeometryRef, URDFDocument, URDFValidationError, Vec3, _floats, geometry_kind
+from .core import GeometryRef, URDFDocument, URDFValidationError, Vec3, _floats
 
 
 Triangle = tuple[Vec3, Vec3, Vec3]
