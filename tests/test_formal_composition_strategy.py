@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import threading
 
 import numpy as np
 import pytest
@@ -36,6 +38,7 @@ from robot_motion.action import (
     BIMANUAL_QPOS_V1,
     ActionComponentCatalog,
     ActionComponentSpec,
+    ProposalAdmissionReceipt,
     ProposalBuffer,
     RobotAction,
     build_robot_action_v1_runtime_schema,
@@ -81,6 +84,8 @@ def build_runtime(
     *,
     information_plan: CompositionInformationPlan | None = None,
     pre_mix_policy=None,
+    event_emitter=None,
+    proposal_admitter=None,
 ):
     clock = Clock()
     coordinator = ControlAdmissionCoordinator(
@@ -128,8 +133,16 @@ def build_runtime(
         action_schema=build_robot_action_v1_runtime_schema(
             component_catalog=component_catalog,
         ),
-        event_emitter=lambda batch: events.extend(batch),
-        proposal_admitter=lambda draft, **_kwargs: proposals.admit(draft),
+        event_emitter=(
+            (lambda batch: events.extend(batch))
+            if event_emitter is None
+            else event_emitter
+        ),
+        proposal_admitter=(
+            (lambda draft, **_kwargs: proposals.admit(draft))
+            if proposal_admitter is None
+            else proposal_admitter
+        ),
         context_retention_spec=retention_spec(),
         composition_input_retention_spec=retention_spec(),
         information_plan=information_plan,
@@ -138,6 +151,221 @@ def build_runtime(
         clock=clock,
     )
     return clock, runtime, proposals, events
+
+
+def test_domain_event_observer_failure_cannot_half_fail_input_admission() -> None:
+    def failing_event_emitter(_events) -> None:
+        raise RuntimeError("trace unavailable")
+
+    _, runtime, _, _ = build_runtime(
+        strategy=None,
+        event_emitter=failing_event_emitter,
+    )
+
+    receipt = runtime.admit_composition_input(input_draft())
+
+    assert receipt.accepted
+    assert receipt.composition_input is not None
+    assert len(runtime.composition_inputs) == 1
+    assert runtime.event_emission_failure_count == 1
+    failure = runtime.event_emission_failures[0]
+    assert failure.event_kinds == (
+        "composition_input_admission",
+        "composition_input",
+    )
+    assert failure.error_type == "RuntimeError"
+    assert failure.message == "trace unavailable"
+
+
+def test_failed_evaluation_events_are_not_claimed_emitted_and_specs_retry() -> None:
+    emitted = []
+    fail = {"enabled": True}
+
+    def event_emitter(events) -> None:
+        if fail["enabled"]:
+            raise RuntimeError("trace unavailable")
+        emitted.extend(events)
+
+    _, runtime, _, _ = build_runtime(
+        strategy=None,
+        event_emitter=event_emitter,
+    )
+    assert runtime.admit_composition_input(input_draft()).accepted
+    first = runtime.evaluate_composition(
+        spec=composition_spec(),
+        target_effective_at=10.1,
+    )
+
+    assert first.composition_evaluation.output_status == "ready"
+    assert first.evaluation_record is not None
+    assert first.evaluation_record.domain_events_emitted == ()
+    assert runtime.event_emission_failure_count == 2
+
+    fail["enabled"] = False
+    second = runtime.evaluate_composition(
+        spec=composition_spec(),
+        target_effective_at=10.2,
+    )
+
+    assert second.evaluation_record is not None
+    assert second.evaluation_record.domain_events_emitted
+    emitted_kinds = tuple(event.event_kind for event in emitted)
+    assert emitted_kinds.count("composition_temporal_selection_spec") == 1
+    assert emitted_kinds.count("composition_spec") == 1
+
+
+class _PublicationRaceStrategy:
+    def __init__(
+        self,
+        spec: FormalCompositionStrategySpec,
+        *,
+        fail_first_commit: bool = False,
+    ) -> None:
+        self.spec = spec
+        self.decide_count = 0
+        self.validated_decide_count: int | None = None
+        self.committed = 0
+        self.second_decide_entered = threading.Event()
+        self.fail_first_commit = fail_first_commit
+        self.commit_attempts = 0
+
+    def decide(
+        self,
+        strategy_input: FormalCompositionStrategyInput,
+    ) -> CompositionStrategyDecision:
+        self.decide_count += 1
+        if self.decide_count == 2:
+            self.second_decide_entered.set()
+        return CompositionStrategyDecision(
+            output_status="ready",
+            reason="race_fixture",
+            composed_candidate=(
+                strategy_input.input_snapshot.selected_input_by_role["base"].action
+            ),
+        )
+
+    def validate_publication_transaction(self, _evaluation) -> None:
+        self.validated_decide_count = self.decide_count
+
+    def commit_publication_transaction(self, _evaluation) -> None:
+        self.commit_attempts += 1
+        if self.fail_first_commit and self.commit_attempts == 1:
+            raise RuntimeError("synthetic continuity commit failure")
+        if self.decide_count != self.validated_decide_count:
+            raise RuntimeError("prepared strategy state was superseded")
+        self.committed += 1
+
+
+def test_stateful_strategy_evaluation_cannot_supersede_inflight_publication() -> None:
+    strategy_spec = FormalCompositionStrategySpec(
+        strategy_id="publication-race-fixture",
+        strategy_version="1",
+        composition_spec_hash=composition_spec().semantic_content_hash,
+    )
+    strategy = _PublicationRaceStrategy(strategy_spec)
+    proposal_entered = threading.Event()
+    release_proposal = threading.Event()
+    admitted_drafts = []
+
+    def blocking_proposal_admitter(draft, **_kwargs):
+        admitted_drafts.append(draft)
+        proposal_entered.set()
+        assert release_proposal.wait(timeout=2.0)
+        return ProposalAdmissionReceipt(accepted=True, proposal_id="proposal:race")
+
+    _, runtime, _, _ = build_runtime(
+        strategy,
+        proposal_admitter=blocking_proposal_admitter,
+    )
+    assert runtime.admit_composition_input(input_draft()).accepted
+    first = runtime.evaluate_composition(
+        spec=composition_spec(),
+        target_effective_at=10.1,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        promotion = executor.submit(
+            runtime.admit_evaluated_composition,
+            first,
+            runtime_session_id="session-0",
+            producer_id="composer-0",
+            producer_epoch=1,
+            sequence=0,
+            effective_until=10.5,
+        )
+        assert proposal_entered.wait(timeout=1.0)
+        second = executor.submit(
+            runtime.evaluate_composition,
+            spec=composition_spec(),
+            target_effective_at=10.2,
+        )
+        assert not strategy.second_decide_entered.wait(timeout=0.1)
+        release_proposal.set()
+        promoted = promotion.result(timeout=1.0)
+        second.result(timeout=1.0)
+
+    assert promoted.proposal_admission is not None
+    assert promoted.proposal_admission.accepted
+    assert strategy.committed == 1
+    assert len(admitted_drafts) == 1
+
+
+def test_accepted_proposal_retries_pending_strategy_commit_without_readmission() -> None:
+    strategy_spec = FormalCompositionStrategySpec(
+        strategy_id="publication-commit-retry-fixture",
+        strategy_version="1",
+        composition_spec_hash=composition_spec().semantic_content_hash,
+    )
+    strategy = _PublicationRaceStrategy(
+        strategy_spec,
+        fail_first_commit=True,
+    )
+    admitted_drafts = []
+
+    def proposal_admitter(draft, **_kwargs):
+        admitted_drafts.append(draft)
+        return ProposalAdmissionReceipt(
+            accepted=True,
+            proposal_id="proposal:commit-retry",
+        )
+
+    _, runtime, _, _ = build_runtime(
+        strategy,
+        proposal_admitter=proposal_admitter,
+    )
+    assert runtime.admit_composition_input(input_draft()).accepted
+    evaluation = runtime.evaluate_composition(
+        spec=composition_spec(),
+        target_effective_at=10.1,
+    )
+    promotion_kwargs = {
+        "runtime_session_id": "session-0",
+        "producer_id": "composer-0",
+        "producer_epoch": 1,
+        "sequence": 0,
+        "effective_until": 10.5,
+    }
+
+    with pytest.raises(RuntimeError, match="synthetic continuity commit failure"):
+        runtime.admit_evaluated_composition(evaluation, **promotion_kwargs)
+    assert len(admitted_drafts) == 1
+    assert strategy.committed == 0
+    with pytest.raises(RuntimeError, match="exact promotion first"):
+        runtime.evaluate_composition(
+            spec=composition_spec(),
+            target_effective_at=10.2,
+        )
+
+    retried = runtime.admit_evaluated_composition(
+        evaluation,
+        **promotion_kwargs,
+    )
+
+    assert retried.proposal_admission is not None
+    assert retried.proposal_admission.accepted
+    assert len(admitted_drafts) == 1
+    assert strategy.commit_attempts == 2
+    assert strategy.committed == 1
 
 
 def input_draft(

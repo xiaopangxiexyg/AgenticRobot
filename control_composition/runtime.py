@@ -7,6 +7,7 @@ authority policy, execution state, dispatcher, or backend.
 
 from __future__ import annotations
 
+from collections import deque
 import threading
 import time
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from control_composition.activation import CompositionActivationScope
 from control_composition.events import (
     CompositionActivationBinding,
     CompositionDomainEvent,
+    CompositionEventEmissionFailure,
     CompositionInputSemanticBinding,
     CompositionSourceEligibilityBinding,
 )
@@ -382,7 +384,13 @@ class ControlCompositionRuntime:
         self.composer = DeterministicComposer()
         self._evaluation_snapshot_lock = threading.RLock()
         self._composition_promotion_lock = threading.RLock()
+        self._strategy_publication_lock = threading.RLock()
         self._event_spec_lock = threading.RLock()
+        self._event_failure_lock = threading.RLock()
+        self._event_emission_failures: deque[
+            CompositionEventEmissionFailure
+        ] = deque(maxlen=128)
+        self._event_emission_failure_count = 0
         self._emitted_composition_spec_hashes: set[str] = set()
         self._emitted_action_payload_schema_hashes: set[str] = set()
         self._emitted_component_action_schema_hashes: set[str] = set()
@@ -410,9 +418,43 @@ class ControlCompositionRuntime:
         self._accepted_publication_target_by_scope: dict[
             tuple[str, int, str], float
         ] = {}
+        self._pending_publication_commit_by_evaluation_id: dict[
+            str, CompositionEvaluation
+        ] = {}
 
-    def _emit(self, *events: CompositionDomainEvent) -> None:
-        self.event_emitter(tuple(events))
+    @property
+    def event_emission_failures(
+        self,
+    ) -> tuple[CompositionEventEmissionFailure, ...]:
+        """Return the bounded passive-observer failure history."""
+
+        with self._event_failure_lock:
+            return tuple(self._event_emission_failures)
+
+    @property
+    def event_emission_failure_count(self) -> int:
+        """Return the monotonic count, including failures evicted from history."""
+
+        with self._event_failure_lock:
+            return self._event_emission_failure_count
+
+    def _emit(self, *events: CompositionDomainEvent) -> bool:
+        """Best-effort event observation that never gates composition state."""
+
+        batch = tuple(events)
+        try:
+            self.event_emitter(batch)
+        except Exception as error:
+            failure = CompositionEventEmissionFailure(
+                event_kinds=tuple(event.event_kind for event in batch),
+                error_type=type(error).__name__,
+                message=str(error),
+            )
+            with self._event_failure_lock:
+                self._event_emission_failure_count += 1
+                self._event_emission_failures.append(failure)
+            return False
+        return True
 
     @property
     def information_plan(self) -> CompositionInformationPlan | None:
@@ -509,15 +551,15 @@ class ControlCompositionRuntime:
                             occurred_at=revision.available_at,
                         )
                     )
-                if events:
-                    self._emit(*events)
-                if contract is not None:
+                emitted = not events or self._emit(*events)
+                if emitted and contract is not None:
                     self._emitted_dynamic_parameter_contract_hashes.add(
                         contract.semantic_content_hash
                     )
-                self._emitted_strategy_revision_hashes.add(
-                    revision.semantic_content_hash
-                )
+                if emitted:
+                    self._emitted_strategy_revision_hashes.add(
+                        revision.semantic_content_hash
+                    )
         return receipt
 
     def admit_dynamic_parameters(
@@ -570,14 +612,15 @@ class ControlCompositionRuntime:
                         occurred_at=record.available_at,
                     )
                 )
-                self._emit(*events)
-                if contract is not None:
+                emitted = self._emit(*events)
+                if emitted and contract is not None:
                     self._emitted_dynamic_parameter_contract_hashes.add(
                         contract.semantic_content_hash
                     )
-                self._emitted_strategy_revision_hashes.add(
-                    revision.semantic_content_hash
-                )
+                if emitted:
+                    self._emitted_strategy_revision_hashes.add(
+                        revision.semantic_content_hash
+                    )
         return receipt
 
     def _information_plan_event(
@@ -596,9 +639,9 @@ class ControlCompositionRuntime:
     def _emit_with_information_plan(
         self,
         *events: CompositionDomainEvent,
-    ) -> None:
+    ) -> bool:
         if not events:
-            return
+            return True
         with self._event_spec_lock:
             plan_event = self._information_plan_event(
                 occurred_at=events[0].occurred_at
@@ -608,9 +651,10 @@ class ControlCompositionRuntime:
                 if plan_event is None
                 else (plan_event, *events)
             )
-            self._emit(*batch)
-            if plan_event is not None:
+            emitted = self._emit(*batch)
+            if emitted and plan_event is not None:
                 self._information_plan_emitted = True
+            return emitted
 
     def context_requirement_for_channel(
         self,
@@ -929,8 +973,8 @@ class ControlCompositionRuntime:
                         occurred_at=receipt.lifecycle_record.available_at,
                     )
                 )
-            self._emit_with_information_plan(*events)
-            if emit_spec:
+            emitted = self._emit_with_information_plan(*events)
+            if emitted and emit_spec:
                 self._emitted_residual_anchor_lifecycle_spec_hashes.add(
                     spec.semantic_content_hash
                 )
@@ -1066,7 +1110,15 @@ class ControlCompositionRuntime:
             normalized_epoch,
             activation_id,
         )
-        with self._composition_promotion_lock:
+        with self._composition_promotion_lock, self._strategy_publication_lock:
+            publication_transaction = (
+                self.composition_strategy
+                if isinstance(
+                    self.composition_strategy,
+                    FormalCompositionPublicationTransaction,
+                )
+                else None
+            )
             cached = self._proposal_admission_by_composition_evaluation_id.get(
                 result.composition_evaluation_id
             )
@@ -1089,6 +1141,28 @@ class ControlCompositionRuntime:
                     raise ValueError(
                         "Composition result promotion retry changed its "
                         "publication envelope."
+                    )
+                pending_commit = (
+                    self._pending_publication_commit_by_evaluation_id.get(
+                        result.composition_evaluation_id
+                    )
+                )
+                if pending_commit is not None:
+                    if (
+                        publication_transaction is None
+                        or pending_commit.semantic_content_hash
+                        != result.semantic_content_hash
+                    ):
+                        raise RuntimeError(
+                            "Pending strategy publication commit lost its "
+                            "exact transaction owner."
+                        )
+                    publication_transaction.commit_publication_transaction(
+                        pending_commit
+                    )
+                    self._pending_publication_commit_by_evaluation_id.pop(
+                        result.composition_evaluation_id,
+                        None,
                     )
                 return CompositeProposalSubmission(
                     input_snapshot=evaluation.input_snapshot,
@@ -1118,14 +1192,6 @@ class ControlCompositionRuntime:
                     "Production composition targets must increase strictly "
                     "within one producer activation."
                 )
-            publication_transaction = (
-                self.composition_strategy
-                if isinstance(
-                    self.composition_strategy,
-                    FormalCompositionPublicationTransaction,
-                )
-                else None
-            )
             if publication_transaction is not None:
                 publication_transaction.validate_publication_transaction(result)
             produced_at = float(self.clock())
@@ -1196,8 +1262,6 @@ class ControlCompositionRuntime:
                 source_event_id=result.composition_evaluation_id,
             )
             if receipt.accepted:
-                if publication_transaction is not None:
-                    publication_transaction.commit_publication_transaction(result)
                 self._proposal_admission_by_composition_evaluation_id[
                     result.composition_evaluation_id
                 ] = (
@@ -1211,6 +1275,15 @@ class ControlCompositionRuntime:
                 self._accepted_publication_target_by_scope[
                     publication_scope
                 ] = result.target_effective_at
+                if publication_transaction is not None:
+                    self._pending_publication_commit_by_evaluation_id[
+                        result.composition_evaluation_id
+                    ] = result
+                    publication_transaction.commit_publication_transaction(result)
+                    self._pending_publication_commit_by_evaluation_id.pop(
+                        result.composition_evaluation_id,
+                        None,
+                    )
             return CompositeProposalSubmission(
                 input_snapshot=evaluation.input_snapshot,
                 composition_evaluation=result,
@@ -1243,34 +1316,35 @@ class ControlCompositionRuntime:
     ) -> CompositeProposalSubmission:
         """Evaluate one cut using its exact admitted revision and parameters."""
 
-        if self.strategy_control is None:
-            raise RuntimeError("This runtime has no strategy hot-control path.")
-        if control_cut is not None and cutoff_at is not None:
-            raise ValueError("Provide control_cut or cutoff_at, not both.")
-        if control_cut is None:
-            timestamp = float(self.clock() if cutoff_at is None else cutoff_at)
-            cut = self.coordinator.capture_cut(cutoff_at=timestamp).cut
-        else:
-            cut = control_cut
-        producer_epochs = self.producer_epochs.snapshot(cut)
-        binding = self.strategy_control.capture_binding(
-            cut,
-            producer_epochs=producer_epochs,
-            target_effective_at=target_effective_at,
-        )
-        return self.evaluate_composition(
-            spec=binding.revision.composition_spec,
-            target_effective_at=target_effective_at,
-            required_context_channels=required_context_channels,
-            control_cut=cut,
-            source_difference_spec=source_difference_spec,
-            activation_scope=activation_scope,
-            source_eligibility_spec=source_eligibility_spec,
-            residual_anchor_lifecycle_scope_id=(
-                residual_anchor_lifecycle_scope_id
-            ),
-            _strategy_control_binding=binding,
-        )
+        with self._strategy_publication_lock:
+            if self.strategy_control is None:
+                raise RuntimeError("This runtime has no strategy hot-control path.")
+            if control_cut is not None and cutoff_at is not None:
+                raise ValueError("Provide control_cut or cutoff_at, not both.")
+            if control_cut is None:
+                timestamp = float(self.clock() if cutoff_at is None else cutoff_at)
+                cut = self.coordinator.capture_cut(cutoff_at=timestamp).cut
+            else:
+                cut = control_cut
+            producer_epochs = self.producer_epochs.snapshot(cut)
+            binding = self.strategy_control.capture_binding(
+                cut,
+                producer_epochs=producer_epochs,
+                target_effective_at=target_effective_at,
+            )
+            return self.evaluate_composition(
+                spec=binding.revision.composition_spec,
+                target_effective_at=target_effective_at,
+                required_context_channels=required_context_channels,
+                control_cut=cut,
+                source_difference_spec=source_difference_spec,
+                activation_scope=activation_scope,
+                source_eligibility_spec=source_eligibility_spec,
+                residual_anchor_lifecycle_scope_id=(
+                    residual_anchor_lifecycle_scope_id
+                ),
+                _strategy_control_binding=binding,
+            )
 
     def evaluate_composition(
         self,
@@ -1286,7 +1360,44 @@ class ControlCompositionRuntime:
         residual_anchor_lifecycle_scope_id: str | None = None,
         _strategy_control_binding: CompositionStrategyControlBinding | None = None,
     ) -> CompositeProposalSubmission:
-        """Evaluate and observe one composition cut without publishing a proposal."""
+        """Evaluate one cut while fencing stateful publication transactions."""
+
+        with self._strategy_publication_lock:
+            if self._pending_publication_commit_by_evaluation_id:
+                raise RuntimeError(
+                    "A proposal was admitted while its strategy publication "
+                    "commit is pending; retry that exact promotion first."
+                )
+            return self._evaluate_composition_locked(
+                spec=spec,
+                target_effective_at=target_effective_at,
+                required_context_channels=required_context_channels,
+                cutoff_at=cutoff_at,
+                control_cut=control_cut,
+                source_difference_spec=source_difference_spec,
+                activation_scope=activation_scope,
+                source_eligibility_spec=source_eligibility_spec,
+                residual_anchor_lifecycle_scope_id=(
+                    residual_anchor_lifecycle_scope_id
+                ),
+                _strategy_control_binding=_strategy_control_binding,
+            )
+
+    def _evaluate_composition_locked(
+        self,
+        *,
+        spec: CompositionSpec,
+        target_effective_at: float,
+        required_context_channels: tuple[str, ...] = (),
+        cutoff_at: float | None = None,
+        control_cut: ControlCut | None = None,
+        source_difference_spec: SourceDifferenceSpec | None = None,
+        activation_scope: CompositionActivationScope | None = None,
+        source_eligibility_spec: CompositionSourceEligibilitySpec | None = None,
+        residual_anchor_lifecycle_scope_id: str | None = None,
+        _strategy_control_binding: CompositionStrategyControlBinding | None = None,
+    ) -> CompositeProposalSubmission:
+        """Implementation for one strategy/publication-locked evaluation."""
 
         if spec.action_schema_hash is not None and (
             spec.action_schema_hash
@@ -1833,23 +1944,24 @@ class ControlCompositionRuntime:
             else:
                 started_at = time.perf_counter()
                 try:
-                    if _strategy_control_binding is None:
-                        strategy_decision = strategy.decide(strategy_input)
-                    else:
-                        decide_with_control = getattr(
-                            strategy,
-                            "decide_with_control",
-                            None,
-                        )
-                        if not callable(decide_with_control):
-                            raise TypeError(
-                                "Hot-controlled strategy must implement "
-                                "decide_with_control()."
+                    with self._strategy_publication_lock:
+                        if _strategy_control_binding is None:
+                            strategy_decision = strategy.decide(strategy_input)
+                        else:
+                            decide_with_control = getattr(
+                                strategy,
+                                "decide_with_control",
+                                None,
                             )
-                        strategy_decision = decide_with_control(
-                            strategy_input,
-                            _strategy_control_binding,
-                        )
+                            if not callable(decide_with_control):
+                                raise TypeError(
+                                    "Hot-controlled strategy must implement "
+                                    "decide_with_control()."
+                                )
+                            strategy_decision = decide_with_control(
+                                strategy_input,
+                                _strategy_control_binding,
+                            )
                     if not isinstance(
                         strategy_decision,
                         CompositionStrategyDecision,
@@ -2254,51 +2366,54 @@ class ControlCompositionRuntime:
                 )
             if difference_observation_event is not None:
                 evaluation_events.append(difference_observation_event)
-            self._emit(*evaluation_events)
-            if plan_event is not None:
+            emission_succeeded = self._emit(*evaluation_events)
+            if emission_succeeded and plan_event is not None:
                 self._information_plan_emitted = True
-            self._temporal_selection_spec_emitted = True
-            self._emitted_action_payload_schema_hashes.update(
-                schema.semantic_content_hash
-                for schema in action_payload_schemas_to_emit
-            )
-            self._emitted_component_action_schema_hashes.update(
-                schema.semantic_content_hash
-                for schema in component_action_schemas_to_emit
-            )
-            if emit_composition_spec:
+            if emission_succeeded:
+                self._temporal_selection_spec_emitted = True
+                self._emitted_action_payload_schema_hashes.update(
+                    schema.semantic_content_hash
+                    for schema in action_payload_schemas_to_emit
+                )
+                self._emitted_component_action_schema_hashes.update(
+                    schema.semantic_content_hash
+                    for schema in component_action_schemas_to_emit
+                )
+            if emission_succeeded and emit_composition_spec:
                 self._emitted_composition_spec_hashes.add(
                     composition_spec_hash
                 )
-            if emit_source_eligibility_spec:
+            if emission_succeeded and emit_source_eligibility_spec:
                 self._emitted_source_eligibility_spec_hashes.add(
                     source_eligibility_spec.semantic_content_hash
                 )
-            if emit_difference_spec:
+            if emission_succeeded and emit_difference_spec:
                 self._emitted_source_difference_spec_hashes.add(
                     source_difference_spec.semantic_content_hash
                 )
-            if emit_formal_strategy_spec:
+            if emission_succeeded and emit_formal_strategy_spec:
                 self._emitted_formal_strategy_spec_hashes.add(
                     active_strategy_spec.semantic_content_hash
                 )
-            if emit_dynamic_parameter_contract:
+            if emission_succeeded and emit_dynamic_parameter_contract:
                 self._emitted_dynamic_parameter_contract_hashes.add(
                     dynamic_parameter_contract.semantic_content_hash
                 )
-            if emit_strategy_revision:
+            if emission_succeeded and emit_strategy_revision:
                 self._emitted_strategy_revision_hashes.add(
                     active_revision.semantic_content_hash
                 )
-            if emit_component_rule_set:
+            if emission_succeeded and emit_component_rule_set:
                 self._emitted_component_rule_set_hashes.add(
                     component_rule_set.semantic_content_hash
                 )
-            if emit_formal_component_binding:
+            if emission_succeeded and emit_formal_component_binding:
                 self._emitted_formal_component_binding_hashes.add(
                     formal_component_binding.semantic_content_hash
                 )
-            emitted_events = tuple(evaluation_events)
+            emitted_events = (
+                tuple(evaluation_events) if emission_succeeded else ()
+            )
         evaluation_record = CompositionEvaluationRecord(
             information_plan=self.information_plan,
             composition_spec=spec,
