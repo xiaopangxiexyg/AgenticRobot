@@ -1068,11 +1068,16 @@ def _exact_application(application: Any) -> dict[str, str]:
         for item in frame_graph.frames
         if item.semantic_parameters.get("frame_family") == "simulation_world"
     )
-    if len(source_frame_specs) != 1:
+    if len(source_frame_specs) > 1:
         raise ValueError(
-            "Agent perception requires one explicit simulation-world frame."
+            "Agent perception permits at most one simulation-world frame."
         )
-    source_frame_spec = source_frame_specs[0]
+    # Legacy frame graphs treated MuJoCo world and canonical Station as the
+    # same identity.  Preserve that contract while new graphs expose the
+    # explicit world-to-Station adapter.
+    source_frame_spec = (
+        source_frame_specs[0] if source_frame_specs else primitive_frame_spec
+    )
     frame_graph.resolve(reference_frame_id, primitive_reference_frame_id)
     frame_graph.resolve(source_frame_spec.frame_id, primitive_reference_frame_id)
     tool_profile = application.tool_frame_profile
