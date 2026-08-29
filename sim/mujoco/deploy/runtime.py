@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from numbers import Integral
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
@@ -174,6 +175,15 @@ if TYPE_CHECKING:
         MujocoCompositionRuntimeBinding,
         MujocoCompositionRuntimeConfig,
     )
+
+
+def _exact_non_negative_int(value: int, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be a non-negative integer.")
+    normalized = int(value)
+    if normalized < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -436,8 +446,14 @@ class MujocoDeployConfig:
                 self.action_chunk_execution_steps
             ).execution_steps,
         )
-        if int(self.producer_epoch) < 0:
-            raise ValueError("producer_epoch must be non-negative.")
+        object.__setattr__(
+            self,
+            "producer_epoch",
+            _exact_non_negative_int(
+                self.producer_epoch,
+                name="producer_epoch",
+            ),
+        )
         for name in (
             "enable_primary_policy_authority",
             "enable_composer_authority",
@@ -749,8 +765,14 @@ class MujocoPolicyActionChunkSubmission:
 
     def __post_init__(self) -> None:
         chunk_id = str(self.chunk_id).strip()
-        source_chunk_size = int(self.source_chunk_size)
-        executed_chunk_size = int(self.executed_chunk_size)
+        source_chunk_size = _exact_non_negative_int(
+            self.source_chunk_size,
+            name="source_chunk_size",
+        )
+        executed_chunk_size = _exact_non_negative_int(
+            self.executed_chunk_size,
+            name="executed_chunk_size",
+        )
         receipts = tuple(self.receipts)
         if not chunk_id:
             raise ValueError("chunk_id must be non-empty.")
@@ -1709,6 +1731,11 @@ class MujocoDeployRuntime:
             else self._composition_binding._topology
         )
         self._started = False
+        self._rig_started = False
+        self._startup_error: str | None = None
+        self._close_pending = False
+        self._trace_closed = False
+        self._closed = False
         self._latest_target_execution_step: AuthoritativeControlStep | None = None
         self._last_dispatch_context: (
             AuthoritativeCommandDispatchContext
@@ -1940,11 +1967,17 @@ class MujocoDeployRuntime:
 
     def _backend_hold(self, cancellation) -> dict[str, bool]:
         if self.reference_receiver is not None:
-            self.reference_receiver.cancel_all(
+            self.reference_receiver.hold_and_cancel_all(
                 reason=cancellation.cancellation_id,
                 effective_at=float(self.clock()),
+                hold_reason=(
+                    f"{cancellation.reason}:{cancellation.cancellation_id}"
+                ),
             )
-        self.rig.hold_motion(f"{cancellation.reason}:{cancellation.cancellation_id}")
+        else:
+            self.rig.hold_motion(
+                f"{cancellation.reason}:{cancellation.cancellation_id}"
+            )
         return {"software_queue": True}
 
     @property
@@ -2530,33 +2563,66 @@ class MujocoDeployRuntime:
     def start(self) -> None:
         if self._started:
             return
+        if self._closed or self._close_pending:
+            raise RuntimeError(
+                "MujocoDeployRuntime has entered close; construct a fresh runtime "
+                "for another execution lifecycle."
+            )
+        if self._startup_error is not None:
+            raise RuntimeError(
+                "MujocoDeployRuntime startup previously failed after mutating "
+                "its control-plane state; construct a fresh runtime before retry: "
+                f"{self._startup_error}"
+            )
         self._latest_target_execution_step = None
-        self.rig.start()
-        self.core.record_compound_authority_profiles()
-        self.core.activate_producer(
-            producer_id=self.config.producer_id,
-            producer_epoch=self.config.producer_epoch,
-            reason="mujoco deploy startup",
-        )
-        if self.config.enable_replay_authority:
+        try:
+            # Control-plane activation is one-shot: producer epochs cannot be
+            # rolled back or re-activated with the same identity.  Complete it
+            # before publishing a live physics owner so an activation failure
+            # cannot strand a running rig behind ``_started == False``.
+            self.core.record_compound_authority_profiles()
             self.core.activate_producer(
-                producer_id=self.config.replay_producer_id,
+                producer_id=self.config.producer_id,
                 producer_epoch=self.config.producer_epoch,
-                reason="mujoco replay authority startup",
+                reason="mujoco deploy startup",
             )
-        if self.config.enable_composer_authority:
-            self.core.activate_producer(
-                producer_id=self.config.composer_producer_id,
-                producer_epoch=self.config.producer_epoch,
-                reason="mujoco composer authority startup",
-            )
-        direct_source = self.config.direct_component_proposal_source
-        if direct_source is not None:
-            self.core.activate_producer(
-                producer_id=direct_source.producer_id,
-                producer_epoch=direct_source.producer_epoch,
-                reason="mujoco direct component proposal source startup",
-            )
+            if self.config.enable_replay_authority:
+                self.core.activate_producer(
+                    producer_id=self.config.replay_producer_id,
+                    producer_epoch=self.config.producer_epoch,
+                    reason="mujoco replay authority startup",
+                )
+            if self.config.enable_composer_authority:
+                self.core.activate_producer(
+                    producer_id=self.config.composer_producer_id,
+                    producer_epoch=self.config.producer_epoch,
+                    reason="mujoco composer authority startup",
+                )
+            direct_source = self.config.direct_component_proposal_source
+            if direct_source is not None:
+                self.core.activate_producer(
+                    producer_id=direct_source.producer_id,
+                    producer_epoch=direct_source.producer_epoch,
+                    reason="mujoco direct component proposal source startup",
+                )
+            self.rig.start()
+            self._rig_started = True
+        except Exception as exc:
+            cleanup_error = None
+            try:
+                self.rig.close()
+            except Exception as close_exc:
+                cleanup_error = (
+                    f"{type(close_exc).__name__}: {close_exc}"
+                )
+            self._rig_started = cleanup_error is not None
+            self._startup_error = f"{type(exc).__name__}: {exc}"
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    "MuJoCo deploy startup failed and rig cleanup was incomplete: "
+                    f"{self._startup_error}; cleanup_error={cleanup_error}"
+                ) from exc
+            raise
         self._started = True
 
     def activate_policy_node_producer(
@@ -2573,7 +2639,10 @@ class MujocoDeployRuntime:
             producer_epoch=(
                 self.config.producer_epoch
                 if producer_epoch is None
-                else int(producer_epoch)
+                else _exact_non_negative_int(
+                    producer_epoch,
+                    name="producer_epoch",
+                )
             ),
             reason=reason,
         )
@@ -3442,13 +3511,15 @@ class MujocoDeployRuntime:
     ) -> AuthoritativeControlStep:
         if not self._started:
             raise RuntimeError("MujocoDeployRuntime.start() is required.")
-        if int(physics_ticks_after_dispatch) < 0:
-            raise ValueError("physics_ticks_after_dispatch must be non-negative.")
+        normalized_physics_ticks = _exact_non_negative_int(
+            physics_ticks_after_dispatch,
+            name="physics_ticks_after_dispatch",
+        )
         result = self.core.run_decision(now=now)
         if result.target_execution_request is not None:
             self._latest_target_execution_step = result
         if result.status == "dispatched":
-            for _ in range(int(physics_ticks_after_dispatch)):
+            for _ in range(normalized_physics_ticks):
                 self.rig.step_physics()
         # One post-dispatch sync observes both the newly resolved target and
         # any deterministic physics frames requested above.  The realtime
@@ -3460,7 +3531,7 @@ class MujocoDeployRuntime:
                 result,
                 measurement=build_mujoco_backend_measurement(
                     self.rig,
-                    physics_ticks_after_dispatch=int(physics_ticks_after_dispatch),
+                    physics_ticks_after_dispatch=normalized_physics_ticks,
                 ),
             )
         self._publish_execution_observation_cut()
@@ -3691,12 +3762,24 @@ class MujocoDeployRuntime:
         )
 
     def close(self) -> None:
-        if not self._started:
+        if not self._started and not self._rig_started and not self._close_pending:
             return
-        self._sync_reference_trace()
-        self.core.close_trace()
-        self.rig.close()
+        self._close_pending = True
+        # Stop admitting work before the potentially bounded rig join.  If
+        # close times out, a later close() retries the same retained owner;
+        # runtime APIs cannot dispatch into the stopping rig in the meantime.
         self._started = False
+        if self._rig_started:
+            self.rig.close()
+            self._rig_started = False
+        # The stopped rig now has a stable append-only tail.  Only after it is
+        # quiescent may that final tail and the terminal trace fact be sealed.
+        self._sync_reference_trace()
+        if not self._trace_closed:
+            self.core.close_trace()
+            self._trace_closed = True
+        self._close_pending = False
+        self._closed = True
 
 
 __all__ = [

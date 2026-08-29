@@ -53,6 +53,7 @@ from .pose_resolution import MujocoPoseToQposResolution
 from .reference_receiver import (
     MujocoScheduledQposReferenceReceiver,
     ScheduledReferenceAdmissionResult,
+    _serialized_receiver_transaction,
 )
 
 
@@ -171,6 +172,7 @@ class MujocoScheduledResolvedQposReferenceReceiver(
         with self._lock:
             return self._last_component_result
 
+    @_serialized_receiver_transaction
     def dispatch_component_target(
         self,
         command: TeleopCommand,
@@ -393,7 +395,7 @@ class MujocoScheduledResolvedQposReferenceReceiver(
                 segment.reference_segment_id
             ] = target_admission
             try:
-                receipts = self.rig.send_scheduled_commands(
+                receipts = self._send_scheduled_commands_outside_state_lock(
                     command,
                     activate_at=segment.scheduled_from,
                     reference_segment_id=segment.reference_segment_id,
@@ -512,6 +514,7 @@ class MujocoScheduledResolvedQposReferenceReceiver(
                 dispatch_receipts=receipts,
             )
 
+    @_serialized_receiver_transaction
     def dispatch_resolved_target(
         self,
         command: TeleopCommand,
@@ -696,7 +699,7 @@ class MujocoScheduledResolvedQposReferenceReceiver(
                     segment.reference_segment_id
                 ] = compound_manifest
             try:
-                receipts = self.rig.send_scheduled_commands(
+                receipts = self._send_scheduled_commands_outside_state_lock(
                     command,
                     activate_at=segment.scheduled_from,
                     reference_segment_id=segment.reference_segment_id,
@@ -1044,6 +1047,7 @@ class MujocoScheduledResolvedQposReferenceReceiver(
                 "target activation receipt."
             )
 
+    @_serialized_receiver_transaction
     def cancel_all(self, *, reason: str, effective_at: float) -> None:
         with self._lock:
             activated_target_ids = {

@@ -476,3 +476,19 @@ def test_physical_executor_rejects_unsafe_upstream_qcmd_before_physics() -> None
     assert sender.snapshot()["collision_safety_state"]["status"] == (
         "unsafe_upstream_admitted"
     )
+
+
+def test_physical_executor_snapshot_restore_binds_actuation_profile() -> None:
+    scene = _PhysicalFakeScene(projector=None)
+    profile = _physical_test_profile()
+    sender = MujocoActuatedPositionExecutor(scene, _timing(), profile)
+    initial = {side: np.zeros(6) for side in ("left", "right")}
+    sender.reset(_command(0, initial))
+    snapshot = sender.snapshot()
+    snapshot["profile"] = {"name": "different-profile"}
+
+    with pytest.raises(ValueError, match="profile.*does not match"):
+        sender.reset(
+            _command(0, initial),
+            initial_state=snapshot,
+        )

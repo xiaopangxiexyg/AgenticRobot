@@ -75,6 +75,15 @@ def _six_positive(values: Sequence[float], *, name: str) -> tuple[float, ...]:
     return tuple(float(value) for value in vector)
 
 
+def _non_negative_int(value: int, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be a non-negative integer.")
+    normalized = int(value)
+    if normalized < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
+    return normalized
+
+
 @dataclass(frozen=True)
 class MujocoPositionExecutionConfig:
     """Real-aligned position execution with profile-selected independent clocks.
@@ -323,18 +332,16 @@ class MujocoPositionExecutionRig(Rig):
             raise ValueError(
                 "initial_physics_time_sec must be finite and non-negative."
             )
-        if (
-            isinstance(initial_command_sequence, bool)
-            or int(initial_command_sequence) != initial_command_sequence
-            or int(initial_command_sequence) < 0
-        ):
-            raise ValueError("initial_command_sequence must be a non-negative integer.")
+        initial_sequence = _non_negative_int(
+            initial_command_sequence,
+            name="initial_command_sequence",
+        )
         self.scene = scene
         self.config = config
         self._clock = monotonic_clock
         self._sleep = sleep
         self._initial_physics_time_sec = initial_time
-        self._initial_command_sequence = int(initial_command_sequence)
+        self._initial_command_sequence = initial_sequence
         if initial_actuation_state is not None and not isinstance(
             initial_actuation_state, Mapping
         ):
@@ -343,6 +350,18 @@ class MujocoPositionExecutionRig(Rig):
             initial_gripper_state, Mapping
         ):
             raise TypeError("initial_gripper_state must be a mapping or None.")
+        if config.actuation_profile is None and initial_actuation_state is not None:
+            raise ValueError(
+                "initial_actuation_state requires a physical actuation profile."
+            )
+        if (
+            config.gripper_actuation_profile is None
+            and initial_gripper_state is not None
+        ):
+            raise ValueError(
+                "initial_gripper_state requires a configured gripper actuation "
+                "profile."
+            )
         self._initial_actuation_state = initial_actuation_state
         self._initial_gripper_state = initial_gripper_state
         self._lock = threading.RLock()
@@ -568,6 +587,12 @@ class MujocoPositionExecutionRig(Rig):
     def start(self) -> None:
         with self._lock:
             if self._started:
+                if self._stop_event.is_set():
+                    raise RuntimeError(
+                        "MuJoCo position execution is stopping or faulted; "
+                        "close() completion is required before start() can create "
+                        "a new lifecycle."
+                    )
                 return
             # A stopped worker may have left a latched diagnostic error.  A
             # subsequent explicit close/start is a new execution lifecycle;
@@ -682,7 +707,10 @@ class MujocoPositionExecutionRig(Rig):
                     initial_state=self._initial_actuation_state,
                 )
             else:
-                self._execution.reset(initial_command)
+                self._execution.reset(
+                    initial_command,
+                    initial_physics_time_sec=self._initial_physics_time_sec,
+                )
             if self._gripper_execution is not None:
                 self._gripper_execution.reset(
                     (
@@ -699,12 +727,22 @@ class MujocoPositionExecutionRig(Rig):
             self._stop_event.clear()
             self._started = True
             if self.config.realtime_worker:
-                self._worker = threading.Thread(
+                worker = threading.Thread(
                     target=self._worker_loop,
                     name="mujoco_position_execution",
                     daemon=True,
                 )
-                self._worker.start()
+                self._worker = worker
+                try:
+                    worker.start()
+                except Exception:
+                    # Publishing ``started`` without a live worker would make
+                    # dispatch appear accepted while no owner advances the
+                    # physics timeline.  Roll the lifecycle back atomically.
+                    self._worker = None
+                    self._started = False
+                    self._stop_event.set()
+                    raise
             # The override is a one-shot snapshot bootstrap.  A later
             # explicit close/start must always rebase to the then-measured
             # plant rather than silently reusing an old episode's qcmd.
@@ -717,7 +755,11 @@ class MujocoPositionExecutionRig(Rig):
 
     def is_ready(self) -> bool:
         with self._lock:
-            return self._started and self._last_worker_error is None
+            return (
+                self._started
+                and not self._stop_event.is_set()
+                and self._last_worker_error is None
+            )
 
     def send_commands(
         self,
@@ -756,8 +798,14 @@ class MujocoPositionExecutionRig(Rig):
             phase_recorder=None,
             activate_at=activation,
             reference_segment_id=segment_id,
-            execution_epoch=int(execution_epoch),
-            group_segment_generation=int(group_segment_generation),
+            execution_epoch=_non_negative_int(
+                execution_epoch,
+                name="execution_epoch",
+            ),
+            group_segment_generation=_non_negative_int(
+                group_segment_generation,
+                name="group_segment_generation",
+            ),
             operation="queue_mujoco_scheduled_qref",
         )
 
@@ -801,6 +849,13 @@ class MujocoPositionExecutionRig(Rig):
     ) -> dict[str, CommandDispatchReceipt]:
         del phase_recorder
         expected = {f"{side}_arm" for side in self.config.active_sides}
+        allowed = expected | {f"{side}_hand" for side in self.config.active_sides}
+        unsupported = sorted(set(command.commands) - allowed)
+        if unsupported:
+            raise ValueError(
+                "position execution received unsupported effectors: "
+                f"{unsupported}"
+            )
         present = expected.intersection(command.commands)
         if present != expected:
             raise ValueError(
@@ -877,6 +932,11 @@ class MujocoPositionExecutionRig(Rig):
             if not self._started:
                 raise RuntimeError(
                     "MujocoPositionExecutionRig.start() is required before dispatch."
+                )
+            if self._stop_event.is_set():
+                raise RuntimeError(
+                    "MuJoCo position execution is stopping or faulted; "
+                    "close() must complete before dispatch."
                 )
             if self._last_worker_error is not None:
                 raise RuntimeError(
@@ -984,8 +1044,12 @@ class MujocoPositionExecutionRig(Rig):
                         monotonic_time=planner_now,
                         reason=self._hold_reason,
                     )
-            if self._gripper_execution is not None:
-                self._gripper_execution.hold_targets()
+                if self._gripper_execution is not None:
+                    self._gripper_execution.hold_targets()
+                # The quick-stop was applied synchronously while holding the
+                # sole planner/physics lock.  Leaving the reason queued would
+                # apply the same lifecycle event a second time next tick.
+                self._hold_reason = None
 
     def accepted_qcmd_by_side(self) -> dict[str, np.ndarray]:
         with self._lock:
@@ -1068,7 +1132,12 @@ class MujocoPositionExecutionRig(Rig):
             measured = self._measured_qpos_by_side_locked()
             return {
                 "started": self._started,
-                "ready": self._started and self._last_worker_error is None,
+                "ready": (
+                    self._started
+                    and not self._stop_event.is_set()
+                    and self._last_worker_error is None
+                ),
+                "stopping": bool(self._started and self._stop_event.is_set()),
                 **execution_metadata,
                 "timing": self.config.timing.to_dict(),
                 "accepted_qcmd_by_side": {
@@ -1268,8 +1337,16 @@ class MujocoPositionExecutionRig(Rig):
         with self._lock:
             if not self._started:
                 raise RuntimeError("MujocoPositionExecutionRig.start() is required.")
+            if self._stop_event.is_set():
+                raise RuntimeError(
+                    "MuJoCo position execution is stopping or faulted; "
+                    "close() must complete before physics can advance."
+                )
             if self._last_worker_error is not None:
-                raise RuntimeError(self._last_worker_error)
+                raise RuntimeError(
+                    "MuJoCo position execution is faulted; explicit close/start "
+                    f"is required before physics can advance: {self._last_worker_error}"
+                )
             planner_now = self._clock_origin + self._execution.physics_time_sec
             self._consume_reference_locked(planner_now)
             command = self._build_due_command_locked(planner_now)
@@ -1406,7 +1483,51 @@ class MujocoPositionExecutionRig(Rig):
                 self._pending_proposals = {}
             self._worker_physics_ticks += 1
 
+    def _rollback_planner_transaction_locked(
+        self,
+        planner_now: float,
+    ) -> list[str]:
+        """Return both planners and the hand transport to one safe baseline."""
+
+        cleanup_errors: list[str] = []
+        self._pending_reference = None
+        self._last_reference = None
+        self._hold_reason = None
+        self._pending_proposals = {}
+        for side, planner in self._planners.items():
+            try:
+                self._reset_and_prime_planner(
+                    planner,
+                    self._accepted_qcmd_by_side[side],
+                    monotonic_time=planner_now,
+                )
+            except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                cleanup_errors.append(
+                    f"planner[{side!r}].reset: {type(exc).__name__}: {exc}"
+                )
+        if self._gripper_execution is not None:
+            try:
+                self._gripper_execution.hold_targets()
+            except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                cleanup_errors.append(
+                    f"gripper.hold_targets: {type(exc).__name__}: {exc}"
+                )
+        return cleanup_errors
+
     def _consume_reference_locked(self, planner_now: float) -> None:
+        try:
+            self._consume_reference_transaction_locked(planner_now)
+        except Exception as exc:
+            cleanup_errors = self._rollback_planner_transaction_locked(planner_now)
+            if cleanup_errors:
+                raise RuntimeError(
+                    "MuJoCo reference activation failed and its atomic rollback "
+                    f"was incomplete: {type(exc).__name__}: {exc}; "
+                    f"cleanup_errors={cleanup_errors}"
+                ) from exc
+            raise
+
+    def _consume_reference_transaction_locked(self, planner_now: float) -> None:
         reference = self._pending_reference
         hold_reason = self._hold_reason
         if hold_reason is not None:
@@ -1509,14 +1630,6 @@ class MujocoPositionExecutionRig(Rig):
                     reason=policy.reason,
                 )
                 activated_qref_by_side[side] = reference.qref_by_side[side].copy()
-        if reference.gripper_close_by_name:
-            if self._gripper_execution is None:
-                raise RuntimeError(
-                    "Scheduled gripper targets require a configured gripper executor."
-                )
-            self._gripper_execution.queue_close_targets(
-                reference.gripper_close_by_name
-            )
         if sample_aligned_new_bucket is False:
             return
         if sample_aligned_new_bucket is True:
@@ -1530,6 +1643,14 @@ class MujocoPositionExecutionRig(Rig):
                 qref_by_side=activated_qref_by_side,
                 metadata_by_side=reference.metadata_by_side,
                 gripper_close_by_name=reference.gripper_close_by_name,
+            )
+        if reference.gripper_close_by_name:
+            if self._gripper_execution is None:
+                raise RuntimeError(
+                    "Scheduled gripper targets require a configured gripper executor."
+                )
+            self._gripper_execution.queue_close_targets(
+                reference.gripper_close_by_name
             )
         self._last_reference = reference
         if (
@@ -1564,6 +1685,22 @@ class MujocoPositionExecutionRig(Rig):
             )
 
     def _build_due_command_locked(self, planner_now: float) -> DirectQposCommand | None:
+        try:
+            return self._build_due_command_transaction_locked(planner_now)
+        except Exception as exc:
+            cleanup_errors = self._rollback_planner_transaction_locked(planner_now)
+            if cleanup_errors:
+                raise RuntimeError(
+                    "MuJoCo bimanual command proposal failed and its atomic "
+                    f"rollback was incomplete: {type(exc).__name__}: {exc}; "
+                    f"cleanup_errors={cleanup_errors}"
+                ) from exc
+            raise
+
+    def _build_due_command_transaction_locked(
+        self,
+        planner_now: float,
+    ) -> DirectQposCommand | None:
         self._pending_proposals = {}
         if not self._execution.command_due:
             return None

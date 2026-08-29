@@ -376,14 +376,27 @@ class Rm65PositionActuator:
         if isinstance(sequence_value, bool):
             raise TypeError("initial_state accepted_command_sequence must be an integer.")
         sequence = int(sequence_value)
-        if sequence < int(command_sequence) or sequence != sequence_value:
+        if sequence != int(command_sequence) or sequence != sequence_value:
             raise ValueError(
                 "initial_state accepted_command_sequence must be an integer "
-                "at least the initial command sequence."
+                "and exactly match the initial command sequence."
             )
         next_time = float(state["next_command_time_sec"])
-        if not math.isfinite(next_time) or next_time < 0.0:
-            raise ValueError("initial_state next_command_time_sec must be finite and non-negative.")
+        next_phase = next_time * self.command_hz
+        if (
+            not math.isfinite(next_time)
+            or next_time + 1e-12 < initial_physics_time_sec
+            or not math.isclose(
+                next_phase,
+                round(next_phase),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError(
+                "initial_state next_command_time_sec must be a command-rate "
+                "deadline at or after initial_physics_time_sec."
+            )
 
         raw_delayed = state["delayed_targets"]
         if not isinstance(raw_delayed, Sequence) or isinstance(raw_delayed, (str, bytes)):

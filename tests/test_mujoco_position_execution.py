@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import threading
 import time
 from types import SimpleNamespace
@@ -233,6 +234,7 @@ def test_snapshot_restore_primes_planner_at_prior_command_phase() -> None:
     )
     rig.start()
     try:
+        assert rig._execution.physics_time_sec == pytest.approx(0.5)
         planner = rig._planners["right"]
         # The command clock is sampled before each physics step.  A snapshot
         # at t=0.500 therefore has its preceding 120 Hz proposal at the
@@ -243,6 +245,232 @@ def test_snapshot_restore_primes_planner_at_prior_command_phase() -> None:
         )
     finally:
         rig.close()
+
+
+def test_direct_execution_rejects_inapplicable_causal_state() -> None:
+    scene = _FakeScene()
+    config = MujocoPositionExecutionConfig(
+        timing=_timing(),
+        actuation_profile=None,
+        gripper_actuation_profile=None,
+        realtime_worker=False,
+    )
+
+    with pytest.raises(ValueError, match="initial_actuation_state.*actuation profile"):
+        MujocoPositionExecutionRig(
+            scene,
+            config,
+            initial_actuation_state={"physics_tick": 0},
+        )
+    with pytest.raises(ValueError, match="initial_gripper_state.*gripper.*profile"):
+        MujocoPositionExecutionRig(
+            scene,
+            config,
+            initial_gripper_state={"core": {}},
+        )
+
+
+def test_scheduled_generation_identity_rejects_lossy_integer_coercion() -> None:
+    scene = _FakeScene()
+    clock = _Clock()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+        ),
+        monotonic_clock=clock,
+    )
+    rig.start()
+    try:
+        with pytest.raises(ValueError, match="execution_epoch.*non-negative integer"):
+            rig.send_scheduled_commands(
+                _command(0.1, -0.1),
+                activate_at=clock.value,
+                reference_segment_id="segment-1",
+                execution_epoch=True,
+                group_segment_generation=1,
+            )
+        with pytest.raises(ValueError, match="execution_epoch.*non-negative integer"):
+            rig.send_scheduled_commands(
+                _command(0.1, -0.1),
+                activate_at=clock.value,
+                reference_segment_id="segment-1",
+                execution_epoch=1.0,
+                group_segment_generation=1,
+            )
+        with pytest.raises(
+            ValueError,
+            match="group_segment_generation.*non-negative integer",
+        ):
+            rig.send_scheduled_commands(
+                _command(0.1, -0.1),
+                activate_at=clock.value,
+                reference_segment_id="segment-1",
+                execution_epoch=1,
+                group_segment_generation=1.5,
+            )
+        assert rig.snapshot()["pending_reference_sequence"] is None
+    finally:
+        rig.close()
+
+
+def test_hold_quick_stops_each_planner_exactly_once(monkeypatch) -> None:
+    scene = _FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+        ),
+    )
+    rig.start()
+    calls: list[str] = []
+    for side, planner in rig._planners.items():
+        original = planner.quick_stop
+
+        def record_quick_stop(*, _side=side, _original=original, **kwargs):
+            calls.append(_side)
+            return _original(**kwargs)
+
+        monkeypatch.setattr(planner, "quick_stop", record_quick_stop)
+
+    rig.hold_motion("unit hold")
+    assert sorted(calls) == ["left", "right"]
+    rig.step_physics()
+    assert sorted(calls) == ["left", "right"]
+    rig.close()
+
+
+def test_bimanual_reference_activation_failure_rolls_back_both_planners(
+    monkeypatch,
+) -> None:
+    scene = _FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+        ),
+    )
+    rig.start()
+    right_planner = rig._planners["right"]
+    original = right_planner.accept_target
+    fail_once = True
+
+    def reject_nonzero_target(q_target, **kwargs):
+        nonlocal fail_once
+        if fail_once and np.any(np.asarray(q_target, dtype=float)):
+            fail_once = False
+            raise RuntimeError("synthetic right activation failure")
+        return original(q_target, **kwargs)
+
+    monkeypatch.setattr(right_planner, "accept_target", reject_nonzero_target)
+    rig.send_commands(_command(0.2, -0.2))
+
+    with pytest.raises(RuntimeError, match="synthetic right activation failure"):
+        rig.step_physics()
+
+    snapshot = rig.snapshot()
+    assert snapshot["last_reference_sequence"] is None
+    assert snapshot["pending_reference_sequence"] is None
+    assert snapshot["planner_by_side"]["left"]["target_q"] == [0.0] * 6
+    assert snapshot["planner_by_side"]["right"]["target_q"] == [0.0] * 6
+    assert snapshot["last_worker_error"] is None
+    assert rig.is_ready() is True
+    rig.step_physics()
+    rig.close()
+
+
+def test_bimanual_command_proposal_failure_rolls_back_both_planners(
+    monkeypatch,
+) -> None:
+    scene = _FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+        ),
+    )
+    rig.start()
+    while not rig._execution.command_due:
+        rig.step_physics()
+    right_planner = rig._planners["right"]
+    original = right_planner.propose
+    fail_once = True
+
+    def fail_proposal(**kwargs):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise RuntimeError("synthetic right proposal failure")
+        return original(**kwargs)
+
+    monkeypatch.setattr(right_planner, "propose", fail_proposal)
+    with pytest.raises(RuntimeError, match="synthetic right proposal failure"):
+        rig.step_physics()
+
+    assert rig._pending_proposals == {}
+    assert rig.snapshot()["last_worker_error"] is None
+    assert rig.is_ready() is True
+    rig.step_physics()
+    rig.close()
+
+
+def test_sample_aligned_held_source_bucket_does_not_advance_gripper() -> None:
+    scene = _FakeScene()
+    clock = _Clock()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            position_command_planner="sample_aligned_jerk_limited",
+            follow_qpos_alpha=1.0,
+        ),
+        monotonic_clock=clock,
+    )
+    rig.start()
+    rig.send_commands(_command(0.1, -0.1))
+    rig.step_physics()
+
+    class _FakeGripperExecution:
+        def __init__(self) -> None:
+            self.queued: list[dict[str, float]] = []
+
+        def queue_close_targets(self, targets) -> None:
+            self.queued.append(dict(targets))
+
+        def before_physics_step(self, **_kwargs) -> None:
+            return None
+
+        def hold_targets(self) -> None:
+            return None
+
+    rig.send_commands(_command(0.2, -0.2))
+    fake_gripper = _FakeGripperExecution()
+    rig._gripper_execution = fake_gripper
+    assert rig._pending_reference is not None
+    rig._pending_reference = replace(
+        rig._pending_reference,
+        gripper_close_by_name={"right_gripper": 0.75},
+    )
+    rig.step_physics()
+
+    assert fake_gripper.queued == []
+    rig._gripper_execution = None
+    rig.close()
 
 
 def test_mujoco_position_rig_rejects_partial_bimanual_reference() -> None:
@@ -272,6 +500,35 @@ def test_mujoco_position_rig_rejects_partial_bimanual_reference() -> None:
         assert "atomic qref" in str(exc)
     else:
         raise AssertionError("partial bimanual reference must be rejected")
+
+
+def test_mujoco_position_rig_rejects_unowned_extra_effectors() -> None:
+    scene = _FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=_timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+        ),
+    )
+    rig.start()
+    command = _command(0.1, -0.1)
+    command.add_command(
+        EffectorCommand(
+            effector_name="unowned_aux_axis",
+            side="right",
+            command_type="joint_vector",
+            value=np.zeros(6),
+        )
+    )
+
+    with pytest.raises(ValueError, match="unsupported effectors"):
+        rig.send_commands(command)
+
+    assert rig.snapshot()["pending_reference_sequence"] is None
+    rig.close()
 
 
 def test_mujoco_position_rig_reports_actual_forbidden_contact_separately() -> None:
@@ -341,6 +598,11 @@ def test_mujoco_position_rig_close_does_not_wait_on_live_worker_lock() -> None:
         rig.close()
     assert time.monotonic() - started_at < 0.5
     assert rig._worker is worker
+    assert rig.is_ready() is False
+    with pytest.raises(RuntimeError, match="stopping"):
+        rig.send_commands(_command(0.1, -0.1))
+    with pytest.raises(RuntimeError, match=r"close\(\).*required"):
+        rig.start()
 
     release.set()
     worker.join(timeout=1.0)
@@ -406,13 +668,19 @@ def test_mujoco_position_rig_rebases_to_measured_state_after_tick_failure() -> N
     rig.start()
     rig.send_commands(_command(0.4, -0.4))
 
+    execution_calls = 0
+
     def fail_step(command=None):
+        nonlocal execution_calls
         del command
-        raise RuntimeError("synthetic physics failure")
+        execution_calls += 1
+        if execution_calls == 1:
+            raise RuntimeError("synthetic physics failure")
 
     rig._execution.step_physics = fail_step
     with pytest.raises(RuntimeError, match="synthetic physics failure"):
         rig.step_physics()
+    assert execution_calls == 1
 
     # The failed qcmd was never applied by the scene.  Recovery must use the
     # measured scene state and discard the reference/proposal that led to the
@@ -426,8 +694,9 @@ def test_mujoco_position_rig_rebases_to_measured_state_after_tick_failure() -> N
     assert snapshot["planner_by_side"]["left"]["target_q"] == [0.0] * 6
     assert snapshot["planner_by_side"]["right"]["target_q"] == [0.0] * 6
 
-    with pytest.raises(RuntimeError, match="synthetic physics failure"):
+    with pytest.raises(RuntimeError, match="close/start"):
         rig.step_physics()
+    assert execution_calls == 1
 
     # A fresh lifecycle resets the underlying executor as well as the
     # planner-facing accepted qcmd; merely rebasing the planner is not enough

@@ -94,3 +94,52 @@ def test_rm65_actuator_snapshot_bootstrap_preserves_absolute_command_clock() -> 
     actuator.reset(command_sequence=0, qpos_by_side=initial)
     assert actuator.physics_time_sec == pytest.approx(0.0)
     assert actuator.command_due is False
+
+
+def test_rm65_actuator_snapshot_restore_requires_exact_command_high_water_mark() -> None:
+    profile = rm65_bimanual_udp_feedback_profile()
+    initial = {side: np.zeros(6) for side in ("left", "right")}
+    source = Rm65PositionActuator(
+        profile,
+        command_hz=120.0,
+        physics_hz=1000.0,
+    )
+    source.reset(command_sequence=5, qpos_by_side=initial)
+    snapshot = source.snapshot()
+
+    restored = Rm65PositionActuator(
+        profile,
+        command_hz=120.0,
+        physics_hz=1000.0,
+    )
+    with pytest.raises(ValueError, match="exactly match.*command sequence"):
+        restored.reset(
+            command_sequence=4,
+            qpos_by_side=initial,
+            initial_state=snapshot,
+        )
+
+
+def test_rm65_actuator_snapshot_restore_rejects_invalid_command_deadline() -> None:
+    profile = rm65_bimanual_udp_feedback_profile()
+    initial = {side: np.zeros(6) for side in ("left", "right")}
+    source = Rm65PositionActuator(
+        profile,
+        command_hz=120.0,
+        physics_hz=1000.0,
+    )
+    source.reset(command_sequence=0, qpos_by_side=initial)
+    snapshot = source.snapshot()
+    snapshot["next_command_time_sec"] = -1.0 / 120.0
+
+    restored = Rm65PositionActuator(
+        profile,
+        command_hz=120.0,
+        physics_hz=1000.0,
+    )
+    with pytest.raises(ValueError, match="deadline at or after"):
+        restored.reset(
+            command_sequence=0,
+            qpos_by_side=initial,
+            initial_state=snapshot,
+        )

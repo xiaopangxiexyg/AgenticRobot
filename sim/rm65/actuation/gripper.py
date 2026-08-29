@@ -462,7 +462,10 @@ class DmtacPositionActuator:
                 result[side] = value
             return result
 
-        next_command_time = _float_mapping("next_command_time_by_side")
+        next_command_time = _float_mapping(
+            "next_command_time_by_side",
+            nonnegative=True,
+        )
         # The gripper core intentionally does not advance an idle side's
         # deadline while no target is pending.  A settled snapshot can
         # therefore legitimately retain the cold-start value (t=0) even when

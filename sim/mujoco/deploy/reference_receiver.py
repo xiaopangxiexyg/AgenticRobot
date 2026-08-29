@@ -8,6 +8,7 @@ admission.  It intentionally supports only one coupled bimanual-qpos group.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import wraps
 import math
 import threading
 from typing import Callable, Mapping
@@ -46,6 +47,17 @@ from ..adapters import MujocoPositionExecutionRig
 
 
 MEASURED_REBASE_HASH_DOMAIN_V1 = "dexteleop.mujoco.measured_rebase.v1"
+
+
+def _serialized_receiver_transaction(method):
+    """Serialize dispatch/cancel transactions without extending the state lock."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._dispatch_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -92,6 +104,11 @@ class MujocoScheduledQposReferenceReceiver:
         self._activation_callback = activation_callback
         self._clock = clock
         self._lock = threading.RLock()
+        # Dispatch, replacement, and cancellation form one receiver transaction,
+        # but the receiver state lock must not be held while waiting for the Rig.
+        # Physics owns the inverse edge (Rig -> generation guard -> receiver), so
+        # holding both locks here would deadlock concurrent activation.
+        self._dispatch_lock = threading.RLock()
         self._next_timeline_sequence = 1
         self._validations: list[AuthoritativeReceiverValidationReceipt] = []
         self._segment_attempts: list[ReferenceSegment] = []
@@ -169,6 +186,7 @@ class MujocoScheduledQposReferenceReceiver:
         with self._lock:
             return self._last_result
 
+    @_serialized_receiver_transaction
     def dispatch(
         self,
         command: TeleopCommand,
@@ -312,7 +330,7 @@ class MujocoScheduledQposReferenceReceiver:
             ] = reservation
             self._reservations.append(reservation)
             try:
-                receipts = self.rig.send_scheduled_commands(
+                receipts = self._send_scheduled_commands_outside_state_lock(
                     command,
                     activate_at=segment.scheduled_from,
                     reference_segment_id=segment.reference_segment_id,
@@ -350,6 +368,7 @@ class MujocoScheduledQposReferenceReceiver:
             )
             return receipts
 
+    @_serialized_receiver_transaction
     def cancel_all(self, *, reason: str, effective_at: float) -> None:
         """Invalidate every nonterminal segment before the rig enters HOLD."""
 
@@ -373,6 +392,63 @@ class MujocoScheduledQposReferenceReceiver:
             self._pending_reservation_by_group.clear()
             self._active_segment_by_group.clear()
             self._active_generation_by_group = {"arms": 0}
+
+    @_serialized_receiver_transaction
+    def hold_and_cancel_all(
+        self,
+        *,
+        reason: str,
+        effective_at: float,
+        hold_reason: str | None = None,
+    ) -> None:
+        """Quiesce the Rig and terminalize the receiver as one dispatch fence.
+
+        The dispatch gate prevents a new scheduled mailbox publication between
+        the physical-owner Hold and receiver terminalization.  Holding the Rig
+        first also removes its callbacks into this receiver, so cancellation
+        may safely collect the final planner-frame evidence.
+        """
+
+        self.rig.hold_motion(str(reason if hold_reason is None else hold_reason))
+        self.cancel_all(reason=reason, effective_at=effective_at)
+
+    def _send_scheduled_commands_outside_state_lock(
+        self,
+        command: TeleopCommand,
+        *,
+        activate_at: float,
+        reference_segment_id: str,
+        execution_epoch: int,
+        group_segment_generation: int,
+    ) -> Mapping[str, CommandDispatchReceipt]:
+        """Publish a staged transaction without the receiver/Rig lock cycle.
+
+        All callers hold ``_dispatch_lock`` and exactly one acquisition of
+        ``_lock``.  The staged reservation is therefore stable while the Rig
+        mailbox is updated, but physics may enter the receiver-owned activation
+        guard instead of deadlocking behind this control-plane transaction.
+        """
+
+        self._lock.release()
+        try:
+            return self.rig.send_scheduled_commands(
+                command,
+                activate_at=activate_at,
+                reference_segment_id=reference_segment_id,
+                execution_epoch=execution_epoch,
+                group_segment_generation=group_segment_generation,
+            )
+        finally:
+            self._lock.acquire()
+
+    def _measured_qpos_outside_state_lock(self) -> Mapping[str, np.ndarray]:
+        """Read the Rig without holding the receiver side of the lock cycle."""
+
+        self._lock.release()
+        try:
+            return self.rig.measured_qpos_by_side()
+        finally:
+            self._lock.acquire()
 
     def _build_segment(
         self,
@@ -499,7 +575,7 @@ class MujocoScheduledQposReferenceReceiver:
                 f"requested_from={scheduled_from:.12f}."
             )
 
-        measured_qpos = self.rig.measured_qpos_by_side()
+        measured_qpos = self._measured_qpos_outside_state_lock()
         measured = RobotAction.bimanual_qpos(
             left_arm=measured_qpos["left"],
             right_arm=measured_qpos["right"],

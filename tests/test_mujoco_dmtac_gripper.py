@@ -299,6 +299,49 @@ def test_gripper_hold_cancels_commands_still_in_transport_delay() -> None:
 
 
 @pytest.mark.slow_sim
+def test_gripper_snapshot_is_bound_to_completed_physics_time() -> None:
+    pytest.importorskip("mujoco")
+    scene, _arm_profile, profile = _scene()
+    executor = MujocoDmtacGripperExecutor(scene, profile)
+    initial = {"left_gripper": 0.0, "right_gripper": 0.0}
+    executor.reset(initial)
+    executor.before_physics_step(
+        physics_time_sec=0.0,
+        timestep_sec=0.001,
+    )
+    scene.mujoco.mj_step(scene.model, scene.data)
+    snapshot = executor.snapshot()
+
+    assert snapshot["physics_time_sec"] == pytest.approx(float(scene.data.time))
+
+    restored = MujocoDmtacGripperExecutor(scene, profile)
+    with pytest.raises(ValueError, match="physics_time_sec.*does not match"):
+        restored.reset(
+            initial,
+            initial_physics_time_sec=float(scene.data.time) + 0.001,
+            initial_state=snapshot,
+        )
+
+    wrong_profile = dict(snapshot)
+    wrong_profile["profile"] = {"name": "different-profile"}
+    with pytest.raises(ValueError, match="profile.*does not match"):
+        restored.reset(
+            initial,
+            initial_physics_time_sec=float(scene.data.time),
+            initial_state=wrong_profile,
+        )
+
+    mismatched_target = dict(initial)
+    mismatched_target["left_gripper"] = 0.5
+    with pytest.raises(ValueError, match="actuator target.*does not match"):
+        restored.reset(
+            mismatched_target,
+            initial_physics_time_sec=float(scene.data.time),
+            initial_state=snapshot,
+        )
+
+
+@pytest.mark.slow_sim
 def test_15_60_120_rig_dispatches_q6_gripper_on_same_physics_owner() -> None:
     pytest.importorskip("mujoco")
     scene, arm_profile, gripper_profile = _scene()

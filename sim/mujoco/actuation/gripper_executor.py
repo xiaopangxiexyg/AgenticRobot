@@ -103,18 +103,77 @@ class MujocoDmtacGripperExecutor:
             name: self._validate_close(value, name=name)
             for name, value in initial_close_by_gripper.items()
         }
+        core_state = initial_state
+        if isinstance(initial_state, Mapping) and "core" in initial_state:
+            required_wrapper_fields = (
+                "physics_time_sec",
+                "profile",
+                "actuator_target_close_by_gripper",
+            )
+            missing = [
+                name for name in required_wrapper_fields if name not in initial_state
+            ]
+            if missing:
+                raise ValueError(
+                    "initial_state is missing causal gripper wrapper fields: "
+                    f"{missing}"
+                )
+            raw_core = initial_state["core"]
+            if not isinstance(raw_core, Mapping):
+                raise TypeError("initial_state core must be a mapping.")
+            if initial_state["profile"] != self.profile.to_metadata():
+                raise ValueError(
+                    "initial_state gripper profile does not match the "
+                    "configured MuJoCo gripper profile."
+                )
+            raw_targets = initial_state["actuator_target_close_by_gripper"]
+            if not isinstance(raw_targets, Mapping) or set(raw_targets) != expected:
+                raise ValueError(
+                    "initial_state actuator target mapping must exactly match "
+                    "the configured grippers."
+                )
+            for name in expected:
+                try:
+                    saved_target = float(raw_targets[name])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"initial_state actuator target for {name!r} is invalid."
+                    ) from exc
+                if not math.isfinite(saved_target) or not math.isclose(
+                    saved_target,
+                    initial[name],
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ):
+                    raise ValueError(
+                        "initial_state actuator target does not match "
+                        f"initial_close_by_gripper for {name!r}."
+                    )
+            raw_time = initial_state.get("physics_time_sec")
+            try:
+                saved_time = float(raw_time)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "initial_state physics_time_sec must be finite."
+                ) from exc
+            if not math.isfinite(saved_time) or not math.isclose(
+                saved_time,
+                float(initial_physics_time_sec),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    "initial_state physics_time_sec does not match the "
+                    "requested initial_physics_time_sec."
+                )
+            core_state = raw_core
         self._position_actuator.reset(
             {
                 self.profile.side_by_gripper[name]: value
                 for name, value in initial.items()
             },
             initial_physics_time_sec=initial_physics_time_sec,
-            initial_state=(
-                initial_state.get("core")
-                if isinstance(initial_state, Mapping)
-                and isinstance(initial_state.get("core"), Mapping)
-                else initial_state
-            ),
+            initial_state=core_state,
         )
         # A resumed executor may restore queued/delayed targets and a
         # non-zero servo state.  Do not overwrite that causal state with the
@@ -194,7 +253,10 @@ class MujocoDmtacGripperExecutor:
             physics_time_sec=now,
             timestep_sec=dt,
         )
-        self._last_physics_time_sec = now
+        # ``before_physics_step`` integrates the complete servo state for the
+        # interval [now, now + dt).  Bind the resumable snapshot to the end of
+        # that interval, which is the time MuJoCo reaches after ``mj_step``.
+        self._last_physics_time_sec = now + dt
         accepted = self._map_by_gripper(core_tick.accepted_by_side)
         self._accepted_close_by_gripper = self._map_by_gripper(
             core_tick.accepted_target_by_side
