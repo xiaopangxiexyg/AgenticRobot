@@ -316,6 +316,52 @@ def _validate_fault_hold_snapshot(
     return q
 
 
+def _evaluate_fault_hold_candidate(
+    qpos_rad: Sequence[float],
+    *,
+    qvel_rad_s: Sequence[float],
+    velocity_abort_rad_s: float,
+    observed_age_sec: float,
+    position_limits_rad: Sequence[tuple[float, float]],
+    max_age_sec: float,
+    max_velocity_rad_s: float,
+    max_rebase_rad: float,
+) -> tuple[tuple[float, ...] | None, str | None]:
+    """Evaluate whether one control sample may replace ``last_safe``.
+
+    Candidate admission is deliberately separate from the normal control-loop
+    velocity watchdog. A sample may remain legal for bounded control while
+    being unsuitable as a future joint2/joint3 fault-hold reference. In that
+    case the immutable last-safe reference is retained; the strict validator
+    is still rerun if a protective hold is actually requested.
+    """
+
+    qvel = _six(qvel_rad_s, name="control_sample_qvel_rad_s")
+    velocity_abort = _positive(
+        velocity_abort_rad_s,
+        name="velocity_abort_rad_s",
+    )
+    max_velocity = max(abs(value) for value in qvel)
+    if max_velocity > velocity_abort:
+        raise LowGainProbeError(
+            f"velocity abort: max_abs_fd_velocity={max_velocity:.6f} "
+            f"> {velocity_abort:.6f} rad/s"
+        )
+    try:
+        accepted = _validate_fault_hold_snapshot(
+            qpos_rad,
+            qvel_rad_s=qvel,
+            observed_age_sec=observed_age_sec,
+            position_limits_rad=position_limits_rad,
+            max_age_sec=max_age_sec,
+            max_velocity_rad_s=max_velocity_rad_s,
+            max_rebase_rad=max_rebase_rad,
+        )
+    except LowGainProbeError as exc:
+        return None, str(exc)
+    return accepted, None
+
+
 def _validate_arming_settle_transition(
     current_qpos_rad: Sequence[float] | None,
     *,
@@ -1790,6 +1836,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     torque_limit_count = 0
     slew_limit_count = 0
     overlay_limit_count = 0
+    fault_hold_candidate_accepted_count = 0
+    fault_hold_candidate_rejected_count = 0
+    fault_hold_candidate_last_rejection: str | None = None
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
     primary_error: Exception | None = None
@@ -2105,26 +2154,31 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 except LowGainProbeError as exc:
                     stop_reason = str(exc)
                     break
-            max_velocity = max(abs(value) for value in qvel)
-            if max_velocity > args.velocity_abort_rad_s:
-                stop_reason = (
-                    f"velocity abort: max_abs_fd_velocity={max_velocity:.6f} "
-                    f"> {args.velocity_abort_rad_s:.6f} rad/s"
-                )
-                break
             try:
-                safe_candidate_q = _validate_fault_hold_snapshot(
+                (
+                    safe_candidate_q,
+                    fault_hold_candidate_rejection,
+                ) = _evaluate_fault_hold_candidate(
                     q,
                     qvel_rad_s=qvel,
-                    observed_age_sec=max(0.0, time.monotonic() - observed_at_sec),
+                    velocity_abort_rad_s=args.velocity_abort_rad_s,
+                    observed_age_sec=max(
+                        0.0,
+                        time.monotonic() - observed_at_sec,
+                    ),
                     position_limits_rad=position_limits,
                     max_age_sec=args.fault_hold_max_age_sec,
                     max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
                     max_rebase_rad=args.fault_hold_max_rebase_rad,
                 )
             except LowGainProbeError as exc:
-                stop_reason = f"last-safe snapshot rejected: {exc}"
+                stop_reason = str(exc)
                 break
+            if safe_candidate_q is None:
+                fault_hold_candidate_rejected_count += 1
+                fault_hold_candidate_last_rejection = fault_hold_candidate_rejection
+            else:
+                fault_hold_candidate_accepted_count += 1
             elapsed = time.monotonic() - started
             qref, qvel_ref, step_done = plan_reference(
                 initial_q,
@@ -2228,6 +2282,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "conditioned_tau_nm": conditioned_tau,
                     "torque_limited": torque_limited,
                     "slew_limited": slew_limited,
+                    "fault_hold_candidate_accepted": safe_candidate_q is not None,
+                    "fault_hold_candidate_rejection": fault_hold_candidate_rejection,
                     "step_done": step_done,
                     "cartesian_impedance": cartesian_audit,
                     "freshness_verified": state.freshness_verified,
@@ -2237,9 +2293,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             previous_q = q
             previous_feedback_time = state.receive_timestamp_sec
             previous_tau = conditioned_tau
-            last_safe_q = safe_candidate_q
-            last_safe_qvel = tuple(float(value) for value in qvel)
-            last_safe_observed_at_sec = observed_at_sec
+            if safe_candidate_q is not None:
+                last_safe_q = safe_candidate_q
+                last_safe_qvel = tuple(float(value) for value in qvel)
+                last_safe_observed_at_sec = observed_at_sec
             next_deadline += period
             completed_at = time.monotonic()
             if completed_at > next_deadline:
@@ -2469,6 +2526,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "vendor_kd_nm_s_per_rad": _ZERO_SIX,
             "reference_velocity_rad_s": _ZERO_SIX,
         },
+        "fault_hold_candidate_admission": {
+            "accepted_count": fault_hold_candidate_accepted_count,
+            "rejected_count": fault_hold_candidate_rejected_count,
+            "last_rejection": fault_hold_candidate_last_rejection,
+            "max_age_sec": args.fault_hold_max_age_sec,
+            "max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
+            "semantics": "rejected_sample_retains_previous_last_safe",
+        },
         "initial_qpos_rad": initial_q,
         "final_qpos_rad": final_q,
         "profile": {
@@ -2518,6 +2583,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "The active set is the target plus explicitly selected support joints; scheme-1 J6 commissioning selects all six arm joints while only the J6 reference changes.",
             "On an exceptional stop, only joint2/joint3 may be latched; joint1/joint4/joint5/joint6 are safe-stopped, and SIGUSR1 is required for full disable.",
             "Protective hold admits only a host-fresh, in-limit, near-zero-velocity last-safe snapshot and a small fault rebase; otherwise it falls back to full safe_stop.",
+            "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
             "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",

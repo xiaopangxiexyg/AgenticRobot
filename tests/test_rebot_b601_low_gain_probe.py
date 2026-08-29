@@ -440,6 +440,58 @@ def test_fault_hold_snapshot_rejects_motion_and_large_rebase() -> None:
         )
 
 
+def test_moving_control_sample_is_not_promoted_as_fault_hold_candidate() -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+
+    accepted, rejection = probe._evaluate_fault_hold_candidate(
+        q,
+        qvel_rad_s=(0.0, 0.0, 0.0, 0.0, 0.022988, 0.0),
+        velocity_abort_rad_s=0.05,
+        observed_age_sec=0.01,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+    )
+
+    assert accepted is None
+    assert rejection is not None
+    assert "moving" in rejection
+    assert "0.022988" in rejection
+
+
+def test_stationary_control_sample_is_promoted_as_fault_hold_candidate() -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+
+    accepted, rejection = probe._evaluate_fault_hold_candidate(
+        q,
+        qvel_rad_s=(0.0, 0.0, 0.0, 0.0, 0.013779, 0.0),
+        velocity_abort_rad_s=0.05,
+        observed_age_sec=0.01,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+    )
+
+    assert accepted == q
+    assert rejection is None
+
+
+def test_control_sample_above_normal_velocity_limit_still_aborts() -> None:
+    with pytest.raises(probe.LowGainProbeError, match="velocity abort"):
+        probe._evaluate_fault_hold_candidate(
+            (0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+            qvel_rad_s=(0.0, 0.0, 0.0, 0.0, 0.050001, 0.0),
+            velocity_abort_rad_s=0.05,
+            observed_age_sec=0.01,
+            position_limits_rad=_fault_hold_limits(),
+            max_age_sec=0.15,
+            max_velocity_rad_s=0.02,
+            max_rebase_rad=0.05,
+        )
+
+
 def test_arming_settle_transition_accepts_stationary_feedback() -> None:
     previous = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
     current = (0.1, 0.7001, 1.1001, 0.0, -0.1, 0.2)

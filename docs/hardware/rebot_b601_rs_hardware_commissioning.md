@@ -393,6 +393,12 @@ printf '%s\n' 'shell remains active'
 第一档只验收 `hold`：观察 J1..J6 是否都锚定在使能后当前位置、重力方向是否合理、阻尼
 是否耗散而非振荡；ID7 夹爪不参与。`active_joint_names` 的集合必须正好是 joint1..joint6，
 且没有任何关节 reference 变化。
+正常控制的 `--velocity-abort-rad-s` 与故障保持候选门是两个独立安全层：某一帧低于正常
+运动中止阈值、但高于更严格的 `--fault-hold-max-velocity-rad-s` 时，该帧不会替换
+`last_safe`，但也不会单独中止正常 hold。JSON 的 `fault_hold_candidate_admission` 会记录
+拒绝次数与最后原因。若随后发生真实故障，保护保持仍会重新验证当前帧、旧 `last_safe`
+的年龄和 J2/J3 rebase；任一条件不满足仍立即执行六关节 `safe_stop`，不得通过提高故障
+保持速度阈值绕过。
 并在 JSON 中确认 `status=OK`、`acceptance_status=PASS`、
 `cleanup_receipt.completed=true`、`cleanup_errors=[]`、`stop_reason=null`，以及
 `frequency_acceptance.feedback/compute/tx.*.passed=true`。输出中的
