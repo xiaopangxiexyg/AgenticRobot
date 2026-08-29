@@ -10,6 +10,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import utils.calibration_common.robot as common_robot
+import utils.calibration_common.transforms as common_transforms
+import utils.hand_eye.robot as hand_robot
+import utils.hand_eye.transforms as hand_transforms
+import utils.head_eye.robot as head_robot
+import utils.head_eye.transforms as head_transforms
+from utils.hand_eye.run_calibrate_handeye import (
+    build_parser as build_wrist_calibration_parser,
+)
+from utils.hand_eye.visualize_handeye import (
+    build_parser as build_wrist_visualizer_parser,
+)
 from utils.head_eye.calibration import (
     CalibrationResult,
     CalibrationSample,
@@ -24,7 +36,9 @@ from utils.head_eye.camera import (
     _choose_compatible_video_profile_pair,
 )
 from utils.head_eye.dual_arm import build_parser as build_dual_arm_parser
-from utils.head_eye.run_calibrate_handeye import build_parser as build_calibration_parser
+from utils.head_eye.run_calibrate_handeye import (
+    build_parser as build_calibration_parser,
+)
 from utils.head_eye.transforms import (
     average_transforms,
     compose_transforms,
@@ -35,8 +49,76 @@ from utils.head_eye.transforms import (
     transform_distance,
 )
 from utils.head_eye.visualize_handeye import build_parser as build_visualizer_parser
-from utils.hand_eye.run_calibrate_handeye import build_parser as build_wrist_calibration_parser
-from utils.hand_eye.visualize_handeye import build_parser as build_wrist_visualizer_parser
+
+
+class CalibrationCommonOwnershipTest(unittest.TestCase):
+    def test_transform_namespaces_export_one_implementation(self) -> None:
+        names = (
+            "as_transform",
+            "average_quaternion_xyzw",
+            "average_transforms",
+            "compose_transforms",
+            "invert_transform",
+            "make_transform",
+            "matrix_to_quaternion_xyzw",
+            "pose6_xyz_rpy_to_matrix",
+            "project_to_rotation",
+            "quaternion_xyzw_to_matrix",
+            "rotation_angle_deg",
+            "rotation_matrix_from_euler_xyz",
+            "transform_distance",
+            "transform_to_list",
+        )
+        for name in names:
+            shared = getattr(common_transforms, name)
+            self.assertIs(getattr(hand_transforms, name), shared)
+            self.assertIs(getattr(head_transforms, name), shared)
+
+    def test_robot_namespaces_keep_compatibility_types(self) -> None:
+        self.assertIs(hand_robot.RM65PoseReader.__mro__[1], common_robot.RM65PoseReader)
+        self.assertIs(head_robot.RM65PoseReader.__mro__[1], common_robot.RM65PoseReader)
+        self.assertIs(hand_robot.RM65PoseReader.sample_type, hand_robot.RobotPoseSample)
+        self.assertIs(head_robot.RM65PoseReader.sample_type, head_robot.RobotPoseSample)
+        self.assertEqual(hand_robot.RobotPoseSample.__module__, "utils.hand_eye.robot")
+        self.assertEqual(head_robot.RobotPoseSample.__module__, "utils.head_eye.robot")
+        self.assertIs(hand_robot._finite_float_list, common_robot._finite_float_list)
+        self.assertIs(head_robot._finite_float_list, common_robot._finite_float_list)
+
+        values = {
+            "T_gripper_to_base": np.eye(4),
+            "pose_xyz_rpy": [0.0] * 6,
+            "joint_deg": [0.0] * 6,
+            "timestamp_sec": 1.0,
+            "arm_err": 0,
+            "sys_err": 0,
+        }
+        self.assertIsInstance(hand_robot.RobotPoseSample(**values), common_robot.RobotPoseSample)
+        self.assertIsInstance(head_robot.RobotPoseSample(**values), common_robot.RobotPoseSample)
+
+    def test_shared_reader_returns_each_namespace_sample_without_hardware(self) -> None:
+        class FakeArm:
+            def Get_Current_Arm_State(self, *, retry: int):
+                self.retry = retry
+                return 0, [1, 2, 3, 4, 5, 6], [0.1, 0.2, 0.3, 0.0, 0.0, 0.0], 0, 0
+
+        for reader_type, sample_type in (
+            (hand_robot.RM65PoseReader, hand_robot.RobotPoseSample),
+            (head_robot.RM65PoseReader, head_robot.RobotPoseSample),
+        ):
+            reader = object.__new__(reader_type)
+            reader.retry = 3
+            reader.current_tool = "offline-test-tool"
+            reader._arm = FakeArm()
+
+            sample = reader.read()
+
+            self.assertIs(type(sample), sample_type)
+            self.assertEqual(sample.tool_frame, "offline-test-tool")
+            self.assertEqual(reader._arm.retry, 3)
+            np.testing.assert_allclose(
+                sample.T_gripper_to_base,
+                common_transforms.pose6_xyz_rpy_to_matrix(sample.pose_xyz_rpy),
+            )
 
 
 class HeadEyePackageTest(unittest.TestCase):
