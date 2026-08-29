@@ -775,13 +775,24 @@ from control_station.real_agent_primitive_runtime import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def _parse_args_with_configuration(
+    *,
+    configure_parser: Callable[[argparse.ArgumentParser], None] | None = None,
+) -> argparse.Namespace:
     _bind_cli_resolution_support(globals())
     parser = build_real_teleop_argument_parser()
     add_real_agent_primitive_arguments(parser)
+    if configure_parser is not None:
+        configure_parser(parser)
     args = parse_real_teleop_args_with_parser(parser)
     validate_real_agent_primitive_arguments(args, parser)
     return args
+
+
+def parse_args() -> argparse.Namespace:
+    """Preserve the frozen canonical parser entrypoint."""
+
+    return _parse_args_with_configuration()
 
 
 # Compatibility bridge: retain the established entrypoint helper names while
@@ -1731,11 +1742,24 @@ from teleop_runtime.real_teleop.runtime import (
 )
 
 
-def main() -> None:
+def run_real_teleop_entrypoint(
+    *,
+    configure_parser: Callable[[argparse.ArgumentParser], None] | None = None,
+    runtime_extension_factory: Callable[[argparse.Namespace], object | None] = (
+        build_real_agent_primitive_extension
+    ),
+) -> None:
+    """Run the canonical lifecycle with an optional application extension.
+
+    The injected hooks only add application arguments and construct the one
+    existing runtime extension.  Device lifecycle, safety, dispatch, and
+    recording remain owned by :func:`run_real_teleop`.
+    """
+
     try:
-        args = parse_args()
+        args = _parse_args_with_configuration(configure_parser=configure_parser)
         _bind_real_teleop_runtime_support(globals())
-        runtime_extension = build_real_agent_primitive_extension(args)
+        runtime_extension = runtime_extension_factory(args)
         args._real_teleop_runtime_extension = runtime_extension
         run_real_teleop(
             args,
@@ -1753,6 +1777,10 @@ def main() -> None:
         # is disarmed automatically once the normal runtime shutdown owns the
         # resources, so this is idempotent on the regular path.
         cleanup_active_startup()
+
+
+def main() -> None:
+    run_real_teleop_entrypoint()
 
 
 if __name__ == "__main__":
