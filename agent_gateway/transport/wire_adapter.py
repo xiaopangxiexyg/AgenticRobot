@@ -17,8 +17,14 @@ from typing import Any
 
 from ..protocol._contract_validation import (
     finite_number as _finite_number,
+)
+from ..protocol._contract_validation import (
     nonnegative_integer as _nonnegative_integer,
+)
+from ..protocol._contract_validation import (
     positive_integer as _positive_integer,
+)
+from ..protocol._contract_validation import (
     required_text as _required,
 )
 from ..protocol.artifact_contracts import (

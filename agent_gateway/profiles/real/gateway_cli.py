@@ -27,13 +27,13 @@ from teleop_runtime.skill_deploy import (
 )
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
-from .session_authorization import (
-    REAL_AGENT_PRIMITIVE_ACTIONS,
-    REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
-)
 from .rm65_composition import (
     ExclusiveRM65AgentPrimitiveComposition,
     assemble_exclusive_rm65_agent_primitive_composition,
+)
+from .session_authorization import (
+    REAL_AGENT_PRIMITIVE_ACTIONS,
+    REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
 )
 
 

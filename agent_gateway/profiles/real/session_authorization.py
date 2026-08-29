@@ -22,7 +22,6 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .motion_gateway_session import RealAgentPrimitiveGatewaySession
 
-
 REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN = (
     "AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES"
 )

@@ -484,6 +484,12 @@ measurement cuts, at least one lower dispatch, the configured stable-arrival
 count, and terminal lower-confirmed HOLD. Cancellation, disconnect, timeout,
 fault, and Gateway close all use that same lower HOLD boundary.
 
+After a successful terminal HOLD, the exclusive lower runtime remains in HOLD
+while idle. It returns to RUNNING only when a separately admitted operation has
+published a new pending activation; that transition clears the previous HOLD
+receipt so the new operation must produce its own terminal evidence. A failed
+HOLD leaves the runtime faulted and cannot be used as a session re-entry point.
+
 The real Gateway does not treat the existing foot switches as an Agent
 deadman, and it cannot manufacture owner epochs, frame/calibration identities,
 or safety-envelope facts. Those facts come from the selected lower owner and

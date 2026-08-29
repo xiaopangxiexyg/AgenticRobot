@@ -12,7 +12,6 @@ from agent_gateway.profiles.real.session_authorization import (
     REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
