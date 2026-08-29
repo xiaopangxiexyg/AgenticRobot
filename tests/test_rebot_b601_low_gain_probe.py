@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -32,6 +34,97 @@ def test_condition_torque_rejects_nonpositive_dt() -> None:
             max_rate_nm_s=(1.0,) * 6,
             dt_sec=0.0,
         )
+
+
+def test_feedback_stability_summary_reports_raw_finite_difference_excursion() -> None:
+    positions = (
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0012, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0012, 0.0, 0.0, 0.0),
+    )
+    summary = probe.summarize_feedback_stability(
+        positions,
+        (0.0, 0.05, 0.10),
+        stationarity_velocity_limit_rad_s=0.02,
+    )
+
+    joint3 = summary["per_joint"]["joint3"]
+    assert joint3["max_abs_step_rad"] == pytest.approx(0.0012)
+    assert joint3["max_abs_velocity_rad_s"] == pytest.approx(0.024)
+    assert joint3["stationarity_exceed_count"] == 1
+    assert summary["stationarity_passed"] is False
+
+
+def test_feedback_stability_summary_rejects_non_monotonic_time() -> None:
+    with pytest.raises(ValueError, match="strictly increasing"):
+        probe.summarize_feedback_stability(
+            ((0.0,) * 6, (0.0,) * 6),
+            (1.0, 1.0),
+        )
+
+
+def test_feedback_stability_probe_never_enters_motion_path(tmp_path) -> None:
+    class FakeBackend:
+        config = SimpleNamespace(channel="can0")
+
+        def __init__(self) -> None:
+            self.events: list[object] = []
+            self.poll_count = 0
+
+        def connect(self) -> None:
+            self.events.append("connect")
+
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            assert request_feedback is True
+            self.events.append("poll_feedback")
+            self.poll_count += 1
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=(0.0, 0.0, 0.0012 * self.poll_count, 0.0, 0.0, 0.0),
+                receive_timestamp_sec=0.05 * self.poll_count,
+                fault_reason=None,
+            )
+
+        def close(self) -> None:
+            self.events.append("close")
+
+    now = [0.0]
+
+    def clock() -> float:
+        now[0] += 0.01
+        return now[0]
+
+    def sleeper(duration: float) -> None:
+        now[0] += duration
+
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("joints: []\n", encoding="utf-8")
+    urdf_path = tmp_path / "b601.urdf"
+    urdf_path.write_text("<robot name='b601'/>", encoding="utf-8")
+    backend = FakeBackend()
+
+    result = probe._run_feedback_stability_probe(
+        backend,
+        config_path=config_path,
+        source_root=tmp_path,
+        model=SimpleNamespace(urdf_path=urdf_path),
+        position_limits=((-1.0, 1.0),) * 6,
+        duration_sec=1.0,
+        rate_hz=20.0,
+        stationarity_velocity_limit_rad_s=0.02,
+        clock=clock,
+        sleeper=sleeper,
+        max_samples=3,
+    )
+
+    assert result["status"] == "OK"
+    assert result["motion_commands_sent"] is False
+    assert result["mode_transitions_sent"] is False
+    assert result["disable_commands_sent"] is False
+    assert result["acceptance_status"] == "CAPTURED"
+    assert result["stability"]["per_joint"]["joint3"]["stationarity_exceed_count"] == 2
+    assert backend.events == ["connect", "poll_feedback", "poll_feedback", "poll_feedback", "close"]
 
 
 def test_software_profile_has_single_torque_owner() -> None:
@@ -513,6 +606,39 @@ def test_parser_help_is_read_only() -> None:
     assert tuple(args.support_joints) == ("joint2", "joint3")
     assert args.cartesian_stiffness_n_per_m == 20.0
     assert args.cartesian_max_displacement_m == 0.02
+
+
+def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
+    parser = probe.build_parser()
+    args = parser.parse_args(
+        [
+            "--mode",
+            "feedback-stability",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--confirmation",
+            probe.FEEDBACK_STABILITY_CONFIRMATION,
+        ]
+    )
+    probe._validate_cli(args)
+
+    motion_args = parser.parse_args(
+        [
+            "--mode",
+            "feedback-stability",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--allow-motion",
+            "--confirmation",
+            probe.FEEDBACK_STABILITY_CONFIRMATION,
+        ]
+    )
+    with pytest.raises(probe.LowGainProbeError, match="observation-only"):
+        probe._validate_cli(motion_args)
 
 
 def _parse_cartesian_args(*extra: str) -> object:

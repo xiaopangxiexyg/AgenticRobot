@@ -62,6 +62,13 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
 - `gravity-offline` 复用 `B601PinocchioModel.arm_generalized_gravity()` 与
   `compute_b601_mit_torque()` 的 zero-PD 路径，验证固定合法 q 下 `requested_tau == g(q)`
   并测量 compute tick。它不构造硬件 backend，不打开 CAN。
+- `feedback-stability` 是本轮低增益试验前的只读噪声标定入口：它用
+  `allow_motion=False` 构造同一个 backend，主动请求并读取六个 arm 的 `mechPos`，按与
+  active probe 相同的时间戳计算原始有限差分速度，输出每关节步进/速度的 p50/p95/p99/max
+  以及 `0.02 rad/s` stationarity gate 统计。它不切模式、不使能、不失能、不发送
+  MIT/POS_VEL 控制帧，也不改变运行前已经存在的电机状态；`CAPTURED` 只表示采样完成，
+  不能解读为力控或硬件通过。该结果用于判断 `last-safe` 速度门是否被反馈量化噪声触发，
+  不允许据此直接放宽保护阈值。
 
 数学、重力和 haptic 组合仍由 `robot_motion.rebot_b601_rs` 负责，仿真 effort backend
 仍由 `sim.mujoco.rebot_b601_rs` 负责；本模块不复制 Pinocchio 或 MuJoCo 实现。
@@ -116,10 +123,14 @@ required event 的 observed rate 不低于目标的 95%，且超过 `2 * period`
    最后才评估 500 Hz；每档均须机械支撑、物理急停、唯一控制 owner、`--auto-disable`，
    并保存 `feedback/compute/tx` 三个 event 的独立统计。只保持启动时反馈位置，不引入
    trajectory 或 haptic overlay。
-7. **P4 单关节 MIT/重力阻尼**：由硬件负责人另行批准，先单关节、低幅、当前 q 参考和零
+7. **P3.5 反馈稳定性**：在 P4 前先由操作者运行 `feedback-stability`，电机保持既有安全
+   状态。必须得到至少两个完整快照并保存原始 JSON；查看各关节 `p95/p99` 与
+   `stationarity_exceed_count`，若有超限，先分析读取周期、编码器量化和机械实际运动，
+   不得通过提高 active probe 的 `--fault-hold-max-velocity-rad-s` 绕过该证据。
+8. **P4 单关节 MIT/重力阻尼**：由硬件负责人另行批准，先单关节、低幅、当前 q 参考和零
    overlay；确认重力方向、阻尼耗散、最终 torque/slew limit 和 stop receipt 后才扩大到
    多关节。P3 的位置频率通过不等于 P4 的力控通过。
-8. **P5 haptic 频率**：接入 `compute_b601_mit_torque()` 与 `J.T @ wrench` 后，单独记录
+9. **P5 haptic 频率**：接入 `compute_b601_mit_torque()` 与 `J.T @ wrench` 后，单独记录
    `haptic`，并用低幅 virtual spring/wall 或已审查的 synthetic follower wrench 验证
    frame、功率不变量、反馈延迟和限幅。只有 `feedback/compute/tx/haptic` 全部可对齐，
    才能讨论 500 Hz 目标；不能用 aggregate bus rate 代替。
@@ -352,6 +363,41 @@ printf '%s\n' 'shell remains active'
 `frequency_acceptance.feedback/compute/tx.*.passed=true`。输出中的
 `hardware_acceptance` 必须仍为 `NOT_CLAIMED`；这是一份低增益软件路径和现场观察
 记录，不是 `HARDWARE_PASS`。
+
+在重新尝试任何使能或 MIT 之前，建议先运行下面的 P3.5 反馈稳定性采样。它不会改变电机
+的当前状态；如果上一轮异常路径已经完成全臂 `safe_stop`，可直接采样。命令不使用
+`set -euo pipefail`，即使探针返回非零，交接终端仍保持可用：
+
+```bash
+OUT_DIR=/tmp/b601-rs-commissioning
+mkdir -p "$OUT_DIR"
+if cd "$WT"; then
+  if PYTHONDONTWRITEBYTECODE=1 "$PY" \
+      scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+      --mode feedback-stability \
+      --config "$CFG" \
+      --rebot-source-root "$SRC" \
+      --duration-sec 20 \
+      --rate-hz 20 \
+      --fault-hold-max-velocity-rad-s 0.02 \
+      --confirmation B601_RS_FEEDBACK_STABILITY_READ_ONLY \
+      --output "$OUT_DIR/b601_feedback_stability_20s.json"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  printf 'feedback-stability exit code: %s\n' "$STATUS"
+  printf 'result: %s\n' "$OUT_DIR/b601_feedback_stability_20s.json"
+else
+  printf '%s\n' 'ERROR: worktree not found'
+fi
+printf '%s\n' 'shell remains active'
+```
+
+此模式的 `status=OK`/`acceptance_status=CAPTURED` 只表示收到了至少两个完整、合法的
+快照；是否越过保护速度门要看 `stability.per_joint.*.stationarity_exceed_count` 及
+`p95/p99`。任何越过都应先保留 JSON、确认是否有可见机械运动并分析采样量化，再决定后续
+实现；不能把它当成放宽 `last-safe` 门槛的理由。
 
 只有 hold 通过且机械支撑未改变，才可单独运行一档相对慢步；每次只批准一个命令，
 例如 j1 正方向 0.05 rad、0.02 rad/s：

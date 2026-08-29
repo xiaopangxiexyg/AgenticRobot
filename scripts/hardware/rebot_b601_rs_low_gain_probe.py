@@ -23,8 +23,11 @@ explicit ``mechPos`` request path; its source freshness remains unverified by
 MotorBridge 0.4.9 and is reported as such.
 
 This module is motion-capable only after all of ``--allow-motion``,
-``--auto-disable`` and the exact confirmation string are supplied.  Automated
-tests exercise the pure helpers only; they never construct a hardware backend.
+``--auto-disable`` and the exact confirmation string are supplied.  The
+``feedback-stability`` mode is a separate observation-only path: it uses the
+same explicit ``mechPos`` reads with ``allow_motion=False`` and never changes
+the vendor mode or enable state.  Automated tests exercise the pure helpers
+only; they never construct a hardware backend.
 """
 
 from __future__ import annotations
@@ -38,7 +41,8 @@ import signal
 import sys
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +73,7 @@ from robot_motion.rebot_b601_rs import (
 )
 
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
+FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
 _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = ("joint2", "joint3")
@@ -100,6 +105,15 @@ _DEFAULT_CARTESIAN_OVERLAY_LIMIT_SCALE = 0.25
 
 class LowGainProbeError(RuntimeError):
     """A guarded probe precondition, safety stop, or vendor operation failed."""
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    """Return a finite percentile for a non-empty scalar sequence."""
+
+    normalized = tuple(_finite(value, name="percentile_value") for value in values)
+    if not normalized:
+        raise ValueError("percentile values must not be empty")
+    return float(np.percentile(np.asarray(normalized, dtype=float), percentile))
 
 
 def _finite(value: object, *, name: str) -> float:
@@ -369,6 +383,36 @@ def resolve_active_joint_names(
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
+    if args.mode == "feedback-stability":
+        if args.allow_motion:
+            raise LowGainProbeError(
+                "feedback-stability rejects --allow-motion; it is observation-only"
+            )
+        if args.auto_disable:
+            raise LowGainProbeError(
+                "feedback-stability rejects --auto-disable; it does not change motor state"
+            )
+        if args.confirmation != FEEDBACK_STABILITY_CONFIRMATION:
+            raise LowGainProbeError(
+                "feedback-stability requires "
+                f"--confirmation {FEEDBACK_STABILITY_CONFIRMATION}"
+            )
+        if not args.config:
+            raise LowGainProbeError("feedback-stability requires --config")
+        if not args.rebot_source_root:
+            raise LowGainProbeError(
+                "feedback-stability requires --rebot-source-root"
+            )
+        _bounded(args.rate_hz, name="rate_hz", lower=1.0, upper=40.0)
+        _bounded(args.duration_sec, name="duration_sec", lower=0.1, upper=60.0)
+        _bounded(
+            args.fault_hold_max_velocity_rad_s,
+            name="fault_hold_max_velocity_rad_s",
+            lower=0.0001,
+            upper=0.5,
+            lower_inclusive=False,
+        )
+        return
     if not args.allow_motion:
         raise LowGainProbeError("low-gain mode requires --allow-motion")
     if not args.auto_disable:
@@ -561,6 +605,207 @@ def _resolve_effort_limits(
             f"pinned B601-RS URDF has no positive effort for {missing}"
         )
     return tuple(by_name[name] * scale for name in _ALL_JOINTS)
+
+
+def summarize_feedback_stability(
+    positions_rad: Sequence[Sequence[float]],
+    timestamps_sec: Sequence[float],
+    *,
+    stationarity_velocity_limit_rad_s: float = _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S,
+) -> dict[str, object]:
+    """Summarize synchronous ``mechPos`` finite-difference noise.
+
+    This is deliberately a characterization helper, not a controller.  It
+    computes the same first-order finite difference used by the guarded active
+    probe, but does not smooth, clip, or reinterpret an excursion.  The
+    stationarity gate is reported for review; it never authorizes a motion
+    command or changes the protective-hold threshold.
+    """
+
+    try:
+        samples = tuple(_six(sample, name="positions_rad") for sample in positions_rad)
+    except TypeError as exc:
+        raise ValueError("positions_rad must be a sequence of six-joint samples") from exc
+    times = tuple(_finite(value, name="timestamp_sec") for value in timestamps_sec)
+    if len(samples) != len(times):
+        raise ValueError("positions_rad and timestamps_sec must have equal length")
+    if len(samples) < 2:
+        raise ValueError("feedback stability requires at least two complete snapshots")
+    if any(current <= previous for previous, current in pairwise(times)):
+        raise ValueError("timestamps_sec must be strictly increasing")
+    limit = _bounded(
+        stationarity_velocity_limit_rad_s,
+        name="stationarity_velocity_limit_rad_s",
+        lower=0.0001,
+        upper=0.5,
+        lower_inclusive=False,
+    )
+    deltas = np.diff(np.asarray(samples, dtype=float), axis=0)
+    intervals = np.diff(np.asarray(times, dtype=float))
+    velocities = deltas / intervals[:, None]
+    per_joint: dict[str, dict[str, object]] = {}
+    threshold_exceed_count = 0
+    for index, joint_name in enumerate(_ALL_JOINTS):
+        abs_step = np.abs(deltas[:, index])
+        abs_velocity = np.abs(velocities[:, index])
+        exceeds = abs_velocity > limit
+        count = int(np.count_nonzero(exceeds))
+        threshold_exceed_count += count
+        per_joint[joint_name] = {
+            "sample_count": len(samples),
+            "interval_count": len(intervals),
+            "position_first_rad": float(samples[0][index]),
+            "position_last_rad": float(samples[-1][index]),
+            "max_abs_drift_rad": float(np.max(np.abs(np.asarray(samples)[:, index] - samples[0][index]))),
+            "max_abs_step_rad": float(np.max(abs_step)),
+            "p50_abs_step_rad": _percentile(abs_step, 50.0),
+            "p95_abs_step_rad": _percentile(abs_step, 95.0),
+            "p99_abs_step_rad": _percentile(abs_step, 99.0),
+            "max_abs_velocity_rad_s": float(np.max(abs_velocity)),
+            "p50_abs_velocity_rad_s": _percentile(abs_velocity, 50.0),
+            "p95_abs_velocity_rad_s": _percentile(abs_velocity, 95.0),
+            "p99_abs_velocity_rad_s": _percentile(abs_velocity, 99.0),
+            "stationarity_exceed_count": count,
+            "stationarity_exceed_ratio": float(count / len(intervals)),
+            "stationarity_passed": count == 0,
+        }
+    return {
+        "sample_count": len(samples),
+        "interval_count": len(intervals),
+        "stationarity_velocity_limit_rad_s": limit,
+        "stationarity_exceed_count": threshold_exceed_count,
+        "stationarity_passed": threshold_exceed_count == 0,
+        "per_joint": per_joint,
+    }
+
+
+def _run_feedback_stability_probe(
+    backend: B601RSBackend,
+    *,
+    config_path: Path,
+    source_root: Path,
+    model: B601PinocchioModel,
+    position_limits: tuple[tuple[float, float], ...],
+    duration_sec: float,
+    rate_hz: float,
+    stationarity_velocity_limit_rad_s: float,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    max_samples: int | None = None,
+) -> dict[str, object]:
+    """Capture complete feedback without mode, enable, disable, or TX control."""
+
+    if max_samples is not None and max_samples < 1:
+        raise ValueError("max_samples must be positive when provided")
+    period = 1.0 / _positive(rate_hz, name="rate_hz")
+    started = _finite(clock(), name="clock")
+    deadline = started + _positive(duration_sec, name="duration_sec")
+    next_deadline = started
+    ledger = FrequencyLedger()
+    positions: list[tuple[float, ...]] = []
+    timestamps: list[float] = []
+    errors: list[str] = []
+    connected = False
+    try:
+        backend.connect()
+        connected = True
+        while clock() < deadline and (
+            max_samples is None or len(positions) < max_samples
+        ):
+            now = _finite(clock(), name="clock")
+            if now < next_deadline:
+                sleeper(next_deadline - now)
+            state = backend.poll_feedback(request_feedback=True)
+            if (
+                not state.valid
+                or getattr(state, "stale", False)
+                or state.positions_rad is None
+            ):
+                errors.append(
+                    "feedback snapshot is not complete and valid: "
+                    f"{getattr(state, 'fault_reason', None) or 'unknown fault'}"
+                )
+                break
+            try:
+                q = _six(state.positions_rad, name="feedback_qpos_rad")
+                observed_at = _finite(
+                    state.receive_timestamp_sec,
+                    name="feedback_receive_timestamp_sec",
+                )
+            except (TypeError, ValueError) as exc:
+                errors.append(f"invalid feedback snapshot: {exc}")
+                break
+            for index, (value, (lower, upper)) in enumerate(
+                zip(q, position_limits, strict=True)
+            ):
+                if not lower <= value <= upper:
+                    errors.append(
+                        f"feedback qpos_rad[{index}]={value:.6f} is outside "
+                        f"URDF limits [{lower:.6f}, {upper:.6f}]"
+                    )
+                    break
+            if errors:
+                break
+            positions.append(q)
+            timestamps.append(observed_at)
+            ledger.mark("feedback", observed_at)
+            next_deadline += period
+    finally:
+        if connected:
+            try:
+                backend.close()
+            except Exception as exc:  # noqa: BLE001 - preserve evidence
+                errors.append(f"close: {exc}")
+    elapsed = max(0.0, _finite(clock(), name="clock") - started)
+    payload: dict[str, object] = {
+        "status": "OK" if len(positions) >= 2 and not errors else "FAIL",
+        "mode": "feedback-stability",
+        "confirmation": FEEDBACK_STABILITY_CONFIRMATION,
+        "channel": backend.config.channel,
+        "config_path": str(config_path),
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "rebot_source_root": str(source_root),
+        "urdf_path": str(model.urdf_path),
+        "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+        "transport": "motorbridge_wired_local",
+        "joint_names": _ALL_JOINTS,
+        "active_joint_names": (),
+        "support_joint_names": (),
+        "motors_enabled_by_probe": False,
+        "motion_commands_sent": False,
+        "mode_transitions_sent": False,
+        "disable_commands_sent": False,
+        "feedback_requests_sent": len(positions) * len(_ALL_JOINTS),
+        "duration_sec": elapsed,
+        "rate_hz": rate_hz,
+        "stop_reason": errors[0] if errors else None,
+        "errors": tuple(errors),
+        "frequency": {"feedback": ledger.summarize(target_hz=rate_hz)["feedback"].as_dict()},
+        "stability": (
+            summarize_feedback_stability(
+                positions,
+                timestamps,
+                stationarity_velocity_limit_rad_s=stationarity_velocity_limit_rad_s,
+            )
+            if len(positions) >= 2
+            else None
+        ),
+        "acceptance_status": "CAPTURED" if len(positions) >= 2 and not errors else "FAILED",
+        "hardware_acceptance": "NOT_CLAIMED",
+        "freshness_verified": False,
+        "freshness_semantics": "motorbridge_mechPos_parameter_observation_unverified",
+        "samples": [
+            {"receive_timestamp_sec": timestamp, "qpos_rad": q}
+            for timestamp, q in zip(timestamps, positions, strict=True)
+        ],
+        "notes": [
+            "This mode only requests vendor feedback and reads mechPos; it never changes mode, enables, disables, or sends MIT/POS_VEL control frames.",
+            "Run only after the operator has independently made the arm safe; this probe does not alter the existing enable state.",
+            "The stationarity gate is diagnostic evidence for protective-hold review, not permission to relax the active safety threshold.",
+            "MotorBridge 0.4.9 provides no source timestamp or sequence, so freshness remains unverified.",
+        ],
+    }
+    return payload
 
 
 def condition_torque(
@@ -1206,6 +1451,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
     model, position_limits = _resolve_model_and_limits(source_root)
+    if args.mode == "feedback-stability":
+        config = B601RSBackendConfig.from_rs_yaml(
+            config_path,
+            allow_motion=False,
+            position_limits_rad=position_limits,
+        )
+        return _run_feedback_stability_probe(
+            B601RSBackend(config),
+            config_path=config_path,
+            source_root=source_root,
+            model=model,
+            position_limits=position_limits,
+            duration_sec=args.duration_sec,
+            rate_hz=args.rate_hz,
+            stationarity_velocity_limit_rad_s=args.fault_hold_max_velocity_rad_s,
+        )
     torque_limits = _resolve_effort_limits(
         model.urdf_path,
         scale=args.torque_limit_scale,
@@ -1894,7 +2155,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("hold", "slow-step", "cartesian-hold"),
+        choices=("hold", "slow-step", "cartesian-hold", "feedback-stability"),
         default="hold",
     )
     parser.add_argument("--config", required=True, help="explicit rebotarm_rs.yaml")
