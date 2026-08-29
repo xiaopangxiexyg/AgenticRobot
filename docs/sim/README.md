@@ -92,3 +92,6 @@ reference。最终 TCP-pose filter 位于 pose transform 之后、共享 IK 之�
 面向流式混合控制算法的 robosuite 基准属于实验线，不是生产遥操或 canonical
 dataset 入口。其目录边界、三种采集模式和后续晋级条件见
 [robosuite mixed-control 组织说明](./plans/robosuite-mixed-control-organization.md)。
+
+State-BC Sim-HIL 的 canonical RM65 CAD 场景、默认任务和验证边界见
+[canonical URDF Sim-HIL 计划](./plans/state-bc-canonical-urdf-sim-hil.md)。

@@ -1,0 +1,36 @@
+{
+  "schema_version": "dexteleop.sim.mujoco.cube_lift_task.v2",
+  "extends": "sim/configs/tasks/rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json",
+  "name": "rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose_canonical",
+  "base_contract_path": "sim/configs/rm65_bimanual_physics_v1.json",
+  "base_contract_sha256": "dbf0cd77b5e8ffbd0f7951f9a4ae10c6c25757e6f32657e16f1fe14cf100938d",
+  "gripper_actuation_profile_name": "dmtac_bimanual_position_eg2_4b2_cad_20260818.v1",
+  "gripper_actuation_profile_sha256": "3c686f4901e8d557c60c14398f93322a121a06439e94d6964ca46fa34959ff47",
+  "left_gripper_name": "left_eg2_4b2_cad",
+  "right_gripper_name": "right_eg2_4b2_cad",
+  "initial_gripper_close_by_name": {
+    "left_eg2_4b2_cad": 0.0,
+    "right_eg2_4b2_cad": 0.0
+  },
+  "right_grasp_body_name": "right_eg2_4b2_cad_ee_link_4",
+  "grasp_latch_left_finger_body_name": "right_eg2_4b2_cad_l_3",
+  "grasp_latch_right_finger_body_name": "right_eg2_4b2_cad_r_3",
+  "gripper_contact_surface_specs": [
+    {
+      "body_name": "right_eg2_4b2_cad_l_3",
+      "side": "left",
+      "inner_normal_local": [0.0, -1.0, 0.0],
+      "surface_anchor_local": [0.0, 0.0, 0.0],
+      "face_margin_m": 0.001,
+      "score_width_m": 0.002
+    },
+    {
+      "body_name": "right_eg2_4b2_cad_r_3",
+      "side": "right",
+      "inner_normal_local": [0.0, 1.0, 0.0],
+      "surface_anchor_local": [0.0, 0.0, 0.0],
+      "face_margin_m": 0.001,
+      "score_width_m": 0.002
+    }
+  ]
+}
