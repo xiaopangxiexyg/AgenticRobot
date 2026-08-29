@@ -21,11 +21,12 @@ Current bundle:
   suffix is the first 12 characters of the source projection hash; verify the
   complete source and release hashes in `annotation_projection_receipt.json`.
 
-Retained snapshots:
+Retired snapshots:
 
-- [`refinement_annotation_20260807_39895a67ef52`](./refinement_annotation_20260807_39895a67ef52/ANNOTATION_RELEASE.md):
-  prior generated source projection retained for rollback and receipt
-  verification.
+- The 2026-08-07 rollback projection was removed from the current source tree
+  after its 2026-08-08 successor was verified. Its exact tree, hashes, and Git
+  recovery path remain recorded in the
+  [retirement report](../docs/legacy/reports/refinement_annotation_20260807_bundle_retirement_20260829.md).
 
 The former undated `refinement_annotation/` snapshot was retired because its
 tracked contents no longer matched its receipt. See the
