@@ -3,16 +3,14 @@ from __future__ import annotations
 import math
 import tkinter as tk
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from .core import (
     Endpoint,
     GeometryRef,
     GripperPair,
-    Mat4,
     URDFDocument,
     Vec3,
-    get_origin,
     identity,
     invert_rigid,
     iter_geometry,
