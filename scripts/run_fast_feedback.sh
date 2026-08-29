@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the two bounded edit-feedback tiers concurrently.  Each child still
-# goes through run_pytest.sh, which owns the Python selection and basetemp.
-# This wrapper only owns the concurrency, per-child pytest cache, report
-# paths, and the temporary shared assets link needed by a clean worktree.
+# Run the bounded edit-feedback tiers concurrently.  Each child still goes
+# through run_pytest.sh, which owns the Python selection and basetemp.  The
+# unit tier is split by test module into a small number of deterministic file
+# shards; the aggregate JUnit/log keep the historical evidence paths intact.
+# This wrapper owns the concurrency, per-child pytest cache, report paths, and
+# the temporary shared assets link needed by a clean worktree.
 # DEXTELEOP_FAST_FEEDBACK_RUN_ROOT may name a new absolute directory when a
 # caller such as Harness needs the logs and JUnit reports under its Run root.
 
@@ -27,7 +29,13 @@ RUN_ROOT=""
 ASSET_LINK="$REPO_ROOT/assets"
 ASSET_ROOT=""
 ASSET_LINK_CREATED=0
-UNIT_PID=""
+UNIT_SHARD_COUNT=""
+UNIT_SHARD_PATHS=()
+UNIT_SHARD_LOGS=()
+UNIT_SHARD_XMLS=()
+UNIT_SHARD_PIDS=()
+UNIT_SHARD_STATUSES=()
+UNIT_EXPLICIT_TEST_TARGET=0
 INTEGRATION_PID=""
 
 prepare_run_root() {
@@ -82,9 +90,79 @@ prepare_asset_compat_link() {
   ASSET_LINK_CREATED=1
 }
 
+configure_unit_shards() {
+  local requested_count="${DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS:-2}"
+  local argument
+  local explicit_test_target=0
+
+  case "$requested_count" in
+    1|2|3|4) ;;
+    *) die "DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS must be an integer from 1 to 4: $requested_count" ;;
+  esac
+
+  # The normal command accepts shared pytest options.  A path/nodeid is a
+  # targeted invocation, however, and adding the complete shard file list
+  # would duplicate that target.  Preserve the old targeted behavior by using
+  # one unit child in that case.
+  for argument in "$@"; do
+    case "$argument" in
+      --|.|./|tests/*|./tests/*|*/tests/*|*::* )
+        explicit_test_target=1
+        ;;
+    esac
+  done
+  UNIT_SHARD_COUNT="$requested_count"
+  UNIT_EXPLICIT_TEST_TARGET=0
+  if ((explicit_test_target)); then
+    if ((UNIT_SHARD_COUNT > 1)); then
+      echo "[dexteleop-fast-feedback] unit sharding disabled for explicit test target" >&2
+    fi
+    UNIT_SHARD_COUNT=1
+    UNIT_EXPLICIT_TEST_TARGET=1
+  fi
+}
+
+prepare_unit_shards() {
+  local -a test_files=()
+  local index=0
+  local assigned_count=0
+  local test_file
+
+  UNIT_SHARD_PATHS=()
+  UNIT_SHARD_LOGS=()
+  UNIT_SHARD_XMLS=()
+  if ((UNIT_EXPLICIT_TEST_TARGET)); then
+    UNIT_SHARD_PATHS[0]="$RUN_ROOT/unit-target-paths.txt"
+    UNIT_SHARD_LOGS[0]="$RUN_ROOT/unit.log"
+    UNIT_SHARD_XMLS[0]="$RUN_ROOT/unit.xml"
+    : >"${UNIT_SHARD_PATHS[0]}"
+    return
+  fi
+  for ((index = 0; index < UNIT_SHARD_COUNT; index++)); do
+    UNIT_SHARD_PATHS[index]="$RUN_ROOT/unit-${index}-paths.txt"
+    UNIT_SHARD_LOGS[index]="$RUN_ROOT/unit-${index}.log"
+    UNIT_SHARD_XMLS[index]="$RUN_ROOT/unit-${index}.xml"
+    : >"${UNIT_SHARD_PATHS[index]}"
+  done
+
+  mapfile -t test_files < <(
+    find "$REPO_ROOT/tests" -type f -name 'test_*.py' -print | LC_ALL=C sort
+  )
+  ((${#test_files[@]} > 0)) || die "no pytest modules found under $REPO_ROOT/tests"
+
+  for test_file in "${test_files[@]}"; do
+    index=$((assigned_count % UNIT_SHARD_COUNT))
+    printf '%s\n' "$test_file" >>"${UNIT_SHARD_PATHS[index]}"
+    assigned_count=$((assigned_count + 1))
+  done
+  if ((assigned_count != ${#test_files[@]})); then
+    die "internal unit shard accounting mismatch: assigned=$assigned_count files=${#test_files[@]}"
+  fi
+}
+
 stop_children() {
   local pid
-  for pid in "$UNIT_PID" "$INTEGRATION_PID"; do
+  for pid in "${UNIT_SHARD_PIDS[@]}" "$INTEGRATION_PID"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -96,7 +174,7 @@ cleanup() {
   local current_root
 
   trap - EXIT INT TERM
-  if [[ -n "$UNIT_PID" || -n "$INTEGRATION_PID" ]]; then
+  if ((${#UNIT_SHARD_PIDS[@]} > 0)) || [[ -n "$INTEGRATION_PID" ]]; then
     stop_children
   fi
   if ((ASSET_LINK_CREATED)); then
@@ -121,9 +199,12 @@ cleanup() {
 
 on_signal() {
   stop_children
-  wait "$UNIT_PID" 2>/dev/null || true
+  local pid
+  for pid in "${UNIT_SHARD_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
   wait "$INTEGRATION_PID" 2>/dev/null || true
-  UNIT_PID=""
+  UNIT_SHARD_PIDS=()
   INTEGRATION_PID=""
   exit 130
 }
@@ -144,24 +225,140 @@ run_tier() {
     >"$RUN_ROOT/${name}.log" 2>&1
 }
 
+merge_junit_reports() {
+  local destination="$1"
+  shift
+  [[ "$#" -gt 0 ]] || die "no JUnit reports were supplied for $destination"
+
+  python3 - "$destination" "$@" <<'PY'
+from __future__ import annotations
+
+import copy
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+destination = Path(sys.argv[1])
+sources = [Path(value) for value in sys.argv[2:]]
+roots = []
+for source in sources:
+    if not source.is_file():
+        raise SystemExit(f"missing JUnit shard report: {source}")
+    root = ET.parse(source).getroot()
+    if root.tag == "testsuite":
+        roots.append(root)
+    elif root.tag == "testsuites":
+        suites = [child for child in root if child.tag == "testsuite"]
+        if not suites:
+            raise SystemExit(f"JUnit shard has no <testsuite>: {source}")
+        roots.extend(suites)
+    else:
+        raise SystemExit(
+            f"JUnit shard root is not <testsuite> or <testsuites>: {source}"
+        )
+
+merged = ET.Element("testsuite")
+first_attributes = dict(roots[0].attrib)
+merged.attrib.update(first_attributes)
+integer_attributes = ("tests", "errors", "failures", "skipped")
+for name in integer_attributes:
+    merged.set(
+        name,
+        str(sum(int(root.attrib.get(name, "0")) for root in roots)),
+    )
+merged.set(
+    "time",
+    format(sum(float(root.attrib.get("time", "0")) for root in roots), ".6f"),
+)
+
+seen_cases: set[tuple[str, str]] = set()
+for root in roots:
+    for child in root:
+        if child.tag == "testcase":
+            identity = (child.attrib.get("classname", ""), child.attrib.get("name", ""))
+            if identity in seen_cases:
+                raise SystemExit(
+                    "duplicate testcase in JUnit shards: "
+                    f"{identity[0]}::{identity[1]}"
+                )
+            seen_cases.add(identity)
+        merged.append(copy.deepcopy(child))
+
+ET.indent(merged, space="  ")
+destination.parent.mkdir(parents=True, exist_ok=True)
+ET.ElementTree(merged).write(
+    destination,
+    encoding="utf-8",
+    xml_declaration=True,
+)
+PY
+}
+
+merge_unit_logs() {
+  local index
+  if ((UNIT_EXPLICIT_TEST_TARGET)); then
+    return
+  fi
+  : >"$RUN_ROOT/unit.log"
+  for ((index = 0; index < UNIT_SHARD_COUNT; index++)); do
+    {
+      echo "===== unit shard $index ====="
+      if [[ -f "${UNIT_SHARD_LOGS[index]}" ]]; then
+        cat "${UNIT_SHARD_LOGS[index]}"
+      else
+        echo "missing unit shard log: ${UNIT_SHARD_LOGS[index]}" >&2
+        UNIT_STATUS=1
+      fi
+    } >>"$RUN_ROOT/unit.log"
+  done
+}
+
 trap cleanup EXIT
 prepare_run_root
 prepare_asset_compat_link
+configure_unit_shards "$@"
+prepare_unit_shards
 trap on_signal INT TERM
 
-run_tier unit 'unit and not optional and not hardware and not slow_sim' "$@" &
-UNIT_PID=$!
+if ((UNIT_EXPLICIT_TEST_TARGET)); then
+  run_tier unit 'unit and not optional and not hardware and not slow_sim' "$@" &
+  UNIT_SHARD_PIDS[0]=$!
+else
+  for ((index = 0; index < UNIT_SHARD_COUNT; index++)); do
+    mapfile -t shard_paths <"${UNIT_SHARD_PATHS[index]}"
+    run_tier "unit-${index}" 'unit and not optional and not hardware and not slow_sim' \
+      "${shard_paths[@]}" "$@" &
+    UNIT_SHARD_PIDS[index]=$!
+  done
+fi
 run_tier integration 'integration and not optional and not hardware and not slow_sim' "$@" &
 INTEGRATION_PID=$!
 
 set +e
-wait "$UNIT_PID"
-UNIT_STATUS=$?
-UNIT_PID=""
+UNIT_STATUS=0
+UNIT_SHARD_STATUSES=()
+for ((index = 0; index < UNIT_SHARD_COUNT; index++)); do
+  wait "${UNIT_SHARD_PIDS[index]}"
+  shard_status=$?
+  UNIT_SHARD_STATUSES[index]=$shard_status
+  if ((shard_status != 0)); then
+    UNIT_STATUS=1
+  fi
+done
+UNIT_SHARD_PIDS=()
 wait "$INTEGRATION_PID"
 INTEGRATION_STATUS=$?
 INTEGRATION_PID=""
 set -e
+
+merge_unit_logs
+if ((UNIT_EXPLICIT_TEST_TARGET)); then
+  [[ -f "$RUN_ROOT/unit.xml" ]] || UNIT_STATUS=1
+else
+  if ! merge_junit_reports "$RUN_ROOT/unit.xml" "${UNIT_SHARD_XMLS[@]}"; then
+    UNIT_STATUS=1
+  fi
+fi
 
 echo "===== fast unit (status=$UNIT_STATUS) ====="
 cat "$RUN_ROOT/unit.log"

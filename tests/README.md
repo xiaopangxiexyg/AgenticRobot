@@ -72,14 +72,24 @@ dependency, or `mujoco` import alone is not sufficient evidence. Do not share
 `.pytest_cache` between worktrees or enable repository-wide test parallelism
 without first proving that the selected tests are hermetic and
 resource-independent.  `scripts/run_fast_feedback.sh` is the reviewed
-parallel entrypoint for the two bounded selectors: it starts one child for
-each marker set, gives each child its own pytest cache and JUnit report under
-`/tmp`, and keeps the complete acceptance gates unchanged.  If a clean
-worktree does not already have the reviewed `assets/` link, set
-`DEXTELEOP_ASSET_ROOT` to an absolute shared asset root before invoking it;
-the wrapper creates one shared temporary link for both children and removes
-only that link after the run.  Additional pytest options may be appended, but
-the marker, cache, JUnit, and basetemp options remain owned by the wrapper.
+parallel entrypoint for the two bounded selectors.  It splits the unit
+selector into two deterministic test-module shards by default, starts those
+shards alongside the integration child, and merges the shard reports back to
+the historical `unit.log` and `unit.xml` evidence paths.  Each child gets its
+own pytest cache and JUnit report under `/tmp`, and the complete acceptance
+gates remain unchanged.  Set `DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS=1` to
+reproduce one unit process.  A three-shard run has been validated on the
+current 32-CPU development host; choose it only when the machine's CPU and
+memory budget supports the extra pytest process.  Four shards remain
+experimental and are not part of the current integration default.  Explicit
+test paths or node IDs
+automatically disable unit sharding for that targeted invocation so a test is
+never selected twice.  If a clean worktree does not already have the reviewed
+`assets/` link, set `DEXTELEOP_ASSET_ROOT` to an absolute shared asset root
+before invoking it; the wrapper creates one shared temporary link for all
+children and removes only that link after the run.  Additional pytest options
+may be appended, but the marker, cache, JUnit, and basetemp options remain
+owned by the wrapper.
 
 ## Marker semantics
 

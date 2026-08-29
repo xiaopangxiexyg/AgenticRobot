@@ -286,9 +286,16 @@ bash scripts/verify_dev_base.sh
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   bash scripts/run_pytest.sh -m 'unit and not optional and not slow_sim' -q
 
-# 日常并行快速反馈：单元与集成两层并行运行，各自使用独立 cache/JUnit。
+# 日常并行快速反馈：单元与集成两层并行运行；单元层默认再分成两个
+# 文件 shard，各自使用独立 cache/JUnit，最后合并为 unit.xml/unit.log。
 # 若当前 worktree 没有 assets/ 链接，先设置绝对路径的共享只读 assets 根。
 DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets \
+  bash scripts/run_fast_feedback.sh
+
+# 机器资源较小时可退回单一 unit 进程；当前 32-CPU 开发机已验证 3 shard，
+# 4 shard 仍属实验配置，不作为集成默认。
+DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS=1 \
+  DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets \
   bash scripts/run_fast_feedback.sh
 
 # 完整单元回归：合并、提交和推送前仍需执行，不排除 slow_sim。
