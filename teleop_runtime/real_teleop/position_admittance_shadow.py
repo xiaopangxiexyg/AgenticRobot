@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -164,6 +164,37 @@ POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG = 0.05
 # sub-visible creep instead of forcing an exact per-joint stop.  Zero remains
 # available in the retargeter config as the atomic rollback behavior.
 POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG = 0.005
+
+
+@dataclass(frozen=True)
+class ResolvedPositionAdmittanceProfile:
+    """One validated position-admittance authority used by every runtime layer."""
+
+    mode: str
+    translation_config: CartesianAdmittanceConfig | None
+    rotational_config: RotationalAdmittanceConfig | None
+    apply_sides: tuple[str, ...] = ()
+    active_envelope: str = POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE
+    endpoint_policy: str = POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY
+    max_tool_excursion_m: float | None = None
+    max_tool_rotation_excursion_deg: float | None = None
+    maximum_allowed_tool_rotation_excursion_deg: float | None = None
+
+    @property
+    def requested(self) -> bool:
+        return self.translation_config is not None
+
+    @property
+    def active(self) -> bool:
+        return bool(self.apply_sides)
+
+    @property
+    def rotation_requested(self) -> bool:
+        return self.rotational_config is not None
+
+    @property
+    def combined_active(self) -> bool:
+        return self.mode == "combined_active"
 
 
 class PositionAdmittanceActiveFault(RuntimeError):
@@ -893,6 +924,170 @@ def position_admittance_active_config(args: Any) -> CartesianAdmittanceConfig:
     ):
         return replace(config, enabled_axes=(False, False, False))
     return config
+
+
+def resolve_position_admittance_profile(
+    args: Any,
+) -> ResolvedPositionAdmittanceProfile:
+    """Resolve and validate the complete position-admittance request once."""
+
+    shadow, active, rotation_shadow, rotation_active, combined_active = (
+        bool(getattr(args, name, False))
+        for name in (
+            "position_admittance_shadow",
+            "position_admittance_active",
+            "position_admittance_rotation_shadow",
+            "position_admittance_rotation_active",
+            "position_admittance_combined_active",
+        )
+    )
+    if shadow and active:
+        raise ValueError(
+            "--position-admittance-shadow and --position-admittance-active "
+            "are mutually exclusive"
+        )
+    if rotation_shadow and not shadow:
+        raise ValueError(
+            "--position-admittance-rotation-shadow requires "
+            "--position-admittance-shadow"
+        )
+    if rotation_active and not active:
+        raise ValueError(
+            "--position-admittance-rotation-active requires "
+            "--position-admittance-active"
+        )
+    if combined_active and not (active and rotation_active):
+        raise ValueError(
+            "--position-admittance-combined-active requires both "
+            "--position-admittance-active and "
+            "--position-admittance-rotation-active"
+        )
+
+    active_side = getattr(args, "position_admittance_active_side", None)
+    if active and active_side is None:
+        raise ValueError(
+            "--position-admittance-active requires the explicit authority "
+            "selection --position-admittance-active-side {left,right,both}"
+        )
+    if not active and active_side is not None:
+        raise ValueError(
+            "--position-admittance-active-side requires "
+            "--position-admittance-active"
+        )
+
+    def setting(name: str, default: str) -> str:
+        return str(getattr(args, name, default))
+
+    active_envelope = setting(
+        "position_admittance_active_envelope",
+        POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE,
+    )
+    endpoint_policy = setting(
+        "position_admittance_active_endpoint_policy",
+        POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
+    )
+    if not active and active_envelope != POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE:
+        raise ValueError(
+            "--position-admittance-active-envelope other than cautious requires "
+            "--position-admittance-active"
+        )
+    if (
+        not active
+        and endpoint_policy
+        != POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY
+    ):
+        raise ValueError(
+            "--position-admittance-active-endpoint-policy other than "
+            "runtime_home_hold requires --position-admittance-active"
+        )
+
+    if not shadow and not active:
+        return ResolvedPositionAdmittanceProfile(
+            mode="disabled",
+            translation_config=None,
+            rotational_config=None,
+        )
+
+    translation_config = (
+        position_admittance_active_config(args)
+        if active
+        else position_admittance_shadow_config(args)
+    )
+    rotation_profile = None
+    if rotation_active:
+        rotation_profile = setting(
+            "position_admittance_rotation_active_profile",
+            POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
+        )
+    elif rotation_shadow:
+        rotation_profile = setting(
+            "position_admittance_rotation_shadow_profile",
+            POSITION_ADMITTANCE_ROTATION_ACTIVE_BALANCED_PROFILE,
+        )
+    rotational_config = (
+        position_rotational_admittance_config(args, profile=rotation_profile)
+        if rotation_profile is not None
+        else None
+    )
+    if rotation_shadow:
+        translation_config = replace(
+            translation_config,
+            enabled_axes=(False, False, False),
+        )
+
+    if not active:
+        return ResolvedPositionAdmittanceProfile(
+            mode="rotation_shadow" if rotation_shadow else "shadow",
+            translation_config=translation_config,
+            rotational_config=rotational_config,
+        )
+
+    apply_sides = position_admittance_active_apply_sides(str(active_side))
+    max_tool_excursion_m = float(
+        getattr(
+            args,
+            "position_admittance_active_max_tool_excursion_m",
+            POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
+        )
+    )
+    max_tool_rotation_excursion_deg = (
+        float(
+            getattr(
+                args,
+                "position_admittance_active_max_tool_rotation_excursion_deg",
+                POSITION_ADMITTANCE_ROTATION_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_DEG,
+            )
+        )
+        if rotation_active
+        else None
+    )
+    maximum_rotation_excursion_deg = validate_position_admittance_active_authority(
+        translation_config,
+        active_envelope=active_envelope,
+        rotational_config=rotational_config,
+        combined_translation_rotation_active=combined_active,
+        endpoint_policy=endpoint_policy,
+        apply_sides=apply_sides,
+        max_tool_excursion_m=max_tool_excursion_m,
+        max_tool_rotation_excursion_deg=max_tool_rotation_excursion_deg,
+    )
+    return ResolvedPositionAdmittanceProfile(
+        mode=(
+            "combined_active"
+            if combined_active
+            else "rotation_active"
+            if rotation_active
+            else "active"
+        ),
+        translation_config=translation_config,
+        rotational_config=rotational_config,
+        apply_sides=apply_sides,
+        active_envelope=active_envelope,
+        endpoint_policy=endpoint_policy,
+        max_tool_excursion_m=max_tool_excursion_m,
+        max_tool_rotation_excursion_deg=max_tool_rotation_excursion_deg,
+        maximum_allowed_tool_rotation_excursion_deg=maximum_rotation_excursion_deg,
+    )
 
 
 def _qpos_by_side_from_joint_command(command: TeleopCommand) -> dict[str, np.ndarray]:
@@ -3015,6 +3210,44 @@ def install_position_admittance_active(
     return observer
 
 
+def install_resolved_position_admittance_profile(
+    *,
+    profile: ResolvedPositionAdmittanceProfile,
+    retargeter: Any,
+    monitor: Any,
+    active_sides: Sequence[str],
+    side_activity: Callable[[str], tuple[bool, str]],
+    now_sec: float | None = None,
+) -> PositionAdmittanceShadowTargetFilter:
+    """Install one already-resolved profile without rebuilding it from args."""
+
+    if not profile.requested or profile.translation_config is None:
+        raise ValueError("cannot install a disabled position admittance profile")
+    if profile.active:
+        return install_position_admittance_active(
+            retargeter=retargeter,
+            monitor=monitor,
+            active_sides=active_sides,
+            config=profile.translation_config,
+            rotational_config=profile.rotational_config,
+            side_activity=side_activity,
+            apply_sides=profile.apply_sides,
+            active_envelope=profile.active_envelope,
+            combined_translation_rotation_active=profile.combined_active,
+            endpoint_policy=profile.endpoint_policy,
+            now_sec=now_sec,
+        )
+    return install_position_admittance_shadow(
+        retargeter=retargeter,
+        monitor=monitor,
+        active_sides=active_sides,
+        config=profile.translation_config,
+        rotational_config=profile.rotational_config,
+        side_activity=side_activity,
+        now_sec=now_sec,
+    )
+
+
 __all__ = [
     "POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE",
     "POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M",
@@ -3065,7 +3298,10 @@ __all__ = [
     "PositionAdmittanceShadowTargetFilter",
     "admitted_solver_world_poses_from_joint_command",
     "install_position_admittance_active",
+    "install_resolved_position_admittance_profile",
     "install_position_admittance_shadow",
+    "ResolvedPositionAdmittanceProfile",
+    "resolve_position_admittance_profile",
     "position_admittance_shadow_config",
     "position_admittance_active_config",
     "position_admittance_active_apply_sides",

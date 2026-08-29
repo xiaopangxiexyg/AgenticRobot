@@ -409,6 +409,8 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
     )
     assert shadow.active_sides == ("left", "right")
     assert shadow.position_admittance_shadow is True
+    assert shadow._resolved_position_admittance_profile.mode == "shadow"
+    assert shadow._resolved_position_admittance_profile.rotational_config is None
 
     rotation_shadow = _parse_real_teleop_args(
         [
@@ -426,6 +428,14 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
         rotation_shadow.position_admittance_rotation_shadow_profile
         == "balanced-5deg"
     )
+    rotation_shadow_profile = rotation_shadow._resolved_position_admittance_profile
+    assert rotation_shadow_profile.mode == "rotation_shadow"
+    assert rotation_shadow_profile.translation_config.enabled_axes == (
+        False,
+        False,
+        False,
+    )
+    assert rotation_shadow_profile.rotational_config is not None
 
     with pytest.raises(SystemExit, match="2"):
         _parse_real_teleop_args(
@@ -496,6 +506,10 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
     assert active.position_admittance_active_max_tool_excursion_m == pytest.approx(
         0.08
     )
+    active_profile = active._resolved_position_admittance_profile
+    assert active_profile.mode == "active"
+    assert active_profile.apply_sides == ("left",)
+    assert active_profile.max_tool_excursion_m == pytest.approx(0.08)
 
     rotation_active_args = [
         *cautious_active_args,
@@ -516,12 +530,20 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
         rotation_active.position_admittance_active_max_tool_rotation_excursion_deg
         == pytest.approx(3.5)
     )
+    assert (
+        rotation_active._resolved_position_admittance_profile.mode
+        == "rotation_active"
+    )
 
     combined_active = _parse_real_teleop_args(
         [*rotation_active_args, "--position-admittance-combined-active"]
     )
     assert combined_active.position_admittance_rotation_active is True
     assert combined_active.position_admittance_combined_active is True
+    assert (
+        combined_active._resolved_position_admittance_profile.mode
+        == "combined_active"
+    )
 
     normal_combined_args = [
         *rotation_active_args,

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
-from dataclasses import replace
 import shutil
 from typing import Any
 
@@ -40,17 +39,9 @@ from .gripper_warmup_runtime import build_gripper_warmup_probe_runtime
 from .position_episode_debug import build_position_episode_debug_runtime
 from .runtime_extension import RealTeleopRuntimeExtension
 from .position_admittance_shadow import (
-    POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
-    POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
-    POSITION_ADMITTANCE_ROTATION_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_DEG,
-    POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
-    install_position_admittance_active,
-    install_position_admittance_shadow,
-    position_admittance_active_apply_sides,
-    position_admittance_active_config,
-    position_admittance_shadow_config,
-    position_rotational_admittance_config,
-    validate_position_admittance_active_authority,
+    ResolvedPositionAdmittanceProfile,
+    install_resolved_position_admittance_profile,
+    resolve_position_admittance_profile,
 )
 from .progress_contracts import ProgressApplicationPort
 from .recording_admission import (
@@ -278,7 +269,6 @@ _REQUIRED_SUPPORT_NAMES = (
     "merge_teleop_commands",
     "np",
     "os",
-    "replace",
     "run_best_effort_cleanup",
     "sys",
     "tactile_by_side_from_backends",
@@ -436,113 +426,28 @@ def run_real_teleop(
     )
     if hasattr(args, "_real_teleop_runtime_extension"):
         delattr(args, "_real_teleop_runtime_extension")
-    position_admittance_rotation_active = bool(
-        getattr(args, "position_admittance_rotation_active", False)
+    position_admittance_profile = getattr(
+        args,
+        "_resolved_position_admittance_profile",
+        None,
     )
-    position_admittance_combined_active = bool(
-        getattr(args, "position_admittance_combined_active", False)
-    )
-    if position_admittance_rotation_active and not bool(
-        getattr(args, "position_admittance_active", False)
-    ):
+    if hasattr(args, "_resolved_position_admittance_profile"):
+        delattr(args, "_resolved_position_admittance_profile")
+    try:
+        if position_admittance_profile is None:
+            position_admittance_profile = resolve_position_admittance_profile(args)
+        elif not isinstance(
+            position_admittance_profile,
+            ResolvedPositionAdmittanceProfile,
+        ):
+            raise TypeError(
+                "_resolved_position_admittance_profile must be a "
+                "ResolvedPositionAdmittanceProfile"
+            )
+    except (AttributeError, TypeError, ValueError) as exc:
         raise RuntimeError(
-            "rotation admittance Active requires position admittance Active"
-        )
-    if position_admittance_combined_active and not (
-        position_admittance_rotation_active
-        and bool(getattr(args, "position_admittance_active", False))
-    ):
-        raise RuntimeError(
-            "combined translation and rotation admittance Active requires "
-            "both position and rotation admittance Active"
-        )
-    if bool(getattr(args, "position_admittance_shadow", False)):
-        try:
-            position_admittance_shadow_config(args)
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "position admittance shadow preflight failed: " + str(exc)
-            ) from exc
-    if bool(getattr(args, "position_admittance_rotation_shadow", False)):
-        if not bool(getattr(args, "position_admittance_shadow", False)):
-            raise RuntimeError(
-                "rotation admittance shadow requires position admittance shadow"
-            )
-        if bool(getattr(args, "position_admittance_active", False)):
-            raise RuntimeError(
-                "rotation admittance shadow cannot authorize position Active"
-            )
-        try:
-            position_rotational_admittance_config(
-                args,
-                profile=str(args.position_admittance_rotation_shadow_profile),
-            )
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "rotation admittance shadow preflight failed: " + str(exc)
-            ) from exc
-    if bool(getattr(args, "position_admittance_active", False)):
-        # Defense in depth for direct Namespace callers that bypass the
-        # canonical CLI resolver.  Validate the same final Active envelope
-        # before UI, devices, or arms start; the canonical installer repeats
-        # this check immediately before attaching the pre-IK modifier.
-        try:
-            maximum_tool_excursion = float(
-                getattr(
-                    args,
-                    "position_admittance_active_max_tool_excursion_m",
-                    POSITION_ADMITTANCE_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_M,
-                )
-            )
-            rotation_config = None
-            maximum_tool_rotation_excursion_deg = None
-            if position_admittance_rotation_active:
-                rotation_profile = str(
-                    getattr(
-                        args,
-                        "position_admittance_rotation_active_profile",
-                        POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
-                    )
-                )
-                rotation_config = position_rotational_admittance_config(
-                    args,
-                    profile=rotation_profile,
-                )
-                maximum_tool_rotation_excursion_deg = float(
-                    getattr(
-                        args,
-                        "position_admittance_active_max_tool_rotation_excursion_deg",
-                        POSITION_ADMITTANCE_ROTATION_ACTIVE_DEFAULT_MAX_TOOL_EXCURSION_DEG,
-                    )
-                )
-            validate_position_admittance_active_authority(
-                position_admittance_active_config(args),
-                active_envelope=str(
-                    getattr(args, "position_admittance_active_envelope", "cautious")
-                ),
-                rotational_config=rotation_config,
-                combined_translation_rotation_active=(
-                    position_admittance_combined_active
-                ),
-                endpoint_policy=str(
-                    getattr(
-                        args,
-                        "position_admittance_active_endpoint_policy",
-                        POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
-                    )
-                ),
-                apply_sides=position_admittance_active_apply_sides(
-                    str(getattr(args, "position_admittance_active_side", ""))
-                ),
-                max_tool_excursion_m=maximum_tool_excursion,
-                max_tool_rotation_excursion_deg=(
-                    maximum_tool_rotation_excursion_deg
-                ),
-            )
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "active position admittance preflight failed: " + str(exc)
-            ) from exc
+            "position admittance preflight failed: " + str(exc)
+        ) from exc
     materialize_real_teleop_artifact_context(args)
     startup_cleanup = _activate_startup_cleanup(logger=_log)
     capability_admission = (
@@ -569,15 +474,20 @@ def run_real_teleop(
         restore_init_after_fallback=_restore_init_arm_after_foot_pad_fallback,
         log=_log,
     )
-    startup_component_assembly = assemble_startup_components(
-        args,
-        startup_cleanup=startup_cleanup,
-        startup_progress=startup_progress,
-        active_sides_from_args=_active_sides_from_args,
-        build_tactile_visualizer=_build_tactile_visualizer,
-        build_components=_build_components,
-        register_component_cleanup=_register_component_startup_cleanup,
-    )
+    args._resolved_position_admittance_profile = position_admittance_profile
+    try:
+        startup_component_assembly = assemble_startup_components(
+            args,
+            startup_cleanup=startup_cleanup,
+            startup_progress=startup_progress,
+            active_sides_from_args=_active_sides_from_args,
+            build_tactile_visualizer=_build_tactile_visualizer,
+            build_components=_build_components,
+            register_component_cleanup=_register_component_startup_cleanup,
+        )
+    finally:
+        if hasattr(args, "_resolved_position_admittance_profile"):
+            delattr(args, "_resolved_position_admittance_profile")
     components = startup_component_assembly.components
     if runtime_extension is not None:
         attach_components = getattr(runtime_extension, "attach_components", None)
@@ -2226,26 +2136,9 @@ def run_real_teleop(
                 "runtime Home did not produce an arm-admission receipt; "
                 "entering the control loop in Hold with dispatch disabled.",
             )
-        position_admittance_active = bool(
-            getattr(args, "position_admittance_active", False)
-        )
-        position_admittance_shadow_requested = bool(
-            getattr(args, "position_admittance_shadow", False)
-        )
-        if position_admittance_shadow_requested or position_admittance_active:
-            admittance_mode = (
-                "combined_active"
-                if position_admittance_combined_active
-                else "rotation_active"
-                if position_admittance_rotation_active
-                else "active"
-                if position_admittance_active
-                else "rotation_shadow"
-                if bool(
-                    getattr(args, "position_admittance_rotation_shadow", False)
-                )
-                else "shadow"
-            )
+        position_admittance_active = position_admittance_profile.active
+        if position_admittance_profile.requested:
+            admittance_mode = position_admittance_profile.mode
             admittance_error: str | None = None
             if _arm_control_mode_arg(args) != "position":
                 admittance_error = "position admittance requires position arm control"
@@ -2276,78 +2169,14 @@ def run_real_teleop(
                     return True, "running_live_side"
 
                 try:
-                    installer = (
-                        install_position_admittance_active
-                        if position_admittance_active
-                        else install_position_admittance_shadow
-                    )
-                    installer_kwargs: dict[str, object] = {}
-                    if position_admittance_active:
-                        installer_kwargs["apply_sides"] = (
-                            position_admittance_active_apply_sides(
-                                str(args.position_admittance_active_side)
-                            )
+                    position_admittance_shadow = (
+                        install_resolved_position_admittance_profile(
+                            profile=position_admittance_profile,
+                            retargeter=components.dual_arm_retargeter,
+                            monitor=position_force_guard_monitor,
+                            active_sides=components.active_sides,
+                            side_activity=position_admittance_side_activity,
                         )
-                        installer_kwargs["active_envelope"] = str(
-                            args.position_admittance_active_envelope
-                        )
-                        installer_kwargs["endpoint_policy"] = str(
-                            getattr(
-                                args,
-                                "position_admittance_active_endpoint_policy",
-                                POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
-                            )
-                        )
-                        if position_admittance_rotation_active:
-                            installer_kwargs["rotational_config"] = (
-                                position_rotational_admittance_config(
-                                    args,
-                                    profile=str(
-                                        args.position_admittance_rotation_active_profile
-                                    ),
-                                )
-                            )
-                            installer_kwargs[
-                                "combined_translation_rotation_active"
-                            ] = position_admittance_combined_active
-                    elif bool(
-                        getattr(
-                            args,
-                            "position_admittance_rotation_shadow",
-                            False,
-                        )
-                    ):
-                        installer_kwargs["rotational_config"] = (
-                            position_rotational_admittance_config(
-                                args,
-                                profile=str(
-                                    args.position_admittance_rotation_shadow_profile
-                                ),
-                            )
-                        )
-                    admittance_config = (
-                        position_admittance_active_config(args)
-                        if position_admittance_active
-                        else position_admittance_shadow_config(args)
-                    )
-                    if bool(
-                        getattr(
-                            args,
-                            "position_admittance_rotation_shadow",
-                            False,
-                        )
-                    ):
-                        admittance_config = replace(
-                            admittance_config,
-                            enabled_axes=(False, False, False),
-                        )
-                    position_admittance_shadow = installer(
-                        retargeter=components.dual_arm_retargeter,
-                        monitor=position_force_guard_monitor,
-                        active_sides=components.active_sides,
-                        config=admittance_config,
-                        side_activity=position_admittance_side_activity,
-                        **installer_kwargs,
                     )
                 except Exception as exc:  # noqa: BLE001 - active mode fails closed below.
                     admittance_error = f"{type(exc).__name__}: {exc}"
