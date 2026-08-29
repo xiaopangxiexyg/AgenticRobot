@@ -40,6 +40,10 @@ if TYPE_CHECKING:
     from .target_preparation import MujocoSimHILPreparedTarget
 
 
+MUJOCO_SIM_HIL_WORLD_FRAME_ID_V1 = "mujoco_sim_hil/world"
+MUJOCO_SIM_HIL_STATION_FRAME_ID_V1 = "mujoco_sim_hil/station"
+
+
 def build_mujoco_sim_hil_pose_observation_projector(
     prepared_target: MujocoSimHILPreparedTarget,
     component_execution_binding: Any,
@@ -159,7 +163,8 @@ def build_mujoco_sim_hil_coordinate_profiles(
 ) -> tuple[TargetFrameProfile, ToolFrameProfile]:
     """Derive immutable target/tool identities from the loaded MuJoCo scene."""
 
-    canonical_frame_id = "mujoco_sim_hil/station"
+    world_frame_id = MUJOCO_SIM_HIL_WORLD_FRAME_ID_V1
+    canonical_frame_id = MUJOCO_SIM_HIL_STATION_FRAME_ID_V1
     station_contract = (
         None
         if station_pose_contract_path is None
@@ -174,13 +179,65 @@ def build_mujoco_sim_hil_coordinate_profiles(
             raise ValueError(
                 "MuJoCo station pose contract canonical frame must be desk."
             )
+    sides = tuple(str(side).strip().lower() for side in active_sides)
+    if (
+        not sides
+        or any(side not in {"left", "right"} for side in sides)
+        or len(sides) != len(set(sides))
+    ):
+        raise ValueError("active_sides must contain unique known sides.")
+
+    base_body_by_side = {
+        side: _arm_base_body_name(scene, side) for side in sides
+    }
+    world_from_base_by_side = {
+        side: scene.body_pose(base_body_by_side[side]) for side in sides
+    }
+    if station_contract is None:
+        station_from_world = np.eye(4, dtype=np.float64)
+        station_transform_basis = "historical_scene_world_identity"
+    else:
+        station_from_world_by_side = {
+            side: (
+                station_contract.source.effective_raw_to_canonical_desk_transform(
+                    side
+                )
+                @ np.linalg.inv(world_from_base_by_side[side])
+            )
+            for side in sides
+        }
+        station_from_world = station_from_world_by_side[sides[0]]
+        if any(
+            not np.allclose(
+                candidate,
+                station_from_world,
+                rtol=0.0,
+                atol=1e-9,
+            )
+            for candidate in station_from_world_by_side.values()
+        ):
+            raise ValueError(
+                "MuJoCo arm mounts and Station contract disagree on world-to-Station."
+            )
+        station_transform_basis = "reviewed_station_pose_contract_and_scene_mounts"
+
     frames = [
         CoordinateFrameSpec(
+            world_frame_id,
+            frame_version="1",
+            semantic_parameters={
+                "frame_family": "simulation_world",
+                "backend": "mujoco",
+                "axis_contract": "mujoco_world_xyz_right_handed_v1",
+            },
+        ),
+        CoordinateFrameSpec(
             canonical_frame_id,
+            frame_version="1",
             semantic_parameters={
                 "frame_family": "target_station",
                 "source": (
-                    "loaded_mujoco_scene_world"
+                    "historical_scene_world_identity"
                     if station_contract is None
                     else "reviewed_station_pose_contract"
                 ),
@@ -193,19 +250,28 @@ def build_mujoco_sim_hil_coordinate_profiles(
             },
         )
     ]
-    transforms = []
+    transforms = [
+        RigidFrameTransformSpec(
+            transform_id="mujoco-scene:world-to-canonical-station-v1",
+            transform_version="1",
+            source_frame_id=world_frame_id,
+            target_frame_id=canonical_frame_id,
+            matrix_target_source=station_from_world,
+            semantic_parameters={
+                "source": station_transform_basis,
+                **(
+                    {}
+                    if station_contract is None
+                    else {"pose_contract_hash": station_contract.contract_hash}
+                ),
+            },
+        )
+    ]
     reference_by_component: dict[str, str] = {}
-    sides = tuple(str(side).strip().lower() for side in active_sides)
-    if (
-        not sides
-        or any(side not in {"left", "right"} for side in sides)
-        or len(sides) != len(set(sides))
-    ):
-        raise ValueError("active_sides must contain unique known sides.")
     for side in sides:
         component_id = f"{side}_arm"
         reference_frame_id = f"{side}_arm_base"
-        body_name = _arm_base_body_name(scene, side)
+        body_name = base_body_by_side[side]
         frames.append(
             CoordinateFrameSpec(
                 reference_frame_id,
@@ -216,33 +282,16 @@ def build_mujoco_sim_hil_coordinate_profiles(
                 },
             )
         )
-        station_from_base = (
-            scene.body_pose(body_name)
-            if station_contract is None
-            else station_contract.source.effective_raw_to_canonical_desk_transform(
-                side
-            )
-        )
         transforms.append(
             RigidFrameTransformSpec(
-                transform_id=f"mujoco-scene:{reference_frame_id}-to-station",
+                transform_id=f"mujoco-scene:{reference_frame_id}-to-world-v1",
+                transform_version="1",
                 source_frame_id=reference_frame_id,
-                target_frame_id=canonical_frame_id,
-                matrix_target_source=station_from_base,
+                target_frame_id=world_frame_id,
+                matrix_target_source=world_from_base_by_side[side],
                 semantic_parameters={
-                    "source": (
-                        "loaded_scene_body_pose"
-                        if station_contract is None
-                        else "reviewed_station_pose_contract"
-                    ),
+                    "source": "loaded_scene_body_pose",
                     "scene_body_name": body_name,
-                    **(
-                        {}
-                        if station_contract is None
-                        else {
-                            "pose_contract_hash": station_contract.contract_hash
-                        }
-                    ),
                 },
             )
         )
@@ -392,6 +441,8 @@ def capture_mujoco_sim_hil_safety_anchor(
 
 
 __all__ = [
+    "MUJOCO_SIM_HIL_STATION_FRAME_ID_V1",
+    "MUJOCO_SIM_HIL_WORLD_FRAME_ID_V1",
     "build_mujoco_sim_hil_coordinate_profiles",
     "build_mujoco_sim_hil_pose_observation_projector",
     "capture_mujoco_sim_hil_safety_anchor",

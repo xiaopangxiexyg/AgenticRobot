@@ -134,6 +134,88 @@ def capture_depth_schema_entry_v1(
     )
 
 
+def capture_depth_schema_entry_v2(
+    *,
+    skill_definition_hash: str,
+    parameter_profile_id: str,
+    parameter_profile_hash: str,
+    allowed_roles: tuple[str, ...],
+    reference_frame_id: str,
+    reference_frame_spec_hash: str,
+    frame_graph_hash: str,
+) -> AgentSkillSchemaEntry:
+    """Build depth v2 with one exact consumer reference-frame identity."""
+
+    roles = _semantic_roles(allowed_roles)
+    parameter_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "role": {"type": "string", "enum": list(roles)},
+        },
+        "required": ["role"],
+    }
+    execution_result_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "source_id": {"type": "string", "minLength": 1},
+            "role": {"type": "string", "enum": list(roles)},
+            "captured_at": {"type": "number"},
+            "station_revision": {"type": "integer", "minimum": 0},
+            "width": {"type": "integer", "minimum": 1},
+            "height": {"type": "integer", "minimum": 1},
+            "depth_unit": {"const": "meter"},
+            "invalid_depth_value": {"const": 0.0},
+            "reference_frame_id": {"const": reference_frame_id},
+            "reference_frame_spec_hash": {
+                "const": reference_frame_spec_hash,
+            },
+            "frame_graph_hash": {"const": frame_graph_hash},
+            "camera_pose_reference_xyz_quat_xyzw": _pose_schema(),
+            "intrinsics": _intrinsics_schema(),
+        },
+        "required": [
+            "source_id",
+            "role",
+            "captured_at",
+            "station_revision",
+            "width",
+            "height",
+            "depth_unit",
+            "invalid_depth_value",
+            "reference_frame_id",
+            "reference_frame_spec_hash",
+            "frame_graph_hash",
+            "camera_pose_reference_xyz_quat_xyzw",
+            "intrinsics",
+        ],
+    }
+    task_evaluation_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {},
+        "required": [],
+    }
+    profile = SkillParameterProfileRef(
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+        parameter_schema_hash=agent_skill_schema_document_hash(
+            parameter_schema,
+            schema_kind="parameter",
+        ),
+    )
+    return AgentSkillSchemaEntry(
+        skill_id=CAPTURE_DEPTH_SKILL_ID_V1,
+        skill_version="2",
+        skill_definition_hash=skill_definition_hash,
+        parameter_schema=parameter_schema,
+        execution_result_schema=execution_result_schema,
+        task_evaluation_schema=task_evaluation_schema,
+        parameter_profiles=(profile,),
+    )
+
+
 def validate_capture_depth_parameters_v1(
     payload: Mapping[str, Any],
     *,
@@ -249,6 +331,68 @@ def validate_capture_depth_result_for_parameters_v1(
 ) -> None:
     if parameters.get("role") != result.get("role"):
         raise ValueError("Depth result role differs from the request.")
+
+
+def validate_capture_depth_result_v2(
+    payload: Mapping[str, Any],
+    *,
+    source_id_by_role: Mapping[str, str],
+    dimensions_by_role: Mapping[str, tuple[int, int]],
+    reference_frame_id: str,
+    reference_frame_spec_hash: str,
+    frame_graph_hash: str,
+) -> None:
+    fields = {
+        "source_id",
+        "role",
+        "captured_at",
+        "station_revision",
+        "width",
+        "height",
+        "depth_unit",
+        "invalid_depth_value",
+        "reference_frame_id",
+        "reference_frame_spec_hash",
+        "frame_graph_hash",
+        "camera_pose_reference_xyz_quat_xyzw",
+        "intrinsics",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != fields:
+        raise ValueError("Depth v2 result fields do not match the schema.")
+    revision = payload["station_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("Depth station_revision must be non-negative.")
+    expected_identity = {
+        "reference_frame_id": reference_frame_id,
+        "reference_frame_spec_hash": reference_frame_spec_hash,
+        "frame_graph_hash": frame_graph_hash,
+    }
+    if any(payload[field_name] != expected for field_name, expected in expected_identity.items()):
+        raise ValueError("Depth reference-frame identity differs from its deployment.")
+    validate_capture_depth_result_v1(
+        {
+            "source_id": payload["source_id"],
+            "role": payload["role"],
+            "captured_at": payload["captured_at"],
+            "width": payload["width"],
+            "height": payload["height"],
+            "depth_unit": payload["depth_unit"],
+            "invalid_depth_value": payload["invalid_depth_value"],
+            "camera_pose_world_xyz_quat_xyzw": payload[
+                "camera_pose_reference_xyz_quat_xyzw"
+            ],
+            "intrinsics": payload["intrinsics"],
+        },
+        source_id_by_role=source_id_by_role,
+        dimensions_by_role=dimensions_by_role,
+    )
+
+
+def validate_capture_depth_result_for_parameters_v2(
+    parameters: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> None:
+    validate_capture_depth_result_for_parameters_v1(parameters, result)
 
 
 def validate_no_task_evaluation_v1(payload: Mapping[str, Any]) -> None:
@@ -502,10 +646,13 @@ __all__ = [
     "RGB_FRAME_MEDIA_TYPE_V1",
     "RGB_FRAME_SCHEMA_ID_V1",
     "capture_depth_schema_entry_v1",
+    "capture_depth_schema_entry_v2",
     "capture_rgb_schema_entry_v1",
     "validate_capture_depth_parameters_v1",
     "validate_capture_depth_result_for_parameters_v1",
+    "validate_capture_depth_result_for_parameters_v2",
     "validate_capture_depth_result_v1",
+    "validate_capture_depth_result_v2",
     "validate_capture_rgb_parameters_v1",
     "validate_capture_rgb_result_for_parameters_v1",
     "validate_capture_rgb_result_v1",

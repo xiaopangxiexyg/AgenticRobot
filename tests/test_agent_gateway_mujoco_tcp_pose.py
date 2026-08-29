@@ -1403,6 +1403,10 @@ def _build_no_model_contract_bundle_fixture(
         frames=(
             CoordinateFrameSpec(frame_id="right_arm_base"),
             CoordinateFrameSpec(
+                frame_id="mujoco_sim_hil/world",
+                semantic_parameters={"frame_family": "simulation_world"},
+            ),
+            CoordinateFrameSpec(
                 frame_id="mujoco_sim_hil/station",
                 semantic_parameters={
                     "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
@@ -1411,8 +1415,19 @@ def _build_no_model_contract_bundle_fixture(
         ),
         transforms=(
             RigidFrameTransformSpec(
-                transform_id="fixture:right-arm-base-to-station",
+                transform_id="fixture:right-arm-base-to-world",
                 source_frame_id="right_arm_base",
+                target_frame_id="mujoco_sim_hil/world",
+                matrix_target_source=(
+                    (1.0, 0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+            ),
+            RigidFrameTransformSpec(
+                transform_id="fixture:world-to-station",
+                source_frame_id="mujoco_sim_hil/world",
                 target_frame_id="mujoco_sim_hil/station",
                 matrix_target_source=(
                     (1.0, 0.0, 0.0, 0.0),
@@ -1763,7 +1778,7 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
             enable_artifact_perception=True,
         )
     )
-    depth_entry = bundle.route_manifest.route(CAPTURE_DEPTH_SKILL_ID_V1, "1")
+    depth_entry = bundle.route_manifest.route(CAPTURE_DEPTH_SKILL_ID_V1, "2")
     assert depth_entry.route.control_effect_class == "read_only"
     assert depth_entry.route.privilege_tier == "t0_read_only"
     assert not depth_entry.route.may_move_robot
@@ -1939,6 +1954,20 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     assert completed is not None and completed.status == "completed"
     assert completed.execution_result["role"] == "main"
     assert completed.execution_result["source_id"] == "front"
+    assert completed.execution_result["station_revision"] == 0
+    assert completed.execution_result["reference_frame_id"] == (
+        "mujoco_sim_hil/station"
+    )
+    assert completed.execution_result["reference_frame_spec_hash"] == (
+        bundle.depth_capture.deployment_binding.reference_frame_spec_hash
+    )
+    assert completed.execution_result["frame_graph_hash"] == (
+        bundle.depth_capture.deployment_binding.frame_graph_hash
+    )
+    assert completed.execution_result[
+        "camera_pose_reference_xyz_quat_xyzw"
+    ] == (0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    assert "camera_pose_world_xyz_quat_xyzw" not in completed.execution_result
     assert len(completed.output_artifact_bindings) == 1
     output_binding = completed.output_artifact_bindings[0]
     assert (

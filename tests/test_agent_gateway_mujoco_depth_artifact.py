@@ -6,8 +6,10 @@ import pytest
 
 from agent_gateway.profiles.mujoco.depth_deployment import (
     MUJOCO_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
+    MUJOCO_CAPTURE_DEPTH_ROUTE_ID_V2,
     MujocoDepthCaptureProfile,
     build_mujoco_depth_capture_registration,
+    build_mujoco_depth_capture_registration_v2,
 )
 from agent_gateway.profiles.mujoco.motion_factory import (
     MujocoAgentArtifactStorageConfig,
@@ -61,6 +63,56 @@ def _result(*, source_id="front", role="main", width=640, height=480):
     }
 
 
+def _registration_v2():
+    return build_mujoco_depth_capture_registration_v2(
+        source_catalog=(
+            {
+                "source_id": "front",
+                "role": "main",
+                "native_width": 640,
+                "native_height": 480,
+            },
+        ),
+        runtime_session_id="session:mujoco-depth-v2",
+        control_domain_id="domain:mujoco",
+        target_binding_id="target:mujoco",
+        station_manifest_hash="station:hash",
+        execution_manifest_hash="execution:hash",
+        source_frame_id="mujoco_sim_hil/world",
+        source_frame_spec_hash="frame:world:hash",
+        reference_frame_id="mujoco_sim_hil/station",
+        reference_frame_spec_hash="frame:station:hash",
+        frame_graph_hash="frame:graph:hash",
+    )
+
+
+def _result_v2(**overrides):
+    result = {
+        key: value
+        for key, value in _result().items()
+        if key != "camera_pose_world_xyz_quat_xyzw"
+    }
+    result.update(
+        {
+            "station_revision": 7,
+            "reference_frame_id": "mujoco_sim_hil/station",
+            "reference_frame_spec_hash": "frame:station:hash",
+            "frame_graph_hash": "frame:graph:hash",
+            "camera_pose_reference_xyz_quat_xyzw": [
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                1,
+            ],
+        }
+    )
+    result.update(overrides)
+    return result
+
+
 def test_depth_registration_is_strictly_read_only_and_artifact_bearing() -> None:
     bound = _registration()
     template = bound.registration
@@ -82,6 +134,37 @@ def test_depth_registration_is_strictly_read_only_and_artifact_bearing() -> None
     assert slot.direction == "output"
     assert (slot.min_count, slot.max_count) == (1, 1)
     assert route.skill_io_contract_hash == template.io_contract.semantic_content_hash
+
+
+def test_depth_v2_binds_reference_frame_identity_and_preserves_v1() -> None:
+    legacy = _registration()
+    assert legacy.registration.definition.skill_version == "1"
+
+    bound = _registration_v2()
+    template = bound.registration
+    route = template.routes[0]
+    assert template.definition.skill_id == CAPTURE_DEPTH_SKILL_ID_V1
+    assert template.definition.skill_version == "2"
+    assert route.route_id == MUJOCO_CAPTURE_DEPTH_ROUTE_ID_V2
+    assert route.route_version == "2"
+    assert bound.deployment_binding.source_frame_id == "mujoco_sim_hil/world"
+    assert bound.deployment_binding.reference_frame_id == (
+        "mujoco_sim_hil/station"
+    )
+    assert template.schema_entry.execution_result_schema["properties"][
+        "frame_graph_hash"
+    ] == {"const": "frame:graph:hash"}
+    bound.payload_validator.validate_parameters({"role": "main"})
+    bound.payload_validator.validate_execution_result(_result_v2())
+
+    with pytest.raises(ValueError, match="reference-frame identity"):
+        bound.payload_validator.validate_execution_result(
+            _result_v2(frame_graph_hash="other:graph")
+        )
+    with pytest.raises(ValueError, match="station_revision"):
+        bound.payload_validator.validate_execution_result(
+            _result_v2(station_revision=True)
+        )
 
 
 def test_depth_registration_validates_semantic_role_and_contextual_result() -> None:
