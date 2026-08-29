@@ -499,9 +499,10 @@ class MujocoScheduledQposReferenceReceiver:
                 f"requested_from={scheduled_from:.12f}."
             )
 
+        measured_qpos = self.rig.measured_qpos_by_side()
         measured = RobotAction.bimanual_qpos(
-            left_arm=self.rig.accepted_qcmd_by_side()["left"],
-            right_arm=self.rig.accepted_qcmd_by_side()["right"],
+            left_arm=measured_qpos["left"],
+            right_arm=measured_qpos["right"],
             timestamp=admitted_at,
             source="mujoco-measured-rebase",
         )

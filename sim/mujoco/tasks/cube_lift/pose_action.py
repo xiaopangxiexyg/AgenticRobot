@@ -35,6 +35,8 @@ from .config import CubeLiftTaskConfig
 # qref is valid.  This is a simulator numerical-recovery tolerance only; it
 # does not alter the shared planner or any real-robot limit.
 SIM_RM65_JOINT_LIMIT_RECOVERY_TOLERANCE_RAD = 1e-4
+_FALLBACK_POSE_POSITION_TOLERANCE_M = 2e-3
+_FALLBACK_POSE_ORIENTATION_TOLERANCE_RAD = float(np.deg2rad(1.0))
 
 
 def _load_endpoint_to_tool_transform(path: str | Path, *, side: str) -> np.ndarray:
@@ -293,6 +295,19 @@ class CubeLiftPoseActionController:
             self.solver_name = "mujoco.damped_least_squares_pose"
         self._endpoint_to_tool_by_side = transforms
         self._target_pose_arm_base: np.ndarray | None = None
+        # Keep the last resolved qref separate from the measured scene qpos.
+        # A zero incremental pose action means "hold the current target"; it
+        # must not invoke a numerically under-converged IK solve again and
+        # again, because equivalent TCP poses can otherwise produce a small
+        # different joint branch on every policy tick.
+        self._last_resolved_qpos_by_side: dict[str, np.ndarray] | None = None
+        # Keep the exact, limit-sanitized qpos used to re-anchor the canonical
+        # planner.  MuJoCo's soft joint-range constraint can leave a tiny
+        # residual outside the planner limits; retaining the raw measured
+        # value here would feed that residual back into the next zero-action
+        # solve and make branch selection dependent on solver history.
+        self._last_planner_qpos_by_side: dict[str, np.ndarray] | None = None
+        self._pose_motion_started = False
         self.last_step: CubeLiftPoseActionStep | None = None
         self._last_planner_sync = CubeLiftPosePlannerSyncStatus(safe=True, recovered=False)
 
@@ -421,6 +436,9 @@ class CubeLiftPoseActionController:
                 )
                 self._last_planner_sync = status
                 return status
+        self._last_planner_qpos_by_side = {
+            side: values.copy() for side, values in sanitized.items()
+        }
         return status
 
     def reset(self) -> np.ndarray:
@@ -437,6 +455,15 @@ class CubeLiftPoseActionController:
                 f"reason={status.failure_reason or 'joint_limit'}."
             )
         self._target_pose_arm_base = self._current_tool_pose_arm_base()
+        if self._last_planner_qpos_by_side is None:
+            raise RuntimeError(
+                "MuJoCo pose controller did not establish a planner qpos anchor."
+            )
+        self._last_resolved_qpos_by_side = {
+            side: values.astype(np.float64, copy=True)
+            for side, values in self._last_planner_qpos_by_side.items()
+        }
+        self._pose_motion_started = False
         self.last_step = None
         return self.target_pose_arm_base
 
@@ -453,8 +480,123 @@ class CubeLiftPoseActionController:
         increments cannot accumulate into an unreachable target.
         """
 
+        sanitized, status = self._sanitized_scene_qpos()
+        if not status.safe:
+            raise RuntimeError(
+                "Cannot re-anchor MuJoCo pose target from an unsafe joint state: "
+                f"side={status.violating_side} "
+                f"joint={status.violating_joint_index} "
+                f"excess_rad={status.max_violation_rad:.9g}."
+            )
         self._target_pose_arm_base = self._current_tool_pose_arm_base()
+        self._last_resolved_qpos_by_side = {
+            side: values.astype(np.float64, copy=True)
+            for side, values in sanitized.items()
+        }
         return self.target_pose_arm_base
+
+    def begin_policy_episode(self) -> None:
+        """Start policy accounting after an optional scripted preparation.
+
+        Scripted pre-grasp/contact preparation uses the same pose-action
+        controller as policy actions so it benefits from the canonical IK and
+        collision planner.  That preparation is deliberately not part of the
+        policy trajectory, however: a zero policy action immediately after the
+        preparation must be treated as a stationary hold, not as a request to
+        re-solve the preparation target from a different IK branch.  Keep the
+        resolved qref/held TCP target intact for servo convergence while
+        clearing only the policy-motion phase marker.
+        """
+
+        if self._target_pose_arm_base is None:
+            raise RuntimeError(
+                "CubeLiftPoseActionController.reset() is required first."
+            )
+        self._pose_motion_started = False
+        self.last_step = None
+
+    def _zero_increment_result(self) -> IKResult:
+        """Track the held TCP target from a continuity-preserving IK seed.
+
+        A zero arm increment means that the *TCP target* is unchanged; it does
+        not mean that a lagging physical servo should be frozen at the last
+        qref.  Re-solving from the measured qpos on every gripper-only frame
+        can select a nearby equivalent wrist branch and produces visible
+        jitter.  Re-solving from the previous resolved qref keeps the branch
+        continuous while still allowing the physical arm to converge to the
+        held target.
+        """
+
+        if self._last_resolved_qpos_by_side is None:
+            raise RuntimeError("CubeLiftPoseActionController.reset() is required first.")
+        seed = {
+            side: values.astype(np.float64, copy=True)
+            for side, values in self._last_resolved_qpos_by_side.items()
+        }
+        if self._ik is not None:
+            # RM65CanonicalIK owns the coupled planner state.  Explicitly
+            # rebasing it to the last resolved result prevents a solver branch
+            # change when only the gripper dimension is active.
+            self._ik.reset_from_qpos(seed)
+            result = self._ik.solve(
+                {
+                    self.side: PoseTarget(
+                        side=self.side,
+                        pose=self._target_pose_arm_base,
+                        controlled_frame=self.config.pose_control_frame,
+                    )
+                }
+            )
+        else:
+            assert self._fallback_ik is not None
+            qpos, iterations, position_error_m, orientation_error_rad = (
+                self._fallback_ik.solve(
+                    self._target_pose_arm_base,
+                    current_qpos=seed[self.side],
+                )
+            )
+            qpos_by_side = {
+                side: values.tolist() for side, values in seed.items()
+            }
+            qpos_by_side[self.side] = qpos.tolist()
+            result = IKResult(
+                success=bool(
+                    position_error_m <= _FALLBACK_POSE_POSITION_TOLERANCE_M
+                    and orientation_error_rad
+                    <= _FALLBACK_POSE_ORIENTATION_TOLERANCE_RAD
+                ),
+                iterations=iterations,
+                qpos_by_side=qpos_by_side,
+                position_error_m={self.side: position_error_m},
+                orientation_error_rad={self.side: orientation_error_rad},
+                controlled_frame_by_side={
+                    self.side: self.config.pose_control_frame,
+                },
+                status=(
+                    "tracking"
+                    if (
+                        position_error_m <= _FALLBACK_POSE_POSITION_TOLERANCE_M
+                        and orientation_error_rad
+                        <= _FALLBACK_POSE_ORIENTATION_TOLERANCE_RAD
+                    )
+                    else "limited"
+                ),
+                metadata={"solver_fallback": True},
+                solver=self.solver_name,
+            )
+        return IKResult(
+            success=result.success,
+            iterations=result.iterations,
+            qpos_by_side=result.qpos_by_side,
+            position_error_m=result.position_error_m,
+            orientation_error_rad=result.orientation_error_rad,
+            controlled_frame_by_side=result.controlled_frame_by_side,
+            message=result.message,
+            status=result.status,
+            hold=result.hold,
+            metadata={**result.metadata, "zero_pose_action_hold": True},
+            solver=result.solver,
+        )
 
     def apply(self, action: Any) -> CubeLiftPoseActionStep:
         values = np.asarray(action, dtype=float).reshape(-1)
@@ -465,6 +607,51 @@ class CubeLiftPoseActionController:
         if self._target_pose_arm_base is None:
             raise RuntimeError("CubeLiftPoseActionController.reset() is required first.")
 
+        # Keep an unchanged TCP target on a continuity-preserving IK seed.
+        # Re-solving from measured qpos can choose a nearby equivalent joint
+        # branch, while returning the old qref forever prevents a lagging
+        # physical servo from converging.  The helper tracks the held target
+        # without introducing a new relative pose increment.
+        if np.all(np.abs(values[:6]) <= 1e-12):
+            if not self._pose_motion_started:
+                # A zero action immediately after reset is an unconditional
+                # stationary hold.  No physical target is lagging yet, so a
+                # fresh nonlinear solve would only introduce an arbitrary
+                # equivalent wrist branch (and can move a gripper into the
+                # table while the policy is intentionally doing nothing).
+                qpos_by_side = {
+                    side: values.astype(float, copy=True).tolist()
+                    for side, values in self._last_resolved_qpos_by_side.items()
+                }
+                result = IKResult(
+                    success=True,
+                    iterations=0,
+                    qpos_by_side=qpos_by_side,
+                    controlled_frame_by_side={
+                        self.side: self.config.pose_control_frame,
+                    },
+                    message="zero incremental pose action; holding reset qref",
+                    status="held",
+                    hold=False,
+                    metadata={"zero_pose_action_hold": True},
+                    solver=self.solver_name,
+                )
+            else:
+                result = self._zero_increment_result()
+            step = CubeLiftPoseActionStep(
+                target_pose_arm_base=self._target_pose_arm_base.copy(),
+                ik_result=result,
+            )
+            if step.ik_result.success and not step.ik_result.hold:
+                self._last_resolved_qpos_by_side = {
+                    side: np.asarray(qpos, dtype=np.float64).reshape(6).copy()
+                    for side, qpos in step.ik_result.qpos_by_side.items()
+                    if side in {"left", "right"}
+                }
+            self.last_step = step
+            return step
+
+        self._pose_motion_started = True
         target = self._target_pose_arm_base.copy()
         target[:3, 3] += values[:3] * np.asarray(self.config.right_tcp_delta_m, dtype=float)
         rotation_delta = Rotation.from_rotvec(
@@ -488,22 +675,36 @@ class CubeLiftPoseActionController:
             )
         else:
             assert self._fallback_ik is not None
+            fallback_seed = (
+                self._last_resolved_qpos_by_side[self.side]
+                if self._last_resolved_qpos_by_side is not None
+                else self.scene.get_arm_qpos(self.side)
+            )
             qpos, iterations, position_error_m, orientation_error_rad = self._fallback_ik.solve(
                 target,
-                current_qpos=self.scene.get_arm_qpos(self.side),
+                current_qpos=fallback_seed,
             )
+            fallback_success = bool(
+                position_error_m <= _FALLBACK_POSE_POSITION_TOLERANCE_M
+                and orientation_error_rad <= _FALLBACK_POSE_ORIENTATION_TOLERANCE_RAD
+            )
+            qpos_by_side = {
+                side: (
+                    self._last_resolved_qpos_by_side[side].tolist()
+                    if self._last_resolved_qpos_by_side is not None
+                    else self.scene.get_arm_qpos(side).tolist()
+                )
+                for side in ("left", "right")
+            }
+            qpos_by_side[self.side] = qpos.tolist()
             result = IKResult(
-                success=True,
+                success=fallback_success,
                 iterations=iterations,
-                qpos_by_side={
-                    "left": self.scene.get_arm_qpos("left").tolist(),
-                    "right": self.scene.get_arm_qpos("right").tolist(),
-                    self.side: qpos.tolist(),
-                },
+                qpos_by_side=qpos_by_side,
                 position_error_m={self.side: position_error_m},
                 orientation_error_rad={self.side: orientation_error_rad},
                 controlled_frame_by_side={self.side: self.config.pose_control_frame},
-                status="tracking" if position_error_m <= 0.01 else "limited",
+                status="tracking" if fallback_success else "limited",
                 metadata={"solver_fallback": True},
                 solver=self.solver_name,
             )
@@ -511,6 +712,12 @@ class CubeLiftPoseActionController:
             target_pose_arm_base=target.copy(),
             ik_result=result,
         )
+        if result.success and not result.hold:
+            self._last_resolved_qpos_by_side = {
+                side: np.asarray(values, dtype=np.float64).reshape(6).copy()
+                for side, values in result.qpos_by_side.items()
+                if side in {"left", "right"}
+            }
         self.last_step = step
         return step
 

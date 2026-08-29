@@ -74,6 +74,7 @@ class MujocoDmtacGripperExecutor:
         self._actuator_target_close_by_gripper: dict[str, float] = {}
         self._actuator_target_rate_by_gripper: dict[str, float] = {}
         self._last_status_by_gripper: dict[str, str] = {}
+        self._last_physics_time_sec = 0.0
         self._reset = False
 
     @property
@@ -85,7 +86,13 @@ class MujocoDmtacGripperExecutor:
             "profile": self.profile.to_metadata(),
         }
 
-    def reset(self, initial_close_by_gripper: Mapping[str, float]) -> None:
+    def reset(
+        self,
+        initial_close_by_gripper: Mapping[str, float],
+        *,
+        initial_physics_time_sec: float = 0.0,
+        initial_state: Mapping[str, object] | None = None,
+    ) -> None:
         expected = set(self.profile.joint_names_by_gripper)
         if set(initial_close_by_gripper) != expected:
             raise ValueError(
@@ -100,13 +107,36 @@ class MujocoDmtacGripperExecutor:
             {
                 self.profile.side_by_gripper[name]: value
                 for name, value in initial.items()
-            }
+            },
+            initial_physics_time_sec=initial_physics_time_sec,
+            initial_state=(
+                initial_state.get("core")
+                if isinstance(initial_state, Mapping)
+                and isinstance(initial_state.get("core"), Mapping)
+                else initial_state
+            ),
         )
-        self._accepted_close_by_gripper = dict(initial)
-        self._servo_goal_close_by_gripper = dict(initial)
-        self._actuator_target_close_by_gripper = dict(initial)
-        self._actuator_target_rate_by_gripper = {name: 0.0 for name in expected}
+        # A resumed executor may restore queued/delayed targets and a
+        # non-zero servo state.  Do not overwrite that causal state with the
+        # bootstrap values after the core reset; derive every public cache
+        # from the restored core instead.  This also keeps ``ctrl`` and the
+        # snapshot metadata consistent when the saved actuator target differs
+        # from the measured close position.
+        core_snapshot = self._position_actuator.snapshot()
+        self._accepted_close_by_gripper = self._map_by_gripper(
+            core_snapshot["accepted_target_by_side"]
+        )
+        self._servo_goal_close_by_gripper = self._map_by_gripper(
+            core_snapshot["servo_goal_by_side"]
+        )
+        self._actuator_target_close_by_gripper = self._map_by_gripper(
+            core_snapshot["actuator_position_by_side"]
+        )
+        self._actuator_target_rate_by_gripper = self._map_by_gripper(
+            core_snapshot["actuator_rate_by_side"]
+        )
         self._last_status_by_gripper = {name: "reset" for name in expected}
+        self._last_physics_time_sec = float(initial_physics_time_sec)
         self._reset = True
         self._write_ctrl()
 
@@ -164,6 +194,7 @@ class MujocoDmtacGripperExecutor:
             physics_time_sec=now,
             timestep_sec=dt,
         )
+        self._last_physics_time_sec = now
         accepted = self._map_by_gripper(core_tick.accepted_by_side)
         self._accepted_close_by_gripper = self._map_by_gripper(
             core_tick.accepted_target_by_side
@@ -204,10 +235,37 @@ class MujocoDmtacGripperExecutor:
             for name in self.profile.joint_names_by_gripper
         }
 
+    def planned_close_by_gripper(self) -> dict[str, float]:
+        """Return the latest normalized close target for collision preview.
+
+        The arm executor performs its continuous full-scene projection before
+        the next MuJoCo step.  A gripper command is transported on an
+        independent 20 Hz clock, so the arm side needs a read-only view of
+        the target that is pending or already accepted by that transport.  We
+        deliberately expose no mutable core state and never advance the
+        gripper here.
+        """
+
+        core = self._position_actuator.snapshot()
+        accepted_by_side = dict(core["accepted_target_by_side"])
+        pending_by_side = dict(core["pending"])
+        by_gripper: dict[str, float] = {}
+        for name, side in self.profile.side_by_gripper.items():
+            pending = pending_by_side.get(side)
+            value = (
+                pending["target"]
+                if isinstance(pending, Mapping)
+                else accepted_by_side[side]
+            )
+            by_gripper[name] = float(value)
+        return by_gripper
+
     def snapshot(self) -> dict[str, object]:
         core = self._position_actuator.snapshot()
         return {
             **self.execution_metadata,
+            "physics_time_sec": float(self._last_physics_time_sec),
+            "core": core,
             "pending_close_by_gripper": self._map_by_gripper(
                 {
                     side: values["target"]

@@ -38,6 +38,7 @@ _PREVIEW_TARGET_BINDING_HASH = "preview:urdf_workspace_near_boundary_frame"
 _PREVIEW_TOOL_BINDING_HASH = "preview:tool_tcp"
 _RAW_COLOR = np.array([1.0, 0.28, 0.03, 0.94], dtype=np.float32)
 _EFFECTIVE_COLOR = np.array([0.10, 1.0, 0.22, 0.96], dtype=np.float32)
+_UNREACHABLE_COLOR = np.array([1.0, 0.05, 0.05, 0.96], dtype=np.float32)
 _ACTUAL_COLOR = np.array([0.92, 0.10, 1.0, 0.96], dtype=np.float32)
 _DESK_AXIS_COLORS = (
     np.array([1.0, 0.05, 0.05, 0.95], dtype=np.float32),
@@ -453,11 +454,31 @@ def build_review_trajectory(
     *,
     samples_per_leg: int = 40,
     start_pose_desk: np.ndarray | None = None,
+    include_negative_faces: bool = True,
+    endpoint_hold_frames: int = 0,
 ) -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
-    """Return continuous raw/effective desk-frame TCP review trajectories."""
+    """Return a full-range raw/effective desk-frame TCP review trajectory.
+
+    The preview is intentionally a workspace *candidate* rather than an IK
+    reachability guarantee.  It visits both the lower and upper face of each
+    axis by default, with a small raw overshoot so the envelope projector is
+    exercised at both boundaries.  Optional endpoint holds are useful for a
+    closed-loop visualizer: the target stays fixed while the simulated servo
+    catches up, instead of making a large workspace excursion look small
+    merely because the reference timeline was too short.
+    """
 
     if isinstance(samples_per_leg, bool) or int(samples_per_leg) < 2:
         raise ValueError("samples_per_leg must be an integer >= 2")
+    if not isinstance(include_negative_faces, bool):
+        raise TypeError("include_negative_faces must be a bool")
+    if (
+        isinstance(endpoint_hold_frames, bool)
+        or int(endpoint_hold_frames) != endpoint_hold_frames
+        or int(endpoint_hold_frames) < 0
+    ):
+        raise ValueError("endpoint_hold_frames must be a non-negative integer")
+    endpoint_hold_frames = int(endpoint_hold_frames)
     lower = np.asarray(workspace.absolute_min_xyz_m, dtype=float)
     upper = np.asarray(workspace.absolute_max_xyz_m, dtype=float)
     span = upper - lower
@@ -471,32 +492,51 @@ def build_review_trajectory(
         raise ValueError("start_pose_desk must begin inside the selected workspace")
     excursions = []
     for axis in range(3):
-        point = start.copy()
-        point[axis] = upper[axis] + 0.08 * span[axis]
-        excursions.append(point)
-    # Start at the actual Home TCP and cross the positive X/Y/Z faces one at
-    # a time.  Returning to Home between excursions keeps the IK review
-    # interpretable and avoids presenting a diagonal corner jump as one axis.
-    points = (
-        start,
-        excursions[0],
-        start,
-        excursions[1],
-        start,
-        excursions[2],
-        start,
-    )
+        lower_point = start.copy()
+        lower_point[axis] = lower[axis] - 0.08 * span[axis]
+        upper_point = start.copy()
+        upper_point[axis] = upper[axis] + 0.08 * span[axis]
+        excursions.append((lower_point, upper_point))
+    # Start at the actual Home TCP and cross one axis at a time.  Visiting
+    # both faces catches the asymmetric reachable/collision boundary that a
+    # positive-only sweep hides; returning to Home between axes keeps the IK
+    # review interpretable and avoids a diagonal corner jump.
+    points: list[tuple[np.ndarray, np.ndarray]] = []
+    for lower_point, upper_point in excursions:
+        if include_negative_faces:
+            points.extend(
+                (
+                    (start.copy(), lower_point.copy()),
+                    (lower_point.copy(), upper_point.copy()),
+                    (upper_point.copy(), start.copy()),
+                )
+            )
+        else:
+            points.extend(
+                (
+                    (start.copy(), upper_point.copy()),
+                    (upper_point.copy(), start.copy()),
+                )
+            )
+
+    def _pose(position: np.ndarray) -> np.ndarray:
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = np.asarray(position, dtype=float)
+        pose[:3, :3] = start_pose[:3, :3]
+        return pose
+
     raw: list[np.ndarray] = []
-    for start, end in zip(points[:-1], points[1:]):
+    for segment_start, segment_end in points:
         for alpha in np.linspace(0.0, 1.0, int(samples_per_leg), endpoint=False):
-            pose = np.eye(4, dtype=float)
-            pose[:3, 3] = (1.0 - alpha) * start + alpha * end
-            pose[:3, :3] = start_pose[:3, :3]
-            raw.append(pose)
-    final_pose = np.eye(4, dtype=float)
-    final_pose[:3, 3] = points[-1]
-    final_pose[:3, :3] = start_pose[:3, :3]
-    raw.append(final_pose)
+            raw.append(
+                _pose(
+                    (1.0 - alpha) * segment_start + alpha * segment_end
+                )
+            )
+        if endpoint_hold_frames:
+            endpoint = _pose(segment_end)
+            raw.extend(endpoint.copy() for _ in range(endpoint_hold_frames + 1))
+    raw.append(_pose(points[-1][1]))
 
     profile = preview_envelope_profile(workspace)
     effective = tuple(
@@ -569,6 +609,7 @@ class AbsoluteWorkspaceVisualizer:
         effective_pose_world: Sequence[np.ndarray],
         actual_pose_world: Sequence[np.ndarray],
         config: AbsoluteWorkspaceVisualizationConfig | None = None,
+        target_reachability_by_frame: Sequence[str] | None = None,
     ) -> None:
         self.workspace = workspace
         self.raw_pose_world = tuple(as_pose_matrix(pose).copy() for pose in raw_pose_world)
@@ -588,6 +629,22 @@ class AbsoluteWorkspaceVisualizer:
                 "raw/effective/actual trajectories must have equal length >= 2"
             )
         self.config = config or AbsoluteWorkspaceVisualizationConfig()
+        if target_reachability_by_frame is None:
+            reachability = tuple("unknown" for _ in self.raw_pose_world)
+        else:
+            reachability = tuple(str(value) for value in target_reachability_by_frame)
+            if len(reachability) != len(self.raw_pose_world):
+                raise ValueError(
+                    "target_reachability_by_frame must match trajectory length"
+                )
+        allowed_reachability = {"unknown", "reachable", "unreachable_or_unmet"}
+        unknown_reachability = sorted(set(reachability) - allowed_reachability)
+        if unknown_reachability:
+            raise ValueError(
+                "target_reachability_by_frame contains unknown states: "
+                f"{unknown_reachability}"
+            )
+        self.target_reachability_by_frame = reachability
         self._base_geom_index: int | None = None
 
     @property
@@ -661,7 +718,12 @@ class AbsoluteWorkspaceVisualizer:
                 scene.geoms[cursor],
                 position=effective_pose[:3, 3],
                 radius=float(self.config.point_radius_m),
-                rgba=_EFFECTIVE_COLOR,
+                rgba=(
+                    _UNREACHABLE_COLOR
+                    if self.target_reachability_by_frame[index]
+                    == "unreachable_or_unmet"
+                    else _EFFECTIVE_COLOR
+                ),
                 label="absolute_workspace_effective_tcp",
             )
             cursor += 1

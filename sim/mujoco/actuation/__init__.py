@@ -17,10 +17,18 @@ from sim.rm65.actuation import (
 )
 
 if TYPE_CHECKING:
-    from .executor import ActuatedPositionTick, MujocoActuatedPositionExecutor
+    from .executor import (
+        COLLISION_PROJECTION_MODE_EXECUTOR,
+        COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED,
+        ActuatedPositionTick,
+        MujocoActuatedPositionExecutor,
+        normalize_collision_projection_mode,
+    )
     from .gripper_executor import GripperControlTick, MujocoDmtacGripperExecutor
 
 __all__ = [
+    "COLLISION_PROJECTION_MODE_EXECUTOR",
+    "COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED",
     "ActuatedPositionTick",
     "GripperActuationProfile",
     "GripperContactTuning",
@@ -31,6 +39,7 @@ __all__ = [
     "cad_bimanual_dmtac_gripper_profile",
     "cube_lift_contact_dmtac_gripper_profile",
     "identified_bimanual_dmtac_gripper_profile",
+    "normalize_collision_projection_mode",
     "rm65_bimanual_udp_feedback_profile",
     "rm65_bimanual_udp_feedback_profile_v1",
     "rm65_bimanual_udp_feedback_profile_v2",
@@ -42,12 +51,27 @@ __all__ = [
 def __getattr__(name: str):
     """Keep MJCF/profile imports independent from the runtime executor graph."""
 
-    if name in {"ActuatedPositionTick", "MujocoActuatedPositionExecutor"}:
-        from .executor import ActuatedPositionTick, MujocoActuatedPositionExecutor
+    if name in {
+        "ActuatedPositionTick",
+        "COLLISION_PROJECTION_MODE_EXECUTOR",
+        "COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED",
+        "MujocoActuatedPositionExecutor",
+        "normalize_collision_projection_mode",
+    }:
+        from .executor import (
+            COLLISION_PROJECTION_MODE_EXECUTOR,
+            COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED,
+            ActuatedPositionTick,
+            MujocoActuatedPositionExecutor,
+            normalize_collision_projection_mode,
+        )
 
         return {
             "ActuatedPositionTick": ActuatedPositionTick,
+            "COLLISION_PROJECTION_MODE_EXECUTOR": COLLISION_PROJECTION_MODE_EXECUTOR,
+            "COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED": COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED,
             "MujocoActuatedPositionExecutor": MujocoActuatedPositionExecutor,
+            "normalize_collision_projection_mode": normalize_collision_projection_mode,
         }[name]
     if name in {"GripperControlTick", "MujocoDmtacGripperExecutor"}:
         from .gripper_executor import GripperControlTick, MujocoDmtacGripperExecutor

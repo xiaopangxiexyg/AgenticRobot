@@ -41,6 +41,7 @@ from robot_motion.rm65.dual_arm_target_solver import (
 from robot_motion.rm65.position_collision import load_world_from_arm_base_transforms
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from sim.contracts import SimulationContract, TimingSpec
+from ..transforms import rotation_error_world
 from ..actuation import (
     cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
@@ -165,6 +166,14 @@ class DeskTcpPositionControlConfig:
     solve_iteration_reserve_ms: float = (
         RM65_BIMANUAL_POSITION_V1.ik_execution.iteration_reserve_ms
     )
+    # The direct MuJoCo replay path is an offline/reference timeline: physics
+    # advances explicitly after each reference and no realtime worker owns the
+    # 60 Hz deadline.  A zero budget therefore means "run the configured IK
+    # iterations to completion" and avoids making the result depend on host
+    # load, renderer timing, or Python scheduling.  Callers that deliberately
+    # emulate the realtime admission deadline can pass 1000/60 explicitly;
+    # ``None`` keeps the retargeter's historical solver-frequency default.
+    solve_time_budget_ms: float | None = 0.0
     damping: float = RM65_BIMANUAL_POSITION_V1.ik_execution.damping
     orientation_weight: float = RM65_BIMANUAL_POSITION_V1.ik_execution.orientation_weight
     joint_velocity_limit_profile: str = (
@@ -201,6 +210,11 @@ class DeskTcpPositionControlConfig:
             self.orientation_weight
         ) < 0.0:
             raise ValueError("orientation_weight must be finite and >= 0")
+        if self.solve_time_budget_ms is not None:
+            budget = float(self.solve_time_budget_ms)
+            if not np.isfinite(budget) or budget < 0.0:
+                raise ValueError("solve_time_budget_ms must be finite and >= 0")
+            object.__setattr__(self, "solve_time_budget_ms", budget)
 
 
 def _replay_ik_tuning(orientation_weight: float):
@@ -272,6 +286,12 @@ class DeskTcpPositionControl:
             }
             for source in ("ik_reference", "mujoco_actual")
         }
+        self._last_tool_world_target_by_side: dict[str, np.ndarray] | None = None
+        self._last_active_sides: tuple[str, ...] = ("left", "right")
+        self._last_ik_seed_source = "uninitialized"
+        self._last_ik_seed_by_side: dict[str, np.ndarray] | None = None
+        self._last_ik_measured_qpos_by_side: dict[str, np.ndarray] | None = None
+        self._last_ik_target_error_by_side: dict[str, dict[str, float]] | None = None
 
     def _record_height_error(self, source: str, side: str, error_m: float) -> None:
         stats = self._height_error[source][side]
@@ -362,6 +382,7 @@ class DeskTcpPositionControl:
                     solve_iteration_reserve_ms=float(
                         cfg.solve_iteration_reserve_ms
                     ),
+                    solve_time_budget_ms=cfg.solve_time_budget_ms,
                     ik_tuning=_replay_ik_tuning(cfg.orientation_weight),
                     bimanual_result_contract_enabled=True,
                     enforce_realistic_joint_step=True,
@@ -483,10 +504,35 @@ class DeskTcpPositionControl:
             side for side in ("left", "right") if side not in set(held_sides)
         )
 
-        accepted = self.rig.accepted_qcmd_by_side()
+        # IK branch/trajectory continuity follows the qcmd that the 120 Hz
+        # planner actually admitted.  MuJoCo qpos is a delayed plant
+        # measurement and is captured below for diagnostics; feeding that
+        # measurement back into the 60 Hz branch selector makes normal servo
+        # lag look like a branch change and can overshoot a target envelope.
+        current_qpos = self.rig.accepted_qcmd_by_side()
+        measured_reader = getattr(self.rig, "measured_qpos_by_side", None)
+        measured_qpos_at_solve = (
+            measured_reader()
+            if callable(measured_reader)
+            else {
+                side: self.scene.get_arm_qpos(side).copy()
+                for side in ("left", "right")
+            }
+        )
+        self._last_ik_seed_source = "accepted_qcmd"
+        self._last_ik_seed_by_side = {
+            side: np.asarray(current_qpos[side], dtype=float).reshape(6).copy()
+            for side in ("left", "right")
+        }
+        self._last_ik_measured_qpos_by_side = {
+            side: np.asarray(measured_qpos_at_solve[side], dtype=float)
+            .reshape(6)
+            .copy()
+            for side in ("left", "right")
+        }
         self.retargeter.set_current_qpos_pair(
-            left_qpos=accepted["left"],
-            right_qpos=accepted["right"],
+            left_qpos=current_qpos["left"],
+            right_qpos=current_qpos["right"],
             reset_tracking=False,
         )
         tool_world = self.tool_tcp_world_targets(reference)
@@ -542,8 +588,44 @@ class DeskTcpPositionControl:
                 },
             )
         )
+        self._last_active_sides = active_sides
+        # Endpoint convergence follows the effective command contract.  An
+        # explicitly held side has no Cartesian target to solve, so its
+        # effective target is the pose realized by the hard-hold IK result.
+        # Retaining the unused reference pose here would make a valid
+        # one-sided replay look permanently ``ik_target_unmet``.
+        self._last_tool_world_target_by_side = {}
+        self._last_ik_target_error_by_side = {}
+        for side in ("left", "right"):
+            realized = np.asarray(
+                result.side_results[side].tool_tcp_pose_world,
+                dtype=float,
+            ).reshape(4, 4)
+            requested_target = np.asarray(
+                tool_world[side], dtype=float
+            ).reshape(4, 4)
+            target = requested_target if side in active_sides else realized
+            self._last_tool_world_target_by_side[side] = target.copy()
+            translation_error = float(
+                np.linalg.norm(realized[:3, 3] - target[:3, 3])
+            )
+            rotation_error_deg = float(
+                np.rad2deg(
+                    np.linalg.norm(
+                        rotation_error_world(
+                            realized[:3, :3],
+                            target[:3, :3],
+                        )
+                    )
+                )
+            )
+            self._last_ik_target_error_by_side[side] = {
+                "position_error_m": translation_error,
+                "orientation_error_deg": rotation_error_deg,
+            }
         actual_qpos = {
-            side: self.scene.get_arm_qpos(side).copy() for side in ("left", "right")
+            side: np.asarray(value, dtype=float).reshape(6).copy()
+            for side, value in measured_qpos_at_solve.items()
         }
         actual_tool_world = self.retargeter.tool_tcp_world_targets_for_qpos_pair(
             left_qpos=actual_qpos["left"], right_qpos=actual_qpos["right"]
@@ -606,6 +688,128 @@ class DeskTcpPositionControl:
             stats["min"] = min(float(stats["min"]), alpha)
             stats["max"] = max(float(stats["max"]), alpha)
         return result
+
+    def endpoint_tracking_observation(self) -> dict[str, object]:
+        """Report actual TCP convergence independently from IK acceptance.
+
+        A qref can be accepted by the planner while the fitted MuJoCo servo is
+        still following it.  This observation intentionally never gates or
+        rewrites commands; it gives visualizers and recovery logic a truthful
+        endpoint status and preserves the existing control cadence.
+        """
+
+        targets = self._last_tool_world_target_by_side
+        if targets is None:
+            return {
+                "status": "no_target",
+                "measured_source": "mujoco_data_qpos",
+                "by_side": {},
+            }
+        measured_reader = getattr(self.rig, "measured_qpos_by_side", None)
+        measured_qpos = (
+            measured_reader()
+            if callable(measured_reader)
+            else {
+                side: self.scene.get_arm_qpos(side).copy()
+                for side in ("left", "right")
+            }
+        )
+        actual_tool_world = self.retargeter.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=measured_qpos["left"],
+            right_qpos=measured_qpos["right"],
+        )
+        retargeter_config = getattr(self.retargeter, "config", None)
+        position_tolerance_m = float(
+            getattr(retargeter_config, "solve_translation_tolerance_m", 2e-3)
+        )
+        orientation_tolerance_deg = float(
+            getattr(retargeter_config, "solve_orientation_tolerance_deg", 0.5)
+        )
+        by_side: dict[str, dict[str, object]] = {}
+        settled = True
+        ik_target_unmet = False
+        ik_errors = self._last_ik_target_error_by_side or {}
+        active_sides = set(getattr(self, "_last_active_sides", ("left", "right")))
+        for side in ("left", "right"):
+            target = targets[side]
+            actual = actual_tool_world[side]
+            side_active = side in active_sides
+            position_error = np.asarray(actual[:3, 3] - target[:3, 3], dtype=float)
+            rotation_error_rad = rotation_error_world(
+                actual[:3, :3], target[:3, :3]
+            )
+            position_error_m = float(np.linalg.norm(position_error))
+            orientation_error_deg = float(
+                np.rad2deg(np.linalg.norm(rotation_error_rad))
+            )
+            side_settled = (
+                position_error_m <= position_tolerance_m
+                and orientation_error_deg <= orientation_tolerance_deg
+            )
+            ik_error = dict(ik_errors.get(side, {}))
+            ik_position_error_m = float(ik_error.get("position_error_m", 0.0))
+            ik_orientation_error_deg = float(
+                ik_error.get("orientation_error_deg", 0.0)
+            )
+            side_ik_settled = (
+                not side_active
+                or (
+                    ik_position_error_m <= position_tolerance_m
+                    and ik_orientation_error_deg <= orientation_tolerance_deg
+                )
+            )
+            if not side_ik_settled:
+                ik_target_unmet = True
+            settled = settled and side_settled
+            by_side[side] = {
+                "active": side_active,
+                "held": not side_active,
+                "target_tool_tcp_world": target.tolist(),
+                "measured_tool_tcp_world": actual.tolist(),
+                "position_error_m": position_error_m,
+                "orientation_error_deg": orientation_error_deg,
+                "settled": side_settled,
+                "ik_target_error": ik_error,
+                "ik_target_settled": side_ik_settled,
+            }
+        if settled:
+            status = "settled"
+        elif ik_target_unmet:
+            # This is not a transport/servo lag report: the qref itself did
+            # not realize the requested TCP pose within the solver tolerance.
+            # Keeping it distinct prevents visualizers from waiting forever
+            # for a physical endpoint that the current IK/collision branch
+            # cannot provide.
+            status = "ik_target_unmet"
+        else:
+            status = "tracking"
+        return {
+            "status": status,
+            "measured_source": "mujoco_data_qpos",
+            "ik_seed_source": self._last_ik_seed_source,
+            "active_sides": [
+                side for side in ("left", "right") if side in active_sides
+            ],
+            "ik_seed_by_side": (
+                None
+                if self._last_ik_seed_by_side is None
+                else {
+                    side: values.tolist()
+                    for side, values in self._last_ik_seed_by_side.items()
+                }
+            ),
+            "measured_qpos_at_ik_by_side": (
+                None
+                if self._last_ik_measured_qpos_by_side is None
+                else {
+                    side: values.tolist()
+                    for side, values in self._last_ik_measured_qpos_by_side.items()
+                }
+            ),
+            "position_tolerance_m": position_tolerance_m,
+            "orientation_tolerance_deg": orientation_tolerance_deg,
+            "by_side": by_side,
+        }
 
     def tool_tcp_world_targets(
         self, reference: ResampledMotionReference
@@ -735,6 +939,17 @@ class DeskTcpPositionControl:
                 "profile": self.config.position_control_profile_name,
                 "solve_min_iterations": self.config.solve_min_iterations,
                 "solve_max_iterations": self.config.solve_max_iterations,
+                "solve_adaptive_iterations_enabled": (
+                    self.config.solve_adaptive_iterations_enabled
+                ),
+                "solve_time_budget_ms": self.config.solve_time_budget_ms,
+                "solve_deadline_mode": (
+                    "disabled_offline_completion"
+                    if self.config.solve_time_budget_ms == 0.0
+                    else "retargeter_default"
+                    if self.config.solve_time_budget_ms is None
+                    else "bounded"
+                ),
                 "solve_iteration_reserve_ms": (
                     self.config.solve_iteration_reserve_ms
                 ),
@@ -763,6 +978,7 @@ class DeskTcpPositionControl:
             "tcp_source": "DMTAC_M_tool_profile",
             "orientation_policy": "track_dataset_orientation",
             "dmtac_tcp_height_error": height_error,
+            "endpoint_tracking": self.endpoint_tracking_observation(),
             "world_from_desk": self.world_from_desk.tolist(),
             "rig": self.rig.snapshot(),
         }

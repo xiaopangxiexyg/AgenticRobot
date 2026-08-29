@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from sim.contracts import SimulationContract, TimingSpec
 from sim.mujoco.actuation import (
+    COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED,
     MujocoActuatedPositionExecutor,
     rm65_bimanual_udp_feedback_profile,
     rm65_bimanual_udp_feedback_profile_v1,
@@ -18,6 +20,8 @@ from sim.mujoco.adapters import (
 )
 from sim.mujoco.control import DirectQposCommand
 from sim.mujoco.scene import MujocoScene
+from sim.mujoco.collision_safety import CollisionCheckResult, CollisionProjectionResult
+from sim.rm65.actuation import PositionActuationProfile
 
 
 CONTRACT_PATH = "sim/configs/rm65_bimanual_physics_v1.json"
@@ -214,3 +218,261 @@ def test_real_aligned_rig_keeps_15_60_120_and_swaps_only_sender() -> None:
     assert snapshot["robot_dynamics"] == "mujoco_position_actuator"
     assert snapshot["execution"]["accepted_command_sequence"] is not None
     assert rig._direct is None
+
+
+class _PhysicalFakeMujoco:
+    class mjtObj:
+        mjOBJ_ACTUATOR = 1
+
+    def mj_name2id(self, _model, _object_type, name: str) -> int:
+        try:
+            return int(str(name).rsplit("joint", 1)[1]) - 1
+        except (IndexError, ValueError):
+            return -1
+
+    def mj_step(self, _model, data) -> None:
+        data.physics_steps = int(getattr(data, "physics_steps", 0)) + 1
+
+
+class _PhysicalFakeScene:
+    def __init__(self, projector) -> None:
+        names = {
+            side: tuple(f"{side}_joint{index}" for index in range(1, 7))
+            for side in ("left", "right")
+        }
+        self.arm_specs = {
+            side: SimpleNamespace(joint_names=joint_names)
+            for side, joint_names in names.items()
+        }
+        self.mujoco = _PhysicalFakeMujoco()
+        self.model = SimpleNamespace(opt=SimpleNamespace(timestep=0.001))
+        self.data = SimpleNamespace(
+            ctrl=np.zeros(12, dtype=float),
+            qpos=np.zeros(12, dtype=float),
+            physics_steps=0,
+        )
+        self._projector = projector
+        self.collision_safety_available = True
+
+    def collision_projector(self):
+        return self._projector
+
+    def get_arm_qpos(self, side: str) -> np.ndarray:
+        offset = 0 if side == "left" else 6
+        return self.data.qpos[offset : offset + 6].copy()
+
+    def kinematic_controlled_qpos(self) -> np.ndarray:
+        return self.data.qpos.copy()
+
+    def kinematic_target_vector(self, base_qpos, qpos_by_side, **_kwargs) -> np.ndarray:
+        target = np.asarray(base_qpos, dtype=float).reshape(12).copy()
+        for side, values in qpos_by_side.items():
+            offset = 0 if side == "left" else 6
+            target[offset : offset + 6] = np.asarray(values, dtype=float).reshape(6)
+        return target
+
+    def arm_qpos_from_kinematic_vector(self, controlled_qpos, side: str) -> np.ndarray:
+        offset = 0 if side == "left" else 6
+        return np.asarray(controlled_qpos, dtype=float).reshape(12)[offset : offset + 6].copy()
+
+
+def _physical_test_profile() -> PositionActuationProfile:
+    return PositionActuationProfile(
+        name="physical_executor_test",
+        joint_names_by_side={
+            side: tuple(f"{side}_joint{index}" for index in range(1, 7))
+            for side in ("left", "right")
+        },
+        transport_delay_sec_by_side={"left": 0.0, "right": 0.0},
+        position_kp_nm_rad=(1.0,) * 6,
+        position_kv_nm_s_rad=(1.0,) * 6,
+        force_limit_nm=(1.0,) * 6,
+    )
+
+
+def _safe_check() -> CollisionCheckResult:
+    return CollisionCheckResult(safe=True, minimum_distance_m=0.02)
+
+
+def _fake_projection(start, requested) -> CollisionProjectionResult:
+    start = np.asarray(start, dtype=float)
+    requested = np.asarray(requested, dtype=float)
+    return CollisionProjectionResult(
+        status="projected",
+        requested_qpos=requested.copy(),
+        accepted_qpos=start + 0.5 * (requested - start),
+        projection_alpha=0.5,
+        modified=True,
+        check=_safe_check(),
+        sweep_samples=2,
+    )
+
+
+@pytest.mark.parametrize("post_contact_is_safe", [True, False])
+def test_physical_executor_runs_full_scene_guard_and_latches_hard_contact(
+    post_contact_is_safe: bool,
+) -> None:
+    class _Oracle:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def check_contacts(self, _data):
+            self.calls += 1
+            # The executor checks both sides of every mj_step.  Keep the
+            # pre-step/reset checks safe and inject the fault only after the
+            # fake physics owner has advanced once so this regression covers
+            # the post-step latch rather than only the pre-step guard.
+            if (
+                int(getattr(_data, "physics_steps", 0)) > 0
+                and not post_contact_is_safe
+            ):
+                return CollisionCheckResult(
+                    safe=False,
+                    minimum_distance_m=-0.002,
+                    body1_name="arm",
+                    body2_name="obstacle",
+                    pair_class="1:2",
+                )
+            return _safe_check()
+
+    oracle = _Oracle()
+    projector = SimpleNamespace(
+        controlled_qpos_indices=np.arange(12, dtype=np.int32),
+        policy=SimpleNamespace(hard_penetration_m=0.001),
+        oracle=oracle,
+        check_qpos=lambda _data, _qpos, **_kwargs: _safe_check(),
+        project=lambda _data, *, start_qpos, requested_qpos, **_kwargs: _fake_projection(
+            start_qpos, requested_qpos
+        ),
+        recover_from_clearance_violation=lambda _data, *, start_qpos, requested_qpos: _fake_projection(
+            start_qpos, requested_qpos
+        ),
+    )
+    scene = _PhysicalFakeScene(projector)
+    profile = _physical_test_profile()
+    sender = MujocoActuatedPositionExecutor(scene, _timing(), profile)
+    initial = {side: np.zeros(6) for side in ("left", "right")}
+    sender.reset(_command(0, initial))
+    while not sender.command_due:
+        if post_contact_is_safe:
+            tick = sender.step_physics()
+            assert tick.safety_status == "held"
+        else:
+            with pytest.raises(RuntimeError, match="forbidden hard contact"):
+                sender.step_physics()
+            assert sender.hard_contact_latched
+            with pytest.raises(RuntimeError, match="latched"):
+                sender.step_physics()
+            return
+    target = {side: np.full(6, 0.2) for side in ("left", "right")}
+    tick = sender.step_physics(_command(1, target))
+    assert tick.safety_status == "projected"
+    assert tick.target_modified is True
+    assert tick.projection_alpha == pytest.approx(0.5)
+    assert np.allclose(sender.accepted_arm_qpos("left"), 0.1)
+    assert sender.snapshot()["collision_safety_state"]["hard_contact_latched"] is False
+
+
+def test_physical_executor_preserves_upstream_admitted_qcmd_but_keeps_contact_guard() -> None:
+    """A staged task projection must not be applied a second time downstream."""
+
+    class _Oracle:
+        def check_contacts(self, _data):
+            return _safe_check()
+
+    project_calls = 0
+    check_qpos_calls = 0
+
+    def _unexpected_project(*_args, **_kwargs):
+        nonlocal project_calls
+        project_calls += 1
+        raise AssertionError("upstream-admitted qcmd was projected twice")
+
+    def _check_qpos(_data, _qpos, **_kwargs):
+        nonlocal check_qpos_calls
+        check_qpos_calls += 1
+        return _safe_check()
+
+    projector = SimpleNamespace(
+        controlled_qpos_indices=np.arange(12, dtype=np.int32),
+        policy=SimpleNamespace(hard_penetration_m=0.001),
+        oracle=_Oracle(),
+        check_qpos=_check_qpos,
+        project=_unexpected_project,
+        recover_from_clearance_violation=_unexpected_project,
+    )
+    scene = _PhysicalFakeScene(projector)
+    sender = MujocoActuatedPositionExecutor(
+        scene,
+        _timing(),
+        _physical_test_profile(),
+        collision_projection_mode=COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED,
+    )
+    initial = {side: np.zeros(6) for side in ("left", "right")}
+    sender.reset(_command(0, initial))
+    while not sender.command_due:
+        tick = sender.step_physics()
+        assert tick.safety_status == "held"
+    target = {side: np.full(6, 0.2) for side in ("left", "right")}
+    tick = sender.step_physics(_command(1, target))
+
+    assert project_calls == 0
+    # Reset validates the initial state once; the due 120 Hz command is then
+    # checked against the hard bound without being projected a second time.
+    assert check_qpos_calls == 2
+    assert tick.safety_status == COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED
+    assert tick.target_modified is False
+    assert np.allclose(sender.accepted_arm_qpos("left"), target["left"])
+    assert (
+        sender.execution_metadata["collision_projection_mode"]
+        == COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED
+    )
+
+
+def test_physical_executor_rejects_unsafe_upstream_qcmd_before_physics() -> None:
+    class _Oracle:
+        def check_contacts(self, _data):
+            return _safe_check()
+
+    check_qpos_calls = 0
+
+    def _check_qpos(_data, _qpos, **_kwargs):
+        nonlocal check_qpos_calls
+        check_qpos_calls += 1
+        if check_qpos_calls == 1:
+            return _safe_check()
+        return CollisionCheckResult(
+            safe=False,
+            minimum_distance_m=-0.002,
+            body1_name="arm",
+            body2_name="obstacle",
+            pair_class="1:2",
+        )
+
+    projector = SimpleNamespace(
+        controlled_qpos_indices=np.arange(12, dtype=np.int32),
+        policy=SimpleNamespace(hard_penetration_m=0.001),
+        oracle=_Oracle(),
+        check_qpos=_check_qpos,
+    )
+    scene = _PhysicalFakeScene(projector)
+    sender = MujocoActuatedPositionExecutor(
+        scene,
+        _timing(),
+        _physical_test_profile(),
+        collision_projection_mode=COLLISION_PROJECTION_MODE_UPSTREAM_ADMITTED,
+    )
+    initial = {side: np.zeros(6) for side in ("left", "right")}
+    sender.reset(_command(0, initial))
+    while not sender.command_due:
+        sender.step_physics()
+    physics_steps_before = scene.data.physics_steps
+    target = {side: np.full(6, 0.2) for side in ("left", "right")}
+
+    with pytest.raises(RuntimeError, match="Upstream-admitted.*hard collision"):
+        sender.step_physics(_command(1, target))
+
+    assert scene.data.physics_steps == physics_steps_before
+    assert sender.snapshot()["collision_safety_state"]["status"] == (
+        "unsafe_upstream_admitted"
+    )

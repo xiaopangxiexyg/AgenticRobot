@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -18,11 +19,11 @@ class CollisionSafetyPolicy:
     projection_iterations: int = 8
 
     def __post_init__(self) -> None:
-        if self.minimum_clearance_m < 0.0:
+        if not math.isfinite(float(self.minimum_clearance_m)) or self.minimum_clearance_m < 0.0:
             raise ValueError("minimum_clearance_m must be non-negative.")
-        if self.hard_penetration_m < 0.0:
+        if not math.isfinite(float(self.hard_penetration_m)) or self.hard_penetration_m < 0.0:
             raise ValueError("hard_penetration_m must be non-negative.")
-        if self.sweep_max_joint_step_rad <= 0.0:
+        if not math.isfinite(float(self.sweep_max_joint_step_rad)) or self.sweep_max_joint_step_rad <= 0.0:
             raise ValueError("sweep_max_joint_step_rad must be positive.")
         if self.projection_iterations <= 0:
             raise ValueError("projection_iterations must be positive.")

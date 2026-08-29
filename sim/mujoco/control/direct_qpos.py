@@ -113,6 +113,7 @@ class DirectQposDebugTick:
     projection_alpha: float = 1.0
     minimum_distance_m: float = float("inf")
     collision_pair: tuple[str | None, str | None] = (None, None)
+    hard_contact: bool = False
 
 
 class DirectQposDebugController:
@@ -164,6 +165,7 @@ class DirectQposDebugController:
         self._last_requested_controlled_qpos: np.ndarray | None = None
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._hard_contact_latched = False
         self._ticks: list[DirectQposDebugTick] = []
 
     @property
@@ -210,6 +212,12 @@ class DirectQposDebugController:
         return self._last_active_collision_check
 
     @property
+    def hard_contact_latched(self) -> bool:
+        """Whether a post-step forbidden contact requires an explicit reset."""
+
+        return bool(self._hard_contact_latched)
+
+    @property
     def command_due(self) -> bool:
         return self.physics_time_sec + 1e-12 >= self._next_command_time_sec
 
@@ -232,10 +240,19 @@ class DirectQposDebugController:
             if projector is not None:
                 check = projector.check_qpos(self.scene.data, target)
                 if not check.safe:
-                    raise RuntimeError(
-                        "Initial direct-qpos command is collision-unsafe: "
-                        f"{check.to_dict()}"
-                    )
+                    distance = float(check.minimum_distance_m)
+                    hard_limit = float(projector.policy.hard_penetration_m)
+                    # Prepared task scenes can deliberately start on an
+                    # allowed contact surface.  Reject only a non-finite
+                    # distance or penetration beyond the hard bound; the
+                    # preventive margin is handled by the per-command
+                    # staged projection and active-contact guard.
+                    if math.isnan(distance) or distance < -hard_limit:
+                        raise RuntimeError(
+                            "Initial direct-qpos command exceeds the hard "
+                            "collision bound: "
+                            f"{check.to_dict()}"
+                        )
             self._accepted_controlled_qpos = target
             self._last_requested_controlled_qpos = target.copy()
         else:
@@ -246,6 +263,7 @@ class DirectQposDebugController:
             self._last_requested_controlled_qpos = None
         self._last_safety_result = None
         self._last_active_collision_check = None
+        self._hard_contact_latched = False
         self._ticks.clear()
 
     def step_physics(
@@ -259,8 +277,35 @@ class DirectQposDebugController:
         callers cannot silently alter the intended command clock.
         """
 
+        if self._held_command is None:
+            raise RuntimeError("reset(initial_command) is required before stepping physics.")
+        if self._hard_contact_latched:
+            raise RuntimeError(
+                "Direct-qpos execution is latched after forbidden hard contact; "
+                "reset/rearm is required before another physics step."
+            )
+        projector_factory = getattr(self.scene, "collision_projector", None)
+        projector = projector_factory() if callable(projector_factory) else None
+        if projector is not None:
+            oracle = getattr(projector, "oracle", None)
+            check_contacts = getattr(oracle, "check_contacts", None)
+            if not callable(check_contacts):
+                raise RuntimeError(
+                    "collision-enabled direct-qpos execution requires "
+                    "oracle.check_contacts()"
+                )
+            active_check = check_contacts(self.scene.data)
+            self._last_active_collision_check = active_check
+            if not active_check.safe:
+                self._hard_contact_latched = True
+                raise RuntimeError(
+                    "Direct-qpos execution found forbidden hard contact before "
+                    f"physics step: {active_check.to_dict()}"
+                )
         due = self.command_due
         scheduled_time = self._next_command_time_sec if due else None
+        tick_safety_result = None
+        tick_safety_status = "held" if projector is not None else "unavailable"
         if due:
             if command is None:
                 raise RuntimeError(
@@ -293,7 +338,6 @@ class DirectQposDebugController:
                 or not np.array_equal(requested, self._last_requested_controlled_qpos)
             )
             self._last_requested_controlled_qpos = requested.copy()
-            projector = self.scene.collision_projector()
             if projector is None:
                 self._accepted_controlled_qpos = requested
                 self._last_safety_result = None
@@ -314,27 +358,15 @@ class DirectQposDebugController:
                         f"{self._last_safety_result.to_dict()}"
                     )
                 self._accepted_controlled_qpos = self._last_safety_result.accepted_qpos.copy()
+            tick_safety_result = self._last_safety_result if target_changed else None
+            tick_safety_status = (
+                "unavailable"
+                if projector is None
+                else "held"
+                if not target_changed
+                else str(self._last_safety_result.status)
+            )
 
-        safety_result = self._last_safety_result
-        tick = DirectQposDebugTick(
-            physics_tick=self._physics_tick,
-            physics_time_sec=self.physics_time_sec,
-            command_due=due,
-            scheduled_command_time_sec=scheduled_time,
-            active_command_sequence=self._held_command.sequence,
-            command_applied=command_applied,
-            safety_status=("unavailable" if safety_result is None else safety_result.status),
-            target_modified=(False if safety_result is None else safety_result.modified),
-            projection_alpha=(1.0 if safety_result is None else safety_result.projection_alpha),
-            minimum_distance_m=(
-                float("inf") if safety_result is None else safety_result.check.minimum_distance_m
-            ),
-            collision_pair=(
-                (None, None)
-                if safety_result is None
-                else (safety_result.check.body1_name, safety_result.check.body2_name)
-            ),
-        )
         if legacy_scene:
             self.scene.step_kinematic_direct_qpos_debug(
                 self._held_command.qpos_by_side,
@@ -354,16 +386,87 @@ class DirectQposDebugController:
                 zero_controlled_qvel=self.zero_controlled_qvel,
             )
             self.scene.forward()
-            projector = self.scene.collision_projector()
-            self._last_active_collision_check = (
-                None
-                if projector is None
-                else projector.oracle.check_contacts(self.scene.data)
+        hard_contact = False
+        if projector is not None:
+            post_check = projector.oracle.check_contacts(self.scene.data)
+            self._last_active_collision_check = post_check
+            if not post_check.safe:
+                hard_contact = True
+                self._hard_contact_latched = True
+                raise RuntimeError(
+                    "Direct-qpos execution entered forbidden hard contact after "
+                    f"physics step: {post_check.to_dict()}"
+                )
+        safety_result = tick_safety_result
+        safety_check = self._last_active_collision_check
+        if safety_check is None or not np.isfinite(
+            float(safety_check.minimum_distance_m)
+        ):
+            # Active contacts are the authoritative hard-stop signal, but a
+            # collision-free tick normally has no contact pair and therefore
+            # reports ``+inf``.  Preserve the preventive projection distance
+            # for a command-level diagnostic instead of discarding it merely
+            # because no active contact was generated.
+            safety_check = (
+                None if safety_result is None else safety_result.check
             )
+        tick = DirectQposDebugTick(
+            physics_tick=self._physics_tick,
+            physics_time_sec=self.physics_time_sec,
+            command_due=due,
+            scheduled_command_time_sec=scheduled_time,
+            active_command_sequence=self._held_command.sequence,
+            command_applied=command_applied,
+            safety_status=tick_safety_status,
+            target_modified=(False if safety_result is None else safety_result.modified),
+            projection_alpha=(1.0 if safety_result is None else safety_result.projection_alpha),
+            minimum_distance_m=(
+                float("inf")
+                if safety_check is None
+                else float(safety_check.minimum_distance_m)
+            ),
+            collision_pair=(
+                (None, None)
+                if safety_check is None
+                else (
+                    safety_check.body1_name,
+                    safety_check.body2_name,
+                )
+            ),
+            hard_contact=hard_contact,
+        )
         if self.record_ticks:
             self._ticks.append(tick)
         self._physics_tick += 1
         return tick
+
+    def snapshot(self) -> dict[str, object]:
+        """Return observation-only execution state for compatibility callers."""
+
+        accepted = None
+        if self._accepted_controlled_qpos is not None:
+            accepted = {
+                side: self.accepted_arm_qpos(side).tolist()
+                for side in self.active_sides
+            }
+        return {
+            **self.execution_metadata,
+            "physics_tick": int(self._physics_tick),
+            "physics_time_sec": float(self.physics_time_sec),
+            "accepted_qcmd_by_side": accepted,
+            "hard_contact_latched": bool(self._hard_contact_latched),
+            "last_safety_result": (
+                None
+                if self._last_safety_result is None
+                else self._last_safety_result.to_dict()
+            ),
+            "last_active_contact": (
+                None
+                if self._last_active_collision_check is None
+                else self._last_active_collision_check.to_dict()
+            ),
+            "recorded_tick_count": len(self._ticks),
+        }
 
     def _validate_command(
         self,
