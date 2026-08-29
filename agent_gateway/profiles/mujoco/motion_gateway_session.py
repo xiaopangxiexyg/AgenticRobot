@@ -549,9 +549,13 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         if history_enabled
         else None
     )
+    depth_registration = contract_bundle.depth_capture
     depth_entry = (
-        contract_bundle.route_manifest.route(CAPTURE_DEPTH_SKILL_ID_V1, "1")
-        if perception_enabled
+        contract_bundle.route_manifest.route(
+            CAPTURE_DEPTH_SKILL_ID_V1,
+            depth_registration.registration.definition.skill_version,
+        )
+        if depth_registration is not None
         else None
     )
     rgb_entry = (
@@ -927,8 +931,19 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                 source_id = depth_registration.profile.source_id_by_role[role]
             except KeyError as exc:
                 raise ValueError("Depth role is not bound to a source.") from exc
+            station_revision = observation_producer.current_station_revision
             frame = application.capture_depth_npy_frame(
                 view_id=source_id,
+            )
+            if observation_producer.current_station_revision != station_revision:
+                raise RuntimeError(
+                    "Station revision changed during passive depth capture."
+                )
+            depth_binding = depth_registration.deployment_binding
+            camera_pose_reference = application.transform_tcp_pose_xyzquat(
+                frame.camera_pose_world_xyz_quat_xyzw,
+                source_frame_id=depth_binding.source_frame_id,
+                target_frame_id=depth_binding.reference_frame_id,
             )
             artifact = artifact_ref_for_bytes(
                 frame.data,
@@ -950,12 +965,18 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                 "source_id": frame.view_id,
                 "role": role,
                 "captured_at": frame.captured_at,
+                "station_revision": station_revision,
                 "width": frame.width,
                 "height": frame.height,
                 "depth_unit": "meter",
                 "invalid_depth_value": 0.0,
-                "camera_pose_world_xyz_quat_xyzw": list(
-                    frame.camera_pose_world_xyz_quat_xyzw
+                "reference_frame_id": depth_binding.reference_frame_id,
+                "reference_frame_spec_hash": (
+                    depth_binding.reference_frame_spec_hash
+                ),
+                "frame_graph_hash": depth_binding.frame_graph_hash,
+                "camera_pose_reference_xyz_quat_xyzw": list(
+                    camera_pose_reference
                 ),
                 "intrinsics": dict(frame.intrinsics),
             }
@@ -966,7 +987,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                     "result": result,
                     "artifact_ref_hash": committed.semantic_content_hash,
                 },
-                domain="dexteleop.agent_skill.mujoco_depth_capture_receipt.v1",
+                domain="dexteleop.agent_skill.mujoco_depth_capture_receipt.v2",
             )
             return PassiveReadResult(
                 execution_result=result,

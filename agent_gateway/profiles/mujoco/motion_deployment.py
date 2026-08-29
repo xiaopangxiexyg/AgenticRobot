@@ -81,7 +81,7 @@ from robot_motion.primitives import level_tcp_orientation
 
 from .depth_deployment import (
     MujocoDepthCaptureRegistration,
-    build_mujoco_depth_capture_registration,
+    build_mujoco_depth_capture_registration_v2,
 )
 from .motion_primitive_profiles import (
     MUJOCO_AGENT_TCP_CARDINAL_STEP_EXECUTOR_ID_V1,
@@ -1063,7 +1063,23 @@ def _exact_application(application: Any) -> dict[str, str]:
         raise ValueError(
             "Agent primitives require the canonical station axis contract."
         )
+    source_frame_specs = tuple(
+        item
+        for item in frame_graph.frames
+        if item.semantic_parameters.get("frame_family") == "simulation_world"
+    )
+    if len(source_frame_specs) > 1:
+        raise ValueError(
+            "Agent perception permits at most one simulation-world frame."
+        )
+    # Legacy frame graphs treated MuJoCo world and canonical Station as the
+    # same identity.  Preserve that contract while new graphs expose the
+    # explicit world-to-Station adapter.
+    source_frame_spec = (
+        source_frame_specs[0] if source_frame_specs else primitive_frame_spec
+    )
     frame_graph.resolve(reference_frame_id, primitive_reference_frame_id)
+    frame_graph.resolve(source_frame_spec.frame_id, primitive_reference_frame_id)
     tool_profile = application.tool_frame_profile
     if tool_profile.binding_by_component["right_arm"].controlled_frame_id != (
         "tool_tcp"
@@ -1118,6 +1134,14 @@ def _exact_application(application: Any) -> dict[str, str]:
         "primitive_reference_frame_spec_hash": _hash(
             primitive_frame_spec,
             field_name="primitive_reference_frame_spec_hash",
+        ),
+        "perception_source_frame_id": _required(
+            source_frame_spec.frame_id,
+            field_name="perception_source_frame_id",
+        ),
+        "perception_source_frame_spec_hash": _hash(
+            source_frame_spec,
+            field_name="perception_source_frame_spec_hash",
         ),
         "frame_graph_hash": _hash(frame_graph, field_name="frame_graph_hash"),
         "tool_config_hash": _hash(
@@ -1700,7 +1724,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         calibration_hash=profile.calibration_hash,
     )
     depth_capture = (
-        build_mujoco_depth_capture_registration(
+        build_mujoco_depth_capture_registration_v2(
             source_catalog=tuple(
                 {
                     "source_id": source["view_id"],
@@ -1715,6 +1739,15 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
             target_binding_id=target_binding.binding_id,
             station_manifest_hash=station.semantic_content_hash,
             execution_manifest_hash=execution.semantic_content_hash,
+            source_frame_id=exact["perception_source_frame_id"],
+            source_frame_spec_hash=exact[
+                "perception_source_frame_spec_hash"
+            ],
+            reference_frame_id=exact["primitive_reference_frame_id"],
+            reference_frame_spec_hash=exact[
+                "primitive_reference_frame_spec_hash"
+            ],
+            frame_graph_hash=exact["frame_graph_hash"],
         )
         if enable_artifact_perception
         else None
