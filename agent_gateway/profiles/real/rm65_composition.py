@@ -13,8 +13,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
-
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentSafetyEnvelopeRef,
 )
@@ -27,12 +25,7 @@ from agent_gateway.transport.unix_transport import (
     validate_agent_gateway_unix_server_preflight,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from robot_motion.coordinate_frames import (
-    CoordinateFrameGraph,
-    CoordinateFrameSpec,
-    RigidFrameTransformSpec,
-)
-from robot_motion.coordinate_profiles import STATION_RETARGET_FRAME_CONTRACT_V1
+from robot_motion.coordinate_frames import CoordinateFrameGraph
 from teleop_runtime.skill_deploy import (
     RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
     ExclusiveRM65SkillLowerAssembly,
@@ -60,7 +53,13 @@ from .one_shot_authorization import (
 from .perception_deployment import (
     REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
     RealPerceptionCaptureRegistration,
-    build_real_perception_capture_registration,
+    build_real_perception_capture_registration_v2,
+)
+from .perception_frames import (
+    REAL_PERCEPTION_SOURCE_FRAME_ID_V1,
+    REAL_PERCEPTION_STATION_FRAME_ID_V1,
+    RealPerceptionFrameBinding,
+    build_real_perception_station_frame_binding,
 )
 from .realsense_perception import (
     ExclusiveRealPerceptionResources,
@@ -124,6 +123,7 @@ class ExclusiveRM65AgentPrimitiveComposition:
     application: ExclusiveRealSkillApplication
     resources: object
     perception_source_binding: RealPerceptionSourceBinding | None
+    perception_frame_binding: RealPerceptionFrameBinding | None
     perception_capture: RealPerceptionCaptureRegistration | None
     socket_path: Path
     authorized_side: str
@@ -148,8 +148,16 @@ class ExclusiveRM65AgentPrimitiveComposition:
         if self.perception_capture is None:
             if self.resources is not self.lower.ports:
                 raise ValueError("motion-only composition must own lower resources.")
+            if self.perception_source_binding is not None or self.perception_frame_binding is not None:
+                raise ValueError("motion-only composition cannot retain perception bindings.")
         elif not isinstance(self.resources, ExclusiveRealPerceptionResources):
             raise ValueError("perception composition requires aggregate resources.")
+        elif (
+            self.perception_source_binding is None
+            or self.perception_frame_binding is None
+            or self.perception_capture.frame_binding is not self.perception_frame_binding
+        ):
+            raise ValueError("perception composition requires one exact frame binding.")
         if self.application.startup_admission is not self.lower.startup_admission:
             raise ValueError("application must use the exact lower startup gate.")
 
@@ -256,6 +264,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         raise ValueError(
             "lower Station world frame does not match the real Skill execution frame"
         )
+    if RM65_SKILL_EXECUTION_FRAME_ID_V1 != REAL_PERCEPTION_SOURCE_FRAME_ID_V1:
+        raise ValueError("RM65 execution and Real Depth source frames disagree.")
+    if RM65_SKILL_STATION_FRAME_ID_V1 != REAL_PERCEPTION_STATION_FRAME_ID_V1:
+        raise ValueError("RM65 and Real Depth Station frame identities disagree.")
     tool_config_hash = _hash(
         {
             "profiles": _public_tool_profiles(lower),
@@ -299,44 +311,16 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         },
         domain="dexteleop.real_skill.rm65_station_geometry.v1",
     )
-    canonical_station_from_execution = np.linalg.inv(
-        profile.scene_world_from_canonical_station
-    )
-
-    execution_frame = CoordinateFrameSpec(
-        frame_id=RM65_SKILL_EXECUTION_FRAME_ID_V1,
-        frame_version="1",
-        semantic_parameters={
-            "owner": "rm65_collision_scene",
-            "collision_scene_profile": profile.collision_scene_profile,
-            "scene_mount_hash": scene_mount_hash,
-        },
-    )
-    station_frame = CoordinateFrameSpec(
-        frame_id=RM65_SKILL_STATION_FRAME_ID_V1,
-        frame_version="1",
-        semantic_parameters={
-            "axis_contract": STATION_RETARGET_FRAME_CONTRACT_V1,
-        },
-    )
-    frame_graph = CoordinateFrameGraph(
-        graph_id="exclusive-rm65-skill-station-v2",
-        graph_version="2",
-        frames=(execution_frame, station_frame),
-        transforms=(
-            RigidFrameTransformSpec(
-                transform_id="rm65-solver-world-to-canonical-station-v2",
-                transform_version="2",
-                source_frame_id=execution_frame.frame_id,
-                target_frame_id=station_frame.frame_id,
-                matrix_target_source=canonical_station_from_execution,
-                semantic_parameters={
-                    "basis": "inverse_collision_scene_urdf_fixed_joint_chain",
-                    "collision_scene_profile": profile.collision_scene_profile,
-                },
-            ),
+    station_frame_binding = build_real_perception_station_frame_binding(
+        collision_scene_profile=profile.collision_scene_profile,
+        scene_mount_hash=scene_mount_hash,
+        scene_world_from_canonical_station=(
+            profile.scene_world_from_canonical_station
         ),
     )
+    frame_graph = station_frame_binding.frame_graph
+    execution_frame = frame_graph.frame_by_id[RM65_SKILL_EXECUTION_FRAME_ID_V1]
+    station_frame = frame_graph.frame_by_id[RM65_SKILL_STATION_FRAME_ID_V1]
     station_manifest_hash = _hash(
         {
             "frame_graph_hash": frame_graph.semantic_content_hash,
@@ -475,6 +459,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         allowed_route_ids=_route_ids(),
     )
     perception_source_binding = None
+    perception_frame_binding = None
     perception_capture = None
     artifact_store = None
     provider_factory = None
@@ -493,11 +478,12 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 lower.profile.scene_world_from_arm_base_by_side
             ),
         )
+        perception_frame_binding = station_frame_binding
         catalog_provider = RealSenseAgentPerceptionProvider(
             source_binding=perception_source_binding,
             current_station_revision=lambda: 0,
         )
-        perception_capture = build_real_perception_capture_registration(
+        perception_capture = build_real_perception_capture_registration_v2(
             rgb_source_catalog=catalog_provider.rgb_source_catalog(),
             depth_source_catalog=catalog_provider.depth_source_catalog(),
             runtime_session_id=runtime_id,
@@ -506,6 +492,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             station_manifest_hash=station_manifest_hash,
             execution_manifest_hash=execution_manifest_hash,
             source_binding_hash=perception_source_binding.semantic_content_hash,
+            frame_binding=perception_frame_binding,
         )
         partition = _hash(
             {"runtime_session_id": runtime_id},
@@ -597,6 +584,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         application=application,
         resources=resources,
         perception_source_binding=perception_source_binding,
+        perception_frame_binding=perception_frame_binding,
         perception_capture=perception_capture,
         socket_path=endpoint,
         authorized_side=side,

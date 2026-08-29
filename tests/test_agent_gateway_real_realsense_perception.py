@@ -10,12 +10,15 @@ import pytest
 from PIL import Image
 
 from agent_gateway.profiles.real import realsense_perception
-
 from agent_gateway.profiles.real.perception_deployment import (
     REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
     REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
     RealPerceptionCaptureProfile,
     build_real_perception_capture_registration,
+    build_real_perception_capture_registration_v2,
+)
+from agent_gateway.profiles.real.perception_frames import (
+    build_real_perception_station_frame_binding,
 )
 from agent_gateway.profiles.real.realsense_perception import (
     ExclusiveRealPerceptionResources,
@@ -185,6 +188,50 @@ def test_real_perception_registration_is_t0_read_only_and_artifact_bearing() -> 
     )
     assert registration.depth.io_contract.output_artifact_slots[0].slot_id == (
         REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1
+    )
+    assert registration.frame_binding is None
+    assert registration.depth.routes[0].route_version == "1"
+
+
+def test_real_depth_v2_binds_and_transforms_nontrivial_station_frame() -> None:
+    provider, _sources, _revision, _profile = _provider()
+    station_from_source = np.asarray(
+        [
+            [-1.0, 0.0, 0.0, 0.4],
+            [0.0, -1.0, 0.0, -0.2],
+            [0.0, 0.0, 1.0, 0.1],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    frame_binding = build_real_perception_station_frame_binding(
+        collision_scene_profile="depth-v2-test",
+        scene_mount_hash="scene-mounts:depth-v2-test",
+        scene_world_from_canonical_station=np.linalg.inv(station_from_source),
+    )
+    registration = build_real_perception_capture_registration_v2(
+        rgb_source_catalog=provider.rgb_source_catalog(),
+        depth_source_catalog=provider.depth_source_catalog(),
+        runtime_session_id="real-session:v2-test",
+        control_domain_id="real-domain:v2-test",
+        target_binding_id="real-target:v2-test",
+        station_manifest_hash="station:v2-test",
+        execution_manifest_hash="execution:v2-test",
+        source_binding_hash=provider.source_binding.semantic_content_hash,
+        frame_binding=frame_binding,
+    )
+
+    assert registration.frame_binding is frame_binding
+    assert registration.depth.routes[0].route_version == "2"
+    assert registration.depth_binding.reference_frame_id == "canonical_station"
+    assert registration.depth_binding.frame_graph_hash == (
+        frame_binding.frame_graph.semantic_content_hash
+    )
+    camera_pose_reference = frame_binding.camera_pose_reference_xyz_quat_xyzw(
+        (0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0)
+    )
+    assert camera_pose_reference == pytest.approx(
+        (0.3, -0.4, 0.4, 0.0, 0.0, 1.0, 0.0),
+        abs=1e-6,
     )
 
 

@@ -12,6 +12,9 @@ from agent_gateway.profiles.real.perception_application import (
     CameraOnlyRealPerceptionApplicationState,
     assemble_camera_only_real_perception_composition,
 )
+from agent_gateway.profiles.real.perception_frames import (
+    build_real_perception_station_frame_binding,
+)
 from agent_gateway.profiles.real.realsense_perception import (
     RealPerceptionSourceBinding,
 )
@@ -60,6 +63,22 @@ def _source_binding() -> RealPerceptionSourceBinding:
     )
 
 
+def _frame_binding():
+    station_from_source = np.asarray(
+        [
+            [-1.0, 0.0, 0.0, 0.4],
+            [0.0, -1.0, 0.0, -0.2],
+            [0.0, 0.0, 1.0, 0.1],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    return build_real_perception_station_frame_binding(
+        collision_scene_profile="camera-only-test",
+        scene_mount_hash="scene-mounts:camera-only-test",
+        scene_world_from_canonical_station=np.linalg.inv(station_from_source),
+    )
+
+
 def _composition(tmp_path: Path):
     return assemble_camera_only_real_perception_composition(
         source_binding=_source_binding(),
@@ -71,7 +90,7 @@ def _composition(tmp_path: Path):
         ),
         runtime_session_id="real-perception:test",
         control_domain_id="real-perception-only:test",
-        scene_geometry_hash="scene-geometry:test",
+        frame_binding=_frame_binding(),
         clock=lambda: 10.0,
     )
 
@@ -104,6 +123,11 @@ def test_camera_only_composition_exposes_only_real_observe_perception_routes(
             "wrist_right",
         )
         assert composition.registration.profile.depth_roles == ("main",)
+        assert composition.registration.depth.routes[0].route_version == "2"
+        assert composition.registration.frame_binding is composition.frame_binding
+        assert composition.contract_bundle.frame_graph_hash == (
+            composition.frame_binding.frame_graph.semantic_content_hash
+        )
         assert not hasattr(composition.resources, "lower")
         assert not hasattr(composition, "lower")
         assert composition.resources.started is False
