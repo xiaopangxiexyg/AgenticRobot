@@ -717,6 +717,7 @@ def _request_safety_hold_best_effort(
     fallback_values = {
         "_hold_requested": True,
         "_hold_active": True,
+        "_hardware_hold_confirmed": False,
         "_hold_request_reason": str(reason),
         "_teleop_dispatch_confirmed": False,
         "_teleop_dispatch_projection": "hold",
@@ -746,12 +747,9 @@ def _latch_safety_hold_and_hold_hardware_best_effort(
 ) -> bool:
     """Latch the application stop before attempting the fallible Session Hold.
 
-    ``TeleopSession.hold_hardware`` intentionally performs several subordinate
-    reset operations before it reaches the rig Hold and Session transition.
-    Any of those operations may fail.  A safety caller must therefore establish
-    the independently-owned application Hold first, then treat the physical
-    Hold receipt as a best-effort result instead of allowing an exception or a
-    negative receipt to reopen the current transition.
+    The application latch is established before the fallible Session operation.
+    It revokes command admission immediately, while a positive physical Hold
+    receipt remains a separate fact and cannot be inferred from this helper.
     """
 
     _request_safety_hold_best_effort(
@@ -2627,46 +2625,44 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 log=_log,
             )
             recovery_plan = None
-            if not components.session.home_recalibration_required:
-                try:
-                    hold_applied = components.session.hold_hardware(
+            hold_applied = False
+            try:
+                hold_applied = bool(
+                    components.session.hold_hardware(
                         hold_hardware_reason,
                         require_home_recalibration=(
                             requires_session_home_recalibration
                         ),
                     )
-                    if hold_applied:
-                        application_hold_effective_at = time.time()
-                except Exception as exc:  # noqa: BLE001 - stay fail-closed in GUI.
-                    _log(
-                        "Hold",
-                        "Hold hardware transition failed; local dispatch remains blocked: "
-                        f"{type(exc).__name__}: {exc}",
-                        now=loop_start,
-                    )
-                    if control_ui is not None:
-                        try:
-                            control_ui.append_message(
-                                "Hold",
-                                "Hold 下发存在异常；已禁止继续遥操，请检查机械臂状态并重启后再恢复。",
-                            )
-                        except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
-                            _log(
-                                "Hold",
-                                "Hold failure message could not be published: "
-                                f"{type(ui_exc).__name__}: {ui_exc}",
-                                now=loop_start,
-                            )
-            else:
-                # A prior authoritative Hold has already moved the Session out
-                # of RUNNING and required a new Home calibration.
-                application_hold_effective_at = time.time()
+                )
+            except Exception as exc:  # noqa: BLE001 - stay fail-closed in GUI.
+                _log(
+                    "Hold",
+                    "Hold hardware transition failed; local dispatch remains blocked: "
+                    f"{type(exc).__name__}: {exc}",
+                    now=loop_start,
+                )
+                if control_ui is not None:
+                    try:
+                        control_ui.append_message(
+                            "Hold",
+                            "Hold 下发存在异常；已禁止继续遥操，请检查机械臂状态并重启后再恢复。",
+                        )
+                    except Exception as ui_exc:  # noqa: BLE001 - UI cannot change safety state.
+                        _log(
+                            "Hold",
+                            "Hold failure message could not be published: "
+                            f"{type(ui_exc).__name__}: {ui_exc}",
+                            now=loop_start,
+                        )
+            position_streams_disengaged = False
             try:
                 _disengage_position_backends_for_manual_interaction(
                     components,
                     now=loop_start,
                     reason=hold_hardware_reason,
                 )
+                position_streams_disengaged = True
             except Exception as exc:  # noqa: BLE001 - Hold remains fail-closed.
                 _log(
                     "Hold",
@@ -2687,6 +2683,50 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                             f"{type(ui_exc).__name__}: {ui_exc}",
                             now=loop_start,
                         )
+                try:
+                    components.session.fault(
+                        "position command streams could not be disengaged after Hold: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                except Exception as fault_exc:  # noqa: BLE001 - application latch remains closed.
+                    _log(
+                        "Hold",
+                        "Session fault projection failed after position-stream release error: "
+                        f"{type(fault_exc).__name__}: {fault_exc}",
+                        now=loop_start,
+                    )
+            session_state = getattr(
+                getattr(components.session, "state_machine", None),
+                "state",
+                None,
+            )
+            session_state_value = str(
+                getattr(session_state, "value", session_state) or ""
+            ).upper()
+            hardware_hold_confirmed = bool(
+                hold_applied
+                and position_streams_disengaged
+                and session_state_value not in {"FAULT", "ESTOP"}
+            )
+            if hardware_hold_confirmed:
+                application_hold_effective_at = time.time()
+            publish_hold_confirmation = getattr(
+                clutch_input,
+                "publish_hardware_hold_confirmation",
+                None,
+            )
+            if callable(publish_hold_confirmation):
+                publish_hold_confirmation(
+                    confirmed=hardware_hold_confirmed,
+                    message=(
+                        "底层 Hold 与位置命令流释放均已确认；可以重采 Home 或执行维护操作。"
+                        if hardware_hold_confirmed
+                        else (
+                            "应用 Hold 已锁存，但底层停机或位置命令流释放未获完整确认；"
+                            "禁止恢复遥操和维护动作，请检查设备并重启。"
+                        )
+                    ),
+                )
             if hold_pause_error is not None:
                 _stop_recording_best_effort(
                     recording_active=recording_active,
@@ -2716,7 +2756,12 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
                 now=loop_start,
             )
             if control_ui is not None:
-                if hold_reason == "q6_gesture":
+                if not hardware_hold_confirmed:
+                    message = (
+                        "应用 Hold 已生效，但机械臂停机回执不完整；"
+                        "不要执行 Home、设备重连或维护运动，请检查设备并重启。"
+                    )
+                elif hold_reason == "q6_gesture":
                     message = "机械臂已进入保持状态；松开双手后三维到释放区间 1 秒，再次握紧 1 秒后会重新采集 runtime home。"
                 elif hold_reason == "tracker_loss_timeout":
                     message = "Tracker 目标持续丢失已进入手动 Hold；必须点击“开始遥操”重新采集 runtime home 后才能恢复。"

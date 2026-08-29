@@ -364,6 +364,18 @@ def build_device_retry_runtime(
                         control_ui.append_message("Dataset", message)
                     continue
                 elif key == "rig.session":
+                    if bool(
+                        getattr(
+                            components.session,
+                            "startup_retry_requires_reconstruction",
+                            False,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "the failed real-teleop Session owns terminal lifecycle "
+                            "resources; reconstruct the complete component graph "
+                            "instead of restarting the same Session"
+                        )
                     components.session.start()
                     if components.human_shadow_frontend is not None:
                         components.human_shadow_frontend.start()

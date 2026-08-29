@@ -249,6 +249,7 @@ class RealTeleopIdleTactileCompression:
         dataset_recorder: Any | None,
         teleop_started: bool,
         hold_active: bool,
+        maintenance_motion_active: bool = False,
         episode_countdown_active: bool,
         startup_and_devices_ready: bool,
         log: Callable[..., None],
@@ -265,6 +266,7 @@ class RealTeleopIdleTactileCompression:
                 dataset_recorder=dataset_recorder,
                 teleop_started=teleop_started,
                 hold_active=hold_active,
+                maintenance_motion_active=maintenance_motion_active,
                 episode_countdown_active=episode_countdown_active,
                 startup_and_devices_ready=startup_and_devices_ready,
             )
@@ -302,6 +304,7 @@ class RealTeleopIdleTactileCompression:
         dataset_recorder: Any | None,
         teleop_started: bool,
         hold_active: bool,
+        maintenance_motion_active: bool = False,
         episode_countdown_active: bool,
         startup_and_devices_ready: bool,
         shutdown_requested: bool = False,
@@ -316,6 +319,7 @@ class RealTeleopIdleTactileCompression:
             self.enabled
             and startup_and_devices_ready
             and (not teleop_started or hold_active)
+            and not maintenance_motion_active
             and not episode_countdown_active
             and recorder_idle
             and not shutdown_requested

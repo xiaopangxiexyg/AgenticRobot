@@ -44,6 +44,11 @@ class GuiControlState:
     # adapter always supplies a strict per-frame dispatch projection.
     teleop_dispatch_confirmed: bool | None = None
     hold_active: bool = False
+    # ``None`` retains compatibility for thin policy callers.  Production
+    # supplies a strict value: the application Hold latch revokes dispatch
+    # immediately, but maintenance controls are admitted only after the lower
+    # Session Hold and position-stream disengage both return positively.
+    hardware_hold_confirmed: bool | None = None
     episode_recording_available: bool = False
     episode_delete_available: bool = True
     dataset_reconfiguration_available: bool = True
@@ -89,6 +94,11 @@ def teleop_dispatch_active(state: GuiControlState) -> bool:
     )
 
 
+def hardware_hold_ready(state: GuiControlState) -> bool:
+    confirmed = state.hardware_hold_confirmed
+    return bool(state.hold_active and (True if confirmed is None else confirmed))
+
+
 def _apply_foot_pad_test_controls(
     state: GuiControlState,
     controls: list[str],
@@ -106,7 +116,9 @@ def _apply_foot_pad_test_controls(
         if "foot_pad_test_stop" not in controls:
             controls.append("foot_pad_test_stop")
         return controls
-    if episode_busy(state) or (state.teleop_started and not state.hold_active):
+    if episode_busy(state) or (
+        state.teleop_started and not hardware_hold_ready(state)
+    ):
         return controls
     if "foot_pad_test_start" not in controls:
         controls.append("foot_pad_test_start")
@@ -123,7 +135,7 @@ def visualization_controls(state: GuiControlState) -> list[str]:
         state.tactile_solving_available
         and not state.tactile_solving_active
         and not episode_busy(state)
-        and (not state.teleop_started or state.hold_active)
+        and (not state.teleop_started or hardware_hold_ready(state))
     ):
         controls.append("enable_tactile_solving")
     return controls
@@ -426,6 +438,8 @@ def pre_home_controls(state: GuiControlState, events: GuiControlEvents) -> list[
 
 
 def hold_controls(state: GuiControlState, events: GuiControlEvents) -> list[str]:
+    if state.hardware_hold_confirmed is False:
+        return teleop_suspended_controls(state)
     controls = ["p", "d"]
     if not episode_busy(state):
         controls.extend(fix_arm_controls(state))
@@ -491,7 +505,7 @@ def current_active_controls(state: GuiControlState, events: GuiControlEvents) ->
         not episode_busy(state)
         and not state.init_arm_qpos_active
         and not state.fix_hold_active
-        and (not state.teleop_started or state.hold_active)
+        and (not state.teleop_started or hardware_hold_ready(state))
         and "device_retry" not in controls
     ):
         controls.append("device_retry")
@@ -499,7 +513,7 @@ def current_active_controls(state: GuiControlState, events: GuiControlEvents) ->
 
 
 def single_arm_tracker_swap_allowed_in_hold(state: GuiControlState) -> bool:
-    return bool(state.hold_active and int(state.active_side_count) == 1)
+    return bool(hardware_hold_ready(state) and int(state.active_side_count) == 1)
 
 
 __all__ = [
@@ -514,6 +528,7 @@ __all__ = [
     "fix_arm_controls",
     "fix_init_allowed_in_controls",
     "gripper_force_controls",
+    "hardware_hold_ready",
     "hold_controls",
     "init_arm_controls",
     "init_arm_move_controls",

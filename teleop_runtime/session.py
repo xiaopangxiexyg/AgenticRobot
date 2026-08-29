@@ -182,6 +182,12 @@ class TeleopSession:
         self.rate_tracker = RateTracker()
         self.debug_passed = False
         self._started = False
+        # ``start()`` rollback closes every lifecycle object that was attempted.
+        # Several real-device backends (and multiprocessing-backed sources) are
+        # intentionally one-shot after ``close()``.  Retrying this same Session
+        # would therefore mix terminal resources with apparently fresh startup
+        # state.  Callers must rebuild the component graph instead.
+        self._startup_retry_requires_reconstruction = False
         self._freeze_fault_codes: tuple[str, ...] = ()
         self._freeze_channel_names: tuple[str, ...] = ()
         self._healthy_frames_since_fault_clear = 0
@@ -226,6 +232,12 @@ class TeleopSession:
     @property
     def home_recalibration_required(self) -> bool:
         return bool(self._home_recalibration_required)
+
+    @property
+    def startup_retry_requires_reconstruction(self) -> bool:
+        """Whether this Session can no longer be started in place safely."""
+
+        return bool(self._startup_retry_requires_reconstruction)
 
     def evaluate_command_guard(
         self,
@@ -605,6 +617,12 @@ class TeleopSession:
     def start(self) -> None:
         if self._started:
             return
+        if self._startup_retry_requires_reconstruction:
+            raise RuntimeError(
+                "TeleopSession lifecycle resources were closed by a prior "
+                "startup rollback or close; reconstruct the real-teleop "
+                "components before retrying."
+            )
         rollback_steps: list[tuple[str, Callable[[], None]]] = []
         try:
             for source in self.sources:
@@ -620,6 +638,7 @@ class TeleopSession:
                 self.recorder.record_calibration(self.calibration.to_dict())
         except BaseException as start_error:  # noqa: BLE001 - rollback before propagating.
             self._started = False
+            self._startup_retry_requires_reconstruction = True
             rollback_failures = collect_lifecycle_failures(reversed(rollback_steps))
             if rollback_failures:
                 raise LifecycleStartupError(
@@ -669,26 +688,55 @@ class TeleopSession:
         *,
         require_home_recalibration: bool = False,
     ) -> bool:
-        self._clear_recovery_context()
-        self.safety_monitor.request_pose_baseline_reset_many(self.safety_monitor.config.required_channels)
-        self._reset_retargeter_tracking()
+        prior_state = self.state_machine.state
         hold_succeeded = self._hold_rig_motion(reason, context="manual hold")
         if require_home_recalibration:
             self._home_recalibration_required = True
             self._last_home_recalibration_reason = ""
             self._motion_hold_mode = TRACKER_HOLD_MANUAL
             self._motion_hold_reason = str(reason)
+        if not hold_succeeded:
+            self.fault(
+                "manual hardware hold failed; motion stop is unconfirmed and "
+                "manual intervention is required"
+            )
+            return False
+        try:
+            # Physical motion inhibition must happen before resetting the
+            # software baselines used by the next arm transition.  If one of
+            # these bookkeeping operations fails, the arm remains held but the
+            # Session is not safe to re-arm in place.
+            self._clear_recovery_context()
+            self.safety_monitor.request_pose_baseline_reset_many(
+                self.safety_monitor.config.required_channels
+            )
+            self._reset_retargeter_tracking()
+        except Exception as exc:  # noqa: BLE001 - held hardware must stay faulted.
+            self.fault(
+                "post-hold tracking reset failed after hardware motion was "
+                f"inhibited: {type(exc).__name__}: {exc}"
+            )
+            return False
+        if prior_state in {TeleopRunState.FAULT, TeleopRunState.ESTOP}:
+            # A repeated physical Hold is useful during diagnosis, but it must
+            # never clear a terminal safety state or authorize in-process Home.
+            return False
         self._transition(TeleopRunState.DEBUG_ONLY, reason)
-        if require_home_recalibration and not hold_succeeded:
-            self.fault("manual tracker-loss hold failed; manual intervention required")
-        return bool(hold_succeeded)
+        return True
 
     def freeze(self, reason: str) -> None:
         already_frozen = self.state_machine.state == TeleopRunState.FROZEN
         print("\033[1;31;40m" + f"[Debug Info] FROZEN triggered due to: {reason}" + "\033[0m")
-        self._transition(TeleopRunState.FROZEN, reason)
         if self.config.hold_motion_on_freeze and self.rig is not None and not already_frozen:
-            self._hold_rig_motion(f"safety freeze: {reason}", context="safety freeze")
+            if not self._hold_rig_motion(
+                f"safety freeze: {reason}", context="safety freeze"
+            ):
+                self.fault(
+                    "safety freeze could not confirm hardware motion hold; "
+                    "automatic recovery is disabled until restart"
+                )
+                return
+        self._transition(TeleopRunState.FROZEN, reason)
 
     def fault(self, reason: str) -> None:
         self.last_fault_reason = str(reason)
@@ -1338,6 +1386,7 @@ class TeleopSession:
             run_best_effort_cleanup("teleop_session.close", steps)
         finally:
             self._started = False
+            self._startup_retry_requires_reconstruction = True
 
     def __enter__(self) -> "TeleopSession":
         self.start()

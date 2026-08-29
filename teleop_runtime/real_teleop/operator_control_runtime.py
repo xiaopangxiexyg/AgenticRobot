@@ -261,6 +261,7 @@ class RealTeleopControlInput:
         self._tracker_side_override_granted = False
         self._hold_requested = False
         self._hold_active = False
+        self._hardware_hold_confirmed = False
         self._fix_hold_active = False
         self._two_pedal_transition_active = False
         self._two_pedal_transition_target_fixed_side: str | None = None
@@ -332,6 +333,9 @@ class RealTeleopControlInput:
         self._dataset_reconfigure_callback: Callable[..., object] | None = None
         self._dataset_reconfigure_transactional = False
         self._dataset_selection_pending = False
+        self._latency_sensitive_transition_preparer: Callable[[str], None] = (
+            lambda _reason: None
+        )
         self._progress_operator_intents: deque[ProgressMutationCommand] = deque()
         self._progress_profile_selection_intents: deque[
             ProgressProfileSelectionCommand
@@ -515,6 +519,9 @@ class RealTeleopControlInput:
             teleop_started=bool(getattr(self, "_teleop_started", False)),
             teleop_dispatch_confirmed=self._teleop_arm_dispatch_confirmed(),
             hold_active=bool(getattr(self, "_hold_active", False)),
+            hardware_hold_confirmed=bool(
+                getattr(self, "_hardware_hold_confirmed", False)
+            ),
             episode_recording_available=(
                 not bool(getattr(self.args, "no_collection", False))
                 or not bool(getattr(self.args, "no_episode_recording", False))
@@ -1999,7 +2006,7 @@ class RealTeleopControlInput:
         if self._reject_two_pedal_switch_during_init(now=now):
             return
         controller = getattr(self.components, "fix_arm_controller", None)
-        if self._hold_active:
+        if self.hardware_hold_confirmed():
             # The runtime consumes this as a fast, no-start-delay Home request.
             self._supersede_tracker_side_home_gate(
                 reason="superseded_by_two_pedal_b"
@@ -2045,7 +2052,7 @@ class RealTeleopControlInput:
             return
         if self._reject_two_pedal_switch_during_init(now=now):
             return
-        if self._hold_active:
+        if self.hardware_hold_confirmed():
             self._supersede_tracker_side_home_gate(
                 reason=f"superseded_by_{source}"
             )
@@ -2540,7 +2547,9 @@ class RealTeleopControlInput:
             getattr(self, "_startup_qpos_maintenance_enabled", False)
             and not self._teleop_started
         )
-        hold_maintenance = bool(self._teleop_started and self._hold_active)
+        hold_maintenance = bool(
+            self._teleop_started and self.hardware_hold_confirmed()
+        )
         if controller is None or (
             not self._teleop_started and not startup_maintenance
         ):
@@ -2573,6 +2582,7 @@ class RealTeleopControlInput:
             self._publish_init_arm_state(message=message, control_hint=message)
             return True
         try:
+            self._prepare_latency_sensitive_transition("init_arm_exact_qpos")
             transition = _start_gui_qpos_init(self.args, self.components, now=now)
         except Exception as exc:  # noqa: BLE001 - planning admission must fail closed.
             message = f"Init qpos 启动失败，未发送轨迹: {type(exc).__name__}: {exc}"
@@ -2601,7 +2611,9 @@ class RealTeleopControlInput:
             getattr(self, "_startup_qpos_maintenance_enabled", False)
             and not self._teleop_started
         )
-        hold_maintenance = bool(self._teleop_started and self._hold_active)
+        hold_maintenance = bool(
+            self._teleop_started and self.hardware_hold_confirmed()
+        )
         if controller is None or (
             not self._teleop_started and not startup_maintenance
         ):
@@ -2629,6 +2641,17 @@ class RealTeleopControlInput:
             return True
         if bool(getattr(controller, "active", False)):
             message = "已有 Init 操作正在执行；请等待完成或点击 Hold 后重试。"
+            self._publish_init_arm_state(message=message, control_hint=message)
+            return True
+
+        try:
+            self._prepare_latency_sensitive_transition("init_both_arms_exact_qpos")
+        except Exception as exc:  # noqa: BLE001 - maintenance admission fails closed.
+            message = (
+                "双臂顺序归位启动失败，未发送轨迹: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log("InitArmQpos", message, now=now)
             self._publish_init_arm_state(message=message, control_hint=message)
             return True
 
@@ -3100,8 +3123,8 @@ class RealTeleopControlInput:
                 "is already queued",
             )
             return
-        if self._teleop_started and not self._hold_active:
-            message = "运行中重采前请先点击 Hold / 冻结。"
+        if self._teleop_started and not self.hardware_hold_confirmed():
+            message = "运行中重采前请先点击 Hold / 冻结，并等待底层停机确认。"
             if self.ui is not None:
                 self.ui.append_message("Hold", message)
                 self.ui.publish(
@@ -3535,6 +3558,24 @@ class RealTeleopControlInput:
         self._calibration_requested = False
         self._calibration_request_from_hold = False
         self._last_calibration_started_from_hold = False
+        if requested and request_from_hold and not self.hardware_hold_confirmed():
+            message = (
+                "runtime Home 未启动：应用 Hold 已锁存，但底层机械臂停机/"
+                "位置流释放尚未确认；请再次点击 Hold 或重启检查设备。"
+            )
+            self._append_ui_message_observation(
+                "Hold",
+                message,
+                context="runtime Home rejected without hardware Hold receipt",
+            )
+            self._publish_ui_observation(
+                context="runtime Home rejected without hardware Hold receipt",
+                active_controls=self._current_active_controls(),
+                control_hint=message,
+                teleop_running=False,
+                gripper_control_enabled=False,
+            )
+            return False
         if requested:
             if self._teleop_started and not self._hold_active:
                 if self.ui is not None:
@@ -3548,6 +3589,12 @@ class RealTeleopControlInput:
                 return False
             if request_from_hold:
                 self._hold_active = False
+                # Cache the lower Hold receipt while Home samples tracker/arm
+                # state.  ``hardware_hold_confirmed()`` remains false because
+                # the application Hold latch is temporarily open.  If Home
+                # fails before any command is re-admitted, calibration-waiting
+                # can restore this still-valid physical receipt without asking
+                # the operator to issue a redundant second Hold.
                 self._hold_request_reason = "manual"
                 self._last_calibration_started_from_hold = True
             self._gripper_control_enabled = False
@@ -3574,7 +3621,7 @@ class RealTeleopControlInput:
     def request_runtime_home_for_hitl(self) -> bool:
         """Queue the established guarded runtime-Home flow from HITL HOLD."""
 
-        if not self._teleop_started or not self._hold_active:
+        if not self._teleop_started or not self.hardware_hold_confirmed():
             return False
         self._request_calibration_with_tracker_side_guard(source="hitl")
         return bool(
@@ -3691,6 +3738,17 @@ class RealTeleopControlInput:
         if self._hold_requested:
             message = "Hold 正在生效，暂不修改 movement_multiple；请在停臂完成后重试。"
             _log("MovementMultiple", f"{source}: rejected during hold transition")
+            self._publish_movement_multiple(message=message)
+            return None
+        if (
+            self._teleop_started
+            and self._hold_active
+            and not self.hardware_hold_confirmed()
+        ):
+            message = (
+                "应用 Hold 已锁存但底层停机尚未确认，暂不修改 movement_multiple。"
+            )
+            _log("MovementMultiple", f"{source}: rejected without hardware Hold receipt")
             self._publish_movement_multiple(message=message)
             return None
         if self._teleop_started and not self._hold_active:
@@ -4233,6 +4291,7 @@ class RealTeleopControlInput:
         self._cancel_init_arm_qpos_sequence(reason=str(reason or "manual Hold"))
         self._hold_requested = True
         self._hold_active = True
+        self._hardware_hold_confirmed = False
         self._teleop_dispatch_confirmed = False
         self._teleop_dispatch_projection = "hold"
         self._gripper_control_enabled = False
@@ -4245,16 +4304,11 @@ class RealTeleopControlInput:
                 stage="Hold / 停臂保持",
                 active_controls=self._current_active_controls(),
                 control_hint=(
-                    "机械臂保持当前位置；请松开双手 Q6 后三维到释放区间 1 秒，再同时握紧 1 秒以重新标定。"
+                    "已禁止新的机械臂/夹爪命令，正在等待底层停机确认；"
+                    "确认前不能重采 Home 或执行维护动作。"
                     if is_q6_gesture
                     else (
-                        "机械臂保持当前位置；单臂模式可先点击“交换 Tracker”，"
-                            "然后重新点击“开始遥操”。"
-                        if len(tuple(self.components.active_sides)) == 1
-                        else (
-                            "机械臂保持当前位置；需要重新标定时，"
-                            "摆好 VIVE/Q6 后点击“开始遥操”。"
-                        )
+                        "已禁止新的机械臂/夹爪命令，正在等待底层停机和位置流释放确认。"
                     )
                 ),
                 capture_stage="runtime_home",
@@ -4268,9 +4322,9 @@ class RealTeleopControlInput:
                 **_movement_multiple_ui_state(self.args),
             )
             message = (
-                "Q6 手势已请求冻结机械臂；松开双手后三维到释放区间 1 秒，再次握紧 1 秒会重采 runtime home。"
+                "Q6 手势已锁存应用 Hold；正在等待底层停机确认。"
                 if is_q6_gesture
-                else "已请求冻结机械臂；不会自动重采 runtime home。"
+                else "已锁存应用 Hold 并关闭命令接纳；正在等待底层停机确认。"
             )
             self._append_ui_message_observation(
                 "Hold",
@@ -4337,6 +4391,47 @@ class RealTeleopControlInput:
     def hold_active(self) -> bool:
         return bool(self._hold_active)
 
+    def hardware_hold_confirmed(self) -> bool:
+        return bool(self._hold_active and self._hardware_hold_confirmed)
+
+    def publish_hardware_hold_confirmation(
+        self,
+        *,
+        confirmed: bool,
+        message: str = "",
+    ) -> None:
+        """Commit the lower Hold/stream-release receipt into application state."""
+
+        self._hardware_hold_confirmed = bool(confirmed and self._hold_active)
+        if not self._hardware_hold_confirmed:
+            self._teleop_dispatch_confirmed = False
+            self._teleop_dispatch_projection = "hold_unconfirmed"
+            self._gripper_control_enabled = False
+        detail = str(message or "").strip()
+        if not detail:
+            detail = (
+                "底层停机与位置命令流释放均已确认；现在可以重采 Home 或执行维护操作。"
+                if self._hardware_hold_confirmed
+                else "底层停机确认失败；仅保留退出、诊断和再次 Hold，禁止恢复或维护运动。"
+            )
+        self._publish_ui_observation(
+            context="hardware Hold confirmation",
+            stage=(
+                "Hold / 底层停机已确认"
+                if self._hardware_hold_confirmed
+                else "Hold / 底层停机未确认"
+            ),
+            active_controls=self._current_active_controls(),
+            control_hint=detail,
+            teleop_running=False,
+            gripper_control_enabled=False,
+        )
+        self._append_ui_message_observation(
+            "Hold",
+            detail,
+            context="hardware Hold confirmation",
+        )
+
     def hold_request_reason(self) -> str:
         return str(self._hold_request_reason or "manual")
 
@@ -4370,6 +4465,38 @@ class RealTeleopControlInput:
         self._dataset_reconfigure_callback = callback
         self._dataset_reconfigure_transactional = bool(
             callback is not None and transactional
+        )
+
+    def bind_latency_sensitive_transition_preparer(
+        self,
+        callback: Callable[[str], None] | None,
+    ) -> None:
+        """Bind the runtime-owned barrier used before maintenance motion."""
+
+        if callback is not None and not callable(callback):
+            raise TypeError(
+                "latency-sensitive transition preparer must be callable or None"
+            )
+        self._latency_sensitive_transition_preparer = (
+            callback if callback is not None else (lambda _reason: None)
+        )
+
+    def _prepare_latency_sensitive_transition(self, reason: str) -> None:
+        self._latency_sensitive_transition_preparer(str(reason))
+
+    def maintenance_motion_active(self) -> bool:
+        """Return whether exact-qpos owns planning, dispatch, or release state."""
+
+        controller = getattr(self.components, "init_arm_controller", None)
+        return bool(
+            getattr(self, "_init_qpos_sequence_active", False)
+            or (
+                controller is not None
+                and any(
+                    bool(getattr(controller, field, False))
+                    for field in ("active", "qpos_active", "moving", "recapturing")
+                )
+            )
         )
 
     def build_progress_workflow(
@@ -4815,10 +4942,10 @@ class RealTeleopControlInput:
                 "设备重连未执行：精确 Init qpos 正在规划、执行或保持；"
                 "请先停止该流程并进入常规 Hold。",
             )
-        if self._teleop_started and not self._hold_active:
+        if self._teleop_started and not self.hardware_hold_confirmed():
             return (
                 False,
-                "设备重连未执行：运行中请先进入 Hold / 冻结。",
+                "设备重连未执行：运行中请先进入 Hold / 冻结并等待底层停机确认。",
             )
         return True, ""
 
@@ -4858,7 +4985,7 @@ class RealTeleopControlInput:
                 left_q6=None,
                 right_q6=None,
                 teleop_started=self._teleop_started,
-                hold_active=self._hold_active,
+                hold_active=self.hardware_hold_confirmed(),
                 now=float(now),
             )
             return
@@ -4869,7 +4996,7 @@ class RealTeleopControlInput:
             left_q6=left_q6,
             right_q6=right_q6,
             teleop_started=self._teleop_started,
-            hold_active=self._hold_active,
+            hold_active=self.hardware_hold_confirmed(),
             now=float(now),
         )
         if event == Q6HoldRecalibrationGesture.EVENT_HOLD:
@@ -5206,6 +5333,7 @@ class RealTeleopControlInput:
         self._last_calibration_started_from_hold = False
         self._teleop_started = True
         self._hold_active = False
+        self._hardware_hold_confirmed = False
         state_machine = getattr(
             getattr(self.components, "session", None),
             "state_machine",
@@ -5410,6 +5538,23 @@ class RealTeleopControlInput:
         return True
 
     def publish_calibration_waiting(self, message: str = "") -> None:
+        session_state = getattr(
+            getattr(getattr(self.components, "session", None), "state_machine", None),
+            "state",
+            None,
+        )
+        session_state_value = str(
+            getattr(session_state, "value", session_state) or ""
+        ).upper()
+        preserve_hardware_hold_receipt = bool(
+            self._teleop_started
+            and self._hardware_hold_confirmed
+            and (
+                self._hold_active
+                or self._last_calibration_started_from_hold
+            )
+            and session_state_value not in {"FAULT", "ESTOP"}
+        )
         self._calibration_requested = False
         self._calibration_request_from_hold = False
         self._last_calibration_started_from_hold = False
@@ -5434,6 +5579,7 @@ class RealTeleopControlInput:
         )
         if self._teleop_started:
             self._hold_active = True
+            self._hardware_hold_confirmed = preserve_hardware_hold_receipt
             self._teleop_dispatch_confirmed = False
             self._teleop_dispatch_projection = "calibration_waiting"
             self._gripper_control_enabled = False

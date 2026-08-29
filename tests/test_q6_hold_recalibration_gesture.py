@@ -281,6 +281,7 @@ class Q6HoldRecalibrationGestureTests(unittest.TestCase):
         control._poll_q6_hold_recalibration_gesture(now=0.0)
         control._poll_q6_hold_recalibration_gesture(now=1.01)
         self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
         self.assertEqual(control.hold_request_reason(), "q6_gesture")
 
         _set_q6(source, opened, opened)
@@ -330,6 +331,7 @@ class Q6HoldRecalibrationGestureTests(unittest.TestCase):
         control._poll_q6_hold_recalibration_gesture(now=0.0)
         control._poll_q6_hold_recalibration_gesture(now=1.01)
         self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
 
         control._calibration_requested = True
         self.assertTrue(control.consume_calibration_request())
@@ -362,12 +364,14 @@ class Q6HoldRecalibrationGestureTests(unittest.TestCase):
 
         control.request_hold(reason="q6_gesture")
         self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
         control._calibration_requested = True
         self.assertTrue(control.consume_calibration_request())
         self.assertFalse(control.hold_active())
 
         control.publish_calibration_waiting("runtime home 标定失败")
         self.assertTrue(control.hold_active())
+        self.assertTrue(control.hardware_hold_confirmed())
         control._calibration_requested = True
         self.assertTrue(control.consume_calibration_request())
 

@@ -423,6 +423,47 @@ def _close_episode_recording_runtime_before_resources(
     )
 
 
+def _emergency_stop_runtime_arms_before_collection_drain(
+    runtime_state: Mapping[str, Any],
+    *,
+    terminal_error: BaseException | None,
+    support: Mapping[str, Any],
+) -> BaseException | None:
+    """Request the final arm stop before any writer/storage shutdown wait."""
+
+    if not bool(runtime_state.get("session_started", False)):
+        return None
+    components = runtime_state.get("components")
+    if components is None:
+        return None
+    stop = support.get("_emergency_stop_real_arms")
+    log = support.get("_log")
+    clock = support.get("time")
+    if not callable(stop):
+        return RuntimeError("runtime shutdown support lacks _emergency_stop_real_arms")
+    reason = (
+        f"runtime_exception_exit:{type(terminal_error).__name__}"
+        if terminal_error is not None
+        else "runtime_loop_exit"
+    )
+    try:
+        stop(
+            components,
+            reason=reason,
+            now=(clock.time() if clock is not None else None),
+            raise_on_failure=True,
+        )
+    except BaseException as exc:  # noqa: BLE001 - preserve primary exit through cleanup.
+        if callable(log):
+            log(
+                "EmergencyStop",
+                "runtime exit could not confirm every arm stop before collection "
+                f"drain: {type(exc).__name__}: {exc}",
+            )
+        return exc
+    return None
+
+
 def run_real_teleop(
     args: argparse.Namespace,
     *,
@@ -1290,6 +1331,9 @@ def run_real_teleop(
                     getattr(clutch_input, "_teleop_started", False)
                 ),
                 hold_active=bool(clutch_input.hold_active()),
+                maintenance_motion_active=bool(
+                    clutch_input.maintenance_motion_active()
+                ),
                 episode_countdown_active=bool(episode_countdown_active),
                 startup_and_devices_ready=True,
                 log=_log,
@@ -1321,6 +1365,10 @@ def run_real_teleop(
                 log=_log,
                 timeout_sec=2.0,
             )
+
+        clutch_input.bind_latency_sensitive_transition_preparer(
+            require_idle_tactile_quiesced
+        )
 
         def current_dataset_recorder() -> object | None:
             return dataset_recorder
@@ -2734,6 +2782,11 @@ def run_real_teleop(
         )
     finally:
         terminal_error = sys.exc_info()[1]
+        emergency_stop_error = _emergency_stop_runtime_arms_before_collection_drain(
+            locals(),
+            terminal_error=terminal_error,
+            support=globals(),
+        )
         episode_shutdown_error: BaseException | None = None
         try:
             if not _close_episode_recording_runtime_before_resources(
@@ -2757,8 +2810,11 @@ def run_real_teleop(
             terminal_error=terminal_error,
             support=globals(),
         )
-        if terminal_error is None and episode_shutdown_error is not None:
-            raise episode_shutdown_error
+        if terminal_error is None:
+            if emergency_stop_error is not None:
+                raise emergency_stop_error
+            if episode_shutdown_error is not None:
+                raise episode_shutdown_error
 
 __all__ = [
     "bind_legacy_support",

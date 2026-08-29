@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 
 from robot_motion.runtime import EffectorCommand, TeleopCommand
@@ -20,6 +21,8 @@ class _FakeBackend:
         self.holds: list[str] = []
         self.send_count = 0
         self.commands = []
+        self.start_count = 0
+        self.close_count = 0
 
     @property
     def name(self) -> str:
@@ -30,6 +33,15 @@ class _FakeBackend:
         self.send_count += 1
         if self.fail_send:
             raise RuntimeError(f"{self.name} send failed")
+
+    def start(self) -> None:
+        self.start_count += 1
+
+    def is_ready(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        self.close_count += 1
 
     def hold_motion(self, reason: str = "manual hold") -> None:
         self.holds.append(reason)
@@ -79,6 +91,47 @@ class BimanualRigHoldMotionTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "left_arm.*right_arm"):
             rig.hold_motion("unit test hold")
+
+    def test_parallel_rig_submits_both_holds_before_waiting(self) -> None:
+        left_entered = threading.Event()
+        right_entered = threading.Event()
+
+        class CoordinatedBackend(_FakeBackend):
+            def __init__(self, name: str, own: threading.Event, peer: threading.Event) -> None:
+                super().__init__(name)
+                self.own = own
+                self.peer = peer
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+                self.own.set()
+                if not self.peer.wait(timeout=1.0):
+                    raise RuntimeError(f"{self.name} peer hold was not submitted")
+
+        left = CoordinatedBackend("left", left_entered, right_entered)
+        right = CoordinatedBackend("right", right_entered, left_entered)
+        rig = BimanualRig(
+            {"left_arm": left, "right_arm": right},
+            parallel_dispatch=True,
+        )
+        try:
+            rig.hold_motion("unit test hold")
+        finally:
+            rig.close()
+
+        self.assertTrue(left_entered.is_set())
+        self.assertTrue(right_entered.is_set())
+
+    def test_closed_rig_cannot_restart_terminal_backends(self) -> None:
+        backend = _FakeBackend("left")
+        rig = BimanualRig({"left_arm": backend})
+        rig.start()
+        rig.close()
+
+        with self.assertRaisesRegex(RuntimeError, "construct a fresh rig"):
+            rig.start()
+
+        self.assertEqual(backend.start_count, 1)
 
     def test_position_group_dispatch_failure_holds_every_backend(self) -> None:
         left = _FakeBackend("left", fail_send=True)

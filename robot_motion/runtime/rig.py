@@ -28,6 +28,8 @@ class BimanualRig(Rig):
         self.backends = dict(backends)
         self._name = name
         self.fail_stop_on_dispatch_error = bool(fail_stop_on_dispatch_error)
+        self._started = False
+        self._terminal = False
         worker_count = len(self.backends) if parallel_workers is None else max(1, int(parallel_workers))
         self._executor = (
             ThreadPoolExecutor(
@@ -43,12 +45,20 @@ class BimanualRig(Rig):
         return self._name
 
     def start(self) -> None:
+        if self._started:
+            return
+        if self._terminal:
+            raise RuntimeError(
+                f"{self.name} was closed or rolled back and cannot be started "
+                "again; construct a fresh rig."
+            )
         attempted: list[tuple[str, EffectorBackend]] = []
         try:
             for effector_name, backend in self.backends.items():
                 attempted.append((effector_name, backend))
                 backend.start()
         except BaseException as start_error:  # noqa: BLE001 - rollback before propagating.
+            self._terminal = True
             cleanup_failures = collect_lifecycle_failures(
                 (
                     (f"backend[{effector_name}]", backend.close)
@@ -62,6 +72,7 @@ class BimanualRig(Rig):
                     cleanup_failures,
                 ) from start_error
             raise
+        self._started = True
 
     def is_ready(self) -> bool:
         return all(backend.is_ready() for backend in self.backends.values())
@@ -160,11 +171,23 @@ class BimanualRig(Rig):
 
     def hold_motion(self, reason: str = "manual hold") -> None:
         failures: list[tuple[str, Exception]] = []
-        for effector_name, backend in self.backends.items():
-            try:
-                backend.hold_motion(reason)
-            except Exception as exc:  # noqa: BLE001
-                failures.append((effector_name, exc))
+        executor = self._executor
+        if executor is not None and len(self.backends) > 1:
+            futures = [
+                (effector_name, executor.submit(backend.hold_motion, reason))
+                for effector_name, backend in self.backends.items()
+            ]
+            for effector_name, future in futures:
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append((effector_name, exc))
+        else:
+            for effector_name, backend in self.backends.items():
+                try:
+                    backend.hold_motion(reason)
+                except Exception as exc:  # noqa: BLE001
+                    failures.append((effector_name, exc))
         if failures:
             details = "; ".join(
                 f"{effector_name}: {type(exc).__name__}: {exc}"
@@ -175,6 +198,8 @@ class BimanualRig(Rig):
             )
 
     def close(self) -> None:
+        self._terminal = True
+        self._started = False
         executor = self._executor
         self._executor = None
         steps: list[tuple[str, Callable[[], None]]] = []
