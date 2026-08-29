@@ -16,9 +16,11 @@
 - `scripts/probes/rm65_qref_dynamics_probe.py` 使用左右工具标定路径和 `_pose_error`；
 - `scripts/probes/rm65_teleop_smoothing_probe.py` 在离线碰撞复核中使用左右工具标定路径。
 
-这些值和纯计算 helper 现由 `rm65_qref_dynamics_probe.py` 就地拥有，smoothing probe 从该
-仍存续的离线探针导入。位姿误差计算保持原有平移范数与旋转角度语义。除此之外，没有
-生产入口、测试、命令映射、Harness Profile 或 runtime 模块调用被退役脚本。
+这些值和纯计算 helper 现由 `rm65_qref_dynamics_probe.py` 就地拥有。smoothing probe
+曾从该仍存续的离线探针导入工具标定路径，之后也因没有正式调用者和可复现实验资产而
+[于 2026-08-29 退役](./rm65_velocity_smoothing_probes_retirement_20260829.md)。位姿误差计算
+保持原有平移范数与旋转角度语义。除此之外，没有生产入口、命令映射、Harness Profile
+或 runtime 模块调用被退役脚本。
 
 ## 现行所有者
 
