@@ -32,7 +32,7 @@ from .env import DEFAULT_CUBE_LIFT_TASK_CONFIG_PATH
 from .contacts import classify_cube_contact_position
 from .action_conditioning import CubeLiftActionConditioner
 from .grasp_latch import ContactGraspLatch
-from .pose_action import CubeLiftPoseActionController
+from .pose_action import CubeLiftPoseActionController, inset_joint_position_target
 from .reach_guidance import ReachGuidance, build_reach_guidance
 
 
@@ -859,7 +859,11 @@ class CubeLiftKernel:
             if pose_step.ik_result.hold or not pose_step.ik_result.success:
                 planned_right = previous_right_target
                 pose_target_needs_reanchor = True
-            np.clip(planned_right, self._right_lower, self._right_upper, out=self._right_target)
+            self._right_target[:] = inset_joint_position_target(
+                planned_right,
+                self._right_lower,
+                self._right_upper,
+            )
         else:
             np.clip(
                 self._right_target + values[:6] * self._right_delta,
@@ -1019,6 +1023,16 @@ class CubeLiftKernel:
         self._right_target[:] = self.scene.arm_qpos_from_kinematic_vector(
             self._accepted_controlled_qpos, self.config.controlled_side
         )
+        if self._pose_action_controller is not None:
+            # The full-scene projector is the final qref geometry owner and
+            # can replace the earlier IK target.  Apply the simulator-only
+            # numerical inset at this last command boundary as well, while
+            # retaining the original hard limits and collision result.
+            self._right_target[:] = inset_joint_position_target(
+                self._right_target,
+                self._right_lower,
+                self._right_upper,
+            )
         self._gripper_close[:] = [
             self.scene.gripper_close_from_kinematic_vector(
                 self._accepted_controlled_qpos, name

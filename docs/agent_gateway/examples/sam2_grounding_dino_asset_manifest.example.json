@@ -1,0 +1,26 @@
+{
+  "schema_version": "dexteleop.perception_model_assets.v1",
+  "model_profile_id": "sam2.1-hiera-large_grounding-dino-swin-t-ogc.v1",
+  "sources": {
+    "sam2": {
+      "git_url": "https://github.com/facebookresearch/sam2.git",
+      "revision": "aa9b8722d0585b661ded4b3dff1bd103540554ae"
+    },
+    "grounding_dino": {
+      "git_url": "https://github.com/IDEA-Research/GroundingDINO.git",
+      "revision": "856dde20aee659246248e20734ef9ba5214f5e44"
+    }
+  },
+  "checkpoints": {
+    "sam2": {
+      "relative_path": "sam2.1_hiera_large.pt",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "model_config": "configs/sam2.1/sam2.1_hiera_l.yaml"
+    },
+    "grounding_dino": {
+      "relative_path": "groundingdino_swint_ogc.pth",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "model_config": "GroundingDINO_SwinT_OGC.py"
+    }
+  }
+}

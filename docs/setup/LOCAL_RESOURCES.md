@@ -13,7 +13,7 @@
 
 | 分类 | 典型内容 | 默认迁移方式 |
 | --- | --- | --- |
-| `shared-read-mostly` | `assets/` 中已审核的机器人模型 | 只允许现有 asset-store 工具建立兼容软链接 |
+| `shared-read-mostly` | `assets/` 中已审核的机器人模型和模型权重 | 只允许现有 asset-store 工具建立兼容软链接 |
 | `external-input` | `datasets/`、`data/`、`remote_data/`、历史离线数据 | 保留仓库外 canonical root，通过 `local_paths.json`、环境变量或 profile 绑定 |
 | `mutable-evidence` | `runtime_artifacts/`、未跟踪的 `teleop_records/`、日志和输出 | 停止写入后做 inventory、复制和 hash/count 验证，再切换绑定 |
 | `local-vendor` | 模型权重、仿真安装、厂商 checkout | 检查来源与 tracked 边界后逐项绑定或复制 |
@@ -26,6 +26,7 @@
 证明。通过链接写入会直接修改共享目标。因此：
 
 - `assets/` 已有 bundle presence 检查和安全链接工具，可以按只读约定共享；
+- SAM2/Grounding DINO/VGN 等模型权重必须登记为可选 bundle，保存来源 commit 和 checkpoint SHA-256，不能把外部源码 checkout 放进 `assets/`；
 - `runtime_artifacts/`、采集记录、日志和生成输出可能有并发 writer，不允许默认共享链接；
 - `teleop_records/`、`model/`、`hardware/VIVE/triad_openvr/` 是 mixed root，内部同时存在 tracked
   文件和 ignored 文件，绝不能整体替换成软链接；

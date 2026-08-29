@@ -403,13 +403,14 @@ class ExclusiveRealPerceptionResources:
 
 
 class CameraOnlyRealPerceptionResources:
-    """Own only cameras and Artifact storage; never touches a robot backend."""
+    """Own cameras, optional read-only models, and Artifact storage."""
 
     def __init__(
         self,
         *,
         camera_sources: Mapping[str, object],
         artifact_store: _CloseResource,
+        additional_resources: tuple[_LifecycleResource, ...] = (),
         start_cameras: Callable[[Mapping[str, Any]], None] | None = None,
         admit_cameras: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
@@ -417,6 +418,13 @@ class CameraOnlyRealPerceptionResources:
             raise ValueError("camera_sources must not be empty.")
         if not callable(getattr(artifact_store, "close", None)):
             raise TypeError("artifact_store must expose close.")
+        resources = tuple(additional_resources)
+        if any(
+            not callable(getattr(resource, "start", None))
+            or not callable(getattr(resource, "close", None))
+            for resource in resources
+        ):
+            raise TypeError("additional_resources must expose start and close.")
         start_cameras = (
             start_realsense_sources if start_cameras is None else start_cameras
         )
@@ -427,6 +435,7 @@ class CameraOnlyRealPerceptionResources:
             raise TypeError("camera lifecycle callbacks must be callable.")
         self.camera_sources = dict(camera_sources)
         self.artifact_store = artifact_store
+        self.additional_resources = resources
         self._start_cameras = start_cameras
         self._admit_cameras = admit_cameras
         self._lock = threading.Lock()
@@ -444,11 +453,23 @@ class CameraOnlyRealPerceptionResources:
                 raise RuntimeError("closed camera-only resources cannot restart.")
             if self._started:
                 return
+        attempted_resources = []
         try:
             self._start_cameras(self.camera_sources)
             self._admit_cameras(self.camera_sources)
+            for resource in self.additional_resources:
+                attempted_resources.append(resource)
+                resource.start()
         except Exception as start_error:
-            cleanup_errors = self._close_cameras()
+            cleanup_errors = []
+            for resource in reversed(attempted_resources):
+                try:
+                    resource.close()
+                except Exception as exc:  # noqa: BLE001 - aggregate startup cleanup.
+                    cleanup_errors.append(
+                        f"additional_resource:{type(exc).__name__}:{exc}"
+                    )
+            cleanup_errors.extend(self._close_cameras())
             try:
                 self.artifact_store.close()
             except Exception as exc:  # noqa: BLE001 - preserve all cleanup evidence.
@@ -476,7 +497,13 @@ class CameraOnlyRealPerceptionResources:
             if self._closed:
                 return
             self._closed = True
-        errors = self._close_cameras()
+        errors = []
+        for resource in reversed(self.additional_resources):
+            try:
+                resource.close()
+            except Exception as exc:  # noqa: BLE001 - complete remaining cleanup.
+                errors.append(f"additional_resource:{type(exc).__name__}:{exc}")
+        errors.extend(self._close_cameras())
         try:
             self.artifact_store.close()
         except Exception as exc:  # noqa: BLE001 - cameras were already attempted.

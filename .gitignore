@@ -145,3 +145,5 @@ scripts/temp_cmd/
 
 # Personal task planning; shared plans belong under the owning docs/**/plans/ path.
 /todos/
+
+experiments/

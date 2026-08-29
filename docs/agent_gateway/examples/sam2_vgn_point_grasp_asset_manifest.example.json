@@ -1,0 +1,13 @@
+{
+  "schema_version": "dexteleop.perception_point_grasp_assets.v1",
+  "model_profile_id": "vgn-conv-dmtac-m-point-grasp.v1",
+  "source": {
+    "git_url": "https://github.com/ethz-asl/vgn.git",
+    "revision": "d7af0622433f52ae88ebe81533f12b46b33e951a"
+  },
+  "checkpoint": {
+    "relative_path": "vgn_conv.pth",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "model_type": "conv"
+  }
+}

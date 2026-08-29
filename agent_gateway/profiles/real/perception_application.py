@@ -19,6 +19,13 @@ from .perception_deployment import (
     build_real_perception_capture_registration_v2,
 )
 from .perception_frames import RealPerceptionFrameBinding
+from .localization_deployment import (
+    RealObjectLocalizationRegistration,
+    build_real_object_localization_registration,
+)
+from .localization_gateway import ObjectLocalizationProvider
+from .point_grasp_deployment import RealPointGraspRegistration, build_real_point_grasp_registration
+from .point_grasp_gateway import PointGraspProvider
 from .perception_gateway import (
     RealPerceptionContractBundle,
     RealPerceptionGatewaySession,
@@ -179,6 +186,10 @@ class CameraOnlyRealPerceptionComposition:
     source_binding: RealPerceptionSourceBinding
     frame_binding: RealPerceptionFrameBinding
     registration: RealPerceptionCaptureRegistration
+    localization_registration: RealObjectLocalizationRegistration | None
+    localization_provider: ObjectLocalizationProvider | None
+    point_grasp_registration: RealPointGraspRegistration | None
+    point_grasp_provider: PointGraspProvider | None
     contract_bundle: RealPerceptionContractBundle
     artifact_store: RecoverableAgentArtifactStore
     resources: CameraOnlyRealPerceptionResources
@@ -198,6 +209,9 @@ def assemble_camera_only_real_perception_composition(
     runtime_session_id: str,
     control_domain_id: str,
     frame_binding: RealPerceptionFrameBinding,
+    object_localizer: object | None = None,
+    point_grasp_planner: object | None = None,
+    allowed_local_image_roots: tuple[str | Path, ...] = (),
     max_retained_operations: int = 16,
     peer_idle_timeout_sec: float = 10.0,
     clock: Callable[[], float] = time.time,
@@ -219,11 +233,36 @@ def assemble_camera_only_real_perception_composition(
     if not runtime_id or not domain_id:
         raise ValueError("session and control-domain IDs are required.")
     frame_graph_hash = frame_binding.frame_graph.semantic_content_hash
+    localizer_hash = (
+        None
+        if object_localizer is None
+        else str(getattr(object_localizer, "semantic_content_hash", "")).strip()
+    )
+    if object_localizer is not None and not localizer_hash:
+        raise ValueError("object_localizer must expose semantic_content_hash.")
+    roots = tuple(allowed_local_image_roots)
+    if object_localizer is None and roots:
+        raise ValueError("Local image roots require an object localizer.")
+    if point_grasp_planner is not None and object_localizer is None:
+        raise ValueError("Point-grasp planning requires the shared SAM2 object localizer.")
+    if point_grasp_planner is not None and getattr(
+        point_grasp_planner, "point_segmenter", None
+    ) is not object_localizer:
+        raise ValueError("Point-grasp planner must share the registered SAM2 object localizer.")
+    point_grasp_hash = (
+        None
+        if point_grasp_planner is None
+        else str(getattr(point_grasp_planner, "semantic_content_hash", "")).strip()
+    )
+    if point_grasp_planner is not None and not point_grasp_hash:
+        raise ValueError("point_grasp_planner must expose semantic_content_hash.")
     target_binding_hash = canonical_content_hash(
         {
             "source_binding_hash": source_binding.semantic_content_hash,
             "frame_binding_hash": frame_binding.semantic_content_hash,
             "resource_kind": "camera_bundle",
+            "object_localizer_hash": localizer_hash,
+            "point_grasp_planner_hash": point_grasp_hash,
         },
         domain="dexteleop.real_perception.target_binding.v1",
     )
@@ -246,6 +285,8 @@ def assemble_camera_only_real_perception_composition(
             "robot_backend": "absent",
             "command_owner_count": 0,
             "downstream_control_effects": "forbidden",
+            "object_localizer_hash": localizer_hash,
+            "point_grasp_planner_hash": point_grasp_hash,
         },
         domain="dexteleop.real_perception.execution_manifest.v1",
     )
@@ -266,6 +307,60 @@ def assemble_camera_only_real_perception_composition(
         frame_binding=frame_binding,
         current_mode="real_observe",
     )
+    localization_registration = None
+    localization_provider = None
+    point_grasp_registration = None
+    point_grasp_provider = None
+    if object_localizer is not None:
+        model_spec = getattr(object_localizer, "model_spec", None)
+        model_profile_id = str(getattr(model_spec, "model_profile_id", "")).strip()
+        model_profile_hash = str(
+            getattr(model_spec, "semantic_content_hash", "")
+        ).strip()
+        if not model_profile_id or not model_profile_hash:
+            raise ValueError("object_localizer must expose one verified model_spec.")
+        localization_registration = build_real_object_localization_registration(
+            model_profile_id=model_profile_id,
+            model_profile_hash=model_profile_hash,
+            inference_implementation_hash=localizer_hash,
+            local_path_enabled=bool(roots),
+            runtime_session_id=runtime_id,
+            control_domain_id=domain_id,
+            target_binding_id=target_binding_id,
+            station_manifest_hash=station_manifest_hash,
+            execution_manifest_hash=execution_manifest_hash,
+        )
+        localization_provider = ObjectLocalizationProvider(
+            localizer=object_localizer,
+            registration=localization_registration,
+            allowed_local_image_roots=roots,
+        )
+    if point_grasp_planner is not None:
+        backend_id = str(getattr(point_grasp_planner, "backend_id", "")).strip()
+        if backend_id not in {"vgn", "graspnet"}:
+            raise ValueError("point_grasp_planner must expose a reviewed backend_id.")
+        model_spec = getattr(point_grasp_planner, "model_spec", None)
+        model_profile_id = str(getattr(model_spec, "model_profile_id", "")).strip()
+        model_profile_hash = str(getattr(model_spec, "semantic_content_hash", "")).strip()
+        if not model_profile_id or not model_profile_hash:
+            raise ValueError("point_grasp_planner must expose one verified model_spec.")
+        point_grasp_registration = build_real_point_grasp_registration(
+            backend_id=backend_id,
+            model_profile_id=model_profile_id,
+            model_profile_hash=model_profile_hash,
+            inference_implementation_hash=point_grasp_hash,
+            local_path_enabled=bool(roots),
+            runtime_session_id=runtime_id,
+            control_domain_id=domain_id,
+            target_binding_id=target_binding_id,
+            station_manifest_hash=station_manifest_hash,
+            execution_manifest_hash=execution_manifest_hash,
+        )
+        point_grasp_provider = PointGraspProvider(
+            planner=point_grasp_planner,
+            registration=point_grasp_registration,
+            allowed_local_image_roots=roots,
+        )
     tool_config_hash = canonical_content_hash(
         {"tool_configuration": "not_applicable_camera_only"},
         domain="dexteleop.real_perception.no_tool_config.v1",
@@ -277,6 +372,8 @@ def assemble_camera_only_real_perception_composition(
         frame_graph_hash=frame_graph_hash,
         tool_config_hash=tool_config_hash,
         calibration_hash=source_binding.semantic_content_hash,
+        localization_registration=localization_registration,
+        point_grasp_registration=point_grasp_registration,
     )
     partition = canonical_content_hash(
         {"runtime_session_id": runtime_id},
@@ -294,6 +391,8 @@ def assemble_camera_only_real_perception_composition(
             source_binding=source_binding,
             artifact_store=artifact_store,
             allowed_client_ids=client_bindings.allowed_client_ids,
+            localization_provider=localization_provider,
+            point_grasp_provider=point_grasp_provider,
             max_retained_operations=max_retained_operations,
             clock=clock,
         )
@@ -303,6 +402,10 @@ def assemble_camera_only_real_perception_composition(
     resources = CameraOnlyRealPerceptionResources(
         camera_sources=source_binding.camera_sources,
         artifact_store=artifact_store,
+        additional_resources=(
+            (() if localization_provider is None else (localization_provider,))
+            + (() if point_grasp_provider is None else (point_grasp_provider,))
+        ),
     )
 
     def server_factory():
@@ -325,6 +428,9 @@ def assemble_camera_only_real_perception_composition(
             "frame_graph_hash": frame_graph_hash,
             "route_manifest_hash": bundle.route_manifest.semantic_content_hash,
             "artifact_max_bytes": REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
+            "object_localizer_hash": localizer_hash,
+            "point_grasp_planner_hash": point_grasp_hash,
+            "local_path_test_input": bool(roots),
             "robot_backend": "absent",
         },
         domain="dexteleop.real_perception.camera_only_profile.v1",
@@ -333,6 +439,10 @@ def assemble_camera_only_real_perception_composition(
         source_binding=source_binding,
         frame_binding=frame_binding,
         registration=registration,
+        localization_registration=localization_registration,
+        localization_provider=localization_provider,
+        point_grasp_registration=point_grasp_registration,
+        point_grasp_provider=point_grasp_provider,
         contract_bundle=bundle,
         artifact_store=artifact_store,
         resources=resources,
