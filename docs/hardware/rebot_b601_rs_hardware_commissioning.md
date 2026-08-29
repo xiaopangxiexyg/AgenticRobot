@@ -319,7 +319,11 @@ J6 方案显式使能六个 arm 关节并锚定各自的使能后当前位置，
 硬件探针必须在前台同步运行，以便操作者可立即用 Ctrl+C 或物理急停介入。为减少终端
 输出，可把实际命令（含时间、工作目录和参数）及其完整 stdout/stderr 追加到固定日志
 `/tmp/b601-rs-commissioning/command_and_output.log`；不得使用 `&`、`nohup` 或其他
-后台/脱离终端方式。下面交接命令中的 `run_logged` 仅负责记录，不会改变前台执行语义：
+后台/脱离终端方式。下面交接命令中的 `run_logged` 仅负责记录，不会改变前台执行语义。
+所有会调用 `enable()` 的模式在反馈预热、位置/速度边界、preflight `safe_stop` 和 MIT
+模式准备全部通过后，都会把简短的 `[DRIVE] 3/2/1/ENABLE` 同时写入固定日志并镜像到
+当前控制终端；倒计时期间按 Ctrl+C 会输出 `[DRIVE] CANCELLED` 并在调用 `enable()` 前
+结束。只读 `feedback-stability` 不显示该倒计时：
 
 ```bash
 WT=/path/to/isolated/AgenticRobot-worktree
@@ -497,6 +501,17 @@ slow-step 的 `acceptance_status=PASS` 现在同时要求
 不超过 `150% step`，且任一已使能支撑关节相对锚点的峰值漂移不超过 `0.5 deg`。因此
 “命令循环和 cleanup 成功但 J6 没有实际响应”会返回 `status=FAIL` 和
 `motion_response_status=INSUFFICIENT_RESPONSE`，不能再误判为动作通过。
+
+参数升级不得采用无依据的逐次试增。官方 RS 的无接触标定只测得 J4/J5 Coulomb 摩擦约
+`0.30/0.21 N·m`，并明确指出腕部 `0.2–0.5 N·m` 摩擦可与重力相当或更大；该记录没有
+独立测量 J6，因此不能把相邻关节数值当作 J6 标定值。当前 `0.02 rad` 步长、
+`target-kp=2.0` 的软件位置项峰值仅 `0.04 N·m`，正反方向都不足响应与这一量级相容。
+官方重力锁定示例使用驱动器内部 `kp=8.0, kd=1.0`，配置文件中 J6 常规 MIT 参数为
+`kp=50.0, kd=4.0`；二者只是上游实现依据，不是本 commissioning 探针可直接照搬的安全
+参数。若后续引入非零驱动器内部增益，准入必须在发送前对每帧证明
+`|tau_ff| + kp*|q_ref-q| + kd*|dq_ref-dq|` 不超过探针最终力矩 envelope，同时保留当前位置
+锚定、速度/误差 abort、slew limit 和完整 cleanup；在该契约实现并离线验证前，继续保持
+当前单一软件力矩 owner，不运行更高增益真机试验。
 
 任一方向出现反向、跳变、振荡、超速、超误差、非有限反馈或未完成 stop receipt，
 立即按急停/支撑规程停止并保留 JSON；不得通过提高 `max-error`、放宽速度/力矩限幅、

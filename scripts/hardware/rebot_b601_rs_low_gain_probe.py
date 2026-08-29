@@ -49,6 +49,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
 from itertools import pairwise
 from pathlib import Path
+from typing import TextIO
 
 import numpy as np
 
@@ -107,6 +108,8 @@ _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
 _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
 _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
 _DEFAULT_ARMING_SETTLE_SAMPLES = 4
+_DRIVE_ENABLE_COUNTDOWN_SECONDS = 3
+_OPERATOR_TTY_PATH = Path("/dev/tty")
 _DEFAULT_CARTESIAN_STIFFNESS_N_PER_M = 20.0
 _DEFAULT_CARTESIAN_DAMPING_N_S_PER_M = 1.0
 _DEFAULT_CARTESIAN_MAX_FORCE_N = 2.0
@@ -1397,6 +1400,52 @@ def _signal_handler(stop: dict[str, bool], signum: int, _frame: object) -> None:
         stop["full_disable_requested"] = True
 
 
+def _drive_enable_countdown(
+    stop: dict[str, bool],
+    *,
+    seconds: int = _DRIVE_ENABLE_COUNTDOWN_SECONDS,
+    sleeper: Callable[[float], None] = time.sleep,
+    log_stream: TextIO | None = None,
+    operator_tty_path: Path | None = _OPERATOR_TTY_PATH,
+) -> bool:
+    """Log and foreground-mirror the final interruptible enable countdown."""
+
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+        raise ValueError("drive enable countdown seconds must be a positive integer")
+    output = sys.stdout if log_stream is None else log_stream
+    operator_stream: TextIO | None = None
+    try:
+        if operator_tty_path is not None and not output.isatty():
+            try:
+                operator_stream = operator_tty_path.open("w", encoding="utf-8")
+            except OSError:
+                # A missing controlling terminal must not hide the audit log or
+                # turn a valid foreground invocation into an implementation error.
+                operator_stream = None
+
+        def emit(message: str) -> None:
+            print(message, file=output, flush=True)
+            if operator_stream is not None:
+                print(message, file=operator_stream, flush=True)
+
+        for remaining in range(seconds, 0, -1):
+            if stop.get("requested", False) or stop.get(
+                "full_disable_requested", False
+            ):
+                emit("[DRIVE] CANCELLED")
+                return False
+            emit(f"[DRIVE] {remaining}")
+            sleeper(1.0)
+        if stop.get("requested", False) or stop.get("full_disable_requested", False):
+            emit("[DRIVE] CANCELLED")
+            return False
+        emit("[DRIVE] ENABLE")
+        return True
+    finally:
+        if operator_stream is not None:
+            operator_stream.close()
+
+
 def _freeze_and_stop(
     backend: B601RSBackend,
     model: B601PinocchioModel,
@@ -1944,6 +1993,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             )
         if stop["requested"]:
             raise LowGainProbeError("operator interrupt before motor enable")
+        if not _drive_enable_countdown(stop):
+            if stop["full_disable_requested"]:
+                raise LowGainProbeError(
+                    "explicit full disable requested during drive countdown"
+                )
+            raise LowGainProbeError("operator interrupt during drive countdown")
         enable_receipt = backend.enable(joint_names=active_joint_names)
         if not enable_receipt.completed:
             raise LowGainProbeError(

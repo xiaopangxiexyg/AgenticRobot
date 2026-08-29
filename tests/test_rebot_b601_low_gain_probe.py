@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from types import SimpleNamespace
 
 import numpy as np
@@ -663,6 +664,45 @@ def test_sigusr1_requests_full_disable() -> None:
     probe._signal_handler(stop, probe.signal.SIGUSR1, None)
 
     assert stop == {"requested": True, "full_disable_requested": True}
+
+
+def test_drive_enable_countdown_is_logged_and_mirrored(tmp_path) -> None:
+    stop = {"requested": False, "full_disable_requested": False}
+    log_stream = io.StringIO()
+    operator_output = tmp_path / "operator-tty.log"
+    sleeps: list[float] = []
+
+    completed = probe._drive_enable_countdown(
+        stop,
+        sleeper=sleeps.append,
+        log_stream=log_stream,
+        operator_tty_path=operator_output,
+    )
+
+    expected = "[DRIVE] 3\n[DRIVE] 2\n[DRIVE] 1\n[DRIVE] ENABLE\n"
+    assert completed is True
+    assert sleeps == [1.0, 1.0, 1.0]
+    assert log_stream.getvalue() == expected
+    assert operator_output.read_text(encoding="utf-8") == expected
+
+
+def test_drive_enable_countdown_interrupts_before_enable(tmp_path) -> None:
+    stop = {"requested": False, "full_disable_requested": False}
+    log_stream = io.StringIO()
+
+    def interrupt_after_first_tick(_seconds: float) -> None:
+        stop["requested"] = True
+
+    completed = probe._drive_enable_countdown(
+        stop,
+        sleeper=interrupt_after_first_tick,
+        log_stream=log_stream,
+        operator_tty_path=tmp_path / "operator-tty.log",
+    )
+
+    assert completed is False
+    assert log_stream.getvalue() == "[DRIVE] 3\n[DRIVE] CANCELLED\n"
+    assert "ENABLE" not in log_stream.getvalue()
 
 
 def test_slow_step_is_relative_and_bounded() -> None:
