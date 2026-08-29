@@ -40,8 +40,7 @@ def project_grippers_then_arms(
         # actual hard penetration on every physics tick.
         if (
             start_check.minimum_distance_m < 0.0
-            and start_check.penetration_depth_m
-            <= projector.policy.hard_penetration_m
+            and start_check.penetration_depth_m <= projector.policy.hard_penetration_m
         ):
             relaxed = projector.project(
                 source_data,

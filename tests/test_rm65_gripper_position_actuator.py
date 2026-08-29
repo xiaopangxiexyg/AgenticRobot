@@ -140,3 +140,26 @@ def test_actuator_applies_delay_rate_limit_threshold_and_reverse_fit(
     tick = actuator.step(physics_time_sec=1.290, timestep_sec=0.001)
     assert tick.servo_goal_by_side["left"] == 0.0
     assert tick.actuator_rate_by_side["left"] == pytest.approx(-0.025)
+
+
+def test_gripper_snapshot_bootstrap_preserves_absolute_command_clock(
+    tmp_path: Path,
+) -> None:
+    artifact_path = tmp_path / "fit.json"
+    _write_artifact(artifact_path)
+    profile = DmtacPositionActuationProfile.from_fit_artifact(artifact_path)
+    actuator = DmtacPositionActuator(profile)
+    actuator.reset({"left": 0.0}, initial_physics_time_sec=0.5)
+    actuator.queue_targets({"left": 1.0})
+
+    tick = actuator.step(physics_time_sec=0.5, timestep_sec=0.001)
+    assert tick.accepted_by_side["left"] is False
+    tick = actuator.step(physics_time_sec=0.55, timestep_sec=0.001)
+    assert tick.accepted_by_side["left"] is True
+
+    # Keep the established cold-start behavior where a target queued after a
+    # t=0 reset is accepted on the first physics tick.
+    actuator.reset({"left": 0.0})
+    actuator.queue_targets({"left": 1.0})
+    tick = actuator.step(physics_time_sec=0.0, timestep_sec=0.001)
+    assert tick.accepted_by_side["left"] is True

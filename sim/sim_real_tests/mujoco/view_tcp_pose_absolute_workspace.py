@@ -54,6 +54,8 @@ def _generate_closed_loop_playback(
     control: DeskTcpPositionControl,
     workspace,
     samples_per_leg: int,
+    include_negative_faces: bool = True,
+    endpoint_hold_frames: int = 60,
 ) -> dict[str, object]:
     initial_qpos = {
         side: control.scene.get_arm_qpos(side).copy()
@@ -71,6 +73,8 @@ def _generate_closed_loop_playback(
         workspace,
         samples_per_leg=int(samples_per_leg),
         start_pose_desk=initial_desk["left"],
+        include_negative_faces=bool(include_negative_faces),
+        endpoint_hold_frames=int(endpoint_hold_frames),
     )
     raw_world = trajectory_to_world(workspace, raw_desk)
     effective_world = trajectory_to_world(workspace, effective_desk)
@@ -81,8 +85,12 @@ def _generate_closed_loop_playback(
     physics_tick_accumulator = 0.0
     actual_world: list[np.ndarray] = []
     actual_qpos: list[dict[str, np.ndarray]] = []
+    target_reachability: list[str] = []
     status_counts: dict[str, int] = {}
+    ik_target_status_counts: dict[str, int] = {}
     max_position_residual_m = 0.0
+    max_ik_target_position_error_m = 0.0
+    max_ik_target_orientation_error_deg = 0.0
     for index, effective_left in enumerate(effective_desk):
         timestamp = float(index) / float(control.contract.timing.ik_hz)
         reference = ResampledMotionReference(
@@ -107,6 +115,33 @@ def _generate_closed_loop_playback(
             gripper_close_by_side={"left": 0.0, "right": 0.0},
         )
         status_counts[result.status] = int(status_counts.get(result.status, 0)) + 1
+        endpoint = control.endpoint_tracking_observation()
+        left_endpoint = dict(endpoint.get("by_side", {}).get("left", {}))
+        ik_target_status = (
+            "reachable"
+            if bool(left_endpoint.get("ik_target_settled", False))
+            else "unreachable_or_unmet"
+        )
+        ik_target_status_counts[ik_target_status] = int(
+            ik_target_status_counts.get(ik_target_status, 0)
+        ) + 1
+        target_reachability.append(ik_target_status)
+        max_ik_target_position_error_m = max(
+            max_ik_target_position_error_m,
+            float(
+                dict(left_endpoint.get("ik_target_error", {})).get(
+                    "position_error_m", 0.0
+                )
+            ),
+        )
+        max_ik_target_orientation_error_deg = max(
+            max_ik_target_orientation_error_deg,
+            float(
+                dict(left_endpoint.get("ik_target_error", {})).get(
+                    "orientation_error_deg", 0.0
+                )
+            ),
+        )
         physics_tick_accumulator += physics_ticks_exact
         physics_ticks = int(math.floor(physics_tick_accumulator + 1e-12))
         physics_tick_accumulator -= physics_ticks
@@ -131,12 +166,13 @@ def _generate_closed_loop_playback(
             np.max(
                 np.abs(
                     np.rad2deg(
-                        qpos_by_side["left"] - actual_qpos[0]["left"]
+                        qpos_by_side[side] - actual_qpos[0][side]
                     )
                 )
             )
         )
         for qpos_by_side in actual_qpos
+        for side in ("left", "right")
     )
     if max_qpos_motion_deg <= 0.01:
         raise RuntimeError(
@@ -148,9 +184,15 @@ def _generate_closed_loop_playback(
         "effective_world": effective_world,
         "actual_world": tuple(actual_world),
         "actual_qpos": tuple(actual_qpos),
+        "target_reachability": tuple(target_reachability),
         "status_counts": status_counts,
+        "ik_target_status_counts": ik_target_status_counts,
         "max_position_residual_m": max_position_residual_m,
+        "max_ik_target_position_error_m": max_ik_target_position_error_m,
+        "max_ik_target_orientation_error_deg": max_ik_target_orientation_error_deg,
         "max_qpos_motion_deg": max_qpos_motion_deg,
+        "include_negative_faces": bool(include_negative_faces),
+        "endpoint_hold_frames": int(endpoint_hold_frames),
     }
 
 
@@ -174,17 +216,21 @@ def run_viewer(args: argparse.Namespace) -> dict[str, object]:
             control=control,
             workspace=workspace,
             samples_per_leg=int(args.samples_per_leg),
+            include_negative_faces=bool(args.include_negative_faces),
+            endpoint_hold_frames=int(args.endpoint_hold_frames),
         )
         visualizer = AbsoluteWorkspaceVisualizer(
             workspace=workspace,
             raw_pose_world=playback["raw_world"],
             effective_pose_world=playback["effective_world"],
             actual_pose_world=playback["actual_world"],
+            target_reachability_by_frame=playback["target_reachability"],
         )
         print(
             "[AbsoluteWorkspaceView] legend: translucent volume/edges=allowed "
             "tool_tcp region; orange=requested TCP; green=projected TCP; "
-            "magenta=actual TCP/arm; yellow=projection residual; "
+            "red=IK-unreachable projected target; magenta=actual TCP/arm; "
+            "yellow=projection residual; "
             "RGB=canonical desk XYZ",
             flush=True,
         )
@@ -193,8 +239,17 @@ def run_viewer(args: argparse.Namespace) -> dict[str, object]:
             + json.dumps(
                 {
                     "ik_status_counts": playback["status_counts"],
+                    "ik_target_status_counts": playback["ik_target_status_counts"],
                     "max_position_residual_m": playback["max_position_residual_m"],
+                    "max_ik_target_position_error_m": playback[
+                        "max_ik_target_position_error_m"
+                    ],
+                    "max_ik_target_orientation_error_deg": playback[
+                        "max_ik_target_orientation_error_deg"
+                    ],
                     "max_qpos_motion_deg": playback["max_qpos_motion_deg"],
+                    "include_negative_faces": playback["include_negative_faces"],
+                    "endpoint_hold_frames": playback["endpoint_hold_frames"],
                 },
                 ensure_ascii=False,
             ),
@@ -248,8 +303,17 @@ def run_viewer(args: argparse.Namespace) -> dict[str, object]:
         "repeats_completed": repeats_completed,
         "workspace": workspace.to_payload(),
         "ik_status_counts": playback["status_counts"],
+        "ik_target_status_counts": playback["ik_target_status_counts"],
         "max_position_residual_m": playback["max_position_residual_m"],
+        "max_ik_target_position_error_m": playback[
+            "max_ik_target_position_error_m"
+        ],
+        "max_ik_target_orientation_error_deg": playback[
+            "max_ik_target_orientation_error_deg"
+        ],
         "max_qpos_motion_deg": playback["max_qpos_motion_deg"],
+        "include_negative_faces": playback["include_negative_faces"],
+        "endpoint_hold_frames": playback["endpoint_hold_frames"],
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return summary
@@ -265,6 +329,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--playback-hz", type=float, default=60.0)
     parser.add_argument("--samples-per-leg", type=int, default=90)
+    parser.add_argument(
+        "--endpoint-hold-frames",
+        type=int,
+        default=60,
+        help=(
+            "Reference frames held at every workspace face/anchor so the "
+            "physical MuJoCo servo can catch up (default: 60 = 1 s)."
+        ),
+    )
+    parser.add_argument(
+        "--include-negative-faces",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Visit both lower and upper faces of every axis (default: yes).",
+    )
     parser.add_argument("--repeat", type=int, default=0)
     parser.add_argument("--pause-between-repeats-sec", type=float, default=0.4)
     parser.add_argument("--camera-distance", type=float, default=1.75)
@@ -302,6 +381,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--camera-distance must be positive")
     if int(args.samples_per_leg) < 2:
         raise ValueError("--samples-per-leg must be >= 2")
+    if int(args.endpoint_hold_frames) < 0:
+        raise ValueError("--endpoint-hold-frames must be non-negative")
     if int(args.repeat) < 0:
         raise ValueError("--repeat must be non-negative")
 

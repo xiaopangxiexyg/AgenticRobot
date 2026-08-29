@@ -230,6 +230,12 @@ def build_mujoco_agent_skill_motion_target(
             world_from_arm_base_by_side=(
                 load_world_from_arm_base_transforms(retargeter.profile)
             ),
+            # The coupled retargeter is a 60 Hz qref producer.  Its continuity
+            # state is the command stream admitted by the 120 Hz planner, not
+            # the lagging plant measurement.  The rig exposes measured qpos
+            # separately for endpoint/recovery observation; feeding that lag
+            # back into branch selection makes a physically normal servo delay
+            # look like a new IK branch and causes target-edge chatter.
             admitted_qpos_source=rig.accepted_qcmd_by_side,
         )
     else:

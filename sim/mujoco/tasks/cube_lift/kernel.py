@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -220,6 +221,25 @@ class CubeLiftKernel:
             [self.config.initial_gripper_close_by_name[name] for name in self._gripper_names],
             dtype=np.float64,
         )
+        # Keep the policy/requested hand target separate from the kinematic
+        # target admitted by the collision projector.  A finger can be
+        # temporarily shortened by the table-clearance projection while it
+        # is closing on the cube; overwriting the policy target with that
+        # shortened value permanently loses normal force and makes a later
+        # lift release the object.  The requested value is only promoted to
+        # the physical gripper target after a validated bilateral contact
+        # hand-off (see ``_grasp_hold_armed`` below).
+        self._requested_gripper_close = self._gripper_close.copy()
+        # Explicit pick profiles expose the gripper dimension as a policy
+        # action while leaving the hidden post-contact conditioner disabled.
+        # Only that contract needs a second request register; legacy/full
+        # curricula (including scripted-contact resets) retain their historic
+        # projected-target feedback semantics.
+        self._preserve_policy_gripper_request = bool(
+            self.config.policy_action_components
+            and not self.config.post_contact_phase_enabled
+            and not self.config.scripted_contact_reset
+        )
         self._last_action = np.zeros(7, dtype=np.float32)
         self._last_requested_action = np.zeros(7, dtype=np.float32)
         self._last_conditioned_action = np.zeros(7, dtype=np.float32)
@@ -259,7 +279,17 @@ class CubeLiftKernel:
         self._resting_center_z = float("nan")
         self.last_physics_ticks = 0
         self.last_command_ticks = 0
-        self._settled_snapshot: dict[str, np.ndarray | float] | None = None
+        self._settled_snapshot: dict[str, object] | None = None
+        # A settled snapshot captures both the MuJoCo plant and the arm
+        # transport receipt that produced its saved actuator controls.  The
+        # latter is injected into the next rig start exactly once; ordinary
+        # restarts still rebase to live measured qpos.
+        self._restored_initial_qcmd_by_side: dict[str, np.ndarray] | None = None
+        self._restored_initial_gripper_close_by_name: dict[str, float] | None = None
+        self._restored_initial_physics_time_sec = 0.0
+        self._restored_initial_actuation_state: Mapping[str, object] | None = None
+        self._restored_initial_gripper_state: Mapping[str, object] | None = None
+        self._restored_initial_command_sequence = 0
         self._collision_projector = self.scene.collision_projector()
         self._accepted_controlled_qpos = self.scene.kinematic_controlled_qpos()
         self._last_safety_result = None
@@ -299,6 +329,18 @@ class CubeLiftKernel:
         self._pre_action_pose_target_rotation_error_deg: float | None = None
         self._scripted_contact_reset_applied = False
         self._scripted_pregrasp_reset_applied = False
+        self._restored_initial_qcmd_by_side = None
+        self._restored_initial_gripper_close_by_name = None
+        self._restored_initial_physics_time_sec = 0.0
+        self._restored_initial_actuation_state = None
+        self._restored_initial_gripper_state = None
+        self._restored_initial_command_sequence = 0
+        # Once an actuated gripper has acquired both task-declared finger
+        # contacts, preserve the independent policy close target across arm
+        # projection.  This is not a hidden action phase: the policy still
+        # owns and may change the requested gripper dimension on every step.
+        self._grasp_hold_armed = False
+        self._grasp_hold_contact_steps = 0
         self._post_contact_phase_active = False
         self._post_contact_phase_contact_steps = 0
         self._post_contact_phase_loss_steps = 0
@@ -342,6 +384,7 @@ class CubeLiftKernel:
             self.config.initial_gripper_close_by_name[self._gripper_names[0]],
             self.config.initial_gripper_close_by_name[self._gripper_names[1]],
         )
+        self._requested_gripper_close[:] = self._gripper_close
         self._last_action.fill(0.0)
         self._last_requested_action.fill(0.0)
         self._last_conditioned_action.fill(0.0)
@@ -358,6 +401,8 @@ class CubeLiftKernel:
         self._pre_action_pose_target_rotation_error_deg = None
         self._scripted_contact_reset_applied = False
         self._scripted_pregrasp_reset_applied = False
+        self._grasp_hold_armed = False
+        self._grasp_hold_contact_steps = 0
         self._post_contact_phase_active = False
         self._post_contact_phase_contact_steps = 0
         self._post_contact_phase_loss_steps = 0
@@ -373,14 +418,42 @@ class CubeLiftKernel:
         for geom_id, original, _override in self._post_settle_geom_friction:
             self.model.geom_friction[geom_id] = original
 
-        if (
+        restore_settled_snapshot = bool(
             self.use_settled_snapshot
             and self._settled_snapshot is not None
             and not self.config.scripted_contact_reset
+            # Scripted pre-grasp is a live, contact-sensitive preparation
+            # trajectory.  A MuJoCo snapshot restores the plant state but
+            # not every iterative contact-solver warm-start datum, so replay
+            # from it can choose a different IK/contact branch even when qpos
+            # and qvel compare equal.  Re-run this preparation from a clean
+            # settle; static/no-preparation episodes still get the fast
+            # snapshot path below.
+            and not self.config.scripted_pregrasp_reset
             and not self.config.randomizes_cube_spawn
-        ):
+        )
+        if restore_settled_snapshot:
+            if self.config.uses_pose_action:
+                # A restored episode must not inherit mutable Pinocchio/QP
+                # warm-start state from the preceding episode.  Construct a
+                # fresh controller against the reset scene, then anchor it
+                # after the exact settled plant/transport snapshot is loaded.
+                self.scene.reset_data()
+                self._pose_action_controller = CubeLiftPoseActionController(
+                    self.scene,
+                    self.config,
+                )
             self._restore_settled_snapshot()
-            self._start_actuated_rig()
+            self._start_actuated_rig(
+                initial_qcmd_by_side=self._restored_initial_qcmd_by_side,
+                initial_gripper_close_by_name=(
+                    self._restored_initial_gripper_close_by_name
+                ),
+                initial_physics_time_sec=self._restored_initial_physics_time_sec,
+                initial_actuation_state=self._restored_initial_actuation_state,
+                initial_gripper_state=self._restored_initial_gripper_state,
+                initial_command_sequence=self._restored_initial_command_sequence,
+            )
             self.last_physics_ticks = 0
             self.last_command_ticks = 0
         else:
@@ -391,12 +464,10 @@ class CubeLiftKernel:
             # settle for this curriculum instead of exposing that false state.
             self.scene.reset_data()
             if self.config.uses_pose_action:
-                # RM65CanonicalIK construction seeds internal coupled-planner
-                # state before its first explicit reset. Rebuild it for every
-                # cold pose-action reset, not only scripted-contact curricula:
-                # a planner previously exercised by another randomized episode
-                # otherwise changes the next episode's IK trajectory despite
-                # identical simulator state and seed.
+                # Construct the pose controller after the scene reset but
+                # before direct placement so a cold reset starts from a fresh
+                # canonical planner instance.  The controller is explicitly
+                # anchored again after the physical settle below.
                 self._pose_action_controller = CubeLiftPoseActionController(
                     self.scene,
                     self.config,
@@ -452,12 +523,26 @@ class CubeLiftKernel:
 
         for geom_id, _original, override in self._post_settle_geom_friction:
             self.model.geom_friction[geom_id] = override
-        if self._pose_action_controller is not None:
+        if self.config.uses_pose_action:
             # Anchor both the canonical pose planner and the policy's held TCP
             # target after the settled physical actuator state is available.
+            # Snapshot restores constructed a fresh controller immediately
+            # before restore; cold resets constructed one before placement.
+            # Both paths now share a full lifecycle reset rather than reusing
+            # mutable solver state from the previous episode.
+            assert self._pose_action_controller is not None
             self._pose_action_controller.reset()
             self._last_pose_action_step = None
             self._right_target[:] = self.scene.get_arm_qpos(self.config.controlled_side)
+        elif self._pose_action_controller is not None:
+            # Cold resets already constructed a fresh controller above.  Only
+            # its explicit scene anchor is needed after the settled actuator
+            # state is available.
+            self._pose_action_controller.reset()
+            self._last_pose_action_step = None
+            self._right_target[:] = self.scene.get_arm_qpos(self.config.controlled_side)
+        else:
+            self._pose_action_controller = None
 
         self._resting_center_z = float(self.data.qpos[self._cube_qpos_addr + 2])
         self._previous_observation_right_qpos = self.scene.get_arm_qpos(
@@ -469,6 +554,14 @@ class CubeLiftKernel:
             self._advance_to_scripted_pregrasp()
         if self.config.scripted_contact_reset:
             self._advance_to_scripted_contact()
+        if self._pose_action_controller is not None:
+            # Scripted preparation shares the canonical pose controller but is
+            # not policy experience.  Reset its policy-motion phase marker so
+            # the first zero policy action is an exact hold; later zero or
+            # gripper-only actions can still use the convergence-preserving
+            # held-target solver after an actual policy pose update.
+            self._pose_action_controller.begin_policy_episode()
+            self._last_pose_action_step = None
         return self._observation(), self._info(reset=True, terminal=True)
 
     def _advance_to_scripted_pregrasp(self) -> None:
@@ -483,6 +576,23 @@ class CubeLiftKernel:
             raise RuntimeError(
                 "Scripted pre-grasp reset requires a positive closed grasp height."
             )
+        # The canonical Pink/Pinocchio planner is the normal path.  A few
+        # worker environments cannot load its C++ extension (for example when
+        # a caller imported PyTorch first and the process already owns an
+        # incompatible libstdc++); the explicit MuJoCo DLS fallback has the
+        # same TCP contract but a less accurate branch/posture solution.  Do
+        # not expose that residual as the nominal 5 cm pre-grasp: the next
+        # fixed three-step descend action would then close above the cube and
+        # make an otherwise valid contact task appear randomly infeasible.
+        # Requiring a tighter approach is local to fallback preparation, does
+        # not alter policy actions or collision gates, and leaves the declared
+        # profile distance unchanged for the canonical solver.
+        pregrasp_distance_m = float(self.config.scripted_pregrasp_distance_m)
+        if (
+            self._pose_action_controller.solver_name
+            != "robot_motion.rm65.position_collision"
+        ):
+            pregrasp_distance_m = min(pregrasp_distance_m, 0.03)
         base_rotation = self.scene.body_pose("right_arm_base_link")[:3, :3]
         reached = False
         for _ in range(self.config.max_episode_steps):
@@ -493,7 +603,7 @@ class CubeLiftKernel:
                 (0.0, 0.0, closed_height), dtype=np.float64
             )
             error = target - grasp_position
-            if np.linalg.norm(error) <= self.config.scripted_pregrasp_distance_m:
+            if np.linalg.norm(error) <= pregrasp_distance_m:
                 reached = True
                 break
             action = np.zeros(7, dtype=np.float32)
@@ -514,7 +624,7 @@ class CubeLiftKernel:
             raise RuntimeError(
                 "Scripted pre-grasp reset reached its step limit: "
                 f"distance_m={np.linalg.norm(error):.6f}; "
-                f"target_m={self.config.scripted_pregrasp_distance_m:.6f}."
+                f"target_m={pregrasp_distance_m:.6f}."
             )
 
         # Preparation is not policy experience. Keep the gripper open and
@@ -641,6 +751,13 @@ class CubeLiftKernel:
         self._policy_worst_active_collision_check = None
         self._pose_target_reanchored = False
         self._scripted_contact_reset_applied = True
+        # The reset just validated bilateral finger contact and close force;
+        # keep the policy-owned request authoritative for the first policy
+        # lift frame as well as for subsequent frames.
+        self._grasp_hold_armed = True
+        self._grasp_hold_contact_steps = max(
+            1, self.config.post_contact_phase_activation_steps
+        )
         self._scripted_contact_loss_steps = 0
         self._previous_observation_right_qpos = self.scene.get_arm_qpos(
             self.config.controlled_side
@@ -750,12 +867,62 @@ class CubeLiftKernel:
                 self._right_upper,
                 out=self._right_target,
             )
-        self._gripper_close[1] = np.clip(
-            self._gripper_close[1] + float(values[6]) * self.config.right_gripper_delta,
-            0.0,
-            self.config.right_gripper_max_close,
-        )
-        requested_gripper_close = self._gripper_close.copy()
+        if self._preserve_policy_gripper_request:
+            # Advance the policy-owned request independently of the effective
+            # kinematic target.  Before contact, the latter may be shortened
+            # by the table/environment projection; feeding that shortened
+            # value back into the request would make repeated close actions
+            # oscillate around the first blocked sample instead of continuing
+            # toward the declared close target.
+            self._requested_gripper_close[1] = np.clip(
+                self._requested_gripper_close[1]
+                + float(values[6]) * self.config.right_gripper_delta,
+                0.0,
+                self.config.right_gripper_max_close,
+            )
+            requested_gripper_close = self._requested_gripper_close.copy()
+        else:
+            # Legacy profiles intentionally feed back the collision-admitted
+            # close target.  This preserves their established curriculum and
+            # scripted-reset timing; no independent request register is
+            # needed when a task owns the post-contact hand-off itself.
+            self._gripper_close[1] = np.clip(
+                self._gripper_close[1]
+                + float(values[6]) * self.config.right_gripper_delta,
+                0.0,
+                self.config.right_gripper_max_close,
+            )
+            self._requested_gripper_close[:] = self._gripper_close
+            requested_gripper_close = self._gripper_close.copy()
+        if (
+            self.config.uses_actuated_gripper
+            and self._preserve_policy_gripper_request
+            and not self._grasp_hold_armed
+            and not self.config.post_contact_phase_enabled
+        ):
+            # Direct pick profiles intentionally keep the gripper action
+            # visible to the policy instead of enabling the hidden
+            # post-contact conditioner.  They still need the same physical
+            # hand-off: wait for a stable bilateral contact/close window
+            # before promoting the accumulated close request.  Arming on the
+            # first transient contact sends the full target while the cube is
+            # still settling and can knock it off the table.
+            if (
+                left_contact
+                and right_contact
+                and previous_measured_close
+                >= min(
+                    self.config.post_contact_phase_min_measured_close,
+                    self.config.right_gripper_max_close,
+                )
+            ):
+                self._grasp_hold_contact_steps += 1
+            else:
+                self._grasp_hold_contact_steps = 0
+            if self._grasp_hold_contact_steps >= max(
+                1, self.config.post_contact_phase_activation_steps
+            ):
+                self._grasp_hold_armed = True
         locked_gripper_target = (
             self.config.uses_actuated_gripper
             and (
@@ -765,8 +932,16 @@ class CubeLiftKernel:
                     and self.config.scripted_contact_action_bias[6] == 0.0
                 )
                 or self._post_contact_phase_active
+                or self._grasp_hold_armed
             )
         )
+        if self._preserve_policy_gripper_request:
+            # The effective target starts from the latest policy request for
+            # this step.  ``project_grippers_then_arms`` may replace it with a
+            # safe admitted value below; leaving the previous effective target
+            # here would silently drop every close command until contact lock
+            # engages.
+            self._gripper_close[:] = requested_gripper_close
         qpos_by_side = {
             self.config.fixed_side: self._left_home,
             self.config.controlled_side: self._right_target,
@@ -1036,7 +1211,16 @@ class CubeLiftKernel:
     def _measured_gripper_close(self, index: int) -> float:
         return float(self.scene.get_gripper_close(self._gripper_names[index]))
 
-    def _start_actuated_rig(self) -> None:
+    def _start_actuated_rig(
+        self,
+        *,
+        initial_qcmd_by_side: Mapping[str, np.ndarray] | None = None,
+        initial_gripper_close_by_name: Mapping[str, float] | None = None,
+        initial_physics_time_sec: float = 0.0,
+        initial_actuation_state: Mapping[str, object] | None = None,
+        initial_gripper_state: Mapping[str, object] | None = None,
+        initial_command_sequence: int = 0,
+    ) -> None:
         if not self.config.uses_actuated_position:
             return
         profile = self.config.position_actuation_profile()
@@ -1057,10 +1241,23 @@ class CubeLiftKernel:
                 active_sides=(self.config.fixed_side, self.config.controlled_side),
                 actuation_profile=profile,
                 gripper_actuation_profile=self.config.gripper_actuation_profile(),
+                # CubeLift performs the authoritative compound
+                # gripper-then-arm projection before publishing each
+                # reference.  The physical sender must preserve that admitted
+                # qcmd rather than project the delayed arm transport again;
+                # it still keeps the active-contact and post-step hard-contact
+                # guard in the executor.
+                collision_projection_mode="upstream_admitted",
                 realtime_worker=False,
             ),
             monotonic_clock=lambda: self.physics_time,
             sleep=lambda _seconds: None,
+            initial_qcmd_by_side=initial_qcmd_by_side,
+            initial_gripper_close_by_name=initial_gripper_close_by_name,
+            initial_physics_time_sec=initial_physics_time_sec,
+            initial_actuation_state=initial_actuation_state,
+            initial_gripper_state=initial_gripper_state,
+            initial_command_sequence=initial_command_sequence,
         )
         self._actuated_rig.start()
 
@@ -1614,6 +1811,12 @@ class CubeLiftKernel:
             "robot_dynamics": self.config.robot_dynamics,
             "gripper_dynamics": self.config.gripper_dynamics,
             "right_gripper_target_close": float(self._gripper_close[1]),
+            "right_gripper_requested_close": float(
+                self._requested_gripper_close[1]
+            ),
+            "gripper_target_locked_after_contact": bool(
+                self._grasp_hold_armed
+            ),
             "scripted_contact_loss_steps": self._scripted_contact_loss_steps,
             "scripted_contact_action_modified": (
                 self._scripted_contact_action_modified
@@ -1903,6 +2106,49 @@ class CubeLiftKernel:
         )
 
     def _capture_settled_snapshot(self) -> None:
+        accepted_qcmd_by_side = None
+        actuator_target_close_by_name = None
+        actuation_state = None
+        gripper_state = None
+        command_sequence = 0
+        data_snapshot = None
+        # ``mj_copyData`` preserves MuJoCo's complete solver/integrator
+        # working state, including arrays that are not part of the public
+        # qpos/qvel/ctrl snapshot.  Keep the clone in memory for same-process
+        # fast resets; the explicit arrays below remain the compatibility
+        # representation for older or serialized snapshots.
+        try:
+            data_snapshot = self.mujoco.MjData(self.model)
+            self.mujoco.mj_copyData(data_snapshot, self.model, self.data)
+        except (AttributeError, TypeError, ValueError):
+            data_snapshot = None
+        if self._actuated_rig is not None:
+            rig_snapshot = self._actuated_rig.snapshot()
+            accepted_qcmd_by_side = self._actuated_rig.accepted_qcmd_by_side()
+            raw_execution_state = rig_snapshot.get("execution")
+            if isinstance(raw_execution_state, Mapping):
+                actuation_state = dict(raw_execution_state)
+                raw_sequence = raw_execution_state.get(
+                    "accepted_command_sequence",
+                    0,
+                )
+                if (
+                    not isinstance(raw_sequence, bool)
+                    and isinstance(raw_sequence, (int, np.integer))
+                    and int(raw_sequence) >= 0
+                ):
+                    command_sequence = int(raw_sequence)
+            gripper_snapshot = rig_snapshot.get("gripper_execution")
+            if isinstance(gripper_snapshot, Mapping):
+                gripper_state = dict(gripper_snapshot)
+                raw_targets = gripper_snapshot.get(
+                    "actuator_target_close_by_gripper"
+                )
+                if isinstance(raw_targets, Mapping):
+                    actuator_target_close_by_name = {
+                        str(name): float(value)
+                        for name, value in raw_targets.items()
+                    }
         self._settled_snapshot = {
             "time": float(self.data.time),
             "qpos": self.data.qpos.copy(),
@@ -1910,20 +2156,140 @@ class CubeLiftKernel:
             "act": self.data.act.copy(),
             "ctrl": self.data.ctrl.copy(),
             "qacc_warmstart": self.data.qacc_warmstart.copy(),
+            "accepted_qcmd_by_side": accepted_qcmd_by_side,
+            "actuator_target_close_by_name": actuator_target_close_by_name,
+            "actuation_state": actuation_state,
+            "gripper_state": gripper_state,
+            "accepted_command_sequence": command_sequence,
+            "data_snapshot": data_snapshot,
         }
 
     def _restore_settled_snapshot(self) -> None:
         assert self._settled_snapshot is not None
-        self.mujoco.mj_resetData(self.model, self.data)
-        self.data.time = float(self._settled_snapshot["time"])
-        for name in ("qpos", "qvel", "act", "ctrl", "qacc_warmstart"):
-            getattr(self.data, name)[:] = self._settled_snapshot[name]
-        self.mujoco.mj_forward(self.model, self.data)
+        data_snapshot = self._settled_snapshot.get("data_snapshot")
+        if data_snapshot is not None:
+            try:
+                self.mujoco.mj_copyData(self.data, self.model, data_snapshot)
+            except (AttributeError, TypeError, ValueError):
+                data_snapshot = None
+        if data_snapshot is None:
+            self.mujoco.mj_resetData(self.model, self.data)
+            self.data.time = float(self._settled_snapshot["time"])
+            for name in ("qpos", "qvel", "act", "ctrl", "qacc_warmstart"):
+                getattr(self.data, name)[:] = self._settled_snapshot[name]
+            self.mujoco.mj_forward(self.model, self.data)
         self._accepted_controlled_qpos = self.scene.kinematic_controlled_qpos()
-        self._physics_tick = self.config.settle_physics_ticks
+        saved_qcmd = self._settled_snapshot.get("accepted_qcmd_by_side")
+        if isinstance(saved_qcmd, Mapping):
+            restored: dict[str, np.ndarray] = {}
+            for side in (self.config.fixed_side, self.config.controlled_side):
+                values = np.asarray(saved_qcmd.get(side), dtype=float).reshape(-1)
+                if values.shape != (6,) or not np.all(np.isfinite(values)):
+                    raise RuntimeError(
+                        "Settled snapshot contains an invalid accepted qcmd for "
+                        f"side={side!r}."
+                    )
+                restored[side] = values.copy()
+            self._restored_initial_qcmd_by_side = restored
+        else:
+            # Snapshots written by older processes did not persist the
+            # transport receipt.  Falling back to the restored measured qpos
+            # keeps them loadable while new snapshots get exact causal replay.
+            self._restored_initial_qcmd_by_side = {
+                self.config.fixed_side: self.scene.get_arm_qpos(
+                    self.config.fixed_side
+                ).astype(np.float64, copy=True),
+                self.config.controlled_side: self.scene.get_arm_qpos(
+                    self.config.controlled_side
+                ).astype(np.float64, copy=True),
+            }
+        raw_gripper_targets = self._settled_snapshot.get(
+            "actuator_target_close_by_name"
+        )
+        if isinstance(raw_gripper_targets, Mapping):
+            restored_gripper: dict[str, float] = {}
+            for name in self._gripper_names:
+                value = float(raw_gripper_targets.get(name, float("nan")))
+                if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise RuntimeError(
+                        "Settled snapshot contains an invalid actuator target "
+                        f"for gripper={name!r}."
+                    )
+                restored_gripper[name] = value
+            self._restored_initial_gripper_close_by_name = restored_gripper
+        else:
+            self._restored_initial_gripper_close_by_name = {
+                name: self.scene.get_gripper_close(name)
+                for name in self._gripper_names
+            }
+        # Keep the task's effective/requested hand target aligned with the
+        # restored transport receipt.  This matters when a snapshot is taken
+        # while a delayed gripper command is in flight: restoring only the
+        # MuJoCo finger qpos would make the next policy frame silently publish
+        # the old cold-start close value and undo the resumed grasp.
+        if isinstance(self._settled_snapshot.get("gripper_state"), Mapping):
+            raw_gripper_state = self._settled_snapshot["gripper_state"]
+            assert isinstance(raw_gripper_state, Mapping)
+            raw_accepted_close = raw_gripper_state.get("accepted_close_by_gripper")
+            if isinstance(raw_accepted_close, Mapping):
+                restored_policy_close: dict[str, float] = {}
+                for name in self._gripper_names:
+                    value = float(raw_accepted_close.get(name, float("nan")))
+                    if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                        raise RuntimeError(
+                            "Settled snapshot contains an invalid accepted gripper "
+                            f"target for gripper={name!r}."
+                        )
+                    restored_policy_close[name] = value
+                for index, name in enumerate(self._gripper_names):
+                    self._gripper_close[index] = restored_policy_close[name]
+                self._requested_gripper_close[:] = self._gripper_close
+        saved_time = float(self._settled_snapshot.get("time", 0.0))
+        if not np.isfinite(saved_time) or saved_time < 0.0:
+            raise RuntimeError("Settled snapshot contains an invalid time.")
+        self._restored_initial_physics_time_sec = saved_time
+        physics_ticks = saved_time * float(self.config.physics_hz)
+        rounded_ticks = round(physics_ticks)
+        if not np.isclose(physics_ticks, rounded_ticks, rtol=0.0, atol=1e-9):
+            raise RuntimeError(
+                "Settled snapshot time is not aligned to the physics timestep."
+            )
+        self._physics_tick = rounded_ticks
         self._next_command_time = (
             np.floor(self.physics_time * self.config.command_hz + 1e-12) + 1.0
         ) / self.config.command_hz
+        raw_actuation_state = self._settled_snapshot.get("actuation_state")
+        if isinstance(raw_actuation_state, Mapping) and all(
+            field in raw_actuation_state
+            for field in (
+                "delayed_targets",
+                "next_command_time_sec",
+                "raw_actuator_target_by_side",
+            )
+        ):
+            self._restored_initial_actuation_state = dict(raw_actuation_state)
+        raw_gripper_state = self._settled_snapshot.get("gripper_state")
+        if isinstance(raw_gripper_state, Mapping):
+            raw_core = raw_gripper_state.get("core")
+            if isinstance(raw_core, Mapping) and all(
+                field in raw_core
+                for field in (
+                    "delayed_targets",
+                    "next_command_time_by_side",
+                    "pending",
+                )
+            ):
+                self._restored_initial_gripper_state = dict(raw_gripper_state)
+        raw_command_sequence = self._settled_snapshot.get(
+            "accepted_command_sequence",
+            0,
+        )
+        if (
+            not isinstance(raw_command_sequence, bool)
+            and isinstance(raw_command_sequence, (int, np.integer))
+            and int(raw_command_sequence) >= 0
+        ):
+            self._restored_initial_command_sequence = int(raw_command_sequence)
 
     def close(self) -> None:
         self._close_actuated_rig()

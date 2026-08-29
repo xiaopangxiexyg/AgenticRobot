@@ -1332,6 +1332,77 @@ def test_lift_short_v2_zero_policy_holds_and_positive_policy_lifts() -> None:
 
 
 @pytest.mark.optional
+def test_pose_reset_rebuilds_solver_and_syncs_settled_actuator_state() -> None:
+    """A settled-snapshot restore must not inherit a prior IK/QP episode."""
+
+    _require_mujoco_runtime()
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        CONTACT_DESCEND_CLOSE_POSE_Z_GRIPPER_TASK_CONFIG,
+        include_training_reward_state=True,
+        use_model_cache=False,
+    )
+    try:
+        reset_states = []
+        for _ in range(3):
+            env.reset(seed=1)
+            kernel = env.kernel
+            reset_states.append(
+                (
+                    kernel.scene.get_arm_qpos("left").copy(),
+                    kernel.scene.get_arm_qpos("right").copy(),
+                    kernel._right_target.copy(),
+                    kernel._pose_action_controller.target_pose_arm_base.copy(),
+                )
+            )
+        first = reset_states[0]
+        for state in reset_states[1:]:
+            for actual, expected in zip(state, first):
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+    finally:
+        env.close()
+
+
+@pytest.mark.optional
+def test_settled_snapshot_preserves_first_actuated_policy_step() -> None:
+    """Restoring a settled episode must not change its first qcmd phase."""
+
+    _require_mujoco_runtime()
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        DEFAULT_PHYSICAL_TASK_CONFIG,
+        include_training_reward_state=False,
+        use_model_cache=False,
+    )
+    try:
+        action = np.zeros(7, dtype=np.float32)
+        env.reset(seed=1)
+        env.step(action)
+        first_qpos = env.kernel.data.qpos.copy()
+        first_ctrl = env.kernel.data.ctrl.copy()
+        first_execution = env.kernel._actuated_rig.snapshot()["execution"]
+
+        env.reset(seed=1)
+        env.step(action)
+        restored_qpos = env.kernel.data.qpos.copy()
+        restored_ctrl = env.kernel.data.ctrl.copy()
+        restored_execution = env.kernel._actuated_rig.snapshot()["execution"]
+
+        np.testing.assert_array_equal(restored_qpos, first_qpos)
+        np.testing.assert_array_equal(restored_ctrl, first_ctrl)
+        assert restored_execution["accepted_qcmd_by_side"] == first_execution[
+            "accepted_qcmd_by_side"
+        ]
+        assert restored_execution["delayed_targets"] == first_execution[
+            "delayed_targets"
+        ]
+    finally:
+        env.close()
+
+
+@pytest.mark.optional
 def test_descend_close_task_is_feasible_without_hidden_xy_actions() -> None:
     _require_mujoco_runtime()
     from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
