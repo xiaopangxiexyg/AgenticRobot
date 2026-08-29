@@ -19,6 +19,14 @@ from agent_gateway.transport.unix_transport import (
     validate_agent_gateway_unix_server_preflight,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from deployments.perception import (
+    GraspNetPointGraspModelSpec,
+    Sam2GroundingDinoLocalizer,
+    Sam2GroundingDinoModelSpec,
+    Sam2GraspNetPointGraspPlanner,
+    Sam2VgnPointGraspPlanner,
+    VgnPointGraspModelSpec,
+)
 from robot_motion.rm65 import (
     build_rm65_dual_arm_scene_profile,
     load_world_from_arm_base_transforms,
@@ -35,8 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m agent_gateway real-perception",
         description=(
-            "Serve passive real RGB/depth Skills from an exclusive RealSense "
-            "inventory. This profile never constructs or connects an RM65 backend."
+            "Serve passive real RGB/depth and optional supplied-image object "
+            "localization Skills. This profile never constructs or connects an "
+            "RM65 backend."
         ),
     )
     parser.add_argument("--socket-path", type=Path, required=True)
@@ -64,6 +73,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-retained-operations", type=int, default=16)
     parser.add_argument("--peer-idle-timeout-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--enable-object-localization",
+        action="store_true",
+        help="load the reviewed SAM2 + Grounding DINO model bundle before serving",
+    )
+    parser.add_argument(
+        "--object-localization-asset-bundle",
+        type=Path,
+        default=None,
+        help=(
+            "absolute path to assets/perception/sam2_grounding_dino; required "
+            "when object localization is enabled"
+        ),
+    )
+    parser.add_argument("--object-localization-device", default="cuda")
+    parser.add_argument("--object-localization-box-threshold", type=float, default=0.35)
+    parser.add_argument("--object-localization-text-threshold", type=float, default=0.25)
+    parser.add_argument(
+        "--object-localization-automatic-score-threshold",
+        type=float,
+        default=0.80,
+    )
+    parser.add_argument("--object-localization-nms-iou-threshold", type=float, default=0.70)
+    parser.add_argument(
+        "--enable-point-grasp",
+        action="store_true",
+        help="enable passive SAM2 + selected-backend point-conditioned DMTAC M grasp planning",
+    )
+    parser.add_argument(
+        "--point-grasp-asset-bundle",
+        type=Path,
+        default=None,
+        help="absolute path to the selected backend's checkpoint manifest bundle",
+    )
+    parser.add_argument(
+        "--point-grasp-backend",
+        choices=("vgn", "graspnet"),
+        default="vgn",
+        help="grasp generator backend; GraspNet is noncommercial research only",
+    )
+    parser.add_argument("--point-grasp-device", default="cuda")
+    parser.add_argument(
+        "--allow-local-image-root",
+        action="append",
+        type=Path,
+        default=[],
+        help=(
+            "absolute, non-symlink directory allowed for test-only local_image_path "
+            "requests; repeat to allow more than one root"
+        ),
+    )
     return parser
 
 
@@ -134,6 +194,78 @@ def main(argv: list[str] | None = None) -> int:
         args.artifact_root,
         flag="--artifact-root",
     )
+    if args.allow_local_image_root and not (
+        args.enable_object_localization or args.enable_point_grasp
+    ):
+        parser.error(
+            "--allow-local-image-root requires --enable-object-localization"
+        )
+    if args.allow_local_image_root and args.ssh_read_only_client:
+        parser.error(
+            "test-only local image paths cannot be enabled on a Gateway with "
+            "SSH read-only clients"
+        )
+    object_localizer = None
+    point_grasp_planner = None
+    allowed_local_image_roots = ()
+    if args.enable_object_localization:
+        if args.object_localization_asset_bundle is None:
+            parser.error(
+                "--enable-object-localization requires "
+                "--object-localization-asset-bundle"
+            )
+        model_bundle = _absolute_directory(
+            parser,
+            args.object_localization_asset_bundle,
+            flag="--object-localization-asset-bundle",
+        )
+        try:
+            model_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(model_bundle)
+            object_localizer = Sam2GroundingDinoLocalizer(
+                model_spec=model_spec,
+                device=args.object_localization_device,
+                box_threshold=args.object_localization_box_threshold,
+                text_threshold=args.object_localization_text_threshold,
+                automatic_score_threshold=(
+                    args.object_localization_automatic_score_threshold
+                ),
+                nms_iou_threshold=args.object_localization_nms_iou_threshold,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"invalid object-localization model bundle: {error}")
+        allowed_local_image_roots = tuple(
+            _absolute_directory(
+                parser,
+                value,
+                flag="--allow-local-image-root",
+            )
+            for value in args.allow_local_image_root
+        )
+    if args.enable_point_grasp:
+        if not args.enable_object_localization or object_localizer is None:
+            parser.error("--enable-point-grasp requires --enable-object-localization to share SAM2")
+        if args.point_grasp_asset_bundle is None:
+            parser.error("--enable-point-grasp requires --point-grasp-asset-bundle")
+        grasp_bundle = _absolute_directory(
+            parser, args.point_grasp_asset_bundle, flag="--point-grasp-asset-bundle"
+        )
+        try:
+            if args.point_grasp_backend == "graspnet":
+                grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(grasp_bundle)
+                point_grasp_planner = Sam2GraspNetPointGraspPlanner(
+                    model_spec=grasp_spec,
+                    point_segmenter=object_localizer,
+                    device=args.point_grasp_device,
+                )
+            else:
+                grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(grasp_bundle)
+                point_grasp_planner = Sam2VgnPointGraspPlanner(
+                    model_spec=grasp_spec,
+                    point_segmenter=object_localizer,
+                    device=args.point_grasp_device,
+                )
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"invalid point-grasp model bundle: {error}")
     read_only_clients = tuple(
         (str(client_id), int(uid_text))
         for client_id, uid_text in args.ssh_read_only_client
@@ -169,6 +301,9 @@ def main(argv: list[str] | None = None) -> int:
         runtime_session_id=_runtime_session_id(args.runtime_session_id),
         control_domain_id=args.control_domain_id,
         scene_geometry_hash=scene_geometry_hash,
+        object_localizer=object_localizer,
+        point_grasp_planner=point_grasp_planner,
+        allowed_local_image_roots=allowed_local_image_roots,
         max_retained_operations=args.max_retained_operations,
         peer_idle_timeout_sec=peer_timeout,
     )
@@ -191,6 +326,15 @@ def main(argv: list[str] | None = None) -> int:
                     "deployment_profile_hash": composition.deployment_profile_hash,
                     "rgb_roles": list(composition.registration.profile.rgb_roles),
                     "depth_roles": list(composition.registration.profile.depth_roles),
+                    "object_localization_enabled": (
+                        composition.localization_registration is not None
+                    ),
+                    "point_grasp_enabled": (
+                        composition.point_grasp_registration is not None
+                    ),
+                    "local_path_test_input_enabled": bool(
+                        allowed_local_image_roots
+                    ),
                 },
                 sort_keys=True,
             ),

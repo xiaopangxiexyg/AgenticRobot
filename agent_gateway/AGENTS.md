@@ -41,14 +41,26 @@ profile explicitly binds a Station application port.
   historic RealTeleop attachment remains a compatibility path, not the owner
   of new real Skill deployment architecture.
 
-The optional real perception binding reuses the existing
-`perception.capture_rgb` and `perception.capture_depth` contracts. It owns one
-reviewed RealSense inventory and one transient Artifact store as application
-resources; an executor may only read an already-published immutable frame. It
-must never start, reset, restart, or close a device from a Skill invocation,
-and it must never call the motion port, command admission, dispatch, or HOLD.
+The optional real perception binding exposes the existing
+`perception.capture_rgb` and `perception.capture_depth` contracts and may add
+the supplied-image `perception.localize_objects` contract when its reviewed
+SAM2/Grounding DINO resource is enabled. It may additionally expose the read-only
+`perception.plan_point_grasp` contract when a reviewed VGN resource or an explicitly
+acknowledged noncommercial GraspNet resource is enabled;
+that Route consumes aligned RGB-D plus a clicked pixel and fixed-camera calibration,
+returns DMTAC M tool-TCP candidates, and must never invoke motion, IK, or gripper IO.
+It owns one reviewed RealSense
+inventory, optional read-only model lifecycle, and one transient Artifact store
+as application resources; a capture executor may only read an already-published
+immutable frame. A Skill invocation must never start, reset, restart, or close
+a camera or model, and it must never call the motion port, command admission,
+dispatch, or HOLD. Local-file image input is test-only, disabled by default,
+and restricted to explicit same-host roots; ordinary input uses Artifact upload.
 Resource startup belongs to the application transaction before the socket is
-published. A live frame must match the configured source key, hardware serial,
+published. Shared SAM2 must start before the point-grasp planner and close after it.
+VGN remains the default backend. GraspNet source and checkpoint are local-download-only
+and must not enter Git, the team asset archive, or a shared drive. A live frame must
+match the configured source key, hardware serial,
 source generation, freshness bound, and Station revision. Depth additionally
 requires a numeric trusted camera-to-world pose for that exact role; a moving
 wrist camera cannot reuse a static arm-base pose and remains unavailable until

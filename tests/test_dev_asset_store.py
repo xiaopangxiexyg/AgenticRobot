@@ -72,6 +72,20 @@ def test_store_status_requires_only_default_bundles(tmp_path: Path) -> None:
     assert any(
         not item.available for item in status.bundles if not item.required_by_default
     )
+    localization = next(
+        item
+        for item in status.bundles
+        if item.bundle_id == "perception.sam2_grounding_dino"
+    )
+    assert localization.relative_path == "perception/sam2_grounding_dino"
+    assert localization.required_by_default is False
+    point_grasp = next(
+        item
+        for item in status.bundles
+        if item.bundle_id == "perception.sam2_vgn_point_grasp"
+    )
+    assert point_grasp.relative_path == "perception/sam2_vgn_point_grasp"
+    assert point_grasp.required_by_default is False
 
 
 def test_resolution_precedence_is_explicit_environment_git_then_worktree(

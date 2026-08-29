@@ -23,6 +23,7 @@ from dataset_contracts.perception_artifacts import (
 )
 
 from .definition import CAPTURE_DEPTH_SKILL_ID_V1, CAPTURE_RGB_SKILL_ID_V1
+from .definition import LOCALIZE_OBJECTS_SKILL_ID_V1
 
 
 def _semantic_roles(values: tuple[str, ...]) -> tuple[str, ...]:
@@ -254,6 +255,311 @@ def validate_capture_depth_result_for_parameters_v1(
 def validate_no_task_evaluation_v1(payload: Mapping[str, Any]) -> None:
     if not isinstance(payload, Mapping) or payload:
         raise ValueError("Passive perception capture has no task evaluation payload.")
+
+
+def localize_objects_schema_entry_v1(
+    *,
+    skill_definition_hash: str,
+    parameter_profile_id: str,
+    parameter_profile_hash: str,
+    max_detections: int,
+) -> AgentSkillSchemaEntry:
+    """Build strict schemas for automatic or text-prompted bounding boxes."""
+
+    if (
+        isinstance(max_detections, bool)
+        or not isinstance(max_detections, int)
+        or not 1 <= max_detections <= 256
+    ):
+        raise ValueError("max_detections must be between one and 256.")
+    nullable_prompt = {
+        "anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 256},
+            {"type": "null"},
+        ]
+    }
+    nullable_path = {
+        "anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 4096},
+            {"type": "null"},
+        ]
+    }
+    parameter_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "input_source": {"type": "string", "enum": ["artifact", "local_path"]},
+            "local_image_path": nullable_path,
+            "language_prompt": nullable_prompt,
+            "max_detections": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": max_detections,
+            },
+        },
+        "required": [
+            "input_source",
+            "local_image_path",
+            "language_prompt",
+            "max_detections",
+        ],
+    }
+    detection_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "ordinal": {"type": "integer", "minimum": 0},
+            "box_xyxy": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {"type": "integer", "minimum": 0},
+            },
+            "score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "label": nullable_prompt,
+        },
+        "required": ["ordinal", "box_xyxy", "score", "label"],
+    }
+    execution_result_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "input_source": {"type": "string", "enum": ["artifact", "local_path"]},
+            "input_media_content_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "mode": {"type": "string", "enum": ["automatic", "text"]},
+            "language_prompt": nullable_prompt,
+            "image_width": {"type": "integer", "minimum": 1},
+            "image_height": {"type": "integer", "minimum": 1},
+            "coordinate_format": {"const": "xyxy_pixel_0based_half_open"},
+            "detections": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": max_detections,
+                "items": detection_schema,
+            },
+            "detection_count": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": max_detections,
+            },
+            "model_profile_id": {"type": "string", "minLength": 1},
+            "model_profile_hash": {"type": "string", "minLength": 1},
+            "annotated_image_media_content_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+        },
+        "required": [
+            "input_source",
+            "input_media_content_hash",
+            "mode",
+            "language_prompt",
+            "image_width",
+            "image_height",
+            "coordinate_format",
+            "detections",
+            "detection_count",
+            "model_profile_id",
+            "model_profile_hash",
+            "annotated_image_media_content_hash",
+        ],
+    }
+    task_evaluation_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {},
+        "required": [],
+    }
+    profile = SkillParameterProfileRef(
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+        parameter_schema_hash=agent_skill_schema_document_hash(
+            parameter_schema,
+            schema_kind="parameter",
+        ),
+    )
+    return AgentSkillSchemaEntry(
+        skill_id=LOCALIZE_OBJECTS_SKILL_ID_V1,
+        skill_version="1",
+        skill_definition_hash=skill_definition_hash,
+        parameter_schema=parameter_schema,
+        execution_result_schema=execution_result_schema,
+        task_evaluation_schema=task_evaluation_schema,
+        parameter_profiles=(profile,),
+    )
+
+
+def _optional_trimmed_text(
+    value: object,
+    *,
+    field_name: str,
+    maximum: int,
+) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+    ):
+        raise ValueError(f"{field_name} must be null or a bounded trimmed string.")
+    return value
+
+
+def validate_localize_objects_parameters_v1(
+    payload: Mapping[str, Any],
+    *,
+    max_detections: int,
+    local_path_enabled: bool,
+) -> None:
+    fields = {
+        "input_source",
+        "local_image_path",
+        "language_prompt",
+        "max_detections",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != fields:
+        raise ValueError("Object localization parameter fields do not match the schema.")
+    source = payload["input_source"]
+    if source not in {"artifact", "local_path"}:
+        raise ValueError("Object localization input_source is unsupported.")
+    path = _optional_trimmed_text(
+        payload["local_image_path"],
+        field_name="local_image_path",
+        maximum=4096,
+    )
+    if source == "artifact" and path is not None:
+        raise ValueError("Artifact input cannot also supply local_image_path.")
+    if source == "local_path":
+        if not local_path_enabled:
+            raise ValueError("Local-path test input is disabled for this deployment.")
+        if path is None or not path.startswith("/"):
+            raise ValueError("Local-path test input requires one absolute path.")
+    _optional_trimmed_text(
+        payload["language_prompt"],
+        field_name="language_prompt",
+        maximum=256,
+    )
+    requested = payload["max_detections"]
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, int)
+        or not 1 <= requested <= max_detections
+    ):
+        raise ValueError("max_detections is outside the deployment bound.")
+
+
+def validate_localize_objects_result_v1(
+    payload: Mapping[str, Any],
+    *,
+    max_detections: int,
+    model_profile_id: str,
+    model_profile_hash: str,
+) -> None:
+    fields = {
+        "input_source",
+        "input_media_content_hash",
+        "mode",
+        "language_prompt",
+        "image_width",
+        "image_height",
+        "coordinate_format",
+        "detections",
+        "detection_count",
+        "model_profile_id",
+        "model_profile_hash",
+        "annotated_image_media_content_hash",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != fields:
+        raise ValueError("Object localization result fields do not match the schema.")
+    if payload["input_source"] not in {"artifact", "local_path"}:
+        raise ValueError("Object localization result input_source changed.")
+    for field_name in (
+        "input_media_content_hash",
+        "annotated_image_media_content_hash",
+    ):
+        digest = payload[field_name]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"{field_name} must be a lowercase SHA-256 digest.")
+    prompt = _optional_trimmed_text(
+        payload["language_prompt"],
+        field_name="language_prompt",
+        maximum=256,
+    )
+    expected_mode = "text" if prompt is not None else "automatic"
+    if payload["mode"] != expected_mode:
+        raise ValueError("Object localization mode disagrees with language_prompt.")
+    dimensions = []
+    for field_name in ("image_width", "image_height"):
+        value = payload[field_name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("Object localization image dimensions must be positive.")
+        dimensions.append(value)
+    width, height = dimensions
+    if payload["coordinate_format"] != "xyxy_pixel_0based_half_open":
+        raise ValueError("Object localization coordinate semantics changed.")
+    detections = payload["detections"]
+    if (
+        not isinstance(detections, (list, tuple))
+        or len(detections) > max_detections
+        or payload["detection_count"] != len(detections)
+    ):
+        raise ValueError("Object localization detection count is invalid.")
+    detection_fields = {"ordinal", "box_xyxy", "score", "label"}
+    for ordinal, detection in enumerate(detections):
+        if not isinstance(detection, Mapping) or set(detection) != detection_fields:
+            raise ValueError("Object localization detection fields changed.")
+        if detection["ordinal"] != ordinal:
+            raise ValueError("Object localization detection ordinals must be contiguous.")
+        box = detection["box_xyxy"]
+        if (
+            not isinstance(box, (list, tuple))
+            or len(box) != 4
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in box)
+        ):
+            raise ValueError("Object localization boxes must contain four integers.")
+        x_min, y_min, x_max, y_max = box
+        if not (0 <= x_min < x_max <= width and 0 <= y_min < y_max <= height):
+            raise ValueError("Object localization box is outside the image.")
+        score = detection["score"]
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+            or not 0.0 <= float(score) <= 1.0
+        ):
+            raise ValueError("Object localization score must be in [0, 1].")
+        label = _optional_trimmed_text(
+            detection["label"],
+            field_name="detection.label",
+            maximum=256,
+        )
+        if prompt is None and label is not None:
+            raise ValueError("Automatic localization detections must not invent labels.")
+    if payload["model_profile_id"] != model_profile_id:
+        raise ValueError("Object localization model_profile_id changed.")
+    if payload["model_profile_hash"] != model_profile_hash:
+        raise ValueError("Object localization model_profile_hash changed.")
+
+
+def validate_localize_objects_result_for_parameters_v1(
+    parameters: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> None:
+    if parameters.get("input_source") != result.get("input_source"):
+        raise ValueError("Object localization result input_source differs from request.")
+    if parameters.get("language_prompt") != result.get("language_prompt"):
+        raise ValueError("Object localization result prompt differs from request.")
+    if result.get("detection_count", 0) > parameters.get("max_detections", 0):
+        raise ValueError("Object localization result exceeds requested detection bound.")
 
 
 def capture_rgb_schema_entry_v1(
@@ -503,6 +809,7 @@ __all__ = [
     "RGB_FRAME_SCHEMA_ID_V1",
     "capture_depth_schema_entry_v1",
     "capture_rgb_schema_entry_v1",
+    "localize_objects_schema_entry_v1",
     "validate_capture_depth_parameters_v1",
     "validate_capture_depth_result_for_parameters_v1",
     "validate_capture_depth_result_v1",
@@ -510,4 +817,7 @@ __all__ = [
     "validate_capture_rgb_result_for_parameters_v1",
     "validate_capture_rgb_result_v1",
     "validate_no_task_evaluation_v1",
+    "validate_localize_objects_parameters_v1",
+    "validate_localize_objects_result_for_parameters_v1",
+    "validate_localize_objects_result_v1",
 ]

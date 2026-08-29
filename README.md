@@ -10,9 +10,163 @@
 python scripts/dev_asset_store.py configure --asset-root /absolute/path/to/assets
 ```
 
-不要为每个 linked worktree 重复复制约 3 GB 资产。配置一次后，`claim_worktree.py`
+不要为每个 linked worktree 重复复制基础约 3 GB 资产和可选模型权重。配置一次后，`claim_worktree.py`
 会自动建立兼容映射并验证必需的 RM65 bundle；详细规则见
 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
+
+## 2. 安装 SAM2 + Grounding DINO 物体定位 Skill（可选）
+
+`perception.localize_objects` 支持两种单帧图片输入：不传 language prompt 时由 SAM2 自动提出物体
+bbox；传入 `apple` 等 prompt 时由 Grounding DINO 检测文本目标，再由 SAM2 精化 bbox。第三方源码
+不复制进本仓库，一键脚本会 clone 官方仓库、检出固定 commit、安装依赖、编译 Grounding DINO CUDA
+扩展并执行 GPU 算子 smoke test：
+
+```bash
+conda activate agenticvla
+bash scripts/install_perception_models.sh --backend cuda
+```
+
+默认源码目录是当前 Conda 环境的 `src/perception-models/`。重复执行是幂等的；如果第三方 checkout
+存在 tracked/staged 修改，脚本会停止而不会覆盖。完整参数见：
+
+```bash
+bash scripts/install_perception_models.sh --help
+```
+
+### 需要下载的两个权重
+
+基础 `assets.zip` 当前不包含下面两个可选模型权重，需要从模型发布方下载后放进同一个共享 assets 根：
+
+| 模型 | 必须使用的文件名 | 官方发布页 | 直接下载地址 |
+|---|---|---|---|
+| SAM2.1 Hiera Large | `sam2.1_hiera_large.pt` | [Meta SAM2 checkpoints](https://github.com/facebookresearch/sam2#download-checkpoints) | [Meta 权重文件](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt) |
+| Grounding DINO Swin-T OGC | `groundingdino_swint_ogc.pth` | [Grounding DINO v0.1.0-alpha release](https://github.com/IDEA-Research/GroundingDINO/releases/tag/v0.1.0-alpha) | [Grounding DINO 权重文件](https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth) |
+
+```bash
+export DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets
+export PERCEPTION_BUNDLE="${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino"
+mkdir -p "${PERCEPTION_BUNDLE}"
+
+curl -fL \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt \
+  -o "${PERCEPTION_BUNDLE}/sam2.1_hiera_large.pt"
+curl -fL \
+  https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth \
+  -o "${PERCEPTION_BUNDLE}/groundingdino_swint_ogc.pth"
+
+cp docs/agent_gateway/examples/sam2_grounding_dino_asset_manifest.example.json \
+  "${PERCEPTION_BUNDLE}/manifest.json"
+sha256sum \
+  "${PERCEPTION_BUNDLE}/sam2.1_hiera_large.pt" \
+  "${PERCEPTION_BUNDLE}/groundingdino_swint_ogc.pth"
+```
+
+把 `sha256sum` 输出的两个真实值分别填入 `manifest.json` 对应的 `sha256` 字段。示例 manifest 已固定
+经过审查的 SAM2 和 Grounding DINO commit；权重哈希仍故意是全零占位符，不替换就会拒绝启动。
+
+### 用一张本地图片运行真实端到端推理
+
+下面的验证不启动相机、不连接机械臂，也不需要 Agent Gateway。输入只接受 JPEG/PNG，输出 JSON 中的
+bbox 格式固定为 `xyxy_pixel_0based_half_open`，同时生成画框 JPEG：
+
+```bash
+mkdir -p /tmp/agenticvla-perception-output
+
+# 1. SAM2 自动发现图片中的物体
+python -m deployments.perception.localize_image_cli \
+  --asset-bundle "${PERCEPTION_BUNDLE}" \
+  --input-image /absolute/path/to/test.jpg \
+  --output-json /tmp/agenticvla-perception-output/automatic.json \
+  --output-image /tmp/agenticvla-perception-output/automatic.jpg
+
+# 2. Grounding DINO + SAM2 定位文本指定的物体
+python -m deployments.perception.localize_image_cli \
+  --asset-bundle "${PERCEPTION_BUNDLE}" \
+  --input-image /absolute/path/to/test.jpg \
+  --language-prompt apple \
+  --output-json /tmp/agenticvla-perception-output/apple.json \
+  --output-image /tmp/agenticvla-perception-output/apple.jpg
+```
+
+输出已存在时命令默认拒绝覆盖；确认需要替换时显式加 `--overwrite`。完整 Gateway Skill 的启动、
+Artifact 上传和测试用本机路径边界见
+[`SAM2_GROUNDING_DINO.md`](./docs/agent_gateway/SAM2_GROUNDING_DINO.md)。
+
+## 3. 安装 SAM2 + VGN/GraspNet 点击抓姿 Skill（可选）
+
+`perception.plan_point_grasp` 接受对齐 RGB-D、图片点击点、固定相机内参和
+`T_base_from_camera`，返回最多 5 个排序后的 DMTAC M `tool_tcp` 候选，同时给出
+`T_camera_from_tcp` 与 `T_base_from_tcp`。它是纯只读 Skill，只产生建议，不执行机械臂或夹爪命令。
+
+默认后端是 VGN。第三方源码由一键脚本从 Git 安装，不会放进本仓库或 assets：
+
+```bash
+conda activate agenticvla
+bash scripts/install_point_grasp_models.sh --backend cuda
+```
+
+脚本固定 [VGN](https://github.com/ethz-asl/vgn.git) commit
+`d7af0622433f52ae88ebe81533f12b46b33e951a`，并复用上一节固定的 SAM2 checkout。所需新增权重只有
+`vgn_conv.pth`：从 VGN 官方
+[Google Drive 模型包](https://drive.google.com/file/d/1MysYHve3ooWiLq12b58Nm8FWiFBMH-bJ/view?usp=sharing)
+下载 `data.zip`，取出 `data/models/vgn_conv.pth`，放到：
+
+```text
+assets/perception/sam2_vgn_point_grasp/vgn_conv.pth
+```
+
+复制示例 manifest，并将全零 SHA-256 替换为文件的真实哈希：
+
+```bash
+export POINT_GRASP_BUNDLE="${DEXTELEOP_ASSET_ROOT}/perception/sam2_vgn_point_grasp"
+mkdir -p "${POINT_GRASP_BUNDLE}"
+cp /path/extracted/data/models/vgn_conv.pth "${POINT_GRASP_BUNDLE}/vgn_conv.pth"
+cp docs/agent_gateway/examples/sam2_vgn_point_grasp_asset_manifest.example.json \
+  "${POINT_GRASP_BUNDLE}/manifest.json"
+sha256sum "${POINT_GRASP_BUNDLE}/vgn_conv.pth"
+```
+
+项目严格限于非商业研究时，也可选择 [GraspNet baseline](https://github.com/graspnet/graspnet-baseline.git)
+后端。其许可证和 checkpoint 不允许按本项目的统一资产方式再分发，因此每位使用者必须自行确认
+许可证、运行带显式确认 flag 的安装命令，并把官方 `checkpoint-rs.tar` 下载到仓库和共享
+`assets.zip` 之外的本机私有 bundle：
+
+```bash
+bash scripts/install_point_grasp_models.sh \
+  --backend cuda \
+  --with-graspnet \
+  --accept-graspnet-noncommercial-license \
+  --cuda-arch-list 8.9
+```
+
+官方 checkpoint 下载页、私有 manifest 准备方式和完整许可证边界见
+[`POINT_GRASP.md`](./docs/agent_gateway/POINT_GRASP.md#可选-graspnet-后端非商业研究限定)。不得把
+GraspNet 源码、checkpoint 或包含它们的 bundle 加入 Git、团队共享网盘或统一 `assets.zip`。
+
+用一张本地 RGB-D 做真实 GPU 端到端推理：
+
+```bash
+python -m deployments.perception.point_grasp_image_cli \
+  --sam2-asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
+  --point-grasp-asset-bundle "${POINT_GRASP_BUNDLE}" \
+  --input-rgb /absolute/path/to/frame.png \
+  --input-depth /absolute/path/to/aligned_depth_m_float32.npy \
+  --calibration-json /absolute/path/to/fixed_camera_calibration.json \
+  --target-u 640 --target-v 360 --max-candidates 5 \
+  --output-json /tmp/point-grasp.json \
+  --output-image /tmp/point-grasp.jpg
+```
+
+使用 GraspNet 时，把默认命令中的 point-grasp bundle 参数替换为：
+
+```bash
+  --point-grasp-backend graspnet \
+  --point-grasp-asset-bundle /absolute/private/graspnet-point-grasp
+```
+
+深度必须为对齐 RGB 的 C-order `float32` H×W NPY，单位米。标定文件格式、Gateway 完整启动命令、
+官方权重包提取方式、当前 simulation 使用的 DMTAC M URDF，以及单视角碰撞检查局限见
+[`POINT_GRASP.md`](./docs/agent_gateway/POINT_GRASP.md)。
 
 DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy deploy、replay、simulation
 和 dataset contracts。运行命令按领域统一维护在 [`docs/`](./docs/README.md)，不要从历史

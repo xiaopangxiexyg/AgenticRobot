@@ -35,6 +35,36 @@ from .config import CubeLiftTaskConfig
 # qref is valid.  This is a simulator numerical-recovery tolerance only; it
 # does not alter the shared planner or any real-robot limit.
 SIM_RM65_JOINT_LIMIT_RECOVERY_TOLERANCE_RAD = 1e-4
+# Keep pose-IK position references deliberately inside the unchanged hard
+# limits.  MuJoCo models a revolute range as a soft constraint and the fitted
+# position servo can overshoot a reference that lies exactly on the bound.
+# One milliradian (0.057 deg) is large compared with the observed numerical
+# residual, but negligible compared with the RM65 working range.
+SIM_RM65_POSE_QREF_LIMIT_MARGIN_RAD = 1e-3
+
+
+def inset_joint_position_target(
+    target: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    *,
+    margin_rad: float = SIM_RM65_POSE_QREF_LIMIT_MARGIN_RAD,
+) -> np.ndarray:
+    """Clip a pose-IK qref to an inset of the existing hard joint bounds."""
+
+    values = np.asarray(target, dtype=float)
+    minimum = np.asarray(lower, dtype=float)
+    maximum = np.asarray(upper, dtype=float)
+    if values.shape != minimum.shape or values.shape != maximum.shape:
+        raise ValueError("Pose qref and joint-limit arrays must have matching shapes.")
+    margin = float(margin_rad)
+    if not np.isfinite(margin) or margin < 0.0:
+        raise ValueError("Pose qref joint-limit margin must be finite and non-negative.")
+    inset_lower = minimum + margin
+    inset_upper = maximum - margin
+    if np.any(inset_lower > inset_upper):
+        raise ValueError("Pose qref joint-limit margin leaves an empty joint range.")
+    return np.clip(values, inset_lower, inset_upper)
 
 
 def _load_endpoint_to_tool_transform(path: str | Path, *, side: str) -> np.ndarray:
@@ -519,5 +549,7 @@ __all__ = [
     "CubeLiftPoseActionController",
     "CubeLiftPoseActionStep",
     "CubeLiftPosePlannerSyncStatus",
+    "SIM_RM65_POSE_QREF_LIMIT_MARGIN_RAD",
     "SIM_RM65_JOINT_LIMIT_RECOVERY_TOLERANCE_RAD",
+    "inset_joint_position_target",
 ]

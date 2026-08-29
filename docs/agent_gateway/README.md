@@ -8,6 +8,10 @@ profile 负责装配 MuJoCo 或真机下层 owner。它不启动上层 Planner�
 本页是 Agent Gateway 的正式运行入口。协议与 package 所有权细节见
 [`agent_gateway/README.md`](../../agent_gateway/README.md)；局域网开发者的 SSH 只读接入见
 [`SSH_READ_ONLY.md`](./SSH_READ_ONLY.md)。
+SAM2 + Grounding DINO 图片定位 Skill 的源码、权重和测试路径说明见
+[`SAM2_GROUNDING_DINO.md`](./SAM2_GROUNDING_DINO.md)。
+SAM2 + VGN/GraspNet 点击引导 DMTAC M 抓姿 Skill 的 RGB-D、固定相机标定、权重和只读边界见
+[`POINT_GRASP.md`](./POINT_GRASP.md)。
 
 ## 边界和运行等级
 
@@ -64,6 +68,7 @@ python -m agent_gateway mujoco \
 
 ```bash
 python -m agent_gateway real-rm65 --help
+python -m agent_gateway real-perception --help
 ```
 
 `real-rm65` 会装配独占的双 RM65 下层 owner，并要求 profile、设备、safety envelope 和
@@ -71,6 +76,22 @@ python -m agent_gateway real-rm65 --help
 不要把它当作 camera-only diagnostic。正式参数、启动门禁和关闭顺序以
 [`agent_gateway/README.md`](../../agent_gateway/README.md#entrypoints) 为准，运行前仍需明确
 真机授权和现场安全检查。
+
+### 真机只读 perception profile（H1）
+
+```bash
+python -m agent_gateway real-perception --help
+```
+
+`real-perception` 不创建 RM65 backend，只装配 RealSense、Artifact store 和只读 Skill。默认公开
+RGB/depth capture；提供经过验证的模型 bundle 并显式启用后，还会公开
+`perception.localize_objects`；再提供默认 VGN bundle 或非商业研究限定的本地 GraspNet bundle，
+可公开只读的 `perception.plan_point_grasp`。GraspNet 源码和 checkpoint 不进入 Git、团队网盘或
+统一 `assets.zip`，必须由每位使用者自行下载并显式接受其许可证。
+模型权重、外部 Git 源码和本机测试图片白名单见
+[`SAM2_GROUNDING_DINO.md`](./SAM2_GROUNDING_DINO.md) 与
+[`POINT_GRASP.md`](./POINT_GRASP.md)。静态图片测试仍会启动这个 profile 的
+RealSense inventory；它不是无相机的独立模型 server。
 
 ## 状态、占用与并发
 

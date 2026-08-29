@@ -5,7 +5,7 @@
       "resource_id": "development-assets",
       "classification": "shared-read-mostly",
       "migration": "asset-store-link",
-      "summary": "Unpacked robot models and other reviewed development asset bundles.",
+      "summary": "Unpacked robot models, reviewed model weights, and other read-mostly development asset bundles.",
       "locations": [
         {
           "label": "development asset root",

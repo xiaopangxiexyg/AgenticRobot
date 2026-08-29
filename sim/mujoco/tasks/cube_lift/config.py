@@ -17,6 +17,7 @@ from robot_motion.position_control import DEFAULT_POSITION_COMMAND_HZ
 from sim.contracts import SimulationContract
 
 from ...actuation import (
+    cad_bimanual_dmtac_gripper_profile,
     cube_lift_contact_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
@@ -86,6 +87,7 @@ def resolve_dmtac_gripper_actuation_profile(name: str):
         for profile in (
             identified_bimanual_dmtac_gripper_profile(),
             cube_lift_contact_dmtac_gripper_profile(),
+            cad_bimanual_dmtac_gripper_profile(),
         )
     }
     try:

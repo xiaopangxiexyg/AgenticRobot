@@ -1,0 +1,14 @@
+{
+  "schema_version": "dexteleop.perception_graspnet_point_grasp_assets.v1",
+  "model_profile_id": "graspnet-realsense-dmtac-m-point-grasp.v1",
+  "source": {
+    "git_url": "https://github.com/graspnet/graspnet-baseline.git",
+    "revision": "280c215129f759ed8649cb4e89fc5dfee55f4f80"
+  },
+  "checkpoint": {
+    "relative_path": "checkpoint-rs.tar",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "model_type": "realsense"
+  },
+  "license_acknowledgement": "graspnet_noncommercial_research_only_local_download_no_team_redistribution.v1"
+}

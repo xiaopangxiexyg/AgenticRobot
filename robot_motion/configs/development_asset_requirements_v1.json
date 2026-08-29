@@ -41,6 +41,25 @@
         "setup.py",
         "dmrobotics"
       ]
+    },
+    {
+      "bundle_id": "perception.sam2_grounding_dino",
+      "relative_path": "perception/sam2_grounding_dino",
+      "required_by_default": false,
+      "required_paths": [
+        "manifest.json",
+        "sam2.1_hiera_large.pt",
+        "groundingdino_swint_ogc.pth"
+      ]
+    },
+    {
+      "bundle_id": "perception.sam2_vgn_point_grasp",
+      "relative_path": "perception/sam2_vgn_point_grasp",
+      "required_by_default": false,
+      "required_paths": [
+        "manifest.json",
+        "vgn_conv.pth"
+      ]
     }
   ]
 }
