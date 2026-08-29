@@ -16,8 +16,9 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from .perception_deployment import (
     REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
     RealPerceptionCaptureRegistration,
-    build_real_perception_capture_registration,
+    build_real_perception_capture_registration_v2,
 )
+from .perception_frames import RealPerceptionFrameBinding
 from .perception_gateway import (
     RealPerceptionContractBundle,
     RealPerceptionGatewaySession,
@@ -176,6 +177,7 @@ class CameraOnlyRealPerceptionApplication:
 @dataclass(frozen=True)
 class CameraOnlyRealPerceptionComposition:
     source_binding: RealPerceptionSourceBinding
+    frame_binding: RealPerceptionFrameBinding
     registration: RealPerceptionCaptureRegistration
     contract_bundle: RealPerceptionContractBundle
     artifact_store: RecoverableAgentArtifactStore
@@ -195,7 +197,7 @@ def assemble_camera_only_real_perception_composition(
     client_bindings: AgentGatewayUnixClientBindings,
     runtime_session_id: str,
     control_domain_id: str,
-    scene_geometry_hash: str,
+    frame_binding: RealPerceptionFrameBinding,
     max_retained_operations: int = 16,
     peer_idle_timeout_sec: float = 10.0,
     clock: Callable[[], float] = time.time,
@@ -204,6 +206,8 @@ def assemble_camera_only_real_perception_composition(
 
     if not isinstance(source_binding, RealPerceptionSourceBinding):
         raise TypeError("source_binding must be typed.")
+    if not isinstance(frame_binding, RealPerceptionFrameBinding):
+        raise TypeError("frame_binding must be typed.")
     if not isinstance(client_bindings, AgentGatewayUnixClientBindings):
         raise TypeError("client_bindings must be typed.")
     endpoint = Path(socket_path)
@@ -212,13 +216,13 @@ def assemble_camera_only_real_perception_composition(
         raise ValueError("socket_path and artifact_root must be absolute.")
     runtime_id = str(runtime_session_id).strip()
     domain_id = str(control_domain_id).strip()
-    geometry_hash = str(scene_geometry_hash).strip()
-    if not runtime_id or not domain_id or not geometry_hash:
-        raise ValueError("session, control-domain, and geometry IDs are required.")
+    if not runtime_id or not domain_id:
+        raise ValueError("session and control-domain IDs are required.")
+    frame_graph_hash = frame_binding.frame_graph.semantic_content_hash
     target_binding_hash = canonical_content_hash(
         {
             "source_binding_hash": source_binding.semantic_content_hash,
-            "scene_geometry_hash": geometry_hash,
+            "frame_binding_hash": frame_binding.semantic_content_hash,
             "resource_kind": "camera_bundle",
         },
         domain="dexteleop.real_perception.target_binding.v1",
@@ -226,7 +230,11 @@ def assemble_camera_only_real_perception_composition(
     target_binding_id = "real-realsense-only:" + target_binding_hash
     station_manifest_hash = canonical_content_hash(
         {
-            "scene_geometry_hash": geometry_hash,
+            "frame_graph_hash": frame_graph_hash,
+            "reference_frame_id": frame_binding.reference_frame_id,
+            "reference_frame_spec_hash": (
+                frame_binding.reference_frame_spec_hash
+            ),
             "source_binding_hash": source_binding.semantic_content_hash,
         },
         domain="dexteleop.real_perception.station_manifest.v1",
@@ -246,7 +254,7 @@ def assemble_camera_only_real_perception_composition(
         current_station_revision=lambda: 0,
         clock=clock,
     )
-    registration = build_real_perception_capture_registration(
+    registration = build_real_perception_capture_registration_v2(
         rgb_source_catalog=catalog_provider.rgb_source_catalog(),
         depth_source_catalog=catalog_provider.depth_source_catalog(),
         runtime_session_id=runtime_id,
@@ -255,6 +263,7 @@ def assemble_camera_only_real_perception_composition(
         station_manifest_hash=station_manifest_hash,
         execution_manifest_hash=execution_manifest_hash,
         source_binding_hash=source_binding.semantic_content_hash,
+        frame_binding=frame_binding,
         current_mode="real_observe",
     )
     tool_config_hash = canonical_content_hash(
@@ -265,7 +274,7 @@ def assemble_camera_only_real_perception_composition(
     bundle = build_real_perception_contract_bundle(
         registration=registration,
         source_binding_id=source_binding_id,
-        frame_graph_hash=geometry_hash,
+        frame_graph_hash=frame_graph_hash,
         tool_config_hash=tool_config_hash,
         calibration_hash=source_binding.semantic_content_hash,
     )
@@ -312,7 +321,8 @@ def assemble_camera_only_real_perception_composition(
     deployment_profile_hash = canonical_content_hash(
         {
             "source_binding_hash": source_binding.semantic_content_hash,
-            "scene_geometry_hash": geometry_hash,
+            "frame_binding_hash": frame_binding.semantic_content_hash,
+            "frame_graph_hash": frame_graph_hash,
             "route_manifest_hash": bundle.route_manifest.semantic_content_hash,
             "artifact_max_bytes": REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
             "robot_backend": "absent",
@@ -321,6 +331,7 @@ def assemble_camera_only_real_perception_composition(
     )
     return CameraOnlyRealPerceptionComposition(
         source_binding=source_binding,
+        frame_binding=frame_binding,
         registration=registration,
         contract_bundle=bundle,
         artifact_store=artifact_store,

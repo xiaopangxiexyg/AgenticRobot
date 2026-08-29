@@ -48,7 +48,10 @@ _CAMERA_REGISTRY = _REPO_ROOT / "robot_motion/configs/rm65_camera_registry.json"
 _COLLISION_SCENE_PROFILE = "dual_arm_hand_proxy_open"
 _RGB_SKILL_ID = "perception.capture_rgb"
 _DEPTH_SKILL_ID = "perception.capture_depth"
-_SKILL_VERSION = "1"
+_SKILL_VERSION_BY_ID = {
+    _RGB_SKILL_ID: "1",
+    _DEPTH_SKILL_ID: "2",
+}
 _REQUESTED_TIMEOUT_MS = 3_000
 _ARTIFACT_CHUNK_BYTES = 1024 * 1024
 
@@ -104,26 +107,32 @@ def _allocate_default_socket_path() -> tuple[Path, Path, Path]:
     return allocation.socket_path, allocation.endpoint_dir, endpoint_root
 
 
-def _scene_geometry() -> tuple[Mapping[str, np.ndarray], str]:
+def _scene_geometry() -> tuple[Mapping[str, np.ndarray], Any]:
     # Keep ``--help`` and parser inspection free of the optional control-stack
     # environment. Actual probing resolves only the checked-in scene geometry.
     from robot_motion.rm65 import (
         build_rm65_dual_arm_scene_profile,
         load_world_from_arm_base_transforms,
+        load_world_from_fixed_link_transform,
     )
+
+    from .perception_frames import build_real_perception_station_frame_binding
 
     scene_profile = build_rm65_dual_arm_scene_profile(_COLLISION_SCENE_PROFILE)
     world_from_base = load_world_from_arm_base_transforms(scene_profile)
-    geometry_hash = canonical_content_hash(
-        {
-            "collision_scene_profile": _COLLISION_SCENE_PROFILE,
-            "world_from_arm_base_by_side": {
-                side: world_from_base[side].tolist() for side in ("left", "right")
-            },
-        },
-        domain="dexteleop.real_perception.scene_geometry.v1",
+    scene_mount_hash = canonical_content_hash(
+        {side: world_from_base[side].tolist() for side in ("left", "right")},
+        domain="dexteleop.real_skill.rm65_scene_mounts.v1",
     )
-    return world_from_base, geometry_hash
+    frame_binding = build_real_perception_station_frame_binding(
+        collision_scene_profile=_COLLISION_SCENE_PROFILE,
+        scene_mount_hash=scene_mount_hash,
+        scene_world_from_canonical_station=load_world_from_fixed_link_transform(
+            scene_profile,
+            link_name="workspace_near_boundary_frame",
+        ),
+    )
+    return world_from_base, frame_binding
 
 
 def _build_source_binding(**kwargs: Any) -> Any:
@@ -193,7 +202,11 @@ def _request_payload(
     parameters: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     manifest = composition.contract_bundle.route_manifest
-    entry = manifest.route(skill_id, _SKILL_VERSION)
+    try:
+        skill_version = _SKILL_VERSION_BY_ID[skill_id]
+    except KeyError as exc:
+        raise ValueError("Probe requested an unknown perception Skill.") from exc
+    entry = manifest.route(skill_id, skill_version)
     route = entry.route
     profile = route.allowed_parameter_profiles[0]
     request_nonce = uuid.uuid4().hex
@@ -475,6 +488,13 @@ def _validate_depth_operation(
         "sha256": artifact["sha256"],
         "depth_min_m": float(depth.min()),
         "depth_max_m": float(depth.max()),
+        "station_revision": int(result["station_revision"]),
+        "reference_frame_id": result["reference_frame_id"],
+        "reference_frame_spec_hash": result["reference_frame_spec_hash"],
+        "frame_graph_hash": result["frame_graph_hash"],
+        "camera_pose_reference_xyz_quat_xyzw": list(
+            result["camera_pose_reference_xyz_quat_xyzw"]
+        ),
     }
 
 
@@ -491,7 +511,7 @@ def run_probe(
         raise ValueError("--operation-timeout-sec must be positive and finite.")
     endpoint = None if socket_path is None else Path(socket_path)
     owned_endpoint_dirs: tuple[Path, Path] | None = None
-    world_from_base, scene_geometry_hash = _scene_geometry()
+    world_from_base, frame_binding = _scene_geometry()
     source_binding = _build_source_binding(
         camera_config_path=_CAMERA_CONFIG,
         camera_registry_path=_CAMERA_REGISTRY,
@@ -517,7 +537,7 @@ def run_probe(
             client_bindings=client_bindings,
             runtime_session_id="real-perception-probe:" + uuid.uuid4().hex,
             control_domain_id="real-perception-probe",
-            scene_geometry_hash=scene_geometry_hash,
+            frame_binding=frame_binding,
         )
         _assert_no_motion_surface(composition)
         executor_errors = _capture_executor_errors(composition)

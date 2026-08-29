@@ -347,6 +347,20 @@ motion action, or `--confirm`. The selected collision-scene profile is read only
 to derive fixed arm-base geometry for static camera poses; it does not construct
 or connect a robot backend.
 
+Real Depth uses the shared v2 result contract. Each result pins the admitted
+`station_revision`, `canonical_station` frame specification, and complete
+source-world-to-Station graph hash, and reports
+`camera_pose_reference_xyz_quat_xyzw` as
+`T_canonical_station_camera_optical_frame`. The camera-only profile constructs
+the same typed `dual_arm_solver_world -> canonical_station` graph from the
+selected collision-scene URDF fixed-joint chain as the combined RM65 profile;
+it never substitutes a geometry digest for a frame graph. The provider retains
+its internal `T_dual_arm_solver_world_camera` calibration cut, while the
+Gateway rejects a revision change before or during Artifact commit. The legacy
+v1 registration builder and `camera_pose_world_xyz_quat_xyzw` projection remain
+available only for existing compatibility callers; production camera-only and
+RM65 perception composition use v2.
+
 For a finite input-Skill acceptance run, use the purpose-built probe from a
 clean checkout. It fixes the camera config, registry, and collision-scene
 profile to the reviewed repository values and exposes no robot, motion,
@@ -394,7 +408,7 @@ near-zero-frame rejection/restart behavior and zero software startup retries.
 Both capture Routes are `inspection` / `read_only` / `t0_read_only`: invoking
 them needs no motion Grant and cannot call command admission, dispatch, or
 HOLD. RGB is JPEG; depth is native-resolution float32 metric NPY with aligned
-color intrinsics and the trusted world pose. Payload bytes are committed to
+color intrinsics and the trusted canonical-Station camera pose. Payload bytes are committed to
 the same generic transient Artifact CAS and retrieved through `chunked_rpc` or
 a reviewed same-host `local_path` grant.
 

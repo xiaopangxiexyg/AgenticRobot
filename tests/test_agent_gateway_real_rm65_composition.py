@@ -22,6 +22,7 @@ from agent_gateway.profiles.real.rm65_composition import (
 )
 from dataset_contracts.pose_frames import load_pose_frame_contract
 from robot_motion.primitives import level_tcp_orientation
+from robot_motion.relative_action import pose_matrix_to_xyzquat, xyzquat_to_pose_matrix
 from robot_motion.rm65 import (
     build_rm65_dual_arm_scene_profile,
     load_world_from_arm_base_transforms,
@@ -337,6 +338,14 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
             "wrist_right",
         )
         assert composition.perception_capture.profile.depth_roles == ("main",)
+        assert composition.perception_frame_binding is not None
+        assert composition.perception_capture.frame_binding is (
+            composition.perception_frame_binding
+        )
+        assert composition.perception_capture.depth.routes[0].route_version == "2"
+        assert composition.perception_capture.depth_binding.frame_graph_hash == (
+            composition.frame_graph.semantic_content_hash
+        )
         assert session.service.protocol_runtime.session_capabilities.artifact_transfer_enabled
         assert session.rgb_executor is not None
         assert session.depth_executor is not None
@@ -373,6 +382,21 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
             composition.perception_source_binding
             .world_from_depth_camera_by_source["front"],
             expected_world_from_camera,
+        )
+        pose_station_camera = (
+            composition.perception_frame_binding
+            .camera_pose_reference_xyz_quat_xyzw(
+                pose_matrix_to_xyzquat(expected_world_from_camera)
+            )
+        )
+        expected_station_from_camera = (
+            np.linalg.inv(lower.profile.scene_world_from_canonical_station)
+            @ expected_world_from_camera
+        )
+        np.testing.assert_allclose(
+            xyzquat_to_pose_matrix(pose_station_camera),
+            expected_station_from_camera,
+            atol=1e-6,
         )
     finally:
         assert session.artifact_store is not None

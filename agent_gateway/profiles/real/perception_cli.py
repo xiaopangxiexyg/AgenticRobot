@@ -22,12 +22,14 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from robot_motion.rm65 import (
     build_rm65_dual_arm_scene_profile,
     load_world_from_arm_base_transforms,
+    load_world_from_fixed_link_transform,
 )
 
 from .perception_application import (
     CameraOnlyRealPerceptionApplicationState,
     assemble_camera_only_real_perception_composition,
 )
+from .perception_frames import build_real_perception_station_frame_binding
 from .realsense_perception import build_real_perception_source_binding
 
 
@@ -147,14 +149,19 @@ def main(argv: list[str] | None = None) -> int:
         validate_agent_gateway_unix_group_parent(socket_path=endpoint_value)
     scene_profile = build_rm65_dual_arm_scene_profile(args.collision_scene_profile)
     world_from_base = load_world_from_arm_base_transforms(scene_profile)
-    scene_geometry_hash = canonical_content_hash(
+    scene_mount_hash = canonical_content_hash(
         {
-            "collision_scene_profile": args.collision_scene_profile,
-            "world_from_arm_base_by_side": {
-                side: world_from_base[side].tolist() for side in ("left", "right")
-            },
+            side: world_from_base[side].tolist() for side in ("left", "right")
         },
-        domain="dexteleop.real_perception.scene_geometry.v1",
+        domain="dexteleop.real_skill.rm65_scene_mounts.v1",
+    )
+    frame_binding = build_real_perception_station_frame_binding(
+        collision_scene_profile=args.collision_scene_profile,
+        scene_mount_hash=scene_mount_hash,
+        scene_world_from_canonical_station=load_world_from_fixed_link_transform(
+            scene_profile,
+            link_name="workspace_near_boundary_frame",
+        ),
     )
     source_binding = build_real_perception_source_binding(
         camera_config_path=camera_config,
@@ -168,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         client_bindings=client_bindings,
         runtime_session_id=_runtime_session_id(args.runtime_session_id),
         control_domain_id=args.control_domain_id,
-        scene_geometry_hash=scene_geometry_hash,
+        frame_binding=frame_binding,
         max_retained_operations=args.max_retained_operations,
         peer_idle_timeout_sec=peer_timeout,
     )
@@ -189,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
                     "current_mode": manifest.current_mode,
                     "route_manifest_hash": manifest.semantic_content_hash,
                     "deployment_profile_hash": composition.deployment_profile_hash,
+                    "frame_graph_hash": frame_binding.frame_graph.semantic_content_hash,
+                    "reference_frame_id": frame_binding.reference_frame_id,
                     "rgb_roles": list(composition.registration.profile.rgb_roles),
                     "depth_roles": list(composition.registration.profile.depth_roles),
                 },

@@ -22,6 +22,7 @@ from agent_gateway.protocol.skill_registration import SkillRegistrationTemplate
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
 from agent_gateway.skills.perception.definition import (
     capture_depth_skill_definition_v1,
+    capture_depth_skill_definition_v2,
     capture_rgb_skill_definition_v1,
 )
 from agent_gateway.skills.perception.schemas import (
@@ -34,10 +35,13 @@ from agent_gateway.skills.perception.schemas import (
     RGB_FRAME_MEDIA_TYPE_V1,
     RGB_FRAME_SCHEMA_ID_V1,
     capture_depth_schema_entry_v1,
+    capture_depth_schema_entry_v2,
     capture_rgb_schema_entry_v1,
     validate_capture_depth_parameters_v1,
     validate_capture_depth_result_for_parameters_v1,
+    validate_capture_depth_result_for_parameters_v2,
     validate_capture_depth_result_v1,
+    validate_capture_depth_result_v2,
     validate_capture_rgb_parameters_v1,
     validate_capture_rgb_result_for_parameters_v1,
     validate_capture_rgb_result_v1,
@@ -45,10 +49,18 @@ from agent_gateway.skills.perception.schemas import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from .perception_frames import RealPerceptionFrameBinding
+
 REAL_CAPTURE_RGB_ROUTE_ID_V1 = "real.realsense.perception.capture_rgb"
 REAL_CAPTURE_DEPTH_ROUTE_ID_V1 = "real.realsense.perception.capture_depth"
+REAL_CAPTURE_DEPTH_ROUTE_ID_V2 = (
+    "real.realsense.perception.capture_depth_station"
+)
 REAL_CAPTURE_RGB_EXECUTOR_ID_V1 = "control-station.real-passive-rgb-capture.v1"
 REAL_CAPTURE_DEPTH_EXECUTOR_ID_V1 = "control-station.real-passive-depth-capture.v1"
+REAL_CAPTURE_DEPTH_EXECUTOR_ID_V2 = (
+    "control-station.real-passive-depth-capture.v2"
+)
 REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1 = "rgb_frames"
 REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1 = "depth_frame"
 REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1 = 16 * 1024 * 1024
@@ -230,14 +242,95 @@ class RealPerceptionDeploymentBinding:
 
 
 @dataclass(frozen=True)
+class RealPerceptionDepthDeploymentBindingV2:
+    deployment_binding_id: str
+    route_hash: str
+    runtime_session_id: str
+    control_domain_id: str
+    target_binding_id: str
+    station_manifest_hash: str
+    execution_manifest_hash: str
+    profile_hash: str
+    source_frame_id: str
+    source_frame_spec_hash: str
+    reference_frame_id: str
+    reference_frame_spec_hash: str
+    frame_graph_hash: str
+    executor_id: str = REAL_CAPTURE_DEPTH_EXECUTOR_ID_V2
+    deployment_binding_version: str = "2"
+
+    def __post_init__(self) -> None:
+        for field_name in self.__dataclass_fields__:
+            object.__setattr__(
+                self,
+                field_name,
+                _required(getattr(self, field_name), field_name=field_name),
+            )
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                field_name: getattr(self, field_name)
+                for field_name in self.__dataclass_fields__
+            }
+            | {
+                "target_kind": "real",
+                "control_effect_class": "read_only",
+                "downstream_control_effects": "forbidden",
+                "capture_owner": "exclusive_realsense_resource_owner",
+                "pose_semantics": "T_reference_camera_optical_frame",
+            },
+            domain="dexteleop.agent_skill.real_perception_depth_deployment.v2",
+        )
+
+    def to_ref(self) -> SkillDeploymentBindingRef:
+        return SkillDeploymentBindingRef(
+            deployment_binding_id=self.deployment_binding_id,
+            deployment_binding_hash=self.semantic_content_hash,
+            target_binding_id=self.target_binding_id,
+            target_kind="real",
+            execution_manifest_hash=self.execution_manifest_hash,
+        )
+
+
+@dataclass(frozen=True)
 class RealPerceptionCaptureRegistration:
     profile: RealPerceptionCaptureProfile
     rgb: SkillRegistrationTemplate
     depth: SkillRegistrationTemplate
     rgb_binding: RealPerceptionDeploymentBinding
-    depth_binding: RealPerceptionDeploymentBinding
+    depth_binding: (
+        RealPerceptionDeploymentBinding | RealPerceptionDepthDeploymentBindingV2
+    )
     payload_validators: tuple[AgentSkillPayloadValidatorSet, ...]
     availability_hash_by_route_hash: Mapping[str, str]
+    frame_binding: RealPerceptionFrameBinding | None = None
+
+    def __post_init__(self) -> None:
+        if self.frame_binding is None:
+            if not isinstance(self.depth_binding, RealPerceptionDeploymentBinding):
+                raise TypeError("Real Depth v1 requires its v1 deployment binding.")
+            return
+        if not isinstance(
+            self.depth_binding,
+            RealPerceptionDepthDeploymentBindingV2,
+        ):
+            raise TypeError("Real Depth v2 requires its v2 deployment binding.")
+        expected = {
+            "source_frame_id": self.frame_binding.source_frame_id,
+            "source_frame_spec_hash": self.frame_binding.source_frame_spec_hash,
+            "reference_frame_id": self.frame_binding.reference_frame_id,
+            "reference_frame_spec_hash": (
+                self.frame_binding.reference_frame_spec_hash
+            ),
+            "frame_graph_hash": self.frame_binding.frame_graph.semantic_content_hash,
+        }
+        if any(
+            getattr(self.depth_binding, field_name) != value
+            for field_name, value in expected.items()
+        ):
+            raise ValueError("Real Depth v2 binding differs from its typed frame graph.")
 
 
 def _source_tuples(
@@ -261,7 +354,7 @@ def _source_tuples(
     return tuple(values)
 
 
-def build_real_perception_capture_registration(
+def _build_real_perception_capture_registration(
     *,
     rgb_source_catalog: tuple[Mapping[str, object], ...],
     depth_source_catalog: tuple[Mapping[str, object], ...],
@@ -272,6 +365,7 @@ def build_real_perception_capture_registration(
     execution_manifest_hash: str,
     source_binding_hash: str,
     current_mode: str = "real_active",
+    frame_binding: RealPerceptionFrameBinding | None = None,
 ) -> RealPerceptionCaptureRegistration:
     """Build both exact T0 Routes from one reviewed real-camera inventory."""
 
@@ -285,7 +379,16 @@ def build_real_perception_capture_registration(
         source_binding_hash=source_binding_hash,
     )
     rgb_definition = capture_rgb_skill_definition_v1()
-    depth_definition = capture_depth_skill_definition_v1()
+    if frame_binding is not None and not isinstance(
+        frame_binding,
+        RealPerceptionFrameBinding,
+    ):
+        raise TypeError("frame_binding must be typed or None.")
+    depth_definition = (
+        capture_depth_skill_definition_v1()
+        if frame_binding is None
+        else capture_depth_skill_definition_v2()
+    )
     rgb_schema = capture_rgb_schema_entry_v1(
         skill_definition_hash=rgb_definition.semantic_content_hash,
         parameter_profile_id=profile.profile_id + ".rgb",
@@ -293,12 +396,25 @@ def build_real_perception_capture_registration(
         allowed_roles=profile.rgb_roles,
         max_total_bytes=profile.max_artifact_bytes,
     )
-    depth_schema = capture_depth_schema_entry_v1(
-        skill_definition_hash=depth_definition.semantic_content_hash,
-        parameter_profile_id=profile.profile_id + ".depth",
-        parameter_profile_hash=profile.semantic_content_hash,
-        allowed_roles=profile.depth_roles,
-    )
+    if frame_binding is None:
+        depth_schema = capture_depth_schema_entry_v1(
+            skill_definition_hash=depth_definition.semantic_content_hash,
+            parameter_profile_id=profile.profile_id + ".depth",
+            parameter_profile_hash=profile.semantic_content_hash,
+            allowed_roles=profile.depth_roles,
+        )
+    else:
+        depth_schema = capture_depth_schema_entry_v2(
+            skill_definition_hash=depth_definition.semantic_content_hash,
+            parameter_profile_id=profile.profile_id + ".depth_station",
+            parameter_profile_hash=profile.semantic_content_hash,
+            allowed_roles=profile.depth_roles,
+            reference_frame_id=frame_binding.reference_frame_id,
+            reference_frame_spec_hash=(
+                frame_binding.reference_frame_spec_hash
+            ),
+            frame_graph_hash=frame_binding.frame_graph.semantic_content_hash,
+        )
     rgb_io = SkillIOContract(
         skill_id=rgb_definition.skill_id,
         skill_version=rgb_definition.skill_version,
@@ -344,13 +460,13 @@ def build_real_perception_capture_registration(
         ),
     )
 
-    def route(definition, schema, io_contract, route_id):
+    def route(definition, schema, io_contract, route_id, *, route_version="1"):
         return SkillExecutionRoute(
             skill_id=definition.skill_id,
             skill_version=definition.skill_version,
             skill_definition_hash=definition.semantic_content_hash,
             route_id=route_id,
-            route_version="1",
+            route_version=route_version,
             parameter_schema_hash=schema.parameter_schema_hash,
             execution_result_schema_hash=schema.execution_result_schema_hash,
             task_evaluation_schema_hash=schema.task_evaluation_schema_hash,
@@ -374,7 +490,12 @@ def build_real_perception_capture_registration(
         depth_definition,
         depth_schema,
         depth_io,
-        REAL_CAPTURE_DEPTH_ROUTE_ID_V1,
+        (
+            REAL_CAPTURE_DEPTH_ROUTE_ID_V1
+            if frame_binding is None
+            else REAL_CAPTURE_DEPTH_ROUTE_ID_V2
+        ),
+        route_version="1" if frame_binding is None else "2",
     )
     rgb_registration = SkillRegistrationTemplate(
         definition=rgb_definition,
@@ -405,7 +526,31 @@ def build_real_perception_capture_registration(
         )
 
     rgb_binding = binding(rgb_route, REAL_CAPTURE_RGB_EXECUTOR_ID_V1, "rgb")
-    depth_binding = binding(depth_route, REAL_CAPTURE_DEPTH_EXECUTOR_ID_V1, "depth")
+    if frame_binding is None:
+        depth_binding = binding(
+            depth_route,
+            REAL_CAPTURE_DEPTH_EXECUTOR_ID_V1,
+            "depth",
+        )
+    else:
+        depth_binding = RealPerceptionDepthDeploymentBindingV2(
+            deployment_binding_id=(
+                "real.realsense.passive_depth_capture_station:"
+                + runtime_session_id
+            ),
+            route_hash=depth_route.semantic_content_hash,
+            runtime_session_id=runtime_session_id,
+            control_domain_id=control_domain_id,
+            target_binding_id=target_binding_id,
+            station_manifest_hash=station_manifest_hash,
+            execution_manifest_hash=execution_manifest_hash,
+            profile_hash=profile.semantic_content_hash,
+            source_frame_id=frame_binding.source_frame_id,
+            source_frame_spec_hash=frame_binding.source_frame_spec_hash,
+            reference_frame_id=frame_binding.reference_frame_id,
+            reference_frame_spec_hash=frame_binding.reference_frame_spec_hash,
+            frame_graph_hash=frame_binding.frame_graph.semantic_content_hash,
+        )
 
     def validator(definition, route_value, *, modality):
         if modality == "rgb":
@@ -420,7 +565,7 @@ def build_real_perception_capture_registration(
                 max_total_bytes=profile.max_artifact_bytes,
             )
             validate_for_parameters = validate_capture_rgb_result_for_parameters_v1
-        else:
+        elif frame_binding is None:
             validate_parameters = lambda payload: validate_capture_depth_parameters_v1(
                 payload,
                 allowed_roles=profile.depth_roles,
@@ -431,6 +576,22 @@ def build_real_perception_capture_registration(
                 dimensions_by_role=profile.depth_dimensions_by_role,
             )
             validate_for_parameters = validate_capture_depth_result_for_parameters_v1
+        else:
+            validate_parameters = lambda payload: validate_capture_depth_parameters_v1(
+                payload,
+                allowed_roles=profile.depth_roles,
+            )
+            validate_result = lambda payload: validate_capture_depth_result_v2(
+                payload,
+                source_id_by_role=profile.depth_source_id_by_role,
+                dimensions_by_role=profile.depth_dimensions_by_role,
+                reference_frame_id=frame_binding.reference_frame_id,
+                reference_frame_spec_hash=(
+                    frame_binding.reference_frame_spec_hash
+                ),
+                frame_graph_hash=frame_binding.frame_graph.semantic_content_hash,
+            )
+            validate_for_parameters = validate_capture_depth_result_for_parameters_v2
         return AgentSkillPayloadValidatorSet(
             validator_id=(
                 f"dexteleop.agent_skill.validator.real_{modality}_capture:"
@@ -475,13 +636,73 @@ def build_real_perception_capture_registration(
             validator(depth_definition, depth_route, modality="depth"),
         ),
         availability_hash_by_route_hash=availability,
+        frame_binding=frame_binding,
+    )
+
+
+def build_real_perception_capture_registration(
+    *,
+    rgb_source_catalog: tuple[Mapping[str, object], ...],
+    depth_source_catalog: tuple[Mapping[str, object], ...],
+    runtime_session_id: str,
+    control_domain_id: str,
+    target_binding_id: str,
+    station_manifest_hash: str,
+    execution_manifest_hash: str,
+    source_binding_hash: str,
+    current_mode: str = "real_active",
+) -> RealPerceptionCaptureRegistration:
+    """Build the legacy v1 depth registration and passive RGB registration."""
+
+    return _build_real_perception_capture_registration(
+        rgb_source_catalog=rgb_source_catalog,
+        depth_source_catalog=depth_source_catalog,
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        target_binding_id=target_binding_id,
+        station_manifest_hash=station_manifest_hash,
+        execution_manifest_hash=execution_manifest_hash,
+        source_binding_hash=source_binding_hash,
+        current_mode=current_mode,
+        frame_binding=None,
+    )
+
+
+def build_real_perception_capture_registration_v2(
+    *,
+    rgb_source_catalog: tuple[Mapping[str, object], ...],
+    depth_source_catalog: tuple[Mapping[str, object], ...],
+    runtime_session_id: str,
+    control_domain_id: str,
+    target_binding_id: str,
+    station_manifest_hash: str,
+    execution_manifest_hash: str,
+    source_binding_hash: str,
+    frame_binding: RealPerceptionFrameBinding,
+    current_mode: str = "real_active",
+) -> RealPerceptionCaptureRegistration:
+    """Build Real Depth v2 against one exact source-to-Station adapter."""
+
+    return _build_real_perception_capture_registration(
+        rgb_source_catalog=rgb_source_catalog,
+        depth_source_catalog=depth_source_catalog,
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        target_binding_id=target_binding_id,
+        station_manifest_hash=station_manifest_hash,
+        execution_manifest_hash=execution_manifest_hash,
+        source_binding_hash=source_binding_hash,
+        current_mode=current_mode,
+        frame_binding=frame_binding,
     )
 
 
 __all__ = [
     "REAL_CAPTURE_DEPTH_EXECUTOR_ID_V1",
+    "REAL_CAPTURE_DEPTH_EXECUTOR_ID_V2",
     "REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1",
     "REAL_CAPTURE_DEPTH_ROUTE_ID_V1",
+    "REAL_CAPTURE_DEPTH_ROUTE_ID_V2",
     "REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1",
     "REAL_CAPTURE_RGB_EXECUTOR_ID_V1",
     "REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1",
@@ -489,5 +710,7 @@ __all__ = [
     "RealPerceptionCaptureProfile",
     "RealPerceptionCaptureRegistration",
     "RealPerceptionDeploymentBinding",
+    "RealPerceptionDepthDeploymentBindingV2",
     "build_real_perception_capture_registration",
+    "build_real_perception_capture_registration_v2",
 ]

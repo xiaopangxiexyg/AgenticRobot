@@ -115,6 +115,15 @@ class RealPerceptionContractBundle:
             "calibration_hash",
         ):
             _required(getattr(self, field_name), field_name=field_name)
+        frame_binding = self.registration.frame_binding
+        if (
+            frame_binding is not None
+            and frame_binding.frame_graph.semantic_content_hash
+            != self.frame_graph_hash
+        ):
+            raise ValueError(
+                "Real Depth v2 frame graph differs from the Gateway bundle."
+            )
 
 
 def build_real_perception_contract_bundle(
@@ -323,6 +332,59 @@ def build_real_perception_passive_executors(
             role=str(request.parameters["role"]),
             expected_station_revision=request.expected_station_revision,
         )
+        expected_revision = request.expected_station_revision
+        if current_station_revision() != expected_revision:
+            raise RuntimeError(
+                "Station revision changed after passive depth capture."
+            )
+        frame_binding = registration.frame_binding
+        if frame_binding is None:
+            result = {
+                "source_id": frame.source_id,
+                "role": frame.role,
+                "captured_at": frame.captured_at,
+                "width": frame.width,
+                "height": frame.height,
+                "depth_unit": "meter",
+                "invalid_depth_value": 0.0,
+                "camera_pose_world_xyz_quat_xyzw": list(
+                    frame.camera_pose_world_xyz_quat_xyzw
+                ),
+                "intrinsics": dict(frame.intrinsics),
+            }
+            receipt_domain = "dexteleop.agent_skill.real_depth_capture_receipt.v1"
+        else:
+            camera_pose_reference = (
+                frame_binding.camera_pose_reference_xyz_quat_xyzw(
+                    frame.camera_pose_world_xyz_quat_xyzw
+                )
+            )
+            result = {
+                "source_id": frame.source_id,
+                "role": frame.role,
+                "captured_at": frame.captured_at,
+                "station_revision": expected_revision,
+                "width": frame.width,
+                "height": frame.height,
+                "depth_unit": "meter",
+                "invalid_depth_value": 0.0,
+                "reference_frame_id": frame_binding.reference_frame_id,
+                "reference_frame_spec_hash": (
+                    frame_binding.reference_frame_spec_hash
+                ),
+                "frame_graph_hash": (
+                    frame_binding.frame_graph.semantic_content_hash
+                ),
+                "camera_pose_reference_xyz_quat_xyzw": list(
+                    camera_pose_reference
+                ),
+                "intrinsics": dict(frame.intrinsics),
+            }
+            receipt_domain = "dexteleop.agent_skill.real_depth_capture_receipt.v2"
+        if current_station_revision() != expected_revision:
+            raise RuntimeError(
+                "Station revision changed before passive depth Artifact commit."
+            )
         artifact = artifact_ref_for_bytes(
             frame.data,
             media_type=frame.media_type,
@@ -339,19 +401,10 @@ def build_real_perception_passive_executors(
             idempotency_key="depth-output:" + operation.operation_id,
             now=frame.captured_at,
         )
-        result = {
-            "source_id": frame.source_id,
-            "role": frame.role,
-            "captured_at": frame.captured_at,
-            "width": frame.width,
-            "height": frame.height,
-            "depth_unit": "meter",
-            "invalid_depth_value": 0.0,
-            "camera_pose_world_xyz_quat_xyzw": list(
-                frame.camera_pose_world_xyz_quat_xyzw
-            ),
-            "intrinsics": dict(frame.intrinsics),
-        }
+        if current_station_revision() != expected_revision:
+            raise RuntimeError(
+                "Station revision changed during passive depth Artifact commit."
+            )
         identity = canonical_content_hash(
             {
                 "operation_id": operation.operation_id,
@@ -359,7 +412,7 @@ def build_real_perception_passive_executors(
                 "result": result,
                 "artifact_ref_hash": committed.semantic_content_hash,
             },
-            domain="dexteleop.agent_skill.real_depth_capture_receipt.v1",
+            domain=receipt_domain,
         )
         evidence_ref = "real-depth-capture:" + identity
         return PassiveReadResult(
