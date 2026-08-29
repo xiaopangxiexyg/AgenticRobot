@@ -92,8 +92,8 @@ class RealAgentPrimitiveSessionAuthorization:
             raise ValueError("client_id must be non-empty.")
         if str(confirmation_token) != REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN:
             raise ValueError(
-                "exact persistent real primitive session confirmation token is "
-                "required."
+                "exact real primitive confirmation token for a persistent "
+                "session is required."
             )
         lifetime = float(grant_lifetime_sec)
         if not 0.0 < lifetime <= 30.0:
