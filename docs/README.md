@@ -6,7 +6,7 @@
 | 领域 | 简洁运行入口 | 详细文档 |
 |---|---|---|
 | 环境安装与基础检查 | [setup](./setup/README.md) | [环境与复现权威说明](../README_ENV.md) |
-| 真机遥操、数采、Replay、Deploy | [real](./real/README.md) | [参数数组](./real/teleop_args.sh)、[遥操数采与长程 Progress Profile](./real/TELEOP_COLLECTION.md)、[Replay](./real/REPLAY.md)、[Deploy](./real/DEPLOY.md)、[UMI](./real/UMI.md)、[OpenPI](./real/OPENPI.md) |
+| 真机遥操、数采、Replay、Deploy | [real](./real/README.md) | [参数数组](./real/teleop_args.sh)、[遥操数采与长程 Progress Profile](./real/TELEOP_COLLECTION.md)、[Rule-based 书写数采](./real/RULE_BASED_WRITING_COLLECTION.md)、[Replay](./real/REPLAY.md)、[Deploy](./real/DEPLOY.md)、[UMI](./real/UMI.md)、[OpenPI](./real/OPENPI.md) |
 | MuJoCo 与仿真 | [sim](./sim/README.md) | [MuJoCo/仿真说明](./sim/MUJOCO.md)、[State-BC Sim-HIL 计划](./sim/plans/state-bc-sim-hil.md) |
 | 外部 Agent Skill 接入 | [agent_gateway](./agent_gateway/README.md) | [局域网 SSH 只读接入](./agent_gateway/SSH_READ_ONLY.md)、[协议与 package 技术说明](../agent_gateway/README.md) |
 | Sim human-in-the-loop | [HIL](./HIL/README.md) | [profile 速览、安全边界、owner 导航与综合操作指南](./HIL/README.md) |
