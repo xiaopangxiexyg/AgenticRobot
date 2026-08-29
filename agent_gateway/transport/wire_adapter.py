@@ -543,9 +543,10 @@ class BoundAgentGatewayWireAdapter:
         if grant is not None and not isinstance(grant, SkillExecutionGrant):
             raise TypeError("grant_resolver returned an invalid grant.")
         if grant is not None and request.skill_execution_grant_id is None:
-            # An application-local operator resolver may atomically mint the
-            # exact request-bound one-use grant.  The external client never
-            # receives reusable grant material and cannot select another ID.
+            # An application-local operator session resolver may atomically mint
+            # a new exact request-bound one-use grant for this request. The
+            # external client never receives reusable session or grant material
+            # and cannot select another ID.
             request = replace(
                 request,
                 skill_execution_grant_id=grant.grant_id,

@@ -83,10 +83,12 @@ conversion capability must fail closed. Gateway/Agent code must not duplicate
 this tool geometry. The concrete frame details and non-zero-offset test rule
 are documented in `agent_gateway/README.md` and `teleop_runtime/README.md`.
 
-Real motion remains default-off. The exact profile must require a one-use,
-request-bound operator Grant, a fresh lower-measured pose cut, a RUNNING/READY
-lower owner cut, and terminal lower-confirmed HOLD. Do not reinterpret the
-existing foot switches as an Agent deadman lease. In the preferred deployment,
+Real motion remains default-off. The exact profile must require explicit
+operator authorization for a bounded process-session side/action allowlist,
+then mint a fresh one-use, request-bound Grant for every active motion request.
+Each request also requires a fresh lower-measured pose cut, a RUNNING/READY lower
+owner cut, and terminal lower-confirmed HOLD. Do not reinterpret the existing
+foot switches as an Agent deadman lease. In the preferred deployment,
 the independent Skill control owner alone may apply activation/HOLD requests,
 construct commands through the lower coupled target solver, publish already-read
 measured qpos/FK cuts, and pass commands through the lower filter, guard,

@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent_gateway.profiles.real import gateway_cli
-from agent_gateway.profiles.real.one_shot_authorization import (
-    REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+from agent_gateway.profiles.real.session_authorization import (
+    REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
 )
 
 
@@ -68,8 +68,33 @@ def test_cli_rejects_confirmation_before_profile_or_hardware_resolution(
     assert called is False
 
 
-def test_cli_accepts_a_list_of_reviewed_actions_for_temporary_testing() -> None:
-    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN)
+def test_cli_rejects_retired_one_shot_confirmation_before_hardware_resolution(
+    monkeypatch,
+) -> None:
+    called = False
+
+    def should_not_resolve(profile):
+        del profile
+        nonlocal called
+        called = True
+        raise AssertionError("retired confirmation must remain default-off")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        should_not_resolve,
+    )
+
+    with pytest.raises(SystemExit):
+        gateway_cli.main(
+            _argv(confirmation="AUTHORIZE_ONE_REAL_TCP_PRIMITIVE")
+        )
+
+    assert called is False
+
+
+def test_cli_accepts_a_list_of_reviewed_actions_for_persistent_session() -> None:
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
     action_index = argv.index("--authorized-action")
     del argv[action_index : action_index + 2]
     argv.extend(
@@ -105,7 +130,7 @@ def test_cli_accepts_a_list_of_reviewed_actions_for_temporary_testing() -> None:
 def test_cli_accepts_distinct_repeatable_ssh_read_only_identities() -> None:
     parsed = gateway_cli.build_parser().parse_args(
         [
-            *_argv(confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN),
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
             "--ssh-read-only-client",
             "rpent.remote.alice",
             "1101",
@@ -136,7 +161,7 @@ def test_cli_rejects_partial_perception_attachment_before_profile_resolution(
         "resolve_exclusive_rm65_skill_deployment_profile",
         should_not_resolve,
     )
-    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN)
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
     argv.extend(
         [
             "--camera-config",
@@ -181,7 +206,7 @@ def test_cli_rejects_overlong_socket_before_profile_or_hardware_assembly(
         "assemble_exclusive_rm65_skill_lower",
         should_not_assemble,
     )
-    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN)
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
     argv[1] = "/" + "a" * 108
 
     with pytest.raises(SystemExit) as captured:
@@ -281,7 +306,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     )
 
     argv = _argv(
-        confirmation=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         socket_path=socket_path,
     )
     argv.extend(
@@ -298,7 +323,10 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         "gateway_ready",
         "gateway_stopped",
     ]
-    assert events[0]["authorization_scope"] == "one_matching_skill_request"
+    assert (
+        events[0]["authorization_scope"]
+        == "persistent_session_matching_action"
+    )
     assert events[1]["lower_hold_proved"] is True
     assert captured["lower"] is lower
     assert captured["authorized_side"] == "right"

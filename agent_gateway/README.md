@@ -237,7 +237,7 @@ membership or ownership and does not run `chgrp`. Account and group setup stays
 an explicit host-administration step.
 
 The primary `--client-id` remains the only identity eligible for the real
-profile's reviewed one-shot motion grant. Additional identities are marked
+profile's reviewed persistent motion session. Additional identities are marked
 read-only in the Gateway itself: generic submission, lifecycle, HOLD, event
 replay, Artifact upload, and materialization acknowledgement are rejected even
 if a caller bypasses the proxy. Strict read-only Skills, bounded status,
@@ -306,7 +306,7 @@ python -m agent_gateway real-rm65 \
   --envelope-profile /absolute/right_skill_envelope.json \
   --authorized-side right \
   --authorized-action forward \
-  --confirm AUTHORIZE_ONE_REAL_TCP_PRIMITIVE
+  --confirm AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES
 ```
 
 Real RGB/Depth support is opt-in on that same v2 session:
@@ -323,7 +323,7 @@ python -m agent_gateway real-rm65 \
   --artifact-root /absolute/private/artifact_cache \
   --authorized-side right \
   --authorized-action forward \
-  --confirm AUTHORIZE_ONE_REAL_TCP_PRIMITIVE
+  --confirm AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES
 ```
 
 For passive camera input without constructing or connecting either RM65 backend,
@@ -406,7 +406,7 @@ loaded nor accepted by either entrypoint.
 
 `real-rm65` remains the combined real application. Starting it acquires and
 admits all configured cameras, then starts the exclusive dual-RM65 lower owner
-before publishing the socket; consequently the existing one-use motion
+before publishing the socket; consequently the persistent motion-session
 confirmation and real-hardware safety preflight remain mandatory even when an
 upper client intends to invoke only passive Skills. Its runtime TCP-envelope
 anchors come from the fresh lower-measured qpos/FK cut after startup HOLD, not
@@ -419,9 +419,13 @@ the selected side/action are trusted operator inputs. The process exposes no
 transport until optional cameras have passed consecutive-frame freshness
 admission, both RM65 backends have started, lower HOLD is confirmed, a fresh
 measured dual-arm cut has seeded the coupled solver, and the Active pre-IK
-envelope has been anchored. The exact confirmation authorizes at most one
-matching motion request; it does not bypass per-request Gateway admission and
-is not consumed by a passive capture.
+envelope has been anchored. The exact confirmation authorizes only the selected
+side and finite action allowlist for this process session. Each matching active
+request still receives a newly minted short-lived, complete-request-bound,
+one-use Grant and passes normal Gateway admission; passive capture neither needs
+nor consumes a motion Grant. The retired `AUTHORIZE_ONE_REAL_TCP_PRIMITIVE`
+token is rejected so an old one-shot confirmation cannot silently become
+persistent authority.
 
 The MuJoCo launcher starts no RPent planner and connects no real device. Its
 socket parent must already exist, resolve to a real non-world-writable
@@ -431,8 +435,8 @@ The real CLI resolves an `ExclusiveRM65SkillDeploymentProfile`, constructs the
 single lower graph through `assemble_exclusive_rm65_skill_lower`, and binds it
 to the existing Skill/Gateway contracts through
 `assemble_exclusive_rm65_agent_primitive_composition`. It reuses the shared
-RM65 backend, coupled solver, force guard, target-envelope, one-use Grant, and
-Unix transport implementations without importing or constructing RealTeleop,
+RM65 backend, coupled solver, force guard, target-envelope, per-request one-use
+Grant, and Unix transport implementations without importing or constructing RealTeleop,
 VIVE, collection, GUI, or `control_composition`. The application owns the sole
 lower control thread and orders shutdown as Gateway fence -> future-cycle
 fence -> lower-confirmed HOLD -> control-thread join -> resource close.
@@ -472,7 +476,8 @@ remain mandatory.
 
 The real profile exposes the same nine primitives through four exact
 `t2_real_motion` Routes: one cardinal Route with six bounded direction values
-and three fixed-orientation Routes. Every request requires a one-use operator
+and three fixed-orientation Routes. One Gateway process may serve sequential
+requests until shutdown, but every request requires its own one-use operator
 Grant bound to the complete pre-grant request. Activation resolves the target
 from a fresh lower-measured TCP pose, and completion requires distinct fresh
 measurement cuts, at least one lower dispatch, the configured stable-arrival
