@@ -142,6 +142,23 @@ def test_software_profile_has_single_torque_owner() -> None:
     assert profile.metadata["torque_owner"] == "software_composed_tau; vendor_kp_kd_zero"
 
 
+def test_software_profile_overrides_only_the_target_joint_gains() -> None:
+    profile = probe.build_software_profile(
+        kp=0.25,
+        kd=0.5,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=0.1,
+        target_joint="joint6",
+        target_kp=2.0,
+        target_kd=1.0,
+    )
+
+    assert profile.position_kp_nm_per_rad == (0.25,) * 5 + (2.0,)
+    assert profile.damping_kd_nm_s_per_rad == (0.5,) * 5 + (1.0,)
+    assert profile.metadata["target_joint"] == "joint6"
+
+
 def test_software_profile_can_bound_cartesian_overlay_independently() -> None:
     profile = probe.build_software_profile(
         kp=0.0,
@@ -355,6 +372,12 @@ def test_active_joint_resolution_keeps_joint2_joint3_support() -> None:
         "joint3",
         "joint2",
     )
+    assert set(
+        probe.resolve_active_joint_names(
+            "joint6",
+            support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
+        )
+    ) == set(probe._ALL_JOINTS)
 
 
 def test_active_joint_resolution_rejects_missing_fault_support() -> None:
@@ -623,6 +646,140 @@ def test_slow_step_rejects_target_outside_urdf_limit() -> None:
         )
 
 
+def test_slow_step_accepts_exactly_twenty_degrees_and_rejects_more() -> None:
+    limits = ((-3.14, 3.14),) * 6
+    qref, _qvel, done = probe.plan_reference(
+        (0.0,) * 6,
+        mode="slow-step",
+        joint="joint6",
+        elapsed_sec=100.0,
+        step_rad=probe._MAX_STEP_RAD,
+        step_speed_rad_s=0.02,
+        step_direction=1,
+        position_limits_rad=limits,
+    )
+
+    assert qref[5] == pytest.approx(probe._MAX_STEP_RAD)
+    assert done is True
+    with pytest.raises(ValueError, match="step_rad must be"):
+        probe.plan_reference(
+            (0.0,) * 6,
+            mode="slow-step",
+            joint="joint6",
+            elapsed_sec=0.0,
+            step_rad=probe._MAX_STEP_RAD + 1e-6,
+            step_speed_rad_s=0.02,
+            step_direction=1,
+            position_limits_rad=limits,
+        )
+
+
+def test_observed_target_excursion_has_twenty_degree_hard_limit() -> None:
+    anchor = (0.0,) * 6
+    at_limit = (0.0, 0.0, 0.0, 0.0, 0.0, probe._MAX_STEP_RAD)
+    over_limit = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        probe._MAX_STEP_RAD + 1e-6,
+    )
+
+    assert probe.validate_target_excursion(
+        at_limit,
+        anchor_qpos_rad=anchor,
+        target_joint="joint6",
+    ) == pytest.approx(probe._MAX_STEP_RAD)
+    with pytest.raises(probe.LowGainProbeError, match="target excursion abort"):
+        probe.validate_target_excursion(
+            over_limit,
+            anchor_qpos_rad=anchor,
+            target_joint="joint6",
+        )
+
+
+def _slow_step_samples(
+    target_positions: tuple[float, ...],
+    *,
+    support_joint1_position: float = 0.0,
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "qpos_rad": (
+                support_joint1_position,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                target,
+            ),
+            "step_done": True,
+        }
+        for target in target_positions
+    )
+
+
+def test_slow_step_response_requires_real_correct_direction_motion() -> None:
+    active = probe.resolve_active_joint_names(
+        "joint6",
+        support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
+    )
+    passed = probe.evaluate_slow_step_response(
+        mode="slow-step",
+        target_joint="joint6",
+        step_rad=0.02,
+        step_direction=1,
+        initial_qpos_rad=(0.0,) * 6,
+        samples=_slow_step_samples((0.0, 0.005, 0.01, 0.015, 0.019, 0.02)),
+        active_joint_names=active,
+    )
+    insufficient = probe.evaluate_slow_step_response(
+        mode="slow-step",
+        target_joint="joint6",
+        step_rad=0.02,
+        step_direction=1,
+        initial_qpos_rad=(0.0,) * 6,
+        samples=_slow_step_samples((0.0004,) * 6),
+        active_joint_names=active,
+    )
+    wrong_direction = probe.evaluate_slow_step_response(
+        mode="slow-step",
+        target_joint="joint6",
+        step_rad=0.02,
+        step_direction=1,
+        initial_qpos_rad=(0.0,) * 6,
+        samples=_slow_step_samples((-0.003,) * 6),
+        active_joint_names=active,
+    )
+
+    assert passed["status"] == "PASS"
+    assert passed["passed"] is True
+    assert insufficient["status"] == "INSUFFICIENT_RESPONSE"
+    assert insufficient["passed"] is False
+    assert wrong_direction["status"] == "WRONG_DIRECTION"
+    assert wrong_direction["passed"] is False
+
+
+def test_slow_step_response_rejects_support_joint_drift() -> None:
+    active = probe.resolve_active_joint_names(
+        "joint6",
+        support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
+    )
+    result = probe.evaluate_slow_step_response(
+        mode="slow-step",
+        target_joint="joint6",
+        step_rad=0.02,
+        step_direction=1,
+        initial_qpos_rad=(0.0,) * 6,
+        samples=_slow_step_samples((0.02,) * 6, support_joint1_position=0.01),
+        active_joint_names=active,
+    )
+
+    assert result["status"] == "SUPPORT_DRIFT_EXCEEDED"
+    assert result["support_peak_drift_rad"]["joint1"] == pytest.approx(0.01)
+
+
 def test_effort_limits_are_read_from_urdf_and_scaled(tmp_path) -> None:
     effort_values = (36.0, 36.0, 36.0, 14.0, 14.0, 14.0)
     joints = "".join(
@@ -646,6 +803,8 @@ def test_parser_help_is_read_only() -> None:
     args = parser.parse_args(["--config", "config.yaml", "--rebot-source-root", "source"])
     assert args.joint == "joint1"
     assert tuple(args.support_joints) == ("joint2", "joint3")
+    assert args.target_kp is None
+    assert args.target_kd is None
     assert args.cartesian_stiffness_n_per_m == 20.0
     assert args.cartesian_max_displacement_m == 0.02
 

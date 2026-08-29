@@ -96,6 +96,11 @@ _DEFAULT_TORQUE_LIMIT_SCALE = 0.25
 _DEFAULT_TORQUE_RISE_TIME_SEC = 1.0
 _DEFAULT_STEP_RAD = 0.05
 _DEFAULT_STEP_SPEED_RAD_S = 0.02
+_MAX_STEP_RAD = math.radians(20.0)
+_DEFAULT_MIN_STEP_RESPONSE_RATIO = 0.10
+_DEFAULT_MAX_STEP_RESPONSE_RATIO = 1.50
+_DEFAULT_MIN_STEP_RESPONSE_RAD = math.radians(0.1)
+_DEFAULT_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
 _DEFAULT_VELOCITY_ABORT_RAD_S = 0.10
 _DEFAULT_MAX_ERROR_RAD = 0.15
 _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
@@ -489,6 +494,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _bounded(args.freeze_sec, name="freeze_sec", lower=0.1, upper=10.0)
     _bounded(args.kp, name="kp", lower=0.0, upper=5.0)
     _bounded(args.kd, name="kd", lower=0.0, upper=5.0)
+    target_kp = getattr(args, "target_kp", None)
+    target_kd = getattr(args, "target_kd", None)
+    if target_kp is not None:
+        _bounded(target_kp, name="target_kp", lower=0.0, upper=5.0)
+    if target_kd is not None:
+        _bounded(target_kd, name="target_kd", lower=0.0, upper=5.0)
     _bounded(args.gravity_scale, name="gravity_scale", lower=0.0, upper=1.0)
     _bounded(
         args.torque_limit_scale,
@@ -515,7 +526,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         lower=0.01,
         upper=0.5,
     )
-    _bounded(args.step_rad, name="step_rad", lower=0.0, upper=0.2)
+    _bounded(args.step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
     _bounded(
         args.step_speed_rad_s,
         name="step_speed_rad_s",
@@ -601,8 +612,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         getattr(args, "support_joints", _FAULT_HOLD_JOINTS),
     )
     if args.mode == "cartesian-hold":
-        if args.kp != 0.0:
-            raise ValueError("cartesian-hold requires --kp 0 to avoid joint-position stiffness")
+        if args.kp != 0.0 or target_kp not in (None, 0.0):
+            raise ValueError(
+                "cartesian-hold requires --kp 0 and no non-zero --target-kp "
+                "to avoid joint-position stiffness"
+            )
         if active_joint_names != _ALL_JOINTS:
             raise ValueError(
                 "cartesian-hold requires the canonical joint1..joint6 active set; "
@@ -897,6 +911,9 @@ def build_software_profile(
     torque_rise_time_sec: float,
     velocity_limit_rad_s: float,
     overlay_limits_nm: Sequence[float] = _ZERO_SIX,
+    target_joint: str | None = None,
+    target_kp: float | None = None,
+    target_kd: float | None = None,
 ) -> B601MitControlProfile:
     """Build the low-gain software composition profile used by the probe."""
 
@@ -910,10 +927,33 @@ def build_software_profile(
         raise ValueError("overlay_limits_nm must be non-negative")
     rise_time = _positive(torque_rise_time_sec, name="torque_rise_time_sec")
     velocity_limit = _positive(velocity_limit_rad_s, name="velocity_limit_rad_s")
+    position_gains = [kp] * 6
+    damping_gains = [kd] * 6
+    if target_joint is None:
+        if target_kp is not None or target_kd is not None:
+            raise ValueError("target_joint is required for target gain overrides")
+    else:
+        if target_joint not in _ALL_JOINTS:
+            raise ValueError(f"unknown B601-RS joint: {target_joint}")
+        target_index = _ALL_JOINTS.index(target_joint)
+        if target_kp is not None:
+            position_gains[target_index] = _bounded(
+                target_kp,
+                name="target_kp",
+                lower=0.0,
+                upper=5.0,
+            )
+        if target_kd is not None:
+            damping_gains[target_index] = _bounded(
+                target_kd,
+                name="target_kd",
+                lower=0.0,
+                upper=5.0,
+            )
     return B601MitControlProfile(
         name="b601_rs_low_gain_software_gravity_damping",
-        position_kp_nm_per_rad=(kp,) * 6,
-        damping_kd_nm_s_per_rad=(kd,) * 6,
+        position_kp_nm_per_rad=tuple(position_gains),
+        damping_kd_nm_s_per_rad=tuple(damping_gains),
         max_abs_torque_nm=limits,
         max_torque_rate_nm_s=tuple(value / rise_time for value in limits),
         max_abs_overlay_torque_nm=overlay_limits,
@@ -924,6 +964,7 @@ def build_software_profile(
             "torque_owner": "software_composed_tau; vendor_kp_kd_zero",
             "torque_limit_source": "pinned_urdf_effort_scaled",
             "torque_rise_time_sec": rise_time,
+            "target_joint": target_joint,
         },
     )
 
@@ -1102,7 +1143,7 @@ def plan_reference(
     if mode != "slow-step":
         raise ValueError("mode must be hold, slow-step, or cartesian-hold")
     direction = 1 if int(step_direction) >= 0 else -1
-    step = _bounded(step_rad, name="step_rad", lower=0.0, upper=0.2)
+    step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
     speed = _bounded(step_speed_rad_s, name="step_speed_rad_s", lower=0.001, upper=0.05)
     index = _ALL_JOINTS.index(joint)
     target = float(initial[index] + direction * step)
@@ -1120,6 +1161,176 @@ def plan_reference(
     if not done:
         qvel[index] = direction * speed
     return tuple(float(value) for value in qref), tuple(float(value) for value in qvel), done
+
+
+def validate_target_excursion(
+    qpos_rad: Sequence[float],
+    *,
+    anchor_qpos_rad: Sequence[float],
+    target_joint: str,
+    max_excursion_rad: float = _MAX_STEP_RAD,
+) -> float:
+    """Return target excursion or reject motion beyond the hard relative limit."""
+
+    current = _six(qpos_rad, name="qpos_rad")
+    anchor = _six(anchor_qpos_rad, name="anchor_qpos_rad")
+    if target_joint not in _ALL_JOINTS:
+        raise ValueError(f"unknown B601-RS joint: {target_joint}")
+    limit = _bounded(
+        max_excursion_rad,
+        name="max_excursion_rad",
+        lower=0.0,
+        upper=_MAX_STEP_RAD,
+        lower_inclusive=False,
+    )
+    index = _ALL_JOINTS.index(target_joint)
+    excursion = abs(current[index] - anchor[index])
+    if excursion > limit:
+        raise LowGainProbeError(
+            f"target excursion abort: {target_joint} moved {excursion:.6f} rad "
+            f"from the post-enable anchor, exceeding the {limit:.6f} rad "
+            "(20 deg maximum) hard limit"
+        )
+    return excursion
+
+
+def evaluate_slow_step_response(
+    *,
+    mode: str,
+    target_joint: str,
+    step_rad: float,
+    step_direction: int,
+    initial_qpos_rad: Sequence[float] | None,
+    samples: Sequence[dict[str, object]],
+    active_joint_names: Sequence[str],
+    min_response_ratio: float = _DEFAULT_MIN_STEP_RESPONSE_RATIO,
+    max_response_ratio: float = _DEFAULT_MAX_STEP_RESPONSE_RATIO,
+    min_response_rad: float = _DEFAULT_MIN_STEP_RESPONSE_RAD,
+    max_support_drift_rad: float = _DEFAULT_MAX_SUPPORT_DRIFT_RAD,
+) -> dict[str, object]:
+    """Classify whether a completed relative step produced a bounded response.
+
+    This is commissioning evidence only.  It deliberately uses the mean of the
+    final five feedback samples so one quantized sample cannot turn a no-motion
+    run into an apparent response pass.
+    """
+
+    if mode != "slow-step":
+        return {"status": "NOT_APPLICABLE", "passed": True}
+    if target_joint not in _ALL_JOINTS:
+        raise ValueError(f"unknown B601-RS joint: {target_joint}")
+    if initial_qpos_rad is None:
+        return {
+            "status": "NO_INITIAL_REFERENCE",
+            "passed": False,
+            "sample_count": len(samples),
+        }
+    initial = np.asarray(_six(initial_qpos_rad, name="initial_qpos_rad"), dtype=float)
+    step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
+    if step <= 0.0:
+        raise ValueError("slow-step response requires step_rad > 0")
+    minimum_ratio = _bounded(
+        min_response_ratio,
+        name="min_response_ratio",
+        lower=0.0,
+        upper=1.0,
+    )
+    maximum_ratio = _bounded(
+        max_response_ratio,
+        name="max_response_ratio",
+        lower=1.0,
+        upper=5.0,
+    )
+    minimum_rad = _bounded(
+        min_response_rad,
+        name="min_response_rad",
+        lower=0.0,
+        upper=0.1,
+    )
+    support_limit = _bounded(
+        max_support_drift_rad,
+        name="max_support_drift_rad",
+        lower=0.0,
+        upper=0.1,
+    )
+    qpos_samples = tuple(
+        np.asarray(_six(sample["qpos_rad"], name="sample_qpos_rad"), dtype=float)
+        for sample in samples
+    )
+    if not qpos_samples:
+        return {
+            "status": "NO_FEEDBACK_SAMPLES",
+            "passed": False,
+            "sample_count": 0,
+        }
+    tail_size = min(5, len(qpos_samples))
+    settled = np.mean(np.stack(qpos_samples[-tail_size:]), axis=0)
+    target_index = _ALL_JOINTS.index(target_joint)
+    direction = 1 if int(step_direction) >= 0 else -1
+    signed_displacement = direction * float(
+        settled[target_index] - initial[target_index]
+    )
+    response_ratio = signed_displacement / step
+    peak_signed_displacement = max(
+        direction * float(qpos[target_index] - initial[target_index])
+        for qpos in qpos_samples
+    )
+    max_abs_target_excursion = max(
+        abs(float(qpos[target_index] - initial[target_index]))
+        for qpos in qpos_samples
+    )
+    support_names = tuple(
+        name
+        for name in active_joint_names
+        if name in _ALL_JOINTS and name != target_joint
+    )
+    support_peak_drift = {
+        name: max(
+            abs(float(qpos[_ALL_JOINTS.index(name)] - initial[_ALL_JOINTS.index(name)]))
+            for qpos in qpos_samples
+        )
+        for name in support_names
+    }
+    max_support_drift = max(support_peak_drift.values(), default=0.0)
+    reference_completed = any(bool(sample.get("step_done", False)) for sample in samples)
+    minimum_required = max(minimum_rad, minimum_ratio * step)
+    maximum_allowed = maximum_ratio * step
+    if max_abs_target_excursion > _MAX_STEP_RAD:
+        status = "EXCURSION_LIMIT_EXCEEDED"
+    elif not reference_completed:
+        status = "REFERENCE_INCOMPLETE"
+    elif signed_displacement < -minimum_rad:
+        status = "WRONG_DIRECTION"
+    elif signed_displacement < minimum_required:
+        status = "INSUFFICIENT_RESPONSE"
+    elif signed_displacement > maximum_allowed:
+        status = "EXCESSIVE_RESPONSE"
+    elif max_support_drift > support_limit:
+        status = "SUPPORT_DRIFT_EXCEEDED"
+    else:
+        status = "PASS"
+    return {
+        "status": status,
+        "passed": status == "PASS",
+        "sample_count": len(qpos_samples),
+        "settled_sample_count": tail_size,
+        "reference_completed": reference_completed,
+        "target_joint": target_joint,
+        "step_direction": direction,
+        "commanded_step_rad": step,
+        "hard_excursion_limit_rad": _MAX_STEP_RAD,
+        "settled_signed_displacement_rad": signed_displacement,
+        "peak_signed_displacement_rad": peak_signed_displacement,
+        "max_abs_target_excursion_rad": max_abs_target_excursion,
+        "response_ratio": response_ratio,
+        "minimum_response_rad": minimum_required,
+        "maximum_response_rad": maximum_allowed,
+        "final_tracking_error_rad": abs(step - signed_displacement),
+        "support_joint_names": support_names,
+        "support_peak_drift_rad": support_peak_drift,
+        "max_support_drift_rad": max_support_drift,
+        "max_support_drift_limit_rad": support_limit,
+    }
 
 
 def _output_payload(payload: dict[str, object], output: Path | None) -> None:
@@ -1542,6 +1753,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         torque_rise_time_sec=args.torque_rise_time_sec,
         velocity_limit_rad_s=args.velocity_abort_rad_s,
         overlay_limits_nm=overlay_limits,
+        target_joint=args.joint,
+        target_kp=args.target_kp,
+        target_kd=args.target_kd,
     )
     config = B601RSBackendConfig.from_rs_yaml(
         config_path,
@@ -1881,6 +2095,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             if any(not math.isfinite(value) for value in qvel):
                 stop_reason = "non-finite finite-difference velocity"
                 break
+            if args.mode == "slow-step" and initial_q is not None:
+                try:
+                    validate_target_excursion(
+                        q,
+                        anchor_qpos_rad=initial_q,
+                        target_joint=args.joint,
+                    )
+                except LowGainProbeError as exc:
+                    stop_reason = str(exc)
+                    break
             max_velocity = max(abs(value) for value in qvel)
             if max_velocity > args.velocity_abort_rad_s:
                 stop_reason = (
@@ -2161,6 +2385,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         and cleanup_ok
         and all(result.passed for result in frequency_acceptance.values())
     )
+    slow_step_response = evaluate_slow_step_response(
+        mode=args.mode,
+        target_joint=args.joint,
+        step_rad=args.step_rad,
+        step_direction=args.step_direction,
+        initial_qpos_rad=initial_q,
+        samples=samples,
+        active_joint_names=active_joint_names,
+    )
+    response_passed = bool(slow_step_response["passed"])
+    acceptance_passed = control_passed and response_passed
     max_abs_requested = max(
         (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
         default=0.0,
@@ -2170,7 +2405,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         default=0.0,
     )
     return {
-        "status": "OK" if control_passed else "FAIL",
+        "status": "OK" if acceptance_passed else "FAIL",
         "mode": args.mode,
         "confirmation": CONFIRMATION,
         "channel": config.channel,
@@ -2248,6 +2483,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "vendor_kd_nm_s_per_rad": _ZERO_SIX,
             "torque_owner": "software_composed_tau_only",
         },
+        "slow_step_response": slow_step_response,
         "cartesian_impedance": {
             "enabled": args.mode == "cartesian-hold",
             "translation_only": True,
@@ -2270,25 +2506,27 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             event: result.as_dict()
             for event, result in frequency_acceptance.items()
         },
-        "acceptance_status": "PASS" if control_passed else "FAIL",
+        "control_acceptance_status": "PASS" if control_passed else "FAIL",
+        "motion_response_status": slow_step_response["status"],
+        "acceptance_status": "PASS" if acceptance_passed else "FAIL",
         "hardware_acceptance": "NOT_CLAIMED",
         "freshness_verified": False,
         "freshness_semantics": "motorbridge_mechPos_parameter_observation_unverified",
         "samples": samples,
         "notes": [
             "Human-run commissioning only; automated tests never execute this active path.",
-            "The active set is target joint plus mandatory joint2/joint3 support; unselected arm joints are never enabled or dispatched.",
+            "The active set is the target plus explicitly selected support joints; scheme-1 J6 commissioning selects all six arm joints while only the J6 reference changes.",
             "On an exceptional stop, only joint2/joint3 may be latched; joint1/joint4/joint5/joint6 are safe-stopped, and SIGUSR1 is required for full disable.",
             "Protective hold admits only a host-fresh, in-limit, near-zero-velocity last-safe snapshot and a small fault rebase; otherwise it falls back to full safe_stop.",
             "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
-            "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step.",
+            "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
             "Before any torque command, the active path requires four consecutive complete feedback snapshots after enable; no torque command is sent during this arming-settle gate.",
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "Software composes gravity, position, finite-difference damping, and an optional bounded J.T F overlay, then dispatches vendor MIT kp=kd=0.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
-            "A PASS means the guarded software run and cleanup met their declared bounds. It is not a HARDWARE_PASS or force-sensor validation.",
+            "A slow-step PASS additionally requires a completed reference, correct-direction bounded target response, and bounded support-joint drift. It is not a HARDWARE_PASS or force-sensor validation.",
         ],
     }
 
@@ -2338,6 +2576,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-direction", type=int, choices=(-1, 1), default=1)
     parser.add_argument("--kp", type=float, default=_DEFAULT_KP)
     parser.add_argument("--kd", type=float, default=_DEFAULT_KD)
+    parser.add_argument(
+        "--target-kp",
+        type=float,
+        help="optional software position gain override for --joint only",
+    )
+    parser.add_argument(
+        "--target-kd",
+        type=float,
+        help="optional software damping gain override for --joint only",
+    )
     parser.add_argument("--gravity-scale", type=float, default=_DEFAULT_GRAVITY_SCALE)
     parser.add_argument(
         "--torque-limit-scale",

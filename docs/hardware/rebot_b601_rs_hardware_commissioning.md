@@ -308,8 +308,9 @@ MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort cei
 
 运行前必须确认：机械臂处于当前安全、可支撑且有足够间隙的姿态；不得为了探针主动
 移动到示例姿态。操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，
-现场没有第二个 CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；后述
-`cartesian-hold` 必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
+现场没有第二个 CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；当前
+J6 方案显式使能六个 arm 关节并锚定各自的使能后当前位置，但只有 J6 的 reference 可以
+变化。后述 `cartesian-hold` 同样必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
 运行；`safe_stop` 失能后负载可能下落，停止过程中仍需保持支撑。下面命令使用
 状态分支和显式 status 打印，不使用会让交接终端提前退出的 `set -euo pipefail`；
 命令由操作者在目标 worktree 中运行，我们不在自动流程中代运行。版本化文档保留
@@ -353,25 +354,30 @@ if cd "$WT"; then
       --mode hold \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
-      --duration-sec 8 \
+      --duration-sec 4 \
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
-      --joint joint1 \
-      --kp 0.5 \
+      --joint joint6 \
+      --support-joint joint1 \
+      --support-joint joint4 \
+      --support-joint joint5 \
+      --kp 0.25 \
       --kd 0.5 \
-      --gravity-scale 1.0 \
-      --torque-limit-scale 0.25 \
-      --torque-rise-time-sec 1.0 \
-      --velocity-abort-rad-s 0.10 \
-      --max-error-rad 0.15 \
+      --target-kp 0.5 \
+      --target-kd 0.5 \
+      --gravity-scale 0.1 \
+      --torque-limit-scale 0.1 \
+      --torque-rise-time-sec 2.0 \
+      --velocity-abort-rad-s 0.05 \
+      --max-error-rad 0.05 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
       --fault-hold-max-age-sec 0.15 \
       --fault-hold-max-velocity-rad-s 0.02 \
       --fault-hold-max-rebase-rad 0.05 \
-      --output "$OUT_DIR/b601_low_gain_hold_joint1.json"; then
+      --output "$OUT_DIR/b601_low_gain_hold_joint6_all_arm.json"; then
     STATUS=0
   else
     STATUS=$?
@@ -384,8 +390,9 @@ fi
 printf '%s\n' 'shell remains active'
 ```
 
-第一档只验收 `hold`：观察 j1 是否按当前状态工作、j2/j3 是否作为支撑保持、重力方向
-是否合理、阻尼是否耗散而非振荡，
+第一档只验收 `hold`：观察 J1..J6 是否都锚定在使能后当前位置、重力方向是否合理、阻尼
+是否耗散而非振荡；ID7 夹爪不参与。`active_joint_names` 的集合必须正好是 joint1..joint6，
+且没有任何关节 reference 变化。
 并在 JSON 中确认 `status=OK`、`acceptance_status=PASS`、
 `cleanup_receipt.completed=true`、`cleanup_errors=[]`、`stop_reason=null`，以及
 `frequency_acceptance.feedback/compute/tx.*.passed=true`。输出中的
@@ -397,10 +404,10 @@ printf '%s\n' 'shell remains active'
 `set -euo pipefail`，即使探针返回非零，交接终端仍保持可用：
 
 ```bash
-OUT_DIR=/tmp/b601-rs-commissioning
+# 复用上面的 WT/PY/CFG/SRC/OUT_DIR/LOG 和 run_logged
 mkdir -p "$OUT_DIR"
 if cd "$WT"; then
-  if PYTHONDONTWRITEBYTECODE=1 "$PY" \
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" \
       scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode feedback-stability \
       --config "$CFG" \
@@ -416,6 +423,7 @@ if cd "$WT"; then
   fi
   printf 'feedback-stability exit code: %s\n' "$STATUS"
   printf 'result: %s\n' "$OUT_DIR/b601_feedback_stability_20s.json"
+  printf 'command and output log: %s\n' "$LOG"
 else
   printf '%s\n' 'ERROR: worktree not found'
 fi
@@ -427,13 +435,14 @@ printf '%s\n' 'shell remains active'
 `p95/p99`。任何越过都应先保留 JSON、确认是否有可见机械运动并分析采样量化，再决定后续
 实现；不能把它当成放宽 `last-safe` 门槛的理由。
 
-只有 hold 通过且机械支撑未改变，才可单独运行一档相对慢步；每次只批准一个命令，
-例如 j1 正方向 0.05 rad、0.02 rad/s：
+只有上述六关节 hold 通过且机械支撑未改变，才可单独运行一档 J6 相对慢步。实现对 command
+和实测相对锚点 excursion 都设有 `20 deg`（`0.349066 rad`）硬上限，但首轮只批准 J6
+正方向 `0.02 rad`（约 `1.15 deg`）、`0.005 rad/s`，远低于该上限：
 
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR 变量；先确认上一档已停止且 cleanup 完整
 if cd "$WT"; then
-  if PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode slow-step \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
@@ -441,34 +450,47 @@ if cd "$WT"; then
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
-      --joint joint1 \
+      --joint joint6 \
+      --support-joint joint1 \
+      --support-joint joint4 \
+      --support-joint joint5 \
       --step-direction 1 \
-      --step-rad 0.05 \
-      --step-speed-rad-s 0.02 \
-      --kp 0.5 \
+      --step-rad 0.02 \
+      --step-speed-rad-s 0.005 \
+      --kp 0.25 \
       --kd 0.5 \
-      --gravity-scale 1.0 \
-      --torque-limit-scale 0.25 \
-      --torque-rise-time-sec 1.0 \
-      --velocity-abort-rad-s 0.10 \
-      --max-error-rad 0.15 \
+      --target-kp 1.0 \
+      --target-kd 0.75 \
+      --gravity-scale 0.1 \
+      --torque-limit-scale 0.1 \
+      --torque-rise-time-sec 2.0 \
+      --velocity-abort-rad-s 0.05 \
+      --max-error-rad 0.05 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
       --fault-hold-max-age-sec 0.15 \
       --fault-hold-max-velocity-rad-s 0.02 \
       --fault-hold-max-rebase-rad 0.05 \
-      --output "$OUT_DIR/b601_low_gain_slow_step_joint1.json"; then
+      --output "$OUT_DIR/b601_low_gain_slow_step_joint6_pos002_all_arm.json"; then
     STATUS=0
   else
     STATUS=$?
   fi
   printf 'probe exit code: %s\n' "$STATUS"
+  printf 'command and output log: %s\n' "$LOG"
 else
   printf '%s\n' 'ERROR: worktree not found'
 fi
 printf '%s\n' 'shell remains active'
 ```
+
+slow-step 的 `acceptance_status=PASS` 现在同时要求
+`control_acceptance_status=PASS` 和 `motion_response_status=PASS`。后者使用末尾五份反馈的
+均值，要求 reference 已完成、J6 沿命令方向产生至少 `max(0.1 deg, 10% step)` 的响应、
+不超过 `150% step`，且任一已使能支撑关节相对锚点的峰值漂移不超过 `0.5 deg`。因此
+“命令循环和 cleanup 成功但 J6 没有实际响应”会返回 `status=FAIL` 和
+`motion_response_status=INSUFFICIENT_RESPONSE`，不能再误判为动作通过。
 
 任一方向出现反向、跳变、振荡、超速、超误差、非有限反馈或未完成 stop receipt，
 立即按急停/支撑规程停止并保留 JSON；不得通过提高 `max-error`、放宽速度/力矩限幅、
@@ -476,7 +498,7 @@ printf '%s\n' 'shell remains active'
 
 ### P4.2 当前 TCP 锚定的低增益平移阻抗（操作者手动运行）
 
-只有上面的 `hold` 和 joint1 `slow-step` 都通过后，才允许进入这一档。该模式复用已有
+只有上面的六关节 `hold` 和 J6 `slow-step` 都通过后，才允许进入这一档。该模式复用已有
 `B601TranslationalVirtualSpring`、Pinocchio `LOCAL_WORLD_ALIGNED` Jacobian 和统一的
 `J^T F` 映射；锚点是六关节使能后第一份完整、合法、近静止反馈对应的
 `base_link_T_gripper_end` 平移，不读取或追踪任何预设绝对 pose。第一版不控制姿态/转动，
@@ -494,7 +516,7 @@ requested/effective torque 和 `F^T V == tau^T dq` 的 power error。TCP displac
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR；先确认 joint hold/slow-step 已完整 cleanup
 if cd "$WT"; then
-  if PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode cartesian-hold \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
@@ -530,6 +552,7 @@ if cd "$WT"; then
     STATUS=$?
   fi
   printf 'probe exit code: %s\n' "$STATUS"
+  printf 'command and output log: %s\n' "$LOG"
 else
   printf '%s\n' 'ERROR: worktree not found'
 fi
