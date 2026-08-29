@@ -30,12 +30,15 @@ LOCAL_DEFAULT_CHECKPOINT = (
     / "checkpoints"
     / "step_000050176_final.pt"
 )
+# Use the canonical 4B2 CAD scene for new Sim-HIL sessions. Historical
+# checkpoints can still select the legacy task explicitly or via the absolute
+# DEXTELEOP_SIM_HIL_TASK_CONFIG override below.
 LOCAL_DEFAULT_TASK_CONFIG = (
     REPO_ROOT
     / "sim"
     / "configs"
     / "tasks"
-    / "rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose.json"
+    / "rm65_right_cube_lift_rl_normal_pregrasp_bridge_v5_cube_pose_canonical.json"
 )
 
 

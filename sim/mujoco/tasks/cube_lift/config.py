@@ -17,6 +17,7 @@ from robot_motion.position_control import DEFAULT_POSITION_COMMAND_HZ
 from sim.contracts import SimulationContract
 
 from ...actuation import (
+    cad_bimanual_dmtac_gripper_profile,
     cube_lift_contact_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
@@ -36,6 +37,9 @@ RM65_ACTUATION_PROFILE_NAME = "rm65_bimanual_udp_feedback_20260721.v4"
 DMTAC_GRIPPER_ACTUATION_PROFILE_NAME = "dmtac_bimanual_position_20260722.v1"
 CUBE_LIFT_CONTACT_GRIPPER_ACTUATION_PROFILE_NAME = (
     "dmtac_bimanual_position_cube_lift_contact_20260724.v2"
+)
+CAD_DMTAC_GRIPPER_ACTUATION_PROFILE_NAME = (
+    "dmtac_bimanual_position_eg2_4b2_cad_20260818.v1"
 )
 NORMAL_POLICY_CLASS = "normal"
 PRIVILEGED_EXPERT_POLICY_CLASS = "privileged_expert"
@@ -86,6 +90,7 @@ def resolve_dmtac_gripper_actuation_profile(name: str):
         for profile in (
             identified_bimanual_dmtac_gripper_profile(),
             cube_lift_contact_dmtac_gripper_profile(),
+            cad_bimanual_dmtac_gripper_profile(),
         )
     }
     try:
@@ -2567,6 +2572,7 @@ class CubeLiftTaskConfig:
 
 __all__ = [
     "ACTUATED_POSITION_EXECUTION_MODE",
+    "CAD_DMTAC_GRIPPER_ACTUATION_PROFILE_NAME",
     "CUBE_LIFT_ACTUATED_TASK_SCHEMA_VERSION",
     "CUBE_LIFT_CONTACT_GRIPPER_ACTUATION_PROFILE_NAME",
     "CUBE_LIFT_FULLY_ACTUATED_TASK_SCHEMA_VERSION",
