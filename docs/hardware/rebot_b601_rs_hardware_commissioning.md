@@ -233,7 +233,9 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 探针默认只把目标关节和强制支撑关节 `joint2`、`joint3` 放入 active set，明确排除
 ID7 夹爪以及未选中的 arm 关节；因此第一档应从 `--joint joint1` 开始，且必须为
 `joint2`/`joint3` 和未选中的腕部关节提供机械支撑。`hold` 从使能后的当前姿态开始，
-不会跳到预设绝对姿态，`slow-step` 只在 hold 通过后以相对、有界步长运行。
+不会跳到预设绝对姿态，`slow-step` 只在 hold 通过后以相对、有界步长运行。使能后先
+等待四个连续、完整、在限位内且近零速度的反馈快照；这段 arming-settle 期间不发送
+力矩帧，首个力矩参考固定在最后一个通过门禁的当前姿态。
 
 ### 异常时的 protective hold（锁存，不是普通回零）
 
@@ -304,14 +306,19 @@ MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort cei
 或真实重力参数已验收。Pinocchio 重力模型使用中性辅助夹爪坐标，实际夹爪负载和
 摩擦仍须后续标定。
 
-运行前必须确认：机械臂处于可支撑的 clearance/L 姿态（建议 j2≈0.7、j3≈1.1），
-操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，现场没有第二个
-CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；后述
+运行前必须确认：机械臂处于当前安全、可支撑且有足够间隙的姿态；不得为了探针主动
+移动到示例姿态。操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，
+现场没有第二个 CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；后述
 `cartesian-hold` 必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
 运行；`safe_stop` 失能后负载可能下落，停止过程中仍需保持支撑。下面命令使用
 状态分支和显式 status 打印，不使用会让交接终端提前退出的 `set -euo pipefail`；
 命令由操作者在目标 worktree 中运行，我们不在自动流程中代运行。版本化文档保留
 可移植变量；实际交接时必须替换为当前 Task 的绝对路径，并先核对固定的 commit/tree：
+
+硬件探针必须在前台同步运行，以便操作者可立即用 Ctrl+C 或物理急停介入。为减少终端
+输出，可把实际命令（含时间、工作目录和参数）及其完整 stdout/stderr 追加到固定日志
+`/tmp/b601-rs-commissioning/command_and_output.log`；不得使用 `&`、`nohup` 或其他
+后台/脱离终端方式。下面交接命令中的 `run_logged` 仅负责记录，不会改变前台执行语义：
 
 ```bash
 WT=/path/to/isolated/AgenticRobot-worktree
@@ -319,10 +326,30 @@ PY=/path/to/dexteleop310/bin/python3.10
 CFG=/path/to/reBotArm_control_py/config/rebotarm_rs.yaml
 SRC=/path/to/reBotArm_control_py
 OUT_DIR=/tmp/b601-rs-commissioning
+LOG="$OUT_DIR/command_and_output.log"
+
+run_logged() {
+  {
+    printf '\n===== command start =====\n'
+    printf 'started_at=%s\n' "$(date -Is)"
+    printf 'cwd=%s\n' "$PWD"
+    printf 'command:'
+    printf ' %q' "$@"
+    printf '\n'
+  } >>"$LOG"
+  "$@" >>"$LOG" 2>&1
+  STATUS=$?
+  {
+    printf 'exit_code=%s\n' "$STATUS"
+    printf 'finished_at=%s\n' "$(date -Is)"
+    printf '===== command end =====\n'
+  } >>"$LOG"
+  return "$STATUS"
+}
 
 mkdir -p "$OUT_DIR"
 if cd "$WT"; then
-  if PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode hold \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
@@ -350,6 +377,7 @@ if cd "$WT"; then
     STATUS=$?
   fi
   printf 'probe exit code: %s\n' "$STATUS"
+  printf 'command and output log: %s\n' "$LOG"
 else
   printf '%s\n' 'ERROR: worktree not found'
 fi

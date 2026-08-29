@@ -417,6 +417,48 @@ def test_fault_hold_snapshot_rejects_motion_and_large_rebase() -> None:
         )
 
 
+def test_arming_settle_transition_accepts_stationary_feedback() -> None:
+    previous = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    current = (0.1, 0.7001, 1.1001, 0.0, -0.1, 0.2)
+
+    accepted, qvel = probe._validate_arming_settle_transition(
+        current,
+        previous_qpos_rad=previous,
+        current_timestamp_sec=1.05,
+        previous_timestamp_sec=1.0,
+        position_limits_rad=_fault_hold_limits(),
+        max_velocity_rad_s=0.02,
+    )
+
+    assert accepted == current
+    assert qvel[1] == pytest.approx(0.002)
+    assert qvel[2] == pytest.approx(0.002)
+
+
+def test_arming_settle_transition_rejects_motion() -> None:
+    with pytest.raises(probe.LowGainProbeError, match="moving"):
+        probe._validate_arming_settle_transition(
+            (0.1, 0.7012, 1.1, 0.0, -0.1, 0.2),
+            previous_qpos_rad=(0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+            current_timestamp_sec=1.05,
+            previous_timestamp_sec=1.0,
+            position_limits_rad=_fault_hold_limits(),
+            max_velocity_rad_s=0.02,
+        )
+
+
+def test_arming_settle_transition_rejects_non_advancing_timestamp() -> None:
+    with pytest.raises(probe.LowGainProbeError, match="timestamp did not advance"):
+        probe._validate_arming_settle_transition(
+            (0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+            previous_qpos_rad=(0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+            current_timestamp_sec=1.0,
+            previous_timestamp_sec=1.0,
+            position_limits_rad=_fault_hold_limits(),
+            max_velocity_rad_s=0.02,
+        )
+
+
 def test_fault_hold_snapshot_rejects_fault_position_without_velocity() -> None:
     with pytest.raises(probe.LowGainProbeError, match="velocity is unavailable"):
         probe._validate_fault_hold_snapshot(

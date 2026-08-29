@@ -28,6 +28,11 @@ This module is motion-capable only after all of ``--allow-motion``,
 same explicit ``mechPos`` reads with ``allow_motion=False`` and never changes
 the vendor mode or enable state.  Automated tests exercise the pure helpers
 only; they never construct a hardware backend.
+
+After MIT mode setup and enable, the active path first requires four consecutive
+complete, in-limit, near-zero-velocity feedback snapshots.  No torque command
+is sent during this arming-settle gate; the first torque reference is anchored
+to the final settled snapshot.
 """
 
 from __future__ import annotations
@@ -96,6 +101,7 @@ _DEFAULT_MAX_ERROR_RAD = 0.15
 _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
 _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
 _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
+_DEFAULT_ARMING_SETTLE_SAMPLES = 4
 _DEFAULT_CARTESIAN_STIFFNESS_N_PER_M = 20.0
 _DEFAULT_CARTESIAN_DAMPING_N_S_PER_M = 1.0
 _DEFAULT_CARTESIAN_MAX_FORCE_N = 2.0
@@ -303,6 +309,56 @@ def _validate_fault_hold_snapshot(
                     f"{delta:.6f} rad > {max_rebase:.6f} rad"
                 )
     return q
+
+
+def _validate_arming_settle_transition(
+    current_qpos_rad: Sequence[float] | None,
+    *,
+    previous_qpos_rad: Sequence[float],
+    current_timestamp_sec: float,
+    previous_timestamp_sec: float,
+    position_limits_rad: Sequence[tuple[float, float]],
+    max_velocity_rad_s: float = _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Validate one post-enable feedback transition before torque is allowed.
+
+    The transition uses consecutive host receive timestamps and the same
+    fresh/in-limit/near-zero-velocity validator as the protective hold.  This
+    helper only validates observations; it never sends a motor command.
+    """
+
+    if current_qpos_rad is None:
+        raise LowGainProbeError(
+            "arming settle requires a complete feedback position snapshot"
+        )
+    current = _six(current_qpos_rad, name="arming_settle_qpos_rad")
+    previous = _six(previous_qpos_rad, name="arming_settle_previous_qpos_rad")
+    current_timestamp = _finite(
+        current_timestamp_sec,
+        name="arming_settle_current_timestamp_sec",
+    )
+    previous_timestamp = _finite(
+        previous_timestamp_sec,
+        name="arming_settle_previous_timestamp_sec",
+    )
+    dt = current_timestamp - previous_timestamp
+    if dt <= 0.0:
+        raise LowGainProbeError(
+            "arming settle feedback timestamp did not advance: "
+            f"dt={dt:.6f}s"
+        )
+    qvel = tuple(
+        (current_value - previous_value) / dt
+        for current_value, previous_value in zip(current, previous, strict=True)
+    )
+    accepted = _validate_fault_hold_snapshot(
+        current,
+        qvel_rad_s=qvel,
+        observed_age_sec=0.0,
+        position_limits_rad=position_limits_rad,
+        max_velocity_rad_s=max_velocity_rad_s,
+    )
+    return accepted, qvel
 
 
 def _validate_protective_hold_feedback(
@@ -1534,6 +1590,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     protective_hold_first_receipt: B601CommandReceipt | None = None
     protective_hold_non_hold_receipt: B601ModeReceipt | None = None
     protective_hold_full_disable_receipt: B601ModeReceipt | None = None
+    arming_settle_required_samples = _DEFAULT_ARMING_SETTLE_SAMPLES
+    arming_settle_samples = 0
+    arming_settle_passed = False
+    arming_settle_elapsed_sec: float | None = None
+    arming_settle_velocity_limit_rad_s = args.fault_hold_max_velocity_rad_s
+    arming_settle_last_qvel: tuple[float, ...] | None = None
     connected = False
     enabled = False
     old_sigint = signal.getsignal(signal.SIGINT)
@@ -1662,7 +1724,82 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         last_safe_observed_at_sec = arming_observed_at_sec
         previous_q = arming_q
         previous_feedback_time = arming_state.receive_timestamp_sec
-        if args.mode == "cartesian-hold":
+        arming_settle_started_at_sec = time.monotonic()
+        arming_settle_previous_q = arming_q
+        arming_settle_previous_feedback_time = arming_state.receive_timestamp_sec
+        arming_settle_last_qvel = tuple(float(value) for value in arming_qvel)
+        arming_settle_last_observed_at_sec = arming_observed_at_sec
+        arming_settle_samples = 1
+        arming_settle_period = 1.0 / args.rate_hz
+        arming_settle_deadline = arming_settle_started_at_sec + arming_settle_period
+        while arming_settle_samples < arming_settle_required_samples:
+            if stop["full_disable_requested"]:
+                stop_reason = "explicit_full_disable during arming settle"
+                break
+            if stop["requested"]:
+                stop_reason = "operator_interrupt during arming settle"
+                break
+            now = time.monotonic()
+            if now < arming_settle_deadline:
+                time.sleep(arming_settle_deadline - now)
+            if stop["full_disable_requested"]:
+                stop_reason = "explicit_full_disable during arming settle"
+                break
+            if stop["requested"]:
+                stop_reason = "operator_interrupt during arming settle"
+                break
+            settle_state = backend.poll_feedback(request_feedback=True)
+            settle_observed_at_sec = time.monotonic()
+            if (
+                not settle_state.valid
+                or getattr(settle_state, "stale", False)
+                or settle_state.positions_rad is None
+            ):
+                stop_reason = (
+                    "arming settle feedback snapshot was not complete and valid; "
+                    f"last_fault={settle_state.fault_reason or 'unknown'}"
+                )
+                break
+            try:
+                (
+                    arming_settle_previous_q,
+                    arming_settle_last_qvel,
+                ) = _validate_arming_settle_transition(
+                    settle_state.positions_rad,
+                    previous_qpos_rad=arming_settle_previous_q,
+                    current_timestamp_sec=settle_state.receive_timestamp_sec,
+                    previous_timestamp_sec=arming_settle_previous_feedback_time,
+                    position_limits_rad=position_limits,
+                    max_velocity_rad_s=arming_settle_velocity_limit_rad_s,
+                )
+            except (LowGainProbeError, TypeError, ValueError) as exc:
+                stop_reason = f"arming settle rejected: {exc}"
+                break
+            arming_settle_previous_feedback_time = settle_state.receive_timestamp_sec
+            arming_settle_last_observed_at_sec = settle_observed_at_sec
+            arming_settle_samples += 1
+            arming_settle_deadline += arming_settle_period
+            completed_at = time.monotonic()
+            arming_settle_deadline = max(arming_settle_deadline, completed_at)
+        arming_settle_elapsed_sec = max(
+            0.0,
+            time.monotonic() - arming_settle_started_at_sec,
+        )
+        arming_settle_passed = (
+            stop_reason is None
+            and arming_settle_samples >= arming_settle_required_samples
+        )
+        if arming_settle_passed:
+            arming_q = arming_settle_previous_q
+            arming_qvel = arming_settle_last_qvel
+            initial_q = arming_settle_previous_q
+            final_q = arming_settle_previous_q
+            last_safe_q = arming_settle_previous_q
+            last_safe_qvel = arming_settle_last_qvel
+            last_safe_observed_at_sec = arming_settle_last_observed_at_sec
+            previous_q = arming_settle_previous_q
+            previous_feedback_time = arming_settle_previous_feedback_time
+        if stop_reason is None and args.mode == "cartesian-hold":
             arming_transform = np.asarray(
                 model.forward_kinematics(arming_q),
                 dtype=float,
@@ -1686,7 +1823,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         period = 1.0 / args.rate_hz
         started = time.monotonic()
         next_deadline = started
-        while time.monotonic() - started < args.duration_sec:
+        while stop_reason is None and time.monotonic() - started < args.duration_sec:
             fault_qpos_for_hold = None
             fault_qvel_for_hold = None
             if stop["full_disable_requested"]:
@@ -2049,6 +2186,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "fault_hold_joint_names": _FAULT_HOLD_JOINTS,
         "fault_hold_non_hold_joint_names": _NON_FAULT_HOLD_JOINTS,
         "target_joint": args.joint,
+        "arming_settle": {
+            "required_samples": arming_settle_required_samples,
+            "samples": arming_settle_samples,
+            "passed": arming_settle_passed,
+            "elapsed_sec": arming_settle_elapsed_sec,
+            "velocity_limit_rad_s": arming_settle_velocity_limit_rad_s,
+            "last_qvel_rad_s": arming_settle_last_qvel,
+            "torque_commands_sent": 0,
+        },
         "motors_enabled_by_probe": enabled,
         "motion_commands_sent": commands_sent > 0,
         "commands_sent": commands_sent,
@@ -2136,7 +2282,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Protective hold admits only a host-fresh, in-limit, near-zero-velocity last-safe snapshot and a small fault rebase; otherwise it falls back to full safe_stop.",
             "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
-            "The probe never chooses an absolute pose. hold starts at the warmup pose; slow-step uses a bounded relative step.",
+            "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step.",
+            "Before any torque command, the active path requires four consecutive complete feedback snapshots after enable; no torque command is sent during this arming-settle gate.",
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "Software composes gravity, position, finite-difference damping, and an optional bounded J.T F overlay, then dispatches vendor MIT kp=kd=0.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
