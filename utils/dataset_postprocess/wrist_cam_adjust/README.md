@@ -257,6 +257,31 @@ profile 选择的 `left_wrist`/`right_wrist`；`front` 不读取 wrist mask。re
 <final-mask-root>/<source_dataset_id>/<dataset-name>/episode_XXXXXX/{left_wrist,right_wrist}/
 ```
 
+其中 `<dataset-name>` 必须逐字来自 source 的 `meta/info.json.dataset_name`，不是
+source 路径的 basename。流水线会把该值限制为单个安全路径分量；新生成的
+postprocessed depth 与 final keep-mask 都直接写入这个 canonical namespace。
+
+如果已有、带 source receipt 的旧产物曾按 source basename 生成，必须显式运行一次：
+
+```bash
+python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline \
+  --profile <profile.json> \
+  --binding-root <binding-root> \
+  --urdf <pinned-urdf> \
+  --migrate-dataset-name-layout \
+  --jobs 4
+```
+
+迁移先按原 namespace 完整验证 episode/frame/bitpack 契约，再在同一个
+`source_dataset_id` 分区和同一文件系统内原子重命名 final 目录；目录 device/inode、
+episode/manifest 计数、profile/binding/source receipt SHA、未修改 raw/mask/manifest bytes
+以及反向 rename 的回滚前提都会写入
+`layout_migrations/<source_dataset_id>.json`。为了保留旧 final manifest 中精确的
+depth 来源路径，旧 postprocessed 中间层留在 generation namespace；训练只读取迁移后的
+canonical final namespace。目标路径碰撞、无迁移 receipt 的半迁移状态、symlink、跨设备
+或计数不一致都会 fail closed。迁移完成后必须另跑一次 `--verify-only`；迁移 flag 本身不能
+与 `--verify-only` 同时使用。
+
 先运行 `prepared_skill_launch prepare` 并记录其 `openpi_binding_root`，再执行：
 
 ```bash

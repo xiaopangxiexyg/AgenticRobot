@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,6 +32,9 @@ from .geometry_mask.dataset import adjust_dataset
 
 PIPELINE_SCHEMA_V2 = "dexteleop_prepared_wrist_final_keep_mask_pipeline_v2"
 FINAL_MASK_LAYOUT_V1 = "source_dataset_id_partitioned_v1"
+FINAL_MASK_NAMESPACE_MIGRATION_SCHEMA = (
+    "dexteleop_final_mask_dataset_namespace_migration_v1"
+)
 WRIST_CAMERA_KEYS = ("left_wrist", "right_wrist")
 
 
@@ -82,6 +86,331 @@ def _write_receipt(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _canonical_dataset_name(dataset_root: Path) -> str:
+    info_path = dataset_root / "meta" / "info.json"
+    info = _read_json(info_path)
+    raw = info.get("dataset_name")
+    if not isinstance(raw, str):
+        raise TypeError(f"dataset_name must be a string: {info_path}")
+    name = raw
+    if (
+        not name
+        or name != name.strip()
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+        or Path(name).name != name
+    ):
+        raise ValueError(
+            f"dataset_name must be one safe path component: {name!r} in {info_path}"
+        )
+    return name
+
+
+def _directory_inventory(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError(f"derived namespace must not be a symlink: {path}")
+    if not path.is_dir():
+        raise FileNotFoundError(f"derived namespace is missing: {path}")
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+        "episode_directory_count": sum(
+            1 for item in path.glob("episode_*") if item.is_dir()
+        ),
+        "manifest_count": sum(1 for _ in path.glob("episode_*/*/manifest.json")),
+    }
+
+
+def _migration_identity(
+    *,
+    profile_path: Path,
+    binding_hash: str,
+    source_id: str,
+    dataset_root: Path,
+    source_receipt_path: Path,
+    canonical_dataset_name: str,
+) -> dict[str, Any]:
+    return {
+        "schema": FINAL_MASK_NAMESPACE_MIGRATION_SCHEMA,
+        "profile_sha256": _sha256(profile_path),
+        "binding_hash": binding_hash,
+        "source_dataset_id": source_id,
+        "source_dataset_root": str(dataset_root),
+        "source_receipt_sha256": _sha256(source_receipt_path),
+        "generation_namespace": dataset_root.name,
+        "canonical_dataset_name": canonical_dataset_name,
+    }
+
+
+def _validate_final_mask_namespace_migration(
+    *,
+    receipt_path: Path,
+    profile_path: Path,
+    binding_hash: str,
+    source_id: str,
+    dataset_root: Path,
+    source_receipt_path: Path,
+    canonical_dataset_name: str,
+    post_root: Path,
+    final_root: Path,
+) -> dict[str, Any]:
+    receipt = _read_json(receipt_path)
+    expected_identity = _migration_identity(
+        profile_path=profile_path,
+        binding_hash=binding_hash,
+        source_id=source_id,
+        dataset_root=dataset_root,
+        source_receipt_path=source_receipt_path,
+        canonical_dataset_name=canonical_dataset_name,
+    )
+    mismatched = {
+        key: (receipt.get(key), expected)
+        for key, expected in expected_identity.items()
+        if receipt.get(key) != expected
+    }
+    if mismatched:
+        raise ValueError(
+            "final-mask namespace migration receipt differs from the fixed "
+            f"snapshot: {receipt_path} {mismatched}"
+        )
+    operation = receipt.get("final_keep_namespace")
+    if not isinstance(operation, Mapping):
+        raise TypeError(
+            f"migration receipt has no final namespace operation: {receipt_path}"
+        )
+    legacy_path = final_root / dataset_root.name
+    canonical_path = final_root / canonical_dataset_name
+    if legacy_path.exists() or legacy_path.is_symlink():
+        raise ValueError(
+            f"legacy final-mask namespace still exists after migration: {legacy_path}"
+        )
+    inventory = _directory_inventory(canonical_path)
+    recorded_after = operation.get("after")
+    if not isinstance(recorded_after, Mapping):
+        raise TypeError(f"migration receipt has no after inventory: {receipt_path}")
+    inventory_mismatch = {
+        key: (recorded_after.get(key), value)
+        for key, value in inventory.items()
+        if recorded_after.get(key) != value
+    }
+    if inventory_mismatch:
+        raise ValueError(
+            "canonical final-mask namespace differs from its migration "
+            f"receipt: {receipt_path} {inventory_mismatch}"
+        )
+    post = receipt.get("postprocessed_depth_keep")
+    if not isinstance(post, Mapping):
+        raise TypeError(f"migration receipt has no postprocessed state: {receipt_path}")
+    expected_post_path = post_root / dataset_root.name
+    if post.get("path") != str(expected_post_path):
+        raise ValueError(
+            "migration receipt binds a different postprocessed namespace: "
+            f"{receipt_path}"
+        )
+    if post.get("state") == "retained_at_generation_namespace":
+        recorded_post = post.get("inventory")
+        if not isinstance(recorded_post, Mapping):
+            raise TypeError(
+                f"migration receipt has no postprocessed inventory: {receipt_path}"
+            )
+        current_post = _directory_inventory(expected_post_path)
+        post_mismatch = {
+            key: (recorded_post.get(key), value)
+            for key, value in current_post.items()
+            if recorded_post.get(key) != value
+        }
+        if post_mismatch:
+            raise ValueError(
+                "postprocessed namespace differs from its migration receipt: "
+                f"{receipt_path} {post_mismatch}"
+            )
+    elif post.get("state") == "removed_after_validation":
+        if expected_post_path.exists() or expected_post_path.is_symlink():
+            raise ValueError(
+                "migration receipt declares removed postprocessed masks but "
+                f"the namespace exists: {expected_post_path}"
+            )
+    else:
+        raise ValueError(
+            f"unsupported postprocessed migration state: {post.get('state')!r}"
+        )
+    return receipt
+
+
+def _migrate_final_mask_namespace(
+    *,
+    receipt_path: Path,
+    profile_path: Path,
+    binding_hash: str,
+    source_id: str,
+    dataset_root: Path,
+    source_receipt_path: Path,
+    source_receipt: Mapping[str, Any],
+    canonical_dataset_name: str,
+    post_root: Path,
+    final_root: Path,
+    postprocessed_summary: Mapping[str, Any],
+    final_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    if dataset_root.name == canonical_dataset_name:
+        raise ValueError("namespace migration requires two different names")
+    if receipt_path.is_file():
+        return _validate_final_mask_namespace_migration(
+            receipt_path=receipt_path,
+            profile_path=profile_path,
+            binding_hash=binding_hash,
+            source_id=source_id,
+            dataset_root=dataset_root,
+            source_receipt_path=source_receipt_path,
+            canonical_dataset_name=canonical_dataset_name,
+            post_root=post_root,
+            final_root=final_root,
+        )
+
+    legacy_path = final_root / dataset_root.name
+    canonical_path = final_root / canonical_dataset_name
+    if canonical_path.exists() or canonical_path.is_symlink():
+        raise FileExistsError(
+            "canonical final-mask namespace exists without a matching "
+            f"migration receipt: {canonical_path}"
+        )
+    before = _directory_inventory(legacy_path)
+    expected_manifest_count = int(final_summary["episode_count"]) * int(
+        final_summary["camera_count"]
+    )
+    if (
+        before["episode_directory_count"] != int(final_summary["episode_count"])
+        or before["manifest_count"] != expected_manifest_count
+    ):
+        raise ValueError(
+            "legacy final-mask namespace inventory differs from its verified "
+            f"summary: {legacy_path}"
+        )
+    if legacy_path.parent != canonical_path.parent:
+        raise ValueError("namespace migration must stay within one partition")
+    parent_device = int(legacy_path.parent.stat().st_dev)
+    if parent_device != int(before["device"]):
+        raise ValueError("namespace migration would cross filesystem devices")
+
+    retention = source_receipt.get("intermediate_retention")
+    if not isinstance(retention, Mapping):
+        raise TypeError("source receipt has no intermediate retention contract")
+    post_path = post_root / dataset_root.name
+    if retention.get("postprocessed_depth_keep") == "removed_after_validation":
+        if post_path.exists() or post_path.is_symlink():
+            raise ValueError(
+                "source receipt declares removed postprocessed masks but the "
+                f"namespace exists: {post_path}"
+            )
+        post_state: dict[str, Any] = {
+            "state": "removed_after_validation",
+            "path": str(post_path),
+            "validated_summary": dict(postprocessed_summary),
+        }
+    else:
+        post_inventory = _directory_inventory(post_path)
+        expected_post_manifests = int(postprocessed_summary["episode_count"]) * int(
+            postprocessed_summary["camera_count"]
+        )
+        if (
+            post_inventory["episode_directory_count"]
+            != int(postprocessed_summary["episode_count"])
+            or post_inventory["manifest_count"] != expected_post_manifests
+        ):
+            raise ValueError(
+                "postprocessed namespace inventory differs from its verified "
+                f"summary: {post_path}"
+            )
+        post_state = {
+            "state": "retained_at_generation_namespace",
+            "path": str(post_path),
+            "inventory": post_inventory,
+            "validated_summary": dict(postprocessed_summary),
+        }
+
+    moved = False
+    try:
+        os.replace(legacy_path, canonical_path)
+        moved = True
+        after = _directory_inventory(canonical_path)
+        if {
+            key: before[key]
+            for key in (
+                "device",
+                "inode",
+                "episode_directory_count",
+                "manifest_count",
+            )
+        } != {
+            key: after[key]
+            for key in (
+                "device",
+                "inode",
+                "episode_directory_count",
+                "manifest_count",
+            )
+        }:
+            raise RuntimeError(
+                "final-mask namespace inode or inventory changed during rename"
+            )
+        receipt = {
+            **_migration_identity(
+                profile_path=profile_path,
+                binding_hash=binding_hash,
+                source_id=source_id,
+                dataset_root=dataset_root,
+                source_receipt_path=source_receipt_path,
+                canonical_dataset_name=canonical_dataset_name,
+            ),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "profile_path": str(profile_path),
+            "source_receipt_path": str(source_receipt_path),
+            "final_keep_namespace": {
+                "operation": "same_filesystem_atomic_directory_rename",
+                "before": before,
+                "after": after,
+                "validated_summary": dict(final_summary),
+            },
+            "postprocessed_depth_keep": post_state,
+            "content_policy": {
+                "mask_stream_bytes_modified": False,
+                "manifest_bytes_modified": False,
+                "manifest_paths_remain_generation_time_provenance": True,
+                "stream_resolution": "relative_to_manifest_location",
+            },
+            "raw_source_modified": False,
+            "source_receipt_modified": False,
+            "rollback": {
+                "operation": "same_filesystem_atomic_directory_rename",
+                "from": str(canonical_path),
+                "to": str(legacy_path),
+                "required_device": int(after["device"]),
+                "required_inode": int(after["inode"]),
+                "preconditions": (
+                    "canonical path matches this receipt and legacy path is absent"
+                ),
+            },
+        }
+        _write_receipt(receipt_path, receipt)
+        return receipt
+    except BaseException:
+        if (
+            moved
+            and canonical_path.is_dir()
+            and not canonical_path.is_symlink()
+            and not legacy_path.exists()
+            and not legacy_path.is_symlink()
+            and int(canonical_path.stat().st_ino) == int(before["inode"])
+            and int(canonical_path.stat().st_dev) == int(before["device"])
+        ):
+            os.replace(canonical_path, legacy_path)
+        raise
+
+
 def _episode_records(dataset_root: Path) -> dict[int, dict[str, Any]]:
     return {
         int(record["episode_index"]): record
@@ -97,10 +426,7 @@ def _selected_by_source(
         grouped.setdefault(episode.source_dataset_id, []).append(
             int(episode.source_episode_index)
         )
-    return {
-        source_id: tuple(sorted(indices))
-        for source_id, indices in grouped.items()
-    }
+    return {source_id: tuple(sorted(indices)) for source_id, indices in grouped.items()}
 
 
 def _selected_wrist_camera_keys(profile: Mapping[str, Any]) -> tuple[str, ...]:
@@ -148,9 +474,7 @@ def _physical_devices_by_episode(
     plan = audit.get("plan")
     if not isinstance(plan, Mapping) or not isinstance(plan.get("episodes"), list):
         raise TypeError(f"physical build audit has no episode plan: {audit_path}")
-    plan_rows = tuple(
-        item for item in plan["episodes"] if isinstance(item, Mapping)
-    )
+    plan_rows = tuple(item for item in plan["episodes"] if isinstance(item, Mapping))
     provenance_rows = tuple(_read_jsonl(provenance_path))
     if len(plan_rows) != len(provenance_rows):
         raise ValueError(
@@ -162,8 +486,7 @@ def _physical_devices_by_episode(
         output_index = int(row["output_episode_index"])
         if output_index in provenance_by_output:
             raise ValueError(
-                "physical provenance repeats output episode index "
-                f"{output_index}."
+                f"physical provenance repeats output episode index {output_index}."
             )
         provenance_by_output[output_index] = row
     selected = {int(value) for value in episode_indices}
@@ -199,14 +522,11 @@ def _physical_devices_by_episode(
         provenance = provenance_by_output.get(output_index)
         if provenance is None:
             raise ValueError(
-                "physical provenance is missing output episode "
-                f"{output_index}."
+                f"physical provenance is missing output episode {output_index}."
             )
         expected_source_episode = int(item["source_episode_index"])
         if (
-            Path(str(provenance.get("source_dataset_root", "")))
-            .expanduser()
-            .resolve()
+            Path(str(provenance.get("source_dataset_root", ""))).expanduser().resolve()
             != source_root
             or int(provenance.get("source_episode_index", -1))
             != expected_source_episode
@@ -242,21 +562,14 @@ def _physical_devices_by_episode(
         }
         current = source_contracts.setdefault(contract_key, contract)
         if {
-            key: current[key]
-            for key in contract
-            if key != "selected_episode_count"
+            key: current[key] for key in contract if key != "selected_episode_count"
         } != {
-            key: contract[key]
-            for key in contract
-            if key != "selected_episode_count"
+            key: contract[key] for key in contract if key != "selected_episode_count"
         }:
             raise ValueError(
-                "physical source-device contract is inconsistent for "
-                f"{devices_path}."
+                f"physical source-device contract is inconsistent for {devices_path}."
             )
-        current["selected_episode_count"] = int(
-            current["selected_episode_count"]
-        ) + 1
+        current["selected_episode_count"] = int(current["selected_episode_count"]) + 1
         mapping[output_index] = devices_path
     missing = sorted(selected - set(mapping))
     if missing:
@@ -273,9 +586,7 @@ def _physical_devices_by_episode(
         "provenance_path": str(provenance_path.resolve()),
         "provenance_sha256": _sha256(provenance_path),
         "selected_episode_count": len(selected),
-        "source_manifests": [
-            source_contracts[key] for key in sorted(source_contracts)
-        ],
+        "source_manifests": [source_contracts[key] for key in sorted(source_contracts)],
     }
 
 
@@ -305,9 +616,7 @@ def _intrinsics_overlay_for_source(
     if not isinstance(raw_override, Mapping):
         raise TypeError(f"intrinsics override must be an object: {source_id}")
     target_camera_key = str(raw_override.get("target_camera_key", "")).strip()
-    donor_source_id = str(
-        raw_override.get("donor_source_dataset_id", "")
-    ).strip()
+    donor_source_id = str(raw_override.get("donor_source_dataset_id", "")).strip()
     donor_camera_key = str(raw_override.get("donor_camera_key", "")).strip()
     expected_serial = str(raw_override.get("expected_serial", "")).strip()
     if (
@@ -320,10 +629,7 @@ def _intrinsics_overlay_for_source(
 
     target_path = dataset_root / "meta" / "devices" / "realsense.json"
     donor_path = (
-        profile_sources[donor_source_id]
-        / "meta"
-        / "devices"
-        / "realsense.json"
+        profile_sources[donor_source_id] / "meta" / "devices" / "realsense.json"
     )
     target_payload = _read_json(target_path)
     donor_payload = _read_json(donor_path)
@@ -333,9 +639,7 @@ def _intrinsics_overlay_for_source(
         donor_record,
         Mapping,
     ):
-        raise TypeError(
-            f"intrinsics override camera binding is absent: {source_id}"
-        )
+        raise TypeError(f"intrinsics override camera binding is absent: {source_id}")
     target_serial = _camera_serial(target_record)
     donor_serial = _camera_serial(donor_record)
     intrinsics = donor_record.get("intrinsics")
@@ -390,9 +694,7 @@ def _contained_regular_file(
     root_resolved = root.resolve()
     candidate = root_resolved / relative
     if candidate.is_symlink():
-        raise FileNotFoundError(
-            f"{label} must not be a symlink: {candidate}"
-        )
+        raise FileNotFoundError(f"{label} must not be a symlink: {candidate}")
     resolved = candidate.resolve()
     try:
         resolved.relative_to(root_resolved)
@@ -486,9 +788,7 @@ def _wrist_intrinsics_overlays_for_source(
     if raw_source_overrides is None:
         return None, None
     if not isinstance(raw_source_overrides, Mapping):
-        raise TypeError(
-            f"wrist intrinsics overrides must be an object: {source_id}"
-        )
+        raise TypeError(f"wrist intrinsics overrides must be an object: {source_id}")
 
     selected_cameras = tuple(str(value) for value in camera_keys)
     if set(raw_source_overrides) != set(selected_cameras):
@@ -510,8 +810,7 @@ def _wrist_intrinsics_overlays_for_source(
             dataset_root / "meta" / "devices" / "realsense.json"
         ).resolve()
         target_devices_by_episode = {
-            episode_index: default_devices
-            for episode_index in selected_episodes
+            episode_index: default_devices for episode_index in selected_episodes
         }
     else:
         target_devices_by_episode = {
@@ -539,8 +838,7 @@ def _wrist_intrinsics_overlays_for_source(
             ) from exc
         if not target_path.is_file() or target_path.is_symlink():
             raise FileNotFoundError(
-                "target camera devices manifest must be a regular file: "
-                f"{target_path}"
+                f"target camera devices manifest must be a regular file: {target_path}"
             )
         episodes_by_target.setdefault(target_path, []).append(episode_index)
 
@@ -562,21 +860,15 @@ def _wrist_intrinsics_overlays_for_source(
                     "wrist intrinsics camera override must be an object: "
                     f"{source_id}/{camera_key}"
                 )
-            target_camera_key = str(
-                raw_override.get("target_camera_key", "")
-            ).strip()
+            target_camera_key = str(raw_override.get("target_camera_key", "")).strip()
             donor_source_id = str(
                 raw_override.get("donor_source_dataset_id", "")
             ).strip()
             donor_relative_path = str(
                 raw_override.get("donor_devices_relative_path", "")
             ).strip()
-            donor_camera_key = str(
-                raw_override.get("donor_camera_key", "")
-            ).strip()
-            expected_serial = str(
-                raw_override.get("expected_serial", "")
-            ).strip()
+            donor_camera_key = str(raw_override.get("donor_camera_key", "")).strip()
+            expected_serial = str(raw_override.get("expected_serial", "")).strip()
             if (
                 target_camera_key != camera_key
                 or donor_source_id not in profile_sources
@@ -585,8 +877,7 @@ def _wrist_intrinsics_overlays_for_source(
                 or not expected_serial
             ):
                 raise ValueError(
-                    "invalid wrist intrinsics override: "
-                    f"{source_id}/{camera_key}"
+                    f"invalid wrist intrinsics override: {source_id}/{camera_key}"
                 )
 
             cache_key = (donor_source_id, donor_relative_path)
@@ -710,9 +1001,7 @@ def _expected_frames(
                 f"selected episode has no positive frame_count: {episode_index}"
             )
         expected[int(episode_index)] = (
-            min(frame_count, int(max_frames))
-            if int(max_frames) > 0
-            else frame_count
+            min(frame_count, int(max_frames)) if int(max_frames) > 0 else frame_count
         )
     return expected
 
@@ -738,10 +1027,7 @@ def _verify_mask_tree(
         per_camera_bytes = 0
         for episode_index, frame_count in sorted(expected_frames.items()):
             episode_dir = (
-                root
-                / dataset_name
-                / f"episode_{episode_index:06d}"
-                / camera_key
+                root / dataset_name / f"episode_{episode_index:06d}" / camera_key
             )
             manifest_path = episode_dir / "manifest.json"
             manifest = _read_json(manifest_path)
@@ -795,6 +1081,7 @@ def _postprocess_source(
     output_root: Path,
     episodes: Sequence[int],
     *,
+    dataset_name: str,
     camera_keys: Sequence[str],
     jobs: int,
     max_frames: int,
@@ -816,10 +1103,7 @@ def _postprocess_source(
             )
         stream = load_mask_stream(manifests[0], root_hint=dataset_root)
         output_dir = (
-            output_root
-            / dataset_root.name
-            / f"episode_{episode_index:06d}"
-            / camera_key
+            output_root / dataset_name / f"episode_{episode_index:06d}" / camera_key
         )
         return (
             episode_index,
@@ -865,6 +1149,7 @@ def _source_receipt(
     binding: OpenPIPreparedSkillBinding,
     source_id: str,
     dataset_root: Path,
+    dataset_name: str,
     episodes: Sequence[int],
     camera_keys: Sequence[str],
     expected_frames: Mapping[int, int],
@@ -886,6 +1171,7 @@ def _source_receipt(
         "binding_hash": binding.binding_hash,
         "source_dataset_id": source_id,
         "source_dataset_root": str(dataset_root),
+        "dataset_name": dataset_name,
         "eligible_episode_count": len(episodes),
         "eligible_frame_count": sum(expected_frames.values()),
         "episode_indices": list(episodes),
@@ -898,9 +1184,7 @@ def _source_receipt(
         "raw_source_modified": False,
         "raw_trailing_streams": [dict(item) for item in trailing_sources],
         "calibration_contract": (
-            None
-            if calibration_contract is None
-            else dict(calibration_contract)
+            None if calibration_contract is None else dict(calibration_contract)
         ),
         "camera_devices_contract": dict(camera_devices_contract),
         "derived_roots": {
@@ -914,14 +1198,10 @@ def _source_receipt(
         },
         "intermediate_retention": {
             "table_geometry_keep": (
-                "removed_after_validation"
-                if intermediates_removed
-                else "retained"
+                "removed_after_validation" if intermediates_removed else "retained"
             ),
             "postprocessed_depth_keep": (
-                "removed_after_validation"
-                if intermediates_removed
-                else "retained"
+                "removed_after_validation" if intermediates_removed else "retained"
             ),
         },
         "rollback": {
@@ -969,8 +1249,7 @@ def _validated_removed_intermediate_summary(
             {
                 "camera_count": len(cameras),
                 "cameras": list(cameras),
-                "camera_frame_count": sum(expected_frames.values())
-                * len(cameras),
+                "camera_frame_count": sum(expected_frames.values()) * len(cameras),
             }
         )
     mismatched = {
@@ -1012,8 +1291,7 @@ def _remove_validated_intermediate_roots(
             resolved.relative_to(intermediate)
         except ValueError as exc:
             raise ValueError(
-                f"{label} root is outside the intermediate workspace: "
-                f"{resolved}"
+                f"{label} root is outside the intermediate workspace: {resolved}"
             ) from exc
         if resolved == intermediate or not resolved.is_dir():
             raise ValueError(f"invalid {label} root for removal: {resolved}")
@@ -1027,9 +1305,7 @@ def _summary_receipt_name(
 ) -> str:
     if tuple(run_sources) == tuple(all_sources):
         return "summary.json"
-    digest = hashlib.sha256(
-        "\n".join(run_sources).encode("utf-8")
-    ).hexdigest()[:16]
+    digest = hashlib.sha256("\n".join(run_sources).encode("utf-8")).hexdigest()[:16]
     return f"summary-{digest}.json"
 
 
@@ -1067,7 +1343,10 @@ def run_pipeline(
     max_frames: int,
     verify_only: bool,
     remove_validated_intermediates: bool = False,
+    migrate_dataset_name_layout: bool = False,
 ) -> dict[str, Any]:
+    if verify_only and migrate_dataset_name_layout:
+        raise ValueError("dataset-name layout migration cannot run with verify-only")
     profile = _load_profile(profile_path)
     if profile.get("openpi_final_mask_root_layout") != FINAL_MASK_LAYOUT_V1:
         raise ValueError("profile does not declare source-partitioned final masks")
@@ -1092,9 +1371,7 @@ def run_pipeline(
     legacy_overrides = profile.get("right_wrist_intrinsics_overrides", {})
     if not isinstance(legacy_overrides, Mapping):
         raise TypeError("right_wrist_intrinsics_overrides must be an object")
-    overlapping_override_sources = sorted(
-        set(wrist_overrides) & set(legacy_overrides)
-    )
+    overlapping_override_sources = sorted(set(wrist_overrides) & set(legacy_overrides))
     if overlapping_override_sources:
         raise ValueError(
             "sources cannot use both legacy and multi-wrist intrinsics "
@@ -1122,16 +1399,14 @@ def run_pipeline(
     post_base = intermediate_derived_root / "postprocessed_depth_keep_masks"
     profile_id = str(profile["profile_id"])
     receipt_base = (
-        derived_root.parent
-        / "receipts"
-        / "prepared_wrist_final_masks"
-        / profile_id
+        derived_root.parent / "receipts" / "prepared_wrist_final_masks" / profile_id
     )
     overlay_base = intermediate_derived_root / "calibration_overlays"
 
     summaries: list[dict[str, Any]] = []
     for source_id in run_sources:
         dataset_root = profile_sources[source_id]
+        dataset_name = _canonical_dataset_name(dataset_root)
         episodes = selected[source_id]
         records = _episode_records(dataset_root)
         expected = _expected_frames(records, episodes, max_frames=max_frames)
@@ -1139,9 +1414,10 @@ def run_pipeline(
         post_root = post_base / source_id
         final_root = final_base / source_id
         receipt_path = receipt_base / f"{source_id}.json"
-        existing_receipt = (
-            _read_json(receipt_path) if receipt_path.is_file() else None
+        migration_receipt_path = (
+            receipt_base / "layout_migrations" / f"{source_id}.json"
         )
+        existing_receipt = _read_json(receipt_path) if receipt_path.is_file() else None
         if existing_receipt is not None:
             expected_receipt_identity = {
                 "schema": PIPELINE_SCHEMA_V2,
@@ -1153,6 +1429,8 @@ def run_pipeline(
                 "profile_sha256": _sha256(profile_path),
                 "cameras": list(camera_keys),
             }
+            if "dataset_name" in existing_receipt:
+                expected_receipt_identity["dataset_name"] = dataset_name
             mismatched = {
                 key: (existing_receipt.get(key), expected_value)
                 for key, expected_value in expected_receipt_identity.items()
@@ -1184,11 +1462,9 @@ def run_pipeline(
                     overlay_base=overlay_base,
                 )
             )
-            devices_by_episode, camera_devices_contract = (
-                _physical_devices_by_episode(
-                    dataset_root,
-                    episodes,
-                )
+            devices_by_episode, camera_devices_contract = _physical_devices_by_episode(
+                dataset_root,
+                episodes,
             )
             wrist_overlay_devices, wrist_calibration_contract = (
                 _wrist_intrinsics_overlays_for_source(
@@ -1244,6 +1520,7 @@ def run_pipeline(
                 dataset_root,
                 post_root,
                 episodes,
+                dataset_name=dataset_name,
                 camera_keys=camera_keys,
                 jobs=jobs,
                 max_frames=max_frames,
@@ -1257,12 +1534,55 @@ def run_pipeline(
                 cameras=camera_keys,
                 max_frames=max_frames,
                 jobs=jobs,
-                overwrite=(final_root / dataset_root.name).exists(),
+                overwrite=(final_root / dataset_name).exists(),
+                dataset_namespace=dataset_name,
             )
         else:
-            trailing = list(
-                (existing_receipt or {}).get("raw_trailing_streams", [])
-            )
+            trailing = list((existing_receipt or {}).get("raw_trailing_streams", []))
+
+        legacy_receipt_layout = (
+            existing_receipt is not None
+            and "dataset_name" not in existing_receipt
+            and dataset_root.name != dataset_name
+        )
+        post_dataset_name = dataset_name
+        final_dataset_name = dataset_name
+        needs_namespace_migration = False
+        if legacy_receipt_layout:
+            post_dataset_name = dataset_root.name
+            legacy_final_path = final_root / dataset_root.name
+            canonical_final_path = final_root / dataset_name
+            if migration_receipt_path.is_file():
+                _validate_final_mask_namespace_migration(
+                    receipt_path=migration_receipt_path,
+                    profile_path=profile_path,
+                    binding_hash=binding.binding_hash,
+                    source_id=source_id,
+                    dataset_root=dataset_root,
+                    source_receipt_path=receipt_path,
+                    canonical_dataset_name=dataset_name,
+                    post_root=post_root,
+                    final_root=final_root,
+                )
+            elif canonical_final_path.exists() or canonical_final_path.is_symlink():
+                raise FileExistsError(
+                    "canonical final-mask namespace exists without an immutable "
+                    f"migration receipt: {canonical_final_path}"
+                )
+            elif legacy_final_path.is_dir() and not legacy_final_path.is_symlink():
+                if not migrate_dataset_name_layout:
+                    raise ValueError(
+                        "legacy final-mask namespace requires explicit "
+                        "--migrate-dataset-name-layout before verification: "
+                        f"{legacy_final_path} -> {canonical_final_path}"
+                    )
+                final_dataset_name = dataset_root.name
+                needs_namespace_migration = True
+            else:
+                raise FileNotFoundError(
+                    "neither the receipted legacy nor canonical final-mask "
+                    f"namespace exists for {source_id}"
+                )
 
         removed_post_summary = (
             None
@@ -1278,7 +1598,7 @@ def run_pipeline(
             if removed_post_summary is not None
             else _verify_mask_tree(
                 post_root,
-                dataset_root.name,
+                post_dataset_name,
                 expected,
                 camera_keys=camera_keys,
                 stream_name="mask_postprocessed.bitpack.bin",
@@ -1287,17 +1607,36 @@ def run_pipeline(
         )
         final_summary = _verify_mask_tree(
             final_root,
-            dataset_root.name,
+            final_dataset_name,
             expected,
             camera_keys=camera_keys,
             stream_name="final_keep.bitpack.bin",
             expected_mask_name="postprocessed_depth_or_table_keep_mask",
         )
+        if needs_namespace_migration:
+            if existing_receipt is None:
+                raise AssertionError("legacy migration requires a source receipt")
+            _migrate_final_mask_namespace(
+                receipt_path=migration_receipt_path,
+                profile_path=profile_path,
+                binding_hash=binding.binding_hash,
+                source_id=source_id,
+                dataset_root=dataset_root,
+                source_receipt_path=receipt_path,
+                source_receipt=existing_receipt,
+                canonical_dataset_name=dataset_name,
+                post_root=post_root,
+                final_root=final_root,
+                postprocessed_summary=post_summary,
+                final_summary=final_summary,
+            )
+            final_dataset_name = dataset_name
         receipt = _source_receipt(
             profile_path=profile_path,
             binding=binding,
             source_id=source_id,
             dataset_root=dataset_root,
+            dataset_name=dataset_name,
             episodes=episodes,
             camera_keys=camera_keys,
             expected_frames=expected,
@@ -1386,11 +1725,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--remove-validated-intermediates", action="store_true")
+    parser.add_argument(
+        "--migrate-dataset-name-layout",
+        action="store_true",
+        help=(
+            "Atomically rename receipted legacy final-mask directories to the "
+            "canonical meta/info.json dataset_name and publish a rollback "
+            "receipt; raw data and mask bytes are not modified."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
     if args.max_frames < 0:
         parser.error("--max-frames must be non-negative")
+    if args.verify_only and args.migrate_dataset_name_layout:
+        parser.error(
+            "--migrate-dataset-name-layout cannot be combined with --verify-only"
+        )
     summary = run_pipeline(
         profile_path=args.profile.expanduser().resolve(),
         binding_root=args.binding_root.expanduser().resolve(),
@@ -1402,6 +1754,7 @@ def main(argv: list[str] | None = None) -> int:
         max_frames=args.max_frames,
         verify_only=args.verify_only,
         remove_validated_intermediates=args.remove_validated_intermediates,
+        migrate_dataset_name_layout=args.migrate_dataset_name_layout,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
