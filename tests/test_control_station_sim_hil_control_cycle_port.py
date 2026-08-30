@@ -927,3 +927,120 @@ def test_application_episode_end_closes_allocation_binding_before_lower_hold() -
     app.close()
     assert events.index("binding.join:1") > lower_hold
     assert events.count("human.close") == 1
+
+
+def test_allocation_port_retries_only_bindings_that_failed_to_join() -> None:
+    events: list[str] = []
+
+    class FailOnceJoinBinding(_VirtualAllocationBinding):
+        def join(self, *, timeout_sec: float) -> bool:
+            self.join_calls.append(timeout_sec)
+            self.events.append(
+                f"binding.join:{self.activation_scope.session_epoch}:"
+                f"{len(self.join_calls)}"
+            )
+            return len(self.join_calls) > 1
+
+    binding = FailOnceJoinBinding(_activation(), events)
+    port = AllocationProposalExecutionControlCyclePort(
+        port_id="retry-failed-allocation-join",
+        binding_factory=lambda _scope: binding,
+    )
+    port.activate(activation_scope=binding.activation_scope)
+
+    with pytest.raises(RuntimeError, match="allocation_binding_join_timeout"):
+        port.close()
+
+    assert binding.join_calls == [2.0]
+    port.close()
+
+    assert binding.join_calls == [2.0, 2.0]
+
+
+def test_application_keeps_viewer_until_control_cycle_join_retry_succeeds() -> None:
+    events: list[str] = []
+
+    class FailOnceCyclePort:
+        def __init__(self) -> None:
+            self.spec = SimHILControlCyclePortSpec(
+                port_id="fail-once-close-cycle",
+                cycle_kind="allocation_proposal_execution",
+                policy_source_requirement=SIM_HIL_POLICY_SOURCE_ALWAYS,
+                application_blend_failure_fallback_enabled=False,
+                application_human_timeout_fallback_enabled=False,
+                application_owns_human_source_close=True,
+            )
+            self.close_calls = 0
+
+        def activate(self, *, activation_scope) -> None:
+            del activation_scope
+
+        def deactivate(self, *, reason: str) -> None:
+            events.append(f"cycle.deactivate:{reason}")
+
+        def run_cycle(self, **kwargs):
+            del kwargs
+
+        def close(self) -> None:
+            self.close_calls += 1
+            events.append(f"cycle.close:{self.close_calls}")
+            if self.close_calls == 1:
+                raise RuntimeError("synthetic binding join timeout")
+
+    class Composition:
+        started = True
+
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            events.append("composition.close")
+            self.started = False
+
+    class CloseRecorder:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            events.append(f"{self.name}.close")
+
+    cycle_port = FailOnceCyclePort()
+    composition = Composition()
+    policy_source = CloseRecorder("policy")
+    human_source = CloseRecorder("human")
+    viewer = CloseRecorder("viewer")
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=SimpleNamespace(),
+        composition=composition,
+        control_cycle_port=cycle_port,
+        policy_source=policy_source,
+        human_source=human_source,
+        readiness_provider=SimpleNamespace(),
+        viewer=viewer,
+    )
+    app._started = True
+    app._sources_started = True
+    app.hold = lambda *, reason: events.append(f"hold:{reason}")
+
+    with pytest.raises(RuntimeError, match="synthetic binding join timeout"):
+        app.close()
+
+    assert app._closed is False
+    assert composition.close_calls == 1
+    assert policy_source.close_calls == 0
+    assert human_source.close_calls == 0
+    assert viewer.close_calls == 0
+
+    app.close()
+
+    assert cycle_port.close_calls == 2
+    assert composition.close_calls == 1
+    assert policy_source.close_calls == 1
+    assert human_source.close_calls == 1
+    assert viewer.close_calls == 1

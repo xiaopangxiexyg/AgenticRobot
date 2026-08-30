@@ -91,7 +91,12 @@ from robot_motion.replay.control_trace import (
     project_replay_source_frame_emission,
 )
 from robot_motion.runtime.identity import ClockDomainDescriptor
-from robot_motion.runtime import CommandDispatchReceipt
+from robot_motion.runtime import (
+    CommandDispatchReceipt,
+    LifecycleStartupError,
+    collect_lifecycle_failures,
+    raise_lifecycle_failures,
+)
 from robot_motion.runtime.control_admission import (
     ControlAdmissionCoordinator,
     ControlCut,
@@ -1709,6 +1714,14 @@ class MujocoDeployRuntime:
             else self._composition_binding._topology
         )
         self._started = False
+        # ``_started`` is only the operational latch.  Close may still owe
+        # trace terminalization or a worker join after that latch is lowered,
+        # so lifecycle ownership is tracked independently and each completed
+        # step is never repeated on a retry.
+        self._lifecycle_entered = False
+        self._trace_close_pending = False
+        self._rig_close_pending = False
+        self._lifecycle_terminal = False
         self._latest_target_execution_step: AuthoritativeControlStep | None = None
         self._last_dispatch_context: (
             AuthoritativeCommandDispatchContext
@@ -2530,33 +2543,61 @@ class MujocoDeployRuntime:
     def start(self) -> None:
         if self._started:
             return
+        if self._lifecycle_entered:
+            raise RuntimeError(
+                "MujocoDeployRuntime cleanup is pending; close() must "
+                "complete before the runtime is discarded."
+            )
+        if self._lifecycle_terminal:
+            raise RuntimeError(
+                "MujocoDeployRuntime is closed and must be rebuilt."
+            )
         self._latest_target_execution_step = None
-        self.rig.start()
-        self.core.record_compound_authority_profiles()
-        self.core.activate_producer(
-            producer_id=self.config.producer_id,
-            producer_epoch=self.config.producer_epoch,
-            reason="mujoco deploy startup",
-        )
-        if self.config.enable_replay_authority:
+        self._lifecycle_entered = True
+        self._trace_close_pending = True
+        self._rig_close_pending = True
+        try:
+            self.rig.start()
+            self.core.record_compound_authority_profiles()
             self.core.activate_producer(
-                producer_id=self.config.replay_producer_id,
+                producer_id=self.config.producer_id,
                 producer_epoch=self.config.producer_epoch,
-                reason="mujoco replay authority startup",
+                reason="mujoco deploy startup",
             )
-        if self.config.enable_composer_authority:
-            self.core.activate_producer(
-                producer_id=self.config.composer_producer_id,
-                producer_epoch=self.config.producer_epoch,
-                reason="mujoco composer authority startup",
+            if self.config.enable_replay_authority:
+                self.core.activate_producer(
+                    producer_id=self.config.replay_producer_id,
+                    producer_epoch=self.config.producer_epoch,
+                    reason="mujoco replay authority startup",
+                )
+            if self.config.enable_composer_authority:
+                self.core.activate_producer(
+                    producer_id=self.config.composer_producer_id,
+                    producer_epoch=self.config.producer_epoch,
+                    reason="mujoco composer authority startup",
+                )
+            direct_source = self.config.direct_component_proposal_source
+            if direct_source is not None:
+                self.core.activate_producer(
+                    producer_id=direct_source.producer_id,
+                    producer_epoch=direct_source.producer_epoch,
+                    reason="mujoco direct component proposal source startup",
+                )
+        except BaseException as start_error:  # noqa: BLE001 - rollback all owners.
+            rollback_failures = collect_lifecycle_failures(
+                (
+                    ("authoritative_trace.close", self._close_trace_once),
+                    ("mujoco_execution_rig.close", self._close_rig_once),
+                )
             )
-        direct_source = self.config.direct_component_proposal_source
-        if direct_source is not None:
-            self.core.activate_producer(
-                producer_id=direct_source.producer_id,
-                producer_epoch=direct_source.producer_epoch,
-                reason="mujoco direct component proposal source startup",
-            )
+            self._finish_lifecycle_close_if_complete()
+            if rollback_failures:
+                raise LifecycleStartupError(
+                    "MujocoDeployRuntime.start",
+                    start_error,
+                    rollback_failures,
+                ) from start_error
+            raise
         self._started = True
 
     def activate_policy_node_producer(
@@ -3690,13 +3731,60 @@ class MujocoDeployRuntime:
             clock=self.clock,
         )
 
-    def close(self) -> None:
-        if not self._started:
+    def _close_trace_once(self) -> None:
+        if not self._trace_close_pending:
             return
-        self._sync_reference_trace()
-        self.core.close_trace()
+        try:
+            self.core.close_trace()
+        except BaseException:  # noqa: BLE001 - terminalization may precede emit.
+            # AuthoritativeControlRuntime marks its trace terminal before it
+            # emits the terminal fact.  A sink error therefore reports a
+            # failed close call even though a second close is invalid.  Retain
+            # the publication error for the caller, but do not create an
+            # unrecoverable retry loop around an already-terminal trace.
+            if not any(
+                fact.event_type == "runtime_trace_terminal"
+                for fact in self.core.trace_facts
+            ):
+                raise
+            self._trace_close_pending = False
+            self._lifecycle_terminal = True
+            raise
+        self._trace_close_pending = False
+        self._lifecycle_terminal = True
+
+    def _close_rig_once(self) -> None:
+        if not self._rig_close_pending:
+            return
         self.rig.close()
+        self._rig_close_pending = False
+
+    def _finish_lifecycle_close_if_complete(self) -> None:
+        if self._trace_close_pending or self._rig_close_pending:
+            return
         self._started = False
+        self._lifecycle_entered = False
+
+    def close(self) -> None:
+        if not self._lifecycle_entered:
+            return
+        # No caller may continue to dispatch while a lower resource is waiting
+        # for a retryable close.  Ownership remains in the lifecycle-pending
+        # fields, not in this operational latch.
+        self._started = False
+        steps = []
+        if self._trace_close_pending:
+            steps.extend(
+                (
+                    ("reference_trace.sync", self._sync_reference_trace),
+                    ("authoritative_trace.close", self._close_trace_once),
+                )
+            )
+        if self._rig_close_pending:
+            steps.append(("mujoco_execution_rig.close", self._close_rig_once))
+        failures = collect_lifecycle_failures(steps)
+        self._finish_lifecycle_close_if_complete()
+        raise_lifecycle_failures("MujocoDeployRuntime.close", failures)
 
 
 __all__ = [

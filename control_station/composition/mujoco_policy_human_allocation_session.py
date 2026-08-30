@@ -23,6 +23,11 @@ from control_composition.activation import (
 )
 from control_composition.lifecycle import CompositionSessionOperationSpec
 from control_station.publication_barrier import StationPublicationBarrier
+from robot_motion.runtime import (
+    LifecycleStartupError,
+    collect_lifecycle_failures,
+    raise_lifecycle_failures,
+)
 
 from .mujoco_policy_human_allocation import (
     MujocoPolicyHumanAllocationProfileBundle,
@@ -125,6 +130,8 @@ class MujocoPolicyHumanAllocationSession:
         self._next_session_epoch = epoch
         self._activation_scope: CompositionActivationScope | None = None
         self._started = False
+        self._runtime_close_pending = False
+        self._closing = False
         self._rearm_failed = False
         self._last_preflight: MujocoSimHILPreflightReport | None = None
         self._last_operation_result: Any | None = None
@@ -229,6 +236,10 @@ class MujocoPolicyHumanAllocationSession:
 
     def start(self) -> MujocoSimHILPreflightReport:
         with self._lock:
+            if self._closing:
+                raise RuntimeError(
+                    "Allocation composition session cleanup is pending."
+                )
             if self._started:
                 assert self._last_preflight is not None
                 return self._last_preflight
@@ -238,10 +249,12 @@ class MujocoPolicyHumanAllocationSession:
                     "MuJoCo allocation Sim-HIL preflight failed: "
                     + ";".join(report.reasons)
                 )
-            runtime_started = False
             try:
+                # A failed lower start may itself retain retryable cleanup.
+                # Record ownership before entering it so close() remains a
+                # valid recovery operation in either case.
+                self._runtime_close_pending = True
                 self.runtime.start()
-                runtime_started = True
                 activated_at = float(self.runtime.clock())
                 scope = self._build_activation(activated_at=activated_at)
                 producer_activations = self._activate_input_producers(scope)
@@ -270,11 +283,19 @@ class MujocoPolicyHumanAllocationSession:
                 self._last_operation_result = result
                 self._started = True
                 return report
-            except Exception:
+            except BaseException as start_error:  # noqa: BLE001 - preserve rollback.
                 self.publication_barrier.disable(reason="allocation_session_start_failed")
                 self._activation_scope = None
-                if runtime_started:
-                    self.runtime.close()
+                rollback_failures = collect_lifecycle_failures(
+                    (("mujoco_runtime.close", self._close_runtime_once),)
+                )
+                self._closing = bool(self._runtime_close_pending)
+                if rollback_failures:
+                    raise LifecycleStartupError(
+                        "MujocoPolicyHumanAllocationSession.start",
+                        start_error,
+                        rollback_failures,
+                    ) from start_error
                 raise
 
     def request_hold(
@@ -285,7 +306,7 @@ class MujocoPolicyHumanAllocationSession:
         force_cancellation: bool = False,
     ) -> Any | None:
         with self._lock:
-            if not self._started:
+            if not self._started or self._closing:
                 raise RuntimeError("Allocation composition session is not started.")
             normalized_reason = str(reason).strip()
             if not normalized_reason:
@@ -306,7 +327,11 @@ class MujocoPolicyHumanAllocationSession:
 
     def rearm(self, *, now: float | None = None) -> MujocoSimHILPreflightReport:
         with self._lock:
-            if not self._started or self._activation_scope is None:
+            if (
+                not self._started
+                or self._closing
+                or self._activation_scope is None
+            ):
                 raise RuntimeError("Allocation composition session is not started.")
             if self._rearm_failed:
                 raise RuntimeError(
@@ -368,16 +393,29 @@ class MujocoPolicyHumanAllocationSession:
             self._last_operation_result = result
             return report
 
+    def _close_runtime_once(self) -> None:
+        if not self._runtime_close_pending:
+            return
+        self.runtime.close()
+        self._runtime_close_pending = False
+
     def close(self) -> None:
         with self._lock:
-            if not self._started:
+            if not self._started and not self._runtime_close_pending:
                 return
+            self._closing = True
             self.publication_barrier.disable(reason="allocation_session_closed")
-            try:
-                self.runtime.close()
-            finally:
+            failures = collect_lifecycle_failures(
+                (("mujoco_runtime.close", self._close_runtime_once),)
+            )
+            if not self._runtime_close_pending:
                 self._started = False
                 self._activation_scope = None
+                self._closing = False
+            raise_lifecycle_failures(
+                "MujocoPolicyHumanAllocationSession.close",
+                failures,
+            )
 
 
 __all__ = [

@@ -79,6 +79,11 @@ from robot_motion.runtime.control_admission import (
     ControlCut,
 )
 from robot_motion.runtime.producer_epoch import ProducerEpochRegistry
+from robot_motion.runtime import (
+    LifecycleStartupError,
+    collect_lifecycle_failures,
+    raise_lifecycle_failures,
+)
 from sim.mujoco.deploy import (
     MujocoCompositionRuntimeConfig,
     MujocoDeployRuntime,
@@ -1367,6 +1372,9 @@ class MujocoSimHILComposition:
         self._readiness_provider = readiness_provider
         self._lock = threading.RLock()
         self._started = False
+        self._runtime_close_pending = False
+        self._human_source_close_pending = False
+        self._closing = False
         self._activation_scope: CompositionActivationScope | None = None
         self._activation_epoch = 0
         self._cycle_index = 0
@@ -1717,7 +1725,7 @@ class MujocoSimHILComposition:
                 )
 
     def _require_started(self) -> None:
-        if not self._started:
+        if not self._started or bool(getattr(self, "_closing", False)):
             raise RuntimeError("MujocoSimHILComposition.start() is required.")
 
     def _readiness_failure(
@@ -2150,6 +2158,8 @@ class MujocoSimHILComposition:
 
     def start(self) -> MujocoSimHILPreflightReport:
         with self._lock:
+            if bool(getattr(self, "_closing", False)):
+                raise RuntimeError("MuJoCo Sim-HIL cleanup is pending.")
             if self._started:
                 return self.preflight()
             if not self.config.enabled:
@@ -2168,6 +2178,7 @@ class MujocoSimHILComposition:
             self._cycle_index = 0
             source_started = False
             try:
+                self._runtime_close_pending = True
                 self.runtime.start()
                 self.runtime.activate_policy_node_producer(
                     self.config.human_producer_id,
@@ -2187,45 +2198,82 @@ class MujocoSimHILComposition:
                 if not bool(getattr(self.human_source, "started", False)):
                     self.human_source.start()
                     source_started = True
+                    self._human_source_close_pending = True
                 self._activation_epoch += 1
                 self._activate_composition(activated_at=float(self.runtime.clock()))
+                # On a successful composition activation this layer owns the
+                # source close even when the application warm-up started it.
+                self._human_source_close_pending = True
                 self._started = True
                 return report
-            except Exception:
+            except BaseException as start_error:  # noqa: BLE001 - rollback all owners.
+                rollback_steps = []
                 if source_started:
-                    try:
-                        self.human_source.close()
-                    except Exception:
-                        pass
-                self.runtime.close()
-                self._activation_scope = None
+                    rollback_steps.append(
+                        ("human_source.close", self._close_human_source_once)
+                    )
+                rollback_steps.append(
+                    ("mujoco_runtime.close", self._close_runtime_once)
+                )
+                rollback_failures = collect_lifecycle_failures(rollback_steps)
+                self._closing = bool(
+                    self._runtime_close_pending
+                    or self._human_source_close_pending
+                )
+                if not self._runtime_close_pending:
+                    self._activation_scope = None
+                if rollback_failures:
+                    raise LifecycleStartupError(
+                        "MujocoSimHILComposition.start",
+                        start_error,
+                        rollback_failures,
+                    ) from start_error
                 raise
+
+    def _close_human_source_once(self) -> None:
+        if not self._human_source_close_pending:
+            return
+        self.human_source.close()
+        self._human_source_close_pending = False
+
+    def _close_runtime_once(self) -> None:
+        if not self._runtime_close_pending:
+            return
+        self.runtime.close()
+        self._runtime_close_pending = False
 
     def close(self) -> None:
         with self._lock:
-            if not self._started:
+            if (
+                not self._started
+                and not self._runtime_close_pending
+                and not self._human_source_close_pending
+            ):
                 return
-            source_error: BaseException | None = None
-            try:
-                self.human_source.close()
-            except BaseException as error:  # noqa: BLE001 - runtime still closes.
-                source_error = error
-            try:
-                self.runtime.close()
-            finally:
+            self._closing = True
+            failures = collect_lifecycle_failures(
+                (
+                    ("human_source.close", self._close_human_source_once),
+                    ("mujoco_runtime.close", self._close_runtime_once),
+                )
+            )
+            if (
+                not self._runtime_close_pending
+                and not self._human_source_close_pending
+            ):
                 self._started = False
+                self._closing = False
                 self._activation_scope = None
                 self._submission_by_key.clear()
                 self._human_anchor_only_source_ids.clear()
                 self._step_by_decision_key.clear()
-            self._cycle_index = 0
-            self._next_blend_sequence = 0
-            self._human_alpha_by_component = dict(
-                self.contracts.initial_alpha_by_component
-            )
-            self._blend_alpha_schedule.clear()
-            if source_error is not None:
-                raise source_error
+                self._cycle_index = 0
+                self._next_blend_sequence = 0
+                self._human_alpha_by_component = dict(
+                    self.contracts.initial_alpha_by_component
+                )
+                self._blend_alpha_schedule.clear()
+            raise_lifecycle_failures("MujocoSimHILComposition.close", failures)
 
     def rearm(self, *, now: float | None = None) -> MujocoSimHILPreflightReport:
         """Create a new input activation only after an explicit HOLD.

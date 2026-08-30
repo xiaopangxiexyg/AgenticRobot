@@ -218,6 +218,16 @@ class MujocoSimHILApplication(
         self._startup_failure: str | None = None
         self._restart_required = False
         self._closed = False
+        # Terminal cleanup crosses a shared-MjData ownership chain.  Progress
+        # is explicit so a failed lower close can be retried without either
+        # repeating a successful non-idempotent close or tearing down the
+        # viewer while the runtime may still own that data.
+        self._control_cycle_close_complete = False
+        self._composition_close_complete = False
+        self._human_source_close_complete = False
+        self._policy_source_close_complete = False
+        self._viewer_close_complete = viewer is None
+        self._close_human_source_required: bool | None = None
         self._viewer_exit_requested = False
         # A demonstration session may open the passive viewer before any
         # Human device, source, composition, control cycle, or trace episode
@@ -1917,55 +1927,123 @@ class MujocoSimHILApplication(
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
             errors: list[BaseException] = []
-            if self.composition.started:
+            composition_started = bool(
+                getattr(self.composition, "started", False)
+            )
+            composition_close = getattr(self.composition, "close", None)
+            composition_close_required = bool(
+                composition_started
+                or self._started
+                or self._sources_started
+                or self._restart_required
+            )
+            if not composition_started and not callable(composition_close):
+                # Compatibility compositions that fail before entering their
+                # lifecycle historically need no lower close.  The application
+                # must still release sources/viewer already opened by warm-up.
+                composition_close_required = False
+            if (
+                not self._composition_close_complete
+                and not composition_close_required
+            ):
+                # Preserve the historical no-start/preview-only behavior:
+                # a composition that was never entered owns nothing to close.
+                self._composition_close_complete = True
+            if self._close_human_source_required is None:
+                application_owns_human = bool(
+                    self.control_cycle_port.spec.application_owns_human_source_close
+                )
+                self._close_human_source_required = bool(
+                    (application_owns_human and composition_started)
+                    or (self._sources_started and not composition_started)
+                )
+
+            if not self._composition_close_complete and composition_started:
                 try:
                     self.hold(reason="shutdown")
                 except BaseException as error:  # noqa: BLE001 - cleanup continues.
                     errors.append(error)
+
+            if not self._control_cycle_close_complete:
                 try:
                     self.control_cycle_port.close()
                 except BaseException as error:  # noqa: BLE001 - cleanup continues.
                     errors.append(error)
+                else:
+                    self._control_cycle_close_complete = True
+
+            if not self._composition_close_complete:
                 try:
-                    self.composition.close()
-                except BaseException as error:  # noqa: BLE001 - continue lower cleanup.
+                    if not callable(composition_close):
+                        raise TypeError(
+                            "Started Sim-HIL composition must expose close()."
+                        )
+                    composition_close()
+                except BaseException as error:  # noqa: BLE001 - retry owns runtime.
                     errors.append(error)
-                if self.control_cycle_port.spec.application_owns_human_source_close:
-                    try:
-                        self.human_source.close()
-                    except BaseException as error:  # noqa: BLE001 - cleanup continues.
-                        errors.append(error)
-            elif self._sources_started:
-                try:
-                    self.control_cycle_port.close()
-                except BaseException as error:  # noqa: BLE001 - cleanup continues.
-                    errors.append(error)
+                else:
+                    self._composition_close_complete = True
+
+            lower_close_complete = bool(
+                self._control_cycle_close_complete
+                and self._composition_close_complete
+            )
+            if not lower_close_complete:
+                self._last_error = ";".join(
+                    f"{type(error).__name__}:{error}" for error in errors
+                )
+                raise RuntimeError(
+                    "Sim-HIL close encountered lower-runtime errors: "
+                    + self._last_error
+                ) from errors[0]
+
+            # The control-cycle bindings and composition/runtime no longer own
+            # execution or shared simulation data.  Only now can source and
+            # native-viewer teardown proceed.
+            self._started = False
+            if (
+                self._close_human_source_required
+                and not self._human_source_close_complete
+            ):
                 try:
                     self.human_source.close()
-                except BaseException as error:  # noqa: BLE001 - continue lower cleanup.
+                except BaseException as error:  # noqa: BLE001 - retry source close.
                     errors.append(error)
+                else:
+                    self._human_source_close_complete = True
             else:
+                self._human_source_close_complete = True
+
+            if not self._policy_source_close_complete:
                 try:
-                    self.control_cycle_port.close()
-                except BaseException as error:  # noqa: BLE001 - cleanup continues.
+                    self.policy_source.close()
+                except BaseException as error:  # noqa: BLE001 - retry source close.
                     errors.append(error)
-            try:
-                self.policy_source.close()
-            except BaseException as error:  # noqa: BLE001 - continue lower cleanup.
-                errors.append(error)
+                else:
+                    self._policy_source_close_complete = True
+
             # The composition/runtime close above joins the physics worker.
             # Only then may the native viewer tear down the shared MjData.
-            if self.viewer is not None:
+            if self.viewer is not None and not self._viewer_close_complete:
                 try:
                     self.viewer.close()
                 except BaseException as error:  # noqa: BLE001 - cleanup continues.
                     errors.append(error)
-            self._started = False
-            self._viewer_preview_started = False
-            self._sources_started = False
-            self._held = False
+                else:
+                    self._viewer_close_complete = True
+
+            sources_close_complete = bool(
+                self._human_source_close_complete
+                and self._policy_source_close_complete
+            )
+            if sources_close_complete:
+                self._sources_started = False
+            if self._viewer_close_complete:
+                self._viewer_preview_started = False
+            if sources_close_complete and self._viewer_close_complete:
+                self._held = False
+                self._closed = True
             if errors:
                 self._last_error = ";".join(
                     f"{type(error).__name__}:{error}" for error in errors
