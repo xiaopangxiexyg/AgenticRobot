@@ -16,11 +16,10 @@ from .position_admittance_shadow import (
     POSITION_ADMITTANCE_ROTATION_ACTIVE_QPOS_FAST_PATH_ALPHA,
     POSITION_ADMITTANCE_ROTATION_RELEASE_QPOS_FAST_PATH_ALPHA,
     POSITION_ADMITTANCE_ROTATION_RELEASE_QPOS_RAMP_SEC,
-    position_admittance_active_config,
+    _resolve_position_admittance_response_configs,
     position_admittance_rotation_response_weight,
-    position_admittance_shadow_config,
     position_admittance_translation_response_weight,
-    position_rotational_admittance_config,
+    resolve_position_admittance_profile,
 )
 
 
@@ -40,42 +39,42 @@ def position_admittance_response_metadata(
 ) -> dict[str, object]:
     """Describe the effective pre-IK response, including inactive parameters."""
 
-    active = bool(getattr(args, "position_admittance_active", False))
-    shadow = bool(getattr(args, "position_admittance_shadow", False))
-    enabled = active or shadow
-    rotation_active = bool(
-        getattr(args, "position_admittance_rotation_active", False)
-    )
-    rotation_shadow = bool(
-        getattr(args, "position_admittance_rotation_shadow", False)
-    )
-    translation_weight = position_admittance_translation_response_weight(args)
-    rotation_weight = position_admittance_rotation_response_weight(args)
-
-    translation_config = None
-    if enabled:
-        translation_config = (
-            position_admittance_active_config(args)
-            if active
-            else position_admittance_shadow_config(args)
+    cached_profile = getattr(args, "_resolved_position_admittance_profile", None)
+    if cached_profile is not None:
+        profile = resolve_position_admittance_profile(args)
+        active = profile.active
+        enabled = profile.requested
+        shadow = enabled and not active
+        rotation_enabled = profile.rotation_requested
+        translation_config = profile.translation_config
+        rotational_config = profile.rotational_config
+        rotation_profile = profile.rotation_profile
+    else:
+        # This standalone metadata API predates executable Active authority.
+        # It must remain able to describe response tuning before an operator
+        # selects an Active side; that read-only compatibility path cannot
+        # authorize or install a target modifier.
+        active = bool(getattr(args, "position_admittance_active", False))
+        shadow = bool(getattr(args, "position_admittance_shadow", False))
+        enabled = active or shadow
+        rotation_active = bool(
+            getattr(args, "position_admittance_rotation_active", False)
         )
-    rotational_config = None
-    rotation_profile = None
-    if rotation_active or rotation_shadow:
-        rotation_profile = str(
-            getattr(
+        rotation_shadow = bool(
+            getattr(args, "position_admittance_rotation_shadow", False)
+        )
+        rotation_enabled = rotation_active or rotation_shadow
+        translation_config, rotational_config, rotation_profile = (
+            _resolve_position_admittance_response_configs(
                 args,
-                (
-                    "position_admittance_rotation_active_profile"
-                    if rotation_active
-                    else "position_admittance_rotation_shadow_profile"
-                ),
+                active=active,
+                shadow=shadow,
+                rotation_active=rotation_active,
+                rotation_shadow=rotation_shadow,
             )
         )
-        rotational_config = position_rotational_admittance_config(
-            args,
-            profile=rotation_profile,
-        )
+    translation_weight = position_admittance_translation_response_weight(args)
+    rotation_weight = position_admittance_rotation_response_weight(args)
 
     translation_effective_compliance = None
     translation_effective_weight = None
@@ -158,7 +157,7 @@ def position_admittance_response_metadata(
             ),
         },
         "rotation": {
-            "enabled": rotation_active or rotation_shadow,
+            "enabled": rotation_enabled,
             "profile": rotation_profile,
             "response_weight": rotation_weight,
             "accepted_filter_tau_sec": POSITION_ADMITTANCE_ACCEPTED_FILTER_TAU_SEC,

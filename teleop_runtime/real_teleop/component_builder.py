@@ -82,16 +82,12 @@ from ..target_safety.tcp_pose_envelope_runtime import (
     load_tcp_pose_envelope_profile,
 )
 from .position_admittance_shadow import (
-    POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
     POSITION_ADMITTANCE_ACTIVE_QPOS_FAST_PATH_ALPHA,
     POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG,
     POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG,
     PositionAdmittanceEndpointExcursionGuard,
-    position_admittance_active_apply_sides,
-    position_admittance_active_config,
     position_admittance_active_uses_home_endpoint_guard,
-    position_rotational_admittance_config,
-    validate_position_admittance_active_authority,
+    resolve_position_admittance_profile,
 )
 from ..recording import SessionRecorder
 from ..retargeters import (
@@ -249,6 +245,7 @@ def build_real_teleop_components(
     dmtac_backend_configs: Callable[..., dict[str, object]],
 ) -> RealTeleopComponents:
     _dmtac_backend_configs = dmtac_backend_configs
+    position_admittance_profile = resolve_position_admittance_profile(args)
     _resolve_movement_multiple_args(args)
     debug_timing_modules = _debug_timing_modules(args)
     active_sides = _active_sides_from_args(args)
@@ -1436,75 +1433,34 @@ def build_real_teleop_components(
         )
 
     position_admittance_endpoint_guard = None
-    if bool(getattr(args, "position_admittance_active", False)):
+    if position_admittance_profile.active:
         if dual_arm_retargeter is None:
             raise RuntimeError(
                 "Active position admittance endpoint excursion guard requires "
                 "the coupled dual-arm retargeter"
             )
-        rotation_active = bool(
-            getattr(args, "position_admittance_rotation_active", False)
-        )
-        rotational_config = (
-            position_rotational_admittance_config(
-                args,
-                profile=str(args.position_admittance_rotation_active_profile),
-            )
-            if rotation_active
-            else None
-        )
-        active_endpoint_policy = str(
-            getattr(
-                args,
-                "position_admittance_active_endpoint_policy",
-                POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY,
-            )
-        )
-        active_apply_sides = position_admittance_active_apply_sides(
-            str(args.position_admittance_active_side)
-        )
-        maximum_allowed_rotation_excursion_deg = (
-            validate_position_admittance_active_authority(
-                position_admittance_active_config(args),
-                active_envelope=str(args.position_admittance_active_envelope),
-                rotational_config=rotational_config,
-                combined_translation_rotation_active=bool(
-                    getattr(args, "position_admittance_combined_active", False)
-                ),
-                endpoint_policy=active_endpoint_policy,
-                apply_sides=active_apply_sides,
-                max_tool_excursion_m=float(
-                    args.position_admittance_active_max_tool_excursion_m
-                ),
-                max_tool_rotation_excursion_deg=(
-                    float(
-                        args.position_admittance_active_max_tool_rotation_excursion_deg
-                    )
-                    if rotation_active
-                    else None
-                ),
-            )
-        )
         if position_admittance_active_uses_home_endpoint_guard(
-            active_endpoint_policy
+            position_admittance_profile.endpoint_policy
         ):
             endpoint_guard_kwargs: dict[str, float] = {}
-            if maximum_allowed_rotation_excursion_deg is not None:
+            if (
+                position_admittance_profile.maximum_allowed_tool_rotation_excursion_deg
+                is not None
+            ):
                 endpoint_guard_kwargs[
                     "maximum_allowed_tool_rotation_excursion_deg"
-                ] = maximum_allowed_rotation_excursion_deg
+                ] = (
+                    position_admittance_profile.maximum_allowed_tool_rotation_excursion_deg
+                )
+            assert position_admittance_profile.max_tool_excursion_m is not None
             position_admittance_endpoint_guard = PositionAdmittanceEndpointExcursionGuard(
                 retargeter=dual_arm_retargeter,
-                active_side=active_apply_sides[0],
-                max_tool_excursion_m=float(
-                    args.position_admittance_active_max_tool_excursion_m
+                active_side=position_admittance_profile.apply_sides[0],
+                max_tool_excursion_m=(
+                    position_admittance_profile.max_tool_excursion_m
                 ),
                 max_tool_rotation_excursion_deg=(
-                    float(
-                        args.position_admittance_active_max_tool_rotation_excursion_deg
-                    )
-                    if rotation_active
-                    else None
+                    position_admittance_profile.max_tool_rotation_excursion_deg
                 ),
                 **endpoint_guard_kwargs,
             )
