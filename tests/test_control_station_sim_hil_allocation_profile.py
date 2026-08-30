@@ -658,27 +658,36 @@ def test_allocation_profiles_virtual_policy_and_human_run_button_operations(
         post_rebase_cycle = step_when_due()
         assert post_rebase_cycle.human_submission.accepted
         assert post_rebase_cycle.human_submission.input_cycle.derivation.captured_anchor
-        if post_rebase_cycle.execution.status == "execution_cancelled":
-            # Rebase publishes a new anchor generation before the asynchronous
-            # allocation result for that generation is available.  The exact
-            # rebase cycle therefore remains a valid no-action/HOLD cut.
-            assert post_rebase_cycle.publication.proposal_publication.status == (
-                "no_action"
-            )
-            post_rebase_cycle = None
-            for _ in range(10):
-                candidate = step_when_due()
-                if candidate.publication.proposal_publication.status == (
-                    "proposal_admitted"
-                ):
-                    post_rebase_cycle = candidate
-                    break
-            assert post_rebase_cycle is not None
-        assert post_rebase_cycle.execution.status in {
+        executable_statuses = {
             "dispatched",
             "execution_kept_existing",
             "not_due",
         }
+        publication_status = (
+            post_rebase_cycle.publication.proposal_publication.status
+        )
+        if (
+            publication_status != "proposal_admitted"
+            or post_rebase_cycle.execution.status not in executable_statuses
+        ):
+            # Rebase publishes a new anchor generation before the asynchronous
+            # allocation result for that generation is executable.  Publication
+            # may already admit a proposal that execution safely cancels, so wait
+            # for one cycle where admission and executability agree.
+            if post_rebase_cycle.execution.status == "execution_cancelled":
+                assert publication_status in {"no_action", "proposal_admitted"}
+            post_rebase_cycle = None
+            for _ in range(10):
+                candidate = step_when_due()
+                if (
+                    candidate.publication.proposal_publication.status
+                    == "proposal_admitted"
+                    and candidate.execution.status in executable_statuses
+                ):
+                    post_rebase_cycle = candidate
+                    break
+            assert post_rebase_cycle is not None
+        assert post_rebase_cycle.execution.status in executable_statuses
     finally:
         app.close()
     assert local_human_lifecycles == [
