@@ -26,6 +26,11 @@ from agent_gateway.transport.unix_transport import (
     AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
 )
 
+from .grasp_pose_adapter import (
+    CameraRelativeGraspProposal,
+    load_camera_relative_grasp_proposal,
+    resolve_camera_relative_grasp_target,
+)
 from .motion_primitive_profiles import (
     REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
 )
@@ -207,25 +212,37 @@ def _finite_sequence(
     return tuple(normalized)
 
 
-def _absolute_tcp_pose_from_args(args: argparse.Namespace) -> tuple[float, ...] | None:
+def _absolute_tcp_input_from_args(
+    args: argparse.Namespace,
+) -> tuple[tuple[float, ...] | None, CameraRelativeGraspProposal | None]:
     xyz_value = getattr(args, "target_xyz_m", None)
     quaternion_value = getattr(args, "target_quat_xyzw", None)
+    proposal_path = getattr(args, "camera_grasp_proposal", None)
     is_absolute = getattr(args, "action", None) == REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION
     if not is_absolute:
         if (
             xyz_value is not None
             or quaternion_value is not None
             or getattr(args, "speed_scale", None) is not None
+            or proposal_path is not None
         ):
             raise ValueError(
-                "--target-xyz-m/--target-quat-xyzw/--speed-scale require "
+                "absolute target/proposal and --speed-scale require "
                 f"--action {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION}."
             )
-        return None
+        return None, None
+    if proposal_path is not None:
+        if xyz_value is not None or quaternion_value is not None:
+            raise ValueError(
+                "--camera-grasp-proposal is mutually exclusive with direct "
+                "--target-xyz-m/--target-quat-xyzw."
+            )
+        return None, load_camera_relative_grasp_proposal(proposal_path)
     if xyz_value is None or quaternion_value is None:
         raise ValueError(
             f"--action {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION} requires both "
-            "--target-xyz-m and --target-quat-xyzw."
+            "--target-xyz-m and --target-quat-xyzw, or one "
+            "--camera-grasp-proposal."
         )
     xyz = _finite_sequence(xyz_value, size=3, field_name="target_xyz_m")
     quaternion = _finite_sequence(
@@ -237,7 +254,7 @@ def _absolute_tcp_pose_from_args(args: argparse.Namespace) -> tuple[float, ...] 
     if norm <= 1e-12:
         raise ValueError("target_quat_xyzw must have nonzero norm.")
     normalized_quaternion = tuple(value / norm for value in quaternion)
-    return (*xyz, *normalized_quaternion)
+    return (*xyz, *normalized_quaternion), None
 
 
 def _pose_target_component_allowed(
@@ -397,11 +414,11 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         raise ValueError("--socket-path must be absolute")
     expected_component = f"{args.side}_arm"
     skill_id = _ACTION_TO_SKILL_ID[args.action]
-    absolute_tcp_pose = _absolute_tcp_pose_from_args(args)
+    absolute_tcp_pose, camera_grasp_proposal = _absolute_tcp_input_from_args(args)
     requested_timeout = getattr(args, "operation_timeout_sec", None)
     operation_timeout_sec = (
         30.0
-        if requested_timeout is None and absolute_tcp_pose is not None
+        if requested_timeout is None and skill_id == TCP_POSE_TARGET_SKILL_ID_V1
         else (5.0 if requested_timeout is None else float(requested_timeout))
     )
     if not math.isfinite(operation_timeout_sec) or operation_timeout_sec <= 0.0:
@@ -425,6 +442,13 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             snapshot["execution_gate"] != "ready"
         ):
             raise RuntimeError("Lower real Skill owner is not RUNNING/READY.")
+        if camera_grasp_proposal is not None:
+            absolute_tcp_pose = resolve_camera_relative_grasp_target(
+                proposal=camera_grasp_proposal,
+                route_manifest=manifest,
+                motion_snapshot=snapshot,
+                expected_component_id=expected_component,
+            ).target_pose_reference_xyz_quat_xyzw
         parameters = _parameters(
             action=args.action,
             skill_id=skill_id,
@@ -551,6 +575,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "actual tool-TCP quaternion in canonical_station; required only for "
             "--action move_tcp_to_pose"
+        ),
+    )
+    parser.add_argument(
+        "--camera-grasp-proposal",
+        help=(
+            "absolute path to a typed camera-relative grasp proposal bound to "
+            "one real Depth v2 Artifact; mutually exclusive with direct target "
+            "coordinates"
         ),
     )
     parser.add_argument(
