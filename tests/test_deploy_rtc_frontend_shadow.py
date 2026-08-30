@@ -574,11 +574,13 @@ def test_committed_emission_publisher_validates_commit_ttl_and_idempotency() -> 
         assert emission is not None
         assert commit is not None
         assert commit.emission_semantic_content_hash == emission.semantic_content_hash
+        publication_now = commit.committed_at
+        assert publication_now <= emission.effective_until
 
         receipt = publisher.publish_committed_emission(
             emission,
             commit,
-            now=emission.emitted_at,
+            now=publication_now,
         )
         assert receipt.accepted
         assert not receipt.idempotent_replay
@@ -588,7 +590,7 @@ def test_committed_emission_publisher_validates_commit_ttl_and_idempotency() -> 
         replay = publisher.publish_committed_emission(
             emission,
             commit,
-            now=emission.emitted_at,
+            now=publication_now,
         )
         assert replay.accepted
         assert replay.idempotent_replay
@@ -602,7 +604,7 @@ def test_committed_emission_publisher_validates_commit_ttl_and_idempotency() -> 
         mismatch = publisher.publish_committed_emission(
             mismatched_emission,
             commit,
-            now=emission.emitted_at,
+            now=publication_now,
         )
         assert not mismatch.accepted
         assert "producer_commit_emission_hash_mismatch" in mismatch.reasons
