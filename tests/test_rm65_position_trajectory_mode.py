@@ -952,6 +952,78 @@ def test_position_trajectory_policy_distinguishes_stop_degrade_and_normal() -> N
     assert normal.speed_scale == 1.0
 
 
+def test_real_agent_speed_scale_caps_final_trajectory_without_expanding_safety() -> None:
+    requested = _position_trajectory_policy(
+        {
+            "collision_avoidance_status": "tracking",
+            "real_agent_motion_operation": {"speed_scale": 0.35},
+        },
+        {"singularity_gate_status": "pass"},
+        degraded_speed_scale=0.1,
+    )
+    assert requested.quick_stop is False
+    assert requested.mode == "tracking"
+    assert requested.speed_scale == pytest.approx(0.35)
+    assert requested.reasons == ("agent_speed_scale",)
+
+    safety_degraded = _position_trajectory_policy(
+        {
+            "collision_avoidance_status": "tracking",
+            "execution_step_metadata": {"step_limited": True},
+            "real_agent_motion_operation": {"speed_scale": 0.8},
+        },
+        {"singularity_gate_status": "pass"},
+        degraded_speed_scale=0.1,
+    )
+    assert safety_degraded.speed_scale == pytest.approx(0.1)
+    assert safety_degraded.reasons == (
+        "execution_step_limited",
+        "agent_speed_scale",
+    )
+
+    tighter_request = _position_trajectory_policy(
+        {
+            "collision_avoidance_status": "boundary_active",
+            "real_agent_motion_operation": {"speed_scale": 0.05},
+        },
+        {"singularity_gate_status": "pass"},
+        degraded_speed_scale=0.1,
+    )
+    assert tighter_request.speed_scale == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("speed_scale", [True, 0.0, 1.01, float("nan"), "bad"])
+def test_invalid_real_agent_speed_scale_fails_closed(speed_scale) -> None:
+    policy = _position_trajectory_policy(
+        {
+            "collision_avoidance_status": "tracking",
+            "real_agent_motion_operation": {"speed_scale": speed_scale},
+        },
+        {"singularity_gate_status": "pass"},
+        degraded_speed_scale=0.1,
+    )
+    assert policy.quick_stop is True
+    assert policy.speed_scale == 0.0
+    assert policy.reason == "agent_speed_scale_invalid"
+
+
+def test_real_agent_speed_scale_reaches_acceleration_limited_planner() -> None:
+    backend, _arm = _backend()
+    command = _command(0.2)
+    command.metadata["real_agent_motion_operation"] = {"speed_scale": 0.25}
+
+    receipt = backend.send_command(command)
+    stream = backend.get_state()["background_streaming"]
+
+    assert receipt.accepted is True
+    assert stream["trajectory_policy_mode"] == "tracking"
+    assert stream["trajectory_policy_speed_scale"] == pytest.approx(0.25)
+    assert stream["trajectory_planner"]["speed_scale"] == pytest.approx(0.25)
+    assert command.metadata["position_trajectory_policy_speed_scale"] == pytest.approx(
+        0.25
+    )
+
+
 def test_finite_ik_pose_residual_keeps_full_position_tracking_speed() -> None:
     policy = _position_trajectory_policy(
         {

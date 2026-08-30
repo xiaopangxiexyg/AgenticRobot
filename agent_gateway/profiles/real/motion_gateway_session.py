@@ -1,4 +1,4 @@
-"""Default-off Agent Gateway session for real 6+3 TCP primitives."""
+"""Default-off Agent Gateway session for reviewed real TCP motion Skills."""
 
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ from agent_gateway.runtime.station_operation_worker import (
 from agent_gateway.runtime.station_revision import AgentStationRevisionTracker
 from agent_gateway.skills.motion.definition import (
     FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1,
+    TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from agent_gateway.transport.unix_transport import (
     AgentGatewayUnixJsonServer,
@@ -919,7 +920,13 @@ def assemble_real_agent_primitive_gateway_session(
     for entry in motion_entries:
         route = entry.route
         binding = contract_bundle.binding_for_skill(route.skill_id)
-        if route.skill_id == "motion.step_tcp_cardinal" or (
+        if route.skill_id == TCP_POSE_TARGET_SKILL_ID_V1:
+            profile = contract_bundle.pose_target_profile
+            if profile is None:
+                raise RuntimeError(
+                    "Absolute TCP-pose Route exists without its authorized profile."
+                )
+        elif route.skill_id == "motion.step_tcp_cardinal" or (
             route.skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
         ):
             profile = contract_bundle.cardinal_profile

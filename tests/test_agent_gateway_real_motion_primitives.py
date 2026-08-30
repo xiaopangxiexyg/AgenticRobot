@@ -6,11 +6,9 @@ import numpy as np
 import pytest
 
 from agent_gateway.profiles.real.motion_primitive_profiles import (
-    REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-    REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1,
-    REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1,
     RealAgentPrimitiveConvergenceProfile,
     build_real_agent_primitive_contract_bundle,
+    real_agent_motion_route_ids_v1,
 )
 from agent_gateway.profiles.real.observation_gateway import (
     RealTcpPoseObserveAttachmentSpec,
@@ -80,23 +78,12 @@ def _inputs():
         execution_frame_id=execution_frame.frame_id,
         execution_frame_spec_hash=execution_frame.semantic_content_hash,
     )
-    route_ids = (
-        REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1,
-        *tuple(
-            REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
-            for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
-        ),
-        *tuple(
-            REAL_AGENT_TCP_FIXED_ORIENTATION_ROUTE_ID_BY_SKILL_ID_V1[skill_id]
-            for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
-        ),
-    )
     envelope = SkillDeploymentSafetyEnvelopeRef(
         object_id="real-agent-motion-envelope:test",
         schema="dexteleop.deployment_safety_envelope.v1",
         content_hash="real-agent-motion-envelope-hash:test",
         constraint_set_hash="real-agent-motion-constraints-hash:test",
-        allowed_route_ids=route_ids,
+        allowed_route_ids=real_agent_motion_route_ids_v1(),
     )
     return attachment, port_config, graph, envelope
 
@@ -129,7 +116,9 @@ def test_real_bundle_exposes_read_diagnostic_and_fixed_motion_primitives() -> No
         == bundle.cardinal_profile.execution_reference_frame_spec_hash
     )
     assert bundle.tcp_pose_observe.attachment is bundle.attachment
-    assert len(bundle.route_manifest.skill_routes) == 11
+    assert len(bundle.route_manifest.skill_routes) == 12
+    assert bundle.route_manifest.route("motion.move_tcp_to_pose", "1")
+    assert bundle.pose_target_profile.component_id == COMPONENT_ID
     assert len(bundle.cardinal_profile.primitives) == 6
     assert {
         entry.route.skill_id for entry in bundle.route_manifest.skill_routes
@@ -195,6 +184,50 @@ def test_real_cardinal_payload_is_exact_and_selects_all_six_primitives() -> None
     bad["direction"] = "diagonal"
     with pytest.raises(ValueError):
         bundle.payload_validators.validate_parameters(route=route, payload=bad)
+
+
+def test_real_absolute_pose_payload_binds_tool_tcp_frame_and_bounded_speed() -> None:
+    bundle = _bundle()
+    profile = bundle.pose_target_profile
+    route = bundle.route_manifest.route("motion.move_tcp_to_pose", "1").route
+    schema = bundle.schema_catalog.entry("motion.move_tcp_to_pose", "1")
+    speed_schema = schema.parameter_schema["properties"]["speed_scale"]
+    assert speed_schema["minimum"] == profile.min_speed_scale
+    assert speed_schema["maximum"] == profile.max_speed_scale
+    assert route.max_operation_duration_ms == 30_000
+
+    payload = {
+        "pose_targets_by_component": {
+            profile.component_id: [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0],
+        },
+        "reference_frame_id": profile.reference_frame_id,
+        "reference_frame_spec_hash": profile.reference_frame_spec_hash,
+        "controlled_frame_id": "tool_tcp",
+        "frame_graph_hash": profile.frame_graph_hash,
+        "tool_config_hash": profile.tool_config_hash,
+        "calibration_hash": profile.calibration_hash,
+        "speed_scale": 0.25,
+    }
+    bundle.payload_validators.validate_parameters(route=route, payload=payload)
+    without_speed = dict(payload)
+    without_speed.pop("speed_scale")
+    bundle.payload_validators.validate_parameters(
+        route=route,
+        payload=without_speed,
+    )
+
+    too_slow = dict(payload, speed_scale=profile.min_speed_scale / 2.0)
+    with pytest.raises(ValueError, match="outside the exact profile bounds"):
+        bundle.payload_validators.validate_parameters(route=route, payload=too_slow)
+    wrong_component = dict(payload)
+    wrong_component["pose_targets_by_component"] = {
+        "left_arm": payload["pose_targets_by_component"][profile.component_id]
+    }
+    with pytest.raises(ValueError, match="unsupported components"):
+        bundle.payload_validators.validate_parameters(
+            route=route,
+            payload=wrong_component,
+        )
 
 
 def test_real_contract_refuses_missing_or_unbound_lower_safety_envelope() -> None:

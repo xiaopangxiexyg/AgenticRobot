@@ -225,7 +225,7 @@ class RealAgentMotionOwnerCut:
 
 @dataclass(frozen=True)
 class RealAgentMotionActivation:
-    """One operator-granted absolute tool-TCP target in the solver world."""
+    """One operator-granted absolute tool-TCP target in the execution frame."""
 
     operation_id: str
     request_id: str
@@ -242,6 +242,7 @@ class RealAgentMotionActivation:
     measured_state_hash: str
     submitted_at: float
     expires_at: float
+    speed_scale: float = 1.0
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -277,6 +278,10 @@ class RealAgentMotionActivation:
             raise ValueError("expires_at must be later than submitted_at.")
         object.__setattr__(self, "submitted_at", submitted_at)
         object.__setattr__(self, "expires_at", expires_at)
+        speed_scale = _finite(self.speed_scale, field_name="speed_scale")
+        if not 0.0 < speed_scale <= 1.0:
+            raise ValueError("speed_scale must satisfy 0 < speed_scale <= 1.")
+        object.__setattr__(self, "speed_scale", speed_scale)
         object.__setattr__(
             self,
             "target_pose_world",
@@ -1004,6 +1009,7 @@ class RealAgentMotionPort:
                     "controlled_frame_id": "tool_tcp",
                     "target_pose_semantics": "tool_tcp_world",
                     "solver_target_pose_semantics": "solver_world_endpoint",
+                    "speed_scale": activation.speed_scale,
                 },
             )
             command = self._target_builder.build_command_for_target_pair(
@@ -1015,7 +1021,7 @@ class RealAgentMotionPort:
                     source_by_side=source_by_side,
                 )
             )
-            command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = {
+            operation_metadata = {
                 "operation_id": activation.operation_id,
                 "request_id": activation.request_id,
                 "component_id": activation.component_id,
@@ -1028,7 +1034,26 @@ class RealAgentMotionPort:
                 "execution_frame_spec_hash": activation.execution_frame_spec_hash,
                 "measured_state_revision": activation.measured_state_revision,
                 "measured_state_hash": activation.measured_state_hash,
+                "speed_scale": activation.speed_scale,
             }
+            command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = dict(
+                operation_metadata
+            )
+            selected_effectors = tuple(
+                effector
+                for effector in command.commands.values()
+                if effector.side == activation.side
+            )
+            if len(selected_effectors) != 1:
+                raise RuntimeError(
+                    "coupled target command must contain exactly one selected-side "
+                    "effector."
+                )
+            for effector in selected_effectors:
+                effector.metadata = dict(effector.metadata or {})
+                effector.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = dict(
+                    operation_metadata
+                )
         except Exception as exc:
             with self._lock:
                 if (

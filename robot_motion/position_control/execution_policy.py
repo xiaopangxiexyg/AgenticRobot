@@ -23,6 +23,7 @@ _NORMAL_SINGULARITY_STATUSES = frozenset(
         "allow_position_shoulder_singular",
     }
 )
+_REAL_AGENT_MOTION_METADATA_KEY = "real_agent_motion_operation"
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,26 @@ def classify_position_trajectory_policy(
 
     hard_stop_reasons: list[str] = []
     degraded_reasons: list[str] = []
+    speed_limit_reasons: list[str] = []
+    requested_speed_scale = 1.0
+    agent_operation = metadata_mapping(
+        command_metadata.get(_REAL_AGENT_MOTION_METADATA_KEY)
+    )
+    if "speed_scale" in agent_operation:
+        value = agent_operation["speed_scale"]
+        try:
+            requested_speed_scale = float(value)
+        except (TypeError, ValueError):
+            hard_stop_reasons.append("agent_speed_scale_invalid")
+        else:
+            if (
+                isinstance(value, bool)
+                or not math.isfinite(requested_speed_scale)
+                or not 0.0 < requested_speed_scale <= 1.0
+            ):
+                hard_stop_reasons.append("agent_speed_scale_invalid")
+            elif requested_speed_scale < 1.0:
+                speed_limit_reasons.append("agent_speed_scale")
 
     collision_status = str(command_metadata.get("collision_avoidance_status") or "").strip()
     if collision_status in _HARD_STOP_COLLISION_STATUSES:
@@ -124,9 +145,16 @@ def classify_position_trajectory_policy(
     if degraded_reasons:
         return PositionTrajectoryPolicy(
             mode="degraded",
-            speed_scale=float(degraded_speed_scale),
+            speed_scale=min(float(degraded_speed_scale), requested_speed_scale),
             quick_stop=False,
-            reasons=unique(degraded_reasons),
+            reasons=unique((*degraded_reasons, *speed_limit_reasons)),
+        )
+    if speed_limit_reasons:
+        return PositionTrajectoryPolicy(
+            mode="tracking",
+            speed_scale=requested_speed_scale,
+            quick_stop=False,
+            reasons=unique(speed_limit_reasons),
         )
     return PositionTrajectoryPolicy(
         mode="tracking",

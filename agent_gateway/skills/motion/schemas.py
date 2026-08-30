@@ -219,6 +219,8 @@ def tcp_pose_target_schema_entry_v1(
         tuple[float, float, float, float, float, float],
     ]
     | None = None,
+    min_speed_scale: float | None = None,
+    max_speed_scale: float | None = None,
 ) -> AgentSkillSchemaEntry:
     components = _component_ids(allowed_component_ids)
     frames = _component_ids(allowed_reference_frame_ids)
@@ -230,6 +232,17 @@ def tcp_pose_target_schema_entry_v1(
             field_name="max_requested_duration_ms",
         )
     )
+    speed_scale_bounds: tuple[float, float] | None = None
+    if min_speed_scale is not None or max_speed_scale is not None:
+        if min_speed_scale is None or max_speed_scale is None:
+            raise ValueError(
+                "min_speed_scale and max_speed_scale must be provided together."
+            )
+        minimum_speed = _finite(min_speed_scale, field_name="min_speed_scale")
+        maximum_speed = _finite(max_speed_scale, field_name="max_speed_scale")
+        if not 0.0 < minimum_speed <= maximum_speed <= 1.0:
+            raise ValueError("speed_scale bounds must satisfy 0 < min <= max <= 1.")
+        speed_scale_bounds = (minimum_speed, maximum_speed)
     properties = {
         "pose_targets_by_component": _poses_by_component_schema(
             component_ids=components,
@@ -247,6 +260,17 @@ def tcp_pose_target_schema_entry_v1(
             "type": "integer",
             "minimum": 1,
             "maximum": maximum_duration,
+        }
+    if speed_scale_bounds is not None:
+        properties["speed_scale"] = {
+            "type": "number",
+            "minimum": speed_scale_bounds[0],
+            "maximum": speed_scale_bounds[1],
+            "default": 1.0,
+            "description": (
+                "Optional fraction of the lower reviewed trajectory-speed limits. "
+                "It can only reduce, never expand, those limits."
+            ),
         }
     parameter_schema = {
         "type": "object",
@@ -729,6 +753,7 @@ def validate_agent_motion_parameters_v1(
         str, ...
     ] = CARDINAL_TCP_STEP_DIRECTIONS_V1,
     limits: InlineTcpTrajectoryLimits | None = None,
+    speed_scale_bounds: tuple[float, float] | None = None,
 ) -> None:
     """Validate cross-field constraints JSON Schema cannot express."""
 
@@ -805,6 +830,29 @@ def validate_agent_motion_parameters_v1(
             allowed_component_ids=components,
             field_name="pose_targets_by_component",
         )
+        if "speed_scale" in parameters:
+            if speed_scale_bounds is None or len(speed_scale_bounds) != 2:
+                raise ValueError(
+                    "TCP pose speed_scale requires exact profile speed_scale_bounds."
+                )
+            minimum = _finite(
+                speed_scale_bounds[0],
+                field_name="speed_scale_bounds[0]",
+            )
+            maximum = _finite(
+                speed_scale_bounds[1],
+                field_name="speed_scale_bounds[1]",
+            )
+            if not 0.0 < minimum <= maximum <= 1.0:
+                raise ValueError(
+                    "speed_scale_bounds must satisfy 0 < min <= max <= 1."
+                )
+            speed_scale = _finite(
+                parameters["speed_scale"],
+                field_name="speed_scale",
+            )
+            if not minimum <= speed_scale <= maximum:
+                raise ValueError("speed_scale is outside the exact profile bounds.")
         return
 
     if limits is None or not isinstance(limits, InlineTcpTrajectoryLimits):

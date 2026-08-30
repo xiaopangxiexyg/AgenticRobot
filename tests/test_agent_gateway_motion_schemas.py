@@ -138,6 +138,44 @@ def test_tcp_pose_profile_can_explicitly_exclude_duration_semantics() -> None:
     assert schema["additionalProperties"] is False
 
 
+def test_tcp_pose_profile_can_bound_optional_lower_speed_fraction() -> None:
+    entry = tcp_pose_target_schema_entry_v1(
+        skill_definition_hash="definition:tcp-pose-speed:v1",
+        parameter_profile_id="right-arm-speed-v1",
+        parameter_profile_hash="profile:right-arm-speed-v1",
+        allowed_component_ids=("right_arm",),
+        allowed_reference_frame_ids=("canonical_station",),
+        max_requested_duration_ms=None,
+        min_speed_scale=0.05,
+        max_speed_scale=1.0,
+    )
+    speed = entry.parameter_schema["properties"]["speed_scale"]
+    assert speed["minimum"] == 0.05
+    assert speed["maximum"] == 1.0
+    assert "speed_scale" not in entry.parameter_schema["required"]
+
+    parameters = {
+        "controlled_frame_id": "tool_tcp",
+        "pose_targets_by_component": {
+            "right_arm": [0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0],
+        },
+        "speed_scale": 0.2,
+    }
+    validate_agent_motion_parameters_v1(
+        schema_kind="tcp_pose_target",
+        parameters=parameters,
+        allowed_component_ids=("right_arm",),
+        speed_scale_bounds=(0.05, 1.0),
+    )
+    with pytest.raises(ValueError, match="outside the exact profile bounds"):
+        validate_agent_motion_parameters_v1(
+            schema_kind="tcp_pose_target",
+            parameters={**parameters, "speed_scale": 0.01},
+            allowed_component_ids=("right_arm",),
+            speed_scale_bounds=(0.05, 1.0),
+        )
+
+
 def test_cardinal_tcp_step_exposes_direction_but_pins_lower_profile_facts() -> None:
     entry = cardinal_tcp_step_schema_entry_v1(
         skill_definition_hash="definition:tcp-cardinal-step:v1",
