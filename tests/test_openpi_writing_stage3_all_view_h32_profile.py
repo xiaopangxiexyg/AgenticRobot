@@ -190,3 +190,7 @@ def test_stage3_all_view_h32_profile_pins_training_and_mask_contracts() -> None:
     assert profile["openpi_final_mask_root_layout"] == (
         "source_dataset_id_partitioned_v1"
     )
+    assert Path(profile["openpi_final_mask_root"]) == Path(
+        "/home/user/zc/openpi_writing_all_view_h32_4stage_runs/"
+        "20260830_snapshot_v1/masks/stage3/derived/final_keep_masks"
+    )

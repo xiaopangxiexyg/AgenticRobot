@@ -176,7 +176,7 @@
   "openpi_assets_base_dir": "/home/user/zc/openpi_writing_all_view_h32_4stage_runs/20260830_snapshot_v1/artifacts/assets",
   "openpi_checkpoint_base_dir": "/home/user/zc/checkpoints/openpi",
   "openpi_weight_loader_params_path": "/home/user/zc/openpi/pi05_base_para/params",
-  "openpi_final_mask_root": "/home/user/zc/openpi_writing_all_view_h32_4stage_runs/20260830_snapshot_v1/masks/derived/final_keep_masks",
+  "openpi_final_mask_root": "/home/user/zc/openpi_writing_all_view_h32_4stage_runs/20260830_snapshot_v1/masks/stage3/derived/final_keep_masks",
   "openpi_final_mask_root_layout": "source_dataset_id_partitioned_v1",
   "right_wrist_intrinsics_overrides": {},
   "wrist_intrinsics_overrides": {
