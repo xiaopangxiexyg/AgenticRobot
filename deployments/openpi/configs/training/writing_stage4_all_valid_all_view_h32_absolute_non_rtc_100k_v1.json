@@ -153,6 +153,104 @@
   "openpi_final_mask_root": "/home/user/zc/openpi_writing_all_view_h32_4stage_runs/20260830_snapshot_v1/masks/derived/final_keep_masks",
   "openpi_final_mask_root_layout": "source_dataset_id_partitioned_v1",
   "right_wrist_intrinsics_overrides": {},
+  "wrist_intrinsics_overrides": {
+    "writing4_2026_08_03_camera_only": {
+      "left_wrist": {
+        "target_camera_key": "left_wrist",
+        "expected_serial": "260522278055",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "left_wrist"
+      },
+      "right_wrist": {
+        "target_camera_key": "right_wrist",
+        "expected_serial": "261122273924",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "right_wrist"
+      }
+    },
+    "writing4_2026_08_04_camera_only": {
+      "left_wrist": {
+        "target_camera_key": "left_wrist",
+        "expected_serial": "260522278055",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "left_wrist"
+      },
+      "right_wrist": {
+        "target_camera_key": "right_wrist",
+        "expected_serial": "261122273924",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "right_wrist"
+      }
+    },
+    "writing4_2026_08_05_camera_only": {
+      "left_wrist": {
+        "target_camera_key": "left_wrist",
+        "expected_serial": "260522278055",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "left_wrist"
+      },
+      "right_wrist": {
+        "target_camera_key": "right_wrist",
+        "expected_serial": "261122273924",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "right_wrist"
+      }
+    },
+    "writing4_2026_08_06_camera_only_merged": {
+      "left_wrist": {
+        "target_camera_key": "left_wrist",
+        "expected_serial": "260522278055",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "left_wrist"
+      },
+      "right_wrist": {
+        "target_camera_key": "right_wrist",
+        "expected_serial": "261122273924",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "right_wrist"
+      }
+    },
+    "writing4_2026_08_07_camera_only_merged": {
+      "left_wrist": {
+        "target_camera_key": "left_wrist",
+        "expected_serial": "260522278055",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "left_wrist"
+      },
+      "right_wrist": {
+        "target_camera_key": "right_wrist",
+        "expected_serial": "261122273924",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "right_wrist"
+      }
+    },
+    "writing4_2026_08_27_camera_only_merged": {
+      "left_wrist": {
+        "target_camera_key": "left_wrist",
+        "expected_serial": "260522278055",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "left_wrist"
+      },
+      "right_wrist": {
+        "target_camera_key": "right_wrist",
+        "expected_serial": "261122273924",
+        "donor_source_dataset_id": "writing4_2026_08_06_camera_only_merged",
+        "donor_devices_relative_path": "meta/source_devices/2026-08-06_dmtac_rm65_bimanual_position_v2_writing_4_stage/realsense.json",
+        "donor_camera_key": "right_wrist"
+      }
+    }
+  },
   "openpi_wrist_background_augmentation": {
     "schema": "dexteleop.corrected_wrist_background.v1",
     "provider": "mixed",

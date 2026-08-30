@@ -124,7 +124,14 @@ def _physical_devices_by_episode(
     episode_indices: Sequence[int],
 ) -> tuple[dict[int, Path] | None, dict[str, Any]]:
     default_path = dataset_root / "meta" / "devices" / "realsense.json"
-    if default_path.is_file():
+    audit_path = dataset_root / "meta" / "build_audit.json"
+    provenance_path = dataset_root / "meta" / "provenance.jsonl"
+    has_physical_binding = audit_path.is_file() and provenance_path.is_file()
+    if default_path.is_file() and not has_physical_binding:
+        if default_path.is_symlink():
+            raise FileNotFoundError(
+                f"dataset devices manifest must be a regular file: {default_path}"
+            )
         return None, {
             "schema": "dexteleop.camera_devices_binding.v2",
             "mode": "dataset_default",
@@ -132,9 +139,7 @@ def _physical_devices_by_episode(
             "manifest_sha256": _sha256(default_path),
             "source_dataset_root": str(dataset_root.resolve()),
         }
-    audit_path = dataset_root / "meta" / "build_audit.json"
-    provenance_path = dataset_root / "meta" / "provenance.jsonl"
-    if not audit_path.is_file() or not provenance_path.is_file():
+    if not has_physical_binding:
         raise FileNotFoundError(
             "dataset has neither one devices manifest nor a physical build "
             f"audit with provenance: {dataset_root}"
@@ -170,13 +175,19 @@ def _physical_devices_by_episode(
         if output_index not in selected:
             continue
         source_root = Path(str(item["source_root"])).expanduser().resolve()
-        devices_path = (
+        devices_candidate = (
             dataset_root
             / "meta"
             / "source_devices"
             / source_root.name
             / "realsense.json"
-        ).resolve()
+        )
+        if devices_candidate.is_symlink():
+            raise FileNotFoundError(
+                "physical source devices manifest must not be a symlink for "
+                f"output episode {output_index}: {devices_candidate}"
+            )
+        devices_path = devices_candidate.resolve()
         try:
             devices_path.relative_to(dataset_resolved)
         except ValueError as exc:
@@ -365,6 +376,321 @@ def _intrinsics_overlay_for_source(
     }
     _write_receipt(overlay_path, overlay_payload)
     return overlay_path, contract
+
+
+def _contained_regular_file(
+    root: Path,
+    relative_path: str,
+    *,
+    label: str,
+) -> Path:
+    relative = Path(relative_path)
+    if relative.is_absolute():
+        raise ValueError(f"{label} must be relative to its dataset root")
+    root_resolved = root.resolve()
+    candidate = root_resolved / relative
+    if candidate.is_symlink():
+        raise FileNotFoundError(
+            f"{label} must not be a symlink: {candidate}"
+        )
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes its dataset root: {relative}") from exc
+    if not resolved.is_file() or resolved.is_symlink():
+        raise FileNotFoundError(
+            f"{label} must be a regular file inside its dataset root: {resolved}"
+        )
+    return resolved
+
+
+def _donor_devices_contract(
+    dataset_root: Path,
+    donor_path: Path,
+) -> dict[str, Any]:
+    dataset_resolved = dataset_root.resolve()
+    default_path = dataset_resolved / "meta" / "devices" / "realsense.json"
+    if donor_path == default_path.resolve():
+        return {
+            "mode": "dataset_default",
+            "source_dataset_root": str(dataset_resolved),
+            "manifest_path": str(donor_path),
+            "manifest_sha256": _sha256(donor_path),
+        }
+
+    audit_path = dataset_resolved / "meta" / "build_audit.json"
+    if not audit_path.is_file():
+        raise FileNotFoundError(
+            "a protected donor devices manifest requires build_audit.json: "
+            f"{donor_path}"
+        )
+    audit = _read_json(audit_path)
+    plan = audit.get("plan")
+    if not isinstance(plan, Mapping) or not isinstance(plan.get("episodes"), list):
+        raise TypeError(f"physical build audit has no episode plan: {audit_path}")
+    output_indices = tuple(
+        int(item["output_episode_index"])
+        for item in plan["episodes"]
+        if isinstance(item, Mapping)
+    )
+    _mapping, binding_contract = _physical_devices_by_episode(
+        dataset_resolved,
+        output_indices,
+    )
+    matches = [
+        item
+        for item in binding_contract.get("source_manifests", [])
+        if item.get("copied_manifest_path") == str(donor_path)
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "protected donor devices manifest is not uniquely bound by the "
+            f"build audit and provenance: {donor_path}"
+        )
+    return {
+        "mode": "consolidated_source_devices",
+        "source_dataset_root": str(dataset_resolved),
+        "build_audit_path": binding_contract["build_audit_path"],
+        "build_audit_sha256": binding_contract["build_audit_sha256"],
+        "provenance_path": binding_contract["provenance_path"],
+        "provenance_sha256": binding_contract["provenance_sha256"],
+        "source_manifest": matches[0],
+    }
+
+
+def _wrist_intrinsics_overlays_for_source(
+    *,
+    profile: Mapping[str, Any],
+    profile_sources: Mapping[str, Path],
+    source_id: str,
+    dataset_root: Path,
+    overlay_base: Path,
+    episodes: Sequence[int],
+    camera_keys: Sequence[str],
+    devices_by_episode: Mapping[int, Path] | None,
+) -> tuple[dict[int, Path] | None, dict[str, Any] | None]:
+    """Create immutable, serial-bound overlays for every selected wrist.
+
+    The v1 right-wrist override above is retained for existing profiles.  This
+    multi-camera form additionally supports physical collections whose camera
+    manifests are selected per episode.  It never modifies source metadata:
+    each distinct target manifest receives a new overlay under the derived
+    workspace, and the returned map binds every selected episode explicitly.
+    """
+
+    raw_overrides = profile.get("wrist_intrinsics_overrides", {})
+    if not isinstance(raw_overrides, Mapping):
+        raise TypeError("wrist_intrinsics_overrides must be an object")
+    raw_source_overrides = raw_overrides.get(source_id)
+    if raw_source_overrides is None:
+        return None, None
+    if not isinstance(raw_source_overrides, Mapping):
+        raise TypeError(
+            f"wrist intrinsics overrides must be an object: {source_id}"
+        )
+
+    selected_cameras = tuple(str(value) for value in camera_keys)
+    if set(raw_source_overrides) != set(selected_cameras):
+        raise ValueError(
+            "wrist intrinsics overrides must cover exactly the selected wrist "
+            f"cameras for {source_id}: selected={selected_cameras} "
+            f"configured={tuple(raw_source_overrides)}"
+        )
+    legacy = profile.get("right_wrist_intrinsics_overrides", {})
+    if isinstance(legacy, Mapping) and source_id in legacy:
+        raise ValueError(
+            "a source cannot use both right_wrist_intrinsics_overrides and "
+            f"wrist_intrinsics_overrides: {source_id}"
+        )
+
+    selected_episodes = tuple(int(value) for value in episodes)
+    if devices_by_episode is None:
+        default_devices = (
+            dataset_root / "meta" / "devices" / "realsense.json"
+        ).resolve()
+        target_devices_by_episode = {
+            episode_index: default_devices
+            for episode_index in selected_episodes
+        }
+    else:
+        target_devices_by_episode = {
+            int(episode_index): Path(path).expanduser().resolve()
+            for episode_index, path in devices_by_episode.items()
+        }
+        missing = sorted(set(selected_episodes) - set(target_devices_by_episode))
+        extra = sorted(set(target_devices_by_episode) - set(selected_episodes))
+        if missing or extra:
+            raise ValueError(
+                "per-episode camera devices do not exactly match selected "
+                f"episodes for {source_id}: missing={missing[:8]} extra={extra[:8]}"
+            )
+
+    dataset_resolved = dataset_root.resolve()
+    episodes_by_target: dict[Path, list[int]] = {}
+    for episode_index in selected_episodes:
+        target_path = target_devices_by_episode[episode_index]
+        try:
+            target_path.relative_to(dataset_resolved)
+        except ValueError as exc:
+            raise ValueError(
+                "target camera devices manifest escapes its dataset root: "
+                f"{target_path}"
+            ) from exc
+        if not target_path.is_file() or target_path.is_symlink():
+            raise FileNotFoundError(
+                "target camera devices manifest must be a regular file: "
+                f"{target_path}"
+            )
+        episodes_by_target.setdefault(target_path, []).append(episode_index)
+
+    donor_cache: dict[
+        tuple[str, str],
+        tuple[Path, Mapping[str, Any], Mapping[str, Any]],
+    ] = {}
+    episode_overlays: dict[int, Path] = {}
+    target_contracts: list[dict[str, Any]] = []
+    for target_path in sorted(episodes_by_target, key=str):
+        target_payload = _read_json(target_path)
+        target_records = _camera_records(target_payload)
+        overlay_cameras: dict[str, dict[str, Any]] = {}
+        camera_contracts: list[dict[str, Any]] = []
+        for camera_key in selected_cameras:
+            raw_override = raw_source_overrides[camera_key]
+            if not isinstance(raw_override, Mapping):
+                raise TypeError(
+                    "wrist intrinsics camera override must be an object: "
+                    f"{source_id}/{camera_key}"
+                )
+            target_camera_key = str(
+                raw_override.get("target_camera_key", "")
+            ).strip()
+            donor_source_id = str(
+                raw_override.get("donor_source_dataset_id", "")
+            ).strip()
+            donor_relative_path = str(
+                raw_override.get("donor_devices_relative_path", "")
+            ).strip()
+            donor_camera_key = str(
+                raw_override.get("donor_camera_key", "")
+            ).strip()
+            expected_serial = str(
+                raw_override.get("expected_serial", "")
+            ).strip()
+            if (
+                target_camera_key != camera_key
+                or donor_source_id not in profile_sources
+                or not donor_relative_path
+                or not donor_camera_key
+                or not expected_serial
+            ):
+                raise ValueError(
+                    "invalid wrist intrinsics override: "
+                    f"{source_id}/{camera_key}"
+                )
+
+            cache_key = (donor_source_id, donor_relative_path)
+            donor_cached = donor_cache.get(cache_key)
+            if donor_cached is None:
+                donor_root = profile_sources[donor_source_id]
+                donor_path = _contained_regular_file(
+                    donor_root,
+                    donor_relative_path,
+                    label="donor_devices_relative_path",
+                )
+                donor_cached = (
+                    donor_path,
+                    _camera_records(_read_json(donor_path)),
+                    _donor_devices_contract(donor_root, donor_path),
+                )
+                donor_cache[cache_key] = donor_cached
+            donor_path, donor_records, donor_contract = donor_cached
+
+            target_record = target_records.get(target_camera_key)
+            donor_record = donor_records.get(donor_camera_key)
+            if not isinstance(target_record, Mapping) or not isinstance(
+                donor_record,
+                Mapping,
+            ):
+                raise TypeError(
+                    "intrinsics overlay camera binding is absent: "
+                    f"{source_id}/{camera_key}"
+                )
+            target_serial = _camera_serial(target_record)
+            donor_serial = _camera_serial(donor_record)
+            intrinsics = donor_record.get("intrinsics")
+            if (
+                target_serial != expected_serial
+                or donor_serial != expected_serial
+                or not isinstance(intrinsics, Mapping)
+            ):
+                raise ValueError(
+                    "intrinsics donor does not match the target camera serial: "
+                    f"source={source_id} camera={camera_key} "
+                    f"target={target_serial!r} donor={donor_serial!r} "
+                    f"expected={expected_serial!r}"
+                )
+
+            overlay_record = dict(target_record)
+            overlay_record.update(
+                {
+                    "camera_key": target_camera_key,
+                    "semantic_role": target_camera_key,
+                    "serial": expected_serial,
+                    "serial_number": expected_serial,
+                    "intrinsics": dict(intrinsics),
+                }
+            )
+            overlay_cameras[target_camera_key] = overlay_record
+            camera_contracts.append(
+                {
+                    "target_camera_key": target_camera_key,
+                    "expected_serial": expected_serial,
+                    "donor_source_dataset_id": donor_source_id,
+                    "donor_devices_path": str(donor_path),
+                    "donor_devices_sha256": _sha256(donor_path),
+                    "donor_camera_key": donor_camera_key,
+                    "donor_devices_contract": donor_contract,
+                }
+            )
+
+        target_relative = target_path.relative_to(dataset_resolved).as_posix()
+        target_key = hashlib.sha256(target_relative.encode("utf-8")).hexdigest()[:16]
+        overlay_path = overlay_base / source_id / target_key / "realsense.json"
+        overlay_payload = {
+            "schema": "dexteleop.serial_bound_wrist_intrinsics_overlay.v2",
+            "source_dataset_id": source_id,
+            "target_devices_path": str(target_path),
+            "target_devices_sha256": _sha256(target_path),
+            "source_modified": False,
+            "cameras": overlay_cameras,
+            "calibration_provenance": camera_contracts,
+        }
+        _write_receipt(overlay_path, overlay_payload)
+        bound_episodes = sorted(episodes_by_target[target_path])
+        for episode_index in bound_episodes:
+            episode_overlays[episode_index] = overlay_path
+        target_contracts.append(
+            {
+                "target_devices_path": str(target_path),
+                "target_devices_sha256": _sha256(target_path),
+                "target_devices_relative_path": target_relative,
+                "episode_indices": bound_episodes,
+                "overlay_path": str(overlay_path),
+                "overlay_sha256": _sha256(overlay_path),
+                "camera_bindings": camera_contracts,
+            }
+        )
+
+    return episode_overlays, {
+        "schema": "dexteleop.serial_bound_wrist_intrinsics_overlays.v2",
+        "source_dataset_id": source_id,
+        "source_dataset_root": str(dataset_resolved),
+        "selected_episode_count": len(selected_episodes),
+        "cameras": list(selected_cameras),
+        "target_bindings": target_contracts,
+        "source_modified": False,
+    }
 
 
 def _expected_frames(
@@ -754,6 +1080,26 @@ def run_pipeline(
     }
     if set(selected) != set(profile_sources):
         raise ValueError("binding sources differ from the prepared profile")
+    wrist_overrides = profile.get("wrist_intrinsics_overrides", {})
+    if not isinstance(wrist_overrides, Mapping):
+        raise TypeError("wrist_intrinsics_overrides must be an object")
+    unknown_override_sources = sorted(set(wrist_overrides) - set(profile_sources))
+    if unknown_override_sources:
+        raise ValueError(
+            "wrist intrinsics overrides reference unknown source IDs: "
+            f"{unknown_override_sources}"
+        )
+    legacy_overrides = profile.get("right_wrist_intrinsics_overrides", {})
+    if not isinstance(legacy_overrides, Mapping):
+        raise TypeError("right_wrist_intrinsics_overrides must be an object")
+    overlapping_override_sources = sorted(
+        set(wrist_overrides) & set(legacy_overrides)
+    )
+    if overlapping_override_sources:
+        raise ValueError(
+            "sources cannot use both legacy and multi-wrist intrinsics "
+            f"overrides: {overlapping_override_sources}"
+        )
     requested = set(source_ids)
     if requested:
         unknown = sorted(requested - set(profile_sources))
@@ -829,7 +1175,7 @@ def run_pipeline(
             else existing_receipt.get("camera_devices_contract")
         )
         if not verify_only and existing_receipt is None:
-            override_devices, calibration_contract = (
+            legacy_override_devices, legacy_calibration_contract = (
                 _intrinsics_overlay_for_source(
                     profile=profile,
                     profile_sources=profile_sources,
@@ -844,14 +1190,47 @@ def run_pipeline(
                     episodes,
                 )
             )
+            wrist_overlay_devices, wrist_calibration_contract = (
+                _wrist_intrinsics_overlays_for_source(
+                    profile=profile,
+                    profile_sources=profile_sources,
+                    source_id=source_id,
+                    dataset_root=dataset_root,
+                    overlay_base=overlay_base,
+                    episodes=episodes,
+                    camera_keys=camera_keys,
+                    devices_by_episode=devices_by_episode,
+                )
+            )
+            if wrist_overlay_devices is not None:
+                if legacy_override_devices is not None:
+                    raise ValueError(
+                        "legacy and multi-wrist intrinsics overlays cannot both "
+                        f"bind source {source_id}"
+                    )
+                effective_devices = None
+                effective_devices_by_episode = wrist_overlay_devices
+                calibration_contract = wrist_calibration_contract
+            else:
+                if (
+                    legacy_override_devices is not None
+                    and devices_by_episode is not None
+                ):
+                    raise ValueError(
+                        "legacy right-wrist intrinsics overlay cannot replace a "
+                        f"per-episode devices binding: {source_id}"
+                    )
+                effective_devices = legacy_override_devices
+                effective_devices_by_episode = devices_by_episode
+                calibration_contract = legacy_calibration_contract
             adjust_dataset(
                 dataset_root,
                 table_root,
                 urdf_path=urdf_path,
                 cameras=camera_keys,
                 episodes=episodes,
-                devices_json=override_devices,
-                devices_json_by_episode=devices_by_episode,
+                devices_json=effective_devices,
+                devices_json_by_episode=effective_devices_by_episode,
                 output_kind="keep-mask",
                 table_mask_mode="sampled-raycast",
                 table_raycast_stride=2,

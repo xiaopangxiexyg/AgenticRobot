@@ -276,11 +276,16 @@ source root/index 精确一致，再逐 episode 使用
 `original_absent_protected_copy_bound_by_audit_and_provenance`，不能把“找不到原文件”
 静默当作已验证相等。
 
-如果早期 source 只保存 serial、没有保存数值内参，必须由 profile 的
-`right_wrist_intrinsics_overrides` 显式声明 donor source/camera 和 expected serial。
-流水线同时验证 target 与 donor serial，再把 donor 数值内参写入全新的
-`derived/calibration_overlays/<source_dataset_id>/realsense.json`；不能按 donor 的
-`left_wrist`/`right_wrist` 名字猜测，也不能回写 source metadata。
+如果早期 source 只保存 serial、没有保存数值内参，单右腕旧 profile 仍可使用
+`right_wrist_intrinsics_overrides`；选择左右双腕的新 profile 必须使用
+`wrist_intrinsics_overrides`，为每个训练 source 和每个选中的 wrist camera 显式声明
+target camera、expected serial、donor source、donor source 内的相对 devices 路径和 donor
+camera。donor devices 必须是其固定 dataset root 内的普通文件，不能用绝对路径或越界
+路径。流水线逐 target manifest 同时验证 target 与 donor serial，再把 donor 数值内参写入
+全新的 `derived/calibration_overlays/<source_dataset_id>/<target-hash>/realsense.json`。
+物理整合集合会按 build audit/provenance 的逐 episode devices 绑定分别生成 overlay；receipt
+记录 target/donor/overlay 路径与 SHA-256、episode 绑定和两个 wrist camera 的 serial。
+不能按 donor 的 `left_wrist`/`right_wrist` 名字猜测，也不能回写 source metadata。
 
 depth 后处理按 manifest 声明帧数精确读取。完整的额外尾随帧会记录在 receipt 中，
 但不会进入派生结果；短流、半帧尾随、table 视频提前结束或额外可解码尾帧都会停止

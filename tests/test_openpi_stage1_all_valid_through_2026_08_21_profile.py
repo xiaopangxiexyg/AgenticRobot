@@ -3,8 +3,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -188,6 +188,9 @@ def test_consolidated_source_devices_require_audit_and_provenance_binding(
     copied = meta / "source_devices" / source_root.name / "realsense.json"
     copied.parent.mkdir(parents=True)
     copied.write_text(json.dumps({"left_wrist": {}, "right_wrist": {}}))
+    default = meta / "devices" / "realsense.json"
+    default.parent.mkdir(parents=True)
+    default.write_text(json.dumps({"cameras": {}}), encoding="utf-8")
     (meta / "build_audit.json").write_text(
         json.dumps(
             {
