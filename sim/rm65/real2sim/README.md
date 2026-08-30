@@ -86,14 +86,27 @@ held-out result, while v2 and v1 remain historical. Promotion to `identified`
 requires a new clean capture collected after v4 is frozen and never used for
 tuning.
 
-The v4 fit manifest remains immutable when unrelated runtime configuration
-changes. The current complete simulation contract is bound to that fit through
-`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260811_v2.json`.
-This binding records the corrected left/right wrist-camera serial assignment,
-binds the current registry and the exact archived 20260724.v1 registry by
-content hash, and explicitly carries forward the v4 `provisional` and held-out
-`not_run` status. It is a runtime contract rebind, not a refit or a new fidelity
-result.
+The v4 fit manifest remains immutable when runtime implementation or
+configuration changes. In particular, its source hashes describe the exact
+core and MuJoCo adapter used for the 20260721 fit; tests compare those hashes to
+fixed historical values rather than silently reinterpreting the fit against
+the current files.
+
+The current runtime-source binding is
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260829_v4.json`.
+It content-addresses the current arm profile, backend-independent actuator core,
+MuJoCo executor, simulation contract, camera registry, frozen v4 fit, and the
+preceding 20260822.v3 runtime binding. The execution-continuity changes are
+therefore recoverable without rewriting the old fit evidence. This binding
+explicitly records no arm-profile refit, no behavior change caused by the
+evidence-only binding itself, and carries forward the `provisional` claim and
+held-out `not_run` status.
+
+The 20260822.v3 binding remains immutable at
+`artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260822_v3.json`.
+It records the corrected left/right wrist-camera serial assignment, the 4B2 CAD
+scene contract, and the exact archived 20260724.v1 registry. It is a historical
+runtime contract rebind, not a refit or a new fidelity result.
 
 The historical v1 binding remains immutable at
 `artifacts/rm65_arm_free_motion_20260721_v4_runtime_binding_20260724_v1.json`.
