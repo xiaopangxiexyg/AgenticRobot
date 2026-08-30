@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from deployments.openpi.training.prepared_skill_launch import (
     _corrected_wrist_background_overrides,
     _load_profile,
@@ -68,6 +70,12 @@ def test_stage4_all_view_h32_profile_uses_the_canonical_snapshot() -> None:
     assert profile["expected_total_raw_frame_count"] == 597165
     assert profile["expected_total_eligible_episode_count"] == 1406
     assert profile["expected_complete_h32_window_count"] == 62999
+    assert [
+        item["expected_openpi_quality_valid_window_count"]
+        for item in sources
+    ] == [190, 257, 515, 157, 58, 69]
+    assert profile["expected_openpi_quality_valid_window_count"] == 1246
+    assert profile["expected_openpi_repeated_epoch_sample_count"] == 1246
     assert len(profile["annotation_selection"]) == 1490
     assert profile["source_snapshot"]["selector_report_sha256"] == (
         "f237fc9ebb7a30ca8637e34d9fe5eca5cd1da86c20aed239eda7e17d013a4b17"
@@ -82,6 +90,18 @@ def test_stage4_all_view_h32_profile_uses_the_canonical_snapshot() -> None:
     assert by_id["writing4_2026_08_27_camera_only_merged"][
         "expected_task_id"
     ] == "4_stage_writing_detail"
+
+
+def test_stage4_quality_window_contract_fails_closed(tmp_path: Path) -> None:
+    profile = json.loads(_PROFILE.read_text(encoding="utf-8"))
+    profile["sources"][0][
+        "expected_openpi_quality_valid_window_count"
+    ] += 1
+    mismatched = tmp_path / "mismatched-stage4-profile.json"
+    mismatched.write_text(json.dumps(profile), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source counts differ"):
+        _load_profile(mismatched)
 
 
 def test_stage4_all_view_h32_profile_pins_training_and_mask_contracts() -> None:

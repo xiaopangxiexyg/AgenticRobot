@@ -30,7 +30,8 @@
       "expected_raw_episode_count": 207,
       "expected_raw_frame_count": 88732,
       "expected_eligible_episode_count": 186,
-      "expected_complete_h32_window_count": 8613
+      "expected_complete_h32_window_count": 8613,
+      "expected_openpi_quality_valid_window_count": 190
     },
     {
       "source_dataset_id": "writing4_2026_08_04_camera_only",
@@ -46,7 +47,8 @@
       "expected_raw_episode_count": 355,
       "expected_raw_frame_count": 142576,
       "expected_eligible_episode_count": 344,
-      "expected_complete_h32_window_count": 15661
+      "expected_complete_h32_window_count": 15661,
+      "expected_openpi_quality_valid_window_count": 257
     },
     {
       "source_dataset_id": "writing4_2026_08_05_camera_only",
@@ -62,7 +64,8 @@
       "expected_raw_episode_count": 261,
       "expected_raw_frame_count": 102887,
       "expected_eligible_episode_count": 244,
-      "expected_complete_h32_window_count": 9412
+      "expected_complete_h32_window_count": 9412,
+      "expected_openpi_quality_valid_window_count": 515
     },
     {
       "source_dataset_id": "writing4_2026_08_06_camera_only_merged",
@@ -78,7 +81,8 @@
       "expected_raw_episode_count": 294,
       "expected_raw_frame_count": 112817,
       "expected_eligible_episode_count": 289,
-      "expected_complete_h32_window_count": 13411
+      "expected_complete_h32_window_count": 13411,
+      "expected_openpi_quality_valid_window_count": 157
     },
     {
       "source_dataset_id": "writing4_2026_08_07_camera_only_merged",
@@ -94,7 +98,8 @@
       "expected_raw_episode_count": 331,
       "expected_raw_frame_count": 113517,
       "expected_eligible_episode_count": 317,
-      "expected_complete_h32_window_count": 12030
+      "expected_complete_h32_window_count": 12030,
+      "expected_openpi_quality_valid_window_count": 58
     },
     {
       "source_dataset_id": "writing4_2026_08_27_camera_only_merged",
@@ -110,13 +115,16 @@
       "expected_raw_episode_count": 56,
       "expected_raw_frame_count": 36636,
       "expected_eligible_episode_count": 26,
-      "expected_complete_h32_window_count": 3872
+      "expected_complete_h32_window_count": 3872,
+      "expected_openpi_quality_valid_window_count": 69
     }
   ],
   "expected_total_raw_episode_count": 1504,
   "expected_total_raw_frame_count": 597165,
   "expected_total_eligible_episode_count": 1406,
   "expected_complete_h32_window_count": 62999,
+  "expected_openpi_quality_valid_window_count": 1246,
+  "expected_openpi_repeated_epoch_sample_count": 1246,
   "target_skill_id": "writing.return_brush",
   "target_progress_step_id": "right_return_brush",
   "training_domain": "NOMINAL",
