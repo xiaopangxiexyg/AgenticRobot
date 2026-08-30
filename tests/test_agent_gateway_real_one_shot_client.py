@@ -135,6 +135,149 @@ class _FakeClient:
         raise AssertionError(method)
 
 
+class _FakeAbsolutePoseClient(_FakeClient):
+    def call(self, method, payload):
+        self.calls.append((method, payload))
+        if method == "get_skill_route_manifest":
+            return {
+                "runtime_session_id": "real-session:absolute-pose-test",
+                "route_manifest_hash": "route-manifest:absolute-pose-test",
+                "skill_routes": [
+                    {
+                        "route": {
+                            "skill_id": "motion.move_tcp_to_pose",
+                            "skill_version": "1",
+                            "skill_definition_hash": "skill-definition:absolute-pose",
+                            "route_id": "real.rm65.agent_skill_tcp_pose_target",
+                            "route_version": "1",
+                            "route_hash": "route:absolute-pose",
+                            "parameter_schema_hash": "schema:absolute-pose",
+                            "allowed_parameter_profiles": [
+                                {
+                                    "parameter_profile_id": (
+                                        "real-tool-tcp-absolute-grasp-pose-v1"
+                                    ),
+                                    "parameter_profile_hash": "profile:absolute-pose",
+                                    "parameter_schema_hash": "schema:absolute-pose",
+                                }
+                            ],
+                        },
+                        "deployment_binding": {
+                            "deployment_binding_hash": "binding:absolute-pose",
+                            "safety_envelope_refs": [
+                                {
+                                    "object_id": "envelope:absolute-pose",
+                                    "content_hash": "envelope-hash:absolute-pose",
+                                    "constraint_set_hash": (
+                                        "constraint-hash:absolute-pose"
+                                    ),
+                                    "allowed_route_ids": [
+                                        "real.rm65.agent_skill_tcp_pose_target"
+                                    ],
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "skill_schema_catalog_hash": "catalog:absolute-pose",
+            }
+        if method == "get_agent_skill_schema_catalog":
+            return {
+                "skill_schema_catalog_hash": "catalog:absolute-pose",
+                "schema_entries": [
+                    {
+                        "skill_id": "motion.move_tcp_to_pose",
+                        "skill_version": "1",
+                        "parameter_schema_hash": "schema:absolute-pose",
+                        "parameter_schema": {
+                            "properties": {
+                                "pose_targets_by_component": {
+                                    "properties": {
+                                        "right_arm": {
+                                            "type": "array",
+                                            "minItems": 7,
+                                            "maxItems": 7,
+                                        }
+                                    }
+                                },
+                                "reference_frame_id": {
+                                    "enum": ["canonical_station"]
+                                },
+                                "reference_frame_spec_hash": {
+                                    "type": "string"
+                                },
+                                "controlled_frame_id": {"const": "tool_tcp"},
+                                "frame_graph_hash": {"type": "string"},
+                                "tool_config_hash": {"type": "string"},
+                                "calibration_hash": {"type": "string"},
+                                "speed_scale": {
+                                    "type": "number",
+                                    "minimum": 0.05,
+                                    "maximum": 1.0,
+                                },
+                            }
+                        },
+                        "parameter_profiles": [
+                            {
+                                "parameter_profile_id": (
+                                    "real-tool-tcp-absolute-grasp-pose-v1"
+                                ),
+                                "parameter_profile_hash": "profile:absolute-pose",
+                                "parameter_schema_hash": "schema:absolute-pose",
+                            }
+                        ],
+                    }
+                ],
+            }
+        if method == "get_observation_snapshot":
+            return {
+                "snapshot_id": "snapshot:absolute-pose",
+                "station_revision": 8,
+                "lifecycle_state": "running",
+                "execution_gate": "ready",
+                "frame_graph_hash": "frame-graph:absolute-pose",
+                "tool_config_hash": "tool-config:absolute-pose",
+                "calibration_hash": "calibration:absolute-pose",
+                "measurement_summary": {
+                    "pose_xyz_quat_xyzw_by_component": {
+                        "right_arm": [0.0] * 7
+                    },
+                    "reference_frame_id": "canonical_station",
+                    "reference_frame_spec_hash": "station-frame:absolute-pose",
+                },
+            }
+        if method == "submit_skill_request":
+            parameters = payload["parameters"]
+            assert payload["requested_timeout_ms"] == 30_000
+            assert "component_id" not in parameters
+            assert parameters["reference_frame_id"] == "canonical_station"
+            assert parameters["reference_frame_spec_hash"] == (
+                "station-frame:absolute-pose"
+            )
+            assert parameters["pose_targets_by_component"] == {
+                "right_arm": [0.31, -0.12, 0.28, 0.0, 0.0, 0.0, 1.0]
+            }
+            assert parameters["speed_scale"] == 0.2
+            return {
+                "accepted": True,
+                "reason_code": "request_admitted",
+                "operation": {
+                    "operation_id": "operation:absolute-pose",
+                    "status": "running",
+                },
+            }
+        if method == "get_own_operation":
+            return {
+                "accepted": True,
+                "reason_code": "own_operation_found",
+                "operation": {
+                    "operation_id": "operation:absolute-pose",
+                    "status": "completed",
+                },
+            }
+        raise AssertionError(method)
+
+
 def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch) -> None:
     _FakeClient.instances.clear()
     monkeypatch.setattr(one_shot_client, "_Client", _FakeClient)
@@ -145,7 +288,7 @@ def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch) -> None:
         action="forward",
         client_id="dexteleop-local-primitive-operator",
         timeout_sec=1.0,
-        operation_timeout_sec=1.0,
+        operation_timeout_sec=None,
     )
 
     operation = one_shot_client.execute_one_shot(args)
@@ -169,3 +312,55 @@ def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch) -> None:
     assert request["parameters"]["reference_frame_spec_hash"] == (
         "station-frame:test"
     )
+
+
+def test_one_shot_client_submits_absolute_dmtac_tcp_in_canonical_station(
+    monkeypatch,
+) -> None:
+    _FakeClient.instances.clear()
+    monkeypatch.setattr(one_shot_client, "_Client", _FakeAbsolutePoseClient)
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path="/tmp/absolute-pose.sock",
+        side="right",
+        action="move_tcp_to_pose",
+        target_xyz_m=(0.31, -0.12, 0.28),
+        target_quat_xyzw=(0.0, 0.0, 0.0, 2.0),
+        speed_scale=0.2,
+        client_id="dexteleop-local-primitive-operator",
+        timeout_sec=1.0,
+        operation_timeout_sec=None,
+    )
+
+    operation = one_shot_client.execute_one_shot(args)
+
+    assert operation["status"] == "completed"
+    assert _FakeClient.instances[0].closed is True
+
+
+def test_absolute_pose_client_requires_a_complete_pose_before_connect(
+    monkeypatch,
+) -> None:
+    _FakeClient.instances.clear()
+    monkeypatch.setattr(one_shot_client, "_Client", _FakeAbsolutePoseClient)
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path="/tmp/absolute-pose.sock",
+        side="right",
+        action="move_tcp_to_pose",
+        target_xyz_m=(0.31, -0.12, 0.28),
+        target_quat_xyzw=None,
+        speed_scale=0.2,
+        client_id="dexteleop-local-primitive-operator",
+        timeout_sec=1.0,
+        operation_timeout_sec=1.0,
+    )
+
+    try:
+        one_shot_client.execute_one_shot(args)
+    except ValueError as error:
+        assert "requires both" in str(error)
+    else:
+        raise AssertionError("incomplete absolute TCP pose must be rejected")
+
+    assert _FakeClient.instances == []

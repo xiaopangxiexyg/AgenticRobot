@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import socket
 import struct
 import time
@@ -19,6 +20,7 @@ from agent_gateway.skills.motion.definition import (
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
+    TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from agent_gateway.transport.unix_transport import (
     AGENT_GATEWAY_UNIX_JSON_PROTOCOL_V2,
@@ -27,6 +29,7 @@ from agent_gateway.transport.unix_transport import (
 from .motion_primitive_profiles import (
     REAL_AGENT_TCP_FIXED_ORIENTATION_HEADING_BY_SKILL_ID_V1,
 )
+from .session_authorization import REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION
 
 _PREFIX = struct.Struct(">I")
 _CONFIRM_TOKEN = "EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE"
@@ -35,6 +38,7 @@ _ACTION_TO_SKILL_ID = {
     "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
+    REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
 }
 _TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "timed_out"}
@@ -184,6 +188,95 @@ def _schema_enum(
     return tuple(values)
 
 
+def _finite_sequence(
+    value: object,
+    *,
+    size: int,
+    field_name: str,
+) -> tuple[float, ...]:
+    if not isinstance(value, (tuple, list)) or len(value) != size:
+        raise ValueError(f"{field_name} must contain exactly {size} numbers.")
+    normalized: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{field_name} must contain only numbers.")
+        number = float(item)
+        if not math.isfinite(number):
+            raise ValueError(f"{field_name} must contain only finite numbers.")
+        normalized.append(number)
+    return tuple(normalized)
+
+
+def _absolute_tcp_pose_from_args(args: argparse.Namespace) -> tuple[float, ...] | None:
+    xyz_value = getattr(args, "target_xyz_m", None)
+    quaternion_value = getattr(args, "target_quat_xyzw", None)
+    is_absolute = getattr(args, "action", None) == REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION
+    if not is_absolute:
+        if (
+            xyz_value is not None
+            or quaternion_value is not None
+            or getattr(args, "speed_scale", None) is not None
+        ):
+            raise ValueError(
+                "--target-xyz-m/--target-quat-xyzw/--speed-scale require "
+                f"--action {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION}."
+            )
+        return None
+    if xyz_value is None or quaternion_value is None:
+        raise ValueError(
+            f"--action {REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION} requires both "
+            "--target-xyz-m and --target-quat-xyzw."
+        )
+    xyz = _finite_sequence(xyz_value, size=3, field_name="target_xyz_m")
+    quaternion = _finite_sequence(
+        quaternion_value,
+        size=4,
+        field_name="target_quat_xyzw",
+    )
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if norm <= 1e-12:
+        raise ValueError("target_quat_xyzw must have nonzero norm.")
+    normalized_quaternion = tuple(value / norm for value in quaternion)
+    return (*xyz, *normalized_quaternion)
+
+
+def _pose_target_component_allowed(
+    properties: Mapping[str, Any],
+    component_id: str,
+) -> bool:
+    pose_targets = properties.get("pose_targets_by_component")
+    component_properties = (
+        None
+        if not isinstance(pose_targets, Mapping)
+        else pose_targets.get("properties")
+    )
+    return bool(
+        isinstance(component_properties, Mapping)
+        and component_id in component_properties
+    )
+
+
+def _validated_speed_scale(
+    properties: Mapping[str, Any],
+    value: object,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("speed_scale must be a number.")
+    speed = float(value)
+    if not math.isfinite(speed):
+        raise ValueError("speed_scale must be finite.")
+    field = properties.get("speed_scale")
+    if not isinstance(field, Mapping):
+        raise TypeError("Absolute TCP-pose schema has no speed_scale field.")
+    minimum = float(field.get("minimum", 0.0))
+    maximum = float(field.get("maximum", 1.0))
+    if not minimum <= speed <= maximum:
+        raise ValueError(
+            f"speed_scale must be within the advertised [{minimum}, {maximum}]."
+        )
+    return speed
+
+
 def _parameters(
     *,
     action: str,
@@ -191,6 +284,8 @@ def _parameters(
     side: str,
     snapshot: Mapping[str, Any],
     schema_entry: Mapping[str, Any],
+    absolute_tcp_pose_xyz_quat_xyzw: tuple[float, ...] | None = None,
+    speed_scale: float | None = None,
 ) -> dict[str, Any]:
     summary = snapshot["measurement_summary"]
     components = tuple(summary["pose_xyz_quat_xyzw_by_component"])
@@ -200,7 +295,13 @@ def _parameters(
             "Real primitive observation does not exactly match the selected side."
         )
     properties = _schema_properties(schema_entry)
-    if expected_component not in _schema_enum(properties, "component_id"):
+    is_absolute = skill_id == TCP_POSE_TARGET_SKILL_ID_V1
+    if is_absolute:
+        if not _pose_target_component_allowed(properties, expected_component):
+            raise RuntimeError("Selected side is not allowed by the Skill schema.")
+        if absolute_tcp_pose_xyz_quat_xyzw is None:
+            raise ValueError("Absolute TCP-pose action requires a target pose.")
+    elif expected_component not in _schema_enum(properties, "component_id"):
         raise RuntimeError("Selected side is not allowed by the Skill schema.")
     fixed_cardinal_direction = (
         FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(skill_id)
@@ -213,22 +314,67 @@ def _parameters(
     reference_frames = _schema_enum(properties, "reference_frame_id")
     if len(reference_frames) != 1:
         raise RuntimeError("Real primitive schema must bind one reference frame.")
-    payload = {
-        "component_id": expected_component,
+    if is_absolute:
+        if summary.get("reference_frame_id") != reference_frames[0]:
+            raise RuntimeError(
+                "Absolute TCP-pose schema frame disagrees with the observation."
+            )
+        reference_frame_spec_hash = summary.get("reference_frame_spec_hash")
+        if not isinstance(reference_frame_spec_hash, str) or not (
+            reference_frame_spec_hash
+        ):
+            raise RuntimeError(
+                "Observation has no canonical Station frame specification hash."
+            )
+        identity_values = {
+            "reference_frame_spec_hash": reference_frame_spec_hash,
+            "frame_graph_hash": snapshot.get("frame_graph_hash"),
+            "tool_config_hash": snapshot.get("tool_config_hash"),
+            "calibration_hash": snapshot.get("calibration_hash"),
+        }
+        if any(
+            not isinstance(value, str) or not value
+            for value in identity_values.values()
+        ):
+            raise RuntimeError(
+                "Observation omits an absolute TCP-pose identity hash."
+            )
+    else:
+        identity_values = {
+            "reference_frame_spec_hash": _schema_const(
+                properties, "reference_frame_spec_hash"
+            ),
+            "frame_graph_hash": _schema_const(properties, "frame_graph_hash"),
+            "tool_config_hash": _schema_const(properties, "tool_config_hash"),
+            "calibration_hash": _schema_const(properties, "calibration_hash"),
+        }
+    payload: dict[str, Any] = {
         "reference_frame_id": reference_frames[0],
-        "reference_frame_spec_hash": _schema_const(
-            properties, "reference_frame_spec_hash"
-        ),
+        "reference_frame_spec_hash": identity_values[
+            "reference_frame_spec_hash"
+        ],
         "controlled_frame_id": _schema_const(properties, "controlled_frame_id"),
-        "frame_graph_hash": _schema_const(properties, "frame_graph_hash"),
-        "tool_config_hash": _schema_const(properties, "tool_config_hash"),
-        "calibration_hash": _schema_const(properties, "calibration_hash"),
+        "frame_graph_hash": identity_values["frame_graph_hash"],
+        "tool_config_hash": identity_values["tool_config_hash"],
+        "calibration_hash": identity_values["calibration_hash"],
     }
+    if is_absolute:
+        payload["pose_targets_by_component"] = {
+            expected_component: list(absolute_tcp_pose_xyz_quat_xyzw)
+        }
+        payload["speed_scale"] = _validated_speed_scale(
+            properties,
+            0.25 if speed_scale is None else speed_scale,
+        )
+    else:
+        payload["component_id"] = expected_component
     for field_name in ("frame_graph_hash", "tool_config_hash", "calibration_hash"):
         if payload[field_name] != snapshot.get(field_name):
             raise RuntimeError(
                 f"Skill schema {field_name} disagrees with the observation snapshot."
             )
+    if is_absolute:
+        return payload
     if (
         skill_id == TCP_CARDINAL_STEP_SKILL_ID_V1
         or fixed_cardinal_direction is not None
@@ -251,6 +397,15 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         raise ValueError("--socket-path must be absolute")
     expected_component = f"{args.side}_arm"
     skill_id = _ACTION_TO_SKILL_ID[args.action]
+    absolute_tcp_pose = _absolute_tcp_pose_from_args(args)
+    requested_timeout = getattr(args, "operation_timeout_sec", None)
+    operation_timeout_sec = (
+        30.0
+        if requested_timeout is None and absolute_tcp_pose is not None
+        else (5.0 if requested_timeout is None else float(requested_timeout))
+    )
+    if not math.isfinite(operation_timeout_sec) or operation_timeout_sec <= 0.0:
+        raise ValueError("operation_timeout_sec must be finite and positive.")
     client = _Client(
         socket_path=args.socket_path,
         timeout_sec=args.timeout_sec,
@@ -276,8 +431,15 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             side=args.side,
             snapshot=snapshot,
             schema_entry=schema_entry,
+            absolute_tcp_pose_xyz_quat_xyzw=absolute_tcp_pose,
+            speed_scale=getattr(args, "speed_scale", None),
         )
-        if parameters["component_id"] != expected_component:
+        requested_components = (
+            tuple(parameters["pose_targets_by_component"])
+            if skill_id == TCP_POSE_TARGET_SKILL_ID_V1
+            else (parameters["component_id"],)
+        )
+        if requested_components != (expected_component,):
             raise RuntimeError(
                 "Server component does not match the operator-selected side."
             )
@@ -313,7 +475,7 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
             "parameters": parameters,
             "observation_snapshot_id": snapshot["snapshot_id"],
             "requested_mode": "real_active",
-            "requested_timeout_ms": int(args.operation_timeout_sec * 1000.0),
+            "requested_timeout_ms": int(operation_timeout_sec * 1000.0),
             "skill_execution_grant_id": None,
             "input_artifact_bindings": [],
             "safety_profile_id": envelope["object_id"],
@@ -332,7 +494,7 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
         if not isinstance(operation, Mapping):
             raise TypeError("Gateway returned no admitted operation.")
         operation_id = str(operation["operation_id"])
-        deadline = time.monotonic() + float(args.operation_timeout_sec) + 3.0
+        deadline = time.monotonic() + operation_timeout_sec + 3.0
         while str(operation["status"]) not in _TERMINAL_STATUSES:
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for terminal operation/HOLD.")
@@ -362,14 +524,54 @@ def execute_one_shot(args: argparse.Namespace) -> Mapping[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Execute the exact primitive pre-authorized by RealTeleop.",
+        description=(
+            "Execute one exact action pre-authorized by the independent real "
+            "RM65 Gateway session."
+        ),
     )
     parser.add_argument("--socket-path", required=True)
     parser.add_argument("--client-id", default="dexteleop-local-primitive-operator")
     parser.add_argument("--side", choices=("left", "right"), required=True)
     parser.add_argument("--action", choices=tuple(_ACTION_TO_SKILL_ID), required=True)
+    parser.add_argument(
+        "--target-xyz-m",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        help=(
+            "actual tool-TCP position in the Gateway-advertised canonical_station "
+            "frame; required only for --action move_tcp_to_pose"
+        ),
+    )
+    parser.add_argument(
+        "--target-quat-xyzw",
+        type=float,
+        nargs=4,
+        metavar=("QX", "QY", "QZ", "QW"),
+        help=(
+            "actual tool-TCP quaternion in canonical_station; required only for "
+            "--action move_tcp_to_pose"
+        ),
+    )
+    parser.add_argument(
+        "--speed-scale",
+        type=float,
+        default=None,
+        help=(
+            "fraction of the lower reviewed trajectory limits for "
+            "move_tcp_to_pose (default: 0.25)"
+        ),
+    )
     parser.add_argument("--timeout-sec", type=float, default=10.0)
-    parser.add_argument("--operation-timeout-sec", type=float, default=5.0)
+    parser.add_argument(
+        "--operation-timeout-sec",
+        type=float,
+        default=None,
+        help=(
+            "operation deadline (default: 30s for move_tcp_to_pose, 5s for "
+            "fixed primitives)"
+        ),
+    )
     parser.add_argument("--confirm", default="")
     return parser
 

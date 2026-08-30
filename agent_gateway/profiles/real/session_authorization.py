@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.runtime.access_policy import (
@@ -17,6 +17,7 @@ from agent_gateway.skills.motion.definition import (
     TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
     TCP_LEVEL_FORWARD_SKILL_ID_V1,
+    TCP_POSE_TARGET_SKILL_ID_V1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
@@ -28,6 +29,7 @@ REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN = (
 # Compatibility name used by the existing composition API. Its value is the
 # persistent-session token; the retired one-shot token is intentionally invalid.
 REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN = REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
+REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION = "move_tcp_to_pose"
 REAL_AGENT_PRIMITIVE_ACTIONS = (
     "forward",
     "backward",
@@ -38,16 +40,70 @@ REAL_AGENT_PRIMITIVE_ACTIONS = (
     "level_forward",
     "level_forward_left_30",
     "level_forward_right_30",
+    REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION,
 )
 _FIXED_SKILL_ID_BY_ACTION = {
     **dict(FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1),
     "level_forward": TCP_LEVEL_FORWARD_SKILL_ID_V1,
     "level_forward_left_30": TCP_LEVEL_FORWARD_LEFT_30_SKILL_ID_V1,
     "level_forward_right_30": TCP_LEVEL_FORWARD_RIGHT_30_SKILL_ID_V1,
+    REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION: TCP_POSE_TARGET_SKILL_ID_V1,
 }
 _ACTION_BY_FIXED_SKILL_ID = {
     skill_id: action for action, skill_id in _FIXED_SKILL_ID_BY_ACTION.items()
 }
+
+
+def _requested_action_and_component_ids(
+    request: AgentSkillRequest,
+) -> tuple[str | None, tuple[str, ...]]:
+    """Resolve only the operator authorization class and selected components.
+
+    Absolute TCP targets intentionally use ``pose_targets_by_component`` while
+    the fixed primitives use ``component_id``.  Keeping this distinction here
+    prevents a published absolute-pose Route from becoming permanently
+    ungrantable merely because its payload shape is not a cardinal primitive.
+    Target values, frame identities, profile hashes, safety envelopes, and all
+    lower admission remain validated by their existing owners.
+    """
+
+    parameters = request.parameters
+    fixed_cardinal_action = (
+        FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
+            request.skill_id
+        )
+    )
+    if fixed_cardinal_action is not None and parameters.get(
+        "direction"
+    ) != fixed_cardinal_action:
+        return None, ()
+    if request.skill_id == TCP_POSE_TARGET_SKILL_ID_V1:
+        targets = parameters.get("pose_targets_by_component")
+        if not isinstance(targets, Mapping):
+            return REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, ()
+        component_ids = tuple(
+            sorted(
+                key
+                for key in targets
+                if isinstance(key, str) and key.strip() == key and key
+            )
+        )
+        if len(component_ids) != len(targets):
+            return REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, ()
+        return REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION, component_ids
+    requested_action = (
+        parameters.get("direction")
+        if request.skill_id == "motion.step_tcp_cardinal"
+        else (
+            fixed_cardinal_action
+            or _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id)
+        )
+    )
+    component_id = parameters.get("component_id")
+    return (
+        requested_action if isinstance(requested_action, str) else None,
+        (component_id,) if isinstance(component_id, str) else (),
+    )
 
 
 class RealAgentPrimitiveSessionAuthorization:
@@ -159,26 +215,12 @@ class RealAgentPrimitiveSessionAuthorization:
             return None
         if request.skill_execution_grant_id is not None:
             return None
-        fixed_cardinal_action = (
-            FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1.get(
-                request.skill_id
-            )
-        )
-        if fixed_cardinal_action is not None and request.parameters.get(
-            "direction"
-        ) != fixed_cardinal_action:
-            return None
-        requested_action = (
-            request.parameters.get("direction")
-            if request.skill_id == "motion.step_tcp_cardinal"
-            else (
-                fixed_cardinal_action
-                or _ACTION_BY_FIXED_SKILL_ID.get(request.skill_id)
-            )
+        requested_action, component_ids = _requested_action_and_component_ids(
+            request
         )
         if requested_action not in self.authorized_actions:
             return None
-        if request.parameters.get("component_id") != f"{self.side}_arm":
+        if component_ids != (f"{self.side}_arm",):
             return None
         if requested_action not in REAL_AGENT_PRIMITIVE_ACTIONS:
             return None
@@ -211,6 +253,7 @@ class RealAgentPrimitiveSessionAuthorization:
 
 
 __all__ = [
+    "REAL_AGENT_ABSOLUTE_TCP_POSE_ACTION",
     "REAL_AGENT_PRIMITIVE_ACTIONS",
     "REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN",
     "REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN",

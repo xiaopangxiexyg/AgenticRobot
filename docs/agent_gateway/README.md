@@ -72,6 +72,29 @@ python -m agent_gateway real-rm65 --help
 [`agent_gateway/README.md`](../../agent_gateway/README.md#entrypoints) 为准，运行前仍需明确
 真机授权和现场安全检查。
 
+绝对抓姿使用现有 `motion.move_tcp_to_pose@1`，但 session 必须由操作者显式加入
+`--authorized-action move_tcp_to_pose`；仅在 Route manifest 中看到它不代表已经取得运动
+Grant。它的公共目标始终是 `canonical_station` 下的实际 DMTAC `tool_tcp`，本地一次请求
+客户端提供 `--target-xyz-m`、`--target-quat-xyzw` 和可选 `--speed-scale`。客户端从同一份
+实时 observation/schema 绑定 frame graph、Station frame、tool config 和 calibration hash，
+不允许调用方用字符串把 arm-base 或 camera pose 冒充 Station pose。
+
+MuJoCo 任意抓姿可视化的显式输入则是所选机械臂 base 下的实际 DMTAC TCP，二者数值不能
+直接复用。相同物理目标应通过选定 collision-scene URDF/profile 的固定链转换：
+
+```text
+T_station_tcp = inverse(T_solver_world_station)
+              @ T_solver_world_arm_base(side)
+              @ T_arm_base_tcp
+```
+
+若抓姿来自相机，必须使用同一 Station revision 的
+`T_canonical_station_camera_optical_frame` 先转换到 `canonical_station`；缺少或不匹配的
+revision/frame graph/calibration 应关闭失败。DMTAC TCP 到 solver endpoint 的工具几何转换
+仍只在下层 target owner 执行一次，Gateway/上层不得硬编码约 0.13–0.14 m 的偏置。
+这些说明和离线测试不构成真机运行授权；任何真实调用仍需下层 envelope、IK、碰撞/跳变/
+奇异性门禁、dispatch admission、收敛检查和终态 HOLD 证明。
+
 ## 状态、占用与并发
 
 Gateway 可返回两个小型只读投影：
