@@ -45,11 +45,13 @@ from robot_motion.runtime.dispatch import CommandDispatchReceipt
 from sim.contracts import TimingSpec
 
 from ..actuation import (
+    COLLISION_PROJECTION_MODE_EXECUTOR,
     GripperActuationProfile,
     MujocoActuatedPositionExecutor,
     MujocoDmtacGripperExecutor,
     PositionActuationProfile,
     identified_bimanual_dmtac_gripper_profile,
+    normalize_collision_projection_mode,
     rm65_bimanual_udp_feedback_profile,
 )
 from ..control import DirectQposCommand, DirectQposDebugController
@@ -113,6 +115,11 @@ class MujocoPositionExecutionConfig:
     gripper_actuation_profile: GripperActuationProfile | None = field(
         default_factory=identified_bimanual_dmtac_gripper_profile
     )
+    # ``executor`` keeps the historical generic-rig behaviour.  A task kernel
+    # that has already projected one complete gripper/arm transaction may opt
+    # into ``upstream_admitted``; the physical adapter still performs active
+    # contact checks and post-step hard-contact latching in that mode.
+    collision_projection_mode: str = COLLISION_PROJECTION_MODE_EXECUTOR
     realtime_worker: bool = True
     worker_join_timeout_sec: float = 2.0
 
@@ -267,6 +274,11 @@ class MujocoPositionExecutionConfig:
                 raise ValueError(
                     "gripper actuation profile sides must exactly match active_sides."
                 )
+        object.__setattr__(
+            self,
+            "collision_projection_mode",
+            normalize_collision_projection_mode(self.collision_projection_mode),
+        )
 
 
 @dataclass(frozen=True)
@@ -297,13 +309,42 @@ class MujocoPositionExecutionRig(Rig):
         *,
         monotonic_clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        initial_qcmd_by_side: Mapping[str, Sequence[float] | np.ndarray] | None = None,
+        initial_gripper_close_by_name: Mapping[str, float] | None = None,
+        initial_physics_time_sec: float = 0.0,
+        initial_actuation_state: Mapping[str, object] | None = None,
+        initial_gripper_state: Mapping[str, object] | None = None,
+        initial_command_sequence: int = 0,
     ) -> None:
         if not callable(monotonic_clock) or not callable(sleep):
             raise TypeError("monotonic_clock and sleep must be callable.")
+        initial_time = float(initial_physics_time_sec)
+        if not math.isfinite(initial_time) or initial_time < 0.0:
+            raise ValueError(
+                "initial_physics_time_sec must be finite and non-negative."
+            )
+        if (
+            isinstance(initial_command_sequence, bool)
+            or int(initial_command_sequence) != initial_command_sequence
+            or int(initial_command_sequence) < 0
+        ):
+            raise ValueError("initial_command_sequence must be a non-negative integer.")
         self.scene = scene
         self.config = config
         self._clock = monotonic_clock
         self._sleep = sleep
+        self._initial_physics_time_sec = initial_time
+        self._initial_command_sequence = int(initial_command_sequence)
+        if initial_actuation_state is not None and not isinstance(
+            initial_actuation_state, Mapping
+        ):
+            raise TypeError("initial_actuation_state must be a mapping or None.")
+        if initial_gripper_state is not None and not isinstance(
+            initial_gripper_state, Mapping
+        ):
+            raise TypeError("initial_gripper_state must be a mapping or None.")
+        self._initial_actuation_state = initial_actuation_state
+        self._initial_gripper_state = initial_gripper_state
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
@@ -350,6 +391,7 @@ class MujocoPositionExecutionRig(Rig):
                 config.timing,
                 config.actuation_profile,
                 active_sides=config.active_sides,
+                collision_projection_mode=config.collision_projection_mode,
             )
             self._direct = None
         self._gripper_execution = (
@@ -364,6 +406,47 @@ class MujocoPositionExecutionRig(Rig):
             side: np.asarray(scene.get_arm_qpos(side), dtype=float).reshape(6).copy()
             for side in config.active_sides
         }
+        if initial_qcmd_by_side is None:
+            self._initial_qcmd_by_side: dict[str, np.ndarray] | None = None
+        else:
+            if set(initial_qcmd_by_side) != set(config.active_sides):
+                raise ValueError(
+                    "initial_qcmd_by_side must exactly match active_sides: "
+                    f"expected={sorted(config.active_sides)} "
+                    f"got={sorted(initial_qcmd_by_side)}"
+                )
+            self._initial_qcmd_by_side = {}
+            for side in config.active_sides:
+                values = np.asarray(initial_qcmd_by_side[side], dtype=float).reshape(-1)
+                if values.shape != (6,) or not np.all(np.isfinite(values)):
+                    raise ValueError(
+                        f"initial qcmd for {side!r} must contain six finite values."
+                    )
+                self._initial_qcmd_by_side[side] = values.copy()
+        if initial_gripper_close_by_name is None:
+            self._initial_gripper_close_by_name: dict[str, float] | None = None
+        else:
+            if config.gripper_actuation_profile is None:
+                raise ValueError(
+                    "initial_gripper_close_by_name requires a gripper actuation profile."
+                )
+            expected_grippers = set(
+                config.gripper_actuation_profile.joint_names_by_gripper
+            )
+            if set(initial_gripper_close_by_name) != expected_grippers:
+                raise ValueError(
+                    "initial_gripper_close_by_name must exactly match configured "
+                    f"grippers: expected={sorted(expected_grippers)} "
+                    f"got={sorted(initial_gripper_close_by_name)}"
+                )
+            self._initial_gripper_close_by_name = {}
+            for name, value in initial_gripper_close_by_name.items():
+                close = float(value)
+                if not math.isfinite(close) or not 0.0 <= close <= 1.0:
+                    raise ValueError(
+                        f"initial close for {name!r} must be finite and in [0, 1]."
+                    )
+                self._initial_gripper_close_by_name[str(name)] = close
 
     @property
     def name(self) -> str:
@@ -453,6 +536,7 @@ class MujocoPositionExecutionRig(Rig):
         qpos: np.ndarray,
         *,
         monotonic_time: float,
+        initial_target_published_monotonic_time: float | None = None,
     ) -> None:
         planner.reset(qpos, monotonic_time=monotonic_time)
         if isinstance(planner, SampleAlignedJerkLimitedJointTrajectoryPlanner):
@@ -461,6 +545,8 @@ class MujocoPositionExecutionRig(Rig):
                 source_timestamp=(
                     monotonic_time
                     - 1.0 / float(self.config.sample_aligned_source_hz)
+                    if initial_target_published_monotonic_time is None
+                    else initial_target_published_monotonic_time
                 ),
                 speed_scale=1.0,
                 mode="tracking",
@@ -473,6 +559,8 @@ class MujocoPositionExecutionRig(Rig):
             sequence=0,
             published_monotonic_time=(
                 monotonic_time - 1.0 / self.config.timing.reference_hz
+                if initial_target_published_monotonic_time is None
+                else initial_target_published_monotonic_time
             ),
             monotonic_time=monotonic_time,
         )
@@ -481,29 +569,132 @@ class MujocoPositionExecutionRig(Rig):
         with self._lock:
             if self._started:
                 return
-            self._clock_origin = float(self._clock())
+            # A stopped worker may have left a latched diagnostic error.  A
+            # subsequent explicit close/start is a new execution lifecycle;
+            # do not let the old worker exception poison the new run.  The
+            # fault remains visible in the previous snapshot and is only
+            # cleared at this deliberate restart boundary.
+            self._last_worker_error = None
+            # ``close()`` ends the previous simulation lifecycle.  Rebase all
+            # transport/planner clocks and the command mailbox to the qpos that
+            # is physically present now; retaining a prior accepted qcmd or
+            # physics tick would create a restart jump and stale references.
+            if self._initial_qcmd_by_side is None:
+                measured = self._measured_qpos_by_side_locked()
+                self._accepted_qcmd_by_side = {
+                    side: values.copy() for side, values in measured.items()
+                }
+            else:
+                # A settled MuJoCo snapshot may include a tiny, legitimate
+                # actuator lag: its saved qpos is the measured plant state,
+                # while the accepted qcmd/filtered target is the state that
+                # produced the saved ``ctrl``.  Restore that transport receipt
+                # when explicitly supplied so replay starts from the exact
+                # captured causal state; ordinary close/start calls continue
+                # to rebase to live measured qpos above.
+                self._accepted_qcmd_by_side = {
+                    side: values.copy()
+                    for side, values in self._initial_qcmd_by_side.items()
+                }
+            self._pending_reference = None
+            self._last_reference = None
+            self._hold_reason = None
+            self._pending_proposals = {}
+            self._planners.clear()
+            self._reference_activation_observations.clear()
+            self._planner_command_frame_observations.clear()
+            self._worker_physics_ticks = 0
+            self._worker_deadline_misses = 0
+            self._next_reference_sequence = 1
+            self._next_command_sequence = self._initial_command_sequence + 1
+            # The execution core can resume at a non-zero absolute physics
+            # time when a settled snapshot is restored.  Offset the injected
+            # monotonic origin by that amount so planner timestamps remain
+            # identical to the cold-settle trajectory (origin + execution
+            # time), rather than jumping one settle period into the future.
+            self._clock_origin = float(self._clock()) - self._initial_physics_time_sec
+            planner_start_time = (
+                self._clock_origin + self._initial_physics_time_sec
+            )
+            if self._initial_physics_time_sec > 0.0:
+                # ``step_physics`` samples/proposes at the beginning of a
+                # physics tick and advances the actuator clock afterwards.
+                # The last qcmd before a settled snapshot is therefore the
+                # physics tick at which the previous command deadline became
+                # due, not simply ``snapshot_time - physics_dt``.  Recreate
+                # that phase from the two clocks; for the normal 120/1000 Hz
+                # pair a t=1.000 snapshot has its last planner commit at
+                # t=0.992.  Starting at t=0.999 would make the first restored
+                # reference one command interval shorter than the cold path.
+                prior_deadline = math.floor(
+                    (
+                        self._initial_physics_time_sec
+                        - self.config.timing.physics_timestep_sec
+                        + 1e-12
+                    )
+                    * self.config.timing.command_hz
+                ) / self.config.timing.command_hz
+                prior_tick = math.ceil(
+                    prior_deadline * self.config.timing.physics_hz - 1e-12
+                ) / self.config.timing.physics_hz
+                planner_start_time = self._clock_origin + prior_tick
             for side in self.config.active_sides:
                 planner = self._new_planner()
                 initial = self._accepted_qcmd_by_side[side]
                 self._reset_and_prime_planner(
                     planner,
                     initial,
-                    monotonic_time=self._clock_origin,
+                    # The execution timeline may resume at a non-zero
+                    # physics timestamp.  Prime at the command/physics phase
+                    # immediately preceding the saved tick; priming at the
+                    # current wall-clock point would shorten the first
+                    # command interval and create a visible restore jump.
+                    monotonic_time=planner_start_time,
+                    # The settled snapshot is captured after a cold start
+                    # that began at ``_clock_origin``.  Its priming target was
+                    # published one reference period before that origin and
+                    # intentionally remained idle throughout settling.  Keep
+                    # that publication timestamp on restore; using the
+                    # non-zero snapshot time here would make the first
+                    # policy target appear to have arrived one period later
+                    # than it did on the cold timeline and changes the
+                    # velocity-filter/acceleration result.
+                    initial_target_published_monotonic_time=(
+                        self._clock_origin
+                        - 1.0 / self.config.timing.reference_hz
+                    ),
                 )
                 self._planners[side] = planner
-            self._execution.reset(
-                DirectQposCommand(
-                    sequence=0,
-                    qpos_by_side=self._accepted_qcmd_by_side,
-                    source="mujoco_position_execution_start",
-                )
+            initial_command = DirectQposCommand(
+                # A restored actuator core may already have accepted commands
+                # on the saved timeline.  Keep the held-command receipt at
+                # the same sequence so the next 120 Hz command is validated
+                # against one coherent high-water mark (cold starts retain
+                # the historical sequence=0 value).
+                sequence=self._initial_command_sequence,
+                qpos_by_side=self._accepted_qcmd_by_side,
+                source="mujoco_position_execution_start",
             )
+            if self._direct is None:
+                self._execution.reset(
+                    initial_command,
+                    initial_physics_time_sec=self._initial_physics_time_sec,
+                    initial_state=self._initial_actuation_state,
+                )
+            else:
+                self._execution.reset(initial_command)
             if self._gripper_execution is not None:
                 self._gripper_execution.reset(
-                    {
-                        name: self.scene.get_gripper_close(name)
-                        for name in self.config.gripper_actuation_profile.joint_names_by_gripper
-                    }
+                    (
+                        self._initial_gripper_close_by_name
+                        if self._initial_gripper_close_by_name is not None
+                        else {
+                            name: self.scene.get_gripper_close(name)
+                            for name in self.config.gripper_actuation_profile.joint_names_by_gripper
+                        }
+                    ),
+                    initial_physics_time_sec=self._initial_physics_time_sec,
+                    initial_state=self._initial_gripper_state,
                 )
             self._stop_event.clear()
             self._started = True
@@ -514,6 +705,15 @@ class MujocoPositionExecutionRig(Rig):
                     daemon=True,
                 )
                 self._worker.start()
+            # The override is a one-shot snapshot bootstrap.  A later
+            # explicit close/start must always rebase to the then-measured
+            # plant rather than silently reusing an old episode's qcmd.
+            self._initial_qcmd_by_side = None
+            self._initial_gripper_close_by_name = None
+            self._initial_physics_time_sec = 0.0
+            self._initial_actuation_state = None
+            self._initial_gripper_state = None
+            self._initial_command_sequence = 0
 
     def is_ready(self) -> bool:
         with self._lock:
@@ -794,6 +994,60 @@ class MujocoPositionExecutionRig(Rig):
                 for side, qpos in self._accepted_qcmd_by_side.items()
             }
 
+    def _measured_qpos_by_side_locked(self) -> dict[str, np.ndarray]:
+        """Read the physical scene state while the rig lock is held.
+
+        ``accepted_qcmd_by_side`` is a transport/planner contract: it records
+        the last command admitted by the 120 Hz sender.  It is intentionally
+        not used as a substitute for the qpos currently present in MuJoCo.
+        The direct debug executor has no separate measurement method, so its
+        scene read is the same public observation in that compatibility mode.
+        """
+
+        measured_reader = getattr(self._execution, "measured_arm_qpos", None)
+        if not callable(measured_reader):
+            measured_reader = self.scene.get_arm_qpos
+        return {
+            side: np.asarray(measured_reader(side), dtype=float).reshape(6).copy()
+            for side in self.config.active_sides
+        }
+
+    def measured_qpos_by_side(self) -> dict[str, np.ndarray]:
+        """Return a lock-consistent copy of the actual MuJoCo arm qpos."""
+
+        with self._lock:
+            return self._measured_qpos_by_side_locked()
+
+    def capture_tracking_observation(self) -> dict[str, object]:
+        """Expose command/measured divergence without changing execution.
+
+        This is deliberately an observation-only seam.  It makes transport
+        delay, servo lag, and endpoint non-convergence visible to visualizers
+        and recovery code instead of allowing a command-level ``accepted``
+        status to masquerade as a physically settled arm.
+        """
+
+        with self._lock:
+            measured = self._measured_qpos_by_side_locked()
+            accepted = {
+                side: qpos.copy()
+                for side, qpos in self._accepted_qcmd_by_side.items()
+            }
+            by_side = {}
+            for side in self.config.active_sides:
+                error = accepted[side] - measured[side]
+                by_side[side] = {
+                    "accepted_qcmd": accepted[side].tolist(),
+                    "measured_qpos": measured[side].tolist(),
+                    "accepted_minus_measured_qpos": error.tolist(),
+                    "max_abs_error_rad": float(np.max(np.abs(error))),
+                    "mean_abs_error_rad": float(np.mean(np.abs(error))),
+                }
+            return {
+                "semantics": "accepted_qcmd_minus_mujoco_measured_qpos",
+                "by_side": by_side,
+            }
+
     @property
     def reference_activation_observations(
         self,
@@ -811,6 +1065,7 @@ class MujocoPositionExecutionRig(Rig):
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             execution_metadata = dict(self._execution.execution_metadata)
+            measured = self._measured_qpos_by_side_locked()
             return {
                 "started": self._started,
                 "ready": self._started and self._last_worker_error is None,
@@ -820,6 +1075,16 @@ class MujocoPositionExecutionRig(Rig):
                     side: qpos.tolist()
                     for side, qpos in self._accepted_qcmd_by_side.items()
                 },
+                "measured_qpos_by_side": {
+                    side: qpos.tolist() for side, qpos in measured.items()
+                },
+                "accepted_minus_measured_qpos_by_side": {
+                    side: (
+                        self._accepted_qcmd_by_side[side] - measured[side]
+                    ).tolist()
+                    for side in self.config.active_sides
+                },
+                "tracking_observation": self.capture_tracking_observation(),
                 "last_reference_sequence": (
                     None if self._last_reference is None else self._last_reference.sequence
                 ),
@@ -848,7 +1113,7 @@ class MujocoPositionExecutionRig(Rig):
                 },
                 "execution": (
                     self._execution.snapshot()
-                    if isinstance(self._execution, MujocoActuatedPositionExecutor)
+                    if callable(getattr(self._execution, "snapshot", None))
                     else execution_metadata
                 ),
                 "gripper_execution": (
@@ -1074,19 +1339,24 @@ class MujocoPositionExecutionRig(Rig):
                                 accepted_qcmd_by_side=accepted,
                             )
                         )
-            except Exception:
+            except Exception as exc:
+                cleanup_errors: list[str] = []
                 for side, proposal in proposals.items():
                     try:
                         self._planners[side].reject(proposal)
-                    except Exception:
+                    except (KeyError, RuntimeError, TypeError, ValueError) as cleanup_exc:
                         # A preceding side may already have committed.  Reset
                         # every planner to the qpos actually held by MuJoCo so
                         # retry/recovery cannot mix two planner generations.
-                        pass
-                actual = {
-                    side: self._execution.accepted_arm_qpos(side)
-                    for side in self.config.active_sides
-                }
+                        cleanup_errors.append(
+                            f"planner[{side!r}].reject: "
+                            f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                        )
+                # The planner must be rebased to the state that MuJoCo
+                # actually holds.  Accepted qcmd is a transport receipt and
+                # can be ahead of the plant when a projection or hard-contact
+                # fault interrupts a tick.
+                actual = self._measured_qpos_by_side_locked()
                 for side, planner in self._planners.items():
                     self._reset_and_prime_planner(
                         planner,
@@ -1096,6 +1366,41 @@ class MujocoPositionExecutionRig(Rig):
                 self._accepted_qcmd_by_side = {
                     side: qpos.copy() for side, qpos in actual.items()
                 }
+                # A failed tick must not leave an old reference eligible for
+                # an implicit retry.  The caller must explicitly publish a
+                # fresh reference after handling the fault/recovery boundary.
+                self._pending_reference = None
+                self._last_reference = None
+                self._hold_reason = None
+                # A failed physical tick is a lifecycle boundary, not a
+                # transient command rejection.  Stop any independent gripper
+                # transport as well and latch the failure so a manual caller
+                # cannot accidentally continue with an actuator whose
+                # internal accepted state may already have advanced.  The
+                # explicit close()/start() path resets both arm and gripper
+                # state from measured MuJoCo qpos.
+                if self._gripper_execution is not None:
+                    try:
+                        self._gripper_execution.hold_targets()
+                    except (KeyError, RuntimeError, TypeError, ValueError) as cleanup_exc:
+                        # Preserve the original physics failure as the
+                        # authoritative diagnostic; restart will rebuild the
+                        # gripper state regardless.
+                        cleanup_errors.append(
+                            "gripper.hold_targets: "
+                            f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                        )
+                # ``step_physics`` still re-raises with its original
+                # traceback; only the normalized string is retained for the
+                # worker/readiness snapshot.
+                cleanup_suffix = (
+                    ""
+                    if not cleanup_errors
+                    else f"; cleanup_errors={cleanup_errors}"
+                )
+                self._last_worker_error = (
+                    f"{type(exc).__name__}: {exc}{cleanup_suffix}"
+                )
                 raise
             finally:
                 self._pending_proposals = {}
@@ -1294,6 +1599,16 @@ class MujocoPositionExecutionRig(Rig):
             self._pending_proposals[side] = proposal
         sequence = self._next_command_sequence
         self._next_command_sequence += 1
+        # Arm collision projection deliberately leaves gripper coordinates at
+        # their live MuJoCo state.  The gripper has an independent 20 Hz
+        # transport and task kernels already apply the staged
+        # gripper-then-arm safety policy before publishing a compound
+        # reference.  Re-injecting the gripper's accepted target here would
+        # project normal finger closure a second time (including intentional
+        # fingertip/self-contact) and could reject an otherwise valid arm
+        # command because the plant has not caught up with the delayed hand
+        # servo.  This command still carries the arm qcmd atomically; the
+        # gripper executor remains the sole owner of its transport.
         return DirectQposCommand(
             sequence=sequence,
             qpos_by_side=qcmd_by_side,
@@ -1304,7 +1619,12 @@ class MujocoPositionExecutionRig(Rig):
         period = 1.0 / self.config.timing.physics_hz
         try:
             while not self._stop_event.is_set():
-                scheduled = self._clock_origin + self._worker_physics_ticks * period
+                # ``physics_time_sec`` is the execution core's absolute
+                # timeline.  A snapshot-restored rig may start at a non-zero
+                # time; deriving the wall-clock deadline from the per-worker
+                # tick counter would then schedule the first tick one entire
+                # snapshot lifetime in the past and trigger a catch-up burst.
+                scheduled = self._clock_origin + self._execution.physics_time_sec
                 now = float(self._clock())
                 remaining = scheduled - now
                 if remaining > 0.0:
@@ -1341,6 +1661,13 @@ class MujocoPositionExecutionRig(Rig):
         self._worker = None
         with self._lock:
             self._started = False
+            # No queued reference may cross a close/start lifecycle boundary.
+            # Keep the last worker error for the diagnostic snapshot; start()
+            # clears it only after an explicit new lifecycle is requested.
+            self._pending_reference = None
+            self._last_reference = None
+            self._hold_reason = None
+            self._pending_proposals = {}
 
 
 __all__ = ["MujocoPositionExecutionConfig", "MujocoPositionExecutionRig"]

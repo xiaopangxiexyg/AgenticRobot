@@ -97,6 +97,61 @@ def test_review_trajectory_uses_real_projector_and_never_exceeds_bounds(
     )
 
 
+def test_review_trajectory_covers_both_workspace_faces_and_can_hold_endpoints() -> None:
+    config = load_absolute_workspace_preview_config(DEFAULT_CONFIG_PATH)
+    workspace = derive_absolute_workspace(config, "absolute_standard")
+    raw, effective = build_review_trajectory(
+        workspace,
+        samples_per_leg=3,
+        endpoint_hold_frames=2,
+    )
+
+    # Three axes x (lower -> upper -> home) gives nine segments.  Each segment
+    # has three interpolation samples plus the endpoint and two hold frames,
+    # followed by the final home endpoint.
+    assert len(raw) == len(effective) == 9 * (3 + 3) + 1
+    lower = np.asarray(workspace.absolute_min_xyz_m, dtype=float)
+    upper = np.asarray(workspace.absolute_max_xyz_m, dtype=float)
+    effective_positions = np.asarray([pose[:3, 3] for pose in effective])
+    for axis in range(3):
+        assert np.min(effective_positions[:, axis]) == pytest.approx(lower[axis])
+        assert np.max(effective_positions[:, axis]) == pytest.approx(upper[axis])
+
+
+def test_visualizer_marks_ik_unreachable_target_without_changing_trail_contract() -> None:
+    config = load_absolute_workspace_preview_config(DEFAULT_CONFIG_PATH)
+    workspace = derive_absolute_workspace(config, "absolute_standard")
+    raw_desk, effective_desk = build_review_trajectory(
+        workspace,
+        samples_per_leg=3,
+    )
+    poses = trajectory_to_world(workspace, effective_desk)
+    visualizer = AbsoluteWorkspaceVisualizer(
+        workspace=workspace,
+        raw_pose_world=trajectory_to_world(workspace, raw_desk),
+        effective_pose_world=poses,
+        actual_pose_world=poses,
+        target_reachability_by_frame=(
+            ("unreachable_or_unmet",) + ("reachable",) * (len(poses) - 1)
+        ),
+    )
+    model = mujoco.MjModel.from_xml_string("<mujoco model='absolute_workspace' />")
+    user_scene = mujoco.MjvScene(model, 512)
+    viewer = _FakeViewerHandle(user_scene)
+
+    visualizer.update(viewer, frame_index=0)
+    effective_geom = next(
+        user_scene.geoms[index]
+        for index in range(user_scene.ngeom)
+        if str(user_scene.geoms[index].label) == "absolute_workspace_effective_tcp"
+    )
+    np.testing.assert_allclose(
+        np.asarray(effective_geom.rgba, dtype=float),
+        np.asarray((1.0, 0.05, 0.05, 0.96), dtype=float),
+        atol=1e-6,
+    )
+
+
 def test_absolute_workspace_visualizer_draws_volume_edges_paths_and_desk_axes() -> None:
     config = load_absolute_workspace_preview_config(DEFAULT_CONFIG_PATH)
     workspace = derive_absolute_workspace(config, "absolute_standard")
@@ -144,6 +199,9 @@ def test_viewer_requires_explicit_candidate_selection() -> None:
         "absolute_tight",
     ):
         assert parser.parse_args(["--profile", profile_name]).profile == profile_name
+    args = parser.parse_args(["--profile", "absolute_standard"])
+    assert args.include_negative_faces is True
+    assert args.endpoint_hold_frames == 60
 
 
 @pytest.mark.slow_sim

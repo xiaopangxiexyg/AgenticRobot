@@ -68,3 +68,29 @@ def test_rm65_actuator_core_supports_one_arm_without_backend_dependencies() -> N
             command_sequence=8,
             qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
         )
+
+
+def test_rm65_actuator_snapshot_bootstrap_preserves_absolute_command_clock() -> None:
+    actuator = Rm65PositionActuator(
+        rm65_bimanual_udp_feedback_profile(),
+        command_hz=120.0,
+        physics_hz=1000.0,
+    )
+    initial = {side: np.zeros(6) for side in ("left", "right")}
+    actuator.reset(
+        command_sequence=0,
+        qpos_by_side=initial,
+        initial_physics_time_sec=0.5,
+    )
+
+    assert actuator.physics_time_sec == pytest.approx(0.5)
+    assert actuator.command_due is False
+    while actuator.physics_time_sec < (0.5 + 1.0 / 120.0):
+        actuator.step()
+    assert actuator.command_due is True
+
+    # The historical cold-start contract remains unchanged: t=0 begins with
+    # the first command deadline one period later.
+    actuator.reset(command_sequence=0, qpos_by_side=initial)
+    assert actuator.physics_time_sec == pytest.approx(0.0)
+    assert actuator.command_due is False

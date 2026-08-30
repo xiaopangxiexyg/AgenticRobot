@@ -110,7 +110,8 @@ class CollisionSafetyOracle:
         that margin (or just inside the hard penetration bound) even when the
         command target itself is valid.  Callers may therefore request a
         temporary, explicit threshold for that recovery projection; active
-        contact checks remain governed by ``hard_penetration_m``.
+        contact checks remain governed by the configured ``hard_penetration_m``
+        bound.
         """
 
         clearance = (

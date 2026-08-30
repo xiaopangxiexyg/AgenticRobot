@@ -6,10 +6,11 @@ import hashlib
 import heapq
 import json
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -233,7 +234,18 @@ class DmtacPositionActuator:
         self._applied_sequence_by_side: dict[str, int] = {}
         self._reset = False
 
-    def reset(self, initial_position_by_side: Mapping[str, float]) -> None:
+    def reset(
+        self,
+        initial_position_by_side: Mapping[str, float],
+        *,
+        initial_physics_time_sec: float = 0.0,
+        initial_state: Mapping[str, object] | None = None,
+    ) -> None:
+        initial_time = float(initial_physics_time_sec)
+        if not math.isfinite(initial_time) or initial_time < 0.0:
+            raise ValueError(
+                "initial_physics_time_sec must be finite and non-negative"
+            )
         if set(initial_position_by_side) != set(self.active_sides):
             raise ValueError(
                 "initial sides must exactly match profile: "
@@ -248,11 +260,26 @@ class DmtacPositionActuator:
         self._servo_goal = dict(values)
         self._position = dict(values)
         self._rate = {side: 0.0 for side in values}
-        self._next_command_time = {side: 0.0 for side in values}
+        period = 1.0 / self.profile.command_hz
+        if initial_time == 0.0:
+            # Preserve the established cold-start contract: a target queued
+            # immediately after reset is accepted on the first physics tick.
+            # A resumed snapshot (non-zero absolute time) instead starts at
+            # the first command deadline strictly after its saved timestamp.
+            next_command_time = 0.0
+        else:
+            next_command_time = (
+                math.floor(initial_time / period + 1e-12) + 1.0
+            ) * period
+        self._next_command_time = {
+            side: next_command_time for side in values
+        }
         self._delayed.clear()
         self._sequence = 0
         self._applied_sequence_by_side = {side: 0 for side in values}
         self._reset = True
+        if initial_state is not None:
+            self._restore_state(initial_state, initial_physics_time_sec=initial_time)
 
     def queue_targets(self, target_by_side: Mapping[str, float]) -> int:
         self._require_reset()
@@ -359,18 +386,175 @@ class DmtacPositionActuator:
     def snapshot(self) -> dict[str, Any]:
         self._require_reset()
         return {
+            "state_schema": "dmtac_position_actuator_state.v1",
             "execution_mode": self.execution_mode,
             "profile": self.profile.to_metadata(),
+            "next_command_time_by_side": {
+                side: float(value) for side, value in self._next_command_time.items()
+            },
+            "sequence": int(self._sequence),
+            "applied_sequence_by_side": {
+                side: int(value)
+                for side, value in self._applied_sequence_by_side.items()
+            },
             "pending": {
                 side: {"target": target, "sequence": sequence}
                 for side, (target, sequence) in self._pending.items()
             },
             "pending_delayed_targets": len(self._delayed),
+            "delayed_targets": [
+                {
+                    "apply_time_sec": float(apply_time),
+                    "sequence": int(sequence),
+                    "side": str(side),
+                    "target": float(target),
+                }
+                for apply_time, sequence, side, target in self._delayed
+            ],
             "accepted_target_by_side": dict(self._accepted),
             "servo_goal_by_side": dict(self._servo_goal),
             "actuator_position_by_side": dict(self._position),
             "actuator_rate_by_side": dict(self._rate),
         }
+
+    def _restore_state(
+        self,
+        state: Mapping[str, object],
+        *,
+        initial_physics_time_sec: float,
+    ) -> None:
+        """Restore delayed gripper transport and servo state exactly."""
+
+        if not isinstance(state, Mapping):
+            raise TypeError("initial_state must be a mapping.")
+        required = (
+            "next_command_time_by_side",
+            "sequence",
+            "applied_sequence_by_side",
+            "pending",
+            "delayed_targets",
+            "accepted_target_by_side",
+            "servo_goal_by_side",
+            "actuator_position_by_side",
+            "actuator_rate_by_side",
+        )
+        missing = [name for name in required if name not in state]
+        if missing:
+            raise ValueError(
+                "initial_state is missing causal gripper fields: " f"{missing}"
+            )
+
+        def _side_mapping(name: str) -> Mapping[str, object]:
+            value = state[name]
+            if not isinstance(value, Mapping) or set(value) != set(self.active_sides):
+                raise ValueError(
+                    f"initial_state {name} must exactly match active gripper sides."
+                )
+            return value
+
+        def _float_mapping(name: str, *, nonnegative: bool = False) -> dict[str, float]:
+            values = _side_mapping(name)
+            result: dict[str, float] = {}
+            for side in self.active_sides:
+                value = float(values[side])
+                if not math.isfinite(value) or (nonnegative and value < 0.0):
+                    raise ValueError(f"initial_state {name}[{side!r}] is invalid.")
+                result[side] = value
+            return result
+
+        next_command_time = _float_mapping("next_command_time_by_side")
+        # The gripper core intentionally does not advance an idle side's
+        # deadline while no target is pending.  A settled snapshot can
+        # therefore legitimately retain the cold-start value (t=0) even when
+        # the MuJoCo absolute time is later; preserving that value makes the
+        # first newly queued target immediately eligible, just as it was on
+        # the original timeline.
+        accepted = _float_mapping("accepted_target_by_side")
+        servo_goal = _float_mapping("servo_goal_by_side")
+        position = _float_mapping("actuator_position_by_side")
+        rate = _float_mapping("actuator_rate_by_side")
+        for name, values in (
+            ("accepted_target_by_side", accepted),
+            ("servo_goal_by_side", servo_goal),
+            ("actuator_position_by_side", position),
+        ):
+            if any(not 0.0 <= value <= 1.0 for value in values.values()):
+                raise ValueError(f"initial_state {name} values must lie in [0, 1].")
+
+        sequence_value = state["sequence"]
+        if isinstance(sequence_value, bool):
+            raise TypeError("initial_state sequence must be a non-negative integer.")
+        sequence = int(sequence_value)
+        if sequence < 0 or sequence != sequence_value:
+            raise ValueError("initial_state sequence must be a non-negative integer.")
+        applied_values = _side_mapping("applied_sequence_by_side")
+        applied: dict[str, int] = {}
+        for side in self.active_sides:
+            value = applied_values[side]
+            if isinstance(value, bool):
+                raise TypeError("initial_state applied sequence must be an integer.")
+            integer = int(value)
+            if integer < 0 or integer != value or integer > sequence:
+                raise ValueError("initial_state applied sequence is invalid.")
+            applied[side] = integer
+
+        raw_pending = state["pending"]
+        if not isinstance(raw_pending, Mapping):
+            raise TypeError("initial_state pending must be a mapping.")
+        pending: dict[str, tuple[float, int]] = {}
+        if set(raw_pending) - set(self.active_sides):
+            raise ValueError("initial_state pending contains an inactive side.")
+        for side, entry in raw_pending.items():
+            if not isinstance(entry, Mapping):
+                raise TypeError("initial_state pending entries must be mappings.")
+            target = float(entry.get("target", float("nan")))
+            item_sequence = entry.get("sequence")
+            if (
+                not math.isfinite(target)
+                or not 0.0 <= target <= 1.0
+                or isinstance(item_sequence, bool)
+                or not isinstance(item_sequence, (int, np.integer))
+                or int(item_sequence) < 0
+                or int(item_sequence) > sequence
+            ):
+                raise ValueError("initial_state pending entry is invalid.")
+            pending[str(side)] = (target, int(item_sequence))
+
+        raw_delayed = state["delayed_targets"]
+        if not isinstance(raw_delayed, Sequence) or isinstance(raw_delayed, (str, bytes)):
+            raise TypeError("initial_state delayed_targets must be a sequence.")
+        delayed: list[tuple[float, int, str, float]] = []
+        for item in raw_delayed:
+            if not isinstance(item, Mapping):
+                raise TypeError("initial_state delayed target entries must be mappings.")
+            apply_time = float(item.get("apply_time_sec", float("nan")))
+            item_sequence = item.get("sequence")
+            side = str(item.get("side", ""))
+            target = float(item.get("target", float("nan")))
+            if (
+                not math.isfinite(apply_time)
+                or apply_time < initial_physics_time_sec
+                or isinstance(item_sequence, bool)
+                or not isinstance(item_sequence, (int, np.integer))
+                or int(item_sequence) < 0
+                or int(item_sequence) > sequence
+                or side not in self.active_sides
+                or not math.isfinite(target)
+                or not 0.0 <= target <= 1.0
+            ):
+                raise ValueError("initial_state delayed target entry is invalid.")
+            delayed.append((apply_time, int(item_sequence), side, target))
+
+        self._next_command_time = next_command_time
+        self._sequence = sequence
+        self._applied_sequence_by_side = applied
+        self._pending = pending
+        self._delayed = delayed
+        heapq.heapify(self._delayed)
+        self._accepted = accepted
+        self._servo_goal = servo_goal
+        self._position = position
+        self._rate = rate
 
     @staticmethod
     def _validate_position(value: float, *, side: str) -> float:
