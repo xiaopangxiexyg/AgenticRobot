@@ -1159,6 +1159,65 @@ def test_shutdown_runtime_preserves_cleanup_registration_order() -> None:
     ]
 
 
+def test_runtime_exit_stops_arms_before_collection_drain() -> None:
+    events: list[tuple[object, ...]] = []
+    components = object()
+
+    error = runtime._emergency_stop_runtime_arms_before_collection_drain(
+        {"session_started": True, "components": components},
+        terminal_error=KeyboardInterrupt(),
+        support={
+            "_emergency_stop_real_arms": (
+                lambda received, *, reason, now, raise_on_failure: events.append(
+                    (received, reason, now, raise_on_failure)
+                )
+            ),
+            "_log": lambda *_args, **_kwargs: None,
+            "time": SimpleNamespace(time=lambda: 123.5),
+        },
+    )
+
+    assert error is None
+    assert events == [
+        (components, "runtime_exception_exit:KeyboardInterrupt", 123.5, True)
+    ]
+    source = inspect.getsource(runtime.run_real_teleop)
+    assert source.index(
+        "_emergency_stop_runtime_arms_before_collection_drain("
+    ) < source.index("_close_episode_recording_runtime_before_resources(")
+
+
+def test_repeated_runtime_emergency_stop_skips_already_latched_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AlreadyStoppedBackend:
+        def is_emergency_stopped(self) -> bool:
+            return True
+
+        def emergency_stop(self) -> None:
+            pytest.fail("already-latched backend must not receive a duplicate SDK stop")
+
+    backend = AlreadyStoppedBackend()
+    monkeypatch.setattr(
+        impedance_force_runtime,
+        "_command_backend_for_side",
+        lambda _components, _side: backend,
+    )
+    monkeypatch.setattr(
+        impedance_force_runtime,
+        "_log",
+        lambda *_args, **_kwargs: None,
+    )
+
+    errors = impedance_force_runtime._emergency_stop_real_arms(
+        SimpleNamespace(active_sides=("left",)),
+        reason="runtime_loop_exit",
+        raise_on_failure=True,
+    )
+
+    assert errors == {}
+
+
 def test_episode_recording_shutdown_commits_force_guard_reason_before_resources() -> None:
     close_calls: list[dict[str, object]] = []
 
@@ -1653,6 +1712,68 @@ def test_generic_device_retry_never_starts_or_reuses_dataset_writer() -> None:
     assert writer_status["status_level"] == "error"
     assert writer_status["status_label"] == "writer 准备失败"
     assert "全新 writer" in writer_status["error"]
+
+
+def test_device_retry_refuses_terminal_session_instance() -> None:
+    errors = {"rig.session": "initial startup failure"}
+
+    class TerminalSession:
+        startup_retry_requires_reconstruction = True
+
+        def start(self) -> None:
+            pytest.fail("terminal Session instance must not be restarted")
+
+    clutch = SimpleNamespace(
+        _current_active_controls=lambda: ("device_retry",),
+        device_retry_admission=lambda: (True, ""),
+        _episode_busy=lambda: False,
+        _teleop_started=True,
+        hold_active=lambda: True,
+    )
+    components = SimpleNamespace(
+        gripper_input_source="",
+        left_state_backend=None,
+        right_state_backend=None,
+        left_hand_backend=None,
+        right_hand_backend=None,
+        session=TerminalSession(),
+        human_shadow_frontend=None,
+    )
+    retry_runtime = device_retry_runtime.build_device_retry_runtime(
+        args=SimpleNamespace(
+            foot_pad_requested=False,
+            ignore_camera=(),
+            q6_config_required=False,
+        ),
+        components=components,
+        control_ui=SimpleNamespace(
+            publish=lambda **_kwargs: None,
+            append_message=lambda *_args: None,
+        ),
+        clutch_input=clutch,
+        camera_sources={},
+        vive_source=None,
+        startup_device_errors=errors,
+        position_force_guard_requested=False,
+        dataset_recorder_provider=lambda: None,
+        set_dataset_recorder=lambda _value: None,
+        foot_pad_input_provider=lambda: None,
+        set_foot_pad_input=lambda _value: None,
+        dataset_recorder_type=object,
+        dmtac_gripper_backend_type=object,
+        foot_pad_input_type=object,
+        foot_pad_control_mode="foot-pad",
+        has_dmtac_gripper_backend=lambda _components: False,
+        promote_angle_trigger_gripper_input_to_q6=lambda *_args, **_kwargs: (
+            False,
+            "",
+        ),
+        log=lambda *_args, **_kwargs: None,
+    )
+
+    retry_runtime.retry_failed_devices()
+
+    assert "reconstruct the complete component graph" in errors["rig.session"]
 
 
 def test_visualization_runtime_mirrors_preview_state_without_opening_devices() -> None:

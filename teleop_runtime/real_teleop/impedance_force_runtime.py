@@ -167,6 +167,14 @@ def _emergency_stop_real_arms(
             )
             return side, detail
         try:
+            is_stopped = getattr(backend, "is_emergency_stopped", None)
+            if callable(is_stopped) and bool(is_stopped()):
+                _log(
+                    "EmergencyStop",
+                    f"{label} stop already latched reason={reason}",
+                    now=stop_time,
+                )
+                return side, None
             stop = getattr(backend, "emergency_stop", None)
             if callable(stop):
                 stop()

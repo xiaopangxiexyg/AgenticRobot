@@ -476,6 +476,20 @@ class RealTeleopIdleTactileCompressionAdmissionTest(unittest.TestCase):
             facade.controller.start_if_eligible.assert_called_once()
             facade.controller.request_quiesce.assert_not_called()
 
+            facade.controller.reset_mock()
+            facade.tick(
+                dataset_recorder=recorder,
+                teleop_started=True,
+                hold_active=True,
+                maintenance_motion_active=True,
+                episode_countdown_active=False,
+                startup_and_devices_ready=True,
+            )
+            facade.controller.request_quiesce.assert_called_once_with(
+                reason="real_teleop_not_idle"
+            )
+            facade.controller.start_if_eligible.assert_not_called()
+
     def test_facade_acknowledges_only_after_application_validation(self) -> None:
         receipt = IdleMaintenanceQuiesceReceipt(
             quiesced=True,

@@ -165,22 +165,11 @@ class HandQ6Source(ObservationSource):
         if self._running:
             return
 
-        from hardware.teleop_hand.hand_q6_reader import SingleHandQ6Reader
-
         readers: dict[str, object] = {}
         startup_errors: dict[str, Exception] = {}
-        for side, spec in self._reader_specs.items():
+        for side in self._reader_specs:
             try:
-                readers[side] = SingleHandQ6Reader(
-                    port=spec.port,
-                    side=side,
-                    baudrate=spec.baudrate,
-                    timeout=spec.timeout,
-                    raw_only=False,
-                    show_raw_lines=spec.show_raw_lines,
-                    exo_hand_calibration=spec.exo_hand_calibration,
-                    calibration_path=spec.calibration_path,
-                )
+                readers[side] = self._open_reader(side)
             except Exception as exc:
                 startup_errors[side] = exc
                 if self._critical or self._strict_expected:
@@ -196,6 +185,7 @@ class HandQ6Source(ObservationSource):
         self._threads = {}
         with self._lock:
             for side, exc in startup_errors.items():
+                self._reader_error_counts[side] = 1
                 self._latest_channels[self._channel_name_for_side(side)] = self._invalid_channel(
                     side,
                     error=f"startup_failed: {exc}",
@@ -210,6 +200,84 @@ class HandQ6Source(ObservationSource):
             )
             thread.start()
             self._threads[side] = thread
+        for side in startup_errors:
+            thread = threading.Thread(
+                target=self._reader_startup_retry_loop,
+                args=(side,),
+                name=f"{self.name}_{side}_startup_retry",
+                daemon=True,
+            )
+            thread.start()
+            self._threads[side] = thread
+
+    def _open_reader(self, side: str) -> object:
+        from hardware.teleop_hand.hand_q6_reader import SingleHandQ6Reader
+
+        spec = self._reader_specs[side]
+        return SingleHandQ6Reader(
+            port=spec.port,
+            side=side,
+            baudrate=spec.baudrate,
+            timeout=spec.timeout,
+            raw_only=False,
+            show_raw_lines=spec.show_raw_lines,
+            exo_hand_calibration=spec.exo_hand_calibration,
+            calibration_path=spec.calibration_path,
+        )
+
+    def _reader_startup_retry_loop(self, side: str) -> None:
+        """Recover an optional channel whose reader constructor initially failed."""
+
+        consecutive_errors = int(self._reader_error_counts.get(side, 1))
+        while self._running:
+            time.sleep(self._READ_ERROR_RETRY_SEC)
+            if not self._running:
+                return
+            try:
+                reader = self._open_reader(side)
+            except Exception as exc:  # noqa: BLE001 - optional source stays retryable.
+                consecutive_errors += 1
+                self._reader_error_counts[side] = consecutive_errors
+                error_text = f"{type(exc).__name__}: {exc}"
+                with self._lock:
+                    self._latest_channels[
+                        self._channel_name_for_side(side)
+                    ] = self._invalid_channel(
+                        side,
+                        error=f"startup_retry_failed: {error_text}",
+                        metadata={
+                            "error_count": int(consecutive_errors),
+                            "reader_running": False,
+                            "startup_retry_active": True,
+                        },
+                    )
+                self._log_reader_error(
+                    side,
+                    f"reader construction retry failed ({error_text}); retrying",
+                )
+                continue
+
+            close_after_open = False
+            with self._lock:
+                if not self._running:
+                    close_after_open = True
+                else:
+                    self._readers[side] = reader
+                    self._reader_recovery_counts[side] = (
+                        int(self._reader_recovery_counts.get(side, 0)) + 1
+                    )
+            if close_after_open:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+                return
+            self._log_reader_error(
+                side,
+                f"reader construction recovered after {consecutive_errors} error(s)",
+            )
+            self._reader_loop(side, reader)
+            return
 
     def _channel_name_for_side(self, side: str) -> str:
         return f"{side}_hand_q6"
@@ -392,7 +460,9 @@ class HandQ6Source(ObservationSource):
 
     def close(self) -> None:
         self._running = False
-        for reader in self._readers.values():
+        with self._lock:
+            readers = tuple(self._readers.values())
+        for reader in readers:
             try:
                 reader.close()
             except Exception:
@@ -400,4 +470,5 @@ class HandQ6Source(ObservationSource):
         for thread in self._threads.values():
             thread.join(timeout=1.0)
         self._threads = {}
-        self._readers = {}
+        with self._lock:
+            self._readers = {}

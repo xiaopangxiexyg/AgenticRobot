@@ -32,6 +32,7 @@ def test_legacy_control_input_delegates_active_controls_to_extracted_policy() ->
     )
     control._teleop_started = True
     control._hold_active = True
+    control._hardware_hold_confirmed = True
     control._episode_recording_ui_active = False
     control._episode_countdown_ui_active = False
     control._episode_finalizing_ui_active = False
@@ -40,6 +41,7 @@ def test_legacy_control_input_delegates_active_controls_to_extracted_policy() ->
     state = GuiControlState(
         teleop_started=True,
         hold_active=True,
+        hardware_hold_confirmed=True,
         episode_recording_available=True,
         camera_visualization_available=True,
         fix_arm_available=True,
@@ -136,6 +138,26 @@ def test_armed_lifecycle_without_live_dispatch_exposes_only_recovery_controls() 
         foot_pad_available=True,
         foot_pad_count=2,
         active_side_count=2,
+    )
+
+    assert current_active_controls(state, GuiControlEvents()) == ["q", "d", "h"]
+
+
+def test_application_hold_without_lower_receipt_exposes_only_fail_safe_controls() -> None:
+    state = GuiControlState(
+        teleop_started=True,
+        hold_active=True,
+        hardware_hold_confirmed=False,
+        episode_recording_available=True,
+        camera_visualization_available=True,
+        tactile_visualization_available=True,
+        tactile_solving_available=True,
+        fix_arm_available=True,
+        init_arm_available=True,
+        pose_snapshot_available=True,
+        foot_pad_available=True,
+        foot_pad_count=2,
+        active_side_count=1,
     )
 
     assert current_active_controls(state, GuiControlEvents()) == ["q", "d", "h"]
@@ -239,7 +261,19 @@ def test_device_retry_is_only_available_before_home_or_in_regular_hold() -> None
         events,
     )
     assert "device_retry" in current_active_controls(
-        GuiControlState(teleop_started=True, hold_active=True),
+        GuiControlState(
+            teleop_started=True,
+            hold_active=True,
+            hardware_hold_confirmed=True,
+        ),
+        events,
+    )
+    assert "device_retry" not in current_active_controls(
+        GuiControlState(
+            teleop_started=True,
+            hold_active=True,
+            hardware_hold_confirmed=False,
+        ),
         events,
     )
 

@@ -460,6 +460,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
         control._tracker_side_check = {
             "status": "swapped",
             "warning_required": True,
@@ -501,6 +502,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
         control._tracker_side_check = {
             "status": "swapped",
             "warning_required": True,
@@ -529,6 +531,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
         control._tracker_side_check = {
             "status": "correct",
             "warning_required": False,
@@ -611,6 +614,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
 
         control._handle_two_pedal_b_event(now=10.0)
 
@@ -697,6 +701,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
         control._tracker_side_check = {
             "status": "correct",
             "warning_required": False,
@@ -725,6 +730,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
         control._tracker_side_check = {
             "status": "unavailable",
             "warning_required": False,
@@ -794,6 +800,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
         control._tracker_side_check = {
             "status": "unavailable",
             "warning_required": False,
@@ -827,6 +834,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
         control._tracker_side_check = {
             "status": "unavailable",
             "warning_required": False,
@@ -2204,7 +2212,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("record_pose_snapshot", active_controls)
         self.assertFalse(running_publish["pose_snapshot_available"])
 
-    def test_device_retry_is_restored_only_after_hold_is_consumed(self) -> None:
+    def test_device_retry_is_restored_only_after_lower_hold_receipt(self) -> None:
         ui = _FakeUi()
         control = real_teleop.RealTeleopControlInput(
             terminal=_FakeTerminal(),
@@ -2231,6 +2239,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("device_retry", ui.published[-1]["active_controls"])
 
         self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
         control.set_visualization_state(camera_active=True)
         self.assertIn("device_retry", ui.published[-1]["active_controls"])
 
@@ -2303,6 +2312,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertEqual(args.movement_multiple, 1.0)
 
         self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
         self.assertEqual(
             control._set_movement_multiple_value(1.5, source="test"),
             1.5,
@@ -3045,6 +3055,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertNotIn("enable_tactile_solving", pending_hold["active_controls"])
 
         self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
         control.set_visualization_state(status="hold settled")
         hold = next(
             item for item in reversed(ui.published) if "active_controls" in item
@@ -3660,6 +3671,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control._teleop_started = True
         control._hold_active = True
+        control._hardware_hold_confirmed = True
         transition = SimpleNamespace(ok=True, side="left", message="planning")
 
         with patch.object(
@@ -3671,6 +3683,63 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
         start.assert_called_once()
         self.assertTrue(control.hold_active())
+
+    def test_gui_exact_qpos_quiesces_idle_work_before_planning(self) -> None:
+        components = _components()
+        components.init_arm_controller = SimpleNamespace(
+            selected_side="left",
+            active=False,
+            qpos_active=False,
+            status_payload=lambda: {"init_arm_available": True},
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(arm_control_mode="position"),
+            components=components,
+        )
+        control._teleop_started = True
+        calls: list[str] = []
+        control.bind_latency_sensitive_transition_preparer(
+            lambda reason: calls.append("quiesce:" + reason)
+        )
+        transition = SimpleNamespace(ok=True, side="left", message="planning")
+
+        with patch.object(
+            real_teleop,
+            "_start_gui_qpos_init",
+            side_effect=lambda *_args, **_kwargs: (
+                calls.append("start") or transition
+            ),
+        ):
+            self.assertTrue(control._handle_init_arm_move_to_qpos_event(now=2.0))
+
+        self.assertEqual(calls, ["quiesce:init_arm_exact_qpos", "start"])
+
+    def test_gui_exact_qpos_does_not_plan_when_idle_quiesce_fails(self) -> None:
+        components = _components()
+        components.init_arm_controller = SimpleNamespace(
+            selected_side="left",
+            active=False,
+            qpos_active=False,
+            status_payload=lambda: {"init_arm_available": True},
+        )
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=_FakeUi(),
+            args=_args(arm_control_mode="position"),
+            components=components,
+        )
+        control._teleop_started = True
+        control.bind_latency_sensitive_transition_preparer(
+            lambda _reason: (_ for _ in ()).throw(RuntimeError("worker busy"))
+        )
+
+        with patch.object(real_teleop, "_start_gui_qpos_init") as start:
+            self.assertTrue(control._handle_init_arm_move_to_qpos_event(now=2.0))
+
+        start.assert_not_called()
+        self.assertFalse(control.maintenance_motion_active())
 
     def test_startup_qpos_maintenance_dispatches_without_building_teleop_action(self) -> None:
         class Controller:
@@ -5053,6 +5122,9 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         control._tracker_swap_locked = True
 
         control.request_hold()
+        self.assertNotIn("w", ui.published[-1]["active_controls"])
+        self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
         self.assertIn("w", ui.published[-1]["active_controls"])
 
         ui.events.append("w")
@@ -6262,9 +6334,20 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         )
         control.request_hold()
 
+        pending = ui.published[-1]
+        self.assertIn("episode_stop", pending["active_controls"])
+        self.assertNotIn("p", pending["active_controls"])
+        self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
+
         published = ui.published[-1]
-        self.assertTrue(ui.published[-2]["episode_recording"])
-        self.assertEqual(ui.published[-2]["episode_event_status"], "paused")
+        episode_state = next(
+            item
+            for item in reversed(ui.published)
+            if "episode_event_status" in item
+        )
+        self.assertTrue(episode_state["episode_recording"])
+        self.assertEqual(episode_state["episode_event_status"], "paused")
         self.assertIn("episode_stop", published["active_controls"])
         self.assertIn("p", published["active_controls"])
         self.assertNotIn("c", published["active_controls"])
@@ -6288,6 +6371,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
         control.request_hold()
         self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
         self.assertIn("episode_stop", ui.published[-1]["active_controls"])
         self.assertIn("p", ui.published[-1]["active_controls"])
         self.assertNotIn("h", ui.published[-1]["active_controls"])
@@ -6299,6 +6383,7 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
 
         control.request_hold()
         self.assertTrue(control.consume_hold_request())
+        control.publish_hardware_hold_confirmation(confirmed=True)
         self.assertIn("episode_stop", ui.published[-1]["active_controls"])
         self.assertIn("p", ui.published[-1]["active_controls"])
         self.assertNotIn("h", ui.published[-1]["active_controls"])

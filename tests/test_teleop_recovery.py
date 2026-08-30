@@ -1082,6 +1082,63 @@ class TeleopRecoveryTests(unittest.TestCase):
         finally:
             source.close()
 
+    def test_optional_hand_source_constructor_failure_recovers_without_restart(self) -> None:
+        construction_count = 0
+
+        class RecoveringReader:
+            def __init__(self, *, port, side, baudrate, timeout, **kwargs):
+                nonlocal construction_count
+                del timeout, kwargs
+                construction_count += 1
+                if construction_count == 1:
+                    raise RuntimeError("serial unavailable")
+                self.port = port
+                self.side = side
+                self.baudrate = baudrate
+
+            def read_frame(self):
+                return {
+                    "timestamp": np.asarray([time.time()], dtype=float),
+                    "norm": np.asarray(
+                        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                        dtype=np.float32,
+                    ),
+                    "port": self.port,
+                    "baudrate": self.baudrate,
+                }
+
+            def close(self):
+                return None
+
+        source = HandQ6Source.from_single_hand(
+            port="/dev/fake_left_hand",
+            side="left",
+            critical=False,
+            strict_expected=False,
+        )
+        source._READ_ERROR_RETRY_SEC = 0.01
+        source._READ_ERROR_LOG_INTERVAL_SEC = 60.0
+        with patch(
+            "hardware.teleop_hand.hand_q6_reader.SingleHandQ6Reader",
+            RecoveringReader,
+        ):
+            source.start()
+            try:
+                channel = None
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    channel = source.get_latest_channels().get("left_hand_q6")
+                    if channel is not None and channel.valid:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(channel)
+                assert channel is not None
+                self.assertTrue(channel.valid)
+                self.assertGreaterEqual(construction_count, 2)
+                self.assertEqual(channel.metadata["reader_recovery_count"], 1)
+            finally:
+                source.close()
+
     def test_required_hand_source_startup_failure_still_raises(self) -> None:
         source = HandQ6Source.from_single_hand(
             port="/dev/fake_left_hand",
@@ -2624,7 +2681,7 @@ class TeleopRecoveryTests(unittest.TestCase):
         finally:
             session.close()
 
-    def test_session_hold_enters_debug_only_when_rig_hold_reports_failure(self) -> None:
+    def test_session_hold_faults_when_rig_hold_reports_failure(self) -> None:
         class FailingRig:
             name = "failing_rig"
 
@@ -2657,11 +2714,148 @@ class TeleopRecoveryTests(unittest.TestCase):
         session.mark_debug_passed()
         session.arm_hardware()
 
-        session.hold_hardware("unit test hold")
+        applied = session.hold_hardware("unit test hold")
 
         self.assertEqual(rig.holds, ["unit test hold"])
-        self.assertEqual(session.state_machine.state, TeleopRunState.DEBUG_ONLY)
+        self.assertFalse(applied)
+        self.assertEqual(session.state_machine.state, TeleopRunState.FAULT)
         session.close()
+
+    def test_session_hold_faults_after_physical_hold_if_tracking_reset_fails(self) -> None:
+        class FakeRig:
+            name = "fake_rig"
+
+            def __init__(self) -> None:
+                self.holds: list[str] = []
+
+            def start(self) -> None:
+                pass
+
+            def is_ready(self) -> bool:
+                return True
+
+            def send_commands(self, command, phase_recorder=None) -> None:
+                del command, phase_recorder
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                self.holds.append(reason)
+
+            def close(self) -> None:
+                pass
+
+        class FailingResetRetargeter:
+            name = "failing_reset"
+
+            def reset_target_pose_smoothing(self) -> None:
+                raise RuntimeError("reset failed")
+
+            def retarget(self, observation, calibration):
+                del observation, calibration
+                return TeleopCommand(timestamp=0.0)
+
+        rig = FakeRig()
+        session = TeleopSession(
+            config=TeleopSessionConfig(
+                record_enabled=False,
+                allow_hardware_after_debug_pass=False,
+            ),
+            retargeters=[FailingResetRetargeter()],
+            rig=rig,
+        )
+        try:
+            session.start()
+            session.set_calibration_ready()
+            session.mark_debug_passed()
+            session.arm_hardware()
+
+            applied = session.hold_hardware("unit test hold")
+
+            self.assertEqual(rig.holds, ["unit test hold"])
+            self.assertFalse(applied)
+            self.assertEqual(session.state_machine.state, TeleopRunState.FAULT)
+            self.assertIn("post-hold tracking reset failed", session.last_fault_reason)
+        finally:
+            session.close()
+
+    def test_safety_freeze_hold_failure_is_terminal_fault(self) -> None:
+        class FailingRig:
+            name = "failing_rig"
+
+            def start(self) -> None:
+                pass
+
+            def is_ready(self) -> bool:
+                return True
+
+            def send_commands(self, command, phase_recorder=None) -> None:
+                del command, phase_recorder
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                raise RuntimeError(f"hold failed: {reason}")
+
+            def close(self) -> None:
+                pass
+
+        session = TeleopSession(
+            config=TeleopSessionConfig(
+                record_enabled=False,
+                allow_hardware_after_debug_pass=False,
+                hold_motion_on_freeze=True,
+            ),
+            rig=FailingRig(),
+        )
+        try:
+            session.start()
+            session.set_calibration_ready()
+            session.mark_debug_passed()
+            session.arm_hardware()
+
+            session.freeze("invalid_channel")
+            session.finish_recovery()
+
+            self.assertEqual(session.state_machine.state, TeleopRunState.FAULT)
+            self.assertIn("automatic recovery is disabled", session.last_fault_reason)
+        finally:
+            session.close()
+
+    def test_failed_session_start_requires_component_reconstruction(self) -> None:
+        class FailingStartRig:
+            name = "failing_start_rig"
+
+            def __init__(self) -> None:
+                self.start_count = 0
+                self.close_count = 0
+
+            def start(self) -> None:
+                self.start_count += 1
+                raise RuntimeError("startup failed")
+
+            def is_ready(self) -> bool:
+                return False
+
+            def send_commands(self, command, phase_recorder=None) -> None:
+                del command, phase_recorder
+
+            def hold_motion(self, reason: str = "manual hold") -> None:
+                del reason
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        rig = FailingStartRig()
+        session = TeleopSession(
+            config=TeleopSessionConfig(record_enabled=False),
+            rig=rig,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "startup failed"):
+            session.start()
+        with self.assertRaisesRegex(RuntimeError, "reconstruct"):
+            session.start()
+
+        self.assertTrue(session.startup_retry_requires_reconstruction)
+        self.assertEqual(rig.start_count, 1)
+        self.assertEqual(rig.close_count, 1)
 
     def test_real_runtime_restart_resets_command_start_from_live_qpos(self) -> None:
         class FakeStateBackend:
