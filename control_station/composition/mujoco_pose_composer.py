@@ -402,18 +402,19 @@ class MujocoPoseComposerAuthorityComposition:
             raise ValueError("Composition activation required roles mismatch.")
         with self._lock:
             self._require_started()
+            if self._composition_activation_scope == scope:
+                return scope.input_barrier_at
+            activation_fact = project_composition_activation_scope(
+                self.runtime.authoritative_port.trace_context,
+                scope,
+            )
+            self.runtime.authoritative_port.record_external_facts(
+                (activation_fact,)
+            )
             self._input_receipt_by_role.clear()
             self._human_fact_time_by_emission_id.clear()
             self._step_by_decision_key.clear()
             self._composition_activation_scope = scope
-            self.runtime.authoritative_port.record_external_facts(
-                (
-                    project_composition_activation_scope(
-                        self.runtime.authoritative_port.trace_context,
-                        scope,
-                    ),
-                )
-            )
         return scope.input_barrier_at
 
     def _submit_input(
@@ -1335,6 +1336,14 @@ class ScopedMujocoPoseCompositionSession:
         self._rearm_receipt_by_spec_id: dict[
             str, CompositionSessionRearmReceipt
         ] = {}
+        self._session_operation_execution_by_intent_id: dict[
+            str, StationOperationExecution
+        ] = {}
+        self._session_operation_transition_by_intent_id: dict[
+            str, ControlStationTransition
+        ] = {}
+        self._finalized_session_operation_intent_ids: set[str] = set()
+        self._session_operation_lock = threading.RLock()
         self.session_controller = CompositionSessionController(
             composer_source_slot_id=composer_source_slot_id,
             contributor_source_slot_ids=(
@@ -1663,23 +1672,57 @@ class ScopedMujocoPoseCompositionSession:
         self,
         transition: ControlStationTransition,
     ) -> StationOperationExecution:
-        self.prepare_pending_operation(transition)
-        subject = transition.intent.subject_id
-        adapter_by_subject = {
-            adapter.subject_id: adapter for adapter in self.adapters
-        }
-        try:
-            adapter = adapter_by_subject[str(subject)]
-        except KeyError as exc:
-            raise ValueError("Pending operation has no CS6b1i adapter.") from exc
-        execution = self.station.execute_pending_operation(transition, adapter)
-        completion = execution.completion_transition
+        with self._session_operation_lock:
+            return self._complete_pending_operation_locked(transition)
+
+    def _complete_pending_operation_locked(
+        self,
+        transition: ControlStationTransition,
+    ) -> StationOperationExecution:
         kind = transition.intent.intent_kind
-        if kind not in {
+        session_operation_kinds = {
             "start_composition_session",
             "rearm_composition_session",
             "stop_composition_session",
-        }:
+        }
+        intent_id = str(transition.intent.intent_id)
+        execution = (
+            self._session_operation_execution_by_intent_id.get(intent_id)
+            if kind in session_operation_kinds
+            else None
+        )
+        if execution is None:
+            self.prepare_pending_operation(transition)
+            subject = transition.intent.subject_id
+            adapter_by_subject = {
+                adapter.subject_id: adapter for adapter in self.adapters
+            }
+            try:
+                adapter = adapter_by_subject[str(subject)]
+            except KeyError as exc:
+                raise ValueError(
+                    "Pending operation has no CS6b1i adapter."
+                ) from exc
+            execution = self.station.execute_pending_operation(
+                transition,
+                adapter,
+            )
+            if kind in session_operation_kinds:
+                self._session_operation_execution_by_intent_id[intent_id] = (
+                    execution
+                )
+                self._session_operation_transition_by_intent_id[intent_id] = (
+                    transition
+                )
+        elif (
+            self._session_operation_transition_by_intent_id[intent_id]
+            != transition
+        ):
+            raise RuntimeError("Station operation intent identity collision.")
+        elif intent_id in self._finalized_session_operation_intent_ids:
+            return execution
+        completion = execution.completion_transition
+        if kind not in session_operation_kinds:
             return execution
         projected = project_station_operation_transition(
             completion,
@@ -1688,6 +1731,7 @@ class ScopedMujocoPoseCompositionSession:
             ),
         )
         if kind == "start_composition_session":
+            before_publication = None
             if completion.accepted and completion.result.succeeded:
                 spec = self.session_controller.require_registered_spec(
                     transition.intent.operation_spec_id
@@ -1710,8 +1754,10 @@ class ScopedMujocoPoseCompositionSession:
                         self.data_plane.composition_spec.required_roles
                     ),
                 )
-                self.data_plane.begin_composition_activation(
-                    scope=activation_scope,
+                before_publication = lambda: (
+                    self.data_plane.begin_composition_activation(
+                        scope=activation_scope,
+                    )
                 )
             self.session_controller.complete_start_operation(
                 operation_spec_id=transition.intent.operation_spec_id,
@@ -1720,6 +1766,7 @@ class ScopedMujocoPoseCompositionSession:
                 source_fact_id=projected.fact_id,
                 source_fact_hash=projected.semantic_content_hash,
                 start_intent_id=transition.intent.intent_id,
+                before_publication=before_publication,
             )
         elif kind == "rearm_composition_session":
             receipt = self._rearm_receipt_by_spec_id.get(
@@ -1745,6 +1792,7 @@ class ScopedMujocoPoseCompositionSession:
                 source_fact_id=projected.fact_id,
                 source_fact_hash=projected.semantic_content_hash,
             )
+        self._finalized_session_operation_intent_ids.add(intent_id)
         return execution
 
     def _require_active_session(self) -> None:

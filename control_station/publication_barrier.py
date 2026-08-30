@@ -9,18 +9,19 @@ Arbitration, execution epochs, and final dispatch authorization.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, TypeVar
+from typing import TypeVar
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 from .contracts import StationOperationResult
 
-
 STATION_PUBLICATION_BARRIER_HASH_DOMAIN_V1 = (
     "dexteleop.control_station.publication_barrier_snapshot.v1"
 )
 T = TypeVar("T")
+U = TypeVar("U")
 
 
 @dataclass(frozen=True)
@@ -164,6 +165,28 @@ class StationPublicationBarrier:
             transition_reason="typed_composition_session_completion",
         )
 
+    def linearize_composition_session_enable(
+        self,
+        result: StationOperationResult,
+        commit: Callable[[StationPublicationBarrierSnapshot], U],
+    ) -> U:
+        """Publish one start only after its application commit completes.
+
+        The barrier lock remains held while ``commit`` installs the matching
+        application state.  Concurrent publishers therefore cannot observe an
+        enabled barrier before the composition session and activation boundary
+        are complete.  If the application commit fails, the exact prior
+        barrier snapshot is restored before the lock is released.
+        """
+
+        return self._linearize_enable_from_result(
+            result,
+            operation_kind="start_composition_session",
+            required_status="composition_session_ready",
+            transition_reason="typed_composition_session_completion",
+            commit=commit,
+        )
+
     def enable_from_composition_session_rearm_result(
         self,
         result: StationOperationResult,
@@ -177,6 +200,21 @@ class StationPublicationBarrier:
             transition_reason="typed_composition_session_rearm_completion",
         )
 
+    def linearize_composition_session_rearm_enable(
+        self,
+        result: StationOperationResult,
+        commit: Callable[[StationPublicationBarrierSnapshot], U],
+    ) -> U:
+        """Publish one rearm only after its fresh activation is committed."""
+
+        return self._linearize_enable_from_result(
+            result,
+            operation_kind="rearm_composition_session",
+            required_status="composition_session_rearmed",
+            transition_reason="typed_composition_session_rearm_completion",
+            commit=commit,
+        )
+
     def _enable_from_result(
         self,
         result: StationOperationResult,
@@ -185,8 +223,27 @@ class StationPublicationBarrier:
         required_status: str | None,
         transition_reason: str,
     ) -> StationPublicationBarrierSnapshot:
+        return self._linearize_enable_from_result(
+            result,
+            operation_kind=operation_kind,
+            required_status=required_status,
+            transition_reason=transition_reason,
+            commit=lambda snapshot: snapshot,
+        )
+
+    def _linearize_enable_from_result(
+        self,
+        result: StationOperationResult,
+        *,
+        operation_kind: str,
+        required_status: str | None,
+        transition_reason: str,
+        commit: Callable[[StationPublicationBarrierSnapshot], U],
+    ) -> U:
         if not isinstance(result, StationOperationResult):
             raise TypeError("result must be a StationOperationResult.")
+        if not callable(commit):
+            raise TypeError("commit must be callable.")
         if (
             not result.succeeded
             or result.operation_kind != operation_kind
@@ -200,14 +257,32 @@ class StationPublicationBarrier:
         with self._lock:
             if self._enabled:
                 if self._authority_operation_result_id == result.operation_result_id:
-                    return self._snapshot_locked()
+                    return commit(self._snapshot_locked())
                 raise RuntimeError("Publication authority is already enabled.")
+            prior_state = (
+                self._generation,
+                self._enabled,
+                self._authority_operation_result_id,
+                self._authority_evidence_refs,
+                self._transition_reason,
+            )
             self._generation += 1
             self._enabled = True
             self._authority_operation_result_id = result.operation_result_id
             self._authority_evidence_refs = tuple(result.evidence_refs)
             self._transition_reason = transition_reason
-            return self._snapshot_locked()
+            snapshot = self._snapshot_locked()
+            try:
+                return commit(snapshot)
+            except BaseException:
+                (
+                    self._generation,
+                    self._enabled,
+                    self._authority_operation_result_id,
+                    self._authority_evidence_refs,
+                    self._transition_reason,
+                ) = prior_state
+                raise
 
     def disable(self, *, reason: str) -> StationPublicationBarrierSnapshot:
         normalized_reason = str(reason).strip()
