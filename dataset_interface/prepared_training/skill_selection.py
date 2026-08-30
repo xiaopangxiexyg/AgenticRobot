@@ -147,15 +147,12 @@ def _successful_complete_projection(
     stage_ids: tuple[str, ...],
 ) -> bool:
     progress = getattr(item, "progress")
-    successful_attempt_ids = {
+    target_attempt_ids = {
         attempt.attempt_id
         for attempt in progress.timeline.attempts
-        if (
-            attempt.progress_step_id == progress_step_id
-            and attempt.outcome == "SUCCESS"
-        )
+        if attempt.progress_step_id == progress_step_id
     }
-    for attempt_id in successful_attempt_ids:
+    for attempt_id in target_attempt_ids:
         occurrences = tuple(
             sorted(
                 (

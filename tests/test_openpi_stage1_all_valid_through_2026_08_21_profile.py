@@ -35,10 +35,13 @@ from utils.dataset_postprocess.wrist_cam_adjust.geometry_mask.dataset import (
 )
 from utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline import (
     _intrinsics_overlay_for_source,
+    _physical_devices_by_episode,
     _remove_validated_intermediate_roots,
     _resolve_pipeline_derived_roots,
+    _selected_wrist_camera_keys,
     _summary_receipt_name,
     _validated_removed_intermediate_summary,
+    _verify_mask_tree,
 )
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
@@ -115,6 +118,129 @@ def test_stage1_mask_removed_summary_and_subset_receipts(tmp_path: Path) -> None
     }
     assert _summary_receipt_name(("a", "b"), ("a", "b")) == "summary.json"
     assert _summary_receipt_name(("a",), ("a", "b")).startswith("summary-")
+
+
+def test_selected_wrist_cameras_and_mask_tree_cover_both_views(
+    tmp_path: Path,
+) -> None:
+    cameras = _selected_wrist_camera_keys(
+        {"camera_selection": ["front", "left_wrist", "right_wrist"]}
+    )
+    assert cameras == ("left_wrist", "right_wrist")
+
+    root = tmp_path / "masks"
+    expected = {0: 2, 3: 1}
+    for camera_key in cameras:
+        for episode_index, frame_count in expected.items():
+            episode_dir = (
+                root
+                / "dataset"
+                / f"episode_{episode_index:06d}"
+                / camera_key
+            )
+            episode_dir.mkdir(parents=True)
+            (episode_dir / "final_keep.bitpack.bin").write_bytes(
+                b"x" * frame_count
+            )
+            (episode_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "mask_name": (
+                            "postprocessed_depth_or_table_keep_mask"
+                        ),
+                        "stream": {
+                            "frame_count": frame_count,
+                            "packed_bytes_per_frame": 1,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    summary = _verify_mask_tree(
+        root,
+        "dataset",
+        expected,
+        camera_keys=cameras,
+        stream_name="final_keep.bitpack.bin",
+        expected_mask_name="postprocessed_depth_or_table_keep_mask",
+    )
+    assert summary == {
+        "episode_count": 2,
+        "camera_count": 2,
+        "cameras": ["left_wrist", "right_wrist"],
+        "frame_count": 3,
+        "camera_frame_count": 6,
+        "stream_bytes": 6,
+        "by_camera": {
+            "left_wrist": {"frame_count": 3, "stream_bytes": 3},
+            "right_wrist": {"frame_count": 3, "stream_bytes": 3},
+        },
+    }
+
+
+def test_consolidated_source_devices_require_audit_and_provenance_binding(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "consolidated"
+    source_root = tmp_path / "retired-source"
+    meta = dataset_root / "meta"
+    copied = meta / "source_devices" / source_root.name / "realsense.json"
+    copied.parent.mkdir(parents=True)
+    copied.write_text(json.dumps({"left_wrist": {}, "right_wrist": {}}))
+    (meta / "build_audit.json").write_text(
+        json.dumps(
+            {
+                "plan": {
+                    "episodes": [
+                        {
+                            "output_episode_index": 0,
+                            "source_root": str(source_root),
+                            "source_episode_index": 7,
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    provenance_path = meta / "provenance.jsonl"
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "output_episode_index": 0,
+                "source_dataset_root": str(source_root),
+                "source_episode_index": 7,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    mapping, contract = _physical_devices_by_episode(dataset_root, (0,))
+
+    assert mapping == {0: copied.resolve()}
+    assert contract["mode"] == "consolidated_source_devices"
+    assert contract["source_manifests"][0]["original_manifest_state"] == (
+        "original_absent_protected_copy_bound_by_audit_and_provenance"
+    )
+    assert contract["source_manifests"][0]["copied_manifest_sha256"] == (
+        hashlib.sha256(copied.read_bytes()).hexdigest()
+    )
+
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "output_episode_index": 0,
+                "source_dataset_root": str(source_root),
+                "source_episode_index": 8,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="differs from the build plan"):
+        _physical_devices_by_episode(dataset_root, (0,))
 
 
 def test_through_2026_08_21_profile_matches_logical_source_contract() -> None:

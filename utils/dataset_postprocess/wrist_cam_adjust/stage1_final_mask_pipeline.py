@@ -29,8 +29,9 @@ from .depth_mask.visualize import (
 from .final_mask import compose_final_masks
 from .geometry_mask.dataset import adjust_dataset
 
-PIPELINE_SCHEMA_V1 = "dexteleop_stage1_final_keep_mask_pipeline_v1"
+PIPELINE_SCHEMA_V2 = "dexteleop_prepared_wrist_final_keep_mask_pipeline_v2"
 FINAL_MASK_LAYOUT_V1 = "source_dataset_id_partitioned_v1"
+WRIST_CAMERA_KEYS = ("left_wrist", "right_wrist")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -102,28 +103,69 @@ def _selected_by_source(
     }
 
 
+def _selected_wrist_camera_keys(profile: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = profile.get("camera_selection")
+    if not isinstance(raw, list):
+        raise TypeError("camera_selection must be a list")
+    selected = tuple(str(value).strip() for value in raw)
+    cameras = tuple(key for key in WRIST_CAMERA_KEYS if key in selected)
+    if not cameras:
+        raise ValueError("final keep-mask generation requires a wrist camera")
+    unexpected = tuple(
+        key for key in selected if "wrist" in key and key not in WRIST_CAMERA_KEYS
+    )
+    if unexpected:
+        raise ValueError(f"unsupported wrist camera keys: {unexpected}")
+    return cameras
+
+
 def _physical_devices_by_episode(
     dataset_root: Path,
     episode_indices: Sequence[int],
-) -> dict[int, Path] | None:
+) -> tuple[dict[int, Path] | None, dict[str, Any]]:
     default_path = dataset_root / "meta" / "devices" / "realsense.json"
     if default_path.is_file():
-        return None
+        return None, {
+            "schema": "dexteleop.camera_devices_binding.v2",
+            "mode": "dataset_default",
+            "manifest_path": str(default_path.resolve()),
+            "manifest_sha256": _sha256(default_path),
+            "source_dataset_root": str(dataset_root.resolve()),
+        }
     audit_path = dataset_root / "meta" / "build_audit.json"
-    if not audit_path.is_file():
+    provenance_path = dataset_root / "meta" / "provenance.jsonl"
+    if not audit_path.is_file() or not provenance_path.is_file():
         raise FileNotFoundError(
             "dataset has neither one devices manifest nor a physical build "
-            f"audit: {dataset_root}"
+            f"audit with provenance: {dataset_root}"
         )
     audit = _read_json(audit_path)
     plan = audit.get("plan")
     if not isinstance(plan, Mapping) or not isinstance(plan.get("episodes"), list):
         raise TypeError(f"physical build audit has no episode plan: {audit_path}")
+    plan_rows = tuple(
+        item for item in plan["episodes"] if isinstance(item, Mapping)
+    )
+    provenance_rows = tuple(_read_jsonl(provenance_path))
+    if len(plan_rows) != len(provenance_rows):
+        raise ValueError(
+            "physical build audit and provenance row counts differ: "
+            f"audit={len(plan_rows)} provenance={len(provenance_rows)}"
+        )
+    provenance_by_output: dict[int, Mapping[str, Any]] = {}
+    for row in provenance_rows:
+        output_index = int(row["output_episode_index"])
+        if output_index in provenance_by_output:
+            raise ValueError(
+                "physical provenance repeats output episode index "
+                f"{output_index}."
+            )
+        provenance_by_output[output_index] = row
     selected = {int(value) for value in episode_indices}
     mapping: dict[int, Path] = {}
-    for item in plan["episodes"]:
-        if not isinstance(item, Mapping):
-            continue
+    source_contracts: dict[str, dict[str, Any]] = {}
+    dataset_resolved = dataset_root.resolve()
+    for item in plan_rows:
         output_index = int(item["output_episode_index"])
         if output_index not in selected:
             continue
@@ -135,17 +177,75 @@ def _physical_devices_by_episode(
             / source_root.name
             / "realsense.json"
         ).resolve()
+        try:
+            devices_path.relative_to(dataset_resolved)
+        except ValueError as exc:
+            raise ValueError(
+                "physical source devices copy escapes the consolidated root: "
+                f"{devices_path}"
+            ) from exc
         original_path = source_root / "meta" / "devices" / "realsense.json"
-        if not devices_path.is_file() or not original_path.is_file():
+        provenance = provenance_by_output.get(output_index)
+        if provenance is None:
+            raise ValueError(
+                "physical provenance is missing output episode "
+                f"{output_index}."
+            )
+        expected_source_episode = int(item["source_episode_index"])
+        if (
+            Path(str(provenance.get("source_dataset_root", "")))
+            .expanduser()
+            .resolve()
+            != source_root
+            or int(provenance.get("source_episode_index", -1))
+            != expected_source_episode
+        ):
+            raise ValueError(
+                "physical provenance differs from the build plan for output "
+                f"episode {output_index}."
+            )
+        if not devices_path.is_file() or devices_path.is_symlink():
             raise FileNotFoundError(
                 "physical source devices manifest is missing for output "
                 f"episode {output_index}: {devices_path}"
             )
-        if _sha256(devices_path) != _sha256(original_path):
+        copied_sha256 = _sha256(devices_path)
+        original_present = original_path.is_file()
+        if original_present and copied_sha256 != _sha256(original_path):
             raise ValueError(
                 "physical source devices copy differs from the original for "
                 f"output episode {output_index}."
             )
+        contract_key = str(devices_path)
+        contract = {
+            "source_dataset_root": str(source_root),
+            "copied_manifest_path": contract_key,
+            "copied_manifest_sha256": copied_sha256,
+            "original_manifest_path": str(original_path),
+            "original_manifest_state": (
+                "copy_matches_original"
+                if original_present
+                else "original_absent_protected_copy_bound_by_audit_and_provenance"
+            ),
+            "selected_episode_count": 0,
+        }
+        current = source_contracts.setdefault(contract_key, contract)
+        if {
+            key: current[key]
+            for key in contract
+            if key != "selected_episode_count"
+        } != {
+            key: contract[key]
+            for key in contract
+            if key != "selected_episode_count"
+        }:
+            raise ValueError(
+                "physical source-device contract is inconsistent for "
+                f"{devices_path}."
+            )
+        current["selected_episode_count"] = int(
+            current["selected_episode_count"]
+        ) + 1
         mapping[output_index] = devices_path
     missing = sorted(selected - set(mapping))
     if missing:
@@ -153,7 +253,19 @@ def _physical_devices_by_episode(
             "physical build audit does not bind every selected episode to "
             f"camera intrinsics: {missing[:8]}"
         )
-    return mapping
+    return mapping, {
+        "schema": "dexteleop.camera_devices_binding.v2",
+        "mode": "consolidated_source_devices",
+        "source_dataset_root": str(dataset_resolved),
+        "build_audit_path": str(audit_path.resolve()),
+        "build_audit_sha256": _sha256(audit_path),
+        "provenance_path": str(provenance_path.resolve()),
+        "provenance_sha256": _sha256(provenance_path),
+        "selected_episode_count": len(selected),
+        "source_manifests": [
+            source_contracts[key] for key in sorted(source_contracts)
+        ],
+    }
 
 
 def _camera_records(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -284,48 +396,71 @@ def _verify_mask_tree(
     dataset_name: str,
     expected_frames: Mapping[int, int],
     *,
+    camera_keys: Sequence[str],
     stream_name: str,
     expected_mask_name: str,
 ) -> dict[str, Any]:
-    total_frames = 0
+    cameras = tuple(str(value) for value in camera_keys)
+    if not cameras:
+        raise ValueError("mask-tree verification requires at least one camera")
+    logical_frames = sum(int(value) for value in expected_frames.values())
+    camera_frames = 0
     total_bytes = 0
-    for episode_index, frame_count in sorted(expected_frames.items()):
-        episode_dir = (
-            root
-            / dataset_name
-            / f"episode_{episode_index:06d}"
-            / "right_wrist"
-        )
-        manifest_path = episode_dir / "manifest.json"
-        manifest = _read_json(manifest_path)
-        if manifest.get("mask_name") != expected_mask_name:
-            raise ValueError(f"unexpected mask semantics: {manifest_path}")
-        stream = manifest.get("stream")
-        if not isinstance(stream, Mapping):
-            raise TypeError(f"mask manifest has no stream: {manifest_path}")
-        actual_count = int(stream.get("frame_count", 0))
-        if actual_count != frame_count:
-            raise ValueError(
-                "mask frame count differs: "
-                f"episode={episode_index} actual={actual_count} "
-                f"expected={frame_count}"
+    by_camera: dict[str, dict[str, int]] = {}
+    for camera_key in cameras:
+        per_camera_frames = 0
+        per_camera_bytes = 0
+        for episode_index, frame_count in sorted(expected_frames.items()):
+            episode_dir = (
+                root
+                / dataset_name
+                / f"episode_{episode_index:06d}"
+                / camera_key
             )
-        packed = int(stream.get("packed_bytes_per_frame", 0))
-        stream_path = episode_dir / stream_name
-        actual_bytes = int(stream_path.stat().st_size)
-        expected_bytes = actual_count * packed
-        if actual_bytes != expected_bytes:
-            raise ValueError(
-                "mask stream size differs: "
-                f"episode={episode_index} actual={actual_bytes} "
-                f"expected={expected_bytes}"
-            )
-        total_frames += actual_count
-        total_bytes += actual_bytes
+            manifest_path = episode_dir / "manifest.json"
+            manifest = _read_json(manifest_path)
+            if manifest.get("mask_name") != expected_mask_name:
+                raise ValueError(f"unexpected mask semantics: {manifest_path}")
+            stream = manifest.get("stream")
+            if not isinstance(stream, Mapping):
+                raise TypeError(f"mask manifest has no stream: {manifest_path}")
+            actual_count = int(stream.get("frame_count", 0))
+            if actual_count != frame_count:
+                raise ValueError(
+                    "mask frame count differs: "
+                    f"episode={episode_index} camera={camera_key} "
+                    f"actual={actual_count} expected={frame_count}"
+                )
+            packed = int(stream.get("packed_bytes_per_frame", 0))
+            if packed <= 0:
+                raise ValueError(
+                    f"mask manifest has invalid packed frame size: {manifest_path}"
+                )
+            stream_path = episode_dir / stream_name
+            actual_bytes = int(stream_path.stat().st_size)
+            expected_bytes = actual_count * packed
+            if actual_bytes != expected_bytes:
+                raise ValueError(
+                    "mask stream size differs: "
+                    f"episode={episode_index} camera={camera_key} "
+                    f"actual={actual_bytes} expected={expected_bytes}"
+                )
+            per_camera_frames += actual_count
+            per_camera_bytes += actual_bytes
+        by_camera[camera_key] = {
+            "frame_count": per_camera_frames,
+            "stream_bytes": per_camera_bytes,
+        }
+        camera_frames += per_camera_frames
+        total_bytes += per_camera_bytes
     return {
         "episode_count": len(expected_frames),
-        "frame_count": total_frames,
+        "camera_count": len(cameras),
+        "cameras": list(cameras),
+        "frame_count": logical_frames,
+        "camera_frame_count": camera_frames,
         "stream_bytes": total_bytes,
+        "by_camera": by_camera,
     }
 
 
@@ -334,50 +469,65 @@ def _postprocess_source(
     output_root: Path,
     episodes: Sequence[int],
     *,
+    camera_keys: Sequence[str],
     jobs: int,
     max_frames: int,
 ) -> tuple[list[DepthMaskPostprocessResult], list[dict[str, Any]]]:
     config = DepthMaskPostprocessConfig()
 
-    def run(episode_index: int) -> DepthMaskPostprocessResult:
+    def run(
+        episode_index: int,
+        camera_key: str,
+    ) -> tuple[int, str, DepthMaskPostprocessResult]:
         manifests = find_session_mask_manifests(
             dataset_root,
             episode=episode_index,
-            camera_keys=("right_wrist",),
+            camera_keys=(camera_key,),
         )
         if len(manifests) != 1:
             raise ValueError(
-                f"episode {episode_index} did not resolve one right wrist mask"
+                f"episode {episode_index} did not resolve one {camera_key} mask"
             )
         stream = load_mask_stream(manifests[0], root_hint=dataset_root)
         output_dir = (
             output_root
             / dataset_root.name
             / f"episode_{episode_index:06d}"
-            / "right_wrist"
+            / camera_key
         )
-        return process_mask_stream(
-            stream,
-            output_dir,
-            config=config,
-            max_frames=max_frames,
-            overwrite=output_dir.exists(),
+        return (
+            episode_index,
+            camera_key,
+            process_mask_stream(
+                stream,
+                output_dir,
+                config=config,
+                max_frames=max_frames,
+                overwrite=output_dir.exists(),
+            ),
         )
 
-    results: list[DepthMaskPostprocessResult] = []
+    processed: list[tuple[int, str, DepthMaskPostprocessResult]] = []
     with ThreadPoolExecutor(max_workers=max(1, int(jobs))) as executor:
-        futures = {executor.submit(run, episode): episode for episode in episodes}
+        futures = {
+            executor.submit(run, episode, camera_key): (episode, camera_key)
+            for episode in episodes
+            for camera_key in camera_keys
+        }
         for future in as_completed(futures):
-            results.append(future.result())
-    results.sort(key=lambda item: str(item.manifest_path))
+            processed.append(future.result())
+    processed.sort(key=lambda item: (item[0], item[1]))
+    results = [item[2] for item in processed]
     trailing = [
         {
+            "episode_index": episode_index,
+            "camera_key": camera_key,
             "manifest_path": str(result.manifest_path),
             "source_declared_bytes": result.source_declared_bytes,
             "source_actual_bytes": result.source_actual_bytes,
             "source_trailing_bytes": result.source_trailing_bytes,
         }
-        for result in results
+        for episode_index, camera_key, result in processed
         if result.source_trailing_bytes
     ]
     return results, trailing
@@ -390,6 +540,7 @@ def _source_receipt(
     source_id: str,
     dataset_root: Path,
     episodes: Sequence[int],
+    camera_keys: Sequence[str],
     expected_frames: Mapping[int, int],
     table_root: Path,
     post_root: Path,
@@ -399,9 +550,10 @@ def _source_receipt(
     intermediates_removed: bool,
     trailing_sources: Sequence[Mapping[str, Any]],
     calibration_contract: Mapping[str, Any] | None,
+    camera_devices_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
-        "schema": PIPELINE_SCHEMA_V1,
+        "schema": PIPELINE_SCHEMA_V2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "profile_path": str(profile_path),
         "profile_sha256": _sha256(profile_path),
@@ -411,7 +563,7 @@ def _source_receipt(
         "eligible_episode_count": len(episodes),
         "eligible_frame_count": sum(expected_frames.values()),
         "episode_indices": list(episodes),
-        "camera": "right_wrist",
+        "cameras": list(camera_keys),
         "mask_policy": (
             "raw depth keep -> default spatial/temporal postprocess -> "
             "OR table geometry keep -> final keep mask"
@@ -424,6 +576,7 @@ def _source_receipt(
             if calibration_contract is None
             else dict(calibration_contract)
         ),
+        "camera_devices_contract": dict(camera_devices_contract),
         "derived_roots": {
             "table_geometry_keep": str(table_root),
             "postprocessed_depth_keep": str(post_root),
@@ -455,6 +608,8 @@ def _source_receipt(
 def _validated_removed_intermediate_summary(
     receipt: Mapping[str, Any],
     expected_frames: Mapping[int, int],
+    *,
+    camera_keys: Sequence[str] | None = None,
 ) -> dict[str, Any] | None:
     retention = receipt.get("intermediate_retention")
     if not isinstance(retention, Mapping):
@@ -471,10 +626,27 @@ def _validated_removed_intermediate_summary(
     postprocessed = summaries.get("postprocessed_depth_keep")
     if not isinstance(postprocessed, Mapping):
         raise ValueError("removed postprocessed masks have no validated summary")
-    expected_summary = {
+    cameras = tuple(
+        str(value)
+        for value in (
+            camera_keys
+            if camera_keys is not None
+            else receipt.get("cameras", (receipt.get("camera", "right_wrist"),))
+        )
+    )
+    expected_summary: dict[str, Any] = {
         "episode_count": len(expected_frames),
         "frame_count": sum(expected_frames.values()),
     }
+    if camera_keys is not None or receipt.get("schema") == PIPELINE_SCHEMA_V2:
+        expected_summary.update(
+            {
+                "camera_count": len(cameras),
+                "cameras": list(cameras),
+                "camera_frame_count": sum(expected_frames.values())
+                * len(cameras),
+            }
+        )
     mismatched = {
         key: (postprocessed.get(key), expected_value)
         for key, expected_value in expected_summary.items()
@@ -574,13 +746,14 @@ def run_pipeline(
     if profile.get("openpi_final_mask_root_layout") != FINAL_MASK_LAYOUT_V1:
         raise ValueError("profile does not declare source-partitioned final masks")
     binding = load_openpi_prepared_skill_binding_manifest(binding_root)
+    camera_keys = _selected_wrist_camera_keys(profile)
     selected = _selected_by_source(binding)
     profile_sources = {
         str(item["source_dataset_id"]): Path(str(item["dataset_root"])).resolve()
         for item in profile["sources"]
     }
     if set(selected) != set(profile_sources):
-        raise ValueError("binding sources differ from the Stage1 profile")
+        raise ValueError("binding sources differ from the prepared profile")
     requested = set(source_ids)
     if requested:
         unknown = sorted(requested - set(profile_sources))
@@ -601,7 +774,13 @@ def run_pipeline(
     final_base = derived_root / "final_keep_masks"
     table_base = intermediate_derived_root / "table_geometry_keep_masks"
     post_base = intermediate_derived_root / "postprocessed_depth_keep_masks"
-    receipt_base = derived_root.parent / "receipts" / "stage1_final_masks"
+    profile_id = str(profile["profile_id"])
+    receipt_base = (
+        derived_root.parent
+        / "receipts"
+        / "prepared_wrist_final_masks"
+        / profile_id
+    )
     overlay_base = intermediate_derived_root / "calibration_overlays"
 
     summaries: list[dict[str, Any]] = []
@@ -619,13 +798,14 @@ def run_pipeline(
         )
         if existing_receipt is not None:
             expected_receipt_identity = {
-                "schema": PIPELINE_SCHEMA_V1,
+                "schema": PIPELINE_SCHEMA_V2,
                 "binding_hash": binding.binding_hash,
                 "source_dataset_id": source_id,
                 "source_dataset_root": str(dataset_root),
                 "eligible_episode_count": len(episodes),
                 "eligible_frame_count": sum(expected.values()),
                 "profile_sha256": _sha256(profile_path),
+                "cameras": list(camera_keys),
             }
             mismatched = {
                 key: (existing_receipt.get(key), expected_value)
@@ -643,6 +823,11 @@ def run_pipeline(
             if existing_receipt is None
             else existing_receipt.get("calibration_contract")
         )
+        camera_devices_contract = (
+            None
+            if existing_receipt is None
+            else existing_receipt.get("camera_devices_contract")
+        )
         if not verify_only and existing_receipt is None:
             override_devices, calibration_contract = (
                 _intrinsics_overlay_for_source(
@@ -653,15 +838,17 @@ def run_pipeline(
                     overlay_base=overlay_base,
                 )
             )
-            devices_by_episode = _physical_devices_by_episode(
-                dataset_root,
-                episodes,
+            devices_by_episode, camera_devices_contract = (
+                _physical_devices_by_episode(
+                    dataset_root,
+                    episodes,
+                )
             )
             adjust_dataset(
                 dataset_root,
                 table_root,
                 urdf_path=urdf_path,
-                cameras=("right_wrist",),
+                cameras=camera_keys,
                 episodes=episodes,
                 devices_json=override_devices,
                 devices_json_by_episode=devices_by_episode,
@@ -678,6 +865,7 @@ def run_pipeline(
                 dataset_root,
                 post_root,
                 episodes,
+                camera_keys=camera_keys,
                 jobs=jobs,
                 max_frames=max_frames,
             )
@@ -687,7 +875,7 @@ def run_pipeline(
                 depth_mask_root=post_root,
                 output_root=final_root,
                 episodes=episodes,
-                cameras=("right_wrist",),
+                cameras=camera_keys,
                 max_frames=max_frames,
                 jobs=jobs,
                 overwrite=(final_root / dataset_root.name).exists(),
@@ -703,6 +891,7 @@ def run_pipeline(
             else _validated_removed_intermediate_summary(
                 existing_receipt,
                 expected,
+                camera_keys=camera_keys,
             )
         )
         post_summary = (
@@ -712,6 +901,7 @@ def run_pipeline(
                 post_root,
                 dataset_root.name,
                 expected,
+                camera_keys=camera_keys,
                 stream_name="mask_postprocessed.bitpack.bin",
                 expected_mask_name=DEPTH_RANGE_POSTPROCESSED_MASK_NAME,
             )
@@ -720,6 +910,7 @@ def run_pipeline(
             final_root,
             dataset_root.name,
             expected,
+            camera_keys=camera_keys,
             stream_name="final_keep.bitpack.bin",
             expected_mask_name="postprocessed_depth_or_table_keep_mask",
         )
@@ -729,6 +920,7 @@ def run_pipeline(
             source_id=source_id,
             dataset_root=dataset_root,
             episodes=episodes,
+            camera_keys=camera_keys,
             expected_frames=expected,
             table_root=table_root,
             post_root=post_root,
@@ -741,6 +933,11 @@ def run_pipeline(
                 calibration_contract
                 if isinstance(calibration_contract, Mapping)
                 else None
+            ),
+            camera_devices_contract=(
+                camera_devices_contract
+                if isinstance(camera_devices_contract, Mapping)
+                else {}
             ),
         )
         if not verify_only and existing_receipt is None:
@@ -764,18 +961,22 @@ def run_pipeline(
         )
 
     summary = {
-        "schema": PIPELINE_SCHEMA_V1,
+        "schema": PIPELINE_SCHEMA_V2,
         "profile_path": str(profile_path),
         "binding_root": str(binding_root),
         "binding_hash": binding.binding_hash,
         "workspace_derived_root": str(derived_root),
         "intermediate_workspace_derived_root": str(intermediate_derived_root),
         "source_count": len(summaries),
+        "cameras": list(camera_keys),
         "eligible_episode_count": sum(
             int(item["final"]["episode_count"]) for item in summaries
         ),
         "eligible_frame_count": sum(
             int(item["final"]["frame_count"]) for item in summaries
+        ),
+        "eligible_camera_frame_count": sum(
+            int(item["final"]["camera_frame_count"]) for item in summaries
         ),
         "sources": summaries,
     }
@@ -791,8 +992,9 @@ def run_pipeline(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate and verify source-partitioned Stage1 right-wrist final "
-            "keep masks without modifying source datasets."
+            "Generate and verify source-partitioned final keep masks for the "
+            "wrist cameras selected by a prepared OpenPI profile, without "
+            "modifying source datasets."
         )
     )
     parser.add_argument("--profile", required=True, type=Path)

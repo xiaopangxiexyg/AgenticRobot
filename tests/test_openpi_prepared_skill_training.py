@@ -10,6 +10,9 @@ import types
 import numpy as np
 import pytest
 
+from dataset_interface.prepared_training.skill_selection import (
+    _successful_complete_projection,
+)
 from deployments.openpi.training.prepared_skill import (
     OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1,
     OPENPI_SOURCE_MIXING_NATURAL_V1,
@@ -70,6 +73,61 @@ class _FakeOpenPITrainConfig:
     @property
     def assets_dirs(self) -> Path:
         return (Path(self.assets_base_dir) / self.name).resolve()
+
+
+def test_successful_skill_projection_survives_later_coarse_abort() -> None:
+    attempt = types.SimpleNamespace(
+        attempt_id="attempt-1",
+        progress_step_id="write",
+        outcome="ABORTED",
+    )
+    item = types.SimpleNamespace(
+        progress=types.SimpleNamespace(
+            timeline=types.SimpleNamespace(attempts=(attempt,))
+        )
+    )
+    occurrences = tuple(
+        types.SimpleNamespace(
+            coarse_attempt_id="attempt-1",
+            progress_step_id="write",
+            stage_id=stage_id,
+            outcome="SUCCESS",
+            occurrence_index_in_attempt=index,
+            start_at=float(index),
+            annotation_id=f"occurrence-{index}",
+        )
+        for index, stage_id in enumerate(("approach", "write"))
+    )
+    annotation = types.SimpleNamespace(
+        bundle=types.SimpleNamespace(occurrences=occurrences)
+    )
+
+    assert _successful_complete_projection(
+        item=item,
+        annotation=annotation,
+        progress_step_id="write",
+        stage_ids=("approach", "write"),
+    )
+
+    failed_annotation = types.SimpleNamespace(
+        bundle=types.SimpleNamespace(
+            occurrences=(
+                occurrences[0],
+                types.SimpleNamespace(
+                    **{
+                        **occurrences[1].__dict__,
+                        "outcome": "ABORTED",
+                    }
+                ),
+            )
+        )
+    )
+    assert not _successful_complete_projection(
+        item=item,
+        annotation=failed_annotation,
+        progress_step_id="write",
+        stage_ids=("approach", "write"),
+    )
 
 
 def test_openpi_checkpoint_dir_resolves_relative_base_in_checkout(
