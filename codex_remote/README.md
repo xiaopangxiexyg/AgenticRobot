@@ -141,6 +141,47 @@ ssh dex-remote 'cd ~/DexTeleop && source ~/anaconda3/etc/profile.d/conda.sh && c
 
 远程 Python 进程运行在远程电脑上，因此可以访问远程电脑的真实硬件。
 
+### 3.1 远端受保护 Harness
+
+Harness preflight 和 portable exchange 不属于 Python 入口，不能通过
+`remote_python.sh` 绕过解释器限制。使用专用入口，并显式指定 SSH target 与远端
+host-private wrapper：
+
+```bash
+./remote_harness.sh \
+  -H user@192.168.70.116 \
+  --harness /home/user/zc/HarnessConfig/bin/harness \
+  runner preflight agentic-source-runner \
+  --profile agenticrobot-integration \
+  --expected-control-commit FULL_HARNESS_COMMIT \
+  --json
+
+./remote_harness.sh \
+  -H user@192.168.70.116 \
+  --harness /home/user/zc/HarnessConfig/bin/harness \
+  transfer exchange-run /absolute/path/to/exchange \
+  --runner-id agentic-source-runner \
+  --slot-id source-slot-01 \
+  --sender-id local-controller \
+  --recipient-id agentic-source-node \
+  --key-id KEY_ID \
+  --key-file /private/path/to/transfer.key \
+  --json
+```
+
+该 wrapper 只接受 `runner preflight` 和 `transfer exchange-run`，并要求远端入口为
+普通、可执行、非软链接的 `*/HarnessConfig/bin/harness`。它不开放通用 shell，也不
+替代 exchange 的 HMAC、exact protected commit、Queue Profile、R1/设备或运动授权。
+等待远端 evidence 时本地 Task writer 应释放；wrapper 本身不 claim writer。
+
+这个入口只解决“如何受控调用远端 protected Harness”，不负责生成 transfer 身份或
+密钥。本地 controller 在提交 exchange 前仍必须从仓库外的 host-private Harness
+配置解析 `HARNESS_ACTOR`、`HARNESS_TRANSFER_{SENDER_ID,RECIPIENT_ID,KEY_ID,KEY_FILE}`、
+`HARNESS_INTEGRATION_EXCHANGE_ROOT` 和 `HARNESS_TRANSFER_RECEIVER_BASES_FILE`；可选的
+回收目录使用 `HARNESS_TRANSFER_RESULT_ROOT`。receiver-bases 文件必须保存各 repository
+经远端 preflight 核验的精确 commit，不能保存移动 branch 名。任一字段缺失时应在创建
+request/exchange 前停止，由 operator provision；不得把站点地址、身份或 key 写入源码。
+
 ### 4. 远程访问真机设备
 
 设备访问原则：
@@ -1057,6 +1098,7 @@ Python 跑在远程。
 ```text
 remote_whoami.sh
 remote_env.sh
+remote_harness.sh
 remote_python.sh
 remote_module.sh
 remote_pytest.sh
