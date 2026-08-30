@@ -436,6 +436,7 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
         False,
     )
     assert rotation_shadow_profile.rotational_config is not None
+    assert rotation_shadow_profile.rotation_profile == "balanced-5deg"
 
     with pytest.raises(SystemExit, match="2"):
         _parse_real_teleop_args(
@@ -533,6 +534,10 @@ def test_position_admittance_requires_coupled_dual_arm_topology(
     assert (
         rotation_active._resolved_position_admittance_profile.mode
         == "rotation_active"
+    )
+    assert (
+        rotation_active._resolved_position_admittance_profile.rotation_profile
+        == "cautious-3deg"
     )
 
     combined_active = _parse_real_teleop_args(

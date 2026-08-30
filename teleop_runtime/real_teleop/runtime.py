@@ -39,7 +39,6 @@ from .gripper_warmup_runtime import build_gripper_warmup_probe_runtime
 from .position_episode_debug import build_position_episode_debug_runtime
 from .runtime_extension import RealTeleopRuntimeExtension
 from .position_admittance_shadow import (
-    ResolvedPositionAdmittanceProfile,
     install_resolved_position_admittance_profile,
     resolve_position_admittance_profile,
 )
@@ -426,28 +425,14 @@ def run_real_teleop(
     )
     if hasattr(args, "_real_teleop_runtime_extension"):
         delattr(args, "_real_teleop_runtime_extension")
-    position_admittance_profile = getattr(
-        args,
-        "_resolved_position_admittance_profile",
-        None,
-    )
-    if hasattr(args, "_resolved_position_admittance_profile"):
-        delattr(args, "_resolved_position_admittance_profile")
     try:
-        if position_admittance_profile is None:
-            position_admittance_profile = resolve_position_admittance_profile(args)
-        elif not isinstance(
-            position_admittance_profile,
-            ResolvedPositionAdmittanceProfile,
-        ):
-            raise TypeError(
-                "_resolved_position_admittance_profile must be a "
-                "ResolvedPositionAdmittanceProfile"
-            )
+        position_admittance_profile = resolve_position_admittance_profile(args)
     except (AttributeError, TypeError, ValueError) as exc:
         raise RuntimeError(
             "position admittance preflight failed: " + str(exc)
         ) from exc
+    if hasattr(args, "_resolved_position_admittance_profile"):
+        delattr(args, "_resolved_position_admittance_profile")
     materialize_real_teleop_artifact_context(args)
     startup_cleanup = _activate_startup_cleanup(logger=_log)
     capability_admission = (
@@ -475,19 +460,15 @@ def run_real_teleop(
         log=_log,
     )
     args._resolved_position_admittance_profile = position_admittance_profile
-    try:
-        startup_component_assembly = assemble_startup_components(
-            args,
-            startup_cleanup=startup_cleanup,
-            startup_progress=startup_progress,
-            active_sides_from_args=_active_sides_from_args,
-            build_tactile_visualizer=_build_tactile_visualizer,
-            build_components=_build_components,
-            register_component_cleanup=_register_component_startup_cleanup,
-        )
-    finally:
-        if hasattr(args, "_resolved_position_admittance_profile"):
-            delattr(args, "_resolved_position_admittance_profile")
+    startup_component_assembly = assemble_startup_components(
+        args,
+        startup_cleanup=startup_cleanup,
+        startup_progress=startup_progress,
+        active_sides_from_args=_active_sides_from_args,
+        build_tactile_visualizer=_build_tactile_visualizer,
+        build_components=_build_components,
+        register_component_cleanup=_register_component_startup_cleanup,
+    )
     components = startup_component_assembly.components
     if runtime_extension is not None:
         attach_components = getattr(runtime_extension, "attach_components", None)

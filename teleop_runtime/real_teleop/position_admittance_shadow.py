@@ -173,6 +173,7 @@ class ResolvedPositionAdmittanceProfile:
     mode: str
     translation_config: CartesianAdmittanceConfig | None
     rotational_config: RotationalAdmittanceConfig | None
+    rotation_profile: str | None = None
     apply_sides: tuple[str, ...] = ()
     active_envelope: str = POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENVELOPE
     endpoint_policy: str = POSITION_ADMITTANCE_ACTIVE_DEFAULT_ENDPOINT_POLICY
@@ -926,10 +927,70 @@ def position_admittance_active_config(args: Any) -> CartesianAdmittanceConfig:
     return config
 
 
+def _resolve_position_admittance_response_configs(
+    args: Any,
+    *,
+    active: bool,
+    shadow: bool,
+    rotation_active: bool,
+    rotation_shadow: bool,
+) -> tuple[
+    CartesianAdmittanceConfig | None,
+    RotationalAdmittanceConfig | None,
+    str | None,
+]:
+    """Resolve response tuning without granting executable Active authority."""
+
+    translation_config = (
+        position_admittance_active_config(args)
+        if active
+        else position_admittance_shadow_config(args)
+        if shadow
+        else None
+    )
+    rotation_profile = None
+    if rotation_active:
+        rotation_profile = str(
+            getattr(
+                args,
+                "position_admittance_rotation_active_profile",
+                POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
+            )
+        )
+    elif rotation_shadow:
+        rotation_profile = str(
+            getattr(
+                args,
+                "position_admittance_rotation_shadow_profile",
+                POSITION_ADMITTANCE_ROTATION_ACTIVE_BALANCED_PROFILE,
+            )
+        )
+    rotational_config = (
+        position_rotational_admittance_config(args, profile=rotation_profile)
+        if rotation_profile is not None
+        else None
+    )
+    if rotation_shadow and translation_config is not None:
+        translation_config = replace(
+            translation_config,
+            enabled_axes=(False, False, False),
+        )
+    return translation_config, rotational_config, rotation_profile
+
+
 def resolve_position_admittance_profile(
     args: Any,
 ) -> ResolvedPositionAdmittanceProfile:
     """Resolve and validate the complete position-admittance request once."""
+
+    resolved = getattr(args, "_resolved_position_admittance_profile", None)
+    if resolved is not None:
+        if not isinstance(resolved, ResolvedPositionAdmittanceProfile):
+            raise TypeError(
+                "_resolved_position_admittance_profile must be a "
+                "ResolvedPositionAdmittanceProfile"
+            )
+        return resolved
 
     shadow, active, rotation_shadow, rotation_active, combined_active = (
         bool(getattr(args, name, False))
@@ -1008,38 +1069,23 @@ def resolve_position_admittance_profile(
             rotational_config=None,
         )
 
-    translation_config = (
-        position_admittance_active_config(args)
-        if active
-        else position_admittance_shadow_config(args)
+    translation_config, rotational_config, rotation_profile = (
+        _resolve_position_admittance_response_configs(
+            args,
+            active=active,
+            shadow=shadow,
+            rotation_active=rotation_active,
+            rotation_shadow=rotation_shadow,
+        )
     )
-    rotation_profile = None
-    if rotation_active:
-        rotation_profile = setting(
-            "position_admittance_rotation_active_profile",
-            POSITION_ADMITTANCE_ROTATION_ACTIVE_PROFILE,
-        )
-    elif rotation_shadow:
-        rotation_profile = setting(
-            "position_admittance_rotation_shadow_profile",
-            POSITION_ADMITTANCE_ROTATION_ACTIVE_BALANCED_PROFILE,
-        )
-    rotational_config = (
-        position_rotational_admittance_config(args, profile=rotation_profile)
-        if rotation_profile is not None
-        else None
-    )
-    if rotation_shadow:
-        translation_config = replace(
-            translation_config,
-            enabled_axes=(False, False, False),
-        )
+    assert translation_config is not None
 
     if not active:
         return ResolvedPositionAdmittanceProfile(
             mode="rotation_shadow" if rotation_shadow else "shadow",
             translation_config=translation_config,
             rotational_config=rotational_config,
+            rotation_profile=rotation_profile,
         )
 
     apply_sides = position_admittance_active_apply_sides(str(active_side))
@@ -1081,6 +1127,7 @@ def resolve_position_admittance_profile(
         ),
         translation_config=translation_config,
         rotational_config=rotational_config,
+        rotation_profile=rotation_profile,
         apply_sides=apply_sides,
         active_envelope=active_envelope,
         endpoint_policy=endpoint_policy,

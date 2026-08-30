@@ -86,7 +86,6 @@ from .position_admittance_shadow import (
     POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_CREEP_DEG,
     POSITION_ADMITTANCE_ACTIVE_QPOS_MICRO_REVERSAL_HOLD_DEG,
     PositionAdmittanceEndpointExcursionGuard,
-    ResolvedPositionAdmittanceProfile,
     position_admittance_active_uses_home_endpoint_guard,
     resolve_position_admittance_profile,
 )
@@ -246,21 +245,7 @@ def build_real_teleop_components(
     dmtac_backend_configs: Callable[..., dict[str, object]],
 ) -> RealTeleopComponents:
     _dmtac_backend_configs = dmtac_backend_configs
-    position_admittance_profile = getattr(
-        args,
-        "_resolved_position_admittance_profile",
-        None,
-    )
-    if position_admittance_profile is None:
-        position_admittance_profile = resolve_position_admittance_profile(args)
-    elif not isinstance(
-        position_admittance_profile,
-        ResolvedPositionAdmittanceProfile,
-    ):
-        raise TypeError(
-            "_resolved_position_admittance_profile must be a "
-            "ResolvedPositionAdmittanceProfile"
-        )
+    position_admittance_profile = resolve_position_admittance_profile(args)
     _resolve_movement_multiple_args(args)
     debug_timing_modules = _debug_timing_modules(args)
     active_sides = _active_sides_from_args(args)
