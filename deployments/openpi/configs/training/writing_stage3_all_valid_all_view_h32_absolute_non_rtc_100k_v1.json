@@ -166,7 +166,7 @@
   "expected_policy_io_layout_hash": "sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16",
   "expected_progress_profile_hash": "0874f6b97b3b5255240dd34e6cfac01c76a95c1077df8a20af6b9b3119f3a438",
   "expected_stage_profile_hash": "b3e3d19daefa9dbf9fe870c769c062c72b24e1442cfb400d52fae9664dc3934b",
-  "openpi_checkout": "/home/user/zc/openpi_writing_all_view_h32_4stage_runs/20260830_snapshot_v1/code/AgenticRobot/model/openpi",
+  "openpi_checkout": "/home/user/zc/openpi_writing_all_view_h32_4stage_runs/20260830_snapshot_v1/code-stage3/AgenticRobot/model/openpi",
   "openpi_source_revision": "940cdc87516a7cf07db7ae46147548c1cf8382ee",
   "openpi_source_identity_sha256": "c20777aa75069d08e61eee3e23451421a8629f97954e1cfd6500ddfcc08438e5",
   "openpi_base_config": "writing-all-view-h32-absolute-standard-v1",
