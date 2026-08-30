@@ -7,6 +7,11 @@ from typing import Any
 import numpy as np
 
 from .interfaces import CollisionChecker, KinematicsProvider
+from .ik_candidate_policy import (
+    local_step_scale_factors,
+    local_step_worsening_limits,
+    prefer_tracking_candidate_pool,
+)
 from .joint_limits import JointVelocityLimitProfile, limit_joint_step
 from .pose import pose_delta_metrics, relax_pose_toward_reference
 from .posture_preferences import JointPosturePreference, posture_preference_from_metadata
@@ -1347,7 +1352,7 @@ class IKSafetyResolver:
                         candidates.extend(wrist_unload_candidates)
         evaluated: list[_EvaluatedCandidate] = []
         rejection_log: list[dict[str, Any]] = []
-        step_scales = _local_step_scale_factors(self.profile)
+        step_scales = local_step_scale_factors(self.profile)
         primary_step_scales = step_scales[:1]
         fallback_step_scales = step_scales[1:]
         limit_escape_active = str(limit_escape_metadata.get("status", "")) == "active"
@@ -1557,7 +1562,12 @@ class IKSafetyResolver:
             rate_metadata["local_step_rejection_count"] = len(rejection_log)
             rate_metadata["local_step_last_rejections"] = rejection_log[-8:]
             return None
-        selection_pool, selection_policy = _local_step_stable_selection_pool(evaluated)
+        selection_pool, selection_policy = prefer_tracking_candidate_pool(
+            evaluated,
+            is_auxiliary_without_pose_progress=(
+                _local_step_is_auxiliary_recovery_without_pose_progress
+            ),
+        )
         selected = min(selection_pool, key=lambda item: item.score)
         full_metadata = dict(full_result.metadata) if full_result is not None else {}
         metadata = {
@@ -1652,7 +1662,7 @@ class IKSafetyResolver:
         evaluated: list[_EvaluatedCandidate] = []
         rejection_log: list[dict[str, Any]] = []
         stage_records: list[dict[str, Any]] = []
-        step_scales = _local_step_scale_factors(self.profile)
+        step_scales = local_step_scale_factors(self.profile)
         primary_scales = step_scales[:1]
         fallback_scales = step_scales[1:]
         rate_metadata = dict(rate_metadata)
@@ -1747,7 +1757,12 @@ class IKSafetyResolver:
         def selected_result() -> IKResolveResult | None:
             if not evaluated:
                 return None
-            selection_pool, selection_policy = _local_step_stable_selection_pool(evaluated)
+            selection_pool, selection_policy = prefer_tracking_candidate_pool(
+                evaluated,
+                is_auxiliary_without_pose_progress=(
+                    _local_step_is_auxiliary_recovery_without_pose_progress
+                ),
+            )
             selected = min(selection_pool, key=lambda item: item.score)
             full_metadata = dict(full_result.metadata) if full_result is not None else {}
             metadata = {
@@ -2577,10 +2592,10 @@ class IKSafetyResolver:
         min_progress = max(0.0, float(self.profile.local_step_min_progress_fraction))
         position_progress_threshold = max(0.0, float(self.profile.local_step_accept_position_progress_m))
         orientation_progress_threshold = max(0.0, float(self.profile.local_step_accept_orientation_progress_deg))
-        worsen_limits = _local_step_worsen_limits(
+        worsen_limits = local_step_worsening_limits(
             profile=self.profile,
-            before_m=before_m,
-            before_deg=before_deg,
+            before_position_m=before_m,
+            before_orientation_deg=before_deg,
         )
         max_position_worsen_m = worsen_limits["position_m"]
         max_orientation_worsen_deg = worsen_limits["orientation_deg"]
@@ -3087,31 +3102,6 @@ def _local_step_is_auxiliary_recovery_without_pose_progress(metadata: dict[str, 
     return True
 
 
-def _local_step_stable_selection_pool(
-    evaluated: list[_EvaluatedCandidate],
-) -> tuple[list[_EvaluatedCandidate], dict[str, Any]]:
-    preferred = [
-        item
-        for item in evaluated
-        if not _local_step_is_auxiliary_recovery_without_pose_progress(item.metadata)
-    ]
-    if preferred:
-        return preferred, {
-            "name": "prefer_tracking_over_auxiliary_posture_recovery",
-            "accepted_count": len(evaluated),
-            "selection_count": len(preferred),
-            "posture_wrist_auxiliary_deprioritized_count": len(evaluated) - len(preferred),
-            "fallback_to_auxiliary_recovery": False,
-        }
-    return evaluated, {
-        "name": "prefer_tracking_over_auxiliary_posture_recovery",
-        "accepted_count": len(evaluated),
-        "selection_count": len(evaluated),
-        "posture_wrist_auxiliary_deprioritized_count": 0,
-        "fallback_to_auxiliary_recovery": True,
-    }
-
-
 def _elapsed_ms(started_at: float) -> float:
     return float((time.perf_counter() - float(started_at)) * 1000.0)
 
@@ -3264,61 +3254,6 @@ def _local_step_iteration_counts(profile: IKSafetyProfile) -> tuple[int, ...]:
     return tuple(counts)
 
 
-def _local_step_scale_factors(profile: IKSafetyProfile) -> tuple[float, ...]:
-    raw_scales = tuple(float(value) for value in getattr(profile, "local_step_scale_factors", ()) or ())
-    if not raw_scales:
-        raw_scales = (1.0,)
-    scales: list[float] = []
-    for value in raw_scales:
-        if not np.isfinite(value) or value <= 0.0:
-            continue
-        scale = max(1e-6, min(1.0, float(value)))
-        if any(abs(scale - existing) < 1e-9 for existing in scales):
-            continue
-        scales.append(scale)
-    if not scales:
-        scales = [1.0]
-    scales.sort(reverse=True)
-    return tuple(scales)
-
-
-def _local_step_worsen_limits(
-    *,
-    profile: IKSafetyProfile,
-    before_m: float,
-    before_deg: float,
-) -> dict[str, Any]:
-    base_position_m = max(0.0, float(profile.local_step_max_position_worsen_m))
-    base_orientation_deg = max(0.0, float(profile.local_step_max_orientation_worsen_deg))
-    enabled = bool(getattr(profile, "local_step_dynamic_worsen_enabled", False))
-    start_m = max(0.0, float(getattr(profile, "local_step_dynamic_worsen_error_start_m", 0.05)))
-    start_deg = max(0.0, float(getattr(profile, "local_step_dynamic_worsen_error_start_deg", 15.0)))
-    active = bool(enabled and (float(before_m) >= start_m or float(before_deg) >= start_deg))
-    position_m = base_position_m
-    orientation_deg = base_orientation_deg
-    position_fraction = max(0.0, float(getattr(profile, "local_step_dynamic_worsen_position_fraction", 0.10)))
-    orientation_fraction = max(0.0, float(getattr(profile, "local_step_dynamic_worsen_orientation_fraction", 0.10)))
-    max_position_m = max(0.0, float(getattr(profile, "local_step_dynamic_worsen_max_position_m", 0.02)))
-    max_orientation_deg = max(0.0, float(getattr(profile, "local_step_dynamic_worsen_max_orientation_deg", 8.0)))
-    if active:
-        position_m = max(base_position_m, max(0.0, float(before_m)) * position_fraction)
-        orientation_deg = max(base_orientation_deg, max(0.0, float(before_deg)) * orientation_fraction)
-        if max_position_m > 0.0:
-            position_m = min(position_m, max_position_m)
-        if max_orientation_deg > 0.0:
-            orientation_deg = min(orientation_deg, max_orientation_deg)
-    return {
-        "position_m": float(position_m),
-        "orientation_deg": float(orientation_deg),
-        "base_position_m": float(base_position_m),
-        "base_orientation_deg": float(base_orientation_deg),
-        "enabled": bool(enabled),
-        "active": bool(active),
-        "position_fraction": float(position_fraction),
-        "orientation_fraction": float(orientation_fraction),
-    }
-
-
 def _coarse_tracking_acceptance(
     *,
     profile: IKSafetyProfile,
@@ -3393,10 +3328,10 @@ def _coarse_tracking_acceptance(
     balanced_progress = float(before_balanced) - float(after_balanced)
     start_fraction = max(0.0, float(metadata["start_fraction"]))
     min_progress = max(0.0, float(metadata["min_fraction_progress"]))
-    worsen_limits = _local_step_worsen_limits(
+    worsen_limits = local_step_worsening_limits(
         profile=profile,
-        before_m=before_m,
-        before_deg=before_deg,
+        before_position_m=before_m,
+        before_orientation_deg=before_deg,
     )
     position_progress_m = float(before_m) - float(pose_error_m)
     orientation_progress_deg = float(before_deg) - float(pose_error_deg)

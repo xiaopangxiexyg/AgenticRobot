@@ -15,6 +15,11 @@ from robot_motion.frames import (
     TOOL_TCP_SEMANTICS,
     canonical_arm_controlled_frame,
 )
+from robot_motion.ik_candidate_policy import (
+    local_step_scale_factors,
+    local_step_worsening_limits,
+    prefer_tracking_candidate_pool,
+)
 from robot_motion.rm65.ik_tuning import (
     RM65IKTuningConfig,
     hard_branch_jump_exceeds,
@@ -217,24 +222,6 @@ def _load_joint_velocity_profile(
             f"Dual-arm retargeting expects a per-arm 6-DOF velocity profile, got {profile.dof}."
         )
     return profile
-
-
-def _dual_arm_step_scale_factors(profile: IKSafetyProfile) -> tuple[float, ...]:
-    raw_scales = tuple(float(value) for value in getattr(profile, "local_step_scale_factors", ()) or ())
-    if not raw_scales:
-        raw_scales = (1.0,)
-    scales: list[float] = []
-    for value in raw_scales:
-        if not np.isfinite(value) or value <= 0.0:
-            continue
-        scale = max(1e-6, min(1.0, float(value)))
-        if any(abs(scale - existing) < 1e-9 for existing in scales):
-            continue
-        scales.append(scale)
-    if not scales:
-        scales = [1.0]
-    scales.sort(reverse=True)
-    return tuple(scales)
 
 
 @dataclass(frozen=True)
@@ -6682,7 +6669,7 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                 include_posture_escape=False,
                 include_wrist_unload=False,
             )
-        scale_factors = _dual_arm_step_scale_factors(safety_profile)
+        scale_factors = local_step_scale_factors(safety_profile)
 
         def evaluate_stage(
             *,
@@ -6934,7 +6921,12 @@ class DualArmCollisionAwareRetargeter(Retargeter):
                     )
                     if count == minimum_singular_sides
                 ]
-            selection_pool, selection_policy = self._dual_stable_selection_pool(wrist_pool)
+            selection_pool, selection_policy = prefer_tracking_candidate_pool(
+                wrist_pool,
+                is_auxiliary_without_pose_progress=(
+                    self._dual_auxiliary_recovery_without_pose_progress
+                ),
+            )
             metadata["selection_policy"] = selection_policy
             selection_pool = list(selection_pool)
             if directional_escape_pool:
@@ -11080,31 +11072,6 @@ class DualArmCollisionAwareRetargeter(Retargeter):
             fractions.append(float(values["rotation_deg"]) / orientation_tol)
         return float(max(fractions) if fractions else 0.0)
 
-    def _dual_stable_selection_pool(
-        self,
-        evaluated: list[_DualArmEvaluatedCandidate],
-    ) -> tuple[list[_DualArmEvaluatedCandidate], dict[str, object]]:
-        preferred = [
-            item
-            for item in evaluated
-            if not self._dual_auxiliary_recovery_without_pose_progress(item.metadata)
-        ]
-        if preferred:
-            return preferred, {
-                "name": "prefer_tracking_over_auxiliary_posture_recovery",
-                "accepted_count": len(evaluated),
-                "selection_count": len(preferred),
-                "posture_wrist_auxiliary_deprioritized_count": len(evaluated) - len(preferred),
-                "fallback_to_auxiliary_recovery": False,
-            }
-        return evaluated, {
-            "name": "prefer_tracking_over_auxiliary_posture_recovery",
-            "accepted_count": len(evaluated),
-            "selection_count": len(evaluated),
-            "posture_wrist_auxiliary_deprioritized_count": 0,
-            "fallback_to_auxiliary_recovery": True,
-        }
-
     def _dual_auxiliary_recovery_without_pose_progress(self, metadata: dict[str, object]) -> bool:
         source = str(metadata.get("source", ""))
         if source not in {"posture_escape", "wrist_unload"}:
@@ -11126,45 +11093,19 @@ class DualArmCollisionAwareRetargeter(Retargeter):
     def _dual_worsen_limits(self, before_metrics: dict[str, dict[str, float]]) -> dict[str, object]:
         safety_profile = self.ik_safety_profile
         assert safety_profile is not None
-        base_position_m = max(0.0, float(safety_profile.local_step_max_position_worsen_m))
-        base_orientation_deg = max(0.0, float(safety_profile.local_step_max_orientation_worsen_deg))
         before_m = max(float(before_metrics[side]["translation_m"]) for side in ("left", "right"))
         before_deg = max(float(before_metrics[side]["rotation_deg"]) for side in ("left", "right"))
-        enabled = bool(getattr(safety_profile, "local_step_dynamic_worsen_enabled", False))
-        start_m = max(0.0, float(getattr(safety_profile, "local_step_dynamic_worsen_error_start_m", 0.05)))
-        start_deg = max(0.0, float(getattr(safety_profile, "local_step_dynamic_worsen_error_start_deg", 15.0)))
-        active = bool(enabled and (before_m >= start_m or before_deg >= start_deg))
-        position_m = base_position_m
-        orientation_deg = base_orientation_deg
-        if active:
-            position_fraction = max(
-                0.0,
-                float(getattr(safety_profile, "local_step_dynamic_worsen_position_fraction", 0.10)),
-            )
-            orientation_fraction = max(
-                0.0,
-                float(getattr(safety_profile, "local_step_dynamic_worsen_orientation_fraction", 0.10)),
-            )
-            max_position_m = max(
-                0.0,
-                float(getattr(safety_profile, "local_step_dynamic_worsen_max_position_m", 0.02)),
-            )
-            max_orientation_deg = max(
-                0.0,
-                float(getattr(safety_profile, "local_step_dynamic_worsen_max_orientation_deg", 8.0)),
-            )
-            position_m = max(position_m, before_m * position_fraction)
-            orientation_deg = max(orientation_deg, before_deg * orientation_fraction)
-            if max_position_m > 0.0:
-                position_m = min(position_m, max_position_m)
-            if max_orientation_deg > 0.0:
-                orientation_deg = min(orientation_deg, max_orientation_deg)
+        limits = local_step_worsening_limits(
+            profile=safety_profile,
+            before_position_m=before_m,
+            before_orientation_deg=before_deg,
+        )
         return {
-            "position_m": float(position_m),
-            "orientation_deg": float(orientation_deg),
-            "base_position_m": float(base_position_m),
-            "base_orientation_deg": float(base_orientation_deg),
-            "active": bool(active),
+            "position_m": limits["position_m"],
+            "orientation_deg": limits["orientation_deg"],
+            "base_position_m": limits["base_position_m"],
+            "base_orientation_deg": limits["base_orientation_deg"],
+            "active": limits["active"],
         }
 
     def _dual_bounded_worsening(
