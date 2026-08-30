@@ -489,6 +489,53 @@ reviewed profile. The request still passes the lower TCP envelope, coupled IK,
 collision/jump/singularity gates, dispatch admission, convergence evaluation,
 and terminal HOLD proof.
 
+A grasp generator that consumes the real Station-aware Depth v2 output may use
+the same action without manually converting camera coordinates. It writes one
+bounded UTF-8 JSON proposal and passes its absolute path instead of the direct
+`--target-*` arguments:
+
+```bash
+python -m agent_gateway.profiles.real.one_shot_client \
+  --socket-path /absolute/private/gateway.sock \
+  --side right \
+  --action move_tcp_to_pose \
+  --camera-grasp-proposal /absolute/path/grasp-proposal.json \
+  --speed-scale 0.20 \
+  --confirm EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE
+```
+
+The proposal schema is `dexteleop.real.camera_relative_grasp_proposal.v1`. It
+binds the grasp to the exact Gateway runtime session and Route manifest, source
+operation, Station-aware Depth v2 Route/deployment, selected arm, Station
+revision, Station frame specification, frame graph, camera pose, and typed
+metric-depth Artifact plus its real-capture receipt. The grasp itself is the
+actual DMTAC tool-TCP pose in that camera optical frame. An optional
+`capture_group_id` may preserve an already-produced cross-modal capture
+correlation; it is provenance only and does not weaken any identity check.
+Unknown fields, stale identities, a different arm, or an Artifact that is not
+the reviewed metric Depth output close the request before submission.
+In-process grasp generators should construct it with
+`CameraRelativeGraspProposal.from_depth_operation_wire(...)` and serialize
+`to_mapping()` so Route, operation, result, and Artifact identities are copied
+from the completed Depth operation instead of retyped.
+
+The adapter computes exactly:
+
+```text
+T_canonical_station_actual_tool_tcp
+  = T_canonical_station_camera_optical_frame
+  @ T_camera_optical_frame_actual_tool_tcp
+```
+
+It then supplies the resulting canonical-Station pose to the unchanged
+`motion.move_tcp_to_pose@1` request. The proposal is not a Grant, does not make
+the perception operation authoritative for motion, and is not forwarded as a
+motion input Artifact. The same explicit session authorization, one-use Grant,
+fresh RUNNING/READY snapshot, safety envelope, IK/collision admission,
+dispatch, convergence, and lower-confirmed HOLD still apply. Direct
+`--target-xyz-m`/`--target-quat-xyzw` input remains unchanged and is mutually
+exclusive with `--camera-grasp-proposal`.
+
 The MuJoCo arbitrary-grasp viewer and the real Skill deliberately do not accept
 the same numeric input frame. The viewer's explicit input is
 `selected_arm_base_from_actual_dmtac_tool_tcp`, while the real Skill public

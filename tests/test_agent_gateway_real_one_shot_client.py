@@ -1,9 +1,30 @@
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 from typing import ClassVar
 
+import pytest
+
 from agent_gateway.profiles.real import one_shot_client
+from agent_gateway.profiles.real.grasp_pose_adapter import (
+    CAMERA_RELATIVE_GRASP_PROPOSAL_SCHEMA_V1,
+)
+from agent_gateway.profiles.real.perception_deployment import (
+    REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
+    REAL_CAPTURE_DEPTH_ROUTE_ID_V2,
+)
+from agent_gateway.protocol.artifact_contracts import (
+    AgentArtifactBinding,
+    AgentArtifactRef,
+)
+from agent_gateway.skills.perception.definition import CAPTURE_DEPTH_SKILL_ID_V1
+from agent_gateway.skills.perception.schemas import (
+    DEPTH_FRAME_COMPRESSION_V1,
+    DEPTH_FRAME_ENCODING_V1,
+    DEPTH_FRAME_MEDIA_TYPE_V1,
+    DEPTH_FRAME_SCHEMA_ID_V1,
+)
 
 
 class _FakeClient:
@@ -136,6 +157,16 @@ class _FakeClient:
 
 
 class _FakeAbsolutePoseClient(_FakeClient):
+    expected_pose: ClassVar[list[float]] = [
+        0.31,
+        -0.12,
+        0.28,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+
     def call(self, method, payload):
         self.calls.append((method, payload))
         if method == "get_skill_route_manifest":
@@ -177,7 +208,20 @@ class _FakeAbsolutePoseClient(_FakeClient):
                                 }
                             ],
                         },
-                    }
+                    },
+                    {
+                        "route": {
+                            "skill_id": CAPTURE_DEPTH_SKILL_ID_V1,
+                            "skill_version": "2",
+                            "route_id": REAL_CAPTURE_DEPTH_ROUTE_ID_V2,
+                            "route_hash": "depth-route:absolute-pose",
+                        },
+                        "deployment_binding": {
+                            "deployment_binding_hash": (
+                                "depth-binding:absolute-pose"
+                            ),
+                        },
+                    },
                 ],
                 "skill_schema_catalog_hash": "catalog:absolute-pose",
             }
@@ -254,9 +298,10 @@ class _FakeAbsolutePoseClient(_FakeClient):
             assert parameters["reference_frame_spec_hash"] == (
                 "station-frame:absolute-pose"
             )
-            assert parameters["pose_targets_by_component"] == {
-                "right_arm": [0.31, -0.12, 0.28, 0.0, 0.0, 0.0, 1.0]
-            }
+            assert set(parameters["pose_targets_by_component"]) == {"right_arm"}
+            assert parameters["pose_targets_by_component"]["right_arm"] == (
+                pytest.approx(self.expected_pose, abs=1e-6)
+            )
             assert parameters["speed_scale"] == 0.2
             return {
                 "accepted": True,
@@ -276,6 +321,10 @@ class _FakeAbsolutePoseClient(_FakeClient):
                 },
             }
         raise AssertionError(method)
+
+
+class _FakeCameraGraspClient(_FakeAbsolutePoseClient):
+    expected_pose: ClassVar[list[float]] = [0.3, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]
 
 
 def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch) -> None:
@@ -364,3 +413,103 @@ def test_absolute_pose_client_requires_a_complete_pose_before_connect(
         raise AssertionError("incomplete absolute TCP pose must be rejected")
 
     assert _FakeClient.instances == []
+
+
+def test_one_shot_client_resolves_camera_grasp_before_motion_submit(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _FakeClient.instances.clear()
+    monkeypatch.setattr(one_shot_client, "_Client", _FakeCameraGraspClient)
+    artifact_binding = AgentArtifactBinding(
+        slot_id=REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
+        ordinal=0,
+        artifact=AgentArtifactRef(
+            media_type=DEPTH_FRAME_MEDIA_TYPE_V1,
+            schema_id=DEPTH_FRAME_SCHEMA_ID_V1,
+            encoding=DEPTH_FRAME_ENCODING_V1,
+            compression=DEPTH_FRAME_COMPRESSION_V1,
+            byte_length=4096,
+            sha256="a" * 64,
+        ),
+        production_receipt_ref="real-depth-capture:" + "b" * 64,
+    )
+    proposal_path = tmp_path / "camera-grasp.json"
+    proposal_path.write_text(
+        json.dumps(
+            {
+                "schema": CAMERA_RELATIVE_GRASP_PROPOSAL_SCHEMA_V1,
+                "runtime_session_id": "real-session:absolute-pose-test",
+                "skill_route_manifest_hash": (
+                    "route-manifest:absolute-pose-test"
+                ),
+                "source_operation_id": "depth-operation:test",
+                "source_operation_hash": "depth-operation-hash:test",
+                "perception_route_id": REAL_CAPTURE_DEPTH_ROUTE_ID_V2,
+                "perception_route_hash": "depth-route:absolute-pose",
+                "perception_deployment_binding_hash": (
+                    "depth-binding:absolute-pose"
+                ),
+                "component_id": "right_arm",
+                "station_revision": 8,
+                "reference_frame_id": "canonical_station",
+                "reference_frame_spec_hash": "station-frame:absolute-pose",
+                "frame_graph_hash": "frame-graph:absolute-pose",
+                "camera_pose_reference_xyz_quat_xyzw": [
+                    0.1,
+                    0.2,
+                    0.3,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                "tool_tcp_pose_camera_xyz_quat_xyzw": [
+                    0.2,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                "depth_artifact_binding": artifact_binding.to_wire(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path="/tmp/absolute-pose.sock",
+        side="right",
+        action="move_tcp_to_pose",
+        target_xyz_m=None,
+        target_quat_xyzw=None,
+        camera_grasp_proposal=str(proposal_path),
+        speed_scale=0.2,
+        client_id="dexteleop-local-primitive-operator",
+        timeout_sec=1.0,
+        operation_timeout_sec=None,
+    )
+
+    operation = one_shot_client.execute_one_shot(args)
+
+    assert operation["status"] == "completed"
+    assert _FakeClient.instances[0].closed is True
+
+
+def test_camera_grasp_is_mutually_exclusive_with_direct_target(tmp_path) -> None:
+    args = Namespace(
+        action="move_tcp_to_pose",
+        target_xyz_m=(0.1, 0.2, 0.3),
+        target_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
+        camera_grasp_proposal=str(tmp_path / "unused.json"),
+        speed_scale=0.2,
+    )
+
+    try:
+        one_shot_client._absolute_tcp_input_from_args(args)
+    except ValueError as error:
+        assert "mutually exclusive" in str(error)
+    else:
+        raise AssertionError("camera and direct target modes must be exclusive")

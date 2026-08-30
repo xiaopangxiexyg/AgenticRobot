@@ -79,6 +79,29 @@ Grant。它的公共目标始终是 `canonical_station` 下的实际 DMTAC `tool
 实时 observation/schema 绑定 frame graph、Station frame、tool config 和 calibration hash，
 不允许调用方用字符串把 arm-base 或 camera pose 冒充 Station pose。
 
+若抓姿生成器使用同一 Gateway session 内 Station-aware Depth v2 的输出，可把直接数值参数
+替换为 `--camera-grasp-proposal /absolute/path/grasp-proposal.json`。该文件使用
+`dexteleop.real.camera_relative_grasp_proposal.v1`，必须逐项绑定当前 runtime session、Route
+manifest、源 operation、Depth v2 Route/deployment、左右臂、Station revision、Station frame
+spec、frame graph、相机在 Station 下的位姿，以及带真实采集 receipt 的 typed metric-depth
+Artifact；可选 `capture_group_id` 只保留跨模态采集相关性，不参与控制授权。客户端只在取得
+当前 RUNNING/READY snapshot 后执行：
+
+```text
+T_station_actual_tool_tcp
+  = T_station_camera_optical @ T_camera_optical_actual_tool_tcp
+```
+
+进程内抓姿生成器应使用
+`CameraRelativeGraspProposal.from_depth_operation_wire(...)` 从已完成的 Depth operation
+构造，再序列化 `to_mapping()`，避免人工抄写 Route、operation、result 和 Artifact 身份。
+
+session、Station、frame graph、相机/深度部署或机械臂任一身份不一致时，都会在提交运动请求
+前关闭失败。proposal 不是 Grant，不会绕过一次性授权，也不会作为 motion Artifact 进入
+下层；解析后的结果仍是原有 `move_tcp_to_pose` 的 Station TCP 参数，并继续经过 envelope、
+IK、碰撞/跳变/奇异性、dispatch、收敛和终态 HOLD。直接 `--target-*` 模式保持不变，且与
+`--camera-grasp-proposal` 互斥。
+
 MuJoCo 任意抓姿可视化的显式输入则是所选机械臂 base 下的实际 DMTAC TCP，二者数值不能
 直接复用。相同物理目标应通过选定 collision-scene URDF/profile 的固定链转换：
 
