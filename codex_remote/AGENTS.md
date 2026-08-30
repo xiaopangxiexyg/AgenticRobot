@@ -82,6 +82,12 @@ made from the repository root. Do not let them steer unrelated local-only work.
   `remote_sync_check.sh`.
 - Remote Python/test execution: `remote_python.sh`, `remote_module.sh`,
   `remote_pytest.sh`. Do not bypass their control-risk checks.
+- Protected Harness execution: `remote_harness.sh`, limited to `runner
+  preflight` and authenticated `transfer exchange-run`. It does not grant
+  request, device, motion, or arbitrary-command authority.
+  Wrapper availability is not transfer readiness: the local controller must
+  resolve its sender, recipient, key, exchange root, and exact receiver bases
+  from host-private Harness configuration. Never invent or commit those values.
 - Arm dry-run work: `remote_arm_dry_run.sh`. Do not pass flags that disable
   dry-run behavior.
 - Intentional result retrieval: `remote_pull.sh` or
