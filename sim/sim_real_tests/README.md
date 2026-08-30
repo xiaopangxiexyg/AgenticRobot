@@ -93,6 +93,44 @@ The random stream is fixed by the JSON config. Increase `sample_count` for a
 longer offline soak test; do not replace deterministic CI coverage with an
 unbounded random loop.
 
+## Arbitrary grasp-pose reachability probe
+
+`rm65_random_grasp_pose_reachability_v1.json` defines a bounded Cartesian box,
+a PCG64 seed, and a Shoemake-uniform SO(3) sampler.  The probe emits exactly one
+pose per requested sample without rejection sampling, then records exactly one
+typed terminal endpoint result:
+
+The config, generated sample, endpoint receipt, and scenario record all carry
+the same `reference_frame_id` and `reference_frame_spec_hash`.  The default is
+the single-arm URDF solver's model/arm-base frame.  The target translation and
+the conservative workspace origin are interpreted in that exact frame; a frame
+ID or spec-hash mismatch is `invalid_target`, never an unreachability proof.
+Each sample also has a deterministic `target_pose_content_hash` over the
+sampler ID, PCG64 seed, sample index, frame identity, and exact little-endian
+float64 pose bytes.  Scenario projection verifies both that hash identity and
+the target matrix before accepting an evaluator receipt.
+
+- `reachable`: a residual-bounded endpoint IK candidate was found;
+- `kinematically_unreachable`: a conservative workspace exclusion proves the
+  target lies outside the configured outer envelope;
+- `ik_search_exhausted`: bounded multi-start IK found no accepted candidate,
+  which is not a mathematical unreachability claim;
+- `collision_blocked` or `collision_search_exhausted`: injected endpoint
+  collision checks proved every IK candidate blocked or exhausted their bounded
+  search;
+- `invalid_target` or `planner_error`: target/adapter failures were converted
+  to typed terminal evidence.
+
+The JSON loader accepts only the exact
+`rm65.random_grasp_pose_reachability.v1` schema and scenario identifier; a
+missing or different version is rejected rather than silently interpreted.
+
+An unreachable or collision-blocked sample is a valid scenario observation,
+not a failed scenario.  The receipt contains endpoint candidates, residuals,
+rejection reasons, proof scope, and collision metadata only.  It never contains
+an executable path or trajectory; the future obstacle/path planner owns that
+separate receipt layer.
+
 ## Adding scenarios
 
 1. Put reusable scenario code under `rm65/` or the relevant backend package.
