@@ -710,6 +710,83 @@ def test_third_lookahead_requires_second_lookahead() -> None:
         executor.close()
 
 
+def test_lookahead_sequence_preserves_speculative_source_lattice() -> None:
+    class StagingPlanner(_FakePositionCollisionPlanner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.staged_sources: list[tuple[int, float]] = []
+
+        def stage_source_pose(
+            self,
+            *,
+            source_index: int,
+            source_timestamp: float,
+            pose_by_side,
+            **_kwargs,
+        ) -> None:
+            assert set(pose_by_side) == {"left", "right"}
+            self.staged_sources.append((source_index, source_timestamp))
+
+    planner = StagingPlanner()
+    sample_period = 1.0 / 15.0
+    started_at = 10.0
+    observation = _observation(sides=("left", "right"))
+    current = _filtered_bimanual_pose(0.16, 0.18)
+    first_lookahead = _filtered_bimanual_pose(0.20, 0.22)
+    second_lookahead = _filtered_bimanual_pose(0.24, 0.26)
+    third_lookahead = _filtered_bimanual_pose(0.28, 0.30)
+    executor = PositionDeployExecutor(
+        config=PositionDeployExecutorConfig(
+            sample_hz=15.0,
+            reference_hz=60.0,
+            command_hz=120.0,
+            stale_after_sec=0.5,
+            collision_required=True,
+            allow_non_authoritative_collision_reset_in_dry_run=True,
+            chunk_lookahead_enabled=True,
+        ),
+        canonical_pipeline=_pipeline(("left", "right")),
+        collision_planner_factory=lambda: planner,
+        clock=lambda: started_at,
+        wall_clock=lambda: started_at,
+    )
+    try:
+        current_index = executor.submit(
+            current,
+            observation,
+            "chunk_policy",
+            timestamp_monotonic=started_at,
+            lookahead_filtered=first_lookahead,
+            second_lookahead_filtered=second_lookahead,
+            third_lookahead_filtered=third_lookahead,
+        )
+        executor._drain_submissions()
+
+        assert current_index == 0
+        assert [index for index, _ in planner.staged_sources] == [0, 1, 2, 3]
+        assert [timestamp for _, timestamp in planner.staged_sources] == pytest.approx(
+            [started_at + offset * sample_period for offset in range(4)]
+        )
+
+        staged_index = executor.submit(
+            first_lookahead,
+            observation,
+            "chunk_policy",
+            timestamp_monotonic=started_at + sample_period,
+            lookahead_filtered=second_lookahead,
+            second_lookahead_filtered=third_lookahead,
+        )
+        executor._drain_submissions()
+
+        assert staged_index == 1
+        assert [index for index, _ in planner.staged_sources[-3:]] == [1, 2, 3]
+        assert [timestamp for _, timestamp in planner.staged_sources[-3:]] == pytest.approx(
+            [started_at + offset * sample_period for offset in range(1, 4)]
+        )
+    finally:
+        executor.close()
+
+
 def test_pose_segment_emits_reference_points_without_rerunning_safety() -> None:
     pipeline = _pipeline(("left",))
 

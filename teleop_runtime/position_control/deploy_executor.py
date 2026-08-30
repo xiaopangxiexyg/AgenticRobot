@@ -416,6 +416,26 @@ class _StreamStartPreludeSource:
 
 
 @dataclass(frozen=True)
+class _ReferenceTemplate:
+    filtered: FilteredNormalizedAction
+    observation: DeploymentObservation
+    policy_name: str
+    source_timestamp: float
+    discrete_command: TeleopCommand | None = None
+    execution_work_item: ExecutionWorkItem | None = None
+    plan_splice_decision: PositionPlanSpliceDecision | None = None
+
+
+@dataclass(frozen=True)
+class _LookaheadSource:
+    source_index: int
+    source_timestamp: float
+    pose_by_side: Mapping[str, np.ndarray]
+    qpos_by_side: Mapping[str, np.ndarray]
+    reference_template: _ReferenceTemplate | None = None
+
+
+@dataclass(frozen=True)
 class _Submission:
     generation: int
     source_index: int
@@ -434,36 +454,10 @@ class _Submission:
     collision_reset_metadata: Mapping[str, Any] | None = None
     logical_timestamp: float | None = None
     current_already_staged: bool = False
-    lookahead_source_index: int | None = None
-    lookahead_timestamp: float | None = None
-    lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
-    lookahead_qpos_by_side: Mapping[str, np.ndarray] | None = None
-    lookahead_filtered: FilteredNormalizedAction | None = None
-    lookahead_observation: DeploymentObservation | None = None
-    lookahead_policy_name: str | None = None
-    lookahead_discrete_command: TeleopCommand | None = None
-    second_lookahead_source_index: int | None = None
-    second_lookahead_timestamp: float | None = None
-    second_lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
-    third_lookahead_source_index: int | None = None
-    third_lookahead_timestamp: float | None = None
-    third_lookahead_pose_by_side: Mapping[str, np.ndarray] | None = None
+    lookahead_sources: tuple[_LookaheadSource, ...] = ()
     execution_work_item: ExecutionWorkItem | None = None
-    lookahead_execution_work_item: ExecutionWorkItem | None = None
     plan_splice_decision: PositionPlanSpliceDecision | None = None
     stream_start_prelude: tuple[_StreamStartPreludeSource, ...] = ()
-    stream_start_acquisition_metadata: Mapping[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class _ReferenceTemplate:
-    filtered: FilteredNormalizedAction
-    observation: DeploymentObservation
-    policy_name: str
-    source_timestamp: float
-    discrete_command: TeleopCommand | None = None
-    execution_work_item: ExecutionWorkItem | None = None
-    plan_splice_decision: PositionPlanSpliceDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -993,26 +987,16 @@ class PositionDeployExecutor:
                 "cannot submit a keyframe with safety faults: "
                 + ", ".join(str(fault) for fault in filtered.faults)
             )
-        if lookahead_filtered is not None and lookahead_filtered.faults:
-            raise PositionDeployExecutorFault(
-                "cannot stage a lookahead keyframe with safety faults: "
-                + ", ".join(str(fault) for fault in lookahead_filtered.faults)
-            )
-        if (
-            second_lookahead_filtered is not None
-            and second_lookahead_filtered.faults
+        for role, candidate in (
+            ("lookahead", lookahead_filtered),
+            ("second lookahead", second_lookahead_filtered),
+            ("third lookahead", third_lookahead_filtered),
         ):
-            raise PositionDeployExecutorFault(
-                "cannot stage a second lookahead keyframe with safety faults: "
-                + ", ".join(
-                    str(fault) for fault in second_lookahead_filtered.faults
+            if candidate is not None and candidate.faults:
+                raise PositionDeployExecutorFault(
+                    f"cannot stage a {role} keyframe with safety faults: "
+                    + ", ".join(str(fault) for fault in candidate.faults)
                 )
-            )
-        if third_lookahead_filtered is not None and third_lookahead_filtered.faults:
-            raise PositionDeployExecutorFault(
-                "cannot stage a third lookahead keyframe with safety faults: "
-                + ", ".join(str(fault) for fault in third_lookahead_filtered.faults)
-            )
         if lookahead_discrete_command is not None and lookahead_filtered is None:
             raise ValueError(
                 "lookahead_discrete_command requires lookahead_filtered"
@@ -1098,63 +1082,59 @@ class PositionDeployExecutor:
             if lookahead_observation is None
             else lookahead_observation
         )
-        lookahead_pose_by_side: Mapping[str, np.ndarray] = {}
-        lookahead_qpos_by_side: Mapping[str, np.ndarray] = {}
-        if lookahead_filtered is not None:
-            (
-                lookahead_pose_by_side,
-                lookahead_qpos_by_side,
-            ) = self._target_maps(
-                lookahead_filtered,
-                resolved_lookahead_observation,
-            )
-            lookahead_pose_by_side = self._project_pose_targets_fail_closed(
-                lookahead_pose_by_side,
-                observation=resolved_lookahead_observation,
-                execution_work_item=lookahead_execution_work_item,
-                target_role="lookahead",
-            )
         resolved_second_lookahead_observation = (
             resolved_lookahead_observation
             if second_lookahead_observation is None
             else second_lookahead_observation
         )
-        second_lookahead_pose_by_side: Mapping[str, np.ndarray] = {}
-        second_lookahead_qpos_by_side: Mapping[str, np.ndarray] = {}
-        if second_lookahead_filtered is not None:
-            (
-                second_lookahead_pose_by_side,
-                second_lookahead_qpos_by_side,
-            ) = self._target_maps(
-                second_lookahead_filtered,
-                resolved_second_lookahead_observation,
-            )
-            second_lookahead_pose_by_side = self._project_pose_targets_fail_closed(
-                second_lookahead_pose_by_side,
-                observation=resolved_second_lookahead_observation,
-                execution_work_item=lookahead_execution_work_item,
-                target_role="second_lookahead",
-            )
         resolved_third_lookahead_observation = (
             resolved_second_lookahead_observation
             if third_lookahead_observation is None
             else third_lookahead_observation
         )
-        third_lookahead_pose_by_side: Mapping[str, np.ndarray] = {}
-        third_lookahead_qpos_by_side: Mapping[str, np.ndarray] = {}
-        if third_lookahead_filtered is not None:
+        lookahead_inputs = (
+            ("lookahead", lookahead_filtered, resolved_lookahead_observation),
             (
-                third_lookahead_pose_by_side,
-                third_lookahead_qpos_by_side,
-            ) = self._target_maps(
+                "second lookahead",
+                second_lookahead_filtered,
+                resolved_second_lookahead_observation,
+            ),
+            (
+                "third lookahead",
                 third_lookahead_filtered,
                 resolved_third_lookahead_observation,
+            ),
+        )
+        lookahead_targets: list[
+            tuple[
+                str,
+                FilteredNormalizedAction,
+                DeploymentObservation,
+                Mapping[str, np.ndarray],
+                Mapping[str, np.ndarray],
+            ]
+        ] = []
+        for role, candidate, candidate_observation in lookahead_inputs:
+            if candidate is None:
+                continue
+            candidate_pose_by_side, candidate_qpos_by_side = self._target_maps(
+                candidate,
+                candidate_observation,
             )
-            third_lookahead_pose_by_side = self._project_pose_targets_fail_closed(
-                third_lookahead_pose_by_side,
-                observation=resolved_third_lookahead_observation,
+            candidate_pose_by_side = self._project_pose_targets_fail_closed(
+                candidate_pose_by_side,
+                observation=candidate_observation,
                 execution_work_item=lookahead_execution_work_item,
-                target_role="third_lookahead",
+                target_role=role.replace(" ", "_"),
+            )
+            lookahead_targets.append(
+                (
+                    role,
+                    candidate,
+                    candidate_observation,
+                    candidate_pose_by_side,
+                    candidate_qpos_by_side,
+                )
             )
         try:
             self._validate_observation_reference_domain(
@@ -1170,58 +1150,25 @@ class PositionDeployExecutor:
                 stage="reference_anchor_safety",
             )
             raise
-        if lookahead_filtered is not None:
+        for role, _, candidate_observation, candidate_pose, candidate_qpos in (
+            lookahead_targets
+        ):
             self._validate_observation_reference_domain(
-                resolved_lookahead_observation,
-                pose_sides=tuple(lookahead_pose_by_side),
-                qpos_sides=tuple(lookahead_qpos_by_side),
-                require_fresh_measurement=False,
-            )
-        if second_lookahead_filtered is not None:
-            self._validate_observation_reference_domain(
-                resolved_second_lookahead_observation,
-                pose_sides=tuple(second_lookahead_pose_by_side),
-                qpos_sides=tuple(second_lookahead_qpos_by_side),
-                require_fresh_measurement=False,
-            )
-        if third_lookahead_filtered is not None:
-            self._validate_observation_reference_domain(
-                resolved_third_lookahead_observation,
-                pose_sides=tuple(third_lookahead_pose_by_side),
-                qpos_sides=tuple(third_lookahead_qpos_by_side),
+                candidate_observation,
+                pose_sides=tuple(candidate_pose),
+                qpos_sides=tuple(candidate_qpos),
                 require_fresh_measurement=False,
             )
         signature = (tuple(sorted(pose_by_side)), tuple(sorted(qpos_by_side)))
-        lookahead_signature = (
-            tuple(sorted(lookahead_pose_by_side)),
-            tuple(sorted(lookahead_qpos_by_side)),
-        )
-        if lookahead_filtered is not None and lookahead_signature != signature:
-            raise ValueError(
-                "current and lookahead pose/qpos side modalities must match"
+        for role, _, _, candidate_pose, candidate_qpos in lookahead_targets:
+            lookahead_signature = (
+                tuple(sorted(candidate_pose)),
+                tuple(sorted(candidate_qpos)),
             )
-        second_lookahead_signature = (
-            tuple(sorted(second_lookahead_pose_by_side)),
-            tuple(sorted(second_lookahead_qpos_by_side)),
-        )
-        if (
-            second_lookahead_filtered is not None
-            and second_lookahead_signature != signature
-        ):
-            raise ValueError(
-                "current and second lookahead pose/qpos side modalities must match"
-            )
-        third_lookahead_signature = (
-            tuple(sorted(third_lookahead_pose_by_side)),
-            tuple(sorted(third_lookahead_qpos_by_side)),
-        )
-        if (
-            third_lookahead_filtered is not None
-            and third_lookahead_signature != signature
-        ):
-            raise ValueError(
-                "current and third lookahead pose/qpos side modalities must match"
-            )
+            if lookahead_signature != signature:
+                raise ValueError(
+                    f"current and {role} pose/qpos side modalities must match"
+                )
         if self.config.collision_required:
             if qpos_by_side:
                 raise ValueError(
@@ -1232,27 +1179,11 @@ class PositionDeployExecutor:
                 raise ValueError(
                     "collision-required online deploy needs left+right target poses at each keyframe"
                 )
-            if lookahead_filtered is not None and set(lookahead_pose_by_side) != {
-                "left",
-                "right",
-            }:
-                raise ValueError(
-                    "collision-required lookahead needs left+right target poses"
-                )
-            if (
-                second_lookahead_filtered is not None
-                and set(second_lookahead_pose_by_side) != {"left", "right"}
-            ):
-                raise ValueError(
-                    "collision-required second lookahead needs left+right target poses"
-                )
-            if (
-                third_lookahead_filtered is not None
-                and set(third_lookahead_pose_by_side) != {"left", "right"}
-            ):
-                raise ValueError(
-                    "collision-required third lookahead needs left+right target poses"
-                )
+            for role, _, _, candidate_pose, _ in lookahead_targets:
+                if set(candidate_pose) != {"left", "right"}:
+                    raise ValueError(
+                        f"collision-required {role} needs left+right target poses"
+                    )
 
         with self._lock:
             if self._closing or self._closed:
@@ -1455,36 +1386,61 @@ class PositionDeployExecutor:
                     source_index = next_source_index
                     next_source_index += 1
 
-            lookahead_source_index: int | None = None
-            lookahead_timestamp: float | None = None
-            if lookahead_filtered is not None:
-                lookahead_source_index = next_source_index
+            primary_lookahead_template: _ReferenceTemplate | None = None
+            if lookahead_targets:
+                (
+                    _,
+                    primary_candidate,
+                    primary_observation,
+                    _,
+                    _,
+                ) = lookahead_targets[0]
+                primary_lookahead_template = _ReferenceTemplate(
+                    filtered=_copy_filtered_action(primary_candidate),
+                    observation=_slim_observation(primary_observation),
+                    policy_name=str(policy_name),
+                    source_timestamp=(
+                        float(logical_timestamp) + self.config.sample_period_sec
+                    ),
+                    discrete_command=(
+                        None
+                        if lookahead_discrete_command is None
+                        else _copy_teleop_command(lookahead_discrete_command)
+                    ),
+                    execution_work_item=lookahead_execution_work_item,
+                    plan_splice_decision=None,
+                )
+            lookahead_sources = tuple(
+                _LookaheadSource(
+                    # Only the first lookahead reserves an index.  Later
+                    # entries are speculative planner inputs which become the
+                    # ordinary first lookahead on subsequent queue pops.
+                    source_index=next_source_index + offset,
+                    source_timestamp=(
+                        float(logical_timestamp)
+                        + float(offset + 1) * self.config.sample_period_sec
+                    ),
+                    pose_by_side=dict(candidate_pose),
+                    qpos_by_side=(
+                        dict(candidate_qpos) if offset == 0 else {}
+                    ),
+                    reference_template=(
+                        primary_lookahead_template if offset == 0 else None
+                    ),
+                )
+                for offset, (
+                    _,
+                    candidate,
+                    candidate_observation,
+                    candidate_pose,
+                    candidate_qpos,
+                ) in enumerate(lookahead_targets)
+            )
+            if lookahead_sources:
                 next_source_index += 1
-                lookahead_timestamp = (
-                    float(logical_timestamp) + self.config.sample_period_sec
-                )
-            second_lookahead_source_index: int | None = None
-            second_lookahead_timestamp: float | None = None
-            if second_lookahead_filtered is not None:
-                # This successor is speculative path-planner input only.  Do
-                # not reserve the source index: on the next pop it becomes
-                # the ordinary first lookahead at exactly this index.
-                second_lookahead_source_index = next_source_index
-                second_lookahead_timestamp = (
-                    float(logical_timestamp)
-                    + 2.0 * self.config.sample_period_sec
-                )
-            third_lookahead_source_index: int | None = None
-            third_lookahead_timestamp: float | None = None
-            if third_lookahead_filtered is not None:
-                # Like the second successor, this is speculative planner input
-                # only. It is exposed so a two-interval C2 plan for the next
-                # source cut can finish before that cut becomes authoritative.
-                third_lookahead_source_index = next_source_index + 1
-                third_lookahead_timestamp = (
-                    float(logical_timestamp)
-                    + 3.0 * self.config.sample_period_sec
-                )
+            primary_lookahead = (
+                lookahead_sources[0] if lookahead_sources else None
+            )
 
             submission = _Submission(
                 generation=self._generation,
@@ -1508,57 +1464,10 @@ class PositionDeployExecutor:
                 collision_reset_metadata=collision_reset_metadata,
                 logical_timestamp=float(logical_timestamp),
                 current_already_staged=bool(current_already_staged),
-                lookahead_source_index=lookahead_source_index,
-                lookahead_timestamp=lookahead_timestamp,
-                lookahead_pose_by_side=(
-                    None
-                    if lookahead_filtered is None
-                    else dict(lookahead_pose_by_side)
-                ),
-                lookahead_qpos_by_side=(
-                    None
-                    if lookahead_filtered is None
-                    else dict(lookahead_qpos_by_side)
-                ),
-                lookahead_filtered=(
-                    None
-                    if lookahead_filtered is None
-                    else _copy_filtered_action(lookahead_filtered)
-                ),
-                lookahead_observation=(
-                    None
-                    if lookahead_filtered is None
-                    else _slim_observation(resolved_lookahead_observation)
-                ),
-                lookahead_policy_name=(
-                    None if lookahead_filtered is None else str(policy_name)
-                ),
-                lookahead_discrete_command=(
-                    None
-                    if lookahead_discrete_command is None
-                    else _copy_teleop_command(lookahead_discrete_command)
-                ),
-                second_lookahead_source_index=second_lookahead_source_index,
-                second_lookahead_timestamp=second_lookahead_timestamp,
-                second_lookahead_pose_by_side=(
-                    None
-                    if second_lookahead_filtered is None
-                    else dict(second_lookahead_pose_by_side)
-                ),
-                third_lookahead_source_index=third_lookahead_source_index,
-                third_lookahead_timestamp=third_lookahead_timestamp,
-                third_lookahead_pose_by_side=(
-                    None
-                    if third_lookahead_filtered is None
-                    else dict(third_lookahead_pose_by_side)
-                ),
+                lookahead_sources=lookahead_sources,
                 execution_work_item=execution_work_item,
-                lookahead_execution_work_item=lookahead_execution_work_item,
                 plan_splice_decision=plan_splice_decision,
                 stream_start_prelude=stream_start_prelude,
-                stream_start_acquisition_metadata=(
-                    stream_start_acquisition_metadata
-                ),
             )
             guard_acquired_before_submit = self._cyclic_gc_guard_acquired
             if first and self.config.cyclic_gc_guard_enabled:
@@ -1593,39 +1502,52 @@ class PositionDeployExecutor:
             self._stream_signature = signature
             self._last_submitted_timestamp = timestamp
             if self.config.chunk_lookahead_enabled:
-                self._staged_lookahead_source_index = lookahead_source_index
-                self._staged_lookahead_timestamp = lookahead_timestamp
+                self._staged_lookahead_source_index = (
+                    None
+                    if primary_lookahead is None
+                    else primary_lookahead.source_index
+                )
+                self._staged_lookahead_timestamp = (
+                    None
+                    if primary_lookahead is None
+                    else primary_lookahead.source_timestamp
+                )
                 self._staged_lookahead_pose_by_side = (
                     None
-                    if lookahead_filtered is None
-                    else dict(lookahead_pose_by_side)
+                    if primary_lookahead is None
+                    else dict(primary_lookahead.pose_by_side)
                 )
                 self._staged_lookahead_qpos_by_side = (
                     None
-                    if lookahead_filtered is None
-                    else dict(lookahead_qpos_by_side)
+                    if primary_lookahead is None
+                    else dict(primary_lookahead.qpos_by_side)
                 )
                 self._staged_lookahead_discrete_command = (
                     None
-                    if lookahead_discrete_command is None
-                    else _copy_teleop_command(lookahead_discrete_command)
+                    if primary_lookahead_template is None
+                    or primary_lookahead_template.discrete_command is None
+                    else _copy_teleop_command(
+                        primary_lookahead_template.discrete_command
+                    )
                 )
                 self._staged_lookahead_execution_work_item = (
-                    lookahead_execution_work_item
+                    None
+                    if primary_lookahead_template is None
+                    else primary_lookahead_template.execution_work_item
                 )
                 self._terminal_pose_by_side = (
-                    dict(lookahead_pose_by_side)
-                    if lookahead_filtered is not None
+                    dict(primary_lookahead.pose_by_side)
+                    if primary_lookahead is not None
                     else dict(pose_by_side)
                 )
                 self._terminal_qpos_by_side = (
-                    dict(lookahead_qpos_by_side)
-                    if lookahead_filtered is not None
+                    dict(primary_lookahead.qpos_by_side)
+                    if primary_lookahead is not None
                     else dict(qpos_by_side)
                 )
                 self._terminal_timestamp = (
-                    float(lookahead_timestamp)
-                    if lookahead_timestamp is not None
+                    float(primary_lookahead.source_timestamp)
+                    if primary_lookahead is not None
                     else float(logical_timestamp)
                 )
             self._submitted_count += 1
@@ -1650,15 +1572,19 @@ class PositionDeployExecutor:
                         effective_discrete_command is not None
                         and effective_discrete_command.commands
                     ),
-                    "lookahead_source_index": lookahead_source_index,
-                    "lookahead_timestamp_monotonic": lookahead_timestamp,
-                    "same_chunk_lookahead": bool(lookahead_filtered is not None),
-                    "same_chunk_second_lookahead": bool(
-                        second_lookahead_filtered is not None
+                    "lookahead_source_index": (
+                        None
+                        if primary_lookahead is None
+                        else primary_lookahead.source_index
                     ),
-                    "same_chunk_third_lookahead": bool(
-                        third_lookahead_filtered is not None
+                    "lookahead_timestamp_monotonic": (
+                        None
+                        if primary_lookahead is None
+                        else primary_lookahead.source_timestamp
                     ),
+                    "same_chunk_lookahead": len(lookahead_sources) >= 1,
+                    "same_chunk_second_lookahead": len(lookahead_sources) >= 2,
+                    "same_chunk_third_lookahead": len(lookahead_sources) >= 3,
                     "current_already_staged": bool(current_already_staged),
                     "position_plan_splice": (
                         None
@@ -1766,7 +1692,12 @@ class PositionDeployExecutor:
                 for submission in queued:
                     for item in (
                         submission.execution_work_item,
-                        submission.lookahead_execution_work_item,
+                        *(
+                            None
+                            if source.reference_template is None
+                            else source.reference_template.execution_work_item
+                            for source in submission.lookahead_sources
+                        ),
                     ):
                         if (
                             item is not None
@@ -3704,23 +3635,14 @@ class PositionDeployExecutor:
                             else submission.plan_splice_decision
                         ),
                     ),
-                    (
-                        submission.lookahead_source_index,
-                        submission.lookahead_timestamp,
-                        submission.lookahead_pose_by_side,
-                        None,
-                    ),
-                    (
-                        submission.second_lookahead_source_index,
-                        submission.second_lookahead_timestamp,
-                        submission.second_lookahead_pose_by_side,
-                        None,
-                    ),
-                    (
-                        submission.third_lookahead_source_index,
-                        submission.third_lookahead_timestamp,
-                        submission.third_lookahead_pose_by_side,
-                        None,
+                    *tuple(
+                        (
+                            source.source_index,
+                            source.source_timestamp,
+                            source.pose_by_side,
+                            None,
+                        )
+                        for source in submission.lookahead_sources
                     ),
                 )
                 for (
@@ -3967,29 +3889,29 @@ class PositionDeployExecutor:
                     )
                 )
             self._store_template_locked(submission.source_index, template)
-            if submission.lookahead_source_index is not None:
-                if (
-                    submission.lookahead_timestamp is None
-                    or submission.lookahead_filtered is None
-                    or submission.lookahead_observation is None
-                ):
-                    raise RuntimeError("incomplete chunk lookahead submission")
-                if submission.lookahead_pose_by_side:
+            if submission.lookahead_sources:
+                lookahead = submission.lookahead_sources[0]
+                lookahead_template = lookahead.reference_template
+                if lookahead_template is None:
+                    raise RuntimeError(
+                        "primary lookahead submission has no reference template"
+                    )
+                if lookahead.pose_by_side:
                     self._store_legacy_reference_source_fact_locked(
                         modality="pose",
-                        source_index=int(submission.lookahead_source_index),
-                        source_timestamp=float(submission.lookahead_timestamp),
+                        source_index=lookahead.source_index,
+                        source_timestamp=lookahead.source_timestamp,
                         source_stage=(
                             f"safe_{_rate_label(self.config.sample_hz)}hz_"
                             "chunk_lookahead"
                         ),
-                        target_by_side=submission.lookahead_pose_by_side,
+                        target_by_side=lookahead.pose_by_side,
                     )
                     self._pose_resampler.push(
                         TimestampedMotionTarget(
-                            timestamp=float(submission.lookahead_timestamp),
-                            source_index=int(submission.lookahead_source_index),
-                            pose_by_side=dict(submission.lookahead_pose_by_side),
+                            timestamp=lookahead.source_timestamp,
+                            source_index=lookahead.source_index,
+                            pose_by_side=dict(lookahead.pose_by_side),
                             metadata={
                                 "stage": (
                                     f"safe_{_rate_label(self.config.sample_hz)}hz_"
@@ -3999,22 +3921,22 @@ class PositionDeployExecutor:
                             available_timestamp=submission.timestamp,
                         )
                     )
-                if submission.lookahead_qpos_by_side:
+                if lookahead.qpos_by_side:
                     self._store_legacy_reference_source_fact_locked(
                         modality="qpos",
-                        source_index=int(submission.lookahead_source_index),
-                        source_timestamp=float(submission.lookahead_timestamp),
+                        source_index=lookahead.source_index,
+                        source_timestamp=lookahead.source_timestamp,
                         source_stage=(
                             f"safe_{_rate_label(self.config.sample_hz)}hz_"
                             "chunk_lookahead"
                         ),
-                        target_by_side=submission.lookahead_qpos_by_side,
+                        target_by_side=lookahead.qpos_by_side,
                     )
                     self._qpos_resampler.push(
                         TimestampedMotionTarget(
-                            timestamp=float(submission.lookahead_timestamp),
-                            source_index=int(submission.lookahead_source_index),
-                            qpos_by_side=dict(submission.lookahead_qpos_by_side),
+                            timestamp=lookahead.source_timestamp,
+                            source_index=lookahead.source_index,
+                            qpos_by_side=dict(lookahead.qpos_by_side),
                             metadata={
                                 "stage": (
                                     f"safe_{_rate_label(self.config.sample_hz)}hz_"
@@ -4025,21 +3947,8 @@ class PositionDeployExecutor:
                         )
                     )
                 self._store_template_locked(
-                    int(submission.lookahead_source_index),
-                    _ReferenceTemplate(
-                        filtered=submission.lookahead_filtered,
-                        observation=submission.lookahead_observation,
-                        policy_name=str(
-                            submission.lookahead_policy_name
-                            or submission.policy_name
-                        ),
-                        source_timestamp=float(submission.lookahead_timestamp),
-                        discrete_command=submission.lookahead_discrete_command,
-                        execution_work_item=(
-                            submission.lookahead_execution_work_item
-                        ),
-                        plan_splice_decision=None,
-                    ),
+                    lookahead.source_index,
+                    lookahead_template,
                 )
             self._last_source_timestamp = submission.timestamp
             self._active = True
