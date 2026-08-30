@@ -9,6 +9,7 @@ from robot_motion.rebot_b601_rs import (
     B601_RS_URDF_RELATIVE_PATH,
     B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME,
     B601PinocchioModel,
+    B601PoseVirtualSpring,
     B601SpatialWrench,
     B601TranslationalVirtualSpring,
     B601VirtualWall,
@@ -176,6 +177,86 @@ def test_virtual_spring_has_restoring_sign_damping_and_component_limits() -> Non
     np.testing.assert_allclose(result.wrench.force_n, (-3.0, 1.4, -1.0))
     np.testing.assert_allclose(result.wrench.torque_nm, 0.0)
     assert result.force_limited is True
+
+
+def test_pose_virtual_spring_is_zero_at_anchor() -> None:
+    anchor = np.eye(4)
+    anchor[:3, 3] = (0.3, -0.1, 0.4)
+    spring = B601PoseVirtualSpring(
+        anchor_pose=anchor,
+        translational_stiffness_n_per_m=(20.0,) * 3,
+        translational_damping_n_s_per_m=(1.0,) * 3,
+        rotational_stiffness_nm_per_rad=(0.5,) * 3,
+        rotational_damping_nm_s_per_rad=(0.05,) * 3,
+        max_abs_force_n=(2.0,) * 3,
+        max_abs_torque_nm=(0.25,) * 3,
+    )
+
+    result = spring.evaluate(anchor, (0.0,) * 6)
+
+    np.testing.assert_allclose(result.displacement_m, 0.0)
+    np.testing.assert_allclose(result.rotation_error_rad, 0.0)
+    np.testing.assert_allclose(result.wrench.as_vector(), 0.0)
+    assert result.force_limited is False
+    assert result.torque_limited is False
+
+
+def test_pose_virtual_spring_restores_rotation_and_bounds_force_and_torque() -> None:
+    anchor = np.eye(4)
+    current = np.eye(4)
+    current[:3, :3] = _rotation_z(0.2)
+    current[:3, 3] = (0.2, -0.1, 0.0)
+    spring = B601PoseVirtualSpring(
+        anchor_pose=anchor,
+        translational_stiffness_n_per_m=(20.0, 10.0, 5.0),
+        translational_damping_n_s_per_m=(1.0, 2.0, 3.0),
+        rotational_stiffness_nm_per_rad=(1.0, 2.0, 3.0),
+        rotational_damping_nm_s_per_rad=(0.1, 0.2, 0.3),
+        max_abs_force_n=(2.0, 2.0, 2.0),
+        max_abs_torque_nm=(0.1, 0.1, 0.1),
+    )
+
+    result = spring.evaluate(
+        current,
+        (0.5, -0.5, 0.0, 0.0, 0.0, 0.5),
+    )
+
+    np.testing.assert_allclose(result.displacement_m, (0.2, -0.1, 0.0))
+    np.testing.assert_allclose(result.rotation_error_rad, (0.0, 0.0, 0.2))
+    np.testing.assert_allclose(result.raw_force_n, (-4.5, 2.0, 0.0))
+    np.testing.assert_allclose(result.wrench.force_n, (-2.0, 2.0, 0.0))
+    np.testing.assert_allclose(result.raw_torque_nm, (0.0, 0.0, -0.75))
+    np.testing.assert_allclose(result.wrench.torque_nm, (0.0, 0.0, -0.1))
+    assert result.force_limited is True
+    assert result.torque_limited is True
+
+
+def test_pose_virtual_spring_rejects_invalid_anchor_and_sample_pose() -> None:
+    invalid = np.eye(4)
+    invalid[3, 3] = 2.0
+    with pytest.raises(ValueError, match="homogeneous"):
+        B601PoseVirtualSpring(
+            anchor_pose=invalid,
+            translational_stiffness_n_per_m=(1.0,) * 3,
+            translational_damping_n_s_per_m=(1.0,) * 3,
+            rotational_stiffness_nm_per_rad=(1.0,) * 3,
+            rotational_damping_nm_s_per_rad=(1.0,) * 3,
+            max_abs_force_n=(1.0,) * 3,
+            max_abs_torque_nm=(1.0,) * 3,
+        )
+    spring = B601PoseVirtualSpring(
+        anchor_pose=np.eye(4),
+        translational_stiffness_n_per_m=(1.0,) * 3,
+        translational_damping_n_s_per_m=(1.0,) * 3,
+        rotational_stiffness_nm_per_rad=(1.0,) * 3,
+        rotational_damping_nm_s_per_rad=(1.0,) * 3,
+        max_abs_force_n=(1.0,) * 3,
+        max_abs_torque_nm=(1.0,) * 3,
+    )
+    with pytest.raises(ValueError, match="orthonormal"):
+        sample = np.eye(4)
+        sample[0, 0] = 2.0
+        spring.evaluate(sample, (0.0,) * 6)
 
 
 def test_virtual_wall_is_unilateral_bounded_and_never_attractive() -> None:

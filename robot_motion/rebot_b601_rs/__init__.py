@@ -6,6 +6,8 @@ Importing this package has no hardware or vendor-package side effects.
 from .haptics import (
     B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME,
     B601_RS_WRENCH_ORDER,
+    B601PoseVirtualSpring,
+    B601PoseVirtualSpringResult,
     B601SpatialWrench,
     B601TranslationalVirtualSpring,
     B601VirtualSpringResult,
@@ -58,6 +60,8 @@ __all__ = [
     "B601ModelDependencyError",
     "B601ModelError",
     "B601PinocchioModel",
+    "B601PoseVirtualSpring",
+    "B601PoseVirtualSpringResult",
     "B601SingularityMetrics",
     "B601SpatialWrench",
     "B601TranslationalVirtualSpring",

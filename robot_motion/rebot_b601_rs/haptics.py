@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from .model import B601PinocchioModel
 
@@ -147,6 +148,19 @@ class B601VirtualSpringResult:
     displacement_m: tuple[float, ...]
     raw_force_n: tuple[float, ...]
     force_limited: bool
+
+
+@dataclass(frozen=True)
+class B601PoseVirtualSpringResult:
+    """Auditable six-axis restoring wrench about one fixed SE(3) anchor."""
+
+    wrench: B601SpatialWrench
+    displacement_m: tuple[float, ...]
+    rotation_error_rad: tuple[float, ...]
+    raw_force_n: tuple[float, ...]
+    raw_torque_nm: tuple[float, ...]
+    force_limited: bool
+    torque_limited: bool
 
 
 @dataclass(frozen=True)
@@ -343,6 +357,120 @@ class B601TranslationalVirtualSpring:
 
 
 @dataclass(frozen=True)
+class B601PoseVirtualSpring:
+    """Axis-wise world-aligned SE(3) spring and damper at the gripper origin.
+
+    ``anchor_pose`` and the pose passed to :meth:`evaluate` are
+    ``base_link_T_gripper_end``.  The rotational error is the shortest
+    world-aligned rotation vector of ``R_current @ R_anchor.T``.  Therefore a
+    positive pose displacement produces a negative, restoring wrench in the
+    same ``LOCAL_WORLD_ALIGNED`` convention as the B601 Jacobian.
+    """
+
+    anchor_pose: Sequence[Sequence[float]] | np.ndarray
+    translational_stiffness_n_per_m: tuple[float, ...]
+    translational_damping_n_s_per_m: tuple[float, ...]
+    rotational_stiffness_nm_per_rad: tuple[float, ...]
+    rotational_damping_nm_s_per_rad: tuple[float, ...]
+    max_abs_force_n: tuple[float, ...]
+    max_abs_torque_nm: tuple[float, ...]
+    frame_id: str = B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME
+
+    def __post_init__(self) -> None:
+        anchor = _proper_transform(self.anchor_pose)
+        object.__setattr__(
+            self,
+            "anchor_pose",
+            tuple(tuple(float(value) for value in row) for row in anchor),
+        )
+        for name in (
+            "translational_stiffness_n_per_m",
+            "translational_damping_n_s_per_m",
+            "rotational_stiffness_nm_per_rad",
+            "rotational_damping_nm_s_per_rad",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _non_negative_vector(
+                    getattr(self, name),
+                    size=3,
+                    name=name,
+                ),
+            )
+        object.__setattr__(
+            self,
+            "max_abs_force_n",
+            _non_negative_vector(
+                self.max_abs_force_n,
+                size=3,
+                name="max_abs_force_n",
+                strictly_positive=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_abs_torque_nm",
+            _non_negative_vector(
+                self.max_abs_torque_nm,
+                size=3,
+                name="max_abs_torque_nm",
+                strictly_positive=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "frame_id",
+            _frame_id(self.frame_id, name="frame_id"),
+        )
+
+    def evaluate(
+        self,
+        pose: Sequence[Sequence[float]] | np.ndarray,
+        spatial_velocity: Sequence[float],
+    ) -> B601PoseVirtualSpringResult:
+        current = _proper_transform(pose)
+        anchor = np.asarray(self.anchor_pose, dtype=float)
+        velocity = np.asarray(
+            _finite_vector(spatial_velocity, size=6, name="spatial_velocity"),
+            dtype=float,
+        )
+        displacement = current[:3, 3] - anchor[:3, 3]
+        rotation_error = Rotation.from_matrix(
+            current[:3, :3] @ anchor[:3, :3].T
+        ).as_rotvec()
+        raw_force = -(
+            np.asarray(self.translational_stiffness_n_per_m, dtype=float)
+            * displacement
+            + np.asarray(self.translational_damping_n_s_per_m, dtype=float)
+            * velocity[:3]
+        )
+        raw_torque = -(
+            np.asarray(self.rotational_stiffness_nm_per_rad, dtype=float)
+            * rotation_error
+            + np.asarray(self.rotational_damping_nm_s_per_rad, dtype=float)
+            * velocity[3:]
+        )
+        force_limit = np.asarray(self.max_abs_force_n, dtype=float)
+        torque_limit = np.asarray(self.max_abs_torque_nm, dtype=float)
+        force = np.clip(raw_force, -force_limit, force_limit)
+        torque = np.clip(raw_torque, -torque_limit, torque_limit)
+        return B601PoseVirtualSpringResult(
+            wrench=B601SpatialWrench(
+                force_n=tuple(float(value) for value in force),
+                torque_nm=tuple(float(value) for value in torque),
+                frame_id=self.frame_id,
+            ),
+            displacement_m=tuple(float(value) for value in displacement),
+            rotation_error_rad=tuple(float(value) for value in rotation_error),
+            raw_force_n=tuple(float(value) for value in raw_force),
+            raw_torque_nm=tuple(float(value) for value in raw_torque),
+            force_limited=not np.array_equal(raw_force, force),
+            torque_limited=not np.array_equal(raw_torque, torque),
+        )
+
+
+@dataclass(frozen=True)
 class B601VirtualWall:
     """One-sided Cartesian wall with forbidden half-space ``n.p > offset``."""
 
@@ -439,6 +567,8 @@ class B601VirtualWall:
 __all__ = [
     "B601_RS_WORLD_ALIGNED_EE_WRENCH_FRAME",
     "B601_RS_WRENCH_ORDER",
+    "B601PoseVirtualSpring",
+    "B601PoseVirtualSpringResult",
     "B601SpatialWrench",
     "B601TranslationalVirtualSpring",
     "B601VirtualSpringResult",

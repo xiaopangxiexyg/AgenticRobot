@@ -373,6 +373,24 @@ def test_cartesian_hold_reference_never_adds_joint_motion() -> None:
     assert done is True
 
 
+def test_pose_hold_reference_never_adds_joint_motion() -> None:
+    q0 = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    qref, qvel, done = probe.plan_reference(
+        q0,
+        mode="pose-hold",
+        joint="joint1",
+        elapsed_sec=10.0,
+        step_rad=0.05,
+        step_speed_rad_s=0.02,
+        step_direction=1,
+        position_limits_rad=_fault_hold_limits(),
+    )
+
+    assert qref == q0
+    assert qvel == (0.0,) * 6
+    assert done is True
+
+
 def test_cartesian_impedance_overlay_restores_toward_anchor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -466,6 +484,122 @@ def test_cartesian_impedance_overlay_aborts_large_displacement(
             qpos_rad=(0.0,) * 6,
             qvel_rad_s=(0.0,) * 6,
             max_displacement_m=0.02,
+        )
+
+
+def test_pose_impedance_overlay_restores_translation_and_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModel:
+        def forward_kinematics(self, qpos_rad: object) -> np.ndarray:
+            values = tuple(qpos_rad)
+            transform = np.eye(4)
+            transform[0, 3] = values[0]
+            cosine = np.cos(values[5])
+            sine = np.sin(values[5])
+            transform[:3, :3] = (
+                (cosine, -sine, 0.0),
+                (sine, cosine, 0.0),
+                (0.0, 0.0, 1.0),
+            )
+            return transform
+
+        def arm_jacobian(self, _qpos_rad: object) -> np.ndarray:
+            return np.eye(6)
+
+    def fake_map(
+        _model: object,
+        _qpos_rad: object,
+        wrench: object,
+        *,
+        qvel_rad_s: object,
+    ) -> object:
+        torque = tuple(wrench.as_vector())
+        qvel = tuple(qvel_rad_s)
+        power = sum(
+            value * velocity for value, velocity in zip(torque, qvel, strict=True)
+        )
+        return type(
+            "Mapping",
+            (),
+            {
+                "joint_torque_nm": torque,
+                "cartesian_power_w": power,
+                "joint_power_w": power,
+            },
+        )()
+
+    monkeypatch.setattr(
+        probe,
+        "map_world_aligned_ee_wrench_to_joint_torque",
+        fake_map,
+    )
+    spring = probe.B601PoseVirtualSpring(
+        anchor_pose=np.eye(4),
+        translational_stiffness_n_per_m=(20.0,) * 3,
+        translational_damping_n_s_per_m=(1.0,) * 3,
+        rotational_stiffness_nm_per_rad=(1.0,) * 3,
+        rotational_damping_nm_s_per_rad=(0.1,) * 3,
+        max_abs_force_n=(2.0,) * 3,
+        max_abs_torque_nm=(0.25,) * 3,
+    )
+
+    overlay, audit = probe.compute_pose_impedance_overlay(
+        FakeModel(),
+        spring,
+        qpos_rad=(0.01, 0.0, 0.0, 0.0, 0.0, 0.02),
+        qvel_rad_s=(0.0,) * 6,
+        max_displacement_m=0.02,
+        max_rotation_rad=0.05,
+    )
+
+    assert np.allclose(overlay, (-0.2, 0.0, 0.0, 0.0, 0.0, -0.02))
+    assert audit["displacement_norm_m"] == pytest.approx(0.01)
+    assert audit["rotation_error_norm_rad"] == pytest.approx(0.02)
+    assert audit["power_error_w"] == pytest.approx(0.0)
+
+
+def test_pose_impedance_overlay_aborts_excessive_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModel:
+        def forward_kinematics(self, _qpos_rad: object) -> np.ndarray:
+            transform = np.eye(4)
+            cosine = np.cos(0.06)
+            sine = np.sin(0.06)
+            transform[:3, :3] = (
+                (cosine, -sine, 0.0),
+                (sine, cosine, 0.0),
+                (0.0, 0.0, 1.0),
+            )
+            return transform
+
+        def arm_jacobian(self, _qpos_rad: object) -> np.ndarray:
+            return np.eye(6)
+
+    monkeypatch.setattr(
+        probe,
+        "map_world_aligned_ee_wrench_to_joint_torque",
+        lambda *_args, **_kwargs: pytest.fail("mapping must not run after abort"),
+    )
+    spring = probe.B601PoseVirtualSpring(
+        anchor_pose=np.eye(4),
+        translational_stiffness_n_per_m=(20.0,) * 3,
+        translational_damping_n_s_per_m=(1.0,) * 3,
+        rotational_stiffness_nm_per_rad=(1.0,) * 3,
+        rotational_damping_nm_s_per_rad=(0.1,) * 3,
+        max_abs_force_n=(2.0,) * 3,
+        max_abs_torque_nm=(0.25,) * 3,
+    )
+
+    with pytest.raises(probe.LowGainProbeError, match="rotation abort"):
+        probe.compute_pose_impedance_overlay(
+            FakeModel(),
+            spring,
+            qpos_rad=(0.0,) * 6,
+            qvel_rad_s=(0.0,) * 6,
+            max_displacement_m=0.02,
+            max_rotation_rad=0.05,
         )
 
 
@@ -1036,6 +1170,8 @@ def test_parser_help_is_read_only() -> None:
     assert args.apply_driver_torque_limits is False
     assert args.cartesian_stiffness_n_per_m == 20.0
     assert args.cartesian_max_displacement_m == 0.02
+    assert args.rotational_stiffness_nm_per_rad == 0.5
+    assert args.rotational_max_displacement_rad == pytest.approx(np.deg2rad(5.0))
 
 
 def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
@@ -1168,3 +1304,40 @@ def test_cartesian_cli_requires_all_six_joints_and_zero_joint_stiffness() -> Non
     nonzero_kp = _parse_cartesian_args("--kp", "0.1")
     with pytest.raises(ValueError, match="requires --kp 0"):
         probe._validate_cli(nonzero_kp)
+
+
+def _parse_pose_args(*extra: str) -> object:
+    return probe.build_parser().parse_args(
+        [
+            "--mode",
+            "pose-hold",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--kp",
+            "0",
+            "--support-joint",
+            "joint4",
+            "--support-joint",
+            "joint5",
+            "--support-joint",
+            "joint6",
+            "--allow-motion",
+            "--auto-disable",
+            "--confirmation",
+            probe.CONFIRMATION,
+            *extra,
+        ]
+    )
+
+
+def test_pose_cli_requires_all_six_joints_zero_joint_stiffness_and_safe_rotation() -> None:
+    probe._validate_cli(_parse_pose_args())
+
+    with pytest.raises(ValueError, match="requires --kp 0"):
+        probe._validate_cli(_parse_pose_args("--kp", "0.1"))
+    with pytest.raises(ValueError, match="rotational_max_displacement_rad"):
+        probe._validate_cli(
+            _parse_pose_args("--rotational-max-displacement-rad", "0.5")
+        )

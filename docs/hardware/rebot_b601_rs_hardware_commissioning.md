@@ -237,7 +237,9 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 探针默认只把目标关节和强制支撑关节 `joint2`、`joint3` 放入 active set，明确排除
 ID7 夹爪以及未选中的 arm 关节；因此第一档应从 `--joint joint1` 开始，且必须为
 `joint2`/`joint3` 和未选中的腕部关节提供机械支撑。`hold` 从使能后的当前姿态开始，
-不会跳到预设绝对姿态，`slow-step` 只在 hold 通过后以相对、有界步长运行。使能后先
+不会跳到预设绝对姿态；它就是静止 `qpos` 阻抗：固定最后一个 arming-settle 合法 q 为
+`q_ref`、固定 `dq_ref=0`，由软件唯一拥有 `Kp(q_ref-q)+Kd(dq_ref-dq)`。`slow-step`
+只在 hold 通过后以相对、有界步长运行。使能后先
 等待四个连续、完整、在限位内且近零速度的反馈快照；这段 arming-settle 期间不发送
 力矩帧，首个力矩参考固定在最后一个通过门禁的当前姿态。
 
@@ -314,7 +316,7 @@ MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort cei
 移动到示例姿态。操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，
 现场没有第二个 CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；当前
 J6 方案显式使能六个 arm 关节并锚定各自的使能后当前位置，但只有 J6 的 reference 可以
-变化。后述 `cartesian-hold` 同样必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
+变化。后述 `cartesian-hold` 和 `pose-hold` 同样必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
 运行；`safe_stop` 失能后负载可能下落，停止过程中仍需保持支撑。下面命令使用
 状态分支和显式 status 打印，不使用会让交接终端提前退出的 `set -euo pipefail`；
 命令由操作者在目标 worktree 中运行，我们不在自动流程中代运行。版本化文档保留
@@ -445,7 +447,10 @@ printf '%s\n' 'shell remains active'
 
 第一档只验收 `hold`：观察 J1..J6 是否都锚定在使能后当前位置、重力方向是否合理、阻尼
 是否耗散而非振荡；ID7 夹爪不参与。`active_joint_names` 的集合必须正好是 joint1..joint6，
-且没有任何关节 reference 变化。
+且没有任何关节 reference 变化。输出 JSON 的 `joint_impedance.enabled=true`、
+`reference_source=fresh_post_enable_settled_qpos`、`reference_velocity_rad_s` 全零且
+`vendor_kp/vendor_kd` 全零，共同确认这是单一软件 torque owner 下的静止 qpos 阻抗，
+而不是驱动器内部 PD 或预设姿态命令。
 正常控制的 `--velocity-abort-rad-s` 与故障保持候选门是两个独立安全层：某一帧低于正常
 运动中止阈值、但高于更严格的 `--fault-hold-max-velocity-rad-s` 时，该帧不会替换
 `last_safe`，但也不会单独中止正常 hold。JSON 的 `fault_hold_candidate_admission` 会记录
@@ -638,6 +643,76 @@ P4.1 的通用字段外，还应确认 `active_joint_names` 覆盖 joint1..joint
 `cartesian_impedance.anchor_source=fresh_post_enable_fk`、`position_tau_nm` 全程为零、
 `power_error_w` 接近数值零，且恢复力始终与 displacement 反向。20 Hz 下只能进行这种慢速
 commissioning；不得据此声明触觉带宽、接触稳定性或最终 impedance gains 已验收。
+
+### P4.3 当前末端 SE(3) 锚定的低增益位姿阻抗（操作者手动运行）
+
+`pose-hold` 是 P4.2 之后的独立模式，不改变旧 `cartesian-hold`。它在同一个四样本
+arming-settle 门后固定完整的 `base_link_T_gripper_end`，用
+`R_current R_anchor^T` 的最短 world-aligned rotation vector 表示姿态误差，并计算
+`[f, torque] = -K [translation, rotation] - D [linear velocity, angular velocity]`。
+完整 6D wrench 仍只经过现有 `LOCAL_WORLD_ALIGNED J^T` 映射、joint overlay 限幅和最终
+总力矩/slew 包络。该模式强制六个 arm 关节共同使能且 `--kp 0`，避免同时存在关节位置
+弹簧和任务空间弹簧；ID7 仍不参与。
+
+首次只允许不触碰保持 4 秒，并采用更低的旋转增益、力矩上限和 2 度姿态硬中止。下面是
+版本化模板，不是自动执行授权；实际交接仍须绑定干净 Task commit/tree、保持前台运行并
+记录完整命令/输出日志：
+
+```bash
+if cd "$WT"; then
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+      --mode pose-hold \
+      --config "$CFG" \
+      --rebot-source-root "$SRC" \
+      --duration-sec 4 \
+      --warmup-sec 2 \
+      --freeze-sec 1 \
+      --rate-hz 20 \
+      --joint joint1 \
+      --support-joint joint4 \
+      --support-joint joint5 \
+      --support-joint joint6 \
+      --kp 0 \
+      --kd 0.5 \
+      --gravity-scale 0.5 \
+      --torque-limit-scale 0.15 \
+      --torque-rise-time-sec 2.0 \
+      --velocity-abort-rad-s 0.05 \
+      --max-error-rad 0.15 \
+      --cartesian-stiffness-n-per-m 10 \
+      --cartesian-damping-n-s-per-m 0.5 \
+      --cartesian-max-force-n 1.0 \
+      --cartesian-max-displacement-m 0.01 \
+      --rotational-stiffness-nm-per-rad 0.2 \
+      --rotational-damping-nm-s-per-rad 0.03 \
+      --rotational-max-torque-nm 0.1 \
+      --rotational-max-displacement-rad 0.0349066 \
+      --cartesian-overlay-limit-scale 0.10 \
+      --allow-motion \
+      --auto-disable \
+      --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
+      --fault-hold-max-age-sec 0.15 \
+      --fault-hold-max-velocity-rad-s 0.02 \
+      --fault-hold-max-rebase-rad 0.05 \
+      --output "$OUT_DIR/b601_pose_hold_no_touch.json"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  printf 'probe exit code: %s\n' "$STATUS"
+  printf 'command and output log: %s\n' "$LOG"
+else
+  printf '%s\n' 'ERROR: worktree not found'
+fi
+printf '%s\n' 'shell remains active'
+```
+
+不触碰档先确认 `pose_impedance.enabled=true`、anchor 是 fresh post-enable FK、
+`joint_position_stiffness_disabled=true`、所有样本的 translation/rotation error 均未触发
+硬中止、`power_error_w` 接近数值零，并且 `position_tau_nm` 全程为零。之后如需人工施加
+姿态扰动，必须另行明确批准，单轴缓慢转动小于 1 度后放手；不得同时推移和扭转、不得
+接触环境或提高上述阈值。20 Hz 同步 `mechPos` 只足以做这种慢速符号/包络验收，不能证明
+动态 6D 阻抗稳定性、触觉频率或最终手感。
 
 ## 已使能力控仍然阻塞的契约
 
