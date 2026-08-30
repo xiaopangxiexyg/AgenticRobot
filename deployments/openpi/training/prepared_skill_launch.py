@@ -96,6 +96,26 @@ _EMPTY_CHECKPOINT_ROOT_ENTRIES = frozenset({"wandb", "wandb_id.txt"})
 OPENPI_SOURCE_IDENTITY_FILENAME = "OPENPI_SOURCE_IDENTITY.json"
 
 
+def _configure_camera_semantic_prepared_view_opt_in(
+    enabled: bool,
+) -> bool:
+    """Bind an explicit camera-only projection decision to worker processes."""
+
+    from dataset_interface.pipeline import (
+        CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV,
+    )
+
+    if not isinstance(enabled, bool):
+        raise TypeError(
+            "camera-semantic prepared-view opt-in must be a boolean."
+        )
+    if enabled:
+        os.environ[CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV] = "1"
+    else:
+        os.environ.pop(CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV, None)
+    return enabled
+
+
 def _corrected_wrist_background_overrides(
     profile: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -2638,6 +2658,14 @@ def main(argv: list[str] | None = None) -> int:
             "keep-mask path instead of checking numeric samples only."
         ),
     )
+    parser.add_argument(
+        "--allow-camera-semantic-prepared-view",
+        action="store_true",
+        help=(
+            "Explicitly opt this training process and its DataLoader workers "
+            "into validated non-tactile camera-semantic prepared views."
+        ),
+    )
     parser.add_argument("--model-rtc-profile", type=Path, default=None)
     parser.add_argument("--model-rtc-adapter-debug", action="store_true")
     parser.add_argument("--num-train-steps", type=int, default=None)
@@ -2665,6 +2693,21 @@ def main(argv: list[str] | None = None) -> int:
             "--model-rtc-profile is supported only by sample-check and train"
         )
     profile = _load_profile(args.profile)
+    camera_prepared_view_opt_in = (
+        _configure_camera_semantic_prepared_view_opt_in(
+            bool(args.allow_camera_semantic_prepared_view)
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "event": "openpi_camera_semantic_prepared_view_opt_in",
+                "enabled": camera_prepared_view_opt_in,
+                "profile_id": str(profile["profile_id"]),
+            },
+            sort_keys=True,
+        )
+    )
     if (
         profile.get("openpi_training_mode")
         == STANDARD_NON_RTC_TRAINING_MODE_V1

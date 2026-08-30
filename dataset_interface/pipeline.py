@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 from typing import Any, Mapping
@@ -12,6 +13,10 @@ from .camera_semantics import (
     camera_role_registry_from_environment,
     load_camera_role_binding,
 )
+from .camera_semantic_prepared_view import (
+    is_camera_semantic_prepared_view,
+    load_camera_semantic_prepared_view,
+)
 from .mask_source import FinalMaskSource
 from .metadata import DexTeleopDatasetIndex, InvalidTrainingDataError, TrainingEligibility
 from .missing_views import MissingViewResolver
@@ -22,6 +27,44 @@ from .random_background import (
     RandomBackgroundVideoAugmenter,
     default_real_image_root,
 )
+
+
+CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV = (
+    "DEXTELEOP_ALLOW_CAMERA_SEMANTIC_PREPARED_VIEW"
+)
+
+
+def _masked_pipeline_dataset_index(
+    dataset_root: str | Path,
+    *,
+    allow_camera_semantic_prepared_view: bool | None,
+) -> DexTeleopDatasetIndex:
+    """Open one source without weakening the default capture contract.
+
+    Camera-semantic prepared views are authenticated non-tactile projections.
+    Their projected ``modality_validity.json`` intentionally omits tactile
+    policy fields, so the generic full-dataset capture-contract parser must not
+    consume it.  An explicit constructor argument or exact process-local
+    launcher flag opts in; the manifest is still validated before capture
+    parsing is skipped.
+    """
+
+    root = Path(dataset_root).expanduser().resolve()
+    is_prepared_view = is_camera_semantic_prepared_view(root)
+    if not is_prepared_view:
+        return DexTeleopDatasetIndex(root)
+
+    allow = allow_camera_semantic_prepared_view
+    if allow is None:
+        allow = os.environ.get(CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV) == "1"
+    if not allow:
+        raise ValueError(
+            "Camera-semantic prepared views are non-tactile projections and "
+            "require explicit MaskedFramePipeline opt-in: "
+            f"{root}"
+        )
+    load_camera_semantic_prepared_view(root, verify_payload_hashes=False)
+    return DexTeleopDatasetIndex(root, parse_capture_contract=False)
 
 
 def convert_layout(image_bgr: np.ndarray, layout: ImageLayout) -> np.ndarray:
@@ -47,9 +90,15 @@ class MaskedFramePipeline:
         config: DatasetInterfaceConfig,
         *,
         real_image_provider: LocalImageBackgroundProvider | None = None,
+        allow_camera_semantic_prepared_view: bool | None = None,
     ):
         self.config = config
-        self.index = DexTeleopDatasetIndex(config.dataset_root)
+        self.index = _masked_pipeline_dataset_index(
+            config.dataset_root,
+            allow_camera_semantic_prepared_view=(
+                allow_camera_semantic_prepared_view
+            ),
+        )
         self._camera_role_binding = config.camera_role_binding
         self._camera_role_registry = camera_role_registry_from_environment()
         self.camera_semantics: DatasetCameraSemanticResolver | None = None

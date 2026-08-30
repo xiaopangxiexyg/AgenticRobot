@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import types
@@ -12,6 +13,9 @@ import pytest
 
 from dataset_interface.prepared_training.skill_selection import (
     _successful_complete_projection,
+)
+from dataset_interface.pipeline import (
+    CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV,
 )
 from deployments.openpi.training.prepared_skill import (
     OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1,
@@ -31,6 +35,7 @@ from deployments.openpi.training.prepared_skill import (
 from deployments.openpi.training.prepared_skill_launch import (
     _CheckpointBoundPreparedResume,
     _TrainCheckpointPolicy,
+    _configure_camera_semantic_prepared_view_opt_in,
     _load_module,
     _load_checkpoint_bound_prepared_resume,
     _load_profile,
@@ -73,6 +78,24 @@ class _FakeOpenPITrainConfig:
     @property
     def assets_dirs(self) -> Path:
         return (Path(self.assets_base_dir) / self.name).resolve()
+
+
+def test_prepared_launcher_binds_camera_prepared_view_opt_in_from_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV,
+        "ambient-value-must-not-win",
+    )
+
+    assert _configure_camera_semantic_prepared_view_opt_in(True) is True
+    assert os.environ[CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV] == "1"
+
+    assert _configure_camera_semantic_prepared_view_opt_in(False) is False
+    assert CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV not in os.environ
+
+    with pytest.raises(TypeError, match="must be a boolean"):
+        _configure_camera_semantic_prepared_view_opt_in("true")  # type: ignore[arg-type]
 
 
 def test_successful_skill_projection_survives_later_coarse_abort() -> None:
