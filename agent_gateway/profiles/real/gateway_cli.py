@@ -27,13 +27,13 @@ from teleop_runtime.skill_deploy import (
 )
 
 from .exclusive_application import ExclusiveRealSkillApplicationState
-from .one_shot_authorization import (
-    REAL_AGENT_PRIMITIVE_ACTIONS,
-    REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
-)
 from .rm65_composition import (
     ExclusiveRM65AgentPrimitiveComposition,
     assemble_exclusive_rm65_agent_primitive_composition,
+)
+from .session_authorization import (
+    REAL_AGENT_PRIMITIVE_ACTIONS,
+    REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
 )
 
 
@@ -88,22 +88,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--authorized-action",
         choices=REAL_AGENT_PRIMITIVE_ACTIONS,
-        help="one reviewed primitive action (compatibility form)",
+        help="one reviewed primitive action allowed for this process session",
     )
     parser.add_argument(
         "--authorized-actions",
         choices=REAL_AGENT_PRIMITIVE_ACTIONS,
         nargs="+",
         help=(
-            "one or more reviewed primitive actions allowed for this temporary "
-            "test profile"
+            "one or more reviewed primitive actions allowed for this persistent "
+            "Gateway process session"
         ),
     )
     parser.add_argument(
         "--confirm",
         required=True,
         help=(
-            "must exactly equal " + REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN
+            "must exactly equal " + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
         ),
     )
     parser.add_argument("--client-id", default="rpent.dexteleop")
@@ -230,9 +230,9 @@ def _ready_payload(
         "authorized_action": composition.authorized_action,
         "authorized_actions": list(authorized_actions),
         "authorization_scope": (
-            "one_matching_skill_request"
+            "persistent_session_matching_action"
             if len(authorized_actions) == 1
-            else "one_request_from_listed_primitive_actions"
+            else "persistent_session_listed_primitive_actions"
         ),
         "perception": (
             None
@@ -283,10 +283,10 @@ def _stopped_payload(
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.confirm != REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN:
+    if args.confirm != REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN:
         parser.error(
             "--confirm must exactly equal "
-            + REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN
+            + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
         )
     if (args.authorized_action is None) == (args.authorized_actions is None):
         parser.error(

@@ -252,6 +252,28 @@ class ExclusiveRealSkillControlRuntime:
             )
         return receipt.succeeded
 
+    def _resume_confirmed_hold_for_pending_activation(self) -> bool:
+        """Reopen only a successful HOLD that now has a new activation."""
+
+        if self.motion_port.snapshot().phase != RealAgentMotionPhase.PENDING_ACTIVATION:
+            return False
+        with self._lock:
+            if self._lifecycle != RealSkillControlLifecycle.HOLD:
+                return False
+            receipt = self._last_hold_receipt
+            if receipt is None or not receipt.succeeded:
+                self._lifecycle = RealSkillControlLifecycle.FAULT
+                raise RuntimeError(
+                    "exclusive Skill runtime cannot resume without a successful "
+                    "lower HOLD receipt."
+                )
+            # The previous receipt proves only the previous terminal boundary.
+            # Clear it before exposing RUNNING so shutdown or completion must
+            # obtain new lower HOLD evidence for the new operation.
+            self._last_hold_receipt = None
+            self._lifecycle = RealSkillControlLifecycle.RUNNING
+            return True
+
     def step(self, *, now: float | None = None) -> RealSkillControlStep:
         with self._cycle_lock:
             return self._step(now=now)
@@ -282,6 +304,7 @@ class ExclusiveRealSkillControlRuntime:
             available_at=control_cut_at,
             source_evidence_refs=cut.evidence_refs,
         )
+        self._resume_confirmed_hold_for_pending_activation()
         snapshot = self.motion_port.apply_control_owner_requests(
             owner=self,
             now=control_cut_at,

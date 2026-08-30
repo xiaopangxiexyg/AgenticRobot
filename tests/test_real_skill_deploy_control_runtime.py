@@ -89,14 +89,19 @@ def _port(builder: _TargetBuilder) -> RealAgentMotionPort:
     )
 
 
-def _activation() -> RealAgentMotionActivation:
+def _activation(
+    *,
+    suffix: str = "test",
+    submitted_at: float = 1.0,
+    expires_at: float = 10.0,
+) -> RealAgentMotionActivation:
     target = np.eye(4)
     target[0, 3] = 0.03
     return RealAgentMotionActivation(
-        operation_id="operation:test",
-        request_id="request:test",
-        activation_grant_id="grant:test",
-        activation_grant_hash="grant-hash:test",
+        operation_id=f"operation:{suffix}",
+        request_id=f"request:{suffix}",
+        activation_grant_id=f"grant:{suffix}",
+        activation_grant_hash=f"grant-hash:{suffix}",
         component_id="left_arm",
         side="left",
         primitive_id="tcp_step_forward",
@@ -106,8 +111,8 @@ def _activation() -> RealAgentMotionActivation:
         execution_frame_spec_hash="frame-spec:test",
         measured_state_revision=0,
         measured_state_hash="measured:test",
-        submitted_at=1.0,
-        expires_at=10.0,
+        submitted_at=submitted_at,
+        expires_at=expires_at,
     )
 
 
@@ -180,6 +185,113 @@ def test_independent_runtime_owns_dispatch_and_lower_confirmed_hold() -> None:
 
     runtime.close()
     assert runtime.lifecycle == RealSkillControlLifecycle.CLOSED
+
+
+def test_confirmed_hold_reopens_only_for_a_new_pending_activation() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    dispatched: list[TeleopCommand] = []
+    hold_reasons: list[str] = []
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=_observation_cut,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: (
+            dispatched.append(command)
+            or RealSkillMotionDispatchReceipt(
+                succeeded=True,
+                evidence_refs=(f"rm65-dispatch:{len(dispatched)}",),
+            )
+        ),
+        hold_controller=lambda reason: (
+            hold_reasons.append(reason)
+            or RealSkillMotionHoldReceipt(
+                succeeded=True,
+                evidence_refs=(f"rm65-hold:{len(hold_reasons)}",),
+            )
+        ),
+    )
+    runtime.start()
+    port.submit_activation(_activation(suffix="first"))
+    first_active = runtime.step(now=2.0)
+    assert first_active.port_snapshot.phase == RealAgentMotionPhase.ACTIVE
+
+    port.request_hold(
+        operation_id="operation:first",
+        reason="skill_completed",
+        requested_at=2.1,
+    )
+    first_held = runtime.step(now=2.2)
+    assert first_held.lifecycle == RealSkillControlLifecycle.HOLD
+    assert first_held.port_snapshot.phase == RealAgentMotionPhase.HELD
+    first_receipt = runtime.last_hold_receipt
+    assert first_receipt is not None and first_receipt.succeeded
+
+    idle_held = runtime.step(now=2.3)
+    assert idle_held.lifecycle == RealSkillControlLifecycle.HOLD
+    assert idle_held.port_snapshot.phase == RealAgentMotionPhase.HELD
+    assert runtime.last_hold_receipt is first_receipt
+
+    port.submit_activation(
+        _activation(suffix="second", submitted_at=2.4, expires_at=10.0)
+    )
+    second_active = runtime.step(now=2.5)
+
+    assert second_active.lifecycle == RealSkillControlLifecycle.RUNNING
+    assert second_active.port_snapshot.phase == RealAgentMotionPhase.ACTIVE
+    assert second_active.port_snapshot.operation_id == "operation:second"
+    assert second_active.dispatch_succeeded is True
+    assert runtime.last_hold_receipt is None
+    assert len(dispatched) == 2
+
+    port.request_hold(
+        operation_id="operation:second",
+        reason="skill_completed",
+        requested_at=2.6,
+    )
+    second_held = runtime.step(now=2.7)
+    assert second_held.lifecycle == RealSkillControlLifecycle.HOLD
+    assert second_held.port_snapshot.phase == RealAgentMotionPhase.HELD
+    assert len(hold_reasons) == 2
+
+
+def test_failed_lower_hold_never_becomes_a_rearmable_session_boundary() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=_observation_cut,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: RealSkillMotionDispatchReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-dispatch:test",),
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=False,
+            evidence_refs=("rm65-hold-failed:test",),
+        ),
+    )
+    runtime.start()
+    port.submit_activation(_activation())
+    runtime.step(now=2.0)
+    port.request_hold(
+        operation_id="operation:test",
+        reason="skill_completed",
+        requested_at=2.1,
+    )
+
+    failed_hold = runtime.step(now=2.2)
+
+    assert failed_hold.lifecycle == RealSkillControlLifecycle.FAULT
+    assert failed_hold.port_snapshot.phase == RealAgentMotionPhase.FAULTED
+    assert runtime.last_hold_receipt is not None
+    assert runtime.last_hold_receipt.succeeded is False
+    with pytest.raises(RuntimeError, match="busy in phase faulted"):
+        port.submit_activation(
+            _activation(suffix="second", submitted_at=2.3, expires_at=10.0)
+        )
 
 
 def test_failed_dispatch_fails_closed_through_same_hold_owner() -> None:

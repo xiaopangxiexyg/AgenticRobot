@@ -22,6 +22,9 @@ from agent_gateway.profiles.real.observation_gateway import (
     RealControlOwnerState,
     RealTcpPoseObserveAttachmentSpec,
 )
+from agent_gateway.profiles.real.one_shot_authorization import (
+    RealAgentPrimitiveOneShotAuthorization,
+)
 from agent_gateway.profiles.real.perception_deployment import (
     build_real_perception_capture_registration,
 )
@@ -29,9 +32,9 @@ from agent_gateway.profiles.real.realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
 )
-from agent_gateway.profiles.real.one_shot_authorization import (
-    REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
-    RealAgentPrimitiveOneShotAuthorization,
+from agent_gateway.profiles.real.session_authorization import (
+    REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+    RealAgentPrimitiveSessionAuthorization,
 )
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.protocol.skill_catalog import SkillDeploymentSafetyEnvelopeRef
@@ -120,6 +123,13 @@ class _OwnerSession:
     def hold_hardware(self, reason, *, require_home_recalibration=False):
         self.holds.append((reason, require_home_recalibration))
         self.state_machine.state = TeleopRunState.DEBUG_ONLY
+        return True
+
+
+class _PersistentOwnerSession(_OwnerSession):
+    def hold_hardware(self, reason, *, require_home_recalibration=False):
+        self.holds.append((reason, require_home_recalibration))
+        self.state_machine.state = TeleopRunState.ARMED
         return True
 
 
@@ -256,7 +266,15 @@ def _owner_state(bundle, *, captured_at: float) -> RealControlOwnerState:
     )
 
 
-def _request(bundle, snapshot, *, skill_id: str, direction: str | None):
+def _request(
+    bundle,
+    snapshot,
+    *,
+    skill_id: str,
+    direction: str | None,
+    client_sequence: int = 1,
+    request_suffix: str | None = None,
+):
     entry = bundle.route_manifest.route(skill_id, "1")
     route = entry.route
     if skill_id == "motion.step_tcp_cardinal" or skill_id in (
@@ -289,11 +307,12 @@ def _request(bundle, snapshot, *, skill_id: str, direction: str | None):
             "calibration_hash": profile.calibration_hash,
             "primitive_hash": profile.primitive.semantic_content_hash,
         }
+    identity = request_suffix or direction or "fixed"
     return AgentSkillRequest(
         client_id=CLIENT_ID,
-        request_id=f"request:{skill_id}:{direction or 'fixed'}",
-        idempotency_key=f"idempotency:{skill_id}:{direction or 'fixed'}",
-        client_sequence=1,
+        request_id=f"request:{skill_id}:{identity}",
+        idempotency_key=f"idempotency:{skill_id}:{identity}",
+        client_sequence=client_sequence,
         runtime_session_id=bundle.route_manifest.runtime_session_id,
         skill_route_manifest_hash=bundle.route_manifest.semantic_content_hash,
         expected_station_revision=snapshot.station_revision,
@@ -431,18 +450,20 @@ def test_real_gateway_reads_tcp_pose_without_consuming_motion_grant() -> None:
         allowed_client_ids=(CLIENT_ID,),
         clock=clock,
     )
-    authorization = RealAgentPrimitiveOneShotAuthorization(
+    authorization = RealAgentPrimitiveSessionAuthorization(
         gateway_session=gateway,
         side="right",
         action="forward",
         client_id=CLIENT_ID,
-        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         clock=clock,
     )
     snapshot = gateway.observation_producer.capture_and_publish(
         gateway.service
     ).snapshot
     assert snapshot is not None
+    assert authorization.grant_resolver(_read_request(bundle, snapshot)) is None
+    assert authorization.grants_issued == 0
     raw_revision_before_refresh = port.snapshot().revision
     port.publish_measured_pose(
         pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
@@ -725,7 +746,7 @@ def test_real_gateway_refuses_a_port_from_another_execution_binding() -> None:
         )
 
 
-def test_one_shot_authorization_issues_exactly_one_bound_grant() -> None:
+def test_session_authorization_issues_a_distinct_bound_grant_per_request() -> None:
     bundle, port, _ = _runtime_fixture()
     clock = _Clock()
     owner_state = _owner_state(bundle, captured_at=clock())
@@ -746,36 +767,69 @@ def test_one_shot_authorization_issues_exactly_one_bound_grant() -> None:
         gateway.service,
     ).snapshot
     assert snapshot is not None
-    request = _request(
+    first_request = _request(
         bundle,
         snapshot,
-        skill_id=FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1["forward"],
+        skill_id="motion.step_tcp_cardinal",
         direction="forward",
+        client_sequence=1,
+        request_suffix="session-1",
     )
-    authorization = RealAgentPrimitiveOneShotAuthorization(
+    second_request = _request(
+        bundle,
+        snapshot,
+        skill_id="motion.step_tcp_cardinal",
+        direction="backward",
+        client_sequence=2,
+        request_suffix="session-2",
+    )
+    authorization = RealAgentPrimitiveSessionAuthorization(
         gateway_session=gateway,
         side="right",
-        action="forward",
+        authorized_actions=("forward", "backward"),
         client_id=CLIENT_ID,
-        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         clock=clock,
     )
 
-    mismatched = replace(
-        request,
-        parameters={**request.parameters, "direction": "backward"},
+    mismatched_client = replace(first_request, client_id="another-client")
+    mismatched_side = replace(
+        first_request,
+        parameters={**first_request.parameters, "component_id": "left_arm"},
     )
-    assert authorization.grant_resolver(mismatched) is None
-    grant = authorization.grant_resolver(request)
+    unlisted_action = replace(
+        first_request,
+        parameters={**first_request.parameters, "direction": "right"},
+    )
+    assert authorization.grant_resolver(mismatched_client) is None
+    assert authorization.grant_resolver(mismatched_side) is None
+    assert authorization.grant_resolver(unlisted_action) is None
+    assert authorization.grants_issued == 0
 
-    assert grant is not None
-    assert grant.client_id == CLIENT_ID
-    assert grant.max_invocations == 1
+    first_grant = authorization.grant_resolver(first_request)
+    second_grant = authorization.grant_resolver(second_request)
+
+    assert first_grant is not None
+    assert second_grant is not None
+    assert first_grant.grant_id != second_grant.grant_id
+    assert first_grant.client_id == second_grant.client_id == CLIENT_ID
+    assert first_grant.max_invocations == second_grant.max_invocations == 1
+    assert (
+        first_grant.authorized_request_hash
+        == first_request.authorization_content_hash
+    )
+    assert (
+        second_grant.authorized_request_hash
+        == second_request.authorization_content_hash
+    )
+    assert first_grant.operator_authorization_receipt_id == (
+        second_grant.operator_authorization_receipt_id
+    )
+    assert authorization.grants_issued == 2
     assert authorization.grant_issued is True
-    assert authorization.grant_resolver(request) is None
 
 
-def test_one_shot_authorization_requires_exact_operator_confirmation() -> None:
+def test_session_authorization_rejects_the_retired_one_shot_confirmation() -> None:
     bundle, port, _ = _runtime_fixture()
     clock = _Clock()
     gateway = assemble_real_agent_primitive_gateway_session(
@@ -790,17 +844,24 @@ def test_one_shot_authorization_requires_exact_operator_confirmation() -> None:
     )
 
     with pytest.raises(ValueError, match="confirmation token"):
-        RealAgentPrimitiveOneShotAuthorization(
+        RealAgentPrimitiveSessionAuthorization(
             gateway_session=gateway,
             side="right",
             action="forward",
             client_id=CLIENT_ID,
-            confirmation_token="not-authorized",
+            confirmation_token="AUTHORIZE_ONE_REAL_TCP_PRIMITIVE",
             clock=clock,
         )
 
 
-def test_one_shot_authorization_accepts_one_request_from_listed_actions() -> None:
+def test_historic_one_shot_authorization_import_is_a_session_alias() -> None:
+    assert (
+        RealAgentPrimitiveOneShotAuthorization
+        is RealAgentPrimitiveSessionAuthorization
+    )
+
+
+def test_session_authorization_accepts_requests_from_listed_actions() -> None:
     bundle, port, _ = _runtime_fixture()
     clock = _Clock()
     port.publish_measured_pose(
@@ -826,18 +887,110 @@ def test_one_shot_authorization_accepts_one_request_from_listed_actions() -> Non
         skill_id=FIXED_CARDINAL_TCP_STEP_SKILL_ID_BY_DIRECTION_V1["backward"],
         direction="backward",
     )
-    authorization = RealAgentPrimitiveOneShotAuthorization(
+    authorization = RealAgentPrimitiveSessionAuthorization(
         gateway_session=gateway,
         side="right",
         authorized_actions=("forward", "backward"),
         client_id=CLIENT_ID,
-        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
         clock=clock,
     )
     grant = authorization.grant_resolver(request)
     assert grant is not None
     assert authorization.action is None
     assert authorization.authorized_actions == ("backward", "forward")
+
+
+def test_one_gateway_session_executes_two_motion_requests_and_holds_between() -> None:
+    bundle, port, target_builder = _runtime_fixture()
+    clock = _Clock()
+    owner_session = _PersistentOwnerSession()
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:persistent-session-initial",),
+    )
+    owner_state = _owner_state(bundle, captured_at=clock())
+    publish_sequence = 0
+
+    def owner_sleep(duration: float) -> None:
+        nonlocal publish_sequence
+        clock.value += duration
+        lower = port.apply_owner_requests(session=owner_session, now=clock())
+        if lower.phase != RealAgentMotionPhase.ACTIVE:
+            return
+        observation = TeleopObservation(timestamp=clock())
+        command = port.command_for_observation(observation, clock())
+        assert isinstance(command, TeleopCommand)
+        assert port.admit_command(command, observation, clock())
+        port.observe_session_step(command=command, command_dispatched=True)
+        assert target_builder.last_target is not None
+        publish_sequence += 1
+        port.publish_measured_pose(
+            pose_world_by_component={
+                COMPONENT_ID: target_builder.last_target.target_pose_by_side["right"]
+            },
+            measured_at=clock(),
+            available_at=clock(),
+            source_evidence_refs=(
+                f"real-hardware-cut:persistent-session-{publish_sequence}",
+            ),
+        )
+
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: owner_state,
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+        sleep=owner_sleep,
+    )
+    authorization = RealAgentPrimitiveSessionAuthorization(
+        gateway_session=gateway,
+        side="right",
+        authorized_actions=("forward", "backward"),
+        client_id=CLIENT_ID,
+        confirmation_token=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+        clock=clock,
+    )
+    adapter = gateway.wire_adapter(
+        authenticated_client_id=CLIENT_ID,
+        grant_resolver=authorization.grant_resolver,
+    )
+    operation_ids = []
+
+    for client_sequence, direction in enumerate(("forward", "backward"), start=1):
+        observation = gateway.observation_producer.capture_and_publish(
+            gateway.service
+        )
+        assert observation.accepted and observation.snapshot is not None
+        request = _request(
+            bundle,
+            observation.snapshot,
+            skill_id="motion.step_tcp_cardinal",
+            direction=direction,
+            client_sequence=client_sequence,
+            request_suffix=f"persistent-session-{client_sequence}",
+        )
+
+        submission = adapter.submit_skill_request(request.to_wire())
+
+        assert submission["accepted"] is True
+        assert submission["operation"] is not None
+        operation_id = submission["operation"]["operation_id"]
+        operation_ids.append(operation_id)
+        assert gateway.wait(timeout_sec=1.0)
+        operation = gateway.service.get_operation(operation_id)
+        assert operation is not None
+        assert operation.status == "completed"
+        assert operation.execution_result is not None
+        assert port.snapshot().phase == RealAgentMotionPhase.HELD
+
+    assert len(set(operation_ids)) == 2
+    assert authorization.grants_issued == 2
+    assert len(owner_session.holds) == 2
+    assert gateway.close().accepted
 
 
 def test_real_gateway_applies_only_an_explicit_session_admission_budget() -> None:
