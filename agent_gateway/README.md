@@ -462,6 +462,54 @@ independent launcher is the preferred path. `one_shot_client` is only an
 authenticated one-request
 Unix client and never initializes or dispatches hardware itself.
 
+The absolute grasp-pose Route is authorized explicitly with
+`--authorized-action move_tcp_to_pose`; publishing the Route without this
+operator action does not mint a motion Grant. The matching local client accepts
+only an actual tool-TCP pose in the Gateway-advertised `canonical_station`
+frame. For example, after an independently authorized and admitted real Gateway
+session is already RUNNING/READY:
+
+```bash
+python -m agent_gateway.profiles.real.one_shot_client \
+  --socket-path /absolute/private/gateway.sock \
+  --side right \
+  --action move_tcp_to_pose \
+  --target-xyz-m 0.31 -0.12 0.28 \
+  --target-quat-xyzw 0 0 0 1 \
+  --speed-scale 0.20 \
+  --confirm EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE
+```
+
+This is an Active real-motion request, not a probe or dry run. Do not run it
+without the real-hardware authorization and site safety checks. The client
+normalizes the quaternion, derives all frame/tool/calibration identities from
+the same fresh observation and advertised schema, and rejects incomplete poses,
+wrong components, stale identity disagreement, and speed scales outside the
+reviewed profile. The request still passes the lower TCP envelope, coupled IK,
+collision/jump/singularity gates, dispatch admission, convergence evaluation,
+and terminal HOLD proof.
+
+The MuJoCo arbitrary-grasp viewer and the real Skill deliberately do not accept
+the same numeric input frame. The viewer's explicit input is
+`selected_arm_base_from_actual_dmtac_tool_tcp`, while the real Skill public
+input is `canonical_station_from_actual_dmtac_tool_tcp`. The physical pose
+conversion is:
+
+```text
+T_canonical_station_tool_tcp
+  = inverse(T_solver_world_canonical_station)
+  @ T_solver_world_selected_arm_base
+  @ T_selected_arm_base_tool_tcp
+```
+
+Both transforms must come from the exact selected collision-scene URDF/profile;
+never substitute the sim world origin, copy a numeric arm-base pose into the
+real request, or hard-code the DMTAC flange/TCP offset. A camera-frame grasp
+proposal must first use the admitted perception result's
+`T_canonical_station_camera_optical_frame` and the same pinned Station revision
+to become a canonical-Station tool-TCP target. The lower target owner then does
+the one and only tool-TCP-to-solver-endpoint conversion described below.
+
 ## Skill and execution boundary
 
 The default-off MuJoCo profile publishes one lower motion domain with separate
