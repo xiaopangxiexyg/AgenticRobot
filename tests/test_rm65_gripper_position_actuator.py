@@ -163,3 +163,15 @@ def test_gripper_snapshot_bootstrap_preserves_absolute_command_clock(
     actuator.queue_targets({"left": 1.0})
     tick = actuator.step(physics_time_sec=0.0, timestep_sec=0.001)
     assert tick.accepted_by_side["left"] is True
+def test_gripper_snapshot_rejects_negative_command_deadline(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "fit.json"
+    _write_artifact(artifact_path)
+    profile = DmtacPositionActuationProfile.from_fit_artifact(artifact_path)
+    source = DmtacPositionActuator(profile)
+    source.reset({"left": 0.0})
+    snapshot = source.snapshot()
+    snapshot["next_command_time_by_side"]["left"] = -1.0
+
+    restored = DmtacPositionActuator(profile)
+    with pytest.raises(ValueError, match="next_command_time_by_side.*invalid"):
+        restored.reset({"left": 0.0}, initial_state=snapshot)

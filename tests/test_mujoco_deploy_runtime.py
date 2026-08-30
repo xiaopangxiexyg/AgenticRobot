@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 from dataclasses import replace
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -210,6 +211,73 @@ def build_runtime(
         clock=actual_clock,
     )
     return runtime, scene, actual_clock
+
+
+def test_runtime_start_failure_does_not_leave_a_live_execution_rig(
+    monkeypatch,
+) -> None:
+    runtime, _scene, _clock = build_runtime()
+
+    def fail_activation(**_kwargs):
+        raise RuntimeError("synthetic producer activation failure")
+
+    monkeypatch.setattr(runtime.core, "activate_producer", fail_activation)
+    with pytest.raises(RuntimeError, match="synthetic producer activation failure"):
+        runtime.start()
+
+    assert runtime._started is False
+    assert runtime.rig.is_ready() is False
+    with pytest.raises(RuntimeError, match="fresh runtime"):
+        runtime.start()
+
+
+def test_runtime_close_stops_execution_before_terminal_trace_and_can_retry(
+    monkeypatch,
+) -> None:
+    runtime, _scene, _clock = build_runtime()
+    runtime.start()
+    original = runtime.core.close_trace
+    fail_once = True
+
+    def fail_terminal_trace(*args, **kwargs):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise RuntimeError("synthetic terminal trace failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.core, "close_trace", fail_terminal_trace)
+    with pytest.raises(RuntimeError, match="synthetic terminal trace failure"):
+        runtime.close()
+
+    assert runtime._started is False
+    assert runtime.rig.is_ready() is False
+    runtime.close()
+    assert runtime._lifecycle_terminal is True
+    assert runtime._lifecycle_entered is False
+    with pytest.raises(RuntimeError, match="fresh runtime"):
+        runtime.start()
+
+
+def test_runtime_rejects_lossy_control_identity_and_tick_counts() -> None:
+    runtime, _scene, _clock = build_runtime()
+    with pytest.raises(ValueError, match="producer_epoch.*non-negative integer"):
+        replace(runtime.config, producer_epoch=1.5)
+
+    runtime.start()
+    try:
+        with pytest.raises(
+            ValueError,
+            match="physics_ticks_after_dispatch.*non-negative integer",
+        ):
+            runtime.step(physics_ticks_after_dispatch=1.5)
+        with pytest.raises(ValueError, match="producer_epoch.*non-negative integer"):
+            runtime.activate_policy_node_producer(
+                "fixture-policy-node",
+                producer_epoch=True,
+            )
+    finally:
+        runtime.close()
 
 
 def test_composition_binding_preserves_runtime_compatibility_views() -> None:
@@ -1101,6 +1169,109 @@ def test_scheduled_qpos_receiver_admits_future_segment_without_early_activation(
         implementation_status="runtime_integrated",
     )
     assert evaluate_control_trace_lineage(runtime.trace_facts, profile=profile) == ()
+
+
+def test_scheduled_dispatch_does_not_hold_receiver_lock_while_waiting_for_rig(
+    monkeypatch,
+) -> None:
+    """The control-plane and physics lock order must not form a cycle."""
+
+    clock = ManualClock()
+    scene = FakeScene()
+    rig = MujocoPositionExecutionRig(
+        scene,
+        MujocoPositionExecutionConfig(
+            timing=timing(),
+            actuation_profile=None,
+            gripper_actuation_profile=None,
+            realtime_worker=False,
+            follow_qpos_alpha=1.0,
+        ),
+        monotonic_clock=clock,
+    )
+    runtime = MujocoDeployRuntime(
+        rig,
+        MujocoDeployConfig(
+            reference_activation_profile_id=SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
+        ),
+        clock=clock,
+    )
+    runtime.start()
+    runtime.submit_policy_action(action(0.25, -0.25), policy_output_id="lock-order")
+    assert runtime.reference_receiver is not None
+
+    entered_measurement = threading.Event()
+    release_measurement = threading.Event()
+    original_measurement = rig.measured_qpos_by_side
+
+    def blocked_measurement():
+        entered_measurement.set()
+        assert release_measurement.wait(timeout=1.0)
+        return original_measurement()
+
+    monkeypatch.setattr(rig, "measured_qpos_by_side", blocked_measurement)
+    entered_rig_submission = threading.Event()
+    release_rig_submission = threading.Event()
+    original_submission = rig.send_scheduled_commands
+
+    def blocked_submission(*args, **kwargs):
+        entered_rig_submission.set()
+        assert release_rig_submission.wait(timeout=1.0)
+        return original_submission(*args, **kwargs)
+
+    monkeypatch.setattr(rig, "send_scheduled_commands", blocked_submission)
+
+    result: list[object] = []
+    failure: list[BaseException] = []
+
+    def dispatch() -> None:
+        try:
+            result.append(runtime.step(now=clock.value))
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failure.append(exc)
+
+    worker = threading.Thread(target=dispatch, daemon=True)
+    worker.start()
+    try:
+        assert entered_measurement.wait(timeout=1.0)
+        measurement_receiver_available = threading.Event()
+
+        def inspect_during_measurement() -> None:
+            runtime.reference_receiver.terminals
+            measurement_receiver_available.set()
+
+        measurement_inspector = threading.Thread(
+            target=inspect_during_measurement,
+            daemon=True,
+        )
+        measurement_inspector.start()
+        assert measurement_receiver_available.wait(timeout=0.5), (
+            "scheduled dispatch retained the receiver lock while reading the Rig"
+        )
+        release_measurement.set()
+        assert entered_rig_submission.wait(timeout=1.0)
+
+        receiver_available = threading.Event()
+
+        def inspect_receiver() -> None:
+            runtime.reference_receiver.terminals
+            receiver_available.set()
+
+        inspector = threading.Thread(target=inspect_receiver, daemon=True)
+        inspector.start()
+        assert receiver_available.wait(timeout=0.5), (
+            "scheduled dispatch retained the receiver lock while blocked on "
+            "the Rig lock"
+        )
+    finally:
+        release_measurement.set()
+        release_rig_submission.set()
+
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert not failure
+    assert result and result[0].status == "dispatched"
+    runtime.close()
 
 
 def test_scheduled_qpos_receiver_uses_previous_endpoint_and_cancels_pending() -> None:
@@ -2707,32 +2878,30 @@ def test_shared_safety_fault_cancels_and_latches_next_gate_cut() -> None:
     assert runtime.core.execution_epoch == faulted.cancellation.execution_epoch
 
 
-def test_start_rolls_back_trace_and_rig_after_post_rig_failure() -> None:
+def test_start_terminalizes_trace_without_starting_rig_after_control_failure() -> None:
     runtime, _scene, _clock = build_runtime()
     events: list[str] = []
     runtime.rig.start = lambda: events.append("rig.start")
     runtime.rig.close = lambda: events.append("rig.close")
     runtime.core.close_trace = lambda: events.append("trace.close")
 
-    def fail_after_rig_start() -> None:
+    def fail_before_rig_start() -> None:
         events.append("core.configure")
         raise RuntimeError("synthetic core startup failure")
 
-    runtime.core.record_compound_authority_profiles = fail_after_rig_start
+    runtime.core.record_compound_authority_profiles = fail_before_rig_start
 
     with pytest.raises(RuntimeError, match="synthetic core startup failure"):
         runtime.start()
 
     assert events == [
-        "rig.start",
         "core.configure",
         "trace.close",
-        "rig.close",
     ]
     assert runtime._started is False
 
 
-def test_close_does_not_short_circuit_trace_or_rig_after_sync_failure() -> None:
+def test_close_retries_trace_sync_after_rig_is_quiescent() -> None:
     runtime, _scene, _clock = build_runtime()
     runtime.start()
     events: list[str] = []
@@ -2748,8 +2917,20 @@ def test_close_does_not_short_circuit_trace_or_rig_after_sync_failure() -> None:
     with pytest.raises(RuntimeError, match="synthetic trace sync failure"):
         runtime.close()
 
-    assert events == ["trace.sync", "trace.close", "rig.close"]
+    assert events == ["rig.close", "trace.sync"]
     assert runtime._started is False
+    assert runtime._rig_close_pending is False
+    assert runtime._trace_close_pending is True
+
+    runtime._sync_reference_trace = lambda: events.append("trace.sync:retry")
+    runtime.close()
+
+    assert events == [
+        "rig.close",
+        "trace.sync",
+        "trace.sync:retry",
+        "trace.close",
+    ]
 
 
 def test_close_retries_only_the_resource_that_remains_pending() -> None:
@@ -2777,10 +2958,10 @@ def test_close_retries_only_the_resource_that_remains_pending() -> None:
     runtime.close()
 
     assert events == [
-        "trace.sync",
-        "trace.close",
         "rig.close:1",
         "rig.close:2",
+        "trace.sync",
+        "trace.close",
     ]
     assert runtime._started is False
 
@@ -2789,11 +2970,12 @@ def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
     runtime, _scene, _clock = build_runtime()
     events: list[str] = []
     rig_close_attempts = 0
-    runtime.rig.start = lambda: events.append("rig.start")
+    runtime._sync_reference_trace = lambda: events.append("trace.sync")
     runtime.core.close_trace = lambda: events.append("trace.close")
 
-    def fail_after_rig_start() -> None:
-        raise RuntimeError("synthetic startup failure")
+    def fail_rig_start() -> None:
+        events.append("rig.start")
+        raise RuntimeError("synthetic rig startup failure")
 
     def close_rig() -> None:
         nonlocal rig_close_attempts
@@ -2802,7 +2984,7 @@ def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
         if rig_close_attempts == 1:
             raise RuntimeError("synthetic rollback join timeout")
 
-    runtime.core.record_compound_authority_profiles = fail_after_rig_start
+    runtime.rig.start = fail_rig_start
     runtime.rig.close = close_rig
 
     with pytest.raises(LifecycleStartupError) as caught:
@@ -2812,15 +2994,16 @@ def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
     assert tuple(
         failure.label for failure in caught.value.rollback_failures
     ) == ("mujoco_execution_rig.close",)
-    assert events == ["rig.start", "trace.close", "rig.close:1"]
+    assert events == ["rig.start", "rig.close:1"]
 
     runtime.close()
 
     assert events == [
         "rig.start",
-        "trace.close",
         "rig.close:1",
         "rig.close:2",
+        "trace.sync",
+        "trace.close",
     ]
 
 
@@ -2841,7 +3024,7 @@ def test_close_does_not_retry_trace_after_terminal_sink_failure() -> None:
     with pytest.raises(RuntimeError, match="synthetic terminal sink failure"):
         runtime.close()
 
-    assert events == ["trace.sync", "trace.terminal_sink", "rig.close"]
+    assert events == ["rig.close", "trace.sync", "trace.terminal_sink"]
     assert runtime._started is False
     assert sum(
         fact.event_type == "runtime_trace_terminal"
@@ -2850,4 +3033,4 @@ def test_close_does_not_retry_trace_after_terminal_sink_failure() -> None:
 
     runtime.close()
 
-    assert events == ["trace.sync", "trace.terminal_sink", "rig.close"]
+    assert events == ["rig.close", "trace.sync", "trace.terminal_sink"]

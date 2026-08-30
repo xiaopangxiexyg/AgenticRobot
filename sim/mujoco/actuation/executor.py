@@ -227,6 +227,59 @@ class MujocoActuatedPositionExecutor:
         initial_state: Mapping[str, object] | None = None,
     ) -> None:
         self._validate_command(initial_command, require_newer_than=None)
+        wrapper_identity_fields = {
+            "execution_mode",
+            "profile",
+            "command_hz",
+            "physics_hz",
+            "collision_projection_mode",
+        }
+        if isinstance(initial_state, Mapping) and (
+            wrapper_identity_fields.intersection(initial_state)
+        ):
+            missing_identity = sorted(wrapper_identity_fields - set(initial_state))
+            if missing_identity:
+                raise ValueError(
+                    "initial_state is missing MuJoCo executor identity fields: "
+                    f"{missing_identity}"
+                )
+            if initial_state["profile"] != self.profile.to_metadata():
+                raise ValueError(
+                    "initial_state actuation profile does not match the "
+                    "configured MuJoCo executor profile."
+                )
+            expected_identity = {
+                "execution_mode": self.execution_mode,
+                "collision_projection_mode": self.collision_projection_mode,
+            }
+            for name, expected in expected_identity.items():
+                if name in initial_state and initial_state[name] != expected:
+                    raise ValueError(
+                        f"initial_state {name} does not match the configured "
+                        "MuJoCo executor."
+                    )
+            for name, expected in (
+                ("command_hz", float(self.timing.command_hz)),
+                ("physics_hz", float(self.timing.physics_hz)),
+            ):
+                if name not in initial_state:
+                    continue
+                try:
+                    observed = float(initial_state[name])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"initial_state {name} must be finite."
+                    ) from exc
+                if not math.isfinite(observed) or not math.isclose(
+                    observed,
+                    expected,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise ValueError(
+                        f"initial_state {name} does not match the configured "
+                        "MuJoCo executor."
+                    )
         self._held_command = initial_command
         self._actuator.reset(
             command_sequence=int(initial_command.sequence),

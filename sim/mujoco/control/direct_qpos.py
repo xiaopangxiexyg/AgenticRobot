@@ -221,13 +221,30 @@ class DirectQposDebugController:
     def command_due(self) -> bool:
         return self.physics_time_sec + 1e-12 >= self._next_command_time_sec
 
-    def reset(self, initial_command: DirectQposCommand) -> None:
+    def reset(
+        self,
+        initial_command: DirectQposCommand,
+        *,
+        initial_physics_time_sec: float = 0.0,
+    ) -> None:
         self._validate_command(initial_command, require_newer_than=None)
-        self._physics_tick = 0
-        # ``initial_command`` is already the command at t=0.  The first call
-        # to step_physics therefore holds it and asks for a new command only at
-        # the following configured command-rate deadline.
-        self._next_command_time_sec = 1.0 / self.timing.command_hz
+        initial_time = _finite_non_negative(
+            initial_physics_time_sec,
+            name="initial_physics_time_sec",
+        )
+        physics_tick = initial_time * self.timing.physics_hz
+        rounded_tick = round(physics_tick)
+        if not math.isclose(physics_tick, rounded_tick, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(
+                "initial_physics_time_sec must align to the physics timestep."
+            )
+        self._physics_tick = rounded_tick
+        # ``initial_command`` is already the held command at the restored
+        # instant.  The next command deadline is strictly after that instant,
+        # both for a cold t=0 reset and for a non-zero direct-qpos snapshot.
+        self._next_command_time_sec = (
+            math.floor(initial_time * self.timing.command_hz + 1e-12) + 1.0
+        ) / self.timing.command_hz
         self._held_command = initial_command
         if hasattr(self.scene, "kinematic_controlled_qpos"):
             current = self.scene.kinematic_controlled_qpos()
