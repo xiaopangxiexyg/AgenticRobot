@@ -42,6 +42,9 @@ B601_RS_DEFAULT_CHANNEL = "can0"
 B601_RS_DEFAULT_RATE_HZ = 500.0
 B601_RS_DEFAULT_FEEDBACK_TIMEOUT_SEC = 0.10
 B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC = 0.10
+B601_RS_TORQUE_LIMIT_PARAM_ID = 0x700B
+B601_RS_TORQUE_LIMIT_MAX_NM = 60.0
+B601_RS_TORQUE_LIMIT_VERIFY_ABS_TOL_NM = 1e-4
 B601_RS_MECH_POS_PARAM_ID = 0x7019
 # RobStride POS_VEL parameter IDs used by the pinned reBotArm
 # ``JointGroup._write_pv_params`` implementation.  Keep these explicit so a
@@ -505,6 +508,24 @@ class B601ModeReceipt:
     completed: bool
 
 
+@dataclass(frozen=True)
+class B601DriverTorqueLimitReceipt:
+    """Auditable apply/restore result for temporary RobStride torque limits."""
+
+    operation: str
+    requested_joint_names: tuple[str, ...]
+    target_limits_nm: tuple[float, ...]
+    prior_limits_nm: tuple[float | None, ...]
+    verified_limits_nm: tuple[float | None, ...]
+    applied_joint_names: tuple[str, ...]
+    restored_joint_names: tuple[str, ...]
+    failed_joint_names: tuple[str, ...]
+    errors: tuple[str, ...]
+    completed: bool
+    rollback_attempted: bool = False
+    rollback_completed: bool | None = None
+
+
 class B601RSBackend:
     """Thin wired backend with a fail-closed, opt-in command boundary."""
 
@@ -531,6 +552,10 @@ class B601RSBackend:
         self._last_state: B601HardwareState | None = None
         self._last_command: B601CommandReceipt | None = None
         self._last_fault_reason: str | None = None
+        self._enabled_joint_names: set[str] = set()
+        self._disabled_joint_names: set[str] = set()
+        self._driver_torque_limit_original_nm: dict[str, float] = {}
+        self._driver_torque_limit_applied_nm: dict[str, float | None] = {}
 
     @property
     def connected(self) -> bool:
@@ -551,6 +576,26 @@ class B601RSBackend:
     @property
     def last_fault_reason(self) -> str | None:
         return self._last_fault_reason
+
+    @property
+    def enabled_joint_names(self) -> tuple[str, ...]:
+        return tuple(
+            name for name in B601_RS_ARM_JOINT_NAMES if name in self._enabled_joint_names
+        )
+
+    @property
+    def confirmed_disabled_joint_names(self) -> tuple[str, ...]:
+        return tuple(
+            name for name in B601_RS_ARM_JOINT_NAMES if name in self._disabled_joint_names
+        )
+
+    @property
+    def temporary_driver_torque_limit_joint_names(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in B601_RS_ARM_JOINT_NAMES
+            if name in self._driver_torque_limit_original_nm
+        )
 
     def connect(self) -> None:
         """Open CAN and register the six motors, without sending commands."""
@@ -594,9 +639,16 @@ class B601RSBackend:
     def close(self) -> None:
         """Release the vendor handle without implicit disable or command I/O."""
 
+        if self._driver_torque_limit_original_nm:
+            raise B601HardwareError(
+                "temporary driver torque limits must be restored before close"
+            )
+
         controller = self._controller
         self._controller = None
         self._motors = {}
+        self._enabled_joint_names.clear()
+        self._disabled_joint_names.clear()
         if controller is None:
             return
         close = getattr(controller, "close", None)
@@ -1088,7 +1140,267 @@ class B601RSBackend:
             except Exception as exc:
                 failed.append(name)
                 errors.append(f"{name}: {exc}")
+        if operation == "enable":
+            self._enabled_joint_names.update(completed)
+            self._disabled_joint_names.difference_update(completed)
+        elif operation in ("disable", "safe_stop"):
+            self._enabled_joint_names.difference_update(completed)
+            self._disabled_joint_names.update(completed)
         return B601ModeReceipt(operation, names, tuple(completed), tuple(failed), tuple(errors), not failed)
+
+    @staticmethod
+    def _validate_parameter_timeout_ms(timeout_ms: int) -> int:
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
+            raise ValueError("timeout_ms must be a positive integer")
+        return timeout_ms
+
+    def _read_driver_torque_limit(self, name: str, *, timeout_ms: int) -> float:
+        value = _finite_float(
+            self._motors[name].robstride_get_param_f32(
+                B601_RS_TORQUE_LIMIT_PARAM_ID,
+                timeout_ms,
+            ),
+            name=f"{name}.driver_torque_limit_nm",
+        )
+        if not 0.0 <= value <= B601_RS_TORQUE_LIMIT_MAX_NM:
+            raise ValueError(
+                f"{name}.driver_torque_limit_nm={value:.6f} is outside "
+                f"[0, {B601_RS_TORQUE_LIMIT_MAX_NM:.1f}]"
+            )
+        return value
+
+    def _write_and_verify_driver_torque_limit(
+        self,
+        name: str,
+        value_nm: float,
+        *,
+        timeout_ms: int,
+    ) -> float:
+        self._motors[name].robstride_write_param_f32(
+            B601_RS_TORQUE_LIMIT_PARAM_ID,
+            value_nm,
+        )
+        observed = self._read_driver_torque_limit(name, timeout_ms=timeout_ms)
+        if not math.isclose(
+            observed,
+            value_nm,
+            rel_tol=0.0,
+            abs_tol=B601_RS_TORQUE_LIMIT_VERIFY_ABS_TOL_NM,
+        ):
+            raise B601HardwareError(
+                f"{name}: driver torque-limit verify mismatch: "
+                f"requested={value_nm:.6f} observed={observed:.6f} Nm"
+            )
+        return observed
+
+    @staticmethod
+    def _aligned_limit_values(
+        names: Sequence[str],
+        values: Mapping[str, float | None],
+    ) -> tuple[float | None, ...]:
+        return tuple(values.get(name) for name in names)
+
+    def apply_temporary_driver_torque_limits(
+        self,
+        limits_nm: Sequence[float],
+        *,
+        joint_names: Sequence[str] | None = None,
+        timeout_ms: int = 500,
+    ) -> B601DriverTorqueLimitReceipt:
+        """Apply volatile ``limit_torque`` values with readback and rollback.
+
+        This operation is admitted only while the selected joints are locally
+        known disabled.  All original values are read before the first write.
+        A write/readback failure rolls every touched joint back to its original
+        value; any unverified rollback remains latched for an explicit retry.
+        """
+
+        self._require_motion_authorized()
+        names = self._resolve_joint_names(joint_names)
+        timeout = self._validate_parameter_timeout_ms(timeout_ms)
+        if self._driver_torque_limit_original_nm:
+            raise B601HardwareError(
+                "temporary driver torque limits are already active; restore them first"
+            )
+        requested = _six_nonnegative(limits_nm, name="limits_nm")
+        index_by_name = {
+            name: index for index, name in enumerate(B601_RS_ARM_JOINT_NAMES)
+        }
+        targets = {name: requested[index_by_name[name]] for name in names}
+        if any(value > B601_RS_TORQUE_LIMIT_MAX_NM for value in targets.values()):
+            raise ValueError(
+                f"limits_nm exceeds RobStride {B601_RS_TORQUE_LIMIT_MAX_NM:.1f} Nm"
+            )
+        not_confirmed_disabled = tuple(
+            name for name in names if name not in self._disabled_joint_names
+        )
+        if not_confirmed_disabled:
+            raise B601HardwareError(
+                "temporary driver torque limits require a successful disable/safe_stop "
+                "receipt in this backend session: " + ", ".join(not_confirmed_disabled)
+            )
+
+        originals: dict[str, float] = {}
+        verified: dict[str, float] = {}
+        errors: list[str] = []
+        failed: list[str] = []
+        for name in names:
+            try:
+                originals[name] = self._read_driver_torque_limit(
+                    name,
+                    timeout_ms=timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 - vendor failure becomes receipt evidence
+                failed.append(name)
+                errors.append(f"read original {name}: {exc}")
+                return B601DriverTorqueLimitReceipt(
+                    operation="apply_temporary_driver_torque_limits",
+                    requested_joint_names=names,
+                    target_limits_nm=tuple(targets[item] for item in names),
+                    prior_limits_nm=self._aligned_limit_values(names, originals),
+                    verified_limits_nm=self._aligned_limit_values(names, verified),
+                    applied_joint_names=(),
+                    restored_joint_names=(),
+                    failed_joint_names=tuple(failed),
+                    errors=tuple(errors),
+                    completed=False,
+                )
+
+        touched: list[str] = []
+        applied: list[str] = []
+        for name in names:
+            touched.append(name)
+            try:
+                verified[name] = self._write_and_verify_driver_torque_limit(
+                    name,
+                    targets[name],
+                    timeout_ms=timeout,
+                )
+                applied.append(name)
+            except Exception as exc:  # noqa: BLE001 - vendor failure becomes receipt evidence
+                failed.append(name)
+                errors.append(f"apply {name}: {exc}")
+                break
+
+        if failed:
+            restored: list[str] = []
+            rollback_failed: list[str] = []
+            for name in reversed(touched):
+                try:
+                    verified[name] = self._write_and_verify_driver_torque_limit(
+                        name,
+                        originals[name],
+                        timeout_ms=timeout,
+                    )
+                    restored.append(name)
+                except Exception as exc:  # noqa: BLE001 - vendor failure becomes receipt evidence
+                    rollback_failed.append(name)
+                    errors.append(f"rollback {name}: {exc}")
+            unresolved = set(touched).difference(restored)
+            self._driver_torque_limit_original_nm = {
+                name: originals[name] for name in touched if name in unresolved
+            }
+            self._driver_torque_limit_applied_nm = {
+                # A failed rollback leaves the device value uncertain even if
+                # the target was previously verified.  Do not misreport a
+                # stale observation as the final driver state.
+                name: None
+                for name in touched
+                if name in unresolved
+            }
+            failed_names = tuple(dict.fromkeys((*failed, *rollback_failed)))
+            return B601DriverTorqueLimitReceipt(
+                operation="apply_temporary_driver_torque_limits",
+                requested_joint_names=names,
+                target_limits_nm=tuple(targets[item] for item in names),
+                prior_limits_nm=self._aligned_limit_values(names, originals),
+                verified_limits_nm=self._aligned_limit_values(names, verified),
+                applied_joint_names=tuple(applied),
+                restored_joint_names=tuple(restored),
+                failed_joint_names=failed_names,
+                errors=tuple(errors),
+                completed=False,
+                rollback_attempted=True,
+                rollback_completed=not rollback_failed,
+            )
+
+        self._driver_torque_limit_original_nm = dict(originals)
+        self._driver_torque_limit_applied_nm = dict(targets)
+        return B601DriverTorqueLimitReceipt(
+            operation="apply_temporary_driver_torque_limits",
+            requested_joint_names=names,
+            target_limits_nm=tuple(targets[item] for item in names),
+            prior_limits_nm=self._aligned_limit_values(names, originals),
+            verified_limits_nm=self._aligned_limit_values(names, verified),
+            applied_joint_names=tuple(applied),
+            restored_joint_names=(),
+            failed_joint_names=(),
+            errors=(),
+            completed=True,
+        )
+
+    def restore_driver_torque_limits(
+        self,
+        *,
+        timeout_ms: int = 500,
+    ) -> B601DriverTorqueLimitReceipt:
+        """Restore every latched original torque limit after motor disable."""
+
+        self._require_connected()
+        timeout = self._validate_parameter_timeout_ms(timeout_ms)
+        names = self.temporary_driver_torque_limit_joint_names
+        if not names:
+            return B601DriverTorqueLimitReceipt(
+                operation="restore_driver_torque_limits",
+                requested_joint_names=(),
+                target_limits_nm=(),
+                prior_limits_nm=(),
+                verified_limits_nm=(),
+                applied_joint_names=(),
+                restored_joint_names=(),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+        enabled = tuple(name for name in names if name in self._enabled_joint_names)
+        if enabled:
+            raise B601HardwareError(
+                "driver torque limits may be restored only after disable: "
+                + ", ".join(enabled)
+            )
+
+        targets = dict(self._driver_torque_limit_original_nm)
+        prior = dict(self._driver_torque_limit_applied_nm)
+        verified: dict[str, float] = {}
+        restored: list[str] = []
+        failed: list[str] = []
+        errors: list[str] = []
+        for name in names:
+            try:
+                verified[name] = self._write_and_verify_driver_torque_limit(
+                    name,
+                    targets[name],
+                    timeout_ms=timeout,
+                )
+                restored.append(name)
+            except Exception as exc:  # noqa: BLE001 - vendor failure becomes receipt evidence
+                failed.append(name)
+                errors.append(f"restore {name}: {exc}")
+        for name in restored:
+            self._driver_torque_limit_original_nm.pop(name, None)
+            self._driver_torque_limit_applied_nm.pop(name, None)
+        return B601DriverTorqueLimitReceipt(
+            operation="restore_driver_torque_limits",
+            requested_joint_names=names,
+            target_limits_nm=tuple(targets[name] for name in names),
+            prior_limits_nm=self._aligned_limit_values(names, prior),
+            verified_limits_nm=self._aligned_limit_values(names, verified),
+            applied_joint_names=(),
+            restored_joint_names=tuple(restored),
+            failed_joint_names=tuple(failed),
+            errors=tuple(errors),
+            completed=not failed and not self._driver_torque_limit_original_nm,
+        )
 
     def send_position_velocity(
         self,
@@ -1225,9 +1537,24 @@ class B601RSBackend:
 
 
 __all__ = [
+    "B601_RS_DEFAULT_CHANNEL",
+    "B601_RS_DEFAULT_FEEDBACK_TIMEOUT_SEC",
+    "B601_RS_DEFAULT_RATE_HZ",
+    "B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC",
+    "B601_RS_FEEDBACK_FRAME",
+    "B601_RS_MECH_POS_PARAM_ID",
+    "B601_RS_POSITION_FRAME",
+    "B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID",
+    "B601_RS_POS_VEL_POS_KP_PARAM_ID",
+    "B601_RS_POS_VEL_VEL_KI_PARAM_ID",
+    "B601_RS_POS_VEL_VEL_KP_PARAM_ID",
+    "B601_RS_TORQUE_LIMIT_MAX_NM",
+    "B601_RS_TORQUE_LIMIT_PARAM_ID",
+    "B601_RS_TORQUE_LIMIT_VERIFY_ABS_TOL_NM",
     "B601CommandReceipt",
-    "B601HardwareError",
+    "B601DriverTorqueLimitReceipt",
     "B601HardwareDependencyError",
+    "B601HardwareError",
     "B601HardwareState",
     "B601JointConfig",
     "B601JointState",
@@ -1235,15 +1562,4 @@ __all__ = [
     "B601MotionAuthorizationError",
     "B601RSBackend",
     "B601RSBackendConfig",
-    "B601_RS_DEFAULT_CHANNEL",
-    "B601_RS_DEFAULT_FEEDBACK_TIMEOUT_SEC",
-    "B601_RS_DEFAULT_RATE_HZ",
-    "B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC",
-    "B601_RS_FEEDBACK_FRAME",
-    "B601_RS_MECH_POS_PARAM_ID",
-    "B601_RS_POS_VEL_LIMIT_SPD_PARAM_ID",
-    "B601_RS_POS_VEL_VEL_KP_PARAM_ID",
-    "B601_RS_POS_VEL_VEL_KI_PARAM_ID",
-    "B601_RS_POS_VEL_POS_KP_PARAM_ID",
-    "B601_RS_POSITION_FRAME",
 ]

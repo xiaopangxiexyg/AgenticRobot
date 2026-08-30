@@ -12,6 +12,7 @@ from hardware.rebot_b601_rs import (
     B601_RS_POS_VEL_POS_KP_PARAM_ID,
     B601_RS_POS_VEL_VEL_KI_PARAM_ID,
     B601_RS_POS_VEL_VEL_KP_PARAM_ID,
+    B601_RS_TORQUE_LIMIT_PARAM_ID,
     B601HardwareError,
     B601JointConfig,
     B601ModeReceipt,
@@ -93,6 +94,9 @@ class _FakeMotor:
         self.motor_id = motor_id
         self.state = state
         self.position_param: float | None = None
+        self.parameter_values: dict[int, float] = {}
+        self.write_without_effect: set[int] = set()
+        self.fail_write_values: set[float] = set()
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.fail_method: str | None = None
 
@@ -110,12 +114,21 @@ class _FakeMotor:
 
     def robstride_get_param_f32(self, *args: object) -> float:
         self._call("robstride_get_param_f32", *args)
+        param_id = int(args[0])
+        if param_id in self.parameter_values:
+            return self.parameter_values[param_id]
         if self.position_param is None:
             raise RuntimeError("synthetic position parameter unavailable")
         return self.position_param
 
     def robstride_write_param_f32(self, *args: object) -> None:
         self._call("robstride_write_param_f32", *args)
+        param_id = int(args[0])
+        value = float(args[1])
+        if value in self.fail_write_values:
+            raise RuntimeError(f"synthetic write failure for value {value}")
+        if param_id not in self.write_without_effect:
+            self.parameter_values[param_id] = value
 
     def ensure_mode(self, *args: object) -> None:
         self._call("ensure_mode", *args)
@@ -486,6 +499,200 @@ def test_safe_stop_is_available_without_motion_start_authorization() -> None:
         for index, motor in controller.motors.items()
         if index not in (1, 2)
     )
+
+
+def test_temporary_driver_torque_limit_requires_motion_authorization() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+    backend.connect()
+    controller.motors[6].parameter_values[B601_RS_TORQUE_LIMIT_PARAM_ID] = 14.0
+
+    with pytest.raises(B601MotionAuthorizationError):
+        backend.apply_temporary_driver_torque_limits(
+            (0.5,) * 6,
+            joint_names=("joint6",),
+        )
+
+    assert controller.motors[6].calls == []
+
+
+def test_temporary_driver_torque_limit_round_trip_requires_disable_before_restore() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    motor = controller.motors[6]
+    motor.parameter_values[B601_RS_TORQUE_LIMIT_PARAM_ID] = 14.0
+    assert backend.safe_stop(joint_names=("joint6",)).completed is True
+
+    apply_receipt = backend.apply_temporary_driver_torque_limits(
+        (0.5,) * 6,
+        joint_names=("joint6",),
+    )
+
+    assert apply_receipt.completed is True
+    assert apply_receipt.target_limits_nm == (0.5,)
+    assert apply_receipt.prior_limits_nm == (14.0,)
+    assert apply_receipt.verified_limits_nm == (0.5,)
+    assert apply_receipt.applied_joint_names == ("joint6",)
+    assert backend.temporary_driver_torque_limit_joint_names == ("joint6",)
+    assert motor.parameter_values[B601_RS_TORQUE_LIMIT_PARAM_ID] == 0.5
+
+    assert backend.enable(joint_names=("joint6",)).completed is True
+    assert backend.enabled_joint_names == ("joint6",)
+    with pytest.raises(B601HardwareError, match="only after disable"):
+        backend.restore_driver_torque_limits()
+
+    assert backend.safe_stop(joint_names=("joint6",)).completed is True
+    restore_receipt = backend.restore_driver_torque_limits()
+
+    assert restore_receipt.completed is True
+    assert restore_receipt.target_limits_nm == (14.0,)
+    assert restore_receipt.prior_limits_nm == (0.5,)
+    assert restore_receipt.verified_limits_nm == (14.0,)
+    assert restore_receipt.restored_joint_names == ("joint6",)
+    assert backend.temporary_driver_torque_limit_joint_names == ()
+    backend.close()
+
+
+def test_temporary_driver_torque_limit_readback_mismatch_rolls_back_every_touched_joint() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    for motor_id in (5, 6):
+        controller.motors[motor_id].parameter_values[
+            B601_RS_TORQUE_LIMIT_PARAM_ID
+        ] = 14.0
+    controller.motors[6].write_without_effect.add(B601_RS_TORQUE_LIMIT_PARAM_ID)
+    assert backend.safe_stop(joint_names=("joint5", "joint6")).completed is True
+
+    receipt = backend.apply_temporary_driver_torque_limits(
+        (0.5,) * 6,
+        joint_names=("joint5", "joint6"),
+    )
+
+    assert receipt.completed is False
+    assert receipt.applied_joint_names == ("joint5",)
+    assert receipt.failed_joint_names == ("joint6",)
+    assert receipt.rollback_attempted is True
+    assert receipt.rollback_completed is True
+    assert set(receipt.restored_joint_names) == {"joint5", "joint6"}
+    assert backend.temporary_driver_torque_limit_joint_names == ()
+    assert all(
+        controller.motors[motor_id].parameter_values[
+            B601_RS_TORQUE_LIMIT_PARAM_ID
+        ]
+        == 14.0
+        for motor_id in (5, 6)
+    )
+
+
+def test_failed_driver_torque_limit_restore_stays_latched_and_blocks_close() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    motor = controller.motors[6]
+    motor.parameter_values[B601_RS_TORQUE_LIMIT_PARAM_ID] = 14.0
+    assert backend.safe_stop(joint_names=("joint6",)).completed is True
+    assert backend.apply_temporary_driver_torque_limits(
+        (0.5,) * 6,
+        joint_names=("joint6",),
+    ).completed
+    motor.fail_method = "robstride_write_param_f32"
+
+    failed_restore = backend.restore_driver_torque_limits()
+
+    assert failed_restore.completed is False
+    assert failed_restore.failed_joint_names == ("joint6",)
+    assert backend.temporary_driver_torque_limit_joint_names == ("joint6",)
+    with pytest.raises(B601HardwareError, match="must be restored before close"):
+        backend.close()
+    assert backend.connected is True
+
+    motor.fail_method = None
+    assert backend.restore_driver_torque_limits().completed is True
+    backend.close()
+
+
+def test_failed_driver_torque_limit_rollback_marks_final_value_unknown() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    for motor_id in (5, 6):
+        controller.motors[motor_id].parameter_values[
+            B601_RS_TORQUE_LIMIT_PARAM_ID
+        ] = 14.0
+    controller.motors[6].write_without_effect.add(B601_RS_TORQUE_LIMIT_PARAM_ID)
+    controller.motors[5].fail_write_values.add(14.0)
+    assert backend.safe_stop(joint_names=("joint5", "joint6")).completed is True
+
+    receipt = backend.apply_temporary_driver_torque_limits(
+        (0.5,) * 6,
+        joint_names=("joint5", "joint6"),
+    )
+
+    assert receipt.completed is False
+    assert receipt.rollback_attempted is True
+    assert receipt.rollback_completed is False
+    assert receipt.failed_joint_names == ("joint6", "joint5")
+    assert backend.temporary_driver_torque_limit_joint_names == ("joint5",)
+    with pytest.raises(B601HardwareError, match="must be restored before close"):
+        backend.close()
+
+    controller.motors[5].fail_write_values.clear()
+    restore_receipt = backend.restore_driver_torque_limits()
+    assert restore_receipt.completed is True
+    assert restore_receipt.prior_limits_nm == (None,)
+    assert restore_receipt.verified_limits_nm == (14.0,)
+    backend.close()
+
+
+def test_temporary_driver_torque_limit_rejects_protocol_range_before_io() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    controller.motors[6].parameter_values[B601_RS_TORQUE_LIMIT_PARAM_ID] = 14.0
+
+    with pytest.raises(ValueError, match="exceeds RobStride"):
+        backend.apply_temporary_driver_torque_limits(
+            (61.0,) * 6,
+            joint_names=("joint6",),
+        )
+
+    assert controller.motors[6].calls == []
+
+
+def test_temporary_driver_torque_limit_requires_confirmed_disabled_state() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_motion=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    controller.motors[6].parameter_values[B601_RS_TORQUE_LIMIT_PARAM_ID] = 14.0
+
+    with pytest.raises(B601HardwareError, match="successful disable/safe_stop"):
+        backend.apply_temporary_driver_torque_limits(
+            (0.5,) * 6,
+            joint_names=("joint6",),
+        )
+
+    assert backend.confirmed_disabled_joint_names == ()
+    assert controller.motors[6].calls == []
 
 
 def test_motion_requires_urdf_limits_and_respects_velocity_envelope() -> None:

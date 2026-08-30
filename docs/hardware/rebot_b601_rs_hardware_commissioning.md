@@ -31,6 +31,10 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   `ensure_mode(MIT)` 并保留相同 settling delay；它不使能电机，也不选择运行增益。当前
   backend 的 `send_mit()` 参数顺序与 upstream 一致，均为
   `(position, velocity, kp, kd, feedforward_tau)`；
+- backend 可显式读写 RobStride `limit_torque (0x700B)`，但只提供临时、易失事务：当前
+  session 必须先取得所选关节成功的 `disable/safe_stop` receipt，随后才会读取全部原值、
+  写入新值并逐项回读；任一失败会回滚全部已触碰关节。原值未全部恢复并回读前，`close()`
+  会拒绝释放 backend。该接口不写 flash、不替代软件总力矩/slew envelope，也不授权使能；
 - MotorBridge 0.4.9 的 `MotorState` 没有源时间戳或接收序号，所以反馈状态明确标为
   `freshness_verified=false`、`poll_observation_unverified`，报告的 `vel/torq` 也保留
   `vendor_reported_unverified` 语义；
@@ -308,8 +312,9 @@ MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort cei
 
 运行前必须确认：机械臂处于当前安全、可支撑且有足够间隙的姿态；不得为了探针主动
 移动到示例姿态。操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，
-现场没有第二个 CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；后述
-`cartesian-hold` 必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
+现场没有第二个 CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；当前
+J6 方案显式使能六个 arm 关节并锚定各自的使能后当前位置，但只有 J6 的 reference 可以
+变化。后述 `cartesian-hold` 同样必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
 运行；`safe_stop` 失能后负载可能下落，停止过程中仍需保持支撑。下面命令使用
 状态分支和显式 status 打印，不使用会让交接终端提前退出的 `set -euo pipefail`；
 命令由操作者在目标 worktree 中运行，我们不在自动流程中代运行。版本化文档保留
@@ -318,7 +323,11 @@ MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort cei
 硬件探针必须在前台同步运行，以便操作者可立即用 Ctrl+C 或物理急停介入。为减少终端
 输出，可把实际命令（含时间、工作目录和参数）及其完整 stdout/stderr 追加到固定日志
 `/tmp/b601-rs-commissioning/command_and_output.log`；不得使用 `&`、`nohup` 或其他
-后台/脱离终端方式。下面交接命令中的 `run_logged` 仅负责记录，不会改变前台执行语义：
+后台/脱离终端方式。下面交接命令中的 `run_logged` 仅负责记录，不会改变前台执行语义。
+所有会调用 `enable()` 的模式在反馈预热、位置/速度边界、preflight `safe_stop` 和 MIT
+模式准备全部通过后，都会把简短的 `[DRIVE] 3/2/1/ENABLE` 同时写入固定日志并镜像到
+当前控制终端；倒计时期间按 Ctrl+C 会输出 `[DRIVE] CANCELLED` 并在调用 `enable()` 前
+结束。只读 `feedback-stability` 不显示该倒计时：
 
 ```bash
 WT=/path/to/isolated/AgenticRobot-worktree
@@ -346,6 +355,50 @@ run_logged() {
   } >>"$LOG"
   return "$STATUS"
 }
+```
+
+在任何新的 active J6 试验前，先单独验证驱动器临时总力矩限幅事务。下面模式只对 J6：
+读取一份完整合法反馈、`safe_stop`、把 scaled URDF effort 写入易失的 `0x700B` 并回读，
+再次 `safe_stop`，最后恢复本次运行实际读到的原值并回读。它不切模式、不调用 `enable()`、
+不发 MIT/POS_VEL 命令，因此不会显示 `[DRIVE]` 倒计时；但它会写驱动器参数，仍须前台运行、
+保持机械支撑和可触达急停：
+
+```bash
+# 复用上面的 WT/PY/CFG/SRC/OUT_DIR/LOG 和 run_logged
+mkdir -p "$OUT_DIR"
+if cd "$WT"; then
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" \
+      scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+      --mode driver-torque-limit-roundtrip \
+      --config "$CFG" \
+      --rebot-source-root "$SRC" \
+      --joint joint6 \
+      --torque-limit-scale 0.1 \
+      --allow-motion \
+      --auto-disable \
+      --confirmation B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP \
+      --output "$OUT_DIR/b601_driver_torque_limit_roundtrip_joint6.json"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  printf 'driver-limit roundtrip exit code: %s\n' "$STATUS"
+  printf 'command and output log: %s\n' "$LOG"
+else
+  printf '%s\n' 'ERROR: worktree not found'
+fi
+printf '%s\n' 'shell remains active'
+```
+
+只有 `status=OK`、两份 `safe_stop` receipt 完整、`apply_receipt.completed=true`、
+`restore_receipt.completed=true`，且 apply 的 `prior_limits_nm` 与 restore 的
+`verified_limits_nm` 一致，才允许在后续 active 命令中加入
+`--apply-driver-torque-limits`。active 路径也只会临时改写 `--joint` 指定的同一个目标关节，
+不会顺带改写支撑关节。这只验收 J6 参数事务，不证明电机会运动或力控有效。
+
+完成该往返验收后，active `hold` 命令如下。它仍会在前台显示 `[DRIVE] 3/2/1/ENABLE`：
+
+```bash
 
 mkdir -p "$OUT_DIR"
 if cd "$WT"; then
@@ -353,25 +406,31 @@ if cd "$WT"; then
       --mode hold \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
-      --duration-sec 8 \
+      --duration-sec 4 \
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
-      --joint joint1 \
-      --kp 0.5 \
+      --joint joint6 \
+      --support-joint joint1 \
+      --support-joint joint4 \
+      --support-joint joint5 \
+      --kp 0.25 \
       --kd 0.5 \
-      --gravity-scale 1.0 \
-      --torque-limit-scale 0.25 \
-      --torque-rise-time-sec 1.0 \
-      --velocity-abort-rad-s 0.10 \
-      --max-error-rad 0.15 \
+      --target-kp 0.5 \
+      --target-kd 0.5 \
+      --gravity-scale 0.1 \
+      --torque-limit-scale 0.1 \
+      --apply-driver-torque-limits \
+      --torque-rise-time-sec 2.0 \
+      --velocity-abort-rad-s 0.05 \
+      --max-error-rad 0.05 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
       --fault-hold-max-age-sec 0.15 \
       --fault-hold-max-velocity-rad-s 0.02 \
       --fault-hold-max-rebase-rad 0.05 \
-      --output "$OUT_DIR/b601_low_gain_hold_joint1.json"; then
+      --output "$OUT_DIR/b601_low_gain_hold_joint6_all_arm.json"; then
     STATUS=0
   else
     STATUS=$?
@@ -384,8 +443,15 @@ fi
 printf '%s\n' 'shell remains active'
 ```
 
-第一档只验收 `hold`：观察 j1 是否按当前状态工作、j2/j3 是否作为支撑保持、重力方向
-是否合理、阻尼是否耗散而非振荡，
+第一档只验收 `hold`：观察 J1..J6 是否都锚定在使能后当前位置、重力方向是否合理、阻尼
+是否耗散而非振荡；ID7 夹爪不参与。`active_joint_names` 的集合必须正好是 joint1..joint6，
+且没有任何关节 reference 变化。
+正常控制的 `--velocity-abort-rad-s` 与故障保持候选门是两个独立安全层：某一帧低于正常
+运动中止阈值、但高于更严格的 `--fault-hold-max-velocity-rad-s` 时，该帧不会替换
+`last_safe`，但也不会单独中止正常 hold。JSON 的 `fault_hold_candidate_admission` 会记录
+拒绝次数与最后原因。若随后发生真实故障，保护保持仍会重新验证当前帧、旧 `last_safe`
+的年龄和 J2/J3 rebase；任一条件不满足仍立即执行六关节 `safe_stop`，不得通过提高故障
+保持速度阈值绕过。
 并在 JSON 中确认 `status=OK`、`acceptance_status=PASS`、
 `cleanup_receipt.completed=true`、`cleanup_errors=[]`、`stop_reason=null`，以及
 `frequency_acceptance.feedback/compute/tx.*.passed=true`。输出中的
@@ -397,10 +463,10 @@ printf '%s\n' 'shell remains active'
 `set -euo pipefail`，即使探针返回非零，交接终端仍保持可用：
 
 ```bash
-OUT_DIR=/tmp/b601-rs-commissioning
+# 复用上面的 WT/PY/CFG/SRC/OUT_DIR/LOG 和 run_logged
 mkdir -p "$OUT_DIR"
 if cd "$WT"; then
-  if PYTHONDONTWRITEBYTECODE=1 "$PY" \
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" \
       scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode feedback-stability \
       --config "$CFG" \
@@ -416,6 +482,7 @@ if cd "$WT"; then
   fi
   printf 'feedback-stability exit code: %s\n' "$STATUS"
   printf 'result: %s\n' "$OUT_DIR/b601_feedback_stability_20s.json"
+  printf 'command and output log: %s\n' "$LOG"
 else
   printf '%s\n' 'ERROR: worktree not found'
 fi
@@ -427,13 +494,14 @@ printf '%s\n' 'shell remains active'
 `p95/p99`。任何越过都应先保留 JSON、确认是否有可见机械运动并分析采样量化，再决定后续
 实现；不能把它当成放宽 `last-safe` 门槛的理由。
 
-只有 hold 通过且机械支撑未改变，才可单独运行一档相对慢步；每次只批准一个命令，
-例如 j1 正方向 0.05 rad、0.02 rad/s：
+只有上述六关节 hold 通过且机械支撑未改变，才可单独运行一档 J6 相对慢步。实现对 command
+和实测相对锚点 excursion 都设有 `20 deg`（`0.349066 rad`）硬上限，但首轮只批准 J6
+正方向 `0.02 rad`（约 `1.15 deg`）、`0.005 rad/s`，远低于该上限：
 
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR 变量；先确认上一档已停止且 cleanup 完整
 if cd "$WT"; then
-  if PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode slow-step \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
@@ -441,34 +509,61 @@ if cd "$WT"; then
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
-      --joint joint1 \
+      --joint joint6 \
+      --support-joint joint1 \
+      --support-joint joint4 \
+      --support-joint joint5 \
       --step-direction 1 \
-      --step-rad 0.05 \
-      --step-speed-rad-s 0.02 \
-      --kp 0.5 \
+      --step-rad 0.02 \
+      --step-speed-rad-s 0.005 \
+      --kp 0.25 \
       --kd 0.5 \
-      --gravity-scale 1.0 \
-      --torque-limit-scale 0.25 \
-      --torque-rise-time-sec 1.0 \
-      --velocity-abort-rad-s 0.10 \
-      --max-error-rad 0.15 \
+      --target-kp 1.0 \
+      --target-kd 0.75 \
+      --gravity-scale 0.1 \
+      --torque-limit-scale 0.1 \
+      --apply-driver-torque-limits \
+      --torque-rise-time-sec 2.0 \
+      --velocity-abort-rad-s 0.05 \
+      --max-error-rad 0.05 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
       --fault-hold-max-age-sec 0.15 \
       --fault-hold-max-velocity-rad-s 0.02 \
       --fault-hold-max-rebase-rad 0.05 \
-      --output "$OUT_DIR/b601_low_gain_slow_step_joint1.json"; then
+      --output "$OUT_DIR/b601_low_gain_slow_step_joint6_pos002_all_arm.json"; then
     STATUS=0
   else
     STATUS=$?
   fi
   printf 'probe exit code: %s\n' "$STATUS"
+  printf 'command and output log: %s\n' "$LOG"
 else
   printf '%s\n' 'ERROR: worktree not found'
 fi
 printf '%s\n' 'shell remains active'
 ```
+
+slow-step 的 `acceptance_status=PASS` 现在同时要求
+`control_acceptance_status=PASS` 和 `motion_response_status=PASS`。后者使用末尾五份反馈的
+均值，要求 reference 已完成、J6 沿命令方向产生至少 `max(0.1 deg, 10% step)` 的响应、
+不超过 `150% step`，且任一已使能支撑关节相对锚点的峰值漂移不超过 `0.5 deg`。因此
+“命令循环和 cleanup 成功但 J6 没有实际响应”会返回 `status=FAIL` 和
+`motion_response_status=INSUFFICIENT_RESPONSE`，不能再误判为动作通过。
+
+参数升级不得采用无依据的逐次试增。官方 RS 的无接触标定只测得 J4/J5 Coulomb 摩擦约
+`0.30/0.21 N·m`，并明确指出腕部 `0.2–0.5 N·m` 摩擦可与重力相当或更大；该记录没有
+独立测量 J6，因此不能把相邻关节数值当作 J6 标定值。当前 `0.02 rad` 步长、
+`target-kp=2.0` 的软件位置项峰值仅 `0.04 N·m`，正反方向都不足响应与这一量级相容。
+官方重力锁定示例使用驱动器内部 `kp=8.0, kd=1.0`，配置文件中 J6 常规 MIT 参数为
+`kp=50.0, kd=4.0`；二者只是上游实现依据，不是本 commissioning 探针可直接照搬的安全
+参数。若后续引入非零驱动器内部增益，准入必须在发送前对每帧证明
+`|tau_ff| + kp*|q_ref-q| + kd*|dq_ref-dq|` 不超过探针最终力矩 envelope，同时保留当前位置
+锚定、速度/误差 abort、slew limit 和完整 cleanup。新增的 `0x700B` 临时限幅可作为驱动器
+侧独立绝对上限，但它不提供软件 slew-rate 约束，也不能单独证明内部 PD 与前馈的精确合成
+语义；在非零驱动器 PD 契约实现并离线验证前，继续保持当前单一软件力矩 owner，不运行
+更高增益真机试验。
 
 任一方向出现反向、跳变、振荡、超速、超误差、非有限反馈或未完成 stop receipt，
 立即按急停/支撑规程停止并保留 JSON；不得通过提高 `max-error`、放宽速度/力矩限幅、
@@ -476,7 +571,7 @@ printf '%s\n' 'shell remains active'
 
 ### P4.2 当前 TCP 锚定的低增益平移阻抗（操作者手动运行）
 
-只有上面的 `hold` 和 joint1 `slow-step` 都通过后，才允许进入这一档。该模式复用已有
+只有上面的六关节 `hold` 和 J6 `slow-step` 都通过后，才允许进入这一档。该模式复用已有
 `B601TranslationalVirtualSpring`、Pinocchio `LOCAL_WORLD_ALIGNED` Jacobian 和统一的
 `J^T F` 映射；锚点是六关节使能后第一份完整、合法、近静止反馈对应的
 `base_link_T_gripper_end` 平移，不读取或追踪任何预设绝对 pose。第一版不控制姿态/转动，
@@ -494,7 +589,7 @@ requested/effective torque 和 `F^T V == tau^T dq` 的 power error。TCP displac
 ```bash
 # 复用上面的 WT/PY/CFG/SRC/OUT_DIR；先确认 joint hold/slow-step 已完整 cleanup
 if cd "$WT"; then
-  if PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
       --mode cartesian-hold \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
@@ -530,6 +625,7 @@ if cd "$WT"; then
     STATUS=$?
   fi
   printf 'probe exit code: %s\n' "$STATUS"
+  printf 'command and output log: %s\n' "$LOG"
 else
   printf '%s\n' 'ERROR: worktree not found'
 fi
@@ -553,10 +649,10 @@ commissioning；不得据此声明触觉带宽、接触稳定性或最终 impeda
 
 另外，`compute_b601_mit_torque()` 已经在软件中组合 position、damping、gravity 和 overlay；
 若把该总力矩作为 `tau` 发送，同时给驱动器非零 `kp/kd`，会重复计算 PD。反过来，若使用
-upstream 的驱动器 PD 加 `g(q)` 前馈，当前 backend 仅能限制前馈 `tau`，不能证明驱动器
-内部 PD 与前馈相加后的最终总力矩满足项目的 final-output bound。进入 P4 前必须先确定并
-实现唯一的一种 torque ownership，并取得高频、可验证 freshness 的 q 与差分 dq，再补齐
-watchdog、最终 torque/slew 限制和单关节安全验收。P4.1/P4.2 的已使能 MIT 命令只用于
+upstream 的驱动器 PD 加 `g(q)` 前馈，`0x700B` 临时限幅能提供驱动器侧绝对上限，却不能
+单独证明内部 PD/前馈的精确合成、方向、动态或软件 slew envelope。进入非零驱动器 PD 前
+仍必须先确定并实现唯一 torque ownership，并取得高频、可验证 freshness 的 q 与差分 dq，
+再补齐 watchdog、最终 torque/slew 限制和单关节安全验收。P4.1/P4.2 的已使能 MIT 命令只用于
 现场低速 commissioning，不构成高频 haptic/force-control 验收入口。
 
 ## 操作者手动 enabled 位置频率入口（本轮不执行）

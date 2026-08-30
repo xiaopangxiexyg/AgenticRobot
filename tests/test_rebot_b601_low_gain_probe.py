@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from types import SimpleNamespace
 
 import numpy as np
@@ -127,6 +128,112 @@ def test_feedback_stability_probe_never_enters_motion_path(tmp_path) -> None:
     assert backend.events == ["connect", "poll_feedback", "poll_feedback", "poll_feedback", "close"]
 
 
+def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -> None:
+    class FakeBackend:
+        config = SimpleNamespace(channel="can0")
+
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        def connect(self) -> None:
+            self.events.append("connect")
+
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            assert request_feedback is True
+            self.events.append("poll_feedback")
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=(0.0,) * 6,
+                fault_reason=None,
+            )
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> object:
+            assert joint_names == ("joint6",)
+            self.events.append("safe_stop")
+            return probe.B601ModeReceipt(
+                operation="safe_stop",
+                requested_joint_names=joint_names,
+                completed_joint_names=joint_names,
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+        def apply_temporary_driver_torque_limits(
+            self,
+            limits_nm: tuple[float, ...],
+            *,
+            joint_names: tuple[str, ...],
+        ) -> object:
+            assert limits_nm == (3.6, 3.6, 3.6, 1.4, 1.4, 1.4)
+            assert joint_names == ("joint6",)
+            self.events.append("apply")
+            return probe.B601DriverTorqueLimitReceipt(
+                operation="apply_temporary_driver_torque_limits",
+                requested_joint_names=joint_names,
+                target_limits_nm=(1.4,),
+                prior_limits_nm=(14.0,),
+                verified_limits_nm=(1.4,),
+                applied_joint_names=joint_names,
+                restored_joint_names=(),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+        def restore_driver_torque_limits(self) -> object:
+            self.events.append("restore")
+            return probe.B601DriverTorqueLimitReceipt(
+                operation="restore_driver_torque_limits",
+                requested_joint_names=("joint6",),
+                target_limits_nm=(14.0,),
+                prior_limits_nm=(1.4,),
+                verified_limits_nm=(14.0,),
+                applied_joint_names=(),
+                restored_joint_names=("joint6",),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+        def close(self) -> None:
+            self.events.append("close")
+
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("joints: []\n", encoding="utf-8")
+    urdf_path = tmp_path / "b601.urdf"
+    urdf_path.write_text("<robot name='b601'/>", encoding="utf-8")
+    backend = FakeBackend()
+
+    result = probe._run_driver_torque_limit_roundtrip_probe(
+        backend,
+        config_path=config_path,
+        source_root=tmp_path,
+        model=SimpleNamespace(urdf_path=urdf_path),
+        position_limits=((-1.0, 1.0),) * 6,
+        target_joint="joint6",
+        torque_limits_nm=(3.6, 3.6, 3.6, 1.4, 1.4, 1.4),
+    )
+
+    assert result["status"] == "OK"
+    assert result["motors_enabled_by_probe"] is False
+    assert result["motion_commands_sent"] is False
+    assert result["mode_transitions_sent"] is False
+    assert result["target_limit_nm"] == 1.4
+    assert result["apply_receipt"]["prior_limits_nm"] == (14.0,)
+    assert result["restore_receipt"]["verified_limits_nm"] == (14.0,)
+    assert backend.events == [
+        "connect",
+        "poll_feedback",
+        "safe_stop",
+        "apply",
+        "safe_stop",
+        "restore",
+        "close",
+    ]
+
+
 def test_software_profile_has_single_torque_owner() -> None:
     profile = probe.build_software_profile(
         kp=0.5,
@@ -140,6 +247,23 @@ def test_software_profile_has_single_torque_owner() -> None:
     assert profile.damping_kd_nm_s_per_rad == (0.5,) * 6
     assert profile.max_torque_rate_nm_s == (2.0,) * 6
     assert profile.metadata["torque_owner"] == "software_composed_tau; vendor_kp_kd_zero"
+
+
+def test_software_profile_overrides_only_the_target_joint_gains() -> None:
+    profile = probe.build_software_profile(
+        kp=0.25,
+        kd=0.5,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=0.1,
+        target_joint="joint6",
+        target_kp=2.0,
+        target_kd=1.0,
+    )
+
+    assert profile.position_kp_nm_per_rad == (0.25,) * 5 + (2.0,)
+    assert profile.damping_kd_nm_s_per_rad == (0.5,) * 5 + (1.0,)
+    assert profile.metadata["target_joint"] == "joint6"
 
 
 def test_software_profile_can_bound_cartesian_overlay_independently() -> None:
@@ -355,6 +479,12 @@ def test_active_joint_resolution_keeps_joint2_joint3_support() -> None:
         "joint3",
         "joint2",
     )
+    assert set(
+        probe.resolve_active_joint_names(
+            "joint6",
+            support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
+        )
+    ) == set(probe._ALL_JOINTS)
 
 
 def test_active_joint_resolution_rejects_missing_fault_support() -> None:
@@ -414,6 +544,58 @@ def test_fault_hold_snapshot_rejects_motion_and_large_rebase() -> None:
             observed_age_sec=0.01,
             position_limits_rad=_fault_hold_limits(),
             fault_qpos_rad=(0.1, 0.76, 1.1, 0.0, -0.1, 0.2),
+        )
+
+
+def test_moving_control_sample_is_not_promoted_as_fault_hold_candidate() -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+
+    accepted, rejection = probe._evaluate_fault_hold_candidate(
+        q,
+        qvel_rad_s=(0.0, 0.0, 0.0, 0.0, 0.022988, 0.0),
+        velocity_abort_rad_s=0.05,
+        observed_age_sec=0.01,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+    )
+
+    assert accepted is None
+    assert rejection is not None
+    assert "moving" in rejection
+    assert "0.022988" in rejection
+
+
+def test_stationary_control_sample_is_promoted_as_fault_hold_candidate() -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+
+    accepted, rejection = probe._evaluate_fault_hold_candidate(
+        q,
+        qvel_rad_s=(0.0, 0.0, 0.0, 0.0, 0.013779, 0.0),
+        velocity_abort_rad_s=0.05,
+        observed_age_sec=0.01,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+    )
+
+    assert accepted == q
+    assert rejection is None
+
+
+def test_control_sample_above_normal_velocity_limit_still_aborts() -> None:
+    with pytest.raises(probe.LowGainProbeError, match="velocity abort"):
+        probe._evaluate_fault_hold_candidate(
+            (0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+            qvel_rad_s=(0.0, 0.0, 0.0, 0.0, 0.050001, 0.0),
+            velocity_abort_rad_s=0.05,
+            observed_age_sec=0.01,
+            position_limits_rad=_fault_hold_limits(),
+            max_age_sec=0.15,
+            max_velocity_rad_s=0.02,
+            max_rebase_rad=0.05,
         )
 
 
@@ -590,6 +772,75 @@ def test_sigusr1_requests_full_disable() -> None:
     assert stop == {"requested": True, "full_disable_requested": True}
 
 
+def test_drive_enable_countdown_is_logged_and_mirrored(tmp_path) -> None:
+    stop = {"requested": False, "full_disable_requested": False}
+    log_stream = io.StringIO()
+    operator_output = tmp_path / "operator-tty.log"
+    sleeps: list[float] = []
+
+    completed = probe._drive_enable_countdown(
+        stop,
+        sleeper=sleeps.append,
+        log_stream=log_stream,
+        operator_tty_path=operator_output,
+    )
+
+    expected = "[DRIVE] 3\n[DRIVE] 2\n[DRIVE] 1\n[DRIVE] ENABLE\n"
+    assert completed is True
+    assert sleeps == [1.0, 1.0, 1.0]
+    assert log_stream.getvalue() == expected
+    assert operator_output.read_text(encoding="utf-8") == expected
+
+
+def test_drive_enable_countdown_interrupts_before_enable(tmp_path) -> None:
+    stop = {"requested": False, "full_disable_requested": False}
+    log_stream = io.StringIO()
+
+    def interrupt_after_first_tick(_seconds: float) -> None:
+        stop["requested"] = True
+
+    completed = probe._drive_enable_countdown(
+        stop,
+        sleeper=interrupt_after_first_tick,
+        log_stream=log_stream,
+        operator_tty_path=tmp_path / "operator-tty.log",
+    )
+
+    assert completed is False
+    assert log_stream.getvalue() == "[DRIVE] 3\n[DRIVE] CANCELLED\n"
+    assert "ENABLE" not in log_stream.getvalue()
+
+
+def test_driver_torque_limit_receipt_payload_preserves_transaction_evidence() -> None:
+    receipt = probe.B601DriverTorqueLimitReceipt(
+        operation="apply_temporary_driver_torque_limits",
+        requested_joint_names=("joint6",),
+        target_limits_nm=(1.4,),
+        prior_limits_nm=(14.0,),
+        verified_limits_nm=(1.4,),
+        applied_joint_names=("joint6",),
+        restored_joint_names=(),
+        failed_joint_names=(),
+        errors=(),
+        completed=True,
+    )
+
+    assert probe._driver_torque_limit_receipt_payload(receipt) == {
+        "operation": "apply_temporary_driver_torque_limits",
+        "requested_joint_names": ("joint6",),
+        "target_limits_nm": (1.4,),
+        "prior_limits_nm": (14.0,),
+        "verified_limits_nm": (1.4,),
+        "applied_joint_names": ("joint6",),
+        "restored_joint_names": (),
+        "failed_joint_names": (),
+        "errors": (),
+        "completed": True,
+        "rollback_attempted": False,
+        "rollback_completed": None,
+    }
+
+
 def test_slow_step_is_relative_and_bounded() -> None:
     q0 = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
     limits = ((-2.8, 2.8), (0.0, 3.14), (0.0, 3.14), (-1.57, 1.57), (-1.57, 1.57), (-3.14, 3.14))
@@ -623,6 +874,140 @@ def test_slow_step_rejects_target_outside_urdf_limit() -> None:
         )
 
 
+def test_slow_step_accepts_exactly_twenty_degrees_and_rejects_more() -> None:
+    limits = ((-3.14, 3.14),) * 6
+    qref, _qvel, done = probe.plan_reference(
+        (0.0,) * 6,
+        mode="slow-step",
+        joint="joint6",
+        elapsed_sec=100.0,
+        step_rad=probe._MAX_STEP_RAD,
+        step_speed_rad_s=0.02,
+        step_direction=1,
+        position_limits_rad=limits,
+    )
+
+    assert qref[5] == pytest.approx(probe._MAX_STEP_RAD)
+    assert done is True
+    with pytest.raises(ValueError, match="step_rad must be"):
+        probe.plan_reference(
+            (0.0,) * 6,
+            mode="slow-step",
+            joint="joint6",
+            elapsed_sec=0.0,
+            step_rad=probe._MAX_STEP_RAD + 1e-6,
+            step_speed_rad_s=0.02,
+            step_direction=1,
+            position_limits_rad=limits,
+        )
+
+
+def test_observed_target_excursion_has_twenty_degree_hard_limit() -> None:
+    anchor = (0.0,) * 6
+    at_limit = (0.0, 0.0, 0.0, 0.0, 0.0, probe._MAX_STEP_RAD)
+    over_limit = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        probe._MAX_STEP_RAD + 1e-6,
+    )
+
+    assert probe.validate_target_excursion(
+        at_limit,
+        anchor_qpos_rad=anchor,
+        target_joint="joint6",
+    ) == pytest.approx(probe._MAX_STEP_RAD)
+    with pytest.raises(probe.LowGainProbeError, match="target excursion abort"):
+        probe.validate_target_excursion(
+            over_limit,
+            anchor_qpos_rad=anchor,
+            target_joint="joint6",
+        )
+
+
+def _slow_step_samples(
+    target_positions: tuple[float, ...],
+    *,
+    support_joint1_position: float = 0.0,
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "qpos_rad": (
+                support_joint1_position,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                target,
+            ),
+            "step_done": True,
+        }
+        for target in target_positions
+    )
+
+
+def test_slow_step_response_requires_real_correct_direction_motion() -> None:
+    active = probe.resolve_active_joint_names(
+        "joint6",
+        support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
+    )
+    passed = probe.evaluate_slow_step_response(
+        mode="slow-step",
+        target_joint="joint6",
+        step_rad=0.02,
+        step_direction=1,
+        initial_qpos_rad=(0.0,) * 6,
+        samples=_slow_step_samples((0.0, 0.005, 0.01, 0.015, 0.019, 0.02)),
+        active_joint_names=active,
+    )
+    insufficient = probe.evaluate_slow_step_response(
+        mode="slow-step",
+        target_joint="joint6",
+        step_rad=0.02,
+        step_direction=1,
+        initial_qpos_rad=(0.0,) * 6,
+        samples=_slow_step_samples((0.0004,) * 6),
+        active_joint_names=active,
+    )
+    wrong_direction = probe.evaluate_slow_step_response(
+        mode="slow-step",
+        target_joint="joint6",
+        step_rad=0.02,
+        step_direction=1,
+        initial_qpos_rad=(0.0,) * 6,
+        samples=_slow_step_samples((-0.003,) * 6),
+        active_joint_names=active,
+    )
+
+    assert passed["status"] == "PASS"
+    assert passed["passed"] is True
+    assert insufficient["status"] == "INSUFFICIENT_RESPONSE"
+    assert insufficient["passed"] is False
+    assert wrong_direction["status"] == "WRONG_DIRECTION"
+    assert wrong_direction["passed"] is False
+
+
+def test_slow_step_response_rejects_support_joint_drift() -> None:
+    active = probe.resolve_active_joint_names(
+        "joint6",
+        support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
+    )
+    result = probe.evaluate_slow_step_response(
+        mode="slow-step",
+        target_joint="joint6",
+        step_rad=0.02,
+        step_direction=1,
+        initial_qpos_rad=(0.0,) * 6,
+        samples=_slow_step_samples((0.02,) * 6, support_joint1_position=0.01),
+        active_joint_names=active,
+    )
+
+    assert result["status"] == "SUPPORT_DRIFT_EXCEEDED"
+    assert result["support_peak_drift_rad"]["joint1"] == pytest.approx(0.01)
+
+
 def test_effort_limits_are_read_from_urdf_and_scaled(tmp_path) -> None:
     effort_values = (36.0, 36.0, 36.0, 14.0, 14.0, 14.0)
     joints = "".join(
@@ -646,6 +1031,9 @@ def test_parser_help_is_read_only() -> None:
     args = parser.parse_args(["--config", "config.yaml", "--rebot-source-root", "source"])
     assert args.joint == "joint1"
     assert tuple(args.support_joints) == ("joint2", "joint3")
+    assert args.target_kp is None
+    assert args.target_kd is None
+    assert args.apply_driver_torque_limits is False
     assert args.cartesian_stiffness_n_per_m == 20.0
     assert args.cartesian_max_displacement_m == 0.02
 
@@ -681,6 +1069,50 @@ def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
     )
     with pytest.raises(probe.LowGainProbeError, match="observation-only"):
         probe._validate_cli(motion_args)
+
+    driver_write_args = parser.parse_args(
+        [
+            "--mode",
+            "feedback-stability",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--apply-driver-torque-limits",
+            "--confirmation",
+            probe.FEEDBACK_STABILITY_CONFIRMATION,
+        ]
+    )
+    with pytest.raises(probe.LowGainProbeError, match="observation-only"):
+        probe._validate_cli(driver_write_args)
+
+
+def test_driver_torque_limit_roundtrip_cli_requires_explicit_authority() -> None:
+    parser = probe.build_parser()
+    base = [
+        "--mode",
+        "driver-torque-limit-roundtrip",
+        "--config",
+        "config.yaml",
+        "--rebot-source-root",
+        "source",
+        "--joint",
+        "joint6",
+    ]
+
+    with pytest.raises(probe.LowGainProbeError, match="requires --allow-motion"):
+        probe._validate_cli(parser.parse_args(base))
+
+    args = parser.parse_args(
+        [
+            *base,
+            "--allow-motion",
+            "--auto-disable",
+            "--confirmation",
+            probe.DRIVER_TORQUE_LIMIT_CONFIRMATION,
+        ]
+    )
+    probe._validate_cli(args)
 
 
 def _parse_cartesian_args(*extra: str) -> object:

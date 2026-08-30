@@ -49,6 +49,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
 from itertools import pairwise
 from pathlib import Path
+from typing import TextIO
 
 import numpy as np
 
@@ -60,6 +61,7 @@ if __package__ in (None, ""):
 from hardware.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
     B601CommandReceipt,
+    B601DriverTorqueLimitReceipt,
     B601HardwareError,
     B601ModeReceipt,
     B601RSBackend,
@@ -79,6 +81,7 @@ from robot_motion.rebot_b601_rs import (
 
 CONFIRMATION = "B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING"
 FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
+DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = ("joint2", "joint3")
@@ -96,12 +99,19 @@ _DEFAULT_TORQUE_LIMIT_SCALE = 0.25
 _DEFAULT_TORQUE_RISE_TIME_SEC = 1.0
 _DEFAULT_STEP_RAD = 0.05
 _DEFAULT_STEP_SPEED_RAD_S = 0.02
+_MAX_STEP_RAD = math.radians(20.0)
+_DEFAULT_MIN_STEP_RESPONSE_RATIO = 0.10
+_DEFAULT_MAX_STEP_RESPONSE_RATIO = 1.50
+_DEFAULT_MIN_STEP_RESPONSE_RAD = math.radians(0.1)
+_DEFAULT_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
 _DEFAULT_VELOCITY_ABORT_RAD_S = 0.10
 _DEFAULT_MAX_ERROR_RAD = 0.15
 _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
 _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
 _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
 _DEFAULT_ARMING_SETTLE_SAMPLES = 4
+_DRIVE_ENABLE_COUNTDOWN_SECONDS = 3
+_OPERATOR_TTY_PATH = Path("/dev/tty")
 _DEFAULT_CARTESIAN_STIFFNESS_N_PER_M = 20.0
 _DEFAULT_CARTESIAN_DAMPING_N_S_PER_M = 1.0
 _DEFAULT_CARTESIAN_MAX_FORCE_N = 2.0
@@ -196,6 +206,27 @@ def _command_receipt_payload(
         "errors": receipt.errors,
         "accepted": receipt.accepted,
         "source_sequence": receipt.source_sequence,
+    }
+
+
+def _driver_torque_limit_receipt_payload(
+    receipt: B601DriverTorqueLimitReceipt | None,
+) -> dict[str, object] | None:
+    if receipt is None:
+        return None
+    return {
+        "operation": receipt.operation,
+        "requested_joint_names": receipt.requested_joint_names,
+        "target_limits_nm": receipt.target_limits_nm,
+        "prior_limits_nm": receipt.prior_limits_nm,
+        "verified_limits_nm": receipt.verified_limits_nm,
+        "applied_joint_names": receipt.applied_joint_names,
+        "restored_joint_names": receipt.restored_joint_names,
+        "failed_joint_names": receipt.failed_joint_names,
+        "errors": receipt.errors,
+        "completed": receipt.completed,
+        "rollback_attempted": receipt.rollback_attempted,
+        "rollback_completed": receipt.rollback_completed,
     }
 
 
@@ -309,6 +340,52 @@ def _validate_fault_hold_snapshot(
                     f"{delta:.6f} rad > {max_rebase:.6f} rad"
                 )
     return q
+
+
+def _evaluate_fault_hold_candidate(
+    qpos_rad: Sequence[float],
+    *,
+    qvel_rad_s: Sequence[float],
+    velocity_abort_rad_s: float,
+    observed_age_sec: float,
+    position_limits_rad: Sequence[tuple[float, float]],
+    max_age_sec: float,
+    max_velocity_rad_s: float,
+    max_rebase_rad: float,
+) -> tuple[tuple[float, ...] | None, str | None]:
+    """Evaluate whether one control sample may replace ``last_safe``.
+
+    Candidate admission is deliberately separate from the normal control-loop
+    velocity watchdog. A sample may remain legal for bounded control while
+    being unsuitable as a future joint2/joint3 fault-hold reference. In that
+    case the immutable last-safe reference is retained; the strict validator
+    is still rerun if a protective hold is actually requested.
+    """
+
+    qvel = _six(qvel_rad_s, name="control_sample_qvel_rad_s")
+    velocity_abort = _positive(
+        velocity_abort_rad_s,
+        name="velocity_abort_rad_s",
+    )
+    max_velocity = max(abs(value) for value in qvel)
+    if max_velocity > velocity_abort:
+        raise LowGainProbeError(
+            f"velocity abort: max_abs_fd_velocity={max_velocity:.6f} "
+            f"> {velocity_abort:.6f} rad/s"
+        )
+    try:
+        accepted = _validate_fault_hold_snapshot(
+            qpos_rad,
+            qvel_rad_s=qvel,
+            observed_age_sec=observed_age_sec,
+            position_limits_rad=position_limits_rad,
+            max_age_sec=max_age_sec,
+            max_velocity_rad_s=max_velocity_rad_s,
+            max_rebase_rad=max_rebase_rad,
+        )
+    except LowGainProbeError as exc:
+        return None, str(exc)
+    return accepted, None
 
 
 def _validate_arming_settle_transition(
@@ -440,6 +517,11 @@ def resolve_active_joint_names(
 
 def _validate_cli(args: argparse.Namespace) -> None:
     if args.mode == "feedback-stability":
+        if getattr(args, "apply_driver_torque_limits", False):
+            raise LowGainProbeError(
+                "feedback-stability rejects --apply-driver-torque-limits; "
+                "it is observation-only"
+            )
         if args.allow_motion:
             raise LowGainProbeError(
                 "feedback-stability rejects --allow-motion; it is observation-only"
@@ -469,6 +551,33 @@ def _validate_cli(args: argparse.Namespace) -> None:
             lower_inclusive=False,
         )
         return
+    if args.mode == "driver-torque-limit-roundtrip":
+        if not args.allow_motion:
+            raise LowGainProbeError(
+                "driver-torque-limit-roundtrip requires --allow-motion"
+            )
+        if not args.auto_disable:
+            raise LowGainProbeError(
+                "driver-torque-limit-roundtrip requires explicit --auto-disable"
+            )
+        if args.confirmation != DRIVER_TORQUE_LIMIT_CONFIRMATION:
+            raise LowGainProbeError(
+                "driver-torque-limit-roundtrip requires --confirmation "
+                f"{DRIVER_TORQUE_LIMIT_CONFIRMATION}"
+            )
+        if getattr(args, "apply_driver_torque_limits", False):
+            raise LowGainProbeError(
+                "driver-torque-limit-roundtrip already performs the explicit "
+                "temporary write; omit --apply-driver-torque-limits"
+            )
+        _bounded(
+            args.torque_limit_scale,
+            name="torque_limit_scale",
+            lower=0.01,
+            upper=0.5,
+            lower_inclusive=False,
+        )
+        return
     if not args.allow_motion:
         raise LowGainProbeError("low-gain mode requires --allow-motion")
     if not args.auto_disable:
@@ -489,6 +598,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _bounded(args.freeze_sec, name="freeze_sec", lower=0.1, upper=10.0)
     _bounded(args.kp, name="kp", lower=0.0, upper=5.0)
     _bounded(args.kd, name="kd", lower=0.0, upper=5.0)
+    target_kp = getattr(args, "target_kp", None)
+    target_kd = getattr(args, "target_kd", None)
+    if target_kp is not None:
+        _bounded(target_kp, name="target_kp", lower=0.0, upper=5.0)
+    if target_kd is not None:
+        _bounded(target_kd, name="target_kd", lower=0.0, upper=5.0)
     _bounded(args.gravity_scale, name="gravity_scale", lower=0.0, upper=1.0)
     _bounded(
         args.torque_limit_scale,
@@ -515,7 +630,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         lower=0.01,
         upper=0.5,
     )
-    _bounded(args.step_rad, name="step_rad", lower=0.0, upper=0.2)
+    _bounded(args.step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
     _bounded(
         args.step_speed_rad_s,
         name="step_speed_rad_s",
@@ -601,8 +716,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         getattr(args, "support_joints", _FAULT_HOLD_JOINTS),
     )
     if args.mode == "cartesian-hold":
-        if args.kp != 0.0:
-            raise ValueError("cartesian-hold requires --kp 0 to avoid joint-position stiffness")
+        if args.kp != 0.0 or target_kp not in (None, 0.0):
+            raise ValueError(
+                "cartesian-hold requires --kp 0 and no non-zero --target-kp "
+                "to avoid joint-position stiffness"
+            )
         if active_joint_names != _ALL_JOINTS:
             raise ValueError(
                 "cartesian-hold requires the canonical joint1..joint6 active set; "
@@ -864,6 +982,150 @@ def _run_feedback_stability_probe(
     return payload
 
 
+def _run_driver_torque_limit_roundtrip_probe(
+    backend: B601RSBackend,
+    *,
+    config_path: Path,
+    source_root: Path,
+    model: B601PinocchioModel,
+    position_limits: tuple[tuple[float, float], ...],
+    target_joint: str,
+    torque_limits_nm: tuple[float, ...],
+) -> dict[str, object]:
+    """Verify one volatile ``0x700B`` apply/restore transaction while disabled."""
+
+    if target_joint not in _ALL_JOINTS:
+        raise ValueError(f"unknown B601-RS joint: {target_joint}")
+    target_names = (target_joint,)
+    connected = False
+    preflight_disable: B601ModeReceipt | None = None
+    cleanup_receipt: B601ModeReceipt | None = None
+    apply_receipt: B601DriverTorqueLimitReceipt | None = None
+    restore_receipt: B601DriverTorqueLimitReceipt | None = None
+    feedback_validated = False
+    errors: list[str] = []
+    try:
+        backend.connect()
+        connected = True
+        state = backend.poll_feedback(request_feedback=True)
+        if (
+            not state.valid
+            or getattr(state, "stale", False)
+            or state.positions_rad is None
+        ):
+            raise LowGainProbeError(
+                "driver torque-limit roundtrip requires one complete valid feedback "
+                f"snapshot; last_fault={state.fault_reason or 'unknown'}"
+            )
+        qpos = _six(state.positions_rad, name="driver_limit_feedback_qpos_rad")
+        for index, (value, (lower, upper)) in enumerate(
+            zip(qpos, position_limits, strict=True)
+        ):
+            if not lower <= value <= upper:
+                raise LowGainProbeError(
+                    f"driver limit feedback qpos_rad[{index}]={value:.6f} is "
+                    f"outside URDF limits [{lower:.6f}, {upper:.6f}]"
+                )
+        feedback_validated = True
+        preflight_disable = backend.safe_stop(joint_names=target_names)
+        if not preflight_disable.completed:
+            raise LowGainProbeError(
+                "preflight safe_stop failed: "
+                + "; ".join(preflight_disable.errors)
+            )
+        apply_receipt = backend.apply_temporary_driver_torque_limits(
+            torque_limits_nm,
+            joint_names=target_names,
+        )
+        if not apply_receipt.completed:
+            raise LowGainProbeError(
+                "temporary driver torque-limit apply failed: "
+                + "; ".join(apply_receipt.errors)
+            )
+    except (B601HardwareError, LowGainProbeError, OSError, TypeError, ValueError) as exc:
+        errors.append(str(exc))
+    except Exception as exc:  # noqa: BLE001 - preserve vendor failure evidence
+        errors.append(f"unexpected roundtrip failure: {exc}")
+    finally:
+        if connected:
+            try:
+                cleanup_receipt = backend.safe_stop(joint_names=target_names)
+                if not cleanup_receipt.completed:
+                    errors.extend(
+                        f"cleanup safe_stop: {error}"
+                        for error in cleanup_receipt.errors
+                    )
+                    if not cleanup_receipt.errors:
+                        errors.append(
+                            "cleanup safe_stop incomplete without vendor error"
+                        )
+            except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                errors.append(f"cleanup safe_stop: {exc}")
+            try:
+                restore_receipt = backend.restore_driver_torque_limits()
+                if not restore_receipt.completed:
+                    errors.extend(
+                        f"restore driver torque limit: {error}"
+                        for error in restore_receipt.errors
+                    )
+                    if not restore_receipt.errors:
+                        errors.append(
+                            "restore driver torque limit incomplete without vendor error"
+                        )
+            except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                errors.append(f"restore driver torque limit: {exc}")
+            try:
+                backend.close()
+            except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                errors.append(f"close: {exc}")
+
+    completed = (
+        feedback_validated
+        and preflight_disable is not None
+        and preflight_disable.completed
+        and apply_receipt is not None
+        and apply_receipt.completed
+        and cleanup_receipt is not None
+        and cleanup_receipt.completed
+        and restore_receipt is not None
+        and restore_receipt.completed
+        and not errors
+    )
+    return {
+        "status": "OK" if completed else "FAIL",
+        "mode": "driver-torque-limit-roundtrip",
+        "confirmation": DRIVER_TORQUE_LIMIT_CONFIRMATION,
+        "channel": backend.config.channel,
+        "config_path": str(config_path),
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "rebot_source_root": str(source_root),
+        "urdf_path": str(model.urdf_path),
+        "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+        "transport": "motorbridge_wired_local",
+        "target_joint": target_joint,
+        "target_limit_nm": torque_limits_nm[_ALL_JOINTS.index(target_joint)],
+        "parameter": "RobStride limit_torque 0x700B",
+        "parameter_persistence": "volatile_not_saved",
+        "feedback_validated": feedback_validated,
+        "motors_enabled_by_probe": False,
+        "motion_commands_sent": False,
+        "mode_transitions_sent": False,
+        "parameter_write_attempted": apply_receipt is not None,
+        "preflight_disable_receipt": _mode_receipt_payload(preflight_disable),
+        "apply_receipt": _driver_torque_limit_receipt_payload(apply_receipt),
+        "cleanup_receipt": _mode_receipt_payload(cleanup_receipt),
+        "restore_receipt": _driver_torque_limit_receipt_payload(restore_receipt),
+        "errors": tuple(errors),
+        "acceptance_status": "PASS" if completed else "FAIL",
+        "hardware_acceptance": "NOT_CLAIMED",
+        "notes": [
+            "This mode never changes control mode, enables a motor, or sends MIT/POS_VEL commands.",
+            "It writes only the selected arm motor's volatile RobStride limit_torque (0x700B), verifies readback, safe-stops again, and restores the exact observed original value with readback.",
+            "A PASS validates the guarded parameter transaction only; it is not a motion, force-control, or haptic acceptance result.",
+        ],
+    }
+
+
 def condition_torque(
     requested_nm: Sequence[float],
     previous_nm: Sequence[float],
@@ -897,6 +1159,9 @@ def build_software_profile(
     torque_rise_time_sec: float,
     velocity_limit_rad_s: float,
     overlay_limits_nm: Sequence[float] = _ZERO_SIX,
+    target_joint: str | None = None,
+    target_kp: float | None = None,
+    target_kd: float | None = None,
 ) -> B601MitControlProfile:
     """Build the low-gain software composition profile used by the probe."""
 
@@ -910,10 +1175,33 @@ def build_software_profile(
         raise ValueError("overlay_limits_nm must be non-negative")
     rise_time = _positive(torque_rise_time_sec, name="torque_rise_time_sec")
     velocity_limit = _positive(velocity_limit_rad_s, name="velocity_limit_rad_s")
+    position_gains = [kp] * 6
+    damping_gains = [kd] * 6
+    if target_joint is None:
+        if target_kp is not None or target_kd is not None:
+            raise ValueError("target_joint is required for target gain overrides")
+    else:
+        if target_joint not in _ALL_JOINTS:
+            raise ValueError(f"unknown B601-RS joint: {target_joint}")
+        target_index = _ALL_JOINTS.index(target_joint)
+        if target_kp is not None:
+            position_gains[target_index] = _bounded(
+                target_kp,
+                name="target_kp",
+                lower=0.0,
+                upper=5.0,
+            )
+        if target_kd is not None:
+            damping_gains[target_index] = _bounded(
+                target_kd,
+                name="target_kd",
+                lower=0.0,
+                upper=5.0,
+            )
     return B601MitControlProfile(
         name="b601_rs_low_gain_software_gravity_damping",
-        position_kp_nm_per_rad=(kp,) * 6,
-        damping_kd_nm_s_per_rad=(kd,) * 6,
+        position_kp_nm_per_rad=tuple(position_gains),
+        damping_kd_nm_s_per_rad=tuple(damping_gains),
         max_abs_torque_nm=limits,
         max_torque_rate_nm_s=tuple(value / rise_time for value in limits),
         max_abs_overlay_torque_nm=overlay_limits,
@@ -924,6 +1212,7 @@ def build_software_profile(
             "torque_owner": "software_composed_tau; vendor_kp_kd_zero",
             "torque_limit_source": "pinned_urdf_effort_scaled",
             "torque_rise_time_sec": rise_time,
+            "target_joint": target_joint,
         },
     )
 
@@ -1102,7 +1391,7 @@ def plan_reference(
     if mode != "slow-step":
         raise ValueError("mode must be hold, slow-step, or cartesian-hold")
     direction = 1 if int(step_direction) >= 0 else -1
-    step = _bounded(step_rad, name="step_rad", lower=0.0, upper=0.2)
+    step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
     speed = _bounded(step_speed_rad_s, name="step_speed_rad_s", lower=0.001, upper=0.05)
     index = _ALL_JOINTS.index(joint)
     target = float(initial[index] + direction * step)
@@ -1122,6 +1411,176 @@ def plan_reference(
     return tuple(float(value) for value in qref), tuple(float(value) for value in qvel), done
 
 
+def validate_target_excursion(
+    qpos_rad: Sequence[float],
+    *,
+    anchor_qpos_rad: Sequence[float],
+    target_joint: str,
+    max_excursion_rad: float = _MAX_STEP_RAD,
+) -> float:
+    """Return target excursion or reject motion beyond the hard relative limit."""
+
+    current = _six(qpos_rad, name="qpos_rad")
+    anchor = _six(anchor_qpos_rad, name="anchor_qpos_rad")
+    if target_joint not in _ALL_JOINTS:
+        raise ValueError(f"unknown B601-RS joint: {target_joint}")
+    limit = _bounded(
+        max_excursion_rad,
+        name="max_excursion_rad",
+        lower=0.0,
+        upper=_MAX_STEP_RAD,
+        lower_inclusive=False,
+    )
+    index = _ALL_JOINTS.index(target_joint)
+    excursion = abs(current[index] - anchor[index])
+    if excursion > limit:
+        raise LowGainProbeError(
+            f"target excursion abort: {target_joint} moved {excursion:.6f} rad "
+            f"from the post-enable anchor, exceeding the {limit:.6f} rad "
+            "(20 deg maximum) hard limit"
+        )
+    return excursion
+
+
+def evaluate_slow_step_response(
+    *,
+    mode: str,
+    target_joint: str,
+    step_rad: float,
+    step_direction: int,
+    initial_qpos_rad: Sequence[float] | None,
+    samples: Sequence[dict[str, object]],
+    active_joint_names: Sequence[str],
+    min_response_ratio: float = _DEFAULT_MIN_STEP_RESPONSE_RATIO,
+    max_response_ratio: float = _DEFAULT_MAX_STEP_RESPONSE_RATIO,
+    min_response_rad: float = _DEFAULT_MIN_STEP_RESPONSE_RAD,
+    max_support_drift_rad: float = _DEFAULT_MAX_SUPPORT_DRIFT_RAD,
+) -> dict[str, object]:
+    """Classify whether a completed relative step produced a bounded response.
+
+    This is commissioning evidence only.  It deliberately uses the mean of the
+    final five feedback samples so one quantized sample cannot turn a no-motion
+    run into an apparent response pass.
+    """
+
+    if mode != "slow-step":
+        return {"status": "NOT_APPLICABLE", "passed": True}
+    if target_joint not in _ALL_JOINTS:
+        raise ValueError(f"unknown B601-RS joint: {target_joint}")
+    if initial_qpos_rad is None:
+        return {
+            "status": "NO_INITIAL_REFERENCE",
+            "passed": False,
+            "sample_count": len(samples),
+        }
+    initial = np.asarray(_six(initial_qpos_rad, name="initial_qpos_rad"), dtype=float)
+    step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
+    if step <= 0.0:
+        raise ValueError("slow-step response requires step_rad > 0")
+    minimum_ratio = _bounded(
+        min_response_ratio,
+        name="min_response_ratio",
+        lower=0.0,
+        upper=1.0,
+    )
+    maximum_ratio = _bounded(
+        max_response_ratio,
+        name="max_response_ratio",
+        lower=1.0,
+        upper=5.0,
+    )
+    minimum_rad = _bounded(
+        min_response_rad,
+        name="min_response_rad",
+        lower=0.0,
+        upper=0.1,
+    )
+    support_limit = _bounded(
+        max_support_drift_rad,
+        name="max_support_drift_rad",
+        lower=0.0,
+        upper=0.1,
+    )
+    qpos_samples = tuple(
+        np.asarray(_six(sample["qpos_rad"], name="sample_qpos_rad"), dtype=float)
+        for sample in samples
+    )
+    if not qpos_samples:
+        return {
+            "status": "NO_FEEDBACK_SAMPLES",
+            "passed": False,
+            "sample_count": 0,
+        }
+    tail_size = min(5, len(qpos_samples))
+    settled = np.mean(np.stack(qpos_samples[-tail_size:]), axis=0)
+    target_index = _ALL_JOINTS.index(target_joint)
+    direction = 1 if int(step_direction) >= 0 else -1
+    signed_displacement = direction * float(
+        settled[target_index] - initial[target_index]
+    )
+    response_ratio = signed_displacement / step
+    peak_signed_displacement = max(
+        direction * float(qpos[target_index] - initial[target_index])
+        for qpos in qpos_samples
+    )
+    max_abs_target_excursion = max(
+        abs(float(qpos[target_index] - initial[target_index]))
+        for qpos in qpos_samples
+    )
+    support_names = tuple(
+        name
+        for name in active_joint_names
+        if name in _ALL_JOINTS and name != target_joint
+    )
+    support_peak_drift = {
+        name: max(
+            abs(float(qpos[_ALL_JOINTS.index(name)] - initial[_ALL_JOINTS.index(name)]))
+            for qpos in qpos_samples
+        )
+        for name in support_names
+    }
+    max_support_drift = max(support_peak_drift.values(), default=0.0)
+    reference_completed = any(bool(sample.get("step_done", False)) for sample in samples)
+    minimum_required = max(minimum_rad, minimum_ratio * step)
+    maximum_allowed = maximum_ratio * step
+    if max_abs_target_excursion > _MAX_STEP_RAD:
+        status = "EXCURSION_LIMIT_EXCEEDED"
+    elif not reference_completed:
+        status = "REFERENCE_INCOMPLETE"
+    elif signed_displacement < -minimum_rad:
+        status = "WRONG_DIRECTION"
+    elif signed_displacement < minimum_required:
+        status = "INSUFFICIENT_RESPONSE"
+    elif signed_displacement > maximum_allowed:
+        status = "EXCESSIVE_RESPONSE"
+    elif max_support_drift > support_limit:
+        status = "SUPPORT_DRIFT_EXCEEDED"
+    else:
+        status = "PASS"
+    return {
+        "status": status,
+        "passed": status == "PASS",
+        "sample_count": len(qpos_samples),
+        "settled_sample_count": tail_size,
+        "reference_completed": reference_completed,
+        "target_joint": target_joint,
+        "step_direction": direction,
+        "commanded_step_rad": step,
+        "hard_excursion_limit_rad": _MAX_STEP_RAD,
+        "settled_signed_displacement_rad": signed_displacement,
+        "peak_signed_displacement_rad": peak_signed_displacement,
+        "max_abs_target_excursion_rad": max_abs_target_excursion,
+        "response_ratio": response_ratio,
+        "minimum_response_rad": minimum_required,
+        "maximum_response_rad": maximum_allowed,
+        "final_tracking_error_rad": abs(step - signed_displacement),
+        "support_joint_names": support_names,
+        "support_peak_drift_rad": support_peak_drift,
+        "max_support_drift_rad": max_support_drift,
+        "max_support_drift_limit_rad": support_limit,
+    }
+
+
 def _output_payload(payload: dict[str, object], output: Path | None) -> None:
     encoded = json.dumps(payload, indent=2, sort_keys=True, default=list)
     print(encoded)
@@ -1138,6 +1597,52 @@ def _signal_handler(stop: dict[str, bool], signum: int, _frame: object) -> None:
     stop["requested"] = True
     if getattr(signal, "SIGUSR1", None) == signum:
         stop["full_disable_requested"] = True
+
+
+def _drive_enable_countdown(
+    stop: dict[str, bool],
+    *,
+    seconds: int = _DRIVE_ENABLE_COUNTDOWN_SECONDS,
+    sleeper: Callable[[float], None] = time.sleep,
+    log_stream: TextIO | None = None,
+    operator_tty_path: Path | None = _OPERATOR_TTY_PATH,
+) -> bool:
+    """Log and foreground-mirror the final interruptible enable countdown."""
+
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+        raise ValueError("drive enable countdown seconds must be a positive integer")
+    output = sys.stdout if log_stream is None else log_stream
+    operator_stream: TextIO | None = None
+    try:
+        if operator_tty_path is not None and not output.isatty():
+            try:
+                operator_stream = operator_tty_path.open("w", encoding="utf-8")
+            except OSError:
+                # A missing controlling terminal must not hide the audit log or
+                # turn a valid foreground invocation into an implementation error.
+                operator_stream = None
+
+        def emit(message: str) -> None:
+            print(message, file=output, flush=True)
+            if operator_stream is not None:
+                print(message, file=operator_stream, flush=True)
+
+        for remaining in range(seconds, 0, -1):
+            if stop.get("requested", False) or stop.get(
+                "full_disable_requested", False
+            ):
+                emit("[DRIVE] CANCELLED")
+                return False
+            emit(f"[DRIVE] {remaining}")
+            sleeper(1.0)
+        if stop.get("requested", False) or stop.get("full_disable_requested", False):
+            emit("[DRIVE] CANCELLED")
+            return False
+        emit("[DRIVE] ENABLE")
+        return True
+    finally:
+        if operator_stream is not None:
+            operator_stream.close()
 
 
 def _freeze_and_stop(
@@ -1527,6 +2032,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         model.urdf_path,
         scale=args.torque_limit_scale,
     )
+    if args.mode == "driver-torque-limit-roundtrip":
+        config = B601RSBackendConfig.from_rs_yaml(
+            config_path,
+            allow_motion=True,
+            position_limits_rad=position_limits,
+        )
+        return _run_driver_torque_limit_roundtrip_probe(
+            B601RSBackend(config),
+            config_path=config_path,
+            source_root=source_root,
+            model=model,
+            position_limits=position_limits,
+            target_joint=args.joint,
+            torque_limits_nm=torque_limits,
+        )
     overlay_limits = (
         tuple(
             value * args.cartesian_overlay_limit_scale
@@ -1542,6 +2062,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         torque_rise_time_sec=args.torque_rise_time_sec,
         velocity_limit_rad_s=args.velocity_abort_rad_s,
         overlay_limits_nm=overlay_limits,
+        target_joint=args.joint,
+        target_kp=args.target_kp,
+        target_kd=args.target_kd,
     )
     config = B601RSBackendConfig.from_rs_yaml(
         config_path,
@@ -1576,6 +2099,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     torque_limit_count = 0
     slew_limit_count = 0
     overlay_limit_count = 0
+    fault_hold_candidate_accepted_count = 0
+    fault_hold_candidate_rejected_count = 0
+    fault_hold_candidate_last_rejection: str | None = None
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
     primary_error: Exception | None = None
@@ -1583,6 +2109,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     mode_receipt: B601ModeReceipt | None = None
     enable_receipt: B601ModeReceipt | None = None
     cleanup_receipt: B601ModeReceipt | None = None
+    driver_limit_apply_receipt: B601DriverTorqueLimitReceipt | None = None
+    driver_limit_restore_receipt: B601DriverTorqueLimitReceipt | None = None
     cleanup_errors: list[str] = []
     protective_hold_latched = False
     protective_hold_commands = 0
@@ -1670,6 +2198,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             raise LowGainProbeError(
                 "preflight safe_stop failed: " + "; ".join(preflight_disable.errors)
             )
+        if getattr(args, "apply_driver_torque_limits", False):
+            driver_limit_apply_receipt = (
+                backend.apply_temporary_driver_torque_limits(
+                    torque_limits,
+                    joint_names=(args.joint,),
+                )
+            )
+            if not driver_limit_apply_receipt.completed:
+                detail = "; ".join(driver_limit_apply_receipt.errors)
+                raise LowGainProbeError(
+                    "temporary driver torque-limit apply failed"
+                    + (f": {detail}" if detail else "")
+                )
         mode_receipt = backend.prepare_mit_mode(joint_names=active_joint_names)
         if not mode_receipt.completed:
             raise LowGainProbeError(
@@ -1681,6 +2222,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             )
         if stop["requested"]:
             raise LowGainProbeError("operator interrupt before motor enable")
+        if not _drive_enable_countdown(stop):
+            if stop["full_disable_requested"]:
+                raise LowGainProbeError(
+                    "explicit full disable requested during drive countdown"
+                )
+            raise LowGainProbeError("operator interrupt during drive countdown")
         enable_receipt = backend.enable(joint_names=active_joint_names)
         if not enable_receipt.completed:
             raise LowGainProbeError(
@@ -1881,26 +2428,41 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             if any(not math.isfinite(value) for value in qvel):
                 stop_reason = "non-finite finite-difference velocity"
                 break
-            max_velocity = max(abs(value) for value in qvel)
-            if max_velocity > args.velocity_abort_rad_s:
-                stop_reason = (
-                    f"velocity abort: max_abs_fd_velocity={max_velocity:.6f} "
-                    f"> {args.velocity_abort_rad_s:.6f} rad/s"
-                )
-                break
+            if args.mode == "slow-step" and initial_q is not None:
+                try:
+                    validate_target_excursion(
+                        q,
+                        anchor_qpos_rad=initial_q,
+                        target_joint=args.joint,
+                    )
+                except LowGainProbeError as exc:
+                    stop_reason = str(exc)
+                    break
             try:
-                safe_candidate_q = _validate_fault_hold_snapshot(
+                (
+                    safe_candidate_q,
+                    fault_hold_candidate_rejection,
+                ) = _evaluate_fault_hold_candidate(
                     q,
                     qvel_rad_s=qvel,
-                    observed_age_sec=max(0.0, time.monotonic() - observed_at_sec),
+                    velocity_abort_rad_s=args.velocity_abort_rad_s,
+                    observed_age_sec=max(
+                        0.0,
+                        time.monotonic() - observed_at_sec,
+                    ),
                     position_limits_rad=position_limits,
                     max_age_sec=args.fault_hold_max_age_sec,
                     max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
                     max_rebase_rad=args.fault_hold_max_rebase_rad,
                 )
             except LowGainProbeError as exc:
-                stop_reason = f"last-safe snapshot rejected: {exc}"
+                stop_reason = str(exc)
                 break
+            if safe_candidate_q is None:
+                fault_hold_candidate_rejected_count += 1
+                fault_hold_candidate_last_rejection = fault_hold_candidate_rejection
+            else:
+                fault_hold_candidate_accepted_count += 1
             elapsed = time.monotonic() - started
             qref, qvel_ref, step_done = plan_reference(
                 initial_q,
@@ -2004,6 +2566,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "conditioned_tau_nm": conditioned_tau,
                     "torque_limited": torque_limited,
                     "slew_limited": slew_limited,
+                    "fault_hold_candidate_accepted": safe_candidate_q is not None,
+                    "fault_hold_candidate_rejection": fault_hold_candidate_rejection,
                     "step_done": step_done,
                     "cartesian_impedance": cartesian_audit,
                     "freshness_verified": state.freshness_verified,
@@ -2013,9 +2577,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             previous_q = q
             previous_feedback_time = state.receive_timestamp_sec
             previous_tau = conditioned_tau
-            last_safe_q = safe_candidate_q
-            last_safe_qvel = tuple(float(value) for value in qvel)
-            last_safe_observed_at_sec = observed_at_sec
+            if safe_candidate_q is not None:
+                last_safe_q = safe_candidate_q
+                last_safe_qvel = tuple(float(value) for value in qvel)
+                last_safe_observed_at_sec = observed_at_sec
             next_deadline += period
             completed_at = time.monotonic()
             if completed_at > next_deadline:
@@ -2131,6 +2696,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 issue_full_safe_stop()
             else:
                 issue_full_safe_stop()
+            if getattr(args, "apply_driver_torque_limits", False):
+                try:
+                    driver_limit_restore_receipt = (
+                        backend.restore_driver_torque_limits()
+                    )
+                    if not driver_limit_restore_receipt.completed:
+                        cleanup_errors.extend(
+                            f"restore driver torque limit: {error}"
+                            for error in driver_limit_restore_receipt.errors
+                        )
+                        if not driver_limit_restore_receipt.errors:
+                            cleanup_errors.append(
+                                "restore driver torque limit incomplete without vendor error"
+                            )
+                except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
+                    cleanup_errors.append(f"restore driver torque limit: {exc}")
         try:
             backend.close()
         except Exception as exc:  # noqa: BLE001 - preserve cleanup evidence
@@ -2154,13 +2735,36 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         )
         for event in required_events
     }
-    cleanup_ok = cleanup_receipt is not None and cleanup_receipt.completed and not cleanup_errors
+    driver_limit_cleanup_ok = (
+        not getattr(args, "apply_driver_torque_limits", False)
+        or (
+            driver_limit_restore_receipt is not None
+            and driver_limit_restore_receipt.completed
+        )
+    )
+    cleanup_ok = (
+        cleanup_receipt is not None
+        and cleanup_receipt.completed
+        and driver_limit_cleanup_ok
+        and not cleanup_errors
+    )
     control_passed = (
         stop_reason is None
         and commands_sent > 0
         and cleanup_ok
         and all(result.passed for result in frequency_acceptance.values())
     )
+    slow_step_response = evaluate_slow_step_response(
+        mode=args.mode,
+        target_joint=args.joint,
+        step_rad=args.step_rad,
+        step_direction=args.step_direction,
+        initial_qpos_rad=initial_q,
+        samples=samples,
+        active_joint_names=active_joint_names,
+    )
+    response_passed = bool(slow_step_response["passed"])
+    acceptance_passed = control_passed and response_passed
     max_abs_requested = max(
         (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
         default=0.0,
@@ -2170,7 +2774,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         default=0.0,
     )
     return {
-        "status": "OK" if control_passed else "FAIL",
+        "status": "OK" if acceptance_passed else "FAIL",
         "mode": args.mode,
         "confirmation": CONFIRMATION,
         "channel": config.channel,
@@ -2207,6 +2811,20 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "mode_receipt": _mode_receipt_payload(mode_receipt),
         "enable_receipt": _mode_receipt_payload(enable_receipt),
         "cleanup_receipt": _mode_receipt_payload(cleanup_receipt),
+        "driver_torque_limits": {
+            "requested": bool(
+                getattr(args, "apply_driver_torque_limits", False)
+            ),
+            "source": "pinned_urdf_effort_scaled",
+            "requested_limits_nm": torque_limits,
+            "volatile_parameter": "RobStride limit_torque 0x700B",
+            "apply_receipt": _driver_torque_limit_receipt_payload(
+                driver_limit_apply_receipt
+            ),
+            "restore_receipt": _driver_torque_limit_receipt_payload(
+                driver_limit_restore_receipt
+            ),
+        },
         "protective_hold": {
             "latched": protective_hold_latched,
             "command_count": protective_hold_commands,
@@ -2234,6 +2852,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "vendor_kd_nm_s_per_rad": _ZERO_SIX,
             "reference_velocity_rad_s": _ZERO_SIX,
         },
+        "fault_hold_candidate_admission": {
+            "accepted_count": fault_hold_candidate_accepted_count,
+            "rejected_count": fault_hold_candidate_rejected_count,
+            "last_rejection": fault_hold_candidate_last_rejection,
+            "max_age_sec": args.fault_hold_max_age_sec,
+            "max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
+            "semantics": "rejected_sample_retains_previous_last_safe",
+        },
         "initial_qpos_rad": initial_q,
         "final_qpos_rad": final_q,
         "profile": {
@@ -2248,6 +2874,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "vendor_kd_nm_s_per_rad": _ZERO_SIX,
             "torque_owner": "software_composed_tau_only",
         },
+        "slow_step_response": slow_step_response,
         "cartesian_impedance": {
             "enabled": args.mode == "cartesian-hold",
             "translation_only": True,
@@ -2270,25 +2897,29 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             event: result.as_dict()
             for event, result in frequency_acceptance.items()
         },
-        "acceptance_status": "PASS" if control_passed else "FAIL",
+        "control_acceptance_status": "PASS" if control_passed else "FAIL",
+        "motion_response_status": slow_step_response["status"],
+        "acceptance_status": "PASS" if acceptance_passed else "FAIL",
         "hardware_acceptance": "NOT_CLAIMED",
         "freshness_verified": False,
         "freshness_semantics": "motorbridge_mechPos_parameter_observation_unverified",
         "samples": samples,
         "notes": [
             "Human-run commissioning only; automated tests never execute this active path.",
-            "The active set is target joint plus mandatory joint2/joint3 support; unselected arm joints are never enabled or dispatched.",
+            "The active set is the target plus explicitly selected support joints; scheme-1 J6 commissioning selects all six arm joints while only the J6 reference changes.",
             "On an exceptional stop, only joint2/joint3 may be latched; joint1/joint4/joint5/joint6 are safe-stopped, and SIGUSR1 is required for full disable.",
             "Protective hold admits only a host-fresh, in-limit, near-zero-velocity last-safe snapshot and a small fault rebase; otherwise it falls back to full safe_stop.",
+            "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
             "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
-            "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step.",
+            "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
             "Before any torque command, the active path requires four consecutive complete feedback snapshots after enable; no torque command is sent during this arming-settle gate.",
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "Software composes gravity, position, finite-difference damping, and an optional bounded J.T F overlay, then dispatches vendor MIT kp=kd=0.",
+            "When explicitly requested, the probe temporarily mirrors the target joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies readback before enable, and restores the original value after full safe_stop.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
-            "A PASS means the guarded software run and cleanup met their declared bounds. It is not a HARDWARE_PASS or force-sensor validation.",
+            "A slow-step PASS additionally requires a completed reference, correct-direction bounded target response, and bounded support-joint drift. It is not a HARDWARE_PASS or force-sensor validation.",
         ],
     }
 
@@ -2302,7 +2933,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("hold", "slow-step", "cartesian-hold", "feedback-stability"),
+        choices=(
+            "hold",
+            "slow-step",
+            "cartesian-hold",
+            "feedback-stability",
+            "driver-torque-limit-roundtrip",
+        ),
         default="hold",
     )
     parser.add_argument("--config", required=True, help="explicit rebotarm_rs.yaml")
@@ -2338,12 +2975,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-direction", type=int, choices=(-1, 1), default=1)
     parser.add_argument("--kp", type=float, default=_DEFAULT_KP)
     parser.add_argument("--kd", type=float, default=_DEFAULT_KD)
+    parser.add_argument(
+        "--target-kp",
+        type=float,
+        help="optional software position gain override for --joint only",
+    )
+    parser.add_argument(
+        "--target-kd",
+        type=float,
+        help="optional software damping gain override for --joint only",
+    )
     parser.add_argument("--gravity-scale", type=float, default=_DEFAULT_GRAVITY_SCALE)
     parser.add_argument(
         "--torque-limit-scale",
         type=float,
         default=_DEFAULT_TORQUE_LIMIT_SCALE,
         help="fraction of the pinned URDF effort ceiling; max 0.5 for this probe",
+    )
+    parser.add_argument(
+        "--apply-driver-torque-limits",
+        action="store_true",
+        help=(
+            "temporarily mirror the target joint's scaled URDF torque envelope "
+            "into volatile RobStride limit_torque (0x700B), with readback and "
+            "restoration"
+        ),
     )
     parser.add_argument(
         "--torque-rise-time-sec",
