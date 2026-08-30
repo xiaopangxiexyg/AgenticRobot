@@ -35,13 +35,13 @@
     {
       "artifact_id": "rm65-arm-actuator-core-runtime-20260829-v4",
       "artifact_kind": "sim_actuator_core_source",
-      "sha256": "a2c8e37e1e380ee3805fd8994b3d3ead7649e444f0d92ad7753d448d959ac0a4",
+      "sha256": "4a68394fd359b6481e28594bf933c56ffe270ddcd7806c44675cd3e964e697c6",
       "locator": "sim/rm65/actuation/core.py"
     },
     {
       "artifact_id": "rm65-arm-mujoco-executor-runtime-20260829-v4",
       "artifact_kind": "sim_backend_adapter_source",
-      "sha256": "b40ca440ffda190c6adacd11cb45289e7efd41745bdc516324625c7d4614e84d",
+      "sha256": "35149c17f62f3f0f822084574aeb8f8c38e03a52e7c96e2e237acac4e40806bc",
       "locator": "sim/mujoco/actuation/executor.py"
     },
     {
@@ -72,7 +72,7 @@
       "limitations": [
         "This binding reuses the frozen 20260721.v4 arm fit; no arm parameters were refit or revalidated.",
         "The frozen fit manifest continues to identify its historical core and MuJoCo adapter by their original hashes; the current sources are bound separately here.",
-        "The current core and executor changes repair execution continuity, state restoration, collision admission, and diagnostics; they are not new physical-response evidence.",
+        "The current core and executor changes harden lifecycle close/retry ownership, exact execution identity, state restoration, collision admission, and diagnostics; they are not new physical-response evidence.",
         "The original v4 held-out status remains not_run, so this binding does not promote the arm fidelity claim.",
         "Collision avoidance correctness and MuJoCo contact behavior do not establish real-robot collision or grasp fidelity."
       ],
@@ -106,14 +106,14 @@
       "status": "not_run",
       "metrics": {},
       "evidence_artifact_ids": [],
-      "notes": "Execution-continuity fixes and source rebinding are not new arm-response evidence. A later clean capture must remain untouched before the reused v4 fit can pass held-out validation."
+      "notes": "Lifecycle and identity hardening plus source rebinding are not new arm-response evidence. A later clean capture must remain untouched before the reused v4 fit can pass held-out validation."
     }
   ],
-  "code_revision": "4c56650070a05f8a7f3c97b9fe6851886fd9b4c4",
+  "code_revision": "73e1263bfae1a3606675586805b5a6906ec91bcb",
   "environment_fingerprint": {
     "python": "3.10.20",
     "mujoco": "3.10.0",
-    "source_commit": "4c56650070a05f8a7f3c97b9fe6851886fd9b4c4"
+    "source_commit": "73e1263bfae1a3606675586805b5a6906ec91bcb"
   },
   "metadata": {
     "owner": "sim.rm65",
@@ -124,10 +124,10 @@
     "previous_runtime_binding_artifact_sha256": "c8781f8b9f206133adb58eb0393f4932e9f4442bbc533206deb9479a13b693c1",
     "previous_runtime_binding_file_sha256": "0e347a0c325a4a588ff1b815a73749720ce86be4b1c795b7f6f52a7731758e24",
     "arm_profile_refit": false,
-    "runtime_behavior_change": false,
-    "runtime_behavior_change_scope": "none_evidence_only",
-    "runtime_source_commit": "4c56650070a05f8a7f3c97b9fe6851886fd9b4c4",
-    "migration": "execution_continuity_runtime_source_binding"
+    "runtime_behavior_change": true,
+    "runtime_behavior_change_scope": "lifecycle_and_identity_hardening",
+    "runtime_source_commit": "73e1263bfae1a3606675586805b5a6906ec91bcb",
+    "migration": "lifecycle_identity_hardening_runtime_source_binding"
   },
-  "artifact_sha256": "64bfef5cedf9b8e2031f508f563d21a4183fa4af866790ba0a528313c064e429"
+  "artifact_sha256": "1933f1a764b95ee7eb06a6feca16ed198a72529ce788d98235da8aecd2f71346"
 }

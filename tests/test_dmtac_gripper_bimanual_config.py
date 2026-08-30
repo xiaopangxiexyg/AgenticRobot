@@ -1108,13 +1108,21 @@ class DMTacGripperBimanualConfigTest(unittest.TestCase):
             for published in reversed(ui.published)
             if published.get("stage") == "Hold / 停臂保持"
         )
+        pending_controls = set(hold_publish["active_controls"])
+        self.assertNotIn("p", pending_controls)
         self.assertTrue(control.consume_hold_request())
         self.assertFalse(control.gripper_control_enabled())
-        active_controls = set(hold_publish["active_controls"])
+        control.publish_hardware_hold_confirmation(confirmed=True)
+        confirmed_publish = next(
+            published
+            for published in reversed(ui.published)
+            if published.get("stage") == "Hold / 底层停机已确认"
+        )
+        active_controls = set(confirmed_publish["active_controls"])
         self.assertTrue({"p", "d", "q"}.issubset(active_controls))
         self.assertNotIn("c", active_controls)
         self.assertNotIn("fix_arm_toggle", active_controls)
-        self.assertFalse(hold_publish["gripper_control_enabled"])
+        self.assertFalse(confirmed_publish["gripper_control_enabled"])
 
     def test_dmtac_backend_rejects_nonzero_command_dim(self) -> None:
         with self.assertRaisesRegex(ValueError, "slot 0"):

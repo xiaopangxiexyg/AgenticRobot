@@ -327,10 +327,13 @@ def test_current_arm_runtime_binding_uses_exact_current_inputs() -> None:
         == fit.simulation_contract.sha256
     )
     assert binding.metadata["arm_profile_refit"] is False
-    assert binding.metadata["runtime_behavior_change"] is False
-    assert binding.metadata["runtime_behavior_change_scope"] == "none_evidence_only"
+    assert binding.metadata["runtime_behavior_change"] is True
+    assert (
+        binding.metadata["runtime_behavior_change_scope"]
+        == "lifecycle_and_identity_hardening"
+    )
     assert binding.metadata["runtime_source_commit"] == (
-        "4c56650070a05f8a7f3c97b9fe6851886fd9b4c4"
+        "73e1263bfae1a3606675586805b5a6906ec91bcb"
     )
     assert binding.fidelity_claims[0].status == "provisional"
     held_out = next(
