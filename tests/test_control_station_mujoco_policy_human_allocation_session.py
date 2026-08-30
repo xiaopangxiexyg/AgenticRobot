@@ -21,6 +21,7 @@ from control_station.composition.mujoco_sim_hil import (
     MujocoSimHILReadinessEvidence,
 )
 from robot_motion.action import ActionComponentCatalog, ActionComponentSpec
+from robot_motion.runtime import LifecycleStartupError
 from tests.test_control_station_mujoco_policy_human_allocation_input import _bundle
 
 
@@ -350,3 +351,62 @@ def test_allocation_session_requires_every_readiness_field() -> None:
         MUJOCO_SIM_HIL_READINESS_FIELDS_V1
     )
     assert session.readiness_failures(report.readiness) == ("rebase_ready",)
+
+
+def test_allocation_session_close_preserves_runtime_ownership_for_retry() -> None:
+    session, runtime, _barrier, _evidence_seen, _observed = _session_fixture()
+    session.start()
+    activation = session.activation_scope
+    close_attempts = 0
+    original_close = runtime.close
+
+    def close_runtime() -> None:
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 1:
+            raise RuntimeError("synthetic runtime close failure")
+        original_close()
+
+    runtime.close = close_runtime
+
+    with pytest.raises(RuntimeError, match="synthetic runtime close failure"):
+        session.close()
+
+    assert session.started is True
+    assert session.activation_scope is activation
+
+    session.close()
+
+    assert close_attempts == 2
+    assert session.started is False
+    assert session.activation_scope is None
+    assert runtime.started is False
+
+
+def test_allocation_start_rollback_failure_remains_closeable() -> None:
+    session, runtime, barrier, _evidence_seen, _observed = _session_fixture(
+        omit_start_evidence=True
+    )
+    close_attempts = 0
+    original_close = runtime.close
+
+    def close_runtime() -> None:
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 1:
+            raise RuntimeError("synthetic rollback close failure")
+        original_close()
+
+    runtime.close = close_runtime
+
+    with pytest.raises(LifecycleStartupError) as caught:
+        session.start()
+
+    assert isinstance(caught.value.start_error, ValueError)
+    assert barrier.snapshot().enabled is False
+    assert session.started is False
+
+    session.close()
+
+    assert close_attempts == 2
+    assert runtime.started is False

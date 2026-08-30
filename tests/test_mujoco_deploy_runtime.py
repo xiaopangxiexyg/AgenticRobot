@@ -61,6 +61,7 @@ from robot_motion.runtime import (
     DispatchOwnerRegistry,
     ExecutionCancellationRequest,
     ExecutionEpochRegistry,
+    LifecycleStartupError,
 )
 from robot_motion.replay import (
     ReplayProposalSource,
@@ -2704,3 +2705,149 @@ def test_shared_safety_fault_cancels_and_latches_next_gate_cut() -> None:
     assert next_step.decision is None
     assert next_step.cancellation is None
     assert runtime.core.execution_epoch == faulted.cancellation.execution_epoch
+
+
+def test_start_rolls_back_trace_and_rig_after_post_rig_failure() -> None:
+    runtime, _scene, _clock = build_runtime()
+    events: list[str] = []
+    runtime.rig.start = lambda: events.append("rig.start")
+    runtime.rig.close = lambda: events.append("rig.close")
+    runtime.core.close_trace = lambda: events.append("trace.close")
+
+    def fail_after_rig_start() -> None:
+        events.append("core.configure")
+        raise RuntimeError("synthetic core startup failure")
+
+    runtime.core.record_compound_authority_profiles = fail_after_rig_start
+
+    with pytest.raises(RuntimeError, match="synthetic core startup failure"):
+        runtime.start()
+
+    assert events == [
+        "rig.start",
+        "core.configure",
+        "trace.close",
+        "rig.close",
+    ]
+    assert runtime._started is False
+
+
+def test_close_does_not_short_circuit_trace_or_rig_after_sync_failure() -> None:
+    runtime, _scene, _clock = build_runtime()
+    runtime.start()
+    events: list[str] = []
+
+    def fail_trace_sync() -> None:
+        events.append("trace.sync")
+        raise RuntimeError("synthetic trace sync failure")
+
+    runtime._sync_reference_trace = fail_trace_sync
+    runtime.core.close_trace = lambda: events.append("trace.close")
+    runtime.rig.close = lambda: events.append("rig.close")
+
+    with pytest.raises(RuntimeError, match="synthetic trace sync failure"):
+        runtime.close()
+
+    assert events == ["trace.sync", "trace.close", "rig.close"]
+    assert runtime._started is False
+
+
+def test_close_retries_only_the_resource_that_remains_pending() -> None:
+    runtime, _scene, _clock = build_runtime()
+    runtime.start()
+    events: list[str] = []
+    rig_close_attempts = 0
+
+    runtime._sync_reference_trace = lambda: events.append("trace.sync")
+    runtime.core.close_trace = lambda: events.append("trace.close")
+
+    def close_rig() -> None:
+        nonlocal rig_close_attempts
+        rig_close_attempts += 1
+        events.append(f"rig.close:{rig_close_attempts}")
+        if rig_close_attempts == 1:
+            raise RuntimeError("synthetic rig join timeout")
+
+    runtime.rig.close = close_rig
+
+    with pytest.raises(RuntimeError, match="synthetic rig join timeout"):
+        runtime.close()
+
+    assert runtime._started is False
+    runtime.close()
+
+    assert events == [
+        "trace.sync",
+        "trace.close",
+        "rig.close:1",
+        "rig.close:2",
+    ]
+    assert runtime._started is False
+
+
+def test_start_rollback_failure_keeps_only_failed_resource_closeable() -> None:
+    runtime, _scene, _clock = build_runtime()
+    events: list[str] = []
+    rig_close_attempts = 0
+    runtime.rig.start = lambda: events.append("rig.start")
+    runtime.core.close_trace = lambda: events.append("trace.close")
+
+    def fail_after_rig_start() -> None:
+        raise RuntimeError("synthetic startup failure")
+
+    def close_rig() -> None:
+        nonlocal rig_close_attempts
+        rig_close_attempts += 1
+        events.append(f"rig.close:{rig_close_attempts}")
+        if rig_close_attempts == 1:
+            raise RuntimeError("synthetic rollback join timeout")
+
+    runtime.core.record_compound_authority_profiles = fail_after_rig_start
+    runtime.rig.close = close_rig
+
+    with pytest.raises(LifecycleStartupError) as caught:
+        runtime.start()
+
+    assert isinstance(caught.value.start_error, RuntimeError)
+    assert tuple(
+        failure.label for failure in caught.value.rollback_failures
+    ) == ("mujoco_execution_rig.close",)
+    assert events == ["rig.start", "trace.close", "rig.close:1"]
+
+    runtime.close()
+
+    assert events == [
+        "rig.start",
+        "trace.close",
+        "rig.close:1",
+        "rig.close:2",
+    ]
+
+
+def test_close_does_not_retry_trace_after_terminal_sink_failure() -> None:
+    runtime, _scene, _clock = build_runtime()
+    runtime.start()
+    events: list[str] = []
+    runtime._sync_reference_trace = lambda: events.append("trace.sync")
+    runtime.rig.close = lambda: events.append("rig.close")
+
+    def fail_terminal_sink(fact) -> None:
+        if fact.event_type == "runtime_trace_terminal":
+            events.append("trace.terminal_sink")
+            raise RuntimeError("synthetic terminal sink failure")
+
+    runtime.core.trace_sink = fail_terminal_sink
+
+    with pytest.raises(RuntimeError, match="synthetic terminal sink failure"):
+        runtime.close()
+
+    assert events == ["trace.sync", "trace.terminal_sink", "rig.close"]
+    assert runtime._started is False
+    assert sum(
+        fact.event_type == "runtime_trace_terminal"
+        for fact in runtime.core.trace_facts
+    ) == 1
+
+    runtime.close()
+
+    assert events == ["trace.sync", "trace.terminal_sink", "rig.close"]

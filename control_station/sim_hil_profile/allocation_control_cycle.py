@@ -401,24 +401,26 @@ class AllocationProposalExecutionControlCyclePort:
         retired: tuple[SimHILAllocationActivationBinding, ...]
         fence_failure: str | None = None
         with self._lock:
-            if self._closed:
+            if self._closed and not self._retired_bindings:
                 return
-            binding = self._binding
-            self._binding = None
-            self._active = False
-            self._last_prime = None
-            self._closed = True
-            if binding is not None:
-                self._retired_bindings.append(binding)
-                try:
-                    binding.fence(reason="sim_hil_control_cycle_closed")
-                except Exception as error:  # noqa: BLE001 - still join resources.
-                    fence_failure = f"{type(error).__name__}:{error}"
+            if not self._closed:
+                binding = self._binding
+                self._binding = None
+                self._active = False
+                self._last_prime = None
+                self._closed = True
+                if binding is not None:
+                    self._retired_bindings.append(binding)
+                    try:
+                        binding.fence(reason="sim_hil_control_cycle_closed")
+                    except Exception as error:  # noqa: BLE001 - still join resources.
+                        fence_failure = f"{type(error).__name__}:{error}"
             retired = tuple(self._retired_bindings)
             self._retired_bindings.clear()
         # Application close calls this after lower HOLD. Joining here preserves
         # resource ownership without delaying the safety-relevant transition.
         join_failures: list[str] = []
+        retry_bindings: list[SimHILAllocationActivationBinding] = []
         if fence_failure is not None:
             join_failures.append(f"allocation_binding_fence_failed:{fence_failure}")
         for retired_binding in retired:
@@ -426,9 +428,14 @@ class AllocationProposalExecutionControlCyclePort:
                 joined = retired_binding.join(timeout_sec=2.0)
             except Exception as error:  # noqa: BLE001 - join every binding.
                 join_failures.append(f"{type(error).__name__}:{error}")
+                retry_bindings.append(retired_binding)
             else:
                 if not joined:
                     join_failures.append("allocation_binding_join_timeout")
+                    retry_bindings.append(retired_binding)
+        if retry_bindings:
+            with self._lock:
+                self._retired_bindings.extend(retry_bindings)
         if join_failures:
             raise RuntimeError(";".join(join_failures))
 

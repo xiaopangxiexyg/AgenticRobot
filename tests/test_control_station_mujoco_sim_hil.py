@@ -2733,3 +2733,151 @@ def test_policy_binding_rejects_partial_component_action() -> None:
     object.__setattr__(partial, "pre_safety_robot_action", partial_action)
     with pytest.raises(ValueError, match="exactly cover"):
         binding.validate_emission(partial)
+
+
+def test_fixed_alpha_composition_close_preserves_pending_runtime_for_retry() -> None:
+    class FailOnceClose:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("synthetic runtime close failure")
+
+    class RecordingClose:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    runtime = FailOnceClose()
+    human_source = RecordingClose()
+    composition = object.__new__(MujocoSimHILComposition)
+    composition.runtime = runtime
+    composition.human_source = human_source
+    composition.contracts = SimpleNamespace(
+        initial_alpha_by_component={"right_arm": 0.5}
+    )
+    composition._lock = threading.RLock()
+    composition._started = True
+    composition._runtime_close_pending = True
+    composition._human_source_close_pending = True
+    composition._activation_scope = object()
+    composition._submission_by_key = {("human", "right_arm"): object()}
+    composition._human_anchor_only_source_ids = {"human-anchor"}
+    composition._step_by_decision_key = {"decision": object()}
+    composition._cycle_index = 4
+    composition._next_blend_sequence = 3
+    composition._human_alpha_by_component = {"right_arm": 0.75}
+    composition._blend_alpha_schedule = [(10.0, 1, {"right_arm": 0.75})]
+    activation = composition._activation_scope
+
+    with pytest.raises(RuntimeError, match="synthetic runtime close failure"):
+        composition.close()
+
+    assert composition.started is True
+    assert composition.activation_scope is activation
+    assert composition._submission_by_key
+
+    composition.close()
+
+    assert runtime.close_calls == 2
+    assert human_source.close_calls == 1
+    assert composition.started is False
+    assert composition.activation_scope is None
+
+
+def test_application_close_waits_for_runtime_before_sources_and_viewer() -> None:
+    events: list[str] = []
+
+    class Composition:
+        started = True
+
+        def close(self) -> None:
+            events.append("composition.close")
+            if events.count("composition.close") == 1:
+                raise RuntimeError("synthetic composition close failure")
+            self.started = False
+            # Fixed-alpha composition owns the source close on success.
+            human_source.close()
+
+    class Source:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            events.append(f"{self.name}.close")
+
+    class Viewer(Source):
+        pass
+
+    composition = Composition()
+    policy_source = Source("policy")
+    human_source = Source("human")
+    viewer = Viewer("viewer")
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=SimpleNamespace(),
+        composition=composition,
+        policy_source=policy_source,
+        human_source=human_source,
+        readiness_provider=SimpleNamespace(),
+        viewer=viewer,
+    )
+    app._started = True
+    app._sources_started = True
+    app.hold = lambda *, reason: events.append(f"hold:{reason}")
+
+    with pytest.raises(RuntimeError, match="synthetic composition close failure"):
+        app.close()
+
+    assert app._closed is False
+    assert policy_source.close_calls == 0
+    assert human_source.close_calls == 0
+    assert viewer.close_calls == 0
+
+    app.close()
+
+    assert app._closed is True
+    assert policy_source.close_calls == 1
+    assert human_source.close_calls == 1
+    assert viewer.close_calls == 1
+    assert events.index("composition.close") < events.index("viewer.close")
+
+
+def test_preview_only_close_does_not_enter_unstarted_composition() -> None:
+    close_events: list[str] = []
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=SimpleNamespace(),
+        composition=SimpleNamespace(
+            started=False,
+            close=lambda: pytest.fail(
+                "preview-only close must not enter composition lifecycle"
+            ),
+        ),
+        policy_source=SimpleNamespace(
+            close=lambda: close_events.append("policy.close")
+        ),
+        human_source=SimpleNamespace(
+            close=lambda: close_events.append("human.close")
+        ),
+        readiness_provider=SimpleNamespace(),
+        viewer=SimpleNamespace(
+            close=lambda: close_events.append("viewer.close")
+        ),
+    )
+    app._viewer_preview_started = True
+
+    app.close()
+
+    assert app._closed is True
+    assert close_events == ["policy.close", "viewer.close"]
