@@ -15,6 +15,7 @@ from .ports import (
 from .events import (
     CompositionActivationBinding,
     CompositionDomainEvent,
+    CompositionEventEmissionFailure,
     CompositionInputSemanticBinding,
     CompositionSourceEligibilityBinding,
 )
@@ -174,6 +175,7 @@ __all__ = [
     "CompositionActivationBinding",
     "CompositionContextRequirement",
     "CompositionDomainEvent",
+    "CompositionEventEmissionFailure",
     "CompositionEventEmitter",
     "CompositionInputSemanticBinding",
     "CompositionInformationPlan",

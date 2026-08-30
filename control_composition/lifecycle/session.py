@@ -689,13 +689,22 @@ class CompositionSessionRegistry:
                 spec,
                 session_epoch=self._next_session_epoch,
             )
+            previous_current_spec_id = self._current_spec_id
+            previous_next_session_epoch = self._next_session_epoch
             self._next_session_epoch += 1
             self._spec_by_id[spec.operation_spec_id] = spec
             self._state_by_spec_id[spec.operation_spec_id] = state
             self._current_spec_id = spec.operation_spec_id
             observer = self._spec_observer
-        if observer is not None:
-            observer(spec)
+            if observer is not None:
+                try:
+                    observer(spec)
+                except Exception:
+                    self._spec_by_id.pop(spec.operation_spec_id, None)
+                    self._state_by_spec_id.pop(spec.operation_spec_id, None)
+                    self._current_spec_id = previous_current_spec_id
+                    self._next_session_epoch = previous_next_session_epoch
+                    raise
         return spec.operation_spec_id
 
     def require_current_spec(
@@ -757,8 +766,12 @@ class CompositionSessionRegistry:
                 return spec.rearm_spec_id
             self._rearm_spec_by_id[spec.rearm_spec_id] = spec
             observer = self._rearm_spec_observer
-        if observer is not None:
-            observer(spec)
+            if observer is not None:
+                try:
+                    observer(spec)
+                except Exception:
+                    self._rearm_spec_by_id.pop(spec.rearm_spec_id, None)
+                    raise
         return spec.rearm_spec_id
 
     def require_rearm_spec(
@@ -805,6 +818,7 @@ class CompositionSessionRegistry:
         source_fact_hash: str,
         start_intent_id: str | None = None,
     ) -> CompositionSessionTransition:
+        occurred_at = float(self.clock())
         with self._lock:
             if self._current_spec_id is None:
                 raise RuntimeError("No current composition session.")
@@ -819,12 +833,16 @@ class CompositionSessionRegistry:
             )
             self._state_by_spec_id[self._current_spec_id] = next_state
             observer = self._transition_observer
-        if observer is not None:
-            observer(
-                event,
-                occurred_at=float(self.clock()),
-                clock_domain_id=self.clock_domain_id,
-            )
+            if observer is not None:
+                try:
+                    observer(
+                        event,
+                        occurred_at=occurred_at,
+                        clock_domain_id=self.clock_domain_id,
+                    )
+                except Exception:
+                    self._state_by_spec_id[self._current_spec_id] = state
+                    raise
         return event
 
 

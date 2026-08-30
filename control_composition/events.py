@@ -211,12 +211,42 @@ class CompositionDomainEvent:
             raise ValueError("Composition domain event subject is required.")
 
 
+@dataclass(frozen=True)
+class CompositionEventEmissionFailure:
+    """Bounded diagnostic for a passive domain-event observer failure.
+
+    Event observation is intentionally outside composition authority.  A
+    failing trace/WAL adapter therefore cannot rewrite or veto an already
+    admitted composition fact, but the failure must remain inspectable by an
+    application profile that independently requires capture completeness.
+    """
+
+    event_kinds: tuple[str, ...]
+    error_type: str
+    message: str
+
+    def __post_init__(self) -> None:
+        kinds = tuple(
+            _required(value, name="event_kind") for value in self.event_kinds
+        )
+        if not kinds:
+            raise ValueError("An emission failure must identify at least one event.")
+        object.__setattr__(self, "event_kinds", kinds)
+        object.__setattr__(
+            self,
+            "error_type",
+            _required(self.error_type, name="error_type"),
+        )
+        object.__setattr__(self, "message", str(self.message))
+
+
 __all__ = [
     "COMPOSITION_ACTIVATION_BINDING_HASH_DOMAIN_V2",
     "COMPOSITION_INPUT_SEMANTIC_BINDING_HASH_DOMAIN_DEVELOPMENT",
     "COMPOSITION_SOURCE_ELIGIBILITY_BINDING_HASH_DOMAIN_V1",
     "CompositionActivationBinding",
     "CompositionDomainEvent",
+    "CompositionEventEmissionFailure",
     "CompositionInputSemanticBinding",
     "CompositionSourceEligibilityBinding",
 ]
