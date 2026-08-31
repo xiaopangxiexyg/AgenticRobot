@@ -296,6 +296,28 @@ def test_batch_rejects_mixed_source_lineage() -> None:
     assert coordinator.committed_high_watermark == 2
 
 
+def test_batch_without_policy_output_keeps_legacy_identity() -> None:
+    _clock, _coordinator, _store, action = _fixture()
+    batch = CompositionInputBatchDraft(
+        inputs=(
+            _draft(
+                role="human_absolute",
+                producer_id="human-absolute",
+                action=action,
+            ),
+            _draft(
+                role="human_residual",
+                producer_id="human-residual",
+                action=action,
+            ),
+        )
+    )
+
+    legacy_hash = "a3ebe9a68f3f143406552a43367989d3d92ea30ade67ae4a3be1839a2a9134ec"
+    assert batch.semantic_content_hash == legacy_hash
+    assert batch.batch_id == f"composition-input-batch:{legacy_hash}"
+
+
 def test_batch_identity_includes_each_policy_output_id() -> None:
     _clock, _coordinator, _store, action = _fixture()
     first = replace(

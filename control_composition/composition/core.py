@@ -199,7 +199,11 @@ class CompositionInputBatchDraft:
                     "effective_clock_domain_id": item.effective_clock_domain_id,
                     "context_ids": tuple(item.context_ids),
                     "observation_cut_id": item.observation_cut_id,
-                    "policy_output_id": item.policy_output_id,
+                    **(
+                        {"policy_output_id": item.policy_output_id}
+                        if item.policy_output_id is not None
+                        else {}
+                    ),
                     "source_fact_ids": tuple(item.source_fact_ids),
                     "source_fact_hashes": tuple(item.source_fact_hashes),
                     **(
