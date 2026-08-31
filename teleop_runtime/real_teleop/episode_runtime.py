@@ -6,11 +6,15 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 from project_paths import teleop_records_root
 
 from ..episodes import EpisodeRecorder
+from ..diagnostics import TeleopRunState
 from ..hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER
 from ..log_utils import log_event as _log
+from ..recovery import RecoveryPlan, component_tcp_pose_desk
 from ..special_tasks.fix_arm import FixArmPoseSnapshotRecorder
 from .arm_tool_config import (
     _force_tare_sec_arg,
@@ -350,7 +354,123 @@ def _stop_episode_recording(
         _log("Episode", f"recording stopped reason={end_reason} -> {episode_dir}", now=now)
     return episode_dir
 
+
+def _backend_tcp_pose_base_or_none(backend: object) -> np.ndarray | None:
+    try:
+        return backend.compute_tcp_pose()
+    except Exception:
+        return None
+
+
+def _backend_tcp_pose_desk_or_none(
+    components: RealTeleopComponents,
+    *,
+    side: str,
+) -> np.ndarray | None:
+    try:
+        return component_tcp_pose_desk(components, side=side)
+    except Exception:
+        return None
+
+
+def _episode_arm_payload(
+    components: RealTeleopComponents,
+    *,
+    side: str,
+) -> dict[str, object]:
+    backend = (
+        components.left_preview_backend
+        if side == "left"
+        else components.right_preview_backend
+    )
+    state = backend.get_state()
+    return {
+        "current_qpos": state.get("current_qpos"),
+        "last_target_qpos": state.get("last_target_qpos"),
+        "last_command": state.get("last_command"),
+        "ik_metadata": state.get("ik_metadata"),
+        "tcp_pose_base": _backend_tcp_pose_base_or_none(backend),
+        "tcp_pose_desk": _backend_tcp_pose_desk_or_none(components, side=side),
+    }
+
+
+def _episode_hand_payload(
+    components: RealTeleopComponents,
+    *,
+    side: str,
+) -> dict[str, object] | None:
+    backend = (
+        components.left_hand_backend
+        if side == "left"
+        else components.right_hand_backend
+    )
+    if backend is None:
+        return None
+    state = backend.get_state()
+    return {
+        "joint_pos": state.get("joint_pos"),
+        "last_sent_command": state.get("last_sent_command"),
+        "tactile": state.get("tactile"),
+        "tactile_dict": state.get("tactile_dict"),
+        "telemetry_error": state.get("telemetry_error"),
+    }
+
+
+def _build_episode_frame(
+    components: RealTeleopComponents,
+    *,
+    step_index: int,
+    step_result: object,
+    active_command: object,
+    hand_command: object,
+    recovery_plan: RecoveryPlan | None,
+    left_clutch: bool,
+    right_clutch: bool,
+) -> dict[str, object]:
+    if step_result.state == TeleopRunState.RECOVERING:
+        if active_command is None:
+            active_command_source = "recovery_wait"
+        elif recovery_plan is None:
+            active_command_source = "recovery_direct"
+        else:
+            active_command_source = "recovery_plan"
+    elif active_command is None:
+        active_command_source = "none"
+    else:
+        active_command_source = "session"
+
+    return {
+        "step_index": int(step_index),
+        "state": step_result.state.value,
+        "active_sides": list(components.active_sides),
+        "control_hz": float(step_result.control_hz),
+        "active_command_source": active_command_source,
+        "recovery_plan_mode": None if recovery_plan is None else recovery_plan.mode,
+        "channels": dict(step_result.channels),
+        "channel_validity": {
+            name: bool(channel.valid)
+            for name, channel in sorted(step_result.channels.items())
+        },
+        "clutch": {
+            "left": bool(left_clutch),
+            "right": bool(right_clutch),
+        },
+        "faults": list(step_result.faults),
+        "session_command": step_result.command,
+        "active_command": active_command,
+        "hand_command": hand_command,
+        "arms": {
+            "left": _episode_arm_payload(components, side="left"),
+            "right": _episode_arm_payload(components, side="right"),
+        },
+        "hands": {
+            "left": _episode_hand_payload(components, side="left"),
+            "right": _episode_hand_payload(components, side="right"),
+        },
+    }
+
 __all__ = [
+    "_build_episode_frame",
     "_build_episode_metadata",
     "_debug_episode_recording_enabled",
     "_episode_root_dir",

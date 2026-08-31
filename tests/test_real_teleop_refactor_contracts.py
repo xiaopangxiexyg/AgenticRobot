@@ -15,7 +15,6 @@ from teleop_runtime import cli_value_parsers as shared_cli_value_parsers
 from teleop_runtime import log_utils as shared_log_utils
 from teleop_runtime.debug import calibration_flow as legacy_calibration_flow
 from teleop_runtime.debug import run_vive_rm65_real_teleop as legacy_entrypoint
-from teleop_runtime.debug import run_vive_sapien_virtual as virtual_entrypoint
 from teleop_runtime.debug import log_utils as legacy_log_utils
 from teleop_runtime.gui import collection_tasks as gui_collection_tasks
 from teleop_runtime.gui import status_payloads
@@ -66,12 +65,14 @@ from teleop_runtime.real_teleop import (
     runtime,
     runtime_debug,
     runtime_health,
+    runtime_home,
     runtime_metadata,
     session_recording,
     shutdown_runtime,
     special_arm_runtime,
     startup_runtime,
     tactile_visualization,
+    terminal_input,
     vive_calibration_runtime,
     vive_calibration_profiles,
     visualization_runtime,
@@ -816,7 +817,6 @@ def test_shared_cli_value_parsers_and_hand_argument_groups_preserve_contracts() 
     ):
         shared = getattr(shared_cli_value_parsers, name)
         assert getattr(legacy_entrypoint, name) is shared
-        assert getattr(virtual_entrypoint, name) is shared
 
     parser = argparse.ArgumentParser()
     hand_cli.add_hand_backend_arguments(parser)
@@ -1918,6 +1918,7 @@ def test_camera_episode_and_special_arm_modules_preserve_legacy_seams() -> None:
     )
 
     for name in (
+        "_build_episode_frame",
         "_build_episode_metadata",
         "_debug_episode_recording_enabled",
         "_episode_root_dir",
@@ -1926,6 +1927,15 @@ def test_camera_episode_and_special_arm_modules_preserve_legacy_seams() -> None:
         "_stop_episode_recording",
     ):
         assert getattr(legacy_entrypoint, name) is getattr(episode_runtime, name)
+
+    assert legacy_entrypoint.TerminalClutchInput is terminal_input.TerminalClutchInput
+    for name in (
+        "_build_renderer_debug_boxes",
+        "_build_renderer_debug_frames",
+        "_resolve_robot_home_for_side",
+        "_runtime_home_calibration",
+    ):
+        assert getattr(legacy_entrypoint, name) is getattr(runtime_home, name)
 
     for name in (
         "_cancel_special_arm_modes_for_hold",
@@ -1945,7 +1955,9 @@ def test_camera_episode_and_special_arm_modules_preserve_legacy_seams() -> None:
     for path in (
         ROOT / "teleop_runtime/real_teleop/camera_runtime.py",
         ROOT / "teleop_runtime/real_teleop/episode_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/runtime_home.py",
         ROOT / "teleop_runtime/real_teleop/special_arm_runtime.py",
+        ROOT / "teleop_runtime/real_teleop/terminal_input.py",
     ):
         source = path.read_text(encoding="utf-8")
         assert "from teleop_runtime.debug" not in source

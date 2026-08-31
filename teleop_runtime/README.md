@@ -3,10 +3,9 @@
 > 本页说明模块接口和局部示例。正式真机遥操/数采的组合命令统一从
 > [`docs/real/README.md`](../docs/real/README.md) 复制。
 
-> **SAPIEN 路线状态**：`run_vive_sapien_virtual.py`、SAPIEN renderer 以及本文仍保留的
-> 相关命令只用于复现历史调试流程，不再属于当前遥操、仿真或发布路线。不要为它们新增
-> 功能或调用方，也不要把其结果作为当前验证证据。正式真机遥操/数采使用上面的 canonical
-> 文档；新的虚拟验证和可视化优先使用 MuJoCo、Web UI 或 backend-neutral 工具。
+> **SAPIEN 路线状态**：历史 virtual teleop 入口已退役。正式真机遥操/数采
+> 使用 canonical 文档；新的虚拟验证和可视化使用 MuJoCo、Web UI 或
+> backend-neutral 工具。
 
 `teleop_runtime` 是新的通用遥操作运行时骨架。当前版本已经能把下面两条链路接到统一接口里：
 
@@ -245,7 +244,7 @@ workspace 数值，只保留 tracker/desk 标定。
 
 - `home anchor`
 
-前两项固定标定由 [run_vive_rm65_calibration_debug.py](./debug/run_vive_rm65_calibration_debug.py) 负责；`home anchor` 已经移到 [run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py) 和后续真机部署入口中按 session 重做。
+前两项固定标定由 [run_vive_rm65_calibration_debug.py](./debug/run_vive_rm65_calibration_debug.py) 负责；`home anchor` 由当前真机会话入口按 session 重做。
 
 ## 当前推荐的标定入口
 
@@ -321,7 +320,7 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 ### 3. Home Anchor
 
 这一步现在不在 calibration tool 中做。  
-它已经移到 `run_vive_sapien_virtual.py` 和后续真机部署入口里，每次启动根据：
+它由当前真机会话入口负责，每次启动根据：
 
 1. 当前真机起始姿态
 2. 当前操作者双手起始姿态
@@ -354,15 +353,7 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
   --load-profile teleop_records/calibration_profiles/your_profile.json
 ```
 
-2. 历史虚拟跑法（冻结保留），复用 profile，再做一次 runtime home calibration：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --control-mode absolute \
-  --load-profile teleop_records/calibration_profiles/your_profile.json
-```
+2. 当前真机会话入口复用 profile，再做一次 runtime home calibration。
 
 注意：
 
@@ -381,17 +372,6 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 - 基站位置变化后重新校准
 - wrist tracker 重新安装后重做外参
 - 需要 SAPIEN 内做小动作验收和 fine tune
-
-### `run_vive_sapien_virtual.py`
-
-用于：
-
-- 已有可用 calibration profile 后的快速虚拟跑法
-- 每次启动都重新做 session `home anchor`
-- 简单验证 `absolute`
-- 非完整标定场景下的 home-only 调试
-
-它只为旧实验和诊断流程复现而保留，不再是新开发或正式验收入口，也不替代完整标定流程。
 
 ## 基站、tracker、机器人变化时该怎么处理
 
@@ -542,83 +522,11 @@ from teleop_runtime import RM65ArmBackendConfig, InspireTacHandBackendConfig
 
 如果左右 RM65 backend 都存在，`build_bimanual_session(...)` 现在默认会启用 joint-space 双臂碰撞规避 retargeter；只有单臂场景才退回到独立 `pose_to_arm` 路径。
 
-## VIVE + SAPIEN 虚拟跑法
+## 虚拟验证
 
-当前已经补了一个真实 VIVE 输入、SAPIEN 双臂可视化的虚拟跑法入口。  
-它现在支持两种机械臂渲染模式：
-
-- `--arm-mode real`：读取真 RM65 当前起始姿态，只把它复制到本地 preview，不发送任何运动指令
-- `--arm-mode virtual`：完全不连真机，直接用本地 unlimited-speed preview
-
-同时它现在也支持**可选的手部串口输入预览**：
-
-- 传 `--left-hand-port` / `--right-hand-port` 后，会把 `hardware/teleop_hand/hand_q6_reader.py` 的 `q6` 输入接到 runtime
-- 手部输入只影响 SAPIEN 中的手部渲染，不会改变 arm teleop 主链路
-- 手部输入线程和 VIVE 线程解耦，某一侧手部设备掉线不会阻断双臂控制环
-
-- [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)
-
-建议启动顺序：
-
-1. 在 `dexteleop310` 环境里启动 VIVE 发送端
-2. 再启动虚拟跑法
-
-VIVE 发送端：
-
-```bash
-python hardware/VIVE/mocap/vive_data_sender.py \
-  --host 127.0.0.1 \
-  --port 9999 \
-  --hz 300
-```
-
-SAPIEN 虚拟跑法：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --arm-mode real \
-  --left-arm-ip 192.168.101.21 \
-  --right-arm-ip 192.168.1.20 \
-  --left-hand-port /dev/serial/by-id/your_left_hand \
-  --right-hand-port /dev/serial/by-id/your_right_hand \
-  --control-mode absolute
-```
-
-如果已经有 profile，推荐直接带上：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --arm-mode virtual \
-  --control-mode absolute \
-  --load-profile teleop_records/calibration_profiles/your_profile.json
-```
-
-说明：
-
-- 这个入口使用“之前标注结果”的双臂相对关系预设，当前默认 `left_right_base_distance = 0.525`
-- 默认标定预设来自 `build_annotated_dual_rm65_calibration(...)`
-- 默认先等待你按 `p` 或回车，再开始 runtime home calibration
-- `arm-mode=real` 下会在开始 home capture 前读取真机当前关节状态，并把它作为本地 preview 的起始姿态；整个入口不会发送任何真机动作指令
-- `--load-initial-alignment` 会在你按下 `p` 时提供机器人侧的 home pose/qpos；如果没有它，而又连了真机，则 `p` 会同时采当前真机 arm home；如果既没有它也没连真机，则 `p` 用当前 preview arm pose 作为 robot home
-- 默认会启用 joint-space 双臂碰撞规避，scene profile 默认 `dual_arm_hand_proxy_open`；它使用明确指定的 12 对碰撞检测集合，覆盖固定张开手/arm-link3 proxy 与中央/左右 camera pole、table 的关键组合
-- 默认碰撞模式是 `boundary_slide`；如果要在接触阈值附近直接保持最近安全关节位姿，可改用 `--collision-avoidance-mode freeze_on_contact`
-- 如果想直接退回旧的独立双臂链路，可以加 `--no-collision`；旧参数 `--disable-dual-arm-collision-avoidance` 仍兼容
-- 当前预留的 scene profile 顺序是：`dual_arm` -> `dual_arm_hand_proxy_open` -> `dual_arm_hand` -> `dual_arm_cylinder_table`
-- runtime home calibration 只负责 home 锚点，不负责完整 desk/world 对齐
-- 启动时会打印 `expecting ...` 和 `observed ...`，这是当前最直接的 tracker 绑定验收信息
-- 当前 action 主 frame 是 `tool_tcp`；`--tcp-mode hand_base` 只作为历史兼容参数保留
-- 如果加了 `--left-hand-port` / `--right-hand-port`，对应手部 `q6` 会实时映射成 SAPIEN 手部关节；不传这些参数时，行为和之前完全一致
-- 手部默认 `--hand-joint-order` 是 `5,4,3,2,0,1`，也就是把 reader 的 `[thumb_yaw, thumb_flex, index, middle, ring, pinky]` 重排成 InspireTac 顺序 `[pinky, ring, middle, index, thumb_yaw, thumb_flex]`
-- 手部输入默认是**附加功能**：手部输入异常不会触发 arm teleop 的 `FROZEN`
-- 如果当前机器没有可用渲染设备，可以先用 `--skip-renderer` 验证 teleop 主链是否正常跑通
-- joint-space 双臂碰撞规避依赖 `pinocchio + pink + qpsolvers`
-- RM65 默认 impedance 遥操不再调用 SDK 奇异解检测；其独立的 IK、关节限位、力控与故障保护不变。普通位控遥操仍会在目标从正常区进入 SDK 判定奇异区时保持当前姿态。默认双臂 position replay 则先以原有效关节步幅的 0.2 生成慢速目标，并在同一 12 对碰撞复核通过后才下发；复核失败会 fault/hold，且该 replay 专用规则不影响 deploy。
-- 更详细的控制模式说明见 [teleop_runtime/README_control_modes.md](./README_control_modes.md)
-- 如果发现 `+X/+Y` 同时反了，先回 calibration tool 按 `f`，或者在标定入口直接加 `--virtual-desk-post-yaw-deg 180`
+历史 VIVE + SAPIEN virtual teleop 可执行入口已退役。虚拟验证走 canonical
+MuJoCo、contract 或 backend-neutral 工具；当前真机会话的 runtime home、恢复、碰撞和
+dispatch 语义继续由 real-teleop 运行时保有。
 
 ## RM65 真机只读检查
 
@@ -826,7 +734,7 @@ debug trajectory 不会在正式 dataset 采集中默认重复保存；仅在 `-
 
 1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py --hz 300`
 2. 跑 `run_vive_rm65_calibration_debug.py` 完成 `LINK_CHECK -> virtual desk -> wrist offset -> save profile`
-3. 不再把 `run_vive_sapien_virtual.py` 作为新流程门禁；离线/虚拟验证按 canonical MuJoCo、
+3. 离线/虚拟验证按 canonical MuJoCo、
    contract 或 backend-neutral 工具执行，并明确其证据边界
 4. 启动 `run_vive_rm65_real_teleop.py` 接入真机，统一按 `tool_tcp` action 执行
 5. 正式采集时再打开 `--gui`、相机和需要的 hand/gripper backend

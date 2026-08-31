@@ -281,5 +281,6 @@ __all__ = [
     "_impedance_force_control_not_ready_sides",
     "_impedance_force_control_warmup_backends",
     "_runtime_arm_backend_state",
+    "_sync_dual_arm_retargeter_from_preview",
     "_sync_dual_arm_retargeter_for_real_control",
 ]

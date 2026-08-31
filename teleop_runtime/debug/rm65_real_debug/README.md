@@ -243,19 +243,9 @@ python -m teleop_runtime.debug.rm65_real_debug.run_rm65_real_state_viz \
 
 则按 `s` 后会在该目录下生成一个带时间戳的 JSON。
 
-保存下来的初始对齐状态可以直接给虚拟运行入口加载，这样就不需要在启动时再读真机起始状态：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --arm-mode real \
-  --control-mode absolute \
-  --load-profile teleop_records/calibration_profiles/your_profile.json \
-  --load-initial-alignment teleop_records/initial_alignment_states/your_alignment.json
-```
-
-这里 `arm-mode=real` 仍然保留真机风格的恢复/限步语义，但 preview 起始姿态来自保存文件，不再依赖 `Get_Current_Arm_State`。
+保存下来的初始对齐状态可以传给当前真机遥操入口的
+`--load-initial-alignment`，作为启动检查和 preview/IK seed。它不会复用过期的
+操作者 home anchor。
 
 ## 建议检查顺序
 

@@ -28,7 +28,6 @@ from teleop_runtime.backends.arms import (
 )
 from teleop_runtime.debug import run_vive_rm65_calibration_debug as calibration_debug
 from teleop_runtime.debug import run_vive_rm65_real_teleop as real_teleop
-from teleop_runtime.debug import run_vive_sapien_virtual as virtual_teleop
 from teleop_runtime.real_teleop import camera_runtime
 from teleop_runtime.defaults import (
     DEFAULT_IMPEDANCE_TELEOP_CONTROL_HZ,
@@ -74,11 +73,6 @@ def _parse_real_teleop_args(argv: list[str]):
 def _parse_calibration_debug_args(argv: list[str]):
     with patch.object(sys, "argv", ["prog", *argv]):
         return calibration_debug.parse_args()
-
-
-def _parse_virtual_teleop_args(argv: list[str]):
-    with patch.object(sys, "argv", ["prog", *argv]):
-        return virtual_teleop.parse_args()
 
 
 def test_gripper_warmup_probe_tracks_explicit_cli_override() -> None:
@@ -197,10 +191,8 @@ def test_vive_clock_sync_cli_defaults_to_new_protocol_and_allows_legacy() -> Non
 
 def test_vive_debug_receivers_default_to_new_protocol() -> None:
     calibration = _parse_calibration_debug_args([])
-    virtual = _parse_virtual_teleop_args([])
 
     assert calibration.vive_clock_sync_port == 10001
-    assert virtual.vive_clock_sync_port == 10001
 
 
 def test_real_teleop_position_command_step_envelope_cli() -> None:

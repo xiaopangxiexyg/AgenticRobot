@@ -309,38 +309,42 @@ from teleop_runtime.real_teleop.position_force_guard import (
     position_force_guard_config as _position_force_guard_config,
 )
 from teleop_runtime.real_teleop import dataset_layout as real_teleop_dataset_layout
-
-_expand_cli_path = real_teleop_dataset_layout.expand_cli_path
-_sanitize_dataset_name_for_path = real_teleop_dataset_layout.sanitize_dataset_name_for_path
-_default_task_id_from_name = real_teleop_dataset_layout.default_task_id_from_name
-from teleop_runtime.debug.log_utils import ChangeGate
-from teleop_runtime.debug.run_vive_sapien_virtual import (
-    DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
+from teleop_runtime.log_utils import ChangeGate, log_event as _log
+from teleop_runtime.recovery import (
     RecoveryPlan,
-    TerminalClutchInput,
-    _advance_recovery_plan,
-    _build_episode_frame,
+    advance_component_recovery_plan as _advance_recovery_plan,
+    component_side_retargeter as _side_retargeter,
+    start_component_recovery_plan as _start_recovery_plan,
+)
+from teleop_runtime.real_teleop.arm_runtime import (
+    _sync_dual_arm_retargeter_from_preview,
+)
+from teleop_runtime.real_teleop.arm_state_sync import _qpos_summary, _state_qpos
+from teleop_runtime.real_teleop.component_builder import (
+    _collision_debug_box_templates,
+)
+from teleop_runtime.real_teleop.episode_runtime import _build_episode_frame
+from teleop_runtime.real_teleop.runtime_home import (
+    DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
     _build_renderer_debug_boxes,
     _build_renderer_debug_frames,
     _channel_pose_in_desk,
-    _collision_debug_box_templates,
     _emit_collision_proxy_logs,
     _emit_home_alignment_logs,
     _emit_runtime_orientation_logs,
     _emit_tracker_axis_mapping_logs,
-    _log,
+    _hand_render_qpos,
     _manual_calibration_confirmation_required,
     _mean_pose,
-    _qpos_summary,
     _resolve_robot_home_for_side,
     _runtime_home_calibration,
-    _side_retargeter,
-    _start_recovery_plan,
-    _state_qpos,
-    _sync_dual_arm_retargeter_from_preview,
-    _hand_render_qpos,
     _vive_tracker_local_translation_offset,
 )
+from teleop_runtime.real_teleop.terminal_input import TerminalClutchInput
+
+_expand_cli_path = real_teleop_dataset_layout.expand_cli_path
+_sanitize_dataset_name_for_path = real_teleop_dataset_layout.sanitize_dataset_name_for_path
+_default_task_id_from_name = real_teleop_dataset_layout.default_task_id_from_name
 from teleop_runtime.cli_value_parsers import (
     _active_sides_from_args,
     _alpha_float,

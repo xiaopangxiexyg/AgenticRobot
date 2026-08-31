@@ -15,7 +15,9 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as R
 
-import teleop_runtime.debug.run_vive_sapien_virtual as virtual_runtime
+import teleop_runtime.collection.run_collect as collection_runtime
+import teleop_runtime.real_teleop.runtime_home as runtime_home
+from control_station import real_teleop_entrypoint
 from robot_motion.rm65 import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
@@ -28,17 +30,15 @@ from teleop_runtime.arm_frames import TOOL_TCP_FRAME
 from teleop_runtime.calibration import ArmCalibration, TeleopCalibration
 from teleop_runtime.collection.run_collect import _drive_recovery_step, build_collect_app, parse_args
 from teleop_runtime.configs import build_annotated_dual_rm65_calibration
-from teleop_runtime.debug.run_vive_sapien_virtual import (
+from teleop_runtime.real_teleop.runtime_home import (
     _build_optional_hand_command,
+    _send_optional_hand_command,
+    _update_optional_hand_preview_from_channels,
     _capture_atomic_real_qpos_snapshot,
     _mean_pose,
-    _preview_tcp_pose_desk,
     _resolve_robot_home_for_side,
     _runtime_home_calibration,
     _runtime_human_home_pose,
-    _send_optional_hand_command,
-    _update_optional_hand_preview_from_channels,
-    build_components,
 )
 from teleop_runtime.debug.run_vive_rm65_real_teleop import (
     DEFAULT_REAL_TELEOP_MAX_TRACKER_ROTATION_JUMP_DEG,
@@ -60,6 +60,12 @@ from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
 from teleop_runtime.hand_render import inspire_q6_to_render_qpos
 from teleop_runtime.initial_alignment import AlignmentSideState, TeleopInitialAlignment
+from teleop_runtime.recovery import (
+    RecoveryPlan,
+    advance_component_recovery_plan,
+    component_tcp_pose_desk as _preview_tcp_pose_desk,
+    start_component_recovery_plan,
+)
 from teleop_runtime.retargeters.pose_to_arm import PoseToArmRetargeter, PoseToArmRetargeterConfig
 from teleop_runtime.retargeters.joints_to_dexhand import (
     JointsToDexHandRetargeter,
@@ -89,6 +95,54 @@ def _has_dual_arm_ik_dependencies() -> bool:
 
 
 DUAL_ARM_IK_AVAILABLE = _has_dual_arm_ik_dependencies()
+
+
+def test_recovery_plan_has_one_production_owner() -> None:
+    assert collection_runtime.RecoveryPlan is RecoveryPlan
+    assert real_teleop_entrypoint.RecoveryPlan is RecoveryPlan
+    assert real_teleop_entrypoint._start_recovery_plan is start_component_recovery_plan
+    assert real_teleop_entrypoint._advance_recovery_plan is advance_component_recovery_plan
+
+
+def test_runtime_home_prefers_initial_alignment_pose_and_qpos() -> None:
+    qpos = np.linspace(0.1, 0.6, 6)
+    pose_desk = _pose(tx=0.33, yaw_deg=10.0)
+
+    class PreviewBackend:
+        def __init__(self) -> None:
+            self.local_qpos = None
+
+        def set_local_qpos(self, value: np.ndarray) -> None:
+            self.local_qpos = np.asarray(value, dtype=float).copy()
+
+    preview = PreviewBackend()
+    components = SimpleNamespace(
+        session=SimpleNamespace(calibration=object()),
+        initial_alignment=TeleopInitialAlignment(
+            sides={
+                "left": AlignmentSideState(
+                    side="left",
+                    arm_qpos=qpos,
+                    tcp_pose_desk=pose_desk,
+                )
+            }
+        ),
+        left_preview_backend=preview,
+        right_preview_backend=PreviewBackend(),
+        left_state_backend=None,
+        right_state_backend=None,
+        dual_arm_retargeter=None,
+    )
+
+    resolved_pose, resolved_qpos, source = _resolve_robot_home_for_side(
+        components,
+        side="left",
+    )
+
+    np.testing.assert_allclose(resolved_pose, pose_desk)
+    np.testing.assert_allclose(resolved_qpos, qpos)
+    np.testing.assert_allclose(preview.local_qpos, qpos)
+    assert source == "initial_alignment_pose_desk"
 
 
 def test_session_config_does_not_duplicate_safety_stale_timeout() -> None:
@@ -279,24 +333,24 @@ def test_real_runtime_home_uses_stable_pose_after_atomic_arm_snapshot(
         return {"left": np.zeros(6)}
 
     monkeypatch.setattr(
-        virtual_runtime,
+        runtime_home,
         "_capture_atomic_real_qpos_snapshot",
         capture_atomic,
     )
     monkeypatch.setattr(
-        virtual_runtime,
+        runtime_home,
         "_resolve_robot_home_for_side",
         lambda *args, **kwargs: (np.eye(4), np.zeros(6), "test_snapshot"),
     )
     monkeypatch.setattr(
-        virtual_runtime,
+        runtime_home,
         "_update_optional_hand_preview_from_channels",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(virtual_runtime, "_log", lambda *args, **kwargs: None)
-    monkeypatch.setattr(virtual_runtime.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(runtime_home, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_home.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(
-        virtual_runtime.time,
+        runtime_home.time,
         "monotonic",
         lambda: monotonic_clock,
     )
@@ -416,14 +470,14 @@ def test_runtime_home_freshness_watchdog_rejects_repeated_timestamp(
         right_hand_backend=None,
     )
     monkeypatch.setattr(
-        virtual_runtime.time,
+        runtime_home.time,
         "monotonic",
         lambda: monotonic_clock,
     )
-    monkeypatch.setattr(virtual_runtime.time, "sleep", lambda _delay: None)
-    monkeypatch.setattr(virtual_runtime, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_home.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(runtime_home, "_log", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        virtual_runtime,
+        runtime_home,
         "_update_optional_hand_preview_from_channels",
         lambda *args, **kwargs: None,
     )
@@ -516,19 +570,19 @@ def test_runtime_home_post_snapshot_watchdog_rejects_frozen_stream(
         return {"left": np.zeros(6)}
 
     monkeypatch.setattr(
-        virtual_runtime,
+        runtime_home,
         "_capture_atomic_real_qpos_snapshot",
         capture_atomic,
     )
     monkeypatch.setattr(
-        virtual_runtime,
+        runtime_home,
         "_update_optional_hand_preview_from_channels",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(virtual_runtime, "_log", lambda *args, **kwargs: None)
-    monkeypatch.setattr(virtual_runtime.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(runtime_home, "_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_home.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(
-        virtual_runtime.time,
+        runtime_home.time,
         "monotonic",
         lambda: monotonic_clock,
     )
@@ -1466,176 +1520,8 @@ class TeleopRecoveryTests(unittest.TestCase):
         np.testing.assert_allclose(loaded.get_side("left").hand_qpos_q6, np.linspace(0.0, 1.0, 6))
         np.testing.assert_allclose(loaded.get_side("right").arm_qpos, np.linspace(-0.1, -0.6, 6))
 
-    def test_virtual_components_load_initial_alignment_into_preview_backends(self) -> None:
-        payload = {
-            "format": "teleop_initial_alignment",
-            "format_version": 1,
-            "tcp_frame": "hand_base",
-            "sides": {
-                "left": {
-                    "side": "left",
-                    "arm_qpos": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-                    "tcp_pose_base": identity_pose().tolist(),
-                    "tcp_pose_desk": identity_pose().tolist(),
-                    "hand_qpos_q6": None,
-                    "metadata": {},
-                },
-                "right": {
-                    "side": "right",
-                    "arm_qpos": [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6],
-                    "tcp_pose_base": identity_pose().tolist(),
-                    "tcp_pose_desk": identity_pose().tolist(),
-                    "hand_qpos_q6": None,
-                    "metadata": {},
-                },
-            },
-            "metadata": {},
-        }
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            alignment_path = f"{tmp_dir}/alignment.json"
-            with open(alignment_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle)
-            args = SimpleNamespace(
-                hz=30.0,
-                arm_mode="virtual",
-                disable_dual_arm_collision_avoidance=True,
-                ik_tuning_json="",
-                load_initial_alignment=alignment_path,
-                load_profile="",
-                left_right_base_distance=0.525,
-                left_tracker_name="tracker_1",
-                right_tracker_name="tracker_2",
-                aux_tracker_name="tracker_3",
-                control_mode="absolute",
-                translation_scale=1.0,
-                collision_scene_profile="dual_arm_hand_proxy_open",
-                collision_avoidance_mode="boundary_slide",
-                recovery_healthy_frames=8,
-                no_record=True,
-                host="0.0.0.0",
-                port=9999,
-                tcp_mode="hand_base",
-                left_arm_ip="",
-                right_arm_ip="",
-                skip_renderer=True,
-                headless=True,
-            )
-            components = build_components(args)
-            try:
-                self.assertIsNone(components.left_hand_backend)
-                self.assertIsNone(components.right_hand_backend)
-                self.assertIsNone(components.left_hand_retargeter)
-                self.assertIsNone(components.right_hand_retargeter)
-                np.testing.assert_allclose(
-                    components.left_preview_backend.get_state()["current_qpos"],
-                    np.asarray([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=float),
-                )
-                np.testing.assert_allclose(
-                    components.right_preview_backend.get_state()["current_qpos"],
-                    np.asarray([-0.1, -0.2, -0.3, -0.4, -0.5, -0.6], dtype=float),
-                )
-            finally:
-                components.session.close()
-                components.left_preview_backend.close()
-                components.right_preview_backend.close()
 
-    def test_virtual_components_enable_optional_hand_preview_when_ports_are_provided(self) -> None:
-        args = SimpleNamespace(
-            hz=30.0,
-            arm_mode="virtual",
-            disable_dual_arm_collision_avoidance=True,
-            ik_tuning_json="",
-            load_initial_alignment="",
-            load_profile="",
-            left_right_base_distance=0.525,
-            left_tracker_name="tracker_1",
-            right_tracker_name="tracker_2",
-            aux_tracker_name="tracker_3",
-            control_mode="absolute",
-            translation_scale=1.0,
-            collision_scene_profile="dual_arm_hand_proxy_open",
-            collision_avoidance_mode="boundary_slide",
-            recovery_healthy_frames=8,
-            no_record=True,
-            host="0.0.0.0",
-            port=9999,
-            tcp_mode="hand_base",
-            left_arm_ip="",
-            right_arm_ip="",
-            skip_renderer=True,
-            headless=True,
-            left_hand_port="/dev/fake_left_hand",
-            right_hand_port="",
-            hand_reader_baudrate=115200,
-            hand_reader_timeout=0.05,
-            show_hand_raw_lines=False,
-            hand_joint_order=(5, 4, 3, 2, 0, 1),
-            hand_invert=True,
-            hand_command_alpha=1.0,
-            hand_send_threshold=0.002,
-        )
-        components = build_components(args)
-        try:
-            self.assertIsNotNone(components.left_hand_backend)
-            self.assertIsNone(components.right_hand_backend)
-            self.assertIsNotNone(components.left_hand_retargeter)
-            self.assertIsNone(components.right_hand_retargeter)
-            self.assertEqual(len(components.session.sources), 3)
-        finally:
-            components.session.close()
-            components.left_preview_backend.close()
-            components.right_preview_backend.close()
 
-    def test_virtual_components_single_right_arm_use_single_arm_retargeter(self) -> None:
-        args = SimpleNamespace(
-            active_sides=("right",),
-            hz=30.0,
-            arm_mode="virtual",
-            disable_dual_arm_collision_avoidance=False,
-            ik_tuning_json="",
-            load_initial_alignment="",
-            load_profile="",
-            left_right_base_distance=0.525,
-            left_tracker_name="tracker_1",
-            right_tracker_name="tracker_2",
-            aux_tracker_name="",
-            control_mode="absolute",
-            translation_scale=1.0,
-            collision_scene_profile="dual_arm_hand_proxy_open",
-            collision_avoidance_mode="boundary_slide",
-            arm_max_angvel=(0.35, 0.35, 0.35, 0.5, 0.5, 0.5),
-            recovery_healthy_frames=8,
-            no_record=True,
-            host="0.0.0.0",
-            port=9999,
-            tcp_mode="hand_base",
-            left_arm_ip="",
-            right_arm_ip="",
-            skip_renderer=True,
-            headless=True,
-            left_hand_port="",
-            right_hand_port="",
-            hand_reader_baudrate=115200,
-            hand_reader_timeout=0.05,
-            show_hand_raw_lines=False,
-            hand_joint_order=(5, 4, 3, 2, 0, 1),
-            hand_invert=True,
-            hand_command_alpha=1.0,
-            hand_send_threshold=0.002,
-        )
-        components = build_components(args)
-        try:
-            self.assertEqual(components.active_sides, ("right",))
-            self.assertIsNone(components.dual_arm_retargeter)
-            self.assertEqual([retargeter.name for retargeter in components.session.retargeters], ["pose_to_arm_right"])
-            self.assertEqual(
-                components.session.safety_monitor.config.required_channels,
-                ("right_wrist_pose",),
-            )
-        finally:
-            components.session.close()
-            components.left_preview_backend.close()
-            components.right_preview_backend.close()
 
     def test_real_components_single_left_arm_use_single_arm_retargeter(self) -> None:
         args = SimpleNamespace(
@@ -1723,82 +1609,6 @@ class TeleopRecoveryTests(unittest.TestCase):
             if components.right_state_backend is not None:
                 components.right_state_backend.close()
 
-    def test_robot_home_prefers_initial_alignment_pose_and_qpos(self) -> None:
-        left_pose = _pose(tx=0.33, yaw_deg=10.0)
-        right_pose = _pose(tx=-0.27, yaw_deg=-15.0)
-        payload = {
-            "format": "teleop_initial_alignment",
-            "format_version": 1,
-            "tcp_frame": "hand_base",
-            "sides": {
-                "left": {
-                    "side": "left",
-                    "arm_qpos": [0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
-                    "tcp_pose_base": identity_pose().tolist(),
-                    "tcp_pose_desk": left_pose.tolist(),
-                    "hand_qpos_q6": None,
-                    "metadata": {},
-                },
-                "right": {
-                    "side": "right",
-                    "arm_qpos": [-0.6, -0.5, -0.4, -0.3, -0.2, -0.1],
-                    "tcp_pose_base": identity_pose().tolist(),
-                    "tcp_pose_desk": right_pose.tolist(),
-                    "hand_qpos_q6": None,
-                    "metadata": {},
-                },
-            },
-            "metadata": {},
-        }
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            alignment_path = f"{tmp_dir}/alignment.json"
-            with open(alignment_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle)
-            args = SimpleNamespace(
-                hz=30.0,
-                arm_mode="virtual",
-                disable_dual_arm_collision_avoidance=True,
-                ik_tuning_json="",
-                load_initial_alignment=alignment_path,
-                load_profile="",
-                left_right_base_distance=0.525,
-                left_tracker_name="tracker_1",
-                right_tracker_name="tracker_2",
-                aux_tracker_name="tracker_3",
-                control_mode="absolute",
-                translation_scale=1.0,
-                collision_scene_profile="dual_arm_hand_proxy_open",
-                collision_avoidance_mode="boundary_slide",
-                recovery_healthy_frames=8,
-                no_record=True,
-                host="0.0.0.0",
-                port=9999,
-                tcp_mode="hand_base",
-                left_arm_ip="",
-                right_arm_ip="",
-                skip_renderer=True,
-                headless=True,
-            )
-            components = build_components(args)
-            try:
-                left_robot_home_desk, left_qpos, left_source = _resolve_robot_home_for_side(
-                    components,
-                    side="left",
-                )
-                right_robot_home_desk, right_qpos, right_source = _resolve_robot_home_for_side(
-                    components,
-                    side="right",
-                )
-                np.testing.assert_allclose(left_robot_home_desk, left_pose)
-                np.testing.assert_allclose(right_robot_home_desk, right_pose)
-                np.testing.assert_allclose(left_qpos, np.asarray([0.6, 0.5, 0.4, 0.3, 0.2, 0.1], dtype=float))
-                np.testing.assert_allclose(right_qpos, np.asarray([-0.6, -0.5, -0.4, -0.3, -0.2, -0.1], dtype=float))
-                self.assertEqual(left_source, "initial_alignment_pose_desk")
-                self.assertEqual(right_source, "initial_alignment_pose_desk")
-            finally:
-                components.session.close()
-                components.left_preview_backend.close()
-                components.right_preview_backend.close()
 
     def test_movement_multiple_scales_tracker_translation_without_scaling_rotation(self) -> None:
         calibration = TeleopCalibration()
@@ -1865,225 +1675,11 @@ class TeleopRecoveryTests(unittest.TestCase):
         DUAL_ARM_IK_AVAILABLE,
         "pinocchio/pink/qpsolvers are required for dual-arm IK tests",
     )
-    def test_dual_arm_target_context_uses_desk_pose_with_base_translation(self) -> None:
-        args = SimpleNamespace(
-            hz=30.0,
-            arm_mode="virtual",
-            disable_dual_arm_collision_avoidance=False,
-            ik_tuning_json="teleop_runtime/configs/rm65_ik_tuning.json",
-            load_initial_alignment=_write_default_initial_alignment_fixture(self),
-            load_profile=(
-                "teleop_records/calibration_profiles/"
-                "20260416_231341_vive_rm65_virtual_desk.json"
-            ),
-            left_right_base_distance=0.525,
-            left_tracker_name="tracker_1",
-            right_tracker_name="tracker_2",
-            aux_tracker_name="tracker_3",
-            control_mode="absolute",
-            translation_scale=1.0,
-            collision_scene_profile="dual_arm_hand_proxy_open",
-            collision_avoidance_mode="boundary_slide",
-            recovery_healthy_frames=8,
-            no_record=True,
-            host="0.0.0.0",
-            port=9999,
-            tcp_mode="hand_base",
-            left_arm_ip="",
-            right_arm_ip="",
-            skip_renderer=True,
-            headless=True,
-            keyboard_clutch=False,
-        )
-        components = build_components(args)
-        try:
-            left_human_home = identity_pose()
-            left_human_home[0, 3] = -0.25
-            left_human_home[1, 3] = -0.15
-            left_human_home[2, 3] = 0.32
-            right_human_home = identity_pose()
-            right_human_home[0, 3] = -0.26
-            right_human_home[1, 3] = 0.16
-            right_human_home[2, 3] = 0.31
-
-            left_robot_home_desk, _, _ = _resolve_robot_home_for_side(components, side="left")
-            right_robot_home_desk, _, _ = _resolve_robot_home_for_side(components, side="right")
-            components.left_retargeter.set_home_anchors(
-                human_pose_desk=left_human_home,
-                robot_pose_desk=left_robot_home_desk,
-            )
-            components.right_retargeter.set_home_anchors(
-                human_pose_desk=right_human_home,
-                robot_pose_desk=right_robot_home_desk,
-            )
-
-            timestamp = time.time()
-            observation = TeleopObservation(
-                channels={
-                    "left_wrist_pose": ObservationChannel(
-                        channel_name="left_wrist_pose",
-                        capability="pose6d",
-                        side="left",
-                        value=left_human_home,
-                        frame_name="desk",
-                        timestamp=timestamp,
-                        source_name="unit_test",
-                        valid=True,
-                        critical=True,
-                    ),
-                    "right_wrist_pose": ObservationChannel(
-                        channel_name="right_wrist_pose",
-                        capability="pose6d",
-                        side="right",
-                        value=right_human_home,
-                        frame_name="desk",
-                        timestamp=timestamp,
-                        source_name="unit_test",
-                        valid=True,
-                        critical=True,
-                    ),
-                },
-                timestamp=timestamp,
-                metadata={"tcp_mode": HAND_BASE_TCP_FRAME},
-            )
-            context = components.dual_arm_retargeter.build_target_context(
-                observation,
-                components.session.calibration,
-            )
-            current_targets = components.dual_arm_retargeter.current_world_targets()
-
-            np.testing.assert_allclose(
-                context.left_target[:3, 3],
-                current_targets["left"][:3, 3],
-                atol=2e-2,
-            )
-            np.testing.assert_allclose(
-                context.right_target[:3, 3],
-                current_targets["right"][:3, 3],
-                atol=2e-2,
-            )
-            command = components.session.build_command(observation)
-            # This test owns the desk/base target-context conversion.  The
-            # collision-aware solver has separate convergence fixtures and may
-            # select another bounded branch, so only enforce its public output
-            # envelope here instead of pinning one historical joint seed.
-            lower = np.asarray(RM65_ABSOLUTE_Q_MIN_RAD, dtype=float)
-            upper = np.asarray(RM65_ABSOLUTE_Q_MAX_RAD, dtype=float)
-            for side in ("left", "right"):
-                qpos = np.asarray(command.commands[f"{side}_arm"].value, dtype=float)
-                self.assertTrue(np.all(np.isfinite(qpos)))
-                self.assertTrue(np.all(qpos >= lower))
-                self.assertTrue(np.all(qpos <= upper))
-        finally:
-            components.session.close()
-            components.left_preview_backend.close()
-            components.right_preview_backend.close()
 
     @unittest.skipUnless(
         DUAL_ARM_IK_AVAILABLE,
         "pinocchio/pink/qpsolvers are required for dual-arm IK tests",
     )
-    def test_dual_arm_single_command_converges_to_requested_rotation_axis(self) -> None:
-        args = SimpleNamespace(
-            hz=30.0,
-            arm_mode="virtual",
-            disable_dual_arm_collision_avoidance=False,
-            ik_tuning_json="teleop_runtime/configs/rm65_ik_tuning.json",
-            load_initial_alignment=_write_default_initial_alignment_fixture(self),
-            load_profile=(
-                "teleop_records/calibration_profiles/"
-                "20260416_231341_vive_rm65_virtual_desk.json"
-            ),
-            left_right_base_distance=0.525,
-            left_tracker_name="tracker_1",
-            right_tracker_name="tracker_2",
-            aux_tracker_name="tracker_3",
-            control_mode="absolute",
-            translation_scale=1.0,
-            collision_scene_profile="dual_arm_hand_proxy_open",
-            collision_avoidance_mode="boundary_slide",
-            recovery_healthy_frames=8,
-            no_record=True,
-            host="0.0.0.0",
-            port=9999,
-            tcp_mode="hand_base",
-            left_arm_ip="",
-            right_arm_ip="",
-            skip_renderer=True,
-            headless=True,
-            keyboard_clutch=False,
-        )
-        components = build_components(args)
-        try:
-            home_rot = R.from_euler("xyz", [20.0, -35.0, 40.0], degrees=True).as_matrix()
-            left_human_home = identity_pose()
-            left_human_home[:3, :3] = home_rot
-            left_human_home[:3, 3] = np.asarray([-0.25, -0.15, 0.32], dtype=float)
-            right_human_home = identity_pose()
-            right_human_home[:3, :3] = home_rot
-            right_human_home[:3, 3] = np.asarray([-0.26, 0.16, 0.31], dtype=float)
-            left_robot_home_desk, _, _ = _resolve_robot_home_for_side(components, side="left")
-            right_robot_home_desk, _, _ = _resolve_robot_home_for_side(components, side="right")
-            components.left_retargeter.set_home_anchors(
-                human_pose_desk=left_human_home,
-                robot_pose_desk=left_robot_home_desk,
-            )
-            components.right_retargeter.set_home_anchors(
-                human_pose_desk=right_human_home,
-                robot_pose_desk=right_robot_home_desk,
-            )
-
-            delta_rot = R.from_euler("xyz", [15.0, 0.0, 0.0], degrees=True).as_matrix()
-            left_current = left_human_home.copy()
-            left_current[:3, :3] = left_human_home[:3, :3] @ delta_rot
-            right_current = right_human_home.copy()
-            right_current[:3, :3] = right_human_home[:3, :3] @ delta_rot
-            timestamp = time.time()
-            observation = TeleopObservation(
-                channels={
-                    "left_wrist_pose": ObservationChannel(
-                        channel_name="left_wrist_pose",
-                        capability="pose6d",
-                        side="left",
-                        value=left_current,
-                        frame_name="desk",
-                        timestamp=timestamp,
-                        source_name="unit_test",
-                        valid=True,
-                        critical=True,
-                    ),
-                    "right_wrist_pose": ObservationChannel(
-                        channel_name="right_wrist_pose",
-                        capability="pose6d",
-                        side="right",
-                        value=right_current,
-                        frame_name="desk",
-                        timestamp=timestamp,
-                        source_name="unit_test",
-                        valid=True,
-                        critical=True,
-                    ),
-                },
-                timestamp=timestamp,
-                metadata={"tcp_mode": HAND_BASE_TCP_FRAME},
-            )
-            command = components.session.build_command(observation)
-            components.left_preview_backend.send_command(command.commands["left_arm"])
-            components.right_preview_backend.send_command(command.commands["right_arm"])
-            achieved = _preview_tcp_pose_desk(components, side="left")
-            achieved_delta_deg = R.from_matrix(
-                left_robot_home_desk[:3, :3].T @ achieved[:3, :3]
-            ).as_euler("xyz", degrees=True)
-            expected_delta_deg = R.from_matrix(delta_rot).as_euler("xyz", degrees=True)
-            self.assertGreater(achieved_delta_deg[0], 5.0)
-            self.assertLess(abs(achieved_delta_deg[1]), abs(achieved_delta_deg[0]))
-            self.assertLess(abs(achieved_delta_deg[2]), abs(achieved_delta_deg[0]))
-            self.assertLess(abs(achieved_delta_deg[0] - expected_delta_deg[0]), 6.0)
-            self.assertGreaterEqual(command.metadata.get("ik_solve_iterations", 0), 1)
-        finally:
-            components.session.close()
-            components.left_preview_backend.close()
-            components.right_preview_backend.close()
 
     def test_legacy_tcp_mode_normalizes_to_tool_tcp(self) -> None:
         config = TeleopSessionConfig(record_enabled=False, tcp_mode="rm_eef")

@@ -1,7 +1,8 @@
 # MuJoCo 与仿真参数说明
 
-MuJoCo 是 canonical task-physics backend；运行命令见 [sim README](./README.md)。SAPIEN 只用于
-operator/debug preview，不是 sim 主链路。体系边界见 [`sim/README.md`](../../sim/README.md)。
+MuJoCo 是 canonical task-physics backend；运行命令见 [sim README](./README.md)。
+历史 SAPIEN operator preview 入口已退役，体系边界见
+[`sim/README.md`](../../sim/README.md)。
 
 以下命令按原样运行时均为 R1，不连接真实 RM65。若额外加入 real-arm read 选项，风险至少
 上升为 H1，必须回到该入口的硬件说明核对，不能继续沿用本页的 R1 判断。
@@ -39,20 +40,7 @@ python -m sim.mujoco.replay.runner \
 仅用于相机、URDF/MJCF 和 joint recording 诊断。它跳过 canonical action→IK 语义，报告中
 必须标记为 kinematic/debug replay。
 
-## 5. SAPIEN preview
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --no-camera \
-  --no-video
-```
-
-用途是 VIVE profile、左右 wrist、home anchor 和 operator visualization。SAPIEN 不负责
-task physics、real2sim actuator 结论或策略 rollout。
-
-## 6. Cube-Lift 与性能诊断
+## 5. Cube-Lift 与性能诊断
 
 单次物理诊断：
 
