@@ -102,6 +102,8 @@ class MujocoPolicySkillMotionApplication:
         self._started = False
         self._held = False
         self._closed = False
+        self._policy_source_closed = False
+        self._runtime_closed = False
         self._active_operation_id: str | None = None
 
     @property
@@ -335,13 +337,16 @@ class MujocoPolicySkillMotionApplication:
                 raise RuntimeError(
                     "Closing a started policy Skill application requires HOLD."
                 )
-            try:
+            if not self._policy_source_closed:
                 self.policy_source.close()
-            finally:
-                if self._started:
-                    self.runtime.close()
-                self._closed = True
-                self._active_operation_id = None
+                self._policy_source_closed = True
+            if self._started and not self._runtime_closed:
+                self.runtime.close()
+                self._runtime_closed = True
+            elif not self._started:
+                self._runtime_closed = True
+            self._closed = True
+            self._active_operation_id = None
 
 
 __all__ = [

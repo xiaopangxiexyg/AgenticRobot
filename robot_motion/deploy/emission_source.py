@@ -189,7 +189,14 @@ class ThreadedPolicyEmissionSource:
         self._completions: queue.Queue[_PredictionCompletion] = queue.Queue(maxsize=2)
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
+        self._close_lock = threading.Lock()
         self._started = False
+        self._close_started = False
+        self._worker_drained = False
+        self._policy_closed = False
+        self._close_complete = False
+        self._close_cancel_succeeded = False
+        self._close_cancel_error: BaseException | None = None
         self._generation = 0
         self._in_flight = False
         self._reset_pending = False
@@ -286,7 +293,7 @@ class ThreadedPolicyEmissionSource:
     def start(self) -> None:
         if self._started:
             return
-        if self._worker is not None:
+        if self._worker is not None or self._close_started:
             raise RuntimeError("A closed policy emission source cannot be restarted.")
         self.reset_for_activation()
         self._stop_event.clear()
@@ -463,29 +470,77 @@ class ThreadedPolicyEmissionSource:
         return emission
 
     def close(self) -> None:
-        if self._worker is None:
+        with self._close_lock:
+            if self._close_complete:
+                return
+
+            if not self._close_started:
+                self._close_started = True
+                self._generation += 1
+                self._stop_event.set()
+                self.runtime.clear_action_queue()
+                self._last_emission = None
+
+            worker = self._worker
+            if worker is None:
+                self._worker_drained = True
+            elif not self._worker_drained:
+                if (
+                    self._in_flight
+                    and worker.is_alive()
+                    and not self._close_cancel_succeeded
+                ):
+                    try:
+                        self._request_policy_cancel()
+                    except Exception as exc:  # noqa: BLE001 - drain still required.
+                        self._close_cancel_error = exc
+                    else:
+                        self._close_cancel_succeeded = True
+                        self._close_cancel_error = None
+
+                # Remove work that has not started, then wake an idle worker.
+                # An in-flight worker observes _stop_event after prediction and
+                # exits without publishing a completion.
+                try:
+                    while True:
+                        self._tasks.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._tasks.put_nowait(None)
+                except queue.Full:
+                    pass
+                worker.join(timeout=self.config.worker_join_timeout_sec)
+                if worker.is_alive():
+                    self._started = False
+                    error = RuntimeError(
+                        "policy inference worker did not drain before close timeout."
+                    )
+                    if self._close_cancel_error is not None:
+                        raise error from self._close_cancel_error
+                    raise error
+                self._worker_drained = True
+                self._in_flight = False
+                self._reset_pending = False
+
             self._started = False
-            return
-        self._generation += 1
-        if self._in_flight:
-            self._request_policy_cancel()
-        self._stop_event.set()
-        try:
-            self._tasks.put_nowait(None)
-        except queue.Full:
-            pass
-        self._worker.join(timeout=self.config.worker_join_timeout_sec)
-        alive = self._worker.is_alive()
-        self._started = False
-        self.runtime.clear_action_queue()
-        self._last_emission = None
-        close = getattr(self.policy, "close", None)
-        if callable(close):
-            close()
-        if alive:
-            raise RuntimeError(
-                "policy inference worker did not drain before close timeout."
-            )
+            if not self._policy_closed:
+                close = getattr(self.policy, "close", None)
+                try:
+                    if callable(close):
+                        close()
+                except Exception as exc:  # noqa: BLE001 - retry this stage later.
+                    raise RuntimeError("policy lifecycle close failed") from exc
+                self._policy_closed = True
+
+            # Once the worker and policy are closed there is nothing left to
+            # retry.  Preserve the cancellation contract failure for this
+            # caller, but make subsequent close() calls idempotent.
+            self._close_complete = True
+            if self._close_cancel_error is not None:
+                raise RuntimeError("policy inference cancellation failed") from (
+                    self._close_cancel_error
+                )
 
     def status(self, *, now: float | None = None) -> dict[str, Any]:
         timestamp = self._finite_time(

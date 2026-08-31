@@ -4,6 +4,7 @@ import threading
 import time
 
 import numpy as np
+import pytest
 
 from robot_motion.action import ArmActionSpec
 from robot_motion.deploy import (
@@ -96,6 +97,7 @@ def _source(
     prediction_request_queue_threshold: int = 0,
     policy_interval_sec: float = 0.02,
     action_period_sec: float = 0.02,
+    worker_join_timeout_sec: float = 2.0,
 ) -> ThreadedPolicyEmissionSource:
     runtime = PolicyDeployRuntime(
         PolicyDeployRuntimeConfig(
@@ -128,6 +130,7 @@ def _source(
             prediction_request_queue_threshold=(
                 prediction_request_queue_threshold
             ),
+            worker_join_timeout_sec=worker_join_timeout_sec,
         ),
         runtime=runtime,
         policy=policy,
@@ -269,3 +272,81 @@ def test_cancelled_transport_rearm_is_retried_without_blocking_step() -> None:
         assert source.status()["last_error"] is None
     finally:
         source.close()
+
+
+class _RejectingCloseCancellationPolicy(_BlockingPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.allow_cancel = False
+        self.close_calls = 0
+
+    def request_cancel(self) -> bool:
+        # Model a transport that reports a rejected cancellation after the
+        # in-flight request has nevertheless been released.  close() must
+        # still fence the mailbox, drain the worker, and close the policy.
+        self.release.set()
+        return self.allow_cancel
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_rejected_close_cancellation_still_drains_worker_and_closes_policy() -> None:
+    policy = _RejectingCloseCancellationPolicy()
+    source = _source(policy)
+    source.start()
+    assert source.step(now=time.monotonic()) is None
+    assert policy.entered.wait(timeout=1.0)
+
+    try:
+        with pytest.raises(RuntimeError, match="cancellation failed"):
+            source.close()
+
+        assert source.status()["worker_alive"] is False
+        assert source.started is False
+        assert policy.close_calls == 1
+
+        # The first call reported the cancellation contract failure, but all
+        # owned resources are already closed; retry is idempotent.
+        source.close()
+        assert policy.close_calls == 1
+    finally:
+        # Keep the failure-first version of the implementation from leaking a
+        # daemon worker while this regression test demonstrates the defect.
+        policy.allow_cancel = True
+        policy.release.set()
+        try:
+            source.close()
+        except RuntimeError:
+            pass
+
+
+class _SlowClosePolicy(_BlockingPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+
+    def request_cancel(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_close_timeout_retains_policy_until_worker_drains_on_retry() -> None:
+    policy = _SlowClosePolicy()
+    source = _source(policy, worker_join_timeout_sec=0.01)
+    source.start()
+    assert source.step(now=time.monotonic()) is None
+    assert policy.entered.wait(timeout=1.0)
+
+    with pytest.raises(RuntimeError, match="did not drain"):
+        source.close()
+
+    assert source.status()["worker_alive"] is True
+    assert policy.close_calls == 0
+
+    policy.release.set()
+    source.close()
+    assert source.status()["worker_alive"] is False
+    assert policy.close_calls == 1
