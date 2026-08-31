@@ -1927,6 +1927,208 @@ def test_application_rearm_uses_bounded_freshness_loop_before_preflight(
     assert app._held is False
 
 
+def test_application_rearm_failure_reestablishes_authoritative_lower_hold(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    gate = ["ready"]
+    rollback_receipt = SimpleNamespace(status="held_after_rearm_failure")
+
+    def request_hold(**kwargs):
+        calls.append(("lower.hold", kwargs))
+        gate[0] = "hold"
+        return (
+            rollback_receipt
+            if kwargs.get("force_cancellation") is True
+            else SimpleNamespace(status="initial_hold")
+        )
+
+    def fail_rearm(*, now: float):
+        calls.append(("composition.rearm", now))
+        gate[0] = "ready"
+        raise RuntimeError("composition rearm partially failed")
+
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=SimpleNamespace(clock=lambda: 10.0),
+        composition=SimpleNamespace(
+            human_alpha_by_component={"right_arm": 1.0},
+            request_hold=request_hold,
+            rearm=fail_rearm,
+        ),
+        policy_source=SimpleNamespace(),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: 10.0,
+    )
+    app.control_cycle_port.deactivate = lambda **kwargs: calls.append(
+        ("cycle.fence", kwargs)
+    )
+    app._started = True
+    app._held = True
+    monkeypatch.setattr(
+        app,
+        "_wait_for_source_readiness",
+        lambda **_kwargs: calls.append(("sources.fresh", None)),
+    )
+
+    with pytest.raises(RuntimeError, match="composition rearm partially failed"):
+        app.rearm(now=10.0)
+
+    assert calls == [
+        (
+            "cycle.fence",
+            {"reason": "sim_hil_application:rearm_boundary"},
+        ),
+        (
+            "lower.hold",
+            {"reason": "sim_hil_application:rearm_boundary"},
+        ),
+        ("sources.fresh", None),
+        ("composition.rearm", 10.0),
+        (
+            "cycle.fence",
+            {"reason": "sim_hil_application:rearm_operation_failed"},
+        ),
+        (
+            "lower.hold",
+            {
+                "reason": "sim_hil_application:rearm_operation_failed",
+                "force_cancellation": True,
+            },
+        ),
+    ]
+    assert gate == ["hold"]
+    assert app.held is True
+    assert app.last_hold_outcome is rollback_receipt
+    assert app._last_error == "RuntimeError:composition rearm partially failed"
+    assert app._first_control_fault == app._last_error
+
+
+def test_application_rearm_preserves_fail_closed_transition_failure(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    def request_hold(**kwargs):
+        calls.append(("lower.hold", kwargs))
+        if kwargs.get("force_cancellation") is True:
+            raise RuntimeError("rearm rollback hold failed")
+        return SimpleNamespace(status="initial_hold")
+
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=SimpleNamespace(clock=lambda: 10.0),
+        composition=SimpleNamespace(
+            human_alpha_by_component={"right_arm": 1.0},
+            request_hold=request_hold,
+            rearm=lambda *, now: (_ for _ in ()).throw(
+                RuntimeError("composition rearm partially failed")
+            ),
+        ),
+        policy_source=SimpleNamespace(),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: 10.0,
+    )
+    app.control_cycle_port.deactivate = lambda **kwargs: calls.append(
+        ("cycle.fence", kwargs)
+    )
+    app._started = True
+    app._held = True
+    monkeypatch.setattr(app, "_wait_for_source_readiness", lambda **_kwargs: None)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "RuntimeError:composition rearm partially failed;"
+            "fail_closed_transition_failed:"
+            "RuntimeError:rearm rollback hold failed"
+        ),
+    ) as raised:
+        app.rearm(now=10.0)
+
+    assert app.held is True
+    assert app._first_control_fault == (
+        "RuntimeError:composition rearm partially failed"
+    )
+    assert app._last_error == str(raised.value)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "rearm rollback hold failed"
+
+
+def test_application_rearm_scheduling_failure_rolls_back_active_cycle(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    runtime_times = iter((10.0, 10.0, float("nan")))
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=SimpleNamespace(clock=lambda: next(runtime_times)),
+        composition=SimpleNamespace(
+            human_alpha_by_component={"right_arm": 1.0},
+            request_hold=lambda **kwargs: calls.append(("lower.hold", kwargs)),
+            rearm=lambda *, now: (
+                calls.append(("composition.rearm", now))
+                or SimpleNamespace(passed=True)
+            ),
+        ),
+        policy_source=SimpleNamespace(),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: 10.0,
+    )
+    app.control_cycle_port.deactivate = lambda **kwargs: calls.append(
+        ("cycle.fence", kwargs)
+    )
+    app._started = True
+    app._held = True
+    monkeypatch.setattr(app, "_wait_for_source_readiness", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        app,
+        "_activate_and_prime_control_cycle",
+        lambda **_kwargs: calls.append(("cycle.activate_and_prime", None)),
+    )
+
+    with pytest.raises(ValueError, match="rearm.next_decision_at must be finite"):
+        app.rearm(now=10.0)
+
+    assert calls == [
+        (
+            "cycle.fence",
+            {"reason": "sim_hil_application:rearm_boundary"},
+        ),
+        (
+            "lower.hold",
+            {"reason": "sim_hil_application:rearm_boundary"},
+        ),
+        ("composition.rearm", 10.0),
+        ("cycle.activate_and_prime", None),
+        (
+            "cycle.fence",
+            {"reason": "sim_hil_application:rearm_operation_failed"},
+        ),
+        (
+            "lower.hold",
+            {
+                "reason": "sim_hil_application:rearm_operation_failed",
+                "force_cancellation": True,
+            },
+        ),
+    ]
+    assert app.held is True
+    assert app._last_error == (
+        "ValueError:rearm.next_decision_at must be finite."
+    )
+    assert app._first_control_fault == app._last_error
+
+
 def test_application_rearm_waits_until_human_emission_is_actually_fresh() -> None:
     now = [10.0]
 

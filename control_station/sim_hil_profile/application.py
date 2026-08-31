@@ -1876,6 +1876,33 @@ class MujocoSimHILApplication(
             assert receipt is not None
             return report, receipt
 
+    def _fail_closed_rearm_error(self, error: BaseException) -> None:
+        """Re-establish lower HOLD and preserve both rearm failure domains."""
+
+        rearm_error = f"{type(error).__name__}:{error}"
+        self._last_error = rearm_error
+        if self._first_control_fault is None:
+            self._first_control_fault = rearm_error
+        try:
+            outcome = self._deactivate_cycle_and_request_lower_hold(
+                reason="sim_hil_application:rearm_operation_failed",
+                force_cancellation=True,
+            )
+        except BaseException as transition_error:
+            transition_detail = self._last_error
+            if transition_detail == rearm_error:
+                transition_detail = (
+                    f"{type(transition_error).__name__}:"
+                    f"{transition_error}"
+                )
+            self._last_error = (
+                f"{rearm_error};fail_closed_transition_failed:"
+                f"{transition_detail}"
+            )
+            raise RuntimeError(self._last_error) from transition_error
+        self._last_hold_outcome = outcome
+        self._last_error = rearm_error
+
     def _rearm_locked(
         self,
         *,
@@ -1919,8 +1946,8 @@ class MujocoSimHILApplication(
             hold_observed_at,
             _finite(self.runtime.clock(), name="rearm.observed_at"),
         )
-        report = self.composition.rearm(now=rearm_at)
         try:
+            report = self.composition.rearm(now=rearm_at)
             self._activate_and_prime_control_cycle(
                 human_emission_required=human_emission_required,
             )
@@ -1952,19 +1979,17 @@ class MujocoSimHILApplication(
                         target_effective_at=target_effective_at,
                         timeout_sec=self.config.warmup_timeout_sec,
                     )
-        except BaseException:
-            # The lower session rearm has already moved its gate to READY.
-            # Keep a failed activation/selection transaction physically held,
-            # even though the application-local held latch never opened.
-            self._deactivate_cycle_and_request_lower_hold(
-                reason="sim_hil_application:rearm_operation_failed",
-                force_cancellation=True,
+            self._next_decision_at = _finite(
+                self.runtime.clock(),
+                name="rearm.next_decision_at",
             )
+        except BaseException as error:
+            # The lower rearm may have partially replaced its activation or
+            # moved its gate to READY.  Application-local ``_held`` does not
+            # fence that lower state, so every failure through the final
+            # scheduling cut must re-establish the authoritative HOLD.
+            self._fail_closed_rearm_error(error)
             raise
-        self._next_decision_at = _finite(
-            self.runtime.clock(),
-            name="rearm.next_decision_at",
-        )
         self._last_schedule_overrun = None
         self._held = False
         self._last_error = None
