@@ -193,6 +193,7 @@ class Sam2GraspNetPointGraspPlanner:
         max_click_distance_m: float = 0.100,
         point_conditioned_workspace_margin_m: float = 0.120,
         max_target_width_centering_shift_m: float = 0.020,
+        max_target_height_centering_shift_m: float = 0.030,
     ) -> None:
         if not isinstance(model_spec, GraspNetPointGraspModelSpec):
             raise TypeError("model_spec must be typed.")
@@ -211,6 +212,9 @@ class Sam2GraspNetPointGraspPlanner:
         )
         self.max_target_width_centering_shift_m = float(
             max_target_width_centering_shift_m
+        )
+        self.max_target_height_centering_shift_m = float(
+            max_target_height_centering_shift_m
         )
         if not self.device.startswith("cuda"):
             raise ValueError("Reviewed GraspNet pointnet2 inference requires a CUDA device.")
@@ -235,6 +239,15 @@ class Sam2GraspNetPointGraspPlanner:
         ):
             raise ValueError(
                 "Reviewed target width-centering shift must be 0.020 m."
+            )
+        if not math.isclose(
+            self.max_target_height_centering_shift_m,
+            0.030,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "Reviewed target height-centering shift must be 0.030 m."
             )
         self._lock = threading.RLock()
         self._network: Any = None
@@ -282,6 +295,11 @@ class Sam2GraspNetPointGraspPlanner:
                     "source": "sam2_target_points_5_95_percentile_midpoint",
                     "maximum_shift_m": self.max_target_width_centering_shift_m,
                     "model_axis": "+y_opening",
+                },
+                "target_height_centering": {
+                    "source": "sam2_target_points_5_95_percentile_midpoint",
+                    "maximum_shift_m": self.max_target_height_centering_shift_m,
+                    "model_axis": "+z_height",
                 },
                 "click_distance_m": self.max_click_distance_m,
                 "gripper": {
@@ -606,27 +624,27 @@ class Sam2GraspNetPointGraspPlanner:
             except ValueError:
                 continue
             # GraspNet seeds lie on observed surfaces and can be biased toward
-            # one jaw.  The clicked SAM2 cloud usually observes both object
-            # sides along the closing axis, so center that axis using robust
-            # extents before mapping to the physical DMTAC TCP.  This uses no
-            # simulator object pose or grasp-outcome oracle.
-            width_axis = camera_from_grasp[:3, 1]
-            target_width_coordinates = (
-                target_points - camera_from_grasp[:3, 3]
-            ) @ width_axis
-            width_low, width_high = np.percentile(
-                target_width_coordinates,
-                (5.0, 95.0),
-            )
-            width_center_shift = float((width_low + width_high) * 0.5)
-            width_center_shift = float(
-                np.clip(
-                    width_center_shift,
-                    -self.max_target_width_centering_shift_m,
-                    self.max_target_width_centering_shift_m,
+            # one jaw or one end of an object.  Center both axes orthogonal to
+            # approach using robust clicked-SAM2 extents before mapping to the
+            # physical DMTAC TCP.  This uses no simulator object pose or
+            # grasp-outcome oracle.
+            for axis_index, maximum_shift in (
+                (1, self.max_target_width_centering_shift_m),
+                (2, self.max_target_height_centering_shift_m),
+            ):
+                axis = camera_from_grasp[:3, axis_index]
+                coordinates = (
+                    target_points - camera_from_grasp[:3, 3]
+                ) @ axis
+                low, high = np.percentile(coordinates, (5.0, 95.0))
+                center_shift = float(
+                    np.clip(
+                        (low + high) * 0.5,
+                        -maximum_shift,
+                        maximum_shift,
+                    )
                 )
-            )
-            camera_from_grasp[:3, 3] += width_axis * width_center_shift
+                camera_from_grasp[:3, 3] += axis * center_shift
             # GraspNet's translation is the grasp seed.  In its official
             # collision geometry the fingers occupy local approach X in
             # [depth - 0.06, depth] and the palm ends at depth - 0.06.

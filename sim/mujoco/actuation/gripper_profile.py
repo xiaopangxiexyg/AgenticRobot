@@ -442,9 +442,28 @@ def cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
         "l_2_joint",
         "r_2_joint",
     )
+    # The identified legacy profile drives translational finger joints, while
+    # the official 4B2 CAD mechanism exposes six coupled revolute joints.  MJCF
+    # position actuators interpret kp/kv/forcerange in rotational units here;
+    # copying the N/m and N values verbatim therefore produced 1200 N m/rad and
+    # 20 N m *per mimic joint*.  With all six joints constrained to one master,
+    # that launched light objects instead of applying the intended 20 N pad
+    # force.  Convert through the approximately 40 mm CAD linkage lever arm and
+    # divide the generalized stiffness, damping, and torque among the six
+    # explicitly actuated mimic joints.
+    # The analytic conversion gives a conservative lower bound.  The detailed
+    # linkage's equality constraints and mesh contacts need additional servo
+    # authority to close under load; a fixed-seed contact-only sweep selected
+    # the middle stable setting below.  It acquires/holds bilateral contact
+    # without the projectile behavior of the legacy copied gains.
+    rotational_kp = 5.0
+    rotational_kv = 0.10
+    rotational_force_limit = 0.50
+    rotational_joint_damping = 0.02
+    rotational_joint_friction = 0.005
     return replace(
         base,
-        name="dmtac_bimanual_position_eg2_4b2_cad_20260818.v1",
+        name="dmtac_bimanual_position_eg2_4b2_cad_20260829.v2",
         joint_names_by_gripper={
             name: tuple(f"{name}_{suffix}" for suffix in joint_suffixes)
             for name in names
@@ -467,13 +486,23 @@ def cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
                 ("right_eg2_4b2_cad", "right"),
             )
         },
+        position_kp_n_m=rotational_kp,
+        position_kv_n_s_m=rotational_kv,
+        force_limit_n=rotational_force_limit,
+        joint_damping_n_s_m=rotational_joint_damping,
+        joint_frictionloss_n=rotational_joint_friction,
         calibration_status=(
-            "official_eg2_4b2_cad_normalized_mimic_kinematics_provisional"
+            "official_eg2_4b2_cad_normalized_mimic_kinematics_"
+            "revolute_unit_conversion_provisional"
         ),
         evidence=(
             "additive SolidWorks EG2-4B2 CAD export; r_1_joint is the master, "
             "all five remaining moving joints mimic it with multiplier=1; "
-            "q=0 is open and q=0.864 is closed."
+            "q=0 is open and q=0.864 is closed. The legacy translational "
+            "actuator gains are converted to revolute units through a 0.040 m "
+            "CAD linkage lever-arm model, divided among six coupled actuators, "
+            "then bounded by a fixed-seed contact-only stability sweep; "
+            "hardware force identification remains provisional."
         ),
     )
 
