@@ -1081,13 +1081,48 @@ class ControlCompositionRuntime:
             raise ValueError("Composition promotion belongs to another session.")
         if evaluation.proposal_admission is not None:
             raise ValueError("Composition evaluation was already promoted.")
+        evaluation_record = evaluation.evaluation_record
+        if evaluation_record is None:
+            raise ValueError(
+                "Composition promotion requires its causal evaluation record."
+            )
+        if (
+            evaluation_record.control_cut.runtime_session_id
+            != self.runtime_session_id
+        ):
+            raise ValueError(
+                "Composition evaluation belongs to another runtime session."
+            )
+        snapshot = evaluation.input_snapshot
         result = evaluation.composition_evaluation
         if result.output_status != "ready" or result.composed_candidate is None:
             raise ValueError("Only a ready composition evaluation may be promoted.")
+        if snapshot.control_domain_id != self.control_domain_id:
+            raise ValueError(
+                "Composition evaluation belongs to another control domain."
+            )
+        receiver_clock_domain_id = self.coordinator.clock_domain.clock_domain_id
+        if (
+            snapshot.target_clock_domain_id != receiver_clock_domain_id
+            or result.target_clock_domain_id != receiver_clock_domain_id
+        ):
+            raise ValueError(
+                "Composition evaluation belongs to another target clock domain."
+            )
+        receiver_action_schema_hash = self.action_schema.semantic_content_hash
+        if (
+            snapshot.action_schema_hash != receiver_action_schema_hash
+            or result.action_schema_hash != receiver_action_schema_hash
+            or result.composed_candidate.action_schema.semantic_content_hash
+            != receiver_action_schema_hash
+        ):
+            raise ValueError(
+                "Composition evaluation uses another receiver action schema."
+            )
         missing_required = tuple(
             role
-            for role in evaluation.input_snapshot.required_roles
-            if role not in evaluation.input_snapshot.selected_input_by_role
+            for role in snapshot.required_roles
+            if role not in snapshot.selected_input_by_role
         )
         if missing_required:
             raise ValueError(
@@ -1096,9 +1131,9 @@ class ControlCompositionRuntime:
             )
         if (
             result.composition_input_snapshot_id
-            != evaluation.input_snapshot.composition_input_snapshot_id
+            != snapshot.composition_input_snapshot_id
             or result.composition_input_snapshot_hash
-            != evaluation.input_snapshot.semantic_content_hash
+            != snapshot.semantic_content_hash
         ):
             raise ValueError("Composition result does not match its input snapshot.")
         normalized_epoch = int(producer_epoch)

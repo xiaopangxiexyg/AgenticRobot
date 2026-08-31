@@ -82,6 +82,10 @@ def retention_spec() -> TimeWindowRetentionSpec:
 def build_runtime(
     strategy,
     *,
+    runtime_session_id: str = "session-0",
+    control_domain_id: str = "robot-0",
+    clock_domain_id: str = "control.monotonic",
+    action_catalog_id: str = "left-arm-v1",
     information_plan: CompositionInformationPlan | None = None,
     pre_mix_policy=None,
     event_emitter=None,
@@ -89,17 +93,17 @@ def build_runtime(
 ):
     clock = Clock()
     coordinator = ControlAdmissionCoordinator(
-        "robot-0",
+        control_domain_id,
         clock_domain=ClockDomainDescriptor(
-            clock_domain_id="control.monotonic",
-            runtime_session_id="session-0",
+            clock_domain_id=clock_domain_id,
+            runtime_session_id=runtime_session_id,
             boot_id="boot-0",
             reset_epoch=0,
         ),
         clock=clock,
     )
     epochs = ProducerEpochRegistry(
-        runtime_session_id="session-0",
+        runtime_session_id=runtime_session_id,
         coordinator=coordinator,
     )
     for producer_id in ("source-0", "composer-0"):
@@ -111,22 +115,22 @@ def build_runtime(
             reason="startup",
         )
     proposals = ProposalBuffer(
-        runtime_session_id="session-0",
+        runtime_session_id=runtime_session_id,
         coordinator=coordinator,
         producer_epochs=epochs,
         capacity=16,
     )
     events = []
     component_catalog = ActionComponentCatalog(
-        catalog_id="left-arm-v1",
+        catalog_id=action_catalog_id,
         action_space=BIMANUAL_QPOS_V1,
         components=(
             ActionComponentSpec("left_arm", "left_arm", "left_arm"),
         ),
     )
     runtime = ControlCompositionRuntime(
-        runtime_session_id="session-0",
-        control_domain_id="robot-0",
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
         embodiment_instance_id="fixture-0",
         coordinator=coordinator,
         producer_epochs=epochs,
@@ -734,6 +738,68 @@ def test_formal_deterministic_strategy_is_additive_and_promotable() -> None:
     assert event_types.count("formal_composition_strategy_spec") == 1
     assert "formal_composition_strategy_input" in event_types
     assert "formal_composition_strategy_result_binding" in event_types
+
+
+@pytest.mark.parametrize(
+    ("receiver_kwargs", "message"),
+    (
+        ({"control_domain_id": "robot-other"}, "another control domain"),
+        ({"clock_domain_id": "other-control.monotonic"}, "target clock domain"),
+        ({"action_catalog_id": "other-left-arm-v1"}, "action schema"),
+    ),
+)
+def test_promotion_rejects_evaluation_from_another_receiver(
+    receiver_kwargs: dict[str, str],
+    message: str,
+) -> None:
+    _, source, _, _ = build_runtime(None)
+    assert source.admit_composition_input(input_draft()).accepted
+    evaluation = source.evaluate_composition(
+        spec=composition_spec(),
+        target_effective_at=10.1,
+    )
+    assert evaluation.composition_evaluation.output_status == "ready"
+
+    _, receiver, proposals, _ = build_runtime(None, **receiver_kwargs)
+    with pytest.raises(ValueError, match=message):
+        receiver.admit_evaluated_composition(
+            evaluation,
+            runtime_session_id="session-0",
+            producer_id="composer-0",
+            producer_epoch=1,
+            sequence=0,
+            effective_until=10.2,
+        )
+
+    assert len(proposals) == 0
+
+
+def test_promotion_rejects_evaluation_from_another_runtime_session() -> None:
+    _, source, _, _ = build_runtime(
+        None,
+        runtime_session_id="session-other",
+    )
+    assert source.admit_composition_input(
+        replace(input_draft(), runtime_session_id="session-other")
+    ).accepted
+    evaluation = source.evaluate_composition(
+        spec=composition_spec(),
+        target_effective_at=10.1,
+    )
+    assert evaluation.composition_evaluation.output_status == "ready"
+
+    _, receiver, proposals, _ = build_runtime(None)
+    with pytest.raises(ValueError, match="another runtime session"):
+        receiver.admit_evaluated_composition(
+            evaluation,
+            runtime_session_id="session-0",
+            producer_id="composer-0",
+            producer_epoch=1,
+            sequence=0,
+            effective_until=10.2,
+        )
+
+    assert len(proposals) == 0
 
 
 def test_composition_support_ceiling_and_publication_target_monotonicity() -> None:

@@ -388,6 +388,7 @@ def test_authority_transfer_failure_remains_hold() -> None:
         ({"emission_at": 10.039}, "after authority takeover"),
         ({"deadman_at": 10.039}, "Deadman must be re-armed"),
         ({"rebase_at": 10.039}, "Retargeter must be re-based"),
+        ({"rebase_at": 10.061}, "completion predates"),
         ({"measured_at": 10.0}, "fresh relative to the HOLD"),
         ({"emission_at": 10.05, "completed_at": 10.151}, "emission is stale"),
         ({"measured_at": 10.045, "completed_at": 10.146}, "measured state is stale"),

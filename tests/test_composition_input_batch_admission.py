@@ -296,6 +296,65 @@ def test_batch_rejects_mixed_source_lineage() -> None:
     assert coordinator.committed_high_watermark == 2
 
 
+def test_batch_identity_includes_each_policy_output_id() -> None:
+    _clock, _coordinator, _store, action = _fixture()
+    first = replace(
+        _draft(
+            role="human_absolute",
+            producer_id="human-absolute",
+            action=action,
+        ),
+        policy_output_id="policy-output:7",
+    )
+    second = replace(
+        _draft(
+            role="human_residual",
+            producer_id="human-residual",
+            action=action,
+        ),
+        policy_output_id="policy-output:7",
+    )
+    original = CompositionInputBatchDraft(inputs=(first, second))
+    changed = CompositionInputBatchDraft(
+        inputs=(
+            first,
+            replace(second, policy_output_id="policy-output:8"),
+        )
+    )
+
+    assert changed.semantic_content_hash != original.semantic_content_hash
+    assert changed.batch_id != original.batch_id
+
+
+def test_batch_rejects_mixed_policy_output_lineage() -> None:
+    _clock, coordinator, store, action = _fixture()
+    first = replace(
+        _draft(
+            role="human_absolute",
+            producer_id="human-absolute",
+            action=action,
+        ),
+        policy_output_id="policy-output:7",
+    )
+    other_output = replace(
+        _draft(
+            role="human_residual",
+            producer_id="human-residual",
+            action=action,
+        ),
+        policy_output_id="policy-output:8",
+    )
+
+    receipt = store.admit_batch(
+        CompositionInputBatchDraft(inputs=(first, other_output))
+    )
+
+    assert receipt.accepted is False
+    assert receipt.rejection_code == "batch_causal_mismatch"
+    assert len(store) == 0
+    assert coordinator.committed_high_watermark == 2
+
+
 def test_input_rejects_incomplete_semantic_binding_identity() -> None:
     _clock, coordinator, store, action = _fixture()
     draft = replace(
