@@ -80,6 +80,7 @@ def build_contract(
     missing_behavior: str = "no_action",
     max_translation_disagreement_m: float | None = 0.10,
     max_rotation_disagreement_rad: float | None = math.radians(30.0),
+    maximum_decision_latency_sec: float | None = 0.01,
 ):
     value_spec = hand_spec or HandActionSpec.inspire_tac("left")
     rule_set = ComponentCompositionRuleSet(
@@ -119,7 +120,7 @@ def build_contract(
         implementation_contract_hashes=(
             rule_set.semantic_content_hash,
         ),
-        maximum_decision_latency_sec=0.01,
+        maximum_decision_latency_sec=maximum_decision_latency_sec,
     )
     strategy = FormalComponentCompositionStrategyV2(
         strategy_spec=strategy_spec,
@@ -1162,7 +1163,9 @@ def test_ttl_hot_parameter_expires_to_revision_default() -> None:
 
 
 def test_concurrent_hot_updates_never_expose_a_torn_component_vector() -> None:
-    hand_spec, _, _, strategy = build_contract()
+    hand_spec, _, _, strategy = build_contract(
+        maximum_decision_latency_sec=None,
+    )
     runtime, _, _ = build_runtime(strategy, enable_hot_control=True)
     _admit_hot_control_inputs(runtime, hand_spec=hand_spec)
     observations: list[tuple[float, float, str]] = []
