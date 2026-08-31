@@ -46,6 +46,18 @@ _LOCAL_PACKAGE_ROOTS = (
 )
 
 
+def test_annotation_projection_release_is_generated_on_demand() -> None:
+    materialized_releases = sorted(
+        path.name
+        for path in (_REPOSITORY_ROOT / "release").glob(
+            "refinement_annotation*"
+        )
+        if path.is_dir() and any(child.is_file() for child in path.rglob("*"))
+    )
+
+    assert materialized_releases == []
+
+
 def _checker_payload() -> dict[str, object]:
     result = subprocess.run(
         [sys.executable, str(_CHECKER), "--json"],
