@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from robot_motion.rm65.grasp_reachability import (
     CollisionCandidateAssessment,
@@ -22,6 +24,12 @@ from sim.sim_real_tests.rm65 import (
     compute_target_pose_content_hash,
     generate_random_grasp_pose_samples,
     run_random_grasp_pose_reachability,
+)
+from sim.sim_real_tests.rm65 import (
+    random_grasp_pose_reachability as reachability_module,
+)
+from sim.sim_real_tests.rm65.random_grasp_pose_reachability import (
+    annotate_ik_search_exhaustion,
 )
 
 
@@ -139,6 +147,384 @@ def test_bounded_multistart_exhaustion_is_not_reported_as_unreachable() -> None:
     assert receipt.status is GraspReachabilityStatus.IK_SEARCH_EXHAUSTED
     assert receipt.proof_scope == "bounded_multistart_search_only"
     assert len(receipt.candidates) == 3
+
+
+class _StagedFakeSolver:
+    def __init__(
+        self,
+        solved_poses: tuple[np.ndarray, ...],
+        *,
+        converged_attempt: int | None = None,
+        iterations_per_attempt: int = 4,
+    ) -> None:
+        self._solved_poses = solved_poses
+        self._converged_attempt = converged_attempt
+        self._iterations_per_attempt = iterations_per_attempt
+        self.calls: list[dict[str, Any]] = []
+        self.last_solve_iterations = 0
+        self.last_solve_converged = False
+        self.last_solve_deadline_exceeded = False
+        self.q_min = np.full(6, -4.0, dtype=float)
+        self.q_max = np.full(6, 4.0, dtype=float)
+
+    def solve_iterative(self, **kwargs: Any) -> np.ndarray:
+        self.calls.append(dict(kwargs))
+        attempt = len(self.calls)
+        self.last_solve_iterations = self._iterations_per_attempt
+        self.last_solve_converged = attempt == self._converged_attempt
+        qpos = np.zeros(6, dtype=float)
+        qpos[0] = float(attempt)
+        return qpos
+
+    def compute_pose(self, qpos: np.ndarray) -> np.ndarray:
+        pose_index = round(float(np.asarray(qpos, dtype=float)[0]))
+        return self._solved_poses[min(pose_index, len(self._solved_poses) - 1)]
+
+
+def test_adaptive_provider_keeps_small_pose_change_on_baseline_budget() -> None:
+    target = _pose((0.10, 0.0, 0.0))
+    solver = _StagedFakeSolver((np.eye(4), _pose((0.08, 0.0, 0.0))))
+    provider = build_rm65_multistart_candidate_provider(
+        solver,
+        qpos_seeds=(np.zeros(6),),
+        max_iterations=10,
+        max_joint_step_rad=0.1,
+        damping=0.03,
+    )
+
+    candidate = provider(0, target)
+
+    assert len(solver.calls) == 1
+    assert candidate.metadata["search_tier"] == "baseline"
+    assert candidate.metadata["planned_stage_count"] == 1
+    assert candidate.metadata["attempts_used"] == 1
+    assert candidate.metadata["iteration_budget"] == 10
+    assert candidate.metadata["iterations_used"] == 4
+    assert candidate.metadata["minimum_observed_position_residual_m"] == pytest.approx(
+        0.02
+    )
+    assert candidate.metadata[
+        "selected_candidate_position_residual_m"
+    ] == pytest.approx(0.02)
+
+
+def test_far_residual_skips_near_miss_optimizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _pose((0.60, 0.0, 0.0))
+    solver = _StagedFakeSolver((np.eye(4),) * 5)
+
+    def must_not_run(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("far residual must not spend near-miss optimizer budget")
+
+    monkeypatch.setattr(reachability_module, "least_squares", must_not_run)
+    provider = build_rm65_multistart_candidate_provider(
+        solver,
+        qpos_seeds=(np.zeros(6),),
+        max_iterations=10,
+        max_joint_step_rad=0.1,
+        damping=0.03,
+        near_miss_refinement_enabled=True,
+    )
+
+    candidate = provider(0, target)
+
+    refinement = candidate.metadata["near_miss_refinement"]
+    assert refinement["eligible"] is False
+    assert refinement["attempted"] is False
+    assert refinement["skip_reason"] == "outside_near_miss_gate"
+
+
+def test_near_miss_refinement_can_reach_public_tolerance_and_still_checks_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _pose((0.10, 0.0, 0.0))
+    solver = _StagedFakeSolver((np.eye(4), _pose((0.08, 0.0, 0.0)), target))
+
+    def refine(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            x=np.array([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            nfev=7,
+            status=1,
+            success=True,
+            cost=0.0,
+            optimality=0.0,
+        )
+
+    monkeypatch.setattr(reachability_module, "least_squares", refine)
+    provider = build_rm65_multistart_candidate_provider(
+        solver,
+        qpos_seeds=(np.zeros(6),),
+        max_iterations=10,
+        max_joint_step_rad=0.1,
+        damping=0.03,
+        near_miss_refinement_enabled=True,
+        acceptance_position_m=0.003,
+        acceptance_orientation_rad=np.deg2rad(1.0),
+    )
+
+    receipt = _evaluate(
+        target,
+        candidate_provider=provider,
+        max_candidates=1,
+        collision_checker=lambda _candidate, _target: CollisionCandidateAssessment(
+            status=CollisionCandidateStatus.BLOCKED,
+            reason_code="cube_overlap",
+        ),
+    )
+
+    assert receipt.status is GraspReachabilityStatus.COLLISION_BLOCKED
+    candidate = receipt.candidates[0]
+    assert candidate["converged"] is True
+    assert candidate["metadata"]["selected_stage"] == (
+        "near_miss_exact_pose_refinement"
+    )
+    assert candidate["metadata"]["near_miss_refinement"]["nfev"] == 7
+    assert receipt.collision_assessments[0]["reason_code"] == "cube_overlap"
+
+
+def test_adaptive_provider_stages_large_position_and_orientation_change() -> None:
+    target = _pose((0.60, 0.0, 0.0))
+    target[:3, :3] = Rotation.from_euler("z", 90.0, degrees=True).as_matrix()
+    first = _pose((0.20, 0.0, 0.0))
+    first[:3, :3] = Rotation.from_euler("z", 45.0, degrees=True).as_matrix()
+    second = _pose((0.50, 0.0, 0.0))
+    second[:3, :3] = Rotation.from_euler("z", 80.0, degrees=True).as_matrix()
+    third = _pose((0.58, 0.0, 0.0))
+    third[:3, :3] = Rotation.from_euler("z", 88.0, degrees=True).as_matrix()
+    fourth = target.copy()
+    solver = _StagedFakeSolver(
+        (np.eye(4), first, second, third, fourth),
+        converged_attempt=4,
+        iterations_per_attempt=3,
+    )
+    provider = build_rm65_multistart_candidate_provider(
+        solver,
+        qpos_seeds=(np.zeros(6),),
+        max_iterations=10,
+        max_joint_step_rad=0.1,
+        damping=0.04,
+    )
+
+    candidate = provider(0, target)
+
+    assert candidate.converged
+    assert [call["max_iterations"] for call in solver.calls] == [10, 5, 5, 10]
+    assert [call["max_joint_step"] for call in solver.calls] == pytest.approx(
+        [0.1, 0.1, 0.1, 0.1]
+    )
+    np.testing.assert_array_equal(solver.calls[0]["target_pose"], target)
+    np.testing.assert_allclose(solver.calls[1]["target_pose"][:3, 3], (0.21, 0.0, 0.0))
+    np.testing.assert_allclose(solver.calls[2]["target_pose"][:3, 3], (0.42, 0.0, 0.0))
+    assert np.rad2deg(
+        Rotation.from_matrix(solver.calls[1]["target_pose"][:3, :3]).magnitude()
+    ) == pytest.approx(31.5)
+    assert np.rad2deg(
+        Rotation.from_matrix(solver.calls[2]["target_pose"][:3, :3]).magnitude()
+    ) == pytest.approx(63.0)
+    np.testing.assert_array_equal(solver.calls[3]["target_pose"], target)
+    assert candidate.metadata["search_tier"] == "adaptive_position_orientation"
+    assert candidate.metadata["planned_stage_count"] == 4
+    assert candidate.metadata["attempts_used"] == 4
+    assert candidate.metadata["iteration_budget"] == 30
+    assert candidate.metadata["attempted_iteration_budget"] == 30
+    assert candidate.metadata["iterations_used"] == 12
+    assert candidate.metadata["adaptive_escalation_used"] is True
+    assert candidate.metadata["selected_stage"] == "adaptive_final_target"
+    assert candidate.metadata["minimum_observed_position_residual_m"] == pytest.approx(
+        0.0
+    )
+    assert candidate.metadata["minimum_observed_orientation_residual_deg"] == (
+        pytest.approx(0.0)
+    )
+    assert candidate.metadata[
+        "selected_candidate_position_residual_m"
+    ] == pytest.approx(0.0)
+    assert [stage["stage"] for stage in candidate.metadata["stages"]] == [
+        "baseline_direct",
+        "se3_continuation_35pct",
+        "se3_continuation_70pct",
+        "adaptive_final_target",
+    ]
+
+
+def test_large_change_baseline_success_skips_adaptive_continuation() -> None:
+    target = _pose((0.60, 0.0, 0.0))
+    target[:3, :3] = Rotation.from_euler("z", 90.0, degrees=True).as_matrix()
+    solver = _StagedFakeSolver((np.eye(4), target), converged_attempt=1)
+    provider = build_rm65_multistart_candidate_provider(
+        solver,
+        qpos_seeds=(np.zeros(6),),
+        max_iterations=10,
+        max_joint_step_rad=0.1,
+        damping=0.03,
+    )
+
+    candidate = provider(0, target)
+
+    assert candidate.converged
+    assert len(solver.calls) == 1
+    np.testing.assert_array_equal(solver.calls[0]["target_pose"], target)
+    assert candidate.metadata["search_tier"] == "adaptive_position_orientation"
+    assert candidate.metadata["planned_stage_count"] == 4
+    assert candidate.metadata["attempts_used"] == 1
+    assert candidate.metadata["iteration_budget"] == 30
+    assert candidate.metadata["attempted_iteration_budget"] == 10
+    assert candidate.metadata["adaptive_escalation_used"] is False
+    assert candidate.metadata["selected_stage"] == "baseline_direct"
+
+
+def test_adaptive_search_exhaustion_remains_ik_search_exhausted() -> None:
+    target = _pose((0.60, 0.0, 0.0))
+    target[:3, :3] = Rotation.from_euler("z", 90.0, degrees=True).as_matrix()
+    # Convergence at an intermediate homotopy target is not convergence at the
+    # requested endpoint; the mandatory final solve remains authoritative.
+    solver = _StagedFakeSolver((np.eye(4),) * 5, converged_attempt=2)
+    provider = build_rm65_multistart_candidate_provider(
+        solver,
+        qpos_seeds=(np.zeros(6),),
+        max_iterations=10,
+        max_joint_step_rad=0.1,
+        damping=0.03,
+    )
+
+    receipt = _evaluate(target, candidate_provider=provider, max_candidates=1)
+
+    assert receipt.status is GraspReachabilityStatus.IK_SEARCH_EXHAUSTED
+    assert receipt.proof_scope == "bounded_multistart_search_only"
+    assert receipt.candidates[0]["metadata"]["search_tier"] == (
+        "adaptive_position_orientation"
+    )
+    assert receipt.candidates[0]["metadata"]["attempts_used"] == 4
+    assert receipt.candidates[0]["metadata"]["iteration_budget"] == 30
+    assert receipt.candidates[0]["metadata"]["stages"][1]["converged"] is True
+    assert receipt.candidates[0]["metadata"]["stages"][-1]["converged"] is False
+
+
+def test_position_diagnostic_explains_exhaustion_without_claiming_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _pose((0.30, 0.0, 0.0))
+    solver = _StagedFakeSolver((np.eye(4),))
+
+    def no_position_solution(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            x=np.zeros(6),
+            nfev=11,
+            status=2,
+            success=True,
+            cost=50.0,
+            optimality=1.0,
+        )
+
+    monkeypatch.setattr(reachability_module, "least_squares", no_position_solution)
+
+    def rejected(candidate_index: int, _target: np.ndarray) -> IKCandidate:
+        return IKCandidate(
+            candidate_index=candidate_index,
+            qpos_rad=(0.0,) * 6,
+            converged=False,
+            position_residual_m=0.30,
+            orientation_residual_rad=0.0,
+        )
+
+    original = _evaluate(target, candidate_provider=rejected, max_candidates=1)
+    annotated = annotate_ik_search_exhaustion(
+        original,
+        solver=solver,
+        target_pose=target,
+        maximum_position_residual_m=0.003,
+        near_miss_position_threshold_m=0.05,
+        near_miss_orientation_threshold_rad=np.deg2rad(10.0),
+        position_diagnostic_max_nfev=40,
+        joint_limit_margin_rad=np.deg2rad(0.25),
+    )
+
+    assert annotated.status is GraspReachabilityStatus.IK_SEARCH_EXHAUSTED
+    assert annotated.proof_scope == "bounded_multistart_search_only"
+    assert annotated.reason_code == "bounded_position_search_exhausted"
+    diagnostic = annotated.metadata["ik_exhaustion_diagnostic"]
+    assert diagnostic["is_unreachability_proof"] is False
+    assert diagnostic["position_reached_within_tolerance"] is False
+    assert diagnostic["subreason"] == "position_search_exhausted"
+
+
+def test_position_diagnostic_distinguishes_orientation_conditioned_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _pose((0.30, 0.0, 0.0))
+    target[:3, :3] = Rotation.from_euler("z", 30.0, degrees=True).as_matrix()
+    position_only_pose = _pose((0.30, 0.0, 0.0))
+    solver = _StagedFakeSolver((np.eye(4), position_only_pose))
+
+    def find_position_only(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            x=np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            nfev=9,
+            status=1,
+            success=True,
+            cost=0.0,
+            optimality=0.0,
+        )
+
+    monkeypatch.setattr(reachability_module, "least_squares", find_position_only)
+
+    def rejected(candidate_index: int, _target: np.ndarray) -> IKCandidate:
+        return IKCandidate(
+            candidate_index=candidate_index,
+            qpos_rad=(0.0,) * 6,
+            converged=False,
+            position_residual_m=0.20,
+            orientation_residual_rad=np.deg2rad(30.0),
+        )
+
+    original = _evaluate(target, candidate_provider=rejected, max_candidates=1)
+    annotated = annotate_ik_search_exhaustion(
+        original,
+        solver=solver,
+        target_pose=target,
+        maximum_position_residual_m=0.003,
+        near_miss_position_threshold_m=0.05,
+        near_miss_orientation_threshold_rad=np.deg2rad(10.0),
+        position_diagnostic_max_nfev=40,
+        joint_limit_margin_rad=np.deg2rad(0.25),
+    )
+
+    assert annotated.status is GraspReachabilityStatus.IK_SEARCH_EXHAUSTED
+    assert annotated.reason_code == "bounded_orientation_conditioned_ik_exhausted"
+    diagnostic = annotated.metadata["ik_exhaustion_diagnostic"]
+    assert diagnostic["position_reached_within_tolerance"] is True
+    assert diagnostic["subreason"] == "orientation_conditioned_search_exhausted"
+    assert diagnostic["final_orientation_residual_deg"] == pytest.approx(30.0)
+
+
+def test_adaptive_candidate_does_not_bypass_collision_classification() -> None:
+    target = _pose((0.60, 0.0, 0.0))
+    solver = _StagedFakeSolver(
+        (np.eye(4), _pose((0.30, 0.0, 0.0)), _pose((0.45, 0.0, 0.0)), target),
+        converged_attempt=3,
+    )
+    provider = build_rm65_multistart_candidate_provider(
+        solver,
+        qpos_seeds=(np.zeros(6),),
+        max_iterations=10,
+        max_joint_step_rad=0.1,
+        damping=0.03,
+    )
+
+    receipt = _evaluate(
+        target,
+        candidate_provider=provider,
+        max_candidates=1,
+        collision_checker=lambda _candidate, _target: CollisionCandidateAssessment(
+            status=CollisionCandidateStatus.BLOCKED,
+            reason_code="cube_overlap",
+        ),
+    )
+
+    assert receipt.status is GraspReachabilityStatus.COLLISION_BLOCKED
+    assert receipt.candidates[0]["metadata"]["search_tier"] == "adaptive_position"
+    assert receipt.collision_assessments[0]["reason_code"] == "cube_overlap"
 
 
 def test_mixed_provider_error_and_nonconvergence_is_incomplete_planner_error() -> None:
