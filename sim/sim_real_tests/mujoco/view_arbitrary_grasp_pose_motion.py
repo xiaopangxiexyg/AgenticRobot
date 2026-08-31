@@ -18,12 +18,18 @@ from typing import Any
 
 import numpy as np
 
+from robot_motion.scene_obstacles import (
+    AxisAlignedBoxObstacle,
+    ObstacleSceneSnapshot,
+)
 from sim.mujoco.control.desk_tcp_position import DeskTcpPositionControl
 from sim.mujoco.replay.tcp_target_visualization import TcpTargetVisualizer
 from sim.mujoco.viewer import passive_viewer_handle
 
 from .arbitrary_grasp_pose_motion import (
     MOTION_STATUS_COMPLETED,
+    OBSTACLE_SCENE_FRAME_ID,
+    OBSTACLE_SCENE_FRAME_SPEC_HASH,
     GraspMotionPlayback,
     GraspMotionTarget,
     execute_grasp_motion,
@@ -95,6 +101,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--angular-speed-deg-s", type=float, default=45.0)
     parser.add_argument("--minimum-duration-sec", type=float, default=2.0)
     parser.add_argument("--terminal-hold-sec", type=float, default=1.5)
+    parser.add_argument(
+        "--obstacle-cube-world-m",
+        type=float,
+        nargs=4,
+        action="append",
+        metavar=("CENTER_X", "CENTER_Y", "CENTER_Z", "SIDE"),
+        help=(
+            "Add a static axis-aligned planning cube in the MuJoCo/solver world "
+            "frame. Repeat for multiple cubes."
+        ),
+    )
+    parser.add_argument(
+        "--obstacle-clearance-m",
+        type=float,
+        default=0.02,
+        help="Required FCL clearance from every configured planning cube.",
+    )
     parser.add_argument(
         "--random-position-min-m",
         type=float,
@@ -203,6 +226,20 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 f"--{name.replace('_', '-')} must be finite and non-negative"
             )
+    clearance = float(args.obstacle_clearance_m)
+    if not math.isfinite(clearance) or clearance < 0.0:
+        raise ValueError("--obstacle-clearance-m must be finite and non-negative")
+    for index, cube in enumerate(args.obstacle_cube_world_m or ()):
+        values = np.asarray(cube, dtype=float).reshape(-1)
+        if (
+            values.shape != (4,)
+            or not np.all(np.isfinite(values))
+            or float(values[3]) <= 0.0
+        ):
+            raise ValueError(
+                "--obstacle-cube-world-m entries require finite CENTER_X "
+                f"CENTER_Y CENTER_Z and positive SIDE (entry {index})"
+            )
     for name in ("camera_azimuth_deg", "camera_elevation_deg"):
         if not math.isfinite(float(getattr(args, name))):
             raise ValueError(f"--{name.replace('_', '-')} must be finite")
@@ -239,6 +276,29 @@ def _uses_continuous_random_mode(args: argparse.Namespace) -> bool:
     return args.target_xyz_m is None and not bool(args.single_reachable_demo)
 
 
+def _obstacle_scene_from_args(
+    args: argparse.Namespace,
+) -> ObstacleSceneSnapshot | None:
+    cubes = tuple(args.obstacle_cube_world_m or ())
+    if not cubes:
+        return None
+    obstacles = tuple(
+        AxisAlignedBoxObstacle(
+            obstacle_id=f"cube-{index}",
+            center_xyz_m=tuple(float(value) for value in cube[:3]),
+            size_xyz_m=(float(cube[3]),) * 3,
+        )
+        for index, cube in enumerate(cubes)
+    )
+    return ObstacleSceneSnapshot(
+        reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
+        reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
+        revision=0,
+        obstacles=obstacles,
+        minimum_clearance_m=float(args.obstacle_clearance_m),
+    )
+
+
 def _target_from_args(
     args: argparse.Namespace,
     *,
@@ -254,9 +314,7 @@ def _target_from_args(
             minimum_joint_motion_deg=float(args.demo_min_joint_motion_deg),
         )
     if args.target_quat_xyzw is not None:
-        pose = pose_from_xyz_quat_xyzw(
-            args.target_xyz_m, args.target_quat_xyzw
-        )
+        pose = pose_from_xyz_quat_xyzw(args.target_xyz_m, args.target_quat_xyzw)
         orientation_format = "quaternion_xyzw"
     else:
         pose = pose_from_xyz_rpy_deg(args.target_xyz_m, args.target_rpy_deg)
@@ -305,6 +363,40 @@ class _RandomTargetStatusVisualizer:
             user_scene.ngeom = max(int(user_scene.ngeom), self._geom_index + 1)
 
 
+class _ObstacleSceneVisualizer:
+    """Display-only translucent boxes for the immutable FCL planning scene."""
+
+    def __init__(self, scene: ObstacleSceneSnapshot | None) -> None:
+        self.scene = scene
+        self._first_geom_index: int | None = None
+
+    def update(self, viewer_handle: Any) -> None:
+        if self.scene is None:
+            return
+        import mujoco
+
+        with viewer_handle.lock():
+            user_scene = viewer_handle.user_scn
+            if self._first_geom_index is None:
+                self._first_geom_index = int(user_scene.ngeom)
+            required = self._first_geom_index + len(self.scene.obstacles)
+            if required > int(user_scene.maxgeom):
+                raise RuntimeError("MuJoCo viewer has no room for obstacle cubes")
+            for offset, obstacle in enumerate(self.scene.obstacles):
+                geom = user_scene.geoms[self._first_geom_index + offset]
+                mujoco.mjv_initGeom(
+                    geom,
+                    mujoco.mjtGeom.mjGEOM_BOX,
+                    0.5 * np.asarray(obstacle.size_xyz_m, dtype=float),
+                    np.asarray(obstacle.center_xyz_m, dtype=float),
+                    np.eye(3, dtype=float).reshape(-1),
+                    np.array([1.0, 0.22, 0.05, 0.32], dtype=np.float32),
+                )
+                geom.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
+                geom.label = f"planning_obstacle:{obstacle.obstacle_id}"
+            user_scene.ngeom = max(int(user_scene.ngeom), required)
+
+
 def _print_random_attempt(
     target: GraspMotionTarget,
     outcome: RandomGraspAttemptOutcome,
@@ -328,6 +420,7 @@ def _replay_random_attempt(
     viewer_handle: Any,
     target_visualizer: TcpTargetVisualizer,
     status_visualizer: _RandomTargetStatusVisualizer,
+    obstacle_visualizer: _ObstacleSceneVisualizer,
 ) -> bool:
     target_xyz = playback.target_pose_world_by_side[playback.side][:3, 3]
     inactive_side = "right" if playback.side == "left" else "left"
@@ -338,6 +431,7 @@ def _replay_random_attempt(
         1.7 * float(np.linalg.norm(target_xyz - inactive_xyz)),
     )
     target_visualizer.update(viewer_handle, playback.target_pose_world_by_side)
+    obstacle_visualizer.update(viewer_handle)
     status_visualizer.update(
         viewer_handle,
         target_xyz=target_xyz,
@@ -354,6 +448,7 @@ def _replay_random_attempt(
         with viewer_handle.lock():
             control.scene.set_qpos_by_side(qpos_by_side)
         target_visualizer.update(viewer_handle, playback.target_pose_world_by_side)
+        obstacle_visualizer.update(viewer_handle)
         status_visualizer.update(
             viewer_handle,
             target_xyz=target_xyz,
@@ -373,6 +468,7 @@ def _run_continuous_random(
     control: DeskTcpPositionControl,
     args: argparse.Namespace,
 ) -> dict[str, object]:
+    obstacle_scene = _obstacle_scene_from_args(args)
     config = ContinuousRandomGraspPoseConfig(
         seed=int(args.seed),
         position_min_m=tuple(float(v) for v in args.random_position_min_m),
@@ -404,6 +500,7 @@ def _run_continuous_random(
             "angular_speed_deg_s": float(args.angular_speed_deg_s),
             "minimum_duration_sec": float(args.minimum_duration_sec),
             "terminal_hold_sec": float(args.terminal_hold_sec),
+            "obstacle_scene": obstacle_scene,
         }
         if viewer_handle is None:
             playback = execute_grasp_motion(control, target, **execute_kwargs)
@@ -429,6 +526,7 @@ def _run_continuous_random(
             viewer_handle=viewer_handle,
             target_visualizer=target_visualizer,
             status_visualizer=status_visualizer,
+            obstacle_visualizer=obstacle_visualizer,
         )
 
     if bool(args.headless):
@@ -437,6 +535,7 @@ def _run_continuous_random(
     else:
         target_visualizer = TcpTargetVisualizer()
         status_visualizer = _RandomTargetStatusVisualizer()
+        obstacle_visualizer = _ObstacleSceneVisualizer(obstacle_scene)
         with passive_viewer_handle(
             control.scene,
             show_left_ui=not bool(args.hide_left_ui),
@@ -450,6 +549,7 @@ def _run_continuous_random(
                 "orange=collision blocked, yellow=search exhausted, purple=error",
                 flush=True,
             )
+            obstacle_visualizer.update(viewer_handle)
             while viewer_handle.is_running() and (
                 maximum_samples == 0 or attempted_samples < maximum_samples
             ):
@@ -475,6 +575,14 @@ def _run_continuous_random(
         "raw_cartesian_probe_interval": int(args.raw_cartesian_probe_interval),
         "sample_kind_counts": sample_kind_counts,
         "terminal_classification_counts": counts,
+        "obstacle_scene": (
+            None
+            if obstacle_scene is None
+            else {
+                **obstacle_scene.to_dict(),
+                "semantic_content_hash": obstacle_scene.semantic_content_hash,
+            }
+        ),
         "last_attempt": last_attempt,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
@@ -485,10 +593,12 @@ def _playback_in_viewer(
     control: DeskTcpPositionControl,
     playback: GraspMotionPlayback,
     args: argparse.Namespace,
+    obstacle_scene: ObstacleSceneSnapshot | None,
 ) -> int:
     if playback.frame_count < 2:
         return 0
     visualizer = TcpTargetVisualizer()
+    obstacle_visualizer = _ObstacleSceneVisualizer(obstacle_scene)
     repeats_completed = 0
     target_xyz = playback.target_pose_world_by_side[playback.side][:3, 3]
     with passive_viewer_handle(
@@ -506,6 +616,7 @@ def _playback_in_viewer(
             "command / 1000 Hz physics execution",
             flush=True,
         )
+        obstacle_visualizer.update(viewer_handle)
         print(
             "[ArbitraryGraspMotionView] close the viewer or press Ctrl+C to exit",
             flush=True,
@@ -523,6 +634,7 @@ def _playback_in_viewer(
                     viewer_handle,
                     playback.target_pose_world_by_side,
                 )
+                obstacle_visualizer.update(viewer_handle)
                 viewer_handle.sync()
                 if not _sleep_with_viewer(
                     1.0 / float(args.playback_hz), viewer_handle=viewer_handle
@@ -542,6 +654,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     _validate_args(args)
     control = DeskTcpPositionControl.build()
     repeats_completed = 0
+    obstacle_scene = _obstacle_scene_from_args(args)
     try:
         if _uses_continuous_random_mode(args):
             return _run_continuous_random(control, args)
@@ -559,9 +672,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             angular_speed_deg_s=float(args.angular_speed_deg_s),
             minimum_duration_sec=float(args.minimum_duration_sec),
             terminal_hold_sec=float(args.terminal_hold_sec),
+            obstacle_scene=obstacle_scene,
         )
         if not bool(args.headless) and playback.frame_count > 0:
-            repeats_completed = _playback_in_viewer(control, playback, args)
+            repeats_completed = _playback_in_viewer(
+                control, playback, args, obstacle_scene
+            )
         summary = playback.to_payload()
         summary["headless"] = bool(args.headless)
         summary["repeats_completed"] = repeats_completed

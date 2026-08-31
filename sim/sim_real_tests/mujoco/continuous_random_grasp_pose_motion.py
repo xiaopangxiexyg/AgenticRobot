@@ -26,6 +26,10 @@ from .arbitrary_grasp_pose_motion import (
     MOTION_STATUS_COMPLETED,
     MOTION_STATUS_ENDPOINT_REJECTED,
     MOTION_STATUS_PATH_COLLISION_BLOCKED,
+    MOTION_STATUS_PATH_PLANNER_ERROR,
+    MOTION_STATUS_PATH_SEARCH_EXHAUSTED,
+    MOTION_STATUS_PATH_START_BLOCKED,
+    MOTION_STATUS_PATH_TARGET_BLOCKED,
     GraspMotionPlayback,
     GraspMotionTarget,
 )
@@ -74,7 +78,9 @@ class ContinuousRandomGraspPoseConfig:
         frame_hash = str(self.reference_frame_spec_hash).strip().lower()
         if not frame_id:
             raise ValueError("reference_frame_id must not be empty")
-        if len(frame_hash) != 64 or any(c not in "0123456789abcdef" for c in frame_hash):
+        if len(frame_hash) != 64 or any(
+            c not in "0123456789abcdef" for c in frame_hash
+        ):
             raise ValueError("reference_frame_spec_hash must be a lowercase SHA-256")
         object.__setattr__(self, "seed", int(self.seed))
         object.__setattr__(self, "position_min_m", minimum)
@@ -190,9 +196,7 @@ def sample_random_joint_fk_target(
     world_from_dmtac = control.retargeter.tool_tcp_world_targets_for_qpos_pair(
         left_qpos=qpos_pair["left"], right_qpos=qpos_pair["right"]
     )[normalized_side]
-    base_from_dmtac = (
-        control.world_to_base_by_side[normalized_side] @ world_from_dmtac
-    )
+    base_from_dmtac = control.world_to_base_by_side[normalized_side] @ world_from_dmtac
     content_hash = compute_target_pose_content_hash(
         base_from_dmtac,
         sampler_id=JOINT_FK_SAMPLER_ID,
@@ -282,10 +286,26 @@ def classify_random_grasp_attempt(
             reachability_status, "endpoint_rejected_unknown"
         )
     elif playback.motion_status == MOTION_STATUS_PATH_COLLISION_BLOCKED:
-        terminal_classification = "direct_path_collision_blocked"
+        terminal_classification = (
+            "direct_path_collision_blocked"
+            if playback.summary.get("obstacle_scene") is None
+            else "obstacle_path_collision_blocked"
+        )
         path_preflight = playback.summary.get("path_preflight", {})
         if isinstance(path_preflight, dict):
             reason_code = str(path_preflight.get("reason_code", reason_code))
+    elif playback.motion_status == MOTION_STATUS_PATH_START_BLOCKED:
+        terminal_classification = "path_start_collision_blocked"
+        reason_code = "path_start_configuration_blocked"
+    elif playback.motion_status == MOTION_STATUS_PATH_TARGET_BLOCKED:
+        terminal_classification = "path_target_collision_blocked"
+        reason_code = "path_target_configuration_blocked"
+    elif playback.motion_status == MOTION_STATUS_PATH_SEARCH_EXHAUSTED:
+        terminal_classification = "path_search_exhausted_not_proven_unreachable"
+        reason_code = "bounded_path_search_exhausted"
+    elif playback.motion_status == MOTION_STATUS_PATH_PLANNER_ERROR:
+        terminal_classification = "planner_error"
+        reason_code = "obstacle_path_planner_error"
     elif playback.motion_status == MOTION_STATUS_COMPLETED:
         terminal_classification = "reachable_motion_completed"
         reason_code = "motion_completed"
@@ -297,6 +317,10 @@ def classify_random_grasp_attempt(
     if playback.motion_status in {
         MOTION_STATUS_ENDPOINT_REJECTED,
         MOTION_STATUS_PATH_COLLISION_BLOCKED,
+        MOTION_STATUS_PATH_PLANNER_ERROR,
+        MOTION_STATUS_PATH_SEARCH_EXHAUSTED,
+        MOTION_STATUS_PATH_START_BLOCKED,
+        MOTION_STATUS_PATH_TARGET_BLOCKED,
     } and (motion_emitted or playback.frame_count != 0):
         raise ValueError("preflight-rejected random targets must emit zero motion")
 
@@ -318,7 +342,13 @@ def outcome_color_rgba(outcome: RandomGraspAttemptOutcome) -> np.ndarray:
         return np.array([0.10, 0.95, 0.20, 1.0], dtype=np.float32)
     if classification == "proven_kinematically_unreachable":
         return np.array([1.0, 0.08, 0.08, 1.0], dtype=np.float32)
-    if classification in {"endpoint_collision_blocked", "direct_path_collision_blocked"}:
+    if classification in {
+        "endpoint_collision_blocked",
+        "direct_path_collision_blocked",
+        "obstacle_path_collision_blocked",
+        "path_start_collision_blocked",
+        "path_target_collision_blocked",
+    }:
         return np.array([1.0, 0.35, 0.05, 1.0], dtype=np.float32)
     if "exhausted" in classification:
         return np.array([1.0, 0.85, 0.05, 1.0], dtype=np.float32)
@@ -328,9 +358,7 @@ def outcome_color_rgba(outcome: RandomGraspAttemptOutcome) -> np.ndarray:
 def _rng_for_sample(
     *, seed: int, sample_index: int, stream_tag: int
 ) -> np.random.Generator:
-    sequence = np.random.SeedSequence(
-        [int(seed), int(sample_index), int(stream_tag)]
-    )
+    sequence = np.random.SeedSequence([int(seed), int(sample_index), int(stream_tag)])
     return np.random.Generator(np.random.PCG64(sequence))
 
 

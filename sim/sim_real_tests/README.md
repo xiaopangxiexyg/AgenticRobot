@@ -228,6 +228,47 @@ collision-aware dual-arm retargeter and rig remain authoritative; any
 intermediate `ik_target_unmet` remains the whole motion's terminal status even
 if a later frame settles, so a broken path cannot be relabeled as success.
 
+Static axis-aligned planning cubes can be added in the shared MuJoCo/solver
+world frame. Repeat the option for multiple cubes:
+
+```bash
+python -m sim.sim_real_tests.mujoco.view_arbitrary_grasp_pose_motion \
+  --side left \
+  --single-reachable-demo \
+  --obstacle-cube-world-m -0.3358 -0.0975 0.5000 0.12 \
+  --obstacle-clearance-m 0.02
+```
+
+The translucent orange boxes are display overlays backed by the same immutable
+scene hash used for endpoint filtering and planning. The planner checks the
+direct joint edge first, then runs deterministic bounded BiRRT-Connect only if
+that edge is blocked. A found path is shortened, rechecked against FCL at
+most 0.1 degree joint increments, split into zero-velocity/zero-acceleration
+quintic segments, and every segment is independently rechecked in the MuJoCo
+scene before any reference is sent. `path_start_collision_blocked`,
+`path_target_collision_blocked`, `path_search_exhausted`, and
+`path_planner_error` remain distinct zero-motion results. Search exhaustion is
+yellow evidence that the bounded search found no path, not proof that no path
+exists.
+
+The example above is a deterministic regression case: the cube blocks the
+single-demo target's direct path, the bounded local search returns a detour,
+and the captured MuJoCo playback completes. Search bounds are the
+current/target joint corridor plus 45 degrees, intersected with physical joint
+limits; this avoids full-range detours that are collision-free geometrically
+but unnecessarily large and difficult for the Cartesian execution chain.
+
+This first obstacle mode is a planning-path-guided simulation experiment, not
+an execution certificate or real-motion authorization. The admitted joint
+waypoints are converted by FK to Cartesian references and the existing lower
+retargeter solves IK again; the added display/planning cubes are not yet
+inserted into that lower IK collision model. The local terminal Cartesian
+correction is therefore disabled in obstacle mode, and receipts explicitly
+record `exact_planned_qpos_dispatch=false` and
+`runtime_cube_constraints_in_lower_ik=false`. A strict runtime guarantee needs
+either an admitted exact-qpos execution interface or the identical immutable
+obstacle scene installed in the lower IK/dispatch owner.
+
 Run the focused contract regression with the repository environment wrapper:
 
 ```bash

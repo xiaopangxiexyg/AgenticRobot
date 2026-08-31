@@ -7,6 +7,12 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+from robot_motion.path_planning import (
+    JointConfigurationCheck,
+    JointPathPlannerConfig,
+    JointPathPlanResult,
+    JointPathStatus,
+)
 from robot_motion.rm65.grasp_reachability import (
     GraspReachabilityReceipt,
     GraspReachabilityStatus,
@@ -35,6 +41,7 @@ from sim.sim_real_tests.mujoco.continuous_random_grasp_pose_motion import (
     sample_random_joint_fk_target,
 )
 from sim.sim_real_tests.mujoco.view_arbitrary_grasp_pose_motion import (
+    _obstacle_scene_from_args,
     _uses_continuous_random_mode,
     _validate_args,
     build_parser,
@@ -50,9 +57,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.contract]
 def test_pose_builders_share_explicit_base_from_dmtac_tcp_semantics() -> None:
     xyz = (0.42, -0.18, 0.51)
     from_rpy = pose_from_xyz_rpy_deg(xyz, (20.0, -35.0, 80.0))
-    quaternion = Rotation.from_euler(
-        "xyz", (20.0, -35.0, 80.0), degrees=True
-    ).as_quat()
+    quaternion = Rotation.from_euler("xyz", (20.0, -35.0, 80.0), degrees=True).as_quat()
     from_quaternion = pose_from_xyz_quat_xyzw(xyz, quaternion)
 
     np.testing.assert_allclose(from_rpy, from_quaternion, atol=1e-12)
@@ -91,10 +96,7 @@ def test_quintic_se3_reference_has_exact_endpoints_and_respects_speed_limits() -
         for lhs, rhs in pairwise(trajectory)
     ]
     angular_speed_deg = [
-        np.rad2deg(
-            Rotation.from_matrix(lhs[:3, :3].T @ rhs[:3, :3]).magnitude()
-        )
-        / dt
+        np.rad2deg(Rotation.from_matrix(lhs[:3, :3].T @ rhs[:3, :3]).magnitude()) / dt
         for lhs, rhs in pairwise(trajectory)
     ]
     assert max(translation_speed) <= linear_limit * 1.0001
@@ -117,9 +119,7 @@ def test_tool_tcp_binding_converts_actual_dmtac_target_to_solver_frame() -> None
         position_offset_m=0.131,
         orientation_offset_deg=0.0,
     )
-    base_from_single = pose_from_xyz_rpy_deg(
-        (0.32, -0.08, 0.56), (15.0, 30.0, -25.0)
-    )
+    base_from_single = pose_from_xyz_rpy_deg((0.32, -0.08, 0.56), (15.0, 30.0, -25.0))
     base_from_dmtac = base_from_single @ single_from_dmtac
 
     recovered = binding.solver_target_from_dmtac_target(base_from_dmtac)
@@ -129,27 +129,39 @@ def test_tool_tcp_binding_converts_actual_dmtac_target_to_solver_frame() -> None
 
 
 def test_final_settled_frame_does_not_erase_intermediate_ik_failure() -> None:
-    assert motion.classify_motion_status(
-        final_endpoint_status="settled",
-        endpoint_status_counts={"tracking": 20, "ik_target_unmet": 1, "settled": 5},
-    ) == motion.MOTION_STATUS_IK_TARGET_UNMET
-    assert motion.classify_motion_status(
-        final_endpoint_status="settled",
-        endpoint_status_counts={"tracking": 20, "settled": 5},
-    ) == motion.MOTION_STATUS_COMPLETED
+    assert (
+        motion.classify_motion_status(
+            final_endpoint_status="settled",
+            endpoint_status_counts={"tracking": 20, "ik_target_unmet": 1, "settled": 5},
+        )
+        == motion.MOTION_STATUS_IK_TARGET_UNMET
+    )
+    assert (
+        motion.classify_motion_status(
+            final_endpoint_status="settled",
+            endpoint_status_counts={"tracking": 20, "settled": 5},
+        )
+        == motion.MOTION_STATUS_COMPLETED
+    )
 
 
 def test_recovered_ik_miss_is_visible_but_not_terminal() -> None:
-    assert motion.classify_motion_status(
-        final_endpoint_status="settled",
-        endpoint_status_counts={"ik_target_unmet": 1, "tracking": 1, "settled": 2},
-        unrecovered_ik_target_unmet_count=0,
-    ) == motion.MOTION_STATUS_COMPLETED
-    assert motion.classify_motion_status(
-        final_endpoint_status="settled",
-        endpoint_status_counts={"ik_target_unmet": 2, "settled": 1},
-        unrecovered_ik_target_unmet_count=1,
-    ) == motion.MOTION_STATUS_IK_TARGET_UNMET
+    assert (
+        motion.classify_motion_status(
+            final_endpoint_status="settled",
+            endpoint_status_counts={"ik_target_unmet": 1, "tracking": 1, "settled": 2},
+            unrecovered_ik_target_unmet_count=0,
+        )
+        == motion.MOTION_STATUS_COMPLETED
+    )
+    assert (
+        motion.classify_motion_status(
+            final_endpoint_status="settled",
+            endpoint_status_counts={"ik_target_unmet": 2, "settled": 1},
+            unrecovered_ik_target_unmet_count=1,
+        )
+        == motion.MOTION_STATUS_IK_TARGET_UNMET
+    )
 
 
 class _FrozenReferenceRecoveryControl:
@@ -193,7 +205,8 @@ def test_frozen_reference_retry_recovers_without_bypassing_lower_owner() -> None
     assert len(control.references) == 2
     assert all(reference is frozen_reference for reference in control.references)
     assert all(
-        kwargs == {
+        kwargs
+        == {
             "gripper_close_by_side": {"left": 0.0, "right": 0.0},
             "hold_sides": ("right",),
         }
@@ -445,13 +458,9 @@ def test_cli_requires_position_and_orientation_as_one_explicit_pose() -> None:
         )
     )
     with pytest.raises(ValueError, match="explicit target requires"):
-        _validate_args(
-            parser.parse_args(["--target-xyz-m", "0.3", "0.1", "0.5"])
-        )
+        _validate_args(parser.parse_args(["--target-xyz-m", "0.3", "0.1", "0.5"]))
     with pytest.raises(ValueError, match="explicit target requires"):
-        _validate_args(
-            parser.parse_args(["--target-rpy-deg", "0", "90", "0"])
-        )
+        _validate_args(parser.parse_args(["--target-rpy-deg", "0", "90", "0"]))
 
 
 def test_raw_cartesian_target_stream_is_deterministic_and_never_prefilters() -> None:
@@ -603,6 +612,200 @@ def test_random_attempt_path_collision_is_distinct_and_emits_zero_motion() -> No
     assert outcome.motion_emitted is False
 
 
+@pytest.mark.parametrize(
+    ("motion_status", "classification"),
+    (
+        (
+            motion.MOTION_STATUS_PATH_SEARCH_EXHAUSTED,
+            "path_search_exhausted_not_proven_unreachable",
+        ),
+        (
+            motion.MOTION_STATUS_PATH_START_BLOCKED,
+            "path_start_collision_blocked",
+        ),
+        (
+            motion.MOTION_STATUS_PATH_TARGET_BLOCKED,
+            "path_target_collision_blocked",
+        ),
+        (motion.MOTION_STATUS_PATH_PLANNER_ERROR, "planner_error"),
+    ),
+)
+def test_obstacle_path_failures_are_typed_zero_motion(
+    motion_status: str,
+    classification: str,
+) -> None:
+    outcome = classify_random_grasp_attempt(
+        _random_attempt_playback(
+            reachability_status=GraspReachabilityStatus.REACHABLE,
+            motion_status=motion_status,
+        )
+    )
+
+    assert outcome.terminal_classification == classification
+    assert outcome.motion_emitted is False
+    assert outcome.frame_count == 0
+
+
+class _SequenceOracle:
+    scene_hash = "test-scene"
+
+    def __init__(self, checks: list[JointConfigurationCheck]) -> None:
+        self.checks = list(checks)
+        self.queries: list[dict[str, np.ndarray]] = []
+
+    def check(self, qpos_by_component):
+        self.queries.append(
+            {key: np.asarray(value).copy() for key, value in qpos_by_component.items()}
+        )
+        return self.checks.pop(0)
+
+
+def test_final_obstacle_revalidation_is_dense_and_fail_closed() -> None:
+    safe = JointConfigurationCheck(safe=True, minimum_distance_m=0.08)
+    blocked = JointConfigurationCheck(
+        safe=False,
+        minimum_distance_m=0.01,
+        reason="collision_clearance_violated",
+    )
+    oracle = _SequenceOracle([safe, safe, blocked])
+    waypoints = (
+        {"left": np.zeros(6), "right": np.ones(6)},
+        {"left": np.full(6, np.deg2rad(0.3)), "right": np.ones(6)},
+    )
+
+    result = motion.revalidate_obstacle_path(
+        waypoints,
+        oracle=oracle,
+        edge_resolution_rad=np.deg2rad(0.1),
+    )
+
+    assert result["safe"] is False
+    assert result["collision_check_available"] is True
+    assert result["reason_code"] == "final_obstacle_revalidation_blocked"
+    assert len(oracle.queries) == 3
+    assert all(set(query) == {"left", "right"} for query in oracle.queries)
+    assert all(np.array_equal(query["right"], np.ones(6)) for query in oracle.queries)
+
+
+def test_obstacle_search_bounds_stay_local_and_within_joint_limits(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return "planned"
+
+    monkeypatch.setattr(motion, "plan_collision_aware_joint_path", capture)
+    control = _FakeControl()
+    control.scene.get_arm_qpos = lambda side: (
+        np.zeros(6) if side == "left" else np.ones(6)
+    )
+    padding = np.deg2rad(20.0)
+    result = motion.plan_obstacle_aware_joint_path(
+        control,
+        side="left",
+        target_qpos_rad=np.full(6, 0.2),
+        single_arm_solver=SimpleNamespace(
+            q_min=np.full(6, -1.0), q_max=np.full(6, 1.0)
+        ),
+        obstacle_oracle=SimpleNamespace(scene_hash="scene"),
+        planner_config=JointPathPlannerConfig(sample_padding_rad=padding),
+    )
+
+    assert result == "planned"
+    np.testing.assert_allclose(
+        captured["joint_lower_by_component"]["left"], np.full(6, -padding)
+    )
+    np.testing.assert_allclose(
+        captured["joint_upper_by_component"]["left"], np.full(6, 0.2 + padding)
+    )
+    assert captured["movable_components"] == ("left",)
+    np.testing.assert_array_equal(
+        captured["target_qpos_by_component"]["right"], np.ones(6)
+    )
+
+
+def test_execute_path_search_exhaustion_emits_no_motion(monkeypatch) -> None:
+    receipt, binding = _reachable_receipt_and_binding()
+    oracle = SimpleNamespace(scene_hash="test-scene")
+    monkeypatch.setattr(motion, "build_obstacle_collision_oracle", lambda *_: oracle)
+    monkeypatch.setattr(
+        motion, "_MujocoFclObstacleOracle", lambda _control, value: value
+    )
+    monkeypatch.setattr(
+        motion,
+        "evaluate_motion_target_endpoint",
+        lambda _control, _target, **_kwargs: (
+            receipt,
+            binding,
+            SimpleNamespace(q_min=-np.ones(6), q_max=np.ones(6)),
+        ),
+    )
+    result = JointPathPlanResult(
+        status=JointPathStatus.PATH_SEARCH_EXHAUSTED,
+        start_qpos_by_component={"left": np.zeros(6), "right": np.zeros(6)},
+        target_qpos_by_component={"left": np.zeros(6), "right": np.zeros(6)},
+        movable_components=("left",),
+        scene_hash="test-scene",
+        reason="bounded_search_exhausted",
+    )
+    monkeypatch.setattr(
+        motion, "plan_obstacle_aware_joint_path", lambda *_args, **_kwargs: result
+    )
+    control = _FakeControl()
+    target = GraspMotionTarget(
+        side="left",
+        target_pose_base_from_dmtac_tcp=np.eye(4),
+        source="test",
+    )
+    scene = SimpleNamespace(
+        reference_frame_id=motion.OBSTACLE_SCENE_FRAME_ID,
+        reference_frame_spec_hash=motion.OBSTACLE_SCENE_FRAME_SPEC_HASH,
+        semantic_content_hash="test-scene",
+        to_dict=lambda: {"obstacles": []},
+    )
+
+    playback = execute_grasp_motion(control, target, obstacle_scene=scene)
+
+    assert playback.motion_status == motion.MOTION_STATUS_PATH_SEARCH_EXHAUSTED
+    assert playback.frame_count == 0
+    assert playback.summary["motion_emitted"] is False
+    assert control.dispatch_count == 0
+
+
+def test_cli_builds_repeatable_world_frame_obstacle_cubes() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--obstacle-cube-world-m",
+            "-0.4",
+            "-0.2",
+            "0.4",
+            "0.12",
+            "--obstacle-cube-world-m",
+            "-0.3",
+            "-0.1",
+            "0.5",
+            "0.08",
+            "--obstacle-clearance-m",
+            "0.015",
+        ]
+    )
+    _validate_args(args)
+    scene = _obstacle_scene_from_args(args)
+
+    assert scene is not None
+    assert scene.reference_frame_id == motion.OBSTACLE_SCENE_FRAME_ID
+    assert scene.minimum_clearance_m == pytest.approx(0.015)
+    assert tuple(item.obstacle_id for item in scene.obstacles) == ("cube-0", "cube-1")
+    assert scene.obstacles[0].size_xyz_m == pytest.approx((0.12, 0.12, 0.12))
+    with pytest.raises(ValueError, match="positive SIDE"):
+        _validate_args(
+            parser.parse_args(["--obstacle-cube-world-m", "0", "0", "0", "0"])
+        )
+
+
 def test_continuous_cli_is_default_and_headless_requires_a_finite_count() -> None:
     parser = build_parser()
     continuous = parser.parse_args([])
@@ -615,7 +818,5 @@ def test_continuous_cli_is_default_and_headless_requires_a_finite_count() -> Non
 
     with pytest.raises(ValueError, match="headless continuous mode requires"):
         _validate_args(parser.parse_args(["--headless"]))
-    finite_headless = parser.parse_args(
-        ["--headless", "--random-sample-count", "3"]
-    )
+    finite_headless = parser.parse_args(["--headless", "--random-sample-count", "3"])
     _validate_args(finite_headless)
