@@ -1452,6 +1452,45 @@ class MujocoSimHILApplication(
             "source_error": source_error,
         }
 
+    def _fail_closed_control_cycle_error(
+        self,
+        error: Exception,
+        *,
+        cycle_started_at: float,
+        period: float,
+    ) -> None:
+        """Fence publication and establish lower HOLD after one cycle fault."""
+
+        self._last_cycle_timing = {
+            "total_sec": time.perf_counter() - cycle_started_at,
+            "configured_period_sec": period,
+        }
+        cycle_error = f"{type(error).__name__}:{error}"
+        self._last_error = cycle_error
+        if self._first_control_fault is None:
+            self._first_control_fault = cycle_error
+        try:
+            outcome = self._deactivate_cycle_and_request_lower_hold(
+                reason="sim_hil_application:control_cycle_failed",
+                force_cancellation=True,
+            )
+        except Exception as transition_error:
+            transition_detail = self._last_error
+            if transition_detail == cycle_error:
+                transition_detail = (
+                    f"{type(transition_error).__name__}:"
+                    f"{transition_error}"
+                )
+            self._last_error = (
+                f"{cycle_error};fail_closed_transition_failed:"
+                f"{transition_detail}"
+            )
+            raise RuntimeError(self._last_error) from transition_error
+        self._last_hold_outcome = outcome
+        # The lower transition may update diagnostic state while it establishes
+        # HOLD.  Preserve the primary cycle fault after fail-closed succeeds.
+        self._last_error = cycle_error
+
     def step(self, *, now: float | None = None) -> Any:
         with self._lock:
             cycle_started_at = time.perf_counter()
@@ -1461,27 +1500,37 @@ class MujocoSimHILApplication(
                 raise RuntimeError(
                     "MuJoCo Sim-HIL is held; explicit rearm is required."
                 )
-            timestamp = _finite(
-                self.clock() if now is None else now,
-                name="step.now",
-            )
-            decision_at = (
-                timestamp if self._next_decision_at is None else self._next_decision_at
-            )
             period = 1.0 / float(self.runtime.config.decision_hz)
-            lateness = timestamp - decision_at
-            maximum_lateness = max(0.02, period)
-            if lateness > maximum_lateness:
-                # Station composition is not the canonical execution watchdog.
-                # Skip missed upstream compose cuts without burst catch-up;
-                # the lower target gate remains authoritative for whether the
-                # newly scheduled target can still be admitted and executed.
-                decision_at = self._skip_missed_compose_cuts(
-                    decision_at=decision_at,
-                    observed_at=timestamp,
-                    period=period,
-                    phase="step_entry",
+            try:
+                timestamp = _finite(
+                    self.clock() if now is None else now,
+                    name="step.now",
                 )
+                decision_at = (
+                    timestamp
+                    if self._next_decision_at is None
+                    else self._next_decision_at
+                )
+                lateness = timestamp - decision_at
+                maximum_lateness = max(0.02, period)
+                if lateness > maximum_lateness:
+                    # Station composition is not the canonical execution watchdog.
+                    # Skip missed upstream compose cuts without burst catch-up;
+                    # the lower target gate remains authoritative for whether the
+                    # newly scheduled target can still be admitted and executed.
+                    decision_at = self._skip_missed_compose_cuts(
+                        decision_at=decision_at,
+                        observed_at=timestamp,
+                        period=period,
+                        phase="step_entry",
+                    )
+            except Exception as error:
+                self._fail_closed_control_cycle_error(
+                    error,
+                    cycle_started_at=cycle_started_at,
+                    period=period,
+                )
+                raise
             try:
                 policy_started_at = time.perf_counter()
                 policy_emission = None
@@ -1656,13 +1705,11 @@ class MujocoSimHILApplication(
                     self._last_error = None
                 return self._last_cycle
             except Exception as error:
-                self._last_cycle_timing = {
-                    "total_sec": time.perf_counter() - cycle_started_at,
-                    "configured_period_sec": period,
-                }
-                self._last_error = f"{type(error).__name__}:{error}"
-                if self._first_control_fault is None:
-                    self._first_control_fault = self._last_error
+                self._fail_closed_control_cycle_error(
+                    error,
+                    cycle_started_at=cycle_started_at,
+                    period=period,
+                )
                 raise
 
     def hold(

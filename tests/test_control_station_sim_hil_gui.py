@@ -1451,6 +1451,187 @@ def test_application_latches_when_lower_gate_holds_or_hold_transition_fails() ->
     assert app._last_error == "RuntimeError:lower hold failed"
 
 
+def test_application_step_failure_fences_cycle_and_establishes_lower_hold() -> None:
+    calls: list[tuple[str, object]] = []
+    hold_receipt = SimpleNamespace(status="held")
+    runtime = SimpleNamespace(
+        clock=lambda: 10.0,
+        config=SimpleNamespace(decision_hz=60.0),
+        reference_activation_spec=SimpleNamespace(
+            activation_mode="immediate_target",
+            target_lead_time_sec=0.0,
+        ),
+        reset_pose_resolution_temporal_state=lambda: calls.append(
+            ("pose.reset", None)
+        ),
+    )
+    composition = SimpleNamespace(
+        started=True,
+        human_alpha_by_component={"right_arm": 0.0},
+        request_hold=lambda **kwargs: (
+            calls.append(("lower.hold", kwargs)) or hold_receipt
+        ),
+    )
+    # The constructor requires the exact typed port spec.  Reuse the
+    # compatibility port and replace only its observable methods so this test
+    # stays at the application boundary instead of duplicating port contracts.
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=runtime,
+        composition=composition,
+        policy_source=SimpleNamespace(step=lambda *, now: None),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: 10.0,
+    )
+    app.control_cycle_port.deactivate = lambda **kwargs: calls.append(
+        ("cycle.fence", kwargs)
+    )
+    app.control_cycle_port.run_cycle = lambda **_kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("cycle publication failed"))
+    app._started = True
+
+    with pytest.raises(RuntimeError, match="cycle publication failed"):
+        app.step(now=10.0)
+
+    assert calls == [
+        (
+            "cycle.fence",
+            {"reason": "sim_hil_application:control_cycle_failed"},
+        ),
+        (
+            "lower.hold",
+            {
+                "reason": "sim_hil_application:control_cycle_failed",
+                "force_cancellation": True,
+            },
+        ),
+        ("pose.reset", None),
+    ]
+    assert app.held is True
+    assert app.last_hold_outcome is hold_receipt
+    assert app._last_error == "RuntimeError:cycle publication failed"
+    assert app._first_control_fault == app._last_error
+
+
+def test_application_step_failure_preserves_fail_closed_transition_failure() -> None:
+    calls: list[tuple[str, object]] = []
+    runtime = SimpleNamespace(
+        clock=lambda: 10.0,
+        config=SimpleNamespace(decision_hz=60.0),
+        reference_activation_spec=SimpleNamespace(
+            activation_mode="immediate_target",
+            target_lead_time_sec=0.0,
+        ),
+    )
+    composition = SimpleNamespace(
+        started=True,
+        human_alpha_by_component={"right_arm": 0.0},
+        request_hold=lambda **kwargs: (
+            calls.append(("lower.hold", kwargs))
+            or (_ for _ in ()).throw(RuntimeError("lower hold failed"))
+        ),
+    )
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=runtime,
+        composition=composition,
+        policy_source=SimpleNamespace(step=lambda *, now: None),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: 10.0,
+    )
+    app.control_cycle_port.deactivate = lambda **kwargs: calls.append(
+        ("cycle.fence", kwargs)
+    )
+    app.control_cycle_port.run_cycle = lambda **_kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("cycle publication failed"))
+    app._started = True
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "RuntimeError:cycle publication failed;"
+            "fail_closed_transition_failed:RuntimeError:lower hold failed"
+        ),
+    ) as raised:
+        app.step(now=10.0)
+
+    assert calls == [
+        (
+            "cycle.fence",
+            {"reason": "sim_hil_application:control_cycle_failed"},
+        ),
+        (
+            "lower.hold",
+            {
+                "reason": "sim_hil_application:control_cycle_failed",
+                "force_cancellation": True,
+            },
+        ),
+    ]
+    assert app.held is True
+    assert app.last_hold_outcome is None
+    assert app._first_control_fault == "RuntimeError:cycle publication failed"
+    assert app._last_error == str(raised.value)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "lower hold failed"
+
+
+def test_application_scheduler_failure_also_establishes_lower_hold() -> None:
+    calls: list[tuple[str, object]] = []
+    app = MujocoSimHILApplication(
+        config=MujocoSimHILApplicationConfig(),
+        task_config=SimpleNamespace(),
+        scene=SimpleNamespace(),
+        runtime=SimpleNamespace(
+            config=SimpleNamespace(decision_hz=60.0),
+            reset_pose_resolution_temporal_state=lambda: calls.append(
+                ("pose.reset", None)
+            ),
+        ),
+        composition=SimpleNamespace(
+            started=True,
+            request_hold=lambda **kwargs: calls.append(("lower.hold", kwargs)),
+        ),
+        policy_source=SimpleNamespace(),
+        human_source=SimpleNamespace(),
+        readiness_provider=SimpleNamespace(),
+        clock=lambda: float("nan"),
+    )
+    app.control_cycle_port.deactivate = lambda **kwargs: calls.append(
+        ("cycle.fence", kwargs)
+    )
+    app._started = True
+
+    with pytest.raises(ValueError, match="step.now must be finite"):
+        app.step()
+
+    assert calls == [
+        (
+            "cycle.fence",
+            {"reason": "sim_hil_application:control_cycle_failed"},
+        ),
+        (
+            "lower.hold",
+            {
+                "reason": "sim_hil_application:control_cycle_failed",
+                "force_cancellation": True,
+            },
+        ),
+        ("pose.reset", None),
+    ]
+    assert app.held is True
+    assert app._last_error == "ValueError:step.now must be finite."
+    assert app._first_control_fault == app._last_error
+
+
 def test_application_hold_resets_lower_pose_resolution_temporal_state() -> None:
     calls: list[str] = []
     app = MujocoSimHILApplication(
