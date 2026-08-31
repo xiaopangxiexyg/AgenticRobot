@@ -63,7 +63,10 @@ from robot_motion.deploy.async_producer import (
     RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_V1,
 )
-from robot_motion.deploy.canonical_action import CanonicalDeployActionPipeline
+from robot_motion.deploy.canonical_action import (
+    CanonicalDeployActionPipeline,
+    CanonicalDeployActionResult,
+)
 from robot_motion.deploy.emission_port import (
     PassivePolicyEmissionObserverPort,
     require_passive_policy_emission_observer,
@@ -71,6 +74,7 @@ from robot_motion.deploy.emission_port import (
 from robot_motion.deploy.next_step import sync_queue_preserves_same_chunk_successor
 from robot_motion.deploy.observation import (
     DEFAULT_HAND_STATE_MAX_AGE_SEC,
+    DeploymentObservation,
     build_deployment_observation,
 )
 from robot_motion.deploy.prediction_worker import ThreadedPolicyPredictionWorker
@@ -1417,6 +1421,51 @@ def _build_arm_state_reader(
         compute_tcp_pose=bool(args.arms_enabled),
         **pose_kwargs,
     )
+
+
+def _prepare_position_lookahead_chain(
+    raw_actions: tuple[NormalizedAction, ...],
+    observation: DeploymentObservation,
+    current_action: CanonicalDeployActionResult,
+    *,
+    pipeline: CanonicalDeployActionPipeline,
+    policy_name: str,
+    phase_timing: dict[str, Any],
+) -> tuple[tuple[CanonicalDeployActionResult, DeploymentObservation], ...]:
+    """Prepare causal same-chunk successors until the first safety fault.
+
+    Each successor is filtered against the immediately preceding safe action.
+    This is chained canonical validation, not an extra temporal smoothing
+    stage. The returned sequence contains only fault-free candidates; timing
+    still includes the first rejected candidate so diagnostics preserve the
+    existing per-stage contract.
+    """
+
+    prepared: list[tuple[CanonicalDeployActionResult, DeploymentObservation]] = []
+    previous_action = current_action
+    for offset, raw_action in enumerate(raw_actions, start=1):
+        successor_observation = replace(
+            observation,
+            last_action=previous_action.action.vector.astype(
+                np.float32,
+                copy=True,
+            ),
+        )
+        prepare_started = time.monotonic()
+        successor = pipeline.prepare(
+            raw_action,
+            successor_observation,
+            policy_name=policy_name,
+        )
+        phase_timing[f"lookahead_prepare_{offset}_ms"] = max(
+            0.0,
+            time.monotonic() - prepare_started,
+        ) * 1000.0
+        if successor.faults:
+            break
+        prepared.append((successor, successor_observation))
+        previous_action = successor
+    return tuple(prepared)
 
 
 def main(
@@ -4760,105 +4809,41 @@ def main(
                                         "error_type": type(exc).__name__,
                                     },
                                 )
-                        lookahead_canonical_action = None
-                        lookahead_observation = None
-                        second_lookahead_canonical_action = None
-                        second_lookahead_observation = None
-                        third_lookahead_canonical_action = None
-                        third_lookahead_observation = None
+                        prepared_lookahead_chain = ()
                         if (
                             position_deploy_executor is not None
                             and bool(args.position_chunk_lookahead)
                             and raw_lookahead_action is not None
                             and not canonical_action.faults
                         ):
-                            # The current safe action is the correct 15 Hz
-                            # reference for filtering the next action in the
-                            # same already-decoded chunk.  This is validation,
-                            # not an extra temporal smoothing stage.
-                            lookahead_observation = replace(
-                                observation,
-                                last_action=canonical_action.action.vector.astype(
-                                    np.float32,
-                                    copy=True,
-                                ),
-                            )
-                            lookahead_prepare_started = time.monotonic()
-                            prepared_lookahead = canonical_action_pipeline.prepare(
-                                raw_lookahead_action,
-                                lookahead_observation,
-                                policy_name=policy.name,
-                            )
-                            action_phase_timing["lookahead_prepare_1_ms"] = max(
-                                0.0,
-                                time.monotonic() - lookahead_prepare_started,
-                            ) * 1000.0
-                            if not prepared_lookahead.faults:
-                                lookahead_canonical_action = prepared_lookahead
+                            raw_lookahead_chain = [raw_lookahead_action]
+                            if (
+                                raw_second_lookahead_action is not None
+                                and action_step.next_step_execution_signal is not None
+                            ):
+                                raw_lookahead_chain.append(
+                                    raw_second_lookahead_action
+                                )
                                 if (
-                                    raw_second_lookahead_action is not None
-                                    and action_step.next_step_execution_signal
-                                    is not None
+                                    bool(
+                                        args.position_continuous_waypoint_async_precompute
+                                    )
+                                    and raw_third_lookahead_action is not None
                                 ):
-                                    second_lookahead_observation = replace(
-                                        observation,
-                                        last_action=(
-                                            prepared_lookahead.action.vector.astype(
-                                                np.float32,
-                                                copy=True,
-                                            )
-                                        ),
+                                    raw_lookahead_chain.append(
+                                        raw_third_lookahead_action
                                     )
-                                    lookahead_prepare_started = time.monotonic()
-                                    prepared_second_lookahead = (
-                                        canonical_action_pipeline.prepare(
-                                            raw_second_lookahead_action,
-                                            second_lookahead_observation,
-                                            policy_name=policy.name,
-                                        )
-                                    )
-                                    action_phase_timing["lookahead_prepare_2_ms"] = max(
-                                        0.0,
-                                        time.monotonic() - lookahead_prepare_started,
-                                    ) * 1000.0
-                                    if not prepared_second_lookahead.faults:
-                                        second_lookahead_canonical_action = (
-                                            prepared_second_lookahead
-                                        )
-                                        if (
-                                            bool(
-                                                args.position_continuous_waypoint_async_precompute
-                                            )
-                                            and raw_third_lookahead_action is not None
-                                        ):
-                                            third_lookahead_observation = replace(
-                                                observation,
-                                                last_action=(
-                                                    prepared_second_lookahead.action.vector.astype(
-                                                        np.float32,
-                                                        copy=True,
-                                                    )
-                                                ),
-                                            )
-                                            lookahead_prepare_started = time.monotonic()
-                                            prepared_third_lookahead = (
-                                                canonical_action_pipeline.prepare(
-                                                    raw_third_lookahead_action,
-                                                    third_lookahead_observation,
-                                                    policy_name=policy.name,
-                                                )
-                                            )
-                                            action_phase_timing[
-                                                "lookahead_prepare_3_ms"
-                                            ] = max(
-                                                0.0,
-                                                time.monotonic()
-                                                - lookahead_prepare_started,
-                                            ) * 1000.0
-                                            if not prepared_third_lookahead.faults:
-                                                third_lookahead_canonical_action = (
-                                                    prepared_third_lookahead
-                                                )
+                            prepared_lookahead_chain = _prepare_position_lookahead_chain(
+                                tuple(raw_lookahead_chain),
+                                observation,
+                                canonical_action,
+                                pipeline=canonical_action_pipeline,
+                                policy_name=policy.name,
+                                phase_timing=action_phase_timing,
+                            )
+                        lookahead_slots = prepared_lookahead_chain + (
+                            (None, None),
+                        ) * (3 - len(prepared_lookahead_chain))
                         faults.extend(canonical_action.faults)
                         latch_canonical_safety_fault(
                             canonical_action,
@@ -4951,21 +4936,19 @@ def main(
                                             f"{policy.name}:{step_index}"
                                         )
                                     ),
-                                    lookahead_canonical_action=(
-                                        lookahead_canonical_action
-                                    ),
-                                    lookahead_observation=lookahead_observation,
+                                    lookahead_canonical_action=lookahead_slots[0][0],
+                                    lookahead_observation=lookahead_slots[0][1],
                                     second_lookahead_canonical_action=(
-                                        second_lookahead_canonical_action
+                                        lookahead_slots[1][0]
                                     ),
                                     second_lookahead_observation=(
-                                        second_lookahead_observation
+                                        lookahead_slots[1][1]
                                     ),
                                     third_lookahead_canonical_action=(
-                                        third_lookahead_canonical_action
+                                        lookahead_slots[2][0]
                                     ),
                                     third_lookahead_observation=(
-                                        third_lookahead_observation
+                                        lookahead_slots[2][1]
                                     ),
                                     source_plan_cut=(
                                         None
