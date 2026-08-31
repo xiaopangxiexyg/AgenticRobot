@@ -354,12 +354,12 @@ PY
 PYTHONNOUSERSITE=1 python - <<'PY'
 import collection_runtime
 import control_station
-from hardware.rm65.robotic_arm_package.robotic_arm import RM65, dllPath
+from hardware.rm65.rm_api2_adapter import Arm, RM65
 from teleop_runtime.backends.arms import RM65ArmBackend, RM65ImpedanceArmBackend
 from teleop_runtime.backends.grippers import DMTacGripperBackend
 from teleop_runtime.backends.hands import InspireTacHandBackend
 
-print("RM65 SDK", RM65, dllPath)
+print("RM65 SDK", RM65, Arm.__module__)
 print("collection_runtime import ok", collection_runtime.__name__)
 print("control_station import ok", control_station.__name__)
 print("teleop_runtime imports ok")
