@@ -9,7 +9,7 @@ import termios
 import time
 import tty
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +39,15 @@ from ..hand_render import (
     open_hand_render_qpos,
 )
 from ..initial_alignment import TeleopInitialAlignment
+from ..recovery import (
+    RecoveryPlan,
+    advance_absolute_recovery_plan,
+    build_absolute_recovery_plan,
+    component_side_retargeter as _side_retargeter,
+    component_tcp_pose_desk as _preview_tcp_pose_desk,
+    validate_absolute_recovery_control_mode,
+)
+from ..real_teleop.arm_runtime import _sync_dual_arm_retargeter_from_preview
 from ..retargeters import (
     DualArmCollisionAwareRetargeter,
     DualArmCollisionAwareRetargeterConfig,
@@ -59,7 +68,7 @@ from ..sources.pose import (
 )
 from ..special_tasks.home_capture_stability import HomeCaptureStabilityState
 from ..tcp import legacy_tcp_mode_requested
-from ..transforms import as_pose_matrix, identity_pose, interpolate_pose
+from ..transforms import as_pose_matrix, identity_pose
 from .log_utils import ChangeGate, log_event
 from robot_motion.rm65 import build_rm65_dual_arm_scene_profile
 from robot_motion.rm65.ik_tuning import load_ik_tuning_config
@@ -93,10 +102,6 @@ from ..cli_value_parsers import (
 
 def _active_side_set(components) -> set[str]:
     return set(_normalize_active_sides(getattr(components, "active_sides", ("left", "right"))))
-
-
-def _side_retargeter(components, side: str) -> PoseToArmRetargeter:
-    return components.left_retargeter if side == "left" else components.right_retargeter
 
 
 def _side_state_backend(components, side: str) -> RM65ArmBackend | None:
@@ -268,14 +273,6 @@ class VirtualRunComponents:
     right_retargeter: PoseToArmRetargeter
     left_hand_retargeter: JointsToDexHandRetargeter | None
     right_hand_retargeter: JointsToDexHandRetargeter | None
-
-
-@dataclass
-class RecoveryPlan:
-    mode: str
-    started_at: float
-    duration_sec: float = 0.0
-    payload: dict[str, object] = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
@@ -2414,48 +2411,6 @@ def _wait_for_calibration_start(
         time.sleep(0.02)
 
 
-def _sync_dual_arm_retargeter_from_preview(
-    components: VirtualRunComponents,
-    *,
-    reset_tracking: bool = True,
-) -> None:
-    if components.dual_arm_retargeter is None:
-        return
-    left_qpos = components.left_preview_backend.get_state()["current_qpos"]
-    right_qpos = components.right_preview_backend.get_state()["current_qpos"]
-    if left_qpos is None or right_qpos is None:
-        return
-    try:
-        components.dual_arm_retargeter.set_current_qpos_pair(
-            left_qpos=left_qpos,
-            right_qpos=right_qpos,
-            reset_tracking=reset_tracking,
-        )
-    except TypeError as exc:
-        if "reset_tracking" not in str(exc):
-            raise
-        components.dual_arm_retargeter.set_current_qpos_pair(
-            left_qpos=left_qpos,
-            right_qpos=right_qpos,
-        )
-
-
-def _preview_tcp_pose_desk(
-    components: VirtualRunComponents,
-    *,
-    side: str,
-) -> np.ndarray:
-    calibration = components.session.calibration
-    assert calibration is not None
-    backend = (
-        components.left_preview_backend
-        if side == "left"
-        else components.right_preview_backend
-    )
-    pose_base = backend.compute_tcp_pose()
-    return calibration.get_arm_for_side(side).T_D_B @ pose_base
-
-
 def _send_preview_command(
     components: VirtualRunComponents,
     command,
@@ -2808,58 +2763,26 @@ def _start_recovery_plan(
     control_mode: str,
     ramp_sec: float,
 ) -> tuple[RecoveryPlan | None, object | None, bool]:
-    if control_mode != "absolute":
-        raise ValueError("delta_clutch has been hard-archived; recovery only supports 'absolute'.")
+    validate_absolute_recovery_control_mode(control_mode)
     calibration = components.session.calibration
     assert calibration is not None
     _sync_dual_arm_retargeter_from_preview(components)
 
     if arm_mode == "virtual":
         return None, components.session.build_command(observation), True
-
-    if components.dual_arm_retargeter is not None:
-        context = components.dual_arm_retargeter.build_target_context(observation, calibration)
-        return (
-            RecoveryPlan(
-                mode="absolute_ramp_dual",
-                started_at=now,
-                duration_sec=float(ramp_sec),
-                payload={
-                    "context": context,
-                    "start_targets": components.dual_arm_retargeter.current_world_targets(),
-                    "end_targets": {
-                        "left": context.left_target.copy(),
-                        "right": context.right_target.copy(),
-                    },
-                },
-            ),
-            None,
-            False,
-        )
-
-    end_resolutions: dict[str, dict[str, object]] = {}
-    for side in components.active_sides:
-        resolution = _side_retargeter(components, side).resolve_absolute_target_from_observation(
-            observation,
-            calibration,
-        )
-        if resolution is None:
-            raise RuntimeError(
-                f"Absolute recovery requires active wrist channel '{side}_wrist_pose' to be valid."
-            )
-        end_resolutions[side] = resolution
     return (
-        RecoveryPlan(
-            mode="absolute_ramp_independent",
-            started_at=now,
-            duration_sec=float(ramp_sec),
-            payload={
-                "start_targets": {
-                    side: _preview_tcp_pose_desk(components, side=side)
-                    for side in components.active_sides
-                },
-                "end_resolutions": end_resolutions,
-            },
+        build_absolute_recovery_plan(
+            observation,
+            calibration=calibration,
+            active_sides=components.active_sides,
+            dual_arm_retargeter=components.dual_arm_retargeter,
+            side_retargeter=lambda side: _side_retargeter(components, side),
+            current_tcp_pose_desk=lambda side: _preview_tcp_pose_desk(
+                components,
+                side=side,
+            ),
+            now=now,
+            ramp_sec=ramp_sec,
         ),
         None,
         False,
@@ -2875,49 +2798,16 @@ def _advance_recovery_plan(
 ) -> tuple[object, bool]:
     calibration = components.session.calibration
     assert calibration is not None
-    alpha = 1.0
-    if plan.duration_sec > 1e-6:
-        alpha = float(np.clip((now - plan.started_at) / plan.duration_sec, 0.0, 1.0))
-
     if plan.mode == "absolute_ramp_dual":
         assert components.dual_arm_retargeter is not None
-        context = plan.payload["context"]
-        start_targets = plan.payload["start_targets"]
-        end_targets = plan.payload["end_targets"]
-        command = components.dual_arm_retargeter.build_command_for_context(
-            context,
-            targets=components.dual_arm_retargeter.interpolate_world_targets(
-                start_targets,
-                end_targets,
-                alpha,
-            ),
-        )
-        command.timestamp = observation.timestamp
-        return command, alpha >= 1.0
-
-    if plan.mode == "absolute_ramp_independent":
-        start_targets = plan.payload["start_targets"]
-        end_resolutions = plan.payload["end_resolutions"]
-        commands = []
-        for side, resolution in end_resolutions.items():
-            target_pose = interpolate_pose(
-                start_targets[side],
-                resolution["target_pose_desk"],
-                alpha,
-            )
-            commands.append(
-                _side_retargeter(components, side).build_command_from_target_pose_desk(
-                    target_pose_desk=target_pose,
-                    observation=observation,
-                    calibration=calibration,
-                    pose_operator=resolution.get("pose_operator"),
-                )
-            )
-        command = merge_teleop_commands(commands)
-        command.timestamp = observation.timestamp
-        return command, alpha >= 1.0
-
-    raise ValueError(f"Unsupported recovery plan mode: {plan.mode}")
+    return advance_absolute_recovery_plan(
+        observation,
+        plan,
+        calibration=calibration,
+        dual_arm_retargeter=components.dual_arm_retargeter,
+        side_retargeter=lambda side: _side_retargeter(components, side),
+        now=now,
+    )
 
 
 def main() -> None:

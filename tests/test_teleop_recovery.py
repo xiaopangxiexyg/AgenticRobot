@@ -15,7 +15,9 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as R
 
+import teleop_runtime.collection.run_collect as collection_runtime
 import teleop_runtime.debug.run_vive_sapien_virtual as virtual_runtime
+from control_station import real_teleop_entrypoint
 from robot_motion.rm65 import (
     DEFAULT_LEFT_ARM_QPOS,
     DEFAULT_RIGHT_ARM_QPOS,
@@ -60,6 +62,7 @@ from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
 from teleop_runtime.hand_render import inspire_q6_to_render_qpos
 from teleop_runtime.initial_alignment import AlignmentSideState, TeleopInitialAlignment
+from teleop_runtime.recovery import RecoveryPlan
 from teleop_runtime.retargeters.pose_to_arm import PoseToArmRetargeter, PoseToArmRetargeterConfig
 from teleop_runtime.retargeters.joints_to_dexhand import (
     JointsToDexHandRetargeter,
@@ -89,6 +92,16 @@ def _has_dual_arm_ik_dependencies() -> bool:
 
 
 DUAL_ARM_IK_AVAILABLE = _has_dual_arm_ik_dependencies()
+
+
+def test_recovery_plan_has_one_production_owner() -> None:
+    assert virtual_runtime.RecoveryPlan is RecoveryPlan
+    assert collection_runtime.RecoveryPlan is RecoveryPlan
+    assert real_teleop_entrypoint.RecoveryPlan is RecoveryPlan
+    assert (
+        real_teleop_entrypoint._start_recovery_plan.__module__
+        == "control_station.real_teleop_entrypoint"
+    )
 
 
 def test_session_config_does_not_duplicate_safety_stale_timeout() -> None:

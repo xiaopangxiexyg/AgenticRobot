@@ -309,6 +309,17 @@ from teleop_runtime.real_teleop.position_force_guard import (
     position_force_guard_config as _position_force_guard_config,
 )
 from teleop_runtime.real_teleop import dataset_layout as real_teleop_dataset_layout
+from teleop_runtime.recovery import (
+    RecoveryPlan,
+    advance_absolute_recovery_plan,
+    build_absolute_recovery_plan,
+    component_side_retargeter as _side_retargeter,
+    component_tcp_pose_desk,
+    validate_absolute_recovery_control_mode,
+)
+from teleop_runtime.real_teleop.arm_runtime import (
+    _sync_dual_arm_retargeter_from_preview,
+)
 
 _expand_cli_path = real_teleop_dataset_layout.expand_cli_path
 _sanitize_dataset_name_for_path = real_teleop_dataset_layout.sanitize_dataset_name_for_path
@@ -316,9 +327,7 @@ _default_task_id_from_name = real_teleop_dataset_layout.default_task_id_from_nam
 from teleop_runtime.debug.log_utils import ChangeGate
 from teleop_runtime.debug.run_vive_sapien_virtual import (
     DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
-    RecoveryPlan,
     TerminalClutchInput,
-    _advance_recovery_plan,
     _build_episode_frame,
     _build_renderer_debug_boxes,
     _build_renderer_debug_frames,
@@ -334,13 +343,65 @@ from teleop_runtime.debug.run_vive_sapien_virtual import (
     _qpos_summary,
     _resolve_robot_home_for_side,
     _runtime_home_calibration,
-    _side_retargeter,
-    _start_recovery_plan,
     _state_qpos,
-    _sync_dual_arm_retargeter_from_preview,
     _hand_render_qpos,
     _vive_tracker_local_translation_offset,
 )
+
+
+def _start_recovery_plan(
+    components: object,
+    observation: object,
+    *,
+    now: float,
+    arm_mode: str,
+    control_mode: str,
+    ramp_sec: float,
+) -> tuple[RecoveryPlan | None, object | None, bool]:
+    validate_absolute_recovery_control_mode(control_mode)
+    calibration = components.session.calibration
+    assert calibration is not None
+    _sync_dual_arm_retargeter_from_preview(components)
+    if arm_mode == "virtual":
+        return None, components.session.build_command(observation), True
+    return (
+        build_absolute_recovery_plan(
+            observation,
+            calibration=calibration,
+            active_sides=components.active_sides,
+            dual_arm_retargeter=components.dual_arm_retargeter,
+            side_retargeter=lambda side: _side_retargeter(components, side),
+            current_tcp_pose_desk=lambda side: component_tcp_pose_desk(
+                components,
+                side=side,
+            ),
+            now=now,
+            ramp_sec=ramp_sec,
+        ),
+        None,
+        False,
+    )
+
+
+def _advance_recovery_plan(
+    components: object,
+    observation: object,
+    plan: RecoveryPlan,
+    *,
+    now: float,
+) -> tuple[object, bool]:
+    calibration = components.session.calibration
+    assert calibration is not None
+    if plan.mode == "absolute_ramp_dual":
+        assert components.dual_arm_retargeter is not None
+    return advance_absolute_recovery_plan(
+        observation,
+        plan,
+        calibration=calibration,
+        dual_arm_retargeter=components.dual_arm_retargeter,
+        side_retargeter=lambda side: _side_retargeter(components, side),
+        now=now,
+    )
 from teleop_runtime.cli_value_parsers import (
     _active_sides_from_args,
     _alpha_float,

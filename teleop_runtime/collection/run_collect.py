@@ -78,6 +78,12 @@ from ..position_control import (
     PositionReferencePublisher,
     PositionReferencePublisherConfig,
 )
+from ..recovery import (
+    RecoveryPlan,
+    advance_absolute_recovery_plan,
+    build_absolute_recovery_plan,
+    validate_absolute_recovery_control_mode,
+)
 from ..rigs import BimanualRig
 from ..safety import TeleopSafetyConfig
 from ..schemas import (
@@ -105,7 +111,7 @@ from ..tactile_visualizer import (
     tactile_by_side_from_backends,
     tactile_by_side_from_hand_states,
 )
-from ..transforms import as_pose_matrix, interpolate_pose
+from ..transforms import as_pose_matrix
 from .arm_state_polling import ArmHardwareStatePoller, ArmHardwareStatePollerConfig
 from .hand_state_polling import HandStateHistoryPoller, HandStateHistoryPollerConfig
 from collection_runtime.async_writer import AsyncWriterConfig, AsyncWriterPool
@@ -574,14 +580,6 @@ class CollectControlState:
     debug_frozen_suppressed_reports: int = 0
     recording_paused: bool = False
     recording_pause_reason: str = ""
-
-
-@dataclass
-class RecoveryPlan:
-    mode: str
-    started_at: float
-    duration_sec: float = 0.0
-    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1887,8 +1885,7 @@ def _start_recovery_plan(
     control_mode: str,
     ramp_sec: float,
 ) -> tuple[RecoveryPlan | None, TeleopCommand | None, bool]:
-    if control_mode != "absolute":
-        raise ValueError("delta_clutch has been hard-archived; recovery only supports 'absolute'.")
+    validate_absolute_recovery_control_mode(control_mode)
     _seed_dual_arm_retargeter_from_backends(app)
     fixed_arm_retargeters = getattr(app, "fixed_arm_retargeters", {}) or {}
     jitter_arm_retargeters = getattr(app, "jitter_arm_retargeters", {}) or {}
@@ -1898,53 +1895,22 @@ def _start_recovery_plan(
         if side not in fixed_arm_retargeters and side not in jitter_arm_retargeters
     )
 
-    if app.dual_arm_retargeter is not None:
-        context = app.dual_arm_retargeter.build_target_context(
-            observation,
-            app.calibration,
-        )
-        return (
-            RecoveryPlan(
-                mode="absolute_ramp_dual",
-                started_at=now,
-                duration_sec=float(ramp_sec),
-                payload={
-                    "context": context,
-                    "start_targets": app.dual_arm_retargeter.current_world_targets(),
-                    "end_targets": {
-                        "left": context.left_target.copy(),
-                        "right": context.right_target.copy(),
-                    },
-                },
-            ),
-            None,
-            False,
-        )
-
-    end_resolutions: dict[str, dict[str, object]] = {}
-    for side in moving_sides:
-        resolution = app.pose_retargeters[side].resolve_absolute_target_from_observation(
-            observation,
-            app.calibration,
-        )
-        if resolution is None:
-            channel_name = CollectionTopology.for_active_sides((side,)).wrist_pose_channel(side)
-            raise RuntimeError(
-                f"Absolute recovery requires active wrist channel '{channel_name}' to be valid."
-            )
-        end_resolutions[side] = resolution
     return (
-        RecoveryPlan(
-            mode="absolute_ramp_independent",
-            started_at=now,
-            duration_sec=float(ramp_sec),
-            payload={
-                "start_targets": {
-                    side: _backend_tcp_pose_desk(app, side=side)
-                    for side in moving_sides
-                },
-                "end_resolutions": end_resolutions,
-            },
+        build_absolute_recovery_plan(
+            observation,
+            calibration=app.calibration,
+            active_sides=moving_sides,
+            dual_arm_retargeter=app.dual_arm_retargeter,
+            side_retargeter=lambda side: app.pose_retargeters[side],
+            current_tcp_pose_desk=lambda side: _backend_tcp_pose_desk(
+                app,
+                side=side,
+            ),
+            channel_name_for_side=lambda side: CollectionTopology.for_active_sides(
+                (side,)
+            ).wrist_pose_channel(side),
+            now=now,
+            ramp_sec=ramp_sec,
         ),
         None,
         False,
@@ -1958,53 +1924,20 @@ def _advance_recovery_plan(
     *,
     now: float,
 ) -> tuple[TeleopCommand, bool]:
-    alpha = 1.0
-    if plan.duration_sec > 1e-6:
-        alpha = float(np.clip((now - plan.started_at) / plan.duration_sec, 0.0, 1.0))
-
     if plan.mode == "absolute_ramp_dual":
         if app.dual_arm_retargeter is None:
             raise RuntimeError(
                 "Dual-arm recovery plan is active but dual retargeter is unavailable."
             )
         _seed_dual_arm_retargeter_from_backends(app)
-        context = plan.payload["context"]
-        start_targets = plan.payload["start_targets"]
-        end_targets = plan.payload["end_targets"]
-        command = app.dual_arm_retargeter.build_command_for_context(
-            context,
-            targets=app.dual_arm_retargeter.interpolate_world_targets(
-                start_targets,
-                end_targets,
-                alpha,
-            ),
-        )
-        command.timestamp = observation.timestamp
-        return command, alpha >= 1.0
-
-    if plan.mode == "absolute_ramp_independent":
-        start_targets = plan.payload["start_targets"]
-        end_resolutions = plan.payload["end_resolutions"]
-        commands: list[TeleopCommand] = []
-        for side, resolution in end_resolutions.items():
-            target_pose = interpolate_pose(
-                start_targets[side],
-                resolution["target_pose_desk"],
-                alpha,
-            )
-            commands.append(
-                app.pose_retargeters[side].build_command_from_target_pose_desk(
-                    target_pose_desk=target_pose,
-                    observation=observation,
-                    calibration=app.calibration,
-                    pose_operator=resolution.get("pose_operator"),
-                )
-            )
-        command = merge_teleop_commands(tuple(commands))
-        command.timestamp = observation.timestamp
-        return command, alpha >= 1.0
-
-    raise ValueError(f"Unsupported recovery plan mode: {plan.mode}")
+    return advance_absolute_recovery_plan(
+        observation,
+        plan,
+        calibration=app.calibration,
+        dual_arm_retargeter=app.dual_arm_retargeter,
+        side_retargeter=lambda side: app.pose_retargeters[side],
+        now=now,
+    )
 
 
 def _drive_recovery_step(
