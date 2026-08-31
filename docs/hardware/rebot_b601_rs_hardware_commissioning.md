@@ -15,7 +15,8 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   对 RobStride 的通用 `request_feedback()` 是 no-op。显式传入 `request_feedback=True` 的
   active commissioning loop 仍会调用该兼容入口，然后消费接收队列，并对六个 arm 电机
   串行读取 RobStride `mechPos` 参数 `0x7019`。MotorBridge 的连续状态路径要求另行启用
-  active report；本 backend 当前不会隐式改变该设备配置。两条路径对缺失/错误
+  active report；backend 仅在独立 `allow_active_reporting=True` 授权下提供显式、可回滚的
+  `set_active_reporting()`，不会由 `connect()`、`poll_feedback()` 或运动接口隐式改变。两条路径对缺失/错误
   ID/非零 vendor status/非有限值都生成 `invalid/stale` 状态，绝不补成零；active position
   fallback 可能没有 velocity/torque 字段，力控调用必须单独检查对应字段存在；
 - `prepare_position_velocity_mode()` 对照 pinned reBotArm 的
@@ -42,6 +43,9 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   命令返回逐关节 receipt；部分发送不会被报告成六关节成功；
 - `safe_stop()` 是单独的、可在未授权启动运动的 backend 上调用的逐关节失能入口；它仍然
   需要现场机械支撑和物理急停配合，`close()` 不隐式失能；
+- active-report 使用与 `allow_motion` 分离的授权，且不切模式、不使能、不发送 POS_VEL/MIT
+  参考。多关节启用部分失败时会对所有已尝试关节反向发送关闭请求；任何未确认关闭的关节会
+  保持锁存，`close()` 拒绝释放 backend，避免把不确定的设备上报状态隐藏在析构中；
 - 低增益 probe 的 active set 默认是 `--joint` 指定的一个目标关节加
   `joint2`/`joint3` 支撑关节；其余 arm 关节不会被使能。异常路径只有在
   last-safe 快照通过新鲜度、限位、速度和小 rebase 检查后才锁存 J2/J3，否则直接全部
@@ -116,25 +120,28 @@ required event 的 observed rate 不低于目标的 95%，且超过 `2 * period`
 3. **P2 backend 只读**：使用明确 RS YAML 构造 backend，确认六个 arm ID 顺序、位置符号、
    空反馈/错误 status 的 fail-closed 行为；默认 `poll_feedback()` 不调用
    `request_feedback`、mode、enable 或 send。
-4. **P2.5 失能 TX 上限**：仅由操作者运行 `position-tx-disabled`。确认 preflight/final
+4. **P2.1 主动上报传输**：仅由操作者在前台运行下方 no-motion active-report probe。它只
+   切换 type-24 上报配置并被动统计 type-2 完整帧，必须自动关闭且逐设备通过。该 PASS 仍
+   固定为 `control_feedback_admission=NOT_ADMITTED`，不能进入阻抗/力控状态反馈。
+5. **P2.5 失能 TX 上限**：仅由操作者运行 `position-tx-disabled`。确认 preflight/final
    `safe_stop` 均完整、`motors_enabled_by_probe=false`，再检查 `compute/tx` 是否通过；该
    阶段不要求 warmup `feedback` 达到目标，也不构成运动或闭环通过。
-5. **P2.6 离线重力与失能 MIT TX**：先离线运行 `gravity-offline`，再仅由操作者运行
+6. **P2.6 离线重力与失能 MIT TX**：先离线运行 `gravity-offline`，再仅由操作者运行
    `mit-tx-disabled`。后者必须同时具有 preflight、post-mode 和 final 三份完整
    `safe_stop` receipt、`motors_enabled_by_probe=false`，且命令语义必须保持
    `qvel=kp=kd=tau=0`。这仍不构成已使能 MIT/重力/阻尼通过。
-6. **P3 高频 POS_VEL**：仅由操作者运行下方 enabled guarded command。先 125 Hz，再 250 Hz，
+7. **P3 高频 POS_VEL**：仅由操作者运行下方 enabled guarded command。先 125 Hz，再 250 Hz，
    最后才评估 500 Hz；每档均须机械支撑、物理急停、唯一控制 owner、`--auto-disable`，
    并保存 `feedback/compute/tx` 三个 event 的独立统计。只保持启动时反馈位置，不引入
    trajectory 或 haptic overlay。
-7. **P3.5 反馈稳定性**：在 P4 前先由操作者运行 `feedback-stability`，电机保持既有安全
+8. **P3.5 反馈稳定性**：在 P4 前先由操作者运行 `feedback-stability`，电机保持既有安全
    状态。必须得到至少两个完整快照并保存原始 JSON；查看各关节 `p95/p99` 与
    `stationarity_exceed_count`，若有超限，先分析读取周期、编码器量化和机械实际运动，
    不得通过提高 active probe 的 `--fault-hold-max-velocity-rad-s` 绕过该证据。
-8. **P4 单关节 MIT/重力阻尼**：由硬件负责人另行批准，先单关节、低幅、当前 q 参考和零
+9. **P4 单关节 MIT/重力阻尼**：由硬件负责人另行批准，先单关节、低幅、当前 q 参考和零
    overlay；确认重力方向、阻尼耗散、最终 torque/slew limit 和 stop receipt 后才扩大到
    多关节。P3 的位置频率通过不等于 P4 的力控通过。
-9. **P5 haptic 频率**：接入 `compute_b601_mit_torque()` 与 `J.T @ wrench` 后，单独记录
+10. **P5 haptic 频率**：接入 `compute_b601_mit_torque()` 与 `J.T @ wrench` 后，单独记录
    `haptic`，并用低幅 virtual spring/wall 或已审查的 synthetic follower wrench 验证
    frame、功率不变量、反馈延迟和限幅。只有 `feedback/compute/tx/haptic` 全部可对齐，
    才能讨论 500 Hz 目标；不能用 aggregate bus rate 代替。
@@ -179,6 +186,66 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 启用或总线上没有生产者，不能推断硬件不支持该路径。任一类型计数非零也只建立 host 接收
 节拍；在检查周期性、ID 方向和 payload 契约前不能区分一次性切换命令与连续设备上报，更
 不能证明源端新鲜度或 MotorBridge cache 新鲜度。
+
+## P2.1 主动上报传输探针（无使能、无运动，操作者手动运行）
+
+该探针复用上面的被动 SocketCAN 解析，只额外通过 MotorBridge 对所选电机发送 type-24
+active-report 开/关配置。它不调用 motor `enable()`、不切 MIT/POS_VEL mode，也不发送位置或
+力矩参考。因为会改变设备上报配置，所以仍须现场唯一 CAN owner、前台运行和显式自动关闭；
+Ctrl+C 会进入同一个 `finally` 清理路径。若任一关闭请求失败，JSON 和终端都会保留
+`cleanup_errors`，backend 也会拒绝正常 close，不能把这次运行视为通过。
+
+下面模板不会使用 `set -e`，不会后台运行；命令和完整输出同时追加到固定 log，Python 退出后
+当前 shell 保持存活：
+
+```bash
+WT=/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260831-b601-active-report-telemetry-r0/AgenticRobot
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
+CFG=/home/zc/HandMotion/Developing/reBotArm_control_py/config/rebotarm_rs.yaml
+OUT_DIR=/tmp/b601-rs-commissioning/AR-20260831-b601-active-report-telemetry-r0
+LOG="$OUT_DIR/command_and_output.log"
+JSON="$OUT_DIR/b601_active_report_all_arm_125hz.json"
+
+mkdir -p "$OUT_DIR"
+CMD=(
+  "$PY" "$WT/scripts/hardware/rebot_b601_rs_active_report_probe.py"
+  --config "$CFG"
+  --channel can0
+  --duration-sec 10
+  --target-hz 125
+  --minimum-rate-ratio 0.90
+  --maximum-p99-factor 2.0
+  --minimum-sample-count 100
+  --joint joint1,joint2,joint3,joint4,joint5,joint6
+  --allow-active-report
+  --confirmation B601_RS_ACTIVE_REPORT_TELEMETRY
+  --auto-disable-active-report
+  --output "$JSON"
+)
+
+printf 'command:' | tee -a "$LOG"
+printf ' %q' "${CMD[@]}" | tee -a "$LOG"
+printf '\n' | tee -a "$LOG"
+"${CMD[@]}" 2>&1 | tee -a "$LOG"
+STATUS=${PIPESTATUS[0]}
+printf 'probe exit code: %s\n' "$STATUS" | tee -a "$LOG"
+printf 'JSON: %s\n' "$JSON" | tee -a "$LOG"
+printf 'full command/output log: %s\n' "$LOG"
+printf '%s\n' 'shell remains active'
+```
+
+运行时会先显示 `[REPORT] 3/2/1/ENABLE STREAM`；这里的 `ENABLE STREAM` 只表示开启遥测上报，
+不是电机使能。只有以下条件全部满足，`stream_transport_acceptance` 才是 `PASS`：
+
+- ID1--6 都收到不少于 `--minimum-sample-count` 个完整 type-2 operation-status frame；
+- 每个设备的 observed Hz 不低于目标的 90%，且 p99 interval 不超过 `2 / target_hz`；
+- host/feedback ID 包含 YAML 声明的 `0xFD`，且没有短 type-2 frame；
+- enable 和 cleanup receipt 都完整，没有 cleanup error。
+
+即使上述全部通过，输出仍必须是 `freshness_verified=false`、
+`control_feedback_admission=NOT_ADMITTED`、`hardware_acceptance=NOT_CLAIMED`。本探针没有把
+payload 解码并绑定到源序号/源时间戳，也没有验证 `q/dq/tau` 的量纲、符号和同帧一致性；因此
+它只回答“周期帧是否能到达”，不回答“该状态是否可用于高频阻抗或力反馈”。
 
 ## 操作者手动失能 TX 频率入口（本轮不执行）
 
