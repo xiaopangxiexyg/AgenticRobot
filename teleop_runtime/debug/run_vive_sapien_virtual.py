@@ -41,11 +41,10 @@ from ..hand_render import (
 from ..initial_alignment import TeleopInitialAlignment
 from ..recovery import (
     RecoveryPlan,
-    advance_absolute_recovery_plan,
-    build_absolute_recovery_plan,
+    advance_component_recovery_plan as _advance_recovery_plan,
     component_side_retargeter as _side_retargeter,
     component_tcp_pose_desk as _preview_tcp_pose_desk,
-    validate_absolute_recovery_control_mode,
+    start_component_recovery_plan as _start_recovery_plan,
 )
 from ..real_teleop.arm_runtime import _sync_dual_arm_retargeter_from_preview
 from ..retargeters import (
@@ -2752,62 +2751,6 @@ def _build_episode_frame(
             "right": _episode_hand_payload(components, side="right"),
         },
     }
-
-
-def _start_recovery_plan(
-    components: VirtualRunComponents,
-    observation,
-    *,
-    now: float,
-    arm_mode: str,
-    control_mode: str,
-    ramp_sec: float,
-) -> tuple[RecoveryPlan | None, object | None, bool]:
-    validate_absolute_recovery_control_mode(control_mode)
-    calibration = components.session.calibration
-    assert calibration is not None
-    _sync_dual_arm_retargeter_from_preview(components)
-
-    if arm_mode == "virtual":
-        return None, components.session.build_command(observation), True
-    return (
-        build_absolute_recovery_plan(
-            observation,
-            calibration=calibration,
-            active_sides=components.active_sides,
-            dual_arm_retargeter=components.dual_arm_retargeter,
-            side_retargeter=lambda side: _side_retargeter(components, side),
-            current_tcp_pose_desk=lambda side: _preview_tcp_pose_desk(
-                components,
-                side=side,
-            ),
-            now=now,
-            ramp_sec=ramp_sec,
-        ),
-        None,
-        False,
-    )
-
-
-def _advance_recovery_plan(
-    components: VirtualRunComponents,
-    observation,
-    plan: RecoveryPlan,
-    *,
-    now: float,
-) -> tuple[object, bool]:
-    calibration = components.session.calibration
-    assert calibration is not None
-    if plan.mode == "absolute_ramp_dual":
-        assert components.dual_arm_retargeter is not None
-    return advance_absolute_recovery_plan(
-        observation,
-        plan,
-        calibration=calibration,
-        dual_arm_retargeter=components.dual_arm_retargeter,
-        side_retargeter=lambda side: _side_retargeter(components, side),
-        now=now,
-    )
 
 
 def main() -> None:

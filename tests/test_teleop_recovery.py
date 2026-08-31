@@ -62,7 +62,11 @@ from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.hand_tcp_alignment import tracker_hand_to_rm65_tcp_rotation
 from teleop_runtime.hand_render import inspire_q6_to_render_qpos
 from teleop_runtime.initial_alignment import AlignmentSideState, TeleopInitialAlignment
-from teleop_runtime.recovery import RecoveryPlan
+from teleop_runtime.recovery import (
+    RecoveryPlan,
+    advance_component_recovery_plan,
+    start_component_recovery_plan,
+)
 from teleop_runtime.retargeters.pose_to_arm import PoseToArmRetargeter, PoseToArmRetargeterConfig
 from teleop_runtime.retargeters.joints_to_dexhand import (
     JointsToDexHandRetargeter,
@@ -98,10 +102,10 @@ def test_recovery_plan_has_one_production_owner() -> None:
     assert virtual_runtime.RecoveryPlan is RecoveryPlan
     assert collection_runtime.RecoveryPlan is RecoveryPlan
     assert real_teleop_entrypoint.RecoveryPlan is RecoveryPlan
-    assert (
-        real_teleop_entrypoint._start_recovery_plan.__module__
-        == "control_station.real_teleop_entrypoint"
-    )
+    assert virtual_runtime._start_recovery_plan is start_component_recovery_plan
+    assert real_teleop_entrypoint._start_recovery_plan is start_component_recovery_plan
+    assert virtual_runtime._advance_recovery_plan is advance_component_recovery_plan
+    assert real_teleop_entrypoint._advance_recovery_plan is advance_component_recovery_plan
 
 
 def test_session_config_does_not_duplicate_safety_stale_timeout() -> None:

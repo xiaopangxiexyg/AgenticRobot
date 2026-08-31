@@ -53,6 +53,68 @@ def component_tcp_pose_desk(components: object, *, side: str) -> np.ndarray:
     return calibration.get_arm_for_side(side).T_D_B @ pose_base
 
 
+def start_component_recovery_plan(
+    components: Any,
+    observation: TeleopObservation,
+    *,
+    now: float,
+    arm_mode: str,
+    control_mode: str,
+    ramp_sec: float,
+) -> tuple[RecoveryPlan | None, TeleopCommand | None, bool]:
+    """Start recovery for the shared virtual/real teleop component shape."""
+
+    validate_absolute_recovery_control_mode(control_mode)
+    calibration = components.session.calibration
+    assert calibration is not None
+
+    # Keep collection imports lightweight while reusing the established preview
+    # synchronization owner for component-based teleop runtimes.
+    from .real_teleop.arm_runtime import _sync_dual_arm_retargeter_from_preview
+
+    _sync_dual_arm_retargeter_from_preview(components)
+    if arm_mode == "virtual":
+        return None, components.session.build_command(observation), True
+    return (
+        build_absolute_recovery_plan(
+            observation,
+            calibration=calibration,
+            active_sides=components.active_sides,
+            dual_arm_retargeter=components.dual_arm_retargeter,
+            side_retargeter=lambda side: component_side_retargeter(components, side),
+            current_tcp_pose_desk=lambda side: component_tcp_pose_desk(
+                components,
+                side=side,
+            ),
+            now=now,
+            ramp_sec=ramp_sec,
+        ),
+        None,
+        False,
+    )
+
+
+def advance_component_recovery_plan(
+    components: Any,
+    observation: TeleopObservation,
+    plan: RecoveryPlan,
+    *,
+    now: float,
+) -> tuple[TeleopCommand, bool]:
+    """Advance recovery for the shared virtual/real teleop component shape."""
+
+    calibration = components.session.calibration
+    assert calibration is not None
+    return advance_absolute_recovery_plan(
+        observation,
+        plan,
+        calibration=calibration,
+        dual_arm_retargeter=components.dual_arm_retargeter,
+        side_retargeter=lambda side: component_side_retargeter(components, side),
+        now=now,
+    )
+
+
 def build_absolute_recovery_plan(
     observation: TeleopObservation,
     *,
@@ -177,8 +239,10 @@ def advance_absolute_recovery_plan(
 __all__ = [
     "RecoveryPlan",
     "advance_absolute_recovery_plan",
+    "advance_component_recovery_plan",
     "build_absolute_recovery_plan",
     "component_side_retargeter",
     "component_tcp_pose_desk",
+    "start_component_recovery_plan",
     "validate_absolute_recovery_control_mode",
 ]
