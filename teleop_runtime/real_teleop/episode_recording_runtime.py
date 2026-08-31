@@ -197,27 +197,22 @@ def build_episode_recording_runtime(
         name="real-teleop-collection-control"
     )
     runtime_closing = False
-    episode_prepare_generation: int | None = None
     episode_prepare_reason = "manual_key_start"
     episode_prepare_cancel_reason = ""
     episode_prepare_previous: Any | None = None
     episode_prepare_previous_retirement_started = False
-    episode_open_generation: int | None = None
     episode_open_recorder: Any | None = None
     episode_open_start_attempted = False
     episode_open_formal_started = False
     episode_open_start_reason = "manual_key_start"
     episode_open_cancel_reason = ""
-    episode_stop_generation: int | None = None
     episode_stop_recorder: Any | None = None
     episode_stop_frame_count = 0
     episode_stop_reason = ""
-    dataset_selection_generation: int | None = None
     dataset_selection_previous: Any | None = None
     dataset_selection_on_commit: Callable[[Mapping[str, Any]], None] | None = None
     dataset_selection_on_complete: Callable[[], None] | None = None
     dataset_selection_on_failure: Callable[[BaseException], None] | None = None
-    dataset_selection_cleanup_generation: int | None = None
     dataset_selection_cleanup_on_complete: Callable[[], None] | None = None
     dataset_selection_cleanup_kind = ""
     dataset_selection_cleanup_pending_recorder: Any | None = None
@@ -227,6 +222,12 @@ def build_episode_recording_runtime(
     dataset_selection_cleanup_last_error = ""
     finalize_failure_count = 0
     debug_episode_quarantined = False
+
+    def transition_generation(kind: str) -> int | None:
+        operation = collection_control_plane.active_operation
+        if operation is None or operation[1] != kind:
+            return None
+        return operation[0]
 
     def start_position_episode_debug(
         episode_index: int,
@@ -466,18 +467,18 @@ def build_episode_recording_runtime(
 
     def collection_transition_active() -> bool:
         return bool(
-            episode_prepare_generation is not None
-            or episode_open_generation is not None
-            or episode_stop_generation is not None
-            or dataset_selection_generation is not None
-            or dataset_selection_cleanup_generation is not None
+            collection_control_plane.active_operation is not None
             or dataset_selection_cleanup_pending_recorder is not None
             or dataset_selection_cleanup_active_recorder is not None
         )
 
     def recording_active() -> bool:
         refresh_runtime_views()
-        if episode_open_generation is not None or episode_stop_generation is not None:
+        active_operation = collection_control_plane.active_operation
+        if active_operation is not None and active_operation[1] in {
+            "open_episode",
+            "stop_episode",
+        }:
             # Open/stop owns the episode mutation.  Do not let the control loop
             # enqueue a sample or debug frame before that mutation has been
             # published back on the control thread.
@@ -655,7 +656,7 @@ def build_episode_recording_runtime(
 
 
     def start_recording(now: float, *, start_reason: str) -> bool:
-        nonlocal episode_open_generation, episode_open_recorder
+        nonlocal episode_open_recorder
         nonlocal episode_open_start_attempted, episode_open_formal_started
         nonlocal episode_open_start_reason, episode_open_cancel_reason
         nonlocal episode_start_failure_message, dataset_recorder
@@ -914,7 +915,7 @@ def build_episode_recording_runtime(
         episode_open_start_reason = str(start_reason)
         episode_open_cancel_reason = ""
         try:
-            episode_open_generation = collection_control_plane.submit(
+            open_generation = collection_control_plane.submit(
                 "open_episode",
                 open_episode_lifecycle,
                 discard_value=discard_open_completion,
@@ -951,7 +952,7 @@ def build_episode_recording_runtime(
         )
         _log(
             "Dataset",
-            f"episode open submitted generation={episode_open_generation} "
+            f"episode open submitted generation={open_generation} "
             f"reason={start_reason}",
             now=now,
         )
@@ -1044,7 +1045,6 @@ def build_episode_recording_runtime(
                 pass
 
     def submit_pending_dataset_selection_cleanup() -> bool:
-        nonlocal dataset_selection_cleanup_generation
         nonlocal dataset_selection_cleanup_pending_recorder
         nonlocal dataset_selection_cleanup_active_recorder
         nonlocal dataset_selection_cleanup_on_complete
@@ -1060,7 +1060,7 @@ def build_episode_recording_runtime(
             recorder.close()
 
         try:
-            generation = collection_control_plane.submit(
+            collection_control_plane.submit(
                 str(dataset_selection_cleanup_kind),
                 close_recorder,
             )
@@ -1085,7 +1085,6 @@ def build_episode_recording_runtime(
         dataset_selection_cleanup_pending_recorder = None
         dataset_selection_cleanup_active_recorder = recorder
         dataset_selection_cleanup_retry_at = 0.0
-        dataset_selection_cleanup_generation = generation
         return True
 
     def schedule_dataset_selection_cleanup(
@@ -1098,7 +1097,7 @@ def build_episode_recording_runtime(
         nonlocal dataset_selection_cleanup_on_complete
         nonlocal dataset_selection_cleanup_kind
         if (
-            dataset_selection_cleanup_generation is not None
+            collection_control_plane.active_operation is not None
             or dataset_selection_cleanup_pending_recorder is not None
             or dataset_selection_cleanup_active_recorder is not None
         ):
@@ -1133,7 +1132,7 @@ def build_episode_recording_runtime(
         control plane.
         """
 
-        nonlocal dataset_recorder, dataset_selection_generation
+        nonlocal dataset_recorder
         nonlocal dataset_selection_previous, dataset_selection_on_commit
         nonlocal dataset_selection_on_complete, dataset_selection_on_failure
         refresh_runtime_views()
@@ -1215,7 +1214,7 @@ def build_episode_recording_runtime(
         dataset_selection_on_commit = on_commit
         dataset_selection_on_complete = on_complete
         dataset_selection_on_failure = on_failure
-        dataset_selection_generation = collection_control_plane.submit(
+        selection_generation = collection_control_plane.submit(
             "prepare_selection",
             prepare_selection,
             discard_value=discard_prepared_dataset_selection,
@@ -1230,12 +1229,12 @@ def build_episode_recording_runtime(
         _log(
             "Dataset",
             "dataset selection preparation submitted "
-            f"generation={dataset_selection_generation}",
+            f"generation={selection_generation}",
         )
         return "pending"
 
     def schedule_recording_countdown(now: float, *, start_reason: str) -> bool:
-        nonlocal episode_prepare_generation, episode_prepare_reason
+        nonlocal episode_prepare_reason
         nonlocal episode_prepare_cancel_reason, episode_start_failure_message
         nonlocal episode_prepare_previous
         nonlocal episode_prepare_previous_retirement_started, dataset_recorder
@@ -1356,7 +1355,7 @@ def build_episode_recording_runtime(
         episode_prepare_previous_retirement_started = False
         episode_start_failure_message = None
         try:
-            episode_prepare_generation = collection_control_plane.submit(
+            prepare_generation = collection_control_plane.submit(
                 "prepare_writer",
                 prepare_writer,
                 discard_value=discard_prepared_dataset_recorder,
@@ -1399,7 +1398,7 @@ def build_episode_recording_runtime(
         )
         _log(
             "Dataset",
-            f"writer preparation submitted generation={episode_prepare_generation} "
+            f"writer preparation submitted generation={prepare_generation} "
             f"reason={start_reason}",
             now=now,
         )
@@ -1418,9 +1417,10 @@ def build_episode_recording_runtime(
         nonlocal episode_prepare_cancel_reason
         nonlocal episode_open_cancel_reason
         refresh_runtime_views()
-        if episode_prepare_generation is not None:
+        prepare_generation = transition_generation("prepare_writer")
+        if prepare_generation is not None:
             episode_prepare_cancel_reason = str(reason)
-            collection_control_plane.cancel(episode_prepare_generation)
+            collection_control_plane.cancel(prepare_generation)
             episode_start_warmup_ready_since = None
             episode_start_warmup_last_message = None
             message = f"数采 writer 预备正在取消并回收：{reason}。"
@@ -1436,14 +1436,15 @@ def build_episode_recording_runtime(
                 message=message,
             )
             return True
-        if episode_open_generation is not None:
+        open_generation = transition_generation("open_episode")
+        if open_generation is not None:
             # Countdown completion does not end start ownership: the detached
             # writer may still be blocked in start_episode().  Hold, safety, and
             # the operator stop button must be able to revoke that pending
             # admission before the completion is made sample-visible.
             if not episode_open_cancel_reason:
                 episode_open_cancel_reason = str(reason)
-            collection_control_plane.cancel(episode_open_generation)
+            collection_control_plane.cancel(open_generation)
             episode_start_warmup_ready_since = None
             episode_start_warmup_last_message = None
             message = f"数采 Episode 正在取消并安全回收：{reason}。"
@@ -1565,7 +1566,7 @@ def build_episode_recording_runtime(
         end_reason: str,
         summary: Mapping[str, object] | None = None,
     ) -> bool:
-        nonlocal episode_stop_generation, episode_stop_recorder
+        nonlocal episode_stop_recorder
         nonlocal episode_stop_frame_count, episode_stop_reason, dataset_recorder
         nonlocal episode_recording_paused, episode_recording_pause_reason
         refresh_runtime_views()
@@ -1686,7 +1687,7 @@ def build_episode_recording_runtime(
                     pass
 
         try:
-            episode_stop_generation = collection_control_plane.submit(
+            stop_generation = collection_control_plane.submit(
                 "stop_episode",
                 stop_episode_lifecycle,
                 discard_value=discard_stop_completion,
@@ -1751,7 +1752,7 @@ def build_episode_recording_runtime(
         )
         _log(
             "Dataset",
-            f"episode stop submitted generation={episode_stop_generation} "
+            f"episode stop submitted generation={stop_generation} "
             f"reason={end_reason}",
             now=now,
         )
@@ -2171,7 +2172,7 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_recorder, episode_prepare_generation
+        nonlocal dataset_recorder
         nonlocal episode_prepare_cancel_reason, episode_start_failure_message
         nonlocal episode_prepare_previous
         nonlocal episode_prepare_previous_retirement_started
@@ -2180,7 +2181,6 @@ def build_episode_recording_runtime(
             previous_recorder is not None
             and not episode_prepare_previous_retirement_started
         )
-        episode_prepare_generation = None
         episode_prepare_previous = None
         episode_prepare_previous_retirement_started = False
         if result.cancelled:
@@ -2263,14 +2263,13 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_recorder, dataset_selection_generation
+        nonlocal dataset_recorder
         nonlocal dataset_selection_previous, dataset_selection_on_commit
         nonlocal dataset_selection_on_complete, dataset_selection_on_failure
         previous_recorder = dataset_selection_previous
         commit_callback = dataset_selection_on_commit
         complete_callback = dataset_selection_on_complete
         failure_callback = dataset_selection_on_failure
-        dataset_selection_generation = None
         dataset_selection_previous = None
         dataset_selection_on_commit = None
         dataset_selection_on_complete = None
@@ -2404,7 +2403,6 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_selection_cleanup_generation
         nonlocal dataset_selection_cleanup_pending_recorder
         nonlocal dataset_selection_cleanup_active_recorder
         nonlocal dataset_selection_cleanup_on_complete
@@ -2415,7 +2413,6 @@ def build_episode_recording_runtime(
         completion_callback = dataset_selection_cleanup_on_complete
         cleanup_kind = dataset_selection_cleanup_kind
         cleanup_recorder = dataset_selection_cleanup_active_recorder
-        dataset_selection_cleanup_generation = None
         dataset_selection_cleanup_active_recorder = None
         if not result.succeeded:
             failure = result.error or result.discard_error or RuntimeError(
@@ -2473,7 +2470,7 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_recorder, episode_open_generation, episode_open_recorder
+        nonlocal dataset_recorder, episode_open_recorder
         nonlocal episode_open_start_attempted, episode_open_formal_started
         nonlocal episode_open_cancel_reason
         nonlocal episode_start_failure_message, episode_last_state
@@ -2482,7 +2479,6 @@ def build_episode_recording_runtime(
         opened_recorder = episode_open_recorder
         start_attempted = bool(episode_open_start_attempted)
         cancel_reason = str(episode_open_cancel_reason or "")
-        episode_open_generation = None
         episode_open_recorder = None
         episode_open_start_attempted = False
         episode_open_formal_started = False
@@ -2702,7 +2698,7 @@ def build_episode_recording_runtime(
         *,
         now: float,
     ) -> None:
-        nonlocal dataset_recorder, episode_stop_generation, episode_stop_recorder
+        nonlocal dataset_recorder, episode_stop_recorder
         nonlocal episode_stop_frame_count, episode_stop_reason, episode_last_state
         nonlocal last_collection_frequency_warning_active
         nonlocal episode_recording_paused, episode_recording_pause_reason
@@ -2711,7 +2707,6 @@ def build_episode_recording_runtime(
         stopped_recorder = episode_stop_recorder
         stopped_frame_count = int(episode_stop_frame_count)
         stopped_reason = str(episode_stop_reason or "control_plane_completion")
-        episode_stop_generation = None
         episode_stop_recorder = None
         episode_stop_frame_count = 0
         episode_stop_reason = ""
@@ -2835,28 +2830,22 @@ def build_episode_recording_runtime(
             and time.monotonic() >= dataset_selection_cleanup_retry_at
         ):
             submit_pending_dataset_selection_cleanup()
-        if dataset_selection_generation is not None:
-            result = collection_control_plane.poll(dataset_selection_generation)
+        active_operation = collection_control_plane.active_operation
+        if active_operation is not None:
+            generation, kind = active_operation
+            result = collection_control_plane.poll(generation)
             if result is not None:
-                publish_dataset_selection_completion(result, now=now)
-        elif dataset_selection_cleanup_generation is not None:
-            result = collection_control_plane.poll(
-                dataset_selection_cleanup_generation
-            )
-            if result is not None:
-                publish_dataset_selection_cleanup(result, now=now)
-        elif episode_prepare_generation is not None:
-            result = collection_control_plane.poll(episode_prepare_generation)
-            if result is not None:
-                publish_prepare_completion(result, now=now)
-        elif episode_open_generation is not None:
-            result = collection_control_plane.poll(episode_open_generation)
-            if result is not None:
-                publish_open_completion(result, now=now)
-        elif episode_stop_generation is not None:
-            result = collection_control_plane.poll(episode_stop_generation)
-            if result is not None:
-                publish_stop_completion(result, now=now)
+                publishers = {
+                    "prepare_selection": publish_dataset_selection_completion,
+                    "prepare_writer": publish_prepare_completion,
+                    "open_episode": publish_open_completion,
+                    "stop_episode": publish_stop_completion,
+                }
+                publish = publishers.get(
+                    kind,
+                    publish_dataset_selection_cleanup,
+                )
+                publish(result, now=now)
         if collection_transition_active():
             # The active worker exclusively owns its detached recorder.  In
             # particular, do not poll finalize/status state concurrently with
@@ -3044,14 +3033,16 @@ def build_episode_recording_runtime(
             # a successfully opened episode is stopped through the normal
             # drain/seal lifecycle rather than discarded as an unknown partial
             # mutation.
-            if episode_open_generation is not None:
+            open_generation = transition_generation("open_episode")
+            if open_generation is not None:
                 lifecycle_committed = wait_and_publish(
-                    episode_open_generation,
+                    open_generation,
                     publish_open_completion,
                 )
-            if lifecycle_committed and episode_stop_generation is not None:
+            stop_generation = transition_generation("stop_episode")
+            if lifecycle_committed and stop_generation is not None:
                 lifecycle_committed = wait_and_publish(
-                    episode_stop_generation,
+                    stop_generation,
                     publish_stop_completion,
                 )
             if lifecycle_committed and recording_active():
@@ -3060,9 +3051,10 @@ def build_episode_recording_runtime(
                     end_reason=str(end_reason),
                     summary=shutdown_summary,
                 )
-                if lifecycle_committed and episode_stop_generation is not None:
+                stop_generation = transition_generation("stop_episode")
+                if lifecycle_committed and stop_generation is not None:
                     lifecycle_committed = wait_and_publish(
-                        episode_stop_generation,
+                        stop_generation,
                         publish_stop_completion,
                     )
             # stop_episode() only hands the sample drain to the writer's
@@ -3098,8 +3090,11 @@ def build_episode_recording_runtime(
             # control plane one final attempt before its cancellation barrier.
             dataset_selection_cleanup_retry_at = 0.0
             submit_pending_dataset_selection_cleanup()
-        if dataset_selection_cleanup_generation is not None:
-            cleanup_generation = dataset_selection_cleanup_generation
+        cleanup_generation = transition_generation(dataset_selection_cleanup_kind)
+        if (
+            cleanup_generation is not None
+            and dataset_selection_cleanup_active_recorder is not None
+        ):
             if not wait_and_publish(
                 cleanup_generation,
                 publish_dataset_selection_cleanup,
@@ -3127,16 +3122,9 @@ def build_episode_recording_runtime(
                     f"{type(exc).__name__}: {exc}",
                     now=shutdown_now,
                 )
-        if dataset_selection_generation is not None:
-            collection_control_plane.cancel(dataset_selection_generation)
-        if dataset_selection_cleanup_generation is not None:
-            collection_control_plane.cancel(dataset_selection_cleanup_generation)
-        if episode_prepare_generation is not None:
-            collection_control_plane.cancel(episode_prepare_generation)
-        if episode_open_generation is not None:
-            collection_control_plane.cancel(episode_open_generation)
-        if episode_stop_generation is not None:
-            collection_control_plane.cancel(episode_stop_generation)
+        active_operation = collection_control_plane.active_operation
+        if active_operation is not None:
+            collection_control_plane.cancel(active_operation[0])
         # Prepare/open/stop detach their recorder before the worker mutates it.
         # Keep the outer shutdown path from reattaching or closing that private
         # lifecycle concurrently.  The bounded close barrier waits for its
