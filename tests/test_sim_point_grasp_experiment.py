@@ -123,9 +123,13 @@ def test_evaluation_task_randomizes_observable_scene_and_requires_contact() -> N
     assert config.wrist_rgb_camera_name == "front"
     assert config.randomizes_cube_spawn
     assert config.success_requires_bilateral_contact
+    assert config.post_contact_phase_enabled
+    assert config.post_contact_phase_activation_steps == 1
+    assert config.post_contact_phase_min_measured_close == 0.0
+    assert config.post_contact_phase_loss_grace_steps == 3
     assert config.object_size_m == (0.04, 0.04, 0.10)
     assert config.gripper_actuation_profile_name == (
-        "dmtac_bimanual_position_eg2_4b2_cad_20260818.v1"
+        "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
     )
     assert config.left_gripper_name == "left_eg2_4b2_cad"
     assert config.right_gripper_name == "right_eg2_4b2_cad"

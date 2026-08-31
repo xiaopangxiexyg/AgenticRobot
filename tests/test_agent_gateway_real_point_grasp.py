@@ -475,7 +475,7 @@ def test_graspnet_candidate_axes_are_mapped_to_dmtac_tool_tcp(tmp_path: Path) ->
     candidates = planner._rank(
         prediction,
         target_points=np.asarray(
-            [[0.0, -0.01, 0.5], [0.0, 0.02, 0.5]],
+            [[0.0, -0.01, 0.51], [0.0, 0.02, 0.53]],
             dtype=np.float32,
         ),
         target_camera=np.asarray([0.0, 0.005, 0.5]),
@@ -495,9 +495,10 @@ def test_graspnet_candidate_axes_are_mapped_to_dmtac_tool_tcp(tmp_path: Path) ->
     np.testing.assert_allclose(camera[:3, 2], [1.0, 0.0, 0.0])
     # depth=0.03 and the official 0.06 m finger length place tool_tcp at
     # the model palm/finger boundary, 0.03 m behind the grasp seed.
-    # Robust target-cloud extents also center the grasp on the opening axis.
-    np.testing.assert_allclose(camera[:3, 3], [-0.03, 0.005, 0.5])
-    np.testing.assert_allclose(base[:3, 3], [0.07, 0.205, 0.8])
+    # Robust target-cloud extents also center the grasp on both axes
+    # perpendicular to approach (opening y and finger-height z).
+    np.testing.assert_allclose(camera[:3, 3], [-0.03, 0.005, 0.52])
+    np.testing.assert_allclose(base[:3, 3], [0.07, 0.205, 0.82])
 
 
 def test_graspnet_point_conditioned_workspace_crops_unrelated_scene_points() -> None:

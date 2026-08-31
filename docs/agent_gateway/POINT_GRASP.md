@@ -238,13 +238,18 @@ assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_ca
 接近、+Y 开口、+Z 高度轴则分别映射到 DMTAC `tool_tcp` 的 +Z 接近、+X 开口、+Y 高度轴。
 GraspNet 输出第 3 列的 grasp depth 不能丢弃：实现按官方 0.060 m 指长，把 model seed 沿
 `depth - 0.060` 平移到 DMTAC 掌/指边界；同时使用 SAM2 目标点云沿开口轴的 5%/95% 分位
-中点做最多 0.020 m 的居中校正。两项语义均纳入 planner semantic content hash。
+中点做最多 0.020 m 的居中校正，并沿指高轴做最多 0.030 m 的同类居中校正。三项语义均纳入
+planner semantic content hash。
 可见点云碰撞门禁使用 DMTAC M 的指体/掌体近似包络；落入该实体包络的采样点不超过 200 个时
 判为通过，达到 201 个时拒绝。该阈值属于部署实现语义并纳入 planner semantic content hash。
 
 `experiments/sim_point_grasp` 的版本化 tall-box 场景合同同样强制加载上述详细 CAD URDF，
-并使用六关节 mimic 驱动配置 `dmtac_bimanual_position_eg2_4b2_cad_20260818.v1`；不得回退到
+并使用经过转动关节单位换算的六关节 mimic 驱动配置
+`dmtac_bimanual_position_eg2_4b2_cad_20260829.v2`；不得回退到
 `rm65_dual_arm_wrist_cameras_v3_head_camera.urdf` 中的简化平行夹爪代理。
+旧 CAD profile 把直线夹爪的 `1200 N/m`、`20 N` 直接解释为每个转动 mimic 关节的
+`1200 N·m/rad`、`20 N·m`，会把轻物体弹飞；v2 使用接触消融后受限的转动参数
+`kp=5`、`kv=0.1`、每关节 force limit `0.5`，并保留原始物体质量与摩擦。
 该实验另用哈希锁定的 `rm65_right_DMTAC_M_4b2_cad_tool_tcp.json`，保留标定的 0.14 m 深度，
 并把 TCP +X 旋转到 CAD 的真实张合方向、补偿约 24.5 mm 的 CAD 横向中心偏置。
 

@@ -144,7 +144,12 @@ def test_identified_dmtac_profile_freezes_bilateral_stage_semantics() -> None:
 def test_cad_dmtac_profile_preserves_official_six_joint_open_close_semantics() -> None:
     profile = cad_bimanual_dmtac_gripper_profile()
 
-    assert profile.name == "dmtac_bimanual_position_eg2_4b2_cad_20260818.v1"
+    assert profile.name == "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
+    assert profile.position_kp_n_m == pytest.approx(5.0)
+    assert profile.position_kv_n_s_m == pytest.approx(0.1)
+    assert profile.force_limit_n == pytest.approx(0.5)
+    assert profile.joint_damping_n_s_m == pytest.approx(0.02)
+    assert profile.joint_frictionloss_n == pytest.approx(0.005)
     for name, side in (
         ("left_eg2_4b2_cad", "left"),
         ("right_eg2_4b2_cad", "right"),
