@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Any
 
@@ -42,7 +42,16 @@ from robot_motion.rm65.grasp_reachability import (
 from robot_motion.rm65.ik import RM65SingleArmIKConfig, build_rm65_single_arm_ik_solver
 from robot_motion.rm65.obstacle_collision import RM65ObstacleCollisionOracle
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
-from sim.mujoco.control.desk_tcp_position import DeskTcpPositionControl
+from robot_motion.shadow_execution import (
+    AuthoritativeRobotStateSnapshot,
+    RegisteredShadowJointTrajectory,
+    ShadowSimulationReceipt,
+    ShadowSimulationStatus,
+)
+from sim.mujoco.control.desk_tcp_position import (
+    DeskTcpPositionControl,
+    DeskTcpPositionControlConfig,
+)
 from sim.sim_real_tests.rm65.random_grasp_pose_reachability import (
     DEFAULT_REFERENCE_FRAME_ID,
     DEFAULT_REFERENCE_FRAME_SPEC_HASH,
@@ -65,6 +74,158 @@ DEFAULT_IK_TARGET_UNMET_RETRY_LIMIT = 2
 OBSTACLE_SCENE_FRAME_ID = "rm65_scene_world"
 OBSTACLE_SCENE_FRAME_SPEC_HASH = "mujoco-desk-collision-world-v1"
 FINAL_OBSTACLE_EDGE_RESOLUTION_RAD = float(np.deg2rad(0.1))
+
+
+class ShadowMujocoInitializationError(RuntimeError):
+    """Typed fail-closed rejection while cold-initializing the shadow scene."""
+
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        self.reason_code = str(reason_code)
+        self.details = dict(details or {})
+        super().__init__(self.reason_code)
+
+
+def shadow_control_initialization_observation(
+    control: DeskTcpPositionControl,
+    snapshot: AuthoritativeRobotStateSnapshot,
+) -> dict[str, object]:
+    """Observe whether a cold MuJoCo control chain matches one real state cut."""
+
+    measured = control.rig.measured_qpos_by_side()
+    accepted = control.rig.accepted_qcmd_by_side()
+    qpos_error = {
+        side: float(np.max(np.abs(measured[side] - snapshot.qpos_by_side[side])))
+        for side in SIDES
+    }
+    accepted_error = {
+        side: float(np.max(np.abs(accepted[side] - snapshot.qpos_by_side[side])))
+        for side in SIDES
+    }
+    profile = control.rig.config.gripper_actuation_profile
+    if profile is None:
+        raise ShadowMujocoInitializationError("gripper_model_unavailable")
+    gripper_by_side = {
+        side: float(control.scene.get_gripper_close(name))
+        for name, side in profile.side_by_gripper.items()
+    }
+    if set(gripper_by_side) != set(SIDES):
+        raise ShadowMujocoInitializationError(
+            "gripper_side_mapping_invalid",
+            details={"mapped_sides": tuple(sorted(gripper_by_side))},
+        )
+    gripper_error = {
+        side: abs(gripper_by_side[side] - snapshot.gripper_close_by_side[side])
+        for side in SIDES
+    }
+    projector = control.scene.collision_projector()
+    if projector is None:
+        raise ShadowMujocoInitializationError("mujoco_collision_projector_unavailable")
+    collision = projector.check_qpos(
+        control.scene.data,
+        control.scene.kinematic_controlled_qpos(),
+    )
+    maximum_qvel = float(np.max(np.abs(np.asarray(control.scene.data.qvel))))
+    return {
+        "snapshot_hash": snapshot.semantic_content_hash,
+        "identity_hash": snapshot.identity.semantic_content_hash,
+        "qpos_max_abs_error_rad_by_side": qpos_error,
+        "accepted_qcmd_max_abs_error_rad_by_side": accepted_error,
+        "gripper_close_abs_error_by_side": gripper_error,
+        "maximum_qvel_rad_s": maximum_qvel,
+        "collision_safe": bool(collision.safe),
+        "collision_check": collision.to_dict(),
+        "exact_state_match": bool(
+            max(*qpos_error.values(), *accepted_error.values()) <= 1e-12
+            and max(gripper_error.values()) <= 1e-12
+            and maximum_qvel <= 1e-12
+        ),
+    }
+
+
+def build_shadow_initialized_control(
+    snapshot: AuthoritativeRobotStateSnapshot,
+    *,
+    config: DeskTcpPositionControlConfig | None = None,
+) -> DeskTcpPositionControl:
+    """Cold-start MuJoCo from an authoritative real arm/gripper state.
+
+    The routine intentionally requires the deterministic non-realtime owner.
+    It first seeds both arms through the public control configuration, stops
+    the newly created rig, installs the measured gripper geometry, zeroes all
+    velocities, rechecks collision, and restarts every planner/executor from
+    that same state.  Any mismatch closes the scene and raises a typed error.
+    """
+
+    if not isinstance(snapshot, AuthoritativeRobotStateSnapshot):
+        raise TypeError("snapshot must be AuthoritativeRobotStateSnapshot.")
+    base = config or DeskTcpPositionControlConfig()
+    if base.realtime_worker:
+        raise ShadowMujocoInitializationError("realtime_shadow_initialization_forbidden")
+    cfg = replace(
+        base,
+        left_home_qpos=tuple(float(value) for value in snapshot.qpos_by_side["left"]),
+        right_home_qpos=tuple(float(value) for value in snapshot.qpos_by_side["right"]),
+    )
+    try:
+        control = DeskTcpPositionControl.build(cfg)
+    except RuntimeError as exc:
+        if "simulation home qpos is collision-unsafe" in str(exc):
+            raise ShadowMujocoInitializationError(
+                "conservative_open_gripper_initial_collision_blocked",
+                details={"backend_error": str(exc)},
+            ) from exc
+        raise
+    try:
+        # No realtime worker exists, so this is an atomic cold-reset boundary.
+        # Restarting the rig rebases the arm planners and gripper executors to
+        # the exact state installed below instead of retaining default targets.
+        control.rig.close()
+        control.scene.set_qpos_by_side(snapshot.qpos_by_side)
+        profile = control.rig.config.gripper_actuation_profile
+        if profile is None:
+            raise ShadowMujocoInitializationError("gripper_model_unavailable")
+        for name, side in profile.side_by_gripper.items():
+            control.scene.set_gripper_close(
+                name,
+                float(snapshot.gripper_close_by_side[side]),
+            )
+        control.scene.data.qvel[:] = 0.0
+        control.scene.forward()
+        projector = control.scene.collision_projector()
+        if projector is None:
+            raise ShadowMujocoInitializationError(
+                "mujoco_collision_projector_unavailable"
+            )
+        collision = projector.check_qpos(
+            control.scene.data,
+            control.scene.kinematic_controlled_qpos(),
+        )
+        if not collision.safe:
+            raise ShadowMujocoInitializationError(
+                "measured_initial_state_collision_blocked",
+                details={"collision_check": collision.to_dict()},
+            )
+        control.rig.start()
+        observation = shadow_control_initialization_observation(control, snapshot)
+        if not observation["collision_safe"]:
+            raise ShadowMujocoInitializationError(
+                "measured_initial_state_collision_blocked",
+                details=observation,
+            )
+        if not observation["exact_state_match"]:
+            raise ShadowMujocoInitializationError(
+                "shadow_initial_state_mismatch",
+                details=observation,
+            )
+        return control
+    except BaseException:
+        control.close()
+        raise
 
 
 class _MujocoFclObstacleOracle:
@@ -372,6 +533,85 @@ class GraspMotionPlayback:
             "frame_binding": self.frame_binding.to_payload(),
             "summary": _plain(self.summary),
         }
+
+
+def build_shadow_simulation_receipt_from_playback(
+    *,
+    playback: GraspMotionPlayback,
+    trajectory: RegisteredShadowJointTrajectory,
+    evidence_refs: Sequence[str],
+) -> ShadowSimulationReceipt:
+    """Translate current MuJoCo playback into fail-closed replay evidence.
+
+    The existing arbitrary-grasp runner re-solves Cartesian IK while following
+    FK-derived waypoints.  Therefore even a visually completed playback is not
+    evidence that the exact registered qpos trajectory was executed.  Such a
+    run is reported as ``execution_uncertified`` until a lower-owned exact-qpos
+    simulation executor and terminal HOLD receipt are present.
+    """
+
+    if not isinstance(playback, GraspMotionPlayback):
+        raise TypeError("playback must be GraspMotionPlayback.")
+    if not isinstance(trajectory, RegisteredShadowJointTrajectory):
+        raise TypeError("trajectory must be RegisteredShadowJointTrajectory.")
+    status_by_motion = {
+        MOTION_STATUS_ENDPOINT_REJECTED: ShadowSimulationStatus.ENDPOINT_REJECTED,
+        MOTION_STATUS_PATH_START_BLOCKED: (
+            ShadowSimulationStatus.PATH_START_COLLISION_BLOCKED
+        ),
+        MOTION_STATUS_PATH_TARGET_BLOCKED: (
+            ShadowSimulationStatus.PATH_TARGET_COLLISION_BLOCKED
+        ),
+        MOTION_STATUS_PATH_COLLISION_BLOCKED: (
+            ShadowSimulationStatus.PATH_COLLISION_BLOCKED
+        ),
+        MOTION_STATUS_PATH_SEARCH_EXHAUSTED: (
+            ShadowSimulationStatus.PATH_SEARCH_EXHAUSTED
+        ),
+        MOTION_STATUS_PATH_PLANNER_ERROR: ShadowSimulationStatus.PATH_PLANNER_ERROR,
+        MOTION_STATUS_IK_TARGET_UNMET: ShadowSimulationStatus.IK_TARGET_UNMET,
+        MOTION_STATUS_TRACKING_INCOMPLETE: ShadowSimulationStatus.TRACKING_INCOMPLETE,
+    }
+    # GraspMotionPlayback has neither a typed exact-qpos lower receipt nor a
+    # typed terminal HOLD receipt.  Free-form summary flags cannot upgrade it.
+    exact_confirmed = False
+    terminal_hold_confirmed = False
+    model_identity_confirmed = False
+    if playback.motion_status == MOTION_STATUS_COMPLETED:
+        status = (
+            ShadowSimulationStatus.COMPLETED
+            if exact_confirmed and terminal_hold_confirmed
+            else ShadowSimulationStatus.EXECUTION_UNCERTIFIED
+        )
+    else:
+        try:
+            status = status_by_motion[playback.motion_status]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported playback motion_status: {playback.motion_status!r}"
+            ) from exc
+    clearance = None
+    path_preflight = dict(playback.summary.get("path_preflight", {}))
+    raw_clearance = path_preflight.get("minimum_distance_m")
+    if raw_clearance is not None:
+        clearance = float(raw_clearance)
+    return ShadowSimulationReceipt(
+        trajectory_hash=trajectory.semantic_content_hash,
+        initial_snapshot_hash=trajectory.initial_snapshot.semantic_content_hash,
+        identity_hash=trajectory.initial_snapshot.identity.semantic_content_hash,
+        scene_hash=trajectory.scene_hash,
+        status=status,
+        executed_point_count=(
+            len(trajectory.points)
+            if exact_confirmed and playback.frame_count == len(trajectory.points)
+            else 0
+        ),
+        terminal_hold_confirmed=terminal_hold_confirmed,
+        exact_planned_qpos_execution_confirmed=exact_confirmed,
+        model_identity_confirmed=model_identity_confirmed,
+        evidence_refs=tuple(evidence_refs),
+        minimum_clearance_m=clearance,
+    )
 
 
 @dataclass(frozen=True)
@@ -1804,10 +2044,13 @@ __all__ = [
     "GraspMotionPlayback",
     "GraspMotionTarget",
     "JointFkReferencePlan",
+    "ShadowMujocoInitializationError",
     "ToolTcpFrameBinding",
     "build_collision_checked_joint_fk_reference_plan",
     "build_collision_checked_multiwaypoint_joint_fk_reference_plan",
     "build_obstacle_collision_oracle",
+    "build_shadow_initialized_control",
+    "build_shadow_simulation_receipt_from_playback",
     "build_smooth_se3_trajectory",
     "classify_motion_status",
     "derive_tool_tcp_frame_binding",
@@ -1820,4 +2063,5 @@ __all__ = [
     "required_motion_duration_sec",
     "revalidate_obstacle_path",
     "select_random_reachable_demo_target",
+    "shadow_control_initialization_observation",
 ]

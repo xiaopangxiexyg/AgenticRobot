@@ -17,6 +17,18 @@ from robot_motion.rm65.grasp_reachability import (
     GraspReachabilityReceipt,
     GraspReachabilityStatus,
 )
+from robot_motion.shadow_execution import (
+    AuthoritativeRobotStateSnapshot,
+    RegisteredJointTrajectoryPoint,
+    RegisteredShadowJointTrajectory,
+    ShadowExecutionIdentity,
+    ShadowSimulationStatus,
+)
+from sim.mujoco.control.desk_tcp_position import (
+    DEFAULT_INSPIRE_V3_DUAL_ARM_URDF,
+    DEFAULT_SIM_HOME_QPOS_BY_SIDE,
+    DeskTcpPositionControlConfig,
+)
 from sim.sim_real_tests.mujoco import arbitrary_grasp_pose_motion as motion
 from sim.sim_real_tests.mujoco import (
     continuous_random_grasp_pose_motion as random_motion,
@@ -27,12 +39,15 @@ from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
     GraspMotionPlayback,
     GraspMotionTarget,
     ToolTcpFrameBinding,
+    build_shadow_initialized_control,
+    build_shadow_simulation_receipt_from_playback,
     build_smooth_se3_trajectory,
     execute_grasp_motion,
     pose_from_xyz_quat_xyzw,
     pose_from_xyz_rpy_deg,
     quintic_progress,
     required_motion_duration_sec,
+    shadow_control_initialization_observation,
 )
 from sim.sim_real_tests.mujoco.continuous_random_grasp_pose_motion import (
     ContinuousRandomGraspPoseConfig,
@@ -52,6 +67,87 @@ from sim.sim_real_tests.rm65 import (
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def _shadow_identity() -> ShadowExecutionIdentity:
+    return ShadowExecutionIdentity(
+        station_revision="canonical-station:test",
+        reference_frame_id="canonical_station",
+        reference_frame_spec_hash="frame-spec:test",
+        frame_graph_hash="frame-graph:test",
+        tool_profile_hash_by_side={"left": "tool:left", "right": "tool:right"},
+        robot_model_hash="robot-model:test",
+        collision_model_hash="collision-model:test",
+        joint_layout_hash="joint-layout:test",
+        gripper_model_hash="gripper-model:test",
+    )
+
+
+def _shadow_home_snapshot() -> AuthoritativeRobotStateSnapshot:
+    return AuthoritativeRobotStateSnapshot(
+        qpos_by_side=DEFAULT_SIM_HOME_QPOS_BY_SIDE,
+        gripper_close_by_side={"left": 0.2, "right": 0.3},
+        arm_measured_at=1.0,
+        gripper_measured_at_by_side={"left": 1.0, "right": 1.0},
+        available_at=1.01,
+        arm_evidence_refs=("arm:test",),
+        gripper_evidence_refs=("gripper:left", "gripper:right"),
+        identity=_shadow_identity(),
+    )
+
+
+def _registered_shadow_trajectory() -> RegisteredShadowJointTrajectory:
+    snapshot = _shadow_home_snapshot()
+    target = {side: snapshot.qpos_by_side[side].copy() for side in ("left", "right")}
+    target["left"][0] += 0.01
+    return RegisteredShadowJointTrajectory(
+        trajectory_id="trajectory:test",
+        created_at=2.0,
+        initial_snapshot=snapshot,
+        scene_hash="scene:test",
+        target_hash="target:test",
+        planner_config_hash="planner:test",
+        moving_sides=("left",),
+        points=(
+            RegisteredJointTrajectoryPoint(
+                time_from_start_sec=0.0,
+                qpos_by_side=snapshot.qpos_by_side,
+            ),
+            RegisteredJointTrajectoryPoint(
+                time_from_start_sec=0.1,
+                qpos_by_side=target,
+            ),
+        ),
+    )
+
+
+@pytest.mark.skipif(
+    not DEFAULT_INSPIRE_V3_DUAL_ARM_URDF.is_file(),
+    reason="local canonical Inspire-v3 URDF asset is unavailable",
+)
+def test_shadow_control_cold_starts_from_exact_arm_and_gripper_state() -> None:
+    snapshot = _shadow_home_snapshot()
+    control = build_shadow_initialized_control(snapshot)
+    try:
+        observation = shadow_control_initialization_observation(control, snapshot)
+        assert observation["exact_state_match"] is True
+        assert observation["collision_safe"] is True
+        assert observation["maximum_qvel_rad_s"] == pytest.approx(0.0, abs=1e-12)
+        assert max(observation["qpos_max_abs_error_rad_by_side"].values()) <= 1e-12
+        assert max(observation["gripper_close_abs_error_by_side"].values()) <= 1e-12
+    finally:
+        control.close()
+
+
+def test_shadow_control_rejects_realtime_initialization_before_build() -> None:
+    with pytest.raises(
+        motion.ShadowMujocoInitializationError,
+        match="realtime_shadow_initialization_forbidden",
+    ):
+        build_shadow_initialized_control(
+            _shadow_home_snapshot(),
+            config=DeskTcpPositionControlConfig(realtime_worker=True),
+        )
 
 
 def test_pose_builders_share_explicit_base_from_dmtac_tcp_semantics() -> None:
@@ -565,6 +661,56 @@ def _random_attempt_playback(
         actual_qpos_by_frame=frames,
         summary=summary or {"motion_emitted": False},
     )
+
+
+def test_current_cartesian_re_ik_playback_cannot_claim_exact_replay_evidence() -> None:
+    trajectory = _registered_shadow_trajectory()
+    playback = _random_attempt_playback(
+        reachability_status=GraspReachabilityStatus.REACHABLE,
+        motion_status=motion.MOTION_STATUS_COMPLETED,
+        frame_count=len(trajectory.points),
+        summary={
+            "terminal_hold_sec": 0.5,
+            "terminal_hold_confirmed": True,
+            "trajectory": {
+                "execution_contract": {
+                    # Free-form summary flags cannot upgrade the current
+                    # playback into typed lower-owned evidence.
+                    "planner_execution_certified": True,
+                    "exact_planned_qpos_dispatch": True,
+                }
+            },
+        },
+    )
+
+    receipt = build_shadow_simulation_receipt_from_playback(
+        playback=playback,
+        trajectory=trajectory,
+        evidence_refs=("mujoco-current-run:test",),
+    )
+
+    assert receipt.status is ShadowSimulationStatus.EXECUTION_UNCERTIFIED
+    assert receipt.exact_planned_qpos_execution_confirmed is False
+    assert receipt.model_identity_confirmed is False
+    assert receipt.terminal_hold_confirmed is False
+    assert receipt.executed_point_count == 0
+
+
+def test_path_collision_playback_keeps_distinct_shadow_failure_status() -> None:
+    trajectory = _registered_shadow_trajectory()
+    playback = _random_attempt_playback(
+        reachability_status=GraspReachabilityStatus.REACHABLE,
+        motion_status=motion.MOTION_STATUS_PATH_COLLISION_BLOCKED,
+    )
+
+    receipt = build_shadow_simulation_receipt_from_playback(
+        playback=playback,
+        trajectory=trajectory,
+        evidence_refs=("mujoco-path-collision:test",),
+    )
+
+    assert receipt.status is ShadowSimulationStatus.PATH_COLLISION_BLOCKED
+    assert receipt.executed_point_count == 0
 
 
 def test_random_attempt_classification_never_calls_ik_exhaustion_unreachable() -> None:

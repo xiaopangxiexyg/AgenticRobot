@@ -276,6 +276,57 @@ bash scripts/run_pytest.sh \
   sim/sim_real_tests/tests/test_mujoco_arbitrary_grasp_pose_motion.py -q
 ```
 
+## Simulation-first real shadow trajectory boundary
+
+The real integration path is intentionally split into evidence-producing
+stages. It currently performs no real motion and is not published as a real
+Skill:
+
+1. the exclusive lower owner supplies one fresh dual-arm hardware qpos cut;
+2. independently measured left/right gripper state and evidence complete the
+   collision-relevant initial state;
+3. the snapshot binds the canonical station frame, tool profiles, frame graph,
+   robot, joint layout, gripper, and collision-model hashes;
+4. deterministic MuJoCo is cold-started from that full snapshot with zero
+   velocity, rebased arm planners, rebased gripper executors, and a fresh
+   collision check;
+5. one registered joint trajectory binds the exact initial snapshot, obstacle
+   scene, target, planner configuration, moving side, and every timed dual-arm
+   qpos point;
+6. only an exact-qpos simulation execution plus a terminal HOLD receipt can
+   pass replay preflight; a new hardware cut must still match identity, scene,
+   freshness, arm position, and gripper position thresholds.
+
+The preflight result always records `preflight_only=true` and
+`real_motion_authorized=false`. It is not a dispatch permit. Assumed or
+disconnected fallback gripper state is rejected because the hand geometry can
+change both initial collision and path clearance. Endpoint, start collision,
+target collision, path collision, search exhaustion, planner error, IK failure,
+and incomplete tracking remain distinct simulation statuses.
+
+The current Cartesian waypoint runner cannot yet satisfy stage 6: it re-solves
+IK after FK waypoint generation and has no lower terminal-HOLD receipt. A
+visually completed run is therefore translated to `execution_uncertified`, not
+`completed`, and real replay preflight rejects it. This is the principal reason
+the workflow has not been released as a real Skill. The current public MuJoCo
+builder also checks the requested arm state once with its conservative default
+open gripper before installing measured gripper geometry; it then performs a
+second exact-state collision check. A default-open collision returns
+`conservative_open_gripper_initial_collision_blocked` rather than silently
+continuing.
+
+Run the no-device contracts and the MuJoCo cold-start check with explicit
+checkout, Python 3.10 environment, and local asset root:
+
+```bash
+cd /home/zc/HandMotion/Developing/AgenticRobot
+DEXTELEOP_PYTHON=/home/zc/anaconda3/envs/dexteleop310/bin/python \
+DEXTELEOP_ASSET_ROOT=/home/zc/HandMotion/Developing/AgenticRobot/assets \
+bash scripts/run_pytest.sh -q \
+  tests/test_real_shadow_grasp_trajectory.py \
+  sim/sim_real_tests/tests/test_mujoco_arbitrary_grasp_pose_motion.py
+```
+
 ## Adding scenarios
 
 1. Put reusable scenario code under `rm65/` or the relevant backend package.
