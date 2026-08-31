@@ -2,7 +2,8 @@
 
 MuJoCo 是 canonical task-physics backend；运行命令见 [sim README](./README.md)。
 历史 SAPIEN operator preview 入口已退役，体系边界见
-[`sim/README.md`](../../sim/README.md)。
+[`sim/README.md`](../../sim/README.md)，退役原因和替代所有者见
+[退役记录](../legacy/reports/sapien_virtual_teleop_retirement_20260831.md)。
 
 以下命令按原样运行时均为 R1，不连接真实 RM65。若额外加入 real-arm read 选项，风险至少
 上升为 H1，必须回到该入口的硬件说明核对，不能继续沿用本页的 R1 判断。
