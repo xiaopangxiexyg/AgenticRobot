@@ -92,6 +92,7 @@ class EpisodeTraceLegacyFinalizeReport:
     message: str
     native_stream_manifest_hash: str | None = None
     native_stream_seal_error: str = ""
+    native_stream_retry_pending: bool = False
 
 
 class NativeStreamEpisodeCapture(Protocol):
@@ -592,13 +593,21 @@ class EpisodeTraceRecorderSink:
                 "External native stream receipts were supplied without a "
                 "pending post-finalize capture."
             )
+        native_stream_retry_pending = False
+        reported_native_stream_seal_error = released.native_stream_seal_error
         if released.native_stream_pending_finalize:
             with self._lock:
-                pending_capture = (
-                    self._native_pending_finalize_by_episode_index.pop(
-                        prepared.legacy_episode_index,
-                        None,
+                if (
+                    self._released_by_episode_index.get(
+                        prepared.legacy_episode_index
                     )
+                    != released
+                ):
+                    raise ValueError(
+                        "Released ControlTrace episode is not current for this index."
+                    )
+                pending_capture = self._native_pending_finalize_by_episode_index.get(
+                    prepared.legacy_episode_index
                 )
             native_stream_manifest = None
             native_stream_seal_error = ""
@@ -619,17 +628,37 @@ class EpisodeTraceRecorderSink:
                     )
                 except BaseException as exc:
                     native_stream_seal_error = f"{type(exc).__name__}: {exc}"
-                    pending_capture.close_unsealed()
-            released = replace(
-                released,
-                native_stream_manifest=native_stream_manifest,
-                native_stream_seal_error=native_stream_seal_error,
-                native_stream_pending_finalize=False,
-            )
-            with self._lock:
-                self._released_by_episode_index[
-                    prepared.legacy_episode_index
-                ] = released
+                    # The legacy episode is already durable, but the native
+                    # capture still owns a frozen, unsealed transaction.  Keep
+                    # that exact capture so the caller can retry with corrected
+                    # or newly available external artifact receipts.
+                    native_stream_retry_pending = True
+            reported_native_stream_seal_error = native_stream_seal_error
+            if not native_stream_retry_pending:
+                released = replace(
+                    released,
+                    native_stream_manifest=native_stream_manifest,
+                    native_stream_seal_error=native_stream_seal_error,
+                    native_stream_pending_finalize=False,
+                )
+                with self._lock:
+                    if pending_capture is not None:
+                        current_capture = (
+                            self._native_pending_finalize_by_episode_index.get(
+                                prepared.legacy_episode_index
+                            )
+                        )
+                        if current_capture is not pending_capture:
+                            raise RuntimeError(
+                                "Post-finalize native stream capture ownership changed."
+                            )
+                        self._native_pending_finalize_by_episode_index.pop(
+                            prepared.legacy_episode_index,
+                            None,
+                        )
+                    self._released_by_episode_index[
+                        prepared.legacy_episode_index
+                    ] = released
         with self._lock:
             if self._released_by_episode_index.get(prepared.legacy_episode_index) != released:
                 raise ValueError("Released ControlTrace episode is not current for this index.")
@@ -672,6 +701,7 @@ class EpisodeTraceRecorderSink:
                     "native_streams_not_sealed:"
                     + (
                         released.native_stream_seal_error
+                        or reported_native_stream_seal_error
                         or "missing_native_stream_manifest"
                     )
                 )
@@ -695,7 +725,11 @@ class EpisodeTraceRecorderSink:
                         except BaseException as exc:  # legacy finalize remains successful
                             commit_status = "publication_failed"
                             message = f"capture_commit_publish:{type(exc).__name__}: {exc}"
-            self._released_by_episode_index.pop(prepared.legacy_episode_index, None)
+            if not native_stream_retry_pending:
+                self._released_by_episode_index.pop(
+                    prepared.legacy_episode_index,
+                    None,
+                )
         return EpisodeTraceLegacyFinalizeReport(
             episode_uuid=prepared.episode_uuid,
             legacy_episode_index=prepared.legacy_episode_index,
@@ -711,7 +745,8 @@ class EpisodeTraceRecorderSink:
                 if released.native_stream_manifest is None
                 else released.native_stream_manifest.semantic_content_hash
             ),
-            native_stream_seal_error=released.native_stream_seal_error,
+            native_stream_seal_error=reported_native_stream_seal_error,
+            native_stream_retry_pending=native_stream_retry_pending,
         )
 
     def legacy_finalize_failed(
