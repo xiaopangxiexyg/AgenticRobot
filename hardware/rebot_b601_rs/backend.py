@@ -4,8 +4,10 @@ This module is deliberately a thin adapter around the pinned
 ``reBotArm_control_py``/``motorbridge`` stack.  It owns neither kinematics nor
 the haptic law; those remain in :mod:`robot_motion.rebot_b601_rs`.  Importing
 the module is side-effect free.  A controller is opened only by an explicit
-call to :meth:`B601RSBackend.connect`, and every command path is disabled
-unless the caller constructed the backend with ``allow_motion=True``.
+call to :meth:`B601RSBackend.connect`, and every motor-control command path is
+disabled unless the caller constructed the backend with ``allow_motion=True``.
+Active-report configuration has a separate, explicit authorization and never
+enables a motor or sends a motion reference.
 
 The default feedback path intentionally uses the vendor cache as a *poll
 observation*.  An active caller may opt in to an explicit vendor feedback
@@ -66,6 +68,10 @@ class B601HardwareDependencyError(B601HardwareError):
 
 class B601MotionAuthorizationError(B601HardwareError):
     """A command was attempted without an explicit motion authorization."""
+
+
+class B601ActiveReportAuthorizationError(B601HardwareError):
+    """Active telemetry was attempted without its separate authorization."""
 
 
 def _finite_float(value: object, *, name: str) -> float:
@@ -208,6 +214,7 @@ class B601RSBackendConfig:
     feedback_timeout_sec: float = B601_RS_DEFAULT_FEEDBACK_TIMEOUT_SEC
     watchdog_timeout_sec: float = B601_RS_DEFAULT_WATCHDOG_TIMEOUT_SEC
     allow_motion: bool = False
+    allow_active_reporting: bool = False
     position_limits_rad: tuple[tuple[float, float], ...] | None = None
     source_config: str | None = None
 
@@ -239,6 +246,8 @@ class B601RSBackendConfig:
         )
         if not isinstance(self.allow_motion, bool):
             raise TypeError("allow_motion must be a bool")
+        if not isinstance(self.allow_active_reporting, bool):
+            raise TypeError("allow_active_reporting must be a bool")
         if self.position_limits_rad is not None:
             try:
                 limits = tuple(
@@ -265,6 +274,7 @@ class B601RSBackendConfig:
         path: str | Path,
         *,
         allow_motion: bool = False,
+        allow_active_reporting: bool = False,
         position_limits_rad: tuple[tuple[float, float], ...] | None = None,
     ) -> "B601RSBackendConfig":
         """Load the explicit RS YAML without importing or connecting hardware."""
@@ -282,6 +292,7 @@ class B601RSBackendConfig:
         return cls.from_mapping(
             payload,
             allow_motion=allow_motion,
+            allow_active_reporting=allow_active_reporting,
             position_limits_rad=position_limits_rad,
             source_config=str(config_path),
         )
@@ -292,6 +303,7 @@ class B601RSBackendConfig:
         payload: Mapping[str, object],
         *,
         allow_motion: bool = False,
+        allow_active_reporting: bool = False,
         position_limits_rad: tuple[tuple[float, float], ...] | None = None,
         source_config: str | None = None,
     ) -> "B601RSBackendConfig":
@@ -358,6 +370,7 @@ class B601RSBackendConfig:
             rate_hz=_positive_float(data.get("rate", B601_RS_DEFAULT_RATE_HZ), name="rate"),
             joints=tuple(parsed),
             allow_motion=allow_motion,
+            allow_active_reporting=allow_active_reporting,
             position_limits_rad=position_limits_rad,
             source_config=source_config,
         )
@@ -526,6 +539,20 @@ class B601DriverTorqueLimitReceipt:
     rollback_completed: bool | None = None
 
 
+@dataclass(frozen=True)
+class B601ActiveReportReceipt:
+    """Auditable result for a RobStride active-report state transition."""
+
+    operation: str
+    requested_joint_names: tuple[str, ...]
+    completed_joint_names: tuple[str, ...]
+    failed_joint_names: tuple[str, ...]
+    errors: tuple[str, ...]
+    completed: bool
+    rollback_attempted: bool = False
+    rollback_completed: bool | None = None
+
+
 class B601RSBackend:
     """Thin wired backend with a fail-closed, opt-in command boundary."""
 
@@ -556,6 +583,7 @@ class B601RSBackend:
         self._disabled_joint_names: set[str] = set()
         self._driver_torque_limit_original_nm: dict[str, float] = {}
         self._driver_torque_limit_applied_nm: dict[str, float | None] = {}
+        self._active_report_joint_names: set[str] = set()
 
     @property
     def connected(self) -> bool:
@@ -595,6 +623,16 @@ class B601RSBackend:
             name
             for name in B601_RS_ARM_JOINT_NAMES
             if name in self._driver_torque_limit_original_nm
+        )
+
+    @property
+    def active_report_joint_names(self) -> tuple[str, ...]:
+        """Joints whose active-report stream may still be enabled."""
+
+        return tuple(
+            name
+            for name in B601_RS_ARM_JOINT_NAMES
+            if name in self._active_report_joint_names
         )
 
     def connect(self) -> None:
@@ -639,6 +677,11 @@ class B601RSBackend:
     def close(self) -> None:
         """Release the vendor handle without implicit disable or command I/O."""
 
+        if self._active_report_joint_names:
+            raise B601HardwareError(
+                "active reporting must be disabled before close: "
+                + ", ".join(self.active_report_joint_names)
+            )
         if self._driver_torque_limit_original_nm:
             raise B601HardwareError(
                 "temporary driver torque limits must be restored before close"
@@ -664,6 +707,13 @@ class B601RSBackend:
         if not self.config.allow_motion:
             raise B601MotionAuthorizationError(
                 "motion command rejected: construct the backend with allow_motion=True"
+            )
+
+    def _require_active_reporting_authorized(self) -> None:
+        if not self.config.allow_active_reporting:
+            raise B601ActiveReportAuthorizationError(
+                "active-report request rejected: construct the backend with "
+                "allow_active_reporting=True"
             )
 
     def _resolve_joint_names(self, joint_names: Sequence[str] | None) -> tuple[str, ...]:
@@ -1147,6 +1197,88 @@ class B601RSBackend:
             self._enabled_joint_names.difference_update(completed)
             self._disabled_joint_names.update(completed)
         return B601ModeReceipt(operation, names, tuple(completed), tuple(failed), tuple(errors), not failed)
+
+    def set_active_reporting(
+        self,
+        enabled: bool,
+        *,
+        joint_names: Sequence[str] | None = None,
+    ) -> B601ActiveReportReceipt:
+        """Toggle RobStride type-24 active reporting without motor enable.
+
+        This is a telemetry configuration operation with an authorization gate
+        separate from motion.  Enabling is transactional across the selected
+        joints: after a partial failure every successfully enabled joint is
+        disabled in reverse order.  Any failed cleanup remains latched so
+        :meth:`close` cannot silently discard an uncertain device state.
+        """
+
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a bool")
+        self._require_active_reporting_authorized()
+        names = self._resolve_joint_names(joint_names)
+        operation = "enable_active_reporting" if enabled else "disable_active_reporting"
+        completed: list[str] = []
+        failed: list[str] = []
+        errors: list[str] = []
+
+        for name in names:
+            try:
+                self._motors[name].robstride_set_active_report(enabled)
+                completed.append(name)
+            except Exception as exc:  # noqa: BLE001 - vendor failure becomes receipt evidence
+                failed.append(name)
+                errors.append(f"{name}: {exc}")
+                if enabled:
+                    break
+
+        if not enabled:
+            self._active_report_joint_names.difference_update(completed)
+            return B601ActiveReportReceipt(
+                operation=operation,
+                requested_joint_names=names,
+                completed_joint_names=tuple(completed),
+                failed_joint_names=tuple(failed),
+                errors=tuple(errors),
+                completed=not failed,
+            )
+
+        if not failed:
+            self._active_report_joint_names.update(completed)
+            return B601ActiveReportReceipt(
+                operation=operation,
+                requested_joint_names=names,
+                completed_joint_names=tuple(completed),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+        # A vendor exception does not prove the type-24 request was never put
+        # on the bus.  Treat the failing joint as uncertain and send the
+        # disable request to every attempted joint, not only acknowledged ones.
+        attempted = (*completed, failed[0])
+        rollback_completed: list[str] = []
+        rollback_failed: list[str] = []
+        for name in reversed(attempted):
+            try:
+                self._motors[name].robstride_set_active_report(False)
+                rollback_completed.append(name)
+            except Exception as exc:  # noqa: BLE001 - vendor failure becomes receipt evidence
+                rollback_failed.append(name)
+                errors.append(f"rollback {name}: {exc}")
+        self._active_report_joint_names.update(rollback_failed)
+        failed_names = tuple(dict.fromkeys((*failed, *rollback_failed)))
+        return B601ActiveReportReceipt(
+            operation=operation,
+            requested_joint_names=names,
+            completed_joint_names=tuple(completed),
+            failed_joint_names=failed_names,
+            errors=tuple(errors),
+            completed=False,
+            rollback_attempted=True,
+            rollback_completed=not rollback_failed,
+        )
 
     @staticmethod
     def _validate_parameter_timeout_ms(timeout_ms: int) -> int:

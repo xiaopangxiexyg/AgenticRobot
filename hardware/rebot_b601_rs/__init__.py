@@ -4,11 +4,17 @@ The package is safe to import without ``motorbridge`` and does not open CAN
 until an explicit ``connect()`` call.  The default feedback observation is
 receive-only; an active caller may explicitly request vendor feedback through
 ``poll_feedback(request_feedback=True)``.  Motion commands still require an
-explicitly motion-authorized backend.
+explicitly motion-authorized backend; active-report configuration uses its own
+authorization and does not imply motion authorization.
 """
 
 from robot_motion.rebot_b601_rs import B601_RS_ARM_JOINT_NAMES
 
+from .active_report import (
+    B601ActiveReportAcceptance,
+    B601ActiveReportDeviceAcceptance,
+    evaluate_active_report_capture,
+)
 from .backend import (
     B601_RS_DEFAULT_CHANNEL,
     B601_RS_DEFAULT_FEEDBACK_TIMEOUT_SEC,
@@ -24,6 +30,8 @@ from .backend import (
     B601_RS_TORQUE_LIMIT_MAX_NM,
     B601_RS_TORQUE_LIMIT_PARAM_ID,
     B601_RS_TORQUE_LIMIT_VERIFY_ABS_TOL_NM,
+    B601ActiveReportAuthorizationError,
+    B601ActiveReportReceipt,
     B601CommandReceipt,
     B601DriverTorqueLimitReceipt,
     B601HardwareDependencyError,
@@ -60,6 +68,10 @@ __all__ = [
     "B601_RS_TORQUE_LIMIT_MAX_NM",
     "B601_RS_TORQUE_LIMIT_PARAM_ID",
     "B601_RS_TORQUE_LIMIT_VERIFY_ABS_TOL_NM",
+    "B601ActiveReportAcceptance",
+    "B601ActiveReportAuthorizationError",
+    "B601ActiveReportDeviceAcceptance",
+    "B601ActiveReportReceipt",
     "B601CommandReceipt",
     "B601DriverTorqueLimitReceipt",
     "B601HardwareDependencyError",
@@ -74,6 +86,7 @@ __all__ = [
     "FrequencyAcceptance",
     "FrequencyLedger",
     "FrequencyStats",
+    "evaluate_active_report_capture",
     "evaluate_frequency_target",
     "summarize_timestamps",
 ]

@@ -13,6 +13,7 @@ from hardware.rebot_b601_rs import (
     B601_RS_POS_VEL_VEL_KI_PARAM_ID,
     B601_RS_POS_VEL_VEL_KP_PARAM_ID,
     B601_RS_TORQUE_LIMIT_PARAM_ID,
+    B601ActiveReportAuthorizationError,
     B601HardwareError,
     B601JointConfig,
     B601ModeReceipt,
@@ -49,12 +50,17 @@ def _joint_configs() -> tuple[B601JointConfig, ...]:
     )
 
 
-def _config(*, allow_motion: bool = False) -> B601RSBackendConfig:
+def _config(
+    *,
+    allow_motion: bool = False,
+    allow_active_reporting: bool = False,
+) -> B601RSBackendConfig:
     return B601RSBackendConfig(
         channel="can0",
         rate_hz=500.0,
         joints=_joint_configs(),
         allow_motion=allow_motion,
+        allow_active_reporting=allow_active_reporting,
         position_limits_rad=((-3.0, 3.0),) * 6,
     )
 
@@ -99,6 +105,8 @@ class _FakeMotor:
         self.fail_write_values: set[float] = set()
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.fail_method: str | None = None
+        self.active_report_call_count = 0
+        self.fail_active_report_calls: set[int] = set()
 
     def _call(self, method: str, *args: object) -> None:
         self.calls.append((method, args))
@@ -138,6 +146,12 @@ class _FakeMotor:
 
     def disable(self) -> None:
         self._call("disable")
+
+    def robstride_set_active_report(self, enabled: bool) -> None:
+        self.active_report_call_count += 1
+        self.calls.append(("robstride_set_active_report", (enabled,)))
+        if self.active_report_call_count in self.fail_active_report_calls:
+            raise RuntimeError("synthetic active-report failure")
 
     def send_pos_vel(self, *args: object) -> None:
         self._call("send_pos_vel", *args)
@@ -271,6 +285,14 @@ def test_config_parser_keeps_explicit_arm_order_and_excludes_gripper() -> None:
     assert config.joints[0].position_kp == pytest.approx(13.0)
     assert config.joints[0].position_ki == pytest.approx(0.0)
     assert config.allow_motion is False
+    assert config.allow_active_reporting is False
+
+    telemetry_config = B601RSBackendConfig.from_mapping(
+        _yaml_mapping(),
+        allow_active_reporting=True,
+    )
+    assert telemetry_config.allow_active_reporting is True
+    assert telemetry_config.allow_motion is False
 
 
 def test_prepare_position_velocity_mode_mirrors_rebot_parameter_order() -> None:
@@ -499,6 +521,103 @@ def test_safe_stop_is_available_without_motion_start_authorization() -> None:
         for index, motor in controller.motors.items()
         if index not in (1, 2)
     )
+
+
+def test_active_reporting_requires_separate_authorization() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(_config(), controller_factory=lambda _channel: controller)
+    backend.connect()
+
+    with pytest.raises(B601ActiveReportAuthorizationError):
+        backend.set_active_reporting(True, joint_names=("joint1",))
+
+    assert controller.motors[1].calls == []
+
+
+def test_active_reporting_round_trip_never_calls_motion_methods() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_active_reporting=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+
+    enabled = backend.set_active_reporting(
+        True,
+        joint_names=("joint1", "joint2"),
+    )
+    assert enabled.completed is True
+    assert backend.active_report_joint_names == ("joint1", "joint2")
+    disabled = backend.set_active_reporting(
+        False,
+        joint_names=("joint1", "joint2"),
+    )
+
+    assert disabled.completed is True
+    assert backend.active_report_joint_names == ()
+    for motor_id in (1, 2):
+        methods = [method for method, _args in controller.motors[motor_id].calls]
+        assert methods == [
+            "robstride_set_active_report",
+            "robstride_set_active_report",
+        ]
+    backend.close()
+
+
+def test_partial_active_report_enable_rolls_back_every_attempted_joint() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_active_reporting=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    controller.motors[2].fail_active_report_calls.add(1)
+
+    receipt = backend.set_active_reporting(
+        True,
+        joint_names=("joint1", "joint2"),
+    )
+
+    assert receipt.completed is False
+    assert receipt.rollback_attempted is True
+    assert receipt.rollback_completed is True
+    assert receipt.failed_joint_names == ("joint2",)
+    assert backend.active_report_joint_names == ()
+    assert controller.motors[1].calls == [
+        ("robstride_set_active_report", (True,)),
+        ("robstride_set_active_report", (False,)),
+    ]
+    assert controller.motors[2].calls == [
+        ("robstride_set_active_report", (True,)),
+        ("robstride_set_active_report", (False,)),
+    ]
+    backend.close()
+
+
+def test_failed_active_report_rollback_stays_latched_and_blocks_close() -> None:
+    controller = _FakeController()
+    backend = B601RSBackend(
+        _config(allow_active_reporting=True),
+        controller_factory=lambda _channel: controller,
+    )
+    backend.connect()
+    controller.motors[1].fail_active_report_calls.add(2)
+    controller.motors[2].fail_active_report_calls.add(1)
+
+    receipt = backend.set_active_reporting(
+        True,
+        joint_names=("joint1", "joint2"),
+    )
+
+    assert receipt.rollback_completed is False
+    assert receipt.failed_joint_names == ("joint2", "joint1")
+    assert backend.active_report_joint_names == ("joint1",)
+    with pytest.raises(B601HardwareError, match="active reporting must be disabled"):
+        backend.close()
+
+    cleanup = backend.set_active_reporting(False, joint_names=("joint1",))
+    assert cleanup.completed is True
+    backend.close()
 
 
 def test_temporary_driver_torque_limit_requires_motion_authorization() -> None:
