@@ -38,6 +38,7 @@ from sim.sim_real_tests.rm65.random_grasp_pose_reachability import (
     DEFAULT_REFERENCE_FRAME_ID,
     DEFAULT_REFERENCE_FRAME_SPEC_HASH,
     RM65RandomGraspPoseReachabilityConfig,
+    annotate_ik_search_exhaustion,
     build_rm65_multistart_candidate_provider,
 )
 
@@ -434,6 +435,16 @@ def evaluate_motion_target_endpoint(
         max_iterations=int(cfg.ik_max_iterations),
         max_joint_step_rad=float(cfg.ik_max_joint_step_rad),
         damping=float(cfg.ik_damping),
+        near_miss_refinement_enabled=cfg.near_miss_refinement_enabled,
+        near_miss_position_threshold_m=float(cfg.near_miss_position_threshold_m),
+        near_miss_orientation_threshold_rad=math.radians(
+            float(cfg.near_miss_orientation_threshold_deg)
+        ),
+        near_miss_max_nfev=int(cfg.near_miss_max_nfev),
+        acceptance_position_m=float(cfg.maximum_position_residual_m),
+        acceptance_orientation_rad=math.radians(
+            float(cfg.maximum_orientation_residual_deg)
+        ),
     )
     receipt = evaluate_grasp_pose_reachability(
         solver_target,
@@ -452,6 +463,19 @@ def evaluate_motion_target_endpoint(
             maximum_radius_m=float(cfg.conservative_workspace_maximum_radius_m),
         ),
         collision_checker=_collision_checker(control, side=target.side),
+    )
+    receipt = annotate_ik_search_exhaustion(
+        receipt,
+        solver=solver,
+        target_pose=solver_target,
+        maximum_position_residual_m=float(cfg.maximum_position_residual_m),
+        near_miss_position_threshold_m=float(cfg.near_miss_position_threshold_m),
+        near_miss_orientation_threshold_rad=math.radians(
+            float(cfg.near_miss_orientation_threshold_deg)
+        ),
+        position_diagnostic_max_nfev=int(cfg.exhaustion_position_diagnostic_max_nfev),
+        joint_limit_margin_rad=float(cfg.joint_limit_margin_rad),
+        enabled=cfg.exhaustion_position_diagnostic_enabled,
     )
     return receipt, binding, solver
 

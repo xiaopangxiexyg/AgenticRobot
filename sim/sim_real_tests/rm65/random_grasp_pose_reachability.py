@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from robot_motion.rm65.grasp_reachability import (
@@ -51,6 +52,11 @@ DEFAULT_REFERENCE_FRAME_SPEC_HASH = hashlib.sha256(
 DEFAULT_ADAPTIVE_POSITION_THRESHOLD_M = 0.25
 DEFAULT_ADAPTIVE_ORIENTATION_THRESHOLD_RAD = float(np.deg2rad(45.0))
 DEFAULT_ADAPTIVE_REFINEMENT_ITERATION_FRACTION = 0.5
+DEFAULT_NEAR_MISS_POSITION_THRESHOLD_M = 0.05
+DEFAULT_NEAR_MISS_ORIENTATION_THRESHOLD_RAD = float(np.deg2rad(10.0))
+DEFAULT_NEAR_MISS_MAX_NFEV = 120
+DEFAULT_POSITION_DIAGNOSTIC_MAX_NFEV = 100
+DEFAULT_JOINT_LIMIT_MARGIN_RAD = float(np.deg2rad(0.25))
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,13 @@ class RM65RandomGraspPoseReachabilityConfig:
     ik_damping: float = 0.03
     maximum_position_residual_m: float = 0.003
     maximum_orientation_residual_deg: float = 1.0
+    near_miss_refinement_enabled: bool = True
+    near_miss_position_threshold_m: float = DEFAULT_NEAR_MISS_POSITION_THRESHOLD_M
+    near_miss_orientation_threshold_deg: float = 10.0
+    near_miss_max_nfev: int = DEFAULT_NEAR_MISS_MAX_NFEV
+    exhaustion_position_diagnostic_enabled: bool = True
+    exhaustion_position_diagnostic_max_nfev: int = DEFAULT_POSITION_DIAGNOSTIC_MAX_NFEV
+    joint_limit_margin_rad: float = DEFAULT_JOINT_LIMIT_MARGIN_RAD
     conservative_workspace_origin_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     conservative_workspace_maximum_radius_m: float = 1.25
 
@@ -104,8 +117,13 @@ class RM65RandomGraspPoseReachabilityConfig:
             "sample_count",
             "max_ik_candidates",
             "ik_max_iterations",
+            "near_miss_max_nfev",
+            "exhaustion_position_diagnostic_max_nfev",
             "ik_max_joint_step_rad",
             "ik_damping",
+            "near_miss_position_threshold_m",
+            "near_miss_orientation_threshold_deg",
+            "joint_limit_margin_rad",
             "conservative_workspace_maximum_radius_m",
         )
         if any(
@@ -121,8 +139,37 @@ class RM65RandomGraspPoseReachabilityConfig:
         object.__setattr__(self, "sample_count", int(self.sample_count))
         object.__setattr__(self, "max_ik_candidates", int(self.max_ik_candidates))
         object.__setattr__(self, "ik_max_iterations", int(self.ik_max_iterations))
+        object.__setattr__(self, "near_miss_max_nfev", int(self.near_miss_max_nfev))
+        object.__setattr__(
+            self,
+            "exhaustion_position_diagnostic_max_nfev",
+            int(self.exhaustion_position_diagnostic_max_nfev),
+        )
         object.__setattr__(self, "ik_max_joint_step_rad", float(self.ik_max_joint_step_rad))
         object.__setattr__(self, "ik_damping", float(self.ik_damping))
+        object.__setattr__(
+            self,
+            "near_miss_position_threshold_m",
+            float(self.near_miss_position_threshold_m),
+        )
+        object.__setattr__(
+            self,
+            "near_miss_orientation_threshold_deg",
+            float(self.near_miss_orientation_threshold_deg),
+        )
+        object.__setattr__(
+            self, "joint_limit_margin_rad", float(self.joint_limit_margin_rad)
+        )
+        object.__setattr__(
+            self,
+            "near_miss_refinement_enabled",
+            bool(self.near_miss_refinement_enabled),
+        )
+        object.__setattr__(
+            self,
+            "exhaustion_position_diagnostic_enabled",
+            bool(self.exhaustion_position_diagnostic_enabled),
+        )
         object.__setattr__(
             self, "maximum_position_residual_m", float(self.maximum_position_residual_m)
         )
@@ -258,14 +305,25 @@ def build_rm65_multistart_candidate_provider(
     refinement_iteration_fraction: float = (
         DEFAULT_ADAPTIVE_REFINEMENT_ITERATION_FRACTION
     ),
+    near_miss_refinement_enabled: bool = False,
+    near_miss_position_threshold_m: float = DEFAULT_NEAR_MISS_POSITION_THRESHOLD_M,
+    near_miss_orientation_threshold_rad: float = (
+        DEFAULT_NEAR_MISS_ORIENTATION_THRESHOLD_RAD
+    ),
+    near_miss_max_nfev: int = DEFAULT_NEAR_MISS_MAX_NFEV,
+    acceptance_position_m: float = 0.003,
+    acceptance_orientation_rad: float = float(np.deg2rad(1.0)),
 ) -> Callable[[int, np.ndarray], IKCandidate]:
     """Build a bounded per-seed IK provider with difficulty-gated refinement.
 
     Every seed first receives the historical full solve budget at the true
     final target.  Only when that direct solve fails and the initial FK pose is
     far from the target do bounded SE(3) continuation stages run, followed by
-    another mandatory full-budget solve at the true target.  This preserves
-    direct-solve successes and keeps local targets on the original budget.
+    another mandatory full-budget solve at the true target.  A deterministic
+    bounded least-squares refinement is available only for candidates already
+    close to both public residual limits.  This preserves direct-solve
+    successes, avoids spending more time on clearly distant residuals, and
+    keeps collision admission downstream of exact-pose acceptance.
     """
 
     seeds = tuple(np.asarray(seed, dtype=float).reshape(-1).copy() for seed in qpos_seeds)
@@ -282,6 +340,11 @@ def build_rm65_multistart_candidate_provider(
     position_threshold = float(adaptive_position_threshold_m)
     orientation_threshold = float(adaptive_orientation_threshold_rad)
     refinement_fraction = float(refinement_iteration_fraction)
+    near_miss_position_threshold = float(near_miss_position_threshold_m)
+    near_miss_orientation_threshold = float(near_miss_orientation_threshold_rad)
+    near_miss_evaluations = int(near_miss_max_nfev)
+    public_position_limit = float(acceptance_position_m)
+    public_orientation_limit = float(acceptance_orientation_rad)
     if not np.isfinite(position_threshold) or position_threshold <= 0.0:
         raise ValueError("adaptive_position_threshold_m must be finite and positive.")
     if not np.isfinite(orientation_threshold) or orientation_threshold <= 0.0:
@@ -294,6 +357,29 @@ def build_rm65_multistart_candidate_provider(
         or refinement_fraction > 1.0
     ):
         raise ValueError("refinement_iteration_fraction must be in (0, 1].")
+    if (
+        not np.isfinite(near_miss_position_threshold)
+        or near_miss_position_threshold <= 0.0
+    ):
+        raise ValueError("near_miss_position_threshold_m must be finite and positive.")
+    if (
+        not np.isfinite(near_miss_orientation_threshold)
+        or near_miss_orientation_threshold <= 0.0
+    ):
+        raise ValueError(
+            "near_miss_orientation_threshold_rad must be finite and positive."
+        )
+    if near_miss_evaluations < 1:
+        raise ValueError("near_miss_max_nfev must be positive.")
+    if (
+        not np.isfinite(public_position_limit)
+        or public_position_limit < 0.0
+        or not np.isfinite(public_orientation_limit)
+        or public_orientation_limit < 0.0
+    ):
+        raise ValueError(
+            "public acceptance residual limits must be finite and non-negative."
+        )
 
     baseline_iterations = int(max_iterations)
     refinement_iterations = max(
@@ -476,6 +562,106 @@ def build_rm65_multistart_candidate_provider(
                 orientation_residual = adaptive_orientation
                 selected_stage = "adaptive_final_target"
 
+        accepted_by_public_tolerance = bool(
+            position_residual <= public_position_limit
+            and orientation_residual <= public_orientation_limit
+        )
+        if accepted_by_public_tolerance:
+            selected_converged = True
+
+        near_miss_eligible = bool(
+            not accepted_by_public_tolerance
+            and position_residual <= near_miss_position_threshold
+            and orientation_residual <= near_miss_orientation_threshold
+        )
+        near_miss_record: dict[str, Any] = {
+            "enabled": bool(near_miss_refinement_enabled),
+            "eligible": near_miss_eligible,
+            "attempted": False,
+            "position_threshold_m": near_miss_position_threshold,
+            "orientation_threshold_rad": near_miss_orientation_threshold,
+            "orientation_threshold_deg": float(
+                np.rad2deg(near_miss_orientation_threshold)
+            ),
+            "max_nfev": near_miss_evaluations,
+            "initial_position_residual_m": position_residual,
+            "initial_orientation_residual_rad": orientation_residual,
+            "initial_orientation_residual_deg": float(np.rad2deg(orientation_residual)),
+        }
+        joint_bounds = _solver_joint_bounds(solver)
+        if (
+            near_miss_refinement_enabled
+            and near_miss_eligible
+            and joint_bounds is not None
+        ):
+            near_miss_record["attempted"] = True
+            try:
+                refined_qpos, optimizer_record = _refine_exact_pose_near_miss(
+                    solver,
+                    target_pose=target,
+                    q_init=selected_qpos,
+                    q_min=joint_bounds[0],
+                    q_max=joint_bounds[1],
+                    maximum_position_residual_m=public_position_limit,
+                    maximum_orientation_residual_rad=public_orientation_limit,
+                    max_nfev=near_miss_evaluations,
+                )
+                refined_pose = np.asarray(
+                    solver.compute_pose(refined_qpos), dtype=float
+                ).reshape(4, 4)
+                refined_position, refined_orientation = _pose_residuals(
+                    target, refined_pose
+                )
+                refined_accepted = bool(
+                    refined_position <= public_position_limit
+                    and refined_orientation <= public_orientation_limit
+                )
+                current_score = _normalized_pose_residual_score(
+                    position_residual,
+                    orientation_residual,
+                    position_scale=public_position_limit,
+                    orientation_scale=public_orientation_limit,
+                )
+                refined_score = _normalized_pose_residual_score(
+                    refined_position,
+                    refined_orientation,
+                    position_scale=public_position_limit,
+                    orientation_scale=public_orientation_limit,
+                )
+                near_miss_record.update(
+                    optimizer_record,
+                    final_position_residual_m=refined_position,
+                    final_orientation_residual_rad=refined_orientation,
+                    final_orientation_residual_deg=float(
+                        np.rad2deg(refined_orientation)
+                    ),
+                    accepted_by_public_tolerance=refined_accepted,
+                )
+                if refined_accepted or refined_score < current_score:
+                    selected_qpos = refined_qpos
+                    position_residual = refined_position
+                    orientation_residual = refined_orientation
+                    selected_stage = "near_miss_exact_pose_refinement"
+                if refined_accepted:
+                    selected_converged = True
+                    accepted_by_public_tolerance = True
+            except Exception as exc:
+                near_miss_record.update(
+                    {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "accepted_by_public_tolerance": False,
+                    }
+                )
+        elif near_miss_refinement_enabled and near_miss_eligible:
+            near_miss_record["skip_reason"] = "solver_joint_bounds_unavailable"
+        else:
+            near_miss_record["skip_reason"] = (
+                "disabled"
+                if not near_miss_refinement_enabled
+                else "outside_near_miss_gate"
+            )
+
         return IKCandidate(
             candidate_index=index,
             qpos_rad=tuple(float(value) for value in selected_qpos),
@@ -495,6 +681,8 @@ def build_rm65_multistart_candidate_provider(
                 "iterations_used": total_iterations_used,
                 "adaptive_escalation_used": adaptive_escalation_used,
                 "selected_stage": selected_stage,
+                "accepted_by_public_tolerance": accepted_by_public_tolerance,
+                "near_miss_refinement": near_miss_record,
                 "initial_position_residual_m": initial_position_residual,
                 "initial_orientation_residual_rad": initial_orientation_residual,
                 "initial_orientation_residual_deg": float(
@@ -523,6 +711,86 @@ def build_rm65_multistart_candidate_provider(
         )
 
     return provide
+
+
+def _solver_joint_bounds(solver: Any) -> tuple[np.ndarray, np.ndarray] | None:
+    try:
+        q_min = np.asarray(solver.q_min, dtype=float).reshape(-1)
+        q_max = np.asarray(solver.q_max, dtype=float).reshape(-1)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if (
+        q_min.shape != (6,)
+        or q_max.shape != (6,)
+        or not np.all(np.isfinite(q_min))
+        or not np.all(np.isfinite(q_max))
+        or np.any(q_min >= q_max)
+    ):
+        return None
+    return q_min.copy(), q_max.copy()
+
+
+def _normalized_pose_residual_score(
+    position_residual_m: float,
+    orientation_residual_rad: float,
+    *,
+    position_scale: float,
+    orientation_scale: float,
+) -> float:
+    safe_position_scale = max(float(position_scale), 1e-9)
+    safe_orientation_scale = max(float(orientation_scale), 1e-9)
+    return float(
+        position_residual_m / safe_position_scale
+        + orientation_residual_rad / safe_orientation_scale
+    )
+
+
+def _refine_exact_pose_near_miss(
+    solver: Any,
+    *,
+    target_pose: np.ndarray,
+    q_init: np.ndarray,
+    q_min: np.ndarray,
+    q_max: np.ndarray,
+    maximum_position_residual_m: float,
+    maximum_orientation_residual_rad: float,
+    max_nfev: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Run one deterministic bounded exact-pose trust-region refinement."""
+
+    target = np.asarray(target_pose, dtype=float).reshape(4, 4)
+    lower = np.asarray(q_min, dtype=float).reshape(6)
+    upper = np.asarray(q_max, dtype=float).reshape(6)
+    initial = np.clip(np.asarray(q_init, dtype=float).reshape(6), lower, upper)
+    position_scale = max(float(maximum_position_residual_m), 1e-6)
+    orientation_scale = max(float(maximum_orientation_residual_rad), 1e-6)
+
+    def residual(qpos: np.ndarray) -> np.ndarray:
+        solved = np.asarray(solver.compute_pose(qpos), dtype=float).reshape(4, 4)
+        position_error = (target[:3, 3] - solved[:3, 3]) / position_scale
+        orientation_error = (
+            Rotation.from_matrix(target[:3, :3] @ solved[:3, :3].T).as_rotvec()
+            / orientation_scale
+        )
+        return np.concatenate((position_error, orientation_error))
+
+    result = least_squares(
+        residual,
+        initial,
+        bounds=(lower, upper),
+        method="trf",
+        x_scale="jac",
+        max_nfev=int(max_nfev),
+    )
+    q_result = np.clip(np.asarray(result.x, dtype=float).reshape(6), lower, upper)
+    return q_result, {
+        "optimizer": "scipy_least_squares_trf_exact_pose_v1",
+        "nfev": int(result.nfev),
+        "status": int(result.status),
+        "success": bool(result.success),
+        "cost": float(result.cost),
+        "optimality": float(result.optimality),
+    }
 
 
 def _pose_residuals(
@@ -559,6 +827,189 @@ def _interpolate_pose(
     return interpolated
 
 
+def annotate_ik_search_exhaustion(
+    receipt: GraspReachabilityReceipt,
+    *,
+    solver: Any,
+    target_pose: np.ndarray,
+    maximum_position_residual_m: float,
+    near_miss_position_threshold_m: float,
+    near_miss_orientation_threshold_rad: float,
+    position_diagnostic_max_nfev: int,
+    joint_limit_margin_rad: float,
+    enabled: bool = True,
+) -> GraspReachabilityReceipt:
+    """Add bounded evidence to yellow IK exhaustion without changing its status.
+
+    This auxiliary position-only solve is diagnostic, not a workspace proof.
+    It explains whether the bounded search still missed the target position, or
+    whether position was found while the requested exact orientation remained
+    unsatisfied.  Collision semantics are untouched because the helper only
+    runs after an IK-exhausted receipt with zero eligible exact-pose candidates.
+    """
+
+    if receipt.status is not GraspReachabilityStatus.IK_SEARCH_EXHAUSTED or not enabled:
+        return receipt
+
+    metadata = dict(receipt.metadata)
+    diagnostic: dict[str, Any] = {
+        "schema": "rm65.bounded_ik_exhaustion_diagnostic.v1",
+        "attempted": False,
+        "is_unreachability_proof": False,
+        "position_tolerance_m": float(maximum_position_residual_m),
+        "max_nfev": int(position_diagnostic_max_nfev),
+    }
+    bounds = _solver_joint_bounds(solver)
+    candidates = [
+        candidate
+        for candidate in receipt.candidates
+        if candidate.get("qpos_rad") is not None
+        and candidate.get("position_residual_m") is not None
+        and candidate.get("orientation_residual_rad") is not None
+    ]
+    if bounds is None or not candidates:
+        diagnostic["skip_reason"] = (
+            "solver_joint_bounds_unavailable"
+            if bounds is None
+            else "candidate_qpos_unavailable"
+        )
+        metadata["ik_exhaustion_diagnostic"] = diagnostic
+        return _replace_reachability_receipt(receipt, metadata=metadata)
+
+    best = min(
+        candidates,
+        key=lambda candidate: _normalized_pose_residual_score(
+            float(candidate["position_residual_m"]),
+            float(candidate["orientation_residual_rad"]),
+            position_scale=near_miss_position_threshold_m,
+            orientation_scale=near_miss_orientation_threshold_rad,
+        ),
+    )
+    q_initial = np.asarray(best["qpos_rad"], dtype=float).reshape(6)
+    q_min, q_max = bounds
+    limit_margin = float(joint_limit_margin_rad)
+    initial_limit_indices = np.flatnonzero(
+        (q_initial - q_min <= limit_margin) | (q_max - q_initial <= limit_margin)
+    )
+    diagnostic.update(
+        {
+            "candidate_index": int(best["candidate_index"]),
+            "attempted": True,
+            "optimizer": "scipy_least_squares_trf_position_only_v1",
+            "initial_position_residual_m": float(best["position_residual_m"]),
+            "initial_orientation_residual_rad": float(best["orientation_residual_rad"]),
+            "initial_orientation_residual_deg": float(
+                np.rad2deg(float(best["orientation_residual_rad"]))
+            ),
+            "joint_limit_margin_rad": limit_margin,
+            "initial_joint_limit_indices": [
+                int(index) for index in initial_limit_indices
+            ],
+        }
+    )
+
+    target = np.asarray(target_pose, dtype=float).reshape(4, 4)
+    position_scale = max(float(maximum_position_residual_m), 1e-6)
+
+    def position_residual(qpos: np.ndarray) -> np.ndarray:
+        solved = np.asarray(solver.compute_pose(qpos), dtype=float).reshape(4, 4)
+        return (target[:3, 3] - solved[:3, 3]) / position_scale
+
+    try:
+        result = least_squares(
+            position_residual,
+            np.clip(q_initial, q_min, q_max),
+            bounds=(q_min, q_max),
+            method="trf",
+            x_scale="jac",
+            max_nfev=int(position_diagnostic_max_nfev),
+        )
+        q_result = np.clip(np.asarray(result.x, dtype=float).reshape(6), q_min, q_max)
+        solved_pose = np.asarray(solver.compute_pose(q_result), dtype=float).reshape(
+            4, 4
+        )
+        final_position, final_orientation = _pose_residuals(target, solved_pose)
+        final_limit_indices = np.flatnonzero(
+            (q_result - q_min <= limit_margin) | (q_max - q_result <= limit_margin)
+        )
+        position_reached = final_position <= float(maximum_position_residual_m)
+        exact_candidate_was_near_miss = bool(
+            float(best["position_residual_m"]) <= float(near_miss_position_threshold_m)
+            and float(best["orientation_residual_rad"])
+            <= float(near_miss_orientation_threshold_rad)
+        )
+        if exact_candidate_was_near_miss:
+            subreason = "numerical_near_miss_exhausted"
+            reason_code = "bounded_numerical_near_miss_ik_exhausted"
+        elif position_reached:
+            subreason = "orientation_conditioned_search_exhausted"
+            reason_code = "bounded_orientation_conditioned_ik_exhausted"
+        else:
+            subreason = "position_search_exhausted"
+            reason_code = "bounded_position_search_exhausted"
+        diagnostic.update(
+            {
+                "nfev": int(result.nfev),
+                "status": int(result.status),
+                "success": bool(result.success),
+                "cost": float(result.cost),
+                "optimality": float(result.optimality),
+                "final_position_residual_m": final_position,
+                "final_orientation_residual_rad": final_orientation,
+                "final_orientation_residual_deg": float(np.rad2deg(final_orientation)),
+                "position_reached_within_tolerance": position_reached,
+                "final_joint_limit_indices": [
+                    int(index) for index in final_limit_indices
+                ],
+                "joint_limit_saturated": bool(
+                    len(initial_limit_indices) or len(final_limit_indices)
+                ),
+                "subreason": subreason,
+            }
+        )
+    except Exception as exc:
+        diagnostic.update(
+            {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "subreason": "diagnostic_optimizer_error",
+            }
+        )
+        reason_code = receipt.reason_code
+
+    metadata["ik_exhaustion_diagnostic"] = diagnostic
+    metadata["ik_exhaustion_subreason"] = diagnostic["subreason"]
+    metadata["joint_limit_saturated"] = bool(
+        diagnostic.get("joint_limit_saturated", False)
+    )
+    return _replace_reachability_receipt(
+        receipt,
+        reason_code=reason_code,
+        metadata=metadata,
+    )
+
+
+def _replace_reachability_receipt(
+    receipt: GraspReachabilityReceipt,
+    *,
+    reason_code: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> GraspReachabilityReceipt:
+    return GraspReachabilityReceipt(
+        status=receipt.status,
+        reason_code=receipt.reason_code if reason_code is None else reason_code,
+        proof_scope=receipt.proof_scope,
+        reference_frame_id=receipt.reference_frame_id,
+        reference_frame_spec_hash=receipt.reference_frame_spec_hash,
+        target_pose=receipt.target_pose,
+        target_pose_content_hash=receipt.target_pose_content_hash,
+        selected_candidate_index=receipt.selected_candidate_index,
+        candidates=receipt.candidates,
+        collision_assessments=receipt.collision_assessments,
+        metadata=receipt.metadata if metadata is None else metadata,
+    )
+
+
 def make_default_rm65_grasp_pose_evaluator(
     config: RM65RandomGraspPoseReachabilityConfig,
 ) -> Callable[[RandomGraspPoseSample], GraspReachabilityReceipt]:
@@ -577,6 +1028,14 @@ def make_default_rm65_grasp_pose_evaluator(
         max_iterations=config.ik_max_iterations,
         max_joint_step_rad=config.ik_max_joint_step_rad,
         damping=config.ik_damping,
+        near_miss_refinement_enabled=config.near_miss_refinement_enabled,
+        near_miss_position_threshold_m=config.near_miss_position_threshold_m,
+        near_miss_orientation_threshold_rad=np.deg2rad(
+            config.near_miss_orientation_threshold_deg
+        ),
+        near_miss_max_nfev=config.near_miss_max_nfev,
+        acceptance_position_m=config.maximum_position_residual_m,
+        acceptance_orientation_rad=np.deg2rad(config.maximum_orientation_residual_deg),
     )
     envelope = ConservativeWorkspaceEnvelope(
         reference_frame_id=config.reference_frame_id,
@@ -586,7 +1045,7 @@ def make_default_rm65_grasp_pose_evaluator(
     )
 
     def evaluate(sample: RandomGraspPoseSample) -> GraspReachabilityReceipt:
-        return evaluate_grasp_pose_reachability(
+        receipt = evaluate_grasp_pose_reachability(
             sample.target_pose,
             reference_frame_id=sample.reference_frame_id,
             reference_frame_spec_hash=sample.reference_frame_spec_hash,
@@ -598,6 +1057,21 @@ def make_default_rm65_grasp_pose_evaluator(
             ),
             workspace_envelope=envelope,
             target_pose_content_hash=sample.target_pose_content_hash,
+        )
+        return annotate_ik_search_exhaustion(
+            receipt,
+            solver=solver,
+            target_pose=sample.target_pose,
+            maximum_position_residual_m=config.maximum_position_residual_m,
+            near_miss_position_threshold_m=config.near_miss_position_threshold_m,
+            near_miss_orientation_threshold_rad=np.deg2rad(
+                config.near_miss_orientation_threshold_deg
+            ),
+            position_diagnostic_max_nfev=(
+                config.exhaustion_position_diagnostic_max_nfev
+            ),
+            joint_limit_margin_rad=config.joint_limit_margin_rad,
+            enabled=config.exhaustion_position_diagnostic_enabled,
         )
 
     return evaluate
@@ -732,6 +1206,7 @@ __all__ = [
     "DEFAULT_SAMPLER_ID",
     "RM65RandomGraspPoseReachabilityConfig",
     "RandomGraspPoseSample",
+    "annotate_ik_search_exhaustion",
     "build_rm65_multistart_candidate_provider",
     "compute_target_pose_content_hash",
     "generate_random_grasp_pose_samples",

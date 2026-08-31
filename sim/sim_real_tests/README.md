@@ -163,7 +163,16 @@ The extra target marker is green for a completed motion, red only for a
 conservatively proven kinematic unreachable target, orange for endpoint/path
 collision blocking, yellow for bounded search exhaustion, and purple for a
 system error. In particular, `ik_search_exhausted` is not mislabeled as proven
-unreachable.
+unreachable. Yellow receipts now carry a bounded diagnostic reason in the
+viewer log: `bounded_position_search_exhausted` means the auxiliary
+position-only search also missed the position tolerance, while
+`bounded_orientation_conditioned_ik_exhausted` means position was found but
+the requested exact orientation still was not. A candidate already within
+5 cm and 10 degrees receives one deterministic, joint-limited trust-region
+refinement; distant residuals do not receive an indiscriminate time increase.
+All refined candidates still have to meet the original 3 mm / 1 degree exact
+pose limits and pass the unchanged MuJoCo collision check. These diagnostics
+remain bounded-search evidence, never a mathematical unreachability proof.
 
 Use a finite headless batch to exercise the same target generation, endpoint
 admission, path preflight, and physics execution without a GUI:
