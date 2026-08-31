@@ -82,10 +82,37 @@ def capture_rgb_skill_definition_v1() -> SkillDefinition:
     )
 
 
+def capture_rgb_skill_definition_v2() -> SkillDefinition:
+    """Describe one passive, bounded multi-camera RGB capture window."""
+
+    return SkillDefinition(
+        skill_id=CAPTURE_RGB_SKILL_ID_V1,
+        skill_version="2",
+        skill_kind="inspection",
+        summary=(
+            "Capture deployment-registered RGB roles in one bounded capture "
+            "window, preserving ordered roles, per-frame acquisition times, "
+            "and the admitted Station revision without changing downstream "
+            "control state."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id="registered_roles.latest_rgb_scene_cut.v1",
+        execution_result_semantics_id=(
+            "registered_roles.rgb_capture_window_and_artifacts.v2"
+        ),
+        task_outcome_semantics_id="passive_rgb_capture.v1",
+        entry_predicate_ids=("registered_visual_roles_available.v1",),
+        task_outcome_predicate_ids=("rgb_frames_captured.v1",),
+    )
+
+
 __all__ = [
     "CAPTURE_DEPTH_SKILL_ID_V1",
     "CAPTURE_RGB_SKILL_ID_V1",
     "capture_depth_skill_definition_v1",
     "capture_depth_skill_definition_v2",
     "capture_rgb_skill_definition_v1",
+    "capture_rgb_skill_definition_v2",
 ]

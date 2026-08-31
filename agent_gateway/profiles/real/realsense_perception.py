@@ -122,6 +122,7 @@ def _pose_matrix(value: object, *, field_name: str) -> np.ndarray:
 class EncodedRealRgbFrame:
     source_id: str
     role: str
+    acquired_at: float
     width: int
     height: int
     data: bytes
@@ -130,9 +131,16 @@ class EncodedRealRgbFrame:
 
 @dataclass(frozen=True)
 class RealRgbCapture:
-    captured_at: float
+    capture_window_started_at: float
+    capture_window_ended_at: float
     station_revision: int
     frames: tuple[EncodedRealRgbFrame, ...]
+
+    @property
+    def captured_at(self) -> float:
+        """Compatibility projection for v1 callers."""
+
+        return self.capture_window_ended_at
 
 
 @dataclass(frozen=True)
@@ -702,6 +710,7 @@ class RealSenseAgentPerceptionProvider:
                 EncodedRealRgbFrame(
                     source_id=source_id,
                     role=role,
+                    acquired_at=source_at,
                     width=width,
                     height=height,
                     data=encoded,
@@ -714,7 +723,8 @@ class RealSenseAgentPerceptionProvider:
         if self._current_station_revision() != expected_station_revision:
             raise RuntimeError("rgb_capture_station_revision_changed")
         return RealRgbCapture(
-            captured_at=max(source_timestamps),
+            capture_window_started_at=min(source_timestamps),
+            capture_window_ended_at=max(source_timestamps),
             station_revision=expected_station_revision,
             frames=tuple(frames),
         )

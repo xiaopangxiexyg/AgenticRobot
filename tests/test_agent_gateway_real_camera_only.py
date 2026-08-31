@@ -123,6 +123,8 @@ def test_camera_only_composition_exposes_only_real_observe_perception_routes(
             "wrist_right",
         )
         assert composition.registration.profile.depth_roles == ("main",)
+        assert composition.registration.rgb.routes[0].route_version == "2"
+        assert composition.registration.rgb.definition.skill_version == "2"
         assert composition.registration.depth.routes[0].route_version == "2"
         assert composition.registration.frame_binding is composition.frame_binding
         assert composition.contract_bundle.frame_graph_hash == (

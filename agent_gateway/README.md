@@ -165,7 +165,9 @@ that leaves enough pathname budget.
 non-world-writable directory enables the read-only
 `perception.capture_depth` and `perception.capture_rgb` Skills. Depth returns
 role-selected native-resolution float32 metric data; RGB returns one
-role-selected JPEG per output Artifact ordinal from a single scene cut. The
+role-selected JPEG per output Artifact ordinal. Production RGB v2 also reports
+the admitted Station revision, an explicit capture window, and each frame's
+acquisition timestamp while preserving the requested semantic-role order. The
 trusted MuJoCo profile maps semantic roles to lower camera sources. Inline
 results contain only bounded metadata and content hashes. Pixel arrays never
 enter the control frame.
@@ -347,7 +349,10 @@ motion action, or `--confirm`. The selected collision-scene profile is read only
 to derive fixed arm-base geometry for static camera poses; it does not construct
 or connect a robot backend.
 
-Real Depth uses the shared v2 result contract. Each result pins the admitted
+Real RGB and Depth use the shared v2 result contracts. RGB preserves each
+camera worker's source timestamp and bounds the selected frames by the minimum
+and maximum source timestamps; it does not claim that separate RealSense reads
+are one atomic exposure. Each Depth result pins the admitted
 `station_revision`, `canonical_station` frame specification, and complete
 source-world-to-Station graph hash, and reports
 `camera_pose_reference_xyz_quat_xyzw` as
@@ -357,9 +362,10 @@ selected collision-scene URDF fixed-joint chain as the combined RM65 profile;
 it never substitutes a geometry digest for a frame graph. The provider retains
 its internal `T_dual_arm_solver_world_camera` calibration cut, while the
 Gateway rejects a revision change before or during Artifact commit. The legacy
-v1 registration builder and `camera_pose_world_xyz_quat_xyzw` projection remain
-available only for existing compatibility callers; production camera-only and
-RM65 perception composition use v2.
+v1 registration builder, RGB `captured_at`, and Depth
+`camera_pose_world_xyz_quat_xyzw` projections remain available only for
+existing compatibility callers; production camera-only and RM65 perception
+composition use RGB/Depth v2.
 
 For a finite input-Skill acceptance run, use the purpose-built probe from a
 clean checkout. It fixes the camera config, registry, and collision-scene
@@ -407,10 +413,11 @@ near-zero-frame rejection/restart behavior and zero software startup retries.
 
 Both capture Routes are `inspection` / `read_only` / `t0_read_only`: invoking
 them needs no motion Grant and cannot call command admission, dispatch, or
-HOLD. RGB is JPEG; depth is native-resolution float32 metric NPY with aligned
-color intrinsics and the trusted canonical-Station camera pose. Payload bytes are committed to
-the same generic transient Artifact CAS and retrieved through `chunked_rpc` or
-a reviewed same-host `local_path` grant.
+HOLD. RGB is JPEG with per-frame acquisition time and a bounded multi-camera
+capture window; depth is native-resolution float32 metric NPY with aligned
+color intrinsics and the trusted canonical-Station camera pose. Payload bytes
+are committed to the same generic transient Artifact CAS and retrieved through
+`chunked_rpc` or a reviewed same-host `local_path` grant.
 
 For both real profiles, the selected `--collision-scene-profile` is the source
 of Station geometry. Its scene URDF fixed-joint chain defines both arm bases in
@@ -645,13 +652,16 @@ not a dedicated transport method: `perception.capture_rgb` is an ordinary
 `inspection` Skill with a `read_only`, `t0_read_only` Route and generic output
 Artifacts. Its deployment profile publishes the trusted semantic roles; the
 MuJoCo binding maps `main`, `wrist_left`, and `wrist_right` to current cameras,
-renders one scene cut under the existing scene/physics lock, and rejects a cut
-if its Station revision changes. Other profiles may bind their own producer to
-the same Definition/schema/I/O contract without importing the MuJoCo renderer.
-The real binding maps the same roles to an exclusive RealSense inventory,
-rejects stale, cross-generation, serial-mismatched, or revision-racing frames,
-and commits encoded output through the generic Artifact lifecycle. Device
-lifecycle remains outside the passive executor.
+renders one scene cut under the existing scene/physics lock, assigns the same
+acquisition time to every selected frame, and rejects a cut if its Station
+revision changes. Other profiles may bind their own producer to the same
+Definition/schema/I/O contract without importing the MuJoCo renderer. The real
+binding maps the same roles to an exclusive RealSense inventory, retains each
+source timestamp, rejects stale, cross-generation, serial-mismatched,
+over-skewed, or revision-racing frames, and commits encoded output through the
+generic Artifact lifecycle. RGB intentionally carries no camera pose; geometry
+consumers use the Station-aware Depth v2 result. Device lifecycle remains
+outside the passive executor.
 
 ## Compatibility
 

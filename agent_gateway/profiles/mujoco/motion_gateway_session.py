@@ -559,8 +559,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
         else None
     )
     rgb_entry = (
-        contract_bundle.route_manifest.route(CAPTURE_RGB_SKILL_ID_V1, "1")
-        if perception_enabled
+        contract_bundle.route_manifest.route(
+            CAPTURE_RGB_SKILL_ID_V1,
+            contract_bundle.rgb_capture.registration.definition.skill_version,
+        )
+        if contract_bundle.rgb_capture is not None
         else None
     )
     observation_producer = MujocoAgentObservationProducer(
@@ -1022,6 +1025,7 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
             raise RuntimeError("RGB Route lost its registration.")
 
         def read_rgb(request, operation) -> PassiveReadResult:
+            is_v2 = rgb_registration.registration.definition.skill_version == "2"
             capture = rgb_capture_provider.capture(
                 request.parameters,
                 expected_station_revision=request.expected_station_revision,
@@ -1052,6 +1056,11 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                         "ordinal": ordinal,
                         "source_id": source_id,
                         "role": role,
+                        **(
+                            {"acquired_at": capture.captured_at}
+                            if is_v2
+                            else {}
+                        ),
                         "media_type": committed.media_type,
                         "width": frame.width,
                         "height": frame.height,
@@ -1074,15 +1083,39 @@ def assemble_mujoco_agent_tcp_pose_gateway_session(
                     "operation_id": operation.operation_id,
                     "request_hash": request.semantic_content_hash,
                     "station_revision": capture.station_revision,
-                    "captured_at": capture.captured_at,
+                    **(
+                        {
+                            "capture_window_started_at": (
+                                capture.capture_window_started_at
+                            ),
+                            "capture_window_ended_at": (
+                                capture.capture_window_ended_at
+                            ),
+                        }
+                        if is_v2
+                        else {"captured_at": capture.captured_at}
+                    ),
                     "frames": frame_metadata,
                 },
-                domain="dexteleop.agent_skill.mujoco_rgb_capture_receipt.v1",
+                domain=(
+                    "dexteleop.agent_skill.mujoco_rgb_capture_receipt.v2"
+                    if is_v2
+                    else "dexteleop.agent_skill.mujoco_rgb_capture_receipt.v1"
+                ),
             )
             result = {
                 "snapshot_id": "rgb-snapshot:" + result_identity,
                 "station_revision": capture.station_revision,
-                "captured_at": capture.captured_at,
+                **(
+                    {
+                        "capture_window_started_at": (
+                            capture.capture_window_started_at
+                        ),
+                        "capture_window_ended_at": capture.capture_window_ended_at,
+                    }
+                    if is_v2
+                    else {"captured_at": capture.captured_at}
+                ),
                 "frames": frame_metadata,
                 "total_bytes": total_bytes,
             }

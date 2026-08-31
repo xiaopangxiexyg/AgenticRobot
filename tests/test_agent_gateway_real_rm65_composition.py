@@ -353,6 +353,7 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         assert composition.perception_capture.frame_binding is (
             composition.perception_frame_binding
         )
+        assert composition.perception_capture.rgb.routes[0].route_version == "2"
         assert composition.perception_capture.depth.routes[0].route_version == "2"
         assert composition.perception_capture.depth_binding.frame_graph_hash == (
             composition.frame_graph.semantic_content_hash

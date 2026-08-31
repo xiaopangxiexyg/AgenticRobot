@@ -45,6 +45,16 @@ class MujocoAgentRgbCapture:
     station_revision: int
     frames: tuple[tuple[str, str, EncodedMujocoRgbFrame], ...]
 
+    @property
+    def capture_window_started_at(self) -> float:
+        """MuJoCo renders every selected camera from one atomic scene cut."""
+
+        return self.captured_at
+
+    @property
+    def capture_window_ended_at(self) -> float:
+        return self.captured_at
+
 
 class MujocoAgentRgbCaptureProvider:
     """Resolve trusted roles and capture one bounded, revision-stable scene cut."""
