@@ -12,7 +12,13 @@ from robot_motion.rm65.grasp_reachability import (
     GraspReachabilityStatus,
 )
 from sim.sim_real_tests.mujoco import arbitrary_grasp_pose_motion as motion
+from sim.sim_real_tests.mujoco import (
+    continuous_random_grasp_pose_motion as random_motion,
+)
 from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
+    MOTION_STATUS_ENDPOINT_REJECTED,
+    MOTION_STATUS_PATH_COLLISION_BLOCKED,
+    GraspMotionPlayback,
     GraspMotionTarget,
     ToolTcpFrameBinding,
     build_smooth_se3_trajectory,
@@ -22,7 +28,14 @@ from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
     quintic_progress,
     required_motion_duration_sec,
 )
+from sim.sim_real_tests.mujoco.continuous_random_grasp_pose_motion import (
+    ContinuousRandomGraspPoseConfig,
+    RawCartesianGraspTargetStream,
+    classify_random_grasp_attempt,
+    sample_random_joint_fk_target,
+)
 from sim.sim_real_tests.mujoco.view_arbitrary_grasp_pose_motion import (
+    _uses_continuous_random_mode,
     _validate_args,
     build_parser,
 )
@@ -220,3 +233,170 @@ def test_cli_requires_position_and_orientation_as_one_explicit_pose() -> None:
         _validate_args(
             parser.parse_args(["--target-rpy-deg", "0", "90", "0"])
         )
+
+
+def test_raw_cartesian_target_stream_is_deterministic_and_never_prefilters() -> None:
+    config = ContinuousRandomGraspPoseConfig(
+        seed=17,
+        position_min_m=(-0.4, -0.3, 0.1),
+        position_max_m=(0.2, 0.5, 0.9),
+    )
+    lhs = RawCartesianGraspTargetStream(side="left", config=config)
+    rhs = RawCartesianGraspTargetStream(side="left", config=config)
+
+    lhs_first = lhs.next_target()
+    lhs_second = lhs.next_target()
+    rhs_first = rhs.next_target()
+
+    np.testing.assert_array_equal(
+        lhs_first.target_pose_base_from_dmtac_tcp,
+        rhs_first.target_pose_base_from_dmtac_tcp,
+    )
+    assert not np.array_equal(
+        lhs_first.target_pose_base_from_dmtac_tcp,
+        lhs_second.target_pose_base_from_dmtac_tcp,
+    )
+    xyz = lhs_first.target_pose_base_from_dmtac_tcp[:3, 3]
+    assert np.all(xyz >= np.asarray(config.position_min_m))
+    assert np.all(xyz < np.asarray(config.position_max_m))
+    rotation = lhs_first.target_pose_base_from_dmtac_tcp[:3, :3]
+    np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-12)
+    assert np.linalg.det(rotation) == pytest.approx(1.0)
+    assert lhs_first.known_qpos_rad is None
+    assert lhs_first.metadata["sample_index"] == 0
+    assert lhs_first.metadata["rejection_sampled"] is False
+    assert len(str(lhs_first.metadata["target_pose_content_hash"])) == 64
+
+
+def test_joint_fk_target_is_one_draw_without_collision_prefilter(monkeypatch) -> None:
+    monkeypatch.setattr(
+        random_motion,
+        "build_rm65_single_arm_ik_solver",
+        lambda _config: SimpleNamespace(
+            q_min=np.full(6, -2.0),
+            q_max=np.full(6, 2.0),
+        ),
+    )
+    target = sample_random_joint_fk_target(
+        _FakeControl(),
+        side="left",
+        seed=23,
+        sample_index=5,
+        maximum_joint_offset_deg=30.0,
+    )
+
+    assert target.known_qpos_rad is not None
+    assert target.metadata["sample_index"] == 5
+    assert target.metadata["sample_kind"] == "random_joint_fk_candidate"
+    assert target.metadata["rejection_sampled"] is False
+    assert target.metadata["selected_max_joint_motion_deg"] <= 30.0
+
+
+def _random_attempt_playback(
+    *,
+    reachability_status: GraspReachabilityStatus,
+    motion_status: str = MOTION_STATUS_ENDPOINT_REJECTED,
+    summary: dict[str, object] | None = None,
+    frame_count: int = 0,
+) -> GraspMotionPlayback:
+    target = GraspMotionTarget(
+        side="left",
+        target_pose_base_from_dmtac_tcp=np.eye(4),
+        source="test_random_cartesian",
+        metadata={
+            "sample_index": 4,
+            "target_pose_content_hash": "a" * 64,
+        },
+    )
+    receipt = GraspReachabilityReceipt(
+        status=reachability_status,
+        reason_code=f"test_{reachability_status.value}",
+        proof_scope="test",
+        reference_frame_id=DEFAULT_REFERENCE_FRAME_ID,
+        reference_frame_spec_hash=DEFAULT_REFERENCE_FRAME_SPEC_HASH,
+        target_pose=tuple(tuple(row) for row in np.eye(4)),
+    )
+    binding = ToolTcpFrameBinding(
+        side="left",
+        single_tool_from_dmtac_tool=np.eye(4),
+        position_offset_m=0.0,
+        orientation_offset_deg=0.0,
+    )
+    frames = tuple(
+        {"left": np.zeros(6), "right": np.zeros(6)} for _ in range(frame_count)
+    )
+    return GraspMotionPlayback(
+        motion_status=motion_status,
+        side="left",
+        target=target,
+        endpoint_receipt=receipt,
+        frame_binding=binding,
+        target_pose_world_by_side={"left": np.eye(4), "right": np.eye(4)},
+        reference_pose_world=(),
+        actual_pose_world=(),
+        actual_qpos_by_frame=frames,
+        summary=summary or {"motion_emitted": False},
+    )
+
+
+def test_random_attempt_classification_never_calls_ik_exhaustion_unreachable() -> None:
+    proven = classify_random_grasp_attempt(
+        _random_attempt_playback(
+            reachability_status=GraspReachabilityStatus.KINEMATICALLY_UNREACHABLE
+        )
+    )
+    exhausted = classify_random_grasp_attempt(
+        _random_attempt_playback(
+            reachability_status=GraspReachabilityStatus.IK_SEARCH_EXHAUSTED
+        )
+    )
+    collision = classify_random_grasp_attempt(
+        _random_attempt_playback(
+            reachability_status=GraspReachabilityStatus.COLLISION_BLOCKED
+        )
+    )
+
+    assert proven.proven_unreachable is True
+    assert proven.terminal_classification == "proven_kinematically_unreachable"
+    assert exhausted.proven_unreachable is False
+    assert exhausted.terminal_classification == (
+        "ik_search_exhausted_not_proven_unreachable"
+    )
+    assert collision.terminal_classification == "endpoint_collision_blocked"
+    assert all(not outcome.motion_emitted for outcome in (proven, exhausted, collision))
+
+
+def test_random_attempt_path_collision_is_distinct_and_emits_zero_motion() -> None:
+    outcome = classify_random_grasp_attempt(
+        _random_attempt_playback(
+            reachability_status=GraspReachabilityStatus.REACHABLE,
+            motion_status=MOTION_STATUS_PATH_COLLISION_BLOCKED,
+            summary={
+                "motion_emitted": False,
+                "path_preflight": {"reason_code": "blocked_at_progress_0_4"},
+            },
+        )
+    )
+
+    assert outcome.reachability_status == "reachable"
+    assert outcome.terminal_classification == "direct_path_collision_blocked"
+    assert outcome.reason_code == "blocked_at_progress_0_4"
+    assert outcome.motion_emitted is False
+
+
+def test_continuous_cli_is_default_and_headless_requires_a_finite_count() -> None:
+    parser = build_parser()
+    continuous = parser.parse_args([])
+    assert _uses_continuous_random_mode(continuous) is True
+    _validate_args(continuous)
+
+    single = parser.parse_args(["--single-reachable-demo"])
+    assert _uses_continuous_random_mode(single) is False
+    _validate_args(single)
+
+    with pytest.raises(ValueError, match="headless continuous mode requires"):
+        _validate_args(parser.parse_args(["--headless"]))
+    finite_headless = parser.parse_args(
+        ["--headless", "--random-sample-count", "3"]
+    )
+    _validate_args(finite_headless)
