@@ -32,7 +32,7 @@ same explicit ``mechPos`` reads with ``allow_motion=False`` and never changes
 the vendor mode or enable state.  Automated tests exercise the pure helpers
 only; they never construct a hardware backend.
 
-At feedback admission, only J2/J3 values in ``[-1e-5, 0)`` rad are represented
+At feedback admission, only J2/J3 values in ``[-5e-4, 0)`` rad are represented
 as the legal zero-lower-limit reading.  The raw value is retained in evidence
 records, while values below that narrow boundary and all outgoing references
 remain subject to the exact pinned-URDF limits.
@@ -95,7 +95,7 @@ _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = ("joint2", "joint3")
 _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3")
-_FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD = 1.0e-5
+_FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD = 5.0e-4
 _NON_FAULT_HOLD_JOINTS = tuple(
     name for name in _ALL_JOINTS if name not in _FAULT_HOLD_JOINTS
 )
@@ -200,7 +200,7 @@ def normalize_feedback_boundary_qpos(
 
     RobStride ``mechPos`` may report a tiny negative value immediately below
     the zero lower limit after zeroing.  The requested compatibility boundary
-    treats only ``-1e-5 <= q < 0`` on joint2/joint3 as the legal zero reading.
+    treats only ``-5e-4 <= q < 0`` on joint2/joint3 as the legal zero reading.
     Every other joint and every more-negative value is returned unchanged so
     the caller's existing exact URDF-limit check still rejects it.  The raw
     value must be retained by callers that write an evidence record.
@@ -1116,7 +1116,7 @@ def _run_feedback_stability_probe(
             "This mode only requests vendor feedback and reads mechPos; it never changes mode, enables, disables, or sends MIT/POS_VEL control frames.",
             "Run only after the operator has independently made the arm safe; this probe does not alter the existing enable state.",
             "The stationarity gate is diagnostic evidence for protective-hold review, not permission to relax the active safety threshold.",
-            "Only J2/J3 feedback readings in [-1e-5, 0) rad are represented as 0 rad at admission; raw readings are retained per sample, and more-negative values remain outside the strict URDF limit.",
+            "Only J2/J3 feedback readings in [-5e-4, 0) rad are represented as 0 rad at admission; raw readings are retained per sample, and more-negative values remain outside the strict URDF limit.",
             "MotorBridge 0.4.9 provides no source timestamp or sequence, so freshness remains unverified.",
         ],
     }
@@ -3267,7 +3267,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Protective hold admits only a host-fresh, in-limit, near-zero-velocity last-safe snapshot and a small fault rebase; otherwise it falls back to full safe_stop.",
             "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
             "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
-            "Only J2/J3 feedback readings in [-1e-5, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
+            "Only J2/J3 feedback readings in [-5e-4, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
             "Before any torque command, the active path requires four consecutive complete feedback snapshots after enable; no torque command is sent during this arming-settle gate.",

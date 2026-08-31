@@ -79,9 +79,9 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   不能解读为力控或硬件通过。该结果用于判断 `last-safe` 速度门是否被反馈量化噪声触发，
   不允许据此直接放宽保护阈值。
 - 反馈进入限位/速度/阻抗计算前，只有 joint2 与 joint3 的窄边界
-  `-1e-5 <= q < 0 rad` 会被表示为合法的 `0 rad`。这是对已标零后编码器量化负零的
+  `-5e-4 <= q < 0 rad` 会被表示为合法的 `0 rad`。这是对已标零后编码器量化负零的
   反馈表示归一化，不修改 pinned URDF 的 `[0, 3.14]` 位置限位，也不改变出站参考、
-  torque/slew 包络或更负值的 fail-closed 行为；例如 `q < -1e-5 rad` 仍会被原有限位门
+  torque/slew 包络或更负值的 fail-closed 行为；例如 `q < -5e-4 rad` 仍会被原有限位门
   拒绝。JSON 样本同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
   `boundary_normalized_joint_names`，便于复核实际读数。
 
