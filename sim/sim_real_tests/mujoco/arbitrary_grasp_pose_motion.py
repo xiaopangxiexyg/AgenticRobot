@@ -13,7 +13,7 @@ to hardware.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
@@ -22,6 +22,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from robot_motion.joint_limits import load_joint_velocity_limit_profiles
+from robot_motion.path_planning import (
+    JointConfigurationCheck,
+    JointPathPlannerConfig,
+    JointPathPlanResult,
+    JointPathStatus,
+    plan_collision_aware_joint_path,
+)
 from robot_motion.position_control import ResampledMotionReference
 from robot_motion.rm65.grasp_reachability import (
     CollisionCandidateAssessment,
@@ -33,11 +40,14 @@ from robot_motion.rm65.grasp_reachability import (
     evaluate_grasp_pose_reachability,
 )
 from robot_motion.rm65.ik import RM65SingleArmIKConfig, build_rm65_single_arm_ik_solver
+from robot_motion.rm65.obstacle_collision import RM65ObstacleCollisionOracle
+from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from sim.mujoco.control.desk_tcp_position import DeskTcpPositionControl
 from sim.sim_real_tests.rm65.random_grasp_pose_reachability import (
     DEFAULT_REFERENCE_FRAME_ID,
     DEFAULT_REFERENCE_FRAME_SPEC_HASH,
     RM65RandomGraspPoseReachabilityConfig,
+    annotate_ik_search_exhaustion,
     build_rm65_multistart_candidate_provider,
 )
 
@@ -45,8 +55,85 @@ SIDES = ("left", "right")
 MOTION_STATUS_COMPLETED = "completed"
 MOTION_STATUS_ENDPOINT_REJECTED = "endpoint_rejected"
 MOTION_STATUS_PATH_COLLISION_BLOCKED = "path_collision_blocked"
+MOTION_STATUS_PATH_START_BLOCKED = "path_start_collision_blocked"
+MOTION_STATUS_PATH_TARGET_BLOCKED = "path_target_collision_blocked"
+MOTION_STATUS_PATH_SEARCH_EXHAUSTED = "path_search_exhausted"
+MOTION_STATUS_PATH_PLANNER_ERROR = "path_planner_error"
 MOTION_STATUS_IK_TARGET_UNMET = "ik_target_unmet"
 MOTION_STATUS_TRACKING_INCOMPLETE = "tracking_incomplete"
+DEFAULT_IK_TARGET_UNMET_RETRY_LIMIT = 2
+OBSTACLE_SCENE_FRAME_ID = "rm65_scene_world"
+OBSTACLE_SCENE_FRAME_SPEC_HASH = "mujoco-desk-collision-world-v1"
+FINAL_OBSTACLE_EDGE_RESOLUTION_RAD = float(np.deg2rad(0.1))
+
+
+class _MujocoFclObstacleOracle:
+    """Require both the immutable FCL scene and live MuJoCo scene to be safe."""
+
+    def __init__(
+        self,
+        control: DeskTcpPositionControl,
+        fcl_oracle: RM65ObstacleCollisionOracle,
+    ) -> None:
+        projector = control.scene.collision_projector()
+        if projector is None:
+            raise RuntimeError(
+                "combined path planning requires MuJoCo collision safety"
+            )
+        self.scene_hash = fcl_oracle.scene_hash
+        self._control = control
+        self._fcl_oracle = fcl_oracle
+        self._projector = projector
+        self._base_vector = control.scene.kinematic_controlled_qpos()
+
+    def check(
+        self, qpos_by_component: Mapping[str, np.ndarray]
+    ) -> JointConfigurationCheck:
+        fcl = self._fcl_oracle.check(qpos_by_component)
+        if not fcl.collision_check_available or not fcl.safe:
+            return fcl
+        try:
+            target_vector = self._control.scene.kinematic_target_vector(
+                self._base_vector,
+                {
+                    side: np.asarray(qpos_by_component[side], dtype=float)
+                    for side in SIDES
+                },
+            )
+            mujoco = self._projector.check_qpos(self._control.scene.data, target_vector)
+            payload = mujoco.to_dict()
+        except Exception as exc:  # noqa: BLE001 - backend failures fail closed
+            return JointConfigurationCheck(
+                safe=False,
+                collision_check_available=False,
+                reason="mujoco_collision_query_failed",
+                metadata={
+                    "exception_type": type(exc).__name__,
+                    "exception": str(exc),
+                    "fcl_check": fcl.to_dict(),
+                },
+            )
+        mujoco_distance = payload.get("minimum_distance_m")
+        distances = [
+            float(value)
+            for value in (fcl.minimum_distance_m, mujoco_distance)
+            if value is not None
+        ]
+        return JointConfigurationCheck(
+            safe=bool(mujoco.safe),
+            collision_check_available=True,
+            reason=(
+                "combined_fcl_mujoco_collision_safe"
+                if mujoco.safe
+                else "mujoco_collision_blocked"
+            ),
+            minimum_distance_m=min(distances) if distances else None,
+            metadata={
+                "collision_sources": ("pinocchio_fcl", "mujoco"),
+                "fcl_check": fcl.to_dict(),
+                "mujoco_check": payload,
+            },
+        )
 
 
 def _pose(value: Any, *, name: str) -> np.ndarray:
@@ -126,7 +213,9 @@ def required_motion_duration_sec(
     )
     # max d/du of 10u^3 - 15u^4 + 6u^5 is 1.875 at u=0.5.
     peak_progress_derivative = 1.875
-    translation_duration = peak_progress_derivative * translation_distance / linear_speed
+    translation_duration = (
+        peak_progress_derivative * translation_distance / linear_speed
+    )
     rotation_duration = peak_progress_derivative * rotation_angle / angular_speed
     duration = max(minimum, translation_duration, rotation_duration)
     return duration, {
@@ -163,18 +252,14 @@ def build_smooth_se3_trajectory(
         raise ValueError("terminal_hold_sec must be finite and non-negative")
     motion_frames = math.ceil(duration * rate) + 1
     unit_times = np.linspace(0.0, 1.0, motion_frames, dtype=float)
-    relative_rotvec = Rotation.from_matrix(
-        start[:3, :3].T @ target[:3, :3]
-    ).as_rotvec()
+    relative_rotvec = Rotation.from_matrix(start[:3, :3].T @ target[:3, :3]).as_rotvec()
     poses: list[np.ndarray] = []
     for progress in np.asarray(quintic_progress(unit_times), dtype=float):
         pose = np.eye(4, dtype=float)
-        pose[:3, 3] = start[:3, 3] + progress * (
-            target[:3, 3] - start[:3, 3]
+        pose[:3, 3] = start[:3, 3] + progress * (target[:3, 3] - start[:3, 3])
+        pose[:3, :3] = (
+            start[:3, :3] @ Rotation.from_rotvec(progress * relative_rotvec).as_matrix()
         )
-        pose[:3, :3] = start[:3, :3] @ Rotation.from_rotvec(
-            progress * relative_rotvec
-        ).as_matrix()
         poses.append(pose)
     hold_frames = math.ceil(hold * rate)
     poses.extend(target.copy() for _ in range(hold_frames))
@@ -204,7 +289,9 @@ class ToolTcpFrameBinding:
             self, "orientation_offset_deg", float(self.orientation_offset_deg)
         )
 
-    def solver_target_from_dmtac_target(self, target_pose_base: np.ndarray) -> np.ndarray:
+    def solver_target_from_dmtac_target(
+        self, target_pose_base: np.ndarray
+    ) -> np.ndarray:
         return _pose(target_pose_base, name="target_pose_base") @ np.linalg.inv(
             self.single_tool_from_dmtac_tool
         )
@@ -329,9 +416,7 @@ def derive_tool_tcp_frame_binding(
     normalized_side = str(side).strip().lower()
     if normalized_side not in SIDES:
         raise ValueError(f"side must be one of {SIDES}")
-    qpos = {
-        item: control.scene.get_arm_qpos(item).copy() for item in SIDES
-    }
+    qpos = {item: control.scene.get_arm_qpos(item).copy() for item in SIDES}
     single_base_from_tool = np.asarray(
         single_arm_solver.compute_pose(qpos[normalized_side]), dtype=float
     ).reshape(4, 4)
@@ -354,11 +439,15 @@ def _collision_checker(
     control: DeskTcpPositionControl,
     *,
     side: str,
+    obstacle_oracle: RM65ObstacleCollisionOracle | None = None,
 ) -> Any:
     projector = control.scene.collision_projector()
     base_vector = control.scene.kinematic_controlled_qpos()
+    current_qpos = {item: control.scene.get_arm_qpos(item).copy() for item in SIDES}
 
-    def check(candidate: IKCandidate, _target_pose: np.ndarray) -> CollisionCandidateAssessment:
+    def check(
+        candidate: IKCandidate, _target_pose: np.ndarray
+    ) -> CollisionCandidateAssessment:
         if candidate.qpos_rad is None:
             return CollisionCandidateAssessment(
                 status=CollisionCandidateStatus.ERROR,
@@ -375,32 +464,127 @@ def _collision_checker(
         )
         result = projector.check_qpos(control.scene.data, target)
         payload = result.to_dict()
+        obstacle_payload: dict[str, object] | None = None
+        obstacle_distance: float | None = None
+        obstacle_required_distance = 0.0
+        if not result.safe:
+            return CollisionCandidateAssessment(
+                status=CollisionCandidateStatus.BLOCKED,
+                reason_code="mujoco_endpoint_collision_blocked",
+                minimum_distance_m=(
+                    None
+                    if payload.get("minimum_distance_m") is None
+                    else float(payload["minimum_distance_m"])
+                ),
+                required_distance_m=float(projector.policy.minimum_clearance_m),
+                obstacle_ids=tuple(
+                    str(value)
+                    for value in (payload.get("body1"), payload.get("body2"))
+                    if value
+                ),
+                metadata={"collision_source": "mujoco", **payload},
+            )
+        if obstacle_oracle is not None:
+            qpos_by_side = {
+                item: values.copy() for item, values in current_qpos.items()
+            }
+            qpos_by_side[side] = np.asarray(candidate.qpos_rad, dtype=float).copy()
+            obstacle = obstacle_oracle.check(qpos_by_side)
+            obstacle_payload = obstacle.to_dict()
+            obstacle_distance = obstacle.minimum_distance_m
+            obstacle_required_distance = float(
+                obstacle.metadata.get("minimum_clearance_m", 0.0)
+            )
+            if not obstacle.collision_check_available:
+                return CollisionCandidateAssessment(
+                    status=CollisionCandidateStatus.ERROR,
+                    reason_code="obstacle_endpoint_collision_check_unavailable",
+                    metadata={
+                        "collision_source": "pinocchio_fcl_obstacle_scene",
+                        **obstacle_payload,
+                    },
+                )
+            if not obstacle.safe:
+                obstacle_id = obstacle.metadata.get("closest_obstacle_id")
+                return CollisionCandidateAssessment(
+                    status=CollisionCandidateStatus.BLOCKED,
+                    reason_code="obstacle_endpoint_collision_blocked",
+                    minimum_distance_m=obstacle.minimum_distance_m,
+                    required_distance_m=float(
+                        obstacle.metadata.get("minimum_clearance_m", 0.0)
+                    ),
+                    obstacle_ids=(str(obstacle_id),) if obstacle_id else (),
+                    metadata={
+                        "collision_source": "pinocchio_fcl_obstacle_scene",
+                        **obstacle_payload,
+                    },
+                )
         return CollisionCandidateAssessment(
-            status=(
-                CollisionCandidateStatus.SAFE
-                if result.safe
-                else CollisionCandidateStatus.BLOCKED
-            ),
+            status=CollisionCandidateStatus.SAFE,
             reason_code=(
-                "mujoco_endpoint_collision_safe"
-                if result.safe
-                else "mujoco_endpoint_collision_blocked"
+                "mujoco_and_obstacle_endpoint_collision_safe"
+                if obstacle_oracle is not None
+                else "mujoco_endpoint_collision_safe"
             ),
             minimum_distance_m=(
-                None
-                if payload.get("minimum_distance_m") is None
-                else float(payload["minimum_distance_m"])
+                min(
+                    (
+                        float(value)
+                        for value in (
+                            payload.get("minimum_distance_m"),
+                            obstacle_distance,
+                        )
+                        if value is not None
+                    ),
+                    default=None,
+                )
             ),
-            required_distance_m=float(projector.policy.minimum_clearance_m),
+            required_distance_m=max(
+                float(projector.policy.minimum_clearance_m),
+                obstacle_required_distance,
+            ),
             obstacle_ids=tuple(
                 str(value)
                 for value in (payload.get("body1"), payload.get("body2"))
                 if value
             ),
-            metadata=payload,
+            metadata={
+                "collision_source": (
+                    "mujoco_and_pinocchio_fcl_obstacle_scene"
+                    if obstacle_payload is not None
+                    else "mujoco"
+                ),
+                "mujoco_check": payload,
+                "obstacle_check": obstacle_payload,
+            },
         )
 
     return check
+
+
+def build_obstacle_collision_oracle(
+    control: DeskTcpPositionControl,
+    scene: ObstacleSceneSnapshot,
+) -> RM65ObstacleCollisionOracle:
+    """Bind one immutable world-frame cube scene to the active dual-arm model."""
+
+    if scene.reference_frame_id != OBSTACLE_SCENE_FRAME_ID:
+        raise ValueError(
+            f"obstacle scene reference_frame_id must be {OBSTACLE_SCENE_FRAME_ID!r}"
+        )
+    if scene.reference_frame_spec_hash != OBSTACLE_SCENE_FRAME_SPEC_HASH:
+        raise ValueError(
+            "obstacle scene reference_frame_spec_hash must be "
+            f"{OBSTACLE_SCENE_FRAME_SPEC_HASH!r}"
+        )
+    solver = control.retargeter.ik_solver
+    return RM65ObstacleCollisionOracle.from_solver(
+        solver,
+        scene=scene,
+        solution_layout=control.retargeter.profile.solution_layout,
+        expected_reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
+        expected_reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
+    )
 
 
 def evaluate_motion_target_endpoint(
@@ -408,6 +592,7 @@ def evaluate_motion_target_endpoint(
     target: GraspMotionTarget,
     *,
     config: RM65RandomGraspPoseReachabilityConfig | None = None,
+    obstacle_oracle: RM65ObstacleCollisionOracle | None = None,
 ) -> tuple[GraspReachabilityReceipt, ToolTcpFrameBinding, Any]:
     cfg = config or RM65RandomGraspPoseReachabilityConfig()
     solver = build_rm65_single_arm_ik_solver(
@@ -433,6 +618,16 @@ def evaluate_motion_target_endpoint(
         max_iterations=int(cfg.ik_max_iterations),
         max_joint_step_rad=float(cfg.ik_max_joint_step_rad),
         damping=float(cfg.ik_damping),
+        near_miss_refinement_enabled=cfg.near_miss_refinement_enabled,
+        near_miss_position_threshold_m=float(cfg.near_miss_position_threshold_m),
+        near_miss_orientation_threshold_rad=math.radians(
+            float(cfg.near_miss_orientation_threshold_deg)
+        ),
+        near_miss_max_nfev=int(cfg.near_miss_max_nfev),
+        acceptance_position_m=float(cfg.maximum_position_residual_m),
+        acceptance_orientation_rad=math.radians(
+            float(cfg.maximum_orientation_residual_deg)
+        ),
     )
     receipt = evaluate_grasp_pose_reachability(
         solver_target,
@@ -450,7 +645,24 @@ def evaluate_motion_target_endpoint(
             origin_xyz_m=cfg.conservative_workspace_origin_m,
             maximum_radius_m=float(cfg.conservative_workspace_maximum_radius_m),
         ),
-        collision_checker=_collision_checker(control, side=target.side),
+        collision_checker=_collision_checker(
+            control,
+            side=target.side,
+            obstacle_oracle=obstacle_oracle,
+        ),
+    )
+    receipt = annotate_ik_search_exhaustion(
+        receipt,
+        solver=solver,
+        target_pose=solver_target,
+        maximum_position_residual_m=float(cfg.maximum_position_residual_m),
+        near_miss_position_threshold_m=float(cfg.near_miss_position_threshold_m),
+        near_miss_orientation_threshold_rad=math.radians(
+            float(cfg.near_miss_orientation_threshold_deg)
+        ),
+        position_diagnostic_max_nfev=int(cfg.exhaustion_position_diagnostic_max_nfev),
+        joint_limit_margin_rad=float(cfg.joint_limit_margin_rad),
+        enabled=cfg.exhaustion_position_diagnostic_enabled,
     )
     return receipt, binding, solver
 
@@ -478,18 +690,14 @@ def _direct_joint_path_collision_assessment(
     if projector is None:
         raise RuntimeError("direct joint path requires MuJoCo collision safety")
     base_vector = control.scene.kinematic_controlled_qpos()
-    maximum_joint_motion_deg = float(
-        np.max(np.abs(np.rad2deg(target - start)))
-    )
+    maximum_joint_motion_deg = float(np.max(np.abs(np.rad2deg(target - start))))
     sample_count = max(
         241,
         math.ceil(maximum_joint_motion_deg / 0.1) + 1,
     )
     sample_count = min(sample_count, 5001)
     minimum_clearance_m = math.inf
-    for index, progress in enumerate(
-        np.linspace(0.0, 1.0, sample_count, dtype=float)
-    ):
+    for index, progress in enumerate(np.linspace(0.0, 1.0, sample_count, dtype=float)):
         qpos = start + float(progress) * (target - start)
         target_vector = control.scene.kinematic_target_vector(
             base_vector, {normalized_side: qpos}
@@ -518,9 +726,148 @@ def _direct_joint_path_collision_assessment(
         "reason_code": "mujoco_direct_joint_path_collision_safe",
         "collision_sample_count": sample_count,
         "minimum_path_clearance_m": (
-            None
-            if not math.isfinite(minimum_clearance_m)
-            else minimum_clearance_m
+            None if not math.isfinite(minimum_clearance_m) else minimum_clearance_m
+        ),
+    }
+
+
+def plan_obstacle_aware_joint_path(
+    control: DeskTcpPositionControl,
+    *,
+    side: str,
+    target_qpos_rad: np.ndarray,
+    single_arm_solver: Any,
+    obstacle_oracle: Any,
+    planner_config: JointPathPlannerConfig | None = None,
+) -> JointPathPlanResult:
+    """Run direct-first bounded BiRRT while freezing the inactive arm."""
+
+    normalized_side = str(side).strip().lower()
+    if normalized_side not in SIDES:
+        raise ValueError(f"side must be one of {SIDES}")
+    start = {item: control.scene.get_arm_qpos(item).copy() for item in SIDES}
+    target = {item: values.copy() for item, values in start.items()}
+    target[normalized_side] = np.asarray(target_qpos_rad, dtype=float).reshape(6)
+    cfg = planner_config or JointPathPlannerConfig()
+    physical_lower = np.asarray(single_arm_solver.q_min, dtype=float).reshape(6)
+    physical_upper = np.asarray(single_arm_solver.q_max, dtype=float).reshape(6)
+    # A full-limit search can find enormous, numerically awkward detours even
+    # when a small local avoidance move exists.  Keep the search around the
+    # current/goal corridor while intersecting it with physical joint limits.
+    lower = np.maximum(
+        physical_lower,
+        np.minimum(start[normalized_side], target[normalized_side])
+        - cfg.sample_padding_rad,
+    )
+    upper = np.minimum(
+        physical_upper,
+        np.maximum(start[normalized_side], target[normalized_side])
+        + cfg.sample_padding_rad,
+    )
+    return plan_collision_aware_joint_path(
+        start_qpos_by_component=start,
+        target_qpos_by_component=target,
+        movable_components=(normalized_side,),
+        oracle=obstacle_oracle,
+        config=cfg,
+        joint_lower_by_component={normalized_side: lower},
+        joint_upper_by_component={normalized_side: upper},
+        scene_hash=obstacle_oracle.scene_hash,
+    )
+
+
+def revalidate_obstacle_path(
+    waypoints: Sequence[Mapping[str, np.ndarray]],
+    *,
+    oracle: Any,
+    edge_resolution_rad: float = FINAL_OBSTACLE_EDGE_RESOLUTION_RAD,
+) -> dict[str, object]:
+    """Densely recheck the final shortened path against the bound FCL scene."""
+
+    resolution = float(edge_resolution_rad)
+    if not math.isfinite(resolution) or resolution <= 0.0:
+        raise ValueError("edge_resolution_rad must be finite and positive")
+    if not waypoints:
+        raise ValueError("obstacle path revalidation requires waypoints")
+    sample_count = 0
+    minimum_distance_m = math.inf
+    for segment_index, (left, right) in enumerate(pairwise(waypoints)):
+        if set(left) != set(right):
+            raise ValueError("path waypoint component names must match")
+        maximum_delta = max(
+            float(
+                np.max(
+                    np.abs(
+                        np.asarray(right[item], dtype=float)
+                        - np.asarray(left[item], dtype=float)
+                    )
+                )
+            )
+            for item in left
+        )
+        edge_samples = max(1, math.ceil(maximum_delta / resolution))
+        for edge_sample_index in range(edge_samples + 1):
+            alpha = float(edge_sample_index) / float(edge_samples)
+            candidate = {
+                item: np.asarray(left[item], dtype=float)
+                + alpha
+                * (
+                    np.asarray(right[item], dtype=float)
+                    - np.asarray(left[item], dtype=float)
+                )
+                for item in left
+            }
+            assessment = oracle.check(candidate)
+            sample_count += 1
+            if assessment.minimum_distance_m is not None:
+                minimum_distance_m = min(
+                    minimum_distance_m, float(assessment.minimum_distance_m)
+                )
+            if not assessment.collision_check_available:
+                return {
+                    "safe": False,
+                    "collision_check_available": False,
+                    "reason_code": "final_obstacle_revalidation_unavailable",
+                    "segment_index": segment_index,
+                    "edge_sample_index": edge_sample_index,
+                    "sample_count": sample_count,
+                    "check": assessment.to_dict(),
+                }
+            if not assessment.safe:
+                return {
+                    "safe": False,
+                    "collision_check_available": True,
+                    "reason_code": "final_obstacle_revalidation_blocked",
+                    "segment_index": segment_index,
+                    "edge_sample_index": edge_sample_index,
+                    "sample_count": sample_count,
+                    "check": assessment.to_dict(),
+                }
+    if len(waypoints) == 1:
+        assessment = oracle.check(waypoints[0])
+        sample_count = 1
+        if assessment.minimum_distance_m is not None:
+            minimum_distance_m = float(assessment.minimum_distance_m)
+        if not assessment.collision_check_available or not assessment.safe:
+            return {
+                "safe": False,
+                "collision_check_available": assessment.collision_check_available,
+                "reason_code": (
+                    "final_obstacle_revalidation_blocked"
+                    if assessment.collision_check_available
+                    else "final_obstacle_revalidation_unavailable"
+                ),
+                "sample_count": sample_count,
+                "check": assessment.to_dict(),
+            }
+    return {
+        "safe": True,
+        "collision_check_available": True,
+        "reason_code": "final_obstacle_revalidation_safe",
+        "edge_resolution_deg": math.degrees(resolution),
+        "sample_count": sample_count,
+        "minimum_path_distance_m": (
+            None if not math.isfinite(minimum_distance_m) else minimum_distance_m
         ),
     }
 
@@ -550,9 +897,7 @@ def select_random_reachable_demo_target(
     solver = build_rm65_single_arm_ik_solver(
         RM65SingleArmIKConfig(controlled_frame="tool_tcp")
     )
-    current = {
-        item: control.scene.get_arm_qpos(item).copy() for item in SIDES
-    }
+    current = {item: control.scene.get_arm_qpos(item).copy() for item in SIDES}
     projector = control.scene.collision_projector()
     if projector is None:
         raise RuntimeError("demo target selection requires MuJoCo collision safety")
@@ -644,9 +989,7 @@ def _pose_step_statistics(
         )
         maximum_rotation = max(
             maximum_rotation,
-            float(
-                Rotation.from_matrix(lhs[:3, :3].T @ rhs[:3, :3]).magnitude()
-            )
+            float(Rotation.from_matrix(lhs[:3, :3].T @ rhs[:3, :3]).magnitude())
             / denominator,
         )
     return maximum_translation, maximum_rotation
@@ -656,16 +999,100 @@ def classify_motion_status(
     *,
     final_endpoint_status: str,
     endpoint_status_counts: Mapping[str, int],
+    unrecovered_ik_target_unmet_count: int | None = None,
 ) -> str:
-    """Classify the whole path without letting the last frame erase failures."""
+    """Classify the path while preserving only unresolved execution failures.
 
-    if int(endpoint_status_counts.get("ik_target_unmet", 0)) > 0:
+    Older callers can omit ``unrecovered_ik_target_unmet_count`` and retain the
+    conservative historical rule that any observed IK miss poisons the run.
+    The execution loop supplies the explicit unresolved count so a bounded,
+    same-reference retry that genuinely recovers remains visible in diagnostics
+    without being misreported as a terminal failure.
+    """
+
+    if unrecovered_ik_target_unmet_count is None:
+        unresolved = int(endpoint_status_counts.get("ik_target_unmet", 0))
+    else:
+        unresolved = int(unrecovered_ik_target_unmet_count)
+        if unresolved < 0:
+            raise ValueError("unrecovered_ik_target_unmet_count must be non-negative")
+    if unresolved > 0:
         return MOTION_STATUS_IK_TARGET_UNMET
     if str(final_endpoint_status) == "settled":
         return MOTION_STATUS_COMPLETED
     if str(final_endpoint_status) == "ik_target_unmet":
         return MOTION_STATUS_IK_TARGET_UNMET
     return MOTION_STATUS_TRACKING_INCOMPLETE
+
+
+def _dispatch_frozen_reference_with_bounded_ik_recovery(
+    control: DeskTcpPositionControl,
+    reference: ResampledMotionReference,
+    *,
+    inactive_side: str,
+    retry_limit: int,
+    settle_once: Callable[[], int],
+) -> dict[str, object]:
+    """Dispatch one frozen reference and retry only an explicit IK target miss.
+
+    Every attempt uses the exact same ``ResampledMotionReference`` object and
+    the existing collision-aware ``solve_and_dispatch`` owner.  The helper does
+    not rewrite targets, inject qpos, or relax lower safety.  Exhaustion is a
+    terminal, explicit result for the caller rather than a swallowed transient.
+    """
+
+    limit = int(retry_limit)
+    if limit < 0:
+        raise ValueError("retry_limit must be non-negative")
+    observations: list[dict[str, object]] = []
+    result_statuses: list[str] = []
+    physics_ticks_by_attempt: list[int] = []
+    total_physics_ticks = 0
+    initial_unmet = False
+    final_result: Any = None
+
+    for attempt_index in range(limit + 1):
+        final_result = control.solve_and_dispatch(
+            reference,
+            gripper_close_by_side={"left": 0.0, "right": 0.0},
+            hold_sides=(inactive_side,),
+        )
+        result_statuses.append(str(final_result.status))
+        physics_ticks = int(settle_once())
+        physics_ticks_by_attempt.append(physics_ticks)
+        total_physics_ticks += physics_ticks
+        observation = dict(control.endpoint_tracking_observation())
+        observations.append(observation)
+        unmet = str(observation.get("status", "unknown")) == "ik_target_unmet"
+        if attempt_index == 0:
+            initial_unmet = unmet
+        if not unmet:
+            break
+
+    assert final_result is not None
+    final_status = str(observations[-1].get("status", "unknown"))
+    unrecovered = final_status == "ik_target_unmet"
+    recovered = initial_unmet and not unrecovered
+    retry_count = len(observations) - 1
+    return {
+        "result": final_result,
+        "result_statuses": tuple(result_statuses),
+        "observations": tuple(observations),
+        "initial_ik_target_unmet": initial_unmet,
+        "status": (
+            "unrecovered"
+            if unrecovered
+            else "transient_recovered"
+            if recovered
+            else "not_needed"
+        ),
+        "recovered": recovered,
+        "unrecovered": unrecovered,
+        "retry_count": retry_count,
+        "attempt_count": len(observations),
+        "physics_ticks": total_physics_ticks,
+        "retry_physics_ticks": sum(physics_ticks_by_attempt[1:]),
+    }
 
 
 def build_collision_checked_joint_fk_reference_plan(
@@ -709,9 +1136,7 @@ def build_collision_checked_joint_fk_reference_plan(
     if not math.isfinite(minimum_duration) or minimum_duration <= 0.0:
         raise ValueError("minimum_duration_sec must be finite and positive")
 
-    initial_by_side = {
-        item: control.scene.get_arm_qpos(item).copy() for item in SIDES
-    }
+    initial_by_side = {item: control.scene.get_arm_qpos(item).copy() for item in SIDES}
     delta = target - start
     maximum_joint_motion_deg = float(np.max(np.abs(np.rad2deg(delta))))
     path_collision = _direct_joint_path_collision_assessment(
@@ -735,9 +1160,7 @@ def build_collision_checked_joint_fk_reference_plan(
     inactive_side = "right" if normalized_side == "left" else "left"
 
     def world_pose(qpos: np.ndarray) -> np.ndarray:
-        qpos_by_side = {
-            item: values.copy() for item, values in initial_by_side.items()
-        }
+        qpos_by_side = {item: values.copy() for item, values in initial_by_side.items()}
         qpos_by_side[normalized_side] = np.asarray(qpos, dtype=float).copy()
         return control.retargeter.tool_tcp_world_targets_for_qpos_pair(
             left_qpos=qpos_by_side["left"],
@@ -786,8 +1209,7 @@ def build_collision_checked_joint_fk_reference_plan(
         step_size=1.0 / reference_hz,
     )
     maximum_joint_speed = np.max(
-        np.abs(np.diff(np.rad2deg(np.stack(qpos_path, axis=0)), axis=0))
-        * reference_hz,
+        np.abs(np.diff(np.rad2deg(np.stack(qpos_path, axis=0)), axis=0)) * reference_hz,
         axis=0,
     )
     if maximum_linear_speed > linear_speed * 1.0001:
@@ -795,7 +1217,9 @@ def build_collision_checked_joint_fk_reference_plan(
     if maximum_angular_speed > angular_speed * 1.0001:
         raise RuntimeError("joint-FK plan exceeded requested angular TCP speed")
     if np.any(maximum_joint_speed > joint_velocity_limits * 1.0001):
-        raise RuntimeError("joint-FK plan exceeded the configured joint velocity profile")
+        raise RuntimeError(
+            "joint-FK plan exceeded the configured joint velocity profile"
+        )
     return JointFkReferencePlan(
         status="safe",
         pose_desk=pose_desk,
@@ -805,9 +1229,7 @@ def build_collision_checked_joint_fk_reference_plan(
             "path_reference_semantics": "dmtac_tcp_fk_of_admitted_joint_path",
             "inactive_side": inactive_side,
             "collision_sample_count": path_collision["collision_sample_count"],
-            "minimum_path_clearance_m": path_collision[
-                "minimum_path_clearance_m"
-            ],
+            "minimum_path_clearance_m": path_collision["minimum_path_clearance_m"],
             "maximum_joint_motion_deg": maximum_joint_motion_deg,
             "reference_frame_count": frame_count,
             "duration_sec": effective_duration,
@@ -824,6 +1246,112 @@ def build_collision_checked_joint_fk_reference_plan(
     )
 
 
+def build_collision_checked_multiwaypoint_joint_fk_reference_plan(
+    control: DeskTcpPositionControl,
+    *,
+    side: str,
+    waypoints_qpos_rad: Sequence[np.ndarray],
+    linear_speed_m_s: float,
+    angular_speed_deg_s: float,
+    minimum_duration_sec: float,
+) -> JointFkReferencePlan:
+    """Time-parameterize a validated waypoint path as C2 stop-at-waypoint segments."""
+
+    waypoints = tuple(
+        np.asarray(value, dtype=float).reshape(6).copy() for value in waypoints_qpos_rad
+    )
+    if not waypoints:
+        raise ValueError("multiwaypoint plan requires at least one waypoint")
+    if any(not np.all(np.isfinite(value)) for value in waypoints):
+        raise ValueError("multiwaypoint plan requires finite waypoints")
+    if len(waypoints) == 1:
+        waypoints = (waypoints[0], waypoints[0].copy())
+    segment_count = len(waypoints) - 1
+    segment_minimum_duration = max(
+        0.25, float(minimum_duration_sec) / float(segment_count)
+    )
+    poses: list[np.ndarray] = []
+    qpos_values: list[np.ndarray] = []
+    segment_metadata: list[dict[str, object]] = []
+    for segment_index, (start, target) in enumerate(pairwise(waypoints)):
+        segment = build_collision_checked_joint_fk_reference_plan(
+            control,
+            side=side,
+            start_qpos_rad=start,
+            target_qpos_rad=target,
+            linear_speed_m_s=linear_speed_m_s,
+            angular_speed_deg_s=angular_speed_deg_s,
+            minimum_duration_sec=segment_minimum_duration,
+        )
+        segment_metadata.append(
+            {"segment_index": segment_index, **dict(segment.metadata)}
+        )
+        if segment.status != "safe":
+            return JointFkReferencePlan(
+                status="collision_blocked",
+                pose_desk=(),
+                qpos_rad=(),
+                metadata={
+                    "planner": "multiwaypoint_joint_quintic_fk",
+                    "reason_code": "mujoco_waypoint_segment_collision_blocked",
+                    "blocked_segment_index": segment_index,
+                    "waypoint_count": len(waypoints),
+                    "segment_count": segment_count,
+                    "segments": segment_metadata,
+                    "motion_emitted": False,
+                },
+            )
+        offset = 0 if segment_index == 0 else 1
+        poses.extend(segment.pose_desk[offset:])
+        qpos_values.extend(segment.qpos_rad[offset:])
+    return JointFkReferencePlan(
+        status="safe",
+        pose_desk=tuple(poses),
+        qpos_rad=tuple(qpos_values),
+        metadata={
+            "planner": "multiwaypoint_joint_quintic_fk",
+            "path_reference_semantics": "dmtac_tcp_fk_of_admitted_joint_path",
+            "time_parameterization": "per_segment_quintic_stop_at_waypoint",
+            "continuity": "C2_at_waypoints_with_zero_velocity_and_acceleration",
+            "jerk_bounded": False,
+            "waypoint_count": len(waypoints),
+            "segment_count": segment_count,
+            "reference_frame_count": len(poses),
+            "segments": segment_metadata,
+        },
+    )
+
+
+def _planner_error_receipt(
+    target: GraspMotionTarget,
+    *,
+    reason_code: str,
+    metadata: Mapping[str, object],
+) -> GraspReachabilityReceipt:
+    return GraspReachabilityReceipt(
+        status=GraspReachabilityStatus.PLANNER_ERROR,
+        reason_code=str(reason_code),
+        proof_scope="obstacle_scene_planner_initialization",
+        reference_frame_id=DEFAULT_REFERENCE_FRAME_ID,
+        reference_frame_spec_hash=DEFAULT_REFERENCE_FRAME_SPEC_HASH,
+        target_pose=tuple(
+            tuple(float(value) for value in row)
+            for row in target.target_pose_base_from_dmtac_tcp
+        ),
+        metadata=dict(metadata),
+    )
+
+
+def _path_failure_motion_status(status: JointPathStatus) -> str:
+    if status is JointPathStatus.START_BLOCKED:
+        return MOTION_STATUS_PATH_START_BLOCKED
+    if status is JointPathStatus.TARGET_BLOCKED:
+        return MOTION_STATUS_PATH_TARGET_BLOCKED
+    if status is JointPathStatus.PATH_SEARCH_EXHAUSTED:
+        return MOTION_STATUS_PATH_SEARCH_EXHAUSTED
+    return MOTION_STATUS_PATH_PLANNER_ERROR
+
+
 def execute_grasp_motion(
     control: DeskTcpPositionControl,
     target: GraspMotionTarget,
@@ -832,31 +1360,78 @@ def execute_grasp_motion(
     angular_speed_deg_s: float = 45.0,
     minimum_duration_sec: float = 2.0,
     terminal_hold_sec: float = 1.5,
+    ik_target_unmet_retry_limit: int = DEFAULT_IK_TARGET_UNMET_RETRY_LIMIT,
+    obstacle_scene: ObstacleSceneSnapshot | None = None,
+    obstacle_planner_config: JointPathPlannerConfig | None = None,
 ) -> GraspMotionPlayback:
-    receipt, binding, _solver = evaluate_motion_target_endpoint(control, target)
-    initial_qpos = {
-        side: control.scene.get_arm_qpos(side).copy() for side in SIDES
-    }
+    retry_limit = int(ik_target_unmet_retry_limit)
+    if retry_limit < 0:
+        raise ValueError("ik_target_unmet_retry_limit must be non-negative")
+    initial_qpos = {side: control.scene.get_arm_qpos(side).copy() for side in SIDES}
     initial_world = control.retargeter.tool_tcp_world_targets_for_qpos_pair(
         left_qpos=initial_qpos["left"], right_qpos=initial_qpos["right"]
     )
     world_from_base = np.linalg.inv(control.world_to_base_by_side[target.side])
-    target_world_active = (
-        world_from_base @ target.target_pose_base_from_dmtac_tcp
-    )
-    target_world_by_side = {
-        side: initial_world[side].copy() for side in SIDES
-    }
+    target_world_active = world_from_base @ target.target_pose_base_from_dmtac_tcp
+    target_world_by_side = {side: initial_world[side].copy() for side in SIDES}
     target_world_by_side[target.side] = target_world_active.copy()
+    obstacle_oracle: RM65ObstacleCollisionOracle | None = None
+    path_oracle: Any | None = None
+    obstacle_initialization_error: dict[str, object] | None = None
+    if obstacle_scene is not None:
+        try:
+            obstacle_oracle = build_obstacle_collision_oracle(control, obstacle_scene)
+            path_oracle = _MujocoFclObstacleOracle(control, obstacle_oracle)
+        except Exception as exc:  # noqa: BLE001 - planner initialization fails closed
+            obstacle_initialization_error = {
+                "reason_code": "obstacle_collision_oracle_initialization_failed",
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+            }
+    if obstacle_initialization_error is None:
+        if obstacle_oracle is None:
+            receipt, binding, endpoint_solver = evaluate_motion_target_endpoint(
+                control, target
+            )
+        else:
+            receipt, binding, endpoint_solver = evaluate_motion_target_endpoint(
+                control,
+                target,
+                obstacle_oracle=obstacle_oracle,
+            )
+    else:
+        endpoint_solver = build_rm65_single_arm_ik_solver(
+            RM65SingleArmIKConfig(controlled_frame="tool_tcp")
+        )
+        binding = derive_tool_tcp_frame_binding(
+            control, side=target.side, single_arm_solver=endpoint_solver
+        )
+        receipt = _planner_error_receipt(
+            target,
+            reason_code="obstacle_collision_oracle_initialization_failed",
+            metadata=obstacle_initialization_error,
+        )
     empty_summary = {
         "reference_rate_hz": float(control.contract.timing.ik_hz),
         "command_rate_hz": float(control.contract.timing.command_hz),
         "physics_rate_hz": float(control.contract.timing.physics_hz),
         "motion_emitted": False,
+        "obstacle_scene": (
+            None
+            if obstacle_scene is None
+            else {
+                **obstacle_scene.to_dict(),
+                "semantic_content_hash": obstacle_scene.semantic_content_hash,
+            }
+        ),
     }
     if receipt.status is not GraspReachabilityStatus.REACHABLE:
         return GraspMotionPlayback(
-            motion_status=MOTION_STATUS_ENDPOINT_REJECTED,
+            motion_status=(
+                MOTION_STATUS_PATH_PLANNER_ERROR
+                if obstacle_initialization_error is not None
+                else MOTION_STATUS_ENDPOINT_REJECTED
+            ),
             side=target.side,
             target=target,
             endpoint_receipt=receipt,
@@ -870,15 +1445,85 @@ def execute_grasp_motion(
 
     target_pose_desk = np.linalg.inv(control.world_from_desk) @ target_world_active
     selected_qpos = _selected_candidate_qpos(receipt)
-    joint_fk_plan = build_collision_checked_joint_fk_reference_plan(
-        control,
-        side=target.side,
-        start_qpos_rad=initial_qpos[target.side],
-        target_qpos_rad=selected_qpos,
-        linear_speed_m_s=linear_speed_m_s,
-        angular_speed_deg_s=angular_speed_deg_s,
-        minimum_duration_sec=minimum_duration_sec,
-    )
+    joint_path_search: dict[str, object] | None = None
+    final_obstacle_revalidation: dict[str, object] | None = None
+    if obstacle_oracle is None:
+        joint_fk_plan = build_collision_checked_joint_fk_reference_plan(
+            control,
+            side=target.side,
+            start_qpos_rad=initial_qpos[target.side],
+            target_qpos_rad=selected_qpos,
+            linear_speed_m_s=linear_speed_m_s,
+            angular_speed_deg_s=angular_speed_deg_s,
+            minimum_duration_sec=minimum_duration_sec,
+        )
+    else:
+        joint_path_result = plan_obstacle_aware_joint_path(
+            control,
+            side=target.side,
+            target_qpos_rad=selected_qpos,
+            single_arm_solver=endpoint_solver,
+            obstacle_oracle=path_oracle,
+            planner_config=obstacle_planner_config,
+        )
+        joint_path_search = joint_path_result.to_dict()
+        if joint_path_result.status is not JointPathStatus.PATH_FOUND:
+            return GraspMotionPlayback(
+                motion_status=_path_failure_motion_status(joint_path_result.status),
+                side=target.side,
+                target=target,
+                endpoint_receipt=receipt,
+                frame_binding=binding,
+                target_pose_world_by_side=target_world_by_side,
+                reference_pose_world=(),
+                actual_pose_world=(),
+                actual_qpos_by_frame=(),
+                summary={
+                    **empty_summary,
+                    "path_preflight": joint_path_search,
+                },
+            )
+        final_obstacle_revalidation = revalidate_obstacle_path(
+            joint_path_result.waypoints,
+            oracle=path_oracle,
+        )
+        if not bool(final_obstacle_revalidation["safe"]):
+            return GraspMotionPlayback(
+                motion_status=(
+                    MOTION_STATUS_PATH_COLLISION_BLOCKED
+                    if bool(
+                        final_obstacle_revalidation.get(
+                            "collision_check_available", False
+                        )
+                    )
+                    else MOTION_STATUS_PATH_PLANNER_ERROR
+                ),
+                side=target.side,
+                target=target,
+                endpoint_receipt=receipt,
+                frame_binding=binding,
+                target_pose_world_by_side=target_world_by_side,
+                reference_pose_world=(),
+                actual_pose_world=(),
+                actual_qpos_by_frame=(),
+                summary={
+                    **empty_summary,
+                    "path_preflight": {
+                        "joint_path_search": joint_path_search,
+                        "final_obstacle_revalidation": (final_obstacle_revalidation),
+                    },
+                },
+            )
+        joint_fk_plan = build_collision_checked_multiwaypoint_joint_fk_reference_plan(
+            control,
+            side=target.side,
+            waypoints_qpos_rad=tuple(
+                waypoint[target.side] for waypoint in joint_path_result.waypoints
+            ),
+            linear_speed_m_s=linear_speed_m_s,
+            angular_speed_deg_s=angular_speed_deg_s,
+            minimum_duration_sec=minimum_duration_sec,
+        )
     if joint_fk_plan.status == "collision_blocked":
         return GraspMotionPlayback(
             motion_status=MOTION_STATUS_PATH_COLLISION_BLOCKED,
@@ -892,29 +1537,51 @@ def execute_grasp_motion(
             actual_qpos_by_frame=(),
             summary={
                 **empty_summary,
-                "path_preflight": dict(joint_fk_plan.metadata),
+                "path_preflight": (
+                    dict(joint_fk_plan.metadata)
+                    if joint_path_search is None
+                    else {
+                        "joint_path_search": joint_path_search,
+                        "final_obstacle_revalidation": (final_obstacle_revalidation),
+                        "mujoco_segment_preflight": dict(joint_fk_plan.metadata),
+                    }
+                ),
             },
         )
-    correction_duration, correction_metadata = required_motion_duration_sec(
-        joint_fk_plan.pose_desk[-1],
-        target_pose_desk,
-        linear_speed_m_s=linear_speed_m_s,
-        angular_speed_deg_s=angular_speed_deg_s,
-        minimum_duration_sec=0.25,
-    )
-    terminal_correction = build_smooth_se3_trajectory(
-        joint_fk_plan.pose_desk[-1],
-        target_pose_desk,
-        reference_hz=float(control.contract.timing.ik_hz),
-        duration_sec=correction_duration,
-        terminal_hold_sec=terminal_hold_sec,
-    )
-    active_poses_desk = joint_fk_plan.pose_desk + terminal_correction[1:]
+    if obstacle_oracle is None:
+        correction_duration, correction_metadata = required_motion_duration_sec(
+            joint_fk_plan.pose_desk[-1],
+            target_pose_desk,
+            linear_speed_m_s=linear_speed_m_s,
+            angular_speed_deg_s=angular_speed_deg_s,
+            minimum_duration_sec=0.25,
+        )
+        terminal_correction = build_smooth_se3_trajectory(
+            joint_fk_plan.pose_desk[-1],
+            target_pose_desk,
+            reference_hz=float(control.contract.timing.ik_hz),
+            duration_sec=correction_duration,
+            terminal_hold_sec=terminal_hold_sec,
+        )
+        active_poses_desk = joint_fk_plan.pose_desk + terminal_correction[1:]
+    else:
+        hold_frame_count = math.ceil(
+            float(terminal_hold_sec) * float(control.contract.timing.ik_hz)
+        )
+        active_poses_desk = joint_fk_plan.pose_desk + tuple(
+            joint_fk_plan.pose_desk[-1].copy() for _ in range(hold_frame_count)
+        )
+        correction_metadata = {
+            "enabled": False,
+            "reason": "obstacle_mode_preserves_only_fcl_revalidated_fk_references",
+            "terminal_hold_frame_count": hold_frame_count,
+        }
     inactive_side = "right" if target.side == "left" else "left"
-    inactive_pose_desk = np.linalg.inv(control.world_from_desk) @ initial_world[inactive_side]
-    physics_ticks_exact = (
-        float(control.contract.timing.physics_hz)
-        / float(control.contract.timing.ik_hz)
+    inactive_pose_desk = (
+        np.linalg.inv(control.world_from_desk) @ initial_world[inactive_side]
+    )
+    physics_ticks_exact = float(control.contract.timing.physics_hz) / float(
+        control.contract.timing.ik_hz
     )
     physics_tick_accumulator = 0.0
     # Preserve the exact pre-dispatch state as frame zero.  The GUI therefore
@@ -927,7 +1594,24 @@ def execute_grasp_motion(
     reference_pose_world: list[np.ndarray] = [initial_world[target.side].copy()]
     ik_status_counts: dict[str, int] = {}
     endpoint_status_counts: dict[str, int] = {}
+    recovery_records: list[dict[str, object]] = []
+    recovery_retry_count = 0
+    recovery_physics_ticks = 0
+    execution_physics_ticks = 0
+    recovered_reference_count = 0
+    unrecovered_reference_count = 0
+    dispatched_reference_count = 0
     maximum_tracking_error_m = 0.0
+
+    def settle_reference_interval() -> int:
+        nonlocal physics_tick_accumulator
+        physics_tick_accumulator += physics_ticks_exact
+        physics_ticks = math.floor(physics_tick_accumulator + 1e-12)
+        physics_tick_accumulator -= physics_ticks
+        for _ in range(physics_ticks):
+            control.step_physics()
+        return physics_ticks
+
     for index, active_pose_desk in enumerate(active_poses_desk):
         timestamp = float(index) / float(control.contract.timing.ik_hz)
         poses = {
@@ -949,21 +1633,48 @@ def execute_grasp_motion(
                 "trajectory": "collision_checked_joint_quintic_fk_then_local_tcp_correction",
             },
         )
-        result = control.solve_and_dispatch(
+        recovery = _dispatch_frozen_reference_with_bounded_ik_recovery(
+            control,
             reference,
-            gripper_close_by_side={"left": 0.0, "right": 0.0},
-            hold_sides=(inactive_side,),
+            inactive_side=inactive_side,
+            retry_limit=retry_limit,
+            settle_once=settle_reference_interval,
         )
-        result_status = str(result.status)
-        ik_status_counts[result_status] = int(ik_status_counts.get(result_status, 0)) + 1
-        physics_tick_accumulator += physics_ticks_exact
-        physics_ticks = math.floor(physics_tick_accumulator + 1e-12)
-        physics_tick_accumulator -= physics_ticks
-        for _ in range(physics_ticks):
-            control.step_physics()
-        qpos = {
-            side: control.scene.get_arm_qpos(side).copy() for side in SIDES
-        }
+        for result_status in recovery["result_statuses"]:
+            status = str(result_status)
+            ik_status_counts[status] = int(ik_status_counts.get(status, 0)) + 1
+        observations = tuple(recovery["observations"])
+        for observation in observations:
+            endpoint_status = str(observation.get("status", "unknown"))
+            endpoint_status_counts[endpoint_status] = (
+                int(endpoint_status_counts.get(endpoint_status, 0)) + 1
+            )
+        retry_count = int(recovery["retry_count"])
+        dispatched_reference_count += 1
+        recovery_retry_count += retry_count
+        recovery_physics_ticks += int(recovery["retry_physics_ticks"])
+        execution_physics_ticks += int(recovery["physics_ticks"])
+        if bool(recovery["recovered"]):
+            recovered_reference_count += 1
+        if bool(recovery["unrecovered"]):
+            unrecovered_reference_count += 1
+        if bool(recovery["initial_ik_target_unmet"]):
+            recovery_records.append(
+                {
+                    "reference_index": index,
+                    "reference_sequence": int(reference.sequence),
+                    "status": str(recovery["status"]),
+                    "retry_count": retry_count,
+                    "attempt_count": int(recovery["attempt_count"]),
+                    "result_statuses": [
+                        str(value) for value in recovery["result_statuses"]
+                    ],
+                    "endpoint_statuses": [
+                        str(value.get("status", "unknown")) for value in observations
+                    ],
+                }
+            )
+        qpos = {side: control.scene.get_arm_qpos(side).copy() for side in SIDES}
         actual = control.retargeter.tool_tcp_world_targets_for_qpos_pair(
             left_qpos=qpos["left"], right_qpos=qpos["right"]
         )[target.side]
@@ -972,30 +1683,25 @@ def execute_grasp_motion(
             maximum_tracking_error_m,
             float(np.linalg.norm(actual[:3, 3] - reference_world[:3, 3])),
         )
-        endpoint_status = str(control.endpoint_tracking_observation()["status"])
-        endpoint_status_counts[endpoint_status] = int(
-            endpoint_status_counts.get(endpoint_status, 0)
-        ) + 1
         actual_qpos_by_frame.append(qpos)
         actual_pose_world.append(actual.copy())
         reference_pose_world.append(reference_world.copy())
+        if bool(recovery["unrecovered"]):
+            break
 
     endpoint = control.endpoint_tracking_observation()
     final_status = str(endpoint.get("status", "unknown"))
-    # A final settled frame cannot erase a discontinuous or unreachable
-    # intermediate target.  Preserve any observed IK target failure as the
-    # terminal motion classification.
+    # A final settled observation can clear only a miss that the bounded
+    # same-reference loop explicitly recovered.  An exhausted reference remains
+    # an execution failure even if a later observation happens to look settled.
     motion_status = classify_motion_status(
         final_endpoint_status=final_status,
         endpoint_status_counts=endpoint_status_counts,
+        unrecovered_ik_target_unmet_count=unrecovered_reference_count,
     )
     maximum_joint_motion_deg = max(
         float(
-            np.max(
-                np.abs(
-                    np.rad2deg(frame[target.side] - initial_qpos[target.side])
-                )
-            )
+            np.max(np.abs(np.rad2deg(frame[target.side] - initial_qpos[target.side])))
         )
         for frame in actual_qpos_by_frame
     )
@@ -1003,18 +1709,55 @@ def execute_grasp_motion(
         **empty_summary,
         "motion_emitted": True,
         "trajectory": {
-            "planner": "collision_checked_joint_quintic_fk_then_local_tcp_correction",
+            "planner": (
+                "collision_checked_joint_quintic_fk_then_local_tcp_correction"
+                if obstacle_oracle is None
+                else "deterministic_birrt_then_multiwaypoint_joint_quintic_fk"
+            ),
+            "joint_path_search": joint_path_search,
+            "final_obstacle_revalidation": final_obstacle_revalidation,
             "joint_fk_path": dict(joint_fk_plan.metadata),
             "terminal_tcp_correction": correction_metadata,
+            "execution_contract": {
+                "simulation_only": True,
+                "planner_execution_certified": False,
+                "real_motion_authorized": False,
+                "reference_mode": "validated_q_waypoint_fk_then_cartesian_re_ik",
+                "exact_planned_qpos_dispatch": False,
+                "runtime_cube_constraints_in_lower_ik": False,
+                "limitation": (
+                    "static cubes constrain endpoint selection and offline path "
+                    "planning, but the lower Cartesian IK does not yet include "
+                    "those added cube geometries"
+                ),
+            },
             "total_reference_duration_sec": (
-                float(len(active_poses_desk) - 1)
+                float(max(0, dispatched_reference_count - 1))
                 / float(control.contract.timing.ik_hz)
+            ),
+            "planned_reference_duration_sec": (
+                float(len(active_poses_desk) - 1) / float(control.contract.timing.ik_hz)
+            ),
+            "execution_physics_duration_sec": (
+                float(execution_physics_ticks)
+                / float(control.contract.timing.physics_hz)
             ),
         },
         "terminal_hold_sec": float(terminal_hold_sec),
-        "reference_frame_count": len(active_poses_desk),
+        "reference_frame_count": dispatched_reference_count,
+        "planned_reference_frame_count": len(active_poses_desk),
+        "dispatched_reference_count": dispatched_reference_count,
         "ik_status_counts": ik_status_counts,
         "endpoint_status_counts": endpoint_status_counts,
+        "ik_target_unmet_recovery": {
+            "semantics": "bounded_same_frozen_reference_retry_v1",
+            "retry_limit_per_reference": retry_limit,
+            "retry_count": recovery_retry_count,
+            "retry_physics_ticks": recovery_physics_ticks,
+            "transient_recovered_reference_count": recovered_reference_count,
+            "unrecovered_reference_count": unrecovered_reference_count,
+            "records": recovery_records,
+        },
         "final_endpoint_tracking": endpoint,
         "maximum_actual_joint_motion_deg": maximum_joint_motion_deg,
         "maximum_translation_tracking_error_m": maximum_tracking_error_m,
@@ -1051,20 +1794,30 @@ __all__ = [
     "MOTION_STATUS_ENDPOINT_REJECTED",
     "MOTION_STATUS_IK_TARGET_UNMET",
     "MOTION_STATUS_PATH_COLLISION_BLOCKED",
+    "MOTION_STATUS_PATH_PLANNER_ERROR",
+    "MOTION_STATUS_PATH_SEARCH_EXHAUSTED",
+    "MOTION_STATUS_PATH_START_BLOCKED",
+    "MOTION_STATUS_PATH_TARGET_BLOCKED",
     "MOTION_STATUS_TRACKING_INCOMPLETE",
+    "OBSTACLE_SCENE_FRAME_ID",
+    "OBSTACLE_SCENE_FRAME_SPEC_HASH",
     "GraspMotionPlayback",
     "GraspMotionTarget",
     "JointFkReferencePlan",
     "ToolTcpFrameBinding",
     "build_collision_checked_joint_fk_reference_plan",
+    "build_collision_checked_multiwaypoint_joint_fk_reference_plan",
+    "build_obstacle_collision_oracle",
     "build_smooth_se3_trajectory",
     "classify_motion_status",
     "derive_tool_tcp_frame_binding",
     "evaluate_motion_target_endpoint",
     "execute_grasp_motion",
+    "plan_obstacle_aware_joint_path",
     "pose_from_xyz_quat_xyzw",
     "pose_from_xyz_rpy_deg",
     "quintic_progress",
     "required_motion_duration_sec",
+    "revalidate_obstacle_path",
     "select_random_reachable_demo_target",
 ]
