@@ -335,6 +335,52 @@ def test_application_owns_control_loop_and_holds_before_resource_close() -> None
     assert deployment.control_runtime.last_hold_receipt.succeeded is True
 
 
+def test_application_close_failure_is_retryable_and_retains_resources(
+    monkeypatch,
+) -> None:
+    holds: list[str] = []
+    resources = _Resources()
+    server = _Server()
+    deployment = _deployment(
+        observation_provider=_fresh_observation_cut,
+        hold_reasons=holds,
+    )
+    application = ExclusiveRealSkillApplication(
+        deployment=deployment,
+        resources=resources,
+        startup_admission=lambda: {"startup": "admitted"},
+        server_factory=lambda: server,
+        config=ExclusiveRealSkillApplicationConfig(control_hz=100.0),
+    )
+    original_close = deployment.control_runtime.close
+    close_calls = 0
+
+    def fail_once() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise RuntimeError("injected lower HOLD failure")
+        original_close()
+
+    monkeypatch.setattr(deployment.control_runtime, "close", fail_once)
+    application.start()
+    time.sleep(0.03)
+
+    with pytest.raises(RuntimeError, match="injected lower HOLD failure"):
+        application.close()
+
+    assert application.state == ExclusiveRealSkillApplicationState.FAULT
+    assert resources.closes == 0
+    assert server.closed == 1
+
+    application.close()
+
+    assert close_calls == 2
+    assert application.state == ExclusiveRealSkillApplicationState.CLOSED
+    assert resources.closes == 1
+    assert server.closed == 1
+
+
 def test_application_control_fault_reaches_hold_without_another_read() -> None:
     calls = 0
 

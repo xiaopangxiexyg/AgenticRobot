@@ -528,3 +528,60 @@ def test_real_lifecycle_confirms_hold_after_operation_deadline() -> None:
     assert hold.lower_hold_confirmed is True
     assert port.snapshot().phase == RealAgentMotionPhase.HELD
     assert len(owner.holds) == 1
+
+
+def test_real_gateway_session_retries_unconfirmed_close_hold() -> None:
+    bundle, port, _builder = _runtime_fixture()
+    clock = _Clock()
+    lower_owner = _OwnerSession()
+    attachment = bundle.attachment
+    owner_state = RealControlOwnerState(
+        runtime_session_id=attachment.runtime_session_id,
+        control_domain_id=attachment.control_domain_id,
+        embodiment_instance_id=attachment.embodiment_instance_id,
+        target_binding_id=attachment.target_binding_id,
+        execution_manifest_hash=attachment.execution_manifest_hash,
+        backend_inventory_hash=attachment.backend_inventory_hash,
+        clock_domain_id=attachment.clock_domain_id,
+        owner_token_id="real-owner-token:close-retry",
+        owner_kind="exclusive_real_skill_motion_port",
+        owner_generation=1,
+        authority_epoch=1,
+        execution_epoch=1,
+        lifecycle_state="running",
+        execution_gate="ready",
+        owner_state_revision=1,
+        captured_at=clock(),
+        source_owner_state_hash="lower-owner-state:close-retry",
+        evidence_refs=("lower-owner-evidence:close-retry",),
+    )
+    apply_lower_hold = False
+
+    def lower_sleep(duration: float) -> None:
+        clock.value += duration
+        if apply_lower_hold:
+            port.apply_owner_requests(session=lower_owner, now=clock())
+
+    session = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: owner_state,
+        allowed_client_ids=("rpent-test-client",),
+        clock=clock,
+        sleep=lower_sleep,
+    )
+
+    first = session.close()
+    assert not first.accepted
+    assert session.service.is_closed
+    assert not session._closed_executor_ids
+
+    apply_lower_hold = True
+    second = session.close()
+    third = session.close()
+
+    assert second.accepted
+    assert third is second
+    assert len(session._closed_executor_ids) == len(
+        {id(executor) for executor in session.executors_by_skill_id.values()}
+    )

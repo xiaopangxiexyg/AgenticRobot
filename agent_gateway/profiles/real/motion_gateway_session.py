@@ -535,6 +535,7 @@ class RealAgentPrimitiveGatewaySession:
         init=False,
     )
     _artifact_store_closed: bool = field(default=False, init=False)
+    _closed_executor_ids: set[int] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
         enabled = self.contract_bundle.perception_capture is not None
@@ -625,12 +626,17 @@ class RealAgentPrimitiveGatewaySession:
     def close(self) -> AgentGatewayOperationOutcome:
         with self._close_lock:
             if self._close_outcome is None:
-                self._close_outcome = self.service.close(
+                outcome = self.service.close(
                     current_station_revision=(
                         self.observation_producer.current_station_revision
                     )
                 )
-            outcome = self._close_outcome
+                if outcome.accepted:
+                    self._close_outcome = outcome
+            else:
+                outcome = self._close_outcome
+            if not outcome.accepted:
+                return outcome
             passive_reads_settled = all(
                 executor is None or executor.wait_all(timeout_sec=5.0)
                 for executor in (
@@ -644,19 +650,31 @@ class RealAgentPrimitiveGatewaySession:
                     "Passive real reads did not quiesce before Gateway close."
                 )
             receipt = outcome.port_receipt
-            if (
-                outcome.accepted
-                and isinstance(receipt, AgentGatewayAuthoritativePortReceipt)
+            if not (
+                isinstance(receipt, AgentGatewayAuthoritativePortReceipt)
                 and receipt.succeeded
                 and receipt.proves_motion_or_hold
             ):
-                for executor in self.executors_by_skill_id.values():
-                    executor_receipt = executor.request_hold(
-                        operation=None,
-                        reason="real_agent_gateway_close_route_fence",
+                raise RuntimeError(
+                    "Real Gateway close requires authoritative lower HOLD proof."
+                )
+            for executor in self.executors_by_skill_id.values():
+                executor_id = id(executor)
+                if executor_id in self._closed_executor_ids:
+                    continue
+                executor_receipt = executor.request_hold(
+                    operation=None,
+                    reason="real_agent_gateway_close_route_fence",
+                )
+                if not (
+                    executor_receipt.succeeded
+                    and executor_receipt.proves_motion_or_hold
+                ):
+                    raise RuntimeError(
+                        "Real Gateway route executor did not confirm lower HOLD."
                     )
-                    if executor_receipt.succeeded and executor_receipt.proves_motion_or_hold:
-                        executor.close_after_hold(hold_receipt=executor_receipt)
+                executor.close_after_hold(hold_receipt=executor_receipt)
+                self._closed_executor_ids.add(executor_id)
             if (
                 self.owns_artifact_store
                 and self.artifact_store is not None

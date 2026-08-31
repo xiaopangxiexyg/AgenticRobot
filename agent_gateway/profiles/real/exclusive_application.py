@@ -90,6 +90,7 @@ class ExclusiveRealSkillApplication:
         self.server_factory = server_factory
         self.config = config or ExclusiveRealSkillApplicationConfig()
         self._lock = threading.RLock()
+        self._close_lock = threading.Lock()
         self._state = ExclusiveRealSkillApplicationState.CREATED
         self._server: ExclusiveRealSkillServer | None = None
         self._control_thread: threading.Thread | None = None
@@ -97,6 +98,9 @@ class ExclusiveRealSkillApplication:
         self._serving = threading.Event()
         self._control_fault: BaseException | None = None
         self._startup_admission_receipt: object | None = None
+        self._control_runtime_closed = False
+        self._server_closed = False
+        self._resources_closed = False
 
     @property
     def state(self) -> ExclusiveRealSkillApplicationState:
@@ -162,11 +166,15 @@ class ExclusiveRealSkillApplication:
                     server.server_close()
                 except Exception:
                     pass
+                else:
+                    self._server_closed = True
             if resources_started:
                 try:
                     self.resources.close()
                 except Exception:
                     pass
+                else:
+                    self._resources_closed = True
             with self._lock:
                 self._state = ExclusiveRealSkillApplicationState.FAULT
             raise
@@ -245,51 +253,92 @@ class ExclusiveRealSkillApplication:
         return True
 
     def close(self) -> None:
-        """Fence Gateway and future cycles, then HOLD and close resources."""
+        """Fence once, but retain every unconfirmed close stage for retry."""
 
-        with self._lock:
-            if self._state == ExclusiveRealSkillApplicationState.CLOSED:
-                return
-            server = self._server
-            thread = self._control_thread
-        errors: list[str] = []
-        try:
-            self.deployment.gateway_session.close()
-        except Exception as exc:  # noqa: BLE001 - continue lower shutdown.
-            errors.append(f"gateway_close:{type(exc).__name__}:{exc}")
-        # Prevent another cycle from entering after the serialized HOLD below.
-        # An already-running cycle is allowed to finish before HOLD becomes the
-        # barrier; the runtime's cycle lock makes that ordering explicit.
-        self._control_stop.set()
-        try:
-            self.deployment.control_runtime.close()
-        except Exception as exc:  # noqa: BLE001 - continue resource shutdown.
-            errors.append(f"control_close:{type(exc).__name__}:{exc}")
-        if self._serving.is_set() and server is not None:
+        with self._close_lock:
+            with self._lock:
+                if self._state == ExclusiveRealSkillApplicationState.CLOSED:
+                    return
+                server = self._server
+                thread = self._control_thread
+            errors: list[str] = []
+            gateway_closed = False
             try:
-                server.shutdown()
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"server_shutdown:{type(exc).__name__}:{exc}")
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=self.config.control_join_timeout_sec)
-            if thread.is_alive():
-                errors.append("control_thread_join_timeout")
-        if server is not None:
-            try:
-                server.server_close()
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"server_close:{type(exc).__name__}:{exc}")
-        try:
-            self.resources.close()
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"resources_close:{type(exc).__name__}:{exc}")
-        with self._lock:
-            self._state = ExclusiveRealSkillApplicationState.CLOSED
-        if errors:
-            raise RuntimeError(
-                "exclusive real Skill application close failed: "
-                + "; ".join(errors)
+                gateway_outcome = self.deployment.gateway_session.close()
+                gateway_closed = gateway_outcome.accepted
+                if not gateway_closed:
+                    errors.append(
+                        "gateway_close_not_confirmed:"
+                        + gateway_outcome.reason_code
+                    )
+            except Exception as exc:  # noqa: BLE001 - keep retryable owner state.
+                errors.append(f"gateway_close:{type(exc).__name__}:{exc}")
+
+            # Prevent another cycle from entering after the serialized HOLD.
+            # An already-running cycle may finish before the runtime cycle lock
+            # establishes the barrier.
+            self._control_stop.set()
+            if not self._control_runtime_closed:
+                try:
+                    self.deployment.control_runtime.close()
+                except Exception as exc:  # noqa: BLE001 - retry on next close.
+                    errors.append(f"control_close:{type(exc).__name__}:{exc}")
+                else:
+                    self._control_runtime_closed = True
+
+            if self._serving.is_set() and server is not None:
+                try:
+                    server.shutdown()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"server_shutdown:{type(exc).__name__}:{exc}")
+
+            control_thread_stopped = True
+            if thread is threading.current_thread():
+                control_thread_stopped = False
+                errors.append("control_thread_cannot_join_itself")
+            elif thread is not None:
+                thread.join(timeout=self.config.control_join_timeout_sec)
+                if thread.is_alive():
+                    control_thread_stopped = False
+                    errors.append("control_thread_join_timeout")
+
+            if server is not None and not self._server_closed:
+                try:
+                    server.server_close()
+                except Exception as exc:  # noqa: BLE001 - retry transport close.
+                    errors.append(f"server_close:{type(exc).__name__}:{exc}")
+                else:
+                    self._server_closed = True
+            server_closed = server is None or self._server_closed
+
+            prerequisites_closed = (
+                gateway_closed
+                and self._control_runtime_closed
+                and control_thread_stopped
+                and server_closed
             )
+            if prerequisites_closed and not self._resources_closed:
+                try:
+                    self.resources.close()
+                except Exception as exc:  # noqa: BLE001 - preserve for retry.
+                    errors.append(f"resources_close:{type(exc).__name__}:{exc}")
+                else:
+                    self._resources_closed = True
+
+            complete = prerequisites_closed and self._resources_closed
+            with self._lock:
+                self._state = (
+                    ExclusiveRealSkillApplicationState.CLOSED
+                    if complete and not errors
+                    else ExclusiveRealSkillApplicationState.FAULT
+                )
+            if not complete and not errors:
+                errors.append("close_transaction_incomplete")
+            if errors:
+                raise RuntimeError(
+                    "exclusive real Skill application close failed: "
+                    + "; ".join(errors)
+                )
 
 
 __all__ = [

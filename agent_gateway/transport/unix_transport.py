@@ -611,6 +611,7 @@ class AgentGatewayUnixJsonServer(
         )
         self._close_lock = threading.Lock()
         self._transport_closed = False
+        self._gateway_close_complete = False
         self._gateway_close_outcome: Any | None = None
         self._gateway_close_error: BaseException | None = None
         self._bound_endpoint_identity: tuple[int, int] | None = None
@@ -873,13 +874,24 @@ class AgentGatewayUnixJsonServer(
 
     def server_close(self) -> None:
         with self._close_lock:
+            if not self._gateway_close_complete:
+                try:
+                    outcome = self._close_gateway()
+                except BaseException as error:  # noqa: BLE001 - retryable fence.
+                    self._gateway_close_error = error
+                else:
+                    self._gateway_close_outcome = outcome
+                    self._gateway_close_error = None
+                    # The transport does not manufacture HOLD evidence.  It
+                    # only preserves an explicit rejected close as retryable;
+                    # legacy callbacks without an ``accepted`` projection are
+                    # still treated as completed when they return normally.
+                    self._gateway_close_complete = (
+                        getattr(outcome, "accepted", None) is not False
+                    )
             if self._transport_closed:
                 return
             self._transport_closed = True
-            try:
-                self._gateway_close_outcome = self._close_gateway()
-            except BaseException as error:  # noqa: BLE001 - cleanup still runs.
-                self._gateway_close_error = error
             with self._connection_lock:
                 active_sockets = tuple(self._active_connections.values())
             for active_socket in active_sockets:

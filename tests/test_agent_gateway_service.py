@@ -1389,6 +1389,31 @@ def test_close_is_idempotent_closes_submission_and_calls_hold_once() -> None:
     assert rejected.reason_code == "agent_gateway_service_closed"
 
 
+def test_close_retries_unconfirmed_hold_without_reopening_admission() -> None:
+    clock = _ManualClock()
+    port = DeterministicNoIoAgentSkillOperationPort(
+        succeeds_by_kind={"hold": False},
+        clock=clock,
+    )
+    service, _, _, manifest, capability = _service(port=port)
+
+    first = service.close(current_station_revision=4, now=10.0)
+    assert not first.accepted
+    assert service.is_closed
+    rejected = _submit(service, manifest, capability)
+    assert not rejected.accepted
+    assert rejected.reason_code == "agent_gateway_service_closed"
+
+    port._succeeds_by_kind["hold"] = True
+    clock.set(10.1)
+    second = service.close(current_station_revision=5, now=10.1)
+    third = service.close(current_station_revision=999, now=99.0)
+
+    assert second.accepted
+    assert third is second
+    assert port.call_count("hold") == 2
+
+
 def test_operator_grant_budget_is_consumed_once_for_idempotent_retry() -> None:
     clock = _ManualClock(12.0)
     capability = SkillExecutionRoute(
