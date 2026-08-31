@@ -29,6 +29,9 @@ from robot_motion.replay import (
     build_replay_source_frame_emission,
     replay_robot_action_at_index,
 )
+from robot_motion.replay.control_trace import (
+    project_replay_adapter_result as project_core_replay_adapter_result,
+)
 from teleop_runtime.action.replay_proposal import (
     DatasetReplayProposalShadowAdapter,
     DatasetReplayProposalShadowConfig,
@@ -42,6 +45,7 @@ from teleop_runtime.control_trace.projection import (
     project_shadow_startup,
     project_shadow_step,
 )
+from teleop_runtime.control_trace import projection as teleop_trace_projection
 from teleop_runtime.control_trace import ControlTraceRuntime, RuntimeTraceSession
 from teleop_runtime.deploy.arbiter_shadow import (
     PassivePolicyArbiterShadow,
@@ -56,6 +60,25 @@ class Clock:
 
     def __call__(self) -> float:
         return self.value
+
+
+def test_replay_trace_projection_has_one_production_owner() -> None:
+    replay_projection_names = (
+        "project_candidate_binding_eligibility",
+        "project_legacy_replay_contract_derivation",
+        "project_replay_action_record",
+        "project_replay_binding_assessment",
+        "project_replay_binding_evidence",
+        "project_replay_proposal_adapter_result",
+        "project_replay_source_action_contract",
+        "project_replay_source_adapter_receipt",
+        "project_replay_source_frame_emission",
+        "project_target_runtime_action_contract",
+    )
+    assert {
+        getattr(teleop_trace_projection, name).__module__
+        for name in replay_projection_names
+    } == {"robot_motion.replay.control_trace"}
 
 
 def _shadow_contract():
@@ -248,6 +271,50 @@ def test_dataset_replay_uses_unique_pop_and_replays_same_frozen_decision(tmp_pat
         occurred_at=clock.value,
         clock_domain_id=coordinator.config.clock_domain_id,
     )
+    combined_facts = project_core_replay_adapter_result(
+        adapted,
+        runtime_session_id=coordinator.config.runtime_session_id,
+        control_domain_id=coordinator.config.control_domain_id,
+        embodiment_instance_id=coordinator.config.embodiment_instance_id,
+        occurred_at=clock.value,
+        clock_domain_id=coordinator.config.clock_domain_id,
+    )
+    assert [fact.semantic_content_hash for fact in combined_facts] == [
+        fact.semantic_content_hash
+        for fact in (*replay_binding_facts, *replay_facts)
+    ]
+    trace_binding_facts = project_replay_binding_evidence(
+        adapted,
+        runtime_session_id=coordinator.config.runtime_session_id,
+        control_domain_id="trace-domain",
+        embodiment_instance_id="trace-embodiment",
+        occurred_at=clock.value,
+        clock_domain_id=coordinator.config.clock_domain_id,
+    )
+    target_fact = next(
+        fact
+        for fact in trace_binding_facts
+        if fact.event_type == "target_runtime_action_contract"
+    )
+    assert target_fact.control_domain_id == adapted.target_runtime_contract.control_domain_id
+    assert (
+        target_fact.embodiment_instance_id
+        == adapted.target_runtime_contract.embodiment_instance_id
+    )
+    bulk_target_fact = next(
+        fact
+        for fact in project_core_replay_adapter_result(
+            adapted,
+            runtime_session_id=coordinator.config.runtime_session_id,
+            control_domain_id="trace-domain",
+            embodiment_instance_id="trace-embodiment",
+            occurred_at=clock.value,
+            clock_domain_id=coordinator.config.clock_domain_id,
+        )
+        if fact.event_type == "target_runtime_action_contract"
+    )
+    assert bulk_target_fact.control_domain_id == "trace-domain"
+    assert bulk_target_fact.embodiment_instance_id == "trace-embodiment"
 
     legacy = coordinator.observe_legacy_execution(
         emission=action_step.emission,
