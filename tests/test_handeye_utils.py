@@ -10,11 +10,20 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import utils.calibration_common.camera as common_camera
+import utils.calibration_common.capture as common_capture
+import utils.calibration_common.interactive as common_interactive
 import utils.calibration_common.robot as common_robot
 import utils.calibration_common.transforms as common_transforms
+import utils.hand_eye.camera as hand_camera
+import utils.hand_eye.capture as hand_capture
 import utils.hand_eye.robot as hand_robot
+import utils.hand_eye.run_calibrate_handeye as hand_runner
 import utils.hand_eye.transforms as hand_transforms
+import utils.head_eye.camera as head_camera
+import utils.head_eye.capture as head_capture
 import utils.head_eye.robot as head_robot
+import utils.head_eye.run_calibrate_handeye as head_runner
 import utils.head_eye.transforms as head_transforms
 from utils.hand_eye.run_calibrate_handeye import (
     build_parser as build_wrist_calibration_parser,
@@ -52,6 +61,51 @@ from utils.head_eye.visualize_handeye import build_parser as build_visualizer_pa
 
 
 class CalibrationCommonOwnershipTest(unittest.TestCase):
+    def test_interactive_namespaces_export_one_mechanics_implementation(self) -> None:
+        self.assertIs(hand_runner.AutoRecordState, common_interactive.AutoRecordState)
+        self.assertIs(head_runner.AutoRecordState, common_interactive.AutoRecordState)
+        self.assertIs(hand_runner._draw_session_overlay, common_interactive.draw_session_overlay)
+        self.assertIs(head_runner._draw_session_overlay, common_interactive.draw_session_overlay)
+
+    def test_camera_namespaces_export_one_leaf_helper_implementation(self) -> None:
+        names = (
+            "_aruco_dictionary",
+            "_detector_parameters",
+            "_make_aruco_detector",
+            "_put_status",
+            "_requested_profile_text",
+            "_require_aruco",
+            "_require_cv2",
+            "_require_pyrealsense2",
+            "_safe_device_info",
+        )
+        shared_names = (
+            "aruco_dictionary",
+            "detector_parameters",
+            "make_aruco_detector",
+            "put_status",
+            "requested_profile_text",
+            "require_aruco",
+            "require_cv2",
+            "require_pyrealsense2",
+            "safe_device_info",
+        )
+        for compatibility_name, shared_name in zip(names, shared_names, strict=True):
+            shared = getattr(common_camera, shared_name)
+            self.assertIs(getattr(hand_camera, compatibility_name), shared)
+            self.assertIs(getattr(head_camera, compatibility_name), shared)
+
+    def test_capture_namespaces_export_one_stateless_helper_implementation(self) -> None:
+        for compatibility_name, shared_name in (
+            ("_max_distance", "max_distance"),
+            ("_mean_vector", "mean_vector"),
+            ("_most_common", "most_common"),
+            ("_now_utc", "now_utc"),
+        ):
+            shared = getattr(common_capture, shared_name)
+            self.assertIs(getattr(hand_capture, compatibility_name), shared)
+            self.assertIs(getattr(head_capture, compatibility_name), shared)
+
     def test_transform_namespaces_export_one_implementation(self) -> None:
         names = (
             "as_transform",

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import time
 from typing import Any
 
 import numpy as np
+
+from utils.calibration_common.capture import (
+    max_distance as _max_distance,
+    mean_vector as _mean_vector,
+    most_common as _most_common,
+    now_utc as _now_utc,
+)
 
 from .calibration import CalibrationSample
 from .transforms import average_transforms, transform_distance
@@ -283,29 +289,3 @@ def _target_point_metadata(observation: dict[str, Any]) -> dict[str, Any]:
     metadata["camera_matrix"] = np.asarray(observation["intrinsics_matrix"], dtype=np.float64).tolist()
     metadata["distortion_coeffs"] = np.asarray(observation["distortion_coeffs"], dtype=np.float64).reshape(-1).tolist()
     return metadata
-
-
-def _most_common(values: list[str]) -> str:
-    if not values:
-        return ""
-    return max(set(values), key=values.count)
-
-
-def _max_distance(reference: np.ndarray, values: list[np.ndarray]) -> tuple[float, float]:
-    trans = 0.0
-    rot = 0.0
-    for value in values:
-        current_trans, current_rot = transform_distance(reference, value)
-        trans = max(trans, current_trans)
-        rot = max(rot, current_rot)
-    return float(trans), float(rot)
-
-
-def _mean_vector(values: list[list[float]]) -> list[float] | None:
-    if not values:
-        return None
-    return np.mean(np.asarray(values, dtype=np.float64), axis=0).tolist()
-
-
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
