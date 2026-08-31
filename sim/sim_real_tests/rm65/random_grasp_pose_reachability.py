@@ -48,6 +48,9 @@ DEFAULT_REFERENCE_FRAME_SPEC_HASH = hashlib.sha256(
         ensure_ascii=True,
     ).encode("ascii")
 ).hexdigest()
+DEFAULT_ADAPTIVE_POSITION_THRESHOLD_M = 0.25
+DEFAULT_ADAPTIVE_ORIENTATION_THRESHOLD_RAD = float(np.deg2rad(45.0))
+DEFAULT_ADAPTIVE_REFINEMENT_ITERATION_FRACTION = 0.5
 
 
 @dataclass(frozen=True)
@@ -248,7 +251,23 @@ def build_rm65_multistart_candidate_provider(
     max_iterations: int,
     max_joint_step_rad: float,
     damping: float,
+    adaptive_position_threshold_m: float = DEFAULT_ADAPTIVE_POSITION_THRESHOLD_M,
+    adaptive_orientation_threshold_rad: float = (
+        DEFAULT_ADAPTIVE_ORIENTATION_THRESHOLD_RAD
+    ),
+    refinement_iteration_fraction: float = (
+        DEFAULT_ADAPTIVE_REFINEMENT_ITERATION_FRACTION
+    ),
 ) -> Callable[[int, np.ndarray], IKCandidate]:
+    """Build a bounded per-seed IK provider with difficulty-gated refinement.
+
+    Every seed first receives the historical full solve budget at the true
+    final target.  Only when that direct solve fails and the initial FK pose is
+    far from the target do bounded SE(3) continuation stages run, followed by
+    another mandatory full-budget solve at the true target.  This preserves
+    direct-solve successes and keeps local targets on the original budget.
+    """
+
     seeds = tuple(np.asarray(seed, dtype=float).reshape(-1).copy() for seed in qpos_seeds)
     if not seeds:
         raise ValueError("qpos_seeds must not be empty.")
@@ -260,41 +279,284 @@ def build_rm65_multistart_candidate_provider(
         raise ValueError("max_joint_step_rad must be finite and positive.")
     if not np.isfinite(float(damping)) or float(damping) <= 0.0:
         raise ValueError("damping must be finite and positive.")
+    position_threshold = float(adaptive_position_threshold_m)
+    orientation_threshold = float(adaptive_orientation_threshold_rad)
+    refinement_fraction = float(refinement_iteration_fraction)
+    if not np.isfinite(position_threshold) or position_threshold <= 0.0:
+        raise ValueError("adaptive_position_threshold_m must be finite and positive.")
+    if not np.isfinite(orientation_threshold) or orientation_threshold <= 0.0:
+        raise ValueError(
+            "adaptive_orientation_threshold_rad must be finite and positive."
+        )
+    if (
+        not np.isfinite(refinement_fraction)
+        or refinement_fraction <= 0.0
+        or refinement_fraction > 1.0
+    ):
+        raise ValueError("refinement_iteration_fraction must be in (0, 1].")
+
+    baseline_iterations = int(max_iterations)
+    refinement_iterations = max(
+        1, int(np.ceil(baseline_iterations * refinement_fraction))
+    )
+    baseline_joint_step = float(max_joint_step_rad)
+    baseline_damping = float(damping)
 
     def provide(candidate_index: int, target_pose: np.ndarray) -> IKCandidate:
-        seed = seeds[int(candidate_index)]
-        qpos = np.asarray(
-            solver.solve_iterative(
-                target_pose=target_pose,
-                q_init=seed,
-                max_iterations=int(max_iterations),
-                max_joint_step=float(max_joint_step_rad),
-                damping=float(damping),
-                tolerance=1e-6,
-            ),
-            dtype=float,
-        ).reshape(-1)
-        solved_pose = np.asarray(solver.compute_pose(qpos), dtype=float).reshape(4, 4)
-        position_residual = float(np.linalg.norm(solved_pose[:3, 3] - target_pose[:3, 3]))
-        orientation_residual = float(
-            Rotation.from_matrix(target_pose[:3, :3] @ solved_pose[:3, :3].T).magnitude()
+        index = int(candidate_index)
+        if index < 0 or index >= len(seeds):
+            raise IndexError("candidate_index is outside the configured qpos seeds.")
+        target = np.asarray(target_pose, dtype=float).reshape(4, 4)
+        seed = seeds[index]
+        initial_pose = np.asarray(solver.compute_pose(seed), dtype=float).reshape(4, 4)
+        initial_position_residual, initial_orientation_residual = _pose_residuals(
+            target, initial_pose
         )
+        large_position_change = initial_position_residual >= position_threshold
+        large_orientation_change = initial_orientation_residual >= orientation_threshold
+
+        if large_position_change and large_orientation_change:
+            search_tier = "adaptive_position_orientation"
+            continuation_stages = (
+                ("se3_continuation_35pct", 0.35),
+                ("se3_continuation_70pct", 0.70),
+            )
+        elif large_position_change:
+            search_tier = "adaptive_position"
+            continuation_stages = (("position_continuation_50pct", 0.50),)
+        elif large_orientation_change:
+            search_tier = "adaptive_orientation"
+            continuation_stages = (("orientation_continuation_50pct", 0.50),)
+        else:
+            search_tier = "baseline"
+            continuation_stages = ()
+
+        potential_stages: list[tuple[str, float, int]] = [
+            ("baseline_direct", 1.0, baseline_iterations)
+        ]
+        potential_stages.extend(
+            (stage_name, target_fraction, refinement_iterations)
+            for stage_name, target_fraction in continuation_stages
+        )
+        if continuation_stages:
+            potential_stages.append(("adaptive_final_target", 1.0, baseline_iterations))
+
+        minimum_observed_position_residual = initial_position_residual
+        minimum_observed_orientation_residual = initial_orientation_residual
+        stage_records: list[dict[str, Any]] = []
+        total_iterations_used = 0
+        attempted_iteration_budget = 0
+
+        def solve_stage(
+            stage_name: str,
+            target_fraction: float,
+            stage_budget: int,
+            q_init: np.ndarray,
+        ) -> tuple[np.ndarray, bool, float, float]:
+            nonlocal attempted_iteration_budget
+            nonlocal minimum_observed_orientation_residual
+            nonlocal minimum_observed_position_residual
+            nonlocal total_iterations_used
+            stage_target = (
+                target
+                if target_fraction == 1.0
+                else _interpolate_pose(initial_pose, target, target_fraction)
+            )
+            q_result = np.asarray(
+                solver.solve_iterative(
+                    target_pose=stage_target,
+                    q_init=q_init,
+                    max_iterations=stage_budget,
+                    max_joint_step=baseline_joint_step,
+                    damping=baseline_damping,
+                    tolerance=1e-6,
+                ),
+                dtype=float,
+            ).reshape(-1)
+            solved_pose = np.asarray(
+                solver.compute_pose(q_result), dtype=float
+            ).reshape(4, 4)
+            stage_position_residual, stage_orientation_residual = _pose_residuals(
+                stage_target, solved_pose
+            )
+            final_position_residual, final_orientation_residual = _pose_residuals(
+                target, solved_pose
+            )
+            iterations_used = int(getattr(solver, "last_solve_iterations", 0))
+            stage_converged = bool(getattr(solver, "last_solve_converged", False))
+            deadline_exceeded = bool(
+                getattr(solver, "last_solve_deadline_exceeded", False)
+            )
+            total_iterations_used += iterations_used
+            attempted_iteration_budget += stage_budget
+            stage_records.append(
+                {
+                    "stage": stage_name,
+                    "target_fraction": target_fraction,
+                    "target_is_final": target_fraction == 1.0,
+                    "iteration_budget": stage_budget,
+                    "iterations_used": iterations_used,
+                    "max_joint_step_rad": baseline_joint_step,
+                    "damping": baseline_damping,
+                    "converged": stage_converged,
+                    "deadline_exceeded": deadline_exceeded,
+                    "stage_target_position_residual_m": stage_position_residual,
+                    "stage_target_orientation_residual_rad": stage_orientation_residual,
+                    "stage_target_orientation_residual_deg": float(
+                        np.rad2deg(stage_orientation_residual)
+                    ),
+                    "final_target_position_residual_m": final_position_residual,
+                    "final_target_orientation_residual_rad": final_orientation_residual,
+                    "final_target_orientation_residual_deg": float(
+                        np.rad2deg(final_orientation_residual)
+                    ),
+                }
+            )
+            minimum_observed_position_residual = min(
+                minimum_observed_position_residual, final_position_residual
+            )
+            minimum_observed_orientation_residual = min(
+                minimum_observed_orientation_residual, final_orientation_residual
+            )
+            return (
+                q_result,
+                stage_converged,
+                final_position_residual,
+                final_orientation_residual,
+            )
+
+        baseline_qpos, baseline_converged, baseline_position, baseline_orientation = (
+            solve_stage(
+                "baseline_direct",
+                1.0,
+                baseline_iterations,
+                seed,
+            )
+        )
+        selected_qpos = baseline_qpos
+        selected_converged = baseline_converged
+        position_residual = baseline_position
+        orientation_residual = baseline_orientation
+        selected_stage = "baseline_direct"
+        adaptive_escalation_used = False
+
+        if not baseline_converged and continuation_stages:
+            adaptive_escalation_used = True
+            continuation_qpos = seed.copy()
+            for stage_name, target_fraction in continuation_stages:
+                continuation_qpos, _, _, _ = solve_stage(
+                    stage_name,
+                    target_fraction,
+                    refinement_iterations,
+                    continuation_qpos,
+                )
+            (
+                adaptive_qpos,
+                adaptive_converged,
+                adaptive_position,
+                adaptive_orientation,
+            ) = solve_stage(
+                "adaptive_final_target",
+                1.0,
+                baseline_iterations,
+                continuation_qpos,
+            )
+            baseline_score = (
+                baseline_position / position_threshold
+                + baseline_orientation / orientation_threshold
+            )
+            adaptive_score = (
+                adaptive_position / position_threshold
+                + adaptive_orientation / orientation_threshold
+            )
+            if adaptive_converged or adaptive_score < baseline_score:
+                selected_qpos = adaptive_qpos
+                selected_converged = adaptive_converged
+                position_residual = adaptive_position
+                orientation_residual = adaptive_orientation
+                selected_stage = "adaptive_final_target"
+
         return IKCandidate(
-            candidate_index=int(candidate_index),
-            qpos_rad=tuple(float(value) for value in qpos),
-            converged=bool(getattr(solver, "last_solve_converged", False)),
+            candidate_index=index,
+            qpos_rad=tuple(float(value) for value in selected_qpos),
+            converged=selected_converged,
             position_residual_m=position_residual,
             orientation_residual_rad=orientation_residual,
-            iterations=int(getattr(solver, "last_solve_iterations", 0)),
+            iterations=total_iterations_used,
             metadata={
-                "seed_index": int(candidate_index),
-                "deadline_exceeded": bool(
-                    getattr(solver, "last_solve_deadline_exceeded", False)
+                "seed_index": index,
+                "search_tier": search_tier,
+                "large_position_change": large_position_change,
+                "large_orientation_change": large_orientation_change,
+                "planned_stage_count": len(potential_stages),
+                "attempts_used": len(stage_records),
+                "iteration_budget": sum(stage[2] for stage in potential_stages),
+                "attempted_iteration_budget": attempted_iteration_budget,
+                "iterations_used": total_iterations_used,
+                "adaptive_escalation_used": adaptive_escalation_used,
+                "selected_stage": selected_stage,
+                "initial_position_residual_m": initial_position_residual,
+                "initial_orientation_residual_rad": initial_orientation_residual,
+                "initial_orientation_residual_deg": float(
+                    np.rad2deg(initial_orientation_residual)
                 ),
+                "minimum_observed_position_residual_m": (
+                    minimum_observed_position_residual
+                ),
+                "minimum_observed_orientation_residual_rad": (
+                    minimum_observed_orientation_residual
+                ),
+                "minimum_observed_orientation_residual_deg": float(
+                    np.rad2deg(minimum_observed_orientation_residual)
+                ),
+                "minimum_observed_residuals_are_independent_per_metric": True,
+                "selected_candidate_position_residual_m": position_residual,
+                "selected_candidate_orientation_residual_rad": orientation_residual,
+                "selected_candidate_orientation_residual_deg": float(
+                    np.rad2deg(orientation_residual)
+                ),
+                "deadline_exceeded": any(
+                    bool(record["deadline_exceeded"]) for record in stage_records
+                ),
+                "stages": stage_records,
             },
         )
 
     return provide
+
+
+def _pose_residuals(
+    target_pose: np.ndarray, solved_pose: np.ndarray
+) -> tuple[float, float]:
+    position_residual = float(
+        np.linalg.norm(solved_pose[:3, 3] - target_pose[:3, 3])
+    )
+    orientation_residual = float(
+        Rotation.from_matrix(target_pose[:3, :3] @ solved_pose[:3, :3].T).magnitude()
+    )
+    return position_residual, orientation_residual
+
+
+def _interpolate_pose(
+    start_pose: np.ndarray, target_pose: np.ndarray, fraction: float
+) -> np.ndarray:
+    fraction_value = float(fraction)
+    if not 0.0 < fraction_value < 1.0:
+        raise ValueError("continuation pose fraction must be in (0, 1).")
+    start = np.asarray(start_pose, dtype=float).reshape(4, 4)
+    target = np.asarray(target_pose, dtype=float).reshape(4, 4)
+    interpolated = np.eye(4, dtype=float)
+    interpolated[:3, 3] = start[:3, 3] + fraction_value * (
+        target[:3, 3] - start[:3, 3]
+    )
+    relative_rotvec = Rotation.from_matrix(
+        target[:3, :3] @ start[:3, :3].T
+    ).as_rotvec()
+    interpolated[:3, :3] = (
+        Rotation.from_rotvec(fraction_value * relative_rotvec).as_matrix()
+        @ start[:3, :3]
+    )
+    return interpolated
 
 
 def make_default_rm65_grasp_pose_evaluator(

@@ -139,6 +139,87 @@ def test_final_settled_frame_does_not_erase_intermediate_ik_failure() -> None:
     ) == motion.MOTION_STATUS_COMPLETED
 
 
+def test_recovered_ik_miss_is_visible_but_not_terminal() -> None:
+    assert motion.classify_motion_status(
+        final_endpoint_status="settled",
+        endpoint_status_counts={"ik_target_unmet": 1, "tracking": 1, "settled": 2},
+        unrecovered_ik_target_unmet_count=0,
+    ) == motion.MOTION_STATUS_COMPLETED
+    assert motion.classify_motion_status(
+        final_endpoint_status="settled",
+        endpoint_status_counts={"ik_target_unmet": 2, "settled": 1},
+        unrecovered_ik_target_unmet_count=1,
+    ) == motion.MOTION_STATUS_IK_TARGET_UNMET
+
+
+class _FrozenReferenceRecoveryControl:
+    def __init__(self, endpoint_statuses: tuple[str, ...]) -> None:
+        self.endpoint_statuses = list(endpoint_statuses)
+        self.references: list[object] = []
+        self.dispatch_kwargs: list[dict[str, object]] = []
+
+    def solve_and_dispatch(self, reference, **kwargs):
+        self.references.append(reference)
+        self.dispatch_kwargs.append(dict(kwargs))
+        return SimpleNamespace(status="tracking")
+
+    def endpoint_tracking_observation(self) -> dict[str, object]:
+        return {"status": self.endpoint_statuses.pop(0)}
+
+
+def test_frozen_reference_retry_recovers_without_bypassing_lower_owner() -> None:
+    control = _FrozenReferenceRecoveryControl(("ik_target_unmet", "tracking"))
+    frozen_reference = object()
+    settle_calls = 0
+
+    def settle_once() -> int:
+        nonlocal settle_calls
+        settle_calls += 1
+        return 17
+
+    recovery = motion._dispatch_frozen_reference_with_bounded_ik_recovery(
+        control,
+        frozen_reference,
+        inactive_side="right",
+        retry_limit=2,
+        settle_once=settle_once,
+    )
+
+    assert recovery["status"] == "transient_recovered"
+    assert recovery["retry_count"] == 1
+    assert recovery["physics_ticks"] == 34
+    assert recovery["retry_physics_ticks"] == 17
+    assert settle_calls == 2
+    assert len(control.references) == 2
+    assert all(reference is frozen_reference for reference in control.references)
+    assert all(
+        kwargs == {
+            "gripper_close_by_side": {"left": 0.0, "right": 0.0},
+            "hold_sides": ("right",),
+        }
+        for kwargs in control.dispatch_kwargs
+    )
+
+
+def test_frozen_reference_retry_exhaustion_remains_unrecovered() -> None:
+    control = _FrozenReferenceRecoveryControl(
+        ("ik_target_unmet", "ik_target_unmet", "ik_target_unmet")
+    )
+    recovery = motion._dispatch_frozen_reference_with_bounded_ik_recovery(
+        control,
+        object(),
+        inactive_side="right",
+        retry_limit=2,
+        settle_once=lambda: 16,
+    )
+
+    assert recovery["status"] == "unrecovered"
+    assert recovery["unrecovered"] is True
+    assert recovery["retry_count"] == 2
+    assert recovery["attempt_count"] == 3
+    assert len(control.references) == 3
+
+
 class _FakeScene:
     def get_arm_qpos(self, _side: str) -> np.ndarray:
         return np.zeros(6, dtype=float)
@@ -205,6 +286,144 @@ def test_rejected_endpoint_emits_no_motion_or_dispatch(monkeypatch) -> None:
     assert playback.frame_count == 0
     assert playback.summary["motion_emitted"] is False
     assert control.dispatch_count == 0
+
+
+class _RecoveryExecutionControl(_FakeControl):
+    def __init__(self, endpoint_statuses: tuple[str, ...]) -> None:
+        super().__init__()
+        self.endpoint_statuses = list(endpoint_statuses)
+        self.references: list[object] = []
+        self.physics_ticks = 0
+
+    def solve_and_dispatch(self, reference, **_kwargs):
+        self.dispatch_count += 1
+        self.references.append(reference)
+        return SimpleNamespace(status="tracking")
+
+    def step_physics(self) -> None:
+        self.physics_ticks += 1
+
+    def endpoint_tracking_observation(self) -> dict[str, object]:
+        return {"status": self.endpoint_statuses.pop(0)}
+
+
+def _reachable_receipt_and_binding() -> tuple[
+    GraspReachabilityReceipt, ToolTcpFrameBinding
+]:
+    receipt = GraspReachabilityReceipt(
+        status=GraspReachabilityStatus.REACHABLE,
+        reason_code="test_reachable",
+        proof_scope="test",
+        reference_frame_id=DEFAULT_REFERENCE_FRAME_ID,
+        reference_frame_spec_hash=DEFAULT_REFERENCE_FRAME_SPEC_HASH,
+        target_pose=tuple(tuple(row) for row in np.eye(4)),
+        selected_candidate_index=0,
+        candidates=(
+            {
+                "candidate_index": 0,
+                "qpos_rad": [0.0] * 6,
+            },
+        ),
+    )
+    binding = ToolTcpFrameBinding(
+        side="left",
+        single_tool_from_dmtac_tool=np.eye(4),
+        position_offset_m=0.0,
+        orientation_offset_deg=0.0,
+    )
+    return receipt, binding
+
+
+def _install_two_reference_motion(monkeypatch) -> None:
+    receipt, binding = _reachable_receipt_and_binding()
+    monkeypatch.setattr(
+        motion,
+        "evaluate_motion_target_endpoint",
+        lambda _control, _target: (receipt, binding, None),
+    )
+    monkeypatch.setattr(
+        motion,
+        "build_collision_checked_joint_fk_reference_plan",
+        lambda *_args, **_kwargs: motion.JointFkReferencePlan(
+            status="safe",
+            pose_desk=(np.eye(4), np.eye(4)),
+            qpos_rad=(np.zeros(6), np.zeros(6)),
+            metadata={"planner": "test_two_reference_plan"},
+        ),
+    )
+    monkeypatch.setattr(
+        motion,
+        "required_motion_duration_sec",
+        lambda *_args, **_kwargs: (0.25, {"duration_sec": 0.25}),
+    )
+    monkeypatch.setattr(
+        motion,
+        "build_smooth_se3_trajectory",
+        lambda start, *_args, **_kwargs: (np.asarray(start).copy(),),
+    )
+
+
+def test_execute_reports_transient_recovery_and_continues(monkeypatch) -> None:
+    _install_two_reference_motion(monkeypatch)
+    control = _RecoveryExecutionControl(
+        ("ik_target_unmet", "tracking", "settled", "settled")
+    )
+    target = GraspMotionTarget(
+        side="left",
+        target_pose_base_from_dmtac_tcp=np.eye(4),
+        source="test_recovery",
+    )
+
+    playback = execute_grasp_motion(
+        control,
+        target,
+        ik_target_unmet_retry_limit=2,
+    )
+
+    recovery = playback.summary["ik_target_unmet_recovery"]
+    assert playback.motion_status == motion.MOTION_STATUS_COMPLETED
+    assert playback.endpoint_receipt.status is GraspReachabilityStatus.REACHABLE
+    assert control.dispatch_count == 3
+    assert control.references[0] is control.references[1]
+    assert control.references[2] is not control.references[1]
+    assert recovery["transient_recovered_reference_count"] == 1
+    assert recovery["unrecovered_reference_count"] == 0
+    assert recovery["records"][0]["status"] == "transient_recovered"
+    assert playback.summary["planned_reference_frame_count"] == 2
+    assert playback.summary["dispatched_reference_count"] == 2
+
+
+def test_execute_stops_after_unrecovered_reference_without_reclassifying_endpoint(
+    monkeypatch,
+) -> None:
+    _install_two_reference_motion(monkeypatch)
+    control = _RecoveryExecutionControl(
+        ("ik_target_unmet", "ik_target_unmet", "ik_target_unmet")
+    )
+    target = GraspMotionTarget(
+        side="left",
+        target_pose_base_from_dmtac_tcp=np.eye(4),
+        source="test_unrecovered",
+    )
+
+    playback = execute_grasp_motion(
+        control,
+        target,
+        ik_target_unmet_retry_limit=1,
+    )
+
+    recovery = playback.summary["ik_target_unmet_recovery"]
+    assert playback.motion_status == motion.MOTION_STATUS_IK_TARGET_UNMET
+    assert playback.endpoint_receipt.status is GraspReachabilityStatus.REACHABLE
+    assert control.dispatch_count == 2
+    assert control.references[0] is control.references[1]
+    assert playback.summary["planned_reference_frame_count"] == 2
+    assert playback.summary["dispatched_reference_count"] == 1
+    assert playback.summary["reference_frame_count"] == 1
+    assert playback.summary["trajectory"]["total_reference_duration_sec"] == 0.0
+    assert playback.summary["trajectory"]["planned_reference_duration_sec"] > 0.0
+    assert recovery["unrecovered_reference_count"] == 1
+    assert recovery["records"][0]["status"] == "unrecovered"
 
 
 def test_cli_requires_position_and_orientation_as_one_explicit_pose() -> None:

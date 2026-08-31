@@ -13,7 +13,7 @@ to hardware.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
@@ -47,6 +47,7 @@ MOTION_STATUS_ENDPOINT_REJECTED = "endpoint_rejected"
 MOTION_STATUS_PATH_COLLISION_BLOCKED = "path_collision_blocked"
 MOTION_STATUS_IK_TARGET_UNMET = "ik_target_unmet"
 MOTION_STATUS_TRACKING_INCOMPLETE = "tracking_incomplete"
+DEFAULT_IK_TARGET_UNMET_RETRY_LIMIT = 2
 
 
 def _pose(value: Any, *, name: str) -> np.ndarray:
@@ -656,16 +657,100 @@ def classify_motion_status(
     *,
     final_endpoint_status: str,
     endpoint_status_counts: Mapping[str, int],
+    unrecovered_ik_target_unmet_count: int | None = None,
 ) -> str:
-    """Classify the whole path without letting the last frame erase failures."""
+    """Classify the path while preserving only unresolved execution failures.
 
-    if int(endpoint_status_counts.get("ik_target_unmet", 0)) > 0:
+    Older callers can omit ``unrecovered_ik_target_unmet_count`` and retain the
+    conservative historical rule that any observed IK miss poisons the run.
+    The execution loop supplies the explicit unresolved count so a bounded,
+    same-reference retry that genuinely recovers remains visible in diagnostics
+    without being misreported as a terminal failure.
+    """
+
+    if unrecovered_ik_target_unmet_count is None:
+        unresolved = int(endpoint_status_counts.get("ik_target_unmet", 0))
+    else:
+        unresolved = int(unrecovered_ik_target_unmet_count)
+        if unresolved < 0:
+            raise ValueError("unrecovered_ik_target_unmet_count must be non-negative")
+    if unresolved > 0:
         return MOTION_STATUS_IK_TARGET_UNMET
     if str(final_endpoint_status) == "settled":
         return MOTION_STATUS_COMPLETED
     if str(final_endpoint_status) == "ik_target_unmet":
         return MOTION_STATUS_IK_TARGET_UNMET
     return MOTION_STATUS_TRACKING_INCOMPLETE
+
+
+def _dispatch_frozen_reference_with_bounded_ik_recovery(
+    control: DeskTcpPositionControl,
+    reference: ResampledMotionReference,
+    *,
+    inactive_side: str,
+    retry_limit: int,
+    settle_once: Callable[[], int],
+) -> dict[str, object]:
+    """Dispatch one frozen reference and retry only an explicit IK target miss.
+
+    Every attempt uses the exact same ``ResampledMotionReference`` object and
+    the existing collision-aware ``solve_and_dispatch`` owner.  The helper does
+    not rewrite targets, inject qpos, or relax lower safety.  Exhaustion is a
+    terminal, explicit result for the caller rather than a swallowed transient.
+    """
+
+    limit = int(retry_limit)
+    if limit < 0:
+        raise ValueError("retry_limit must be non-negative")
+    observations: list[dict[str, object]] = []
+    result_statuses: list[str] = []
+    physics_ticks_by_attempt: list[int] = []
+    total_physics_ticks = 0
+    initial_unmet = False
+    final_result: Any = None
+
+    for attempt_index in range(limit + 1):
+        final_result = control.solve_and_dispatch(
+            reference,
+            gripper_close_by_side={"left": 0.0, "right": 0.0},
+            hold_sides=(inactive_side,),
+        )
+        result_statuses.append(str(final_result.status))
+        physics_ticks = int(settle_once())
+        physics_ticks_by_attempt.append(physics_ticks)
+        total_physics_ticks += physics_ticks
+        observation = dict(control.endpoint_tracking_observation())
+        observations.append(observation)
+        unmet = str(observation.get("status", "unknown")) == "ik_target_unmet"
+        if attempt_index == 0:
+            initial_unmet = unmet
+        if not unmet:
+            break
+
+    assert final_result is not None
+    final_status = str(observations[-1].get("status", "unknown"))
+    unrecovered = final_status == "ik_target_unmet"
+    recovered = initial_unmet and not unrecovered
+    retry_count = len(observations) - 1
+    return {
+        "result": final_result,
+        "result_statuses": tuple(result_statuses),
+        "observations": tuple(observations),
+        "initial_ik_target_unmet": initial_unmet,
+        "status": (
+            "unrecovered"
+            if unrecovered
+            else "transient_recovered"
+            if recovered
+            else "not_needed"
+        ),
+        "recovered": recovered,
+        "unrecovered": unrecovered,
+        "retry_count": retry_count,
+        "attempt_count": len(observations),
+        "physics_ticks": total_physics_ticks,
+        "retry_physics_ticks": sum(physics_ticks_by_attempt[1:]),
+    }
 
 
 def build_collision_checked_joint_fk_reference_plan(
@@ -832,7 +917,11 @@ def execute_grasp_motion(
     angular_speed_deg_s: float = 45.0,
     minimum_duration_sec: float = 2.0,
     terminal_hold_sec: float = 1.5,
+    ik_target_unmet_retry_limit: int = DEFAULT_IK_TARGET_UNMET_RETRY_LIMIT,
 ) -> GraspMotionPlayback:
+    retry_limit = int(ik_target_unmet_retry_limit)
+    if retry_limit < 0:
+        raise ValueError("ik_target_unmet_retry_limit must be non-negative")
     receipt, binding, _solver = evaluate_motion_target_endpoint(control, target)
     initial_qpos = {
         side: control.scene.get_arm_qpos(side).copy() for side in SIDES
@@ -927,7 +1016,24 @@ def execute_grasp_motion(
     reference_pose_world: list[np.ndarray] = [initial_world[target.side].copy()]
     ik_status_counts: dict[str, int] = {}
     endpoint_status_counts: dict[str, int] = {}
+    recovery_records: list[dict[str, object]] = []
+    recovery_retry_count = 0
+    recovery_physics_ticks = 0
+    execution_physics_ticks = 0
+    recovered_reference_count = 0
+    unrecovered_reference_count = 0
+    dispatched_reference_count = 0
     maximum_tracking_error_m = 0.0
+
+    def settle_reference_interval() -> int:
+        nonlocal physics_tick_accumulator
+        physics_tick_accumulator += physics_ticks_exact
+        physics_ticks = math.floor(physics_tick_accumulator + 1e-12)
+        physics_tick_accumulator -= physics_ticks
+        for _ in range(physics_ticks):
+            control.step_physics()
+        return physics_ticks
+
     for index, active_pose_desk in enumerate(active_poses_desk):
         timestamp = float(index) / float(control.contract.timing.ik_hz)
         poses = {
@@ -949,18 +1055,47 @@ def execute_grasp_motion(
                 "trajectory": "collision_checked_joint_quintic_fk_then_local_tcp_correction",
             },
         )
-        result = control.solve_and_dispatch(
+        recovery = _dispatch_frozen_reference_with_bounded_ik_recovery(
+            control,
             reference,
-            gripper_close_by_side={"left": 0.0, "right": 0.0},
-            hold_sides=(inactive_side,),
+            inactive_side=inactive_side,
+            retry_limit=retry_limit,
+            settle_once=settle_reference_interval,
         )
-        result_status = str(result.status)
-        ik_status_counts[result_status] = int(ik_status_counts.get(result_status, 0)) + 1
-        physics_tick_accumulator += physics_ticks_exact
-        physics_ticks = math.floor(physics_tick_accumulator + 1e-12)
-        physics_tick_accumulator -= physics_ticks
-        for _ in range(physics_ticks):
-            control.step_physics()
+        for result_status in recovery["result_statuses"]:
+            status = str(result_status)
+            ik_status_counts[status] = int(ik_status_counts.get(status, 0)) + 1
+        observations = tuple(recovery["observations"])
+        for observation in observations:
+            endpoint_status = str(observation.get("status", "unknown"))
+            endpoint_status_counts[endpoint_status] = int(
+                endpoint_status_counts.get(endpoint_status, 0)
+            ) + 1
+        retry_count = int(recovery["retry_count"])
+        dispatched_reference_count += 1
+        recovery_retry_count += retry_count
+        recovery_physics_ticks += int(recovery["retry_physics_ticks"])
+        execution_physics_ticks += int(recovery["physics_ticks"])
+        if bool(recovery["recovered"]):
+            recovered_reference_count += 1
+        if bool(recovery["unrecovered"]):
+            unrecovered_reference_count += 1
+        if bool(recovery["initial_ik_target_unmet"]):
+            recovery_records.append(
+                {
+                    "reference_index": index,
+                    "reference_sequence": int(reference.sequence),
+                    "status": str(recovery["status"]),
+                    "retry_count": retry_count,
+                    "attempt_count": int(recovery["attempt_count"]),
+                    "result_statuses": [
+                        str(value) for value in recovery["result_statuses"]
+                    ],
+                    "endpoint_statuses": [
+                        str(value.get("status", "unknown")) for value in observations
+                    ],
+                }
+            )
         qpos = {
             side: control.scene.get_arm_qpos(side).copy() for side in SIDES
         }
@@ -972,22 +1107,21 @@ def execute_grasp_motion(
             maximum_tracking_error_m,
             float(np.linalg.norm(actual[:3, 3] - reference_world[:3, 3])),
         )
-        endpoint_status = str(control.endpoint_tracking_observation()["status"])
-        endpoint_status_counts[endpoint_status] = int(
-            endpoint_status_counts.get(endpoint_status, 0)
-        ) + 1
         actual_qpos_by_frame.append(qpos)
         actual_pose_world.append(actual.copy())
         reference_pose_world.append(reference_world.copy())
+        if bool(recovery["unrecovered"]):
+            break
 
     endpoint = control.endpoint_tracking_observation()
     final_status = str(endpoint.get("status", "unknown"))
-    # A final settled frame cannot erase a discontinuous or unreachable
-    # intermediate target.  Preserve any observed IK target failure as the
-    # terminal motion classification.
+    # A final settled observation can clear only a miss that the bounded
+    # same-reference loop explicitly recovered.  An exhausted reference remains
+    # an execution failure even if a later observation happens to look settled.
     motion_status = classify_motion_status(
         final_endpoint_status=final_status,
         endpoint_status_counts=endpoint_status_counts,
+        unrecovered_ik_target_unmet_count=unrecovered_reference_count,
     )
     maximum_joint_motion_deg = max(
         float(
@@ -1007,14 +1141,33 @@ def execute_grasp_motion(
             "joint_fk_path": dict(joint_fk_plan.metadata),
             "terminal_tcp_correction": correction_metadata,
             "total_reference_duration_sec": (
+                float(max(0, dispatched_reference_count - 1))
+                / float(control.contract.timing.ik_hz)
+            ),
+            "planned_reference_duration_sec": (
                 float(len(active_poses_desk) - 1)
                 / float(control.contract.timing.ik_hz)
             ),
+            "execution_physics_duration_sec": (
+                float(execution_physics_ticks)
+                / float(control.contract.timing.physics_hz)
+            ),
         },
         "terminal_hold_sec": float(terminal_hold_sec),
-        "reference_frame_count": len(active_poses_desk),
+        "reference_frame_count": dispatched_reference_count,
+        "planned_reference_frame_count": len(active_poses_desk),
+        "dispatched_reference_count": dispatched_reference_count,
         "ik_status_counts": ik_status_counts,
         "endpoint_status_counts": endpoint_status_counts,
+        "ik_target_unmet_recovery": {
+            "semantics": "bounded_same_frozen_reference_retry_v1",
+            "retry_limit_per_reference": retry_limit,
+            "retry_count": recovery_retry_count,
+            "retry_physics_ticks": recovery_physics_ticks,
+            "transient_recovered_reference_count": recovered_reference_count,
+            "unrecovered_reference_count": unrecovered_reference_count,
+            "records": recovery_records,
+        },
         "final_endpoint_tracking": endpoint,
         "maximum_actual_joint_motion_deg": maximum_joint_motion_deg,
         "maximum_translation_tracking_error_m": maximum_tracking_error_m,
