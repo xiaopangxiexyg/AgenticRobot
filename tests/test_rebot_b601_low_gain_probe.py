@@ -64,6 +64,32 @@ def test_feedback_stability_summary_rejects_non_monotonic_time() -> None:
         )
 
 
+def test_feedback_boundary_normalization_is_narrow_and_preserves_raw_values() -> None:
+    raw = (0.1, -5.0e-4, -2.5e-4, -5.0e-6, 0.0, 0.0)
+
+    normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+    assert normalized == (0.1, 0.0, 0.0, -5.0e-6, 0.0, 0.0)
+    assert normalized_joint_names == ("joint2", "joint3")
+    assert raw[1:3] == (-5.0e-4, -2.5e-4)
+
+
+def test_feedback_boundary_normalization_does_not_admit_more_negative_values() -> None:
+    raw = (0.1, -5.0001e-4, 0.0, 0.0, 0.0, 0.0)
+
+    normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+    assert normalized == raw
+    assert normalized_joint_names == ()
+    with pytest.raises(probe.LowGainProbeError, match="outside URDF limits"):
+        probe._validate_fault_hold_snapshot(
+            raw,
+            qvel_rad_s=(0.0,) * 6,
+            observed_age_sec=0.0,
+            position_limits_rad=_fault_hold_limits(),
+        )
+
+
 def test_feedback_stability_probe_never_enters_motion_path(tmp_path) -> None:
     class FakeBackend:
         config = SimpleNamespace(channel="can0")
@@ -126,6 +152,79 @@ def test_feedback_stability_probe_never_enters_motion_path(tmp_path) -> None:
     assert result["acceptance_status"] == "CAPTURED"
     assert result["stability"]["per_joint"]["joint3"]["stationarity_exceed_count"] == 2
     assert backend.events == ["connect", "poll_feedback", "poll_feedback", "poll_feedback", "close"]
+
+
+def test_feedback_stability_probe_normalizes_only_admitted_j2_j3_boundary(tmp_path) -> None:
+    class FakeBackend:
+        config = SimpleNamespace(channel="can0")
+
+        def __init__(self) -> None:
+            self.poll_count = 0
+
+        def connect(self) -> None:
+            return None
+
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            assert request_feedback is True
+            self.poll_count += 1
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=(
+                    0.0,
+                    -2.5e-4,
+                    -5.0e-4,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
+                receive_timestamp_sec=0.05 * self.poll_count,
+                fault_reason=None,
+            )
+
+        def close(self) -> None:
+            return None
+
+    now = [0.0]
+
+    def clock() -> float:
+        now[0] += 0.01
+        return now[0]
+
+    def sleeper(duration: float) -> None:
+        now[0] += duration
+
+    config_path = tmp_path / "rebotarm_rs.yaml"
+    config_path.write_text("joints: []\n", encoding="utf-8")
+    urdf_path = tmp_path / "b601.urdf"
+    urdf_path.write_text("<robot name='b601'/>", encoding="utf-8")
+    backend = FakeBackend()
+    limits = _fault_hold_limits()
+
+    result = probe._run_feedback_stability_probe(
+        backend,
+        config_path=config_path,
+        source_root=tmp_path,
+        model=SimpleNamespace(urdf_path=urdf_path),
+        position_limits=limits,
+        duration_sec=1.0,
+        rate_hz=20.0,
+        stationarity_velocity_limit_rad_s=0.02,
+        clock=clock,
+        sleeper=sleeper,
+        max_samples=3,
+    )
+
+    assert result["status"] == "OK"
+    boundary = result["feedback_boundary_normalization"]
+    assert boundary["applied_sample_count"] == 3
+    assert boundary["applied_joint_counts"] == {"joint2": 3, "joint3": 3}
+    assert result["samples"][0]["raw_qpos_rad"][1:3] == (-2.5e-4, -5.0e-4)
+    assert result["samples"][0]["qpos_rad"][1:3] == (0.0, 0.0)
+    assert result["samples"][0]["boundary_normalized_joint_names"] == (
+        "joint2",
+        "joint3",
+    )
 
 
 def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -> None:

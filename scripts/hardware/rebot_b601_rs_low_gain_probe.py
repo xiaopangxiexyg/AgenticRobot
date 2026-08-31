@@ -32,6 +32,11 @@ same explicit ``mechPos`` reads with ``allow_motion=False`` and never changes
 the vendor mode or enable state.  Automated tests exercise the pure helpers
 only; they never construct a hardware backend.
 
+At feedback admission, only J2/J3 values in ``[-5e-4, 0)`` rad are represented
+as the legal zero-lower-limit reading.  The raw value is retained in evidence
+records, while values below that narrow boundary and all outgoing references
+remain subject to the exact pinned-URDF limits.
+
 After MIT mode setup and enable, the active path first requires four consecutive
 complete, in-limit, near-zero-velocity feedback snapshots.  No torque command
 is sent during this arming-settle gate; the first torque reference is anchored
@@ -89,6 +94,8 @@ DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = ("joint2", "joint3")
+_FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3")
+_FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD = 5.0e-4
 _NON_FAULT_HOLD_JOINTS = tuple(
     name for name in _ALL_JOINTS if name not in _FAULT_HOLD_JOINTS
 )
@@ -184,6 +191,37 @@ def _bounded(
     return normalized
 
 
+def normalize_feedback_boundary_qpos(
+    qpos_rad: Sequence[float],
+    *,
+    name: str = "feedback_qpos_rad",
+) -> tuple[tuple[float, ...], tuple[str, ...]]:
+    """Normalize only the admitted J2/J3 encoder boundary quantization.
+
+    RobStride ``mechPos`` may report a tiny negative value immediately below
+    the zero lower limit after zeroing.  The requested compatibility boundary
+    treats only ``-5e-4 <= q < 0`` on joint2/joint3 as the legal zero reading.
+    Every other joint and every more-negative value is returned unchanged so
+    the caller's existing exact URDF-limit check still rejects it.  The raw
+    value must be retained by callers that write an evidence record.
+    """
+
+    q = _six(qpos_rad, name=name)
+    normalized = list(q)
+    normalized_joint_names: list[str] = []
+    for index, joint_name in enumerate(_ALL_JOINTS):
+        value = q[index]
+        if (
+            joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
+            and -_FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD
+            <= value
+            < 0.0
+        ):
+            normalized[index] = 0.0
+            normalized_joint_names.append(joint_name)
+    return tuple(normalized), tuple(normalized_joint_names)
+
+
 def _mode_receipt_payload(receipt: B601ModeReceipt | None) -> dict[str, object] | None:
     if receipt is None:
         return None
@@ -267,7 +305,10 @@ def _validate_fault_hold_snapshot(
         raise LowGainProbeError(
             "fault hold requires a complete last-safe velocity observation"
         )
-    q = _six(qpos_rad, name="fault_hold_qpos_rad")
+    q, _ = normalize_feedback_boundary_qpos(
+        qpos_rad,
+        name="fault_hold_qpos_rad",
+    )
     qvel = _six(qvel_rad_s, name="fault_hold_qvel_rad_s")
     limits = tuple(
         (float(lower), float(upper)) for lower, upper in position_limits_rad
@@ -312,7 +353,10 @@ def _validate_fault_hold_snapshot(
                 f"URDF limits [{lower:.6f}, {upper:.6f}]"
             )
     if fault_qpos_rad is not None:
-        fault_q = _six(fault_qpos_rad, name="fault_qpos_rad")
+        fault_q, _ = normalize_feedback_boundary_qpos(
+            fault_qpos_rad,
+            name="fault_qpos_rad",
+        )
         if fault_qvel_rad_s is None:
             raise LowGainProbeError(
                 "fault snapshot velocity is unavailable; refusing protective rebase"
@@ -416,8 +460,14 @@ def _validate_arming_settle_transition(
         raise LowGainProbeError(
             "arming settle requires a complete feedback position snapshot"
         )
-    current = _six(current_qpos_rad, name="arming_settle_qpos_rad")
-    previous = _six(previous_qpos_rad, name="arming_settle_previous_qpos_rad")
+    current, _ = normalize_feedback_boundary_qpos(
+        current_qpos_rad,
+        name="arming_settle_qpos_rad",
+    )
+    previous, _ = normalize_feedback_boundary_qpos(
+        previous_qpos_rad,
+        name="arming_settle_previous_qpos_rad",
+    )
     current_timestamp = _finite(
         current_timestamp_sec,
         name="arming_settle_current_timestamp_sec",
@@ -929,6 +979,8 @@ def _run_feedback_stability_probe(
     next_deadline = started
     ledger = FrequencyLedger()
     positions: list[tuple[float, ...]] = []
+    raw_positions: list[tuple[float, ...]] = []
+    normalization_events: list[tuple[str, ...]] = []
     timestamps: list[float] = []
     errors: list[str] = []
     connected = False
@@ -953,7 +1005,11 @@ def _run_feedback_stability_probe(
                 )
                 break
             try:
-                q = _six(state.positions_rad, name="feedback_qpos_rad")
+                raw_q = _six(state.positions_rad, name="feedback_qpos_rad")
+                q, normalized_joint_names = normalize_feedback_boundary_qpos(
+                    raw_q,
+                    name="feedback_qpos_rad",
+                )
                 observed_at = _finite(
                     state.receive_timestamp_sec,
                     name="feedback_receive_timestamp_sec",
@@ -973,6 +1029,8 @@ def _run_feedback_stability_probe(
             if errors:
                 break
             positions.append(q)
+            raw_positions.append(raw_q)
+            normalization_events.append(normalized_joint_names)
             timestamps.append(observed_at)
             ledger.mark("feedback", observed_at)
             next_deadline += period
@@ -1020,14 +1078,45 @@ def _run_feedback_stability_probe(
         "hardware_acceptance": "NOT_CLAIMED",
         "freshness_verified": False,
         "freshness_semantics": "motorbridge_mechPos_parameter_observation_unverified",
+        "feedback_boundary_normalization": {
+            "joints": _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS,
+            "interval_rad": (
+                -_FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD,
+                0.0,
+            ),
+            "interval_semantics": "inclusive_lower_exclusive_upper",
+            "applied_sample_count": sum(
+                bool(names) for names in normalization_events
+            ),
+            "applied_joint_counts": {
+                joint_name: sum(joint_name in names for names in normalization_events)
+                for joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
+            },
+            "raw_values_preserved": True,
+            "semantics": (
+                "feedback_admission_only; URDF limits and outgoing references remain strict"
+            ),
+        },
         "samples": [
-            {"receive_timestamp_sec": timestamp, "qpos_rad": q}
-            for timestamp, q in zip(timestamps, positions, strict=True)
+            {
+                "receive_timestamp_sec": timestamp,
+                "raw_qpos_rad": raw_q,
+                "qpos_rad": q,
+                "boundary_normalized_joint_names": normalized_joint_names,
+            }
+            for timestamp, raw_q, q, normalized_joint_names in zip(
+                timestamps,
+                raw_positions,
+                positions,
+                normalization_events,
+                strict=True,
+            )
         ],
         "notes": [
             "This mode only requests vendor feedback and reads mechPos; it never changes mode, enables, disables, or sends MIT/POS_VEL control frames.",
             "Run only after the operator has independently made the arm safe; this probe does not alter the existing enable state.",
             "The stationarity gate is diagnostic evidence for protective-hold review, not permission to relax the active safety threshold.",
+            "Only J2/J3 feedback readings in [-5e-4, 0) rad are represented as 0 rad at admission; raw readings are retained per sample, and more-negative values remain outside the strict URDF limit.",
             "MotorBridge 0.4.9 provides no source timestamp or sequence, so freshness remains unverified.",
         ],
     }
@@ -1069,7 +1158,10 @@ def _run_driver_torque_limit_roundtrip_probe(
                 "driver torque-limit roundtrip requires one complete valid feedback "
                 f"snapshot; last_fault={state.fault_reason or 'unknown'}"
             )
-        qpos = _six(state.positions_rad, name="driver_limit_feedback_qpos_rad")
+        qpos, _ = normalize_feedback_boundary_qpos(
+            state.positions_rad,
+            name="driver_limit_feedback_qpos_rad",
+        )
         for index, (value, (lower, upper)) in enumerate(
             zip(qpos, position_limits, strict=True)
         ):
@@ -1981,9 +2073,12 @@ def _run_latched_fault_hold(
             fault_qvel_rad_s=fault_qvel_rad_s,
             max_rebase_rad=max_rebase_rad,
         )
-        measured_qpos = (
-            fault_qpos_rad if fault_qpos_rad is not None else hold_q
-        )
+        measured_qpos = hold_q
+        if fault_qpos_rad is not None:
+            measured_qpos, _ = normalize_feedback_boundary_qpos(
+                fault_qpos_rad,
+                name="fault_measured_qpos_rad",
+            )
         measured_qvel = (
             fault_qvel_rad_s if fault_qvel_rad_s is not None else qvel_rad_s
         )
@@ -2087,16 +2182,20 @@ def _run_latched_fault_hold(
                 raise LowGainProbeError(
                     "protective hold feedback timestamp did not advance"
                 )
+            current_q, _ = normalize_feedback_boundary_qpos(
+                state.positions_rad,
+                name="protective_hold_feedback_qpos_rad",
+            )
             monitor_qvel = tuple(
                 (current - previous) / monitor_dt
                 for current, previous in zip(
-                    state.positions_rad,
+                    current_q,
                     monitor_q,
                     strict=True,
                 )
             )
             measured_q = _validate_protective_hold_feedback(
-                state.positions_rad,
+                current_q,
                 qvel_rad_s=monitor_qvel,
                 hold_qpos_rad=hold_q,
                 observed_age_sec=0.0,
@@ -2395,7 +2494,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         arm_dt = arming_observed_at_sec - warmup_observed_at_sec
         if not math.isfinite(arm_dt) or arm_dt <= 0.0:
             raise LowGainProbeError("non-positive warmup-to-enable observation interval")
-        arming_q = _six(arming_state.positions_rad, name="arming_qpos_rad")
+        arming_q, _ = normalize_feedback_boundary_qpos(
+            arming_state.positions_rad,
+            name="arming_qpos_rad",
+        )
         arming_qvel = tuple(
             (current - previous) / arm_dt
             for current, previous in zip(arming_q, warmup_q, strict=True)
@@ -2563,13 +2665,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             if getattr(state, "stale", False):
                 stop_reason = "stale feedback snapshot"
                 break
-            q = state.positions_rad
-            final_q = q
             try:
-                q = _six(q, name="feedback_qpos_rad")
+                raw_q = _six(state.positions_rad, name="feedback_qpos_rad")
+                q, normalized_joint_names = normalize_feedback_boundary_qpos(
+                    raw_q,
+                    name="feedback_qpos_rad",
+                )
             except (TypeError, ValueError) as exc:
                 stop_reason = f"invalid feedback position: {exc}"
                 break
+            final_q = q
             fault_qpos_for_hold = q
             for index, (value, (lower, upper)) in enumerate(
                 zip(q, position_limits, strict=True)
@@ -2736,7 +2841,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "sequence": state.sequence,
                     "elapsed_sec": elapsed,
                     "feedback_timestamp_sec": state.receive_timestamp_sec,
+                    "raw_qpos_rad": raw_q,
                     "qpos_rad": q,
+                    "boundary_normalized_joint_names": normalized_joint_names,
                     "qvel_fd_rad_s": qvel,
                     "qref_rad": qref,
                     "qvel_ref_rad_s": qvel_ref,
@@ -3129,6 +3236,29 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "hardware_acceptance": "NOT_CLAIMED",
         "freshness_verified": False,
         "freshness_semantics": "motorbridge_mechPos_parameter_observation_unverified",
+        "feedback_boundary_normalization": {
+            "joints": _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS,
+            "interval_rad": (
+                -_FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD,
+                0.0,
+            ),
+            "interval_semantics": "inclusive_lower_exclusive_upper",
+            "applied_sample_count": sum(
+                bool(sample.get("boundary_normalized_joint_names"))
+                for sample in samples
+            ),
+            "applied_joint_counts": {
+                joint_name: sum(
+                    joint_name in sample.get("boundary_normalized_joint_names", ())
+                    for sample in samples
+                )
+                for joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
+            },
+            "raw_values_preserved": True,
+            "semantics": (
+                "feedback_admission_only; URDF limits and outgoing references remain strict"
+            ),
+        },
         "samples": samples,
         "notes": [
             "Human-run commissioning only; automated tests never execute this active path.",
@@ -3137,6 +3267,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Protective hold admits only a host-fresh, in-limit, near-zero-velocity last-safe snapshot and a small fault rebase; otherwise it falls back to full safe_stop.",
             "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
             "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
+            "Only J2/J3 feedback readings in [-5e-4, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
             "Before any torque command, the active path requires four consecutive complete feedback snapshots after enable; no torque command is sent during this arming-settle gate.",

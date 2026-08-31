@@ -72,11 +72,18 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   并测量 compute tick。它不构造硬件 backend，不打开 CAN。
 - `feedback-stability` 是本轮低增益试验前的只读噪声标定入口：它用
   `allow_motion=False` 构造同一个 backend，主动请求并读取六个 arm 的 `mechPos`，按与
-  active probe 相同的时间戳计算原始有限差分速度，输出每关节步进/速度的 p50/p95/p99/max
-  以及 `0.02 rad/s` stationarity gate 统计。它不切模式、不使能、不失能、不发送
+  active probe 相同的时间戳，对通过反馈边界归一化后的 q 计算有限差分速度，输出每关节
+  步进/速度的 p50/p95/p99/max 以及 `0.02 rad/s` stationarity gate 统计；每个样本仍保留
+  原始 q 供复核。它不切模式、不使能、不失能、不发送
   MIT/POS_VEL 控制帧，也不改变运行前已经存在的电机状态；`CAPTURED` 只表示采样完成，
   不能解读为力控或硬件通过。该结果用于判断 `last-safe` 速度门是否被反馈量化噪声触发，
   不允许据此直接放宽保护阈值。
+- 反馈进入限位/速度/阻抗计算前，只有 joint2 与 joint3 的窄边界
+  `-5e-4 <= q < 0 rad` 会被表示为合法的 `0 rad`。这是对已标零后编码器量化负零的
+  反馈表示归一化，不修改 pinned URDF 的 `[0, 3.14]` 位置限位，也不改变出站参考、
+  torque/slew 包络或更负值的 fail-closed 行为；例如 `q < -5e-4 rad` 仍会被原有限位门
+  拒绝。JSON 样本同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
+  `boundary_normalized_joint_names`，便于复核实际读数。
 
 数学、重力和 haptic 组合仍由 `robot_motion.rebot_b601_rs` 负责，仿真 effort backend
 仍由 `sim.mujoco.rebot_b601_rs` 负责；本模块不复制 Pinocchio 或 MuJoCo 实现。
