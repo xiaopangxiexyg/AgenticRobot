@@ -268,6 +268,8 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert "/api/commit-detail/" in app_source
         assert "当前有效分析仍使用粗粒度 fallback" in app_source
         assert "detail_overlay" in app_source
+        assert "Boolean(overlay?.confirmed)" in app_source
+        assert "Boolean(overlay.confirmed)" not in app_source
         assert "function currentTimelineSamplePoint" in app_source
         assert "function successOccurrenceOwningSample" in app_source
         assert "function recoverableFailureConflict" in app_source

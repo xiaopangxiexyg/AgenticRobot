@@ -21,6 +21,8 @@ from ..operator_ui_ports import (
 from .foot_pad_controls import (
     FOOT_PAD_FIVE_PROGRESS_EVENTS,
     FOOT_PAD_TWO_PEDAL_STYLE_COUNTS,
+    SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+    SPECIAL_ARM_CONTROL_MODE_MANUAL,
     persist_five_pedal_test_receipt,
     persisted_five_pedal_test_verified,
 )
@@ -581,7 +583,7 @@ class RealTeleopControlInput:
             ),
             special_arm_control_mode=str(
                 SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
-                if self._foot_pad_mode_enabled()
+                if self._foot_pad_mode_configured()
                 else SPECIAL_ARM_CONTROL_MODE_MANUAL
             ),
             foot_pad_available=self._foot_pad_online(),
@@ -655,16 +657,32 @@ class RealTeleopControlInput:
         # the production adapter exposes the explicit online property.
         return bool(online if online is not None else True)
 
-    def _foot_pad_mode_enabled(self) -> bool:
+    def _foot_pad_mode_configured(self) -> bool:
+        """Whether the configured operator scheme expects foot-pad controls.
+
+        Device availability is reported separately.  In particular, losing a
+        2/5-pedal virtual keyboard must pause only physical pedal edges; it
+        must not silently change the already selected A/B/C keyboard scheme.
+        """
+
+        args = getattr(self, "args", None)
+        if args is None:
+            # Preserve lightweight compatibility adapters that expose only a
+            # resolved topology.  The production runtime always owns args.
+            return self._foot_pad_count() in {2, 4, 5}
         mode = str(
-            getattr(self.args, "special_arm_control_mode", SPECIAL_ARM_CONTROL_MODE_MANUAL)
+            getattr(args, "special_arm_control_mode", SPECIAL_ARM_CONTROL_MODE_MANUAL)
             or SPECIAL_ARM_CONTROL_MODE_MANUAL
         )
         return (
             mode == SPECIAL_ARM_CONTROL_MODE_FOOT_PAD
-            and self._foot_pad_online()
             and self._foot_pad_count() in {2, 4, 5}
         )
+
+    def _foot_pad_mode_enabled(self) -> bool:
+        """Whether physical foot-pad events can currently be consumed."""
+
+        return bool(self._foot_pad_mode_configured() and self._foot_pad_online())
 
     def _foot_pad_count(self) -> int:
         return int(getattr(getattr(self, "foot_pad_input", None), "foot_pad_count", 0) or 0)
@@ -699,11 +717,15 @@ class RealTeleopControlInput:
         return verified
 
     def _two_pedal_mode_active(self) -> bool:
-        """Return whether the 2/5-pedal side-switch contract is active."""
+        """Return whether the configured 2/5-pedal A/B/C contract is active.
+
+        This is an operator-interaction contract, not a live-device fact.  A
+        disconnected pedal source therefore leaves A/B/C behavior unchanged;
+        ``_foot_pad_mode_enabled`` still gates every physical pedal event.
+        """
 
         return bool(
-            self._foot_pad_mode_enabled()
-            and self._foot_pad_online()
+            self._foot_pad_mode_configured()
             and self._foot_pad_count() in FOOT_PAD_TWO_PEDAL_STYLE_COUNTS
         )
 
