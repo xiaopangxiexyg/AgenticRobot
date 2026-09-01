@@ -583,6 +583,27 @@ def execute_registered_shadow_trajectory_with_ports(
                 if remaining <= 0.0:
                     break
                 sleep(min(remaining, poll))
+            pre_dispatch = current_snapshot_provider()
+            if not isinstance(pre_dispatch, AuthoritativeRobotStateSnapshot):
+                raise TypeError(
+                    "current_snapshot_provider must return "
+                    "AuthoritativeRobotStateSnapshot."
+                )
+            pre_dispatch_gripper_drift = max(
+                abs(
+                    pre_dispatch.gripper_close_by_side[side]
+                    - trajectory.initial_snapshot.gripper_close_by_side[side]
+                )
+                for side in _SIDES
+            )
+            if pre_dispatch_gripper_drift > maximum_gripper_start_drift:
+                return terminal(
+                    RegisteredTrajectoryRealReplayStatus.GRIPPER_HOLD_DRIFT,
+                    executed_count=executed_count,
+                    hold_reason=(
+                        "registered shadow replay pre-dispatch gripper drift"
+                    ),
+                )
             dispatch_attempted = True
             dispatch = point_dispatcher(point, trajectory.semantic_content_hash)
             if not isinstance(dispatch, RegisteredTrajectoryPointDispatchReceipt):

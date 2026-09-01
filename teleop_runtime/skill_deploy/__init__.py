@@ -9,6 +9,11 @@ from .control_runtime import (
     RealSkillMotionObservationCut,
     RealSkillMotionTargetSynchronizer,
 )
+from .dmtac_shadow_ports import (
+    DMTacRM65RegisteredTrajectoryPorts,
+    DMTacShadowReplayPortProfile,
+    StartedRM65ShadowPorts,
+)
 from .motion_port import (
     REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
     RealAgentMotionActivation,
@@ -57,6 +62,8 @@ from .rm65_target_safety import (
 __all__ = [
     "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
     "RM65_SKILL_SCENE_WORLD_FRAME_ID_V1",
+    "DMTacRM65RegisteredTrajectoryPorts",
+    "DMTacShadowReplayPortProfile",
     "ExclusiveRM65SkillDeployPorts",
     "ExclusiveRM65SkillDeploymentProfile",
     "ExclusiveRM65SkillLowerAssembly",
@@ -89,6 +96,7 @@ __all__ = [
     "RealSkillMotionObservationCut",
     "RealSkillMotionTargetSynchronizer",
     "ResolvedExclusiveRM65SkillDeploymentProfile",
+    "StartedRM65ShadowPorts",
     "assemble_exclusive_rm65_skill_lower",
     "build_exclusive_rm65_skill_position_force_guard",
     "capture_authoritative_shadow_state_from_backends",
