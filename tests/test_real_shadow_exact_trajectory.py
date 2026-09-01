@@ -13,8 +13,13 @@ from robot_motion.shadow_execution import (
     ShadowSimulationStatus,
 )
 from teleop_runtime.skill_deploy.control_runtime import (
+    RealSkillMotionDispatchReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
+)
+from teleop_runtime.skill_deploy.dmtac_shadow_ports import (
+    DMTacRM65RegisteredTrajectoryPorts,
+    DMTacShadowReplayPortProfile,
 )
 from teleop_runtime.skill_deploy.registered_trajectory import (
     RegisteredTrajectoryExecutionAuthority,
@@ -38,7 +43,7 @@ class _GripperBackend:
         return self.payload
 
 
-def _identity() -> ShadowExecutionIdentity:
+def _identity(*, gripper_model_hash: str = "gripper:test") -> ShadowExecutionIdentity:
     return ShadowExecutionIdentity(
         station_revision="station:test",
         reference_frame_id="desk",
@@ -48,7 +53,7 @@ def _identity() -> ShadowExecutionIdentity:
         robot_model_hash="robot:test",
         collision_model_hash="collision:test",
         joint_layout_hash="joints:test",
-        gripper_model_hash="gripper:test",
+        gripper_model_hash=gripper_model_hash,
     )
 
 
@@ -449,12 +454,219 @@ def test_mock_real_replay_lower_dispatch_or_feedback_error_always_holds() -> Non
         "registered shadow replay lower port error"
     ]
 
-    feedback_error_ports = _ReplayPorts(trajectory, snapshot_raise_call=1)
+    feedback_error_ports = _ReplayPorts(trajectory, snapshot_raise_call=2)
     feedback_error = _execute(feedback_error_ports, trajectory, simulation)
     assert feedback_error.status is RegisteredTrajectoryRealReplayStatus.LOWER_PORT_ERROR
     assert feedback_error.executed_point_count == 1
     assert feedback_error.real_motion_executed is True
     assert feedback_error.terminal_hold_confirmed is True
+
+
+class _StartedRM65Ports:
+    def __init__(self, trajectory, *, clock, admitted=True, hold_succeeds=True):
+        self.trajectory = trajectory
+        self.clock = clock
+        self.admitted = admitted
+        self.hold_succeeds = hold_succeeds
+        self.qpos = {
+            side: value.copy()
+            for side, value in trajectory.initial_snapshot.qpos_by_side.items()
+        }
+        self.admitted_commands = []
+        self.dispatched_commands = []
+        self.hold_reasons = []
+
+    def observe(self):
+        now = self.clock()
+        return RealSkillMotionObservationCut(
+            observation=TeleopObservation(timestamp=now),
+            qpos_by_side=self.qpos,
+            measured_at=now - 0.01,
+            available_at=now,
+            evidence_refs=(f"rm65-cut:{now}",),
+        )
+
+    def admit_command(self, command, observation, now):
+        assert observation.timestamp == pytest.approx(now)
+        self.admitted_commands.append(command)
+        return self.admitted
+
+    def dispatch(self, command):
+        self.dispatched_commands.append(command)
+        self.qpos = {
+            side: np.asarray(command.commands[f"{side}_arm"].value).copy()
+            for side in ("left", "right")
+        }
+        return RealSkillMotionDispatchReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-dispatch:test",),
+        )
+
+    def hold(self, reason):
+        self.hold_reasons.append(reason)
+        return RealSkillMotionHoldReceipt(
+            succeeded=self.hold_succeeds,
+            evidence_refs=("rm65-hold:test",),
+        )
+
+
+def _dmtac_replay_ports(*, admitted=True, right_close=0.3, identity=None):
+    trajectory = _trajectory()
+    now = 10.0
+    rm65 = _StartedRM65Ports(
+        trajectory,
+        clock=lambda: now,
+        admitted=admitted,
+    )
+    dmtac = {
+        "left": _backend("left", 0.2, now - 0.009),
+        "right": _backend("right", right_close, now - 0.008),
+    }
+    ports = DMTacRM65RegisteredTrajectoryPorts(
+        trajectory=trajectory,
+        identity=identity or trajectory.initial_snapshot.identity,
+        rm65_ports=rm65,
+        dmtac_backends_by_side=dmtac,
+        profile=DMTacShadowReplayPortProfile(
+            maximum_inter_gripper_skew_sec=0.05,
+            maximum_arm_gripper_skew_sec=0.05,
+            maximum_gripper_hold_drift=0.02,
+        ),
+        clock=lambda: now,
+    )
+    return trajectory, ports, rm65, dmtac
+
+
+def test_dmtac_rm65_ports_join_measured_state_and_dispatch_only_arm_qpos() -> None:
+    trajectory, ports, rm65, dmtac = _dmtac_replay_ports()
+
+    snapshot = ports.current_snapshot()
+    receipt = ports.dispatch_point(
+        trajectory.points[-1],
+        trajectory.semantic_content_hash,
+    )
+
+    assert snapshot.gripper_close_by_side == {"left": 0.2, "right": 0.3}
+    assert receipt.succeeded is True
+    assert len(rm65.admitted_commands) == 1
+    assert len(rm65.dispatched_commands) == 1
+    assert set(rm65.dispatched_commands[0].commands) == {
+        "left_arm",
+        "right_arm",
+    }
+    assert all(backend.read_count == 1 for backend in dmtac.values())
+
+
+def test_dmtac_rm65_ports_never_dispatch_when_lower_admission_rejects() -> None:
+    trajectory, ports, rm65, _ = _dmtac_replay_ports(admitted=False)
+    ports.current_snapshot()
+
+    receipt = ports.dispatch_point(
+        trajectory.points[0],
+        trajectory.semantic_content_hash,
+    )
+
+    assert receipt.succeeded is False
+    assert len(rm65.admitted_commands) == 1
+    assert rm65.dispatched_commands == []
+
+
+def test_dmtac_rm65_current_identity_is_independent_of_registered_trajectory() -> None:
+    trajectory, ports, rm65, _ = _dmtac_replay_ports(
+        identity=_identity(gripper_model_hash="dmtac-model:changed"),
+    )
+
+    snapshot = ports.current_snapshot()
+    dispatch = ports.dispatch_point(
+        trajectory.points[0],
+        trajectory.semantic_content_hash,
+    )
+
+    assert (
+        snapshot.identity.semantic_content_hash
+        != trajectory.initial_snapshot.identity.semantic_content_hash
+    )
+    assert dispatch.succeeded is False
+    assert rm65.admitted_commands == []
+
+
+def test_dmtac_rm65_hold_is_arm_hold_plus_passive_measured_opening_fence() -> None:
+    _, ports, rm65, dmtac = _dmtac_replay_ports()
+
+    receipt = ports.hold("test terminal hold")
+
+    assert receipt.succeeded is True
+    assert rm65.hold_reasons == ["test terminal hold"]
+    assert all(backend.read_count == 1 for backend in dmtac.values())
+    assert any(ref.startswith("dmtac-passive-fence-hold:") for ref in receipt.evidence_refs)
+
+
+def test_dmtac_rm65_hold_reports_measured_gripper_drift_without_commanding_it() -> None:
+    _, ports, rm65, dmtac = _dmtac_replay_ports(right_close=0.36)
+
+    receipt = ports.hold("drift hold")
+
+    assert receipt.succeeded is False
+    assert rm65.hold_reasons == ["drift hold"]
+    assert all(backend.read_count == 1 for backend in dmtac.values())
+
+
+def test_dmtac_rm65_adapter_completes_injected_exact_replay_without_gripper_command() -> None:
+    trajectory = _trajectory()
+    simulation = _simulation_receipt(trajectory)
+    clock = {"wall": 10.0, "monotonic": 0.0}
+
+    def sleep(duration):
+        clock["wall"] += float(duration)
+        clock["monotonic"] += float(duration)
+
+    rm65 = _StartedRM65Ports(
+        trajectory,
+        clock=lambda: clock["wall"],
+    )
+    dmtac = {
+        "left": _backend("left", 0.2, 9.995),
+        "right": _backend("right", 0.3, 9.996),
+    }
+    ports = DMTacRM65RegisteredTrajectoryPorts(
+        trajectory=trajectory,
+        identity=trajectory.initial_snapshot.identity,
+        rm65_ports=rm65,
+        dmtac_backends_by_side=dmtac,
+        profile=DMTacShadowReplayPortProfile(
+            maximum_inter_gripper_skew_sec=0.05,
+            maximum_arm_gripper_skew_sec=0.1,
+            maximum_gripper_hold_drift=0.02,
+        ),
+        clock=lambda: clock["wall"],
+    )
+
+    receipt = execute_registered_shadow_trajectory_with_ports(
+        trajectory=trajectory,
+        simulation_receipt=simulation,
+        current_scene_hash=trajectory.scene_hash,
+        current_snapshot_provider=ports.current_snapshot,
+        point_dispatcher=ports.dispatch_point,
+        hold_controller=ports.hold,
+        authority=_authority(trajectory, simulation),
+        consume_execution_authority=lambda authority: (
+            f"authority-consumed:{authority.authority_id}",
+        ),
+        execution_enabled=True,
+        wall_clock=lambda: clock["wall"],
+        monotonic_clock=lambda: clock["monotonic"],
+        sleep=sleep,
+        final_tracking_timeout_sec=0.06,
+        feedback_poll_sec=0.01,
+    )
+
+    assert receipt.status is RegisteredTrajectoryRealReplayStatus.COMPLETED
+    assert receipt.executed_point_count == len(trajectory.points)
+    assert all(
+        set(command.commands) == {"left_arm", "right_arm"}
+        for command in rm65.dispatched_commands
+    )
+    assert all(backend.read_count >= 4 for backend in dmtac.values())
 
 
 def test_mock_real_replay_initial_read_and_hold_transport_errors_fail_closed() -> None:

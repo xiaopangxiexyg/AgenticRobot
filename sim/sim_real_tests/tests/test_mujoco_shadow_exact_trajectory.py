@@ -98,6 +98,19 @@ def test_exact_registered_qpos_executes_in_mujoco_and_finishes_in_hold() -> None
     trajectory = _trajectory()
     control = build_shadow_initialized_control(trajectory.initial_snapshot)
     try:
+        gripper_profile = control.rig.config.gripper_actuation_profile
+        assert (
+            gripper_profile.name
+            == "dmtac_bimanual_position_eg2_4b2_cad_20260818.v1"
+        )
+        assert gripper_profile.side_by_gripper == {
+            "left_eg2_4b2_cad": "left",
+            "right_eg2_4b2_cad": "right",
+        }
+        assert all(
+            len(gripper_profile.joint_names_by_gripper[name]) == 6
+            for name in gripper_profile.side_by_gripper
+        )
         receipt = execute_registered_shadow_trajectory(
             control=control,
             trajectory=trajectory,
