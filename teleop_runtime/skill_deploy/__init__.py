@@ -30,6 +30,10 @@ from .motion_port import (
 from .registered_trajectory import (
     MeasuredGripperBackend,
     MeasuredGripperStateCut,
+    RegisteredTrajectoryAuthorityConsumptionReceipt,
+    RegisteredTrajectoryAuthorityConsumptionStatus,
+    RegisteredTrajectoryExecutionAuthority,
+    SingleUseRegisteredTrajectoryAuthorityConsumer,
     capture_authoritative_shadow_state_from_backends,
     read_measured_gripper_state_cut,
 )
@@ -95,7 +99,11 @@ __all__ = [
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
     "RealSkillMotionTargetSynchronizer",
+    "RegisteredTrajectoryAuthorityConsumptionReceipt",
+    "RegisteredTrajectoryAuthorityConsumptionStatus",
+    "RegisteredTrajectoryExecutionAuthority",
     "ResolvedExclusiveRM65SkillDeploymentProfile",
+    "SingleUseRegisteredTrajectoryAuthorityConsumer",
     "StartedRM65ShadowPorts",
     "assemble_exclusive_rm65_skill_lower",
     "build_exclusive_rm65_skill_position_force_guard",
