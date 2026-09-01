@@ -122,7 +122,8 @@ hand16 中的空槽必须按无效值处理，而不是按 0 处理：
 按链路分别准备：
 
 - VIVE 发送端：`triad_openvr`
-- RM65 arm backend：RM65 SDK，可导入 `hardware.rm65.robotic_arm_package.robotic_arm`
+- RM65 arm backend：RealMan API2，通过
+  `hardware.rm65.rm_api2_adapter.Arm` 提供项目兼容接口
 - Inspire hand backend：`hardware/inspire_tac/inspire_tac_modbus.py` 依赖的 `pymodbus`
 - arm IK：`rm65_inspire_tac.ik.SingleArmIKSolver` 依赖 `pinocchio`
 - 推荐环境：`conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"`

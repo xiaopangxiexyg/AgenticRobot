@@ -91,7 +91,8 @@ conda activate grasp_py310_copy
 
 采集链路按需依赖：
 
-- RM65 SDK：需要能导入 `hardware.rm65.robotic_arm_package.robotic_arm`
+- RM65 SDK：需要能导入 `hardware.rm65.rm_api2_adapter.Arm`；底层使用
+  `hardware.rm65.Robotic_Arm` 中的 RealMan API2 vendor snapshot
 - hand q6 串口读取：需要 `hardware.teleop_hand.hand_q6_reader`
 - InspireTac：需要 `hardware.inspire_tac.inspire_tac_modbus`
 - parquet 导出：需要 `pyarrow`
