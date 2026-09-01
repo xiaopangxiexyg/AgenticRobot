@@ -7,7 +7,6 @@ import pytest
 from teleop_runtime.deploy.replay_cli_validation import (
     validate_debug_replay_chunk_size,
     validate_debug_replay_window_and_sources,
-    validate_replay_prediction_mode,
 )
 
 
@@ -96,19 +95,3 @@ def test_replay_rejects_non_hold_policy() -> None:
         validate_debug_replay_window_and_sources(
             _args(debug_replay_dataset="dataset", policy_spec="pi05")
         )
-
-
-def test_threaded_prediction_is_rejected_for_replay() -> None:
-    with pytest.raises(
-        ValueError,
-        match="dataset replay owns prediction transactions and must use --policy-prediction-mode synchronous",
-    ):
-        validate_replay_prediction_mode(
-            _args(debug_replay_dataset="dataset"), threaded_prediction=True
-        )
-
-
-def test_non_threaded_prediction_is_allowed_for_replay() -> None:
-    validate_replay_prediction_mode(
-        _args(debug_replay_dataset="dataset"), threaded_prediction=False
-    )

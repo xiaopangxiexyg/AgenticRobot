@@ -216,7 +216,6 @@ from .emission_source import (
     ThreadedPolicyEmissionSource,
     ThreadedPolicyEmissionSourceConfig,
 )
-from .prediction_worker import ThreadedPolicyPredictionWorker
 from .emission_port import (
     PassivePolicyEmissionObserverPort,
     PolicyEmissionSourcePort,
@@ -508,7 +507,6 @@ __all__ = [
     "PolicyDeployRuntime",
     "PolicyDeployRuntimeConfig",
     "PolicyPredictionTransactionRequiresSynchronousQueueError",
-    "ThreadedPolicyPredictionWorker",
     "PolicyExecutorCancellationReceipt",
     "PolicyInferenceCancellationHook",
     "PolicyWorkerCompletion",
