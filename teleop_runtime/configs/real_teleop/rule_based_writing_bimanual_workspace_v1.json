@@ -1,0 +1,12 @@
+{
+  "schema_version": "teleop_runtime.tcp_pose_envelope.v1",
+  "profile_id": "rule-based-writing-bimanual-workspace-v1",
+  "sides": {
+    "left": {
+      "absolute_bounds": "calibration_workspace"
+    },
+    "right": {
+      "absolute_bounds": "calibration_workspace"
+    }
+  }
+}

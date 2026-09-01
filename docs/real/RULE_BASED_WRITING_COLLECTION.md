@@ -2,7 +2,10 @@
 
 This entrypoint composes existing RealTeleop, replay, fixed-trajectory, safety,
 and formal writer implementations. It does not introduce another hardware
-loop or recorder.
+loop or recorder. Rule-based motion does not use an operator gripper input:
+the launcher selects `gripper_input_source=none`, so Q6 and the angle-trigger
+fallback are both outside this path. The DMTAC backend remains available for
+its independent measured state and tactile streams.
 
 ## Executed plan
 
@@ -42,6 +45,13 @@ hold:
   tool-frame force guarding, and formal collection are enabled;
 - all Active admittance overlays are disabled.
 
+The launcher pins
+`teleop_runtime/configs/real_teleop/rule_based_writing_bimanual_workspace_v1.json`
+and enables it in Active mode. The profile covers both final `tool_tcp` targets
+at the authoritative pre-IK boundary and resolves each side's absolute bounds
+from the same runtime calibration workspace already selected for that arm. It
+does not add a force/admittance modifier or maintain a second workspace owner.
+
 The fixed path is authored in glyph-local XY and rotated only within
 `canonical_desk`. Its right-arm start is the causal real TCP endpoint converted
 through the current runtime contract. The existing RealTeleop resolver then
@@ -69,18 +79,10 @@ it does not import the source episode and does not prove hardware readiness.
 
 ## One real collection
 
-Run the existing five-pedal service in one terminal:
-
-```bash
-cd /home/user/zc/AgenticRobot
-source /home/user/miniconda3/etc/profile.d/conda.sh
-conda activate dexteleop310
-python -m hardware.foot_pad --count 5
-```
-
-After the normal device, calibration, workspace-clearance, and operator
-preflight, run the collector in a second terminal by removing `--dry-run` from
-the inspected command. Start exactly one formal Episode in the existing GUI.
+There is no five-pedal service or Q6 input step for this entrypoint. After the
+normal arm, DMTAC/tactile, camera, calibration, workspace-clearance, and
+operator preflight, run the collector by removing `--dry-run` from the
+inspected command. Start exactly one formal Episode in the existing GUI.
 The rule extension remains idle until the formal writer and causal dual-arm
 feedback are ready, then runs the bounded plan and enters the existing hardware
 hold after completion.

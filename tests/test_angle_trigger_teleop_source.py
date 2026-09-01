@@ -274,6 +274,10 @@ def test_gripper_input_source_cli_selector_preserves_legacy_flag_and_default() -
     assert q6_args.gripper_input_source == "q6"
     assert q6_args.gripper_angle_trigger is False
 
+    none_args = parser.parse_args(["--gripper-input-source", "none"])
+    assert none_args.gripper_input_source == "none"
+    assert none_args.gripper_angle_trigger is False
+
     legacy_args = parser.parse_args(["--gripper-angle-trigger"])
     assert legacy_args.gripper_input_source == "angle_trigger"
     assert legacy_args.gripper_angle_trigger is True
@@ -302,6 +306,76 @@ def test_explicit_angle_trigger_selection_skips_q6_probe() -> None:
 
     assert args.gripper_input_source == "angle_trigger"
     assert args._gripper_input_source_request == "angle_trigger"
+
+
+def test_explicit_no_input_selection_skips_q6_probe_and_assignment_load() -> None:
+    args = SimpleNamespace(
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="none",
+        gripper_angle_trigger=False,
+        active_sides=("left", "right"),
+        q6_default_config=True,
+        q6_config="latest",
+        q6_config_required=True,
+        left_hand_port="",
+        right_hand_port="",
+    )
+    with (
+        patch(
+            "hardware.teleop_hand.q6_assignment.scan_q6_devices",
+            side_effect=pytest.fail,
+        ),
+        patch.object(
+            cli_runtime_config,
+            "load_latest_q6_ports",
+            side_effect=pytest.fail,
+        ),
+    ):
+        real_teleop._resolve_gripper_input_source(args, ("left", "right"))
+        real_teleop._apply_default_q6_ports(args)
+
+    assert args.gripper_input_source == "none"
+    assert args._gripper_input_source_request == "none"
+    assert args.q6_startup_error == ""
+    assert args.q6_config_loaded_ports == {}
+
+
+def test_no_input_source_has_no_gripper_input_channel() -> None:
+    components = SimpleNamespace(gripper_input_source="none")
+
+    assert real_teleop._gripper_input_channel_name(components, "right") is None
+
+
+def test_no_input_source_does_not_require_q6_in_gui_preflight() -> None:
+    args = SimpleNamespace(
+        gui_requested=True,
+        device_preflight=True,
+        hand_backend="dmtac-gripper",
+        left_hand_backend=None,
+        right_hand_backend=None,
+        gripper_input_source="none",
+        visualize_tactile=False,
+        dmtac_tactile=False,
+        no_camera=True,
+    )
+    captured: dict[str, object] = {}
+
+    def prepare(options):
+        captured["require_q6"] = options.require_q6
+        captured["require_dmtac_gripper"] = options.require_dmtac_gripper
+        return SimpleNamespace(ok=True, messages=(), q6_ports={}, dmtac_assignment=None)
+
+    parser = SimpleNamespace(error=lambda message: pytest.fail(message))
+    with patch.object(cli_runtime_config, "prepare_devices_for_teleop", prepare):
+        real_teleop._run_gui_device_preflight(
+            args,
+            active_sides=("left", "right"),
+            parser=parser,
+        )
+
+    assert captured == {"require_q6": False, "require_dmtac_gripper": True}
 
 
 def test_explicit_q6_selection_fails_closed_when_q6_is_missing() -> None:

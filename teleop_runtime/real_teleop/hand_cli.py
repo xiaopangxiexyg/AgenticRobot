@@ -51,7 +51,9 @@ class _GripperInputSourceAction(argparse.Action):
     ) -> None:
         option = str(option_string or "")
         if option == "--gripper-input-source" and values is None:
-            parser.error("--gripper-input-source requires q6 or angle_trigger")
+            parser.error(
+                "--gripper-input-source requires q6, angle_trigger, or none"
+            )
         source = "angle_trigger" if values is None else str(values)
         previous = getattr(namespace, "gripper_input_source", None)
         if previous not in (None, source):
@@ -75,8 +77,8 @@ def add_hand_backend_arguments(parser: argparse.ArgumentParser) -> None:
         choices=HAND_BACKEND_CHOICES,
         default=HAND_BACKEND_INSPIRE,
         help=(
-            "Hand/gripper backend type. Use dmtac-gripper to map Q6 to the DMTAC "
-            "1D gripper backend and expose browser GUI control/status."
+            "Hand/gripper backend type. Use dmtac-gripper to expose the DMTAC "
+            "1D gripper backend and browser GUI control/status."
         ),
     )
     parser.add_argument(
@@ -117,12 +119,13 @@ def add_hand_backend_arguments(parser: argparse.ArgumentParser) -> None:
         "--gripper-input-source",
         dest="gripper_input_source",
         nargs="?",
-        choices=("q6", "angle_trigger"),
-        metavar="{q6,angle_trigger}",
+        choices=("q6", "angle_trigger", "none"),
+        metavar="{q6,angle_trigger,none}",
         default=None,
         action=_GripperInputSourceAction,
         help=(
-            "Select the DMTAC gripper input explicitly: q6 or angle_trigger. "
+            "Select the DMTAC gripper input explicitly: q6, angle_trigger, or none. "
+            "Use none when gripper commands are not operator-input driven. "
             "The legacy bare --gripper-angle-trigger selects angle_trigger; "
             "omit both options to preserve automatic Q6/AngleTrigger discovery."
         ),

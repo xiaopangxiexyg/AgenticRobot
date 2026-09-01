@@ -193,7 +193,7 @@ def _explicit_q6_gripper_input_requested(args: argparse.Namespace) -> bool:
 
 
 def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[str, ...]) -> None:
-    """Prefer usable Q6 input; fall back to the calibrated angle triggers."""
+    """Resolve the optional operator input without probing unrequested devices."""
     args.q6_startup_error = ""
 
     # Keep the original request separate from the resolved source.  The
@@ -212,12 +212,20 @@ def _resolve_gripper_input_source(args: argparse.Namespace, active_sides: tuple[
             )
         if requested in (None, ""):
             requested = "angle_trigger" if legacy_angle_trigger else None
-        elif requested not in {"q6", "angle_trigger"}:
+        elif requested not in {"q6", "angle_trigger", "none"}:
             raise ValueError(
-                "gripper_input_source must be q6 or angle_trigger"
+                "gripper_input_source must be q6, angle_trigger, or none"
             )
         setattr(args, request_marker, requested)
     requested = getattr(args, request_marker, None)
+
+    # Rule-based and other arm-only flows can keep the DMTAC backend for
+    # measured state/tactile capture while deliberately having no operator
+    # gripper input.  This is a terminal choice: do not scan Q6, load a Q6
+    # assignment, or create the angle-trigger fallback for it.
+    if requested == "none":
+        args.gripper_input_source = "none"
+        return
 
     if not _dmtac_sides(args, active_sides):
         args.gripper_input_source = "none"
