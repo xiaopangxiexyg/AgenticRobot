@@ -36,8 +36,15 @@ def _hand_q6_source_from_components(components: RealTeleopComponents) -> HandQ6S
     return None
 
 
-def _gripper_input_channel_name(components: RealTeleopComponents, side: str) -> str:
+def _gripper_input_channel_name(
+    components: RealTeleopComponents,
+    side: str,
+) -> str | None:
+    """Return the input channel, or ``None`` when input is intentionally disabled."""
+
     source = str(getattr(components, "gripper_input_source", "q6") or "q6")
+    if source == "none":
+        return None
     return f"{side}_angle_trigger" if source == "angle_trigger" else f"{side}_hand_q6"
 
 
@@ -58,7 +65,9 @@ def _dmtac_command_contract_configured(
     Q6 is reconnectable, so its schema exists even when no serial device was
     present during startup.  Angle-trigger uses the same registered scalar
     command vocabulary; source startup failure makes its channel unavailable
-    but must not erase the writer schema either.
+    but must not erase the writer schema either.  ``none`` deliberately has no
+    operator-input command contract; the DMTAC backend can still expose
+    measured state and tactile telemetry independently.
     """
 
     return bool(str(gripper_input_source) in {"q6", "angle_trigger"})

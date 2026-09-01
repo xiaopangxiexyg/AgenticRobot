@@ -176,9 +176,20 @@ def _gripper_status_for_side(
     backend = _gripper_backend_for_side(components, side)
     retargeter = _gripper_retargeter_for_side(components, side)
     input_channel_name = _gripper_input_channel_name(components, side)
-    channel = None if channels is None else channels.get(input_channel_name)
-    q6_status = _q6_channel_status(channel, side=side, now=now, channel_name=input_channel_name)
-    q6_status["input_source"] = str(getattr(components, "gripper_input_source", "q6") or "q6")
+    channel = (
+        None
+        if channels is None or input_channel_name is None
+        else channels.get(input_channel_name)
+    )
+    q6_status = _q6_channel_status(
+        channel,
+        side=side,
+        now=now,
+        channel_name=input_channel_name or "none",
+    )
+    q6_status["input_source"] = str(
+        getattr(components, "gripper_input_source", "q6") or "q6"
+    )
     q6_status.update(
         _q6_retarget_status(
             components,
@@ -304,7 +315,10 @@ def _hand_channel_status(
 ) -> tuple[str, ...]:
     statuses: list[str] = []
     for side in components.active_sides:
-        channel = channels.get(_gripper_input_channel_name(components, side))
+        channel_name = _gripper_input_channel_name(components, side)
+        if channel_name is None:
+            continue
+        channel = channels.get(channel_name)
         if channel is None:
             continue
         valid = bool(getattr(channel, "valid", False))
@@ -334,8 +348,20 @@ def _gripper_runtime_status_signature(
         backend = _gripper_backend_for_side(components, side)
         retargeter = _gripper_retargeter_for_side(components, side)
         channel_name = _gripper_input_channel_name(components, side)
-        channel = None if channels is None else channels.get(channel_name)
-        q6_status = _q6_channel_status(channel, side=side, now=current_time, channel_name=channel_name)
+        channel = (
+            None
+            if channels is None or channel_name is None
+            else channels.get(channel_name)
+        )
+        q6_status = _q6_channel_status(
+            channel,
+            side=side,
+            now=current_time,
+            channel_name=channel_name or "none",
+        )
+        q6_status["input_source"] = str(
+            getattr(components, "gripper_input_source", "q6") or "q6"
+        )
         q6_status.update(
             _q6_retarget_status(
                 components,

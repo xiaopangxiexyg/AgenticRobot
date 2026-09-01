@@ -157,6 +157,17 @@ cd -- "$PROJECT_ROOT"
 # shellcheck source=../docs/real/teleop_args.sh
 source docs/real/teleop_args.sh
 
+# Reuse the established real-teleop/DMTAC/arm defaults, but remove the
+# operator-only Q6 gesture from this arm-plan entrypoint.  The explicit
+# ``none`` source below also makes the no-input boundary visible to the
+# runtime resolver, so it will not probe or load Q6 assignments.
+RULE_BASED_COMMON_ARGS=()
+for argument in "${COMMON_REAL_TELEOP_ARGS[@]}"; do
+  [[ "$argument" == "--q6-hold-recalibration-gesture" ]] && continue
+  RULE_BASED_COMMON_ARGS+=("$argument")
+done
+RULE_BASED_COMMON_ARGS+=(--gripper-input-source none)
+
 RULE_ARGS=(
   --rule-source-dataset "$SOURCE_DATASET"
   --rule-source-episode "$SOURCE_EPISODE"
@@ -170,7 +181,7 @@ if [[ -n "$SPEED_M_S" ]]; then
 fi
 
 TELEOP_ARGS=(
-  "${COMMON_REAL_TELEOP_ARGS[@]}"
+  "${RULE_BASED_COMMON_ARGS[@]}"
   "${DMTAC_CAPTURE_COMMON_ARGS[@]}"
   "${DMTAC_A_ARGS[@]}"
   "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}"
@@ -186,8 +197,6 @@ TELEOP_ARGS=(
   --collection-progress-profile
   catalog:dmtac_rm65_bimanual_position_writing_four_stage_progress
   --collection-progress-gui
-  --q6-config latest
-  --q6-config-required
   --dmtac-config latest
   --require-dmtac-config
   --camera-config teleop_runtime/configs/devices/realsense.json
@@ -218,7 +227,7 @@ fi
 
 printf '%s\n' \
   '[RuleBased] starting formal pure-position rule-based writing collection.' \
-  '[RuleBased] verify the five-pedal service, clear workspace, and use the GUI to start one formal episode.' \
+  '[RuleBased] no foot pedal or Q6 input is required; clear workspace and use the GUI to start one formal episode.' \
   "[RuleBased] source_dataset=$SOURCE_DATASET episode=$SOURCE_EPISODE" \
   "[RuleBased] detail_annotation_dir=$DETAIL_ANNOTATION_DIR" \
   "[RuleBased] trajectory=$TRAJECTORY size_m=$SIZE_M direction=$DIRECTION speed_m_s=${SPEED_M_S:-source_average}" \

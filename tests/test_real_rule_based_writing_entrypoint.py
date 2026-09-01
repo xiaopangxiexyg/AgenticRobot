@@ -330,6 +330,11 @@ def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     assert "--rule-writing-trajectory digit_9_v1" in output
     assert "--rule-writing-size-m 0.05" in output
     assert "--rule-writing-direction left" in output
+    assert "--gripper-input-source none" in output
+    assert "--q6-hold-recalibration-gesture" not in output
+    assert "--q6-config" not in output
+    assert "five-pedal" not in output
+    assert "--dmtac-with-tactile" in output
 
 
 def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
