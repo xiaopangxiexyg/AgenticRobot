@@ -24,6 +24,7 @@ from agent_gateway.skills.perception.definition import (
     capture_depth_skill_definition_v1,
     capture_depth_skill_definition_v2,
     capture_rgb_skill_definition_v1,
+    capture_rgb_skill_definition_v2,
 )
 from agent_gateway.skills.perception.schemas import (
     DEPTH_FRAME_COMPRESSION_V1,
@@ -37,6 +38,7 @@ from agent_gateway.skills.perception.schemas import (
     capture_depth_schema_entry_v1,
     capture_depth_schema_entry_v2,
     capture_rgb_schema_entry_v1,
+    capture_rgb_schema_entry_v2,
     validate_capture_depth_parameters_v1,
     validate_capture_depth_result_for_parameters_v1,
     validate_capture_depth_result_for_parameters_v2,
@@ -44,7 +46,9 @@ from agent_gateway.skills.perception.schemas import (
     validate_capture_depth_result_v2,
     validate_capture_rgb_parameters_v1,
     validate_capture_rgb_result_for_parameters_v1,
+    validate_capture_rgb_result_for_parameters_v2,
     validate_capture_rgb_result_v1,
+    validate_capture_rgb_result_v2,
     validate_no_task_evaluation_v1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
@@ -52,11 +56,13 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from .perception_frames import RealPerceptionFrameBinding
 
 REAL_CAPTURE_RGB_ROUTE_ID_V1 = "real.realsense.perception.capture_rgb"
+REAL_CAPTURE_RGB_ROUTE_ID_V2 = "real.realsense.perception.capture_rgb_window"
 REAL_CAPTURE_DEPTH_ROUTE_ID_V1 = "real.realsense.perception.capture_depth"
 REAL_CAPTURE_DEPTH_ROUTE_ID_V2 = (
     "real.realsense.perception.capture_depth_station"
 )
 REAL_CAPTURE_RGB_EXECUTOR_ID_V1 = "control-station.real-passive-rgb-capture.v1"
+REAL_CAPTURE_RGB_EXECUTOR_ID_V2 = "control-station.real-passive-rgb-capture.v2"
 REAL_CAPTURE_DEPTH_EXECUTOR_ID_V1 = "control-station.real-passive-depth-capture.v1"
 REAL_CAPTURE_DEPTH_EXECUTOR_ID_V2 = (
     "control-station.real-passive-depth-capture.v2"
@@ -373,12 +379,22 @@ def _build_real_perception_capture_registration(
     if mode not in {"real_active", "real_observe"}:
         raise ValueError("current_mode must be real_active or real_observe.")
 
+    is_v2 = frame_binding is not None
     profile = RealPerceptionCaptureProfile(
         rgb_sources=_source_tuples(rgb_source_catalog, label="RGB"),
         depth_sources=_source_tuples(depth_source_catalog, label="Depth"),
         source_binding_hash=source_binding_hash,
+        profile_id=(
+            "real-realsense-registered-perception-roles-v2"
+            if is_v2
+            else "real-realsense-registered-perception-roles-v1"
+        ),
     )
-    rgb_definition = capture_rgb_skill_definition_v1()
+    rgb_definition = (
+        capture_rgb_skill_definition_v2()
+        if is_v2
+        else capture_rgb_skill_definition_v1()
+    )
     if frame_binding is not None and not isinstance(
         frame_binding,
         RealPerceptionFrameBinding,
@@ -389,7 +405,10 @@ def _build_real_perception_capture_registration(
         if frame_binding is None
         else capture_depth_skill_definition_v2()
     )
-    rgb_schema = capture_rgb_schema_entry_v1(
+    rgb_schema_builder = (
+        capture_rgb_schema_entry_v2 if is_v2 else capture_rgb_schema_entry_v1
+    )
+    rgb_schema = rgb_schema_builder(
         skill_definition_hash=rgb_definition.semantic_content_hash,
         parameter_profile_id=profile.profile_id + ".rgb",
         parameter_profile_hash=profile.semantic_content_hash,
@@ -485,7 +504,13 @@ def _build_real_perception_capture_registration(
             skill_io_contract_hash=io_contract.semantic_content_hash,
         )
 
-    rgb_route = route(rgb_definition, rgb_schema, rgb_io, REAL_CAPTURE_RGB_ROUTE_ID_V1)
+    rgb_route = route(
+        rgb_definition,
+        rgb_schema,
+        rgb_io,
+        REAL_CAPTURE_RGB_ROUTE_ID_V2 if is_v2 else REAL_CAPTURE_RGB_ROUTE_ID_V1,
+        route_version="2" if is_v2 else "1",
+    )
     depth_route = route(
         depth_definition,
         depth_schema,
@@ -510,7 +535,13 @@ def _build_real_perception_capture_registration(
         routes=(depth_route,),
     )
 
-    def binding(route_value, executor_id, modality):
+    def binding(
+        route_value,
+        executor_id,
+        modality,
+        *,
+        deployment_binding_version="1",
+    ):
         return RealPerceptionDeploymentBinding(
             deployment_binding_id=(
                 f"real.realsense.passive_{modality}_capture:" + runtime_session_id
@@ -523,9 +554,15 @@ def _build_real_perception_capture_registration(
             execution_manifest_hash=execution_manifest_hash,
             profile_hash=profile.semantic_content_hash,
             executor_id=executor_id,
+            deployment_binding_version=deployment_binding_version,
         )
 
-    rgb_binding = binding(rgb_route, REAL_CAPTURE_RGB_EXECUTOR_ID_V1, "rgb")
+    rgb_binding = binding(
+        rgb_route,
+        REAL_CAPTURE_RGB_EXECUTOR_ID_V2 if is_v2 else REAL_CAPTURE_RGB_EXECUTOR_ID_V1,
+        "rgb_window" if is_v2 else "rgb",
+        deployment_binding_version="2" if is_v2 else "1",
+    )
     if frame_binding is None:
         depth_binding = binding(
             depth_route,
@@ -559,12 +596,24 @@ def _build_real_perception_capture_registration(
                 allowed_roles=profile.rgb_roles,
                 max_total_bytes=profile.max_artifact_bytes,
             )
-            validate_result = lambda payload: validate_capture_rgb_result_v1(
-                payload,
-                source_id_by_role=profile.rgb_source_id_by_role,
-                max_total_bytes=profile.max_artifact_bytes,
-            )
-            validate_for_parameters = validate_capture_rgb_result_for_parameters_v1
+            if is_v2:
+                validate_result = lambda payload: validate_capture_rgb_result_v2(
+                    payload,
+                    source_id_by_role=profile.rgb_source_id_by_role,
+                    max_total_bytes=profile.max_artifact_bytes,
+                )
+                validate_for_parameters = (
+                    validate_capture_rgb_result_for_parameters_v2
+                )
+            else:
+                validate_result = lambda payload: validate_capture_rgb_result_v1(
+                    payload,
+                    source_id_by_role=profile.rgb_source_id_by_role,
+                    max_total_bytes=profile.max_artifact_bytes,
+                )
+                validate_for_parameters = (
+                    validate_capture_rgb_result_for_parameters_v1
+                )
         elif frame_binding is None:
             validate_parameters = lambda payload: validate_capture_depth_parameters_v1(
                 payload,
@@ -618,7 +667,11 @@ def _build_real_perception_capture_registration(
                 "deployment_binding_hash": binding_value.semantic_content_hash,
                 "profile_hash": profile.semantic_content_hash,
             },
-            domain="dexteleop.agent_skill.real_perception_availability.v1",
+            domain=(
+                "dexteleop.agent_skill.real_rgb_capture_availability.v2"
+                if is_v2 and route_value is rgb_route
+                else "dexteleop.agent_skill.real_perception_availability.v1"
+            ),
         )
         for route_value, binding_value in (
             (rgb_route, rgb_binding),
@@ -681,7 +734,7 @@ def build_real_perception_capture_registration_v2(
     frame_binding: RealPerceptionFrameBinding,
     current_mode: str = "real_active",
 ) -> RealPerceptionCaptureRegistration:
-    """Build Real Depth v2 against one exact source-to-Station adapter."""
+    """Build RGB/Depth v2 against one exact source-to-Station adapter."""
 
     return _build_real_perception_capture_registration(
         rgb_source_catalog=rgb_source_catalog,
@@ -705,8 +758,10 @@ __all__ = [
     "REAL_CAPTURE_DEPTH_ROUTE_ID_V2",
     "REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1",
     "REAL_CAPTURE_RGB_EXECUTOR_ID_V1",
+    "REAL_CAPTURE_RGB_EXECUTOR_ID_V2",
     "REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1",
     "REAL_CAPTURE_RGB_ROUTE_ID_V1",
+    "REAL_CAPTURE_RGB_ROUTE_ID_V2",
     "RealPerceptionCaptureProfile",
     "RealPerceptionCaptureRegistration",
     "RealPerceptionDeploymentBinding",

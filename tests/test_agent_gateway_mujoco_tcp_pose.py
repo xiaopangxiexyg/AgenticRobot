@@ -1991,7 +1991,7 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     ) == ("activate",)
     assert session.motion_executor.workers == ()
 
-    rgb_entry = bundle.route_manifest.route(CAPTURE_RGB_SKILL_ID_V1, "1")
+    rgb_entry = bundle.route_manifest.route(CAPTURE_RGB_SKILL_ID_V1, "2")
     rgb_route = rgb_entry.route
     rgb_binding = rgb_entry.deployment_binding
     rgb_request = AgentSkillRequest(
@@ -2044,7 +2044,11 @@ def test_depth_artifact_route_uses_passive_executor_and_artifact_runtime(
     )
     assert rgb_completed is not None and rgb_completed.status == "completed"
     assert rgb_completed.execution_result["station_revision"] == 0
+    assert rgb_completed.execution_result["capture_window_started_at"] == 10.0
+    assert rgb_completed.execution_result["capture_window_ended_at"] == 10.0
     assert rgb_completed.execution_result["frames"][0]["role"] == "main"
+    assert rgb_completed.execution_result["frames"][0]["acquired_at"] == 10.0
+    assert "captured_at" not in rgb_completed.execution_result
     assert len(rgb_completed.output_artifact_bindings) == 1
     rgb_output = rgb_completed.output_artifact_bindings[0]
     assert rgb_output.ordinal == 0

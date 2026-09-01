@@ -16,23 +16,32 @@ from agent_gateway.protocol.skill_io_contracts import (
 )
 from agent_gateway.protocol.skill_registration import SkillRegistrationTemplate
 from agent_gateway.runtime.payload_validation import AgentSkillPayloadValidatorSet
-from agent_gateway.skills.perception.definition import capture_rgb_skill_definition_v1
+from agent_gateway.skills.perception.definition import (
+    capture_rgb_skill_definition_v1,
+    capture_rgb_skill_definition_v2,
+)
 from agent_gateway.skills.perception.schemas import (
     RGB_FRAME_COMPRESSION_V1,
     RGB_FRAME_ENCODING_V1,
     RGB_FRAME_MEDIA_TYPE_V1,
     RGB_FRAME_SCHEMA_ID_V1,
     capture_rgb_schema_entry_v1,
+    capture_rgb_schema_entry_v2,
     validate_capture_rgb_parameters_v1,
     validate_capture_rgb_result_for_parameters_v1,
+    validate_capture_rgb_result_for_parameters_v2,
     validate_capture_rgb_result_v1,
+    validate_capture_rgb_result_v2,
     validate_no_task_evaluation_v1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
 MUJOCO_CAPTURE_RGB_ROUTE_ID_V1 = "sim.mujoco.perception.capture_rgb"
+MUJOCO_CAPTURE_RGB_ROUTE_ID_V2 = "sim.mujoco.perception.capture_rgb_window"
 MUJOCO_CAPTURE_RGB_EXECUTOR_ID_V1 = "control-station.mujoco-passive-rgb-capture.v1"
+MUJOCO_CAPTURE_RGB_EXECUTOR_ID_V2 = "control-station.mujoco-passive-rgb-capture.v2"
 MUJOCO_CAPTURE_RGB_PARAMETER_PROFILE_ID_V1 = "mujoco-registered-rgb-roles-v1"
+MUJOCO_CAPTURE_RGB_PARAMETER_PROFILE_ID_V2 = "mujoco-registered-rgb-roles-v2"
 MUJOCO_CAPTURE_RGB_OUTPUT_SLOT_ID_V1 = "rgb_frames"
 MUJOCO_CAPTURE_RGB_MAX_ARTIFACT_BYTES_V1 = 16 * 1024 * 1024
 MUJOCO_CAPTURE_RGB_MAX_FRAMES_V1 = 8
@@ -174,7 +183,7 @@ class MujocoRgbCaptureRegistration:
     availability_hash: str
 
 
-def build_mujoco_rgb_capture_registration(
+def _build_mujoco_rgb_capture_registration(
     *,
     source_catalog: tuple[Mapping[str, object], ...],
     runtime_session_id: str,
@@ -182,7 +191,11 @@ def build_mujoco_rgb_capture_registration(
     target_binding_id: str,
     station_manifest_hash: str,
     execution_manifest_hash: str,
+    skill_version: str,
 ) -> MujocoRgbCaptureRegistration:
+    if skill_version not in {"1", "2"}:
+        raise ValueError("skill_version must be 1 or 2.")
+    is_v2 = skill_version == "2"
     sources: list[tuple[str, str, int, int]] = []
     for item in source_catalog:
         if not isinstance(item, Mapping) or set(item) != {
@@ -200,9 +213,23 @@ def build_mujoco_rgb_capture_registration(
                 item["native_height"],
             )
         )
-    profile = MujocoRgbCaptureProfile(sources=tuple(sources))
-    definition = capture_rgb_skill_definition_v1()
-    schema_entry = capture_rgb_schema_entry_v1(
+    profile = MujocoRgbCaptureProfile(
+        sources=tuple(sources),
+        profile_id=(
+            MUJOCO_CAPTURE_RGB_PARAMETER_PROFILE_ID_V2
+            if is_v2
+            else MUJOCO_CAPTURE_RGB_PARAMETER_PROFILE_ID_V1
+        ),
+    )
+    definition = (
+        capture_rgb_skill_definition_v2()
+        if is_v2
+        else capture_rgb_skill_definition_v1()
+    )
+    schema_builder = (
+        capture_rgb_schema_entry_v2 if is_v2 else capture_rgb_schema_entry_v1
+    )
+    schema_entry = schema_builder(
         skill_definition_hash=definition.semantic_content_hash,
         parameter_profile_id=profile.profile_id,
         parameter_profile_hash=profile.semantic_content_hash,
@@ -235,8 +262,12 @@ def build_mujoco_rgb_capture_registration(
         skill_id=definition.skill_id,
         skill_version=definition.skill_version,
         skill_definition_hash=definition.semantic_content_hash,
-        route_id=MUJOCO_CAPTURE_RGB_ROUTE_ID_V1,
-        route_version="1",
+        route_id=(
+            MUJOCO_CAPTURE_RGB_ROUTE_ID_V2
+            if is_v2
+            else MUJOCO_CAPTURE_RGB_ROUTE_ID_V1
+        ),
+        route_version=skill_version,
         parameter_schema_hash=schema_entry.parameter_schema_hash,
         execution_result_schema_hash=schema_entry.execution_result_schema_hash,
         task_evaluation_schema_hash=schema_entry.task_evaluation_schema_hash,
@@ -261,7 +292,14 @@ def build_mujoco_rgb_capture_registration(
         routes=(route,),
     )
     binding = MujocoRgbCaptureDeploymentBinding(
-        deployment_binding_id="sim.mujoco.passive_rgb_capture:" + runtime_session_id,
+        deployment_binding_id=(
+            (
+                "sim.mujoco.passive_rgb_capture_window:"
+                if is_v2
+                else "sim.mujoco.passive_rgb_capture:"
+            )
+            + runtime_session_id
+        ),
         route_hash=route.semantic_content_hash,
         runtime_session_id=runtime_session_id,
         control_domain_id=control_domain_id,
@@ -269,6 +307,12 @@ def build_mujoco_rgb_capture_registration(
         station_manifest_hash=station_manifest_hash,
         execution_manifest_hash=execution_manifest_hash,
         profile_hash=profile.semantic_content_hash,
+        executor_id=(
+            MUJOCO_CAPTURE_RGB_EXECUTOR_ID_V2
+            if is_v2
+            else MUJOCO_CAPTURE_RGB_EXECUTOR_ID_V1
+        ),
+        deployment_binding_version=skill_version,
     )
 
     def validate_parameters(payload: Mapping[str, Any]) -> None:
@@ -279,11 +323,18 @@ def build_mujoco_rgb_capture_registration(
         )
 
     def validate_result(payload: Mapping[str, Any]) -> None:
-        validate_capture_rgb_result_v1(
-            payload,
-            source_id_by_role=profile.source_id_by_role,
-            max_total_bytes=profile.max_artifact_bytes,
-        )
+        if is_v2:
+            validate_capture_rgb_result_v2(
+                payload,
+                source_id_by_role=profile.source_id_by_role,
+                max_total_bytes=profile.max_artifact_bytes,
+            )
+        else:
+            validate_capture_rgb_result_v1(
+                payload,
+                source_id_by_role=profile.source_id_by_role,
+                max_total_bytes=profile.max_artifact_bytes,
+            )
 
     validator = AgentSkillPayloadValidatorSet(
         validator_id=(
@@ -299,7 +350,9 @@ def build_mujoco_rgb_capture_registration(
         validate_parameters=validate_parameters,
         validate_execution_result=validate_result,
         validate_execution_result_for_parameters=(
-            validate_capture_rgb_result_for_parameters_v1
+            validate_capture_rgb_result_for_parameters_v2
+            if is_v2
+            else validate_capture_rgb_result_for_parameters_v1
         ),
         validate_task_evaluation=validate_no_task_evaluation_v1,
     )
@@ -310,7 +363,11 @@ def build_mujoco_rgb_capture_registration(
             "deployment_binding_hash": binding.semantic_content_hash,
             "profile_hash": profile.semantic_content_hash,
         },
-        domain="dexteleop.agent_skill.mujoco_rgb_capture_availability.v1",
+        domain=(
+            "dexteleop.agent_skill.mujoco_rgb_capture_availability.v2"
+            if is_v2
+            else "dexteleop.agent_skill.mujoco_rgb_capture_availability.v1"
+        ),
     )
     return MujocoRgbCaptureRegistration(
         registration=registration,
@@ -321,15 +378,63 @@ def build_mujoco_rgb_capture_registration(
     )
 
 
+def build_mujoco_rgb_capture_registration(
+    *,
+    source_catalog: tuple[Mapping[str, object], ...],
+    runtime_session_id: str,
+    control_domain_id: str,
+    target_binding_id: str,
+    station_manifest_hash: str,
+    execution_manifest_hash: str,
+) -> MujocoRgbCaptureRegistration:
+    """Build the compatibility RGB v1 registration."""
+
+    return _build_mujoco_rgb_capture_registration(
+        source_catalog=source_catalog,
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        target_binding_id=target_binding_id,
+        station_manifest_hash=station_manifest_hash,
+        execution_manifest_hash=execution_manifest_hash,
+        skill_version="1",
+    )
+
+
+def build_mujoco_rgb_capture_registration_v2(
+    *,
+    source_catalog: tuple[Mapping[str, object], ...],
+    runtime_session_id: str,
+    control_domain_id: str,
+    target_binding_id: str,
+    station_manifest_hash: str,
+    execution_manifest_hash: str,
+) -> MujocoRgbCaptureRegistration:
+    """Build RGB v2 with an explicit capture window and frame timestamps."""
+
+    return _build_mujoco_rgb_capture_registration(
+        source_catalog=source_catalog,
+        runtime_session_id=runtime_session_id,
+        control_domain_id=control_domain_id,
+        target_binding_id=target_binding_id,
+        station_manifest_hash=station_manifest_hash,
+        execution_manifest_hash=execution_manifest_hash,
+        skill_version="2",
+    )
+
+
 __all__ = [
     "MUJOCO_CAPTURE_RGB_EXECUTOR_ID_V1",
+    "MUJOCO_CAPTURE_RGB_EXECUTOR_ID_V2",
     "MUJOCO_CAPTURE_RGB_MAX_ARTIFACT_BYTES_V1",
     "MUJOCO_CAPTURE_RGB_MAX_FRAMES_V1",
     "MUJOCO_CAPTURE_RGB_OUTPUT_SLOT_ID_V1",
     "MUJOCO_CAPTURE_RGB_PARAMETER_PROFILE_ID_V1",
+    "MUJOCO_CAPTURE_RGB_PARAMETER_PROFILE_ID_V2",
     "MUJOCO_CAPTURE_RGB_ROUTE_ID_V1",
+    "MUJOCO_CAPTURE_RGB_ROUTE_ID_V2",
     "MujocoRgbCaptureDeploymentBinding",
     "MujocoRgbCaptureProfile",
     "MujocoRgbCaptureRegistration",
     "build_mujoco_rgb_capture_registration",
+    "build_mujoco_rgb_capture_registration_v2",
 ]

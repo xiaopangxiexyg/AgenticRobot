@@ -221,6 +221,9 @@ def test_real_depth_v2_binds_and_transforms_nontrivial_station_frame() -> None:
     )
 
     assert registration.frame_binding is frame_binding
+    assert registration.rgb.definition.skill_version == "2"
+    assert registration.rgb.routes[0].route_version == "2"
+    assert registration.rgb_binding.deployment_binding_version == "2"
     assert registration.depth.routes[0].route_version == "2"
     assert registration.depth_binding.reference_frame_id == "canonical_station"
     assert registration.depth_binding.frame_graph_hash == (
@@ -248,6 +251,9 @@ def test_real_provider_encodes_rgb_and_metric_aligned_depth_without_control_io()
     )
     assert rgb.station_revision == 7
     assert [frame.role for frame in rgb.frames] == ["wrist_left", "main"]
+    assert [frame.acquired_at for frame in rgb.frames] == [9.97, 9.95]
+    assert rgb.capture_window_started_at == 9.95
+    assert rgb.capture_window_ended_at == 9.97
     assert all(Image.open(io.BytesIO(frame.data)).size == (2, 2) for frame in rgb.frames)
 
     depth = provider.capture_depth(role="main", expected_station_revision=7)

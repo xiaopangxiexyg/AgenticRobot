@@ -49,7 +49,7 @@ _COLLISION_SCENE_PROFILE = "dual_arm_hand_proxy_open"
 _RGB_SKILL_ID = "perception.capture_rgb"
 _DEPTH_SKILL_ID = "perception.capture_depth"
 _SKILL_VERSION_BY_ID = {
-    _RGB_SKILL_ID: "1",
+    _RGB_SKILL_ID: "2",
     _DEPTH_SKILL_ID: "2",
 }
 _REQUESTED_TIMEOUT_MS = 3_000

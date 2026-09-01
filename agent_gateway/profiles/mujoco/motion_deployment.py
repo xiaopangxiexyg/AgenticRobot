@@ -104,7 +104,7 @@ from .motion_primitive_profiles import (
 )
 from .rgb_deployment import (
     MujocoRgbCaptureRegistration,
-    build_mujoco_rgb_capture_registration,
+    build_mujoco_rgb_capture_registration_v2,
 )
 from .state_deployment import MujocoPassiveTcpPoseStateDeploymentBinding
 from .visual_observation import mujoco_rgb_role_for_source
@@ -1753,7 +1753,7 @@ def build_mujoco_agent_tcp_pose_contract_bundle(
         else None
     )
     rgb_capture = (
-        build_mujoco_rgb_capture_registration(
+        build_mujoco_rgb_capture_registration_v2(
             source_catalog=tuple(
                 {
                     **dict(source),

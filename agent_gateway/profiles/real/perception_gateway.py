@@ -258,6 +258,7 @@ def build_real_perception_passive_executors(
     session_id = _required(runtime_session_id, field_name="runtime_session_id")
 
     def read_rgb(request, operation) -> PassiveReadResult:
+        is_v2 = registration.rgb.definition.skill_version == "2"
         capture = provider.capture_rgb(
             request.parameters,
             expected_station_revision=request.expected_station_revision,
@@ -280,13 +281,14 @@ def build_real_perception_passive_executors(
                 producer_id="agent_gateway.provider.real_realsense_rgb",
                 runtime_session_id=session_id,
                 idempotency_key=f"rgb-output:{operation.operation_id}:{ordinal}",
-                now=capture.captured_at,
+                now=frame.acquired_at if is_v2 else capture.captured_at,
             )
             total_bytes += committed.byte_length
             metadata = {
                 "ordinal": ordinal,
                 "source_id": frame.source_id,
                 "role": frame.role,
+                **({"acquired_at": frame.acquired_at} if is_v2 else {}),
                 "media_type": committed.media_type,
                 "width": frame.width,
                 "height": frame.height,
@@ -309,16 +311,38 @@ def build_real_perception_passive_executors(
                 "operation_id": operation.operation_id,
                 "request_hash": request.semantic_content_hash,
                 "station_revision": capture.station_revision,
-                "captured_at": capture.captured_at,
+                **(
+                    {
+                        "capture_window_started_at": (
+                            capture.capture_window_started_at
+                        ),
+                        "capture_window_ended_at": capture.capture_window_ended_at,
+                    }
+                    if is_v2
+                    else {"captured_at": capture.captured_at}
+                ),
                 "frames": frame_metadata,
             },
-            domain="dexteleop.agent_skill.real_rgb_capture_receipt.v1",
+            domain=(
+                "dexteleop.agent_skill.real_rgb_capture_receipt.v2"
+                if is_v2
+                else "dexteleop.agent_skill.real_rgb_capture_receipt.v1"
+            ),
         )
         return PassiveReadResult(
             execution_result={
                 "snapshot_id": "rgb-snapshot:" + identity,
                 "station_revision": capture.station_revision,
-                "captured_at": capture.captured_at,
+                **(
+                    {
+                        "capture_window_started_at": (
+                            capture.capture_window_started_at
+                        ),
+                        "capture_window_ended_at": capture.capture_window_ended_at,
+                    }
+                    if is_v2
+                    else {"captured_at": capture.captured_at}
+                ),
                 "frames": frame_metadata,
                 "total_bytes": total_bytes,
             },
