@@ -20,7 +20,6 @@ from .depth_mask.core import (
 )
 from .depth_mask.visualize import DEFAULT_WRIST_CAMERA_KEYS, load_mask_stream
 
-
 FINAL_KEEP_MASK_FAMILY = "wrist_final_keep"
 FINAL_KEEP_MASK_NAME = "postprocessed_depth_or_table_keep_mask"
 
@@ -66,13 +65,17 @@ class FinalMaskResult:
             "depth_fraction_mean": float(self.depth_fraction_mean),
             "table_fraction_mean": float(self.table_fraction_mean),
             "output_fraction_mean": float(self.output_fraction_mean),
-            "rollback_dir": None if self.rollback_dir is None else str(self.rollback_dir),
+            "rollback_dir": None
+            if self.rollback_dir is None
+            else str(self.rollback_dir),
         }
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         text = line.strip()
         if not text:
             continue
@@ -87,14 +90,39 @@ def _episode_tag(episode_index: int) -> str:
     return f"episode_{int(episode_index):06d}"
 
 
+def _dataset_namespace(session_root: Path, value: str | None) -> str:
+    namespace = session_root.name if value is None else str(value)
+    if (
+        not namespace
+        or namespace != namespace.strip()
+        or namespace in {".", ".."}
+        or "/" in namespace
+        or "\\" in namespace
+        or "\x00" in namespace
+        or Path(namespace).name != namespace
+    ):
+        raise ValueError(
+            f"dataset_namespace must be one safe path component: {namespace!r}"
+        )
+    return namespace
+
+
 def _resolve_processed_depth_manifest(
     *,
     session_root: Path,
     depth_mask_root: Path,
     episode_index: int,
     camera_key: str,
+    dataset_namespace: str | None = None,
 ) -> Path:
-    return depth_mask_root / session_root.name / _episode_tag(episode_index) / camera_key / "manifest.json"
+    namespace = _dataset_namespace(session_root, dataset_namespace)
+    return (
+        depth_mask_root
+        / namespace
+        / _episode_tag(episode_index)
+        / camera_key
+        / "manifest.json"
+    )
 
 
 def _mask_from_table_frame(frame: np.ndarray, *, height: int, width: int) -> np.ndarray:
@@ -165,21 +193,24 @@ def _manifest_payload(
     }
 
 
-def compose_final_mask(task: FinalMaskTask, *, overwrite: bool = False) -> FinalMaskResult:
+def compose_final_mask(
+    task: FinalMaskTask, *, overwrite: bool = False
+) -> FinalMaskResult:
     cv2 = require_cv2()
     if not task.depth_manifest_path.exists():
-        raise FileNotFoundError(f"postprocessed depth mask manifest missing: {task.depth_manifest_path}")
+        raise FileNotFoundError(
+            f"postprocessed depth mask manifest missing: {task.depth_manifest_path}"
+        )
     if not task.table_video_path.exists():
-        raise FileNotFoundError(f"table keep-mask video missing: {task.table_video_path}")
+        raise FileNotFoundError(
+            f"table keep-mask video missing: {task.table_video_path}"
+        )
     task.output_dir.parent.mkdir(parents=True, exist_ok=True)
     if task.output_dir.exists() and not overwrite:
-        raise FileExistsError(
-            f"output exists; pass overwrite=True: {task.output_dir}"
-        )
+        raise FileExistsError(f"output exists; pass overwrite=True: {task.output_dir}")
     transaction_id = uuid.uuid4().hex
     staging_dir = (
-        task.output_dir.parent
-        / f".{task.output_dir.name}.tmp-{transaction_id}"
+        task.output_dir.parent / f".{task.output_dir.name}.tmp-{transaction_id}"
     )
     staging_dir.mkdir(parents=False, exist_ok=False)
     staging_stream_path = staging_dir / "final_keep.bitpack.bin"
@@ -187,8 +218,7 @@ def compose_final_mask(task: FinalMaskTask, *, overwrite: bool = False) -> Final
     final_stream_path = task.output_dir / staging_stream_path.name
     final_manifest_path = task.output_dir / staging_manifest_path.name
     rollback_dir = (
-        task.output_dir.parent
-        / f".{task.output_dir.name}.rollback-{transaction_id}"
+        task.output_dir.parent / f".{task.output_dir.name}.rollback-{transaction_id}"
         if task.output_dir.exists()
         else None
     )
@@ -217,7 +247,10 @@ def compose_final_mask(task: FinalMaskTask, *, overwrite: bool = False) -> Final
     output_sum = 0.0
     frame_count = 0
     try:
-        with depth_stream.stream_path.open("rb") as handle, staging_stream_path.open("wb") as out:
+        with (
+            depth_stream.stream_path.open("rb") as handle,
+            staging_stream_path.open("wb") as out,
+        ):
             for frame_index in range(frame_limit):
                 data = handle.read(int(depth_stream.packed_bytes_per_frame))
                 if len(data) != int(depth_stream.packed_bytes_per_frame):
@@ -231,7 +264,12 @@ def compose_final_mask(task: FinalMaskTask, *, overwrite: bool = False) -> Final
                         "table keep-mask video ended before the declared frame "
                         f"limit at frame {frame_index}: {task.table_video_path}"
                     )
-                depth_mask = unpack_binary_mask(data, height=depth_stream.height, width=depth_stream.width) > 0
+                depth_mask = (
+                    unpack_binary_mask(
+                        data, height=depth_stream.height, width=depth_stream.width
+                    )
+                    > 0
+                )
                 table_mask = _mask_from_table_frame(
                     table_frame,
                     height=depth_stream.height,
@@ -239,9 +277,21 @@ def compose_final_mask(task: FinalMaskTask, *, overwrite: bool = False) -> Final
                 )
                 final_mask = depth_mask | table_mask
                 total = int(final_mask.size)
-                depth_fraction = 0.0 if total <= 0 else float(np.count_nonzero(depth_mask)) / float(total)
-                table_fraction = 0.0 if total <= 0 else float(np.count_nonzero(table_mask)) / float(total)
-                output_fraction = 0.0 if total <= 0 else float(np.count_nonzero(final_mask)) / float(total)
+                depth_fraction = (
+                    0.0
+                    if total <= 0
+                    else float(np.count_nonzero(depth_mask)) / float(total)
+                )
+                table_fraction = (
+                    0.0
+                    if total <= 0
+                    else float(np.count_nonzero(table_mask)) / float(total)
+                )
+                output_fraction = (
+                    0.0
+                    if total <= 0
+                    else float(np.count_nonzero(final_mask)) / float(total)
+                )
                 depth_sum += depth_fraction
                 table_sum += table_fraction
                 output_sum += output_fraction
@@ -336,11 +386,13 @@ def build_final_mask_tasks(
     episodes: Sequence[int] | None = None,
     cameras: Sequence[str] | None = None,
     max_frames: int = 0,
+    dataset_namespace: str | None = None,
 ) -> list[FinalMaskTask]:
     session = Path(session_root).expanduser().resolve()
     table_root = Path(table_mask_root).expanduser().resolve()
     depth_root = Path(depth_mask_root).expanduser().resolve()
     output = Path(output_root).expanduser().resolve()
+    namespace = _dataset_namespace(session, dataset_namespace)
     selected_episodes = None if not episodes else {int(value) for value in episodes}
     selected_cameras = tuple(cameras or DEFAULT_WRIST_CAMERA_KEYS)
     tasks: list[FinalMaskTask] = []
@@ -355,12 +407,7 @@ def build_final_mask_tasks(
             rgb_relative = video_paths.get(camera_key)
             if not isinstance(rgb_relative, str) or not rgb_relative:
                 continue
-            output_dir = (
-                output
-                / session.name
-                / _episode_tag(episode_index)
-                / camera_key
-            )
+            output_dir = output / namespace / _episode_tag(episode_index) / camera_key
             tasks.append(
                 FinalMaskTask(
                     session_root=session,
@@ -375,6 +422,7 @@ def build_final_mask_tasks(
                         depth_mask_root=depth_root,
                         episode_index=episode_index,
                         camera_key=str(camera_key),
+                        dataset_namespace=namespace,
                     ),
                     table_video_path=table_root / rgb_relative,
                     output_dir=output_dir,
@@ -395,15 +443,19 @@ def compose_final_masks(
     max_frames: int = 0,
     jobs: int = 1,
     overwrite: bool = False,
+    dataset_namespace: str | None = None,
 ) -> dict[str, Any]:
+    session = Path(session_root).expanduser().resolve()
+    namespace = _dataset_namespace(session, dataset_namespace)
     tasks = build_final_mask_tasks(
-        session_root=session_root,
+        session_root=session,
         table_mask_root=table_mask_root,
         depth_mask_root=depth_mask_root,
         output_root=output_root,
         episodes=episodes,
         cameras=cameras,
         max_frames=max_frames,
+        dataset_namespace=namespace,
     )
     if not tasks:
         raise ValueError(
@@ -430,6 +482,7 @@ def compose_final_masks(
         "table_mask_root": str(Path(table_mask_root).expanduser().resolve()),
         "depth_mask_root": str(Path(depth_mask_root).expanduser().resolve()),
         "output_root": str(Path(output_root).expanduser().resolve()),
+        "dataset_namespace": namespace,
         "mask_policy": "postprocessed_depth_keep_mask OR table_geometry_keep_mask; no proxy mask",
         "task_count": len(tasks),
         "processed_count": len(results),
@@ -438,8 +491,10 @@ def compose_final_masks(
     }
     output = Path(output_root).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    summary_path = output / Path(session_root).expanduser().resolve().name / "final_mask_summary.json"
+    summary_path = output / namespace / "final_mask_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True), encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=True), encoding="utf-8"
+    )
     summary["summary_path"] = str(summary_path)
     return summary

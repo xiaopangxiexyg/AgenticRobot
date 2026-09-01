@@ -244,18 +244,43 @@ raw wrist_depth_mask_paths (只读)
 fallback。同名数据集（例如来自不同根目录但 basename 相同的分片）按
 `source_dataset_id` 分区，输出布局为：
 
-Stage1 的训练 profile 还必须显式固定 corrected 背景契约：10% 保留原图、40%
+prepared wrist 训练 profile 还必须显式固定 corrected 背景契约：10% 保留原图、40%
 使用固定 real-image 资产、其余 50% 使用 procedural 背景，并以
 `shared_scene_family` 绑定同一条样本中的 wrist 背景族。这个替换只作用于
-`right_wrist`；`front` 不读取 wrist mask。real-image root/manifest 必须来自本次
+profile 选择的 `left_wrist`/`right_wrist`；`front` 不读取 wrist mask。real-image root/manifest 必须来自本次
 训练的独立资产快照，不能继续依赖可变的开发 checkout。
 正式 profile 同时固定 `openpi_checkout` 与 `openpi_source_revision`；启动器要求 checkout
 中的 `OPENPI_SOURCE_IDENTITY.json` 与 revision 一致，并拒绝进程中已从其他路径导入的
 `openpi` 包。
 
 ```text
-<final-mask-root>/<source_dataset_id>/<dataset-name>/episode_XXXXXX/right_wrist/
+<final-mask-root>/<source_dataset_id>/<dataset-name>/episode_XXXXXX/{left_wrist,right_wrist}/
 ```
+
+其中 `<dataset-name>` 必须逐字来自 source 的 `meta/info.json.dataset_name`，不是
+source 路径的 basename。流水线会把该值限制为单个安全路径分量；新生成的
+postprocessed depth 与 final keep-mask 都直接写入这个 canonical namespace。
+
+如果已有、带 source receipt 的旧产物曾按 source basename 生成，必须显式运行一次：
+
+```bash
+python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline \
+  --profile <profile.json> \
+  --binding-root <binding-root> \
+  --urdf <pinned-urdf> \
+  --migrate-dataset-name-layout \
+  --jobs 4
+```
+
+迁移先按原 namespace 完整验证 episode/frame/bitpack 契约，再在同一个
+`source_dataset_id` 分区和同一文件系统内原子重命名 final 目录；目录 device/inode、
+episode/manifest 计数、profile/binding/source receipt SHA、未修改 raw/mask/manifest bytes
+以及反向 rename 的回滚前提都会写入
+`layout_migrations/<source_dataset_id>.json`。为了保留旧 final manifest 中精确的
+depth 来源路径，旧 postprocessed 中间层留在 generation namespace；训练只读取迁移后的
+canonical final namespace。目标路径碰撞、无迁移 receipt 的半迁移状态、symlink、跨设备
+或计数不一致都会 fail closed。迁移完成后必须另跑一次 `--verify-only`；迁移 flag 本身不能
+与 `--verify-only` 同时使用。
 
 先运行 `prepared_skill_launch prepare` 并记录其 `openpi_binding_root`，再执行：
 
@@ -267,16 +292,25 @@ python -m utils.dataset_postprocess.wrist_cam_adjust.stage1_final_mask_pipeline 
   --jobs 4
 ```
 
-物理整合集合不假定单一相机内参。流水线读取 `meta/build_audit.json` 的
-`source_root -> output_episode_index` 绑定，并逐 episode 使用
-`meta/source_devices/<source-name>/realsense.json`；保存副本必须与原 source 的
-内参文件 SHA-256 一致。
+物理整合集合不假定单一相机内参。流水线同时读取 `meta/build_audit.json` 的
+episode plan 与 `meta/provenance.jsonl`，要求两者对每个 output episode 的
+source root/index 精确一致，再逐 episode 使用
+`meta/source_devices/<source-name>/realsense.json`。受保护副本必须是整合集合内的
+普通文件并把 SHA-256 写入新 receipt；原 source 仍存在时必须逐字节哈希相等。原 source
+已按整合流程退役时，receipt 必须显式记录
+`original_absent_protected_copy_bound_by_audit_and_provenance`，不能把“找不到原文件”
+静默当作已验证相等。
 
-如果早期 source 只保存 serial、没有保存数值内参，必须由 profile 的
-`right_wrist_intrinsics_overrides` 显式声明 donor source/camera 和 expected serial。
-流水线同时验证 target 与 donor serial，再把 donor 数值内参写入全新的
-`derived/calibration_overlays/<source_dataset_id>/realsense.json`；不能按 donor 的
-`left_wrist`/`right_wrist` 名字猜测，也不能回写 source metadata。
+如果早期 source 只保存 serial、没有保存数值内参，单右腕旧 profile 仍可使用
+`right_wrist_intrinsics_overrides`；选择左右双腕的新 profile 必须使用
+`wrist_intrinsics_overrides`，为每个训练 source 和每个选中的 wrist camera 显式声明
+target camera、expected serial、donor source、donor source 内的相对 devices 路径和 donor
+camera。donor devices 必须是其固定 dataset root 内的普通文件，不能用绝对路径或越界
+路径。流水线逐 target manifest 同时验证 target 与 donor serial，再把 donor 数值内参写入
+全新的 `derived/calibration_overlays/<source_dataset_id>/<target-hash>/realsense.json`。
+物理整合集合会按 build audit/provenance 的逐 episode devices 绑定分别生成 overlay；receipt
+记录 target/donor/overlay 路径与 SHA-256、episode 绑定和两个 wrist camera 的 serial。
+不能按 donor 的 `left_wrist`/`right_wrist` 名字猜测，也不能回写 source metadata。
 
 depth 后处理按 manifest 声明帧数精确读取。完整的额外尾随帧会记录在 receipt 中，
 但不会进入派生结果；短流、半帧尾随、table 视频提前结束或额外可解码尾帧都会停止
@@ -284,8 +318,8 @@ depth 后处理按 manifest 声明帧数精确读取。完整的额外尾随帧�
 receipt 位于：
 
 ```text
-<workspace>/receipts/stage1_final_masks/<source_dataset_id>.json
-<workspace>/receipts/stage1_final_masks/summary.json
+<workspace>/receipts/prepared_wrist_final_masks/<profile_id>/<source_dataset_id>.json
+<workspace>/receipts/prepared_wrist_final_masks/<profile_id>/summary.json
 ```
 
 当 final root 位于 CIFS/NAS 时，可以把需要被 FFmpeg 复读的 table-geometry 与

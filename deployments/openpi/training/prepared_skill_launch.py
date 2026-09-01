@@ -96,6 +96,26 @@ _EMPTY_CHECKPOINT_ROOT_ENTRIES = frozenset({"wandb", "wandb_id.txt"})
 OPENPI_SOURCE_IDENTITY_FILENAME = "OPENPI_SOURCE_IDENTITY.json"
 
 
+def _configure_camera_semantic_prepared_view_opt_in(
+    enabled: bool,
+) -> bool:
+    """Bind an explicit camera-only projection decision to worker processes."""
+
+    from dataset_interface.pipeline import (
+        CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV,
+    )
+
+    if not isinstance(enabled, bool):
+        raise TypeError(
+            "camera-semantic prepared-view opt-in must be a boolean."
+        )
+    if enabled:
+        os.environ[CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV] = "1"
+    else:
+        os.environ.pop(CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV, None)
+    return enabled
+
+
 def _corrected_wrist_background_overrides(
     profile: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -432,6 +452,71 @@ def _resolve_train_checkpoint_policy(
         overwrite=False,
         latest_checkpoint_step=None,
     )
+
+
+def _declared_openpi_quality_window_contract(
+    profile: Mapping[str, Any],
+) -> tuple[dict[str, int], int, int] | None:
+    """Resolve one optional, fail-closed OpenPI quality-window contract."""
+
+    raw_sources = profile.get("sources")
+    source_values = raw_sources if isinstance(raw_sources, list) else []
+    count_key = "expected_openpi_quality_valid_window_count"
+    repeated_key = "expected_openpi_repeated_epoch_sample_count"
+    declared_by_source = [
+        count_key in item if isinstance(item, Mapping) else False
+        for item in source_values
+    ]
+    any_declared = (
+        count_key in profile
+        or repeated_key in profile
+        or any(declared_by_source)
+    )
+    if not any_declared:
+        return None
+    if (
+        not source_values
+        or not all(isinstance(item, Mapping) for item in source_values)
+        or not all(declared_by_source)
+        or count_key not in profile
+        or repeated_key not in profile
+    ):
+        raise ValueError(
+            "Prepared Skill OpenPI quality-window contract requires positive "
+            "per-source, total, and repeated-epoch counts."
+        )
+
+    counts: dict[str, int] = {}
+    expected_repeated = 0
+    for item in source_values:
+        source_id = str(item.get("source_dataset_id", "")).strip()
+        count = int(item[count_key])
+        repeat_weight = int(item.get("repeat_weight", 1))
+        if (
+            not source_id
+            or source_id in counts
+            or count <= 0
+            or repeat_weight <= 0
+        ):
+            raise ValueError(
+                "Prepared Skill OpenPI quality-window contract requires "
+                "unique source ids and positive counts/weights."
+            )
+        counts[source_id] = count
+        expected_repeated += count * repeat_weight
+
+    expected_total = int(profile[count_key])
+    declared_repeated = int(profile[repeated_key])
+    if (
+        expected_total <= 0
+        or expected_total != sum(counts.values())
+        or declared_repeated != expected_repeated
+    ):
+        raise ValueError(
+            "Prepared Skill OpenPI quality-window source counts differ from "
+            "the declared total or repeated-epoch count."
+        )
+    return counts, expected_total, declared_repeated
 
 
 def _load_profile(path: str | Path) -> dict[str, Any]:
@@ -771,6 +856,7 @@ def _load_profile(path: str | Path) -> dict[str, Any]:
                 "Stage1 scenario profile requires exact per-source repetition."
             )
         payload["_profile_path"] = str(source)
+    _declared_openpi_quality_window_contract(payload)
     return payload
 
 
@@ -2638,6 +2724,14 @@ def main(argv: list[str] | None = None) -> int:
             "keep-mask path instead of checking numeric samples only."
         ),
     )
+    parser.add_argument(
+        "--allow-camera-semantic-prepared-view",
+        action="store_true",
+        help=(
+            "Explicitly opt this training process and its DataLoader workers "
+            "into validated non-tactile camera-semantic prepared views."
+        ),
+    )
     parser.add_argument("--model-rtc-profile", type=Path, default=None)
     parser.add_argument("--model-rtc-adapter-debug", action="store_true")
     parser.add_argument("--num-train-steps", type=int, default=None)
@@ -2665,6 +2759,21 @@ def main(argv: list[str] | None = None) -> int:
             "--model-rtc-profile is supported only by sample-check and train"
         )
     profile = _load_profile(args.profile)
+    camera_prepared_view_opt_in = (
+        _configure_camera_semantic_prepared_view_opt_in(
+            bool(args.allow_camera_semantic_prepared_view)
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "event": "openpi_camera_semantic_prepared_view_opt_in",
+                "enabled": camera_prepared_view_opt_in,
+                "profile_id": str(profile["profile_id"]),
+            },
+            sort_keys=True,
+        )
+    )
     if (
         profile.get("openpi_training_mode")
         == STANDARD_NON_RTC_TRAINING_MODE_V1
@@ -3035,39 +3144,31 @@ def main(argv: list[str] | None = None) -> int:
                         f"actual={dict(mixed_epoch_samples)} "
                         f"expected={expected_mixed_epoch_samples}."
                     )
-                if profile.get("schema") == STAGE1_SCENARIO_PROFILE_SCHEMA_V1:
-                    expected_quality_by_source = {
-                        str(item["source_dataset_id"]): int(
-                            item[
-                                "expected_openpi_quality_valid_window_count"
-                            ]
-                        )
-                        for item in profile["sources"]
-                    }
+                quality_contract = _declared_openpi_quality_window_contract(
+                    profile
+                )
+                if quality_contract is not None:
+                    (
+                        expected_quality_by_source,
+                        expected_quality_total,
+                        expected_repeated_total,
+                    ) = quality_contract
                     if quality_valid_windows != expected_quality_by_source:
                         raise OpenPIPreparedSkillError(
-                            "OpenPI Stage1 quality-valid source counts differ "
+                            "OpenPI quality-valid source counts differ "
                             "from the profile: "
                             f"actual={quality_valid_windows} "
                             f"expected={expected_quality_by_source}."
                         )
                     if (
                         sum(quality_valid_windows.values())
-                        != int(
-                            profile[
-                                "expected_openpi_quality_valid_window_count"
-                            ]
-                        )
+                        != expected_quality_total
                         or sum(mixed_epoch_samples.values())
-                        != int(
-                            profile[
-                                "expected_openpi_repeated_epoch_sample_count"
-                            ]
-                        )
+                        != expected_repeated_total
                     ):
                         raise OpenPIPreparedSkillError(
-                            "OpenPI Stage1 total sample counts differ from "
-                            "the profile."
+                            "OpenPI total quality-valid or repeated-epoch "
+                            "sample counts differ from the profile."
                         )
             openpi_source_mixing = dataset.mixing_metadata()
             if (

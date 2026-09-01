@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import types
@@ -10,6 +11,12 @@ import types
 import numpy as np
 import pytest
 
+from dataset_interface.prepared_training.skill_selection import (
+    _successful_complete_projection,
+)
+from dataset_interface.pipeline import (
+    CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV,
+)
 from deployments.openpi.training.prepared_skill import (
     OPENPI_PROMPT_FAMILY_SAMPLING_CANONICAL_80_VARIANTS_20_V1,
     OPENPI_SOURCE_MIXING_NATURAL_V1,
@@ -28,6 +35,7 @@ from deployments.openpi.training.prepared_skill import (
 from deployments.openpi.training.prepared_skill_launch import (
     _CheckpointBoundPreparedResume,
     _TrainCheckpointPolicy,
+    _configure_camera_semantic_prepared_view_opt_in,
     _load_module,
     _load_checkpoint_bound_prepared_resume,
     _load_profile,
@@ -70,6 +78,79 @@ class _FakeOpenPITrainConfig:
     @property
     def assets_dirs(self) -> Path:
         return (Path(self.assets_base_dir) / self.name).resolve()
+
+
+def test_prepared_launcher_binds_camera_prepared_view_opt_in_from_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV,
+        "ambient-value-must-not-win",
+    )
+
+    assert _configure_camera_semantic_prepared_view_opt_in(True) is True
+    assert os.environ[CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV] == "1"
+
+    assert _configure_camera_semantic_prepared_view_opt_in(False) is False
+    assert CAMERA_SEMANTIC_PREPARED_VIEW_OPT_IN_ENV not in os.environ
+
+    with pytest.raises(TypeError, match="must be a boolean"):
+        _configure_camera_semantic_prepared_view_opt_in("true")  # type: ignore[arg-type]
+
+
+def test_successful_skill_projection_survives_later_coarse_abort() -> None:
+    attempt = types.SimpleNamespace(
+        attempt_id="attempt-1",
+        progress_step_id="write",
+        outcome="ABORTED",
+    )
+    item = types.SimpleNamespace(
+        progress=types.SimpleNamespace(
+            timeline=types.SimpleNamespace(attempts=(attempt,))
+        )
+    )
+    occurrences = tuple(
+        types.SimpleNamespace(
+            coarse_attempt_id="attempt-1",
+            progress_step_id="write",
+            stage_id=stage_id,
+            outcome="SUCCESS",
+            occurrence_index_in_attempt=index,
+            start_at=float(index),
+            annotation_id=f"occurrence-{index}",
+        )
+        for index, stage_id in enumerate(("approach", "write"))
+    )
+    annotation = types.SimpleNamespace(
+        bundle=types.SimpleNamespace(occurrences=occurrences)
+    )
+
+    assert _successful_complete_projection(
+        item=item,
+        annotation=annotation,
+        progress_step_id="write",
+        stage_ids=("approach", "write"),
+    )
+
+    failed_annotation = types.SimpleNamespace(
+        bundle=types.SimpleNamespace(
+            occurrences=(
+                occurrences[0],
+                types.SimpleNamespace(
+                    **{
+                        **occurrences[1].__dict__,
+                        "outcome": "ABORTED",
+                    }
+                ),
+            )
+        )
+    )
+    assert not _successful_complete_projection(
+        item=item,
+        annotation=failed_annotation,
+        progress_step_id="write",
+        stage_ids=("approach", "write"),
+    )
 
 
 def test_openpi_checkpoint_dir_resolves_relative_base_in_checkout(
