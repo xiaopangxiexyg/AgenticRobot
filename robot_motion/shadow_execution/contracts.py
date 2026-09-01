@@ -345,12 +345,17 @@ class RegisteredShadowJointTrajectory:
 class ShadowSimulationStatus(str, Enum):
     COMPLETED = "completed"
     EXECUTION_UNCERTIFIED = "execution_uncertified"
+    MODEL_IDENTITY_MISMATCH = "model_identity_mismatch"
+    TRAJECTORY_START_MISMATCH = "trajectory_start_mismatch"
     ENDPOINT_REJECTED = "endpoint_rejected"
     PATH_START_COLLISION_BLOCKED = "path_start_collision_blocked"
     PATH_TARGET_COLLISION_BLOCKED = "path_target_collision_blocked"
     PATH_COLLISION_BLOCKED = "path_collision_blocked"
     PATH_SEARCH_EXHAUSTED = "path_search_exhausted"
     PATH_PLANNER_ERROR = "path_planner_error"
+    POINT_TRACKING_TIMEOUT = "point_tracking_timeout"
+    GRIPPER_HOLD_DRIFT = "gripper_hold_drift"
+    TERMINAL_HOLD_FAILED = "terminal_hold_failed"
     IK_TARGET_UNMET = "ik_target_unmet"
     TRACKING_INCOMPLETE = "tracking_incomplete"
 
