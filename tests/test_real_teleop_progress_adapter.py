@@ -71,6 +71,7 @@ from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorde
 from teleop_runtime.real_teleop.progress_adapter import (
     DEFAULT_REAL_TELEOP_MANAGED_PROGRESS_PROFILE_ID,
     RealTeleopProgressEpisode,
+    dataset_recorder_matches_progress_selection,
     load_real_teleop_managed_progress_profile,
     load_real_teleop_managed_progress_profile_selection,
     load_real_teleop_progress_profile,
@@ -82,6 +83,33 @@ from teleop_runtime.real_teleop.progress_adapter import (
     select_real_teleop_progress_entry_step,
     validate_real_teleop_initial_progress_profile,
 )
+
+
+def test_progress_selection_recorder_identity_requires_root_and_task(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(dataset_root=tmp_path, collection_task_id="task-a")
+    matching = SimpleNamespace(
+        dataset_root=tmp_path,
+        writer_storage_config=SimpleNamespace(task_id="task-a"),
+    )
+
+    assert dataset_recorder_matches_progress_selection(
+        args=args,
+        dataset_recorder=matching,
+    )
+    assert not dataset_recorder_matches_progress_selection(
+        args=args,
+        dataset_recorder=SimpleNamespace(
+            dataset_root=tmp_path,
+            writer_storage_config=SimpleNamespace(task_id="task-b"),
+        ),
+    )
+    assert not dataset_recorder_matches_progress_selection(
+        args=args,
+        dataset_recorder=None,
+    )
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _FORMAL_PROGRESS_PROFILE = (

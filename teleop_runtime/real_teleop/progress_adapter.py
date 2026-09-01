@@ -423,11 +423,13 @@ def load_real_teleop_managed_progress_profile(
     return profile
 
 
-def _dataset_recorder_matches_progress_selection(
+def dataset_recorder_matches_progress_selection(
     *,
     args: argparse.Namespace,
     dataset_recorder: object | None,
 ) -> bool:
+    """Return whether the recorder owns the pending dataset/task selection."""
+
     if dataset_recorder is None:
         return False
     recorder_root = getattr(dataset_recorder, "dataset_root", None)
@@ -458,7 +460,7 @@ def select_real_teleop_managed_progress_profile(
     )
     selected = selected_bundle.progress_profile
     selected_stage_profile = selected_bundle.stage_profile
-    recorder_matches = _dataset_recorder_matches_progress_selection(
+    recorder_matches = dataset_recorder_matches_progress_selection(
         args=args,
         dataset_recorder=dataset_recorder,
     )
@@ -517,7 +519,7 @@ def select_real_teleop_progress_entry_step(
 
     if not bool(getattr(args, "collection_progress_gui", False)):
         raise RuntimeError("collection progress GUI selection is disabled")
-    recorder_matches = _dataset_recorder_matches_progress_selection(
+    recorder_matches = dataset_recorder_matches_progress_selection(
         args=args,
         dataset_recorder=dataset_recorder,
     )
@@ -1030,6 +1032,7 @@ __all__ = [
     "REAL_TELEOP_PROGRESS_REFERENCE_SCHEMA_V1",
     "REAL_TELEOP_PROGRESS_RELATIVE_ROOT",
     "RealTeleopProgressEpisode",
+    "dataset_recorder_matches_progress_selection",
     "list_real_teleop_managed_progress_profile_selections",
     "load_real_teleop_progress_profile",
     "load_real_teleop_managed_progress_profile_selection",

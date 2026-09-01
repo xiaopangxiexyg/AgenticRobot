@@ -16,6 +16,7 @@ from collection_runtime.progress.profiles import (
     inspect_dataset_progress_profile,
 )
 from teleop_runtime.real_teleop.progress_adapter import (
+    dataset_recorder_matches_progress_selection,
     list_real_teleop_managed_progress_profile_selections,
     real_teleop_managed_progress_selection_id,
     select_real_teleop_managed_progress_profile,
@@ -149,25 +150,6 @@ def _progress_profile_selection_id(
     return explicit or selection_id
 
 
-def _dataset_recorder_matches_progress_selection(
-    *,
-    args: argparse.Namespace,
-    dataset_recorder: object | None,
-) -> bool:
-    if dataset_recorder is None:
-        return False
-    recorder_root = getattr(dataset_recorder, "dataset_root", None)
-    storage_config = getattr(dataset_recorder, "writer_storage_config", None)
-    recorder_task_id = getattr(storage_config, "task_id", None)
-    if recorder_root is None or recorder_task_id is None:
-        return False
-    return bool(
-        Path(recorder_root).expanduser().resolve()
-        == Path(args.dataset_root).expanduser().resolve()
-        and str(recorder_task_id) == str(args.collection_task_id)
-    )
-
-
 def _build_real_teleop_startup_progress_ui_payload(
     *,
     args: argparse.Namespace,
@@ -184,7 +166,7 @@ def _build_real_teleop_startup_progress_ui_payload(
     is supplied.
     """
 
-    recorder_matches = _dataset_recorder_matches_progress_selection(
+    recorder_matches = dataset_recorder_matches_progress_selection(
         args=args,
         dataset_recorder=dataset_recorder,
     )
@@ -418,7 +400,7 @@ class StationProgressApplication:
         dataset_recorder: object | None,
         profile_selection_enabled: bool,
     ) -> dict[str, object]:
-        recorder_matches = _dataset_recorder_matches_progress_selection(
+        recorder_matches = dataset_recorder_matches_progress_selection(
             args=self._args,
             dataset_recorder=dataset_recorder,
         )
@@ -471,7 +453,7 @@ class StationProgressApplication:
         arm_transition_pending: bool,
         profile_selection_enabled: bool,
     ) -> ProgressApplicationProjection:
-        recorder_matches = _dataset_recorder_matches_progress_selection(
+        recorder_matches = dataset_recorder_matches_progress_selection(
             args=self._args,
             dataset_recorder=dataset_recorder,
         )

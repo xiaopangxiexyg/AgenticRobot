@@ -18,13 +18,13 @@ from dataset_contracts.progress_facts import (
     HoldPauseEffectReceiptV1,
 )
 from teleop_runtime.real_teleop.progress_adapter import RealTeleopProgressEpisode
+from teleop_runtime.real_teleop.progress_contracts import PromotableHoldPause
 from teleop_runtime.real_teleop.control_loop import (
     _build_promotable_progress_hold_pause,
     _consume_manual_episode_stop_request,
     run_real_teleop_control_loop,
 )
 from control_station.real_teleop.progress_workflow import (
-    PromotableHoldPause,
     RealTeleopProgressWorkflow,
 )
 

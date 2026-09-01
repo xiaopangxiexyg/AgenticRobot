@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-import math
 from typing import Any, Protocol, cast
 import uuid
 
@@ -72,65 +71,14 @@ class RealTeleopProgressRecorderPort(Protocol):
     def drain_accepted_sample_receipts(self) -> tuple[Any, ...]: ...
 
 
-@dataclass(frozen=True)
-class PromotableHoldPause:
-    """Exact lower-owned effects for one uninterrupted ordinary Hold.
-
-    This is application coordination state, not a persisted dataset contract.
-    The eventual Failure fact and Hold/Pause receipt remain the canonical
-    progress records.
-    """
+class _PromotableHoldPauseView(Protocol):
+    """Read-only view of lower-owned Hold/Pause promotion evidence."""
 
     episode_capture_identity_hash: str
     hold_requested_at: float
     application_hold_effective_at: float
     formal_capture_pause_effective_at: float
     hold_reason: str
-
-    def __post_init__(self) -> None:
-        identity_hash = str(self.episode_capture_identity_hash).strip()
-        reason = str(self.hold_reason).strip()
-        if not identity_hash:
-            raise ValueError(
-                "episode_capture_identity_hash must be non-empty."
-            )
-        if not reason:
-            raise ValueError("hold_reason must be non-empty.")
-        times = {
-            "hold_requested_at": self.hold_requested_at,
-            "application_hold_effective_at": (
-                self.application_hold_effective_at
-            ),
-            "formal_capture_pause_effective_at": (
-                self.formal_capture_pause_effective_at
-            ),
-        }
-        normalized: dict[str, float] = {}
-        for name, value in times.items():
-            if (
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math.isfinite(float(value))
-            ):
-                raise ValueError(f"{name} must be finite.")
-            normalized[name] = float(value)
-        if (
-            normalized["application_hold_effective_at"]
-            < normalized["hold_requested_at"]
-            or normalized["formal_capture_pause_effective_at"]
-            < normalized["hold_requested_at"]
-        ):
-            raise ValueError(
-                "Applied Hold/Pause effects cannot precede the Hold request."
-            )
-        object.__setattr__(
-            self,
-            "episode_capture_identity_hash",
-            identity_hash,
-        )
-        object.__setattr__(self, "hold_reason", reason)
-        for name, value in normalized.items():
-            object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)
@@ -154,7 +102,7 @@ class RealTeleopProgressWorkflow:
 
     def _hold_episode_identity_matches(
         self,
-        candidate: PromotableHoldPause | None,
+        candidate: _PromotableHoldPauseView | None,
     ) -> bool:
         episode = self._episode()
         if episode is None or candidate is None:
@@ -168,7 +116,7 @@ class RealTeleopProgressWorkflow:
 
     def _matches_promotable_hold(
         self,
-        candidate: PromotableHoldPause | None,
+        candidate: _PromotableHoldPauseView | None,
     ) -> bool:
         episode = self._episode()
         return bool(
@@ -181,7 +129,7 @@ class RealTeleopProgressWorkflow:
         self,
         *,
         application_held: bool = False,
-        promotable_hold_pause: PromotableHoldPause | None = None,
+        promotable_hold_pause: _PromotableHoldPauseView | None = None,
     ) -> ProgressControlAvailability:
         episode = self._episode()
         recording = bool(getattr(self.recorder, "is_recording", False))
@@ -209,7 +157,7 @@ class RealTeleopProgressWorkflow:
         request_application_hold: Callable[[str], None],
         pause_formal_capture: Callable[[float, str], bool],
         application_held: bool = False,
-        promotable_hold_pause: PromotableHoldPause | None = None,
+        promotable_hold_pause: _PromotableHoldPauseView | None = None,
     ) -> ProgressWorkflowResult:
         if not isinstance(intent, ProgressOperatorIntent):
             raise TypeError("intent must be ProgressOperatorIntent.")
@@ -308,7 +256,7 @@ class RealTeleopProgressWorkflow:
         now: float,
         request_application_hold: Callable[[str], None],
         pause_formal_capture: Callable[[float, str], bool],
-        promotable_hold_pause: PromotableHoldPause | None = None,
+        promotable_hold_pause: _PromotableHoldPauseView | None = None,
     ) -> ProgressWorkflowResult:
         """Replay a direct Failure effect or bind a verified promoted receipt."""
 
@@ -504,7 +452,6 @@ class RealTeleopProgressWorkflow:
 
 
 __all__ = [
-    "PromotableHoldPause",
     "ProgressWorkflowResult",
     "ProgressEffectRequestPort",
     "RealTeleopProgressEpisodePort",
