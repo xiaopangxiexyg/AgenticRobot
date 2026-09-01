@@ -127,14 +127,8 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 如果当前只连接 2 个踏板，入口会自动关闭 init-arm，不会读取或要求 init-arm qpos
 profile；fix-arm 仍可正常使用。
 
-虚拟 preview 也可使用同一文件：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --load-profile teleop_records/calibration_profiles/your_profile.json \
-  --load-initial-alignment \
-    teleop_records/initial_alignment_states/your_alignment.json
-```
+当前真机会话的 preview/IK seed 也使用同一份 initial-alignment 文件；历史
+SAPIEN virtual teleop 入口已退役。
 
 ## 8. 每次运行前的最小验收
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from teleop_runtime.debug import run_vive_sapien_virtual as virtual_entrypoint
+from teleop_runtime.real_teleop import terminal_input
 from control_station.real_teleop.control_availability import (
     GuiControlEvents,
     GuiControlState,
@@ -308,14 +308,14 @@ def test_terminal_poll_bounds_continuous_keyboard_input(monkeypatch) -> None:
             self.calls.append((str(name), bool(value)))
 
     fake_stdin = SimpleNamespace(read=lambda _count: "z", isatty=lambda: True)
-    monkeypatch.setattr(virtual_entrypoint.sys, "stdin", fake_stdin)
+    monkeypatch.setattr(terminal_input.sys, "stdin", fake_stdin)
     monkeypatch.setattr(
-        virtual_entrypoint.select,
+        terminal_input.select,
         "select",
         lambda *_args, **_kwargs: ([fake_stdin], [], []),
     )
     keyboard = KeyboardSource()
-    terminal = virtual_entrypoint.TerminalClutchInput(keyboard)
+    terminal = terminal_input.TerminalClutchInput(keyboard)
     terminal.enabled = True
 
     terminal.poll()

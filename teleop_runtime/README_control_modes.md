@@ -1,8 +1,7 @@
 # VIVE 到 RM65 的相对控制与绝对控制说明
 
-> **入口状态**：`run_vive_sapien_virtual.py` 是冻结保留的历史调试入口，不再是当前虚拟
-> 验收或新开发路径。本文继续用它说明既有 control-mode 语义，但不得据此新增 SAPIEN
-> 依赖、功能或验证结论；当前真实入口仍以 `run_vive_rm65_real_teleop.py` 为准。
+> **入口状态**：历史 SAPIEN virtual teleop 入口已退役。本文只说明仍由
+> `run_vive_rm65_real_teleop.py` 保有的当前 control-mode 语义。
 
 本文档说明当前仓库里已经落地的 arm teleop 控制模式。当前 active 主路径是 `absolute`；`delta_clutch` 章节仅保留历史说明，已经硬封存：
 
@@ -10,13 +9,9 @@
 - `delta_clutch`：已硬封存的历史相对控制实现
 
 这里讨论的是 `VIVE -> PoseToArmRetargeter -> RM65` 这条链路，**不包含** `q6 -> hand/gripper` 手部链路。
-本文涉及的保留/当前入口是：
-
-- [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)
-- [teleop_runtime/debug/run_vive_rm65_real_teleop.py](./debug/run_vive_rm65_real_teleop.py)
-
-前者是冻结历史入口，使用真实 VIVE 输入但默认只驱动 SAPIEN 中的双 RM65 虚拟模型；
-后者是当前真实入口并接入 RM65 真机。
+当前入口是
+[teleop_runtime/debug/run_vive_rm65_real_teleop.py](./debug/run_vive_rm65_real_teleop.py)；
+离线/虚拟验证使用 canonical MuJoCo、contract 或 backend-neutral 工具。
 
 ## 1. 先说结论
 
@@ -48,8 +43,9 @@
    当前 active runtime 固定走 `absolute`。
 5. [teleop_runtime/backends/arms/rm65.py](./backends/arms/rm65.py)  
    把笛卡尔目标位姿转成关节目标；真机模式下调用 `Movej_CANFD`。
-6. [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)  
-   当前现成入口。它每一帧从 `session.run_step()` 取命令，再喂给虚拟 RM65 backend 和 SAPIEN 渲染器。
+6. [control_station/real_teleop_entrypoint.py](../control_station/real_teleop_entrypoint.py)
+   负责当前 real-teleop 的组合和生命周期，具体运行时语义由
+   `teleop_runtime.real_teleop` 模块保有。
 
 ### 2.2 VIVE 接收器在当前链路里的位置
 
@@ -108,7 +104,7 @@ contract 的 canonical `desk`。`T_O_D/T_D_B` 仍作为旧配置别名读取。
 
 ### 3.4 当前虚拟跑法默认标定
 
-[teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py) 默认调用：
+当前 real-teleop 组件 builder 默认调用：
 
 - [teleop_runtime/configs/presets.py](./configs/presets.py) 里的 `build_annotated_dual_rm65_calibration(...)`
 
@@ -173,11 +169,12 @@ target_rotation    = home_robot.rotation * inv(home_human.rotation) * current_hu
 - 超出工作空间的平移会被裁剪回安全范围
 
 只有在**没有建立 home anchor** 的情况下，`_apply_absolute_mapping(...)` 才会退回旧的“直接把当前 pose 当作目标 pose”行为。  
-但当前 [run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py) 会在进入主循环前等待你手动触发 runtime home calibration，所以虚拟跑法默认不会走这个 fallback。
+但当前 real-teleop 会在进入主循环前等待手动触发 runtime home
+calibration，所以正式路径默认不会走这个 fallback。
 
 ### 4.2 默认双臂碰撞规避层
 
-当前 [run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py) 在双臂模式下默认会先走一层
+当前 real-teleop 在双臂模式下默认会先走一层
 `DualArmCollisionAwareRetargeter`：
 
 1. 仍然先用左右两侧 `PoseToArmRetargeter` 生成 `cartesian_pose`
@@ -379,12 +376,9 @@ python hardware/VIVE/mocap/vive_data_sender.py \
 
 ### 6.3 启动绝对控制
 
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --control-mode absolute
-```
+历史 SAPIEN virtual teleop 命令已退役。离线映射和碰撞验证使用 canonical
+MuJoCo/contract 路径；真机命令只从 [`docs/real/README.md`](../docs/real/README.md)
+复制，并遵循其硬件和运动授权门禁。
 
 建议先从这个模式开始，因为更容易发现：
 
@@ -470,12 +464,9 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 
 ### 9.2 现成入口的边界
 
-当前可以直接跑的是：
-
-- [teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)
-- [teleop_runtime/debug/run_vive_rm65_real_teleop.py](./debug/run_vive_rm65_real_teleop.py)
-
-前者用于虚拟验收，后者用于真机短测和 GUI 采集。
+真机短测和 GUI 采集使用
+[teleop_runtime/debug/run_vive_rm65_real_teleop.py](./debug/run_vive_rm65_real_teleop.py)；
+离线和虚拟验收不经过该硬件入口。
 
 ### 9.3 默认虚拟标定更像调试预设
 
@@ -499,10 +490,9 @@ python -m teleop_runtime.debug.run_vive_rm65_real_teleop \
 建议按这个顺序排查：
 
 1. 先跑 `hardware/VIVE/mocap/vive_data_sender.py`，确认 VIVE tracker 本身正常输出
-2. 再跑 `run_vive_sapien_virtual.py --control-mode absolute`
-3. 确认左右 tracker 映射、坐标方向、TCP frame 都合理
-4. 保持 `absolute`，确认 home anchor、tracker 映射和 TCP frame 稳定
-5. 最后用 `run_vive_rm65_real_teleop.py` 做真机短测或 GUI 采集
+2. 用 canonical MuJoCo/contract 路径验证左右 tracker 映射、坐标方向和 TCP frame
+3. 确认 `absolute` 的 home anchor、tracker 映射和 TCP frame 语义稳定
+4. 只有在完成真机授权与安全检查后，才按 `docs/real/README.md` 做真机短测或 GUI 采集
 
 如果你只是想判断“模式是不是工作了”，最直观的判断标准是：
 

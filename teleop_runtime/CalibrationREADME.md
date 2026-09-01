@@ -1,9 +1,8 @@
 # Calibration README
 
-> **SAPIEN 状态**：本文保留的 SAPIEN frame preview 和
-> `run_vive_sapien_virtual.py` 命令只用于复现历史标定诊断，不再是当前开发、验收或发布
-> 路线。新的标定呈现应使用 Web UI、MuJoCo 或 backend-neutral observer；不要为历史入口
-> 新增功能或调用方。下面未改写的命令仅说明保留代码原有行为。
+> **SAPIEN 状态**：历史 SAPIEN virtual teleop 入口已退役。新的标定呈现
+> 使用 Web UI、MuJoCo 或 backend-neutral observer；当前真机会话使用
+> `run_vive_rm65_real_teleop.py`。
 
 这份文档只说明**当前已经落地的** VIVE -> RM65 标定调试流程。  
 它对应的入口是：
@@ -19,9 +18,8 @@
 
 这套流程**不会**重标 `desk -> base`。  
 机器人侧继续沿用当前 preset 里的 `T_D_B_left/right`。
-它现在也**不会**采集 session `home anchor`。`home` 已经移到
-[teleop_runtime/debug/run_vive_sapien_virtual.py](./debug/run_vive_sapien_virtual.py)
-和后续真机部署入口中，每次启动单独采。
+它现在也**不会**采集 session `home anchor`。`home` 由当前真机会话
+入口每次启动单独采集。
 
 当前终端日志默认带 `[HH:MM:SS]` 时间戳，并且只在状态变化、关键采样进度节点或异常时输出，不再持续刷固定频率状态行。
 当前默认只在 `TRACKER_FRAME_VIZ` 阶段执行 SAPIEN `render_data(...)`；`LINK_CHECK`、`VirtualDesk`、`WristCoarse` 都不会做逐帧渲染，以避免拖慢采样。
@@ -291,7 +289,7 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 - 本次 teleop 的 `home anchor`
 
 都不在这一步保存。  
-这些内容现在放到 `run_vive_sapien_virtual.py` 和后续真机部署入口里再采。
+这些内容现在由当前真机会话入口再采集。
 
 ## 7. 虚拟 desk 拟合方法
 
@@ -374,22 +372,11 @@ python -m teleop_runtime.debug.run_vive_rm65_calibration_debug \
 把虚拟 desk 统一到：`+X` 是操作者面向桌面的方向，`+Y` 是从 workspace near-boundary
 原点朝向操作者左侧的方向，`+Z` 是垂直桌面向上的方向。
 
-如果你还希望连 `run_vive_sapien_virtual.py` 的起始机械臂姿态也一起复用，可以先在
-`teleop_runtime.debug.rm65_real_debug.run_rm65_real_state_viz` 里按 `s` 保存一份
-initial alignment，然后启动虚拟入口时额外传：
-
-```bash
-python -m teleop_runtime.debug.run_vive_sapien_virtual \
-  --host 0.0.0.0 \
-  --port 9999 \
-  --load-profile teleop_records/calibration_profiles/20260416_231341_vive_rm65_virtual_desk.json \
-  --load-initial-alignment teleop_records/initial_alignment_states/20260418_154512_rm65_initial_alignment.json
-```
-
-这样 preview 起始姿态会直接用保存下来的 `arm_qpos`，不再依赖启动时读取真机状态。
-它也会在 `run_vive_sapien_virtual.py` 里作为 robot home anchor 的来源使用。
-但它不包含当前操作者双手的 home anchor，所以
-`run_vive_sapien_virtual.py` 仍然会在你按下 `p` 后做一次 runtime home calibration：
+如果需要复用机械臂起始姿态，可以先在
+`teleop_runtime.debug.rm65_real_debug.run_rm65_real_state_viz` 里按 `s` 保存 initial
+alignment，再传给当前真机会话入口的 `--load-initial-alignment`。该文件不包含
+当前操作者双手的 home anchor，所以按下 `p` 后仍会执行一次 runtime home
+calibration：
 
 - tracker home：始终重新采
 - robot home：优先用 `--load-initial-alignment`
@@ -436,7 +423,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 优先检查：
 
 - 你是否已经重新保存 calibration profile
-- `run_vive_sapien_virtual.py` 是否重新加载了新 profile
+- 当前会话入口是否重新加载了新 profile
 - session home 是否在新 profile 生效后重新采集
 
 ### 11.4 看起来“能动”，但姿态总是别扭
@@ -465,7 +452,7 @@ python -m teleop_runtime.debug.run_vive_sapien_virtual \
 6. 如果需要，进入 `TRACKER_FRAME_VIZ` 检查 raw tracker / calibrated hand 坐标系
 7. 如果需要，进 `TRACKER_FRAME_VIZ` 做小步微调 wrist 外参
 8. 满意后 `s` 保存
-9. 后续每次启动 `run_vive_sapien_virtual.py` 或真机部署时，再做 session home capture
+9. 后续每次启动真机会话时，再做 session home capture
 
 保存好的 profile 后续可直接用：
 
