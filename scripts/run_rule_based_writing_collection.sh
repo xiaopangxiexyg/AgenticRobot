@@ -45,6 +45,7 @@ print_command() {
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+TCP_POSE_ENVELOPE_PROFILE="teleop_runtime/configs/real_teleop/rule_based_writing_bimanual_workspace_v1.json"
 SOURCE_DATASET=""
 SOURCE_EPISODE=""
 DETAIL_ANNOTATION_DIR=""
@@ -154,6 +155,8 @@ export TACTILE_BUNDLE_ROOT="$TACTILE_ROOT"
 export TACTILE_BUNDLE_MIN_FREE_GB="$TACTILE_MIN_FREE_GB"
 
 cd -- "$PROJECT_ROOT"
+[[ -f "$TCP_POSE_ENVELOPE_PROFILE" ]] || die \
+  "TCP pose envelope profile does not exist: $TCP_POSE_ENVELOPE_PROFILE"
 # shellcheck source=../docs/real/teleop_args.sh
 source docs/real/teleop_args.sh
 
@@ -176,6 +179,8 @@ TELEOP_ARGS=(
   "${DMTAC_TACTILE_WORKER_2CPU_ARGS[@]}"
   "${DATASET_COMMON_ARGS[@]}"
   "${POSITION_FORMAL_V2_BALANCED_60HZ_JERK_V2_ARGS[@]}"
+  --tcp-pose-envelope-profile "$TCP_POSE_ENVELOPE_PROFILE"
+  --tcp-pose-envelope-active
   "${POSITION_COLLECTION_PROCESS_ARGS[@]}"
   "${POSITION_COLLECTION_PRODUCTION_ARGS[@]}"
   --dataset-root "$DATASET_BASE"

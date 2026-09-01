@@ -24,9 +24,19 @@ from teleop_runtime.real_teleop.pose_frame_runtime import (
     resolve_runtime_pose_frame_contract,
 )
 from teleop_runtime.replay.dataset import EpisodeSummary, LoadedReplayEpisode
+from teleop_runtime.target_safety.tcp_pose_envelope_runtime import (
+    load_tcp_pose_envelope_file_spec,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "scripts" / "run_rule_based_writing_collection.sh"
+TCP_POSE_ENVELOPE_PROFILE = (
+    ROOT
+    / "teleop_runtime"
+    / "configs"
+    / "real_teleop"
+    / "rule_based_writing_bimanual_workspace_v1.json"
+)
 
 
 def _pose(x: float, y: float = 0.0, z: float = 0.5) -> np.ndarray:
@@ -327,9 +337,37 @@ def test_launcher_dry_run_selects_pure_position_and_specialized_entrypoint(
     assert "control_station.real_rule_based_writing_entrypoint" in output
     assert "--position-admittance-active" not in output
     assert "rm65_bimanual_position_v2_balanced_60hz_jerk_v2" in output
+    assert (
+        "--tcp-pose-envelope-profile "
+        "teleop_runtime/configs/real_teleop/"
+        "rule_based_writing_bimanual_workspace_v1.json"
+    ) in output
+    assert "--tcp-pose-envelope-active" in output
     assert "--rule-writing-trajectory digit_9_v1" in output
     assert "--rule-writing-size-m 0.05" in output
     assert "--rule-writing-direction left" in output
+
+
+def test_launcher_tcp_pose_envelope_covers_both_calibration_workspaces() -> None:
+    workspace_by_side = {
+        "left": ((-0.8, -0.7, 0.0), (0.7, 0.8, 0.9)),
+        "right": ((-0.7, -0.8, 0.0), (0.8, 0.7, 0.9)),
+    }
+
+    spec = load_tcp_pose_envelope_file_spec(
+        TCP_POSE_ENVELOPE_PROFILE,
+        active_sides=("left", "right"),
+        calibration_workspace_resolver=workspace_by_side.__getitem__,
+    )
+
+    assert spec.profile_id == "rule-based-writing-bimanual-workspace-v1"
+    assert set(spec.side_config_by_side) == {"left", "right"}
+    for side, (lower, upper) in workspace_by_side.items():
+        config = spec.side_config_by_side[side]
+        assert config.enabled is True
+        assert config.absolute_min_xyz_m == lower
+        assert config.absolute_max_xyz_m == upper
+        assert config.requires_anchor is False
 
 
 def test_rule_arguments_expose_size_direction_and_source_binding() -> None:
