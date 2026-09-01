@@ -5,6 +5,7 @@ const state = {
   detail: null,
   draft: null,
   savedDraftSnapshot: null,
+  volatilePostSealDraft: false,
   selectedEpisode: null,
   selectedCamera: null,
   selectedOccurrenceId: null,
@@ -513,6 +514,11 @@ async function ensureAnnotationsSealedBeforeTransition(targetLabel) {
   if (decision === "proceed" || decision === "discard") return true;
   if (decision !== "seal") return false;
   try {
+    if (state.volatilePostSealDraft) {
+      await persistVolatilePostSealDraft();
+      showToast("粗标注后的详细工作草稿已持久化，继续切换。", "info", 4200);
+      return true;
+    }
     const coarseChanged = hasUnsavedCoarseDraftChanges();
     const detailChanged = hasUnsavedDetailDraftChanges();
     const report = coarseChanged
@@ -529,7 +535,7 @@ async function ensureAnnotationsSealedBeforeTransition(targetLabel) {
       report?.draft_cache_warning ? "error" : "info",
       report?.draft_cache_warning ? 9000 : 4200,
     );
-    return true;
+    return !report?.draft_cache_warning;
   } catch (error) {
     showToast(`封存失败，已取消切换：${error.message}`, "error", 8000);
     return false;
@@ -1752,6 +1758,7 @@ function applyCurrentEpisodePayload(episode) {
   cancelPendingSeek();
   state.detail = episode;
   state.draft = structuredClone(episode.draft);
+  state.volatilePostSealDraft = false;
   setSavedDraftSnapshot(
     episode.draft_requires_seal ? null : state.draft,
   );
@@ -2998,6 +3005,7 @@ async function selectEpisode(episodeUuid) {
     state.selectedEpisode = episodeUuid;
     state.detail = payload.episode;
     state.draft = structuredClone(payload.episode.draft);
+    state.volatilePostSealDraft = false;
     setSavedDraftSnapshot(
       payload.episode.draft_requires_seal ? null : state.draft,
     );
@@ -4409,7 +4417,16 @@ async function publishCurrentAnnotations() {
     : report.detail_annotation?.available
       ? "PENDING"
       : "NOT_APPLICABLE";
-  setSavedDraftSnapshot(state.draft);
+  state.volatilePostSealDraft = Boolean(
+    report.draft_cache_warning && state.draft?.detail_overlay,
+  );
+  if (state.volatilePostSealDraft) {
+    const durableBaseline = structuredClone(state.draft);
+    durableBaseline.detail_overlay = null;
+    setSavedDraftSnapshot(durableBaseline);
+  } else {
+    setSavedDraftSnapshot(state.draft);
+  }
   state.sealedReeditBaseline = null;
   state.sealedReeditSourceId = null;
   renderTimeline();
@@ -4466,7 +4483,9 @@ async function publishCurrentAnnotations() {
     episodeSummaryRefreshedAt.set(state.detail.episode_uuid, Date.now());
   }
   renderEpisodeList();
-  state.detail.draft_persistence_state = "SEALED_SNAPSHOT";
+  state.detail.draft_persistence_state = state.volatilePostSealDraft
+    ? "VOLATILE_POST_SEAL_DETAIL_DRAFT"
+    : "SEALED_SNAPSHOT";
   state.detail.draft_requires_seal = false;
   renderSealedReeditControls();
   $("coverage-preview").textContent =
@@ -4475,10 +4494,44 @@ async function publishCurrentAnnotations() {
   return report;
 }
 
+async function persistVolatilePostSealDraft() {
+  if (!state.volatilePostSealDraft || !state.detail || !state.draft) return null;
+  const payload = await requestJsonWithProgress(
+    "/api/draft/" + encodeURIComponent(state.detail.episode_uuid),
+    {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(state.draft),
+    },
+    {
+      kind: "RETRY_POST_SEAL_DETAIL_DRAFT",
+      message: "正在重试保存粗标注后的详细工作草稿",
+      completeMessage: "详细工作草稿已持久化",
+    },
+  );
+  state.draft = payload.draft;
+  state.volatilePostSealDraft = false;
+  state.detail.draft_persistence_state = "UNSEALED_DRAFT";
+  state.detail.draft_requires_seal = true;
+  setSavedDraftSnapshot(state.draft);
+  renderTimeline();
+  renderSealedReeditControls();
+  return payload;
+}
+
 async function commitAnnotations() {
   if (!state.draft || state.busy) return;
   state.busy = true;
   try {
+    if (state.volatilePostSealDraft) {
+      await persistVolatilePostSealDraft();
+      showToast(
+        "粗标注已封存；详细工作草稿现已单独持久化，未重复发布粗标注。",
+        "info",
+        6000,
+      );
+      return;
+    }
     const report = await publishCurrentAnnotations();
     showToast(
       report.draft_cache_warning

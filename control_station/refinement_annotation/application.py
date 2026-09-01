@@ -3202,14 +3202,18 @@ class RefinementAnnotationApplication:
                 durable=False,
             )
         except StageAnnotationStoreError as exc:
-            # The immutable set and its optional sidecars are already complete.
-            # Treat the mutable draft only as a rebuildable cache; asking the
-            # operator to retry would publish a duplicate set.
+            # The immutable coarse set and its optional sidecars are already
+            # complete, but a rebased, still-unsealed detail overlay is not
+            # reconstructible from that set.  Return the exact draft to the
+            # browser and require a draft-only retry; republishing the coarse
+            # set would create a duplicate immutable version.
             draft_cache_warning = (
                 "The immutable annotation set was committed, but the local "
-                "draft cache could not be updated. Reopening the Episode will "
-                "recover from the sealed set. Check the dataset mount before "
-                f"continuing: {exc}"
+                "working draft could not be updated. Pending detail edits in "
+                "this response are not durable and cannot be reconstructed "
+                "from the sealed coarse set. Keep this Episode open and retry "
+                "saving the working draft; do not republish the coarse "
+                f"annotation set: {exc}"
             )
         with self._lock:
             self._annotation_sets_cache.pop(episode_uuid, None)
@@ -3253,6 +3257,7 @@ class RefinementAnnotationApplication:
                 detail_draft=rebased_detail_draft,
                 reason=rebased_detail_reason,
             ),
+            "draft_cache_persisted": draft_cache_warning is None,
             "draft_cache_warning": draft_cache_warning,
         }
 
