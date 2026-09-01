@@ -10,6 +10,13 @@ from control_station.real_shadow_acceptance import (
     RealShadowAcceptanceStatus,
     run_real_shadow_acceptance,
 )
+from dataset_contracts.pose_frames import load_pose_frame_contract
+from robot_motion.rm65 import (
+    DEFAULT_COLLISION_SCENE,
+    load_rm65_tool_profile,
+    tool_tcp_pose_flange_m_rad,
+)
+from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from robot_motion.shadow_execution import (
     AuthoritativeRobotStateSnapshot,
     RegisteredJointTrajectoryPoint,
@@ -20,14 +27,26 @@ from robot_motion.shadow_execution import (
     ShadowSimulationReceipt,
     ShadowSimulationStatus,
 )
+from sim.contracts import SimulationContract
+from sim.mujoco.actuation import (
+    cad_bimanual_dmtac_gripper_profile,
+    rm65_bimanual_udp_feedback_profile,
+)
 from sim.mujoco.control.desk_tcp_position import (
     DEFAULT_INSPIRE_V3_DUAL_ARM_URDF,
     DEFAULT_SIM_HOME_QPOS_BY_SIDE,
+    DEFAULT_SIMULATION_CONTRACT_PATH,
+    DEFAULT_STATION_POSE_CONTRACT_PATH,
+    DEFAULT_TOOL_PROFILE_BY_SIDE,
 )
 from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
+    OBSTACLE_SCENE_FRAME_ID,
+    OBSTACLE_SCENE_FRAME_SPEC_HASH,
+    build_obstacle_collision_oracle,
     build_shadow_initialized_control,
 )
 from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
+    MujocoShadowCompatibilityExpectation,
     MujocoShadowModelBinding,
     execute_registered_shadow_trajectory,
 )
@@ -84,7 +103,11 @@ def _snapshot(*, identity: ShadowExecutionIdentity | None = None):
     )
 
 
-def _trajectory(snapshot: AuthoritativeRobotStateSnapshot):
+def _trajectory(
+    snapshot: AuthoritativeRobotStateSnapshot,
+    *,
+    scene_hash: str = "scene:test",
+):
     target = {
         side: value.copy() for side, value in snapshot.qpos_by_side.items()
     }
@@ -93,7 +116,7 @@ def _trajectory(snapshot: AuthoritativeRobotStateSnapshot):
         trajectory_id="trajectory:acceptance-test",
         created_at=10.0,
         initial_snapshot=snapshot,
-        scene_hash="scene:test",
+        scene_hash=scene_hash,
         target_hash="target:test",
         planner_config_hash="planner:test",
         moving_sides=("right",),
@@ -145,11 +168,73 @@ class _SimulationControl:
 
 def _binding(_control, trajectory):
     return MujocoShadowModelBinding(
-        observed_identity=trajectory.initial_snapshot.identity,
-        scene_hash=trajectory.scene_hash,
+        station_revision="station:test",
+        reference_frame_id="desk",
+        desk_from_arm_base_by_side={
+            side: tuple(np.eye(4).reshape(-1)) for side in ("left", "right")
+        },
+        joint_names_by_side={
+            side: tuple(f"{side}_joint{i}" for i in range(1, 7))
+            for side in ("left", "right")
+        },
+        tool_profile_id_by_side={
+            "left": "DMTAC_M:left",
+            "right": "DMTAC_M:right",
+        },
+        tool_tcp_pose_flange_m_rad_by_side={
+            side: (0.0, 0.0, 0.14, 0.0, 0.0, 0.0)
+            for side in ("left", "right")
+        },
+        gripper_profile_name="dmtac:test",
+        gripper_side_by_name={
+            "left_gripper": "left",
+            "right_gripper": "right",
+        },
+        scene_revision=trajectory.scene_hash,
+        simulation_scene_profile_name="scene:test",
+        collision_profile_name="collision:test",
         evidence_refs=("model-binding:test",),
-        verified=True,
-        verification_method="canonical_model_identity_v1",
+    )
+
+
+def _actual_binding(_snapshot, trajectory):
+    station = load_pose_frame_contract(DEFAULT_STATION_POSE_CONTRACT_PATH)
+    arm_profile = rm65_bimanual_udp_feedback_profile()
+    gripper_profile = cad_bimanual_dmtac_gripper_profile()
+    simulation_contract = SimulationContract.load(DEFAULT_SIMULATION_CONTRACT_PATH)
+    tool_profile_by_side = {
+        side: load_rm65_tool_profile(DEFAULT_TOOL_PROFILE_BY_SIDE[side], side=side)
+        for side in ("left", "right")
+    }
+    return MujocoShadowCompatibilityExpectation(
+        station_revision=station.source_id,
+        reference_frame_id=station.canonical_absolute_frame,
+        desk_from_arm_base_by_side={
+            side: tuple(
+                station.source.effective_raw_to_canonical_desk_transform(side).reshape(
+                    -1
+                )
+            )
+            for side in ("left", "right")
+        },
+        joint_names_by_side={
+            side: arm_profile.joint_names_by_side[side]
+            for side in ("left", "right")
+        },
+        tool_profile_id_by_side={
+            "left": "DMTAC_M:left",
+            "right": "DMTAC_M:right",
+        },
+        tool_tcp_pose_flange_m_rad_by_side={
+            side: tool_tcp_pose_flange_m_rad(tool_profile_by_side[side])
+            for side in ("left", "right")
+        },
+        gripper_profile_name=gripper_profile.name,
+        gripper_side_by_name=gripper_profile.side_by_gripper,
+        scene_revision=trajectory.scene_hash,
+        simulation_scene_profile_name=simulation_contract.scene.profile_name,
+        collision_profile_name=DEFAULT_COLLISION_SCENE,
+        evidence_refs=("real-owner-compatibility:test",),
     )
 
 
@@ -209,11 +294,29 @@ def test_application_acceptance_initializes_from_snapshot_and_stops_after_mujoco
     )
     real_factory_calls: list[str] = []
 
+    obstacle_scene = ObstacleSceneSnapshot(
+        reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
+        reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
+        revision=0,
+    )
+    scene_revision = obstacle_scene.semantic_content_hash
+
+    def build_control(captured):
+        control = build_shadow_initialized_control(captured)
+        control.shadow_obstacle_oracle = build_obstacle_collision_oracle(
+            control,
+            obstacle_scene,
+        )
+        return control
+
     receipt = run_real_shadow_acceptance(
         snapshot_provider=lambda: snapshot,
-        trajectory_builder=_trajectory,
-        simulation_control_factory=build_shadow_initialized_control,
-        model_binding_provider=_binding,
+        trajectory_builder=lambda captured: _trajectory(
+            captured,
+            scene_hash=scene_revision,
+        ),
+        simulation_control_factory=build_control,
+        model_binding_provider=_actual_binding,
         simulation_executor=execute_registered_shadow_trajectory,
         real_ports_factory=lambda trajectory: real_factory_calls.append(
             trajectory.semantic_content_hash
@@ -268,35 +371,32 @@ def test_simulation_initialization_error_never_requests_real_ports():
     assert real_factory_calls == []
 
 
-@pytest.mark.parametrize(
-    ("overrides", "expected_status"),
-    (
-        (
-            {
-                "model_binding_provider": lambda *_args: (_ for _ in ()).throw(
-                    RuntimeError("identity evidence unavailable")
-                )
-            },
-            RealShadowAcceptanceStatus.MODEL_BINDING_FAILED,
+def test_model_binding_error_does_not_construct_simulation() -> None:
+    sim_calls: list[str] = []
+    receipt, _ = _run(
+        model_binding_provider=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("compatibility expectation unavailable")
         ),
-        (
-            {
-                "simulation_executor": lambda **_kwargs: (_ for _ in ()).throw(
-                    RuntimeError("simulation owner failed")
-                )
-            },
-            RealShadowAcceptanceStatus.SIMULATION_EXECUTION_FAILED,
+        simulation_control_factory=lambda snapshot: sim_calls.append(
+            snapshot.semantic_content_hash
         ),
-    ),
-)
-def test_model_binding_and_simulation_execution_errors_hold_and_close(
-    overrides,
-    expected_status,
-):
-    control = _SimulationControl()
-    receipt, _ = _run(control=control, **overrides)
+    )
 
-    assert receipt.status is expected_status
+    assert receipt.status is RealShadowAcceptanceStatus.MODEL_BINDING_FAILED
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert sim_calls == []
+
+
+def test_simulation_execution_error_holds_and_closes() -> None:
+    control = _SimulationControl()
+    receipt, _ = _run(
+        control=control,
+        simulation_executor=lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulation owner failed")
+        ),
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.SIMULATION_EXECUTION_FAILED
     assert receipt.real_motion_disposition is RealMotionDisposition.NONE
     assert control.hold_reasons == ["real shadow acceptance simulation error"]
     assert control.closed is True
@@ -352,6 +452,31 @@ def test_each_failed_simulation_status_blocks_real_replay(status):
     assert receipt.real_motion_disposition is RealMotionDisposition.NONE
     assert control.closed is True
     assert real_factory_calls == []
+
+
+def test_compatibility_failure_reason_codes_reach_application_receipt() -> None:
+    def simulate(*, trajectory, **_kwargs):
+        receipt = _simulation(
+            trajectory,
+            status=ShadowSimulationStatus.MODEL_IDENTITY_MISMATCH,
+        )
+        return replace(
+            receipt,
+            evidence_refs=(
+                "mujoco-shadow-compatibility-reason:tool_tcp_mismatch",
+                "mujoco-shadow-compatibility-reason:gripper_assignment_mismatch",
+            ),
+        )
+
+    receipt, _ = _run(simulation_executor=simulate)
+
+    assert receipt.status is RealShadowAcceptanceStatus.SIMULATION_REJECTED
+    assert receipt.reason_codes == (
+        "model_identity_mismatch",
+        "gripper_assignment_mismatch",
+        "tool_tcp_mismatch",
+        "executed_point_count_mismatch",
+    )
 
 
 def test_completed_simulation_with_wrong_exact_binding_is_rejected():

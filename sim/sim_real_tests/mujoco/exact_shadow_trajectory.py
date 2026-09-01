@@ -13,15 +13,16 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
+from types import MappingProxyType
 
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.rm65 import load_rm65_tool_profile, tool_tcp_pose_flange_m_rad
 from robot_motion.runtime import EffectorCommand, TeleopCommand
 from robot_motion.shadow_execution import (
     RegisteredJointTrajectoryPoint,
     RegisteredShadowJointTrajectory,
-    ShadowExecutionIdentity,
     ShadowSimulationReceipt,
     ShadowSimulationStatus,
 )
@@ -30,6 +31,7 @@ _SIDES = ("left", "right")
 _EXECUTION_EVIDENCE_HASH_DOMAIN = (
     "agenticrobot.shadow_execution.mujoco_exact_qpos_evidence.v1"
 )
+_COMPATIBILITY_REASON_REF_PREFIX = "mujoco-shadow-compatibility-reason:"
 
 
 def _finite(value: object, *, name: str) -> float:
@@ -48,40 +50,365 @@ def _refs(values: Sequence[str], *, name: str) -> tuple[str, ...]:
     return refs
 
 
-@dataclass(frozen=True)
-class MujocoShadowModelBinding:
-    """Observed MuJoCo model identity, independently bound to one scene."""
+def _side_text_mapping(values: Mapping[str, str], *, name: str):
+    result = {side: str(values[side]).strip() for side in _SIDES}
+    if any(not value for value in result.values()) or set(values) != set(_SIDES):
+        raise ValueError(f"{name} must map exactly left and right to non-empty values.")
+    return MappingProxyType(result)
 
-    observed_identity: ShadowExecutionIdentity
-    scene_hash: str
+
+def _side_sequence_mapping(
+    values: Mapping[str, Sequence[object]],
+    *,
+    name: str,
+    length: int,
+    numeric: bool,
+):
+    if set(values) != set(_SIDES):
+        raise ValueError(f"{name} must map exactly left and right.")
+    result = {}
+    for side in _SIDES:
+        if numeric:
+            sequence = tuple(
+                _finite(value, name=f"{name}.{side}") for value in values[side]
+            )
+        else:
+            sequence = tuple(str(value).strip() for value in values[side])
+        if len(sequence) != length or any(value == "" for value in sequence):
+            raise ValueError(f"{name}.{side} must contain {length} values.")
+        result[side] = sequence
+    return MappingProxyType(result)
+
+
+@dataclass(frozen=True)
+class MujocoShadowCompatibilityExpectation:
+    """Small real-owner contract that MuJoCo observes once before execution.
+
+    These are the values that materially affect joint-trajectory replay. This
+    deliberately is not a URDF/mesh/artifact hash attestation and it contains
+    no caller-supplied ``verified`` flag.
+    """
+
+    station_revision: str
+    reference_frame_id: str
+    desk_from_arm_base_by_side: Mapping[str, Sequence[float]]
+    joint_names_by_side: Mapping[str, Sequence[str]]
+    tool_profile_id_by_side: Mapping[str, str]
+    tool_tcp_pose_flange_m_rad_by_side: Mapping[str, Sequence[float]]
+    gripper_profile_name: str
+    gripper_side_by_name: Mapping[str, str]
+    scene_revision: str
+    simulation_scene_profile_name: str
+    collision_profile_name: str
     evidence_refs: tuple[str, ...]
-    verified: bool = False
-    verification_method: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.observed_identity, ShadowExecutionIdentity):
-            raise TypeError("observed_identity must be ShadowExecutionIdentity.")
-        scene_hash = str(self.scene_hash).strip()
-        if not scene_hash:
-            raise ValueError("scene_hash must be non-empty.")
-        object.__setattr__(self, "scene_hash", scene_hash)
+        for name in (
+            "station_revision",
+            "reference_frame_id",
+            "gripper_profile_name",
+            "scene_revision",
+            "simulation_scene_profile_name",
+            "collision_profile_name",
+        ):
+            value = str(getattr(self, name)).strip()
+            if not value:
+                raise ValueError(f"{name} must be non-empty.")
+            object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "desk_from_arm_base_by_side",
+            _side_sequence_mapping(
+                self.desk_from_arm_base_by_side,
+                name="desk_from_arm_base_by_side",
+                length=16,
+                numeric=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "joint_names_by_side",
+            _side_sequence_mapping(
+                self.joint_names_by_side,
+                name="joint_names_by_side",
+                length=6,
+                numeric=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tool_profile_id_by_side",
+            _side_text_mapping(
+                self.tool_profile_id_by_side,
+                name="tool_profile_id_by_side",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tool_tcp_pose_flange_m_rad_by_side",
+            _side_sequence_mapping(
+                self.tool_tcp_pose_flange_m_rad_by_side,
+                name="tool_tcp_pose_flange_m_rad_by_side",
+                length=6,
+                numeric=True,
+            ),
+        )
+        side_by_name = {
+            str(name).strip(): str(side).strip()
+            for name, side in self.gripper_side_by_name.items()
+        }
+        if (
+            len(side_by_name) != len(_SIDES)
+            or any(not name for name in side_by_name)
+            or set(side_by_name.values()) != set(_SIDES)
+        ):
+            raise ValueError(
+                "gripper_side_by_name must map non-empty grippers to left and right."
+            )
+        object.__setattr__(
+            self,
+            "gripper_side_by_name",
+            MappingProxyType(side_by_name),
+        )
         object.__setattr__(
             self,
             "evidence_refs",
-            _refs(self.evidence_refs, name="model binding"),
+            _refs(self.evidence_refs, name="compatibility expectation"),
         )
-        if not isinstance(self.verified, bool):
-            raise TypeError("verified must be boolean.")
-        method = (
-            None
-            if self.verification_method is None
-            else str(self.verification_method).strip()
+        if any(
+            ref.startswith(_COMPATIBILITY_REASON_REF_PREFIX)
+            for ref in self.evidence_refs
+        ):
+            raise ValueError(
+                "compatibility expectation evidence cannot use the executor-owned "
+                "reason namespace."
+            )
+
+
+# Compatibility name for the application orchestration surface. The fields
+# now describe an expectation, not a caller-asserted model identity.
+MujocoShadowModelBinding = MujocoShadowCompatibilityExpectation
+
+
+def _tool_profile_id(profile: Mapping[str, object], *, side: str) -> str:
+    name = str(profile.get("name", profile.get("tool_name", ""))).strip()
+    arm = str(profile.get("arm", "")).strip()
+    if not name or arm != side:
+        raise ValueError(f"{side} tool profile must identify its name and arm.")
+    return f"{name}:{arm}"
+
+
+def _observe_mujoco_shadow_compatibility(control) -> dict[str, object]:
+    station = control.station_pose_contract
+    source = station.source
+    scene = control.scene
+    rig_config = control.rig.config
+    arm_profile = rig_config.actuation_profile
+    gripper_profile = rig_config.gripper_actuation_profile
+    retargeter = control.retargeter
+
+    station_revision = str(station.source_id).strip()
+    reference_frame_id = str(station.canonical_absolute_frame).strip()
+    if not station_revision or not reference_frame_id:
+        raise ValueError("station revision and reference frame must be non-empty.")
+    joint_names = dict(
+        _side_sequence_mapping(
+            {
+                side: scene.arm_specs[side].joint_names for side in _SIDES
+            },
+            name="observed_joint_names_by_side",
+            length=6,
+            numeric=False,
         )
-        if self.verified and not method:
-            raise ValueError("a verified model binding requires a verification method.")
-        if not self.verified and method is not None:
-            raise ValueError("an unverified model binding cannot name a verification method.")
-        object.__setattr__(self, "verification_method", method)
+    )
+    actuation_joint_names = dict(
+        _side_sequence_mapping(
+            {
+                side: arm_profile.joint_names_by_side[side] for side in _SIDES
+            },
+            name="observed_actuation_joint_names_by_side",
+            length=6,
+            numeric=False,
+        )
+    )
+    scene_profiles = (
+        str(control.contract.scene.profile_name).strip(),
+        str(scene.scene_spec.profile_name).strip(),
+        str(scene.conversion.scene_profile_name).strip(),
+    )
+    if any(not value for value in scene_profiles):
+        raise ValueError("MuJoCo scene profiles must be non-empty.")
+    tool_profiles = {
+        side: load_rm65_tool_profile(
+            getattr(control.config, f"{side}_tool_profile"), side=side
+        )
+        for side in _SIDES
+    }
+    tool_profile_tcp = dict(
+        _side_sequence_mapping(
+            {
+                side: tool_tcp_pose_flange_m_rad(tool_profiles[side])
+                for side in _SIDES
+            },
+            name="observed_tool_profile_tcp_pose_flange_m_rad_by_side",
+            length=6,
+            numeric=True,
+        )
+    )
+    obstacle_oracle = control.shadow_obstacle_oracle
+    shadow_scene_revision = str(obstacle_oracle.scene_hash).strip()
+    if not shadow_scene_revision:
+        raise ValueError("shadow obstacle oracle scene revision must be non-empty.")
+    if not bool(obstacle_oracle.collision_model_is_independent):
+        raise ValueError("shadow obstacle oracle must own an independent collision model.")
+    return {
+        "station_revision": station_revision,
+        "reference_frame_id": reference_frame_id,
+        "desk_from_arm_base_by_side": dict(
+            _side_sequence_mapping(
+                {
+                    side: np.asarray(
+                        source.effective_raw_to_canonical_desk_transform(side),
+                        dtype=float,
+                    ).reshape(-1)
+                    for side in _SIDES
+                },
+                name="observed_desk_from_arm_base_by_side",
+                length=16,
+                numeric=True,
+            )
+        ),
+        "joint_names_by_side": joint_names,
+        "actuation_joint_names_by_side": actuation_joint_names,
+        "tool_profile_id_by_side": {
+            side: _tool_profile_id(tool_profiles[side], side=side)
+            for side in _SIDES
+        },
+        "tool_profile_tcp_pose_flange_m_rad_by_side": tool_profile_tcp,
+        "tool_tcp_pose_flange_m_rad_by_side": dict(
+            _side_sequence_mapping(
+                {
+                    side: np.asarray(
+                        getattr(
+                            retargeter.config,
+                            f"{side}_tool_tcp_pose_flange_m_rad",
+                        ),
+                        dtype=float,
+                    ).reshape(-1)
+                    for side in _SIDES
+                },
+                name="observed_tool_tcp_pose_flange_m_rad_by_side",
+                length=6,
+                numeric=True,
+            )
+        ),
+        "gripper_profile_name": str(gripper_profile.name),
+        "gripper_side_by_name": dict(gripper_profile.side_by_gripper),
+        "scene_profile_names": scene_profiles,
+        "shadow_scene_revision": shadow_scene_revision,
+        "collision_profile_name": str(retargeter.profile.name),
+        "collision_projector_available": scene.collision_projector() is not None,
+    }
+
+
+def verify_mujoco_shadow_compatibility(
+    control,
+    trajectory: RegisteredShadowJointTrajectory,
+    expectation: MujocoShadowCompatibilityExpectation,
+) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    """Observe and compare the small replay-critical contract exactly once."""
+
+    reasons: list[str] = []
+    try:
+        observed = _observe_mujoco_shadow_compatibility(control)
+    except Exception as exc:  # noqa: BLE001 - fail closed with a typed reason.
+        observed = {
+            "observation_error_type": type(exc).__name__,
+            "observation_error": str(exc),
+        }
+        reasons.append("compatibility_observation_failed")
+    else:
+        if observed["station_revision"] != expectation.station_revision:
+            reasons.append("station_revision_mismatch")
+        if observed["reference_frame_id"] != expectation.reference_frame_id:
+            reasons.append("reference_frame_mismatch")
+        if any(
+            not np.allclose(
+                observed["desk_from_arm_base_by_side"][side],
+                expectation.desk_from_arm_base_by_side[side],
+                atol=1e-9,
+                rtol=0.0,
+            )
+            for side in _SIDES
+        ):
+            reasons.append("reference_frame_spec_mismatch")
+        if (
+            observed["joint_names_by_side"]
+            != dict(expectation.joint_names_by_side)
+            or observed["actuation_joint_names_by_side"]
+            != observed["joint_names_by_side"]
+        ):
+            reasons.append("joint_layout_mismatch")
+        if observed["tool_profile_id_by_side"] != dict(
+            expectation.tool_profile_id_by_side
+        ):
+            reasons.append("tool_profile_mismatch")
+        if any(
+            not np.allclose(
+                observed["tool_tcp_pose_flange_m_rad_by_side"][side],
+                expectation.tool_tcp_pose_flange_m_rad_by_side[side],
+                atol=1e-9,
+                rtol=0.0,
+            )
+            for side in _SIDES
+        ):
+            reasons.append("tool_tcp_mismatch")
+        if any(
+            not np.allclose(
+                observed["tool_profile_tcp_pose_flange_m_rad_by_side"][side],
+                observed["tool_tcp_pose_flange_m_rad_by_side"][side],
+                atol=1e-9,
+                rtol=0.0,
+            )
+            for side in _SIDES
+        ):
+            reasons.append("tool_profile_runtime_tcp_mismatch")
+        if observed["gripper_profile_name"] != expectation.gripper_profile_name:
+            reasons.append("gripper_profile_mismatch")
+        if observed["gripper_side_by_name"] != dict(
+            expectation.gripper_side_by_name
+        ):
+            reasons.append("gripper_assignment_mismatch")
+        scene_profiles = observed["scene_profile_names"]
+        if (
+            len(set(scene_profiles)) != 1
+            or scene_profiles[0] != expectation.simulation_scene_profile_name
+        ):
+            reasons.append("simulation_scene_profile_mismatch")
+        if observed["collision_profile_name"] != expectation.collision_profile_name:
+            reasons.append("collision_profile_mismatch")
+        if not observed["collision_projector_available"]:
+            reasons.append("collision_projector_missing")
+        if observed["shadow_scene_revision"] != expectation.scene_revision:
+            reasons.append("simulation_scene_revision_mismatch")
+        if trajectory.scene_hash != expectation.scene_revision:
+            reasons.append("trajectory_scene_revision_mismatch")
+
+    unique_reasons = tuple(dict.fromkeys(reasons))
+    evidence_payload = {
+        "compatible": not unique_reasons,
+        "reason_codes": unique_reasons,
+        "observed": observed,
+    }
+    reason_label = "compatible" if not unique_reasons else "+".join(unique_reasons)
+    summary_ref = (
+        f"mujoco-shadow-compatibility:{reason_label}:"
+        f"{canonical_content_hash(evidence_payload, domain='agenticrobot.shadow_execution.mujoco_compatibility.v1')}"
+    )
+    reason_refs = tuple(
+        f"{_COMPATIBILITY_REASON_REF_PREFIX}{reason}" for reason in unique_reasons
+    )
+    return not unique_reasons, unique_reasons, (*reason_refs, summary_ref)
 
 
 @dataclass(frozen=True)
@@ -214,6 +541,11 @@ def _preflight_points(control, trajectory, gripper_close_by_name, config):
     projector = control.scene.collision_projector()
     if projector is None:
         raise RuntimeError("exact shadow execution requires MuJoCo collision safety.")
+    obstacle_oracle = getattr(control, "shadow_obstacle_oracle", None)
+    if obstacle_oracle is None:
+        raise RuntimeError("exact shadow execution requires a bound obstacle oracle.")
+    if str(obstacle_oracle.scene_hash).strip() != trajectory.scene_hash:
+        raise RuntimeError("obstacle oracle scene revision changed after compatibility.")
     base = control.scene.kinematic_controlled_qpos()
     minimum_clearance: float | None = None
     def check(qpos_by_side, *, point_index, segment_index, segment_fraction):
@@ -225,15 +557,24 @@ def _preflight_points(control, trajectory, gripper_close_by_name, config):
         )
         collision = projector.check_qpos(control.scene.data, target)
         payload = collision.to_dict()
-        raw_clearance = payload.get("minimum_distance_m")
-        if raw_clearance is not None:
-            clearance = float(raw_clearance)
-            minimum_clearance = (
-                clearance
-                if minimum_clearance is None
-                else min(minimum_clearance, clearance)
-            )
-        if not collision.safe:
+        obstacle = obstacle_oracle.check(qpos_by_side)
+        obstacle_payload = obstacle.to_dict()
+        for raw_clearance in (
+            payload.get("minimum_distance_m"),
+            obstacle_payload.get("minimum_distance_m"),
+        ):
+            if raw_clearance is not None:
+                clearance = float(raw_clearance)
+                minimum_clearance = (
+                    clearance
+                    if minimum_clearance is None
+                    else min(minimum_clearance, clearance)
+                )
+        collision_safe = bool(collision.safe)
+        obstacle_safe = bool(
+            obstacle.collision_check_available and obstacle.safe
+        )
+        if not collision_safe or not obstacle_safe:
             if point_index == 0:
                 status = ShadowSimulationStatus.PATH_START_COLLISION_BLOCKED
             elif point_index == len(trajectory.points) - 1:
@@ -248,7 +589,10 @@ def _preflight_points(control, trajectory, gripper_close_by_name, config):
                     "segment_fraction": segment_fraction,
                 },
                 minimum_clearance,
-                payload,
+                {
+                    "mujoco": payload,
+                    "obstacle_oracle": obstacle_payload,
+                },
             )
         return None
 
@@ -367,8 +711,10 @@ def execute_registered_shadow_trajectory(
 
     if not isinstance(trajectory, RegisteredShadowJointTrajectory):
         raise TypeError("trajectory must be RegisteredShadowJointTrajectory.")
-    if not isinstance(model_binding, MujocoShadowModelBinding):
-        raise TypeError("model_binding must be MujocoShadowModelBinding.")
+    if not isinstance(model_binding, MujocoShadowCompatibilityExpectation):
+        raise TypeError(
+            "model_binding must be MujocoShadowCompatibilityExpectation."
+        )
     cfg = config or MujocoExactQposExecutionConfig()
     if not isinstance(cfg, MujocoExactQposExecutionConfig):
         raise TypeError("config must be MujocoExactQposExecutionConfig.")
@@ -377,14 +723,11 @@ def execute_registered_shadow_trajectory(
             raise TypeError(f"control must expose {name}.")
 
     evidence = list(model_binding.evidence_refs)
-    identity_matches = (
-        model_binding.verified
-        and model_binding.verification_method == "canonical_model_identity_v1"
-        and model_binding.observed_identity.semantic_content_hash
-        == trajectory.initial_snapshot.identity.semantic_content_hash
-        and model_binding.scene_hash == trajectory.scene_hash
+    compatibility_matches, _compatibility_reasons, compatibility_evidence = (
+        verify_mujoco_shadow_compatibility(control, trajectory, model_binding)
     )
-    if not identity_matches:
+    evidence.extend(compatibility_evidence)
+    if not compatibility_matches:
         held, hold_observation = _terminal_hold(control, trajectory, cfg)
         evidence.append(_evidence_ref("terminal-hold", hold_observation))
         return ShadowSimulationReceipt(
@@ -607,6 +950,8 @@ def execute_registered_shadow_trajectory(
 
 __all__ = [
     "MujocoExactQposExecutionConfig",
+    "MujocoShadowCompatibilityExpectation",
     "MujocoShadowModelBinding",
     "execute_registered_shadow_trajectory",
+    "verify_mujoco_shadow_compatibility",
 ]

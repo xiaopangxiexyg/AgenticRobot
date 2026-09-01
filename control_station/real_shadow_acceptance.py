@@ -236,6 +236,19 @@ def _simulation_receipt_matches(
     )
 
 
+def _simulation_compatibility_reason_codes(
+    receipt: ShadowSimulationReceipt,
+) -> tuple[str, ...]:
+    prefix = "mujoco-shadow-compatibility-reason:"
+    return tuple(
+        dict.fromkeys(
+            ref.removeprefix(prefix)
+            for ref in receipt.evidence_refs
+            if ref.startswith(prefix) and ref.removeprefix(prefix)
+        )
+    )
+
+
 def run_real_shadow_acceptance(
     *,
     snapshot_provider: Callable[[], AuthoritativeRobotStateSnapshot],
@@ -244,7 +257,7 @@ def run_real_shadow_acceptance(
     ],
     simulation_control_factory: Callable[[AuthoritativeRobotStateSnapshot], object],
     model_binding_provider: Callable[
-        [object, RegisteredShadowJointTrajectory], object
+        [AuthoritativeRobotStateSnapshot, RegisteredShadowJointTrajectory], object
     ],
     simulation_executor: Callable[..., ShadowSimulationReceipt],
     real_replay_enabled: bool = False,
@@ -270,7 +283,10 @@ def run_real_shadow_acceptance(
 
     ``real_replay_enabled`` defaults to false.  When false, neither
     ``real_ports_factory`` nor any real replay callback is called.  When true,
-    the exact authority is checked before real ports are requested.
+    the exact authority is checked before real ports are requested. The model
+    binding provider runs before simulation construction and receives only the
+    captured real snapshot plus registered trajectory, so it cannot derive an
+    expectation from the MuJoCo control it is meant to verify.
     """
 
     for name, callback in (
@@ -334,11 +350,13 @@ def run_real_shadow_acceptance(
     evidence.append(f"registered-shadow-trajectory:{trajectory.semantic_content_hash}")
 
     try:
-        control = simulation_control_factory(snapshot)
-    except Exception as exc:  # noqa: BLE001 - fail closed before any real port.
-        evidence.append(_error_evidence("simulation_initialization", exc))
+        binding = model_binding_provider(snapshot, trajectory)
+        if binding is None:
+            raise TypeError("model_binding_provider must return a model binding.")
+    except Exception as exc:  # noqa: BLE001 - fail before constructing simulation.
+        evidence.append(_error_evidence("model_binding", exc))
         return RealShadowAcceptanceReceipt(
-            status=RealShadowAcceptanceStatus.SIMULATION_INITIALIZATION_FAILED,
+            status=RealShadowAcceptanceStatus.MODEL_BINDING_FAILED,
             snapshot_hash=snapshot.semantic_content_hash,
             trajectory_hash=trajectory.semantic_content_hash,
             simulation_receipt=None,
@@ -349,18 +367,11 @@ def run_real_shadow_acceptance(
         )
 
     try:
-        binding = model_binding_provider(control, trajectory)
-        if binding is None:
-            raise TypeError("model_binding_provider must return a model binding.")
+        control = simulation_control_factory(snapshot)
     except Exception as exc:  # noqa: BLE001 - fail closed before any real port.
-        evidence.extend(_hold_simulation_after_error(control))
-        evidence.append(_error_evidence("model_binding", exc))
-        try:
-            _close_simulation(control)
-        except Exception as close_exc:  # noqa: BLE001 - preserve both failures.
-            evidence.append(_error_evidence("simulation_close", close_exc))
+        evidence.append(_error_evidence("simulation_initialization", exc))
         return RealShadowAcceptanceReceipt(
-            status=RealShadowAcceptanceStatus.MODEL_BINDING_FAILED,
+            status=RealShadowAcceptanceStatus.SIMULATION_INITIALIZATION_FAILED,
             snapshot_hash=snapshot.semantic_content_hash,
             trajectory_hash=trajectory.semantic_content_hash,
             simulation_receipt=None,
@@ -415,7 +426,10 @@ def run_real_shadow_acceptance(
             evidence_refs=tuple(evidence),
         )
     if not _simulation_receipt_matches(trajectory, simulation):
-        simulation_reasons = [simulation.status.value]
+        simulation_reasons = [
+            simulation.status.value,
+            *_simulation_compatibility_reason_codes(simulation),
+        ]
         if simulation.trajectory_hash != trajectory.semantic_content_hash:
             simulation_reasons.append("trajectory_hash_mismatch")
         if (
