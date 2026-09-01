@@ -20,8 +20,16 @@ from robot_motion.shadow_execution import (
     ShadowSimulationReceipt,
     ShadowSimulationStatus,
 )
+from sim.mujoco.control.desk_tcp_position import (
+    DEFAULT_INSPIRE_V3_DUAL_ARM_URDF,
+    DEFAULT_SIM_HOME_QPOS_BY_SIDE,
+)
+from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
+    build_shadow_initialized_control,
+)
 from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
     MujocoShadowModelBinding,
+    execute_registered_shadow_trajectory,
 )
 from teleop_runtime.skill_deploy.control_runtime import RealSkillMotionHoldReceipt
 from teleop_runtime.skill_deploy.registered_trajectory import (
@@ -180,6 +188,42 @@ def test_default_acceptance_runs_simulation_closes_it_and_never_requests_real_po
     assert receipt.terminal_hold_confirmed is True
     assert receipt.terminal_hold_domain == "simulation"
     assert control.closed is True
+    assert real_factory_calls == []
+
+
+@pytest.mark.skipif(
+    not DEFAULT_INSPIRE_V3_DUAL_ARM_URDF.is_file(),
+    reason="local canonical DMTac dual-arm URDF asset is unavailable",
+)
+def test_application_acceptance_initializes_from_snapshot_and_stops_after_mujoco():
+    initial = _snapshot()
+    snapshot = AuthoritativeRobotStateSnapshot(
+        qpos_by_side=DEFAULT_SIM_HOME_QPOS_BY_SIDE,
+        gripper_close_by_side=initial.gripper_close_by_side,
+        arm_measured_at=initial.arm_measured_at,
+        gripper_measured_at_by_side=initial.gripper_measured_at_by_side,
+        available_at=initial.available_at,
+        arm_evidence_refs=initial.arm_evidence_refs,
+        gripper_evidence_refs=initial.gripper_evidence_refs,
+        identity=initial.identity,
+    )
+    real_factory_calls: list[str] = []
+
+    receipt = run_real_shadow_acceptance(
+        snapshot_provider=lambda: snapshot,
+        trajectory_builder=_trajectory,
+        simulation_control_factory=build_shadow_initialized_control,
+        model_binding_provider=_binding,
+        simulation_executor=execute_registered_shadow_trajectory,
+        real_ports_factory=lambda trajectory: real_factory_calls.append(
+            trajectory.semantic_content_hash
+        ),
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.SIMULATION_ACCEPTED_NO_MOTION
+    assert receipt.simulation_receipt.status is ShadowSimulationStatus.COMPLETED
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert receipt.terminal_hold_confirmed is True
     assert real_factory_calls == []
 
 

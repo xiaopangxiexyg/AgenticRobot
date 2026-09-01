@@ -23,10 +23,6 @@ from robot_motion.shadow_execution import (
     ShadowSimulationReceipt,
     ShadowSimulationStatus,
 )
-from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
-    MujocoShadowModelBinding,
-    execute_registered_shadow_trajectory,
-)
 from teleop_runtime.skill_deploy.control_runtime import RealSkillMotionHoldReceipt
 from teleop_runtime.skill_deploy.registered_trajectory import (
     RegisteredTrajectoryAuthorityConsumptionReceipt,
@@ -248,11 +244,9 @@ def run_real_shadow_acceptance(
     ],
     simulation_control_factory: Callable[[AuthoritativeRobotStateSnapshot], object],
     model_binding_provider: Callable[
-        [object, RegisteredShadowJointTrajectory], MujocoShadowModelBinding
+        [object, RegisteredShadowJointTrajectory], object
     ],
-    simulation_executor: Callable[..., ShadowSimulationReceipt] = (
-        execute_registered_shadow_trajectory
-    ),
+    simulation_executor: Callable[..., ShadowSimulationReceipt],
     real_replay_enabled: bool = False,
     real_ports_factory: (
         Callable[[RegisteredShadowJointTrajectory], RegisteredTrajectoryReplayPorts]
@@ -356,10 +350,8 @@ def run_real_shadow_acceptance(
 
     try:
         binding = model_binding_provider(control, trajectory)
-        if not isinstance(binding, MujocoShadowModelBinding):
-            raise TypeError(
-                "model_binding_provider must return MujocoShadowModelBinding."
-            )
+        if binding is None:
+            raise TypeError("model_binding_provider must return a model binding.")
     except Exception as exc:  # noqa: BLE001 - fail closed before any real port.
         evidence.extend(_hold_simulation_after_error(control))
         evidence.append(_error_evidence("model_binding", exc))
