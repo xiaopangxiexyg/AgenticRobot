@@ -1,5 +1,14 @@
 """Exclusive real Skill deployment runtime, independent of RealTeleop."""
 
+from .control_runtime import (
+    ExclusiveRealSkillControlRuntime,
+    RealSkillControlLifecycle,
+    RealSkillControlStep,
+    RealSkillMotionDispatchReceipt,
+    RealSkillMotionHoldReceipt,
+    RealSkillMotionObservationCut,
+    RealSkillMotionTargetSynchronizer,
+)
 from .motion_port import (
     REAL_AGENT_MOTION_COMMAND_METADATA_KEY,
     RealAgentMotionActivation,
@@ -13,12 +22,11 @@ from .motion_port import (
     RealAgentMotionTargetBuilder,
     RealSkillMotionControlOwner,
 )
-from .rm65_ports import (
-    ExclusiveRM65SkillDeployPorts,
-    ExclusiveRM65SkillPortProfile,
-    RM65SkillPositionForceGuard,
-    RM65SkillTargetBuilder,
-    build_exclusive_rm65_skill_position_force_guard,
+from .registered_trajectory import (
+    MeasuredGripperBackend,
+    MeasuredGripperStateCut,
+    capture_authoritative_shadow_state_from_backends,
+    read_measured_gripper_state_cut,
 )
 from .rm65_lower_assembly import (
     ExclusiveRM65SkillLowerAssembly,
@@ -26,9 +34,16 @@ from .rm65_lower_assembly import (
     RM65SkillTargetBuilderFactory,
     assemble_exclusive_rm65_skill_lower,
 )
+from .rm65_ports import (
+    ExclusiveRM65SkillDeployPorts,
+    ExclusiveRM65SkillPortProfile,
+    RM65SkillPositionForceGuard,
+    RM65SkillTargetBuilder,
+    build_exclusive_rm65_skill_position_force_guard,
+)
 from .rm65_profile import (
-    ExclusiveRM65SkillDeploymentProfile,
     RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
+    ExclusiveRM65SkillDeploymentProfile,
     ResolvedExclusiveRM65SkillDeploymentProfile,
     resolve_exclusive_rm65_skill_deployment_profile,
 )
@@ -38,18 +53,25 @@ from .rm65_target_safety import (
     ExclusiveRM65SkillTargetSafetyRuntime,
     RM65SkillTargetSafetyBuilder,
 )
-from .control_runtime import (
-    ExclusiveRealSkillControlRuntime,
-    RealSkillControlLifecycle,
-    RealSkillControlStep,
-    RealSkillMotionDispatchReceipt,
-    RealSkillMotionHoldReceipt,
-    RealSkillMotionObservationCut,
-    RealSkillMotionTargetSynchronizer,
-)
 
 __all__ = [
     "REAL_AGENT_MOTION_COMMAND_METADATA_KEY",
+    "RM65_SKILL_SCENE_WORLD_FRAME_ID_V1",
+    "ExclusiveRM65SkillDeployPorts",
+    "ExclusiveRM65SkillDeploymentProfile",
+    "ExclusiveRM65SkillLowerAssembly",
+    "ExclusiveRM65SkillPortProfile",
+    "ExclusiveRM65SkillStartupSafetyBinder",
+    "ExclusiveRM65SkillStartupSafetyReceipt",
+    "ExclusiveRM65SkillTargetSafetyRuntime",
+    "ExclusiveRealSkillControlRuntime",
+    "MeasuredGripperBackend",
+    "MeasuredGripperStateCut",
+    "RM65SkillBackendFactory",
+    "RM65SkillPositionForceGuard",
+    "RM65SkillTargetBuilder",
+    "RM65SkillTargetBuilderFactory",
+    "RM65SkillTargetSafetyBuilder",
     "RealAgentMotionActivation",
     "RealAgentMotionMeasuredPoseCut",
     "RealAgentMotionOwnerCut",
@@ -59,29 +81,17 @@ __all__ = [
     "RealAgentMotionPortConfig",
     "RealAgentMotionPortSnapshot",
     "RealAgentMotionTargetBuilder",
-    "RealSkillMotionControlOwner",
-    "ExclusiveRealSkillControlRuntime",
     "RealSkillControlLifecycle",
     "RealSkillControlStep",
+    "RealSkillMotionControlOwner",
     "RealSkillMotionDispatchReceipt",
     "RealSkillMotionHoldReceipt",
     "RealSkillMotionObservationCut",
     "RealSkillMotionTargetSynchronizer",
-    "ExclusiveRM65SkillDeployPorts",
-    "ExclusiveRM65SkillLowerAssembly",
-    "ExclusiveRM65SkillPortProfile",
-    "RM65SkillPositionForceGuard",
-    "RM65SkillBackendFactory",
-    "RM65SkillTargetBuilderFactory",
-    "RM65SkillTargetBuilder",
-    "build_exclusive_rm65_skill_position_force_guard",
-    "assemble_exclusive_rm65_skill_lower",
-    "ExclusiveRM65SkillDeploymentProfile",
-    "RM65_SKILL_SCENE_WORLD_FRAME_ID_V1",
     "ResolvedExclusiveRM65SkillDeploymentProfile",
+    "assemble_exclusive_rm65_skill_lower",
+    "build_exclusive_rm65_skill_position_force_guard",
+    "capture_authoritative_shadow_state_from_backends",
+    "read_measured_gripper_state_cut",
     "resolve_exclusive_rm65_skill_deployment_profile",
-    "ExclusiveRM65SkillStartupSafetyReceipt",
-    "ExclusiveRM65SkillStartupSafetyBinder",
-    "ExclusiveRM65SkillTargetSafetyRuntime",
-    "RM65SkillTargetSafetyBuilder",
 ]
