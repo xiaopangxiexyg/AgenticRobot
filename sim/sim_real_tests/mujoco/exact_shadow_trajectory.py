@@ -10,17 +10,22 @@ result from this module grants real-hardware motion authority.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass
 from itertools import pairwise
 from types import MappingProxyType
 
 import numpy as np
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.path_planning import JointPathPlannerConfig, JointPathStatus
 from robot_motion.rm65 import load_rm65_tool_profile, tool_tcp_pose_flange_m_rad
+from robot_motion.rm65.grasp_reachability import GraspReachabilityStatus
 from robot_motion.runtime import EffectorCommand, TeleopCommand
+from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from robot_motion.shadow_execution import (
+    AuthoritativeRobotStateSnapshot,
     RegisteredJointTrajectoryPoint,
     RegisteredShadowJointTrajectory,
     ShadowSimulationReceipt,
@@ -32,6 +37,85 @@ _EXECUTION_EVIDENCE_HASH_DOMAIN = (
     "agenticrobot.shadow_execution.mujoco_exact_qpos_evidence.v1"
 )
 _COMPATIBILITY_REASON_REF_PREFIX = "mujoco-shadow-compatibility-reason:"
+
+
+@dataclass(frozen=True)
+class RealTcpObstacleTrajectoryRequest:
+    """One DMTac TCP goal and immutable cube scene for simulation-first planning."""
+
+    side: str
+    target_pose_base_from_dmtac_tcp: np.ndarray
+    obstacle_scene: ObstacleSceneSnapshot
+    source: str = "real_tcp_obstacle_acceptance"
+    known_qpos_rad: np.ndarray | None = None
+    linear_speed_m_s: float = 0.12
+    angular_speed_deg_s: float = 45.0
+    minimum_duration_sec: float = 2.0
+
+    def __post_init__(self) -> None:
+        side = str(self.side).strip().lower()
+        if side not in _SIDES:
+            raise ValueError("side must be left or right.")
+        pose = np.asarray(self.target_pose_base_from_dmtac_tcp, dtype=float).copy()
+        if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+            raise ValueError("target_pose_base_from_dmtac_tcp must be a finite 4x4 pose.")
+        if not np.allclose(pose[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9):
+            raise ValueError("target pose must have a homogeneous final row.")
+        rotation = pose[:3, :3]
+        if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6) or not np.isclose(
+            np.linalg.det(rotation), 1.0, atol=1e-6
+        ):
+            raise ValueError("target pose rotation must be proper and orthonormal.")
+        if not isinstance(self.obstacle_scene, ObstacleSceneSnapshot):
+            raise TypeError("obstacle_scene must be ObstacleSceneSnapshot.")
+        source = str(self.source).strip()
+        if not source:
+            raise ValueError("source must be non-empty.")
+        known = self.known_qpos_rad
+        if known is not None:
+            known = np.asarray(known, dtype=float).reshape(-1).copy()
+            if known.shape != (6,) or not np.all(np.isfinite(known)):
+                raise ValueError("known_qpos_rad must contain six finite values.")
+            known.setflags(write=False)
+        for name in (
+            "linear_speed_m_s",
+            "angular_speed_deg_s",
+            "minimum_duration_sec",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+            object.__setattr__(self, name, value)
+        pose.setflags(write=False)
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "target_pose_base_from_dmtac_tcp", pose)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "known_qpos_rad", known)
+
+
+class MujocoShadowTrajectoryPreparationError(RuntimeError):
+    """Typed endpoint/path rejection from concrete MuJoCo preparation."""
+
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        additional_reason_codes: tuple[str, ...] = (),
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        reasons = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (reason_code, *additional_reason_codes)
+                if str(value).strip()
+            )
+        )
+        if not reasons:
+            raise ValueError("trajectory preparation error requires a reason code.")
+        self.reason_code = reasons[0]
+        self.reason_codes = reasons
+        self.details = dict(details or {})
+        super().__init__(self.reason_code)
 
 
 def _finite(value: object, *, name: str) -> float:
@@ -48,6 +132,269 @@ def _refs(values: Sequence[str], *, name: str) -> tuple[str, ...]:
     if not refs or any(not value for value in refs):
         raise ValueError(f"{name} requires non-empty evidence refs.")
     return refs
+
+
+def build_obstacle_bound_shadow_control(
+    snapshot: AuthoritativeRobotStateSnapshot,
+    obstacle_scene: ObstacleSceneSnapshot,
+) -> object:
+    """Cold-start MuJoCo from the real cut and bind the exact immutable scene."""
+
+    from .arbitrary_grasp_pose_motion import (
+        build_obstacle_collision_oracle,
+        build_shadow_initialized_control,
+    )
+
+    control = build_shadow_initialized_control(snapshot)
+    try:
+        control.shadow_obstacle_oracle = build_obstacle_collision_oracle(
+            control,
+            obstacle_scene,
+        )
+        return control
+    except BaseException:
+        close = getattr(control, "close", None)
+        if callable(close):
+            close()
+        raise
+
+
+def _path_preparation_reason(status: JointPathStatus) -> str:
+    return {
+        JointPathStatus.START_BLOCKED: "path_start_collision_blocked",
+        JointPathStatus.TARGET_BLOCKED: "path_target_collision_blocked",
+        JointPathStatus.PATH_SEARCH_EXHAUSTED: "path_search_exhausted",
+        JointPathStatus.COLLISION_CHECK_UNAVAILABLE: (
+            "path_collision_check_unavailable"
+        ),
+        JointPathStatus.INVALID_REQUEST: "path_planner_invalid_request",
+    }.get(status, "path_planner_error")
+
+
+def _selected_reachable_candidate_qpos(endpoint: object) -> np.ndarray:
+    selected_index = endpoint.selected_candidate_index
+    if selected_index is None:
+        raise MujocoShadowTrajectoryPreparationError(
+            "reachable_endpoint_candidate_missing"
+        )
+    for candidate in endpoint.candidates:
+        if int(candidate.get("candidate_index", -1)) != int(selected_index):
+            continue
+        qpos = np.asarray(candidate.get("qpos_rad"), dtype=float).reshape(-1)
+        if qpos.shape == (6,) and np.all(np.isfinite(qpos)):
+            return qpos.copy()
+        break
+    raise MujocoShadowTrajectoryPreparationError(
+        "reachable_endpoint_candidate_invalid"
+    )
+
+
+def build_registered_tcp_obstacle_trajectory(
+    snapshot: AuthoritativeRobotStateSnapshot,
+    request: RealTcpObstacleTrajectoryRequest,
+    *,
+    reachability_config: object | None = None,
+    planner_config: JointPathPlannerConfig | None = None,
+    control_factory: (
+        Callable[[AuthoritativeRobotStateSnapshot, ObstacleSceneSnapshot], object]
+        | None
+    ) = None,
+    wall_clock: Callable[[], float] = time.time,
+) -> RegisteredShadowJointTrajectory:
+    """Plan a real TCP request with Sim endpoint and obstacle semantics."""
+
+    from .arbitrary_grasp_pose_motion import (
+        GraspMotionTarget,
+        _MujocoFclObstacleOracle,
+        build_collision_checked_multiwaypoint_joint_fk_reference_plan,
+        evaluate_motion_target_endpoint,
+        plan_obstacle_aware_joint_path,
+        revalidate_obstacle_path,
+    )
+    from ..rm65.random_grasp_pose_reachability import (
+        RM65RandomGraspPoseReachabilityConfig,
+    )
+
+    if not isinstance(snapshot, AuthoritativeRobotStateSnapshot):
+        raise TypeError("snapshot must be AuthoritativeRobotStateSnapshot.")
+    if not isinstance(request, RealTcpObstacleTrajectoryRequest):
+        raise TypeError("request must be RealTcpObstacleTrajectoryRequest.")
+    if not callable(wall_clock):
+        raise TypeError("wall_clock must be callable.")
+    path_config = planner_config or JointPathPlannerConfig()
+    if not isinstance(path_config, JointPathPlannerConfig):
+        raise TypeError("planner_config must be JointPathPlannerConfig.")
+    endpoint_config = reachability_config or RM65RandomGraspPoseReachabilityConfig()
+    if not isinstance(endpoint_config, RM65RandomGraspPoseReachabilityConfig):
+        raise TypeError(
+            "reachability_config must be RM65RandomGraspPoseReachabilityConfig."
+        )
+    factory = control_factory or build_obstacle_bound_shadow_control
+    if not callable(factory):
+        raise TypeError("control_factory must be callable.")
+
+    target = GraspMotionTarget(
+        side=request.side,
+        target_pose_base_from_dmtac_tcp=request.target_pose_base_from_dmtac_tcp,
+        source=request.source,
+        known_qpos_rad=request.known_qpos_rad,
+        metadata={
+            "obstacle_scene_hash": request.obstacle_scene.semantic_content_hash,
+            "planning_origin": "authoritative_real_state_cut",
+        },
+    )
+    target_hash = canonical_content_hash(
+        {
+            "side": request.side,
+            "target_pose_base_from_dmtac_tcp": (
+                request.target_pose_base_from_dmtac_tcp
+            ),
+            "source": request.source,
+            "known_qpos_rad": request.known_qpos_rad,
+        },
+        domain="agenticrobot.real_shadow_acceptance.tcp_target.v1",
+    )
+    planner_config_hash = canonical_content_hash(
+        {
+            "endpoint_reachability": asdict(endpoint_config),
+            "joint_path": asdict(path_config),
+            "linear_speed_m_s": request.linear_speed_m_s,
+            "angular_speed_deg_s": request.angular_speed_deg_s,
+            "minimum_duration_sec": request.minimum_duration_sec,
+            "path_strategy": "direct_then_deterministic_birrt",
+            "time_parameterization": "per_segment_quintic_stop_at_waypoint",
+        },
+        domain="agenticrobot.real_shadow_acceptance.planner_config.v1",
+    )
+
+    control = None
+    try:
+        try:
+            control = factory(snapshot, request.obstacle_scene)
+            fcl_oracle = control.shadow_obstacle_oracle
+            path_oracle = _MujocoFclObstacleOracle(control, fcl_oracle)
+        except Exception as exc:
+            raise MujocoShadowTrajectoryPreparationError(
+                "planning_simulation_initialization_failed",
+                additional_reason_codes=(type(exc).__name__,),
+                details={"exception": str(exc)},
+            ) from exc
+
+        try:
+            endpoint, _binding, solver = evaluate_motion_target_endpoint(
+                control,
+                target,
+                config=endpoint_config,
+                obstacle_oracle=fcl_oracle,
+            )
+        except Exception as exc:
+            raise MujocoShadowTrajectoryPreparationError(
+                "endpoint_evaluation_failed",
+                additional_reason_codes=(type(exc).__name__,),
+                details={"exception": str(exc)},
+            ) from exc
+        if endpoint.status is not GraspReachabilityStatus.REACHABLE:
+            raise MujocoShadowTrajectoryPreparationError(
+                endpoint.status.value,
+                additional_reason_codes=(endpoint.reason_code,),
+                details={"endpoint_receipt": endpoint.to_dict()},
+            )
+
+        selected_qpos = _selected_reachable_candidate_qpos(endpoint)
+        path = plan_obstacle_aware_joint_path(
+            control,
+            side=request.side,
+            target_qpos_rad=selected_qpos,
+            single_arm_solver=solver,
+            obstacle_oracle=path_oracle,
+            planner_config=path_config,
+        )
+        if path.status is not JointPathStatus.PATH_FOUND:
+            raise MujocoShadowTrajectoryPreparationError(
+                _path_preparation_reason(path.status),
+                additional_reason_codes=(path.reason or path.status.value,),
+                details={"path_receipt": path.to_dict()},
+            )
+        final_check = revalidate_obstacle_path(path.waypoints, oracle=path_oracle)
+        if not bool(final_check.get("safe", False)):
+            raise MujocoShadowTrajectoryPreparationError(
+                str(final_check.get("reason_code", "final_path_revalidation_failed")),
+                details={"final_revalidation": final_check},
+            )
+
+        reference = build_collision_checked_multiwaypoint_joint_fk_reference_plan(
+            control,
+            side=request.side,
+            waypoints_qpos_rad=tuple(
+                waypoint[request.side] for waypoint in path.waypoints
+            ),
+            linear_speed_m_s=request.linear_speed_m_s,
+            angular_speed_deg_s=request.angular_speed_deg_s,
+            minimum_duration_sec=request.minimum_duration_sec,
+        )
+        if reference.status != "safe":
+            raise MujocoShadowTrajectoryPreparationError(
+                "path_collision_blocked",
+                additional_reason_codes=(
+                    str(
+                        reference.metadata.get(
+                            "reason_code",
+                            "mujoco_time_parameterized_path_collision_blocked",
+                        )
+                    ),
+                ),
+                details={"reference_plan": dict(reference.metadata)},
+            )
+        reference_hz = float(control.contract.timing.ik_hz)
+        if not np.isfinite(reference_hz) or reference_hz <= 0.0:
+            raise MujocoShadowTrajectoryPreparationError(
+                "invalid_reference_rate",
+                details={"reference_hz": reference_hz},
+            )
+        inactive_side = "right" if request.side == "left" else "left"
+        points = tuple(
+            RegisteredJointTrajectoryPoint(
+                time_from_start_sec=float(index) / reference_hz,
+                qpos_by_side={
+                    request.side: qpos,
+                    inactive_side: snapshot.qpos_by_side[inactive_side],
+                },
+            )
+            for index, qpos in enumerate(reference.qpos_rad)
+        )
+        if not points or any(
+            not np.array_equal(points[0].qpos_by_side[side], snapshot.qpos_by_side[side])
+            for side in _SIDES
+        ):
+            raise MujocoShadowTrajectoryPreparationError(
+                "registered_trajectory_start_mismatch"
+            )
+        created_at = max(float(wall_clock()), snapshot.available_at)
+        trajectory_seed_hash = canonical_content_hash(
+            {
+                "snapshot_hash": snapshot.semantic_content_hash,
+                "scene_hash": request.obstacle_scene.semantic_content_hash,
+                "target_hash": target_hash,
+                "planner_config_hash": planner_config_hash,
+                "path_receipt_hash": path.semantic_content_hash,
+            },
+            domain="agenticrobot.real_shadow_acceptance.trajectory_id.v1",
+        )
+        return RegisteredShadowJointTrajectory(
+            trajectory_id="real-tcp-obstacle:" + trajectory_seed_hash[:24],
+            created_at=created_at,
+            initial_snapshot=snapshot,
+            scene_hash=request.obstacle_scene.semantic_content_hash,
+            target_hash=target_hash,
+            planner_config_hash=planner_config_hash,
+            moving_sides=(request.side,),
+            points=points,
+        )
+    finally:
+        if control is not None:
+            close = getattr(control, "close", None)
+            if callable(close):
+                close()
 
 
 def _side_text_mapping(values: Mapping[str, str], *, name: str):
@@ -952,6 +1299,10 @@ __all__ = [
     "MujocoExactQposExecutionConfig",
     "MujocoShadowCompatibilityExpectation",
     "MujocoShadowModelBinding",
+    "MujocoShadowTrajectoryPreparationError",
+    "RealTcpObstacleTrajectoryRequest",
+    "build_obstacle_bound_shadow_control",
+    "build_registered_tcp_obstacle_trajectory",
     "execute_registered_shadow_trajectory",
     "verify_mujoco_shadow_compatibility",
 ]

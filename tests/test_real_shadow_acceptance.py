@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,10 +12,15 @@ from control_station.real_shadow_acceptance import (
     run_real_shadow_acceptance,
 )
 from dataset_contracts.pose_frames import load_pose_frame_contract
+from robot_motion.path_planning import JointPathPlanResult, JointPathStatus
 from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
     load_rm65_tool_profile,
     tool_tcp_pose_flange_m_rad,
+)
+from robot_motion.rm65.grasp_reachability import (
+    GraspReachabilityReceipt,
+    GraspReachabilityStatus,
 )
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
 from robot_motion.shadow_execution import (
@@ -40,14 +46,19 @@ from sim.mujoco.control.desk_tcp_position import (
     DEFAULT_TOOL_PROFILE_BY_SIDE,
 )
 from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
+    JointFkReferencePlan,
     OBSTACLE_SCENE_FRAME_ID,
     OBSTACLE_SCENE_FRAME_SPEC_HASH,
     build_obstacle_collision_oracle,
     build_shadow_initialized_control,
 )
+from sim.sim_real_tests.mujoco import arbitrary_grasp_pose_motion as grasp_motion
 from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
     MujocoShadowCompatibilityExpectation,
     MujocoShadowModelBinding,
+    MujocoShadowTrajectoryPreparationError,
+    RealTcpObstacleTrajectoryRequest,
+    build_registered_tcp_obstacle_trajectory,
     execute_registered_shadow_trajectory,
 )
 from teleop_runtime.skill_deploy.control_runtime import RealSkillMotionHoldReceipt
@@ -328,6 +339,60 @@ def test_application_acceptance_initializes_from_snapshot_and_stops_after_mujoco
     assert receipt.real_motion_disposition is RealMotionDisposition.NONE
     assert receipt.terminal_hold_confirmed is True
     assert real_factory_calls == []
+
+
+@pytest.mark.skipif(
+    not DEFAULT_INSPIRE_V3_DUAL_ARM_URDF.is_file(),
+    reason="local canonical DMTac dual-arm URDF asset is unavailable",
+)
+def test_real_tcp_builder_runs_actual_sim_planner_from_authoritative_start() -> None:
+    initial = _snapshot()
+    snapshot = AuthoritativeRobotStateSnapshot(
+        qpos_by_side=DEFAULT_SIM_HOME_QPOS_BY_SIDE,
+        gripper_close_by_side=initial.gripper_close_by_side,
+        arm_measured_at=initial.arm_measured_at,
+        gripper_measured_at_by_side=initial.gripper_measured_at_by_side,
+        available_at=initial.available_at,
+        arm_evidence_refs=initial.arm_evidence_refs,
+        gripper_evidence_refs=initial.gripper_evidence_refs,
+        identity=initial.identity,
+    )
+    probe = build_shadow_initialized_control(snapshot)
+    try:
+        world_from_dmtac = probe.retargeter.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=snapshot.qpos_by_side["left"],
+            right_qpos=snapshot.qpos_by_side["right"],
+        )["left"]
+        target_pose = probe.world_to_base_by_side["left"] @ world_from_dmtac
+    finally:
+        probe.close()
+    scene = ObstacleSceneSnapshot(
+        reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
+        reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
+        revision=0,
+    )
+
+    trajectory = build_registered_tcp_obstacle_trajectory(
+        snapshot,
+        RealTcpObstacleTrajectoryRequest(
+            side="left",
+            target_pose_base_from_dmtac_tcp=target_pose,
+            known_qpos_rad=snapshot.qpos_by_side["left"],
+            obstacle_scene=scene,
+            minimum_duration_sec=0.25,
+        ),
+        wall_clock=lambda: 10.0,
+    )
+
+    assert trajectory.initial_snapshot is snapshot
+    assert trajectory.scene_hash == scene.semantic_content_hash
+    assert trajectory.moving_sides == ("left",)
+    assert len(trajectory.points) >= 2
+    np.testing.assert_allclose(
+        trajectory.points[-1].qpos_by_side["left"],
+        snapshot.qpos_by_side["left"],
+        atol=1e-9,
+    )
 
 
 def test_capture_and_trajectory_binding_failures_are_typed_and_do_not_start_sim():
@@ -713,3 +778,330 @@ def test_completed_real_receipt_with_wrong_point_count_is_not_accepted():
     assert observed_receipt
     assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_FAILED
     assert "real_executed_point_count_mismatch" in receipt.reason_codes
+
+
+def _obstacle_request() -> RealTcpObstacleTrajectoryRequest:
+    return RealTcpObstacleTrajectoryRequest(
+        side="left",
+        target_pose_base_from_dmtac_tcp=np.eye(4),
+        obstacle_scene=ObstacleSceneSnapshot(
+            reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
+            reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
+            revision=3,
+        ),
+        source="test-real-tcp-goal",
+    )
+
+
+def _reachable_endpoint(target_qpos: np.ndarray) -> GraspReachabilityReceipt:
+    return GraspReachabilityReceipt(
+        status=GraspReachabilityStatus.REACHABLE,
+        reason_code="collision_safe_ik_candidate_found",
+        proof_scope="bounded_ik_and_collision_search",
+        reference_frame_id="rm65.single_arm_urdf_model_base",
+        reference_frame_spec_hash="0" * 64,
+        target_pose=tuple(tuple(float(value) for value in row) for row in np.eye(4)),
+        selected_candidate_index=0,
+        candidates=(
+            {
+                "candidate_index": 0,
+                "qpos_rad": target_qpos.tolist(),
+            },
+        ),
+    )
+
+
+class _PlanningControl:
+    def __init__(self, scene_hash: str) -> None:
+        self.shadow_obstacle_oracle = SimpleNamespace(scene_hash=scene_hash)
+        self.contract = SimpleNamespace(timing=SimpleNamespace(ik_hz=20.0))
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("detour", (False, True))
+def test_real_tcp_builder_registers_direct_or_birrt_path_without_motion(
+    monkeypatch,
+    detour: bool,
+) -> None:
+    snapshot = _snapshot()
+    request = _obstacle_request()
+    control = _PlanningControl(request.obstacle_scene.semantic_content_hash)
+    target_qpos = np.full(6, 0.2)
+    middle_qpos = np.array((0.1, -0.2, 0.3, 0.0, 0.1, -0.1))
+    active_waypoints = (
+        (np.zeros(6), middle_qpos, target_qpos)
+        if detour
+        else (np.zeros(6), target_qpos)
+    )
+    waypoints = tuple(
+        {"left": value, "right": np.zeros(6)} for value in active_waypoints
+    )
+    path = JointPathPlanResult(
+        status=JointPathStatus.PATH_FOUND,
+        start_qpos_by_component=waypoints[0],
+        target_qpos_by_component=waypoints[-1],
+        movable_components=("left",),
+        waypoints=waypoints,
+        scene_hash=request.obstacle_scene.semantic_content_hash,
+        reason="bounded_search_found_path" if detour else "direct_path_clear",
+        metadata={"direct_path": not detour},
+    )
+    reference = JointFkReferencePlan(
+        status="safe",
+        pose_desk=tuple(np.eye(4) for _ in active_waypoints),
+        qpos_rad=active_waypoints,
+        metadata={"planner": "test"},
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "_MujocoFclObstacleOracle",
+        lambda _control, oracle: oracle,
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "evaluate_motion_target_endpoint",
+        lambda *_args, **_kwargs: (
+            _reachable_endpoint(target_qpos),
+            SimpleNamespace(),
+            SimpleNamespace(q_min=-np.ones(6), q_max=np.ones(6)),
+        ),
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "plan_obstacle_aware_joint_path",
+        lambda *_args, **_kwargs: path,
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "revalidate_obstacle_path",
+        lambda *_args, **_kwargs: {
+            "safe": True,
+            "collision_check_available": True,
+            "reason_code": "final_obstacle_revalidation_safe",
+        },
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "build_collision_checked_multiwaypoint_joint_fk_reference_plan",
+        lambda *_args, **_kwargs: reference,
+    )
+
+    trajectory = build_registered_tcp_obstacle_trajectory(
+        snapshot,
+        request,
+        control_factory=lambda *_args: control,
+        wall_clock=lambda: 10.0,
+    )
+
+    assert trajectory.scene_hash == request.obstacle_scene.semantic_content_hash
+    assert trajectory.initial_snapshot is snapshot
+    assert trajectory.moving_sides == ("left",)
+    assert len(trajectory.points) == len(active_waypoints)
+    assert trajectory.points[-1].time_from_start_sec == pytest.approx(
+        (len(active_waypoints) - 1) / 20.0
+    )
+    np.testing.assert_array_equal(
+        trajectory.points[-1].qpos_by_side["left"], target_qpos
+    )
+    np.testing.assert_array_equal(
+        trajectory.points[-1].qpos_by_side["right"], np.zeros(6)
+    )
+    assert control.closed is True
+
+
+@pytest.mark.parametrize(
+    ("endpoint_status", "expected_reason"),
+    (
+        (
+            GraspReachabilityStatus.KINEMATICALLY_UNREACHABLE,
+            "kinematically_unreachable",
+        ),
+        (GraspReachabilityStatus.IK_SEARCH_EXHAUSTED, "ik_search_exhausted"),
+        (GraspReachabilityStatus.COLLISION_BLOCKED, "collision_blocked"),
+    ),
+)
+def test_real_tcp_builder_preserves_endpoint_failure_classification(
+    monkeypatch,
+    endpoint_status: GraspReachabilityStatus,
+    expected_reason: str,
+) -> None:
+    request = _obstacle_request()
+    control = _PlanningControl(request.obstacle_scene.semantic_content_hash)
+    endpoint = GraspReachabilityReceipt(
+        status=endpoint_status,
+        reason_code="typed_endpoint_reason",
+        proof_scope="test",
+        reference_frame_id="rm65.single_arm_urdf_model_base",
+        reference_frame_spec_hash="0" * 64,
+        target_pose=None,
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "_MujocoFclObstacleOracle",
+        lambda _control, oracle: oracle,
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "evaluate_motion_target_endpoint",
+        lambda *_args, **_kwargs: (endpoint, SimpleNamespace(), SimpleNamespace()),
+    )
+
+    with pytest.raises(MujocoShadowTrajectoryPreparationError) as raised:
+        build_registered_tcp_obstacle_trajectory(
+            _snapshot(),
+            request,
+            control_factory=lambda *_args: control,
+        )
+
+    assert raised.value.reason_codes == (expected_reason, "typed_endpoint_reason")
+    assert control.closed is True
+
+
+@pytest.mark.parametrize(
+    ("path_status", "expected_reason"),
+    (
+        (JointPathStatus.START_BLOCKED, "path_start_collision_blocked"),
+        (JointPathStatus.TARGET_BLOCKED, "path_target_collision_blocked"),
+        (JointPathStatus.PATH_SEARCH_EXHAUSTED, "path_search_exhausted"),
+        (
+            JointPathStatus.COLLISION_CHECK_UNAVAILABLE,
+            "path_collision_check_unavailable",
+        ),
+        (JointPathStatus.INVALID_REQUEST, "path_planner_invalid_request"),
+    ),
+)
+def test_real_tcp_builder_preserves_path_failure_classification(
+    monkeypatch,
+    path_status: JointPathStatus,
+    expected_reason: str,
+) -> None:
+    snapshot = _snapshot()
+    request = _obstacle_request()
+    control = _PlanningControl(request.obstacle_scene.semantic_content_hash)
+    target_qpos = np.full(6, 0.2)
+    path = JointPathPlanResult(
+        status=path_status,
+        start_qpos_by_component=snapshot.qpos_by_side,
+        target_qpos_by_component={"left": target_qpos, "right": np.zeros(6)},
+        movable_components=("left",),
+        scene_hash=request.obstacle_scene.semantic_content_hash,
+        reason="typed_path_reason",
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "_MujocoFclObstacleOracle",
+        lambda _control, oracle: oracle,
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "evaluate_motion_target_endpoint",
+        lambda *_args, **_kwargs: (
+            _reachable_endpoint(target_qpos),
+            SimpleNamespace(),
+            SimpleNamespace(q_min=-np.ones(6), q_max=np.ones(6)),
+        ),
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "plan_obstacle_aware_joint_path",
+        lambda *_args, **_kwargs: path,
+    )
+
+    with pytest.raises(MujocoShadowTrajectoryPreparationError) as raised:
+        build_registered_tcp_obstacle_trajectory(
+            snapshot,
+            request,
+            control_factory=lambda *_args: control,
+        )
+
+    assert raised.value.reason_codes == (expected_reason, "typed_path_reason")
+    assert control.closed is True
+
+
+def test_real_tcp_builder_rejects_final_revalidation_collision(
+    monkeypatch,
+) -> None:
+    snapshot = _snapshot()
+    request = _obstacle_request()
+    control = _PlanningControl(request.obstacle_scene.semantic_content_hash)
+    target_qpos = np.full(6, 0.2)
+    waypoints = (
+        {"left": np.zeros(6), "right": np.zeros(6)},
+        {"left": target_qpos, "right": np.zeros(6)},
+    )
+    path = JointPathPlanResult(
+        status=JointPathStatus.PATH_FOUND,
+        start_qpos_by_component=waypoints[0],
+        target_qpos_by_component=waypoints[-1],
+        movable_components=("left",),
+        waypoints=waypoints,
+        scene_hash=request.obstacle_scene.semantic_content_hash,
+        reason="direct_path_clear",
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "_MujocoFclObstacleOracle",
+        lambda _control, oracle: oracle,
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "evaluate_motion_target_endpoint",
+        lambda *_args, **_kwargs: (
+            _reachable_endpoint(target_qpos),
+            SimpleNamespace(),
+            SimpleNamespace(q_min=-np.ones(6), q_max=np.ones(6)),
+        ),
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "plan_obstacle_aware_joint_path",
+        lambda *_args, **_kwargs: path,
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "revalidate_obstacle_path",
+        lambda *_args, **_kwargs: {
+            "safe": False,
+            "collision_check_available": True,
+            "reason_code": "final_obstacle_revalidation_blocked",
+        },
+    )
+
+    with pytest.raises(MujocoShadowTrajectoryPreparationError) as raised:
+        build_registered_tcp_obstacle_trajectory(
+            snapshot,
+            request,
+            control_factory=lambda *_args: control,
+        )
+
+    assert raised.value.reason_codes == (
+        "final_obstacle_revalidation_blocked",
+    )
+    assert control.closed is True
+
+
+def test_typed_preparation_failure_reaches_acceptance_receipt() -> None:
+    sim_calls: list[str] = []
+    receipt, _control = _run(
+        trajectory_builder=lambda _snapshot: (
+            _ for _ in ()
+        ).throw(
+            MujocoShadowTrajectoryPreparationError(
+                "path_search_exhausted",
+                additional_reason_codes=("bounded_search_exhausted",),
+            )
+        ),
+        simulation_control_factory=lambda snapshot: sim_calls.append(
+            snapshot.semantic_content_hash
+        ),
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.TRAJECTORY_PREPARATION_FAILED
+    assert receipt.reason_codes == (
+        "path_search_exhausted",
+        "bounded_search_exhausted",
+    )
+    assert sim_calls == []

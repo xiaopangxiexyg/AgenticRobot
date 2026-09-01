@@ -337,6 +337,16 @@ def run_real_shadow_acceptance(
             raise ValueError("trajectory is not bound to the captured snapshot.")
     except Exception as exc:  # noqa: BLE001 - compile a typed terminal receipt.
         evidence.append(_error_evidence("trajectory_preparation", exc))
+        raw_reason_codes = getattr(exc, "reason_codes", ())
+        if not isinstance(raw_reason_codes, (tuple, list)):
+            raw_reason_codes = ()
+        reason_codes = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in raw_reason_codes
+                if str(value).strip()
+            )
+        ) or ("trajectory_preparation_failed",)
         return RealShadowAcceptanceReceipt(
             status=RealShadowAcceptanceStatus.TRAJECTORY_PREPARATION_FAILED,
             snapshot_hash=snapshot.semantic_content_hash,
@@ -346,6 +356,7 @@ def run_real_shadow_acceptance(
             real_motion_disposition=RealMotionDisposition.NONE,
             terminal_hold_confirmed=False,
             evidence_refs=tuple(evidence),
+            reason_codes=reason_codes,
         )
     evidence.append(f"registered-shadow-trajectory:{trajectory.semantic_content_hash}")
 
