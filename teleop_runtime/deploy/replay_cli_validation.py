@@ -1,28 +1,14 @@
 """Pure replay-related CLI admission checks for policy deployment.
 
 The deployment facade keeps the call sites in their historical validation
-order, while this module owns only replay-window, source-selection, and
-prediction-mode checks.  It does not load datasets, create workers, inspect
-devices, or dispatch actions.
+order, while this module owns only replay-window and source-selection checks.
+It does not load datasets, create workers, inspect devices, or dispatch
+actions.
 """
 
 from __future__ import annotations
 
 import argparse
-
-
-def validate_replay_prediction_mode(
-    args: argparse.Namespace, *, threaded_prediction: bool
-) -> None:
-    """Reject threaded prediction when dataset replay owns the transaction."""
-
-    if threaded_prediction and (
-        args.debug_replay_dataset is not None or args.debug_replay_parquet is not None
-    ):
-        raise ValueError(
-            "dataset replay owns prediction transactions and must use "
-            "--policy-prediction-mode synchronous."
-        )
 
 
 def validate_debug_replay_chunk_size(args: argparse.Namespace) -> None:
@@ -72,5 +58,4 @@ def validate_debug_replay_window_and_sources(args: argparse.Namespace) -> None:
 __all__ = [
     "validate_debug_replay_chunk_size",
     "validate_debug_replay_window_and_sources",
-    "validate_replay_prediction_mode",
 ]

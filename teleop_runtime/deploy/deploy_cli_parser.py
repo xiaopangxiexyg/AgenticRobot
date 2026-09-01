@@ -100,8 +100,6 @@ from robot_motion.deploy.observation import (
     build_deployment_observation,
 )
 
-from robot_motion.deploy.prediction_worker import ThreadedPolicyPredictionWorker
-
 from robot_motion.deploy.pose_adapter import (
     convert_policy_absolute_vector_to_runtime_raw,
 )
@@ -1233,27 +1231,6 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "During a synchronous policy inference gap, freeze each RM65 impedance arm "
             "at its latest measured qpos while retaining force monitoring (default: enabled)."
-        ),
-    )
-    parser.add_argument(
-        "--policy-prediction-mode",
-        choices=("synchronous", "threaded-prefetch"),
-        default="synchronous",
-        help=(
-            "Prediction scheduling for the legacy action queue. synchronous "
-            "preserves the compatibility path; threaded-prefetch runs only "
-            "model inference on one bounded worker while the control thread "
-            "retains queue admission, safety and dispatch authority."
-        ),
-    )
-    parser.add_argument(
-        "--policy-prediction-prefetch-queue-threshold",
-        type=_non_negative_int,
-        default=4,
-        metavar="ACTIONS",
-        help=(
-            "Submit the next threaded prediction when at most this many "
-            "admitted actions remain (default: 4)."
         ),
     )
     parser.add_argument(
