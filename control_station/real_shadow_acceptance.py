@@ -69,6 +69,8 @@ class RegisteredTrajectoryReplayPorts(Protocol):
 
     def hold(self, reason: str): ...
 
+    def verify_terminal_tool_tcp(self, snapshot): ...
+
 
 @dataclass(frozen=True)
 class RealShadowAcceptanceReceipt:
@@ -122,8 +124,12 @@ class RealShadowAcceptanceReceipt:
             is not RegisteredTrajectoryRealReplayStatus.COMPLETED
             or self.real_motion_disposition is not RealMotionDisposition.EXECUTED
             or not self.terminal_hold_confirmed
+            or self.real_replay_receipt.terminal_tool_tcp_verification is None
+            or not self.real_replay_receipt.terminal_tool_tcp_verification.verified
         ):
-            raise ValueError("completed real replay requires executed motion and HOLD.")
+            raise ValueError(
+                "completed real replay requires executed motion, terminal TCP, and HOLD."
+            )
         object.__setattr__(self, "snapshot_hash", snapshot_hash)
         object.__setattr__(self, "trajectory_hash", trajectory_hash)
         object.__setattr__(self, "evidence_refs", refs)
@@ -561,6 +567,12 @@ def run_real_shadow_acceptance(
             current_snapshot_provider=ports.current_snapshot,
             point_dispatcher=ports.dispatch_point,
             hold_controller=ports.hold,
+            terminal_tool_tcp_verifier=getattr(
+                ports,
+                "verify_terminal_tool_tcp",
+                None,
+            ),
+            terminal_tool_tcp_verification_required=True,
             authority=authority,
             consume_execution_authority=consume_execution_authority,
             begin_replay_session=ports.begin_replay_session,
@@ -609,6 +621,8 @@ def run_real_shadow_acceptance(
         and real_receipt.executed_point_count == len(trajectory.points)
         and real_receipt.real_motion_executed
         and real_receipt.terminal_hold_confirmed
+        and real_receipt.terminal_tool_tcp_verification is not None
+        and real_receipt.terminal_tool_tcp_verification.verified
     )
     uncertain_failure = real_receipt.status in {
         RegisteredTrajectoryRealReplayStatus.DISPATCH_FAILED,
@@ -639,6 +653,13 @@ def run_real_shadow_acceptance(
         and real_receipt.executed_point_count != len(trajectory.points)
     ):
         real_reasons.append("real_executed_point_count_mismatch")
+    if real_receipt.terminal_tool_tcp_verification is None:
+        real_reasons.append("terminal_tool_tcp_verification_missing")
+    elif not real_receipt.terminal_tool_tcp_verification.verified:
+        real_reasons.append(
+            "terminal_tool_tcp_"
+            + real_receipt.terminal_tool_tcp_verification.status.value
+        )
     return RealShadowAcceptanceReceipt(
         status=(
             RealShadowAcceptanceStatus.REAL_REPLAY_COMPLETED

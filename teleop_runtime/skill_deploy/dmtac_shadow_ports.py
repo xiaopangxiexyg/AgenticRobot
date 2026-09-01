@@ -16,7 +16,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
+import numpy as np
+
 from dataset_contracts.canonical_encoding import canonical_content_hash
+from robot_motion.pose import pose_delta_metrics
 from robot_motion.runtime import EffectorCommand, TeleopCommand, TeleopObservation
 from robot_motion.shadow_execution import (
     AuthoritativeRobotStateSnapshot,
@@ -35,6 +38,8 @@ from .registered_trajectory import (
     MeasuredGripperBackend,
     RegisteredTrajectoryAuthorityConsumptionReceipt,
     RegisteredTrajectoryPointDispatchReceipt,
+    TerminalToolTcpVerificationReceipt,
+    TerminalToolTcpVerificationStatus,
     capture_authoritative_shadow_state_from_backends,
     read_measured_gripper_state_cut,
 )
@@ -59,6 +64,17 @@ class StartedRM65ShadowPorts(Protocol):
     def hold(self, reason: str) -> RealSkillMotionHoldReceipt: ...
 
 
+class RM65ToolTcpWorldFk(Protocol):
+    """The exact lower target-builder FK already bound to the RM65 tool TCP."""
+
+    def tool_tcp_world_targets_for_qpos_pair(
+        self,
+        *,
+        left_qpos: np.ndarray,
+        right_qpos: np.ndarray,
+    ) -> Mapping[str, np.ndarray]: ...
+
+
 def _finite(value: object, *, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be numeric.")
@@ -75,12 +91,16 @@ class DMTacShadowReplayPortProfile:
     maximum_inter_gripper_skew_sec: float = 0.05
     maximum_arm_gripper_skew_sec: float = 0.1
     maximum_gripper_hold_drift: float = 0.02
+    terminal_tcp_position_tolerance_m: float = 0.002
+    terminal_tcp_orientation_tolerance_deg: float = 0.5
 
     def __post_init__(self) -> None:
         for name in (
             "maximum_inter_gripper_skew_sec",
             "maximum_arm_gripper_skew_sec",
             "maximum_gripper_hold_drift",
+            "terminal_tcp_position_tolerance_m",
+            "terminal_tcp_orientation_tolerance_deg",
         ):
             value = _finite(getattr(self, name), name=name)
             if value < 0.0:
@@ -98,6 +118,9 @@ class DMTacRM65RegisteredTrajectoryPorts:
         identity: ShadowExecutionIdentity,
         rm65_ports: StartedRM65ShadowPorts,
         dmtac_backends_by_side: Mapping[str, MeasuredGripperBackend],
+        tool_tcp_world_fk: RM65ToolTcpWorldFk,
+        target_tool_tcp_world_by_side: Mapping[str, np.ndarray],
+        target_reference_frame_id: str,
         profile: DMTacShadowReplayPortProfile | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -115,10 +138,37 @@ class DMTacRM65RegisteredTrajectoryPorts:
             )
         if not callable(clock):
             raise TypeError("clock must be callable.")
+        fk_method = getattr(
+            tool_tcp_world_fk,
+            "tool_tcp_world_targets_for_qpos_pair",
+            None,
+        )
+        if not callable(fk_method):
+            raise TypeError(
+                "tool_tcp_world_fk must expose "
+                "tool_tcp_world_targets_for_qpos_pair()."
+            )
+        targets = {
+            str(side).strip().lower(): self._pose(
+                value,
+                name=f"target_tool_tcp_world_by_side.{side}",
+            )
+            for side, value in dict(target_tool_tcp_world_by_side).items()
+        }
+        if set(targets) != set(trajectory.moving_sides):
+            raise ValueError(
+                "terminal TCP targets must contain exactly trajectory.moving_sides."
+            )
+        frame_id = str(target_reference_frame_id).strip()
+        if not frame_id:
+            raise ValueError("target_reference_frame_id must be non-empty.")
         self.trajectory = trajectory
         self.identity = identity
         self.rm65_ports = rm65_ports
         self.dmtac_backends_by_side = backends
+        self.tool_tcp_world_fk = tool_tcp_world_fk
+        self.target_tool_tcp_world_by_side = targets
+        self.target_reference_frame_id = frame_id
         self.profile = profile or DMTacShadowReplayPortProfile()
         self.clock = clock
         self._point_hashes = {
@@ -132,6 +182,82 @@ class DMTacRM65RegisteredTrajectoryPorts:
             RegisteredTrajectoryAuthorityConsumptionReceipt | None
         ) = None
         self._next_point_index = 0
+
+    @staticmethod
+    def _pose(value: object, *, name: str) -> np.ndarray:
+        pose = np.asarray(value, dtype=float).copy()
+        if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+            raise ValueError(f"{name} must be a finite 4x4 pose.")
+        if (
+            not np.allclose(pose[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9)
+            or not np.allclose(
+                pose[:3, :3].T @ pose[:3, :3],
+                np.eye(3),
+                atol=1e-6,
+            )
+            or not np.isclose(np.linalg.det(pose[:3, :3]), 1.0, atol=1e-6)
+        ):
+            raise ValueError(f"{name} must be a rigid pose.")
+        pose.setflags(write=False)
+        return pose
+
+    def verify_terminal_tool_tcp(
+        self,
+        snapshot: AuthoritativeRobotStateSnapshot,
+    ) -> TerminalToolTcpVerificationReceipt:
+        """Evaluate the original requested tool TCP from the measured qpos cut."""
+
+        if not isinstance(snapshot, AuthoritativeRobotStateSnapshot):
+            raise TypeError("snapshot must be AuthoritativeRobotStateSnapshot.")
+        if (
+            snapshot.identity.semantic_content_hash
+            != self.trajectory.initial_snapshot.identity.semantic_content_hash
+        ):
+            raise RuntimeError("terminal TCP snapshot identity changed.")
+        observed_raw = self.tool_tcp_world_fk.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=snapshot.qpos_by_side["left"],
+            right_qpos=snapshot.qpos_by_side["right"],
+        )
+        if not isinstance(observed_raw, Mapping):
+            raise TypeError("tool TCP FK must return a side mapping.")
+        position: dict[str, float] = {}
+        orientation: dict[str, float] = {}
+        for side in self.trajectory.moving_sides:
+            if side not in observed_raw:
+                raise RuntimeError(f"tool TCP FK is missing {side}.")
+            observed = self._pose(
+                observed_raw[side],
+                name=f"observed_tool_tcp_world_by_side.{side}",
+            )
+            position[side], orientation[side] = pose_delta_metrics(
+                observed,
+                self.target_tool_tcp_world_by_side[side],
+            )
+        within = all(
+            position[side]
+            <= self.profile.terminal_tcp_position_tolerance_m
+            and orientation[side]
+            <= self.profile.terminal_tcp_orientation_tolerance_deg
+            for side in position
+        )
+        return TerminalToolTcpVerificationReceipt(
+            status=(
+                TerminalToolTcpVerificationStatus.VERIFIED
+                if within
+                else TerminalToolTcpVerificationStatus.TARGET_MISMATCH
+            ),
+            frame_id=self.target_reference_frame_id,
+            observed_snapshot_hash=snapshot.semantic_content_hash,
+            position_error_m_by_side=position,
+            orientation_error_deg_by_side=orientation,
+            position_tolerance_m=(
+                self.profile.terminal_tcp_position_tolerance_m
+            ),
+            orientation_tolerance_deg=(
+                self.profile.terminal_tcp_orientation_tolerance_deg
+            ),
+            evidence_refs=snapshot.arm_evidence_refs,
+        )
 
     def begin_replay_session(
         self,
@@ -422,5 +548,6 @@ class DMTacRM65RegisteredTrajectoryPorts:
 __all__ = [
     "DMTacRM65RegisteredTrajectoryPorts",
     "DMTacShadowReplayPortProfile",
+    "RM65ToolTcpWorldFk",
     "StartedRM65ShadowPorts",
 ]

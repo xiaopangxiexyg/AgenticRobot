@@ -59,6 +59,16 @@ class RegisteredTrajectoryPointDispatcher(Protocol):
     ) -> RegisteredTrajectoryPointDispatchReceipt: ...
 
 
+class TerminalToolTcpVerifier(Protocol):
+    """Verify a fresh measured-qpos cut against the requested tool TCP."""
+
+    def __call__(
+        self,
+        snapshot: AuthoritativeRobotStateSnapshot,
+        /,
+    ) -> TerminalToolTcpVerificationReceipt: ...
+
+
 def _finite(value: object, *, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be numeric.")
@@ -362,6 +372,102 @@ class RegisteredTrajectoryPointDispatchReceipt:
         object.__setattr__(self, "evidence_refs", refs)
 
 
+class TerminalToolTcpVerificationStatus(str, Enum):
+    VERIFIED = "verified"
+    TARGET_MISMATCH = "target_mismatch"
+    VERIFICATION_UNAVAILABLE = "verification_unavailable"
+
+
+@dataclass(frozen=True)
+class TerminalToolTcpVerificationReceipt:
+    """Terminal TCP error computed from one fresh real hardware-qpos cut.
+
+    This is an endpoint measurement receipt, not another model/asset identity
+    attestation.  The caller supplies the original requested tool-TCP target;
+    the verifier must not substitute FK of the planned terminal qpos as the
+    target because that would merely restate joint tracking.
+    """
+
+    status: TerminalToolTcpVerificationStatus
+    frame_id: str
+    observed_snapshot_hash: str
+    position_error_m_by_side: Mapping[str, float]
+    orientation_error_deg_by_side: Mapping[str, float]
+    position_tolerance_m: float
+    orientation_tolerance_deg: float
+    evidence_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, TerminalToolTcpVerificationStatus):
+            raise TypeError("status must be TerminalToolTcpVerificationStatus.")
+        frame_id = str(self.frame_id).strip()
+        snapshot_hash = str(self.observed_snapshot_hash).strip()
+        if not frame_id or not snapshot_hash:
+            raise ValueError("frame_id and observed_snapshot_hash must be non-empty.")
+        position = {
+            str(side).strip(): _finite(value, name=f"position_error_m_by_side.{side}")
+            for side, value in dict(self.position_error_m_by_side).items()
+        }
+        orientation = {
+            str(side).strip(): _finite(
+                value,
+                name=f"orientation_error_deg_by_side.{side}",
+            )
+            for side, value in dict(self.orientation_error_deg_by_side).items()
+        }
+        if set(position) != set(orientation):
+            raise ValueError(
+                "terminal TCP errors must contain the same side set."
+            )
+        if (
+            self.status
+            is not TerminalToolTcpVerificationStatus.VERIFICATION_UNAVAILABLE
+            and not position
+        ):
+            raise ValueError("available terminal TCP verification requires a side.")
+        if any(not side for side in position) or any(
+            value < 0.0 for value in (*position.values(), *orientation.values())
+        ):
+            raise ValueError("terminal TCP sides and errors must be valid.")
+        position_tolerance = _finite(
+            self.position_tolerance_m,
+            name="position_tolerance_m",
+        )
+        orientation_tolerance = _finite(
+            self.orientation_tolerance_deg,
+            name="orientation_tolerance_deg",
+        )
+        if position_tolerance < 0.0 or orientation_tolerance < 0.0:
+            raise ValueError("terminal TCP tolerances must be non-negative.")
+        refs = tuple(sorted({str(value).strip() for value in self.evidence_refs}))
+        if not refs or any(not value for value in refs):
+            raise ValueError("terminal TCP verification requires measured evidence.")
+        within = all(
+            position[side] <= position_tolerance
+            and orientation[side] <= orientation_tolerance
+            for side in position
+        )
+        if self.status is TerminalToolTcpVerificationStatus.VERIFIED and not within:
+            raise ValueError("verified terminal TCP receipt exceeds its tolerance.")
+        if self.status is TerminalToolTcpVerificationStatus.TARGET_MISMATCH and within:
+            raise ValueError("target-mismatch receipt must exceed a tolerance.")
+        object.__setattr__(self, "frame_id", frame_id)
+        object.__setattr__(self, "observed_snapshot_hash", snapshot_hash)
+        object.__setattr__(self, "position_error_m_by_side", MappingProxyType(position))
+        object.__setattr__(
+            self,
+            "orientation_error_deg_by_side",
+            MappingProxyType(orientation),
+        )
+        object.__setattr__(self, "position_tolerance_m", position_tolerance)
+        object.__setattr__(self, "orientation_tolerance_deg", orientation_tolerance)
+        object.__setattr__(self, "evidence_refs", refs)
+
+    @property
+    def verified(self) -> bool:
+        return self.status is TerminalToolTcpVerificationStatus.VERIFIED
+
+
 class RegisteredTrajectoryRealReplayStatus(str, Enum):
     COMPLETED = "completed"
     EXECUTION_DISABLED = "execution_disabled"
@@ -371,6 +477,8 @@ class RegisteredTrajectoryRealReplayStatus(str, Enum):
     TIMELINE_DEADLINE_MISSED = "timeline_deadline_missed"
     DISPATCH_FAILED = "dispatch_failed"
     FINAL_TRACKING_TIMEOUT = "final_tracking_timeout"
+    FINAL_TCP_TARGET_MISMATCH = "final_tcp_target_mismatch"
+    FINAL_TCP_VERIFICATION_UNAVAILABLE = "final_tcp_verification_unavailable"
     GRIPPER_HOLD_DRIFT = "gripper_hold_drift"
     LOWER_PORT_ERROR = "lower_port_error"
     TERMINAL_HOLD_FAILED = "terminal_hold_failed"
@@ -387,6 +495,7 @@ class RegisteredTrajectoryRealReplayReceipt:
     real_motion_executed: bool
     evidence_refs: tuple[str, ...]
     real_motion_may_have_executed: bool = False
+    terminal_tool_tcp_verification: TerminalToolTcpVerificationReceipt | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, RegisteredTrajectoryRealReplayStatus):
@@ -405,6 +514,13 @@ class RegisteredTrajectoryRealReplayReceipt:
             raise TypeError("real_motion_executed must be boolean.")
         if not isinstance(self.real_motion_may_have_executed, bool):
             raise TypeError("real_motion_may_have_executed must be boolean.")
+        if self.terminal_tool_tcp_verification is not None and not isinstance(
+            self.terminal_tool_tcp_verification,
+            TerminalToolTcpVerificationReceipt,
+        ):
+            raise TypeError(
+                "terminal_tool_tcp_verification must be a typed receipt."
+            )
         refs = tuple(sorted({str(value).strip() for value in self.evidence_refs}))
         if not refs or any(not value for value in refs):
             raise ValueError("real replay receipt requires lower evidence.")
@@ -414,6 +530,10 @@ class RegisteredTrajectoryRealReplayReceipt:
             or not self.terminal_hold_confirmed
             or not self.real_motion_executed
             or self.real_motion_may_have_executed
+            or (
+                self.terminal_tool_tcp_verification is not None
+                and not self.terminal_tool_tcp_verification.verified
+            )
         ):
             raise ValueError("completed real replay requires admission, motion, and HOLD.")
         object.__setattr__(self, "evidence_refs", refs)
@@ -538,6 +658,8 @@ def execute_registered_shadow_trajectory_with_ports(
     current_snapshot_provider: Callable[[], AuthoritativeRobotStateSnapshot],
     point_dispatcher: RegisteredTrajectoryPointDispatcher,
     hold_controller: Callable[[str], RealSkillMotionHoldReceipt],
+    terminal_tool_tcp_verifier: TerminalToolTcpVerifier | None = None,
+    terminal_tool_tcp_verification_required: bool = False,
     authority: RegisteredTrajectoryExecutionAuthority | None = None,
     consume_execution_authority: (
         Callable[
@@ -588,6 +710,12 @@ def execute_registered_shadow_trajectory_with_ports(
     ):
         if not callable(callback):
             raise TypeError(f"{name} must be callable.")
+    if terminal_tool_tcp_verifier is not None and not callable(
+        terminal_tool_tcp_verifier
+    ):
+        raise TypeError("terminal_tool_tcp_verifier must be callable when present.")
+    if not isinstance(terminal_tool_tcp_verification_required, bool):
+        raise TypeError("terminal_tool_tcp_verification_required must be boolean.")
     if not isinstance(execution_enabled, bool):
         raise TypeError("execution_enabled must be boolean.")
     scene_hash = str(current_scene_hash).strip()
@@ -663,6 +791,7 @@ def execute_registered_shadow_trajectory_with_ports(
     evidence = [f"shadow-replay-admission:{admission.semantic_content_hash}"]
 
     session_active = False
+    terminal_tcp_receipt: TerminalToolTcpVerificationReceipt | None = None
 
     def terminal_hold(reason: str) -> bool:
         try:
@@ -741,6 +870,7 @@ def execute_registered_shadow_trajectory_with_ports(
             real_motion_executed=executed_count > 0,
             evidence_refs=tuple(evidence),
             real_motion_may_have_executed=bool(motion_may_have_executed),
+            terminal_tool_tcp_verification=terminal_tcp_receipt,
         )
 
     def lower_port_error(
@@ -780,6 +910,23 @@ def execute_registered_shadow_trajectory_with_ports(
             RegisteredTrajectoryRealReplayStatus.EXECUTION_DISABLED,
             executed_count=0,
             hold_reason="registered shadow replay execution disabled",
+        )
+    if terminal_tool_tcp_verification_required and not callable(
+        terminal_tool_tcp_verifier
+    ):
+        evidence.append(
+            "pre-dispatch-state-rejected:"
+            + canonical_content_hash(
+                {"reason_codes": ("terminal_tool_tcp_verifier_missing",)},
+                domain="agenticrobot.shadow_execution.pre_dispatch_state.v1",
+            )
+        )
+        return terminal(
+            RegisteredTrajectoryRealReplayStatus.PRE_DISPATCH_STATE_REJECTED,
+            executed_count=0,
+            hold_reason=(
+                "registered shadow replay terminal TCP verifier missing"
+            ),
         )
     if not callable(begin_replay_session) or not callable(end_replay_session):
         evidence.append(
@@ -1071,9 +1218,35 @@ def execute_registered_shadow_trajectory_with_ports(
                     executed_count=executed_count,
                     hold_reason="registered shadow replay final gripper drift",
                 )
+            tcp_ready = terminal_tool_tcp_verifier is None
+            if terminal_tool_tcp_verifier is not None:
+                terminal_tcp_receipt = terminal_tool_tcp_verifier(observed)
+                if not isinstance(
+                    terminal_tcp_receipt,
+                    TerminalToolTcpVerificationReceipt,
+                ):
+                    raise TypeError(
+                        "terminal_tool_tcp_verifier must return "
+                        "TerminalToolTcpVerificationReceipt."
+                    )
+                evidence.extend(terminal_tcp_receipt.evidence_refs)
+                if terminal_tcp_receipt.status is (
+                    TerminalToolTcpVerificationStatus.VERIFICATION_UNAVAILABLE
+                ):
+                    return terminal(
+                        RegisteredTrajectoryRealReplayStatus.
+                        FINAL_TCP_VERIFICATION_UNAVAILABLE,
+                        executed_count=executed_count,
+                        hold_reason=(
+                            "registered shadow replay terminal TCP "
+                            "verification unavailable"
+                        ),
+                    )
+                tcp_ready = terminal_tcp_receipt.verified
             tracking_ready = bool(
                 final_error <= final_tolerance
                 and maximum_velocity <= final_velocity_tolerance
+                and tcp_ready
             )
             if tracking_ready:
                 if dwell_started_at is None:
@@ -1090,6 +1263,21 @@ def execute_registered_shadow_trajectory_with_ports(
                     hold_reason="registered shadow replay completed",
                 )
             if current_monotonic >= deadline:
+                if (
+                    terminal_tcp_receipt is not None
+                    and terminal_tcp_receipt.status
+                    is TerminalToolTcpVerificationStatus.TARGET_MISMATCH
+                    and final_error <= final_tolerance
+                    and maximum_velocity <= final_velocity_tolerance
+                ):
+                    return terminal(
+                        RegisteredTrajectoryRealReplayStatus.
+                        FINAL_TCP_TARGET_MISMATCH,
+                        executed_count=executed_count,
+                        hold_reason=(
+                            "registered shadow replay terminal TCP target mismatch"
+                        ),
+                    )
                 return terminal(
                     RegisteredTrajectoryRealReplayStatus.FINAL_TRACKING_TIMEOUT,
                     executed_count=executed_count,
@@ -1117,6 +1305,9 @@ __all__ = [
     "RegisteredTrajectoryRealReplayReceipt",
     "RegisteredTrajectoryRealReplayStatus",
     "SingleUseRegisteredTrajectoryAuthorityConsumer",
+    "TerminalToolTcpVerificationReceipt",
+    "TerminalToolTcpVerificationStatus",
+    "TerminalToolTcpVerifier",
     "capture_authoritative_shadow_state_from_backends",
     "execute_registered_shadow_trajectory_with_ports",
     "read_measured_gripper_state_cut",

@@ -12,6 +12,7 @@ from .control_runtime import (
 from .dmtac_shadow_ports import (
     DMTacRM65RegisteredTrajectoryPorts,
     DMTacShadowReplayPortProfile,
+    RM65ToolTcpWorldFk,
     StartedRM65ShadowPorts,
 )
 from .motion_port import (
@@ -34,6 +35,8 @@ from .registered_trajectory import (
     RegisteredTrajectoryAuthorityConsumptionStatus,
     RegisteredTrajectoryExecutionAuthority,
     SingleUseRegisteredTrajectoryAuthorityConsumer,
+    TerminalToolTcpVerificationReceipt,
+    TerminalToolTcpVerificationStatus,
     capture_authoritative_shadow_state_from_backends,
     read_measured_gripper_state_cut,
 )
@@ -83,6 +86,7 @@ __all__ = [
     "RM65SkillTargetBuilder",
     "RM65SkillTargetBuilderFactory",
     "RM65SkillTargetSafetyBuilder",
+    "RM65ToolTcpWorldFk",
     "RealAgentMotionActivation",
     "RealAgentMotionMeasuredPoseCut",
     "RealAgentMotionOwnerCut",
@@ -105,6 +109,8 @@ __all__ = [
     "ResolvedExclusiveRM65SkillDeploymentProfile",
     "SingleUseRegisteredTrajectoryAuthorityConsumer",
     "StartedRM65ShadowPorts",
+    "TerminalToolTcpVerificationReceipt",
+    "TerminalToolTcpVerificationStatus",
     "assemble_exclusive_rm65_skill_lower",
     "build_exclusive_rm65_skill_position_force_guard",
     "capture_authoritative_shadow_state_from_backends",
