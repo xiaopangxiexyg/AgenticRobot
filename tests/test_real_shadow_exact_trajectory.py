@@ -30,6 +30,8 @@ from teleop_runtime.skill_deploy.registered_trajectory import (
     RegisteredTrajectoryPointDispatchReceipt,
     RegisteredTrajectoryRealReplayStatus,
     SingleUseRegisteredTrajectoryAuthorityConsumer,
+    TerminalToolTcpVerificationReceipt,
+    TerminalToolTcpVerificationStatus,
     capture_authoritative_shadow_state_from_backends,
     execute_registered_shadow_trajectory_with_ports,
     read_measured_gripper_state_cut,
@@ -214,6 +216,52 @@ def _trajectory():
                 qpos_by_side=final,
             ),
         ),
+    )
+
+
+class _ToolTcpWorldFk:
+    def __init__(self):
+        self.calls: list[dict[str, np.ndarray]] = []
+
+    def tool_tcp_world_targets_for_qpos_pair(self, *, left_qpos, right_qpos):
+        qpos_by_side = {
+            "left": np.asarray(left_qpos, dtype=float).copy(),
+            "right": np.asarray(right_qpos, dtype=float).copy(),
+        }
+        self.calls.append(qpos_by_side)
+        result = {}
+        for side, qpos in qpos_by_side.items():
+            pose = np.eye(4)
+            pose[0, 3] = qpos[1]
+            result[side] = pose
+        return result
+
+
+def _terminal_target(trajectory):
+    fk = _ToolTcpWorldFk()
+    observed = fk.tool_tcp_world_targets_for_qpos_pair(
+        left_qpos=trajectory.points[-1].qpos_by_side["left"],
+        right_qpos=trajectory.points[-1].qpos_by_side["right"],
+    )
+    return fk, {
+        side: observed[side] for side in trajectory.moving_sides
+    }
+
+
+def _tcp_receipt(snapshot, *, verified=True):
+    return TerminalToolTcpVerificationReceipt(
+        status=(
+            TerminalToolTcpVerificationStatus.VERIFIED
+            if verified
+            else TerminalToolTcpVerificationStatus.TARGET_MISMATCH
+        ),
+        frame_id="dual_arm_solver_world",
+        observed_snapshot_hash=snapshot.semantic_content_hash,
+        position_error_m_by_side={"right": 0.0 if verified else 0.01},
+        orientation_error_deg_by_side={"right": 0.0},
+        position_tolerance_m=0.002,
+        orientation_tolerance_deg=0.5,
+        evidence_refs=snapshot.arm_evidence_refs,
     )
 
 
@@ -418,6 +466,68 @@ def test_mock_real_ports_replay_exact_simulated_points_then_hold() -> None:
     assert receipt.terminal_hold_confirmed is True
     assert receipt.real_motion_executed is True
     assert ports.monotonic >= 0.12
+
+
+def test_required_terminal_tcp_verifier_is_checked_before_authority_or_dispatch():
+    trajectory = _trajectory()
+    simulation = _simulation_receipt(trajectory)
+    ports = _ReplayPorts(trajectory)
+
+    receipt = _execute(
+        ports,
+        trajectory,
+        simulation,
+        terminal_tool_tcp_verification_required=True,
+    )
+
+    assert receipt.status is RegisteredTrajectoryRealReplayStatus.PRE_DISPATCH_STATE_REJECTED
+    assert ports.authority_consumptions == 0
+    assert ports.dispatched == []
+    assert ports.hold_reasons == [
+        "registered shadow replay terminal TCP verifier missing"
+    ]
+
+
+def test_terminal_tcp_must_share_the_tracking_dwell_and_failure_holds():
+    trajectory = _trajectory()
+    simulation = _simulation_receipt(trajectory)
+    ports = _ReplayPorts(trajectory)
+
+    receipt = _execute(
+        ports,
+        trajectory,
+        simulation,
+        terminal_tool_tcp_verifier=lambda snapshot: _tcp_receipt(
+            snapshot,
+            verified=False,
+        ),
+        terminal_tool_tcp_verification_required=True,
+    )
+
+    assert receipt.status is RegisteredTrajectoryRealReplayStatus.FINAL_TCP_TARGET_MISMATCH
+    assert receipt.terminal_tool_tcp_verification is not None
+    assert receipt.terminal_tool_tcp_verification.verified is False
+    assert receipt.executed_point_count == len(trajectory.points)
+    assert receipt.terminal_hold_confirmed is True
+
+
+def test_terminal_tcp_verifier_exception_is_lower_port_error_and_holds():
+    trajectory = _trajectory()
+    simulation = _simulation_receipt(trajectory)
+    ports = _ReplayPorts(trajectory)
+
+    receipt = _execute(
+        ports,
+        trajectory,
+        simulation,
+        terminal_tool_tcp_verifier=lambda _snapshot: (_ for _ in ()).throw(
+            RuntimeError("FK unavailable")
+        ),
+        terminal_tool_tcp_verification_required=True,
+    )
+
+    assert receipt.status is RegisteredTrajectoryRealReplayStatus.LOWER_PORT_ERROR
+    assert receipt.terminal_hold_confirmed is True
 
 
 def test_authority_consumer_is_atomic_single_use_for_sequential_and_concurrent_calls():
@@ -754,6 +864,7 @@ class _StartedRM65Ports:
 
 def _dmtac_replay_ports(*, admitted=True, right_close=0.3, identity=None):
     trajectory = _trajectory()
+    tool_tcp_fk, targets = _terminal_target(trajectory)
     now = 10.0
     rm65 = _StartedRM65Ports(
         trajectory,
@@ -769,6 +880,9 @@ def _dmtac_replay_ports(*, admitted=True, right_close=0.3, identity=None):
         identity=identity or trajectory.initial_snapshot.identity,
         rm65_ports=rm65,
         dmtac_backends_by_side=dmtac,
+        tool_tcp_world_fk=tool_tcp_fk,
+        target_tool_tcp_world_by_side=targets,
+        target_reference_frame_id="dual_arm_solver_world",
         profile=DMTacShadowReplayPortProfile(
             maximum_inter_gripper_skew_sec=0.05,
             maximum_arm_gripper_skew_sec=0.05,
@@ -862,8 +976,35 @@ def test_dmtac_rm65_hold_reports_measured_gripper_drift_without_commanding_it() 
     assert all(backend.read_count == 1 for backend in dmtac.values())
 
 
+def test_dmtac_terminal_tcp_uses_measured_qpos_and_only_the_moving_side() -> None:
+    trajectory, ports, rm65, _ = _dmtac_replay_ports()
+
+    before = ports.verify_terminal_tool_tcp(ports.current_snapshot())
+    assert before.status is TerminalToolTcpVerificationStatus.TARGET_MISMATCH
+    assert set(before.position_error_m_by_side) == {"right"}
+
+    rm65.qpos = {
+        "left": np.ones(6) * 0.4,
+        "right": trajectory.points[-1].qpos_by_side["right"].copy(),
+    }
+    terminal_snapshot = ports.current_snapshot()
+    verified = ports.verify_terminal_tool_tcp(terminal_snapshot)
+
+    assert verified.status is TerminalToolTcpVerificationStatus.VERIFIED
+    assert verified.observed_snapshot_hash == terminal_snapshot.semantic_content_hash
+    np.testing.assert_allclose(
+        ports.tool_tcp_world_fk.calls[-1]["left"],
+        rm65.qpos["left"],
+    )
+    np.testing.assert_allclose(
+        ports.tool_tcp_world_fk.calls[-1]["right"],
+        rm65.qpos["right"],
+    )
+
+
 def test_dmtac_rm65_adapter_completes_injected_exact_replay_without_gripper_command() -> None:
     trajectory = _trajectory()
+    tool_tcp_fk, targets = _terminal_target(trajectory)
     simulation = _simulation_receipt(trajectory)
     clock = {"wall": 10.0, "monotonic": 0.0}
 
@@ -886,6 +1027,9 @@ def test_dmtac_rm65_adapter_completes_injected_exact_replay_without_gripper_comm
         identity=trajectory.initial_snapshot.identity,
         rm65_ports=rm65,
         dmtac_backends_by_side=dmtac,
+        tool_tcp_world_fk=tool_tcp_fk,
+        target_tool_tcp_world_by_side=targets,
+        target_reference_frame_id="dual_arm_solver_world",
         profile=DMTacShadowReplayPortProfile(
             maximum_inter_gripper_skew_sec=0.05,
             maximum_arm_gripper_skew_sec=0.1,
@@ -902,6 +1046,8 @@ def test_dmtac_rm65_adapter_completes_injected_exact_replay_without_gripper_comm
         current_snapshot_provider=ports.current_snapshot,
         point_dispatcher=ports.dispatch_point,
         hold_controller=ports.hold,
+        terminal_tool_tcp_verifier=ports.verify_terminal_tool_tcp,
+        terminal_tool_tcp_verification_required=True,
         authority=_authority(trajectory, simulation),
         consume_execution_authority=_ReplayPorts(
             trajectory
@@ -917,6 +1063,8 @@ def test_dmtac_rm65_adapter_completes_injected_exact_replay_without_gripper_comm
     )
 
     assert receipt.status is RegisteredTrajectoryRealReplayStatus.COMPLETED
+    assert receipt.terminal_tool_tcp_verification is not None
+    assert receipt.terminal_tool_tcp_verification.verified is True
     assert receipt.executed_point_count == len(trajectory.points)
     assert all(
         set(command.commands) == {"left_arm", "right_arm"}

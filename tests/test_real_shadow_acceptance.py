@@ -68,6 +68,8 @@ from teleop_runtime.skill_deploy.registered_trajectory import (
     RegisteredTrajectoryExecutionAuthority,
     RegisteredTrajectoryRealReplayReceipt,
     RegisteredTrajectoryRealReplayStatus,
+    TerminalToolTcpVerificationReceipt,
+    TerminalToolTcpVerificationStatus,
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
@@ -625,6 +627,22 @@ class _ReplayPorts:
             evidence_refs=("real-hold:test",),
         )
 
+    def verify_terminal_tool_tcp(self, snapshot):  # pragma: no cover - fake executor
+        raise AssertionError(snapshot)
+
+
+def _terminal_tcp_verification(snapshot):
+    return TerminalToolTcpVerificationReceipt(
+        status=TerminalToolTcpVerificationStatus.VERIFIED,
+        frame_id="dual_arm_solver_world",
+        observed_snapshot_hash=snapshot.semantic_content_hash,
+        position_error_m_by_side={"right": 0.0},
+        orientation_error_deg_by_side={"right": 0.0},
+        position_tolerance_m=0.002,
+        orientation_tolerance_deg=0.5,
+        evidence_refs=snapshot.arm_evidence_refs,
+    )
+
 
 def test_exact_authority_delegates_to_existing_real_executor_and_reports_completion():
     observed: dict[str, object] = {}
@@ -650,6 +668,9 @@ def test_exact_authority_delegates_to_existing_real_executor_and_reports_complet
             terminal_hold_confirmed=True,
             real_motion_executed=True,
             evidence_refs=("real-replay:test",),
+            terminal_tool_tcp_verification=_terminal_tcp_verification(
+                trajectory.initial_snapshot
+            ),
         )
 
     snapshot = _snapshot()
@@ -688,6 +709,8 @@ def test_exact_authority_delegates_to_existing_real_executor_and_reports_complet
     assert receipt.terminal_hold_domain == "real"
     assert observed["execution_enabled"] is True
     assert observed["current_snapshot_provider"] == ports.current_snapshot
+    assert observed["terminal_tool_tcp_verifier"] == ports.verify_terminal_tool_tcp
+    assert observed["terminal_tool_tcp_verification_required"] is True
 
 
 def test_real_executor_exception_returns_unknown_motion_outcome():
@@ -748,6 +771,9 @@ def test_completed_real_receipt_with_wrong_point_count_is_not_accepted():
             terminal_hold_confirmed=True,
             real_motion_executed=True,
             evidence_refs=("real-replay:incomplete",),
+            terminal_tool_tcp_verification=_terminal_tcp_verification(
+                trajectory.initial_snapshot
+            ),
         )
         observed_receipt["value"] = result
         return result
@@ -778,6 +804,56 @@ def test_completed_real_receipt_with_wrong_point_count_is_not_accepted():
     assert observed_receipt
     assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_FAILED
     assert "real_executed_point_count_mismatch" in receipt.reason_codes
+
+
+def test_completed_real_receipt_without_terminal_tcp_proof_is_rejected():
+    snapshot = _snapshot()
+    trajectory = _trajectory(snapshot)
+    simulation = _simulation(trajectory)
+    authority = RegisteredTrajectoryExecutionAuthority(
+        authority_id="authority:test",
+        operator_confirmation_ref="operator:test",
+        trajectory_hash=trajectory.semantic_content_hash,
+        simulation_receipt_hash=simulation.semantic_content_hash,
+        run_id="run:test",
+        owner_epoch=1,
+        issued_at=10.0,
+        expires_at=10.1,
+    )
+
+    def real_executor(**_kwargs):
+        admission = ShadowReplayAdmissionReceipt(
+            status=ShadowReplayAdmissionStatus.ADMISSIBLE_PREFLIGHT_ONLY,
+            reason_codes=(),
+            current_snapshot_hash=snapshot.semantic_content_hash,
+            trajectory_hash=trajectory.semantic_content_hash,
+            simulation_receipt_hash=simulation.semantic_content_hash,
+            evaluated_at=10.01,
+            maximum_arm_drift_rad=0.0,
+            maximum_gripper_drift=0.0,
+        )
+        return RegisteredTrajectoryRealReplayReceipt(
+            status=RegisteredTrajectoryRealReplayStatus.COMPLETED,
+            admission=admission,
+            executed_point_count=len(trajectory.points),
+            terminal_hold_confirmed=True,
+            real_motion_executed=True,
+            evidence_refs=("real-replay:missing-tcp",),
+        )
+
+    receipt, _ = _run(
+        snapshot=snapshot,
+        simulation_executor=lambda **_kwargs: simulation,
+        real_replay_enabled=True,
+        real_ports_factory=lambda _trajectory: _ReplayPorts(),
+        authority=authority,
+        consume_execution_authority=_consumption,
+        real_replay_executor=real_executor,
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_FAILED
+    assert receipt.real_motion_disposition is RealMotionDisposition.EXECUTED
+    assert "terminal_tool_tcp_verification_missing" in receipt.reason_codes
 
 
 def _obstacle_request() -> RealTcpObstacleTrajectoryRequest:
