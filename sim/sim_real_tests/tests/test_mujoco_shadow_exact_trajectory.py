@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from control_station.real_shadow_acceptance import (
+    RealMotionDisposition,
+    RealShadowAcceptanceStatus,
+    run_real_shadow_acceptance,
+)
 from robot_motion.shadow_execution import (
     AuthoritativeRobotStateSnapshot,
     RegisteredJointTrajectoryPoint,
@@ -131,6 +136,33 @@ def test_exact_registered_qpos_executes_in_mujoco_and_finishes_in_hold() -> None
     assert receipt.exact_planned_qpos_execution_confirmed is True
     assert receipt.model_identity_confirmed is True
     assert receipt.terminal_hold_confirmed is True
+
+
+@pytest.mark.skipif(
+    not DEFAULT_INSPIRE_V3_DUAL_ARM_URDF.is_file(),
+    reason="local canonical Inspire-v3 URDF asset is unavailable",
+)
+def test_application_acceptance_initializes_from_snapshot_and_stops_after_mujoco() -> None:
+    snapshot = _snapshot()
+    real_factory_calls: list[str] = []
+
+    receipt = run_real_shadow_acceptance(
+        snapshot_provider=lambda: snapshot,
+        trajectory_builder=_trajectory,
+        simulation_control_factory=build_shadow_initialized_control,
+        model_binding_provider=lambda _control, trajectory: _binding(
+            trajectory.initial_snapshot.identity
+        ),
+        real_ports_factory=lambda trajectory: real_factory_calls.append(
+            trajectory.semantic_content_hash
+        ),
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.SIMULATION_ACCEPTED_NO_MOTION
+    assert receipt.simulation_receipt.status is ShadowSimulationStatus.COMPLETED
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert receipt.terminal_hold_confirmed is True
+    assert real_factory_calls == []
 
 
 class _Collision:

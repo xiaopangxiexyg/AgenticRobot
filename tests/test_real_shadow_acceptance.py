@@ -1,0 +1,524 @@
+from __future__ import annotations
+
+from dataclasses import replace
+
+import numpy as np
+import pytest
+
+from control_station.real_shadow_acceptance import (
+    RealMotionDisposition,
+    RealShadowAcceptanceStatus,
+    run_real_shadow_acceptance,
+)
+from robot_motion.shadow_execution import (
+    AuthoritativeRobotStateSnapshot,
+    RegisteredJointTrajectoryPoint,
+    RegisteredShadowJointTrajectory,
+    ShadowExecutionIdentity,
+    ShadowReplayAdmissionReceipt,
+    ShadowReplayAdmissionStatus,
+    ShadowSimulationReceipt,
+    ShadowSimulationStatus,
+)
+from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
+    MujocoShadowModelBinding,
+)
+from teleop_runtime.skill_deploy.control_runtime import RealSkillMotionHoldReceipt
+from teleop_runtime.skill_deploy.registered_trajectory import (
+    RegisteredTrajectoryExecutionAuthority,
+    RegisteredTrajectoryRealReplayReceipt,
+    RegisteredTrajectoryRealReplayStatus,
+)
+
+pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def _identity(*, robot_model_hash: str = "robot:test") -> ShadowExecutionIdentity:
+    return ShadowExecutionIdentity(
+        station_revision="station:test",
+        reference_frame_id="desk",
+        reference_frame_spec_hash="frame-spec:test",
+        frame_graph_hash="frame-graph:test",
+        tool_profile_hash_by_side={"left": "tool:left", "right": "tool:right"},
+        robot_model_hash=robot_model_hash,
+        collision_model_hash="collision:test",
+        joint_layout_hash="joint-layout:test",
+        gripper_model_hash="dmtac-cad:test",
+    )
+
+
+def _snapshot(*, identity: ShadowExecutionIdentity | None = None):
+    return AuthoritativeRobotStateSnapshot(
+        qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
+        gripper_close_by_side={"left": 0.2, "right": 0.3},
+        arm_measured_at=9.98,
+        gripper_measured_at_by_side={"left": 9.985, "right": 9.986},
+        available_at=9.99,
+        arm_evidence_refs=("arm-cut:test",),
+        gripper_evidence_refs=("dmtac:left", "dmtac:right"),
+        identity=identity or _identity(),
+    )
+
+
+def _trajectory(snapshot: AuthoritativeRobotStateSnapshot):
+    target = {
+        side: value.copy() for side, value in snapshot.qpos_by_side.items()
+    }
+    target["right"][1] += 0.02
+    return RegisteredShadowJointTrajectory(
+        trajectory_id="trajectory:acceptance-test",
+        created_at=10.0,
+        initial_snapshot=snapshot,
+        scene_hash="scene:test",
+        target_hash="target:test",
+        planner_config_hash="planner:test",
+        moving_sides=("right",),
+        points=(
+            RegisteredJointTrajectoryPoint(
+                time_from_start_sec=0.0,
+                qpos_by_side=snapshot.qpos_by_side,
+            ),
+            RegisteredJointTrajectoryPoint(
+                time_from_start_sec=0.04,
+                qpos_by_side=target,
+            ),
+        ),
+    )
+
+
+def _simulation(
+    trajectory: RegisteredShadowJointTrajectory,
+    *,
+    status: ShadowSimulationStatus = ShadowSimulationStatus.COMPLETED,
+):
+    completed = status is ShadowSimulationStatus.COMPLETED
+    return ShadowSimulationReceipt(
+        trajectory_hash=trajectory.semantic_content_hash,
+        initial_snapshot_hash=trajectory.initial_snapshot.semantic_content_hash,
+        identity_hash=trajectory.initial_snapshot.identity.semantic_content_hash,
+        scene_hash=trajectory.scene_hash,
+        status=status,
+        executed_point_count=len(trajectory.points) if completed else 0,
+        terminal_hold_confirmed=True,
+        exact_planned_qpos_execution_confirmed=completed,
+        model_identity_confirmed=True,
+        evidence_refs=(f"simulation:{status.value}",),
+    )
+
+
+class _SimulationControl:
+    def __init__(self):
+        self.closed = False
+        self.hold_reasons: list[str] = []
+        self.rig = self
+
+    def hold_motion(self, reason: str):
+        self.hold_reasons.append(reason)
+
+    def close(self):
+        self.closed = True
+
+
+def _binding(_control, trajectory):
+    return MujocoShadowModelBinding(
+        observed_identity=trajectory.initial_snapshot.identity,
+        scene_hash=trajectory.scene_hash,
+        evidence_refs=("model-binding:test",),
+        verified=True,
+        verification_method="canonical_model_identity_v1",
+    )
+
+
+def _run(**overrides):
+    snapshot = overrides.pop("snapshot", _snapshot())
+    control = overrides.pop("control", _SimulationControl())
+
+    def simulate(*, trajectory, **_kwargs):
+        return _simulation(trajectory)
+
+    values = {
+        "snapshot_provider": lambda: snapshot,
+        "trajectory_builder": _trajectory,
+        "simulation_control_factory": lambda _snapshot: control,
+        "model_binding_provider": _binding,
+        "simulation_executor": simulate,
+        "wall_clock": lambda: 10.01,
+        "current_scene_hash_provider": lambda: "scene:test",
+    }
+    values.update(overrides)
+    return run_real_shadow_acceptance(**values), control
+
+
+def test_default_acceptance_runs_simulation_closes_it_and_never_requests_real_ports():
+    real_factory_calls: list[str] = []
+
+    receipt, control = _run(
+        real_ports_factory=lambda trajectory: real_factory_calls.append(
+            trajectory.semantic_content_hash
+        )
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.SIMULATION_ACCEPTED_NO_MOTION
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert receipt.simulation_receipt is not None
+    assert receipt.terminal_hold_confirmed is True
+    assert receipt.terminal_hold_domain == "simulation"
+    assert control.closed is True
+    assert real_factory_calls == []
+
+
+def test_capture_and_trajectory_binding_failures_are_typed_and_do_not_start_sim():
+    sim_calls: list[str] = []
+    capture, _ = _run(
+        snapshot_provider=lambda: (_ for _ in ()).throw(RuntimeError("no fresh cut")),
+        simulation_control_factory=lambda snapshot: sim_calls.append(
+            snapshot.semantic_content_hash
+        ),
+    )
+    assert capture.status is RealShadowAcceptanceStatus.CAPTURE_FAILED
+    assert capture.real_motion_disposition is RealMotionDisposition.NONE
+    assert sim_calls == []
+
+    other = _snapshot(identity=_identity(robot_model_hash="other"))
+    binding, _ = _run(trajectory_builder=lambda _snapshot: _trajectory(other))
+    assert (
+        binding.status
+        is RealShadowAcceptanceStatus.TRAJECTORY_PREPARATION_FAILED
+    )
+    assert sim_calls == []
+
+
+def test_simulation_initialization_error_never_requests_real_ports():
+    real_factory_calls: list[str] = []
+    receipt, _ = _run(
+        simulation_control_factory=lambda _snapshot: (_ for _ in ()).throw(
+            RuntimeError("initial state collision")
+        ),
+        real_replay_enabled=True,
+        real_ports_factory=lambda trajectory: real_factory_calls.append(
+            trajectory.semantic_content_hash
+        ),
+    )
+
+    assert (
+        receipt.status
+        is RealShadowAcceptanceStatus.SIMULATION_INITIALIZATION_FAILED
+    )
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert real_factory_calls == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_status"),
+    (
+        (
+            {
+                "model_binding_provider": lambda *_args: (_ for _ in ()).throw(
+                    RuntimeError("identity evidence unavailable")
+                )
+            },
+            RealShadowAcceptanceStatus.MODEL_BINDING_FAILED,
+        ),
+        (
+            {
+                "simulation_executor": lambda **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("simulation owner failed")
+                )
+            },
+            RealShadowAcceptanceStatus.SIMULATION_EXECUTION_FAILED,
+        ),
+    ),
+)
+def test_model_binding_and_simulation_execution_errors_hold_and_close(
+    overrides,
+    expected_status,
+):
+    control = _SimulationControl()
+    receipt, _ = _run(control=control, **overrides)
+
+    assert receipt.status is expected_status
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert control.hold_reasons == ["real shadow acceptance simulation error"]
+    assert control.closed is True
+
+
+def test_simulation_close_failure_blocks_real_replay():
+    class _CloseFailureControl(_SimulationControl):
+        def close(self):
+            raise RuntimeError("scene close failed")
+
+    real_factory_calls: list[str] = []
+    receipt, _ = _run(
+        control=_CloseFailureControl(),
+        real_replay_enabled=True,
+        real_ports_factory=lambda trajectory: real_factory_calls.append(
+            trajectory.semantic_content_hash
+        ),
+    )
+
+    assert (
+        receipt.status is RealShadowAcceptanceStatus.SIMULATION_SHUTDOWN_FAILED
+    )
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert real_factory_calls == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        ShadowSimulationStatus.PATH_COLLISION_BLOCKED,
+        ShadowSimulationStatus.POINT_TRACKING_TIMEOUT,
+        ShadowSimulationStatus.GRIPPER_HOLD_DRIFT,
+        ShadowSimulationStatus.MODEL_IDENTITY_MISMATCH,
+        ShadowSimulationStatus.TERMINAL_HOLD_FAILED,
+    ),
+)
+def test_each_failed_simulation_status_blocks_real_replay(status):
+    real_factory_calls: list[str] = []
+
+    def simulate(*, trajectory, **_kwargs):
+        return _simulation(trajectory, status=status)
+
+    receipt, control = _run(
+        simulation_executor=simulate,
+        real_replay_enabled=True,
+        real_ports_factory=lambda trajectory: real_factory_calls.append(
+            trajectory.semantic_content_hash
+        ),
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.SIMULATION_REJECTED
+    assert receipt.simulation_receipt.status is status
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert control.closed is True
+    assert real_factory_calls == []
+
+
+def test_completed_simulation_with_wrong_exact_binding_is_rejected():
+    def simulate(*, trajectory, **_kwargs):
+        receipt = _simulation(trajectory)
+        return replace(receipt, trajectory_hash="trajectory:wrong")
+
+    receipt, _ = _run(simulation_executor=simulate)
+
+    assert receipt.status is RealShadowAcceptanceStatus.SIMULATION_REJECTED
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+
+
+def test_explicit_real_request_without_exact_authority_does_not_build_ports():
+    real_factory_calls: list[str] = []
+    receipt, _ = _run(
+        real_replay_enabled=True,
+        real_ports_factory=lambda trajectory: real_factory_calls.append(
+            trajectory.semantic_content_hash
+        ),
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_REJECTED
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert real_factory_calls == []
+
+
+def test_current_real_scene_mismatch_rejects_before_real_ports_are_built():
+    snapshot = _snapshot()
+    trajectory = _trajectory(snapshot)
+    simulation = _simulation(trajectory)
+    authority = RegisteredTrajectoryExecutionAuthority(
+        authority_id="authority:test",
+        operator_confirmation_ref="operator:test",
+        trajectory_hash=trajectory.semantic_content_hash,
+        simulation_receipt_hash=simulation.semantic_content_hash,
+        issued_at=10.0,
+        expires_at=10.1,
+    )
+    real_factory_calls: list[str] = []
+
+    receipt, _ = _run(
+        snapshot=snapshot,
+        simulation_executor=lambda **_kwargs: simulation,
+        real_replay_enabled=True,
+        real_ports_factory=lambda value: real_factory_calls.append(
+            value.semantic_content_hash
+        ),
+        current_scene_hash_provider=lambda: "scene:changed",
+        authority=authority,
+        consume_execution_authority=lambda value: (
+            f"authority-consumed:{value.authority_id}",
+        ),
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_REJECTED
+    assert receipt.reason_codes == ("current_scene_hash_mismatch",)
+    assert real_factory_calls == []
+
+
+class _ReplayPorts:
+    def __init__(self):
+        self.hold_reasons: list[str] = []
+
+    def current_snapshot(self):  # pragma: no cover - fake executor owns this test.
+        raise AssertionError
+
+    def dispatch_point(self, *_args):  # pragma: no cover
+        raise AssertionError
+
+    def hold(self, reason):
+        self.hold_reasons.append(reason)
+        return RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("real-hold:test",),
+        )
+
+
+def test_exact_authority_delegates_to_existing_real_executor_and_reports_completion():
+    observed: dict[str, object] = {}
+
+    def real_executor(**kwargs):
+        observed.update(kwargs)
+        trajectory = kwargs["trajectory"]
+        simulation = kwargs["simulation_receipt"]
+        admission = ShadowReplayAdmissionReceipt(
+            status=ShadowReplayAdmissionStatus.ADMISSIBLE_PREFLIGHT_ONLY,
+            reason_codes=(),
+            current_snapshot_hash=trajectory.initial_snapshot.semantic_content_hash,
+            trajectory_hash=trajectory.semantic_content_hash,
+            simulation_receipt_hash=simulation.semantic_content_hash,
+            evaluated_at=10.01,
+            maximum_arm_drift_rad=0.0,
+            maximum_gripper_drift=0.0,
+        )
+        return RegisteredTrajectoryRealReplayReceipt(
+            status=RegisteredTrajectoryRealReplayStatus.COMPLETED,
+            admission=admission,
+            executed_point_count=len(trajectory.points),
+            terminal_hold_confirmed=True,
+            real_motion_executed=True,
+            evidence_refs=("real-replay:test",),
+        )
+
+    snapshot = _snapshot()
+    trajectory = _trajectory(snapshot)
+    simulation = _simulation(trajectory)
+    authority = RegisteredTrajectoryExecutionAuthority(
+        authority_id="authority:test",
+        operator_confirmation_ref="operator:test",
+        trajectory_hash=trajectory.semantic_content_hash,
+        simulation_receipt_hash=simulation.semantic_content_hash,
+        issued_at=10.0,
+        expires_at=10.1,
+    )
+
+    def simulate(**_kwargs):
+        return simulation
+
+    ports = _ReplayPorts()
+    receipt, _ = _run(
+        snapshot=snapshot,
+        simulation_executor=simulate,
+        real_replay_enabled=True,
+        real_ports_factory=lambda received: ports
+        if received.semantic_content_hash == trajectory.semantic_content_hash
+        else None,
+        authority=authority,
+        consume_execution_authority=lambda value: (
+            f"authority-consumed:{value.authority_id}",
+        ),
+        real_replay_executor=real_executor,
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_COMPLETED
+    assert receipt.real_motion_disposition is RealMotionDisposition.EXECUTED
+    assert receipt.terminal_hold_confirmed is True
+    assert receipt.terminal_hold_domain == "real"
+    assert observed["execution_enabled"] is True
+    assert observed["current_snapshot_provider"] == ports.current_snapshot
+
+
+def test_real_executor_exception_returns_unknown_motion_outcome():
+    snapshot = _snapshot()
+    trajectory = _trajectory(snapshot)
+    simulation = _simulation(trajectory)
+    authority = RegisteredTrajectoryExecutionAuthority(
+        authority_id="authority:test",
+        operator_confirmation_ref="operator:test",
+        trajectory_hash=trajectory.semantic_content_hash,
+        simulation_receipt_hash=simulation.semantic_content_hash,
+        issued_at=10.0,
+        expires_at=10.1,
+    )
+
+    ports = _ReplayPorts()
+    receipt, _ = _run(
+        snapshot=snapshot,
+        simulation_executor=lambda **_kwargs: simulation,
+        real_replay_enabled=True,
+        real_ports_factory=lambda _trajectory: ports,
+        authority=authority,
+        consume_execution_authority=lambda value: (
+            f"authority-consumed:{value.authority_id}",
+        ),
+        real_replay_executor=lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("transport lost after possible dispatch")
+        ),
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_FAILED
+    assert receipt.real_motion_disposition is RealMotionDisposition.UNKNOWN
+    assert receipt.terminal_hold_confirmed is True
+    assert receipt.terminal_hold_domain == "unknown"
+    assert ports.hold_reasons == ["real shadow acceptance replay executor error"]
+
+
+def test_completed_real_receipt_with_wrong_point_count_is_not_accepted():
+    observed_receipt: dict[str, RegisteredTrajectoryRealReplayReceipt] = {}
+
+    def real_executor(**kwargs):
+        trajectory = kwargs["trajectory"]
+        simulation = kwargs["simulation_receipt"]
+        admission = ShadowReplayAdmissionReceipt(
+            status=ShadowReplayAdmissionStatus.ADMISSIBLE_PREFLIGHT_ONLY,
+            reason_codes=(),
+            current_snapshot_hash=trajectory.initial_snapshot.semantic_content_hash,
+            trajectory_hash=trajectory.semantic_content_hash,
+            simulation_receipt_hash=simulation.semantic_content_hash,
+            evaluated_at=10.01,
+            maximum_arm_drift_rad=0.0,
+            maximum_gripper_drift=0.0,
+        )
+        result = RegisteredTrajectoryRealReplayReceipt(
+            status=RegisteredTrajectoryRealReplayStatus.COMPLETED,
+            admission=admission,
+            executed_point_count=1,
+            terminal_hold_confirmed=True,
+            real_motion_executed=True,
+            evidence_refs=("real-replay:incomplete",),
+        )
+        observed_receipt["value"] = result
+        return result
+
+    snapshot = _snapshot()
+    trajectory = _trajectory(snapshot)
+    simulation = _simulation(trajectory)
+    authority = RegisteredTrajectoryExecutionAuthority(
+        authority_id="authority:test",
+        operator_confirmation_ref="operator:test",
+        trajectory_hash=trajectory.semantic_content_hash,
+        simulation_receipt_hash=simulation.semantic_content_hash,
+        issued_at=10.0,
+        expires_at=10.1,
+    )
+    receipt, _ = _run(
+        snapshot=snapshot,
+        simulation_executor=lambda **_kwargs: simulation,
+        real_replay_enabled=True,
+        real_ports_factory=lambda _trajectory: _ReplayPorts(),
+        authority=authority,
+        consume_execution_authority=lambda value: (
+            f"authority-consumed:{value.authority_id}",
+        ),
+        real_replay_executor=real_executor,
+    )
+
+    assert observed_receipt
+    assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_FAILED
+    assert "real_executed_point_count_mismatch" in receipt.reason_codes
