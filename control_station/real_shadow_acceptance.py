@@ -27,13 +27,14 @@ from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
     MujocoShadowModelBinding,
     execute_registered_shadow_trajectory,
 )
+from teleop_runtime.skill_deploy.control_runtime import RealSkillMotionHoldReceipt
 from teleop_runtime.skill_deploy.registered_trajectory import (
+    RegisteredTrajectoryAuthorityConsumptionReceipt,
     RegisteredTrajectoryExecutionAuthority,
     RegisteredTrajectoryRealReplayReceipt,
     RegisteredTrajectoryRealReplayStatus,
     execute_registered_shadow_trajectory_with_ports,
 )
-from teleop_runtime.skill_deploy.control_runtime import RealSkillMotionHoldReceipt
 
 
 class RealShadowAcceptanceStatus(str, Enum):
@@ -60,6 +61,13 @@ class RegisteredTrajectoryReplayPorts(Protocol):
     """Already-owned real replay ports; lifecycle stays with their application."""
 
     def current_snapshot(self) -> AuthoritativeRobotStateSnapshot: ...
+
+    def begin_replay_session(
+        self,
+        consumption: RegisteredTrajectoryAuthorityConsumptionReceipt,
+    ) -> tuple[str, ...]: ...
+
+    def end_replay_session(self, reason: str) -> tuple[str, ...]: ...
 
     def dispatch_point(self, point, trajectory_hash: str, /): ...
 
@@ -200,8 +208,8 @@ def _close_simulation(control: object) -> None:
 
 def _hold_simulation_after_error(control: object) -> tuple[str, ...]:
     try:
-        rig = getattr(control, "rig")
-        hold = getattr(rig, "hold_motion")
+        rig = control.rig
+        hold = rig.hold_motion
         hold("real shadow acceptance simulation error")
         return (
             _gate_evidence(
@@ -253,7 +261,11 @@ def run_real_shadow_acceptance(
     current_scene_hash_provider: Callable[[], str] | None = None,
     authority: RegisteredTrajectoryExecutionAuthority | None = None,
     consume_execution_authority: (
-        Callable[[RegisteredTrajectoryExecutionAuthority], tuple[str, ...]] | None
+        Callable[
+            [RegisteredTrajectoryExecutionAuthority],
+            RegisteredTrajectoryAuthorityConsumptionReceipt,
+        ]
+        | None
     ) = None,
     wall_clock: Callable[[], float] = time.time,
     real_replay_executor: Callable[..., RegisteredTrajectoryRealReplayReceipt] = (
@@ -471,7 +483,7 @@ def run_real_shadow_acceptance(
     else:
         try:
             current_scene_hash = str(current_scene_hash_provider()).strip()
-        except Exception:
+        except Exception:  # noqa: BLE001 - compile a typed no-motion rejection.
             authority_reasons.append("current_scene_hash_read_failed")
         else:
             if not current_scene_hash:
@@ -528,11 +540,14 @@ def run_real_shadow_acceptance(
             trajectory=trajectory,
             simulation_receipt=simulation,
             current_scene_hash=current_scene_hash,
+            current_scene_hash_provider=current_scene_hash_provider,
             current_snapshot_provider=ports.current_snapshot,
             point_dispatcher=ports.dispatch_point,
             hold_controller=ports.hold,
             authority=authority,
             consume_execution_authority=consume_execution_authority,
+            begin_replay_session=ports.begin_replay_session,
+            end_replay_session=ports.end_replay_session,
             execution_enabled=True,
             wall_clock=wall_clock,
         )
@@ -583,7 +598,9 @@ def run_real_shadow_acceptance(
         RegisteredTrajectoryRealReplayStatus.LOWER_PORT_ERROR,
         RegisteredTrajectoryRealReplayStatus.TERMINAL_HOLD_FAILED,
     }
-    if real_receipt.real_motion_executed:
+    if real_receipt.real_motion_may_have_executed:
+        disposition = RealMotionDisposition.UNKNOWN
+    elif real_receipt.real_motion_executed:
         disposition = RealMotionDisposition.EXECUTED
     elif uncertain_failure:
         disposition = RealMotionDisposition.UNKNOWN
@@ -611,7 +628,7 @@ def run_real_shadow_acceptance(
             if completed
             else (
                 RealShadowAcceptanceStatus.REAL_REPLAY_FAILED
-                if real_receipt.real_motion_executed
+                if disposition is not RealMotionDisposition.NONE
                 else RealShadowAcceptanceStatus.REAL_REPLAY_REJECTED
             )
         ),

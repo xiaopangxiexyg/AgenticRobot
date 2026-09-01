@@ -25,12 +25,28 @@ from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
 )
 from teleop_runtime.skill_deploy.control_runtime import RealSkillMotionHoldReceipt
 from teleop_runtime.skill_deploy.registered_trajectory import (
+    RegisteredTrajectoryAuthorityConsumptionReceipt,
+    RegisteredTrajectoryAuthorityConsumptionStatus,
     RegisteredTrajectoryExecutionAuthority,
     RegisteredTrajectoryRealReplayReceipt,
     RegisteredTrajectoryRealReplayStatus,
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def _consumption(authority, *, consumed_at: float = 10.01):
+    return RegisteredTrajectoryAuthorityConsumptionReceipt(
+        status=RegisteredTrajectoryAuthorityConsumptionStatus.CONSUMED,
+        authority_hash=authority.semantic_content_hash,
+        authority_id=authority.authority_id,
+        trajectory_hash=authority.trajectory_hash,
+        simulation_receipt_hash=authority.simulation_receipt_hash,
+        run_id=authority.run_id,
+        owner_epoch=authority.owner_epoch,
+        consumed_at=consumed_at,
+        evidence_refs=(f"authority-consumed:{authority.authority_id}",),
+    )
 
 
 def _identity(*, robot_model_hash: str = "robot:test") -> ShadowExecutionIdentity:
@@ -328,6 +344,8 @@ def test_current_real_scene_mismatch_rejects_before_real_ports_are_built():
         operator_confirmation_ref="operator:test",
         trajectory_hash=trajectory.semantic_content_hash,
         simulation_receipt_hash=simulation.semantic_content_hash,
+        run_id="run:test",
+        owner_epoch=1,
         issued_at=10.0,
         expires_at=10.1,
     )
@@ -342,9 +360,7 @@ def test_current_real_scene_mismatch_rejects_before_real_ports_are_built():
         ),
         current_scene_hash_provider=lambda: "scene:changed",
         authority=authority,
-        consume_execution_authority=lambda value: (
-            f"authority-consumed:{value.authority_id}",
-        ),
+        consume_execution_authority=_consumption,
     )
 
     assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_REJECTED
@@ -358,6 +374,12 @@ class _ReplayPorts:
 
     def current_snapshot(self):  # pragma: no cover - fake executor owns this test.
         raise AssertionError
+
+    def begin_replay_session(self, consumption):
+        return (f"session-begin:{consumption.semantic_content_hash}",)
+
+    def end_replay_session(self, reason):
+        return (f"session-end:{reason}",)
 
     def dispatch_point(self, *_args):  # pragma: no cover
         raise AssertionError
@@ -404,6 +426,8 @@ def test_exact_authority_delegates_to_existing_real_executor_and_reports_complet
         operator_confirmation_ref="operator:test",
         trajectory_hash=trajectory.semantic_content_hash,
         simulation_receipt_hash=simulation.semantic_content_hash,
+        run_id="run:test",
+        owner_epoch=1,
         issued_at=10.0,
         expires_at=10.1,
     )
@@ -420,9 +444,7 @@ def test_exact_authority_delegates_to_existing_real_executor_and_reports_complet
         if received.semantic_content_hash == trajectory.semantic_content_hash
         else None,
         authority=authority,
-        consume_execution_authority=lambda value: (
-            f"authority-consumed:{value.authority_id}",
-        ),
+        consume_execution_authority=_consumption,
         real_replay_executor=real_executor,
     )
 
@@ -443,6 +465,8 @@ def test_real_executor_exception_returns_unknown_motion_outcome():
         operator_confirmation_ref="operator:test",
         trajectory_hash=trajectory.semantic_content_hash,
         simulation_receipt_hash=simulation.semantic_content_hash,
+        run_id="run:test",
+        owner_epoch=1,
         issued_at=10.0,
         expires_at=10.1,
     )
@@ -454,9 +478,7 @@ def test_real_executor_exception_returns_unknown_motion_outcome():
         real_replay_enabled=True,
         real_ports_factory=lambda _trajectory: ports,
         authority=authority,
-        consume_execution_authority=lambda value: (
-            f"authority-consumed:{value.authority_id}",
-        ),
+        consume_execution_authority=_consumption,
         real_replay_executor=lambda **_kwargs: (_ for _ in ()).throw(
             RuntimeError("transport lost after possible dispatch")
         ),
@@ -504,6 +526,8 @@ def test_completed_real_receipt_with_wrong_point_count_is_not_accepted():
         operator_confirmation_ref="operator:test",
         trajectory_hash=trajectory.semantic_content_hash,
         simulation_receipt_hash=simulation.semantic_content_hash,
+        run_id="run:test",
+        owner_epoch=1,
         issued_at=10.0,
         expires_at=10.1,
     )
@@ -513,9 +537,7 @@ def test_completed_real_receipt_with_wrong_point_count_is_not_accepted():
         real_replay_enabled=True,
         real_ports_factory=lambda _trajectory: _ReplayPorts(),
         authority=authority,
-        consume_execution_authority=lambda value: (
-            f"authority-consumed:{value.authority_id}",
-        ),
+        consume_execution_authority=_consumption,
         real_replay_executor=real_executor,
     )
 

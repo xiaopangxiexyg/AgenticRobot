@@ -33,6 +33,7 @@ from .control_runtime import (
 from .motion_port import REAL_AGENT_MOTION_COMMAND_METADATA_KEY
 from .registered_trajectory import (
     MeasuredGripperBackend,
+    RegisteredTrajectoryAuthorityConsumptionReceipt,
     RegisteredTrajectoryPointDispatchReceipt,
     capture_authoritative_shadow_state_from_backends,
     read_measured_gripper_state_cut,
@@ -124,8 +125,68 @@ class DMTacRM65RegisteredTrajectoryPorts:
             point.semantic_content_hash for point in self.trajectory.points
         }
         self._cut_lock = threading.Lock()
+        self._execution_lock = threading.RLock()
         self._pending_arm_cut: RealSkillMotionObservationCut | None = None
         self._pending_snapshot: AuthoritativeRobotStateSnapshot | None = None
+        self._active_consumption: (
+            RegisteredTrajectoryAuthorityConsumptionReceipt | None
+        ) = None
+        self._next_point_index = 0
+
+    def begin_replay_session(
+        self,
+        consumption: RegisteredTrajectoryAuthorityConsumptionReceipt,
+    ) -> tuple[str, ...]:
+        """Open one ordered replay session after exact authority consumption."""
+
+        if not isinstance(
+            consumption, RegisteredTrajectoryAuthorityConsumptionReceipt
+        ):
+            raise TypeError(
+                "consumption must be RegisteredTrajectoryAuthorityConsumptionReceipt."
+            )
+        if (
+            not consumption.consumed
+            or consumption.trajectory_hash != self.trajectory.semantic_content_hash
+        ):
+            raise RuntimeError("authority consumption does not bind this trajectory.")
+        with self._execution_lock:
+            if self._active_consumption is not None:
+                raise RuntimeError("a registered replay session is already active.")
+            self._active_consumption = consumption
+            self._next_point_index = 0
+            evidence_hash = canonical_content_hash(
+                {
+                    "consumption_hash": consumption.semantic_content_hash,
+                    "trajectory_hash": self.trajectory.semantic_content_hash,
+                    "run_id": consumption.run_id,
+                    "owner_epoch": consumption.owner_epoch,
+                },
+                domain="agenticrobot.shadow_execution.dmtac_replay_session.v1",
+            )
+            return ("dmtac-replay-session-begin:" + evidence_hash,)
+
+    def end_replay_session(self, reason: str) -> tuple[str, ...]:
+        """Close the active session and invalidate its point cursor."""
+
+        with self._execution_lock:
+            consumption = self._active_consumption
+            self._active_consumption = None
+            point_index = self._next_point_index
+            self._next_point_index = 0
+            evidence_hash = canonical_content_hash(
+                {
+                    "reason": str(reason),
+                    "consumption_hash": (
+                        None
+                        if consumption is None
+                        else consumption.semantic_content_hash
+                    ),
+                    "next_point_index": point_index,
+                },
+                domain="agenticrobot.shadow_execution.dmtac_replay_session.v1",
+            )
+            return ("dmtac-replay-session-end:" + evidence_hash,)
 
     def _read_cut(
         self,
@@ -169,6 +230,55 @@ class DMTacRM65RegisteredTrajectoryPorts:
         return arm_cut, snapshot
 
     def dispatch_point(
+        self,
+        point: RegisteredJointTrajectoryPoint,
+        trajectory_hash: str,
+        /,
+    ) -> RegisteredTrajectoryPointDispatchReceipt:
+        """Dispatch only the next point of one active authority-bound session."""
+
+        if not isinstance(point, RegisteredJointTrajectoryPoint):
+            raise TypeError("point must be RegisteredJointTrajectoryPoint.")
+        with self._execution_lock:
+            expected = (
+                self.trajectory.points[self._next_point_index]
+                if self._active_consumption is not None
+                and self._next_point_index < len(self.trajectory.points)
+                else None
+            )
+            if (
+                expected is None
+                or point.semantic_content_hash != expected.semantic_content_hash
+                or trajectory_hash != self.trajectory.semantic_content_hash
+            ):
+                evidence_hash = canonical_content_hash(
+                    {
+                        "session_active": self._active_consumption is not None,
+                        "next_point_index": self._next_point_index,
+                        "expected_point_hash": (
+                            None
+                            if expected is None
+                            else expected.semantic_content_hash
+                        ),
+                        "received_point_hash": point.semantic_content_hash,
+                        "trajectory_hash_matches": (
+                            trajectory_hash
+                            == self.trajectory.semantic_content_hash
+                        ),
+                    },
+                    domain="agenticrobot.shadow_execution.dmtac_session_reject.v1",
+                )
+                return RegisteredTrajectoryPointDispatchReceipt(
+                    point_hash=point.semantic_content_hash,
+                    succeeded=False,
+                    evidence_refs=("dmtac-replay-session-reject:" + evidence_hash,),
+                )
+            receipt = self._dispatch_point_in_session(point, trajectory_hash)
+            if receipt.succeeded:
+                self._next_point_index += 1
+            return receipt
+
+    def _dispatch_point_in_session(
         self,
         point: RegisteredJointTrajectoryPoint,
         trajectory_hash: str,
@@ -253,6 +363,10 @@ class DMTacRM65RegisteredTrajectoryPorts:
         )
 
     def hold(self, reason: str) -> RealSkillMotionHoldReceipt:
+        with self._execution_lock:
+            return self._hold_locked(reason)
+
+    def _hold_locked(self, reason: str) -> RealSkillMotionHoldReceipt:
         """HOLD both arms and verify DMTac still matches its measured start cut."""
 
         arm_hold = self.rm65_ports.hold(str(reason))

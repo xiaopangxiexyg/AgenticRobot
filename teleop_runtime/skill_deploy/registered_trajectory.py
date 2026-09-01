@@ -9,6 +9,7 @@ dual-arm observation cut before MuJoCo is initialized.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -152,9 +153,12 @@ class RegisteredTrajectoryExecutionAuthority:
     operator_confirmation_ref: str
     trajectory_hash: str
     simulation_receipt_hash: str
+    run_id: str
+    owner_epoch: int
     issued_at: float
     expires_at: float
     real_motion_enabled: bool = True
+    semantic_content_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
         for name in (
@@ -162,6 +166,7 @@ class RegisteredTrajectoryExecutionAuthority:
             "operator_confirmation_ref",
             "trajectory_hash",
             "simulation_receipt_hash",
+            "run_id",
         ):
             value = str(getattr(self, name)).strip()
             if not value:
@@ -171,10 +176,169 @@ class RegisteredTrajectoryExecutionAuthority:
         expires = _finite(self.expires_at, name="expires_at")
         if expires <= issued:
             raise ValueError("expires_at must be after issued_at.")
+        if (
+            isinstance(self.owner_epoch, bool)
+            or not isinstance(self.owner_epoch, int)
+            or self.owner_epoch < 1
+        ):
+            raise ValueError("owner_epoch must be a positive integer.")
         if self.real_motion_enabled is not True:
             raise ValueError("execution authority must explicitly enable real motion.")
         object.__setattr__(self, "issued_at", issued)
         object.__setattr__(self, "expires_at", expires)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                {
+                    "authority_id": self.authority_id,
+                    "operator_confirmation_ref": self.operator_confirmation_ref,
+                    "trajectory_hash": self.trajectory_hash,
+                    "simulation_receipt_hash": self.simulation_receipt_hash,
+                    "run_id": self.run_id,
+                    "owner_epoch": self.owner_epoch,
+                    "issued_at": issued,
+                    "expires_at": expires,
+                    "real_motion_enabled": True,
+                },
+                domain="agenticrobot.shadow_execution.real_authority.v1",
+            ),
+        )
+
+
+class RegisteredTrajectoryAuthorityConsumptionStatus(str, Enum):
+    CONSUMED = "consumed"
+    ALREADY_CONSUMED = "already_consumed"
+    AUTHORITY_MISMATCH = "authority_mismatch"
+
+
+@dataclass(frozen=True)
+class RegisteredTrajectoryAuthorityConsumptionReceipt:
+    """Atomic lower-owner result for one exact real-motion authority."""
+
+    status: RegisteredTrajectoryAuthorityConsumptionStatus
+    authority_hash: str
+    authority_id: str
+    trajectory_hash: str
+    simulation_receipt_hash: str
+    run_id: str
+    owner_epoch: int
+    consumed_at: float
+    evidence_refs: tuple[str, ...]
+    semantic_content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.status, RegisteredTrajectoryAuthorityConsumptionStatus
+        ):
+            raise TypeError(
+                "status must be RegisteredTrajectoryAuthorityConsumptionStatus."
+            )
+        normalized: dict[str, str] = {}
+        for name in (
+            "authority_hash",
+            "authority_id",
+            "trajectory_hash",
+            "simulation_receipt_hash",
+            "run_id",
+        ):
+            value = str(getattr(self, name)).strip()
+            if not value:
+                raise ValueError(f"{name} must be non-empty.")
+            normalized[name] = value
+            object.__setattr__(self, name, value)
+        if (
+            isinstance(self.owner_epoch, bool)
+            or not isinstance(self.owner_epoch, int)
+            or self.owner_epoch < 1
+        ):
+            raise ValueError("owner_epoch must be a positive integer.")
+        consumed_at = _finite(self.consumed_at, name="consumed_at")
+        refs = tuple(sorted({str(value).strip() for value in self.evidence_refs}))
+        if not refs or any(not value for value in refs):
+            raise ValueError("authority consumption requires non-empty evidence refs.")
+        object.__setattr__(self, "consumed_at", consumed_at)
+        object.__setattr__(self, "evidence_refs", refs)
+        object.__setattr__(
+            self,
+            "semantic_content_hash",
+            canonical_content_hash(
+                {
+                    "status": self.status.value,
+                    **normalized,
+                    "owner_epoch": self.owner_epoch,
+                    "consumed_at": consumed_at,
+                    "evidence_refs": refs,
+                },
+                domain="agenticrobot.shadow_execution.authority_consumption.v1",
+            ),
+        )
+
+    @property
+    def consumed(self) -> bool:
+        return self.status is RegisteredTrajectoryAuthorityConsumptionStatus.CONSUMED
+
+
+class SingleUseRegisteredTrajectoryAuthorityConsumer:
+    """In-process CAS owner for one exact authority and one replay run."""
+
+    def __init__(
+        self,
+        *,
+        authority: RegisteredTrajectoryExecutionAuthority,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if not isinstance(authority, RegisteredTrajectoryExecutionAuthority):
+            raise TypeError("authority must be RegisteredTrajectoryExecutionAuthority.")
+        if not callable(clock):
+            raise TypeError("clock must be callable.")
+        self.authority = authority
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._consumed = False
+
+    def consume(
+        self,
+        authority: RegisteredTrajectoryExecutionAuthority,
+    ) -> RegisteredTrajectoryAuthorityConsumptionReceipt:
+        now = _finite(self.clock(), name="clock()")
+        with self._lock:
+            matches = bool(
+                isinstance(authority, RegisteredTrajectoryExecutionAuthority)
+                and authority.semantic_content_hash
+                == self.authority.semantic_content_hash
+            )
+            if not matches:
+                status = (
+                    RegisteredTrajectoryAuthorityConsumptionStatus.AUTHORITY_MISMATCH
+                )
+            elif self._consumed:
+                status = (
+                    RegisteredTrajectoryAuthorityConsumptionStatus.ALREADY_CONSUMED
+                )
+            else:
+                self._consumed = True
+                status = RegisteredTrajectoryAuthorityConsumptionStatus.CONSUMED
+        observed = authority if matches else self.authority
+        evidence_hash = canonical_content_hash(
+            {
+                "authority_hash": observed.semantic_content_hash,
+                "status": status.value,
+                "consumed_at": now,
+            },
+            domain="agenticrobot.shadow_execution.authority_consumption_evidence.v1",
+        )
+        return RegisteredTrajectoryAuthorityConsumptionReceipt(
+            status=status,
+            authority_hash=observed.semantic_content_hash,
+            authority_id=observed.authority_id,
+            trajectory_hash=observed.trajectory_hash,
+            simulation_receipt_hash=observed.simulation_receipt_hash,
+            run_id=observed.run_id,
+            owner_epoch=observed.owner_epoch,
+            consumed_at=now,
+            evidence_refs=("authority-consumption:" + evidence_hash,),
+        )
 
 
 @dataclass(frozen=True)
@@ -203,6 +367,8 @@ class RegisteredTrajectoryRealReplayStatus(str, Enum):
     EXECUTION_DISABLED = "execution_disabled"
     AUTHORITY_REJECTED = "authority_rejected"
     PREFLIGHT_REJECTED = "preflight_rejected"
+    PRE_DISPATCH_STATE_REJECTED = "pre_dispatch_state_rejected"
+    TIMELINE_DEADLINE_MISSED = "timeline_deadline_missed"
     DISPATCH_FAILED = "dispatch_failed"
     FINAL_TRACKING_TIMEOUT = "final_tracking_timeout"
     GRIPPER_HOLD_DRIFT = "gripper_hold_drift"
@@ -220,6 +386,7 @@ class RegisteredTrajectoryRealReplayReceipt:
     terminal_hold_confirmed: bool
     real_motion_executed: bool
     evidence_refs: tuple[str, ...]
+    real_motion_may_have_executed: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, RegisteredTrajectoryRealReplayStatus):
@@ -236,6 +403,8 @@ class RegisteredTrajectoryRealReplayReceipt:
             raise TypeError("terminal_hold_confirmed must be boolean.")
         if not isinstance(self.real_motion_executed, bool):
             raise TypeError("real_motion_executed must be boolean.")
+        if not isinstance(self.real_motion_may_have_executed, bool):
+            raise TypeError("real_motion_may_have_executed must be boolean.")
         refs = tuple(sorted({str(value).strip() for value in self.evidence_refs}))
         if not refs or any(not value for value in refs):
             raise ValueError("real replay receipt requires lower evidence.")
@@ -244,6 +413,7 @@ class RegisteredTrajectoryRealReplayReceipt:
             or self.executed_point_count == 0
             or not self.terminal_hold_confirmed
             or not self.real_motion_executed
+            or self.real_motion_may_have_executed
         ):
             raise ValueError("completed real replay requires admission, motion, and HOLD.")
         object.__setattr__(self, "evidence_refs", refs)
@@ -364,13 +534,25 @@ def execute_registered_shadow_trajectory_with_ports(
     trajectory: RegisteredShadowJointTrajectory,
     simulation_receipt: ShadowSimulationReceipt,
     current_scene_hash: str,
+    current_scene_hash_provider: Callable[[], str] | None = None,
     current_snapshot_provider: Callable[[], AuthoritativeRobotStateSnapshot],
     point_dispatcher: RegisteredTrajectoryPointDispatcher,
     hold_controller: Callable[[str], RealSkillMotionHoldReceipt],
     authority: RegisteredTrajectoryExecutionAuthority | None = None,
     consume_execution_authority: (
-        Callable[[RegisteredTrajectoryExecutionAuthority], tuple[str, ...]] | None
+        Callable[
+            [RegisteredTrajectoryExecutionAuthority],
+            RegisteredTrajectoryAuthorityConsumptionReceipt,
+        ]
+        | None
     ) = None,
+    begin_replay_session: (
+        Callable[
+            [RegisteredTrajectoryAuthorityConsumptionReceipt], tuple[str, ...]
+        ]
+        | None
+    ) = None,
+    end_replay_session: Callable[[str], tuple[str, ...]] | None = None,
     execution_enabled: bool = False,
     wall_clock: Callable[[], float] = time.time,
     monotonic_clock: Callable[[], float] = time.monotonic,
@@ -380,7 +562,10 @@ def execute_registered_shadow_trajectory_with_ports(
     maximum_gripper_start_drift: float = 0.02,
     final_tracking_tolerance_rad: float = 0.01,
     final_tracking_timeout_sec: float = 3.0,
+    final_tracking_velocity_tolerance_rad_s: float = 0.02,
+    final_tracking_dwell_sec: float = 0.08,
     feedback_poll_sec: float = 0.02,
+    maximum_point_lateness_sec: float = 0.05,
 ) -> RegisteredTrajectoryRealReplayReceipt:
     """Exercise the post-simulation real replay sequence through injected ports.
 
@@ -416,9 +601,31 @@ def execute_registered_shadow_trajectory_with_ports(
         final_tracking_timeout_sec,
         name="final_tracking_timeout_sec",
     )
+    final_velocity_tolerance = _finite(
+        final_tracking_velocity_tolerance_rad_s,
+        name="final_tracking_velocity_tolerance_rad_s",
+    )
+    final_dwell = _finite(
+        final_tracking_dwell_sec,
+        name="final_tracking_dwell_sec",
+    )
     poll = _finite(feedback_poll_sec, name="feedback_poll_sec")
-    if final_tolerance <= 0.0 or final_timeout <= 0.0 or poll <= 0.0:
-        raise ValueError("tracking tolerance, timeout, and polling must be positive.")
+    max_lateness = _finite(
+        maximum_point_lateness_sec,
+        name="maximum_point_lateness_sec",
+    )
+    if (
+        final_tolerance <= 0.0
+        or final_timeout <= 0.0
+        or final_velocity_tolerance <= 0.0
+        or final_dwell <= 0.0
+        or poll <= 0.0
+        or max_lateness < 0.0
+    ):
+        raise ValueError(
+            "tracking tolerance, timeout, velocity, dwell, and polling must be positive; "
+            "point lateness must be non-negative."
+        )
 
     try:
         now = _finite(wall_clock(), name="wall_clock()")
@@ -455,6 +662,8 @@ def execute_registered_shadow_trajectory_with_ports(
         raise
     evidence = [f"shadow-replay-admission:{admission.semantic_content_hash}"]
 
+    session_active = False
+
     def terminal_hold(reason: str) -> bool:
         try:
             receipt = hold_controller(reason)
@@ -485,23 +694,53 @@ def execute_registered_shadow_trajectory_with_ports(
         hold_reason: str,
         motion_may_have_executed: bool | None = None,
     ) -> RegisteredTrajectoryRealReplayReceipt:
+        nonlocal session_active
+        if session_active:
+            try:
+                assert end_replay_session is not None
+                end_refs = tuple(end_replay_session(hold_reason))
+                if not end_refs or any(not str(value).strip() for value in end_refs):
+                    raise RuntimeError("replay session end returned no evidence.")
+                evidence.extend(str(value).strip() for value in end_refs)
+            except Exception as exc:  # noqa: BLE001 - HOLD still takes precedence.
+                evidence.append(
+                    "replay-session-end-error:"
+                    + canonical_content_hash(
+                        {
+                            "exception_type": type(exc).__name__,
+                            "message": str(exc),
+                            "reason": hold_reason,
+                        },
+                        domain="agenticrobot.shadow_execution.session_end_error.v1",
+                    )
+                )
+            finally:
+                session_active = False
         held = terminal_hold(hold_reason)
         final_status = (
             status
-            if held
+            if held or status is not RegisteredTrajectoryRealReplayStatus.COMPLETED
             else RegisteredTrajectoryRealReplayStatus.TERMINAL_HOLD_FAILED
         )
+        if not held:
+            evidence.append(
+                "terminal-hold-unconfirmed:"
+                + canonical_content_hash(
+                    {
+                        "primary_status": status.value,
+                        "hold_reason": hold_reason,
+                    },
+                    domain="agenticrobot.shadow_execution.real_hold_unconfirmed.v1",
+                )
+            )
         return RegisteredTrajectoryRealReplayReceipt(
             status=final_status,
             admission=admission,
             executed_point_count=executed_count,
             terminal_hold_confirmed=held,
-            real_motion_executed=(
-                executed_count > 0
-                if motion_may_have_executed is None
-                else motion_may_have_executed
-            ),
+            real_motion_executed=executed_count > 0,
             evidence_refs=tuple(evidence),
+            real_motion_may_have_executed=bool(motion_may_have_executed),
         )
 
     def lower_port_error(
@@ -542,6 +781,32 @@ def execute_registered_shadow_trajectory_with_ports(
             executed_count=0,
             hold_reason="registered shadow replay execution disabled",
         )
+    if not callable(begin_replay_session) or not callable(end_replay_session):
+        evidence.append(
+            "pre-dispatch-state-rejected:"
+            + canonical_content_hash(
+                {"reason_codes": ("replay_session_controller_missing",)},
+                domain="agenticrobot.shadow_execution.pre_dispatch_state.v1",
+            )
+        )
+        return terminal(
+            RegisteredTrajectoryRealReplayStatus.PRE_DISPATCH_STATE_REJECTED,
+            executed_count=0,
+            hold_reason="registered shadow replay session controller missing",
+        )
+    if not callable(current_scene_hash_provider):
+        evidence.append(
+            "pre-dispatch-state-rejected:"
+            + canonical_content_hash(
+                {"reason_codes": ("current_scene_hash_provider_missing",)},
+                domain="agenticrobot.shadow_execution.pre_dispatch_state.v1",
+            )
+        )
+        return terminal(
+            RegisteredTrajectoryRealReplayStatus.PRE_DISPATCH_STATE_REJECTED,
+            executed_count=0,
+            hold_reason="registered shadow replay scene provider missing",
+        )
     authority_valid = (
         isinstance(authority, RegisteredTrajectoryExecutionAuthority)
         and authority.issued_at <= now < authority.expires_at
@@ -557,23 +822,48 @@ def execute_registered_shadow_trajectory_with_ports(
         )
     assert authority is not None
     try:
-        consumed_refs = tuple(consume_execution_authority(authority))
+        consumption = consume_execution_authority(authority)
     except Exception as exc:  # noqa: BLE001 - fail closed before any dispatch.
         return lower_port_error(exc, executed_count=0)
-    if not consumed_refs or any(not str(value).strip() for value in consumed_refs):
+    consumption_valid = bool(
+        isinstance(consumption, RegisteredTrajectoryAuthorityConsumptionReceipt)
+        and consumption.consumed
+        and consumption.authority_hash == authority.semantic_content_hash
+        and consumption.authority_id == authority.authority_id
+        and consumption.trajectory_hash == trajectory.semantic_content_hash
+        and consumption.simulation_receipt_hash
+        == simulation_receipt.semantic_content_hash
+        and consumption.run_id == authority.run_id
+        and consumption.owner_epoch == authority.owner_epoch
+        and authority.issued_at <= consumption.consumed_at < authority.expires_at
+    )
+    if not consumption_valid:
+        if isinstance(consumption, RegisteredTrajectoryAuthorityConsumptionReceipt):
+            evidence.extend(consumption.evidence_refs)
         return terminal(
             RegisteredTrajectoryRealReplayStatus.AUTHORITY_REJECTED,
             executed_count=0,
             hold_reason="registered shadow replay authority consumption failed",
         )
-    evidence.extend(str(value).strip() for value in consumed_refs)
+    evidence.extend(consumption.evidence_refs)
+    evidence.append(
+        "authority-consumption-receipt:" + consumption.semantic_content_hash
+    )
     evidence.append(authority.operator_confirmation_ref)
+    try:
+        session_refs = tuple(begin_replay_session(consumption))
+        if not session_refs or any(not str(value).strip() for value in session_refs):
+            raise RuntimeError("replay session begin returned no evidence.")
+        evidence.extend(str(value).strip() for value in session_refs)
+        session_active = True
+    except Exception as exc:  # noqa: BLE001 - no dispatch can follow failed begin.
+        return lower_port_error(exc, executed_count=0)
 
     executed_count = 0
     dispatch_attempted = False
     try:
         started = _finite(monotonic_clock(), name="monotonic_clock()")
-        for point in trajectory.points:
+        for point_index, point in enumerate(trajectory.points):
             due = started + point.time_from_start_sec
             while True:
                 current_monotonic = _finite(
@@ -583,11 +873,83 @@ def execute_registered_shadow_trajectory_with_ports(
                 if remaining <= 0.0:
                     break
                 sleep(min(remaining, poll))
+            lateness = current_monotonic - due
+            if lateness > max_lateness:
+                evidence.append(
+                    "timeline-deadline-missed:"
+                    + canonical_content_hash(
+                        {
+                            "point_index": point_index,
+                            "point_hash": point.semantic_content_hash,
+                            "lateness_sec": lateness,
+                            "maximum_point_lateness_sec": max_lateness,
+                        },
+                        domain="agenticrobot.shadow_execution.timeline_deadline.v1",
+                    )
+                )
+                return terminal(
+                    RegisteredTrajectoryRealReplayStatus.TIMELINE_DEADLINE_MISSED,
+                    executed_count=executed_count,
+                    hold_reason="registered shadow replay timeline deadline missed",
+                )
             pre_dispatch = current_snapshot_provider()
             if not isinstance(pre_dispatch, AuthoritativeRobotStateSnapshot):
                 raise TypeError(
                     "current_snapshot_provider must return "
                     "AuthoritativeRobotStateSnapshot."
+                )
+            point_now = _finite(wall_clock(), name="wall_clock()")
+            pre_dispatch_reasons: list[str] = []
+            if (
+                pre_dispatch.identity.semantic_content_hash
+                != trajectory.initial_snapshot.identity.semantic_content_hash
+            ):
+                pre_dispatch_reasons.append("identity_changed")
+            observed_scene_hash = str(current_scene_hash_provider()).strip()
+            if not observed_scene_hash or observed_scene_hash != scene_hash:
+                pre_dispatch_reasons.append("scene_changed")
+            if (
+                point_now < pre_dispatch.available_at
+                or point_now - pre_dispatch.oldest_measurement_at
+                > maximum_snapshot_age_sec
+            ):
+                pre_dispatch_reasons.append("snapshot_stale")
+            expected_start = (
+                trajectory.initial_snapshot.qpos_by_side
+                if point_index == 0
+                else trajectory.points[point_index - 1].qpos_by_side
+            )
+            arm_tracking_drift = max(
+                float(
+                    np.max(
+                        np.abs(
+                            pre_dispatch.qpos_by_side[side]
+                            - expected_start[side]
+                        )
+                    )
+                )
+                for side in _SIDES
+            )
+            if arm_tracking_drift > maximum_arm_start_drift_rad:
+                pre_dispatch_reasons.append("arm_tracking_drift")
+            if pre_dispatch_reasons:
+                evidence.append(
+                    "pre-dispatch-state-rejected:"
+                    + canonical_content_hash(
+                        {
+                            "point_index": point_index,
+                            "point_hash": point.semantic_content_hash,
+                            "reason_codes": tuple(pre_dispatch_reasons),
+                            "snapshot_hash": pre_dispatch.semantic_content_hash,
+                            "arm_tracking_drift_rad": arm_tracking_drift,
+                        },
+                        domain="agenticrobot.shadow_execution.pre_dispatch_state.v1",
+                    )
+                )
+                return terminal(
+                    RegisteredTrajectoryRealReplayStatus.PRE_DISPATCH_STATE_REJECTED,
+                    executed_count=executed_count,
+                    hold_reason="registered shadow replay pre-dispatch state rejected",
                 )
             pre_dispatch_gripper_drift = max(
                 abs(
@@ -620,7 +982,9 @@ def execute_registered_shadow_trajectory_with_ports(
                     RegisteredTrajectoryRealReplayStatus.DISPATCH_FAILED,
                     executed_count=executed_count,
                     hold_reason="registered shadow replay point dispatch failed",
-                    motion_may_have_executed=executed_count > 0,
+                    # A failed aggregate dual-arm receipt cannot prove that
+                    # neither lower transport accepted its side of the batch.
+                    motion_may_have_executed=True,
                 )
             executed_count += 1
             dispatch_attempted = False
@@ -646,9 +1010,12 @@ def execute_registered_shadow_trajectory_with_ports(
                 )
 
         final_qpos = trajectory.points[-1].qpos_by_side
-        deadline = (
-            _finite(monotonic_clock(), name="monotonic_clock()") + final_timeout
+        previous_final = observed
+        previous_final_time = _finite(
+            monotonic_clock(), name="monotonic_clock()"
         )
+        deadline = previous_final_time + final_timeout
+        dwell_started_at: float | None = None
         while True:
             observed = current_snapshot_provider()
             if not isinstance(observed, AuthoritativeRobotStateSnapshot):
@@ -671,27 +1038,65 @@ def execute_registered_shadow_trajectory_with_ports(
                 )
                 for side in _SIDES
             )
+            current_monotonic = _finite(
+                monotonic_clock(), name="monotonic_clock()"
+            )
+            sample_dt = current_monotonic - previous_final_time
+            if sample_dt < 0.0:
+                raise RuntimeError("monotonic clock moved backwards.")
+            maximum_velocity = max(
+                float(
+                    np.max(
+                        np.abs(
+                            observed.qpos_by_side[side]
+                            - previous_final.qpos_by_side[side]
+                        )
+                    )
+                )
+                / sample_dt
+                if sample_dt > 0.0
+                else (
+                    0.0
+                    if np.array_equal(
+                        observed.qpos_by_side[side],
+                        previous_final.qpos_by_side[side],
+                    )
+                    else math.inf
+                )
+                for side in _SIDES
+            )
             if gripper_drift > maximum_gripper_start_drift:
                 return terminal(
                     RegisteredTrajectoryRealReplayStatus.GRIPPER_HOLD_DRIFT,
                     executed_count=executed_count,
                     hold_reason="registered shadow replay final gripper drift",
                 )
-            if final_error <= final_tolerance:
+            tracking_ready = bool(
+                final_error <= final_tolerance
+                and maximum_velocity <= final_velocity_tolerance
+            )
+            if tracking_ready:
+                if dwell_started_at is None:
+                    dwell_started_at = current_monotonic
+            else:
+                dwell_started_at = None
+            if (
+                dwell_started_at is not None
+                and current_monotonic - dwell_started_at >= final_dwell
+            ):
                 return terminal(
                     RegisteredTrajectoryRealReplayStatus.COMPLETED,
                     executed_count=executed_count,
                     hold_reason="registered shadow replay completed",
                 )
-            current_monotonic = _finite(
-                monotonic_clock(), name="monotonic_clock()"
-            )
             if current_monotonic >= deadline:
                 return terminal(
                     RegisteredTrajectoryRealReplayStatus.FINAL_TRACKING_TIMEOUT,
                     executed_count=executed_count,
                     hold_reason="registered shadow replay final tracking timeout",
                 )
+            previous_final = observed
+            previous_final_time = current_monotonic
             sleep(min(poll, deadline - current_monotonic))
     except Exception as exc:  # noqa: BLE001 - any lower error must end in HOLD.
         return lower_port_error(
@@ -704,11 +1109,14 @@ def execute_registered_shadow_trajectory_with_ports(
 __all__ = [
     "MeasuredGripperBackend",
     "MeasuredGripperStateCut",
+    "RegisteredTrajectoryAuthorityConsumptionReceipt",
+    "RegisteredTrajectoryAuthorityConsumptionStatus",
     "RegisteredTrajectoryExecutionAuthority",
     "RegisteredTrajectoryPointDispatchReceipt",
     "RegisteredTrajectoryPointDispatcher",
     "RegisteredTrajectoryRealReplayReceipt",
     "RegisteredTrajectoryRealReplayStatus",
+    "SingleUseRegisteredTrajectoryAuthorityConsumer",
     "capture_authoritative_shadow_state_from_backends",
     "execute_registered_shadow_trajectory_with_ports",
     "read_measured_gripper_state_cut",
