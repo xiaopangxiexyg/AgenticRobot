@@ -666,6 +666,51 @@ class FootPadControlModeTests(unittest.TestCase):
         self.assertIn("two_pedal_b", active_controls)
         self.assertIn("two_pedal_c", active_controls)
 
+    def test_five_pedal_disconnect_preserves_abc_dispatch_contract(self) -> None:
+        controls = ["episode_start", "h", "c", "fix_arm_toggle"]
+        control = RealTeleopControlInput.__new__(RealTeleopControlInput)
+        control.args = SimpleNamespace(
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+        )
+        control.foot_pad_input = SimpleNamespace(foot_pad_count=5, is_online=False)
+        control.components = SimpleNamespace(
+            session=None,
+            init_arm_controller=None,
+            fix_arm_controller=None,
+            active_sides=("left", "right"),
+        )
+        control._gui_control_state = lambda: GuiControlState(
+            teleop_started=True,
+            episode_recording_available=True,
+            fix_arm_available=True,
+            init_arm_available=True,
+            special_arm_control_mode=SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+            foot_pad_available=False,
+            foot_pad_count=5,
+        )
+        control._gui_events = lambda: GuiControlEvents()
+        control._progress_ui_controls = ()
+        control._plus_curation_save_in_flight = lambda: False
+        control.plus_curation = None
+        control._teleop_started = True
+        control._two_pedal_switch_blocked_by_init = lambda: False
+        control._tracker_side_confirmation_pending = False
+        control._tracker_side_request_pending = False
+        control._hold_requested = False
+
+        self.assertTrue(control._foot_pad_mode_configured())
+        self.assertFalse(control._foot_pad_mode_enabled())
+        self.assertTrue(control._two_pedal_mode_active())
+        with mock.patch(
+            "teleop_runtime.real_teleop.operator_control_runtime."
+            "_gui_current_active_controls",
+            return_value=controls,
+            create=True,
+        ):
+            active_controls = control._current_active_controls()
+        self.assertIn("two_pedal_b", active_controls)
+        self.assertIn("two_pedal_c", active_controls)
+
     def test_unavailable_foot_pad_falls_back_to_manual_arm_maintenance(self) -> None:
         controls = current_active_controls(
             GuiControlState(
