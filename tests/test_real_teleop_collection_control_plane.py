@@ -52,12 +52,14 @@ def test_submit_never_waits_for_blocked_operation() -> None:
     assert submit_elapsed < 0.05
     assert entered.wait(timeout=1.0)
     assert plane.busy
+    assert plane.active_operation == (generation, "prepare")
     release.set()
     result = _wait_for_result(plane, generation)
     assert result.succeeded
     assert result.value == "ready"
     assert result.kind == "prepare"
     assert result.elapsed_sec >= 0.0
+    assert plane.active_operation is None
 
 
 def test_single_flight_rejects_overlapping_operation() -> None:
@@ -561,6 +563,7 @@ def test_cancel_of_completed_value_keeps_cleanup_off_the_caller_and_single_fligh
         time.sleep(0.001)
     assert not plane.busy
     assert plane.active_kind == "prepare"
+    assert plane.active_operation == (generation, "prepare")
 
     started_at = time.perf_counter()
     assert plane.cancel(generation)

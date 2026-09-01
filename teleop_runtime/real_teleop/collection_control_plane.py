@@ -96,6 +96,17 @@ class CollectionControlPlane:
                 return self._completed.kind
             return None
 
+    @property
+    def active_operation(self) -> tuple[int, str] | None:
+        """Return the one pending or unconsumed completion identity."""
+
+        with self._lock:
+            if self._pending is not None:
+                return self._pending.generation, self._pending.kind
+            if self._completed is not None:
+                return self._completed.generation, self._completed.kind
+            return None
+
     def submit(
         self,
         kind: str,
