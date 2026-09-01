@@ -45,6 +45,13 @@ hold:
   tool-frame force guarding, and formal collection are enabled;
 - all Active admittance overlays are disabled.
 
+The launcher pins
+`teleop_runtime/configs/real_teleop/rule_based_writing_bimanual_workspace_v1.json`
+and enables it in Active mode. The profile covers both final `tool_tcp` targets
+at the authoritative pre-IK boundary and resolves each side's absolute bounds
+from the same runtime calibration workspace already selected for that arm. It
+does not add a force/admittance modifier or maintain a second workspace owner.
+
 The fixed path is authored in glyph-local XY and rotated only within
 `canonical_desk`. Its right-arm start is the causal real TCP endpoint converted
 through the current runtime contract. The existing RealTeleop resolver then
