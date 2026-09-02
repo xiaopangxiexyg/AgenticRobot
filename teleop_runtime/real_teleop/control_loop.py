@@ -8,139 +8,180 @@ recording admission, and preview toggles retain same-frame visibility.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-import inspect
 import re
 import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
-from dataclasses import replace
 
-from .progress_contracts import (
-    PROGRESS_ARM_CONTROL_MODE_IGNORE,
-    PromotableHoldPause,
-    RealTeleopProgressWorkflowPort,
-)
 from dataset_contracts.stats import (
     FORCE_COLLISION_LABEL_DETECTED,
     has_force_limit_collision_text,
 )
-from .progress_arm_control import (
-    PendingProgressArmTransition,
-    ProgressArmTransitionPlan,
-    build_progress_entry_arm_transition_plan,
-    build_progress_arm_transition_plan,
-    progress_step_arm_requirements_differ,
+from robot_motion.rm65 import DEFAULT_LEFT_ARM_QPOS, DEFAULT_RIGHT_ARM_QPOS
+from robot_motion.runtime import merge_teleop_commands
+from teleop_runtime.collection.diagnostics import PhaseTimer
+from teleop_runtime.diagnostics import TeleopRunState
+from teleop_runtime.log_utils import log_event as _log
+from teleop_runtime.recovery import (
+    advance_component_recovery_plan as _advance_recovery_plan,
+)
+from teleop_runtime.recovery import (
+    component_side_retargeter as _side_retargeter,
+)
+from teleop_runtime.recovery import (
+    start_component_recovery_plan as _start_recovery_plan,
+)
+from teleop_runtime.session import TRACKER_HOLD_AUTOMATIC, TRACKER_HOLD_GRACE
+from teleop_runtime.special_tasks.fix_arm import (
+    advance_fix_arm_home_capture,
+    build_fix_arm_pose_snapshot_payload,
+)
+from teleop_runtime.special_tasks.init_arm import advance_init_arm_home_capture
+from teleop_runtime.tactile_visualizer import (
+    AsyncDMTacDistributedForceVisualizer,
+    DMTacDistributedForceVisualizer,
+    dmtac_visualization_snapshot_from_backends,
+    tactile_by_side_from_backends,
+)
+
+from ..target_safety.tcp_pose_envelope_runtime import (
+    TCPPoseEnvelopeRuntimeError,
+)
+from .action_debug_payload import _build_action_debug_metadata
+from .arm_runtime import (
+    _active_command_backend,
+    _apply_active_arm_command_to_preview_real,
+    _runtime_arm_backend_state,
+    _sync_dual_arm_retargeter_for_real_control,
+)
+from .arm_state_sync import _state_qpos, _sync_real_execution_step_limits
+from .collection_bridge import (
+    collection_sample_step_result as _collection_sample_step_result,
+)
+from .collection_bridge import (
+    collection_step_result as _collection_step_result,
+)
+from .collection_bridge import (
+    copy_teleop_command as _copy_teleop_command,
+)
+from .command_filters import _filter_manual_real_command
+from .debug_log_frames import (
+    _build_debug_timing_log_frame,
+    _build_ik_debug_log_frame,
+)
+from .debug_timing import record_position_loop_timings as _record_position_loop_timings
+from .debug_timing_payload import _channels_log_payload, _faults_log_payload
+from .defaults import runtime_home_fresh_data_timeout_sec
+from .episode_runtime import _build_episode_frame
+from .gripper_control import _dispatch_q6_gripper_control
+from .gripper_status import (
+    _gripper_runtime_health_signature,
+    _gripper_runtime_status_signature,
+    _hand_channel_status,
+)
+from .gui_special_arm_status import (
+    fix_arm_debug_state as _fix_arm_debug_state,
+)
+from .gui_special_arm_status import (
+    fix_arm_status_text as _fix_arm_status_text,
+)
+from .gui_special_arm_status import (
+    fix_arm_ui_state as _fix_arm_ui_state,
+)
+from .gui_special_arm_status import (
+    init_arm_debug_state as _init_arm_debug_state,
+)
+from .gui_special_arm_status import (
+    init_arm_status_text as _init_arm_status_text,
+)
+from .gui_special_arm_status import (
+    init_arm_ui_state as _init_arm_ui_state,
+)
+from .hand_runtime import (
+    _build_runtime_hand_command_for_recovery,
+    _emit_tactile_sum_only_status,
+    _enable_gui_tactile_solving,
+    _extract_hand_command_from_command,
+    _gripper_backend_for_side,
+    _hand_backend_for_side,
+    _hand_tactile_sum,
+    _hold_requested_pause_reason,
+    _merge_runtime_hand_command,
+    _tactile_solving_active,
+    _tactile_visualization_available,
+)
+from .impedance_force_runtime import (
+    _emergency_stop_real_arms,
+    _force_guard_recording_stop_context,
+    _handle_init_qpos_emergency_stop,
+)
+from .movement import (
+    movement_multiple_ui_state as _movement_multiple_ui_state,
+)
+from .movement import (
+    movement_multiple_value as _movement_multiple_value,
 )
 from .position_admittance_shadow import (
     PositionAdmittanceActiveFault,
     admitted_solver_world_poses_from_joint_command,
 )
-from ..target_safety.tcp_pose_envelope_runtime import (
-    TCPPoseEnvelopeRuntimeError,
+from .progress_arm_control import (
+    PendingProgressArmTransition,
+    ProgressArmTransitionPlan,
+    build_progress_arm_transition_plan,
+    build_progress_entry_arm_transition_plan,
+    progress_step_arm_requirements_differ,
 )
-from .defaults import runtime_home_fresh_data_timeout_sec
-from .runtime_extension import runtime_extension_dataset_sample_admission
+from .progress_contracts import (
+    PROGRESS_ARM_CONTROL_MODE_IGNORE,
+    PromotableHoldPause,
+    RealTeleopProgressWorkflowPort,
+)
 from .recording_admission import session_step_arm_dispatch_confirmed
+from .runtime_debug import _debug_timing_maybe_report
+from .runtime_extension import runtime_extension_dataset_sample_admission
+from .runtime_health import (
+    _command_backend_health_signature,
+    _command_backend_status_text,
+    _short_status_text,
+    _temporary_safety_health_signature,
+)
+from .runtime_home import (
+    DEFAULT_RUNTIME_HOME_START_DELAY_SEC,
+    _build_renderer_debug_boxes,
+    _build_renderer_debug_frames,
+    _channel_pose_in_desk,
+    _emit_home_alignment_logs,
+    _emit_runtime_orientation_logs,
+    _mean_pose,
+    _resolve_robot_home_for_side,
+    _runtime_home_calibration,
+)
+from .special_arm_runtime import (
+    _cancel_special_arm_modes_for_hold,
+    _disengage_position_backends_for_manual_interaction,
+    _release_gui_qpos_init_transit,
+)
+from .startup_runtime import (
+    _advance_startup_gui_qpos_maintenance,
+    _arm_after_start_calibration,
+    _runtime_home_failure_message,
+    _update_init_arm_arrival_from_hardware,
+)
+from .status_payloads import (
+    _build_ik_timing_payload,
+    _build_ik_warning_payload,
+    _build_pose_quality_display_payload,
+    _ik_timing_status_text,
+    _pose_quality_reason_list,
+    _pose_quality_status_text,
+    _runtime_fault_label,
+)
 
 _POSITION_ADMITTANCE_CONTROL_PLANE_REARM_THRESHOLD_SEC = 0.05
-
-_REQUIRED_SUPPORT_NAMES = (
-    "AsyncDMTacDistributedForceVisualizer",
-    "DEFAULT_LEFT_ARM_QPOS",
-    "DEFAULT_RIGHT_ARM_QPOS",
-    "DEFAULT_RUNTIME_HOME_START_DELAY_SEC",
-    "DMTacDistributedForceVisualizer",
-    "PhaseTimer",
-    "TRACKER_HOLD_AUTOMATIC",
-    "TRACKER_HOLD_GRACE",
-    "TeleopRunState",
-    "_active_command_backend",
-    "_advance_recovery_plan",
-    "_advance_startup_gui_qpos_maintenance",
-    "_apply_active_arm_command_to_preview_real",
-    "_arm_after_start_calibration",
-    "_build_action_debug_metadata",
-    "_build_debug_timing_log_frame",
-    "_build_episode_frame",
-    "_build_ik_debug_log_frame",
-    "_build_ik_timing_payload",
-    "_build_ik_warning_payload",
-    "_build_pose_quality_display_payload",
-    "_build_renderer_debug_boxes",
-    "_build_renderer_debug_frames",
-    "_build_runtime_hand_command_for_recovery",
-    "_cancel_special_arm_modes_for_hold",
-    "_channel_pose_in_desk",
-    "_channels_log_payload",
-    "_collection_sample_step_result",
-    "_collection_step_result",
-    "_command_backend_health_signature",
-    "_command_backend_status_text",
-    "_copy_teleop_command",
-    "_debug_timing_maybe_report",
-    "_disengage_position_backends_for_manual_interaction",
-    "_dispatch_q6_gripper_control",
-    "_emergency_stop_real_arms",
-    "_emit_home_alignment_logs",
-    "_emit_runtime_orientation_logs",
-    "_emit_tactile_sum_only_status",
-    "_enable_gui_tactile_solving",
-    "_extract_hand_command_from_command",
-    "_faults_log_payload",
-    "_filter_manual_real_command",
-    "_fix_arm_debug_state",
-    "_fix_arm_status_text",
-    "_fix_arm_ui_state",
-    "_force_guard_recording_stop_context",
-    "_gripper_backend_for_side",
-    "_gripper_runtime_health_signature",
-    "_gripper_runtime_status_signature",
-    "_guard_impedance_force_control",
-    "_hand_backend_for_side",
-    "_hand_channel_status",
-    "_hand_tactile_sum",
-    "_handle_ik_debug_log_toggle_request",
-    "_handle_init_qpos_emergency_stop",
-    "_hold_requested_pause_reason",
-    "_ik_timing_status_text",
-    "_init_arm_debug_state",
-    "_init_arm_status_text",
-    "_init_arm_ui_state",
-    "_log",
-    "_mean_pose",
-    "_merge_runtime_hand_command",
-    "_movement_multiple_ui_state",
-    "_movement_multiple_value",
-    "_pose_quality_reason_list",
-    "_pose_quality_status_text",
-    "_real_hand_render_qpos",
-    "_record_position_loop_timings",
-    "_release_gui_qpos_init_transit",
-    "_resolve_robot_home_for_side",
-    "_runtime_arm_backend_state",
-    "_runtime_fault_label",
-    "_runtime_home_calibration",
-    "_runtime_home_failure_message",
-    "_short_status_text",
-    "_side_retargeter",
-    "_start_recovery_plan",
-    "_state_qpos",
-    "_sync_dual_arm_retargeter_for_real_control",
-    "_sync_real_execution_step_limits",
-    "_tactile_solving_active",
-    "_tactile_visualization_available",
-    "_temporary_safety_health_signature",
-    "_update_init_arm_arrival_from_hardware",
-    "advance_fix_arm_home_capture",
-    "advance_init_arm_home_capture",
-    "build_fix_arm_pose_snapshot_payload",
-    "dmtac_visualization_snapshot_from_backends",
-    "merge_teleop_commands",
-    "tactile_by_side_from_backends",
-)
 
 _PROGRESS_FAILURE_PROMOTABLE_HOLD_REASONS = frozenset(
     {"manual", "two_pedal_b", "two_pedal_c"}
@@ -252,23 +293,6 @@ def _publish_real_agent_motion_measured_cut(
             captured_at=cut.available_at,
         )
     return cut
-
-
-class _LegacyFunctionProxy:
-    __slots__ = ("_namespace", "_name")
-
-    def __init__(self, namespace: Mapping[str, object], name: str) -> None:
-        self._namespace = namespace
-        self._name = str(name)
-
-    def __call__(self, *args: object, **kwargs: object) -> object:
-        target = self._namespace[self._name]
-        if target is self:
-            raise RuntimeError(f"recursive control-loop support proxy: {self._name}")
-        return target(*args, **kwargs)  # type: ignore[operator]
-
-    def __getattr__(self, attribute: str) -> object:
-        return getattr(self._namespace[self._name], attribute)
 
 
 def _exception_chain_text(error: BaseException) -> tuple[str, ...]:
@@ -972,25 +996,6 @@ def _cancel_recording_countdown_for_hold_best_effort(
         )
 
 
-def bind_legacy_support(namespace: Mapping[str, object]) -> None:
-    missing = [name for name in _REQUIRED_SUPPORT_NAMES if name not in namespace]
-    if missing:
-        raise RuntimeError(
-            "real-teleop control-loop support is incomplete: "
-            + ", ".join(sorted(missing))
-        )
-    globals().update(
-        {
-            name: (
-                _LegacyFunctionProxy(namespace, name)
-                if inspect.isroutine(namespace[name])
-                else namespace[name]
-            )
-            for name in _REQUIRED_SUPPORT_NAMES
-        }
-    )
-
-
 def _reconcile_idle_progress_entry_arm_control(
     *,
     profile: Any,
@@ -1116,6 +1121,8 @@ class RealTeleopControlLoopContext:
     episode_recorder: Any
     fix_hold_coordinator: Any
     gripper_warmup_probe_running: Callable[[], bool]
+    guard_impedance_force_control: Callable[..., bool]
+    handle_ik_debug_log_toggle_request: Callable[..., None]
     ik_debug_log_recorder: Any
     ik_debug_profile_base_enabled: bool
     idle_tactile_compression_tick: Callable[..., None]
@@ -1144,6 +1151,7 @@ class RealTeleopControlLoopContext:
     recording_pause_reason: Callable[[], str]
     recording_paused: Callable[[], bool]
     recording_warmup_status: Callable[..., tuple[bool, str]]
+    real_hand_render_qpos: Callable[[Any, str], np.ndarray]
     resume_recording_if_ready: Callable[..., None]
     retry_failed_devices: Callable[[], None]
     sample_rate_gate: Any
@@ -1187,6 +1195,10 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     episode_recorder = context.episode_recorder
     fix_hold_coordinator = context.fix_hold_coordinator
     gripper_warmup_probe_running = context.gripper_warmup_probe_running
+    _guard_impedance_force_control = context.guard_impedance_force_control
+    _handle_ik_debug_log_toggle_request = (
+        context.handle_ik_debug_log_toggle_request
+    )
     ik_debug_log_recorder = context.ik_debug_log_recorder
     debug_ik_0827_enabled = bool(getattr(args, "debug_ik_0827", False))
     ik_debug_profile_base_enabled = context.ik_debug_profile_base_enabled
@@ -1216,6 +1228,7 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
     recording_pause_reason = context.recording_pause_reason
     recording_paused = context.recording_paused
     recording_warmup_status = context.recording_warmup_status
+    _real_hand_render_qpos = context.real_hand_render_qpos
     resume_recording_if_ready = context.resume_recording_if_ready
     retry_failed_devices = context.retry_failed_devices
     sample_rate_gate = context.sample_rate_gate
@@ -5421,6 +5434,5 @@ def run_real_teleop_control_loop(context: RealTeleopControlLoopContext) -> None:
 
 __all__ = [
     "RealTeleopControlLoopContext",
-    "bind_legacy_support",
     "run_real_teleop_control_loop",
 ]
