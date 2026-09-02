@@ -61,6 +61,18 @@ class _FailingStartPolicySource(_FakePolicySource):
         raise RuntimeError("source unavailable")
 
 
+class _FailingClosePolicySource(_FakePolicySource):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.events.append("source.close")
+        if self.close_calls == 1:
+            raise RuntimeError("source close unavailable")
+
+
 class _FakeRuntime:
     def __init__(self, events: list[str], clock: _Clock) -> None:
         self.events = events
@@ -112,6 +124,18 @@ class _FakeRuntime:
 
     def close(self) -> None:
         self.events.append("runtime.close")
+
+
+class _FailingCloseRuntime(_FakeRuntime):
+    def __init__(self, events: list[str], clock: _Clock) -> None:
+        super().__init__(events, clock)
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.events.append("runtime.close")
+        if self.close_calls == 1:
+            raise RuntimeError("runtime close unavailable")
 
 
 def _target(runtime: _FakeRuntime) -> MujocoPolicySkillMotionTarget:
@@ -199,6 +223,56 @@ def test_policy_source_start_failure_leaves_closeable_lower_hold() -> None:
         "source.close",
         "runtime.close",
     ]
+
+
+def test_policy_source_close_failure_keeps_application_retryable() -> None:
+    events: list[str] = []
+    runtime = _FakeRuntime(events, _Clock())
+    source = _FailingClosePolicySource(events)
+    application = MujocoPolicySkillMotionApplication(
+        target=_target(runtime),
+        policy_source=source,
+    )
+    application.activate_operation(operation_id="operation-1")
+    application.request_hold(reason="test_close", operation_id="operation-1")
+
+    with pytest.raises(RuntimeError, match="source close unavailable"):
+        application.close_after_hold()
+
+    assert application.closed is False
+    assert application.active_operation_id == "operation-1"
+    assert "runtime.close" not in events
+
+    application.close_after_hold()
+    assert application.closed is True
+    assert application.active_operation_id is None
+    assert source.close_calls == 2
+    assert events[-2:] == ["source.close", "runtime.close"]
+
+
+def test_runtime_close_failure_retries_only_unfinished_runtime_stage() -> None:
+    events: list[str] = []
+    runtime = _FailingCloseRuntime(events, _Clock())
+    source = _FakePolicySource(events)
+    application = MujocoPolicySkillMotionApplication(
+        target=_target(runtime),
+        policy_source=source,
+    )
+    application.activate_operation(operation_id="operation-1")
+    application.request_hold(reason="test_close", operation_id="operation-1")
+
+    with pytest.raises(RuntimeError, match="runtime close unavailable"):
+        application.close_after_hold()
+
+    assert application.closed is False
+    assert application.active_operation_id == "operation-1"
+    assert events.count("source.close") == 1
+
+    application.close_after_hold()
+    assert application.closed is True
+    assert application.active_operation_id is None
+    assert events.count("source.close") == 1
+    assert runtime.close_calls == 2
 
 
 def test_policy_skill_factory_requires_generic_non_scripted_target_config() -> None:
