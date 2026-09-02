@@ -642,13 +642,9 @@ def _prepared_model_rtc_binding_inventory(
                 "episode_manifest": str(episode_manifest),
             }
         )
-    artifact_sources = tuple(
-        Path(value).expanduser().resolve()
-        for value in checkpoint_artifact.source_datasets
-    )
-    expected_artifact_sources = tuple(
-        Path(str(source["dataset_root"])).expanduser().resolve()
-        for source in profile_sources
+    artifact_sources = _canonical_source_roots(checkpoint_artifact.source_datasets)
+    expected_artifact_sources = _canonical_source_roots(
+        tuple(str(source["dataset_root"]) for source in profile_sources)
     )
     if artifact_sources != expected_artifact_sources:
         raise ValueError(
@@ -675,6 +671,24 @@ def _binding_hash(payload: Mapping[str, Any]) -> str:
 
 def _safe_filename(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._") or "policy"
+
+
+def _canonical_source_roots(values: Sequence[object]) -> tuple[str, ...]:
+    """Normalize dataset roots without treating serialization order as identity.
+
+    OpenPI's dataset adapter may serialize the same source collection in an
+    order different from the profile. The roots still form an exact multiset:
+    sorting makes order irrelevant while retaining multiplicity so a missing,
+    substituted, or duplicated source cannot pass silently.
+    """
+
+    roots: list[str] = []
+    for value in values:
+        root = str(value).strip()
+        if not root:
+            raise ValueError("Source dataset roots require non-empty paths.")
+        roots.append(str(Path(root).expanduser().resolve()))
+    return tuple(sorted(roots))
 
 
 def _canonical_source_pairs(
