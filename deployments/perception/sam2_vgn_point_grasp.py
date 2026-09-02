@@ -29,7 +29,7 @@ DEFAULT_DMTAC_M_URDF = (
 DEFAULT_DMTAC_M_URDF_SHA256 = (
     "457a2b92c81cc4f6f2f1ada63f1ed7a4a659209c4af4aba7d2dcd8403e3b0620"
 )
-DMTAC_M_MAX_VISIBLE_COLLISION_POINTS = 200
+DMTAC_M_MAX_VISIBLE_COLLISION_POINTS = 400
 
 
 def _required(value: object, *, field_name: str) -> str:

@@ -196,3 +196,27 @@ def test_cli_emits_machine_readable_audit() -> None:
     payload = json.loads(completed.stdout)
     assert payload["schema"] == "dexteleop.development_local_resource_audit.v1"
     assert payload["ok"] is True
+
+
+def test_perception_sources_are_registered_gitlink_boundaries() -> None:
+    gitmodules = (REPO_ROOT / ".gitmodules").read_text(encoding="utf-8")
+    expected = {
+        "model/perception/sam2": "https://github.com/facebookresearch/sam2.git",
+        "model/perception/GroundingDINO": "https://github.com/IDEA-Research/GroundingDINO.git",
+        "model/perception/vgn": "https://github.com/ethz-asl/vgn.git",
+        "model/perception/graspnet-baseline": (
+            "https://github.com/graspnet/graspnet-baseline.git"
+        ),
+    }
+    for path, url in expected.items():
+        assert f'[submodule "{path}"]' in gitmodules
+        assert f"path = {path}" in gitmodules
+        assert f"url = {url}" in gitmodules
+        completed = subprocess.run(
+            ["git", "ls-files", "--stage", "--", path],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.stdout.startswith("160000 "), completed.stdout

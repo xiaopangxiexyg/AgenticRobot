@@ -770,6 +770,11 @@
       "expected_rule": "!/model/openpi"
     },
     {
+      "label": "perception source submodule boundaries",
+      "probe": "model/perception",
+      "expected_rule": "!/model/perception/"
+    },
+    {
       "label": "tracked calibration profiles",
       "probe": "teleop_records/calibration_profiles",
       "expected_rule": "!teleop_records/calibration_profiles/"

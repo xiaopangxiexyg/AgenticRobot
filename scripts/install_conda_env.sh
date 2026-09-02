@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
 SDK_ROOT="${DEXTELEOP_DMTAC_SDK_ROOT:-$REPO_ROOT/assets/DM_Tac_SDK_Publish_1.2.10}"
+LOCK_INDEX_URL="https://pypi.org/simple"
 UPDATE=0
 SKIP_VENDOR_SDK=0
 
@@ -83,8 +84,13 @@ PIP_LOCK_REQUIREMENTS="$(mktemp)"
 trap 'rm -f "$PIP_LOCK_REQUIREMENTS"' EXIT
 
 echo "[dexteleop-env] Checking uv.lock and installing all locked PyPI extras"
-conda run --no-capture-output --name "$ENV_NAME" uv lock --check
-conda run --no-capture-output --name "$ENV_NAME" \
+# uv treats ambient PIP_INDEX_URL as an input to locking. Pin this check and
+# export to the index recorded by the committed lockfile, so a developer-local
+# mirror cannot make an otherwise current lock appear stale.
+UV_DEFAULT_INDEX="$LOCK_INDEX_URL" PIP_INDEX_URL="$LOCK_INDEX_URL" \
+  conda run --no-capture-output --name "$ENV_NAME" uv lock --check
+UV_DEFAULT_INDEX="$LOCK_INDEX_URL" PIP_INDEX_URL="$LOCK_INDEX_URL" \
+  conda run --no-capture-output --name "$ENV_NAME" \
   uv export --frozen --all-extras --format requirements.txt --no-emit-project \
   >"$PIP_LOCK_REQUIREMENTS"
 PYTHONNOUSERSITE=1 conda run --no-capture-output --name "$ENV_NAME" \

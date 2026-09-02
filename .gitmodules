@@ -4,3 +4,15 @@
 [submodule "hardware/reBotArm_control_py"]
 	path = hardware/reBotArm_control_py
 	url = https://github.com/Seeed-Projects/reBotArm_control_py.git
+[submodule "model/perception/sam2"]
+	path = model/perception/sam2
+	url = https://github.com/facebookresearch/sam2.git
+[submodule "model/perception/GroundingDINO"]
+	path = model/perception/GroundingDINO
+	url = https://github.com/IDEA-Research/GroundingDINO.git
+[submodule "model/perception/vgn"]
+	path = model/perception/vgn
+	url = https://github.com/ethz-asl/vgn.git
+[submodule "model/perception/graspnet-baseline"]
+	path = model/perception/graspnet-baseline
+	url = https://github.com/graspnet/graspnet-baseline.git

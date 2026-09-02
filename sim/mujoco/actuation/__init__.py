@@ -6,6 +6,7 @@ from .gripper_profile import (
     cad_bimanual_dmtac_gripper_profile,
     cube_lift_contact_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
+    strong_cad_bimanual_dmtac_gripper_profile,
     temporary_bimanual_dmtac_gripper_profile,
 )
 from sim.rm65.actuation import (
@@ -40,6 +41,7 @@ __all__ = [
     "cube_lift_contact_dmtac_gripper_profile",
     "identified_bimanual_dmtac_gripper_profile",
     "normalize_collision_projection_mode",
+    "strong_cad_bimanual_dmtac_gripper_profile",
     "rm65_bimanual_udp_feedback_profile",
     "rm65_bimanual_udp_feedback_profile_v1",
     "rm65_bimanual_udp_feedback_profile_v2",

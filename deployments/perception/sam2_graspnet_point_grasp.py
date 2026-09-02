@@ -1,4 +1,4 @@
-"""Noncommercial SAM2 + GraspNet point-conditioned DMTAC M grasp planning."""
+"""SAM2 + GraspNet point-conditioned DMTAC M grasp planning."""
 
 from __future__ import annotations
 
@@ -34,6 +34,15 @@ GRASPNET_REVIEWED_REVISION = "280c215129f759ed8649cb4e89fc5dfee55f4f80"
 GRASPNET_ASSET_SCHEMA_V1 = "dexteleop.perception_graspnet_point_grasp_assets.v1"
 GRASPNET_LICENSE_ACKNOWLEDGEMENT_V1 = (
     "graspnet_noncommercial_research_only_local_download_no_team_redistribution.v1"
+)
+GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2 = (
+    "graspnet_project_authorized_use_and_redistribution.v2"
+)
+GRASPNET_ACCEPTED_AUTHORIZATION_ACKNOWLEDGEMENTS = frozenset(
+    {
+        GRASPNET_LICENSE_ACKNOWLEDGEMENT_V1,
+        GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2,
+    }
 )
 GRASPNET_MODEL_FINGER_LENGTH_M = 0.060
 
@@ -109,8 +118,13 @@ class GraspNetPointGraspModelSpec:
             raise ValueError("Only the reviewed GraspNet RealSense checkpoint is supported.")
         if self.checkpoint_path.name != "checkpoint-rs.tar":
             raise ValueError("The reviewed GraspNet checkpoint must be named checkpoint-rs.tar.")
-        if self.license_acknowledgement != GRASPNET_LICENSE_ACKNOWLEDGEMENT_V1:
-            raise ValueError("GraspNet noncommercial license acknowledgement is required.")
+        if (
+            self.license_acknowledgement
+            not in GRASPNET_ACCEPTED_AUTHORIZATION_ACKNOWLEDGEMENTS
+        ):
+            raise ValueError(
+                "GraspNet project authorization acknowledgement is required."
+            )
 
     @classmethod
     def from_asset_bundle(cls, bundle_root: str | Path) -> "GraspNetPointGraspModelSpec":
@@ -176,7 +190,7 @@ class GraspNetPointGraspModelSpec:
 
 
 class Sam2GraspNetPointGraspPlanner:
-    """Lifecycle-owned GraspNet planner gated to local noncommercial assets."""
+    """Lifecycle-owned GraspNet planner with hash-locked project assets."""
 
     backend_id = "graspnet"
 
@@ -256,6 +270,7 @@ class Sam2GraspNetPointGraspPlanner:
         self._started = False
         self._closed = False
         self._last_plan_timing_ms: dict[str, float] = {}
+        self._last_target_mask: np.ndarray | None = None
 
     @property
     def last_plan_timing_ms(self) -> dict[str, float]:
@@ -263,6 +278,17 @@ class Sam2GraspNetPointGraspPlanner:
 
         with self._lock:
             return dict(self._last_plan_timing_ms)
+
+    @property
+    def last_target_mask(self) -> np.ndarray | None:
+        """Return a diagnostic copy of the most recent SAM2 target mask."""
+
+        with self._lock:
+            return (
+                None
+                if self._last_target_mask is None
+                else self._last_target_mask.copy()
+            )
 
     def _record_plan_timing(self, timing: Mapping[str, float]) -> None:
         with self._lock:
@@ -317,7 +343,7 @@ class Sam2GraspNetPointGraspPlanner:
                         "tool_tcp_origin": "model_palm_finger_boundary",
                     },
                 },
-                "license_scope": "noncommercial_research_only_local_checkpoint",
+                "asset_authorization": self.model_spec.license_acknowledgement,
                 "simulation_urdf": DEFAULT_DMTAC_M_URDF,
                 "simulation_urdf_sha256": DEFAULT_DMTAC_M_URDF_SHA256,
             },
@@ -353,7 +379,7 @@ class Sam2GraspNetPointGraspPlanner:
             except ImportError as exc:
                 raise RuntimeError(
                     "GraspNet is not installed; run install_point_grasp_models.sh "
-                    "with the noncommercial GraspNet flags."
+                    "with --with-graspnet."
                 ) from exc
             revision = subprocess.check_output(
                 ["git", "-C", str(Path(graspnet.__file__).resolve().parent), "rev-parse", "HEAD"],
@@ -442,6 +468,8 @@ class Sam2GraspNetPointGraspPlanner:
             self._record_plan_timing(timing_ms)
         if mask.shape != depth.shape or not mask[v, u]:
             raise RuntimeError("SAM2 returned an invalid point mask.")
+        with self._lock:
+            self._last_target_mask = mask.copy()
         valid = (depth > 0.0) & (depth <= 10.0)
         rows, columns = np.nonzero(valid)
         if len(rows) < 128:
@@ -766,6 +794,7 @@ __all__ = [
     "GRASPNET_ASSET_SCHEMA_V1",
     "GRASPNET_GIT_URL",
     "GRASPNET_LICENSE_ACKNOWLEDGEMENT_V1",
+    "GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2",
     "GRASPNET_MODEL_FINGER_LENGTH_M",
     "GRASPNET_REVIEWED_REVISION",
     "GraspNetPointGraspModelSpec",

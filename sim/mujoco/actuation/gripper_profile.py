@@ -507,6 +507,26 @@ def cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     )
 
 
+def strong_cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
+    """Research-only slow-close force variant for the detailed 4B2 CAD hand."""
+
+    base = cad_bimanual_dmtac_gripper_profile()
+    return replace(
+        base,
+        name="dmtac_bimanual_position_eg2_4b2_cad_20260831.v3_strong",
+        force_limit_n=0.75,
+        calibration_status=(
+            "official_eg2_4b2_cad_research_only_strong_close_ablation"
+        ),
+        evidence=(
+            f"{base.evidence} Research-only rigid-object ablation raises the "
+            "per-coupled-joint rotational force limit from 0.50 to 0.75 N m; "
+            "the evaluator separately slows and extends the close command to "
+            "limit impact. This is not a real-hardware force profile."
+        ),
+    )
+
+
 def temporary_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     """Compatibility alias for the current identified bimanual V1 profile."""
 
@@ -545,5 +565,6 @@ __all__ = [
     "cad_bimanual_dmtac_gripper_profile",
     "cube_lift_contact_dmtac_gripper_profile",
     "identified_bimanual_dmtac_gripper_profile",
+    "strong_cad_bimanual_dmtac_gripper_profile",
     "temporary_bimanual_dmtac_gripper_profile",
 ]

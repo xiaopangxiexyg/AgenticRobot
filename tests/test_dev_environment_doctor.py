@@ -41,6 +41,16 @@ def test_full_environment_install_does_not_pin_one_worktree() -> None:
 
     assert 'pip uninstall --yes dexteleop' in installer
     assert '--editable "$REPO_ROOT"' not in installer
+    assert 'UV_DEFAULT_INDEX="$LOCK_INDEX_URL"' in installer
+
+
+def test_doctor_lock_check_pins_the_committed_index() -> None:
+    doctor = _load_doctor_module()
+
+    assert doctor.LOCK_INDEX_URL == "https://pypi.org/simple"
+    source = DOCTOR_PATH.read_text(encoding="utf-8")
+    assert 'lock_environment["UV_DEFAULT_INDEX"] = LOCK_INDEX_URL' in source
+    assert 'lock_environment["PIP_INDEX_URL"] = LOCK_INDEX_URL' in source
 
 
 def test_personal_todos_are_ignored_and_not_tracked() -> None:

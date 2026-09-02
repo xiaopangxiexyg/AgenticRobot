@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--point-grasp-backend",
         choices=("vgn", "graspnet"),
         default="vgn",
-        help="grasp generator backend; GraspNet is noncommercial research only",
+        help="grasp generator backend; GraspNet uses the authorized project asset bundle",
     )
     parser.add_argument("--point-grasp-device", default="cuda")
     parser.add_argument(

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_NAME="${DEXTELEOP_ENV_NAME:-agenticvla}"
-SOURCE_ROOT=""
+ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
+SOURCE_ROOT="$REPO_ROOT/model/perception"
 BACKEND="auto"
 VERIFY_ONLY=0
 REUSE_INSTALLED_PERCEPTION=0
@@ -20,20 +20,18 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/install_point_grasp_models.sh [options]
 
-Install the existing reviewed SAM2/Grounding DINO stack, clone the reviewed
-BSD-3-Clause VGN revision, install its headless inference dependencies, and verify the
-point-grasp APIs in one Conda environment. Checkpoints are separate assets.
+Install the reviewed SAM2/Grounding DINO/VGN/GraspNet Git submodules and their
+headless inference dependencies, then verify the point-grasp APIs in one Conda
+environment. Checkpoints are separate assets.
 
 Options:
-  --env-name NAME          Conda environment (default: agenticvla)
-  --source-root PATH       Checkout parent (default: ENV_PREFIX/src/perception-models)
+  --env-name NAME          Conda environment (default: dexteleop310)
   --backend auto|cuda|cpu  SAM2/Grounding DINO build mode (default: auto)
   --reuse-installed-perception
                            Verify and reuse already imported reviewed SAM2/DINO
   --with-graspnet          Also install the optional GraspNet backend
   --accept-graspnet-noncommercial-license
-                           Confirm local noncommercial research-only use; required
-                           with --with-graspnet
+                           Deprecated compatibility flag; no longer required
   --cuda-arch-list LIST    GraspNet pointnet2 CUDA architecture, e.g. 8.9
   --max-jobs N             GraspNet CUDA build parallelism (default: 4)
   --verify-only            Do not clone or install; only verify
@@ -46,7 +44,6 @@ die() { echo "[point-grasp-models] ERROR: $*" >&2; exit 1; }
 while (($#)); do
   case "$1" in
     --env-name) ENV_NAME="${2:?}"; shift 2 ;;
-    --source-root) SOURCE_ROOT="${2:?}"; shift 2 ;;
     --backend) BACKEND="${2:?}"; shift 2 ;;
     --reuse-installed-perception) REUSE_INSTALLED_PERCEPTION=1; shift ;;
     --with-graspnet) WITH_GRASPNET=1; shift ;;
@@ -60,25 +57,17 @@ while (($#)); do
 done
 [[ "$BACKEND" == "auto" || "$BACKEND" == "cuda" || "$BACKEND" == "cpu" ]] || die "--backend must be auto, cuda, or cpu"
 [[ "$MAX_JOBS_VALUE" =~ ^[1-9][0-9]*$ ]] || die "--max-jobs must be a positive integer"
-if ((WITH_GRASPNET && ! ACCEPT_GRASPNET_LICENSE)); then
-  die "--with-graspnet requires --accept-graspnet-noncommercial-license"
-fi
 if ((ACCEPT_GRASPNET_LICENSE && ! WITH_GRASPNET)); then
   die "the GraspNet license flag requires --with-graspnet"
 fi
 command -v conda >/dev/null 2>&1 || die "conda is not on PATH"
 ENV_PREFIX="$(conda run --name "$ENV_NAME" python -c 'import sys; print(sys.prefix)')" || die "Conda environment is unavailable"
 PYTHON_BIN="$ENV_PREFIX/bin/python"
-if [[ -z "$SOURCE_ROOT" ]]; then
-  SOURCE_ROOT="$ENV_PREFIX/src/perception-models"
-elif [[ "$SOURCE_ROOT" != /* ]]; then
-  SOURCE_ROOT="$PWD/$SOURCE_ROOT"
-fi
 VGN_ROOT="$SOURCE_ROOT/vgn"
 GRASPNET_ROOT="$SOURCE_ROOT/graspnet-baseline"
 
 if ((REUSE_INSTALLED_PERCEPTION)); then
-  POINT_GRASP_MPL_CACHE="${TMPDIR:-/tmp}/agenticvla-point-grasp-matplotlib-${UID}"
+  POINT_GRASP_MPL_CACHE="${TMPDIR:-/tmp}/dexteleop-point-grasp-matplotlib-${UID}"
   mkdir -p -- "$POINT_GRASP_MPL_CACHE"
   EXPECTED_SAM2_REVISION="aa9b8722d0585b661ded4b3dff1bd103540554ae" \
   EXPECTED_DINO_REVISION="856dde20aee659246248e20734ef9ba5214f5e44" \
@@ -122,34 +111,31 @@ if not callable(getattr(SAM2ImagePredictor, "predict", None)) or Model is None:
 print("reviewed installed SAM2/Grounding DINO reused")
 PY
 else
-  SAM_ARGS=(--env-name "$ENV_NAME" --backend "$BACKEND" --source-root "$SOURCE_ROOT")
+  SAM_ARGS=(--env-name "$ENV_NAME" --backend "$BACKEND")
   if ((VERIFY_ONLY)); then SAM_ARGS+=(--verify-only); fi
   bash "$REPO_ROOT/scripts/install_perception_models.sh" "${SAM_ARGS[@]}"
 fi
 
 if [[ ! -e "$VGN_ROOT" ]]; then
-  ((VERIFY_ONLY == 0)) || die "VGN checkout is absent: $VGN_ROOT"
-  mkdir -p -- "$SOURCE_ROOT"
-  git clone --filter=blob:none "$VGN_URL" "$VGN_ROOT"
-elif [[ ! -d "$VGN_ROOT/.git" ]]; then
-  die "VGN source path is not a Git checkout: $VGN_ROOT"
+  ((VERIFY_ONLY == 0)) || die "VGN submodule is absent: $VGN_ROOT"
+  git -C "$REPO_ROOT" submodule update --init --checkout -- model/perception/vgn
+elif [[ ! -d "$VGN_ROOT/.git" && ! -f "$VGN_ROOT/.git" ]]; then
+  die "VGN submodule path is not a Git checkout: $VGN_ROOT"
 fi
 [[ "$(git -C "$VGN_ROOT" remote get-url origin)" == "$VGN_URL" ]] || die "VGN origin is not reviewed"
 git -C "$VGN_ROOT" diff --quiet -- || die "tracked VGN changes exist"
 git -C "$VGN_ROOT" diff --cached --quiet -- || die "staged VGN changes exist"
-if ! git -C "$VGN_ROOT" cat-file -e "${VGN_REVISION}^{commit}" 2>/dev/null; then
-  ((VERIFY_ONLY == 0)) || die "reviewed VGN revision is absent"
-  git -C "$VGN_ROOT" fetch --depth=1 origin "$VGN_REVISION"
-fi
 if [[ "$(git -C "$VGN_ROOT" rev-parse HEAD)" != "$VGN_REVISION" ]]; then
-  ((VERIFY_ONLY == 0)) || die "VGN HEAD differs from the reviewed revision"
-  git -C "$VGN_ROOT" checkout --detach "$VGN_REVISION"
+  ((VERIFY_ONLY == 0)) || die "VGN HEAD differs from the pinned gitlink"
+  git -C "$REPO_ROOT" submodule update --init --checkout -- model/perception/vgn
 fi
+[[ "$(git -C "$VGN_ROOT" rev-parse HEAD)" == "$VGN_REVISION" ]] || die \
+  "VGN submodule does not match the reviewed revision"
 
 if ((VERIFY_ONLY == 0)); then
   "$PYTHON_BIN" -m pip install --index-url https://pypi.org/simple \
     "catkin-pkg==1.0.0" \
-    "scipy==1.14.1"
+    "scipy==1.13.1"
   "$PYTHON_BIN" -m pip install --no-deps --no-build-isolation --editable "$VGN_ROOT"
 fi
 
@@ -177,23 +163,22 @@ PY
 
 if ((WITH_GRASPNET)); then
   if [[ ! -e "$GRASPNET_ROOT" ]]; then
-    ((VERIFY_ONLY == 0)) || die "GraspNet checkout is absent: $GRASPNET_ROOT"
-    mkdir -p -- "$SOURCE_ROOT"
-    git clone --filter=blob:none "$GRASPNET_URL" "$GRASPNET_ROOT"
-  elif [[ ! -d "$GRASPNET_ROOT/.git" ]]; then
-    die "GraspNet source path is not a Git checkout: $GRASPNET_ROOT"
+    ((VERIFY_ONLY == 0)) || die "GraspNet submodule is absent: $GRASPNET_ROOT"
+    git -C "$REPO_ROOT" submodule update --init --checkout -- \
+      model/perception/graspnet-baseline
+  elif [[ ! -d "$GRASPNET_ROOT/.git" && ! -f "$GRASPNET_ROOT/.git" ]]; then
+    die "GraspNet submodule path is not a Git checkout: $GRASPNET_ROOT"
   fi
   [[ "$(git -C "$GRASPNET_ROOT" remote get-url origin)" == "$GRASPNET_URL" ]] || die "GraspNet origin is not reviewed"
   git -C "$GRASPNET_ROOT" diff --quiet -- || die "tracked GraspNet changes exist"
   git -C "$GRASPNET_ROOT" diff --cached --quiet -- || die "staged GraspNet changes exist"
-  if ! git -C "$GRASPNET_ROOT" cat-file -e "${GRASPNET_REVISION}^{commit}" 2>/dev/null; then
-    ((VERIFY_ONLY == 0)) || die "reviewed GraspNet revision is absent"
-    git -C "$GRASPNET_ROOT" fetch --depth=1 origin "$GRASPNET_REVISION"
-  fi
   if [[ "$(git -C "$GRASPNET_ROOT" rev-parse HEAD)" != "$GRASPNET_REVISION" ]]; then
-    ((VERIFY_ONLY == 0)) || die "GraspNet HEAD differs from the reviewed revision"
-    git -C "$GRASPNET_ROOT" checkout --detach "$GRASPNET_REVISION"
+    ((VERIFY_ONLY == 0)) || die "GraspNet HEAD differs from the pinned gitlink"
+    git -C "$REPO_ROOT" submodule update --init --checkout -- \
+      model/perception/graspnet-baseline
   fi
+  [[ "$(git -C "$GRASPNET_ROOT" rev-parse HEAD)" == "$GRASPNET_REVISION" ]] || die \
+    "GraspNet submodule does not match the reviewed revision"
   CUDA_HOME_VALUE="$(PYTHONNOUSERSITE=1 "$PYTHON_BIN" -c 'from torch.utils.cpp_extension import CUDA_HOME; print(CUDA_HOME or "")')"
   [[ -n "$CUDA_HOME_VALUE" && -x "$CUDA_HOME_VALUE/bin/nvcc" ]] || die "GraspNet pointnet2 requires a CUDA toolkit with nvcc"
   if [[ -z "$CUDA_ARCH_LIST" ]]; then
@@ -202,7 +187,7 @@ if ((WITH_GRASPNET)); then
   [[ -n "$CUDA_ARCH_LIST" ]] || die "GraspNet build cannot see a GPU; pass --cuda-arch-list (RTX 4090: 8.9)"
 
   GRASPNET_SITE_PACKAGES="$(PYTHONNOUSERSITE=1 "$PYTHON_BIN" -c 'import site; print(site.getsitepackages()[0])')"
-  GRASPNET_PTH="$GRASPNET_SITE_PACKAGES/agenticvla_graspnet_baseline.pth"
+  GRASPNET_PTH="$GRASPNET_SITE_PACKAGES/dexteleop_graspnet_baseline.pth"
   if ((VERIFY_ONLY == 0)); then
     "$PYTHON_BIN" -m pip install --index-url https://pypi.org/simple "ninja==1.11.1.4"
     MAX_JOBS="$MAX_JOBS_VALUE" TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_LIST" \
@@ -236,4 +221,5 @@ print("GraspNet point-grasp install verified", revision)
 PY
 fi
 
-echo "[point-grasp-models] Installation complete. Checkpoints were not downloaded; see README.md."
+echo "[point-grasp-models] Installation complete from model/perception submodules."
+echo "Checkpoints were not downloaded; see README.md."

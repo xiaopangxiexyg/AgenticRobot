@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--point-grasp-backend",
         choices=("vgn", "graspnet"),
         default="vgn",
-        help="grasp generator backend; GraspNet is noncommercial research only",
+        help="grasp generator backend; GraspNet uses the authorized project asset bundle",
     )
     parser.add_argument("--input-rgb", type=Path, required=True)
     parser.add_argument("--input-depth", type=Path, required=True, help="C-order float32 HxW NPY in meters")

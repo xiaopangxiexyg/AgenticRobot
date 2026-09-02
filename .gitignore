@@ -124,6 +124,7 @@ hardware/VIVE/VIVE_sender.zip
 /model/*
 !/model/README.md
 !/model/openpi
+!/model/perception/
 
 UV_conversion
 paper_fold_datasets/
@@ -145,5 +146,3 @@ scripts/temp_cmd/
 
 # Personal task planning; shared plans belong under the owning docs/**/plans/ path.
 /todos/
-
-experiments/

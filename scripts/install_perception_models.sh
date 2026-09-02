@@ -2,8 +2,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_NAME="${DEXTELEOP_ENV_NAME:-agenticvla}"
-SOURCE_ROOT=""
+ENV_NAME="${DEXTELEOP_ENV_NAME:-dexteleop310}"
+SOURCE_ROOT="$REPO_ROOT/model/perception"
 BACKEND="auto"
 MAX_JOBS_VALUE="${MAX_JOBS:-4}"
 CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-}"
@@ -19,15 +19,13 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/install_perception_models.sh [options]
 
-Clone the reviewed SAM2 and Grounding DINO revisions, install their pinned
-Python dependencies into one existing Conda environment, build the optional
-Grounding DINO CUDA extension, and run import/revision/operator smoke checks.
+Initialize the reviewed SAM2 and Grounding DINO Git submodules, install their
+pinned Python dependencies into one existing Conda environment, build the
+optional Grounding DINO CUDA extension, and run revision/operator smoke checks.
 
 Options:
-  --env-name NAME              Conda environment (default: agenticvla, or
+  --env-name NAME              Conda environment (default: dexteleop310, or
                                DEXTELEOP_ENV_NAME).
-  --source-root PATH           Stable checkout parent (default:
-                               ENV_PREFIX/src/perception-models).
   --backend auto|cuda|cpu      Build mode (default: auto).
   --cuda-arch-list LIST        TORCH_CUDA_ARCH_LIST override, for example 8.9.
   --max-jobs N                 Extension build parallelism (default: 4).
@@ -50,11 +48,6 @@ while (($# > 0)); do
     --env-name)
       (($# >= 2)) || die "--env-name requires a name"
       ENV_NAME="$2"
-      shift 2
-      ;;
-    --source-root)
-      (($# >= 2)) || die "--source-root requires a path"
-      SOURCE_ROOT="$2"
       shift 2
       ;;
     --backend)
@@ -102,11 +95,6 @@ ENV_PREFIX="$(conda run --name "$ENV_NAME" python -c 'import sys; print(sys.pref
 PYTHON_BIN="$ENV_PREFIX/bin/python"
 [[ -x "$PYTHON_BIN" ]] || die "Python is absent from environment: $PYTHON_BIN"
 
-if [[ -z "$SOURCE_ROOT" ]]; then
-  SOURCE_ROOT="$ENV_PREFIX/src/perception-models"
-elif [[ "$SOURCE_ROOT" != /* ]]; then
-  SOURCE_ROOT="$PWD/$SOURCE_ROOT"
-fi
 SAM2_ROOT="$SOURCE_ROOT/sam2"
 GROUNDING_DINO_ROOT="$SOURCE_ROOT/GroundingDINO"
 
@@ -125,30 +113,31 @@ PY
 
 assert_tracked_clean() {
   local checkout="$1"
-  git -C "$checkout" diff --quiet -- || die \
-    "tracked changes exist in third-party checkout: $checkout"
-  git -C "$checkout" diff --cached --quiet -- || die \
-    "staged changes exist in third-party checkout: $checkout"
+  [[ -z "$(git -C "$checkout" status --porcelain)" ]] || die \
+    "source changes or generated files exist in third-party checkout: $checkout"
 }
 
-ensure_checkout() {
+ensure_submodule() {
   local name="$1"
   local url="$2"
   local revision="$3"
-  local sparse_directory="$4"
+  local relative_path="$4"
   local checkout="$5"
 
   if [[ ! -e "$checkout" ]]; then
-    ((VERIFY_ONLY == 0)) || die "$name checkout is absent: $checkout"
-    echo "[perception-models] Cloning $name into $checkout"
-    mkdir -p -- "$(dirname -- "$checkout")"
-    git clone --filter=blob:none --no-checkout "$url" "$checkout"
-    git -C "$checkout" sparse-checkout init --cone
-    git -C "$checkout" sparse-checkout set "$sparse_directory"
+    ((VERIFY_ONLY == 0)) || die "$name submodule is absent: $checkout"
+    echo "[perception-models] Initializing $name submodule"
+    git -C "$REPO_ROOT" submodule update --init --checkout -- "$relative_path"
   elif [[ ! -d "$checkout/.git" && ! -f "$checkout/.git" ]]; then
-    die "$name source path exists but is not a Git checkout: $checkout"
+    die "$name submodule path is not a Git checkout: $checkout"
   fi
 
+  local configured_url
+  configured_url="$(git -C "$REPO_ROOT" config -f .gitmodules \
+    --get "submodule.${relative_path}.url")" || die \
+    "$name is not registered in .gitmodules"
+  [[ "$configured_url" == "$url" ]] || die \
+    "$name .gitmodules URL is not the reviewed official URL: $configured_url"
   local actual_url
   actual_url="$(git -C "$checkout" remote get-url origin)" || die \
     "$name checkout has no origin remote"
@@ -156,25 +145,23 @@ ensure_checkout() {
     "$name origin is not the reviewed official URL: $actual_url"
   assert_tracked_clean "$checkout"
 
-  if ! git -C "$checkout" cat-file -e "${revision}^{commit}" 2>/dev/null; then
-    ((VERIFY_ONLY == 0)) || die "$name reviewed revision is absent: $revision"
-    echo "[perception-models] Fetching $name revision $revision"
-    git -C "$checkout" fetch --depth=1 origin "$revision"
-  fi
   if [[ "$(git -C "$checkout" rev-parse HEAD 2>/dev/null || true)" != "$revision" ]]; then
-    ((VERIFY_ONLY == 0)) || die "$name HEAD does not match $revision"
-    echo "[perception-models] Checking out $name revision $revision"
-    git -C "$checkout" checkout --detach "$revision"
+    ((VERIFY_ONLY == 0)) || die "$name HEAD does not match the pinned gitlink"
+    echo "[perception-models] Restoring $name to the pinned submodule gitlink"
+    git -C "$REPO_ROOT" submodule update --init --checkout -- "$relative_path"
   fi
+  [[ "$(git -C "$checkout" rev-parse HEAD)" == "$revision" ]] || die \
+    "$name submodule does not match the reviewed revision"
   assert_tracked_clean "$checkout"
 }
 
-ensure_checkout "SAM2" "$SAM2_URL" "$SAM2_REVISION" "sam2" "$SAM2_ROOT"
-ensure_checkout \
+ensure_submodule "SAM2" "$SAM2_URL" "$SAM2_REVISION" \
+  "model/perception/sam2" "$SAM2_ROOT"
+ensure_submodule \
   "Grounding DINO" \
   "$GROUNDING_DINO_URL" \
   "$GROUNDING_DINO_REVISION" \
-  "groundingdino" \
+  "model/perception/GroundingDINO" \
   "$GROUNDING_DINO_ROOT"
 
 [[ -f "$SAM2_ROOT/sam2/build_sam.py" ]] || die "SAM2 runtime source is incomplete"
@@ -240,6 +227,22 @@ if ((VERIFY_ONLY == 0)); then
     "$PYTHON_BIN" -m pip install \
       --no-deps --no-build-isolation --editable "$GROUNDING_DINO_ROOT"
   fi
+
+  # Upstream setup.py writes this untracked file on every editable build. Keep
+  # the submodule clean, but fail closed if its identity or tracking status ever
+  # changes instead of deleting an arbitrary source file.
+  DINO_GENERATED_VERSION="$GROUNDING_DINO_ROOT/groundingdino/version.py"
+  if [[ -e "$DINO_GENERATED_VERSION" ]]; then
+    if git -C "$GROUNDING_DINO_ROOT" ls-files --error-unmatch \
+      groundingdino/version.py >/dev/null 2>&1; then
+      die "Grounding DINO generated version path became tracked"
+    fi
+    [[ "$(tr -d '\r\n' < "$DINO_GENERATED_VERSION")" == \
+      "__version__ = '0.1.0'" ]] || die \
+      "Grounding DINO generated version file has unexpected content"
+    rm -- "$DINO_GENERATED_VERSION"
+  fi
+  assert_tracked_clean "$GROUNDING_DINO_ROOT"
 
   # Grounding DINO/supervision may install overlapping OpenCV wheels. Restore
   # the AgenticRobot-locked contrib implementation last so cv2.aruco remains.
@@ -308,5 +311,5 @@ PY
 echo
 echo "[perception-models] Installation complete."
 echo "  conda activate $ENV_NAME"
-echo "  source checkouts: $SOURCE_ROOT"
+echo "  source submodules: $SOURCE_ROOT"
 echo "Weights are separate runtime assets; see README.md for download and inference commands."

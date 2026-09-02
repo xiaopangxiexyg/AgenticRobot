@@ -20,6 +20,7 @@ from scipy.spatial.transform import Rotation
 from project_paths import resolve_path
 from robot_motion.pose import pose6_to_matrix
 from robot_motion.rm65 import (
+    DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
     RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
     RM65PositionCollisionPlanner,
     RM65PositionCollisionPlannerConfig,
@@ -302,6 +303,10 @@ class CubeLiftPoseActionController:
             solve_translation_tolerance_m=2e-3,
             solve_orientation_tolerance_deg=1.0,
             collision_min_distance_m=sim_collision_min_distance,
+            collision_distance_epsilon_m=min(
+                DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
+                sim_collision_min_distance,
+            ),
         )
         self.planner_collision_min_distance_m = sim_collision_min_distance
         self._ik: RM65CanonicalIK | None = None
