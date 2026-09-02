@@ -199,6 +199,11 @@ class CompositionInputBatchDraft:
                     "effective_clock_domain_id": item.effective_clock_domain_id,
                     "context_ids": tuple(item.context_ids),
                     "observation_cut_id": item.observation_cut_id,
+                    **(
+                        {"policy_output_id": item.policy_output_id}
+                        if item.policy_output_id is not None
+                        else {}
+                    ),
                     "source_fact_ids": tuple(item.source_fact_ids),
                     "source_fact_hashes": tuple(item.source_fact_hashes),
                     **(
@@ -1732,6 +1737,7 @@ class CompositionInputStore:
                     item.draft.produced_clock_domain_id,
                     item.draft.effective_clock_domain_id,
                     item.draft.observation_cut_id,
+                    item.draft.policy_output_id,
                     item.draft.composition_activation_id,
                     item.draft.composition_activation_hash,
                 )
@@ -1739,6 +1745,7 @@ class CompositionInputStore:
                     first.draft.produced_clock_domain_id,
                     first.draft.effective_clock_domain_id,
                     first.draft.observation_cut_id,
+                    first.draft.policy_output_id,
                     first.draft.composition_activation_id,
                     first.draft.composition_activation_hash,
                 )

@@ -978,6 +978,7 @@ def apply_human_readiness(
         receipt.human_emission_available_at,
         receipt.measured_state_available_at,
         receipt.deadman_rearmed_at,
+        receipt.retargeter_rebased_at,
     )
     if receipt.completed_at < newest_input_at:
         raise ValueError("Human readiness completion predates one of its inputs.")
