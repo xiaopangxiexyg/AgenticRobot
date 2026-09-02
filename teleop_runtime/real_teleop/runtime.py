@@ -12,178 +12,242 @@ transferring device or control authority.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+import os
 import shutil
+import sys
+import threading
+import time
+from collections.abc import Callable, Mapping
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from dataset_contracts.capture_modalities import CaptureModalityContract
+from robot_motion.position_control import (
+    DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC,
+    PositionAuditFanout,
+)
+from teleop_runtime.backends.grippers import GRIPPER_ACTION_MAX, DMTacGripperBackend
+from teleop_runtime.cli_value_parsers import _active_sides_from_args
+from teleop_runtime.collection.camera_preview import (
+    CameraPreviewConfig,
+    CameraPreviewer,
+)
+from teleop_runtime.collection.preview_rate import PreviewRateLimiter
+from teleop_runtime.collection.rate_gate import PeriodicRateGate
+from teleop_runtime.episodes import EpisodeRecorder, EpisodeRecorderConfig
+from teleop_runtime.hand_mapping import DEFAULT_INSPIRE_HAND_JOINT_ORDER
+from teleop_runtime.log_utils import ChangeGate
+from teleop_runtime.log_utils import log_event as _log
+from teleop_runtime.session import SessionStepResult
+from teleop_runtime.special_tasks.fix_hold import SpecialArmFixHoldCoordinator
+from teleop_runtime.tactile_visualizer import (
+    AsyncDMTacDistributedForceVisualizer,
+    AsyncTactileUVVisualizer,
+    DMTacDistributedForceVisualizer,
+    dmtac_visualization_snapshot_from_backends,
+    tactile_by_side_from_backends,
+)
+from teleop_runtime.tcp import legacy_tcp_mode_requested
+
 from ..operator_ui_ports import RealTeleopInputBatchPrioritizer
+from ..position_control import PositionDebugRecorder
+from .actuator_command_trace import ActuatorCommandTraceRecorder
+from .arm_state_sync import (
+    _qpos_summary,
+    _run_initial_alignment_start_check,
+    _sync_preview_from_real_state_real,
+    _sync_real_execution_step_limits,
+)
+from .arm_tool_config import (
+    _force_tare_sec_arg,
+    _impedance_mode_arg,
+    _strict_tool_profile_arg,
+)
 from .artifact_context import materialize_real_teleop_artifact_context
+from .camera_runtime import (
+    _build_camera_sources,
+    _select_preview_camera_sources,
+    _start_camera_sources,
+    _start_camera_sources_best_effort,
+)
+from .components import RealTeleopComponents
 from .control_loop import (
     RealTeleopControlLoopContext,
     run_real_teleop_control_loop,
 )
-from .components import RealTeleopComponents
+from .control_profile import (
+    arm_control_mode as _arm_control_mode_arg,
+)
+from .control_profile import (
+    canfd_follow_runtime_config as _canfd_follow_runtime_config,
+)
+from .control_profile import (
+    effective_arm_canfd_follow as _effective_arm_canfd_follow,
+)
+from .control_profile import (
+    effective_arm_control_hz as _effective_arm_control_hz,
+)
+from .control_profile import (
+    effective_arm_follow_qpos_alpha as _effective_arm_follow_qpos_alpha,
+)
+from .control_profile import (
+    effective_dual_arm_temporary_safety as _effective_dual_arm_temporary_safety,
+)
+from .control_profile import (
+    effective_outer_control_hz as _effective_outer_control_hz,
+)
+from .control_profile import (
+    effective_position_post_ik_qpos_smoothing_alpha as _effective_position_post_ik_qpos_smoothing_alpha,
+)
+from .dataset_recorder import RealTeleopDatasetRecorder
+from .debug_recorders import DEFAULT_ACTION_DEBUG_LOG_ROOT
+from .debug_timing import (
+    AsyncDebugTimingConsole,
+    RealDebugTimingState,
+)
+from .debug_timing import (
+    debug_timing_metadata as _debug_timing_metadata,
+)
+from .debug_timing import (
+    debug_timing_modules as _debug_timing_modules,
+)
+from .debug_timing import (
+    merge_control_debug_runtime_metadata as _merge_control_debug_runtime_metadata,
+)
+from .defaults import runtime_home_fresh_data_timeout_sec
 from .device_retry_runtime import build_device_retry_runtime
 from .diagnostic_setup import (
+    _attach_actuator_command_trace_sink,
+    _attach_ik_shadow_trace_sink,
+    _attach_position_audit_sink,
+    _attach_singularity_transition_trace_sink,
+    _new_actuator_command_trace_recorder,
+    _new_position_debug_recorder,
     initialize_control_debug_runtime_metadata,
     setup_actuator_command_trace,
     setup_control_debug_runtime,
 )
 from .episode_recording_runtime import build_episode_recording_runtime
+from .episode_runtime import (
+    _debug_episode_recording_enabled,
+    _episode_root_dir,
+    _fix_arm_pose_snapshot_recorder,
+)
 from .foot_pad_controls import (
+    SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
+    FootPadSpecialArmInput,
+    FootPadUnavailableError,
     apply_live_foot_pad_topology,
     foot_pad_progress_topology_guidance,
     initialize_startup_foot_pad_input,
 )
+from .gripper_control import _run_gripper_warmup_probe_for_side
 from .gripper_warmup_runtime import build_gripper_warmup_probe_runtime
-from .position_episode_debug import build_position_episode_debug_runtime
-from .runtime_extension import RealTeleopRuntimeExtension
+from .hand_runtime import (
+    _enable_gui_tactile_solving,
+    _gripper_backend_for_side,
+    _gripper_retargeter_for_side,
+    _hand_backend_for_side,
+    _has_dmtac_gripper_backend,
+    _parse_hand_tactile_regions,
+    _tactile_solving_active,
+    _tactile_solving_available,
+    _tactile_visualization_available,
+)
+from .impedance_force_runtime import _emergency_stop_real_arms
+from .main_loop_watchdog import MainLoopStallWatchdog
+from .operator_control_runtime import RealTeleopControlInput
 from .position_admittance_shadow import (
     install_resolved_position_admittance_profile,
     resolve_position_admittance_profile,
 )
+from .position_episode_debug import build_position_episode_debug_runtime
+from .position_force_guard import (
+    PositionForceGuardFault,
+    PositionForceGuardMonitor,
+)
+from .position_force_guard import (
+    position_force_guard_config as _position_force_guard_config,
+)
 from .progress_contracts import ProgressApplicationPort
 from .recording_admission import (
     recording_auto_stop_reason as _recording_auto_stop_reason,
+)
+from .recording_admission import (
     recording_warmup_status as _recording_warmup_status,
 )
-from .shutdown_runtime import shutdown_real_teleop_runtime
-from .startup_runtime import (
-    StartupCleanupRegistry as _StartupCleanupRegistry,
-    activate_startup_cleanup as _activate_startup_cleanup,
-    cleanup_active_startup,
-    deactivate_startup_cleanup as _deactivate_startup_cleanup,
-    register_component_startup_cleanup as _register_component_startup_cleanup,
+from .runtime_extension import RealTeleopRuntimeExtension
+from .runtime_home import (
+    _emit_collision_proxy_logs,
+    _emit_home_alignment_logs,
+    _emit_tracker_axis_mapping_logs,
+    _manual_calibration_confirmation_required,
+    _runtime_home_calibration,
 )
-from .startup_progress_runtime import RealTeleopStartupProgressRuntime
-from .startup_device_runtime import StartupDeviceRuntime
+from .runtime_metadata import (
+    arm_execution_profile_metadata as _arm_execution_profile_metadata,
+)
+from .runtime_metadata import (
+    position_ik_iteration_metadata as _position_ik_iteration_metadata,
+)
+from .shutdown_runtime import shutdown_real_teleop_runtime
+from .side_mapping import (
+    resolve_logical_side_assignments as _resolve_logical_side_assignments,
+)
+from .side_mapping import (
+    tracker_source_side_for_logical_side as _tracker_source_side_for_logical_side,
+)
 from .startup_admission import (
     assemble_startup_components,
     configure_startup_cameras,
     initialize_startup_ui,
 )
-from .tactile_idle_compression import (
-    RealTeleopIdleTactileCompression,
+from .startup_device_runtime import StartupDeviceRuntime
+from .startup_progress_runtime import RealTeleopStartupProgressRuntime
+from .startup_runtime import (
+    StartupCleanupRegistry as _StartupCleanupRegistry,
 )
+from .startup_runtime import (
+    _arm_after_start_calibration,
+    _log_dual_arm_readiness,
+    _release_runtime_state_readers,
+    _restore_init_arm_after_foot_pad_fallback,
+    _run_camera_startup_self_check,
+    _runtime_home_failure_message,
+    _wait_for_real_teleop_start_request,
+    cleanup_active_startup,
+)
+from .startup_runtime import (
+    activate_startup_cleanup as _activate_startup_cleanup,
+)
+from .startup_runtime import (
+    deactivate_startup_cleanup as _deactivate_startup_cleanup,
+)
+from .startup_runtime import (
+    register_component_startup_cleanup as _register_component_startup_cleanup,
+)
+from .status_payloads import _camera_status_blocking_message, _safe_float_value
+from .tactile_idle_compression import RealTeleopIdleTactileCompression
+from .tactile_visualization import _build_tactile_visualizer
+from .terminal_input import TerminalClutchInput
 from .visualization_runtime import build_visualization_runtime
-from .defaults import runtime_home_fresh_data_timeout_sec
 
 _REQUIRED_SUPPORT_NAMES = (
     "ActionDebugLogRecorder",
-    "AsyncDMTacDistributedForceVisualizer",
-    "AsyncDebugTimingConsole",
-    "AsyncTactileUVVisualizer",
     "CalibrationWebUi",
-    "CameraPreviewConfig",
-    "CameraPreviewer",
-    "CaptureModalityContract",
-    "ChangeGate",
-    "DEFAULT_ACTION_DEBUG_LOG_ROOT",
-    "DEFAULT_INSPIRE_HAND_JOINT_ORDER",
-    "DEFAULT_POSITION_TARGET_VELOCITY_FILTER_TAU_SEC",
-    "DMTacDistributedForceVisualizer",
-    "DMTacGripperBackend",
     "DebugTimingLogRecorder",
-    "EpisodeRecorder",
-    "EpisodeRecorderConfig",
-    "FootPadSpecialArmInput",
-    "FootPadUnavailableError",
-    "GRIPPER_ACTION_MAX",
     "GuiStartupProgress",
     "IkDebugLogRecorder",
-    "MainLoopStallWatchdog",
-    "Mapping",
-    "Path",
-    "PeriodicRateGate",
-    "PositionAuditFanout",
-    "PositionForceGuardMonitor",
-    "PreviewRateLimiter",
-    "RealDebugTimingState",
-    "RealTeleopControlInput",
-    "RealTeleopDatasetRecorder",
-    "SPECIAL_ARM_CONTROL_MODE_FOOT_PAD",
-    "SpecialArmFixHoldCoordinator",
-    "TerminalClutchInput",
-    "_active_sides_from_args",
-    "_arm_after_start_calibration",
-    "_arm_control_mode_arg",
-    "_arm_execution_profile_metadata",
-    "_attach_actuator_command_trace_sink",
-    "_attach_ik_shadow_trace_sink",
-    "_attach_position_audit_sink",
-    "_attach_singularity_transition_trace_sink",
-    "_build_camera_sources",
     "_build_components",
-    "_build_tactile_visualizer",
-    "_camera_status_blocking_message",
-    "_canfd_follow_runtime_config",
-    "_debug_episode_recording_enabled",
-    "_debug_timing_metadata",
-    "_debug_timing_modules",
-    "_effective_arm_canfd_follow",
-    "_effective_arm_control_hz",
-    "_effective_arm_follow_qpos_alpha",
-    "_effective_dual_arm_temporary_safety",
-    "_effective_outer_control_hz",
-    "_effective_position_post_ik_qpos_smoothing_alpha",
-    "_emergency_stop_real_arms",
-    "_emit_collision_proxy_logs",
-    "_emit_home_alignment_logs",
-    "_emit_tracker_axis_mapping_logs",
-    "_enable_gui_tactile_solving",
-    "_episode_root_dir",
     "_expand_cli_path",
-    "_fix_arm_pose_snapshot_recorder",
-    "_force_tare_sec_arg",
-    "_gripper_backend_for_side",
-    "_gripper_retargeter_for_side",
     "_guard_impedance_force_control",
-    "_hand_backend_for_side",
     "_handle_ik_debug_log_toggle_request",
-    "_has_dmtac_gripper_backend",
-    "_impedance_mode_arg",
-    "_log",
-    "_log_dual_arm_readiness",
-    "_manual_calibration_confirmation_required",
-    "_merge_control_debug_runtime_metadata",
-    "_new_actuator_command_trace_recorder",
-    "_new_position_debug_recorder",
-    "_parse_hand_tactile_regions",
-    "_position_force_guard_config",
-    "_position_ik_iteration_metadata",
     "_promote_angle_trigger_gripper_input_to_q6",
-    "_qpos_summary",
     "_real_hand_render_qpos",
-    "_release_runtime_state_readers",
-    "_resolve_logical_side_assignments",
-    "_restore_init_arm_after_foot_pad_fallback",
-    "_run_camera_startup_self_check",
-    "_run_gripper_warmup_probe_for_side",
-    "_run_initial_alignment_start_check",
-    "_runtime_home_calibration",
-    "_runtime_home_failure_message",
-    "_safe_float_value",
-    "_select_preview_camera_sources",
-    "_start_camera_sources",
-    "_start_camera_sources_best_effort",
-    "_strict_tool_profile_arg",
-    "_sync_preview_from_real_state_real",
-    "_sync_real_execution_step_limits",
-    "_tactile_solving_active",
-    "_tactile_solving_available",
-    "_tactile_visualization_available",
-    "_tracker_source_side_for_logical_side",
     "_vive_pose_source_from_components",
-    "_wait_for_real_teleop_start_request",
-    "datetime",
-    "dmtac_visualization_snapshot_from_backends",
-    "legacy_tcp_mode_requested",
-    "np",
-    "os",
-    "sys",
-    "tactile_by_side_from_backends",
-    "threading",
-    "time",
 )
 
 
