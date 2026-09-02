@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import time
 from typing import Any
 
 import numpy as np
 
+from utils.calibration_common.capture import (
+    max_distance as _max_distance,
+    mean_vector as _mean_vector,
+    most_common as _most_common,
+    now_utc as _now_utc,
+)
+
 from .calibration import CalibrationSample
-from .transforms import average_transforms, transform_distance
+from .transforms import average_transforms
 
 
 @dataclass(frozen=True)
@@ -120,29 +126,3 @@ def capture_burst(
         "reprojection_rmse_px": float(np.mean(reprojections)) if reprojections else -1.0,
     }
     return sample, stats
-
-
-def _most_common(values: list[str]) -> str:
-    if not values:
-        return ""
-    return max(set(values), key=values.count)
-
-
-def _max_distance(reference: np.ndarray, values: list[np.ndarray]) -> tuple[float, float]:
-    trans = 0.0
-    rot = 0.0
-    for value in values:
-        current_trans, current_rot = transform_distance(reference, value)
-        trans = max(trans, current_trans)
-        rot = max(rot, current_rot)
-    return float(trans), float(rot)
-
-
-def _mean_vector(values: list[list[float]]) -> list[float] | None:
-    if not values:
-        return None
-    return np.mean(np.asarray(values, dtype=np.float64), axis=0).tolist()
-
-
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
