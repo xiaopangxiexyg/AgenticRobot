@@ -999,7 +999,7 @@ class OpenPICommonDeployTest(unittest.TestCase):
         )
         self.assertIn("--no-arm-canfd-follow", launched_args)
 
-    def test_openpi_prediction_prefetch_is_explicit_opt_in(self) -> None:
+    def test_openpi_launcher_rejects_retired_prediction_scheduler_args(self) -> None:
         with mock.patch(
             "teleop_runtime.deploy.run_policy.main", return_value=0
         ) as run_main:
@@ -1013,35 +1013,28 @@ class OpenPICommonDeployTest(unittest.TestCase):
             launched_args,
         )
 
-        with mock.patch(
-            "teleop_runtime.deploy.run_policy.main", return_value=0
-        ) as run_main:
-            result = openpi_real_launcher.main(
-                [
-                    "--policy-prediction-mode",
-                    "threaded-prefetch",
-                    "--policy-prediction-prefetch-queue-threshold",
-                    "4",
-                ]
-            )
+        def validate_runtime_parser(argv, **_kwargs):
+            parser = argparse.ArgumentParser()
+            run_policy.add_args(parser)
+            parser.parse_args(argv)
+            return 0
 
-        self.assertEqual(result, 0)
-        launched_args = run_main.call_args.args[0]
-        mode_values = [
-            launched_args[index + 1]
-            for index, token in enumerate(launched_args)
-            if token == "--policy-prediction-mode"
-        ]
-        self.assertEqual(mode_values, ["threaded-prefetch"])
-        self.assertEqual(
-            launched_args[
-                launched_args.index(
-                    "--policy-prediction-prefetch-queue-threshold"
+        with mock.patch(
+            "teleop_runtime.deploy.run_policy.main",
+            side_effect=validate_runtime_parser,
+        ) as run_main:
+            with self.assertRaises(SystemExit) as raised:
+                openpi_real_launcher.main(
+                    [
+                        "--policy-prediction-mode",
+                        "threaded-prefetch",
+                        "--policy-prediction-prefetch-queue-threshold",
+                        "4",
+                    ]
                 )
-                + 1
-            ],
-            "4",
-        )
+
+        self.assertEqual(raised.exception.code, 2)
+        run_main.assert_called_once()
 
     def test_openpi_profile_forwards_no_init_qpos_over_injected_dataset_default(self) -> None:
         resolved: list[tuple[bool, bool, object, object]] = []
