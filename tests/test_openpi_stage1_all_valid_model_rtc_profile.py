@@ -7,7 +7,10 @@ from deployments.openpi.model_rtc_profile import (
     load_prepared_model_rtc_profile,
     prepared_model_rtc_profile_hash,
 )
-from deployments.openpi.training.prepared_skill_launch import _load_profile
+from deployments.openpi.training.prepared_skill_launch import (
+    _load_profile,
+    _model_rtc_profile_matches_prepared_profile,
+)
 
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
@@ -83,3 +86,14 @@ def test_stage1_all_view_h32_model_rtc_profile_has_no_ordinary_checkpoint_fields
     assert payload["output_config_name"] != (
         "writing_stage1_all_valid_all_view_h32_absolute_non_rtc_100k_v1-prepared"
     )
+
+
+def test_stage1_model_rtc_overlay_requires_exact_prepared_profile_identity() -> None:
+    prepared = _load_profile(_PREPARED_PROFILE)
+    model_rtc = load_prepared_model_rtc_profile(_MODEL_RTC_PROFILE)
+
+    assert _model_rtc_profile_matches_prepared_profile(prepared, model_rtc)
+
+    mismatched = dict(model_rtc)
+    mismatched["prepared_skill_profile_id"] = "another-prepared-profile"
+    assert not _model_rtc_profile_matches_prepared_profile(prepared, mismatched)

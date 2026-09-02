@@ -2411,6 +2411,22 @@ def _sha256_digest(value: object, *, name: str) -> str:
     return normalized
 
 
+def _model_rtc_profile_matches_prepared_profile(
+    profile: Mapping[str, Any],
+    model_rtc_profile: Mapping[str, Any],
+) -> bool:
+    """Return whether a model-RTC overlay names this Prepared profile.
+
+    The overlay is intentionally bound to the Prepared data/configuration
+    identity, not to a checkpoint path or continuation-contract hash.  The
+    latter are run artifacts and must remain selectable at launch time.
+    """
+
+    return str(model_rtc_profile.get("prepared_skill_profile_id", "")) == str(
+        profile.get("profile_id", "")
+    )
+
+
 def _model_rtc_checkpoint_root(
     profile: Mapping[str, Any],
     model_rtc_profile: Mapping[str, Any],
@@ -2759,6 +2775,14 @@ def main(argv: list[str] | None = None) -> int:
             "--model-rtc-profile is supported only by sample-check and train"
         )
     profile = _load_profile(args.profile)
+    try:
+        model_rtc_profile = (
+            None
+            if args.model_rtc_profile is None
+            else load_prepared_model_rtc_profile(args.model_rtc_profile)
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(f"invalid --model-rtc-profile: {exc}")
     camera_prepared_view_opt_in = (
         _configure_camera_semantic_prepared_view_opt_in(
             bool(args.allow_camera_semantic_prepared_view)
@@ -2777,10 +2801,15 @@ def main(argv: list[str] | None = None) -> int:
     if (
         profile.get("openpi_training_mode")
         == STANDARD_NON_RTC_TRAINING_MODE_V1
-        and args.model_rtc_profile is not None
+        and model_rtc_profile is not None
+        and not _model_rtc_profile_matches_prepared_profile(
+            profile,
+            model_rtc_profile,
+        )
     ):
         parser.error(
-            "standard_non_rtc_v1 profiles reject --model-rtc-profile"
+            "standard_non_rtc_v1 model-RTC overlays must target the exact "
+            "prepared_skill_profile_id"
         )
     if (
         profile.get("schema") in {
@@ -2792,11 +2821,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "joint prompt training does not yet support --model-rtc-profile"
         )
-    model_rtc_profile = (
-        None
-        if args.model_rtc_profile is None
-        else load_prepared_model_rtc_profile(args.model_rtc_profile)
-    )
     checkpoint_bound_resume = None
     if args.command == "train" and args.resume and model_rtc_profile is not None:
         checkpoint_bound_resume = _load_checkpoint_bound_prepared_resume(
