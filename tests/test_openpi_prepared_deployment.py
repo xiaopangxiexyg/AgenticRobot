@@ -528,6 +528,16 @@ def test_prepared_model_rtc_deployment_binds_profile_receipt_and_stats(
     assert validated.binding == result.binding
 
 
+def test_model_rtc_source_roots_ignore_serialization_order() -> None:
+    assert prepared_deployment._canonical_source_roots(
+        ("/dataset/source-b", "/dataset/source-a", "/dataset/source-a")
+    ) == (
+        "/dataset/source-a",
+        "/dataset/source-a",
+        "/dataset/source-b",
+    )
+
+
 def test_prepared_model_rtc_deployment_rejects_profile_sampling_drift(
     tmp_path: Path,
 ) -> None:

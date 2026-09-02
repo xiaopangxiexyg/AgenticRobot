@@ -2411,6 +2411,69 @@ def _sha256_digest(value: object, *, name: str) -> str:
     return normalized
 
 
+def _model_rtc_profile_matches_prepared_profile(
+    profile: Mapping[str, Any],
+    model_rtc_profile: Mapping[str, Any],
+) -> bool:
+    """Return whether a model-RTC overlay names this Prepared profile.
+
+    The overlay is intentionally bound to the Prepared data/configuration
+    identity, not to a checkpoint path or continuation-contract hash.  The
+    latter are run artifacts and must remain selectable at launch time.
+    """
+
+    return str(model_rtc_profile.get("prepared_skill_profile_id", "")) == str(
+        profile.get("profile_id", "")
+    )
+
+
+def _prepared_profile_for_model_rtc(
+    profile: Mapping[str, Any],
+    model_rtc_profile: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    """Apply a model-RTC-only final-mask root override, when declared.
+
+    Final keep masks are a data-input concern, not a checkpoint identity. A
+    model-RTC profile may therefore point at an isolated, immutable mask
+    materialization without changing the ordinary Prepared profile. Relative
+    paths are rooted at the snapshot root (the grandparent of
+    'organized_dataset_root'); absolute paths remain useful for an explicit
+    remote snapshot. The override is intentionally applied only to the
+    launch-time copy used to construct the DataLoader.
+    """
+
+    if model_rtc_profile is None:
+        return profile
+    configured = model_rtc_profile.get("prepared_final_mask_root")
+    if configured is None or not str(configured).strip():
+        return profile
+    if not isinstance(configured, (str, Path)):
+        raise ValueError(
+            "prepared_final_mask_root must be a path string when declared."
+        )
+    root = Path(str(configured)).expanduser()
+    if not root.is_absolute():
+        organized_root_value = str(profile.get("organized_dataset_root") or "")
+        if not organized_root_value:
+            raise ValueError(
+                "relative prepared_final_mask_root requires "
+                "organized_dataset_root."
+            )
+        root = (
+            Path(organized_root_value).expanduser().resolve().parent.parent
+            / root
+        )
+    if profile.get("openpi_final_mask_root_layout") != (
+        "source_dataset_id_partitioned_v1"
+    ):
+        raise ValueError(
+            "model-RTC final-mask override requires source-partitioned masks."
+        )
+    effective = dict(profile)
+    effective["openpi_final_mask_root"] = str(root.resolve())
+    return effective
+
+
 def _model_rtc_checkpoint_root(
     profile: Mapping[str, Any],
     model_rtc_profile: Mapping[str, Any],
@@ -2759,6 +2822,14 @@ def main(argv: list[str] | None = None) -> int:
             "--model-rtc-profile is supported only by sample-check and train"
         )
     profile = _load_profile(args.profile)
+    try:
+        model_rtc_profile = (
+            None
+            if args.model_rtc_profile is None
+            else load_prepared_model_rtc_profile(args.model_rtc_profile)
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(f"invalid --model-rtc-profile: {exc}")
     camera_prepared_view_opt_in = (
         _configure_camera_semantic_prepared_view_opt_in(
             bool(args.allow_camera_semantic_prepared_view)
@@ -2777,10 +2848,15 @@ def main(argv: list[str] | None = None) -> int:
     if (
         profile.get("openpi_training_mode")
         == STANDARD_NON_RTC_TRAINING_MODE_V1
-        and args.model_rtc_profile is not None
+        and model_rtc_profile is not None
+        and not _model_rtc_profile_matches_prepared_profile(
+            profile,
+            model_rtc_profile,
+        )
     ):
         parser.error(
-            "standard_non_rtc_v1 profiles reject --model-rtc-profile"
+            "standard_non_rtc_v1 model-RTC overlays must target the exact "
+            "prepared_skill_profile_id"
         )
     if (
         profile.get("schema") in {
@@ -2792,11 +2868,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "joint prompt training does not yet support --model-rtc-profile"
         )
-    model_rtc_profile = (
-        None
-        if args.model_rtc_profile is None
-        else load_prepared_model_rtc_profile(args.model_rtc_profile)
-    )
     checkpoint_bound_resume = None
     if args.command == "train" and args.resume and model_rtc_profile is not None:
         checkpoint_bound_resume = _load_checkpoint_bound_prepared_resume(
@@ -2840,8 +2911,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in {"audit", "prepare"}:
         return 0
     assert binding is not None and binding_root is not None
+    launch_profile = _prepared_profile_for_model_rtc(profile, model_rtc_profile)
     config, training_config, checkout = _openpi_config(
-        profile,
+        launch_profile,
         binding,
         binding_root,
         exp_name=args.exp_name,
@@ -2849,7 +2921,7 @@ def main(argv: list[str] | None = None) -> int:
         overwrite=args.overwrite,
     )
     final_mask_contract = _final_mask_training_contract(
-        profile,
+        launch_profile,
         binding,
         binding_root,
     )
@@ -2959,7 +3031,7 @@ def main(argv: list[str] | None = None) -> int:
             post_identity_transform=post_identity_transform,
             load_images=False if state_only_bridge is not None else None,
         ), _source_partitioned_final_mask_binding(
-            profile,
+            launch_profile,
             binding,
             binding_root,
         ):
@@ -3277,7 +3349,7 @@ def main(argv: list[str] | None = None) -> int:
         post_identity_transform=post_identity_transform,
         load_images=False if state_only_bridge is not None else None,
     ), _source_partitioned_final_mask_binding(
-        profile,
+        launch_profile,
         binding,
         binding_root,
     ):
