@@ -108,7 +108,14 @@ def _finite(value: object, *, name: str) -> float:
 
 @dataclass(frozen=True)
 class RtcModelContinuationCapabilityV3:
-    """Continuation capability exported by one loaded model instance."""
+    """Continuation capability exported by one loaded model instance.
+
+    ``artifact_hash`` is retained as model provenance for diagnostics and
+    receipts.  It is intentionally not part of the runtime capability
+    identity: a client may exercise the same continuation protocol against a
+    different server checkpoint or model revision when the declared runtime
+    contracts remain compatible.
+    """
 
     artifact_hash: str
     continuation_contract_hash: str
@@ -185,7 +192,6 @@ class RtcModelContinuationCapabilityV3:
         return canonical_content_hash(
             {
                 "schema": self.schema,
-                "artifact_hash": self.artifact_hash,
                 "continuation_contract_hash": (
                     self.continuation_contract_hash
                 ),
@@ -223,7 +229,13 @@ def validate_rtc_model_continuation_capability_v3_binding(
     codec_identity_hash: str | None = None,
     selected_prefix_schedule: str | None = None,
 ) -> None:
-    """Validate one loaded capability against its authoritative artifact facts."""
+    """Validate one loaded capability against authoritative runtime facts.
+
+    ``artifact_hash`` remains an accepted keyword for source compatibility,
+    but is provenance-only and is deliberately not compared.  Runtime
+    admission is governed by the continuation, codec, schedule, dimensions,
+    sampler, and bootstrap contracts instead of a particular checkpoint.
+    """
 
     if not isinstance(capability, RtcModelContinuationCapabilityV3):
         raise TypeError(
@@ -243,7 +255,7 @@ def validate_rtc_model_continuation_capability_v3_binding(
         "external_action_dim": contract.model_action_dim,
     }
     if artifact_hash is not None:
-        expected["artifact_hash"] = _nonempty(
+        _nonempty(
             artifact_hash,
             name="artifact_hash",
         )
@@ -353,8 +365,6 @@ class RtcConditionedInferenceEnvelopeV3:
             raise ValueError(
                 "Request/encoded conditioning binding hash mismatch."
             )
-        if self.request.artifact_hash != self.capability.artifact_hash:
-            raise ValueError("Request/continuation capability artifact mismatch.")
         if (
             receipt.codec_identity_hash
             != self.capability.codec_identity_hash
@@ -411,7 +421,6 @@ def build_rtc_conditioned_inference_envelope_v3(
     validate_rtc_model_continuation_capability_v3_binding(
         capability,
         continuation_contract=source_contract,
-        artifact_hash=bundle.artifact_hash,
         codec_identity_hash=(
             encoded_conditioning.receipt.codec_identity_hash
         ),

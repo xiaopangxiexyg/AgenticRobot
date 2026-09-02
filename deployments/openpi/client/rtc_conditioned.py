@@ -250,7 +250,6 @@ class OpenPIV22ConditioningCodec:
                 "implementation_id": (
                     OPENPI_CONDITIONING_CODEC_IMPLEMENTATION_V1
                 ),
-                "artifact_hash": config.artifact_hash,
                 "layout_hash": artifact.layout_hash,
                 "action_pose_mode": config.action_pose_mode,
                 "active_sides": config.active_sides,
@@ -544,7 +543,6 @@ class OpenPIConditionedRtcBackendV3:
         validate_rtc_model_continuation_capability_v3_binding(
             self._capability,
             continuation_contract=source_contract,
-            artifact_hash=base_backend.config.artifact_hash,
             codec_identity_hash=self._codec.identity.semantic_content_hash,
             selected_prefix_schedule=config.selected_prefix_schedule,
         )
