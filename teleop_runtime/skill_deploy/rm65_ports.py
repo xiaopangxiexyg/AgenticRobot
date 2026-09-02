@@ -192,10 +192,18 @@ class ExclusiveRM65SkillDeployPorts:
         )
         self._sync_lock = threading.Lock()
         self._target_builder_synchronized = False
+        self._lifecycle_lock = threading.Lock()
         self._resource_lock = threading.Lock()
         self._resources_started = False
         self._resources_closed = False
+        self._start_attempted = False
+        self._closing = False
         self._force_guard_started = False
+        self._backend_close_pending = {"left", "right"}
+        self._shutdown_hold_attempted = False
+        self._shutdown_hold_confirmed = False
+        self._shutdown_hold_error: str | None = None
+        self._terminal_close_error: str | None = None
         self._startup_hold_receipt: RealSkillMotionHoldReceipt | None = None
 
     @property
@@ -204,93 +212,139 @@ class ExclusiveRM65SkillDeployPorts:
             return self._resources_started
 
     @property
+    def resources_closed(self) -> bool:
+        with self._resource_lock:
+            return self._resources_closed
+
+    @property
     def startup_hold_receipt(self) -> RealSkillMotionHoldReceipt | None:
         return self._startup_hold_receipt
 
     def start(self) -> None:
         """Start both lower backends and reject any partial inventory."""
 
-        with self._resource_lock:
-            if self._resources_closed:
-                raise RuntimeError("closed RM65 Skill resources cannot restart.")
-            if self._resources_started:
-                return
-        started: list[EffectorBackend] = []
-        try:
-            for side in ("left", "right"):
-                backend = self.arm_backends[side]
-                backend.start()
-                started.append(backend)
-                if not backend.is_ready():
-                    raise RuntimeError(f"{side} RM65 backend is not ready.")
-            require_arm_backends_ready_for_position_dispatch(
-                self.arm_backends,
-                require_background_target=False,
-                stage="exclusive_real_skill_resource_start",
-                required_sides=("left", "right"),
-            )
-            startup_hold = self.hold("exclusive real Skill startup fence")
-            if not startup_hold.succeeded:
-                raise RuntimeError(
-                    "exclusive RM65 Skill startup HOLD was not confirmed."
-                )
-            self._startup_hold_receipt = startup_hold
-            self.position_force_guard.start(arm_stale_watchdog=True)
-            self._force_guard_started = True
-            self._require_force_guard_motion_ready()
-        except Exception:
-            try:
-                hold_deploy_arm_backends(
-                    self.arm_backends,
-                    reason="exclusive real Skill resource startup rollback",
-                )
-            except Exception:
-                pass
-            if self._force_guard_started:
-                try:
-                    self.position_force_guard.close()
-                except Exception:
-                    pass
-                self._force_guard_started = False
-            for backend in reversed(started):
-                try:
-                    backend.close()
-                except Exception:
-                    pass
+        with self._lifecycle_lock:
             with self._resource_lock:
-                self._resources_closed = True
-            raise
-        with self._resource_lock:
-            self._resources_started = True
+                if self._resources_started:
+                    return
+                if (
+                    self._resources_closed
+                    or self._start_attempted
+                    or self._closing
+                ):
+                    raise RuntimeError("closed RM65 Skill resources cannot restart.")
+                self._start_attempted = True
+            try:
+                for side in ("left", "right"):
+                    backend = self.arm_backends[side]
+                    backend.start()
+                    if not backend.is_ready():
+                        raise RuntimeError(f"{side} RM65 backend is not ready.")
+                require_arm_backends_ready_for_position_dispatch(
+                    self.arm_backends,
+                    require_background_target=False,
+                    stage="exclusive_real_skill_resource_start",
+                    required_sides=("left", "right"),
+                )
+                startup_hold = self.hold("exclusive real Skill startup fence")
+                if not startup_hold.succeeded:
+                    raise RuntimeError(
+                        "exclusive RM65 Skill startup HOLD was not confirmed."
+                    )
+                self._startup_hold_receipt = startup_hold
+                # A start() implementation may acquire resources before raising,
+                # so cleanup ownership begins before the call rather than after
+                # a successful return.
+                self._force_guard_started = True
+                self.position_force_guard.start(arm_stale_watchdog=True)
+                self._require_force_guard_motion_ready()
+            except Exception as startup_exc:
+                with self._resource_lock:
+                    self._resources_started = False
+                    self._closing = True
+                cleanup_errors = self._attempt_resource_shutdown(
+                    reason="exclusive real Skill resource startup rollback"
+                )
+                self._finish_resource_shutdown()
+                if cleanup_errors:
+                    raise RuntimeError(
+                        f"{type(startup_exc).__name__}: {startup_exc}; "
+                        "startup rollback incomplete: " + "; ".join(cleanup_errors)
+                    ) from startup_exc
+                raise
+            with self._resource_lock:
+                self._resources_started = True
 
     def close(self) -> None:
-        """HOLD before closing both lower resources; always attempt both sides."""
+        """Fence motion and retry only unfinished lower cleanup stages."""
 
-        with self._resource_lock:
-            if self._resources_closed:
-                return
-        hold_receipt = self.hold("exclusive real Skill resource shutdown")
+        with self._lifecycle_lock:
+            with self._resource_lock:
+                if self._resources_closed:
+                    terminal_error = self._terminal_close_error
+                    if terminal_error is None:
+                        return
+                    raise RuntimeError(
+                        "exclusive RM65 Skill resource close failed: "
+                        + terminal_error
+                    )
+                # This is the admission fence.  It is permanent even when a
+                # lower close stage fails and must be retried.
+                self._resources_started = False
+                self._closing = True
+            errors = self._attempt_resource_shutdown(
+                reason="exclusive real Skill resource shutdown"
+            )
+            self._finish_resource_shutdown()
+            if errors:
+                raise RuntimeError(
+                    "exclusive RM65 Skill resource close failed: "
+                    + "; ".join(errors)
+                )
+
+    def _attempt_resource_shutdown(self, *, reason: str) -> list[str]:
+        """Attempt each owned stage once, retaining only failed stages."""
+
         errors: list[str] = []
-        if not hold_receipt.succeeded:
-            errors.append("lower HOLD was not confirmed")
+        if not self._shutdown_hold_attempted:
+            self._shutdown_hold_attempted = True
+            hold_receipt = self.hold(reason)
+            self._shutdown_hold_confirmed = bool(hold_receipt.succeeded)
+            if not self._shutdown_hold_confirmed:
+                self._shutdown_hold_error = "lower HOLD was not confirmed"
+        if self._shutdown_hold_error is not None:
+            errors.append(self._shutdown_hold_error)
+
         if self._force_guard_started:
             try:
                 self.position_force_guard.close()
             except Exception as exc:  # noqa: BLE001 - still close both arms.
                 errors.append(f"force_guard: {type(exc).__name__}: {exc}")
-            self._force_guard_started = False
+            else:
+                self._force_guard_started = False
+
         for side in ("right", "left"):
+            if side not in self._backend_close_pending:
+                continue
             try:
                 self.arm_backends[side].close()
             except Exception as exc:  # noqa: BLE001 - close the other side too.
                 errors.append(f"{side}: {type(exc).__name__}: {exc}")
+            else:
+                self._backend_close_pending.remove(side)
+        return errors
+
+    def _finish_resource_shutdown(self) -> None:
+        """Publish terminal ownership only after every resource is released."""
+
+        cleanup_complete = (
+            not self._force_guard_started and not self._backend_close_pending
+        )
         with self._resource_lock:
-            self._resources_closed = True
             self._resources_started = False
-        if errors:
-            raise RuntimeError(
-                "exclusive RM65 Skill resource close failed: " + "; ".join(errors)
-            )
+            self._resources_closed = cleanup_complete
+            if cleanup_complete:
+                self._terminal_close_error = self._shutdown_hold_error
 
     def _require_force_guard_motion_ready(self) -> None:
         fault = self.position_force_guard.fault

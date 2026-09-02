@@ -35,6 +35,8 @@ class _Backend(EffectorBackend):
         *,
         measured_at: float,
         accepted: bool = True,
+        close_failures: int = 0,
+        hold_failures: int = 0,
         events: list[str] | None = None,
     ) -> None:
         self.side = side
@@ -45,6 +47,8 @@ class _Backend(EffectorBackend):
         self.holds: list[str] = []
         self.starts = 0
         self.closes = 0
+        self.close_failures = int(close_failures)
+        self.hold_failures = int(hold_failures)
         self.emergency_stops = 0
         self.events = events if events is not None else []
 
@@ -62,6 +66,9 @@ class _Backend(EffectorBackend):
     def close(self) -> None:
         self.closes += 1
         self.events.append(f"backend_close:{self.side}")
+        if self.close_failures:
+            self.close_failures -= 1
+            raise RuntimeError(f"{self.side} close failed")
 
     def refresh_state_from_hardware(self):
         return self.get_state()
@@ -107,6 +114,9 @@ class _Backend(EffectorBackend):
         self.holds.append(reason)
         self.events.append(f"backend_hold:{self.side}")
         self.target_active = False
+        if self.hold_failures:
+            self.hold_failures -= 1
+            raise RuntimeError(f"{self.side} hold failed")
 
     def emergency_stop(self) -> None:
         self.emergency_stops += 1
@@ -150,12 +160,14 @@ class _ForceGuard:
         self,
         *,
         ready_on_start: bool = True,
+        close_failures: int = 0,
         events: list[str] | None = None,
     ) -> None:
         self.motion_ready = False
         self.fault = None
         self.starts = 0
         self.closes = 0
+        self.close_failures = int(close_failures)
         self.ready_on_start = bool(ready_on_start)
         self.events = events if events is not None else []
 
@@ -168,6 +180,9 @@ class _ForceGuard:
     def close(self) -> None:
         self.closes += 1
         self.events.append("force_guard_close")
+        if self.close_failures:
+            self.close_failures -= 1
+            raise RuntimeError("force guard close failed")
         self.motion_ready = False
 
 
@@ -176,6 +191,9 @@ def _ports(
     accepted: bool = True,
     age_sec: float = 0.01,
     force_guard_ready: bool = True,
+    force_guard_close_failures: int = 0,
+    backend_close_failures: dict[str, int] | None = None,
+    backend_hold_failures: dict[str, int] | None = None,
 ):
     now = time.time()
     events: list[str] = []
@@ -184,6 +202,8 @@ def _ports(
             side,
             measured_at=now - age_sec,
             accepted=accepted,
+            close_failures=(backend_close_failures or {}).get(side, 0),
+            hold_failures=(backend_hold_failures or {}).get(side, 0),
             events=events,
         )
         for side in ("left", "right")
@@ -191,6 +211,7 @@ def _ports(
     target_builder = _TargetBuilder()
     force_guard = _ForceGuard(
         ready_on_start=force_guard_ready,
+        close_failures=force_guard_close_failures,
         events=events,
     )
     ports = ExclusiveRM65SkillDeployPorts(
@@ -276,9 +297,11 @@ def test_rm65_ports_own_start_and_hold_before_close() -> None:
     ports, backends, _ = _ports()
 
     ports.start()
+    ports.start()
     ports.close()
 
     assert ports.resources_started is False
+    assert ports.resources_closed is True
     assert ports.startup_hold_receipt is not None
     assert ports.startup_hold_receipt.succeeded is True
     assert all(backend.starts == 1 for backend in backends.values())
@@ -306,6 +329,70 @@ def test_rm65_ports_own_start_and_hold_before_close() -> None:
     )
 
 
+def test_rm65_ports_retry_only_unfinished_backend_close_stage() -> None:
+    ports, backends, _ = _ports(backend_close_failures={"right": 1})
+    ports.start()
+
+    with pytest.raises(
+        RuntimeError,
+        match="right: RuntimeError: right close failed",
+    ):
+        ports.close()
+
+    assert ports.resources_started is False
+    assert ports.resources_closed is False
+    assert ports.position_force_guard.closes == 1
+    assert backends["right"].closes == 1
+    assert backends["left"].closes == 1
+    assert all(len(backend.holds) == 2 for backend in backends.values())
+
+    ports.close()
+    ports.close()
+
+    assert ports.resources_closed is True
+    assert ports.position_force_guard.closes == 1
+    assert backends["right"].closes == 2
+    assert backends["left"].closes == 1
+    assert all(len(backend.holds) == 2 for backend in backends.values())
+
+
+def test_rm65_ports_retry_only_unfinished_force_guard_close_stage() -> None:
+    ports, backends, _ = _ports(force_guard_close_failures=1)
+    ports.start()
+
+    with pytest.raises(RuntimeError, match="force_guard: RuntimeError"):
+        ports.close()
+
+    assert ports.resources_started is False
+    assert ports.resources_closed is False
+    assert ports.position_force_guard.closes == 1
+    assert all(backend.closes == 1 for backend in backends.values())
+
+    ports.close()
+
+    assert ports.resources_closed is True
+    assert ports.position_force_guard.closes == 2
+    assert all(backend.closes == 1 for backend in backends.values())
+
+
+def test_rm65_ports_do_not_turn_unconfirmed_shutdown_hold_into_success() -> None:
+    ports, backends, _ = _ports()
+    ports.start()
+    backends["left"].hold_failures = 1
+
+    with pytest.raises(RuntimeError, match="lower HOLD was not confirmed"):
+        ports.close()
+
+    assert ports.resources_started is False
+    assert ports.resources_closed is True
+    assert all(backend.closes == 1 for backend in backends.values())
+
+    with pytest.raises(RuntimeError, match="lower HOLD was not confirmed"):
+        ports.close()
+
+    assert all(backend.closes == 1 for backend in backends.values())
+
+
 def test_rm65_ports_start_failure_is_closed_and_not_retryable() -> None:
     ports, backends, _ = _ports(force_guard_ready=False)
 
@@ -318,6 +405,29 @@ def test_rm65_ports_start_failure_is_closed_and_not_retryable() -> None:
     assert all(backend.closes == 1 for backend in backends.values())
     with pytest.raises(RuntimeError, match="cannot restart"):
         ports.start()
+
+
+def test_rm65_ports_start_rollback_keeps_failed_cleanup_retryable() -> None:
+    ports, backends, _ = _ports(
+        force_guard_ready=False,
+        force_guard_close_failures=1,
+    )
+
+    with pytest.raises(RuntimeError, match="startup rollback incomplete"):
+        ports.start()
+
+    assert ports.resources_started is False
+    assert ports.resources_closed is False
+    assert ports.position_force_guard.closes == 1
+    assert all(backend.closes == 1 for backend in backends.values())
+    with pytest.raises(RuntimeError, match="cannot restart"):
+        ports.start()
+
+    ports.close()
+
+    assert ports.resources_closed is True
+    assert ports.position_force_guard.closes == 2
+    assert all(backend.closes == 1 for backend in backends.values())
 
 
 def test_rm65_ports_convert_backend_rejection_to_failed_receipt() -> None:
