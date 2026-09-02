@@ -55,7 +55,6 @@ from deployments.openpi.model_rtc_profile import (
     PREPARED_MODEL_RTC_PROFILE_SCHEMA_V1,
     load_prepared_model_rtc_profile,
 )
-
 from .adapter import (
     OpenPIModelRtcTrainingTransform,
     build_openpi_model_rtc_training_manifest,

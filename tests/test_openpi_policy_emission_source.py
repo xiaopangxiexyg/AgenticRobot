@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from deployments.openpi.client import policy as openpi_policy_module
+from deployments.openpi.client import emission_source as openpi_emission_source_module
 from control_station.sim_hil import (
     _config_from_args,
     _run_dry_run,
@@ -301,6 +302,47 @@ def test_openpi_source_requires_prepared_state_only_artifact() -> None:
         validate_openpi_state_policy_artifact(
             PolicyArtifactContract.from_dict(tampered)
         )
+
+
+def test_openpi_source_does_not_implicitly_bind_artifact_identity(monkeypatch) -> None:
+    """An ordinary emission source can target another compatible server revision."""
+
+    observed_configs = []
+
+    class _CapturingPolicy:
+        name = "capturing-openpi-policy"
+
+        def __init__(self, config) -> None:
+            observed_configs.append(config)
+
+        def predict(self, _observation):
+            raise AssertionError("the identity-only construction test must not predict")
+
+    monkeypatch.setattr(
+        openpi_emission_source_module,
+        "OpenPIClientPolicy",
+        _CapturingPolicy,
+    )
+    source = build_openpi_policy_emission_source(
+        OpenPIEmissionSourceConfig(
+            policy_artifact=_artifact(),
+            runtime_pose_frame_contract=(
+                default_rm65_workspace_near_boundary_runtime_pose_frame_contract()
+            ),
+            output_active_sides=("right",),
+            model_observation_sides=("left", "right"),
+            prediction_request_queue_threshold=1,
+        ),
+        observation_capture=lambda **_kwargs: _observation(0),
+    )
+    try:
+        assert len(observed_configs) == 1
+        assert observed_configs[0].expected_model_id is None
+        assert observed_configs[0].expected_checkpoint_step is None
+        assert observed_configs[0].policy_artifact.model_id == "state-only-fixture"
+        assert observed_configs[0].policy_artifact.checkpoint_step == 60_000
+    finally:
+        source.close()
 
 
 def test_openpi_source_observes_bimanual_state_and_emits_explicit_right_scope() -> None:
