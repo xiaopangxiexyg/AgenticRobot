@@ -1929,7 +1929,7 @@ def test_v3_client_k_d_h_matrix_crops_generation_prefix_exactly_once(
     )
 
 
-def test_v3_client_rejects_loaded_capability_drift_before_provider_call() -> None:
+def test_v3_client_allows_diagnostic_server_artifact_change() -> None:
     bundle = _bundle(indices=(0, 1, 2))
     request = _request(bundle)
     codec = _FakeConditioningCodec()
@@ -1941,7 +1941,9 @@ def test_v3_client_rejects_loaded_capability_drift_before_provider_call() -> Non
 
         def infer_conditioned_rtc_v3(self, envelope, model_input):
             self.call_count += 1
-            raise AssertionError("capability drift must fail before provider call")
+            raise AssertionError(
+                "artifact-only changes must not require a provider call"
+            )
 
     backend = _Backend()
     client = RtcConditionedModelClientV3(
@@ -1954,15 +1956,18 @@ def test_v3_client_rejects_loaded_capability_drift_before_provider_call() -> Non
         artifact_hash="artifact:drifted",
     )
 
-    with pytest.raises(RtcClientProtocolError) as exc_info:
-        client.infer(
-            request,
-            canonical_conditioning=bundle,
-            model_input={"observation": "drift"},
-            model_input_hash="model-input:drift",
-        )
-
-    assert exc_info.value.reasons == ("capability_hash_changed",)
+    assert backend.rtc_continuation_capability.semantic_content_hash == (
+        client.capability.semantic_content_hash
+    )
+    encoded = encode_rtc_conditioning_bundle(codec, bundle)
+    envelope = build_rtc_conditioned_inference_envelope_v3(
+        request=request,
+        bundle=bundle,
+        capability=backend.rtc_continuation_capability,
+        encoded_conditioning=encoded,
+        model_input_hash="model-input:artifact-interchange",
+    )
+    assert envelope.capability.artifact_hash == "artifact:drifted"
     assert backend.call_count == 0
 
 
