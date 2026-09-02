@@ -12,6 +12,8 @@ from deployments.perception.sam2_grounding_dino import GroundedObjectDetection
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "scripts" / "install_perception_models.sh"
+POINT_GRASP_INSTALLER = REPO_ROOT / "scripts" / "install_point_grasp_models.sh"
+POINT_GRASP_ENV_INSTALLER = REPO_ROOT / "scripts" / "install_point_grasp_env.sh"
 
 
 def test_perception_model_installer_is_executable_and_documents_fixed_inputs() -> None:
@@ -28,6 +30,38 @@ def test_perception_model_installer_is_executable_and_documents_fixed_inputs() -
     assert "aa9b8722d0585b661ded4b3dff1bd103540554ae" in source
     assert "856dde20aee659246248e20734ef9ba5214f5e44" in source
     assert "grounding_dino_torch_2_10_compat.h" in source
+    assert 'DEXTELEOP_ENV_NAME:-dexteleop310' in source
+
+
+def test_point_grasp_installer_targets_canonical_environment() -> None:
+    completed = subprocess.run(
+        ["bash", str(POINT_GRASP_INSTALLER), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "default: dexteleop310" in completed.stdout
+    source = POINT_GRASP_INSTALLER.read_text(encoding="utf-8")
+    assert 'DEXTELEOP_ENV_NAME:-dexteleop310' in source
+    assert '"scipy==1.13.1"' in source
+    assert "dexteleop_graspnet_baseline.pth" in source
+
+
+def test_point_grasp_environment_installer_composes_base_and_model_installers() -> None:
+    assert POINT_GRASP_ENV_INSTALLER.stat().st_mode & 0o111
+    completed = subprocess.run(
+        ["bash", str(POINT_GRASP_ENV_INSTALLER), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--update" in completed.stdout
+    assert "--skip-vendor-sdk" in completed.stdout
+    assert "checkpoints are not downloaded" in completed.stdout.lower()
+    source = POINT_GRASP_ENV_INSTALLER.read_text(encoding="utf-8")
+    assert 'scripts/install_conda_env.sh' in source
+    assert 'scripts/install_point_grasp_models.sh' in source
+    assert 'model/perception/graspnet-baseline' in source
 
 
 class _FakeSpec:

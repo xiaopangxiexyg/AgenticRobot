@@ -26,7 +26,7 @@
 证明。通过链接写入会直接修改共享目标。因此：
 
 - `assets/` 已有 bundle presence 检查和安全链接工具，可以按只读约定共享；
-- SAM2/Grounding DINO/VGN 等模型权重必须登记为可选 bundle，保存来源 commit 和 checkpoint SHA-256，不能把外部源码 checkout 放进 `assets/`；
+- SAM2/Grounding DINO/VGN/GraspNet 模型权重必须登记为可选 bundle，保存来源 commit 和 checkpoint SHA-256；外部源码由 `model/perception/` 的 Git submodule 持有，不能放进 `assets/`；
 - `runtime_artifacts/`、采集记录、日志和生成输出可能有并发 writer，不允许默认共享链接；
 - `teleop_records/`、`model/`、`hardware/VIVE/triad_openvr/` 是 mixed root，内部同时存在 tracked
   文件和 ignored 文件，绝不能整体替换成软链接；
@@ -104,7 +104,8 @@ evidence，不能代替数据迁移。
 
 ### 3.4 模型、厂商目录和秘密配置
 
-`model/` 保留 tracked `README.md` 与 `openpi` gitlink；`triad_openvr/` 保留 portable wrapper。
+`model/` 保留 tracked `README.md`、`openpi` gitlink 与 `perception/` 下四个外部源码 gitlink；
+`triad_openvr/` 保留 portable wrapper。
 迁移权重或厂商内容时逐个处理 ignored child，并保留来源、版本和 hash。不得整体替换 mixed root。
 
 `.env*`、`local_paths.json` 和设备配置从 example 或密钥管理重新创建。迁移计划和提交信息不得写入

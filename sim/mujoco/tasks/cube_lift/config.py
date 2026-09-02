@@ -21,6 +21,7 @@ from ...actuation import (
     cube_lift_contact_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
+    strong_cad_bimanual_dmtac_gripper_profile,
 )
 from ...control import DIRECT_QPOS_DEBUG_EXECUTION_MODE
 from ...grasp_contact import GripperContactSurfaceSpec
@@ -88,6 +89,7 @@ def resolve_dmtac_gripper_actuation_profile(name: str):
             identified_bimanual_dmtac_gripper_profile(),
             cube_lift_contact_dmtac_gripper_profile(),
             cad_bimanual_dmtac_gripper_profile(),
+            strong_cad_bimanual_dmtac_gripper_profile(),
         )
     }
     try:

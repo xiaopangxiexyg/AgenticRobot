@@ -13,8 +13,10 @@ from experiments.sim_point_grasp.evaluation import (
     build_pregrasp_pose,
     build_sim_point_grasp_task_config,
     draw_grasp_overlay,
+    merge_point_prompt_candidates,
     optical_camera_pose_world,
     project_world_point,
+    sample_mask_prompt_pixels,
     save_summary_sheet,
 )
 from sim.mujoco.pointcloud import render_intrinsics_from_fovy
@@ -48,6 +50,38 @@ def test_project_world_point_uses_optical_xyz_and_image_bounds() -> None:
     )
     assert (u, v) == (320, 240)
     assert depth == 1.0
+
+
+def test_mask_prompt_sampling_is_deterministic_valid_and_dispersed() -> None:
+    mask = np.zeros((40, 60), dtype=bool)
+    mask[5:35, 10:50] = True
+    depth = np.zeros_like(mask, dtype=np.float32)
+    depth[mask] = 0.6
+    first = sample_mask_prompt_pixels(mask, depth, initial_uv=(30, 20), count=8)
+    second = sample_mask_prompt_pixels(mask, depth, initial_uv=(30, 20), count=8)
+    assert first == second
+    assert first[0] == (30, 20)
+    assert len(first) == len(set(first)) == 8
+    assert all(mask[v, u] and depth[v, u] > 0.0 for u, v in first)
+
+
+def test_point_prompt_candidate_merge_removes_duplicate_poses() -> None:
+    identity = np.eye(4).reshape(-1).tolist()
+    shifted = np.eye(4)
+    shifted[0, 3] = 0.02
+    batches = [
+        [
+            {"score": 0.9, "model_score": 0.8, "T_base_from_tcp": identity},
+            {"score": 0.7, "model_score": 0.6, "T_base_from_tcp": shifted.reshape(-1).tolist()},
+        ],
+        [
+            {"score": 0.85, "model_score": 0.75, "T_base_from_tcp": identity},
+        ],
+    ]
+    merged = merge_point_prompt_candidates(batches, [(10, 10), (20, 20)])
+    assert len(merged) == 2
+    assert merged[0]["_prompt_index"] == 0
+    assert merged[1]["_prompt_uv"] == [10, 10]
 
 
 def test_bounded_pose_action_reaches_limits_without_changing_gripper() -> None:
@@ -128,6 +162,7 @@ def test_evaluation_task_randomizes_observable_scene_and_requires_contact() -> N
     assert config.post_contact_phase_min_measured_close == 0.0
     assert config.post_contact_phase_loss_grace_steps == 3
     assert config.object_size_m == (0.04, 0.04, 0.10)
+    assert config.cube_center_xy_m == (-0.272, 0.0)
     assert config.gripper_actuation_profile_name == (
         "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
     )
@@ -145,13 +180,36 @@ def test_evaluation_task_randomizes_observable_scene_and_requires_contact() -> N
     )
     assert "sim_point_grasp/configs" in config.base_contract_path
     contract = config.base_contract()
+    assert contract.scene.collision.safety_minimum_clearance_m == 0.0
+    assert contract.scene.collision.safety_hard_penetration_m == 0.005
     assert contract.scene.urdf_path.endswith(
         "rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf"
     )
     assert contract.scene.objects[0].size_m == config.object_size_m
+    assert contract.scene.objects[0].initial_position_m[:2] == config.cube_center_xy_m
     first = config.sample_cube_spawn_qpos(np.random.default_rng(7))
     second = config.sample_cube_spawn_qpos(np.random.default_rng(7))
     assert first == second
+
+
+def test_heavy_strong_ablation_scales_mass_inertia_and_force_profile() -> None:
+    config = build_sim_point_grasp_task_config(
+        object_mass_kg=0.20,
+        gripper_force_profile="strong",
+        cube_spawn_xy_jitter_m=(0.01, 0.02),
+        cube_spawn_yaw_jitter_rad=math.pi / 6.0,
+    )
+    contract = config.base_contract()
+    object_spec = contract.scene.objects[0]
+    assert config.base_contract_path.endswith("rm65_bimanual_tall_box_heavy_v1.json")
+    assert object_spec.mass_kg == 0.20
+    np.testing.assert_allclose(
+        object_spec.inertia_diagonal_kg_m2,
+        np.asarray((0.0000773333333333, 0.0000773333333333, 0.0000213333333333))
+        * 2.5,
+    )
+    assert config.gripper_actuation_profile_name.endswith("v3_strong")
+    assert config.gripper_actuation_profile().force_limit_n == 0.75
 
 
 def test_summary_sheet_labels_trial_outcomes(tmp_path: Path) -> None:

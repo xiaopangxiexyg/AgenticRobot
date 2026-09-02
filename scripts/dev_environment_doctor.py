@@ -27,6 +27,7 @@ from typing import Sequence
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_FILE = REPO_ROOT / "pyproject.toml"
 ASSET_STORE_TOOL = REPO_ROOT / "scripts" / "dev_asset_store.py"
+LOCK_INDEX_URL = "https://pypi.org/simple"
 
 
 @dataclass(frozen=True)
@@ -454,12 +455,19 @@ def collect_findings(args: argparse.Namespace) -> tuple[list[Finding], dict[str,
 
     if not args.skip_lock_check:
         try:
+            lock_environment = os.environ.copy()
+            # uv considers PIP_INDEX_URL when deciding whether a lock is fresh.
+            # The committed lock records PyPI, so a developer-local mirror must
+            # not turn this read-only health check into a false stale-lock error.
+            lock_environment["UV_DEFAULT_INDEX"] = LOCK_INDEX_URL
+            lock_environment["PIP_INDEX_URL"] = LOCK_INDEX_URL
             completed = subprocess.run(
                 ["uv", "lock", "--check"],
                 cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
+                env=lock_environment,
             )
         except FileNotFoundError:
             findings.append(Finding("FAIL", "lock.check", "uv is not on PATH"))

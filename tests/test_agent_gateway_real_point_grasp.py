@@ -46,7 +46,7 @@ from deployments.perception.sam2_vgn_point_grasp import (
 )
 from deployments.perception.sam2_graspnet_point_grasp import (
     GRASPNET_GIT_URL,
-    GRASPNET_LICENSE_ACKNOWLEDGEMENT_V1,
+    GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2,
     GRASPNET_REVIEWED_REVISION,
     GraspNetPointGraspModelSpec,
     Sam2GraspNetPointGraspPlanner,
@@ -392,27 +392,27 @@ def test_projective_tsdf_uses_clicked_sam2_mask(tmp_path: Path) -> None:
     "planner_class",
     (Sam2VgnPointGraspPlanner, Sam2GraspNetPointGraspPlanner),
 )
-def test_dmtac_visible_collision_gate_accepts_two_hundred_points_but_rejects_two_hundred_one(
+def test_dmtac_visible_collision_gate_accepts_four_hundred_points_but_rejects_four_hundred_one(
     planner_class: type,
 ) -> None:
-    depth = np.zeros((20, 20), dtype=np.float32)
-    depth[5:15, :] = 1.0
+    depth = np.zeros((25, 20), dtype=np.float32)
+    depth[2:22, :] = 1.0
     camera_from_tcp = np.eye(4, dtype=np.float64)
     camera_from_tcp[2, 3] = 1.0
     intrinsics = {"fx": 1000.0, "fy": 1000.0, "cx": 10.0, "cy": 10.0}
 
-    assert DMTAC_M_MAX_VISIBLE_COLLISION_POINTS == 200
+    assert DMTAC_M_MAX_VISIBLE_COLLISION_POINTS == 400
     assert planner_class._visible_collision_free(
         camera_from_tcp, 0.05, depth, intrinsics
     )
 
-    depth[15, 10] = 1.0
+    depth[22, 10] = 1.0
     assert not planner_class._visible_collision_free(
         camera_from_tcp, 0.05, depth, intrinsics
     )
 
 
-def test_graspnet_manifest_requires_noncommercial_local_download_acknowledgement(
+def test_graspnet_manifest_requires_project_authorization_acknowledgement(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "checkpoint-rs.tar"
@@ -429,7 +429,7 @@ def test_graspnet_manifest_requires_noncommercial_local_download_acknowledgement
             "sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
             "model_type": "realsense",
         },
-        "license_acknowledgement": GRASPNET_LICENSE_ACKNOWLEDGEMENT_V1,
+        "license_acknowledgement": GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2,
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     spec = GraspNetPointGraspModelSpec.from_asset_bundle(tmp_path)
@@ -437,7 +437,7 @@ def test_graspnet_manifest_requires_noncommercial_local_download_acknowledgement
 
     manifest["license_acknowledgement"] = "missing"
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="license acknowledgement"):
+    with pytest.raises(ValueError, match="authorization acknowledgement"):
         GraspNetPointGraspModelSpec.from_asset_bundle(tmp_path)
 
 
@@ -450,7 +450,7 @@ def test_graspnet_candidate_axes_are_mapped_to_dmtac_tool_tcp(tmp_path: Path) ->
         checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         source_revision=GRASPNET_REVIEWED_REVISION,
         model_type="realsense",
-        license_acknowledgement=GRASPNET_LICENSE_ACKNOWLEDGEMENT_V1,
+        license_acknowledgement=GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2,
     )
     segmenter = SimpleNamespace(
         segment_point=lambda *_args, **_kwargs: None,

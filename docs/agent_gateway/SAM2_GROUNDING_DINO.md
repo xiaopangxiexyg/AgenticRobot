@@ -9,12 +9,13 @@
 
 ## 外部源码
 
-源码不复制进 AgenticRobot，也不放进 `assets.zip`。使用以下官方 Git 仓库：
+源码以 Git submodule 位于 AgenticRobot 的 `model/perception/`，不放进 `assets.zip`。使用以下官方
+Git 仓库：
 
 - [SAM2](https://github.com/facebookresearch/sam2.git)
 - [Grounding DINO](https://github.com/IDEA-Research/GroundingDINO.git)
 
-本机统一开发环境名为 `agenticvla`。先激活它，确保 AgenticRobot 固定的
+统一安装到 AgenticRobot 主环境 `dexteleop310`。先激活它，确保 AgenticRobot 固定的
 `torch==2.10.0+cu126`、NumPy 和 Pillow 已就绪；SAM2 与 Grounding DINO 源码包再按下述方式
 从 Git checkout 安装。
 
@@ -22,15 +23,17 @@
 commit ID。推荐直接运行仓库内的一键脚本：
 
 ```bash
-conda activate agenticvla
+git submodule update --init --recursive -- \
+  model/perception/sam2 model/perception/GroundingDINO
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 bash scripts/install_perception_models.sh --backend cuda
 ```
 
-默认 checkout 位于 Conda 环境的 `src/perception-models/`。脚本固定并验证 SAM2
+checkout 固定位于当前 worktree 的 `model/perception/`。脚本固定并验证 SAM2
 `aa9b8722d0585b661ded4b3dff1bd103540554ae` 与 Grounding DINO
 `856dde20aee659246248e20734ef9ba5214f5e44`，安装 Python 包、自动检测 GPU compute capability、
-构建 `_C` 扩展并实际执行一个 CUDA 算子。可使用 `--source-root` 选择其他稳定路径；无 GPU 调试机
-可传 `--backend cpu`。脚本不会下载权重。
+构建 `_C` 扩展并实际执行一个 CUDA 算子。无 GPU 调试机可传 `--backend cpu`。脚本不会下载权重，
+也不再向 Conda prefix 另行 clone 源码。
 
 上述两个 commit 是当前经过 API 对照的推荐版本。SAM2 的 CUDA connected-components 扩展只影响部分
 后处理，因此这里关闭；Grounding DINO 的 `_C` 扩展则是 CUDA 推理必需的。官方 Grounding DINO
@@ -94,22 +97,22 @@ sha256sum assets.zip
 这是最短的权重与模型端到端验证，不启动 RealSense 或 Gateway，也不连接机械臂：
 
 ```bash
-mkdir -p /tmp/agenticvla-perception-output
+mkdir -p /tmp/dexteleop-perception-output
 
 # SAM2 自动 bbox
 python -m deployments.perception.localize_image_cli \
   --asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
   --input-image /absolute/path/to/frame.png \
-  --output-json /tmp/agenticvla-perception-output/automatic.json \
-  --output-image /tmp/agenticvla-perception-output/automatic.jpg
+  --output-json /tmp/dexteleop-perception-output/automatic.json \
+  --output-image /tmp/dexteleop-perception-output/automatic.jpg
 
 # 文本指定目标：Grounding DINO 检测，SAM2 精化
 python -m deployments.perception.localize_image_cli \
   --asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
   --input-image /absolute/path/to/frame.png \
   --language-prompt apple \
-  --output-json /tmp/agenticvla-perception-output/apple.json \
-  --output-image /tmp/agenticvla-perception-output/apple.jpg
+  --output-json /tmp/dexteleop-perception-output/apple.json \
+  --output-image /tmp/dexteleop-perception-output/apple.jpg
 ```
 
 CLI 会先验证 manifest、两个权重 SHA-256 和已安装源码 commit，再加载真实模型。JSON 输出包含原图

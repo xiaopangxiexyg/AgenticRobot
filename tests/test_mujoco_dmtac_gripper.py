@@ -41,6 +41,7 @@ from sim.mujoco.actuation import (
     cad_bimanual_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
+    strong_cad_bimanual_dmtac_gripper_profile,
 )
 from sim.mujoco.adapters import (
     MujocoPositionExecutionConfig,
@@ -166,6 +167,19 @@ def test_cad_dmtac_profile_preserves_official_six_joint_open_close_semantics() -
             master == profile.master_joint_by_gripper[name]
             for master, _mimic in profile.equality_joint_pairs(name)
         )
+
+
+def test_strong_cad_dmtac_profile_changes_only_reviewed_force_semantics() -> None:
+    base = cad_bimanual_dmtac_gripper_profile()
+    strong = strong_cad_bimanual_dmtac_gripper_profile()
+
+    assert strong.name == "dmtac_bimanual_position_eg2_4b2_cad_20260831.v3_strong"
+    assert strong.force_limit_n == pytest.approx(0.75)
+    assert strong.position_kp_n_m == base.position_kp_n_m
+    assert strong.position_kv_n_s_m == base.position_kv_n_s_m
+    assert strong.joint_damping_n_s_m == base.joint_damping_n_s_m
+    assert strong.joint_frictionloss_n == base.joint_frictionloss_n
+    assert strong.joint_names_by_gripper == base.joint_names_by_gripper
 
 
 @pytest.mark.slow_sim

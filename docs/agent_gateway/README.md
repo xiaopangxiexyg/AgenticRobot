@@ -85,10 +85,9 @@ python -m agent_gateway real-perception --help
 
 `real-perception` 不创建 RM65 backend，只装配 RealSense、Artifact store 和只读 Skill。默认公开
 RGB/depth capture；提供经过验证的模型 bundle 并显式启用后，还会公开
-`perception.localize_objects`；再提供默认 VGN bundle 或非商业研究限定的本地 GraspNet bundle，
-可公开只读的 `perception.plan_point_grasp`。GraspNet 源码和 checkpoint 不进入 Git、团队网盘或
-统一 `assets.zip`，必须由每位使用者自行下载并显式接受其许可证。
-模型权重、外部 Git 源码和本机测试图片白名单见
+`perception.localize_objects`；再提供默认 VGN bundle 或项目授权的 GraspNet bundle，可公开只读的
+`perception.plan_point_grasp`。外部源码由 `model/perception/` 的固定 Git submodule 提供；checkpoint
+不进入 Git，但按审核后的统一 assets bundle 分发。模型权重、submodule 和本机测试图片白名单见
 [`SAM2_GROUNDING_DINO.md`](./SAM2_GROUNDING_DINO.md) 与
 [`POINT_GRASP.md`](./POINT_GRASP.md)。静态图片测试仍会启动这个 profile 的
 RealSense inventory；它不是无相机的独立模型 server。
