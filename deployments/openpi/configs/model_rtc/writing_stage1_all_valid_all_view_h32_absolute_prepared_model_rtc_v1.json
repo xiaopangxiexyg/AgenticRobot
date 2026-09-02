@@ -4,6 +4,7 @@
   "prepared_skill_profile_id": "writing_stage1_all_valid_all_view_h32_absolute_non_rtc_100k_v1",
   "output_config_name": "writing-stage1-all-valid-all-view-h32-absolute-prepared-model-rtc-v1",
   "default_exp_name": "writing-stage1-all-valid-all-view-h32-absolute-model-rtc-b1-nw4-v1",
+  "prepared_final_mask_root": "masks/model-rtc-stage1-all-view-h32-v1/derived/final_keep_masks",
   "minimum_forecast_delay_steps": 1,
   "maximum_forecast_delay_steps": 12,
   "minimum_prefix_steps": 0,

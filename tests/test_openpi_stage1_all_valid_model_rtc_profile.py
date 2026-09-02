@@ -10,6 +10,7 @@ from deployments.openpi.model_rtc_profile import (
 from deployments.openpi.training.prepared_skill_launch import (
     _load_profile,
     _model_rtc_profile_matches_prepared_profile,
+    _prepared_profile_for_model_rtc,
 )
 
 
@@ -86,6 +87,9 @@ def test_stage1_all_view_h32_model_rtc_profile_has_no_ordinary_checkpoint_fields
     assert payload["output_config_name"] != (
         "writing_stage1_all_valid_all_view_h32_absolute_non_rtc_100k_v1-prepared"
     )
+    assert payload["prepared_final_mask_root"] == (
+        "masks/model-rtc-stage1-all-view-h32-v1/derived/final_keep_masks"
+    )
 
 
 def test_stage1_model_rtc_overlay_requires_exact_prepared_profile_identity() -> None:
@@ -97,3 +101,17 @@ def test_stage1_model_rtc_overlay_requires_exact_prepared_profile_identity() -> 
     mismatched = dict(model_rtc)
     mismatched["prepared_skill_profile_id"] = "another-prepared-profile"
     assert not _model_rtc_profile_matches_prepared_profile(prepared, mismatched)
+
+
+def test_model_rtc_mask_root_isolated_from_ordinary_prepared_profile() -> None:
+    prepared = _load_profile(_PREPARED_PROFILE)
+    model_rtc = load_prepared_model_rtc_profile(_MODEL_RTC_PROFILE)
+
+    effective = _prepared_profile_for_model_rtc(prepared, model_rtc)
+    snapshot_root = Path(prepared["organized_dataset_root"]).parent.parent
+    assert effective["openpi_final_mask_root"] == str(
+        snapshot_root
+        / "masks/model-rtc-stage1-all-view-h32-v1/derived/final_keep_masks"
+    )
+    assert prepared["openpi_final_mask_root"] != effective["openpi_final_mask_root"]
+    assert _prepared_profile_for_model_rtc(prepared, None) is prepared

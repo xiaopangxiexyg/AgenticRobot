@@ -2427,6 +2427,53 @@ def _model_rtc_profile_matches_prepared_profile(
     )
 
 
+def _prepared_profile_for_model_rtc(
+    profile: Mapping[str, Any],
+    model_rtc_profile: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    """Apply a model-RTC-only final-mask root override, when declared.
+
+    Final keep masks are a data-input concern, not a checkpoint identity. A
+    model-RTC profile may therefore point at an isolated, immutable mask
+    materialization without changing the ordinary Prepared profile. Relative
+    paths are rooted at the snapshot root (the grandparent of
+    'organized_dataset_root'); absolute paths remain useful for an explicit
+    remote snapshot. The override is intentionally applied only to the
+    launch-time copy used to construct the DataLoader.
+    """
+
+    if model_rtc_profile is None:
+        return profile
+    configured = model_rtc_profile.get("prepared_final_mask_root")
+    if configured is None or not str(configured).strip():
+        return profile
+    if not isinstance(configured, (str, Path)):
+        raise ValueError(
+            "prepared_final_mask_root must be a path string when declared."
+        )
+    root = Path(str(configured)).expanduser()
+    if not root.is_absolute():
+        organized_root_value = str(profile.get("organized_dataset_root") or "")
+        if not organized_root_value:
+            raise ValueError(
+                "relative prepared_final_mask_root requires "
+                "organized_dataset_root."
+            )
+        root = (
+            Path(organized_root_value).expanduser().resolve().parent.parent
+            / root
+        )
+    if profile.get("openpi_final_mask_root_layout") != (
+        "source_dataset_id_partitioned_v1"
+    ):
+        raise ValueError(
+            "model-RTC final-mask override requires source-partitioned masks."
+        )
+    effective = dict(profile)
+    effective["openpi_final_mask_root"] = str(root.resolve())
+    return effective
+
+
 def _model_rtc_checkpoint_root(
     profile: Mapping[str, Any],
     model_rtc_profile: Mapping[str, Any],
@@ -2864,8 +2911,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in {"audit", "prepare"}:
         return 0
     assert binding is not None and binding_root is not None
+    launch_profile = _prepared_profile_for_model_rtc(profile, model_rtc_profile)
     config, training_config, checkout = _openpi_config(
-        profile,
+        launch_profile,
         binding,
         binding_root,
         exp_name=args.exp_name,
@@ -2873,7 +2921,7 @@ def main(argv: list[str] | None = None) -> int:
         overwrite=args.overwrite,
     )
     final_mask_contract = _final_mask_training_contract(
-        profile,
+        launch_profile,
         binding,
         binding_root,
     )
@@ -2983,7 +3031,7 @@ def main(argv: list[str] | None = None) -> int:
             post_identity_transform=post_identity_transform,
             load_images=False if state_only_bridge is not None else None,
         ), _source_partitioned_final_mask_binding(
-            profile,
+            launch_profile,
             binding,
             binding_root,
         ):
@@ -3301,7 +3349,7 @@ def main(argv: list[str] | None = None) -> int:
         post_identity_transform=post_identity_transform,
         load_images=False if state_only_bridge is not None else None,
     ), _source_partitioned_final_mask_binding(
-        profile,
+        launch_profile,
         binding,
         binding_root,
     ):
