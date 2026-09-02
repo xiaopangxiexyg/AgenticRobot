@@ -91,6 +91,8 @@ python scripts/dev_asset_store.py configure --asset-root /absolute/path/to/asset
 会自动建立兼容映射并验证必需的 RM65 bundle；详细规则见
 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
 
+如果想运行`SAM2 + Grounding DINO 物体定位 Skill`和`抓姿skill`，还需下载另一份[`assets.zip`](https://disk.pku.edu.cn/link/AA6DAAF3490F7645A18F32230527E5480B)并解压，解压之后所存放的路径请参考压缩包内说明。
+
 ## 2. 安装 SAM2 + Grounding DINO 物体定位 Skill（可选）
 
 `perception.localize_objects` 支持两种单帧图片输入：不传 language prompt 时由 SAM2 自动提出物体

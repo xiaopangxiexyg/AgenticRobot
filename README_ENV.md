@@ -38,7 +38,7 @@ Isaac Gym 单独看第 6 节；MuJoCo 和冻结保留的 SAPIEN 兼容依赖看�
 | GraspNet | `perception/graspnet-point-grasp/checkpoint-rs.tar` |
 
 每个目录还需对应的 `manifest.json` 及真实 SHA-256。使用 worktree 默认 assets 映射时，根就是本仓
-`assets/`；下载来源见 [`README.md`](./README.md#抓姿-skill-必读源码权重与一键环境)。
+`assets/`；下载来源见 [`assets.zip`](https://disk.pku.edu.cn/link/AA6DAAF3490F7645A18F32230527E5480B)，解压之后所存放的路径请参考压缩包内说明。
 
 ### 新机器如何一键安装？
 
