@@ -1,4 +1,8 @@
-"""Portable byte-representation identities for passive perception Artifacts."""
+"""Portable byte-representation identities for perception Skill artifacts.
+
+This module defines wire-format identities shared by perception producers and
+consumers.  It deliberately owns neither dataset layout nor runtime behavior.
+"""
 
 DEPTH_FRAME_MEDIA_TYPE_V1 = "application/x-npy"
 DEPTH_FRAME_SCHEMA_ID_V1 = "dexteleop.perception.depth_image_meters.v1"

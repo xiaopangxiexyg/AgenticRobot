@@ -11,7 +11,7 @@ from agent_gateway.protocol.skill_catalog import (
     SkillParameterProfileRef,
     agent_skill_schema_document_hash,
 )
-from dataset_contracts.perception_artifacts import (
+from perception_contracts.artifacts import (
     DEPTH_FRAME_COMPRESSION_V1,
     DEPTH_FRAME_ENCODING_V1,
     DEPTH_FRAME_MEDIA_TYPE_V1,

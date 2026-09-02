@@ -17,7 +17,7 @@ from agent_gateway.runtime.artifact_producer import artifact_ref_for_bytes, comm
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
 from agent_gateway.runtime.passive_read_executor import PassiveReadResult, PassiveReadSkillExecutor
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from dataset_contracts.perception_artifacts import (
+from perception_contracts.artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
     LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,

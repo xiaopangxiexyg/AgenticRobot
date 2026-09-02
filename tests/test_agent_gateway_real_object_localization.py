@@ -21,7 +21,7 @@ from agent_gateway.runtime.artifact_producer import (
     commit_artifact_bytes,
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
-from dataset_contracts.perception_artifacts import (
+from perception_contracts.artifacts import (
     LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
     LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1,
     LOCALIZATION_INPUT_JPEG_ENCODING_V1,

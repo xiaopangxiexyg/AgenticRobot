@@ -25,7 +25,7 @@ from agent_gateway.skills.perception.schemas import (
     validate_no_task_evaluation_v1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from dataset_contracts.perception_artifacts import (
+from perception_contracts.artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
     LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,

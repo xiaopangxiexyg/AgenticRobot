@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from dataset_contracts.perception_artifacts import RGB_FRAME_MEDIA_TYPE_V1
+from perception_contracts.artifacts import RGB_FRAME_MEDIA_TYPE_V1
 from sim.mujoco.rgb_snapshot import EncodedMujocoRgbFrame
 
 from .motion_application import MujocoAgentSkillMotionApplication
