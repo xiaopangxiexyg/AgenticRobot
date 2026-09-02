@@ -84,8 +84,8 @@ def test_provider_deadline_policy_rejects_before_and_after_the_boundary() -> Non
         _require_request_deadline(request, now=float("nan"), boundary="before")
 
 
-def test_rtc_v3_capability_identity_is_independent_of_server_artifact() -> None:
-    """A client can exercise a compatible server checkpoint or model step."""
+def test_rtc_v3_capability_identity_is_independent_of_provenance() -> None:
+    """Compatible runtime fields, not artifact/contract labels, define identity."""
 
     capability = RtcModelContinuationCapabilityV3(
         artifact_hash="artifact:server-step-1000",
@@ -102,7 +102,7 @@ def test_rtc_v3_capability_identity_is_independent_of_server_artifact() -> None:
     )
     replacement = RtcModelContinuationCapabilityV3(
         artifact_hash="artifact:server-step-2000",
-        continuation_contract_hash=capability.continuation_contract_hash,
+        continuation_contract_hash="contract:server-v2",
         codec_identity_hash=capability.codec_identity_hash,
         continuation_implementation_id=capability.continuation_implementation_id,
         continuation_implementation_parameters_hash=(

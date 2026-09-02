@@ -258,14 +258,17 @@ def build_openpi_policy_emission_source(
     )
     if policy is None:
         camera_input = artifact.camera_input
+        # Artifact model/checkpoint identity remains visible in status and
+        # receipts, but an ordinary OpenPI client may intentionally point at a
+        # different compatible server revision.  Direct callers that need an
+        # identity guard can still opt into ``expected_*`` on the low-level
+        # OpenPIClientPolicyConfig.
         policy = OpenPIClientPolicy(
             OpenPIClientPolicyConfig(
                 host=config.host,
                 port=config.port,
                 api_key=config.api_key,
                 prompt=config.prompt,
-                expected_model_id=artifact.model_id,
-                expected_checkpoint_step=artifact.checkpoint_step,
                 active_sides=config.model_observation_sides,
                 required_camera_slots=(
                     () if camera_input is None else camera_input.server_camera_slots

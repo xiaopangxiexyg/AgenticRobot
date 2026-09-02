@@ -110,11 +110,14 @@ def _finite(value: object, *, name: str) -> float:
 class RtcModelContinuationCapabilityV3:
     """Continuation capability exported by one loaded model instance.
 
-    ``artifact_hash`` is retained as model provenance for diagnostics and
-    receipts.  It is intentionally not part of the runtime capability
-    identity: a client may exercise the same continuation protocol against a
-    different server checkpoint or model revision when the declared runtime
-    contracts remain compatible.
+    ``artifact_hash`` and ``continuation_contract_hash`` are retained as model
+    and implementation provenance for diagnostics and receipts.  They are
+    intentionally not part of the runtime capability identity: a client may
+    exercise the same continuation protocol against a different server
+    checkpoint or implementation revision when the declared runtime contracts
+    remain compatible.  Runtime admission is represented by the codec,
+    implementation parameters, schedule, dimensions, sampler, and bootstrap
+    fields below.
     """
 
     artifact_hash: str
@@ -192,9 +195,6 @@ class RtcModelContinuationCapabilityV3:
         return canonical_content_hash(
             {
                 "schema": self.schema,
-                "continuation_contract_hash": (
-                    self.continuation_contract_hash
-                ),
                 "codec_identity_hash": self.codec_identity_hash,
                 "continuation_implementation_id": (
                     self.continuation_implementation_id
@@ -231,10 +231,11 @@ def validate_rtc_model_continuation_capability_v3_binding(
 ) -> None:
     """Validate one loaded capability against authoritative runtime facts.
 
-    ``artifact_hash`` remains an accepted keyword for source compatibility,
-    but is provenance-only and is deliberately not compared.  Runtime
-    admission is governed by the continuation, codec, schedule, dimensions,
-    sampler, and bootstrap contracts instead of a particular checkpoint.
+    ``artifact_hash`` and ``continuation_contract_hash`` remain accepted for
+    source compatibility and provenance, but are deliberately not compared.
+    Runtime admission is governed by the continuation's actual implementation,
+    codec, schedule, dimensions, sampler, and bootstrap contracts instead of a
+    particular checkpoint or contract label.
     """
 
     if not isinstance(capability, RtcModelContinuationCapabilityV3):
@@ -245,7 +246,6 @@ def validate_rtc_model_continuation_capability_v3_binding(
         continuation_contract
     ).runtime
     expected = {
-        "continuation_contract_hash": continuation_contract.contract_hash,
         "continuation_implementation_id": (
             contract.continuation_implementation_id
         ),

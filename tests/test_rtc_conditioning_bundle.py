@@ -780,6 +780,16 @@ def test_v3_capability_binding_uses_one_selected_schedule_identity() -> None:
         codec_identity_hash=codec.identity.semantic_content_hash,
         selected_prefix_schedule=bundle.prefix_schedule_semantics,
     )
+    validate_rtc_model_continuation_capability_v3_binding(
+        replace(
+            capability,
+            continuation_contract_hash="contract:server-v2",
+        ),
+        continuation_contract=bundle.continuation_contract,
+        artifact_hash=bundle.artifact_hash,
+        codec_identity_hash=codec.identity.semantic_content_hash,
+        selected_prefix_schedule=bundle.prefix_schedule_semantics,
+    )
     assert (
         capability.selected_prefix_schedule
         == bundle.prefix_schedule_semantics
