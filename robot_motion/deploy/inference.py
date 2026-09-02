@@ -47,6 +47,9 @@ INFERENCE_DELAY_ESTIMATOR_SPEC_HASH_DOMAIN_V1 = (
 INFERENCE_DELAY_ESTIMATOR_STATE_HASH_DOMAIN_V1 = (
     "dexteleop.inference_delay_estimator_state.v1"
 )
+INFERENCE_DELAY_VALIDITY_POLICY_V1 = (
+    "forecast_delay_plus_minimum_execution_horizon_v1"
+)
 POLICY_INFERENCE_PREFIX_HASH_DOMAIN_V1 = "dexteleop.policy_inference_prefix.v1"
 POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V1 = "dexteleop.policy_inference_request.v1"
 POLICY_INFERENCE_REQUEST_HASH_DOMAIN_V2 = "dexteleop.policy_inference_request.v2"
@@ -231,6 +234,26 @@ class InferenceDelayEstimatorSpec:
             (estimated_latency + self.network_guard_sec) / self.action_period_sec
         ) + self.control_jitter_guard_steps
         return min(max(raw_steps, self.minimum_delay_steps), self.maximum_delay_steps)
+
+    def minimum_safe_request_validity_steps(
+        self,
+        minimum_execution_horizon_steps: int,
+    ) -> int:
+        """Return the conservative request TTL budget for this delay spec.
+
+        RTC requests are anchored at the first target time, while the result
+        can arrive after the forecasted delay and still needs at least one
+        executable tail.  The caller may use this value as a static profile
+        check, or use the current forecast for a tighter per-request budget.
+        Keeping the calculation beside the estimator prevents each runtime
+        from inventing a different delay/TTL relationship.
+        """
+
+        horizon = _positive_int(
+            minimum_execution_horizon_steps,
+            name="minimum_execution_horizon_steps",
+        )
+        return self.maximum_delay_steps + horizon
 
 
 @dataclass(frozen=True)
@@ -892,6 +915,7 @@ __all__ = [
     "INFERENCE_DELAY_ESTIMATORS_V1",
     "INFERENCE_DELAY_ESTIMATOR_SPEC_HASH_DOMAIN_V1",
     "INFERENCE_DELAY_ESTIMATOR_STATE_HASH_DOMAIN_V1",
+    "INFERENCE_DELAY_VALIDITY_POLICY_V1",
     "InferenceDelayEstimatorSpec",
     "InferenceDelayEstimatorState",
     "NEAREST_RANK_QUANTILE_ESTIMATOR_V1",

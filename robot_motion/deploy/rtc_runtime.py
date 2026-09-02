@@ -53,6 +53,7 @@ from .chunk_plan import empty_policy_action_plan
 from .inference import (
     InferenceDelayEstimatorSpec,
     InferenceDelayEstimatorState,
+    INFERENCE_DELAY_VALIDITY_POLICY_V1,
     PolicyChunkResult,
     PolicyInferenceRequest,
     RTC_FLOW_INPAINT_MODE_V1,
@@ -95,6 +96,22 @@ RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V2 = (
 RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V3 = (
     "dexteleop.deploy.rtc_3c_frontend_config.v3"
 )
+RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V4 = (
+    "dexteleop.deploy.rtc_3c_frontend_config.v4"
+)
+RTC_TIMING_CONTRACT_HASH_DOMAIN_V1 = (
+    "dexteleop.deploy.rtc_timing_contract.v1"
+)
+RTC_REQUEST_VALIDITY_POLICY_V1 = (
+    INFERENCE_DELAY_VALIDITY_POLICY_V1
+)
+RTC_MODEL_WORKER_STOP_POLICY_V1 = (
+    "model_continuation_default_drain_timeout_v1"
+)
+RTC_MODEL_WORKER_STOP_DISABLED_POLICY_V1 = (
+    "disabled_for_non_model_rtc_v1"
+)
+RTC_MODEL_WORKER_STOP_DEFAULT_TIMEOUT_SEC = 2.0
 RTC_3C_LOCAL_POLICY_PROTOCOL_V1 = "rtc_3c_local_policy_worker_v1"
 RTC_OBSERVATION_CUT_IDENTITY_HASH_DOMAIN_V2 = (
     "dexteleop.rtc_observation_cut_identity.v2"
@@ -305,6 +322,91 @@ class RtcPolicyShadowConfig:
             raise ValueError("delay estimator/action profile period mismatch.")
 
     @property
+    def minimum_safe_request_validity_steps(self) -> int:
+        """Conservative TTL budget for the configured delay range."""
+
+        return self.delay_estimator_spec.minimum_safe_request_validity_steps(
+            self.minimum_execution_horizon_steps,
+        )
+
+    def effective_request_validity_steps(self, forecast_delay_steps: int) -> int:
+        """Return the per-request TTL, including the forecast and execution tail.
+
+        ``valid_until`` is measured from the first target rather than from
+        request admission.  A request whose current delay forecast is large
+        therefore needs a correspondingly larger validity window to leave the
+        provider enough time to return a result and the plan enough time to
+        expose the minimum executable suffix.
+        """
+
+        forecast = _nonnegative_integer(
+            forecast_delay_steps,
+            field_name="forecast_delay_steps",
+        )
+        spec = self.delay_estimator_spec
+        if not spec.minimum_delay_steps <= forecast <= spec.maximum_delay_steps:
+            raise ValueError(
+                "forecast_delay_steps must lie within the delay estimator range."
+            )
+        return max(
+            self.request_validity_steps,
+            forecast + self.minimum_execution_horizon_steps,
+        )
+
+    @property
+    def effective_worker_stop_timeout_sec(self) -> float:
+        """Bound model-RTC shutdown long enough to drain its single worker.
+
+        Ordinary synchronous/shadow profiles retain their historical zero
+        timeout.  Model-RTC has a retired-session/rearm invariant, so an
+        omitted timeout must not silently abandon an in-flight provider call.
+        An explicit positive timeout remains authoritative.
+        """
+
+        if (
+            self.model_continuation is not None
+            and self.worker_stop_timeout_sec == 0.0
+        ):
+            return RTC_MODEL_WORKER_STOP_DEFAULT_TIMEOUT_SEC
+        return self.worker_stop_timeout_sec
+
+    @property
+    def timing_contract(self) -> dict[str, Any]:
+        """Portable timing facts exposed in hashes and debug receipts."""
+
+        return {
+            "schema": "dexteleop.rtc_timing_contract.v1",
+            "action_period_sec": self.delay_estimator_spec.action_period_sec,
+            "minimum_execution_horizon_steps": (
+                self.minimum_execution_horizon_steps
+            ),
+            "maximum_forecast_delay_steps": (
+                self.delay_estimator_spec.maximum_delay_steps
+            ),
+            "minimum_safe_request_validity_steps": (
+                self.minimum_safe_request_validity_steps
+            ),
+            "configured_request_validity_steps": self.request_validity_steps,
+            "request_validity_policy": RTC_REQUEST_VALIDITY_POLICY_V1,
+            "configured_worker_stop_timeout_sec": self.worker_stop_timeout_sec,
+            "effective_worker_stop_timeout_sec": (
+                self.effective_worker_stop_timeout_sec
+            ),
+            "worker_stop_policy": (
+                RTC_MODEL_WORKER_STOP_POLICY_V1
+                if self.model_continuation is not None
+                else RTC_MODEL_WORKER_STOP_DISABLED_POLICY_V1
+            ),
+        }
+
+    @property
+    def timing_contract_hash(self) -> str:
+        return canonical_content_hash(
+            self.timing_contract,
+            domain=RTC_TIMING_CONTRACT_HASH_DOMAIN_V1,
+        )
+
+    @property
     def semantic_content_hash(self) -> str:
         payload = {
             "runtime_session_id": self.runtime_session_id,
@@ -329,19 +431,22 @@ class RtcPolicyShadowConfig:
             "worker_result_capacity": self.worker_result_capacity,
             "worker_idle_poll_sec": self.worker_idle_poll_sec,
             "worker_stop_timeout_sec": self.worker_stop_timeout_sec,
+            "timing_contract_hash": self.timing_contract_hash,
             "delay_estimator_spec_hash": (
                 self.delay_estimator_spec.semantic_content_hash
             ),
         }
-        domain = RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V1
+        # V4 is the single current hash domain. V1--V3 remain exported as
+        # historical identifiers for receipt readers, but a new config must
+        # never silently select an older semantic domain when optional pose
+        # or model-continuation fields are present.
+        domain = RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V4
         if self.action_pose_mode is not None:
             payload["action_pose_mode"] = self.action_pose_mode
-            domain = RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V2
         if self.model_continuation is not None:
             payload["model_continuation_hash"] = (
                 self.model_continuation.semantic_content_hash
             )
-            domain = RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V3
         return canonical_content_hash(payload, domain=domain)
 
     @property
@@ -503,6 +608,9 @@ class RtcFrontendStep:
     control_budget_sec: float
     selected_emission_count: int
     late_completion_rejection_count: int
+    forecast_delay_steps: int | None = None
+    request_validity_steps: int | None = None
+    timing_contract_hash: str = ""
 
     @property
     def budget_exceeded(self) -> bool:
@@ -682,6 +790,9 @@ class RtcFrontendStep:
             "late_completion_rejection_count": (
                 self.late_completion_rejection_count
             ),
+            "forecast_delay_steps": self.forecast_delay_steps,
+            "request_validity_steps": self.request_validity_steps,
+            "timing_contract_hash": self.timing_contract_hash,
             "position_lookahead_enabled": False,
             "send_actions": False,
         }
@@ -1077,6 +1188,8 @@ class RtcPolicyShadowFrontend:
         self._last_request_triggered_at: float | None = None
         self._selected_emission_count = 0
         self._late_completion_rejection_count = 0
+        self._last_forecast_delay_steps: int | None = None
+        self._last_request_validity_steps: int | None = None
         self._emitted_keyframe_ids: set[tuple[str, int, int]] = set()
         self._started = False
         self._closed = False
@@ -1104,6 +1217,22 @@ class RtcPolicyShadowFrontend:
     @property
     def late_completion_rejection_count(self) -> int:
         return self._late_completion_rejection_count
+
+    @property
+    def timing_contract(self) -> dict[str, Any]:
+        return self.config.timing_contract
+
+    @property
+    def timing_contract_hash(self) -> str:
+        return self.config.timing_contract_hash
+
+    @property
+    def last_forecast_delay_steps(self) -> int | None:
+        return self._last_forecast_delay_steps
+
+    @property
+    def last_request_validity_steps(self) -> int | None:
+        return self._last_request_validity_steps
 
     @property
     def pending_completion_count(self) -> int:
@@ -1234,6 +1363,11 @@ class RtcPolicyShadowFrontend:
             if eligible_targets:
                 generation_start = eligible_targets[0]
         first_target = generation_start + forecast_steps * period
+        request_validity_steps = self.config.effective_request_validity_steps(
+            forecast_steps,
+        )
+        self._last_forecast_delay_steps = forecast_steps
+        self._last_request_validity_steps = request_validity_steps
         request_id = f"rtc-request:{self.config.runtime_session_id}:{sequence}"
         observation_cut_id = self._observation_cut_id(
             actor,
@@ -1364,7 +1498,7 @@ class RtcPolicyShadowFrontend:
             frame_contract_hash=self.config.frame_contract_hash,
             layout_hash=self.config.layout_hash,
             normalization_hash=self.config.normalization_hash,
-            valid_until=first_target + self.config.request_validity_steps * period,
+            valid_until=first_target + request_validity_steps * period,
             action_representation_context=representation_context,
             conditioning_binding_hash=(
                 None
@@ -1421,7 +1555,7 @@ class RtcPolicyShadowFrontend:
         self._state = transition.state
         self.deploy_runtime.reset_arm_hold_semantics()
         stop = self._worker.stop(
-            timeout_sec=self.config.worker_stop_timeout_sec
+            timeout_sec=self.config.effective_worker_stop_timeout_sec
         )
         session = update_policy_worker_session_state(
             self._state,
@@ -1510,6 +1644,8 @@ class RtcPolicyShadowFrontend:
             )
         )
         self._last_request_triggered_at = None
+        self._last_forecast_delay_steps = None
+        self._last_request_validity_steps = None
         return transition
 
     def step(
@@ -1753,11 +1889,16 @@ class RtcPolicyShadowFrontend:
             late_completion_rejection_count=(
                 self._late_completion_rejection_count
             ),
+            forecast_delay_steps=self._last_forecast_delay_steps,
+            request_validity_steps=self._last_request_validity_steps,
+            timing_contract_hash=self.config.timing_contract_hash,
         )
 
     def close(self, *, now: float | None = None) -> PolicyWorkerStopReceipt:
         if self._closed:
-            return self._worker.stop(timeout_sec=0.0)
+            return self._worker.stop(
+                timeout_sec=self.config.effective_worker_stop_timeout_sec
+            )
         occurred = self.clock() if now is None else now
         occurred = _finite(occurred, field_name="now")
         if self._started and (
@@ -1769,7 +1910,7 @@ class RtcPolicyShadowFrontend:
                 reason="frontend_close",
             )
         stop = self._worker.stop(
-            timeout_sec=self.config.worker_stop_timeout_sec
+            timeout_sec=self.config.effective_worker_stop_timeout_sec
         )
         self._closed = True
         return stop
@@ -1916,11 +2057,19 @@ RtcPolicyProducerRuntime = RtcPolicyShadowFrontend
 __all__ = [
     "POLICY_ACTION_EMISSION_COMMIT_RECEIPT_HASH_DOMAIN_V1",
     "RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V1",
+    "RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V2",
+    "RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V3",
+    "RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V4",
     "RTC_3C_LOCAL_POLICY_PROTOCOL_V1",
+    "RTC_MODEL_WORKER_STOP_DEFAULT_TIMEOUT_SEC",
+    "RTC_MODEL_WORKER_STOP_DISABLED_POLICY_V1",
+    "RTC_MODEL_WORKER_STOP_POLICY_V1",
     "RTC_POLICY_EMISSION_SOURCE_BINDING_HASH_DOMAIN_V1",
     "RTC_POLICY_EMISSION_SOURCE_DESCRIPTOR_HASH_DOMAIN_V1",
     "RTC_POLICY_RUNTIME_SOURCE_CONFIG_HASH_DOMAIN_V1",
     "RTC_PRODUCER_ACTIVATION_READINESS_HASH_DOMAIN_V1",
+    "RTC_REQUEST_VALIDITY_POLICY_V1",
+    "RTC_TIMING_CONTRACT_HASH_DOMAIN_V1",
     "RTC_TYPED_CANONICAL_SOURCE_ADAPTER_CONTRACT_HASH_V1",
     "PolicyActionEmissionCommitReceipt",
     "RtcDecodedPolicyExecutor",

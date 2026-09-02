@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
@@ -84,6 +85,9 @@ OPENPI_CONDITIONED_OUTPUT_ID_HASH_DOMAIN_V1 = (
 OPENPI_CONDITIONED_PROVIDER_CAPABILITY_SCHEMA_V1 = (
     "openpi.conditioned_rtc.provider_capability.v1"
 )
+OPENPI_RTC_REQUEST_DEADLINE_POLICY_V1 = (
+    "reject_before_and_after_provider_inference_v1"
+)
 
 
 def _nonempty(value: object, *, name: str) -> str:
@@ -120,6 +124,28 @@ def _positive_int(value: object, *, name: str) -> int:
     if normalized != value or normalized <= 0:
         raise ValueError(f"{name} must be a positive integer.")
     return normalized
+
+
+def _require_request_deadline(
+    request: PolicyInferenceRequest,
+    *,
+    now: float,
+    boundary: str,
+) -> float:
+    """Reject a conditioned request outside its causal validity window."""
+
+    if not isinstance(request, PolicyInferenceRequest):
+        raise TypeError("request must be a PolicyInferenceRequest.")
+    current = float(now)
+    if not math.isfinite(current):
+        raise ValueError("RTC provider clock must be finite.")
+    if current >= request.valid_until:
+        raise ValueError(
+            "OpenPI conditioned RTC request deadline expired "
+            f"{boundary}: now={current:.9f} valid_until="
+            f"{request.valid_until:.9f}."
+        )
+    return current
 
 
 @dataclass(frozen=True)
@@ -620,7 +646,11 @@ class OpenPIConditionedRtcBackendV3:
             "conditioning_mode": conditioning_mode,
             "receipt_context": context,
         }
-        started = float(self._clock())
+        started = _require_request_deadline(
+            envelope.request,
+            now=self._clock(),
+            boundary="before provider inference",
+        )
         response = _mapping(
             self._base_backend.exchange_provider_request(wire_request),
             name="OpenPI conditioned response",
@@ -629,6 +659,11 @@ class OpenPIConditionedRtcBackendV3:
         received = float(self._clock())
         if started > completed or completed > received:
             raise ValueError("OpenPI conditioned RTC clock regressed.")
+        _require_request_deadline(
+            envelope.request,
+            now=received,
+            boundary="after provider inference",
+        )
 
         provider_receipt = _mapping(
             response.get(OPENPI_CONDITIONED_RTC_RECEIPT_KEY_V1),
@@ -781,6 +816,7 @@ __all__ = [
     "OPENPI_CONDITIONED_PROVIDER_CAPABILITY_SCHEMA_V1",
     "OPENPI_CONDITIONED_RTC_RECEIPT_KEY_V1",
     "OPENPI_CONDITIONED_RTC_WIRE_V1",
+    "OPENPI_RTC_REQUEST_DEADLINE_POLICY_V1",
     "OpenPIConditionedRtcBackendV3",
     "OpenPIConditionedRtcConfig",
     "OpenPIV22ConditioningCodec",
