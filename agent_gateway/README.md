@@ -108,6 +108,131 @@ discovery catalogs. Concrete deployment bindings, device acquisition, camera
 ownership, safety, and executors remain in `profiles/`; they are deliberately
 not hidden inside the template.
 
+## Upper-framework-neutral Skill semantics
+
+This section specifies how an upper planner or orchestration framework must
+interpret the existing v2 discovery documents. It documents the current wire
+contract; it does not add fields to `SkillDefinition`, change any schema or
+hash domain, or move Task/Program behavior into the Gateway.
+
+A Skill is one stable semantic capability. It is not a prompt fragment, model
+checkpoint, controller command, Route, deployment, or upper-framework attempt
+record. An upper framework may organize Skills into direct calls, finite
+Programs, behavior trees, graphs, or another planning representation, but each
+lower invocation must resolve to one exact discovered Skill definition, schema
+entry, I/O contract, Route, and deployment binding. A same-name Skill from a
+different provider is interchangeable only when the versioned semantic
+definition and required schema/I/O references match; name equality alone is
+insufficient.
+
+### Meaning of the definition fields
+
+| Field | Protocol meaning | Must not be interpreted as |
+| --- | --- | --- |
+| `skill_id` + `skill_version` | Stable semantic identity selected by an upper planner. | A Route, checkpoint, device, or deployment identity. |
+| `skill_kind` | Semantic class used with the Route control-effect closure: `inspection`, `motion`, `policy_task`, or `lifecycle`. | Proof that the caller is authorized or that the lower system is ready. |
+| `summary` | Hashed human-facing explanation of the intended capability. Consumers may display it but must not parse it as executable policy. | A substitute for strict schemas, predicates, admission, or evaluation. |
+| `intended_target_kind` + `cross_target_deployment_policy` | Whether the semantics are target-agnostic or require an explicit reviewed sim/real use. | Permission to cross-deploy a concrete Route or reuse a safety profile. |
+| `controlled_component_ids` | Semantic set of components the capability may intentionally affect. | A resource lease, actuator allowlist, dispatch permit, or claim that every listed component moves. |
+| `parameter_semantics_id` | Versioned meaning of the parameter payload. The Schema Catalog separately defines its exact JSON shape. | Caller permission to add parameters or author lower profiles. |
+| `execution_result_semantics_id` | Versioned meaning of bounded execution-result facts returned by the lower implementation. | The upper Task result or a semantic success claim by itself. |
+| `task_outcome_semantics_id` | Versioned meaning of the Skill-level outcome evaluated from reviewed evidence. | Gateway operation status, upper Task completion, or lower HOLD proof. |
+| `entry_predicate_ids` | Named semantic preconditions that must be established by the owning lower Route/profile during admission or activation. | Facts made true by catalog discovery, planner assertion, or prompt text. |
+| `task_outcome_predicate_ids` | Named predicates used by the reviewed evaluator to support a Skill-level outcome. | Conditions the upper framework may silently replace or infer from operation termination. |
+
+The three `*_semantics_id` values name meanings; the three strict schemas
+constrain bytes. Both are required. A payload can be schema-valid while using
+the wrong semantic frame, unit, role, or outcome interpretation, so an adapter
+must pin and check the definition hash and schema hashes together. Profiles
+bind concrete frames, sources, tolerances, safety envelopes, and evaluators;
+those bindings remain trusted assembly rather than Agent-authored arguments.
+
+Entry predicates describe initiation semantics, but discovery does not
+evaluate them. The lower owner checks live readiness, fresh measurements,
+grants, resource ownership, safety-profile selection, and other Route-specific
+conditions at admission or activation. An upper planner may decide not to call
+a Skill, request a fresh observation, or replan when a predicate is not known;
+it cannot make a lower predicate true by asserting it.
+
+Skill termination has three distinct layers:
+
+1. **Operation termination** reports what happened to the admitted lower
+   operation (`succeeded`, `failed`, `cancelled`, `timed_out`, or an unresolved
+   state).
+2. **Skill outcome evaluation** applies the advertised outcome semantics and
+   predicates to the required evidence and produces the typed evaluation
+   payload/receipts.
+3. **Upper Task or Program progression** is owned by the attaching framework,
+   which may combine the Skill outcome with its own guards, retry budget,
+   history, Memory, or task policy.
+
+These layers must not be collapsed. In particular, a terminal or
+`succeeded` operation does not by itself prove the advertised Skill outcome,
+upper Task success, or lower-confirmed HOLD. Conversely, an upper planner's
+decision to stop does not cancel, terminate, or hold a lower operation.
+
+### Invocation, recovery, and evidence mapping
+
+An upper-framework adapter should follow this mapping regardless of whether
+the planner is an LLM, a symbolic planner, a behavior-tree engine, or another
+agent framework:
+
+1. Discover and hash-pin the Definition, Schema, I/O, Route, and Session
+   Capability documents for one runtime session.
+2. Keep upper Task, Program/graph, guard, retry/fallback, planning-generation,
+   Memory, and reasoning records outside the Gateway wire request. In RPent,
+   `ExecutionIntent`, `SemanticProgramSpec`, and `SkillAttempt` are examples of
+   such upper-owned records; they are not Gateway request extensions.
+3. Materialize one invocation against the strict parameter schema and one
+   reviewed parameter profile, then submit one exact `AgentSkillRequest` bound
+   to the discovered definition, Route, deployment, Station revision, client
+   sequence, request identity, and idempotency key.
+4. Treat the resulting `AgentSkillOperation` as lower execution truth. Events
+   are bounded hints; authoritative operation queries and discovery are used
+   after a replay gap or reconnect.
+5. Validate result metadata, Artifact bindings/content hashes, evaluation
+   receipts, and any authoritative lower receipt before projecting a semantic
+   result into the upper framework. Artifact materialization and long-term
+   retention remain upper/data-plane concerns, not Skill success.
+6. On a definite pre-admission rejection, the upper framework may revise its
+   plan and create a fresh invocation. If submission may have crossed the
+   transport boundary, reconcile only the exact original request; never create
+   a new request or retry budget entry until the original acceptance state is
+   known.
+7. A semantic retry or fallback is a new upper attempt and receives fresh
+   Gateway admission. Replacement of an active operation additionally waits
+   for the required authoritative lower HOLD/handoff evidence, takes a fresh
+   post-HOLD observation, and revalidates the replacement. Cancellation ACK,
+   disconnect, elapsed time, event delivery, or ordinary operation termination
+   is not lower-confirmed HOLD evidence.
+
+The lower protocol deliberately does not define an upper Program language,
+planner prompt, model API, Memory format, retry policy, or Task state machine.
+It does define the facts any such framework must preserve: exact identity and
+hash closure, strict payloads, fresh admission, idempotent reconciliation,
+lower-owned operation status, typed outcome evidence, bounded Artifact
+handoff, and fail-closed HOLD semantics. This is the replaceability seam for
+changing the upper planning model or framework without changing downstream
+execution ownership.
+
+### Compatibility and semantic changes
+
+Treat a change to parameters, units, frames, intended effects, initiation,
+termination, outcome predicates, or failure meaning as a Skill semantic
+change. An incompatible semantic change requires a new `skill_version` and
+corresponding versioned semantics/schema references; it must not be hidden
+behind a reused identity. A deployment-only change belongs in the Route or
+deployment binding and changes the corresponding hashes rather than the
+Agent-visible Skill meaning.
+
+Because `summary` and the semantic reference fields are part of the hashed
+definition, even a documentation correction inside a published definition
+produces a new definition/catalog hash and requires rediscovery. Adding a new
+public definition field or request field is a protocol/schema evolution, not a
+documentation-only edit. Do not add upper-specific fields such as RPent Task,
+Program, planning-model, Memory, `SkillAttempt`, or private deployment-binding
+annotations to the exact Gateway request schema.
+
 Control effect is a closed contract, not a naming convention. An `inspection`
 Definition can only use a `read_only` Route; that Route must be
 `t0_read_only`, use `cancel_only`, advertise no robot motion or publication
