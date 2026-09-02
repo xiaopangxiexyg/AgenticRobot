@@ -24,7 +24,7 @@ from agent_gateway.profiles.real.point_grasp_gateway import PointGraspProvider
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
 )
-from dataset_contracts.perception_artifacts import (
+from perception_contracts.artifacts import (
     LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
     LOCALIZATION_INPUT_PNG_ENCODING_V1,
     LOCALIZATION_INPUT_PNG_MEDIA_TYPE_V1,
