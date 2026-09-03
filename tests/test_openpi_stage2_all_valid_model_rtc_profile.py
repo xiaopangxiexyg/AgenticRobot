@@ -76,6 +76,10 @@ def test_stage2_all_view_h32_model_rtc_profile_matches_prepared_profile() -> Non
     }
     assert prepared["action_horizon"] == 32
     assert prepared["action_pose_mode"] == "absolute"
+    assert prepared["openpi_quantile_semantic_bounds"] == {
+        "schema": OPENPI_QUANTILE_SEMANTIC_BOUNDS_V1,
+        "components": {"actions": ["right.end_effector.target"]},
+    }
     assert prepared["expected_total_raw_episode_count"] == 1504
     assert prepared["expected_total_eligible_episode_count"] == 1424
     assert prepared["expected_openpi_quality_valid_window_count"] == 41578

@@ -153,6 +153,14 @@
   "openpi_source_identity_sha256": "c20777aa75069d08e61eee3e23451421a8629f97954e1cfd6500ddfcc08438e5",
   "openpi_base_config": "writing-all-view-h32-absolute-standard-v1",
   "openpi_state_augmentation_from_config": "writing-all-view-h32-absolute-standard-v1",
+  "openpi_quantile_semantic_bounds": {
+    "schema": "dexteleop.openpi_quantile_semantic_bounds.v1",
+    "components": {
+      "actions": [
+        "right.end_effector.target"
+      ]
+    }
+  },
   "openpi_config_name": "writing_stage2_all_valid_all_view_h32_absolute_non_rtc_100k_v1-prepared",
   "openpi_asset_id": "writing_stage2_all_valid_all_view_h32_absolute_non_rtc_100k_v1",
   "openpi_assets_base_dir": "/home/user/zc/openpi_writing_all_view_h32_4stage_runs/20260830_snapshot_v1/artifacts/assets",
