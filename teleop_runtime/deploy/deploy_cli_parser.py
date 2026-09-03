@@ -10,123 +10,19 @@ from __future__ import annotations
 
 import argparse
 
-import json
-
-import math
-
-import sys
-
-import threading
-
-import time
-
-import uuid
-
-from collections.abc import Callable, Mapping
-
-from dataclasses import replace
 
 from pathlib import Path
 
-from typing import Any
-
-import numpy as np
-
-from dataset_contracts.canonical_encoding import canonical_content_hash
-
-from dataset_contracts.layout import episode_id_from_index
-
-from dataset_contracts.policy_artifact import policy_artifact_from_metadata
 
 from dataset_contracts.pose_frames import load_pose_frame_contract
 
-from dataset_contracts.pose_training import POSE_TRAINING_ORIGIN_NATIVE_V23
-
-from dataset_contracts.v22 import (
-    DEXTELEOP_DATASET_SCHEMA_V22,
-    policy_io_layout_from_metadata,
-)
-
-from dataset_contracts.v23 import DEXTELEOP_DATASET_SCHEMA_V23
-
-from deployments.client import load_policy_artifact
-
-from deployments.client.policy import load_policy
-
-from deployments.client.rtc_executor import (
-    rtc_client_inference_bundle_debug_payload,
-)
-
-from deployments.client.rtc_frontend import (
-    build_rtc_conditioned_model_shadow_frontend_v3,
-    build_rtc_model_shadow_frontend,
-)
-
-from robot_motion.action import (
-    ActionComponentCatalog,
-    ActionComponentSpec,
-    ArmActionSpec,
-    HandActionSpec,
-    build_robot_action_v1_runtime_schema,
-)
-
-from robot_motion.deploy.actions import (
-    ActionSafetyFilter,
-    ActionSafetyFilterConfig,
-    NormalizedAction,
-)
 
 from robot_motion.deploy.async_producer import (
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
-    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
-    POLICY_ASYNC_PRODUCER_ELIGIBLE,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
-    RAW_RTC_FINAL_CHUNK_PROFILE_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
-    RTC_3C_VIRTUAL_SHADOW_PROFILE_V1,
 )
 
-from robot_motion.deploy.canonical_action import CanonicalDeployActionPipeline
-
-from robot_motion.deploy.emission_port import (
-    PassivePolicyEmissionObserverPort,
-    require_passive_policy_emission_observer,
-)
-
-from robot_motion.deploy.next_step import sync_queue_preserves_same_chunk_successor
-
-from robot_motion.deploy.observation import (
-    DEFAULT_HAND_STATE_MAX_AGE_SEC,
-    build_deployment_observation,
-)
-
-from robot_motion.deploy.pose_adapter import (
-    convert_policy_absolute_vector_to_runtime_raw,
-)
-
-from robot_motion.deploy.runtime import (
-    PolicyChunkPredictionResult,
-    PolicyDeployRuntime,
-    PolicyDeployRuntimeConfig,
-    resolve_action_queue_policy,
-)
-
-from robot_motion.deploy.schema import (
-    ACTION_DIM,
-    ALL_SIDES,
-    DEPLOY_ACTION_VECTOR_ACTION_SPACE,
-    to_serializable,
-)
-
-from robot_motion.deploy.session_contract import (
-    POLICY_CONTRACT_V22_NATIVE,
-    RuntimeEndEffectorCapability,
-    resolve_deploy_session_contract,
-)
-
-from robot_motion.pose_frame_profiles import (
-    default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
-)
 
 from robot_motion.position_control import (
     DEFAULT_POSITION_DEGRADED_SPEED_SCALE,
@@ -136,8 +32,6 @@ from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_CHOICES,
     POSITION_PLAN_SPLICE_DYNAMICS_OFF,
     POSITION_PLAN_SPLICE_DYNAMICS_PROFILE_CHOICES,
-    PositionStreamStartAcquisitionConfig,
-    resolve_position_plan_splice_dynamics_config,
 )
 
 from robot_motion.replay.trajectory import QPOS_INIT_SOURCES
@@ -146,35 +40,18 @@ from robot_motion.rm65 import (
     DEFAULT_COLLISION_SCENE,
     DEFAULT_DUAL_ARM_COLLISION_DISTANCE_EPSILON_M,
     DEFAULT_DUAL_ARM_COLLISION_MIN_DISTANCE_M,
-    LEGACY_POSITION_CONTROL_PROFILE_NAME,
-    RM65_ABSOLUTE_Q_MAX_RAD,
-    RM65_ABSOLUTE_Q_MIN_RAD,
-    RM65_ARM_CONTROL_MODE_IMPEDANCE,
     RM65_ARM_CONTROL_MODE_POSITION,
     RM65_ARM_CONTROL_MODES,
     RM65_BIMANUAL_POSITION_V1_NAME,
     RM65_POSE_LIFT_PROFILE_CHOICES,
     RM65_POSE_LIFT_V4_QP_CONSTRAINED_NAME,
     RM65_POSITION_CONTROL_PROFILE_CHOICES,
-    RM65_POSITION_TRACKING_FOLLOW_ALPHA,
     RM65_POSITION_TRACKING_MAX_ACCELERATION_RAD_S2,
     RM65_POSITION_TRACKING_MAX_COMMAND_STEP_DEG,
-    RM65_POSITION_TRACKING_MAX_VELOCITY_RAD_S,
     RM65_QREF_ACCELERATION_COMFORT_75_V1,
-    RM65_QREF_ACCELERATION_HARD_V1,
     RM65_QREF_ACCELERATION_PROFILE_CHOICES,
-    normalize_rm65_arm_control_mode,
-    resolve_rm65_pose_lift_profile,
-    resolve_rm65_qref_acceleration_profile,
 )
 
-from robot_motion.runtime import (
-    TeleopCommand,
-    available_cpu_ids,
-    cpu_thread_sibling_ids,
-)
-
-from robot_motion.runtime_gate import IKActionChunkGate
 
 from runtime_artifact_paths import (
     LEGACY_ARTIFACT_LAYOUT_CLI_NAME,
@@ -182,49 +59,26 @@ from runtime_artifact_paths import (
     configured_runtime_artifact_layout,
 )
 
-from ..action.legacy_execution_context import (
-    LegacyControlOwnerStateTransitionOutcome,
-    LegacyControlOwnerStateTransitionRequest,
-)
-
-from ..action.replay_proposal import (
-    DatasetReplayProposalShadowAdapter,
-    DatasetReplayProposalShadowConfig,
-    replay_adapter_debug_payload,
-)
 
 from ..backends.arms import (
     DEFAULT_SINGULARITY_QPOS_INIT_SLOWDOWN,
     RM65_BACKGROUND_TARGET_ADMISSION_CHOICES,
     RM65_BACKGROUND_TARGET_ADMISSION_LATEST_NONBLOCKING,
-    RM65ArmBackend,
-    RM65ImpedanceArmBackend,
 )
 
 from ..backends.grippers import (
     DMTAC_TACTILE_FIELDS,
-    DMTacGripperBackendConfig,
 )
 
 from ..backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
 )
 
-from ..collection.camera_preview import CameraPreviewConfig, CameraPreviewer
-
-from ..collection.hand_state_polling import (
-    HandStateHistoryPoller,
-    HandStateHistoryPollerConfig,
-)
 
 from ..configs.camera_paths import DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
 
 from ..configs.dmtac_hardware import (
     add_dmtac_assignment_arguments,
-    dmtac_backend_configs_from_assignment,
-    load_dmtac_hardware_assignment,
-    manual_dmtac_backend_config_for_side,
-    require_dmtac_sides_resolved,
 )
 
 from ..defaults import (
@@ -232,37 +86,17 @@ from ..defaults import (
     DEFAULT_TELEOP_SAMPLE_HZ,
 )
 
-from ..hand_mapping import parse_tactile_regions
-
-from ..interfaces import EffectorBackend
-
-from ..log_utils import ChangeGate
-
-from ..log_utils import log_event as console_log_event
 
 from ..position_control import (
     ARM_EXECUTION_PROFILE_CHOICES,
     CONTINUOUS_WAYPOINT_WORKER_ISOLATION_CHOICES,
-    CONTINUOUS_WAYPOINT_WORKER_PROCESS,
     CONTINUOUS_WAYPOINT_WORKER_THREAD,
     OFFICIAL_SOURCE_ALL_IK_GOVERNOR_BACKEND,
-    PINK_POSE_LIFT_BACKEND,
-    POSITION_15_60_120HZ_PROFILE_NAME,
     POSITION_PATH_LIFT_BACKEND_CHOICES,
-    PositionDeployExecutor,
-    PositionDeployExecutorConfig,
-    apply_rm65_position_profile_defaults,
-    build_official_all_ik_governor_from_started_backends,
-    build_position_collision_planner_from_started_backends,
-    resolve_real_arm_execution_config,
 )
 
 from ..position_force_guard import (
     POSITION_FORCE_SOURCES,
-    PositionForceGuardFault,
-    PositionForceGuardMonitor,
-    PositionForceGuardTripped,
-    position_force_guard_config,
 )
 
 from ..sources.camera import (
@@ -270,271 +104,68 @@ from ..sources.camera import (
     REALSENSE_STARTUP_WARMUP_POLICIES,
 )
 
-from ..tactile_visualizer import (
-    TactileUVVisualizer,
-    TactileVisualizerConfig,
-    tactile_by_side_from_hand_states,
-)
-
-from ..target_safety.deploy_tcp_pose_envelope import (
-    DeployTCPPoseEnvelopeProjector,
-)
-
-from ..target_safety.tcp_pose_envelope_runtime import (
-    load_tcp_pose_envelope_file_spec,
-)
-
-from .action_dispatch import (
-    command_effector_kind_subset,
-    dispatch_position_discrete_command_checked as _dispatch_position_discrete_command_checked,
-)
-
-from .action_execution import (
-    PreparedActionExecution as _PreparedActionExecution,
-    PreparedActionExecutor,
-)
 
 from .arbiter_shadow import (
-    ARBITER_SHADOW_MODE_SHADOW,
     ARBITER_SHADOW_MODES_M3,
-    PassivePolicyArbiterShadow,
-    PolicyArbiterShadowConfig,
 )
 
 from .arm_backend_runtime import (
     DEPLOY_ARM_STEP_DT_ALPHA,
-    DEPLOY_ARM_STEP_DT_MAX_SCALE,
     DEPLOY_ARM_STEP_DT_STALL_RESET_SEC,
     DEPLOY_MAX_ARM_JOINT_STEP_RAD,
     DEPLOY_RM65_ARM_MAX_ANGVEL,
-    annotate_deploy_arm_command_limits,
-    apply_arm_step_dt_defaults,
-    build_arm_backends,
-    deploy_arm_backend_control_dt_sec,
-    deploy_arm_command_max_joint_step,
-    deploy_arm_command_step_dt_sec,
-    effective_arm_canfd_follow,
-    effective_arm_control_hz,
-    effective_position_reference_hz,
-    _position_deploy_ik_tuning,
-    resolve_arm_step_dt_max_scale,
-    resolve_position_reference_and_command_hz as _resolve_position_reference_and_command_hz,
 )
 
-from .arm_safety_runtime import (
-    emergency_stop_deploy_arm_backends,
-    emergency_stop_position_deploy_on_keyboard_interrupt as _emergency_stop_position_deploy_on_keyboard_interrupt,
-    hold_deploy_arm_backends,
-    request_policy_inference_soft_hold,
-)
-
-from .arm_state_reader import ArmStateReader
 
 from .camera_runtime import (
     DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC,
     DEFAULT_DEPLOYMENT_CAMERA_KEEP_LAST,
     REAL_TELEOP_CAMERA_START_STAGGER_SEC,
-    build_camera_sources,
-    resolve_policy_camera_input_keys,
-    run_camera_startup_self_check,
-    select_preview_camera_sources,
-    start_camera_sources,
 )
 
-from .cli_args import argument_was_supplied as _argument_was_supplied
 
 from .cli_value_parsers import (
     _non_negative_float,
     _non_negative_int,
-    _parse_active_sides,
     _parse_arm_max_angvel,
-    _parse_disconnected_gripper_sides,
     _parse_dmtac_tactile_fields,
-    _parse_end_effector_sides,
-    _parse_float_tuple,
     _parse_qpos6,
-    _parse_vector3,
     _positive_float,
     _positive_int,
     _unit_interval_float,
 )
 
-from .console_runtime import LoopRate, NonBlockingKeyboard
 
 from .debug_payload import (
     DEPLOY_DEBUG_PAYLOAD_COMPACT,
-    DEPLOY_DEBUG_PAYLOAD_FULL,
     DEPLOY_DEBUG_PAYLOAD_MODES,
-    _DEBUG_EFFECTOR_METADATA_KEYS,
-    _DEBUG_LAST_COMMAND_METADATA_KEYS,
-    _debug_action_summary,
-    _debug_action_vector,
-    _debug_arm_joint_targets,
-    _debug_args_payload,
-    _debug_arm_state_summary,
-    _debug_backend_arm_states,
-    _debug_backend_dispatch_by_effector_summary,
-    _debug_backend_group_health_summary,
-    _debug_backend_limits,
-    _debug_background_streaming_summary,
-    _debug_compact_value,
-    _debug_command_arm_pose_by_side,
-    _debug_command_summary,
-    _debug_hand_by_side_from_vector,
-    _debug_metadata_summary,
-    _debug_pose_by_side_from_vector,
-    _debug_pose_delta,
-    _debug_pose_delta_by_side,
-    _debug_position_executor_event_summary,
-    _debug_quat_delta_deg,
-    _debug_redact,
-    _debug_remote_policy_summary,
-    _debug_state_pose_by_side,
-    _debug_vector,
-    _debug_xyzquat,
 )
 
-from .debug_logger import (
-    DeploymentDebugLogger,
-    RuntimeArtifactLayout,
-    canonical_deployment_debug_root,
-    resolve_deployment_debug_root,
-)
 
 from .dispatch import (
     POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES,
     POSITION_REFERENCE_DISPATCH_AUDIT_POST,
-    dispatch_position_reference_command,
-    require_arm_backends_ready_for_position_dispatch,
 )
 
-from .fixed_init import DeployFixedInitController, load_deploy_fixed_init_plan
-
-from .hand_backend_config import (
-    GRIPPER_POLICY_DEFAULTS,
-    _apply_gripper_policy_to_dmtac_config,
-    _dmtac_tactile_enabled,
-    _hand_backend_mode,
-    _hand_backend_mode_for_side,
-    _hands_enabled,
-    _load_gripper_task_profile,
-    _profile_value,
-    _resolved_gripper_policy,
-)
 
 from .hand_backend_runtime import (
     HAND_BACKEND_CHOICES,
-    HAND_BACKEND_DMTAC_GRIPPER,
     HAND_BACKEND_INSPIRE,
-    build_hand_backends as _build_resolved_hand_backends,
-    disconnected_gripper_selection_label as _disconnected_gripper_selection_label,
-    filter_policy_qpos_init_hand_action_specs,
-    hand_action_specs_for_modes,
-    hand_backend_startup_diagnostic as _hand_backend_startup_diagnostic,
-    start_hand_backends_checked as _start_hand_backends_checked,
 )
 
-from .impedance_force_guard import (
-    ImpedanceForceGuardConfig,
-    ImpedanceForceGuardFault,
-    ImpedanceForceGuardMonitor,
-)
-
-from .impedance_runtime import (
-    enable_impedance_force_control_backends,
-    warm_start_impedance_force_control_backends,
-)
 
 from .policy_qpos_init import (
-    DeployPolicyQposInitController,
     DeployPolicyQposInitSettings,
-    load_deploy_policy_qpos_init_plan,
 )
 
-from .policy_binding import (
-    bind_policy_pose_mode_from_artifact as _bind_policy_pose_mode_from_artifact,
-    build_policy_observation_contract as _policy_observation_contract,
-    parse_policy_kwargs,
-)
-
-from .position_plan_cut import (
-    DeploymentPositionPlanCutDetector,
-    prepare_position_plan_cut_for_action_step as _prepare_position_plan_cut_for_action_step,
-)
-
-from .position_stream_handoff import (
-    defer_position_action_after_synchronous_prediction as _defer_position_action_after_synchronous_prediction,
-    hold_active_position_stream_for_synchronous_chunk_gap as _hold_active_position_stream_for_synchronous_chunk_gap,
-    position_source_tail_pending_before_synchronous_chunk_gap as _position_source_tail_pending_before_synchronous_chunk_gap,
-)
-
-from .replay import (
-    bind_debug_replay_arm_control_mode,
-    debug_replay_execution_exhausted as _debug_replay_execution_exhausted,
-    load_dataset_replay_policy,
-    skip_startup_replay_frames as _skip_startup_replay_frames,
-)
-
-from .quest_paired_pose_capture import (
-    QuestPairedPoseCaptureApplicationPort,
-    QuestPairedPoseCaptureFactory,
-    bind_passive_robot_pose_journal_source,
-    require_quest_paired_pose_capture_application,
-)
-
-from .resource_lifecycle import PolicyDeployResourceLifecycle
-
-from .rm65_legacy_worker_binding import RM65LegacyWorkerExecutionBinding
-
-from .rm65_pose_observation import (
-    RM65PoseObservationAssembly,
-    assemble_rm65_pose_observation,
-    build_policy_deploy_receiver_clock,
-)
 
 from .rtc_debug import (
-    RTC_DEBUG_LEVEL_OFF,
-    RTC_DEBUG_LEVEL_SUMMARY,
-    RTC_DEBUG_LEVEL_TRACE,
     RTC_DEBUG_LEVELS,
-    RtcDebugEventObserver,
-    normalize_rtc_debug_level,
 )
 
-from .status_view import (
-    camera_status_text,
-    compact_faults as _compact_faults,
-    compact_log_value,
-    hand_state_snapshot,
-    policy_status_text as _policy_status_text,
-    print_controls,
-)
-
-from .rtc_frontend import RtcPolicyShadowConfig, RtcPolicyShadowFrontend
-
-from .rtc_step_fanout import (
-    PolicyActionEmissionFanout,
-    RtcFrontendStepFanout,
-    RtcPolicyEmissionPublisher,
-)
-
-from .runtime_timing import (
-    _action_hz_reference,
-    _runtime_action_keyframe_period_sec,
-    resolve_effective_action_hz,
-    resolve_effective_policy_hz,
-)
-
-from .safety_shadow import evaluate_policy_legacy_aligned_safety
-
-from .startup_init import (
-    StartupInitializer,
-    finish_policy_qpos_init_reference_cut as _finish_policy_qpos_init_reference_cut,
-    reset_startup_initializer as _reset_startup_initializer,
-    resolve_startup_init_action,
-)
 
 DEFAULT_CAMERA_CONFIG_PATH = DEFAULT_REALSENSE_DEVICE_CONFIG_PATH
+
 
 def add_args(parser: argparse.ArgumentParser) -> None:
     policy_qpos_defaults = DeployPolicyQposInitSettings()

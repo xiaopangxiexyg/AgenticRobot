@@ -72,3 +72,28 @@ def test_deployment_parser_does_not_import_run_policy() -> None:
         and (node.module or "").endswith("run_policy")
         for node in ast.walk(parser_tree)
     )
+
+
+def test_deployment_parser_has_no_unused_import_bindings() -> None:
+    parser_tree = ast.parse(inspect.getsource(deploy_cli_parser))
+    imported_bindings: set[str] = set()
+    for node in parser_tree.body:
+        if isinstance(node, ast.Import):
+            imported_bindings.update(
+                alias.asname or alias.name.split(".", 1)[0]
+                for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
+            imported_bindings.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name != "*"
+            )
+
+    loaded_bindings = {
+        node.id
+        for node in ast.walk(parser_tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+
+    assert sorted(imported_bindings - loaded_bindings) == []
