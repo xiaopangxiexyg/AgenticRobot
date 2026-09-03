@@ -12,9 +12,13 @@
 Isaac Gym 单独看第 6 节；MuJoCo 和冻结保留的 SAPIEN 兼容依赖看第 7 节；只有设备权限问题才进入第 8 节。项目运行命令不在本文维护，完成
 环境后回到 [运行文档索引](./docs/README.md)。
 
-## 抓姿 Skill 必读：四个关键问题
+## 0. 抓姿 Skill 必读：源码、权重与一键环境
 
-### 源码在哪里？
+`perception.plan_point_grasp` 的现行实现是同一 `dexteleop310` Python 进程内的直接调用：
+MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server-client 通信。不要为它新建
+`graspnet` 或其他第二 Conda 环境。
+
+### 0.1 源码在哪里？
 
 | 组件 | 当前 worktree 内路径 |
 | --- | --- |
@@ -26,7 +30,7 @@ Isaac Gym 单独看第 6 节；MuJoCo 和冻结保留的 SAPIEN 兼容依赖看�
 
 这四个目录都是 Git submodule；PointNet2 属于 GraspNet 源码，且没有独立权重。
 
-### 权重在哪里？
+### 0.2 权重在哪里？
 
 权重不提交 Git，不由安装器下载，必须放在共享资产根 `${DEXTELEOP_ASSET_ROOT}` 下：
 
@@ -40,22 +44,29 @@ Isaac Gym 单独看第 6 节；MuJoCo 和冻结保留的 SAPIEN 兼容依赖看�
 每个目录还需对应的 `manifest.json` 及真实 SHA-256。使用 worktree 默认 assets 映射时，根就是本仓
 `assets/`；下载来源见 [`assets.zip`](https://disk.pku.edu.cn/link/AA6DAAF3490F7645A18F32230527E5480B)，解压之后所存放的路径请参考压缩包内说明。
 
-### 新机器如何一键安装？
+### 0.3 新机器如何一键安装？
+
+先取得包含权重的 assets，再在 AgenticRobot 根目录运行一条命令。RTX 4090 使用 `8.9`；其他 GPU
+把它换成 `python -c 'import torch; p=torch.cuda.get_device_properties(0); print(f"{p.major}.{p.minor}")'`
+的输出。
 
 ```bash
-cd /path/to/AgenticRobot
+# 纯仿真/感知开发，没有 DM-Tac SDK 时：
 bash scripts/install_point_grasp_env.sh \
   --skip-vendor-sdk \
   --cuda-arch-list 8.9
+
+# 真机开发且本机已有 assets/DM_Tac_SDK_Publish_1.2.10 时，去掉 --skip-vendor-sdk。
 ```
 
-它创建唯一的 `dexteleop310`，再安装 SAM2、Grounding DINO、VGN、GraspNet 和 PointNet2。真机且
-DM-Tac SDK 已就绪时去掉 `--skip-vendor-sdk`。权重必须事先通过 assets 提供。
+该 wrapper 创建 `dexteleop310`、初始化四个 submodule，并安装/编译 SAM2、Grounding DINO、VGN、
+GraspNet 和 PointNet2；它不会下载模型权重。真机且DM-Tac SDK 已就绪时去掉 `--skip-vendor-sdk`。权重必须事先通过 assets 提供。
 
-### 已有基础 DexTeleop 如何一键更新？
+### 0.4 已有基础 DexTeleop 如何一键更新？
+
+先更新到包含该功能的 AgenticRobot revision，然后运行：
 
 ```bash
-cd /path/to/AgenticRobot
 git pull --ff-only
 bash scripts/install_point_grasp_env.sh \
   --update \
@@ -63,8 +74,14 @@ bash scripts/install_point_grasp_env.sh \
   --cuda-arch-list 8.9
 ```
 
-该命令会更新基础环境、初始化 submodule 并安装模型 runtime；完毕后执行
-`bash scripts/install_point_grasp_models.sh --backend cuda --with-graspnet --verify-only`。
+已有 DM-Tac SDK 的真机开发者同样去掉 `--skip-vendor-sdk`。wrapper 会自动执行
+`git submodule update --init --recursive`；更新完成后可用以下只读检查确认源码 commit、CUDA 算子和
+包导入：
+
+```bash
+bash scripts/install_point_grasp_models.sh \
+  --backend cuda --with-graspnet --verify-only
+```
 
 ## 1. 环境边界与唯一来源
 
