@@ -1298,7 +1298,7 @@ class AgentGatewayService:
         current_station_revision: int,
         now: float | None = None,
     ) -> AgentGatewayOperationOutcome:
-        """Close once and request HOLD; repeated calls are idempotent."""
+        """Fence admission once and retry HOLD until it is confirmed."""
 
         revision = _revision(current_station_revision)
         timestamp = self._time() if now is None else _finite_time(now, field_name="now")
@@ -1307,13 +1307,15 @@ class AgentGatewayService:
                 return self._close_outcome
             with self._admission_lock:
                 self._closed = True
-            self._close_outcome = self._request_hold(
+            outcome = self._request_hold(
                 reason="agent_gateway_service_close",
                 control_kind="service_close",
                 current_station_revision=revision,
                 requested_at=timestamp,
             )
-            return self._close_outcome
+            if outcome.accepted:
+                self._close_outcome = outcome
+            return outcome
 
     def _request_hold(
         self,

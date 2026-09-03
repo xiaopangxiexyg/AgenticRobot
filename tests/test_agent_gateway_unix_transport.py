@@ -247,6 +247,38 @@ def test_server_refuses_existing_endpoint_and_unlinks_only_its_own_socket(
     assert len(close_calls) == 1
 
 
+def test_server_close_retries_gateway_after_transport_is_already_closed(
+    short_unix_socket_path_factory,
+) -> None:
+    path = short_unix_socket_path_factory("close-retry")
+    close_calls: list[int] = []
+
+    def close_gateway():
+        close_calls.append(len(close_calls) + 1)
+        return SimpleNamespace(
+            accepted=len(close_calls) > 1,
+            reason_code=(
+                "station_hold_confirmed" if len(close_calls) > 1 else "hold_failed"
+            ),
+        )
+
+    server = AgentGatewayUnixJsonServer(
+        socket_path=path,
+        peer_client_map=AgentGatewayUnixPeerClientMap(
+            {os.getuid(): "rpent:local"}
+        ),
+        facade_factory=lambda _: _FakeBoundFacade("rpent:local"),
+        close_gateway=close_gateway,
+    )
+
+    server.server_close()
+    assert close_calls == [1]
+    assert not path.exists()
+
+    server.server_close()
+    assert close_calls == [1, 2]
+
+
 def test_group_shared_server_requires_setgid_parent_and_inherits_group(
     short_unix_socket_path_factory,
 ) -> None:
