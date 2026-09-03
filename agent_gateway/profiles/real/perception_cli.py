@@ -20,8 +20,12 @@ from agent_gateway.transport.unix_transport import (
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
 from deployments.perception import (
+    GraspNetPointGraspModelSpec,
+    Sam2GraspNetPointGraspPlanner,
     Sam2GroundingDinoLocalizer,
     Sam2GroundingDinoModelSpec,
+    Sam2VgnPointGraspPlanner,
+    VgnPointGraspModelSpec,
 )
 from robot_motion.rm65 import (
     build_rm65_dual_arm_scene_profile,
@@ -41,9 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m agent_gateway real-perception",
         description=(
-            "Serve passive real RGB/depth and optional supplied-image object "
-            "localization Skills. This profile never constructs or connects an "
-            "RM65 backend."
+            "This profile never constructs or connects an RM65 backend. "
+            "It serves passive real RGB/depth plus optional supplied-image "
+            "object localization and live Station-bound point-grasp Skills."
         ),
     )
     parser.add_argument("--socket-path", type=Path, required=True)
@@ -98,6 +102,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--object-localization-nms-iou-threshold", type=float, default=0.70
     )
+    parser.add_argument(
+        "--enable-point-grasp",
+        action="store_true",
+        help=(
+            "enable the proposal-only live RGB-D point-grasp Route; requires "
+            "the shared object-localization model"
+        ),
+    )
+    parser.add_argument(
+        "--point-grasp-backend",
+        choices=("vgn", "graspnet"),
+        default="vgn",
+    )
+    parser.add_argument(
+        "--point-grasp-asset-bundle",
+        type=Path,
+        default=None,
+        help="absolute path to the reviewed VGN or GraspNet asset bundle",
+    )
+    parser.add_argument("--point-grasp-device", default="cuda")
     return parser
 
 
@@ -194,6 +218,38 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"invalid object-localization model bundle: {error}")
+    point_grasp_planner = None
+    if args.enable_point_grasp:
+        if not args.enable_object_localization or object_localizer is None:
+            parser.error("--enable-point-grasp requires --enable-object-localization")
+        if args.point_grasp_asset_bundle is None:
+            parser.error("--enable-point-grasp requires --point-grasp-asset-bundle")
+        point_grasp_bundle = _absolute_directory(
+            parser,
+            args.point_grasp_asset_bundle,
+            flag="--point-grasp-asset-bundle",
+        )
+        try:
+            if args.point_grasp_backend == "vgn":
+                point_grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(
+                    point_grasp_bundle
+                )
+                point_grasp_planner = Sam2VgnPointGraspPlanner(
+                    model_spec=point_grasp_spec,
+                    point_segmenter=object_localizer,
+                    device=args.point_grasp_device,
+                )
+            else:
+                point_grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(
+                    point_grasp_bundle
+                )
+                point_grasp_planner = Sam2GraspNetPointGraspPlanner(
+                    model_spec=point_grasp_spec,
+                    point_segmenter=object_localizer,
+                    device=args.point_grasp_device,
+                )
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"invalid point-grasp model bundle: {error}")
     read_only_clients = tuple(
         (str(client_id), int(uid_text))
         for client_id, uid_text in args.ssh_read_only_client
@@ -233,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         control_domain_id=args.control_domain_id,
         frame_binding=frame_binding,
         object_localizer=object_localizer,
+        point_grasp_planner=point_grasp_planner,
         max_retained_operations=args.max_retained_operations,
         peer_idle_timeout_sec=peer_timeout,
     )
@@ -242,26 +299,29 @@ def main(argv: list[str] | None = None) -> int:
 
     def ready_callback() -> None:
         manifest = composition.contract_bundle.route_manifest
+        ready_payload = {
+            "event": "gateway_ready",
+            "profile": "real-perception",
+            "robot_backend": "absent",
+            "socket_path": str(composition.socket_path),
+            "runtime_session_id": manifest.runtime_session_id,
+            "current_mode": manifest.current_mode,
+            "route_manifest_hash": manifest.semantic_content_hash,
+            "deployment_profile_hash": composition.deployment_profile_hash,
+            "frame_graph_hash": frame_binding.frame_graph.semantic_content_hash,
+            "reference_frame_id": frame_binding.reference_frame_id,
+            "rgb_roles": list(composition.registration.profile.rgb_roles),
+            "depth_roles": list(composition.registration.profile.depth_roles),
+            "object_localization_enabled": (
+                composition.localization_registration is not None
+            ),
+            "local_path_test_input_enabled": False,
+        }
+        if composition.station_point_grasp_registration is not None:
+            ready_payload["point_grasp_enabled"] = True
         print(
             json.dumps(
-                {
-                    "event": "gateway_ready",
-                    "profile": "real-perception",
-                    "robot_backend": "absent",
-                    "socket_path": str(composition.socket_path),
-                    "runtime_session_id": manifest.runtime_session_id,
-                    "current_mode": manifest.current_mode,
-                    "route_manifest_hash": manifest.semantic_content_hash,
-                    "deployment_profile_hash": composition.deployment_profile_hash,
-                    "frame_graph_hash": frame_binding.frame_graph.semantic_content_hash,
-                    "reference_frame_id": frame_binding.reference_frame_id,
-                    "rgb_roles": list(composition.registration.profile.rgb_roles),
-                    "depth_roles": list(composition.registration.profile.depth_roles),
-                    "object_localization_enabled": (
-                        composition.localization_registration is not None
-                    ),
-                    "local_path_test_input_enabled": False,
-                },
+                ready_payload,
                 sort_keys=True,
             ),
             flush=True,

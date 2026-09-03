@@ -44,10 +44,13 @@ profile explicitly binds a Station application port.
 The optional real perception binding exposes the existing
 `perception.capture_rgb` and `perception.capture_depth` contracts and may add
 the supplied-image `perception.localize_objects` contract when its reviewed
-SAM2/Grounding DINO resource is enabled. Point-grasp model adapters and offline
-evaluation must not be registered as a real Gateway Route until RGB-D capture,
-Station revision, camera role, and calibration lineage are deployment-trusted
-rather than supplied by the caller. It owns one reviewed RealSense
+SAM2/Grounding DINO resource is enabled. It may add
+`perception.plan_point_grasp@2` only when the same application owns one
+correlated live aligned RGB-D capture, the registered camera role and static
+calibration, the admitted Station revision and frame binding, and the shared
+SAM2 plus point-grasp model lifecycle. The caller-supplied RGB-D/calibration
+`perception.plan_point_grasp@1` contract remains offline-only and must not be
+published by this production profile. It owns one reviewed RealSense
 inventory, optional read-only model lifecycle, and one transient Artifact store
 as application resources; a capture executor may only read an already-published
 immutable frame. A Skill invocation must never start, reset, restart, or close
@@ -56,8 +59,9 @@ dispatch, or HOLD. Production input uses Artifact upload; local files belong to
 the separate offline model CLIs and are not a production Gateway capability.
 Resource startup belongs to the application transaction before the socket is
 published. Shared SAM2 must start before the point-grasp planner and close after it.
-This ordering applies to offline/experimental compositions and does not enable a
-Gateway Route. VGN remains the default backend. External model source stays behind pinned Git
+The live Route returns ranked unprivileged proposals without choosing one,
+granting motion authority, or claiming full-scene/robot/path collision safety.
+VGN remains the default backend. External model source stays behind pinned Git
 submodule boundaries; checkpoints remain outside Git in explicitly verified local asset bundles. A live frame must
 match the configured source key, hardware serial,
 source generation, freshness bound, and Station revision. Depth additionally

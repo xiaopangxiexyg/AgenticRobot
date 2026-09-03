@@ -293,8 +293,8 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
     ) == {
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         "agent_gateway/profiles/real/perception_probe.py": ["numpy"],
-        # The unregistered point-grasp prototype is a concrete profile: NumPy
-        # decodes bounded depth arrays and projects annotations at this leaf.
+        # Offline v1 and deployment-bound live v2 point-grasp stay in one
+        # concrete profile leaf: NumPy decodes/projects only at this boundary.
         "agent_gateway/profiles/real/point_grasp_gateway.py": ["numpy"],
         "agent_gateway/profiles/real/realsense_perception.py": ["numpy"],
         # Concrete perception frame binding uses NumPy only to apply the

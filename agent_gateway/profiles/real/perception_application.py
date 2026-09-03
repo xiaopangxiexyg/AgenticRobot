@@ -35,6 +35,10 @@ from .realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
 )
+from .station_point_grasp_deployment import (
+    StationBoundPointGraspRegistration,
+    build_station_bound_point_grasp_registration,
+)
 
 
 class CameraOnlyRealPerceptionApplicationState(str, Enum):
@@ -186,6 +190,8 @@ class CameraOnlyRealPerceptionComposition:
     registration: RealPerceptionCaptureRegistration
     localization_registration: RealObjectLocalizationRegistration | None
     localization_provider: ObjectLocalizationProvider | None
+    station_point_grasp_registration: StationBoundPointGraspRegistration | None
+    point_grasp_planner: object | None
     contract_bundle: RealPerceptionContractBundle
     artifact_store: RecoverableAgentArtifactStore
     resources: CameraOnlyRealPerceptionResources
@@ -206,6 +212,7 @@ def assemble_camera_only_real_perception_composition(
     control_domain_id: str,
     frame_binding: RealPerceptionFrameBinding,
     object_localizer: object | None = None,
+    point_grasp_planner: object | None = None,
     max_retained_operations: int = 16,
     peer_idle_timeout_sec: float = 10.0,
     clock: Callable[[], float] = time.time,
@@ -234,13 +241,33 @@ def assemble_camera_only_real_perception_composition(
     )
     if object_localizer is not None and not localizer_hash:
         raise ValueError("object_localizer must expose semantic_content_hash.")
+    planner_hash = (
+        None
+        if point_grasp_planner is None
+        else str(getattr(point_grasp_planner, "semantic_content_hash", "")).strip()
+    )
+    if point_grasp_planner is not None:
+        if not planner_hash:
+            raise ValueError("point_grasp_planner must expose semantic_content_hash.")
+        if object_localizer is None:
+            raise ValueError("Live point-grasp requires object localization.")
+        if (
+            getattr(point_grasp_planner, "point_segmenter", None)
+            is not object_localizer
+        ):
+            raise ValueError(
+                "Live point-grasp must share the exact object-localizer instance."
+            )
+    target_binding_payload = {
+        "source_binding_hash": source_binding.semantic_content_hash,
+        "frame_binding_hash": frame_binding.semantic_content_hash,
+        "resource_kind": "camera_bundle",
+        "object_localizer_hash": localizer_hash,
+    }
+    if planner_hash is not None:
+        target_binding_payload["point_grasp_planner_hash"] = planner_hash
     target_binding_hash = canonical_content_hash(
-        {
-            "source_binding_hash": source_binding.semantic_content_hash,
-            "frame_binding_hash": frame_binding.semantic_content_hash,
-            "resource_kind": "camera_bundle",
-            "object_localizer_hash": localizer_hash,
-        },
+        target_binding_payload,
         domain="dexteleop.real_perception.target_binding.v1",
     )
     target_binding_id = "real-realsense-only:" + target_binding_hash
@@ -253,15 +280,18 @@ def assemble_camera_only_real_perception_composition(
         },
         domain="dexteleop.real_perception.station_manifest.v1",
     )
+    execution_manifest_payload = {
+        "resource_owner": "camera_only_real_perception_application",
+        "source_binding_hash": source_binding.semantic_content_hash,
+        "robot_backend": "absent",
+        "command_owner_count": 0,
+        "downstream_control_effects": "forbidden",
+        "object_localizer_hash": localizer_hash,
+    }
+    if planner_hash is not None:
+        execution_manifest_payload["point_grasp_planner_hash"] = planner_hash
     execution_manifest_hash = canonical_content_hash(
-        {
-            "resource_owner": "camera_only_real_perception_application",
-            "source_binding_hash": source_binding.semantic_content_hash,
-            "robot_backend": "absent",
-            "command_owner_count": 0,
-            "downstream_control_effects": "forbidden",
-            "object_localizer_hash": localizer_hash,
-        },
+        execution_manifest_payload,
         domain="dexteleop.real_perception.execution_manifest.v1",
     )
     catalog_provider = RealSenseAgentPerceptionProvider(
@@ -307,6 +337,39 @@ def assemble_camera_only_real_perception_composition(
             registration=localization_registration,
             allowed_local_image_roots=(),
         )
+    station_point_grasp_registration = None
+    if point_grasp_planner is not None:
+        model_spec = getattr(point_grasp_planner, "model_spec", None)
+        model_profile_id = str(getattr(model_spec, "model_profile_id", "")).strip()
+        model_profile_hash = str(
+            getattr(model_spec, "semantic_content_hash", "")
+        ).strip()
+        backend_id = str(getattr(point_grasp_planner, "backend_id", "")).strip()
+        if not model_profile_id or not model_profile_hash or not backend_id:
+            raise ValueError(
+                "point_grasp_planner must expose backend_id and verified model_spec."
+            )
+        station_point_grasp_registration = build_station_bound_point_grasp_registration(
+            aligned_rgbd_source_catalog=tuple(
+                dict(item) for item in catalog_provider.aligned_rgbd_source_catalog()
+            ),
+            source_binding_hash=source_binding.semantic_content_hash,
+            frame_binding_hash=frame_binding.semantic_content_hash,
+            frame_graph_hash=frame_graph_hash,
+            source_frame_id=frame_binding.source_frame_id,
+            source_frame_spec_hash=frame_binding.source_frame_spec_hash,
+            reference_frame_id=frame_binding.reference_frame_id,
+            reference_frame_spec_hash=frame_binding.reference_frame_spec_hash,
+            backend_id=backend_id,
+            model_profile_id=model_profile_id,
+            model_profile_hash=model_profile_hash,
+            inference_implementation_hash=planner_hash,
+            runtime_session_id=runtime_id,
+            control_domain_id=domain_id,
+            target_binding_id=target_binding_id,
+            station_manifest_hash=station_manifest_hash,
+            execution_manifest_hash=execution_manifest_hash,
+        )
     tool_config_hash = canonical_content_hash(
         {"tool_configuration": "not_applicable_camera_only"},
         domain="dexteleop.real_perception.no_tool_config.v1",
@@ -319,6 +382,7 @@ def assemble_camera_only_real_perception_composition(
         tool_config_hash=tool_config_hash,
         calibration_hash=source_binding.semantic_content_hash,
         localization_registration=localization_registration,
+        station_point_grasp_registration=station_point_grasp_registration,
     )
     partition = canonical_content_hash(
         {"runtime_session_id": runtime_id},
@@ -337,6 +401,7 @@ def assemble_camera_only_real_perception_composition(
             artifact_store=artifact_store,
             allowed_client_ids=client_bindings.allowed_client_ids,
             localization_provider=localization_provider,
+            station_point_grasp_planner=point_grasp_planner,
             max_retained_operations=max_retained_operations,
             clock=clock,
         )
@@ -347,7 +412,14 @@ def assemble_camera_only_real_perception_composition(
         camera_sources=source_binding.camera_sources,
         artifact_store=artifact_store,
         additional_resources=(
-            () if localization_provider is None else (localization_provider,)
+            tuple(
+                resource
+                for resource in (
+                    localization_provider,
+                    session.station_point_grasp_provider,
+                )
+                if resource is not None
+            )
         ),
     )
 
@@ -364,17 +436,21 @@ def assemble_camera_only_real_perception_composition(
         resources=resources,
         server_factory=server_factory,
     )
+    deployment_profile_payload = {
+        "source_binding_hash": source_binding.semantic_content_hash,
+        "frame_binding_hash": frame_binding.semantic_content_hash,
+        "frame_graph_hash": frame_graph_hash,
+        "route_manifest_hash": bundle.route_manifest.semantic_content_hash,
+        "artifact_max_bytes": REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
+        "object_localizer_hash": localizer_hash,
+        "local_path_test_input": False,
+        "robot_backend": "absent",
+    }
+    if planner_hash is not None:
+        deployment_profile_payload["point_grasp_planner_hash"] = planner_hash
+        deployment_profile_payload["point_grasp_enabled"] = True
     deployment_profile_hash = canonical_content_hash(
-        {
-            "source_binding_hash": source_binding.semantic_content_hash,
-            "frame_binding_hash": frame_binding.semantic_content_hash,
-            "frame_graph_hash": frame_graph_hash,
-            "route_manifest_hash": bundle.route_manifest.semantic_content_hash,
-            "artifact_max_bytes": REAL_CAPTURE_MAX_ARTIFACT_BYTES_V1,
-            "object_localizer_hash": localizer_hash,
-            "local_path_test_input": False,
-            "robot_backend": "absent",
-        },
+        deployment_profile_payload,
         domain="dexteleop.real_perception.camera_only_profile.v1",
     )
     return CameraOnlyRealPerceptionComposition(
@@ -383,6 +459,8 @@ def assemble_camera_only_real_perception_composition(
         registration=registration,
         localization_registration=localization_registration,
         localization_provider=localization_provider,
+        station_point_grasp_registration=station_point_grasp_registration,
+        point_grasp_planner=point_grasp_planner,
         contract_bundle=bundle,
         artifact_store=artifact_store,
         resources=resources,

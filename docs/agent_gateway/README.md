@@ -129,13 +129,18 @@ revision/frame graph/calibration 应关闭失败。DMTAC TCP 到 solver endpoint
 python -m agent_gateway real-perception --help
 ```
 
-`real-perception` 不创建 RM65 backend，只装配 RealSense、Artifact store 和只读 Skill。默认公开
-RGB/depth capture；提供经过验证的模型 bundle 并显式启用后，还会公开
-`perception.localize_objects`。point-grasp 目前只提供离线 CLI 和仿真评测，不进入该生产 Gateway：
-其 RGB-D、Station revision、相机角色与标定 lineage 尚未闭合为 deployment-trusted 输入。外部源码由
+`real-perception` 不创建 RM65 backend，只装配 RealSense、Artifact store 和只读 Skill。默认仅公开
+RGB/depth capture；提供经过验证的模型 bundle 并显式启用后，可增加
+`perception.localize_objects`。再显式传入 `--enable-point-grasp` 及 VGN（默认）或 GraspNet bundle，
+才会增加 `perception.plan_point_grasp@2`。该 v2 Route 的调用方只提供已注册 depth role、点击像素和
+候选数上限；同一应用从单个已发布 `VideoFrame` 取得相关的 RGB 与对齐深度，并绑定相机 generation、
+frame index、内参、静态标定、Station revision 和 frame graph。它只返回未选择、无执行权限的
+canonical-Station TCP 候选，不提供 RM65 backend、Grant 或运动，也不把单帧可见点云检查描述为完整
+场景/机械臂/路径安全证明。调用方提供 RGB-D 和标定的 v1 合同仍只用于离线 CLI。外部源码由
 `model/perception/` 的固定 Git submodule 提供；checkpoint 不进入 Git。模型权重和 submodule 见
 [`SAM2_GROUNDING_DINO.md`](./SAM2_GROUNDING_DINO.md) 与
-[`POINT_GRASP.md`](./POINT_GRASP.md)。本地静态图片应使用独立离线 CLI；生产 Gateway 只接受 Artifact。
+[`POINT_GRASP.md`](./POINT_GRASP.md)。本地静态图片应使用独立离线 CLI；生产 localization 只接受
+Artifact，live point-grasp 则只接受上述三个语义参数并由部署侧采集 RGB-D。
 
 ## 状态、占用与并发
 

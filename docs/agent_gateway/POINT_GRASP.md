@@ -1,4 +1,4 @@
-# SAM2 + VGN/GraspNet 点击引导 DMTAC M 离线抓姿
+# SAM2 + VGN/GraspNet 点击引导 DMTAC M 抓姿
 
 离线 CLI 接受一对像素对齐的 RGB-D 单帧、点击像素、显式本地标定，返回最多
 5 个已排序的 DMTAC M `tool_tcp` 抓姿。每个候选同时包含 `T_camera_from_tcp`、
@@ -200,12 +200,28 @@ python -m deployments.perception.point_grasp_image_cli \
 
 ## Gateway 边界
 
-当前 `real-perception` 不注册 `perception.plan_point_grasp`，也不接受
-`--enable-point-grasp`。候选接口曾让请求方自报 `camera_frame_id`、`base_frame_id`、
-`T_base_from_camera` 和 intrinsics，且 RGB/depth Artifact 未绑定同一次 capture、相机角色和
-`station_revision`，因此不能把结果称为可信 Station/tool-TCP pose。后续 Route 必须先闭合
-RealSense capture receipt、对齐关系、Station revision、frame graph 与受信 calibration identity。
-在此之前只使用上文离线 CLI 或仿真评测。
+生产 `real-perception` 默认仍不加载抓姿模型。只有同时显式启用共享 SAM2 localizer 与
+`--enable-point-grasp`，并提供经过 manifest/hash 校验的 point-grasp bundle，才注册
+`perception.plan_point_grasp@2`。VGN 是默认 backend；GraspNet 仍要求其资产 manifest 中的项目授权
+acknowledgement。启动事务先启动并 admit 相机，再启动共享 localizer，最后启动 planner；关闭顺序
+相反。任一步失败都会清理已尝试资源，Skill 调用本身不会启动、重置或关闭设备/模型。
+
+v2 请求只有三个字段：已注册的对齐 depth `role`、`target_pixel_uv` 和 `max_candidates`。provider
+只调用一次 `get_latest_frame()`，因此 RGB 与 depth 来自同一个已发布 `VideoFrame`；部署侧同时绑定
+source serial/generation/frame index、采集时间、内参、静态相机标定、Station revision、frame graph
+及其 reference-frame identity。模型推理后以及 Artifact commit 前后都会重新核对 Station revision。
+当前只有具有受信静态外参且 depth 已对齐到 color 的角色会进入 catalog；没有动态 FK 的腕部 depth
+不会被调用方字符串启用。
+
+结果保留相机坐标候选和 `canonical_station` 候选，但不含 `selected_ordinal`，并明确标记为
+`ranked_unprivileged_motion_proposals_only`。它不是 motion Grant、不会自动传给
+`motion.move_tcp_to_pose@1`，也不执行 IK、完整场景/机械臂/路径碰撞检查、轨迹规划或运动。若以后由
+独立、获授权的 motion client 采用某一候选，仍必须重新经过其 Station/frame/tool 身份、一次性授权、
+safety envelope、IK/碰撞/奇异性、dispatch、收敛和 HOLD 门禁。
+
+原有 `perception.plan_point_grasp@1` 与上文离线 CLI 保持兼容：它允许调用方提供本地 RGB-D、内参和
+标定，因此其 `base` 输出不能被称为 deployment-trusted Station pose，也不会由生产
+`real-perception` profile 发布。
 
 ## DMTAC M 和坐标语义
 
@@ -267,5 +283,6 @@ planner semantic content hash。
   标定校验和正式下游规划；
 - GraspNet 本身不理解点击语义；SAM2 mask 同时限定其局部三维推理工作区并参与后置表面距离
   过滤。单帧遮挡、仿真到真实的域差异和后置过滤仍可能导致无候选或错误候选；
-- 当前 Skill 只接受固定相机的显式外参，不支持腕部相机的动态 FK 外参；
+- 离线 v1 接受固定相机显式外参；生产 v2 只公开部署已绑定的静态 depth 相机，尚不支持腕部相机
+  的动态 FK 外参；
 - 未下载 checkpoint 时只能完成合同/单元测试，不能声称真实模型端到端验证通过。

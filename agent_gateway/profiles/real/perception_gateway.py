@@ -70,9 +70,16 @@ from .perception_deployment import (
     REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
     RealPerceptionCaptureRegistration,
 )
+from .point_grasp_gateway import (
+    StationBoundPointGraspProvider,
+    build_station_bound_point_grasp_executor,
+)
 from .realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
+)
+from .station_point_grasp_deployment import (
+    StationBoundPointGraspRegistration,
 )
 
 REAL_PERCEPTION_CLOCK_DOMAIN_ID_V1 = "agent-gateway-real-perception-wall-clock"
@@ -90,6 +97,7 @@ class RealPerceptionContractBundle:
 
     registration: RealPerceptionCaptureRegistration
     localization_registration: RealObjectLocalizationRegistration | None
+    station_point_grasp_registration: StationBoundPointGraspRegistration | None
     definition_catalog: SkillDefinitionCatalog
     schema_catalog: AgentSkillSchemaCatalog
     io_catalog: SkillIOCatalog
@@ -103,6 +111,11 @@ class RealPerceptionContractBundle:
     def __post_init__(self) -> None:
         if not isinstance(self.registration, RealPerceptionCaptureRegistration):
             raise TypeError("registration must be typed.")
+        if self.station_point_grasp_registration is not None and not isinstance(
+            self.station_point_grasp_registration,
+            StationBoundPointGraspRegistration,
+        ):
+            raise TypeError("station_point_grasp_registration must be typed or None.")
         validate_skill_route_catalog_closure(
             definition_catalog=self.definition_catalog,
             schema_catalog=self.schema_catalog,
@@ -112,7 +125,11 @@ class RealPerceptionContractBundle:
         self.payload_validators.validate_manifest(self.route_manifest)
         if self.route_manifest.current_mode != "real_observe":
             raise ValueError("Camera-only perception requires real_observe mode.")
-        expected_routes = 2 + int(self.localization_registration is not None)
+        expected_routes = (
+            2
+            + int(self.localization_registration is not None)
+            + int(self.station_point_grasp_registration is not None)
+        )
         if len(self.route_manifest.skill_routes) != expected_routes:
             raise ValueError(
                 "Real perception Route count does not match its resources."
@@ -132,6 +149,14 @@ class RealPerceptionContractBundle:
             raise ValueError(
                 "Real Depth v2 frame graph differs from the Gateway bundle."
             )
+        point_grasp = self.station_point_grasp_registration
+        if point_grasp is not None and (
+            frame_binding is None
+            or point_grasp.profile.frame_binding_hash
+            != frame_binding.semantic_content_hash
+            or point_grasp.profile.frame_graph_hash != self.frame_graph_hash
+        ):
+            raise ValueError("Station point-grasp frame binding differs from bundle.")
 
 
 def build_real_perception_contract_bundle(
@@ -142,6 +167,7 @@ def build_real_perception_contract_bundle(
     tool_config_hash: str,
     calibration_hash: str,
     localization_registration: RealObjectLocalizationRegistration | None = None,
+    station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
 ) -> RealPerceptionContractBundle:
     """Build the passive-only manifest without starting a camera or socket."""
 
@@ -152,6 +178,11 @@ def build_real_perception_contract_bundle(
         RealObjectLocalizationRegistration,
     ):
         raise TypeError("localization_registration must be typed or None.")
+    if station_point_grasp_registration is not None and not isinstance(
+        station_point_grasp_registration,
+        StationBoundPointGraspRegistration,
+    ):
+        raise TypeError("station_point_grasp_registration must be typed or None.")
     raw_pairs = [
         (
             registration.rgb,
@@ -174,6 +205,14 @@ def build_real_perception_contract_bundle(
                 localization_registration.skill,
                 localization_registration.binding,
                 localization_registration.availability_hash,
+            )
+        )
+    if station_point_grasp_registration is not None:
+        raw_pairs.append(
+            (
+                station_point_grasp_registration.skill,
+                station_point_grasp_registration.binding,
+                station_point_grasp_registration.availability_hash,
             )
         )
     registration_pairs = tuple(
@@ -251,19 +290,20 @@ def build_real_perception_contract_bundle(
             "robot_backend",
         ),
     )
+    optional_validators = []
+    if localization_registration is not None:
+        optional_validators.append(localization_registration.payload_validator)
+    if station_point_grasp_registration is not None:
+        optional_validators.append(station_point_grasp_registration.payload_validator)
     validators = AgentSkillPayloadValidatorRegistry(
         registry_id="dexteleop.agent_payload_validators.real_perception_only:"
         + first.runtime_session_id,
-        validators=registration.payload_validators
-        + (
-            ()
-            if localization_registration is None
-            else (localization_registration.payload_validator,)
-        ),
+        validators=registration.payload_validators + tuple(optional_validators),
     )
     return RealPerceptionContractBundle(
         registration=registration,
         localization_registration=localization_registration,
+        station_point_grasp_registration=station_point_grasp_registration,
         definition_catalog=definitions,
         schema_catalog=schemas,
         io_catalog=io_catalog,
@@ -647,6 +687,8 @@ class RealPerceptionGatewaySession:
     rgb_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor
     localization_executor: PassiveReadSkillExecutor | None
+    station_point_grasp_provider: StationBoundPointGraspProvider | None
+    station_point_grasp_executor: PassiveReadSkillExecutor | None
     hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -716,6 +758,13 @@ class RealPerceptionGatewaySession:
             raise RuntimeError(
                 "Passive object localization did not quiesce during close."
             )
+        if (
+            self.station_point_grasp_executor is not None
+            and not self.station_point_grasp_executor.wait_all(timeout_sec=125.0)
+        ):
+            raise RuntimeError(
+                "Passive Station point-grasp did not quiesce during close."
+            )
         return outcome
 
 
@@ -726,6 +775,7 @@ def assemble_real_perception_gateway_session(
     artifact_store: RecoverableAgentArtifactStore,
     allowed_client_ids: tuple[str, ...],
     localization_provider: ObjectLocalizationProvider | None = None,
+    station_point_grasp_planner: object | None = None,
     max_retained_operations: int = 16,
     clock: Callable[[], float] = time.time,
 ) -> RealPerceptionGatewaySession:
@@ -782,6 +832,37 @@ def assemble_real_perception_gateway_session(
         ] = localization_executor
     elif localization_provider is not None:
         raise ValueError("Localization provider cannot exist without its registration.")
+    station_point_grasp_provider = None
+    station_point_grasp_executor = None
+    if bundle.station_point_grasp_registration is not None:
+        if station_point_grasp_planner is None:
+            raise ValueError("Station point-grasp registration requires its planner.")
+        frame_binding = bundle.registration.frame_binding
+        if frame_binding is None:
+            raise ValueError("Station point-grasp requires a v2 Station frame binding.")
+        station_point_grasp_provider = StationBoundPointGraspProvider(
+            planner=station_point_grasp_planner,
+            registration=bundle.station_point_grasp_registration,
+            perception_provider=provider,
+            frame_binding=frame_binding,
+            current_station_revision=lambda: producer.current_station_revision,
+        )
+        station_point_grasp_executor = build_station_bound_point_grasp_executor(
+            registration=bundle.station_point_grasp_registration,
+            provider=station_point_grasp_provider,
+            artifact_store=artifact_store,
+            runtime_session_id=bundle.route_manifest.runtime_session_id,
+            current_station_revision=lambda: producer.current_station_revision,
+            max_retained_operations=max_retained_operations,
+            clock=clock,
+        )
+        ports[
+            bundle.station_point_grasp_registration.skill.routes[
+                0
+            ].semantic_content_hash
+        ] = station_point_grasp_executor
+    elif station_point_grasp_planner is not None:
+        raise ValueError("Point-grasp planner cannot exist without its registration.")
     registry = SkillExecutorRegistry(
         manifest=bundle.route_manifest,
         bindings=tuple(
@@ -825,33 +906,63 @@ def assemble_real_perception_gateway_session(
         clock=clock,
         clock_domain_id=REAL_PERCEPTION_CLOCK_DOMAIN_ID_V1,
     )
-    camera_route_hashes = (
+    camera_route_hashes = [
         bundle.registration.rgb.routes[0].semantic_content_hash,
         bundle.registration.depth.routes[0].semantic_content_hash,
-    )
+    ]
+    if bundle.station_point_grasp_registration is not None:
+        camera_route_hashes.append(
+            bundle.station_point_grasp_registration.skill.routes[
+                0
+            ].semantic_content_hash
+        )
     resource_bindings = [
         HardwareResourceBinding(
             resource_id="perception.cameras",
             resource_kind="camera_bundle",
-            route_hashes=camera_route_hashes,
+            route_hashes=tuple(camera_route_hashes),
             health_provider=lambda: "ready" if producer._status()[1] else "unavailable",
             control_claimed_provider=lambda: False,
         )
     ]
     if bundle.localization_registration is not None:
+        localization_route_hashes = [
+            bundle.localization_registration.skill.routes[0].semantic_content_hash
+        ]
+        if bundle.station_point_grasp_registration is not None:
+            localization_route_hashes.append(
+                bundle.station_point_grasp_registration.skill.routes[
+                    0
+                ].semantic_content_hash
+            )
         resource_bindings.append(
             HardwareResourceBinding(
                 resource_id="perception.object_localization_model",
                 resource_kind="local_model",
+                route_hashes=tuple(localization_route_hashes),
+                health_provider=lambda: (
+                    "ready"
+                    if localization_provider is not None
+                    and localization_provider.started
+                    else "unavailable"
+                ),
+                control_claimed_provider=lambda: False,
+            )
+        )
+    if bundle.station_point_grasp_registration is not None:
+        resource_bindings.append(
+            HardwareResourceBinding(
+                resource_id="perception.point_grasp_model",
+                resource_kind="local_model",
                 route_hashes=(
-                    bundle.localization_registration.skill.routes[
+                    bundle.station_point_grasp_registration.skill.routes[
                         0
                     ].semantic_content_hash,
                 ),
                 health_provider=lambda: (
                     "ready"
-                    if localization_provider is not None
-                    and localization_provider.started
+                    if station_point_grasp_provider is not None
+                    and station_point_grasp_provider.started
                     else "unavailable"
                 ),
                 control_claimed_provider=lambda: False,
@@ -869,6 +980,8 @@ def assemble_real_perception_gateway_session(
         rgb_executor=rgb_executor,
         depth_executor=depth_executor,
         localization_executor=localization_executor,
+        station_point_grasp_provider=station_point_grasp_provider,
+        station_point_grasp_executor=station_point_grasp_executor,
         hardware_view_provider=hardware_view,
         service=service,
     )

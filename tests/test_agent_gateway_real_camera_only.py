@@ -21,6 +21,7 @@ from agent_gateway.profiles.real.realsense_perception import (
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
 )
+from dataset_contracts.canonical_encoding import canonical_content_hash
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -133,6 +134,43 @@ def test_camera_only_composition_exposes_only_real_observe_perception_routes(
         assert not hasattr(composition.resources, "lower")
         assert not hasattr(composition, "lower")
         assert composition.resources.started is False
+        expected_target_hash = canonical_content_hash(
+            {
+                "source_binding_hash": composition.source_binding.semantic_content_hash,
+                "frame_binding_hash": composition.frame_binding.semantic_content_hash,
+                "resource_kind": "camera_bundle",
+                "object_localizer_hash": None,
+            },
+            domain="dexteleop.real_perception.target_binding.v1",
+        )
+        assert (
+            manifest.target_binding_id == "real-realsense-only:" + expected_target_hash
+        )
+        expected_execution_hash = canonical_content_hash(
+            {
+                "resource_owner": "camera_only_real_perception_application",
+                "source_binding_hash": composition.source_binding.semantic_content_hash,
+                "robot_backend": "absent",
+                "command_owner_count": 0,
+                "downstream_control_effects": "forbidden",
+                "object_localizer_hash": None,
+            },
+            domain="dexteleop.real_perception.execution_manifest.v1",
+        )
+        assert manifest.execution_manifest_hash == expected_execution_hash
+        assert composition.deployment_profile_hash == canonical_content_hash(
+            {
+                "source_binding_hash": composition.source_binding.semantic_content_hash,
+                "frame_binding_hash": composition.frame_binding.semantic_content_hash,
+                "frame_graph_hash": composition.frame_binding.frame_graph.semantic_content_hash,
+                "route_manifest_hash": manifest.semantic_content_hash,
+                "artifact_max_bytes": 16 * 1024 * 1024,
+                "object_localizer_hash": None,
+                "local_path_test_input": False,
+                "robot_backend": "absent",
+            },
+            domain="dexteleop.real_perception.camera_only_profile.v1",
+        )
     finally:
         composition.application.close()
 
@@ -206,5 +244,6 @@ def test_real_perception_cli_is_discoverable_without_importing_hardware() -> Non
     assert "--camera-config" in result.stdout
     assert "--artifact-root" in result.stdout
     assert "--enable-object-localization" in result.stdout
-    assert "--enable-point-grasp" not in result.stdout
+    assert "--enable-point-grasp" in result.stdout
+    assert "--point-grasp-backend" in result.stdout
     assert "--allow-local-image-root" not in result.stdout

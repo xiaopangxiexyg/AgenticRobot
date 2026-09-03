@@ -157,6 +157,36 @@ def plan_point_grasp_skill_definition_v1() -> SkillDefinition:
     )
 
 
+def plan_point_grasp_skill_definition_v2() -> SkillDefinition:
+    """Describe passive planning from one deployment-bound live RGB-D cut."""
+
+    return SkillDefinition(
+        skill_id=PLAN_POINT_GRASP_SKILL_ID_V1,
+        skill_version="2",
+        skill_kind="inspection",
+        summary=(
+            "Plan ranked DMTAC M tool_tcp pose proposals from one live, "
+            "deployment-bound aligned RGB-D frame in the canonical Station "
+            "reference frame without selecting a proposal or moving the robot."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "registered_aligned_rgbd_role.clicked_region.bounded_candidates.v2"
+        ),
+        execution_result_semantics_id=(
+            "station_bound_ranked_unprivileged_tool_tcp_proposals.v2"
+        ),
+        task_outcome_semantics_id="passive_point_grasp_planning.v1",
+        entry_predicate_ids=(
+            "trusted_live_rgbd_binding_available.v1",
+            "point_grasp_models_available.v1",
+        ),
+        task_outcome_predicate_ids=("point_grasp_candidates_generated.v1",),
+    )
+
+
 __all__ = [
     "CAPTURE_DEPTH_SKILL_ID_V1",
     "CAPTURE_RGB_SKILL_ID_V1",
@@ -168,4 +198,5 @@ __all__ = [
     "capture_rgb_skill_definition_v2",
     "localize_objects_skill_definition_v1",
     "plan_point_grasp_skill_definition_v1",
+    "plan_point_grasp_skill_definition_v2",
 ]

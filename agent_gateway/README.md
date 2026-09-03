@@ -464,7 +464,7 @@ python -m agent_gateway real-perception \
   --artifact-root /absolute/private/artifact_cache
 ```
 
-`real-perception` exposes exactly `perception.capture_rgb` and
+By default, `real-perception` exposes exactly `perception.capture_rgb` and
 `perception.capture_depth` in `real_observe` mode. It owns the configured
 RealSense inventory and transient Artifact store, starts and admits cameras
 before publishing the Unix socket, and has no RM65 backend, motion Route,
@@ -473,6 +473,33 @@ does not accept `--arm-ip-assignment`, tool/envelope profiles, an authorized
 motion action, or `--confirm`. The selected collision-scene profile is read only
 to derive fixed arm-base geometry for static camera poses; it does not construct
 or connect a robot backend.
+
+`--enable-object-localization` adds the supplied-image localization Route after
+loading its reviewed model bundle. `--enable-point-grasp` is a separate,
+default-off module and requires that same localizer plus a reviewed VGN (default)
+or GraspNet bundle:
+
+```bash
+python -m agent_gateway real-perception \
+  --socket-path /absolute/private/gateway.sock \
+  --camera-config /absolute/DexTeleop/teleop_runtime/configs/devices/agent_gateway_realsense.json \
+  --camera-registry /absolute/DexTeleop/robot_motion/configs/rm65_camera_registry.json \
+  --artifact-root /absolute/private/artifact_cache \
+  --enable-object-localization \
+  --object-localization-asset-bundle /absolute/assets/perception/sam2_grounding_dino \
+  --enable-point-grasp \
+  --point-grasp-asset-bundle /absolute/assets/perception/sam2_vgn_point_grasp
+```
+
+The live `perception.plan_point_grasp@2` request contains only a registered
+aligned-depth role, a clicked pixel, and a bounded candidate count. The
+application reads RGB and aligned depth from one published `VideoFrame`, binds
+source generation/frame index, intrinsics, static camera calibration, Station
+revision and frame graph, and returns ranked canonical-Station tool-TCP
+proposals. It does not select a candidate, expose an RM65 backend, mint a Grant,
+or execute motion. Its visible-scene collision flag is not a complete
+scene/robot/path safety proof. The caller-calibrated v1 Route remains available
+only to the separate offline tooling.
 
 Real RGB and Depth use the shared v2 result contracts. RGB preserves each
 camera worker's source timestamp and bounds the selected frames by the minimum

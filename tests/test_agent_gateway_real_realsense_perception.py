@@ -96,8 +96,10 @@ class _Source:
         }
         self.starts = 0
         self.closes = 0
+        self.latest_frame_reads = 0
 
     def get_latest_frame(self):
+        self.latest_frame_reads += 1
         return self.frame
 
     def device_info(self):
@@ -238,7 +240,9 @@ def test_real_depth_v2_binds_and_transforms_nontrivial_station_frame() -> None:
     )
 
 
-def test_real_provider_encodes_rgb_and_metric_aligned_depth_without_control_io() -> None:
+def test_real_provider_encodes_rgb_and_metric_aligned_depth_without_control_io() -> (
+    None
+):
     provider, _sources, _revision, _profile = _provider()
     rgb = provider.capture_rgb(
         {
@@ -254,7 +258,9 @@ def test_real_provider_encodes_rgb_and_metric_aligned_depth_without_control_io()
     assert [frame.acquired_at for frame in rgb.frames] == [9.97, 9.95]
     assert rgb.capture_window_started_at == 9.95
     assert rgb.capture_window_ended_at == 9.97
-    assert all(Image.open(io.BytesIO(frame.data)).size == (2, 2) for frame in rgb.frames)
+    assert all(
+        Image.open(io.BytesIO(frame.data)).size == (2, 2) for frame in rgb.frames
+    )
 
     depth = provider.capture_depth(role="main", expected_station_revision=7)
     array = np.load(io.BytesIO(depth.data), allow_pickle=False)
@@ -268,6 +274,32 @@ def test_real_provider_encodes_rgb_and_metric_aligned_depth_without_control_io()
     assert depth.intrinsics["height"] == 3
     assert depth.intrinsics["cx"] == 2.0
     assert depth.intrinsics["fovy_deg"] > 0.0
+
+
+def test_real_provider_captures_one_correlated_immutable_rgbd_frame() -> None:
+    provider, sources, _revision, _profile = _provider()
+
+    capture = provider.capture_aligned_rgbd(
+        role="main",
+        expected_station_revision=7,
+    )
+
+    assert sources["front"].latest_frame_reads == 1
+    assert capture.source_id == "front"
+    assert capture.role == "main"
+    assert capture.station_revision == 7
+    assert capture.source_generation == 1
+    assert capture.frame_index == 3
+    assert capture.capture_group_id.startswith("real-aligned-rgbd:")
+    assert capture.rgb.shape == (3, 4, 3)
+    assert capture.rgb.dtype == np.uint8
+    assert capture.rgb.flags.writeable is False
+    assert capture.depth_m.shape == (3, 4)
+    assert capture.depth_m.dtype == np.float32
+    assert capture.depth_m.flags.writeable is False
+    np.testing.assert_allclose(capture.depth_m[0], (0.0, 0.1, 0.2, 0.3))
+    assert len(capture.rgb_content_hash) == 64
+    assert len(capture.depth_content_hash) == 64
 
 
 @pytest.mark.parametrize(
@@ -303,7 +335,10 @@ def test_real_provider_encodes_rgb_and_metric_aligned_depth_without_control_io()
             ),
             "identity_mismatch",
         ),
-        (lambda provider, sources, revision: revision.update(value=8), "revision_mismatch"),
+        (
+            lambda provider, sources, revision: revision.update(value=8),
+            "revision_mismatch",
+        ),
     ),
 )
 def test_real_provider_fails_closed_on_invalid_live_binding(mutation, match) -> None:
@@ -365,9 +400,7 @@ def test_checked_in_binding_exposes_all_rgb_but_only_trusted_static_depth() -> N
         "wrist_left",
         "wrist_right",
     }
-    assert tuple(item["role"] for item in provider.depth_source_catalog()) == (
-        "main",
-    )
+    assert tuple(item["role"] for item in provider.depth_source_catalog()) == ("main",)
     assert set(binding.world_from_depth_camera_by_source) == {"front"}
     assert all(
         source.device_info()["running"] is False

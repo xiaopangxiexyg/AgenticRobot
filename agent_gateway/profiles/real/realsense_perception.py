@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import threading
@@ -157,6 +158,28 @@ class EncodedRealDepthFrame:
     schema_id: str = DEPTH_FRAME_SCHEMA_ID_V1
     encoding: str = DEPTH_FRAME_ENCODING_V1
     compression: str = DEPTH_FRAME_COMPRESSION_V1
+
+
+@dataclass(frozen=True)
+class RealAlignedRgbdCapture:
+    """One correlated live frame with deployment-owned metric geometry."""
+
+    source_id: str
+    role: str
+    acquired_at: float
+    station_revision: int
+    source_generation: int
+    frame_index: int
+    capture_group_id: str
+    source_binding_hash: str
+    width: int
+    height: int
+    intrinsics: Mapping[str, float | int]
+    source_from_camera: tuple[float, ...]
+    rgb: np.ndarray
+    depth_m: np.ndarray
+    rgb_content_hash: str
+    depth_content_hash: str
 
 
 @dataclass(frozen=True)
@@ -600,6 +623,17 @@ class RealSenseAgentPerceptionProvider:
             if source.config.enable_depth
         )
 
+    def aligned_rgbd_source_catalog(self) -> tuple[Mapping[str, object], ...]:
+        """Expose only static depth sources aligned to their color stream."""
+
+        return tuple(
+            item
+            for item in self.depth_source_catalog()
+            if self.source_binding.camera_sources[
+                str(item["source_id"])
+            ].config.align_depth_to_color
+        )
+
     def bind_profile(self, profile: RealPerceptionCaptureProfile) -> None:
         rgb_sources = tuple(
             sorted(
@@ -849,6 +883,145 @@ class RealSenseAgentPerceptionProvider:
             data=data,
         )
 
+    def capture_aligned_rgbd(
+        self,
+        *,
+        role: str,
+        expected_station_revision: int,
+    ) -> RealAlignedRgbdCapture:
+        """Read RGB and aligned depth once from the same published VideoFrame."""
+
+        profile = self._profile
+        if profile is None:
+            raise RuntimeError("real_perception_provider_not_bound")
+        expected_station_revision = self._expected_revision(expected_station_revision)
+        selected_role = _required_text(role, field_name="role")
+        source_by_role = {
+            real_camera_role_for_source(source_id): (source_id, source)
+            for source_id, source in self.source_binding.camera_sources.items()
+            if source.config.enable_depth and source.config.align_depth_to_color
+        }
+        if selected_role not in source_by_role:
+            raise ValueError("Aligned RGB-D role is not registered.")
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("rgbd_capture_station_revision_mismatch")
+        source_id, source = source_by_role[selected_role]
+        now = _finite_timestamp(self._clock(), field_name="capture clock")
+        frame, source_at, info = self._frame(source_id, now=now)
+        rgb = np.asarray(frame.image)
+        expected_rgb_shape = (
+            int(source.config.height),
+            int(source.config.width),
+            3,
+        )
+        if rgb.shape != expected_rgb_shape or rgb.dtype != np.uint8:
+            raise RuntimeError(f"real_rgb_frame_contract_mismatch:{source_id}")
+        if source.config.color_space == "bgr":
+            rgb = rgb[..., ::-1]
+        rgb = np.ascontiguousarray(rgb).copy()
+        depth_raw = np.asarray(frame.depth_image)
+        metadata = frame.depth_metadata
+        if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
+            raise RuntimeError(f"real_depth_frame_contract_mismatch:{source_id}")
+        if depth_raw.shape != rgb.shape[:2]:
+            raise RuntimeError(f"real_rgbd_alignment_dimensions_changed:{source_id}")
+        if (int(depth_raw.shape[1]), int(depth_raw.shape[0])) != (
+            profile.depth_dimensions_by_role[selected_role]
+        ):
+            raise RuntimeError(f"real_depth_dimensions_changed:{source_id}")
+        if not isinstance(metadata, Mapping) or metadata.get("aligned_to") != "color":
+            raise RuntimeError(f"real_depth_alignment_changed:{source_id}")
+        scale = metadata.get("depth_scale_m_per_unit")
+        if (
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(float(scale))
+            or float(scale) <= 0.0
+        ):
+            raise RuntimeError(f"real_depth_scale_invalid:{source_id}")
+        intrinsics = _depth_intrinsics(info.get("intrinsics"), depth_raw.shape)
+        depth_m = np.ascontiguousarray(
+            depth_raw.astype(np.float32) * float(scale),
+            dtype=np.float32,
+        )
+        if not np.all(np.isfinite(depth_m)) or np.any(depth_m < 0.0):
+            raise RuntimeError(f"real_depth_metric_values_invalid:{source_id}")
+        generation = info.get("generation")
+        frame_index = getattr(frame, "frame_index", None)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
+        ):
+            raise RuntimeError(f"real_perception_generation_invalid:{source_id}")
+        if (
+            isinstance(frame_index, bool)
+            or not isinstance(frame_index, int)
+            or frame_index < 0
+        ):
+            raise RuntimeError(f"real_perception_frame_index_invalid:{source_id}")
+        rgb_content_hash = canonical_content_hash(
+            {
+                "dtype": "uint8",
+                "shape": list(rgb.shape),
+                "byte_sha256": hashlib.sha256(rgb.tobytes(order="C")).hexdigest(),
+            },
+            domain="dexteleop.real_aligned_rgbd.rgb_content.v1",
+        )
+        depth_content_hash = canonical_content_hash(
+            {
+                "dtype": "float32",
+                "unit": "meter",
+                "invalid_value": 0.0,
+                "shape": list(depth_m.shape),
+                "byte_sha256": hashlib.sha256(depth_m.tobytes(order="C")).hexdigest(),
+            },
+            domain="dexteleop.real_aligned_rgbd.depth_content.v1",
+        )
+        capture_hash = canonical_content_hash(
+            {
+                "source_binding_hash": self.source_binding.semantic_content_hash,
+                "source_id": source_id,
+                "role": selected_role,
+                "serial": str(info.get("serial_number")),
+                "source_generation": generation,
+                "frame_index": frame_index,
+                "acquired_at": source_at,
+                "station_revision": expected_station_revision,
+                "rgb_content_hash": rgb_content_hash,
+                "depth_content_hash": depth_content_hash,
+            },
+            domain="dexteleop.real_aligned_rgbd.capture_group.v1",
+        )
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("rgbd_capture_station_revision_changed")
+        rgb.setflags(write=False)
+        depth_m.setflags(write=False)
+        source_from_camera = tuple(
+            float(value)
+            for value in self.source_binding.world_from_depth_camera_by_source[
+                source_id
+            ].reshape(-1)
+        )
+        return RealAlignedRgbdCapture(
+            source_id=source_id,
+            role=selected_role,
+            acquired_at=source_at,
+            station_revision=expected_station_revision,
+            source_generation=generation,
+            frame_index=frame_index,
+            capture_group_id="real-aligned-rgbd:" + capture_hash,
+            source_binding_hash=self.source_binding.semantic_content_hash,
+            width=int(rgb.shape[1]),
+            height=int(rgb.shape[0]),
+            intrinsics=MappingProxyType(dict(intrinsics)),
+            source_from_camera=source_from_camera,
+            rgb=rgb,
+            depth_m=depth_m,
+            rgb_content_hash=rgb_content_hash,
+            depth_content_hash=depth_content_hash,
+        )
+
 
 def _encode_rgb_jpeg(image: np.ndarray, *, width: int, height: int) -> bytes:
     if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
@@ -902,6 +1075,7 @@ __all__ = [
     "EncodedRealDepthFrame",
     "EncodedRealRgbFrame",
     "ExclusiveRealPerceptionResources",
+    "RealAlignedRgbdCapture",
     "RealPerceptionSourceBinding",
     "RealRgbCapture",
     "RealSenseAgentPerceptionProvider",

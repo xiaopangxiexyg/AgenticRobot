@@ -217,6 +217,220 @@ def point_grasp_schema_entry_v1(
     )
 
 
+def point_grasp_schema_entry_v2(
+    *,
+    skill_definition_hash: str,
+    parameter_profile_id: str,
+    parameter_profile_hash: str,
+    roles: tuple[str, ...],
+    max_candidates: int,
+    backend_id: str,
+) -> AgentSkillSchemaEntry:
+    """Build the live, deployment-bound point-grasp schema."""
+
+    parameter_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "role": {"type": "string", "enum": list(roles)},
+            "target_pixel_uv": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {"type": "integer", "minimum": 0},
+            },
+            "max_candidates": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": max_candidates,
+            },
+        },
+        "required": ["role", "target_pixel_uv", "max_candidates"],
+    }
+    intrinsics = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "width": {"type": "integer", "minimum": 1},
+            "height": {"type": "integer", "minimum": 1},
+            "fx": {"type": "number", "exclusiveMinimum": 0},
+            "fy": {"type": "number", "exclusiveMinimum": 0},
+            "cx": {"type": "number", "minimum": 0},
+            "cy": {"type": "number", "minimum": 0},
+            "fovy_deg": {"type": "number", "exclusiveMinimum": 0},
+        },
+        "required": ["width", "height", "fx", "fy", "cx", "cy", "fovy_deg"],
+    }
+    candidate = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "ordinal": {"type": "integer", "minimum": 0},
+            "score": {"type": "number", "minimum": 0, "maximum": 1},
+            "model_score": {"type": "number", "minimum": 0, "maximum": 1},
+            "click_distance_m": {"type": "number", "minimum": 0},
+            "gripper_width_m": {
+                "type": "number",
+                "minimum": 0.005,
+                "maximum": 0.070,
+            },
+            "T_camera_from_tool_tcp": _matrix_schema(),
+            "T_reference_from_tool_tcp": _matrix_schema(),
+            "tool_tcp_xyz_camera_m": _vector_schema(3),
+            "tool_tcp_xyz_reference_m": _vector_schema(3),
+            "visible_scene_collision_free": {"const": True},
+        },
+        "required": [
+            "ordinal",
+            "score",
+            "model_score",
+            "click_distance_m",
+            "gripper_width_m",
+            "T_camera_from_tool_tcp",
+            "T_reference_from_tool_tcp",
+            "tool_tcp_xyz_camera_m",
+            "tool_tcp_xyz_reference_m",
+            "visible_scene_collision_free",
+        ],
+    }
+    result_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "source_id": {"type": "string", "minLength": 1},
+            "role": {"type": "string", "enum": list(roles)},
+            "acquired_at": {"type": "number"},
+            "station_revision": {"type": "integer", "minimum": 0},
+            "source_generation": {"type": "integer", "minimum": 0},
+            "frame_index": {"type": "integer", "minimum": 0},
+            "capture_group_id": {
+                "type": "string",
+                "pattern": "^real-aligned-rgbd:[0-9a-f]{64}$",
+            },
+            "source_binding_hash": {"type": "string", "minLength": 1},
+            "frame_binding_hash": {"type": "string", "minLength": 1},
+            "frame_graph_hash": {"type": "string", "minLength": 1},
+            "source_frame_id": {"type": "string", "minLength": 1},
+            "source_frame_spec_hash": {"type": "string", "minLength": 1},
+            "reference_frame_id": {"type": "string", "minLength": 1},
+            "reference_frame_spec_hash": {"type": "string", "minLength": 1},
+            "width": {"type": "integer", "minimum": 1},
+            "height": {"type": "integer", "minimum": 1},
+            "camera_intrinsics": intrinsics,
+            "T_source_from_camera": _matrix_schema(),
+            "T_reference_from_camera": _matrix_schema(),
+            "rgb_content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "depth_content_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "target_pixel_uv": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {"type": "integer", "minimum": 0},
+            },
+            "target_point_camera_m": _vector_schema(3),
+            "target_point_reference_m": _vector_schema(3),
+            "target_mask_bbox_xyxy": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {"type": "integer", "minimum": 0},
+            },
+            "pose_semantics": {"const": "homogeneous_row_major_parent_from_tool_tcp_m"},
+            "gripper_profile_id": {"const": "DMTAC_M"},
+            "backend_id": {"const": backend_id},
+            "candidate_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": max_candidates,
+            },
+            "candidates": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": max_candidates,
+                "items": candidate,
+            },
+            "model_profile_id": {"type": "string", "minLength": 1},
+            "model_profile_hash": {"type": "string", "minLength": 1},
+            "inference_implementation_hash": {"type": "string", "minLength": 1},
+            "annotated_image_media_content_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+            },
+            "proposal_semantics": {
+                "const": "ranked_unprivileged_motion_proposals_only"
+            },
+            "collision_scope": {
+                "const": "visible_scene_only_not_full_scene_or_robot_safety"
+            },
+            "downstream_control_effects": {"const": "forbidden"},
+        },
+        "required": [
+            "source_id",
+            "role",
+            "acquired_at",
+            "station_revision",
+            "source_generation",
+            "frame_index",
+            "capture_group_id",
+            "source_binding_hash",
+            "frame_binding_hash",
+            "frame_graph_hash",
+            "source_frame_id",
+            "source_frame_spec_hash",
+            "reference_frame_id",
+            "reference_frame_spec_hash",
+            "width",
+            "height",
+            "camera_intrinsics",
+            "T_source_from_camera",
+            "T_reference_from_camera",
+            "rgb_content_hash",
+            "depth_content_hash",
+            "target_pixel_uv",
+            "target_point_camera_m",
+            "target_point_reference_m",
+            "target_mask_bbox_xyxy",
+            "pose_semantics",
+            "gripper_profile_id",
+            "backend_id",
+            "candidate_count",
+            "candidates",
+            "model_profile_id",
+            "model_profile_hash",
+            "inference_implementation_hash",
+            "annotated_image_media_content_hash",
+            "proposal_semantics",
+            "collision_scope",
+            "downstream_control_effects",
+        ],
+    }
+    task_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {},
+        "required": [],
+    }
+    profile = SkillParameterProfileRef(
+        parameter_profile_id=parameter_profile_id,
+        parameter_profile_hash=parameter_profile_hash,
+        parameter_schema_hash=agent_skill_schema_document_hash(
+            parameter_schema, schema_kind="parameter"
+        ),
+    )
+    return AgentSkillSchemaEntry(
+        skill_id=PLAN_POINT_GRASP_SKILL_ID_V1,
+        skill_version="2",
+        skill_definition_hash=skill_definition_hash,
+        parameter_schema=parameter_schema,
+        execution_result_schema=result_schema,
+        task_evaluation_schema=task_schema,
+        parameter_profiles=(profile,),
+    )
+
+
 def _text(value: object, *, field: str, maximum: int = 4096) -> str:
     if (
         not isinstance(value, str)
@@ -573,9 +787,339 @@ def validate_point_grasp_result_for_parameters_v1(
             )
 
 
+def validate_point_grasp_parameters_v2(
+    payload: Mapping[str, Any],
+    *,
+    dimensions_by_role: Mapping[str, tuple[int, int]],
+    max_candidates: int,
+) -> None:
+    """Validate the semantic-only live planning request."""
+
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "role",
+        "target_pixel_uv",
+        "max_candidates",
+    }:
+        raise ValueError("Station point-grasp parameter fields changed.")
+    role = _text(payload["role"], field="role", maximum=128)
+    if role not in dimensions_by_role:
+        raise ValueError("Station point-grasp role is not registered.")
+    point = payload["target_pixel_uv"]
+    if (
+        not isinstance(point, (list, tuple))
+        or len(point) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in point
+        )
+    ):
+        raise ValueError("target_pixel_uv must contain two non-negative integers.")
+    width, height = dimensions_by_role[role]
+    if not (point[0] < width and point[1] < height):
+        raise ValueError("target_pixel_uv is outside the registered RGB-D frame.")
+    requested = payload["max_candidates"]
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, int)
+        or not 1 <= requested <= max_candidates
+    ):
+        raise ValueError("max_candidates is outside the deployment bound.")
+
+
+def _sha256_digest(value: object, *, field: str) -> str:
+    text = _text(value, field=field, maximum=64)
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        raise ValueError(f"{field} must be a SHA-256 digest.")
+    return text
+
+
+def validate_point_grasp_result_v2(
+    payload: Mapping[str, Any],
+    *,
+    source_by_role: Mapping[str, str],
+    dimensions_by_role: Mapping[str, tuple[int, int]],
+    source_binding_hash: str,
+    frame_binding_hash: str,
+    frame_graph_hash: str,
+    source_frame_id: str,
+    source_frame_spec_hash: str,
+    reference_frame_id: str,
+    reference_frame_spec_hash: str,
+    backend_id: str,
+    model_profile_id: str,
+    model_profile_hash: str,
+    inference_implementation_hash: str,
+    max_candidates: int,
+) -> None:
+    """Validate identity, geometry, and proposal-only semantics for live v2."""
+
+    expected = {
+        "source_id",
+        "role",
+        "acquired_at",
+        "station_revision",
+        "source_generation",
+        "frame_index",
+        "capture_group_id",
+        "source_binding_hash",
+        "frame_binding_hash",
+        "frame_graph_hash",
+        "source_frame_id",
+        "source_frame_spec_hash",
+        "reference_frame_id",
+        "reference_frame_spec_hash",
+        "width",
+        "height",
+        "camera_intrinsics",
+        "T_source_from_camera",
+        "T_reference_from_camera",
+        "rgb_content_hash",
+        "depth_content_hash",
+        "target_pixel_uv",
+        "target_point_camera_m",
+        "target_point_reference_m",
+        "target_mask_bbox_xyxy",
+        "pose_semantics",
+        "gripper_profile_id",
+        "backend_id",
+        "candidate_count",
+        "candidates",
+        "model_profile_id",
+        "model_profile_hash",
+        "inference_implementation_hash",
+        "annotated_image_media_content_hash",
+        "proposal_semantics",
+        "collision_scope",
+        "downstream_control_effects",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected:
+        raise ValueError("Station point-grasp result fields changed.")
+    role = _text(payload["role"], field="role", maximum=128)
+    if role not in source_by_role or payload["source_id"] != source_by_role[role]:
+        raise ValueError("Station point-grasp source identity changed.")
+    width, height = dimensions_by_role[role]
+    if (payload["width"], payload["height"]) != (width, height):
+        raise ValueError("Station point-grasp dimensions changed.")
+    for field, expected_value in (
+        ("source_binding_hash", source_binding_hash),
+        ("frame_binding_hash", frame_binding_hash),
+        ("frame_graph_hash", frame_graph_hash),
+        ("source_frame_id", source_frame_id),
+        ("source_frame_spec_hash", source_frame_spec_hash),
+        ("reference_frame_id", reference_frame_id),
+        ("reference_frame_spec_hash", reference_frame_spec_hash),
+        ("backend_id", backend_id),
+        ("model_profile_id", model_profile_id),
+        ("model_profile_hash", model_profile_hash),
+        ("inference_implementation_hash", inference_implementation_hash),
+    ):
+        if payload[field] != expected_value:
+            raise ValueError(f"Station point-grasp {field} changed.")
+    if (
+        payload["pose_semantics"] != "homogeneous_row_major_parent_from_tool_tcp_m"
+        or payload["gripper_profile_id"] != "DMTAC_M"
+        or payload["proposal_semantics"] != "ranked_unprivileged_motion_proposals_only"
+        or payload["collision_scope"]
+        != "visible_scene_only_not_full_scene_or_robot_safety"
+        or payload["downstream_control_effects"] != "forbidden"
+    ):
+        raise ValueError("Station point-grasp authority or geometry semantics changed.")
+    for field in ("acquired_at",):
+        value = payload[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"{field} must be finite.")
+    for field in ("station_revision", "source_generation", "frame_index"):
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{field} must be a non-negative integer.")
+    capture_group_id = _text(
+        payload["capture_group_id"], field="capture_group_id", maximum=83
+    )
+    prefix = "real-aligned-rgbd:"
+    if not capture_group_id.startswith(prefix):
+        raise ValueError("capture_group_id has the wrong domain.")
+    _sha256_digest(capture_group_id[len(prefix) :], field="capture_group_id hash")
+    for field in (
+        "rgb_content_hash",
+        "depth_content_hash",
+        "annotated_image_media_content_hash",
+    ):
+        _sha256_digest(payload[field], field=field)
+    intrinsics = payload["camera_intrinsics"]
+    if not isinstance(intrinsics, Mapping) or set(intrinsics) != {
+        "width",
+        "height",
+        "fx",
+        "fy",
+        "cx",
+        "cy",
+        "fovy_deg",
+    }:
+        raise ValueError("Station point-grasp intrinsics fields changed.")
+    if (intrinsics["width"], intrinsics["height"]) != (width, height):
+        raise ValueError("Station point-grasp intrinsics dimensions changed.")
+    for field in ("fx", "fy", "cx", "cy", "fovy_deg"):
+        value = intrinsics[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError("Station point-grasp intrinsics must be finite.")
+    if (
+        float(intrinsics["fx"]) <= 0
+        or float(intrinsics["fy"]) <= 0
+        or float(intrinsics["cx"]) < 0
+        or float(intrinsics["cy"]) < 0
+        or float(intrinsics["fovy_deg"]) <= 0
+    ):
+        raise ValueError("Station point-grasp intrinsics are outside their bounds.")
+    _matrix(payload["T_source_from_camera"], field="T_source_from_camera")
+    reference_from_camera = _matrix(
+        payload["T_reference_from_camera"], field="T_reference_from_camera"
+    )
+    point = payload["target_pixel_uv"]
+    if (
+        not isinstance(point, (list, tuple))
+        or len(point) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in point
+        )
+        or not (point[0] < width and point[1] < height)
+    ):
+        raise ValueError("Station point-grasp target pixel is invalid.")
+    target_camera = _vector(
+        payload["target_point_camera_m"], field="target_point_camera_m", length=3
+    )
+    target_reference = _vector(
+        payload["target_point_reference_m"],
+        field="target_point_reference_m",
+        length=3,
+    )
+    if not _allclose(
+        _transform_point(reference_from_camera, target_camera),
+        target_reference,
+        tolerance=1e-7,
+    ):
+        raise ValueError("Station point-grasp target transform is inconsistent.")
+    bbox = payload["target_mask_bbox_xyxy"]
+    if (
+        not isinstance(bbox, (list, tuple))
+        or len(bbox) != 4
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in bbox)
+        or not (0 <= bbox[0] < bbox[2] <= width)
+        or not (0 <= bbox[1] < bbox[3] <= height)
+    ):
+        raise ValueError("Station point-grasp mask bbox is invalid.")
+    candidates = payload["candidates"]
+    if (
+        not isinstance(candidates, (list, tuple))
+        or not 1 <= len(candidates) <= max_candidates
+        or payload["candidate_count"] != len(candidates)
+    ):
+        raise ValueError("Station point-grasp candidate count is invalid.")
+    candidate_fields = {
+        "ordinal",
+        "score",
+        "model_score",
+        "click_distance_m",
+        "gripper_width_m",
+        "T_camera_from_tool_tcp",
+        "T_reference_from_tool_tcp",
+        "tool_tcp_xyz_camera_m",
+        "tool_tcp_xyz_reference_m",
+        "visible_scene_collision_free",
+    }
+    previous_score = math.inf
+    for ordinal, candidate in enumerate(candidates):
+        if (
+            not isinstance(candidate, Mapping)
+            or set(candidate) != candidate_fields
+            or candidate["ordinal"] != ordinal
+        ):
+            raise ValueError("Station point-grasp candidate fields changed.")
+        camera_from_tcp = _matrix(
+            candidate["T_camera_from_tool_tcp"], field="T_camera_from_tool_tcp"
+        )
+        reference_from_tcp = _matrix(
+            candidate["T_reference_from_tool_tcp"],
+            field="T_reference_from_tool_tcp",
+        )
+        composed = _matmul4(reference_from_camera, camera_from_tcp)
+        if any(
+            not _allclose(actual, expected_row, tolerance=1e-7)
+            for actual, expected_row in zip(composed, reference_from_tcp, strict=True)
+        ):
+            raise ValueError("Station point-grasp candidate transform is inconsistent.")
+        if not _allclose(
+            tuple(camera_from_tcp[row][3] for row in range(3)),
+            _vector(
+                candidate["tool_tcp_xyz_camera_m"],
+                field="tool_tcp_xyz_camera_m",
+                length=3,
+            ),
+            tolerance=1e-8,
+        ) or not _allclose(
+            tuple(reference_from_tcp[row][3] for row in range(3)),
+            _vector(
+                candidate["tool_tcp_xyz_reference_m"],
+                field="tool_tcp_xyz_reference_m",
+                length=3,
+            ),
+            tolerance=1e-8,
+        ):
+            raise ValueError("Station point-grasp candidate xyz is inconsistent.")
+        if candidate["visible_scene_collision_free"] is not True:
+            raise ValueError("Candidate did not pass the bounded visible-scene check.")
+        for field in ("score", "model_score"):
+            value = candidate[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 <= float(value) <= 1
+            ):
+                raise ValueError("Station point-grasp scores must be in [0, 1].")
+        if float(candidate["score"]) > previous_score + 1e-12:
+            raise ValueError("Station point-grasp candidates are not score-ranked.")
+        previous_score = float(candidate["score"])
+        if (
+            not 0.005 <= float(candidate["gripper_width_m"]) <= 0.070
+            or float(candidate["click_distance_m"]) < 0
+        ):
+            raise ValueError("Station point-grasp geometry exceeds DMTAC M bounds.")
+
+
+def validate_point_grasp_result_for_parameters_v2(
+    parameters: Mapping[str, Any], result: Mapping[str, Any]
+) -> None:
+    if parameters.get("role") != result.get("role"):
+        raise ValueError("Station point-grasp result role differs from the request.")
+    parameter_pixel = parameters.get("target_pixel_uv")
+    result_pixel = result.get("target_pixel_uv")
+    if (
+        not isinstance(parameter_pixel, (list, tuple))
+        or not isinstance(result_pixel, (list, tuple))
+        or tuple(parameter_pixel) != tuple(result_pixel)
+    ):
+        raise ValueError("Station point-grasp result pixel differs from the request.")
+    if result.get("candidate_count", 0) > parameters.get("max_candidates", 0):
+        raise ValueError("Station point-grasp result exceeds the requested bound.")
+
+
 __all__ = [
     "point_grasp_schema_entry_v1",
+    "point_grasp_schema_entry_v2",
     "validate_point_grasp_parameters_v1",
+    "validate_point_grasp_parameters_v2",
     "validate_point_grasp_result_for_parameters_v1",
+    "validate_point_grasp_result_for_parameters_v2",
     "validate_point_grasp_result_v1",
+    "validate_point_grasp_result_v2",
 ]

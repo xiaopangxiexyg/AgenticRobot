@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,11 +47,17 @@ from .localization_gateway import (
     read_bounded_regular_file,
     safe_local_path,
 )
+from .perception_frames import RealPerceptionFrameBinding
 from .point_grasp_deployment import (
     REAL_POINT_GRASP_DEPTH_SLOT_ID_V1,
     REAL_POINT_GRASP_OUTPUT_SLOT_ID_V1,
     REAL_POINT_GRASP_RGB_SLOT_ID_V1,
     RealPointGraspRegistration,
+)
+from .realsense_perception import RealSenseAgentPerceptionProvider
+from .station_point_grasp_deployment import (
+    REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2,
+    StationBoundPointGraspRegistration,
 )
 
 
@@ -312,6 +320,210 @@ class PointGraspProvider:
         return PreparedPointGrasp(result, annotated)
 
 
+class StationBoundPointGraspProvider:
+    """Plan from one trusted live RGB-D cut and return proposals only."""
+
+    def __init__(
+        self,
+        *,
+        planner: object,
+        registration: StationBoundPointGraspRegistration,
+        perception_provider: RealSenseAgentPerceptionProvider,
+        frame_binding: RealPerceptionFrameBinding,
+        current_station_revision: Callable[[], int],
+    ) -> None:
+        if not isinstance(registration, StationBoundPointGraspRegistration):
+            raise TypeError("registration must be typed.")
+        if not isinstance(perception_provider, RealSenseAgentPerceptionProvider):
+            raise TypeError("perception_provider must be typed.")
+        if not isinstance(frame_binding, RealPerceptionFrameBinding):
+            raise TypeError("frame_binding must be typed.")
+        if not callable(current_station_revision):
+            raise TypeError("current_station_revision must be callable.")
+        for name in ("start", "close", "plan"):
+            if not callable(getattr(planner, name, None)):
+                raise TypeError(f"planner must expose {name}().")
+        if (
+            getattr(planner, "semantic_content_hash", None)
+            != registration.profile.inference_implementation_hash
+        ):
+            raise ValueError("Point-grasp planner identity differs from registration.")
+        if (
+            perception_provider.source_binding.semantic_content_hash
+            != registration.profile.source_binding_hash
+        ):
+            raise ValueError("Live RGB-D source binding differs from registration.")
+        if (
+            frame_binding.semantic_content_hash
+            != registration.profile.frame_binding_hash
+        ):
+            raise ValueError("Station frame binding differs from registration.")
+        if (
+            frame_binding.frame_graph.semantic_content_hash
+            != registration.profile.frame_graph_hash
+        ):
+            raise ValueError("Station frame graph differs from registration.")
+        self.planner = planner
+        self.registration = registration
+        self.perception_provider = perception_provider
+        self.frame_binding = frame_binding
+        self._current_station_revision = current_station_revision
+        self._lock = threading.Lock()
+        self._started = False
+
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return self.registration.profile.inference_implementation_hash
+
+    def start(self) -> None:
+        self.planner.start()
+        self._started = True
+
+    def close(self) -> None:
+        try:
+            self.planner.close()
+        finally:
+            self._started = False
+
+    def plan_request(self, request: Any) -> PreparedPointGrasp:
+        if request.input_artifact_bindings:
+            raise ValueError("Live Station point-grasp accepts no input Artifacts.")
+        expected_revision = request.expected_station_revision
+        with self._lock:
+            capture = self.perception_provider.capture_aligned_rgbd(
+                role=str(request.parameters["role"]),
+                expected_station_revision=expected_revision,
+            )
+            source_from_camera = np.asarray(
+                capture.source_from_camera, dtype=np.float64
+            ).reshape(4, 4)
+            reference_from_camera, resolution = (
+                self.frame_binding.frame_graph.transform_pose_matrix(
+                    source_from_camera,
+                    source_reference_frame_id=self.frame_binding.source_frame_id,
+                    target_reference_frame_id=self.frame_binding.reference_frame_id,
+                )
+            )
+            if (
+                resolution.frame_graph_hash
+                != self.registration.profile.frame_graph_hash
+            ):
+                raise RuntimeError(
+                    "Station point-grasp frame resolution identity changed."
+                )
+            image = Image.fromarray(capture.rgb, mode="RGB")
+            pixel_uv = tuple(request.parameters["target_pixel_uv"])
+            planned = self.planner.plan(
+                image,
+                capture.depth_m,
+                pixel_uv=pixel_uv,
+                intrinsics=capture.intrinsics,
+                base_from_camera=reference_from_camera,
+                max_candidates=request.parameters["max_candidates"],
+            )
+            if self._current_station_revision() != expected_revision:
+                raise RuntimeError(
+                    "Station revision changed during point-grasp model inference."
+                )
+            annotated = _annotate(
+                image,
+                pixel_uv,
+                planned,
+                dict(capture.intrinsics),
+            )
+            if len(annotated) > self.registration.profile.max_annotated_bytes:
+                raise RuntimeError(
+                    "Annotated Station point-grasp image exceeds its bound."
+                )
+            candidates = []
+            for ordinal, candidate in enumerate(planned.candidates):
+                camera = list(candidate.camera_from_tcp)
+                reference = list(candidate.base_from_tcp)
+                candidates.append(
+                    {
+                        "ordinal": ordinal,
+                        "score": candidate.score,
+                        "model_score": candidate.model_score,
+                        "click_distance_m": candidate.click_distance_m,
+                        "gripper_width_m": candidate.gripper_width_m,
+                        "T_camera_from_tool_tcp": camera,
+                        "T_reference_from_tool_tcp": reference,
+                        "tool_tcp_xyz_camera_m": [
+                            camera[3],
+                            camera[7],
+                            camera[11],
+                        ],
+                        "tool_tcp_xyz_reference_m": [
+                            reference[3],
+                            reference[7],
+                            reference[11],
+                        ],
+                        "visible_scene_collision_free": (
+                            candidate.visible_collision_free
+                        ),
+                    }
+                )
+            if self._current_station_revision() != expected_revision:
+                raise RuntimeError(
+                    "Station revision changed before point-grasp result commit."
+                )
+            profile = self.registration.profile
+            result = {
+                "source_id": capture.source_id,
+                "role": capture.role,
+                "acquired_at": capture.acquired_at,
+                "station_revision": capture.station_revision,
+                "source_generation": capture.source_generation,
+                "frame_index": capture.frame_index,
+                "capture_group_id": capture.capture_group_id,
+                "source_binding_hash": capture.source_binding_hash,
+                "frame_binding_hash": self.frame_binding.semantic_content_hash,
+                "frame_graph_hash": self.frame_binding.frame_graph.semantic_content_hash,
+                "source_frame_id": self.frame_binding.source_frame_id,
+                "source_frame_spec_hash": self.frame_binding.source_frame_spec_hash,
+                "reference_frame_id": self.frame_binding.reference_frame_id,
+                "reference_frame_spec_hash": (
+                    self.frame_binding.reference_frame_spec_hash
+                ),
+                "width": capture.width,
+                "height": capture.height,
+                "camera_intrinsics": dict(capture.intrinsics),
+                "T_source_from_camera": list(capture.source_from_camera),
+                "T_reference_from_camera": [
+                    float(value) for value in reference_from_camera.reshape(-1)
+                ],
+                "rgb_content_hash": capture.rgb_content_hash,
+                "depth_content_hash": capture.depth_content_hash,
+                "target_pixel_uv": list(pixel_uv),
+                "target_point_camera_m": list(planned.target_point_camera_m),
+                "target_point_reference_m": list(planned.target_point_base_m),
+                "target_mask_bbox_xyxy": list(planned.target_mask_bbox_xyxy),
+                "pose_semantics": "homogeneous_row_major_parent_from_tool_tcp_m",
+                "gripper_profile_id": "DMTAC_M",
+                "backend_id": profile.backend_id,
+                "candidate_count": len(candidates),
+                "candidates": candidates,
+                "model_profile_id": profile.model_profile_id,
+                "model_profile_hash": profile.model_profile_hash,
+                "inference_implementation_hash": (
+                    profile.inference_implementation_hash
+                ),
+                "annotated_image_media_content_hash": hashlib.sha256(
+                    annotated
+                ).hexdigest(),
+                "proposal_semantics": "ranked_unprivileged_motion_proposals_only",
+                "collision_scope": (
+                    "visible_scene_only_not_full_scene_or_robot_safety"
+                ),
+                "downstream_control_effects": "forbidden",
+            }
+            return PreparedPointGrasp(result, annotated)
+
+
 def build_real_point_grasp_executor(
     *,
     registration: RealPointGraspRegistration,
@@ -374,8 +586,83 @@ def build_real_point_grasp_executor(
     )
 
 
+def build_station_bound_point_grasp_executor(
+    *,
+    registration: StationBoundPointGraspRegistration,
+    provider: StationBoundPointGraspProvider,
+    artifact_store: RecoverableAgentArtifactStore,
+    runtime_session_id: str,
+    current_station_revision: Callable[[], int],
+    max_retained_operations: int,
+    clock: Callable[[], float] = time.time,
+) -> PassiveReadSkillExecutor:
+    """Bind the live proposal Route without granting downstream execution."""
+
+    def read(request: Any, operation: Any) -> PassiveReadResult:
+        prepared = provider.plan_request(request)
+        expected_revision = request.expected_station_revision
+        if current_station_revision() != expected_revision:
+            raise RuntimeError(
+                "Station revision changed before point-grasp Artifact commit."
+            )
+        artifact = artifact_ref_for_bytes(
+            prepared.annotated_jpeg,
+            media_type=LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,
+            schema_id=POINT_GRASP_ANNOTATED_SCHEMA_ID_V1,
+            encoding=LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
+            compression=LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
+        )
+        committed = commit_artifact_bytes(
+            store=artifact_store,
+            data=prepared.annotated_jpeg,
+            artifact=artifact,
+            producer_id="agent_gateway.provider.station_bound_point_grasp",
+            runtime_session_id=runtime_session_id,
+            idempotency_key="station-point-grasp-output:" + operation.operation_id,
+            now=float(clock()),
+        )
+        if current_station_revision() != expected_revision:
+            raise RuntimeError(
+                "Station revision changed during point-grasp Artifact commit."
+            )
+        identity = canonical_content_hash(
+            {
+                "operation_id": operation.operation_id,
+                "request_hash": request.semantic_content_hash,
+                "result": prepared.execution_result,
+                "artifact": committed.semantic_content_hash,
+            },
+            domain="dexteleop.agent_skill.station_point_grasp_receipt.v2",
+        )
+        evidence = "station-point-grasp:" + identity
+        return PassiveReadResult(
+            execution_result=prepared.execution_result,
+            evidence_refs=(evidence,),
+            output_artifact_bindings=(
+                AgentArtifactBinding(
+                    slot_id=REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2,
+                    ordinal=0,
+                    artifact=committed,
+                    production_receipt_ref=evidence,
+                ),
+            ),
+            reason_code="passive_station_point_grasp_planning_completed",
+        )
+
+    return PassiveReadSkillExecutor(
+        port_id="agent-gateway:station-point-grasp:" + runtime_session_id,
+        executor_id=registration.binding.executor_id,
+        read=read,
+        current_station_revision=current_station_revision,
+        clock=clock,
+        max_retained_operations=max_retained_operations,
+    )
+
+
 __all__ = [
     "PointGraspProvider",
     "PreparedPointGrasp",
+    "StationBoundPointGraspProvider",
     "build_real_point_grasp_executor",
+    "build_station_bound_point_grasp_executor",
 ]
