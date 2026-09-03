@@ -18,6 +18,7 @@ from typing import Any, Iterator, Mapping
 
 import numpy as np
 
+from dataset_contracts.v22 import PolicyIOLayout
 from dataset_interface.prepared_training import (
     PreparedSkillEligibilityExclusion,
     PreparedSkillEligibilityReport,
@@ -83,6 +84,9 @@ STAGE1_SCENARIO_PROFILE_SCHEMA_V1 = (
 STANDARD_NON_RTC_TRAINING_MODE_V1 = "standard_non_rtc_v1"
 CORRECTED_WRIST_BACKGROUND_PROFILE_V1 = (
     "dexteleop.corrected_wrist_background.v1"
+)
+OPENPI_QUANTILE_SEMANTIC_BOUNDS_V1 = (
+    "dexteleop.openpi_quantile_semantic_bounds.v1"
 )
 DEFAULT_PROFILE = (
     Path(__file__).resolve().parents[1]
@@ -2400,6 +2404,233 @@ def _openpi_data_assets_root(config: Any, checkout: Path) -> Path:
         return Path(str(configured or config.assets_dirs)).expanduser().resolve()
 
 
+def _openpi_quantile_semantic_bounds_spec(
+    profile: Mapping[str, Any],
+) -> dict[str, tuple[str, ...]] | None:
+    raw_spec = profile.get("openpi_quantile_semantic_bounds")
+    if raw_spec in (None, {}):
+        return None
+    if not isinstance(raw_spec, Mapping):
+        raise ValueError("openpi_quantile_semantic_bounds must be an object.")
+    if str(raw_spec.get("schema", "")) != OPENPI_QUANTILE_SEMANTIC_BOUNDS_V1:
+        raise ValueError(
+            "openpi_quantile_semantic_bounds has an unsupported schema."
+        )
+    raw_components = raw_spec.get("components")
+    if not isinstance(raw_components, Mapping) or not raw_components:
+        raise ValueError(
+            "openpi_quantile_semantic_bounds.components must be a non-empty object."
+        )
+    invalid_vectors = set(str(key) for key in raw_components) - {
+        "state",
+        "actions",
+    }
+    if invalid_vectors:
+        raise ValueError(
+            "openpi_quantile_semantic_bounds has unsupported vectors: "
+            f"{sorted(invalid_vectors)}."
+        )
+    result: dict[str, tuple[str, ...]] = {}
+    for vector_name, requested_names in raw_components.items():
+        if (
+            not isinstance(requested_names, list)
+            or not requested_names
+            or any(
+                not isinstance(name, str) or not name.strip()
+                for name in requested_names
+            )
+        ):
+            raise ValueError(
+                "Each semantic quantile component list must contain non-empty strings."
+            )
+        normalized_names = tuple(name.strip() for name in requested_names)
+        if len(set(normalized_names)) != len(normalized_names):
+            raise ValueError("Semantic quantile component names must be unique.")
+        result[str(vector_name)] = normalized_names
+    return result
+
+
+def _apply_openpi_quantile_semantic_bounds_to_stats(
+    *,
+    component_spec: Mapping[str, tuple[str, ...]],
+    layout: PolicyIOLayout,
+    norm_stats: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Return copied OpenPI stats with selected layout bounds applied."""
+
+    bounded_stats = dict(norm_stats)
+    replacements: list[dict[str, Any]] = []
+    for vector_name, requested_names in component_spec.items():
+        role = "action" if vector_name == "actions" else "state"
+        component_by_name = {
+            component.name: component
+            for component in layout.components(role, "continuous")
+        }
+        stats = bounded_stats.get(vector_name)
+        if stats is None or not dataclasses.is_dataclass(stats):
+            raise ValueError(
+                f"OpenPI norm stats have no dataclass value for {vector_name!r}."
+            )
+        if getattr(stats, "q01", None) is None or getattr(stats, "q99", None) is None:
+            raise ValueError(
+                f"OpenPI norm stats have no quantiles for {vector_name!r}."
+            )
+        q01 = np.asarray(stats.q01, dtype=np.float64).copy()
+        q99 = np.asarray(stats.q99, dtype=np.float64).copy()
+        expected_dimension = (
+            layout.action_dim if role == "action" else layout.state_dim
+        )
+        if q01.shape != (expected_dimension,) or q99.shape != (expected_dimension,):
+            raise ValueError(
+                f"OpenPI {vector_name} quantile shape differs from the layout."
+            )
+        for component_name in requested_names:
+            component = component_by_name.get(component_name)
+            if component is None:
+                raise ValueError(
+                    f"Unknown continuous {role} component {component_name!r}."
+                )
+            if ".end_effector." not in component.name:
+                raise ValueError(
+                    "Semantic quantile bounds are only defined for layout-declared "
+                    "end-effector components."
+                )
+            channel = layout.channel(role, component.side)
+            semantic = dict(channel.normalization)
+            minimum = semantic.get("minimum")
+            maximum = semantic.get("maximum")
+            if (
+                not isinstance(minimum, (int, float))
+                or isinstance(minimum, bool)
+                or not isinstance(maximum, (int, float))
+                or isinstance(maximum, bool)
+                or not np.isfinite(float(minimum))
+                or not np.isfinite(float(maximum))
+                or float(minimum) >= float(maximum)
+            ):
+                raise ValueError(
+                    f"Layout component {component_name!r} has no finite ordered "
+                    "semantic normalization bounds."
+                )
+            before_q01 = q01[component.offset : component.stop].tolist()
+            before_q99 = q99[component.offset : component.stop].tolist()
+            q01[component.offset : component.stop] = float(minimum)
+            q99[component.offset : component.stop] = float(maximum)
+            replacements.append(
+                {
+                    "vector": str(vector_name),
+                    "component": component.name,
+                    "offset": int(component.offset),
+                    "stop": int(component.stop),
+                    "layout_units": channel.units,
+                    "before_q01": before_q01,
+                    "before_q99": before_q99,
+                    "semantic_q01": [float(minimum)] * component.dim,
+                    "semantic_q99": [float(maximum)] * component.dim,
+                }
+            )
+        bounded_stats[vector_name] = dataclasses.replace(
+            stats,
+            q01=q01,
+            q99=q99,
+        )
+    return bounded_stats, replacements
+
+
+@contextmanager
+def _openpi_quantile_semantic_bounds_binding(
+    profile: Mapping[str, Any],
+    config: Any,
+) -> Iterator[None]:
+    """Patch one norm-stats save so selected q01/q99 values are bounded.
+
+    The destination must be new.  This never modifies an existing statistics
+    asset, so ordinary and RTC runs can retain their exact prior artifacts.
+    """
+
+    component_spec = _openpi_quantile_semantic_bounds_spec(profile)
+    if component_spec is None:
+        yield
+        return
+
+    from openpi.shared import normalize
+
+    data_config = config.data.create(config.assets_dirs, config.model)
+    layout_value = str(
+        getattr(data_config, "dexteleop_v23_layout_path", "")
+        or getattr(data_config, "dexteleop_v22_layout_path", "")
+    ).strip()
+    if not layout_value:
+        raise ValueError("Semantic quantile bounds require a policy-I/O layout path.")
+    layout_path = Path(layout_value).expanduser().resolve()
+    layout_container = json.loads(layout_path.read_text(encoding="utf-8"))
+    layout_payload = layout_container.get("policy_io_layout", layout_container)
+    if not isinstance(layout_payload, Mapping):
+        raise ValueError("Policy-I/O layout payload must be an object.")
+    layout = PolicyIOLayout.from_dict(layout_payload)
+    expected_layout_hash = str(profile["expected_policy_io_layout_hash"])
+    if layout.layout_hash != expected_layout_hash:
+        raise ValueError(
+            "Semantic quantile bounds layout hash differs from the profile: "
+            f"{layout.layout_hash} != {expected_layout_hash}."
+        )
+
+    asset_id = str(data_config.asset_id or data_config.repo_id or "").strip()
+    if not asset_id:
+        raise ValueError("Semantic quantile bounds require a normalization asset id.")
+    output_directory = Path(config.assets_dirs).expanduser().resolve() / asset_id
+    norm_stats_path = output_directory / "norm_stats.json"
+    receipt_path = output_directory / "norm_stats.semantic_bounds_receipt.json"
+    if norm_stats_path.exists() or receipt_path.exists():
+        raise FileExistsError(
+            "Semantic quantile-bound norm stats require a fresh asset directory: "
+            f"{output_directory}."
+        )
+
+    original_save = normalize.save
+    save_called = False
+
+    def save(directory: Path | str, norm_stats: Mapping[str, Any]) -> None:
+        nonlocal save_called
+        if save_called:
+            raise RuntimeError("OpenPI norm stats save was called more than once.")
+        actual_directory = Path(directory).expanduser().resolve()
+        if actual_directory != output_directory:
+            raise ValueError(
+                "OpenPI norm stats output differs from the bounded asset directory: "
+                f"{actual_directory} != {output_directory}."
+            )
+        bounded_stats, replacements = _apply_openpi_quantile_semantic_bounds_to_stats(
+            component_spec=component_spec,
+            layout=layout,
+            norm_stats=norm_stats,
+        )
+        original_save(actual_directory, bounded_stats)
+        rendered_stats = norm_stats_path.read_bytes()
+        receipt = {
+            "schema": OPENPI_QUANTILE_SEMANTIC_BOUNDS_V1,
+            "profile_id": str(profile["profile_id"]),
+            "policy_io_layout_hash": layout.layout_hash,
+            "norm_stats_path": str(norm_stats_path),
+            "bounded_norm_stats_sha256": hashlib.sha256(rendered_stats).hexdigest(),
+            "replacements": replacements,
+        }
+        output_directory.mkdir(parents=True, exist_ok=True)
+        with receipt_path.open("x", encoding="utf-8") as stream:
+            json.dump(receipt, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        print(json.dumps({**receipt, "receipt_path": str(receipt_path)}, indent=2))
+        save_called = True
+
+    normalize.save = save
+    try:
+        yield
+        if not save_called:
+            raise RuntimeError("OpenPI norm stats did not publish an output asset.")
+    finally:
+        normalize.save = original_save
+
+
 def _sha256_digest(value: object, *, name: str) -> str:
     normalized = str(value).strip().lower()
     if normalized.startswith("sha256:"):
@@ -3372,11 +3603,12 @@ def main(argv: list[str] | None = None) -> int:
             previous = registry.get(config.name)
             registry[config.name] = config
             try:
-                compute.main(
-                    config.name,
-                    stats_batch_size=args.stats_batch_size,
-                    stats_num_workers=args.stats_num_workers,
-                )
+                with _openpi_quantile_semantic_bounds_binding(profile, config):
+                    compute.main(
+                        config.name,
+                        stats_batch_size=args.stats_batch_size,
+                        stats_num_workers=args.stats_num_workers,
+                    )
             finally:
                 if previous is None:
                     registry.pop(config.name, None)

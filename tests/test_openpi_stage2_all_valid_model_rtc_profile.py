@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
+import numpy as np
+
+from dataset_contracts.v22 import EndEffectorSpec, PolicyIOLayout
 from deployments.openpi.model_rtc_profile import (
     load_prepared_model_rtc_profile,
     prepared_model_rtc_profile_hash,
 )
 from deployments.openpi.training.prepared_skill_launch import (
+    OPENPI_QUANTILE_SEMANTIC_BOUNDS_V1,
+    _apply_openpi_quantile_semantic_bounds_to_stats,
     _load_profile,
     _model_rtc_profile_matches_prepared_profile,
+    _openpi_quantile_semantic_bounds_spec,
     _prepared_profile_for_model_rtc,
 )
 
@@ -25,6 +32,32 @@ _MODEL_RTC_PROFILE = (
     / "deployments/openpi/configs/model_rtc/"
     / "writing_stage2_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json"
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _NormStats:
+    mean: np.ndarray
+    std: np.ndarray
+    q01: np.ndarray
+    q99: np.ndarray
+
+
+def _continuous_gripper_layout() -> PolicyIOLayout:
+    return PolicyIOLayout(
+        name="semantic-quantile-bounds-test",
+        end_effectors={
+            side: EndEffectorSpec.continuous(
+                side,
+                adapter="dmtac_gripper_v1",
+                target_dim=1,
+                target_names=("gripper_close",),
+                state_names=("gripper_close",),
+                units="normalized_0_1",
+                normalization={"minimum": 0.0, "maximum": 1.0},
+            )
+            for side in ("left", "right")
+        },
+    )
 
 
 def test_stage2_all_view_h32_model_rtc_profile_matches_prepared_profile() -> None:
@@ -100,3 +133,72 @@ def test_stage2_model_rtc_overlay_requires_exact_prepared_profile_identity() -> 
     mismatched = dict(model_rtc)
     mismatched["prepared_skill_profile_id"] = "another-prepared-profile"
     assert not _model_rtc_profile_matches_prepared_profile(prepared, mismatched)
+
+
+def test_semantic_quantile_bounds_replace_only_declared_component() -> None:
+    layout = _continuous_gripper_layout()
+    original_q01 = np.arange(layout.action_dim, dtype=np.float64) / 100.0
+    original_q99 = original_q01 + 0.5
+    original_q01[-1] = 0.999994
+    original_q99[-1] = 0.999994
+    original = _NormStats(
+        mean=np.zeros(layout.action_dim),
+        std=np.ones(layout.action_dim),
+        q01=original_q01,
+        q99=original_q99,
+    )
+    profile = {
+        "openpi_quantile_semantic_bounds": {
+            "schema": OPENPI_QUANTILE_SEMANTIC_BOUNDS_V1,
+            "components": {"actions": ["right.end_effector.target"]},
+        }
+    }
+
+    component_spec = _openpi_quantile_semantic_bounds_spec(profile)
+    assert component_spec is not None
+    bounded, replacements = _apply_openpi_quantile_semantic_bounds_to_stats(
+        component_spec=component_spec,
+        layout=layout,
+        norm_stats={"actions": original},
+    )
+
+    assert original.q01[-1] == 0.999994
+    assert original.q99[-1] == 0.999994
+    assert np.array_equal(bounded["actions"].q01[:-1], original.q01[:-1])
+    assert np.array_equal(bounded["actions"].q99[:-1], original.q99[:-1])
+    assert bounded["actions"].q01[-1] == 0.0
+    assert bounded["actions"].q99[-1] == 1.0
+    assert replacements == [
+        {
+            "vector": "actions",
+            "component": "right.end_effector.target",
+            "offset": 15,
+            "stop": 16,
+            "layout_units": "normalized_0_1",
+            "before_q01": [0.999994],
+            "before_q99": [0.999994],
+            "semantic_q01": [0.0],
+            "semantic_q99": [1.0],
+        }
+    ]
+
+
+def test_semantic_quantile_bounds_reject_non_end_effector_component() -> None:
+    layout = _continuous_gripper_layout()
+    stats = _NormStats(
+        mean=np.zeros(layout.action_dim),
+        std=np.ones(layout.action_dim),
+        q01=np.zeros(layout.action_dim),
+        q99=np.ones(layout.action_dim),
+    )
+
+    try:
+        _apply_openpi_quantile_semantic_bounds_to_stats(
+            component_spec={"actions": ("right.arm.pose",)},
+            layout=layout,
+            norm_stats={"actions": stats},
+        )
+    except ValueError as exc:
+        assert "end-effector components" in str(exc)
+    else:
+        raise AssertionError("arm pose component unexpectedly accepted")
