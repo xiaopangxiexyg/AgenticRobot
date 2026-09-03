@@ -216,6 +216,10 @@ def test_empty_dataset_gui_is_loopback_only_and_releases_lock(
         assert ".operation-progress-fill.indeterminate" in style_source
         assert "payload.episode.draft_requires_seal ? null" in app_source
         assert "report.draft_cache_warning" in app_source
+        assert "volatilePostSealDraft" in app_source
+        assert "function persistVolatilePostSealDraft" in app_source
+        assert "RETRY_POST_SEAL_DETAIL_DRAFT" in app_source
+        assert "未重复发布粗标注" in app_source
         assert "function renderFailedAttemptEditors" in app_source
         assert "/api/reflow-failed-stage/" in app_source
         assert "function renderCaptureEndStepEditor" in app_source
@@ -1788,6 +1792,10 @@ def test_committed_set_survives_draft_cache_write_failure(
         )
         report = application.commit(episode_uuid, draft)
         assert "was committed" in report["draft_cache_warning"]
+        assert "not durable" in report["draft_cache_warning"]
+        assert "do not republish" in report["draft_cache_warning"]
+        assert report["draft_cache_persisted"] is False
+        assert report["draft"] == observed_cache_write["draft"]
         assert observed_cache_write["durable"] is False
         annotation_root = (
             tmp_path
