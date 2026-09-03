@@ -124,8 +124,16 @@ class MaskedFramePipeline:
                 ),
                 manifest_path=manifest_path,
             )
+        # A mixed dataset constructs one pipeline per source in every persistent
+        # DataLoader worker. Reusing the video-reader budget here prevents the
+        # augmenter's several full-resolution caches from multiplying its much
+        # larger standalone default across sources and workers. This changes
+        # only retention/performance; deterministic augmentation selection is
+        # still keyed by source, episode, view, frame and epoch.
+        augmentation_cache_size = max(1, int(config.video.reader_cache_size))
         self.augmenter = RandomBackgroundVideoAugmenter(
             config.augmentation,
+            stream_cache_size=augmentation_cache_size,
             real_image_provider=real_image_provider,
         )
         self._warned_ineligible_training: set[tuple[int, tuple[str, ...], tuple[str, ...]]] = set()

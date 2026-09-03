@@ -91,6 +91,45 @@ def _write_episode_metadata(
         )
 
 
+def test_masked_frame_pipeline_bounds_augmentation_cache_to_video_reader_budget(tmp_path) -> None:
+    dataset = tmp_path / "dataset"
+    _write_episode_metadata(
+        dataset,
+        [{"episode_index": 0, "frame_count": 1}],
+    )
+    config = DatasetInterfaceConfig(
+        dataset_root=dataset,
+        mask=MaskConfig(final_mask_root=tmp_path / "final_masks"),
+        video=VideoConfig(
+            reader_cache_size=3,
+            mask_cache_size=7,
+            output_layout="bgr_hwc_uint8",
+        ),
+        augmentation=RandomBackgroundAugmentConfig(
+            provider="black",
+            photometric=_DISABLED_PHOTOMETRIC,
+        ),
+    )
+
+    with MaskedFramePipeline(config) as pipeline:
+        assert pipeline.augmenter.streams.max_size == 3
+        assert pipeline.augmenter.real_streams.max_size == 3
+        assert pipeline.augmenter.fixed_mask_plans.max_size == 3
+        assert pipeline.augmenter.fixed_backgrounds.max_size == 3
+
+    zero_budget_config = DatasetInterfaceConfig(
+        dataset_root=dataset,
+        mask=MaskConfig(final_mask_root=tmp_path / "final_masks"),
+        video=VideoConfig(reader_cache_size=0),
+        augmentation=RandomBackgroundAugmentConfig(
+            provider="black",
+            photometric=_DISABLED_PHOTOMETRIC,
+        ),
+    )
+    with MaskedFramePipeline(zero_budget_config) as pipeline:
+        assert pipeline.augmenter.streams.max_size == 1
+
+
 def test_final_mask_source_does_not_fall_back_to_wrist_depth_mask(tmp_path) -> None:
     dataset = tmp_path / "dataset"
     depth_manifest = dataset / "wrist_depth/mask/left_wrist/manifest.json"

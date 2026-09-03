@@ -51,6 +51,17 @@ checkpoint 解释、复现和回退。不要用同名配置续训成另一种输
 - `num_workers=4` 与 `shared_worker_v1` epoch 同步；
 - 在 policy metadata 中写入训练输入 contract、配置来源和 real-image manifest SHA256。
 
+每个混合数据源会在各个持久 DataLoader worker 内拥有独立图像管线。管线中的随机背景、
+固定边界、光度和遮挡缓存因此统一受该 source 的 `video.reader_cache_size` 限制，不能再使用
+随机背景组件独立运行时的 128-entry 默认值。自然完成或 SIGINT/SIGUSR1 请求的终止性
+checkpoint 会先同步关闭输入迭代器和持久 workers，再开始 Orbax host staging；交互终端的
+`S` 仍是“保存后继续”，不会关闭 loader。
+
+若异常断电/OOM 留下 `*.orbax-checkpoint-tmp-*`，不得把临时目录改名冒充已提交 checkpoint。
+先保留 inode 和逐文件哈希收据，将其可逆隔离出正式 checkpoint 根目录，再只从 Orbax 已提交
+的最大数字 step 恢复。恢复前还应重验 checkpoint artifact/training-run contract 与实际
+norm-stats；这些检查不要求 client 固定到某个 server step/model identity。
+
 真实图片池使用远端
 `assets/random_real_image/openimages_v7_validation/real_background_manifest_corrected_v1.json`。
 该 manifest 使用相对 `image_root`，可随图片目录迁移；历史
