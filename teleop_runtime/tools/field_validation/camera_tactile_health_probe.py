@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import multiprocessing
+import signal
 import sys
 import time
 from pathlib import Path
@@ -30,8 +33,16 @@ PROJECT_ROOT = _repository_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from teleop_runtime.backends.grippers import DMTacGripperBackend, DMTacGripperBackendConfig
+from teleop_runtime.backends.grippers import (
+    DMTacGripperBackend,
+    DMTacGripperBackendConfig,
+)
 from teleop_runtime.configs.dmtac_hardware import load_dmtac_hardware_assignment
+from teleop_runtime.real_teleop.camera_runtime import (
+    CAMERA_STARTUP_OPERATION_TIMEOUT_SEC,
+    _close_camera_sources,
+    _start_camera_sources_best_effort,
+)
 from teleop_runtime.sources.camera.realsense_rgb import (
     RealSenseRGBSource,
     _load_pyrealsense2,
@@ -127,7 +138,7 @@ def _camera_profiles() -> dict[str, Any]:
                             str(profile.format()),
                         )
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001,S112 - skip malformed native profiles.
                     continue
         result[serial] = {
             "name": name,
@@ -144,9 +155,95 @@ def _camera_profiles() -> dict[str, Any]:
     return result
 
 
-def main() -> int:
+def _camera_profiles_worker(connection: Any) -> None:
+    try:
+        connection.send(("ok", _camera_profiles()))
+    except BaseException as exc:  # noqa: BLE001 - report child failure to parent.
+        try:
+            connection.send(("error", f"{type(exc).__name__}: {exc}"))
+        except BaseException:  # noqa: BLE001
+            return
+    finally:
+        connection.close()
+
+
+def _camera_profiles_bounded(*, timeout_sec: float) -> dict[str, Any]:
+    """Enumerate profiles outside the probe process's native SDK state.
+
+    ``context.query_devices`` has no Python timeout and can block in the USB
+    driver. A short-lived spawned worker keeps that wait from holding the
+    health probe's main process or its later camera lifecycle locks.
+    """
+
+    normalized_timeout_sec = float(timeout_sec)
+    if not math.isfinite(normalized_timeout_sec) or normalized_timeout_sec < 0.0:
+        raise ValueError("timeout_sec must be finite and >= 0.")
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_camera_profiles_worker,
+        args=(child_connection,),
+        name="realsense_camera_profiles",
+        daemon=True,
+    )
+    process_started = False
+    try:
+        process.start()
+        process_started = True
+    except BaseException:
+        parent_connection.close()
+        raise
+    finally:
+        child_connection.close()
+    try:
+        process.join(timeout=normalized_timeout_sec)
+        if process.is_alive():
+            raise TimeoutError(
+                "camera profile enumeration exceeded "
+                f"{normalized_timeout_sec:.3f}s; child native SDK termination "
+                "was requested"
+            )
+        if not parent_connection.poll():
+            raise RuntimeError(
+                "camera profile enumeration worker exited without a result "
+                f"(exitcode={process.exitcode})"
+            )
+        status, payload = parent_connection.recv()
+        if status == "error":
+            raise RuntimeError(str(payload))
+        if status != "ok" or not isinstance(payload, dict):
+            raise RuntimeError("camera profile enumeration returned an invalid result")
+        return payload
+    finally:
+        parent_connection.close()
+        if process_started:
+            try:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=min(1.0, max(0.1, normalized_timeout_sec)))
+                    if process.is_alive() and hasattr(process, "kill"):
+                        process.kill()
+                        process.join(timeout=0.1)
+                if not process.is_alive():
+                    process.close()
+            except BaseException:  # noqa: BLE001
+                # The parent is already on a bounded failure path; do not let
+                # best-effort child cleanup hide the original result.
+                process_started = False
+
+
+def _run_probe() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duration", type=float, default=6.0)
+    parser.add_argument(
+        "--camera-operation-timeout-sec",
+        type=float,
+        default=CAMERA_STARTUP_OPERATION_TIMEOUT_SEC,
+        help=(
+            "Bound each native camera/profile operation; a timeout fails closed "
+            "without an immediate retry or hardware reset."
+        ),
+    )
     parser.add_argument(
         "--soak-sec",
         type=float,
@@ -175,7 +272,15 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.list_camera_profiles:
-        print(json.dumps(_camera_profiles(), ensure_ascii=False, sort_keys=True))
+        print(
+            json.dumps(
+                _camera_profiles_bounded(
+                    timeout_sec=float(args.camera_operation_timeout_sec)
+                ),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
         return 0
 
     camera_configs = load_realsense_camera_config_map(
@@ -239,8 +344,19 @@ def main() -> int:
 
     summary: dict[str, Any] = {"camera": {}, "tactile": {}, "recovery": {}}
     try:
-        for source in cameras.values():
-            source.start()
+        camera_startup_errors = _start_camera_sources_best_effort(
+            cameras,
+            startup_timeout_sec=float(args.camera_operation_timeout_sec),
+        )
+        if camera_startup_errors:
+            detail = "; ".join(
+                f"{camera_key}={camera_startup_errors[camera_key]}"
+                for camera_key in sorted(camera_startup_errors)
+            )
+            raise RuntimeError(
+                "RealSense camera startup failed after the guarded serial "
+                f"lifecycle: {detail}"
+            )
         for backend in tactile.values():
             backend.start()
 
@@ -384,8 +500,22 @@ def main() -> int:
     finally:
         for backend in tactile.values():
             backend.close()
-        for source in cameras.values():
-            source.close()
+        _close_camera_sources(cameras)
+
+
+def main() -> int:
+    """Run the probe while converting SIGTERM into a finally-safe interrupt."""
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def raise_interrupt(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    signal.signal(signal.SIGTERM, raise_interrupt)
+    try:
+        return _run_probe()
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

@@ -337,13 +337,45 @@ class RealSenseRGBSource(ObservationSource):
         with self._lock:
             return dict(self._startup_timing)
 
+    def mark_startup_timeout(self, timeout_sec: float) -> None:
+        """Fault a startup worker without waiting for a native SDK call.
+
+        ``pipeline.start`` can enter an uninterruptible kernel USB wait.  The
+        caller that owns the batch startup therefore needs a non-blocking
+        containment seam: request shutdown, invalidate the startup generation,
+        and leave native cleanup to the worker if/when the SDK call returns.
+        This method deliberately does not acquire ``_lifecycle_lock`` or call
+        into librealsense.
+        """
+
+        normalized_timeout_sec = float(timeout_sec)
+        if not math.isfinite(normalized_timeout_sec) or normalized_timeout_sec < 0.0:
+            raise ValueError("timeout_sec must be finite and >= 0.")
+        message = (
+            "startup_operation_timeout:"
+            f">{normalized_timeout_sec:.3f}s;"
+            "native_sdk_worker_not_joined"
+        )
+        self._mark_faulted(message)
+
+    def _mark_faulted(self, message: str) -> None:
+        with self._lock:
+            self._running = False
+            self._lifecycle_state = _LIFECYCLE_FAULTED
+            self._generation += 1
+            if self._last_error is None:
+                self._last_error = str(message)
+            self._last_runtime_error = str(message)
+            shutdown_event = self._shutdown_event
+        shutdown_event.set()
+
     def expected_channel_names(self) -> tuple[str, ...]:
         return ()
 
     def get_latest_channels(self) -> dict[str, ObservationChannel]:
         return {}
 
-    def start(self) -> None:
+    def start(self, *, startup_software_retry_attempts: int | None = None) -> None:
         with self._lifecycle_lock:
             with self._lock:
                 if self._running and self._lifecycle_state == _LIFECYCLE_RUNNING:
@@ -376,7 +408,20 @@ class RealSenseRGBSource(ObservationSource):
                     self._depth_align = None
                 with _REALSENSE_SDK_LIFECYCLE_LOCK:
                     self._stop_pipeline_quietly(leftover_pipeline)
-                    pipeline, profile = self._start_pipeline(rs)
+                    if startup_software_retry_attempts is None:
+                        pipeline, profile = self._start_pipeline(rs)
+                    else:
+                        pipeline, profile = self._start_pipeline(
+                            rs,
+                            software_retry_attempts=startup_software_retry_attempts,
+                        )
+                if not self._is_startup_generation_active(
+                    generation,
+                    shutdown_event,
+                ):
+                    self._stop_pipeline_quietly(pipeline)
+                    pipeline = None
+                    raise RuntimeError("startup_cancelled:shutdown_requested")
                 device_info = self._device_info_from_profile(profile)
                 with self._pipeline_lock:
                     self._pipeline = pipeline
@@ -420,7 +465,8 @@ class RealSenseRGBSource(ObservationSource):
                 shutdown_event.set()
                 with self._lock:
                     self._running = False
-                    self._lifecycle_state = _LIFECYCLE_STOPPED
+                    if self._lifecycle_state != _LIFECYCLE_FAULTED:
+                        self._lifecycle_state = _LIFECYCLE_STOPPED
                 with self._pipeline_lock:
                     installed_pipeline = self._pipeline
                     self._pipeline = None
@@ -448,9 +494,34 @@ class RealSenseRGBSource(ObservationSource):
                 and int(generation) == int(self._generation)
             )
 
-    def _start_pipeline(self, rs: Any) -> tuple[Any, Any]:
+    def _is_startup_generation_active(
+        self,
+        generation: int,
+        shutdown_event: threading.Event,
+    ) -> bool:
+        if shutdown_event.is_set():
+            return False
+        with self._lock:
+            return bool(
+                self._lifecycle_state == _LIFECYCLE_STARTING
+                and int(generation) == int(self._generation)
+            )
+
+    def _start_pipeline(
+        self,
+        rs: Any,
+        *,
+        software_retry_attempts: int | None = None,
+    ) -> tuple[Any, Any]:
         self._hardware_reset_device_if_requested(rs, reason="configured_startup_reset")
-        software_retries_remaining = int(self.config.startup_software_retry_attempts)
+        if software_retry_attempts is None:
+            software_retries_remaining = int(
+                self.config.startup_software_retry_attempts
+            )
+        else:
+            software_retries_remaining = int(software_retry_attempts)
+            if software_retries_remaining < 0:
+                raise ValueError("software_retry_attempts must be >= 0.")
         hardware_reset_retries_remaining = (
             int(self.config.startup_hardware_reset_retry_attempts)
             if bool(self.config.startup_hardware_reset_on_failure)
@@ -585,6 +656,51 @@ class RealSenseRGBSource(ObservationSource):
             pipeline.stop()
         except Exception:  # noqa: BLE001
             pass
+
+    @staticmethod
+    def _stop_pipeline_bounded(
+        pipeline: Any | None,
+        *,
+        timeout_sec: float,
+    ) -> BaseException | None:
+        """Attempt native stop without allowing teardown to block forever.
+
+        The stop worker is daemonized because Python cannot interrupt a native
+        SDK call that is already blocked in the kernel.  A timeout is reported
+        as a lifecycle failure and the source is left faulted; a later explicit
+        rebuild can then deal with the still-running native worker.
+        """
+
+        if pipeline is None:
+            return None
+        normalized_timeout_sec = float(timeout_sec)
+        if not math.isfinite(normalized_timeout_sec) or normalized_timeout_sec < 0.0:
+            raise ValueError("timeout_sec must be finite and >= 0.")
+        errors: list[BaseException] = []
+
+        def stop_native() -> None:
+            try:
+                with _REALSENSE_SDK_LIFECYCLE_LOCK:
+                    pipeline.stop()
+            except BaseException as exc:  # noqa: BLE001 - preserve teardown evidence.
+                errors.append(exc)
+
+        worker = threading.Thread(
+            target=stop_native,
+            name="realsense_pipeline_stop",
+            daemon=True,
+        )
+        try:
+            worker.start()
+            worker.join(timeout=normalized_timeout_sec)
+        except BaseException as exc:  # noqa: BLE001 - report startup teardown failure.
+            return exc
+        if worker.is_alive():
+            return TimeoutError(
+                "native RealSense pipeline.stop did not finish within "
+                f"{normalized_timeout_sec:.3f}s"
+            )
+        return errors[0] if errors else None
 
     def _warmup_pipeline(self, pipeline: Any) -> None:
         warmup_frames = int(self.config.startup_warmup_frames)
@@ -1504,62 +1620,92 @@ class RealSenseRGBSource(ObservationSource):
         return info
 
     def close(self) -> None:
-        with self._lifecycle_lock:
-            failures: list[LifecycleFailure] = []
-            with self._lock:
-                self._running = False
-                self._lifecycle_state = _LIFECYCLE_STOPPING
-                self._generation += 1
-                shutdown_event = self._shutdown_event
-                shutdown_event.set()
-            with self._pipeline_lock:
-                pipeline = self._pipeline
-                self._pipeline = None
-                self._profile = None
-                self._depth_align = None
-            self._active_color_format = self.config.color_format
-            if pipeline is not None:
-                try:
-                    with _REALSENSE_SDK_LIFECYCLE_LOCK:
-                        pipeline.stop()
-                except Exception as exc:  # noqa: BLE001
-                    with self._lock:
-                        self._last_runtime_error = (
-                            f"pipeline_stop_failed:{type(exc).__name__}:{exc}"
-                        )
+        if not self._lifecycle_lock.acquire(blocking=False):
+            message = (
+                f"{self.name} close could not acquire its lifecycle lock; "
+                "a native startup operation may still be blocked"
+            )
+            self._mark_faulted("close_lifecycle_lock_unavailable:" + message)
+            raise_lifecycle_failures(
+                f"{self.name}.close",
+                (
+                    LifecycleFailure(
+                        label="lifecycle_lock",
+                        error=RuntimeError(message),
+                    ),
+                ),
+            )
+            return
+        try:
+            self._close_locked()
+        finally:
+            self._lifecycle_lock.release()
+
+    def _close_locked(self) -> None:
+        failures: list[LifecycleFailure] = []
+        with self._lock:
+            self._running = False
+            self._lifecycle_state = _LIFECYCLE_STOPPING
+            self._generation += 1
+            shutdown_event = self._shutdown_event
+            shutdown_event.set()
+        with self._pipeline_lock:
+            pipeline = self._pipeline
+            self._pipeline = None
+            self._profile = None
+            self._depth_align = None
+        self._active_color_format = self.config.color_format
+        if pipeline is not None:
+            try:
+                join_timeout_sec = max(
+                    1.5,
+                    float(self.config.wait_timeout_ms) / 1000.0 + 0.5,
+                )
+                stop_error = self._stop_pipeline_bounded(
+                    pipeline,
+                    timeout_sec=join_timeout_sec,
+                )
+            except BaseException as exc:  # noqa: BLE001 - preserve teardown evidence.
+                stop_error = exc
+            if stop_error is not None:
+                with self._lock:
+                    self._last_runtime_error = (
+                        f"pipeline_stop_failed:{type(stop_error).__name__}:{stop_error}"
+                    )
+                    if self._last_error is None:
                         self._last_error = self._last_runtime_error
-                    failures.append(
-                        LifecycleFailure(label="pipeline.stop", error=exc)
+                failures.append(
+                    LifecycleFailure(label="pipeline.stop", error=stop_error)
+                )
+        worker = self._thread
+        worker_alive = False
+        if worker is not None:
+            try:
+                join_timeout_sec = max(
+                    1.5,
+                    float(self.config.wait_timeout_ms) / 1000.0 + 0.5,
+                )
+                worker.join(timeout=join_timeout_sec)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(
+                    LifecycleFailure(label=f"worker[{worker.name}].join", error=exc)
+                )
+            worker_alive = bool(worker.is_alive())
+            if worker_alive:
+                failures.append(
+                    LifecycleFailure(
+                        label=f"worker[{worker.name}].join_timeout",
+                        error=RuntimeError(
+                            f"{self.name} worker did not stop within "
+                            f"{join_timeout_sec:.3f}s"
+                        ),
                     )
-            worker = self._thread
-            worker_alive = False
-            if worker is not None:
-                try:
-                    join_timeout_sec = max(
-                        1.5,
-                        float(self.config.wait_timeout_ms) / 1000.0 + 0.5,
-                    )
-                    worker.join(timeout=join_timeout_sec)
-                except BaseException as exc:  # noqa: BLE001
-                    failures.append(
-                        LifecycleFailure(label=f"worker[{worker.name}].join", error=exc)
-                    )
-                worker_alive = bool(worker.is_alive())
-                if worker_alive:
-                    failures.append(
-                        LifecycleFailure(
-                            label=f"worker[{worker.name}].join_timeout",
-                            error=RuntimeError(
-                                f"{self.name} worker did not stop within "
-                                f"{join_timeout_sec:.3f}s"
-                            ),
-                        )
-                    )
-                else:
-                    self._thread = None
-            with self._lock:
-                if worker_alive or failures:
-                    self._lifecycle_state = _LIFECYCLE_FAULTED
-                else:
-                    self._lifecycle_state = _LIFECYCLE_STOPPED
-            raise_lifecycle_failures(f"{self.name}.close", failures)
+                )
+            else:
+                self._thread = None
+        with self._lock:
+            if worker_alive or failures:
+                self._lifecycle_state = _LIFECYCLE_FAULTED
+            else:
+                self._lifecycle_state = _LIFECYCLE_STOPPED
+        raise_lifecycle_failures(f"{self.name}.close", failures)

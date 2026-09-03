@@ -15,6 +15,9 @@ from ..real_teleop.camera_runtime import (
     CAMERA_START_STAGGER_SEC as REAL_TELEOP_CAMERA_START_STAGGER_SEC,
 )
 from ..real_teleop.camera_runtime import (
+    CAMERA_STARTUP_OPERATION_TIMEOUT_SEC as REAL_TELEOP_CAMERA_STARTUP_OPERATION_TIMEOUT_SEC,
+)
+from ..real_teleop.camera_runtime import (
     CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES,
     CAMERA_STARTUP_SELF_CHECK_DURATION_SEC,
     CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC,
@@ -158,12 +161,14 @@ def start_camera_sources(
     camera_sources: Mapping[str, RealSenseRGBSource],
     *,
     stagger_sec: float = REAL_TELEOP_CAMERA_START_STAGGER_SEC,
+    startup_timeout_sec: float = REAL_TELEOP_CAMERA_STARTUP_OPERATION_TIMEOUT_SEC,
 ) -> None:
     """Use the formal real-teleop collection camera startup lifecycle."""
 
     errors = _start_real_teleop_camera_sources_best_effort(
         camera_sources,
         stagger_sec=float(stagger_sec),
+        startup_timeout_sec=float(startup_timeout_sec),
     )
     if errors:
         detail = "; ".join(
@@ -248,6 +253,7 @@ def select_preview_camera_sources(
 __all__ = [
     "DEFAULT_DEPLOYMENT_CAMERA_FRAME_MAX_AGE_SEC",
     "DEFAULT_DEPLOYMENT_CAMERA_KEEP_LAST",
+    "REAL_TELEOP_CAMERA_STARTUP_OPERATION_TIMEOUT_SEC",
     "REAL_TELEOP_CAMERA_START_STAGGER_SEC",
     "build_camera_sources",
     "close_camera_sources",

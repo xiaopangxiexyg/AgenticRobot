@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import math
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from itertools import count
 from pathlib import Path
 from typing import Protocol
 
 from hardware.realsense.color import normalize_color_format
 from robot_motion.runtime import run_best_effort_cleanup
 
-from ..log_utils import log_event as _log
 from ..collection.sample_assembler import DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
+from ..log_utils import log_event as _log
 from ..sources.camera import (
     REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
     REALSENSE_STARTUP_WARMUP_POLICIES,
@@ -27,13 +30,19 @@ from .wrist_depth_freshness import (
     WRIST_DEPTH_CAMERA_KEYS,
 )
 
-
 CAMERA_START_STAGGER_SEC = 0.5
 CAMERA_DEFERRED_RETRY_COOLDOWN_SEC = 1.0
+# A native librealsense start can block below Python (for example while USB
+# xHCI is waiting for a device response). Keep the batch caller bounded while
+# preserving the historical synchronous API for non-RealSense sources.
+CAMERA_STARTUP_OPERATION_TIMEOUT_SEC = 15.0
 CAMERA_STARTUP_SELF_CHECK_DURATION_SEC = 3.0
 CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC = 0.2
 CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES = 3
 CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC = DEFAULT_CAMERA_FRAME_MAX_AGE_SEC
+
+_CAMERA_STARTUP_SEQUENCE = count()
+_CAMERA_STARTUP_SEQUENCE_ATTR = "_real_teleop_startup_sequence"
 
 
 class CameraStartupProgress(Protocol):
@@ -404,12 +413,101 @@ def _select_preview_camera_sources(
         return {key: camera_sources[key]}
 
 
+def _reset_camera_startup_sequences(
+    camera_sources: Mapping[str, object],
+) -> None:
+    for source in camera_sources.values():
+        try:
+            setattr(source, _CAMERA_STARTUP_SEQUENCE_ATTR, None)
+        except (AttributeError, TypeError):
+            # A read-only test double or proxy does not affect startup itself.
+            continue
+
+
+def _record_camera_start_attempt(source: object) -> None:
+    try:
+        setattr(source, _CAMERA_STARTUP_SEQUENCE_ATTR, next(_CAMERA_STARTUP_SEQUENCE))
+    except (AttributeError, TypeError):
+        # Ordering is an observability aid; failure to annotate a source must
+        # never change whether the source is admitted.
+        return
+
+
+def _start_camera_source_with_containment(
+    source: object,
+    *,
+    timeout_sec: float = CAMERA_STARTUP_OPERATION_TIMEOUT_SEC,
+    software_retry_attempts: int | None = 0,
+) -> None:
+    """Start one RealSense source with a bounded Python-side wait.
+
+    librealsense does not expose a cancellable timeout for every native start
+    edge. Running only the RealSense start call in a daemon worker allows the
+    batch owner to fail closed instead of being held behind a kernel USB wait.
+    Non-RealSense sources retain their historical direct call semantics.
+    """
+
+    if not isinstance(source, RealSenseRGBSource):
+        _record_camera_start_attempt(source)
+        source.start()
+        return
+    normalized_timeout_sec = float(timeout_sec)
+    if not math.isfinite(normalized_timeout_sec) or normalized_timeout_sec < 0.0:
+        raise ValueError("timeout_sec must be finite and >= 0.")
+    errors: list[BaseException] = []
+    start_method_is_base = (
+        getattr(source.start, "__func__", source.start) is RealSenseRGBSource.start
+    )
+    pipeline_method_is_base = (
+        getattr(source._start_pipeline, "__func__", source._start_pipeline)
+        is RealSenseRGBSource._start_pipeline
+    )
+
+    def start_native() -> None:
+        try:
+            # The formal multi-camera caller owns the single deferred retry.
+            # Keep direct RealSenseRGBSource.start() callers compatible with
+            # their configured software retry budget.
+            if (
+                start_method_is_base
+                and pipeline_method_is_base
+                and software_retry_attempts is not None
+            ):
+                source.start(
+                    startup_software_retry_attempts=software_retry_attempts
+                )
+            else:
+                source.start()
+        except BaseException as exc:  # noqa: BLE001 - preserve source failure type.
+            errors.append(exc)
+
+    worker = threading.Thread(
+        target=start_native,
+        name=f"{source.name}_startup",
+        daemon=True,
+    )
+    _record_camera_start_attempt(source)
+    worker.start()
+    worker.join(timeout=normalized_timeout_sec)
+    if worker.is_alive():
+        source.mark_startup_timeout(normalized_timeout_sec)
+        raise TimeoutError(
+            f"{source.name} startup exceeded {normalized_timeout_sec:.3f}s; "
+            "native SDK worker remains blocked; no immediate retry/close was "
+            "attempted"
+        )
+    if errors:
+        raise errors[0]
+
+
 def _start_camera_sources(
     camera_sources: Mapping[str, RealSenseRGBSource],
     *,
     stagger_sec: float = CAMERA_START_STAGGER_SEC,
     startup_progress: CameraStartupProgress | None = None,
+    startup_timeout_sec: float = CAMERA_STARTUP_OPERATION_TIMEOUT_SEC,
 ) -> None:
+    _reset_camera_startup_sequences(camera_sources)
     batch_started = time.perf_counter()
     source_elapsed_sec: dict[str, float] = {}
     stagger_elapsed_sec = 0.0
@@ -429,7 +527,11 @@ def _start_camera_sources(
                 requirement="required_for_collection",
             )
         if index > 0 and float(stagger_sec) > 0.0:
-            _log("Camera", f"waiting {float(stagger_sec):.2f}s before starting camera {camera_key}")
+            _log(
+                "Camera",
+                f"waiting {float(stagger_sec):.2f}s before starting camera "
+                f"{camera_key}",
+            )
             stagger_started = time.perf_counter()
             time.sleep(float(stagger_sec))
             stagger_elapsed_sec += time.perf_counter() - stagger_started
@@ -438,7 +540,11 @@ def _start_camera_sources(
         _log("Camera", f"starting camera {camera_key}")
         start_started = time.perf_counter()
         try:
-            source.start()
+            _start_camera_source_with_containment(
+                source,
+                timeout_sec=startup_timeout_sec,
+                software_retry_attempts=None,
+            )
         except Exception as exc:
             source_elapsed_sec[str(camera_key)] = time.perf_counter() - start_started
             if startup_progress is not None:
@@ -477,6 +583,7 @@ def _start_camera_sources_best_effort(
     stagger_sec: float = CAMERA_START_STAGGER_SEC,
     deferred_retry_cooldown_sec: float = CAMERA_DEFERRED_RETRY_COOLDOWN_SEC,
     startup_progress: CameraStartupProgress | None = None,
+    startup_timeout_sec: float = CAMERA_STARTUP_OPERATION_TIMEOUT_SEC,
 ) -> dict[str, str]:
     """Attempt every camera, then retry bounded first-frame failures once.
 
@@ -484,8 +591,11 @@ def _start_camera_sources_best_effort(
     is retried only after the other configured cameras have completed their
     first startup attempt and a short cooldown has elapsed.  This mirrors the
     successful manual reconnect timing without parallel pipeline negotiation
-    or a USB hardware reset.
+    or a USB hardware reset. A native startup timeout is terminal for the
+    batch: the blocked source is faulted, remaining sources are not opened,
+    and no immediate ``close``/retry is attempted on that source.
     """
+    _reset_camera_startup_sequences(camera_sources)
     errors: dict[str, str] = {}
     first_pass_errors: dict[str, str] = {}
     batch_started = time.perf_counter()
@@ -494,8 +604,26 @@ def _start_camera_sources_best_effort(
     stagger_elapsed_sec = 0.0
     startup_items = _camera_startup_items(camera_sources)
     _log("Camera", f"serial startup order={[key for key, _ in startup_items]}")
+    startup_aborted_after_timeout: str | None = None
     for index, (camera_key, source) in enumerate(startup_items):
         progress_key = f"camera.{camera_key}"
+        if startup_aborted_after_timeout is not None:
+            detail = (
+                "startup_aborted_after_timeout:"
+                f"camera={startup_aborted_after_timeout}"
+            )
+            errors[str(camera_key)] = detail
+            first_pass_errors[str(camera_key)] = detail
+            if startup_progress is not None:
+                startup_progress.begin(
+                    progress_key,
+                    label=f"相机 {camera_key}",
+                    message="因前一相机启动超时而停止尝试",
+                    requirement="required_for_collection",
+                )
+                startup_progress.fail(progress_key, detail)
+            _log("Camera", f"WARNING: camera {camera_key} not attempted: {detail}")
+            continue
         if startup_progress is not None:
             startup_progress.begin(
                 progress_key,
@@ -508,7 +636,11 @@ def _start_camera_sources_best_effort(
                 requirement="required_for_collection",
             )
         if index > 0 and float(stagger_sec) > 0.0:
-            _log("Camera", f"waiting {float(stagger_sec):.2f}s before starting camera {camera_key}")
+            _log(
+                "Camera",
+                f"waiting {float(stagger_sec):.2f}s before starting camera "
+                f"{camera_key}",
+            )
             stagger_started = time.perf_counter()
             time.sleep(float(stagger_sec))
             stagger_elapsed_sec += time.perf_counter() - stagger_started
@@ -517,13 +649,23 @@ def _start_camera_sources_best_effort(
         _log("Camera", f"starting camera {camera_key}")
         start_started = time.perf_counter()
         try:
-            source.start()
+            _start_camera_source_with_containment(
+                source,
+                timeout_sec=startup_timeout_sec,
+            )
         except Exception as exc:  # noqa: BLE001 - optional-device admission records failure.
             source_elapsed_sec[str(camera_key)] = time.perf_counter() - start_started
             detail = f"{type(exc).__name__}: {exc}"
             errors[str(camera_key)] = detail
             first_pass_errors[str(camera_key)] = detail
             _log("Camera", f"WARNING: camera {camera_key} unavailable: {detail}")
+            if isinstance(exc, TimeoutError):
+                startup_aborted_after_timeout = str(camera_key)
+                _log(
+                    "Camera",
+                    "native startup timeout is terminal for this serial batch; "
+                    "remaining cameras will not be opened or retried",
+                )
             if startup_progress is not None:
                 if _is_bounded_first_frame_startup_failure(source, detail):
                     startup_progress.update(
@@ -544,15 +686,24 @@ def _start_camera_sources_best_effort(
             if startup_progress is not None:
                 startup_progress.succeed(progress_key, message="视频流已启动")
 
-    deferred_retry_keys = [
-        str(camera_key)
-        for camera_key, source in startup_items
-        if str(camera_key) in errors
-        and _is_bounded_first_frame_startup_failure(
-            source,
-            first_pass_errors[str(camera_key)],
-        )
-    ]
+    # A timed-out native start may still own librealsense's process-wide
+    # lifecycle lock inside its daemon worker. Do not let an earlier
+    # first-frame failure queue a second start against that potentially wedged
+    # SDK state; the batch remains fail-closed and its caller can rebuild the
+    # process after the failed attempt is recorded.
+    deferred_retry_keys = (
+        []
+        if startup_aborted_after_timeout is not None
+        else [
+            str(camera_key)
+            for camera_key, source in startup_items
+            if str(camera_key) in errors
+            and _is_bounded_first_frame_startup_failure(
+                source,
+                first_pass_errors[str(camera_key)],
+            )
+        ]
+    )
     retry_cooldown_elapsed_sec = 0.0
     recovered_keys: list[str] = []
     if deferred_retry_keys:
@@ -566,9 +717,23 @@ def _start_camera_sources_best_effort(
             cooldown_started = time.perf_counter()
             time.sleep(cooldown_sec)
             retry_cooldown_elapsed_sec = time.perf_counter() - cooldown_started
+        retry_aborted_after_timeout: str | None = None
         for camera_key in deferred_retry_keys:
             source = camera_sources[camera_key]
             progress_key = f"camera.{camera_key}"
+            if retry_aborted_after_timeout is not None:
+                errors[camera_key] = (
+                    "deferred_startup_retry_aborted_after_timeout:"
+                    f"camera={retry_aborted_after_timeout}"
+                )
+                if startup_progress is not None:
+                    startup_progress.fail(progress_key, errors[camera_key])
+                _log(
+                    "Camera",
+                    f"WARNING: camera {camera_key} deferred retry not attempted: "
+                    f"{errors[camera_key]}",
+                )
+                continue
             if startup_progress is not None:
                 startup_progress.update(
                     progress_key,
@@ -581,7 +746,10 @@ def _start_camera_sources_best_effort(
                 # also makes this robust to a source implementation that
                 # retained partial state before raising.
                 source.close()
-                source.start()
+                _start_camera_source_with_containment(
+                    source,
+                    timeout_sec=startup_timeout_sec,
+                )
             except Exception as exc:  # noqa: BLE001 - preserve GUI/device admission.
                 retry_elapsed_sec[camera_key] = time.perf_counter() - retry_started
                 retry_detail = f"{type(exc).__name__}: {exc}"
@@ -589,6 +757,12 @@ def _start_camera_sources_best_effort(
                     "deferred_startup_retry_failed:"
                     f"first={first_pass_errors[camera_key]};retry={retry_detail}"
                 )
+                if isinstance(exc, TimeoutError):
+                    retry_aborted_after_timeout = camera_key
+                    errors[camera_key] = (
+                        "deferred_startup_retry_timeout:"
+                        f"first={first_pass_errors[camera_key]};retry={retry_detail}"
+                    )
                 _log(
                     "Camera",
                     f"WARNING: camera {camera_key} deferred retry unavailable: "
@@ -658,27 +832,46 @@ def _log_camera_startup_batch_timing(
 
 
 def _close_camera_sources(camera_sources: Mapping[str, RealSenseRGBSource]) -> None:
+    declaration_items = tuple(camera_sources.items())
+
+    def close_order(
+        item: tuple[int, tuple[str, RealSenseRGBSource]],
+    ) -> tuple[bool, int, int]:
+        declaration_index, (_, source) = item
+        sequence = getattr(source, _CAMERA_STARTUP_SEQUENCE_ATTR, None)
+        return (
+            sequence is not None,
+            int(sequence) if sequence is not None else -1,
+            declaration_index,
+        )
+
+    ordered_items = sorted(
+        enumerate(declaration_items),
+        key=close_order,
+        reverse=True,
+    )
     run_best_effort_cleanup(
         "real_teleop.camera_sources.close",
         (
             (f"camera[{camera_key}]", source.close)
-            for camera_key, source in reversed(tuple(camera_sources.items()))
+            for _, (camera_key, source) in ordered_items
         ),
     )
 
 __all__ = [
     "CAMERA_DEFERRED_RETRY_COOLDOWN_SEC",
-    "CAMERA_START_STAGGER_SEC",
+    "CAMERA_STARTUP_OPERATION_TIMEOUT_SEC",
     "CAMERA_STARTUP_SELF_CHECK_CONSECUTIVE_FRESH_SAMPLES",
     "CAMERA_STARTUP_SELF_CHECK_DURATION_SEC",
     "CAMERA_STARTUP_SELF_CHECK_FRESH_FRAME_MAX_AGE_SEC",
     "CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC",
+    "CAMERA_START_STAGGER_SEC",
     "CameraStartupFreshnessGate",
-    "apply_real_teleop_camera_startup_defaults",
-    "_camera_startup_items",
     "_build_camera_sources",
+    "_camera_startup_items",
     "_close_camera_sources",
     "_select_preview_camera_sources",
     "_start_camera_sources",
     "_start_camera_sources_best_effort",
+    "apply_real_teleop_camera_startup_defaults",
 ]

@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from teleop_runtime.real_teleop import camera_runtime
 from teleop_runtime.sources.camera import realsense_rgb
 from teleop_runtime.sources.camera.realsense_rgb import (
     REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
@@ -593,6 +594,25 @@ def test_realsense_software_startup_retry_sleep_honours_shutdown() -> None:
     assert len(fake_rs.pipelines) == 1
 
 
+def test_realsense_startup_retry_override_can_disable_configured_retries() -> None:
+    fake_rs = _FakeRealSense()
+    fake_rs.start_errors = [RuntimeError("Device or resource busy")]
+    source = RealSenseRGBSource(
+        RealSenseRGBCameraConfig(
+            serial="FRONT123",
+            startup_reset=False,
+            startup_warmup_frames=0,
+            startup_software_retry_attempts=2,
+            startup_hardware_reset_on_failure=False,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="configured profile was preserved"):
+        source._start_pipeline(fake_rs, software_retry_attempts=0)
+
+    assert len(fake_rs.pipelines) == 1
+
+
 def test_agent_gateway_front_camera_explicitly_allows_reviewed_dark_frames() -> None:
     configs = realsense_rgb.load_realsense_camera_config_map(
         Path("teleop_runtime/configs/devices/agent_gateway_realsense.json")
@@ -897,3 +917,93 @@ def test_realsense_native_start_edges_are_serialized_across_sources() -> None:
     assert max_active_starts == 1
     for source in sources:
         source.close()
+
+
+def test_realsense_close_fails_fast_when_startup_owns_lifecycle_lock() -> None:
+    source = RealSenseRGBSource(RealSenseRGBCameraConfig(serial="SERIAL"))
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with source._lifecycle_lock:
+            lock_acquired.set()
+            release_lock.wait(timeout=2.0)
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert lock_acquired.wait(timeout=1.0)
+    started = time.perf_counter()
+    with pytest.raises(RuntimeError, match="lifecycle_lock"):
+        source.close()
+    assert time.perf_counter() - started < 0.5
+    assert source.device_info()["lifecycle_state"] == "faulted"
+    release_lock.set()
+    holder.join(timeout=1.0)
+    assert not holder.is_alive()
+
+
+def test_real_teleop_camera_start_timeout_faults_without_waiting_for_worker() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class Source(RealSenseRGBSource):
+        def start(self) -> None:
+            started.set()
+            try:
+                release.wait(timeout=2.0)
+            finally:
+                finished.set()
+
+    source = Source(RealSenseRGBCameraConfig(serial="SERIAL"))
+    with pytest.raises(TimeoutError, match="native SDK worker remains blocked"):
+        camera_runtime._start_camera_source_with_containment(
+            source,
+            timeout_sec=0.01,
+        )
+
+    assert started.is_set()
+    assert source.device_info()["lifecycle_state"] == "faulted"
+    release.set()
+    assert finished.wait(timeout=1.0)
+    source.close()
+
+
+def test_real_teleop_camera_timeout_suppresses_deferred_retry() -> None:
+    def source(camera_key: str) -> RealSenseRGBSource:
+        return RealSenseRGBSource(
+            RealSenseRGBCameraConfig(
+                serial=camera_key,
+                camera_key=camera_key,
+                startup_warmup_policy=REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
+            )
+        )
+
+    sources = {
+        "front": source("front"),
+        "left_wrist": source("left_wrist"),
+        "right_wrist": source("right_wrist"),
+    }
+    calls: list[str] = []
+
+    def guarded_start(camera_source: RealSenseRGBSource, **kwargs: object) -> None:
+        del kwargs
+        calls.append(camera_source.camera_key)
+        if camera_source.camera_key == "front":
+            raise RuntimeError(
+                "startup_warmup_failed:policy=bounded_first_frame:no_frames_within_sec=5"
+            )
+        if camera_source.camera_key == "left_wrist":
+            raise TimeoutError("native SDK worker remains blocked")
+
+    with patch.object(camera_runtime, "_start_camera_source_with_containment", guarded_start):
+        errors = camera_runtime._start_camera_sources_best_effort(
+            sources,
+            stagger_sec=0.0,
+            deferred_retry_cooldown_sec=0.0,
+        )
+
+    assert calls == ["front", "left_wrist"]
+    assert set(errors) == {"front", "left_wrist", "right_wrist"}
+    assert "deferred_startup_retry_failed" not in errors["front"]
+    assert errors["right_wrist"].startswith("startup_aborted_after_timeout:")
