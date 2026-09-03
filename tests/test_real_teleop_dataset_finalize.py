@@ -881,6 +881,80 @@ def test_process_finalize_receipts_are_forwarded_only_on_opt_in_result(
     assert task.control_trace_release[0] == "resolved"
 
 
+def test_retryable_native_trace_finalize_is_retried_before_task_is_consumed(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    recorder = _new_recorder(tmp_path, events)
+    receipt = object()
+
+    class _ExternalProcessWriter:
+        native_external_stream_bindings = {
+            "camera.front.selected_rgb": object(),
+        }
+        process_status: dict[str, object] = {}
+
+        def flush(self) -> None:
+            events.append("writer_flush")
+
+        def finalize_episode(self, episode_index: int, *, summary=None):
+            assert episode_index == 12
+            events.append("writer_finalize_episode")
+            return SimpleNamespace(
+                native_stream_artifact_receipts=(receipt,),
+                artifact_receipt_error="",
+            )
+
+    writer = _ExternalProcessWriter()
+    recorder.collection_worker_mode = "process"
+    recorder.process_worker = writer
+    recorder.writer = writer
+    attempts: list[tuple[object, ...]] = []
+
+    class _RetryableTraceSink:
+        def resolve_release(self, released):
+            return released
+
+        def commit_now(self) -> float:
+            return time.time()
+
+        def legacy_finalize_completed(
+            self,
+            _released,
+            *,
+            completed_at: float,
+            native_stream_artifact_receipts,
+        ):
+            assert completed_at > 0.0
+            attempts.append(tuple(native_stream_artifact_receipts))
+            return SimpleNamespace(
+                native_stream_retry_pending=len(attempts) == 1,
+                native_stream_seal_error=(
+                    "transient native seal failure" if len(attempts) == 1 else ""
+                ),
+                capture_commit_publish_receipt=None,
+            )
+
+    recorder.control_trace_episode_sink = _RetryableTraceSink()
+    task = real_teleop.RealDatasetFinalizeTask(
+        episode_index=12,
+        frame_count=1,
+        reason="test",
+        queued_at=time.time(),
+        summary={"collection_integrity_valid": True},
+        control_trace_release=object(),
+    )
+    task.mark_started()
+
+    recorder._run_finalize_task(task)
+
+    assert task.success
+    assert task.control_trace_error == ""
+    assert attempts == [(receipt,), (receipt,)]
+    assert task.stage_timings_ms["control_trace_post_finalize"] >= 0.0
+    assert task.stage_timings_ms["control_trace_post_finalize_retry"] >= 0.0
+
+
 def test_thread_writer_contract_failure_becomes_pauseable_integrity_reason() -> None:
     recorder = real_teleop.RealTeleopDatasetRecorder.__new__(
         real_teleop.RealTeleopDatasetRecorder

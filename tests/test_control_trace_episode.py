@@ -749,7 +749,7 @@ def test_external_native_stream_seals_only_after_legacy_artifact_receipt(
         spool.close()
 
 
-def test_missing_external_receipt_preserves_legacy_finalize_without_v24_commit(
+def test_missing_external_receipt_preserves_capture_for_post_finalize_retry(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(_profile(formal=True))
@@ -779,19 +779,18 @@ def test_missing_external_receipt_preserves_legacy_finalize_without_v24_commit(
             prepared_at=1.0,
         )
         writer = recorder_sink.native_stream_capture(prepared)
-        writer.stage_external_sample(
-            NativeStreamExternalSampleIntent.create(
-                contract=contract,
-                sample_id="q6-missing-0",
-                sequence=0,
-                measured_at=1.1,
-                measured_clock_domain_id="local_monotonic",
-                available_at=1.2,
-                available_clock_domain_id="local_monotonic",
-                source_payload_object_id="shared-slot:q6-missing-0",
-                payload=np.zeros(6, dtype=np.float32),
-            )
+        intent = NativeStreamExternalSampleIntent.create(
+            contract=contract,
+            sample_id="q6-missing-0",
+            sequence=0,
+            measured_at=1.1,
+            measured_clock_domain_id="local_monotonic",
+            available_at=1.2,
+            available_clock_domain_id="local_monotonic",
+            source_payload_object_id="shared-slot:q6-missing-0",
+            payload=np.zeros(6, dtype=np.float32),
         )
+        writer.stage_external_sample(intent)
         recorder_sink.bind_prepared_episode(prepared, bound_at=2.0)
         released = recorder_sink.release_episode(
             prepared,
@@ -807,11 +806,48 @@ def test_missing_external_receipt_preserves_legacy_finalize_without_v24_commit(
         assert finalized.capture_commit_status == "not_eligible"
         assert finalized.message.startswith("native_streams_not_sealed:")
         assert "coverage mismatch" in finalized.native_stream_seal_error
+        assert finalized.native_stream_retry_pending is True
         assert (
             EpisodeCaptureManifestStore(dataset_root).read_commit_payload(
                 prepared.episode_uuid
             )
             is None
+        )
+
+        artifact_bytes = b"late-specialized-writer-artifact"
+        relative_path = "videos/chunk-000/episode_000012.fake"
+        artifact_path = dataset_root / relative_path
+        artifact_path.parent.mkdir(parents=True)
+        artifact_path.write_bytes(artifact_bytes)
+        receipt = NativeStreamExternalArtifactReceipt(
+            episode_uuid=prepared.episode_uuid,
+            legacy_episode_index=prepared.legacy_episode_index,
+            stream_id=contract.stream_id,
+            sample_id=intent.sample_id,
+            payload_content_hash=intent.payload_content_hash,
+            stored_payload_object_id=f"dataset:{relative_path}#frame=0",
+            artifact_relative_path=relative_path,
+            artifact_sha256=hashlib.sha256(artifact_bytes).hexdigest(),
+            artifact_byte_count=len(artifact_bytes),
+            encoding=contract.encoding,
+            compression=contract.compression,
+            durable_at=4.5,
+            durable_clock_domain_id="local_wall_clock",
+        )
+        retried = recorder_sink.legacy_finalize_completed(
+            released,
+            completed_at=5.0,
+            native_stream_artifact_receipts=(receipt,),
+        )
+        assert retried.capture_commit_status == "committed"
+        assert retried.native_stream_manifest_hash is not None
+        assert retried.native_stream_seal_error == ""
+        assert retried.native_stream_retry_pending is False
+        assert (
+            EpisodeCaptureManifestStore(dataset_root).read_commit_payload(
+                prepared.episode_uuid
+            )
+            is not None
         )
     finally:
         health.close()

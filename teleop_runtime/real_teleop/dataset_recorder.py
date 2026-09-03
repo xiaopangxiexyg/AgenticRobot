@@ -2761,6 +2761,46 @@ class RealTeleopDatasetRecorder:
                     "control_trace_post_finalize",
                     complete_control_trace,
                 )
+                # A post-finalize native capture deliberately retains its
+                # exact frozen transaction when sealing fails.  Exercise that
+                # retry ownership here, in the background finalizer that owns
+                # the legacy result and its artifact receipts, instead of
+                # leaving the retryable sink stranded after the task is
+                # consumed by poll_finalize_tasks().
+                if bool(
+                    getattr(
+                        task.control_trace_finalize_report,
+                        "native_stream_retry_pending",
+                        False,
+                    )
+                ):
+                    task.control_trace_finalize_report = run_stage(
+                        "control_trace_post_finalize_retry",
+                        complete_control_trace,
+                    )
+                if bool(
+                    getattr(
+                        task.control_trace_finalize_report,
+                        "native_stream_retry_pending",
+                        False,
+                    )
+                ):
+                    native_retry_error = str(
+                        getattr(
+                            task.control_trace_finalize_report,
+                            "native_stream_seal_error",
+                            "",
+                        )
+                        or "native stream seal remains pending after retry"
+                    )
+                    task.control_trace_error = ";".join(
+                        value
+                        for value in (
+                            task.control_trace_error,
+                            f"post_finalize_retry_pending:{native_retry_error}",
+                        )
+                        if value
+                    )
             except BaseException as trace_exc:  # legacy finalize remains successful
                 post_finalize_error = (
                     f"post_finalize:{type(trace_exc).__name__}: {trace_exc}"
