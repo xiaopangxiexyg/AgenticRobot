@@ -2486,11 +2486,21 @@ def _model_rtc_checkpoint_root(
     training_config = _activate_openpi_checkout(profile)
 
     base = training_config.get_config(str(profile["openpi_base_config"]))
+    configured_root = str(
+        profile.get("openpi_checkpoint_base_dir") or ""
+    ).strip()
+    if configured_root:
+        checkpoint_base_root = Path(configured_root).expanduser()
+        if not checkpoint_base_root.is_absolute():
+            checkpoint_base_root = checkout / checkpoint_base_root
+        checkpoint_base_root = checkpoint_base_root.resolve()
+    else:
+        checkpoint_base_root = _openpi_checkpoint_base_root(base, checkout)
     effective_exp_name = str(
         exp_name or model_rtc_profile["default_exp_name"]
     )
     return (
-        _openpi_checkpoint_base_root(base, checkout)
+        checkpoint_base_root
         / str(model_rtc_profile["output_config_name"])
         / effective_exp_name
     ).resolve()

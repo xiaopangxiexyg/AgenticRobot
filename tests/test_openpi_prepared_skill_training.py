@@ -39,6 +39,7 @@ from deployments.openpi.training.prepared_skill_launch import (
     _load_module,
     _load_checkpoint_bound_prepared_resume,
     _load_profile,
+    _model_rtc_checkpoint_root,
     _openpi_checkpoint_base_root,
     _openpi_checkpoint_dir,
     _openpi_data_assets_root,
@@ -96,6 +97,43 @@ def test_prepared_launcher_binds_camera_prepared_view_opt_in_from_profile(
 
     with pytest.raises(TypeError, match="must be a boolean"):
         _configure_camera_semantic_prepared_view_opt_in("true")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "configured_root", ("external-checkpoints", "/var/tmp/checkpoints")
+)
+def test_model_rtc_checkpoint_root_honors_prepared_profile_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_root: str,
+) -> None:
+    checkout = tmp_path / "openpi"
+    checkout.mkdir()
+    base = _FakeOpenPITrainConfig(checkpoint_base_dir="default-checkpoints")
+    training_config = types.SimpleNamespace(get_config=lambda _name: base)
+    monkeypatch.setattr(
+        "deployments.openpi.training.prepared_skill_launch."
+        "_activate_openpi_checkout",
+        lambda _profile: training_config,
+    )
+    profile = {
+        "openpi_checkout": str(checkout),
+        "openpi_base_config": "fixture",
+        "openpi_checkpoint_base_dir": configured_root,
+    }
+    model_rtc_profile = {
+        "output_config_name": "model-rtc",
+        "default_exp_name": "default-exp",
+    }
+
+    expected_base = Path(configured_root).expanduser()
+    if not expected_base.is_absolute():
+        expected_base = checkout / expected_base
+    assert _model_rtc_checkpoint_root(
+        profile,
+        model_rtc_profile,
+        exp_name="selected-exp",
+    ) == (expected_base / "model-rtc/selected-exp").resolve()
 
 
 def test_successful_skill_projection_survives_later_coarse_abort() -> None:
