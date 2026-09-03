@@ -182,6 +182,31 @@ host-private wrapper：
 经远端 preflight 核验的精确 commit，不能保存移动 branch 名。任一字段缺失时应在创建
 request/exchange 前停止，由 operator provision；不得把站点地址、身份或 key 写入源码。
 
+受保护 Harness 的版本部署使用独立的 `remote_harness_deploy.sh`，不扩大上述运行入口：
+
+```bash
+./remote_harness_deploy.sh \
+  -H user@192.168.70.116 \
+  --root /home/user/zc \
+  --expected-commit FULL_HARNESS_COMMIT \
+  plan
+
+./remote_harness_deploy.sh \
+  -H user@192.168.70.116 \
+  --root /home/user/zc \
+  --expected-commit FULL_HARNESS_COMMIT \
+  --confirm-plan-sha256 FULL_PLAN_SHA256 \
+  install
+```
+
+该入口必须由用户或 deployment owner 对精确 commit 明确授权。它只会从固定的
+`HarnessCodingTool` checkout 获取 `origin/agentic-robot`，验证 canonical identity 和
+精确 commit，然后调用 host-private Harness 完成 plan/install。远端目录布局固定由
+`--root` 推导；不接受任意仓库、branch、命令或安装路径。`install` 会重新 fetch、重新
+验证 commit 和 plan SHA，并核对 `HarnessControl/current` 后输出 control status。
+部署完成后仍应通过 `remote_harness.sh runner preflight --expected-control-commit ...`
+独立确认 runner 实际加载了新版本。
+
 ### 4. 远程访问真机设备
 
 设备访问原则：
@@ -1099,6 +1124,7 @@ Python 跑在远程。
 remote_whoami.sh
 remote_env.sh
 remote_harness.sh
+remote_harness_deploy.sh
 remote_python.sh
 remote_module.sh
 remote_pytest.sh

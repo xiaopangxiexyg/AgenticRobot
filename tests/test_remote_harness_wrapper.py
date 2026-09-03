@@ -4,9 +4,9 @@ import os
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "codex_remote/remote_harness.sh"
+DEPLOY_WRAPPER = ROOT / "codex_remote/remote_harness_deploy.sh"
 
 
 def _write_executable(path: Path, text: str) -> None:
@@ -48,6 +48,10 @@ def _captured(path: Path) -> list[str]:
     return [item.decode() for item in path.read_bytes().split(b"\0") if item]
 
 
+def _captured_lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8").splitlines()
+
+
 def _base(remote_harness: Path) -> list[str]:
     return [
         "bash",
@@ -56,6 +60,113 @@ def _base(remote_harness: Path) -> list[str]:
         "user@192.168.70.116",
         "--harness",
         str(remote_harness),
+    ]
+
+
+def _deployment_environment(
+    tmp_path: Path,
+    *,
+    remote_commit: str = "a" * 40,
+    origin_url: str = "git@github.com:CYBER-QAQ/HarnessCodingTool.git",
+) -> tuple[dict[str, str], Path, Path, Path]:
+    fake_bin = tmp_path / "deploy-bin"
+    fake_bin.mkdir(parents=True)
+    deployment_root = tmp_path / "remote" / "zc"
+    source = deployment_root / "HarnessCodingTool"
+    project = deployment_root / "AgenticRobot"
+    harness = deployment_root / "HarnessConfig" / "bin" / "harness"
+    source.mkdir(parents=True)
+    project.mkdir()
+    capture = tmp_path / "deploy-capture"
+    capture.mkdir()
+
+    _write_executable(
+        fake_bin / "ssh",
+        """#!/usr/bin/env bash
+set -Eeuo pipefail
+exec bash -c "${!#}"
+""",
+    )
+    _write_executable(
+        fake_bin / "git",
+        """#!/usr/bin/env bash
+set -Eeuo pipefail
+while [[ ${1:-} == -c ]]; do shift 2; done
+[[ ${1:-} == -C ]] || exit 90
+repository=$2
+shift 2
+case "${1:-} ${2:-}" in
+  "rev-parse --show-toplevel") printf '%s\n' "$repository" ;;
+  "remote get-url") printf '%s\n' "$FAKE_ORIGIN_URL" ;;
+  "fetch --no-tags") printf '%s\n' "$@" > "$FAKE_DEPLOY_CAPTURE/fetch.bin" ;;
+  "rev-parse --verify") printf '%s\n' "$FAKE_REMOTE_COMMIT" ;;
+  *) printf 'unsupported fake git invocation: %s\n' "$*" >&2; exit 91 ;;
+esac
+""",
+    )
+    _write_executable(
+        harness,
+        """#!/usr/bin/env bash
+set -Eeuo pipefail
+action=""
+install_root=""
+confirm=""
+for ((index=1; index <= $#; index++)); do
+  value=${!index}
+  case "$value" in
+    plan-install|install|status) action=$value ;;
+    --install-root)
+      next=$((index + 1))
+      install_root=${!next}
+      ;;
+    --confirm-plan-sha256)
+      next=$((index + 1))
+      confirm=${!next}
+      ;;
+  esac
+done
+[[ -n "$action" ]] || exit 92
+printf '%s\n' "$@" > "$FAKE_DEPLOY_CAPTURE/$action.bin"
+case "$action" in
+  plan-install)
+    printf '{"action":"INSTALL_READY","commit":"%s","plan_sha256":"%s"}\n' \
+      "$FAKE_REMOTE_COMMIT" "$FAKE_PLAN_SHA256"
+    ;;
+  install)
+    [[ "$confirm" == "$FAKE_PLAN_SHA256" ]] || exit 93
+    mkdir -p "$install_root/versions/$FAKE_REMOTE_COMMIT"
+    ln -s "$install_root/versions/$FAKE_REMOTE_COMMIT" "$install_root/current"
+    printf '{"status":"READY","current_commit":"%s"}\n' "$FAKE_REMOTE_COMMIT"
+    ;;
+  status)
+    printf '{"status":"READY","current_commit":"%s"}\n' "$FAKE_REMOTE_COMMIT"
+    ;;
+esac
+""",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "FAKE_DEPLOY_CAPTURE": str(capture),
+            "FAKE_ORIGIN_URL": origin_url,
+            "FAKE_PLAN_SHA256": "f" * 64,
+            "FAKE_REMOTE_COMMIT": remote_commit,
+        }
+    )
+    return environment, capture, deployment_root, harness
+
+
+def _deploy_base(deployment_root: Path, expected_commit: str) -> list[str]:
+    return [
+        "bash",
+        str(DEPLOY_WRAPPER),
+        "-H",
+        "user@192.168.70.116",
+        "--root",
+        str(deployment_root),
+        "--expected-commit",
+        expected_commit,
     ]
 
 
@@ -294,3 +405,170 @@ def test_remote_wrapper_must_be_regular_executable(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "missing or unsafe" in result.stderr
     assert not capture.exists()
+
+
+def test_deployment_plan_fetches_only_fixed_ref_and_emits_harness_plan(
+    tmp_path: Path,
+) -> None:
+    expected_commit = "a" * 40
+    environment, capture, deployment_root, _ = _deployment_environment(tmp_path)
+
+    result = subprocess.run(
+        [*_deploy_base(deployment_root, expected_commit), "plan"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "protected_branch=agentic-robot" in result.stdout
+    assert f'"plan_sha256":"{"f" * 64}"' in result.stdout
+    assert _captured_lines(capture / "fetch.bin") == [
+        "fetch",
+        "--no-tags",
+        "origin",
+        "refs/heads/agentic-robot:refs/remotes/origin/agentic-robot",
+    ]
+    assert _captured_lines(capture / "plan-install.bin") == [
+        "--project-root",
+        str(deployment_root / "AgenticRobot"),
+        "control",
+        "plan-install",
+        "--install-root",
+        str(deployment_root / "HarnessControl"),
+        "--source-repository",
+        str(deployment_root / "HarnessCodingTool"),
+        "--expected-identity",
+        "CYBER-QAQ/HarnessCodingTool",
+        "--protected-branch",
+        "agentic-robot",
+        "--json",
+    ]
+    assert not (capture / "install.bin").exists()
+
+
+def test_deployment_install_rechecks_plan_and_active_version(tmp_path: Path) -> None:
+    expected_commit = "a" * 40
+    environment, capture, deployment_root, _ = _deployment_environment(tmp_path)
+
+    result = subprocess.run(
+        [
+            *_deploy_base(deployment_root, expected_commit),
+            "--confirm-plan-sha256",
+            "f" * 64,
+            "install",
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"active_protected_commit={expected_commit}" in result.stdout
+    assert _captured_lines(capture / "install.bin")[-5:] == [
+        "--protected-branch",
+        "agentic-robot",
+        "--confirm-plan-sha256",
+        "f" * 64,
+        "--json",
+    ]
+    assert _captured_lines(capture / "status.bin") == [
+        "--project-root",
+        str(deployment_root / "AgenticRobot"),
+        "control",
+        "status",
+        "--install-root",
+        str(deployment_root / "HarnessControl"),
+        "--json",
+    ]
+    assert (deployment_root / "HarnessControl/current").resolve() == (
+        deployment_root / "HarnessControl" / "versions" / expected_commit
+    )
+
+
+def test_deployment_refuses_moving_commit_and_wrong_origin_before_harness(
+    tmp_path: Path,
+) -> None:
+    expected_commit = "a" * 40
+    cases = (
+        ({"remote_commit": "b" * 40}, "differs from expected", True),
+        (
+            {"origin_url": "git@github.com:Example/Unexpected.git"},
+            "source identity mismatch",
+            False,
+        ),
+    )
+    for index, (configuration, expected_error, fetched) in enumerate(cases):
+        case_root = tmp_path / str(index)
+        environment, capture, deployment_root, _ = _deployment_environment(
+            case_root, **configuration
+        )
+        result = subprocess.run(
+            [*_deploy_base(deployment_root, expected_commit), "plan"],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert expected_error in result.stderr
+        assert (capture / "fetch.bin").exists() is fetched
+        assert not (capture / "plan-install.bin").exists()
+
+
+def test_deployment_requires_explicit_safe_target_root_and_hashes(
+    tmp_path: Path,
+) -> None:
+    environment, _, deployment_root, _ = _deployment_environment(tmp_path)
+    expected_commit = "a" * 40
+    cases = (
+        (
+            [
+                "bash",
+                str(DEPLOY_WRAPPER),
+                "--root",
+                str(deployment_root),
+                "--expected-commit",
+                expected_commit,
+                "plan",
+            ],
+            "missing -H/--host",
+        ),
+        (
+            [*_deploy_base(Path("relative"), expected_commit), "plan"],
+            "absolute path",
+        ),
+        (
+            [*_deploy_base(Path(f"{deployment_root}/../escape"), expected_commit), "plan"],
+            "unsafe --root",
+        ),
+        (
+            [*_deploy_base(deployment_root, "A" * 40), "plan"],
+            "full lowercase Git SHA",
+        ),
+        (
+            [*_deploy_base(deployment_root, expected_commit), "install"],
+            "requires a full lowercase --confirm-plan-sha256",
+        ),
+        (
+            [
+                *_deploy_base(deployment_root, expected_commit),
+                "--confirm-plan-sha256",
+                "f" * 64,
+                "plan",
+            ],
+            "plan does not accept",
+        ),
+    )
+    for command, expected_error in cases:
+        result = subprocess.run(
+            command,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert expected_error in result.stderr

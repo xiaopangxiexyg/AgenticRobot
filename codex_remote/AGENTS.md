@@ -88,6 +88,11 @@ made from the repository root. Do not let them steer unrelated local-only work.
   Wrapper availability is not transfer readiness: the local controller must
   resolve its sender, recipient, key, exchange root, and exact receiver bases
   from host-private Harness configuration. Never invent or commit those values.
+- Protected Harness deployment: use `remote_harness_deploy.sh` only after the
+  user or designated deployment owner explicitly authorizes the exact target
+  commit. It is limited to the fixed AgenticRobot Harness layout, fetches only
+  `origin/agentic-robot`, and requires a fresh Harness plan SHA before install.
+  It grants no project branch, project command, device, or motion authority.
 - Arm dry-run work: `remote_arm_dry_run.sh`. Do not pass flags that disable
   dry-run behavior.
 - Intentional result retrieval: `remote_pull.sh` or
