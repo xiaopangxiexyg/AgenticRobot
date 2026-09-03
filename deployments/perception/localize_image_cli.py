@@ -7,8 +7,9 @@ import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from PIL import Image, ImageDraw, ImageOps
 
@@ -169,10 +170,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     prompt = args.language_prompt
     if prompt is not None and (not prompt or prompt != prompt.strip()):
         raise ValueError("--language-prompt must be a non-empty trimmed string")
-    if (
-        isinstance(args.max_detections, bool)
-        or not 1 <= args.max_detections <= 100
-    ):
+    if isinstance(args.max_detections, bool) or not 1 <= args.max_detections <= 100:
         raise ValueError("--max-detections must be in [1, 100]")
 
     spec = Sam2GroundingDinoModelSpec.from_asset_bundle(bundle)
@@ -242,7 +240,9 @@ def main(argv: list[str] | None = None) -> int:
                 "detections": len(payload["detections"]),
                 "mode": payload["mode"],
                 "output_json": str(args.output_json.expanduser().resolve(strict=False)),
-                "output_image": str(args.output_image.expanduser().resolve(strict=False)),
+                "output_image": str(
+                    args.output_image.expanduser().resolve(strict=False)
+                ),
             },
             sort_keys=True,
         )

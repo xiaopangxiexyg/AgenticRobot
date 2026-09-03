@@ -12,10 +12,11 @@ import hashlib
 import json
 import math
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import cv2
 import numpy as np
@@ -52,8 +53,9 @@ from sim.mujoco.tasks.cube_lift.config import (
 )
 from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
 
-
-DEFAULT_TASK_CONFIG = Path("sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json")
+DEFAULT_TASK_CONFIG = Path(
+    "sim/configs/tasks/rm65_right_cube_lift_rl_normal_rgb_v2.json"
+)
 EVALUATION_LIGHT_SCENE_CONTRACT = Path(
     "experiments/sim_point_grasp/configs/rm65_bimanual_tall_box_v1.json"
 )
@@ -74,9 +76,7 @@ EVALUATION_RIGHT_TOOL_PROFILE_SHA256 = (
 )
 EVALUATION_OBJECT_SIZE_M = (0.04, 0.04, 0.10)
 EVALUATION_OBJECT_CENTER_XY_M = (-0.272, 0.0)
-EVALUATION_GRIPPER_PROFILE_NAME = (
-    "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
-)
+EVALUATION_GRIPPER_PROFILE_NAME = "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
 EVALUATION_GRIPPER_PROFILE_SHA256 = (
     "171c6456fffd3fc9abcd02911c389048eb6cdf5a8732bc3704303008c8c12a8c"
 )
@@ -122,12 +122,14 @@ class SimPointGraspEvaluationConfig:
     save_video: bool = True
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "output_dir", Path(self.output_dir).expanduser().resolve())
-        for field in ("sam2_asset_bundle", "graspnet_asset_bundle"):
-            path = Path(getattr(self, field)).expanduser().resolve(strict=True)
+        object.__setattr__(
+            self, "output_dir", Path(self.output_dir).expanduser().resolve()
+        )
+        for field_name in ("sam2_asset_bundle", "graspnet_asset_bundle"):
+            path = Path(getattr(self, field_name)).expanduser().resolve(strict=True)
             if not path.is_dir():
-                raise ValueError(f"{field} must be an existing directory.")
-            object.__setattr__(self, field, path)
+                raise ValueError(f"{field_name} must be an existing directory.")
+            object.__setattr__(self, field_name, path)
         if not 1 <= int(self.trials) <= 100:
             raise ValueError("trials must be in [1, 100].")
         if not 1 <= int(self.max_candidates) <= 5:
@@ -156,19 +158,25 @@ class SimPointGraspEvaluationConfig:
             not math.isfinite(float(value)) or float(value) < 0.0
             for value in self.cube_spawn_xy_jitter_m
         ):
-            raise ValueError("cube_spawn_xy_jitter_m must contain two non-negative values.")
-        for field in (
+            raise ValueError(
+                "cube_spawn_xy_jitter_m must contain two non-negative values."
+            )
+        for field_name in (
             "pregrasp_offset_m",
             "lift_offset_m",
             "pose_position_tolerance_m",
             "pose_orientation_tolerance_rad",
         ):
-            value = float(getattr(self, field))
+            value = float(getattr(self, field_name))
             if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{field} must be finite and positive.")
-        adaptive_offsets = tuple(float(value) for value in self.adaptive_pregrasp_offsets_m)
+                raise ValueError(f"{field_name} must be finite and positive.")
+        adaptive_offsets = tuple(
+            float(value) for value in self.adaptive_pregrasp_offsets_m
+        )
         if any(not math.isfinite(value) or value <= 0.0 for value in adaptive_offsets):
-            raise ValueError("adaptive_pregrasp_offsets_m must contain positive finite values.")
+            raise ValueError(
+                "adaptive_pregrasp_offsets_m must contain positive finite values."
+            )
         object.__setattr__(self, "adaptive_pregrasp_offsets_m", adaptive_offsets)
         if self.candidate_selection_policy not in {
             "provider_selected_ordinal",
@@ -261,9 +269,12 @@ class _ExecutionTrace:
     ) -> None:
         self.info = dict(info)
         self.step_count += 1
-        self.safety_intervention_steps += int(bool(info.get("safety_intervention", False)))
+        self.safety_intervention_steps += int(
+            bool(info.get("safety_intervention", False))
+        )
         self.ik_rejection_steps += int(
-            info.get("pose_ik_success") is False or bool(info.get("pose_ik_hold", False))
+            info.get("pose_ik_success") is False
+            or bool(info.get("pose_ik_hold", False))
         )
         self.bilateral_contact_observed = bool(
             self.bilateral_contact_observed
@@ -345,7 +356,7 @@ def _timing_summary_ms(samples: list[float]) -> dict[str, float | int | None]:
             "max": None,
         }
     return {
-        "count": int(len(values)),
+        "count": len(values),
         "total": float(values.sum()),
         "mean": float(values.mean()),
         "p50": float(np.percentile(values, 50.0)),
@@ -401,7 +412,9 @@ class _TrialVideo:
 
     def write(self, rgb: np.ndarray) -> None:
         if self._writer is not None:
-            self._writer.write(cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2BGR))
+            self._writer.write(
+                cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+            )
 
     def close(self) -> None:
         if self._writer is not None:
@@ -452,7 +465,9 @@ def build_sim_point_grasp_task_config(
             f"expected={EVALUATION_RIGHT_TOOL_PROFILE_SHA256}, "
             f"actual={tool_profile_sha256}."
         )
-    episode_steps = base.max_episode_steps if max_episode_steps is None else int(max_episode_steps)
+    episode_steps = (
+        base.max_episode_steps if max_episode_steps is None else int(max_episode_steps)
+    )
     if episode_steps <= 0:
         raise ValueError("max_episode_steps must be positive.")
     return replace(
@@ -506,14 +521,21 @@ def project_world_point(
     world_from_camera: np.ndarray,
     intrinsics: RenderCameraIntrinsics,
 ) -> tuple[int, int, float]:
-    camera_from_world = np.linalg.inv(np.asarray(world_from_camera, dtype=float).reshape(4, 4))
-    point = camera_from_world @ np.r_[np.asarray(point_world_m, dtype=float).reshape(3), 1.0]
+    camera_from_world = np.linalg.inv(
+        np.asarray(world_from_camera, dtype=float).reshape(4, 4)
+    )
+    point = (
+        camera_from_world
+        @ np.r_[np.asarray(point_world_m, dtype=float).reshape(3), 1.0]
+    )
     if not np.all(np.isfinite(point)) or point[2] <= 0.0:
         raise RuntimeError("Target center is behind the fixed optical camera.")
-    u = int(round(intrinsics.fx * point[0] / point[2] + intrinsics.cx))
-    v = int(round(intrinsics.fy * point[1] / point[2] + intrinsics.cy))
+    u = round(intrinsics.fx * point[0] / point[2] + intrinsics.cx)
+    v = round(intrinsics.fy * point[1] / point[2] + intrinsics.cy)
     if not (0 <= u < intrinsics.width and 0 <= v < intrinsics.height):
-        raise RuntimeError("Projected target center lies outside the fixed camera image.")
+        raise RuntimeError(
+            "Projected target center lies outside the fixed camera image."
+        )
     return u, v, float(point[2])
 
 
@@ -564,7 +586,9 @@ def sample_mask_prompt_pixels(
         )
         minimum_distance_sq = np.minimum(minimum_distance_sq, distance_sq)
     if len(selected) != int(count):
-        raise RuntimeError("Target mask does not contain enough distinct prompt pixels.")
+        raise RuntimeError(
+            "Target mask does not contain enough distinct prompt pixels."
+        )
     return selected
 
 
@@ -635,7 +659,9 @@ def bounded_pose_action(
         -1.0,
         1.0,
     )
-    rotation_error = Rotation.from_matrix(desired[:3, :3] @ current[:3, :3].T).as_rotvec()
+    rotation_error = Rotation.from_matrix(
+        desired[:3, :3] @ current[:3, :3].T
+    ).as_rotvec()
     action[3:6] = np.clip(
         rotation_error / np.asarray(rotation_step_rad, dtype=float),
         -1.0,
@@ -654,7 +680,9 @@ def _current_tool_pose_arm_base(scene: Any, config: CubeLiftTaskConfig) -> np.nd
     side = config.controlled_side
     base = scene.body_pose(f"{side}_arm_base_link")
     endpoint = scene.body_pose(scene.arm_specs[side].controlled_body)
-    profile = load_rm65_tool_profile(resolve_path(config.right_tool_profile_path), side=side)
+    profile = load_rm65_tool_profile(
+        resolve_path(config.right_tool_profile_path), side=side
+    )
     return np.linalg.inv(base) @ endpoint @ endpoint_to_tool_transform(profile)
 
 
@@ -704,8 +732,8 @@ def _project_camera_point(
     xyz = np.asarray(point, dtype=float).reshape(3)
     if xyz[2] <= 1e-6:
         return None
-    u = int(round(float(intrinsics["fx"]) * xyz[0] / xyz[2] + float(intrinsics["cx"])))
-    v = int(round(float(intrinsics["fy"]) * xyz[1] / xyz[2] + float(intrinsics["cy"])))
+    u = round(float(intrinsics["fx"]) * xyz[0] / xyz[2] + float(intrinsics["cx"]))
+    v = round(float(intrinsics["fy"]) * xyz[1] / xyz[2] + float(intrinsics["cy"]))
     if not (0 <= u < int(intrinsics["width"]) and 0 <= v < int(intrinsics["height"])):
         return None
     return u, v
@@ -776,7 +804,7 @@ def save_montage(path: Path, frames: list[tuple[str, np.ndarray]]) -> None:
     width = max(item.width for item in labeled)
     height = max(item.height for item in labeled)
     columns = min(3, len(labeled))
-    rows = int(math.ceil(len(labeled) / columns))
+    rows = math.ceil(len(labeled) / columns)
     canvas = Image.new("RGB", (columns * width, rows * height), color=(28, 28, 28))
     for index, image in enumerate(labeled):
         canvas.paste(image, ((index % columns) * width, (index // columns) * height))
@@ -793,7 +821,7 @@ def save_summary_sheet(
         return
     tile_width, tile_height, label_height = 480, 240, 34
     columns = 2
-    rows = int(math.ceil(len(results) / columns))
+    rows = math.ceil(len(results) / columns)
     canvas = Image.new(
         "RGB",
         (columns * tile_width, rows * (tile_height + label_height)),
@@ -842,11 +870,16 @@ def _drive_pose(
     kernel = env.kernel
     controller = kernel._pose_action_controller
     if controller is None:
-        raise RuntimeError("Physical Cube-Lift profile has no pose-action motion owner.")
+        raise RuntimeError(
+            "Physical Cube-Lift profile has no pose-action motion owner."
+        )
     for _ in range(maximum_steps):
         measured = _current_tool_pose_arm_base(kernel.scene, kernel.config)
         position_error, orientation_error = _pose_error(measured, desired_pose)
-        if position_error <= position_tolerance_m and orientation_error <= orientation_tolerance_rad:
+        if (
+            position_error <= position_tolerance_m
+            and orientation_error <= orientation_tolerance_rad
+        ):
             return True, "pose_reached"
         action = bounded_pose_action(
             controller.target_pose_arm_base,
@@ -873,7 +906,10 @@ def _drive_pose(
             return False, str(step[4].get("termination_reason") or "episode_terminated")
     measured = _current_tool_pose_arm_base(kernel.scene, kernel.config)
     position_error, orientation_error = _pose_error(measured, desired_pose)
-    return False, f"pose_timeout:position={position_error:.6f},rotation={orientation_error:.6f}"
+    return (
+        False,
+        f"pose_timeout:position={position_error:.6f},rotation={orientation_error:.6f}",
+    )
 
 
 def _preflight_candidate(
@@ -937,7 +973,9 @@ def _preflight_candidate(
 def _candidate_preflight_rank(value: _CandidatePreflight) -> tuple[Any, ...]:
     stage_rank = 0 if value.executable else (1 if value.pregrasp_reached else 2)
     margin = value.final_joint_margin_rad
-    safe_margin_rank = -float(margin) if margin is not None and math.isfinite(margin) else math.inf
+    safe_margin_rank = (
+        -float(margin) if margin is not None and math.isfinite(margin) else math.inf
+    )
     return (
         stage_rank,
         int(value.termination_reason is not None),
@@ -1024,10 +1062,14 @@ def _step_action(
     return terminated, truncated, info, frame
 
 
-def _make_provider(config: SimPointGraspEvaluationConfig) -> tuple[Any, PointGraspProvider]:
+def _make_provider(
+    config: SimPointGraspEvaluationConfig,
+) -> tuple[Any, PointGraspProvider]:
     sam_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(config.sam2_asset_bundle)
     localizer = Sam2GroundingDinoLocalizer(model_spec=sam_spec, device=config.device)
-    grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(config.graspnet_asset_bundle)
+    grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(
+        config.graspnet_asset_bundle
+    )
     planner = Sam2GraspNetPointGraspPlanner(
         model_spec=grasp_spec,
         point_segmenter=localizer,
@@ -1138,7 +1180,9 @@ def _trial(
                 "Projected cube-center click is not on the visible cube surface: "
                 f"rendered_depth={float(depth[v, u]):.6f}, center_depth={projected_depth:.6f}."
             )
-        world_from_base = scene.body_pose(f"{env.kernel.config.controlled_side}_arm_base_link")
+        world_from_base = scene.body_pose(
+            f"{env.kernel.config.controlled_side}_arm_base_link"
+        )
         base_from_camera = np.linalg.inv(world_from_base) @ world_from_camera
         parameters = {
             "input_source": "local_path",
@@ -1279,23 +1323,20 @@ def _trial(
                 selected_pregrasp_offset_m,
                 selected_wrist_symmetry_deg,
                 preflight,
-            ) = (
-                select_reachable_candidate(
-                    env=env,
-                    candidates=combined_candidates,
-                    provider_selected_ordinal=0,
-                    seed=seed,
-                    config=config,
-                )
+            ) = select_reachable_candidate(
+                env=env,
+                candidates=combined_candidates,
+                provider_selected_ordinal=0,
+                seed=seed,
+                config=config,
             )
             candidate_preflight = [value.to_dict() for value in preflight]
         finally:
             timing_ms["candidate_motion_preflight"] = (
                 time.perf_counter() - phase_started
             ) * 1000.0
-        if (
-            config.candidate_selection_policy == "reachability_aware"
-            and not any(value.executable for value in preflight)
+        if config.candidate_selection_policy == "reachability_aware" and not any(
+            value.executable for value in preflight
         ):
             failure_stage = "motion_planning_preflight"
             best = min(preflight, key=_candidate_preflight_rank)
@@ -1408,9 +1449,7 @@ def _trial(
                 orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
             )
         finally:
-            timing_ms["grasp_motion"] = (
-                time.perf_counter() - phase_started
-            ) * 1000.0
+            timing_ms["grasp_motion"] = (time.perf_counter() - phase_started) * 1000.0
         if not reached:
             raise RuntimeError(reason)
         grasp_frame = renderer.render(CAMERA_NAME)
@@ -1423,14 +1462,10 @@ def _trial(
             consecutive_bilateral_steps = 0
             for _ in range(config.close_step_limit):
                 action = np.zeros(7, dtype=np.float32)
-                if (
-                    not bool(
-                        trace.info.get("bilateral_finger_cube_contact", False)
-                    )
-                    and float(trace.info.get("right_gripper_target_close", 0.0))
-                    < (
-                        env.kernel.config.right_gripper_max_close - 1e-6
-                    )
+                if not bool(
+                    trace.info.get("bilateral_finger_cube_contact", False)
+                ) and float(trace.info.get("right_gripper_target_close", 0.0)) < (
+                    env.kernel.config.right_gripper_max_close - 1e-6
                 ):
                     action[6] = float(config.close_action_scale)
                 terminated, truncated, info, close_frame = _step_action(
@@ -1453,9 +1488,7 @@ def _trial(
                 if consecutive_bilateral_steps >= config.contact_stability_steps:
                     break
         finally:
-            timing_ms["gripper_close"] = (
-                time.perf_counter() - phase_started
-            ) * 1000.0
+            timing_ms["gripper_close"] = (time.perf_counter() - phase_started) * 1000.0
         if consecutive_bilateral_steps < config.contact_stability_steps:
             reason = "stable_bilateral_finger_contact_not_acquired"
             raise RuntimeError(reason)
@@ -1479,9 +1512,7 @@ def _trial(
                 translation_action_scale=config.lift_translation_action_scale,
             )
         finally:
-            timing_ms["lift_motion"] = (
-                time.perf_counter() - phase_started
-            ) * 1000.0
+            timing_ms["lift_motion"] = (time.perf_counter() - phase_started) * 1000.0
         success = trace.termination_reason == BILATERAL_CONTACT_LIFT_SUCCESS_REASON
         if not success and reached:
             for _ in range(5):
@@ -1496,7 +1527,9 @@ def _trial(
                     break
             success = trace.termination_reason == BILATERAL_CONTACT_LIFT_SUCCESS_REASON
         if not success:
-            raise RuntimeError(reason if not reached else "lift_success_predicate_not_satisfied")
+            raise RuntimeError(
+                reason if not reached else "lift_success_predicate_not_satisfied"
+            )
         failure_stage = None
         reason = BILATERAL_CONTACT_LIFT_SUCCESS_REASON
         keyframes.append(("successful lift", renderer.render(CAMERA_NAME)))
@@ -1504,17 +1537,17 @@ def _trial(
         success = False
         reason = str(exc)
         try:
-            keyframes.append((f"failure: {failure_stage}", renderer.render(CAMERA_NAME)))
-        except Exception:
+            keyframes.append(
+                (f"failure: {failure_stage}", renderer.render(CAMERA_NAME))
+            )
+        except Exception:  # noqa: BLE001, S110 - failure rendering is best effort
             pass
     finally:
         video.close()
         save_montage(trial_dir / "execution_montage.png", keyframes)
         timing_ms["trial_total"] = (time.perf_counter() - trial_started) * 1000.0
         timing_ms["ik_pose_solve_samples"] = list(trace.ik_solve_samples_ms)
-        timing_ms["ik_pose_frame_total_samples"] = list(
-            trace.ik_frame_total_samples_ms
-        )
+        timing_ms["ik_pose_frame_total_samples"] = list(trace.ik_frame_total_samples_ms)
         timing_ms["ik_pose_solve_summary"] = _timing_summary_ms(
             trace.ik_solve_samples_ms
         )
@@ -1666,7 +1699,9 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
     failure_counts: dict[str, int] = {}
     for result in results:
         if result.failure_stage is not None:
-            failure_counts[result.failure_stage] = failure_counts.get(result.failure_stage, 0) + 1
+            failure_counts[result.failure_stage] = (
+                failure_counts.get(result.failure_stage, 0) + 1
+            )
     report = {
         "schema_version": RESULT_SCHEMA_V1,
         "attempted_trials": len(results),
@@ -1722,9 +1757,7 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
                 "hard_penetration_m": (
                     scene_contract.scene.collision.safety_hard_penetration_m
                 ),
-                "collision_checking_enabled": (
-                    scene_contract.scene.collision.enabled
-                ),
+                "collision_checking_enabled": (scene_contract.scene.collision.enabled),
             },
             "gripper_actuation_profile_name": (
                 task_config.gripper_actuation_profile_name
@@ -1793,7 +1826,7 @@ __all__ = [
     "optical_camera_pose_world",
     "project_world_point",
     "sample_mask_prompt_pixels",
-    "select_reachable_candidate",
     "save_montage",
     "save_summary_sheet",
+    "select_reachable_candidate",
 ]

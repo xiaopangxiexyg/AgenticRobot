@@ -10,19 +10,18 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
-from importlib import metadata
 import json
 import os
-from pathlib import Path
 import platform
 import re
 import site
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from typing import Sequence
-
+from importlib import metadata
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_FILE = REPO_ROOT / "pyproject.toml"
@@ -78,10 +77,7 @@ def load_project_environment(path: Path = PROJECT_FILE) -> ProjectEnvironment:
     optional_section = _section(text, "project.optional-dependencies")
 
     include_patterns = _literal_assignment(packages_section, "include")
-    package_roots = tuple(
-        pattern[:-1] if pattern.endswith("*") else pattern
-        for pattern in include_patterns
-    )
+    package_roots = tuple(pattern.removesuffix("*") for pattern in include_patterns)
 
     optional_dependencies: list[str] = []
     for match in re.finditer(
@@ -117,9 +113,7 @@ def _dependency_name(requirement: str) -> str:
 
 
 def _expected_exact_version(requirement: str) -> str | None:
-    match = re.match(
-        r"\s*[A-Za-z0-9][A-Za-z0-9._-]*\s*==\s*([^\s;]+)", requirement
-    )
+    match = re.match(r"\s*[A-Za-z0-9][A-Za-z0-9._-]*\s*==\s*([^\s;]+)", requirement)
     return match.group(1) if match is not None else None
 
 
@@ -129,12 +123,9 @@ def _requirement_applies(requirement: str) -> bool:
     marker = requirement.split(";", 1)[1]
     if "sys_platform == 'linux'" in marker and sys.platform != "linux":
         return False
-    if (
-        "platform_machine == 'x86_64'" in marker
-        and platform.machine() != "x86_64"
-    ):
-        return False
-    return True
+    return not (
+        "platform_machine == 'x86_64'" in marker and platform.machine() != "x86_64"
+    )
 
 
 def _conda_records(prefix: Path) -> dict[str, str]:
@@ -259,7 +250,9 @@ def _development_asset_status() -> dict[str, object]:
         detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
         raise RuntimeError(f"asset-store status was not valid JSON: {detail}") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("asset-store status was not a JSON object")
+        raise RuntimeError(  # noqa: TRY004 - subprocess protocol failure
+            "asset-store status was not a JSON object"
+        )
     return payload
 
 
@@ -301,7 +294,9 @@ def _append_package_findings(
         )
     else:
         findings.append(
-            Finding("PASS", "deps.present", "all declared dependency groups are installed")
+            Finding(
+                "PASS", "deps.present", "all declared dependency groups are installed"
+            )
         )
     if mismatched:
         findings.append(Finding("FAIL", "deps.versions", "; ".join(mismatched)))
@@ -309,7 +304,9 @@ def _append_package_findings(
         findings.append(Finding("PASS", "deps.versions", "all exact pins match"))
 
 
-def collect_findings(args: argparse.Namespace) -> tuple[list[Finding], dict[str, object]]:
+def collect_findings(
+    args: argparse.Namespace,
+) -> tuple[list[Finding], dict[str, object]]:
     findings: list[Finding] = []
     try:
         config = load_project_environment()
@@ -353,7 +350,9 @@ def collect_findings(args: argparse.Namespace) -> tuple[list[Finding], dict[str,
         )
     else:
         findings.append(
-            Finding("FAIL", "conda.environment", f"{sys.prefix} is not a Conda environment")
+            Finding(
+                "FAIL", "conda.environment", f"{sys.prefix} is not a Conda environment"
+            )
         )
 
     active_user_site = [
@@ -376,7 +375,9 @@ def collect_findings(args: argparse.Namespace) -> tuple[list[Finding], dict[str,
         )
 
     missing_roots = [
-        name for name in config.package_roots if not (REPO_ROOT / name / "__init__.py").is_file()
+        name
+        for name in config.package_roots
+        if not (REPO_ROOT / name / "__init__.py").is_file()
     ]
     if missing_roots:
         findings.append(
@@ -473,12 +474,13 @@ def collect_findings(args: argparse.Namespace) -> tuple[list[Finding], dict[str,
             findings.append(Finding("FAIL", "lock.check", "uv is not on PATH"))
         else:
             if completed.returncode == 0:
-                findings.append(Finding("PASS", "lock.check", "uv.lock matches pyproject.toml"))
+                findings.append(
+                    Finding("PASS", "lock.check", "uv.lock matches pyproject.toml")
+                )
             else:
                 detail = completed.stderr.strip() or completed.stdout.strip()
-                cache_is_read_only = (
-                    "Read-only file system" in detail
-                    and ("/.cache/uv/" in detail or "UV_CACHE_DIR" in detail)
+                cache_is_read_only = "Read-only file system" in detail and (
+                    "/.cache/uv/" in detail or "UV_CACHE_DIR" in detail
                 )
                 if cache_is_read_only:
                     findings.append(
@@ -520,18 +522,26 @@ def collect_findings(args: argparse.Namespace) -> tuple[list[Finding], dict[str,
                 and item.get("required_by_default") is True
                 and item.get("available") is not True
             ]
-            detail = str(error) if error else (
-                "required development bundles are unavailable: "
-                + ", ".join(str(item) for item in missing_bundles)
+            detail = (
+                str(error)
+                if error
+                else (
+                    "required development bundles are unavailable: "
+                    + ", ".join(str(item) for item in missing_bundles)
+                )
             )
             findings.append(Finding(level, "assets.development_store", detail))
 
-    configured_sdk = args.vendor_sdk_root or os.environ.get(
-        "DEXTELEOP_DMTAC_SDK_ROOT"
-    ) or str(REPO_ROOT / config.vendor_sdk)
+    configured_sdk = (
+        args.vendor_sdk_root
+        or os.environ.get("DEXTELEOP_DMTAC_SDK_ROOT")
+        or str(REPO_ROOT / config.vendor_sdk)
+    )
     sdk_root = Path(configured_sdk).expanduser().resolve()
     if (sdk_root / "setup.py").is_file():
-        findings.append(Finding("PASS", "vendor_sdk", f"DM-Tac SDK found at {sdk_root}"))
+        findings.append(
+            Finding("PASS", "vendor_sdk", f"DM-Tac SDK found at {sdk_root}")
+        )
     else:
         level = "FAIL" if args.require_vendor_sdk else "WARN"
         findings.append(
@@ -562,7 +572,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Check the shared DexTeleop Conda development environment without device I/O."
     )
-    parser.add_argument("--json", action="store_true", help="emit machine-readable output")
+    parser.add_argument(
+        "--json", action="store_true", help="emit machine-readable output"
+    )
     parser.add_argument(
         "--skip-lock-check",
         action="store_true",
@@ -619,7 +631,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         print(
             "Summary: "
-            + ", ".join(f"{level}={counts[level]}" for level in ("PASS", "WARN", "FAIL"))
+            + ", ".join(
+                f"{level}={counts[level]}" for level in ("PASS", "WARN", "FAIL")
+            )
         )
     return 1 if any(item.level == "FAIL" for item in findings) else 0
 

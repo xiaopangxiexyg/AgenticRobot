@@ -10,9 +10,10 @@ not import ``teleop_runtime`` or initialize a vendor device.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -28,7 +29,6 @@ from robot_motion.rm65 import (
 
 from ...ik import IKResult, PoseTarget, RM65CanonicalIK
 from .config import CubeLiftTaskConfig
-
 
 # MuJoCo enforces revolute joint ranges through a soft constraint.  A position
 # servo can therefore leave a tiny residual (observed here at roughly
@@ -62,7 +62,9 @@ def inset_joint_position_target(
         raise ValueError("Pose qref and joint-limit arrays must have matching shapes.")
     margin = float(margin_rad)
     if not np.isfinite(margin) or margin < 0.0:
-        raise ValueError("Pose qref joint-limit margin must be finite and non-negative.")
+        raise ValueError(
+            "Pose qref joint-limit margin must be finite and non-negative."
+        )
     inset_lower = minimum + margin
     inset_upper = maximum - margin
     if np.any(inset_lower > inset_upper):
@@ -81,7 +83,9 @@ def _load_endpoint_to_tool_transform(path: str | Path, *, side: str) -> np.ndarr
     resolved = resolve_path(path)
     payload = json.loads(resolved.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"RM65 tool profile {resolved} must contain a JSON object.")
+        raise ValueError(  # noqa: TRY004 - profile validation contract
+            f"RM65 tool profile {resolved} must contain a JSON object."
+        )
     arm = str(payload.get("arm", "")).strip().lower()
     if arm and arm != str(side).strip().lower():
         raise ValueError(
@@ -89,7 +93,9 @@ def _load_endpoint_to_tool_transform(path: str | Path, *, side: str) -> np.ndarr
         )
     tcp = payload.get("tcp")
     if not isinstance(tcp, dict):
-        raise ValueError(f"RM65 tool profile {resolved} is missing tcp metadata.")
+        raise ValueError(  # noqa: TRY004 - profile validation contract
+            f"RM65 tool profile {resolved} is missing tcp metadata."
+        )
     values = np.asarray(tcp.get("pose_flange_m_rad"), dtype=float).reshape(-1)
     if values.shape != (6,) or not np.all(np.isfinite(values)):
         raise ValueError(
@@ -153,15 +159,28 @@ class _MujocoDampedLeastSquaresIK:
         self.body_name = scene.arm_specs[self.side].controlled_body
         self.body_id = scene.body_id(self.body_name)
         self.qpos_idx = np.asarray(
-            [scene.joint_qpos_addr(name) for name in scene.arm_specs[self.side].joint_names],
+            [
+                scene.joint_qpos_addr(name)
+                for name in scene.arm_specs[self.side].joint_names
+            ],
             dtype=np.int32,
         )
         self.dof_idx = np.asarray(
-            [scene.joint_dof_addr(name) for name in scene.arm_specs[self.side].joint_names],
+            [
+                scene.joint_dof_addr(name)
+                for name in scene.arm_specs[self.side].joint_names
+            ],
             dtype=np.int32,
         )
         self.lower = np.asarray(
-            (-3.1, -1.57079632679, -2.355, -2.443460952792061, -2.233, -2.0943951023931953),
+            (
+                -3.1,
+                -1.57079632679,
+                -2.355,
+                -2.443460952792061,
+                -2.233,
+                -2.0943951023931953,
+            ),
             dtype=float,
         )
         self.upper = -self.lower
@@ -211,8 +230,12 @@ class _MujocoDampedLeastSquaresIK:
                 if position_error_m <= 2e-3 and orientation_error_rad <= 0.03:
                     break
 
-                jacobian_position_world = np.zeros((3, self.scene.model.nv), dtype=float)
-                jacobian_rotation_world = np.zeros((3, self.scene.model.nv), dtype=float)
+                jacobian_position_world = np.zeros(
+                    (3, self.scene.model.nv), dtype=float
+                )
+                jacobian_rotation_world = np.zeros(
+                    (3, self.scene.model.nv), dtype=float
+                )
                 mujoco.mj_jacBody(
                     self.scene.model,
                     data,
@@ -222,23 +245,32 @@ class _MujocoDampedLeastSquaresIK:
                 )
                 endpoint_world = self.scene.body_pose(self.body_name)
                 tcp_offset_world = endpoint_world[:3, :3] @ self.endpoint_to_tool[:3, 3]
-                tcp_position_world = jacobian_position_world - _skew(tcp_offset_world) @ jacobian_rotation_world
+                tcp_position_world = (
+                    jacobian_position_world
+                    - _skew(tcp_offset_world) @ jacobian_rotation_world
+                )
                 jacobian = np.vstack(
                     (
                         base_from_world_rotation @ tcp_position_world[:, self.dof_idx],
-                        base_from_world_rotation @ jacobian_rotation_world[:, self.dof_idx],
+                        base_from_world_rotation
+                        @ jacobian_rotation_world[:, self.dof_idx],
                     )
                 )
                 weighting = np.diag((1.0, 1.0, 1.0, 0.35, 0.35, 0.35))
                 weighted_jacobian = weighting @ jacobian
-                weighted_error = weighting @ np.concatenate((position_error, rotation_error))
+                weighted_error = weighting @ np.concatenate(
+                    (position_error, rotation_error)
+                )
                 normal = weighted_jacobian @ weighted_jacobian.T
                 dq = weighted_jacobian.T @ np.linalg.solve(
                     normal + (float(damping) ** 2) * np.eye(6),
                     weighted_error,
                 )
                 q = np.clip(
-                    q + np.clip(dq, -float(max_joint_step_rad), float(max_joint_step_rad)),
+                    q
+                    + np.clip(
+                        dq, -float(max_joint_step_rad), float(max_joint_step_rad)
+                    ),
                     self.lower,
                     self.upper,
                 )
@@ -257,7 +289,9 @@ class CubeLiftPoseActionController:
 
     def __init__(self, scene, config: CubeLiftTaskConfig) -> None:
         if not config.uses_pose_action:
-            raise ValueError("CubeLiftPoseActionController requires an actuated task config.")
+            raise ValueError(
+                "CubeLiftPoseActionController requires an actuated task config."
+            )
         self.scene = scene
         self.config = config
         self.side = str(config.controlled_side)
@@ -288,8 +322,13 @@ class CubeLiftPoseActionController:
         if sim_collision_min_distance is None:
             sim_collision_min_distance = 0.03
         sim_collision_min_distance = float(sim_collision_min_distance)
-        if not np.isfinite(sim_collision_min_distance) or sim_collision_min_distance < 0.0:
-            raise ValueError("MuJoCo pose planner collision clearance must be finite and non-negative.")
+        if (
+            not np.isfinite(sim_collision_min_distance)
+            or sim_collision_min_distance < 0.0
+        ):
+            raise ValueError(
+                "MuJoCo pose planner collision clearance must be finite and non-negative."
+            )
         planner_config = RM65PositionCollisionPlannerConfig(
             # Policy actions arrive at 15 Hz, while the shared position rig
             # consumes qref at 60 Hz and qcmd at 120 Hz.  The planner remains
@@ -344,7 +383,9 @@ class CubeLiftPoseActionController:
         self._last_planner_qpos_by_side: dict[str, np.ndarray] | None = None
         self._pose_motion_started = False
         self.last_step: CubeLiftPoseActionStep | None = None
-        self._last_planner_sync = CubeLiftPosePlannerSyncStatus(safe=True, recovered=False)
+        self._last_planner_sync = CubeLiftPosePlannerSyncStatus(
+            safe=True, recovered=False
+        )
 
     @property
     def last_planner_sync(self) -> CubeLiftPosePlannerSyncStatus:
@@ -353,19 +394,21 @@ class CubeLiftPoseActionController:
     @property
     def target_pose_arm_base(self) -> np.ndarray:
         if self._target_pose_arm_base is None:
-            raise RuntimeError("CubeLiftPoseActionController.reset() is required first.")
+            raise RuntimeError(
+                "CubeLiftPoseActionController.reset() is required first."
+            )
         return self._target_pose_arm_base.copy()
 
     def _current_tool_pose_arm_base(self) -> np.ndarray:
         base = self.scene.body_pose(_arm_base_body_name(self.scene, self.side))
         endpoint = self.scene.body_pose(self.scene.arm_specs[self.side].controlled_body)
         return (
-            np.linalg.inv(base)
-            @ endpoint
-            @ self._endpoint_to_tool_by_side[self.side]
+            np.linalg.inv(base) @ endpoint @ self._endpoint_to_tool_by_side[self.side]
         )
 
-    def _effective_joint_limits_by_side(self) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    def _effective_joint_limits_by_side(
+        self,
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """Read the limits already resolved by the canonical planner.
 
         The planner intersects its configured RM65 limits with the Pinocchio
@@ -407,7 +450,9 @@ class CubeLiftPoseActionController:
     ) -> tuple[dict[str, np.ndarray], CubeLiftPosePlannerSyncStatus]:
         lower_by_side, upper_by_side = self._effective_joint_limits_by_side()
         observed = {
-            side: np.asarray(self.scene.get_arm_qpos(side), dtype=float).reshape(6).copy()
+            side: np.asarray(self.scene.get_arm_qpos(side), dtype=float)
+            .reshape(6)
+            .copy()
             for side in ("left", "right")
         }
         max_violation = 0.0
@@ -455,7 +500,10 @@ class CubeLiftPoseActionController:
                 self._ik.reset_from_qpos(sanitized)
             except ValueError as exc:
                 message = str(exc)
-                if "collision planner initial qpos is not certifiably safe" not in message:
+                if (
+                    "collision planner initial qpos is not certifiably safe"
+                    not in message
+                ):
                     raise
                 reason = "collision_margin_low"
                 if "reason=" in message:
@@ -563,7 +611,9 @@ class CubeLiftPoseActionController:
         """
 
         if self._last_resolved_qpos_by_side is None:
-            raise RuntimeError("CubeLiftPoseActionController.reset() is required first.")
+            raise RuntimeError(
+                "CubeLiftPoseActionController.reset() is required first."
+            )
         seed = {
             side: values.astype(np.float64, copy=True)
             for side, values in self._last_resolved_qpos_by_side.items()
@@ -590,9 +640,7 @@ class CubeLiftPoseActionController:
                     current_qpos=seed[self.side],
                 )
             )
-            qpos_by_side = {
-                side: values.tolist() for side, values in seed.items()
-            }
+            qpos_by_side = {side: values.tolist() for side, values in seed.items()}
             qpos_by_side[self.side] = qpos.tolist()
             result = IKResult(
                 success=bool(
@@ -640,7 +688,9 @@ class CubeLiftPoseActionController:
         if np.any(values < -1.0) or np.any(values > 1.0):
             raise ValueError("CubeLift pose action values must lie in [-1, 1].")
         if self._target_pose_arm_base is None:
-            raise RuntimeError("CubeLiftPoseActionController.reset() is required first.")
+            raise RuntimeError(
+                "CubeLiftPoseActionController.reset() is required first."
+            )
 
         # Keep an unchanged TCP target on a continuity-preserving IK seed.
         # Re-solving from measured qpos can choose a nearby equivalent joint
@@ -688,9 +738,12 @@ class CubeLiftPoseActionController:
 
         self._pose_motion_started = True
         target = self._target_pose_arm_base.copy()
-        target[:3, 3] += values[:3] * np.asarray(self.config.right_tcp_delta_m, dtype=float)
+        target[:3, 3] += values[:3] * np.asarray(
+            self.config.right_tcp_delta_m, dtype=float
+        )
         rotation_delta = Rotation.from_rotvec(
-            values[3:6] * np.asarray(self.config.right_tcp_rotation_delta_rad, dtype=float)
+            values[3:6]
+            * np.asarray(self.config.right_tcp_rotation_delta_rad, dtype=float)
         ).as_matrix()
         # The policy action is expressed in the arm-base axes.  Left-multiply
         # so translation and rotation semantics are independent of the current
@@ -715,9 +768,11 @@ class CubeLiftPoseActionController:
                 if self._last_resolved_qpos_by_side is not None
                 else self.scene.get_arm_qpos(self.side)
             )
-            qpos, iterations, position_error_m, orientation_error_rad = self._fallback_ik.solve(
-                target,
-                current_qpos=fallback_seed,
+            qpos, iterations, position_error_m, orientation_error_rad = (
+                self._fallback_ik.solve(
+                    target,
+                    current_qpos=fallback_seed,
+                )
             )
             fallback_success = bool(
                 position_error_m <= _FALLBACK_POSE_POSITION_TOLERANCE_M
@@ -758,10 +813,10 @@ class CubeLiftPoseActionController:
 
 
 __all__ = [
+    "SIM_RM65_JOINT_LIMIT_RECOVERY_TOLERANCE_RAD",
+    "SIM_RM65_POSE_QREF_LIMIT_MARGIN_RAD",
     "CubeLiftPoseActionController",
     "CubeLiftPoseActionStep",
     "CubeLiftPosePlannerSyncStatus",
-    "SIM_RM65_POSE_QREF_LIMIT_MARGIN_RAD",
-    "SIM_RM65_JOINT_LIMIT_RECOVERY_TOLERANCE_RAD",
     "inset_joint_position_target",
 ]

@@ -154,13 +154,8 @@ python -m agent_gateway real-perception \
 }
 ```
 
-仅用于同机测试时，可以在启动命令中逐个允许真实、非 symlink 根目录：
-
-```bash
---allow-local-image-root /absolute/path/to/test-images
-```
-
-然后请求可以使用：
+生产 Gateway 不接受本地路径。需要对本机文件运行模型时，使用前文独立的
+`deployments.perception.localize_image_cli`；以下 `local_path` 请求不是生产合同：
 
 ```json
 {

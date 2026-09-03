@@ -1,13 +1,14 @@
-# SAM2 + VGN/GraspNet 点击引导 DMTAC M 抓姿 Skill
+# SAM2 + VGN/GraspNet 点击引导 DMTAC M 离线抓姿
 
-`perception.plan_point_grasp` 接受一对像素对齐的 RGB-D 单帧、点击像素、固定相机标定，返回最多
+离线 CLI 接受一对像素对齐的 RGB-D 单帧、点击像素、显式本地标定，返回最多
 5 个已排序的 DMTAC M `tool_tcp` 抓姿。每个候选同时包含 `T_camera_from_tcp`、
 `T_base_from_tcp`、建议开口宽度、模型分数、到点击区域的距离和单帧可见点云碰撞近似结果；
 `selected_ordinal=0` 是当前最佳候选，`backend_id` 明确报告 `vgn` 或 `graspnet`，并输出一张标注
-JPEG Artifact。VGN 是默认后端；GraspNet 是已取得项目使用与再分发授权的可选后端。
+JPEG 文件。VGN 是默认后端；GraspNet 仅在操作者持有相应授权并提供显式 acknowledgement 时可选。
 
-该 Route 固定为 `read_only` / `t0_read_only`，不创建 RM65 backend、不执行 IK、轨迹规划、夹爪命令
-或机械臂运动。输出抓姿不能绕过下游正式 motion owner、碰撞场景和安全门禁。
+该入口不创建 RM65 backend、不执行 IK、轨迹规划、夹爪命令或机械臂运动。输出中的 base-frame
+姿态只绑定用户提供的本地标定文件，不是 Gateway 可信 Station pose，不能绕过下游正式 motion
+owner、碰撞场景和安全门禁。
 
 ## 算法与第三方源码
 
@@ -21,8 +22,9 @@ JPEG Artifact。VGN 是默认后端；GraspNet 是已取得项目使用与再分
   `d7af0622433f52ae88ebe81533f12b46b33e951a`；选择 GraspNet 时固定 commit
   `280c215129f759ed8649cb4e89fc5dfee55f4f80`。
 
-四个源码仓库分别由各自上游维护，父仓只跟踪官方 URL 和固定 gitlink。项目已经取得所需源码与
-模型资产的使用及再分发授权；权重仍不提交 Git，而是按运行资产合同放入统一 `assets/` bundle。
+四个源码仓库分别由各自上游维护，父仓只跟踪官方 URL 和固定 gitlink。权重仍不提交 Git；
+本地 manifest 的 SHA-256 只证明文件与该 manifest 一致，不证明 checkpoint 已经由项目审核。
+使用者必须单独确认模型资产的许可与来源边界。
 
 一键安装源码和 Python inference 依赖：
 
@@ -66,6 +68,12 @@ assets/perception/sam2_grounding_dino/
 SAM2 权重下载和 manifest 准备见
 [`SAM2_GROUNDING_DINO.md`](./SAM2_GROUNDING_DINO.md)。点击抓姿不调用 Grounding DINO，但共享的
 localizer bundle 仍按现有严格 manifest 一起验证。
+
+本页后续命令使用的受版本控制模板可直接从文档导航访问：
+
+- [VGN point-grasp asset manifest](./examples/sam2_vgn_point_grasp_asset_manifest.example.json)
+- [GraspNet point-grasp local manifest](./examples/graspnet_point_grasp_local_manifest.example.json)
+- [固定相机显式标定模板](./examples/point_grasp_fixed_camera_calibration.example.json)
 
 VGN 官方仓库 README 的模型包：
 
@@ -190,36 +198,14 @@ python -m deployments.perception.point_grasp_image_cli \
 
 该命令加载真实 SAM2/GraspNet 并使用 GPU，同样不会启动 RealSense 或连接机械臂。
 
-## Gateway 启动
+## Gateway 边界
 
-在完整 `real-perception` 参数上同时启用共享 SAM2 localizer 和 point-grasp：
-
-```bash
-python -m agent_gateway real-perception \
-  --socket-path "${DEXTELEOP_GATEWAY_SOCKET}" \
-  --camera-config /absolute/path/to/agent_gateway_realsense.json \
-  --camera-registry /absolute/path/to/rm65_camera_registry.json \
-  --artifact-root /absolute/path/to/runtime-artifacts \
-  --enable-object-localization \
-  --object-localization-asset-bundle \
-    "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
-  --enable-point-grasp \
-  --point-grasp-backend vgn \
-  --point-grasp-asset-bundle \
-    "${DEXTELEOP_ASSET_ROOT}/perception/sam2_vgn_point_grasp"
-```
-
-Gateway 使用 GraspNet 时，把最后三个 point-grasp 参数替换为：
-
-```bash
-  --enable-point-grasp \
-  --point-grasp-backend graspnet \
-  --point-grasp-asset-bundle "${GRASPNET_BUNDLE}"
-```
-
-生产请求通过 `rgb_image` 与 `aligned_depth_m` 两个 Artifact slot 输入。仅同机测试时可重复添加
-`--allow-local-image-root /absolute/test/root`，然后参数中的 `local_rgb_path`、`local_depth_path`
-可以位于不同的已允许根；该功能默认关闭，SSH read-only client 存在时禁止启用。
+当前 `real-perception` 不注册 `perception.plan_point_grasp`，也不接受
+`--enable-point-grasp`。候选接口曾让请求方自报 `camera_frame_id`、`base_frame_id`、
+`T_base_from_camera` 和 intrinsics，且 RGB/depth Artifact 未绑定同一次 capture、相机角色和
+`station_revision`，因此不能把结果称为可信 Station/tool-TCP pose。后续 Route 必须先闭合
+RealSense capture receipt、对齐关系、Station revision、frame graph 与受信 calibration identity。
+在此之前只使用上文离线 CLI 或仿真评测。
 
 ## DMTAC M 和坐标语义
 

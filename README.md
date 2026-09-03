@@ -40,8 +40,8 @@ python -m deployments.perception.localize_image_cli \
   --output-image /tmp/dexteleop-perception-output/apple.jpg
 ```
 
-输出已存在时命令默认拒绝覆盖；确认需要替换时显式加 `--overwrite`。完整 Gateway Skill 的启动、
-Artifact 上传和测试用本机路径边界见
+输出已存在时命令默认拒绝覆盖；确认需要替换时显式加 `--overwrite`。可选 object-localization
+Gateway 的启动与 Artifact 上传边界见
 [`SAM2_GROUNDING_DINO.md`](./docs/agent_gateway/SAM2_GROUNDING_DINO.md)。
 
 ## 3. SAM2 + GraspNet 点击抓姿 Skill（可选）
@@ -68,8 +68,9 @@ python -m deployments.perception.point_grasp_image_cli \
     "${DEXTELEOP_ASSET_ROOT}/perception/graspnet-point-grasp"
 ```
 
-深度必须为对齐 RGB 的 C-order `float32` H×W NPY，单位米。标定文件格式、Gateway 完整启动命令、
-官方权重包提取方式、当前 simulation 使用的 DMTAC M URDF，以及单视角碰撞检查局限见
+深度必须为对齐 RGB 的 C-order `float32` H×W NPY，单位米。该入口目前仅为离线/仿真能力，
+不注册 real Gateway Route；标定文件格式、权重包提取方式、当前 simulation 使用的 DMTAC M
+URDF，以及单视角碰撞检查局限见
 [`POINT_GRASP.md`](./docs/agent_gateway/POINT_GRASP.md)。
 
 DexTeleop 汇集共享 robot motion、真实机械臂遥操与数采、policy deploy、replay、simulation

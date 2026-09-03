@@ -3,23 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import math
 from pathlib import Path
-from types import SimpleNamespace
 
-from agent_gateway.profiles.real.point_grasp_deployment import build_real_point_grasp_registration
-from agent_gateway.profiles.real.point_grasp_gateway import PointGraspProvider
-from agent_gateway.skills.perception.point_grasp_schemas import validate_point_grasp_parameters_v1
+import numpy as np
+from PIL import Image, ImageDraw
 
-from .localize_image_cli import _atomic_write
-from .sam2_grounding_dino import Sam2GroundingDinoLocalizer, Sam2GroundingDinoModelSpec
+from .localize_image_cli import MAX_INPUT_PIXELS, _atomic_write, _load_image
 from .sam2_graspnet_point_grasp import (
     GraspNetPointGraspModelSpec,
     Sam2GraspNetPointGraspPlanner,
 )
+from .sam2_grounding_dino import Sam2GroundingDinoLocalizer, Sam2GroundingDinoModelSpec
 from .sam2_vgn_point_grasp import Sam2VgnPointGraspPlanner, VgnPointGraspModelSpec
 
 OUTPUT_SCHEMA_V1 = "dexteleop.perception.point_grasp_image_cli.v1"
+MAX_DEPTH_BYTES = 64 * 1024 * 1024
+MAX_CALIBRATION_BYTES = 64 * 1024
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,7 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="grasp generator backend; GraspNet uses the authorized project asset bundle",
     )
     parser.add_argument("--input-rgb", type=Path, required=True)
-    parser.add_argument("--input-depth", type=Path, required=True, help="C-order float32 HxW NPY in meters")
+    parser.add_argument(
+        "--input-depth",
+        type=Path,
+        required=True,
+        help="C-order float32 HxW NPY in meters",
+    )
     parser.add_argument("--calibration-json", type=Path, required=True)
     parser.add_argument("--target-u", type=int, required=True)
     parser.add_argument("--target-v", type=int, required=True)
@@ -64,6 +71,103 @@ def _output(path: Path, *, overwrite: bool) -> Path:
     return resolved
 
 
+def _validated_calibration(
+    payload: object,
+) -> tuple[dict[str, float | int], str, str, np.ndarray]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "camera_frame_id",
+        "base_frame_id",
+        "camera_intrinsics",
+        "T_base_from_camera",
+    }:
+        raise ValueError("Calibration JSON fields are invalid.")
+    camera_frame_id = payload["camera_frame_id"]
+    base_frame_id = payload["base_frame_id"]
+    if any(
+        not isinstance(value, str) or not value or value != value.strip()
+        for value in (camera_frame_id, base_frame_id)
+    ):
+        raise ValueError("Calibration frame IDs must be non-empty trimmed strings.")
+    intrinsics = payload["camera_intrinsics"]
+    if not isinstance(intrinsics, dict) or set(intrinsics) != {
+        "width",
+        "height",
+        "fx",
+        "fy",
+        "cx",
+        "cy",
+    }:
+        raise ValueError("Calibration camera_intrinsics fields are invalid.")
+    width, height = intrinsics["width"], intrinsics["height"]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (width, height)
+    ):
+        raise ValueError("Calibration image dimensions must be positive integers.")
+    for field in ("fx", "fy", "cx", "cy"):
+        value = intrinsics[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError("Calibration intrinsics must be finite numeric values.")
+    if float(intrinsics["fx"]) <= 0 or float(intrinsics["fy"]) <= 0:
+        raise ValueError("Calibration focal lengths must be positive.")
+    transform = np.asarray(payload["T_base_from_camera"], dtype=float)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("T_base_from_camera must be a finite 4x4 transform.")
+    if not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9, rtol=0.0):
+        raise ValueError("T_base_from_camera has an invalid homogeneous row.")
+    rotation = transform[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0.0):
+        raise ValueError("T_base_from_camera rotation is not orthonormal.")
+    if not math.isclose(float(np.linalg.det(rotation)), 1.0, abs_tol=1e-6):
+        raise ValueError("T_base_from_camera rotation is not right-handed.")
+    return intrinsics, camera_frame_id, base_frame_id, transform
+
+
+def _annotated_jpeg(
+    image: Image.Image,
+    pixel_uv: tuple[int, int],
+    planned: object,
+    intrinsics: dict[str, float | int],
+) -> bytes:
+    output = image.copy()
+    draw = ImageDraw.Draw(output)
+    u, v = pixel_uv
+    draw.ellipse((u - 5, v - 5, u + 5, v + 5), outline=(255, 255, 0), width=3)
+    x0, y0, x1, y1 = planned.target_mask_bbox_xyxy
+    draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(64, 220, 255), width=2)
+    for ordinal, candidate in enumerate(planned.candidates):
+        matrix = np.asarray(candidate.camera_from_tcp, dtype=float).reshape(4, 4)
+        point = matrix[:3, 3]
+        if point[2] <= 0:
+            continue
+        candidate_u = round(
+            float(intrinsics["fx"]) * point[0] / point[2] + float(intrinsics["cx"])
+        )
+        candidate_v = round(
+            float(intrinsics["fy"]) * point[1] / point[2] + float(intrinsics["cy"])
+        )
+        if not (0 <= candidate_u < output.width and 0 <= candidate_v < output.height):
+            continue
+        color = (255, 32, 32) if ordinal == 0 else (255, 160, 32)
+        draw.line(
+            (candidate_u - 6, candidate_v, candidate_u + 6, candidate_v),
+            fill=color,
+            width=2,
+        )
+        draw.line(
+            (candidate_u, candidate_v - 6, candidate_u, candidate_v + 6),
+            fill=color,
+            width=2,
+        )
+    stream = io.BytesIO()
+    output.save(stream, format="JPEG", quality=90, optimize=True)
+    return stream.getvalue()
+
+
 def run(args: argparse.Namespace) -> dict:
     sam_bundle = _existing(args.sam2_asset_bundle, directory=True)
     grasp_bundle = _existing(args.point_grasp_asset_bundle, directory=True)
@@ -72,25 +176,41 @@ def run(args: argparse.Namespace) -> dict:
     calibration_path = _existing(args.calibration_json)
     output_json = _output(args.output_json, overwrite=args.overwrite)
     output_image = _output(args.output_image, overwrite=args.overwrite)
+    if len({rgb, depth, calibration_path, output_json, output_image}) != 5:
+        raise ValueError("RGB, depth, calibration, and output paths must be distinct.")
     if output_image.suffix.lower() not in {".jpg", ".jpeg"}:
         raise ValueError("--output-image must end in .jpg or .jpeg")
-    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
-    if not isinstance(calibration, dict) or set(calibration) != {
-        "camera_frame_id", "base_frame_id", "camera_intrinsics", "T_base_from_camera"
-    }:
-        raise ValueError("Calibration JSON fields are invalid.")
-    parameters = {
-        "input_source": "local_path",
-        "local_rgb_path": str(rgb),
-        "local_depth_path": str(depth),
-        "target_pixel_uv": [args.target_u, args.target_v],
-        "camera_intrinsics": calibration["camera_intrinsics"],
-        "camera_frame_id": calibration["camera_frame_id"],
-        "base_frame_id": calibration["base_frame_id"],
-        "T_base_from_camera": calibration["T_base_from_camera"],
-        "max_candidates": args.max_candidates,
-    }
-    validate_point_grasp_parameters_v1(parameters, local_path_enabled=True, max_candidates=5)
+    calibration_size = calibration_path.stat().st_size
+    if calibration_size <= 0 or calibration_size > MAX_CALIBRATION_BYTES:
+        raise ValueError("Calibration JSON must be non-empty and at most 64 KiB.")
+    intrinsics, camera_frame_id, base_frame_id, base_from_camera = (
+        _validated_calibration(json.loads(calibration_path.read_text(encoding="utf-8")))
+    )
+    pixel_uv = (args.target_u, args.target_v)
+    if not 1 <= args.max_candidates <= 5:
+        raise ValueError("--max-candidates must be in [1, 5].")
+    if not (
+        0 <= pixel_uv[0] < intrinsics["width"]
+        and 0 <= pixel_uv[1] < intrinsics["height"]
+    ):
+        raise ValueError("Target pixel is outside the calibrated image.")
+    image, _ = _load_image(rgb)
+    if image.size != (intrinsics["width"], intrinsics["height"]):
+        raise ValueError("RGB dimensions differ from camera_intrinsics.")
+    depth_size = depth.stat().st_size
+    if depth_size <= 0 or depth_size > MAX_DEPTH_BYTES:
+        raise ValueError("Depth NPY must be non-empty and at most 64 MiB.")
+    depth_values = np.load(depth, allow_pickle=False)
+    if (
+        depth_values.dtype != np.float32
+        or depth_values.shape != (intrinsics["height"], intrinsics["width"])
+        or depth_values.size > MAX_INPUT_PIXELS
+        or not depth_values.flags.c_contiguous
+        or not np.all(np.isfinite(depth_values))
+        or np.any(depth_values < 0)
+        or np.any(depth_values > 10.0)
+    ):
+        raise ValueError("Depth must be finite C-order float32 HxW aligned meters.")
     sam_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(sam_bundle)
     localizer = Sam2GroundingDinoLocalizer(model_spec=sam_spec, device=args.device)
     if args.point_grasp_backend == "graspnet":
@@ -103,35 +223,62 @@ def run(args: argparse.Namespace) -> dict:
         planner = Sam2VgnPointGraspPlanner(
             model_spec=grasp_spec, point_segmenter=localizer, device=args.device
         )
-    registration = build_real_point_grasp_registration(
-        backend_id=planner.backend_id,
-        model_profile_id=grasp_spec.model_profile_id,
-        model_profile_hash=grasp_spec.semantic_content_hash,
-        inference_implementation_hash=planner.semantic_content_hash,
-        local_path_enabled=True,
-        runtime_session_id="local-point-grasp-cli",
-        control_domain_id="local-read-only",
-        target_binding_id="local-files",
-        station_manifest_hash="not-applicable",
-        execution_manifest_hash="local-point-grasp-cli",
-    )
-    roots = tuple(sorted({rgb.parent, depth.parent}, key=str))
-    provider = PointGraspProvider(planner=planner, registration=registration, allowed_local_image_roots=roots)
     localizer.start()
     try:
-        provider.start()
+        planner.start()
         try:
-            prepared = provider.plan_request(
-                SimpleNamespace(parameters=parameters, input_artifact_bindings=()),
-                artifact_store=SimpleNamespace(),
+            planned = planner.plan(
+                image,
+                depth_values,
+                pixel_uv=pixel_uv,
+                intrinsics=intrinsics,
+                base_from_camera=base_from_camera,
+                max_candidates=args.max_candidates,
             )
         finally:
-            provider.close()
+            planner.close()
     finally:
         localizer.close()
-    payload = {"schema_version": OUTPUT_SCHEMA_V1, **prepared.execution_result}
+    candidates = []
+    for ordinal, candidate in enumerate(planned.candidates):
+        camera = list(candidate.camera_from_tcp)
+        base = list(candidate.base_from_tcp)
+        candidates.append(
+            {
+                "ordinal": ordinal,
+                "score": candidate.score,
+                "model_score": candidate.model_score,
+                "click_distance_m": candidate.click_distance_m,
+                "gripper_width_m": candidate.gripper_width_m,
+                "T_camera_from_tcp": camera,
+                "T_base_from_tcp": base,
+                "tcp_xyz_camera_m": [camera[3], camera[7], camera[11]],
+                "tcp_xyz_base_m": [base[3], base[7], base[11]],
+                "visible_collision_free": candidate.visible_collision_free,
+            }
+        )
+    annotated = _annotated_jpeg(image, pixel_uv, planned, intrinsics)
+    payload = {
+        "schema_version": OUTPUT_SCHEMA_V1,
+        "input_source": "local_path",
+        "target_pixel_uv": list(pixel_uv),
+        "target_point_camera_m": list(planned.target_point_camera_m),
+        "target_point_base_m": list(planned.target_point_base_m),
+        "target_mask_bbox_xyxy": list(planned.target_mask_bbox_xyxy),
+        "camera_frame_id": camera_frame_id,
+        "base_frame_id": base_frame_id,
+        "pose_semantics": "homogeneous_row_major_parent_from_tool_tcp_m",
+        "gripper_profile_id": "DMTAC_M",
+        "backend_id": planner.backend_id,
+        "candidate_count": len(candidates),
+        "selected_ordinal": 0,
+        "candidates": candidates,
+        "model_profile_id": grasp_spec.model_profile_id,
+        "model_profile_hash": grasp_spec.semantic_content_hash,
+        "calibration_source": "explicit_local_file_not_gateway_trusted",
+    }
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    _atomic_write(output_image, prepared.annotated_jpeg)
+    _atomic_write(output_image, annotated)
     _atomic_write(output_json, encoded)
     return payload
 
@@ -142,7 +289,12 @@ def main(argv: list[str] | None = None) -> int:
         payload = run(parser.parse_args(argv))
     except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
         parser.exit(2, f"point-grasp inference failed: {exc}\n")
-    print(json.dumps({"candidate_count": payload["candidate_count"], "selected_ordinal": 0}, sort_keys=True))
+    print(
+        json.dumps(
+            {"candidate_count": payload["candidate_count"], "selected_ordinal": 0},
+            sort_keys=True,
+        )
+    )
     return 0
 
 

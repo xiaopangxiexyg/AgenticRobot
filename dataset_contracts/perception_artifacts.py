@@ -1,7 +1,7 @@
 """Portable byte-representation identities for perception Skill artifacts.
 
-This module defines wire-format identities shared by perception producers and
-consumers.  It deliberately owns neither dataset layout nor runtime behavior.
+This module defines immutable wire-format identities shared by perception
+producers and consumers. It owns neither dataset layout nor runtime behavior.
 """
 
 DEPTH_FRAME_MEDIA_TYPE_V1 = "application/x-npy"
@@ -32,7 +32,9 @@ LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1 = "none"
 
 POINT_GRASP_RGB_SCHEMA_ID_V1 = "dexteleop.perception.point_grasp_rgb.v1"
 POINT_GRASP_DEPTH_SCHEMA_ID_V1 = "dexteleop.perception.point_grasp_depth_meters.v1"
-POINT_GRASP_ANNOTATED_SCHEMA_ID_V1 = "dexteleop.perception.point_grasp_annotated_image.v1"
+POINT_GRASP_ANNOTATED_SCHEMA_ID_V1 = (
+    "dexteleop.perception.point_grasp_annotated_image.v1"
+)
 POINT_GRASP_DEPTH_MEDIA_TYPE_V1 = "application/x-npy"
 POINT_GRASP_DEPTH_ENCODING_V1 = "npy.float32.c_order.v1"
 POINT_GRASP_DEPTH_COMPRESSION_V1 = "none"

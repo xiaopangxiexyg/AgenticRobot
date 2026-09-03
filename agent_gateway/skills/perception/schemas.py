@@ -11,7 +11,7 @@ from agent_gateway.protocol.skill_catalog import (
     SkillParameterProfileRef,
     agent_skill_schema_document_hash,
 )
-from perception_contracts.artifacts import (
+from dataset_contracts.perception_artifacts import (
     DEPTH_FRAME_COMPRESSION_V1,
     DEPTH_FRAME_ENCODING_V1,
     DEPTH_FRAME_MEDIA_TYPE_V1,
@@ -22,8 +22,11 @@ from perception_contracts.artifacts import (
     RGB_FRAME_SCHEMA_ID_V1,
 )
 
-from .definition import CAPTURE_DEPTH_SKILL_ID_V1, CAPTURE_RGB_SKILL_ID_V1
-from .definition import LOCALIZE_OBJECTS_SKILL_ID_V1
+from .definition import (
+    CAPTURE_DEPTH_SKILL_ID_V1,
+    CAPTURE_RGB_SKILL_ID_V1,
+    LOCALIZE_OBJECTS_SKILL_ID_V1,
+)
 
 
 def _semantic_roles(values: tuple[str, ...]) -> tuple[str, ...]:
@@ -368,7 +371,10 @@ def validate_capture_depth_result_v2(
         "reference_frame_spec_hash": reference_frame_spec_hash,
         "frame_graph_hash": frame_graph_hash,
     }
-    if any(payload[field_name] != expected for field_name, expected in expected_identity.items()):
+    if any(
+        payload[field_name] != expected
+        for field_name, expected in expected_identity.items()
+    ):
         raise ValueError("Depth reference-frame identity differs from its deployment.")
     validate_capture_depth_result_v1(
         {
@@ -407,6 +413,7 @@ def localize_objects_schema_entry_v1(
     parameter_profile_id: str,
     parameter_profile_hash: str,
     max_detections: int,
+    local_path_enabled: bool,
 ) -> AgentSkillSchemaEntry:
     """Build strict schemas for automatic or text-prompted bounding boxes."""
 
@@ -416,6 +423,8 @@ def localize_objects_schema_entry_v1(
         or not 1 <= max_detections <= 256
     ):
         raise ValueError("max_detections must be between one and 256.")
+    if not isinstance(local_path_enabled, bool):
+        raise TypeError("local_path_enabled must be boolean.")
     nullable_prompt = {
         "anyOf": [
             {"type": "string", "minLength": 1, "maxLength": 256},
@@ -428,12 +437,18 @@ def localize_objects_schema_entry_v1(
             {"type": "null"},
         ]
     }
+    input_source_schema = (
+        {"type": "string", "enum": ["artifact", "local_path"]}
+        if local_path_enabled
+        else {"const": "artifact"}
+    )
+    local_image_path_schema = nullable_path if local_path_enabled else {"type": "null"}
     parameter_schema = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "input_source": {"type": "string", "enum": ["artifact", "local_path"]},
-            "local_image_path": nullable_path,
+            "input_source": input_source_schema,
+            "local_image_path": local_image_path_schema,
             "language_prompt": nullable_prompt,
             "max_detections": {
                 "type": "integer",
@@ -468,7 +483,7 @@ def localize_objects_schema_entry_v1(
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "input_source": {"type": "string", "enum": ["artifact", "local_path"]},
+            "input_source": input_source_schema,
             "input_media_content_hash": {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$",
@@ -567,7 +582,9 @@ def validate_localize_objects_parameters_v1(
         "max_detections",
     }
     if not isinstance(payload, Mapping) or set(payload) != fields:
-        raise ValueError("Object localization parameter fields do not match the schema.")
+        raise ValueError(
+            "Object localization parameter fields do not match the schema."
+        )
     source = payload["input_source"]
     if source not in {"artifact", "local_path"}:
         raise ValueError("Object localization input_source is unsupported.")
@@ -662,12 +679,16 @@ def validate_localize_objects_result_v1(
         if not isinstance(detection, Mapping) or set(detection) != detection_fields:
             raise ValueError("Object localization detection fields changed.")
         if detection["ordinal"] != ordinal:
-            raise ValueError("Object localization detection ordinals must be contiguous.")
+            raise ValueError(
+                "Object localization detection ordinals must be contiguous."
+            )
         box = detection["box_xyxy"]
         if (
             not isinstance(box, (list, tuple))
             or len(box) != 4
-            or any(isinstance(value, bool) or not isinstance(value, int) for value in box)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) for value in box
+            )
         ):
             raise ValueError("Object localization boxes must contain four integers.")
         x_min, y_min, x_max, y_max = box
@@ -687,7 +708,9 @@ def validate_localize_objects_result_v1(
             maximum=256,
         )
         if prompt is None and label is not None:
-            raise ValueError("Automatic localization detections must not invent labels.")
+            raise ValueError(
+                "Automatic localization detections must not invent labels."
+            )
     if payload["model_profile_id"] != model_profile_id:
         raise ValueError("Object localization model_profile_id changed.")
     if payload["model_profile_hash"] != model_profile_hash:
@@ -699,11 +722,15 @@ def validate_localize_objects_result_for_parameters_v1(
     result: Mapping[str, Any],
 ) -> None:
     if parameters.get("input_source") != result.get("input_source"):
-        raise ValueError("Object localization result input_source differs from request.")
+        raise ValueError(
+            "Object localization result input_source differs from request."
+        )
     if parameters.get("language_prompt") != result.get("language_prompt"):
         raise ValueError("Object localization result prompt differs from request.")
     if result.get("detection_count", 0) > parameters.get("max_detections", 0):
-        raise ValueError("Object localization result exceeds requested detection bound.")
+        raise ValueError(
+            "Object localization result exceeds requested detection bound."
+        )
 
 
 def capture_rgb_schema_entry_v1(
@@ -1166,8 +1193,8 @@ __all__ = [
     "validate_capture_rgb_result_for_parameters_v2",
     "validate_capture_rgb_result_v1",
     "validate_capture_rgb_result_v2",
-    "validate_no_task_evaluation_v1",
     "validate_localize_objects_parameters_v1",
     "validate_localize_objects_result_for_parameters_v1",
     "validate_localize_objects_result_v1",
+    "validate_no_task_evaluation_v1",
 ]

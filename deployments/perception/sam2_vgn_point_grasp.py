@@ -7,10 +7,11 @@ import json
 import math
 import subprocess
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -40,8 +41,12 @@ def _required(value: object, *, field_name: str) -> str:
 
 def _lower_hex(value: object, *, field_name: str, length: int) -> str:
     text = _required(value, field_name=field_name)
-    if len(text) != length or any(character not in "0123456789abcdef" for character in text):
-        raise ValueError(f"{field_name} must be {length} lowercase hexadecimal characters.")
+    if len(text) != length or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        raise ValueError(
+            f"{field_name} must be {length} lowercase hexadecimal characters."
+        )
     return text
 
 
@@ -58,7 +63,9 @@ def _rigid_matrix(value: object, *, field_name: str) -> np.ndarray:
         matrix = np.asarray(value, dtype=np.float64).reshape(4, 4)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must contain 16 numeric values.") from exc
-    if not np.all(np.isfinite(matrix)) or not np.allclose(matrix[3], [0, 0, 0, 1], atol=1e-8):
+    if not np.all(np.isfinite(matrix)) or not np.allclose(
+        matrix[3], [0, 0, 0, 1], atol=1e-8
+    ):
         raise ValueError(f"{field_name} must be a finite homogeneous transform.")
     rotation = matrix[:3, :3]
     if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5) or not np.isclose(
@@ -77,26 +84,45 @@ class VgnPointGraspModelSpec:
     model_type: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "model_profile_id", _required(self.model_profile_id, field_name="model_profile_id"))
+        object.__setattr__(
+            self,
+            "model_profile_id",
+            _required(self.model_profile_id, field_name="model_profile_id"),
+        )
         checkpoint = Path(self.checkpoint_path).resolve(strict=True)
         if not checkpoint.is_file():
             raise ValueError("checkpoint_path must be an existing file.")
         object.__setattr__(self, "checkpoint_path", checkpoint)
-        object.__setattr__(self, "checkpoint_sha256", _lower_hex(self.checkpoint_sha256, field_name="checkpoint_sha256", length=64))
-        object.__setattr__(self, "source_revision", _lower_hex(self.source_revision, field_name="source_revision", length=40))
+        object.__setattr__(
+            self,
+            "checkpoint_sha256",
+            _lower_hex(
+                self.checkpoint_sha256, field_name="checkpoint_sha256", length=64
+            ),
+        )
+        object.__setattr__(
+            self,
+            "source_revision",
+            _lower_hex(self.source_revision, field_name="source_revision", length=40),
+        )
         if self.source_revision != VGN_REVIEWED_REVISION:
             raise ValueError("VGN source revision is not the reviewed commit.")
         if self.model_type != "conv":
-            raise ValueError("Only the reviewed VGN conv checkpoint is supported.")
+            raise ValueError(
+                "Only the configured VGN conv checkpoint type is supported."
+            )
         if self.checkpoint_path.name != "vgn_conv.pth":
-            raise ValueError("The reviewed VGN checkpoint must be named vgn_conv.pth.")
+            raise ValueError("The VGN checkpoint must be named vgn_conv.pth.")
 
     @classmethod
-    def from_asset_bundle(cls, bundle_root: str | Path) -> "VgnPointGraspModelSpec":
+    def from_asset_bundle(cls, bundle_root: str | Path) -> VgnPointGraspModelSpec:
         root = Path(bundle_root).expanduser().resolve(strict=True)
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         if not isinstance(manifest, dict) or set(manifest) != {
-            "schema_version", "model_profile_id", "source", "checkpoint"
+            "schema_version",
+            "model_profile_id",
+            "source",
+            "checkpoint",
         }:
             raise ValueError("Point-grasp asset manifest fields are invalid.")
         if manifest["schema_version"] != POINT_GRASP_ASSET_SCHEMA_V1:
@@ -108,16 +134,26 @@ class VgnPointGraspModelSpec:
         if source["git_url"] != VGN_GIT_URL:
             raise ValueError("Point-grasp source URL is not reviewed.")
         if not isinstance(checkpoint, dict) or set(checkpoint) != {
-            "relative_path", "sha256", "model_type"
+            "relative_path",
+            "sha256",
+            "model_type",
         }:
             raise ValueError("Point-grasp checkpoint identity is invalid.")
-        relative = Path(_required(checkpoint["relative_path"], field_name="checkpoint.relative_path"))
+        relative = Path(
+            _required(
+                checkpoint["relative_path"], field_name="checkpoint.relative_path"
+            )
+        )
         if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError("Point-grasp checkpoint must stay inside its asset bundle.")
+            raise ValueError(
+                "Point-grasp checkpoint must stay inside its asset bundle."
+            )
         path = (root / relative).resolve(strict=True)
         if not path.is_file() or root not in path.parents:
             raise ValueError("Point-grasp checkpoint is not a regular bundle file.")
-        expected = _lower_hex(checkpoint["sha256"], field_name="checkpoint.sha256", length=64)
+        expected = _lower_hex(
+            checkpoint["sha256"], field_name="checkpoint.sha256", length=64
+        )
         if _sha256_file(path) != expected:
             raise ValueError("Point-grasp checkpoint hash mismatch.")
         return cls(
@@ -190,9 +226,13 @@ class Sam2VgnPointGraspPlanner:
         self.max_gripper_width_m = float(max_gripper_width_m)
         self.max_click_distance_m = float(max_click_distance_m)
         if self.cube_size_m != 0.30 or self.resolution != 40:
-            raise ValueError("Reviewed VGN checkpoint requires a 0.30 m, 40-voxel cube.")
+            raise ValueError(
+                "Reviewed VGN checkpoint requires a 0.30 m, 40-voxel cube."
+            )
         if self.quality_threshold != 0.90:
-            raise ValueError("The reviewed VGN detector uses a fixed 0.90 quality threshold.")
+            raise ValueError(
+                "The reviewed VGN detector uses a fixed 0.90 quality threshold."
+            )
         if not 0.0 < self.max_gripper_width_m <= 0.070:
             raise ValueError("DMTAC M gripper width must be in (0, 0.070].")
         self._lock = threading.RLock()
@@ -206,7 +246,10 @@ class Sam2VgnPointGraspPlanner:
         return canonical_content_hash(
             {
                 "model_spec_hash": self.model_spec.semantic_content_hash,
-                "sam2_segmenter_hash": _required(getattr(self.point_segmenter, "semantic_content_hash", None), field_name="point_segmenter.semantic_content_hash"),
+                "sam2_segmenter_hash": _required(
+                    getattr(self.point_segmenter, "semantic_content_hash", None),
+                    field_name="point_segmenter.semantic_content_hash",
+                ),
                 "device": self.device,
                 "cube_size_m": self.cube_size_m,
                 "resolution": self.resolution,
@@ -232,21 +275,35 @@ class Sam2VgnPointGraspPlanner:
             if self._started:
                 return
             try:
-                import vgn
                 import torch
+                import vgn
                 from vgn.networks import load_network
             except ImportError as exc:
-                raise RuntimeError("VGN is not installed; run scripts/install_point_grasp_models.sh.") from exc
+                raise RuntimeError(
+                    "VGN is not installed; run scripts/install_point_grasp_models.sh."
+                ) from exc
             revision = subprocess.check_output(
-                ["git", "-C", str(Path(vgn.__file__).resolve().parent), "rev-parse", "HEAD"],
+                [
+                    "git",
+                    "-C",
+                    str(Path(vgn.__file__).resolve().parent),
+                    "rev-parse",
+                    "HEAD",
+                ],
                 text=True,
             ).strip()
             if revision != self.model_spec.source_revision:
-                raise RuntimeError("Installed VGN revision differs from the asset manifest.")
+                raise RuntimeError(
+                    "Installed VGN revision differs from the asset manifest."
+                )
             selected_device = torch.device(self.device)
             if selected_device.type == "cuda" and not torch.cuda.is_available():
-                raise RuntimeError("VGN CUDA deployment requested but CUDA is unavailable.")
-            self._network = load_network(self.model_spec.checkpoint_path, selected_device)
+                raise RuntimeError(
+                    "VGN CUDA deployment requested but CUDA is unavailable."
+                )
+            self._network = load_network(
+                self.model_spec.checkpoint_path, selected_device
+            )
             self._network.eval()
             self._torch = torch
             self._started = True
@@ -280,17 +337,35 @@ class Sam2VgnPointGraspPlanner:
         if not (0 <= u < rgb.width and 0 <= v < rgb.height):
             raise ValueError("pixel_uv is outside the image.")
         values = {name: float(intrinsics[name]) for name in ("fx", "fy", "cx", "cy")}
-        if int(intrinsics["width"]) != rgb.width or int(intrinsics["height"]) != rgb.height:
-            raise ValueError("Intrinsics dimensions differ from the aligned RGB-D image.")
-        if values["fx"] <= 0 or values["fy"] <= 0 or not all(math.isfinite(x) for x in values.values()):
+        if (
+            int(intrinsics["width"]) != rgb.width
+            or int(intrinsics["height"]) != rgb.height
+        ):
+            raise ValueError(
+                "Intrinsics dimensions differ from the aligned RGB-D image."
+            )
+        if (
+            values["fx"] <= 0
+            or values["fy"] <= 0
+            or not all(math.isfinite(x) for x in values.values())
+        ):
             raise ValueError("Camera intrinsics are invalid.")
-        transform_base_camera = _rigid_matrix(base_from_camera, field_name="base_from_camera")
-        mask = np.asarray(self.point_segmenter.segment_point(rgb, pixel_uv=(u, v)), dtype=bool)
+        transform_base_camera = _rigid_matrix(
+            base_from_camera, field_name="base_from_camera"
+        )
+        mask = np.asarray(
+            self.point_segmenter.segment_point(rgb, pixel_uv=(u, v)), dtype=bool
+        )
         if mask.shape != depth.shape or not mask[v, u]:
             raise RuntimeError("SAM2 returned an invalid point mask.")
         target_depth = self._target_depth(depth, mask, u=u, v=v)
         point_camera = np.asarray(
-            [(u - values["cx"]) * target_depth / values["fx"], (v - values["cy"]) * target_depth / values["fy"], target_depth, 1.0],
+            [
+                (u - values["cx"]) * target_depth / values["fx"],
+                (v - values["cy"]) * target_depth / values["fy"],
+                target_depth,
+                1.0,
+            ],
             dtype=np.float64,
         )
         point_base = transform_base_camera @ point_camera
@@ -311,12 +386,19 @@ class Sam2VgnPointGraspPlanner:
             maximum=int(max_candidates),
         )
         if not candidates:
-            raise RuntimeError("No visible collision-free DMTAC M grasp was found near the clicked region.")
+            raise RuntimeError(
+                "No visible collision-free DMTAC M grasp was found near the clicked region."
+            )
         rows, columns = np.nonzero(mask)
         return PointGraspResult(
             target_point_camera_m=tuple(float(x) for x in point_camera[:3]),
             target_point_base_m=tuple(float(x) for x in point_base[:3]),
-            target_mask_bbox_xyxy=(int(columns.min()), int(rows.min()), int(columns.max()) + 1, int(rows.max()) + 1),
+            target_mask_bbox_xyxy=(
+                int(columns.min()),
+                int(rows.min()),
+                int(columns.max()) + 1,
+                int(rows.max()) + 1,
+            ),
             candidates=candidates,
         )
 
@@ -372,7 +454,9 @@ class Sam2VgnPointGraspPlanner:
         values = depth[ys, xs]
         valid = values[(values > 0) & mask[ys, xs]]
         if not len(valid):
-            raise RuntimeError("Clicked region has no valid aligned depth within 5 pixels.")
+            raise RuntimeError(
+                "Clicked region has no valid aligned depth within 5 pixels."
+            )
         return float(np.median(valid))
 
     def _projective_tsdf(
@@ -384,16 +468,34 @@ class Sam2VgnPointGraspPlanner:
     ) -> np.ndarray:
         indices = np.indices((self.resolution,) * 3, dtype=np.float32).reshape(3, -1).T
         cube_points = (indices + 0.5) * (self.cube_size_m / self.resolution)
-        camera_points = cube_points @ camera_from_cube[:3, :3].T + camera_from_cube[:3, 3]
+        camera_points = (
+            cube_points @ camera_from_cube[:3, :3].T + camera_from_cube[:3, 3]
+        )
         z = camera_points[:, 2]
-        projected_u = np.rint(intrinsics["fx"] * camera_points[:, 0] / np.maximum(z, 1e-6) + intrinsics["cx"]).astype(np.int64)
-        projected_v = np.rint(intrinsics["fy"] * camera_points[:, 1] / np.maximum(z, 1e-6) + intrinsics["cy"]).astype(np.int64)
-        valid = (z > 0) & (projected_u >= 0) & (projected_u < depth.shape[1]) & (projected_v >= 0) & (projected_v < depth.shape[0])
+        projected_u = np.rint(
+            intrinsics["fx"] * camera_points[:, 0] / np.maximum(z, 1e-6)
+            + intrinsics["cx"]
+        ).astype(np.int64)
+        projected_v = np.rint(
+            intrinsics["fy"] * camera_points[:, 1] / np.maximum(z, 1e-6)
+            + intrinsics["cy"]
+        ).astype(np.int64)
+        valid = (
+            (z > 0)
+            & (projected_u >= 0)
+            & (projected_u < depth.shape[1])
+            & (projected_v >= 0)
+            & (projected_v < depth.shape[0])
+        )
         valid_indices = np.flatnonzero(valid)
-        valid[valid_indices] &= mask[projected_v[valid_indices], projected_u[valid_indices]]
+        valid[valid_indices] &= mask[
+            projected_v[valid_indices], projected_u[valid_indices]
+        ]
         valid_indices = np.flatnonzero(valid)
         measured = np.zeros_like(z)
-        measured[valid_indices] = depth[projected_v[valid_indices], projected_u[valid_indices]]
+        measured[valid_indices] = depth[
+            projected_v[valid_indices], projected_u[valid_indices]
+        ]
         valid &= measured > 0
         truncation = 4.0 * self.cube_size_m / self.resolution
         grid = np.zeros(len(z), dtype=np.float32)
@@ -416,7 +518,9 @@ class Sam2VgnPointGraspPlanner:
         # VGN uses +Y as jaw width and +Z as approach. DMTAC M's reviewed
         # tool_tcp uses +X as jaw width and +Z as approach.
         grasp_from_tcp = np.eye(4, dtype=np.float64)
-        grasp_from_tcp[:3, :3] = np.asarray([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
+        grasp_from_tcp[:3, :3] = np.asarray(
+            [[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float64
+        )
         ranked = []
         for grasp, raw_score in zip(grasps, scores, strict=True):
             width = float(grasp.width)
@@ -428,12 +532,16 @@ class Sam2VgnPointGraspPlanner:
             distance = float(np.linalg.norm(camera_from_tcp[:3, 3] - target_camera))
             if distance > self.max_click_distance_m:
                 continue
-            collision_free = self._visible_collision_free(camera_from_tcp, width, depth, intrinsics)
+            collision_free = self._visible_collision_free(
+                camera_from_tcp, width, depth, intrinsics
+            )
             if not collision_free:
                 continue
             model_score = min(1.0, max(0.0, float(raw_score)))
             score = model_score * math.exp(-distance / 0.05)
-            ranked.append((score, model_score, distance, width, camera_from_tcp, base_from_tcp))
+            ranked.append(
+                (score, model_score, distance, width, camera_from_tcp, base_from_tcp)
+            )
         ranked.sort(key=lambda item: (-item[0], item[2]))
         return tuple(
             PointGraspCandidate(
@@ -445,7 +553,9 @@ class Sam2VgnPointGraspPlanner:
                 base_from_tcp=tuple(float(x) for x in base_from_tcp.reshape(-1)),
                 visible_collision_free=True,
             )
-            for score, model_score, distance, width, camera_from_tcp, base_from_tcp in ranked[:maximum]
+            for score, model_score, distance, width, camera_from_tcp, base_from_tcp in ranked[
+                :maximum
+            ]
         )
 
     @staticmethod
@@ -460,7 +570,13 @@ class Sam2VgnPointGraspPlanner:
         rows = rows * step
         columns = columns * step
         z = depth[rows, columns].astype(np.float64)
-        points = np.column_stack(((columns - intrinsics["cx"]) * z / intrinsics["fx"], (rows - intrinsics["cy"]) * z / intrinsics["fy"], z))
+        points = np.column_stack(
+            (
+                (columns - intrinsics["cx"]) * z / intrinsics["fx"],
+                (rows - intrinsics["cy"]) * z / intrinsics["fy"],
+                z,
+            )
+        )
         tcp_from_camera = np.linalg.inv(camera_from_tcp)
         local = points @ tcp_from_camera[:3, :3].T + tcp_from_camera[:3, 3]
         # Actual DMTAC M visible-envelope approximation: 25.5 mm pad height,
@@ -472,7 +588,11 @@ class Sam2VgnPointGraspPlanner:
         forward = (local[:, 2] > 0.0) & (local[:, 2] < depth_m)
         left = (local[:, 0] > width / 2.0) & (local[:, 0] < width / 2.0 + finger)
         right = (local[:, 0] < -width / 2.0) & (local[:, 0] > -width / 2.0 - finger)
-        palm = (local[:, 2] > -finger) & (local[:, 2] <= 0.0) & (np.abs(local[:, 0]) < width / 2.0 + finger)
+        palm = (
+            (local[:, 2] > -finger)
+            & (local[:, 2] <= 0.0)
+            & (np.abs(local[:, 0]) < width / 2.0 + finger)
+        )
         return (
             int(np.count_nonzero(within_height & (forward & (left | right) | palm)))
             <= DMTAC_M_MAX_VISIBLE_COLLISION_POINTS
@@ -483,11 +603,11 @@ __all__ = [
     "DEFAULT_DMTAC_M_URDF",
     "DEFAULT_DMTAC_M_URDF_SHA256",
     "DMTAC_M_MAX_VISIBLE_COLLISION_POINTS",
+    "POINT_GRASP_ASSET_SCHEMA_V1",
     "VGN_GIT_URL",
     "VGN_REVIEWED_REVISION",
-    "POINT_GRASP_ASSET_SCHEMA_V1",
-    "VgnPointGraspModelSpec",
     "PointGraspCandidate",
     "PointGraspResult",
     "Sam2VgnPointGraspPlanner",
+    "VgnPointGraspModelSpec",
 ]

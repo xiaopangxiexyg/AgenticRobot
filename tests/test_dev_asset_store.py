@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
-from pathlib import Path
 import subprocess
 import sys
-
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSET_TOOL_PATH = REPO_ROOT / "scripts" / "dev_asset_store.py"
@@ -14,7 +12,9 @@ CLAIM_TOOL_PATH = REPO_ROOT / "scripts" / "claim_worktree.py"
 
 
 def _load_asset_tool():
-    spec = importlib.util.spec_from_file_location("dev_asset_store_test_module", ASSET_TOOL_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "dev_asset_store_test_module", ASSET_TOOL_PATH
+    )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -66,9 +66,7 @@ def test_store_status_requires_only_default_bundles(tmp_path: Path) -> None:
     status = asset_tool.inspect_asset_store(store, source="test")
 
     assert status.available is True
-    assert all(
-        item.available for item in status.bundles if item.required_by_default
-    )
+    assert all(item.available for item in status.bundles if item.required_by_default)
     assert any(
         not item.available for item in status.bundles if not item.required_by_default
     )

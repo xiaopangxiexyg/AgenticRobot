@@ -72,7 +72,11 @@ def test_point_prompt_candidate_merge_removes_duplicate_poses() -> None:
     batches = [
         [
             {"score": 0.9, "model_score": 0.8, "T_base_from_tcp": identity},
-            {"score": 0.7, "model_score": 0.6, "T_base_from_tcp": shifted.reshape(-1).tolist()},
+            {
+                "score": 0.7,
+                "model_score": 0.6,
+                "T_base_from_tcp": shifted.reshape(-1).tolist(),
+            },
         ],
         [
             {"score": 0.85, "model_score": 0.75, "T_base_from_tcp": identity},
@@ -95,7 +99,9 @@ def test_bounded_pose_action_reaches_limits_without_changing_gripper() -> None:
         translation_step_m=(0.02, 0.02, 0.02),
         rotation_step_rad=(0.15, 0.15, 0.15),
     )
-    np.testing.assert_allclose(action, [1.0, -0.5, 0.25, 1.0, -1.0 / 3.0, 0.0, 0.0], atol=1e-6)
+    np.testing.assert_allclose(
+        action, [1.0, -0.5, 0.25, 1.0, -1.0 / 3.0, 0.0, 0.0], atol=1e-6
+    )
 
 
 def test_pregrasp_backs_away_on_candidate_approach_axis() -> None:
@@ -133,7 +139,14 @@ def test_pose_qref_is_inset_without_widening_hard_limits() -> None:
 
 def test_grasp_overlay_changes_pixels_and_keeps_shape() -> None:
     rgb = np.zeros((100, 120, 3), dtype=np.uint8)
-    intrinsics = {"width": 120, "height": 100, "fx": 100.0, "fy": 100.0, "cx": 60.0, "cy": 50.0}
+    intrinsics = {
+        "width": 120,
+        "height": 100,
+        "fx": 100.0,
+        "fy": 100.0,
+        "cx": 60.0,
+        "cy": 50.0,
+    }
     camera_from_tcp = np.eye(4)
     camera_from_tcp[:3, 3] = [0.0, 0.0, 0.5]
     output = draw_grasp_overlay(
@@ -172,12 +185,8 @@ def test_evaluation_task_randomizes_observable_scene_and_requires_contact() -> N
     assert config.right_tool_profile_path.endswith(
         "rm65_right_DMTAC_M_4b2_cad_tool_tcp.json"
     )
-    assert config.grasp_latch_left_finger_body_name == (
-        "right_eg2_4b2_cad_ee_link_2"
-    )
-    assert config.grasp_latch_right_finger_body_name == (
-        "right_eg2_4b2_cad_ee_link_3"
-    )
+    assert config.grasp_latch_left_finger_body_name == ("right_eg2_4b2_cad_ee_link_2")
+    assert config.grasp_latch_right_finger_body_name == ("right_eg2_4b2_cad_ee_link_3")
     assert "sim_point_grasp/configs" in config.base_contract_path
     contract = config.base_contract()
     assert contract.scene.collision.safety_minimum_clearance_m == 0.0
@@ -205,8 +214,7 @@ def test_heavy_strong_ablation_scales_mass_inertia_and_force_profile() -> None:
     assert object_spec.mass_kg == 0.20
     np.testing.assert_allclose(
         object_spec.inertia_diagonal_kg_m2,
-        np.asarray((0.0000773333333333, 0.0000773333333333, 0.0000213333333333))
-        * 2.5,
+        np.asarray((0.0000773333333333, 0.0000773333333333, 0.0000213333333333)) * 2.5,
     )
     assert config.gripper_actuation_profile_name.endswith("v3_strong")
     assert config.gripper_actuation_profile().force_limit_n == 0.75

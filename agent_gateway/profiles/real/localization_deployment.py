@@ -25,7 +25,7 @@ from agent_gateway.skills.perception.schemas import (
     validate_no_task_evaluation_v1,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from perception_contracts.artifacts import (
+from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
     LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,
@@ -102,7 +102,9 @@ class RealObjectLocalizationProfile:
                 "model_profile_hash": self.model_profile_hash,
                 "inference_implementation_hash": self.inference_implementation_hash,
                 "local_path_test_input": (
-                    "explicit_allowlisted_roots" if self.local_path_enabled else "disabled"
+                    "explicit_allowlisted_roots"
+                    if self.local_path_enabled
+                    else "disabled"
                 ),
                 "max_detections": self.max_detections,
                 "max_image_bytes": self.max_image_bytes,
@@ -197,6 +199,7 @@ def build_real_object_localization_registration(
         parameter_profile_id=profile.profile_id,
         parameter_profile_hash=profile.semantic_content_hash,
         max_detections=profile.max_detections,
+        local_path_enabled=profile.local_path_enabled,
     )
     io_contract = SkillIOContract(
         skill_id=definition.skill_id,
@@ -209,7 +212,7 @@ def build_real_object_localization_registration(
             SkillArtifactSlotSpec(
                 slot_id=REAL_LOCALIZE_OBJECTS_INPUT_SLOT_ID_V1,
                 direction="input",
-                min_count=0,
+                min_count=0 if profile.local_path_enabled else 1,
                 max_count=1,
                 allowed_media_types=(
                     LOCALIZATION_INPUT_JPEG_MEDIA_TYPE_V1,
@@ -270,7 +273,8 @@ def build_real_object_localization_registration(
         routes=(route,),
     )
     binding = RealObjectLocalizationDeploymentBinding(
-        deployment_binding_id="real.local_model.object_localization:" + runtime_session_id,
+        deployment_binding_id="real.local_model.object_localization:"
+        + runtime_session_id,
         route_hash=route.semantic_content_hash,
         runtime_session_id=runtime_session_id,
         control_domain_id=control_domain_id,

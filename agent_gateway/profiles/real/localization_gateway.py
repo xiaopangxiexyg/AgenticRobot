@@ -24,7 +24,7 @@ from agent_gateway.runtime.passive_read_executor import (
     PassiveReadSkillExecutor,
 )
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from perception_contracts.artifacts import (
+from dataset_contracts.perception_artifacts import (
     LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
     LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
     LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,
@@ -73,7 +73,9 @@ def read_bounded_regular_file(path: Path, *, maximum: int) -> bytes:
         os.close(descriptor)
 
 
-def safe_local_path(raw_path: object, roots: tuple[Path, ...], *, field_name: str = "local_image_path") -> Path:
+def safe_local_path(
+    raw_path: object, roots: tuple[Path, ...], *, field_name: str = "local_image_path"
+) -> Path:
     text = _required(raw_path, field_name=field_name)
     candidate = Path(text)
     if not candidate.is_absolute():
@@ -107,14 +109,18 @@ def decode_bounded_image(
             LOCALIZATION_INPUT_PNG_MEDIA_TYPE_V1: "PNG",
         }.get(expected_media_type)
         if expected_format is not None and source_format != expected_format:
-            raise ValueError("Input Artifact bytes do not match their declared media type.")
+            raise ValueError(
+                "Input Artifact bytes do not match their declared media type."
+            )
         if source_format not in {"JPEG", "PNG"}:
             raise ValueError("Object localization accepts only JPEG or PNG images.")
         image = ImageOps.exif_transpose(source).convert("RGB")
         image.load()
         return image
     except (OSError, Image.DecompressionBombError) as exc:
-        raise ValueError("Object-localization input is not a valid bounded image.") from exc
+        raise ValueError(
+            "Object-localization input is not a valid bounded image."
+        ) from exc
 
 
 def _annotated_jpeg(image: Image.Image, detections: tuple[Any, ...]) -> bytes:
@@ -213,30 +219,42 @@ class ObjectLocalizationProvider:
         finally:
             self._started = False
 
-    def _input_bytes(self, request: Any, store: RecoverableAgentArtifactStore) -> tuple[bytes, str]:
+    def _input_bytes(
+        self, request: Any, store: RecoverableAgentArtifactStore
+    ) -> tuple[bytes, str]:
         source = request.parameters["input_source"]
         bindings = tuple(request.input_artifact_bindings)
         if source == "artifact":
             if len(bindings) != 1 or request.parameters["local_image_path"] is not None:
-                raise ValueError("Artifact localization requires exactly one input Artifact.")
+                raise ValueError(
+                    "Artifact localization requires exactly one input Artifact."
+                )
             binding = bindings[0]
             if binding.slot_id != REAL_LOCALIZE_OBJECTS_INPUT_SLOT_ID_V1:
-                raise ValueError("Object-localization input Artifact uses another slot.")
+                raise ValueError(
+                    "Object-localization input Artifact uses another slot."
+                )
             artifact = binding.artifact
             identity = (artifact.media_type, artifact.encoding, artifact.compression)
-            if identity not in {
-                (
-                    LOCALIZATION_INPUT_JPEG_MEDIA_TYPE_V1,
-                    LOCALIZATION_INPUT_JPEG_ENCODING_V1,
-                    LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
-                ),
-                (
-                    LOCALIZATION_INPUT_PNG_MEDIA_TYPE_V1,
-                    LOCALIZATION_INPUT_PNG_ENCODING_V1,
-                    LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
-                ),
-            } or artifact.schema_id != LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1:
-                raise ValueError("Object-localization input Artifact identity is invalid.")
+            if (
+                identity
+                not in {
+                    (
+                        LOCALIZATION_INPUT_JPEG_MEDIA_TYPE_V1,
+                        LOCALIZATION_INPUT_JPEG_ENCODING_V1,
+                        LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
+                    ),
+                    (
+                        LOCALIZATION_INPUT_PNG_MEDIA_TYPE_V1,
+                        LOCALIZATION_INPUT_PNG_ENCODING_V1,
+                        LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
+                    ),
+                }
+                or artifact.schema_id != LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1
+            ):
+                raise ValueError(
+                    "Object-localization input Artifact identity is invalid."
+                )
             path = store.managed_read_path(artifact.artifact_id)
             return (
                 read_bounded_regular_file(
@@ -247,7 +265,9 @@ class ObjectLocalizationProvider:
             )
         if source == "local_path":
             if bindings:
-                raise ValueError("Local-path localization cannot also bind an Artifact.")
+                raise ValueError(
+                    "Local-path localization cannot also bind an Artifact."
+                )
             path = safe_local_path(
                 request.parameters["local_image_path"],
                 self.allowed_local_image_roots,
@@ -284,8 +304,7 @@ class ObjectLocalizationProvider:
         for ordinal, detection in enumerate(detections):
             x_min, y_min, x_max, y_max = detection.box_xyxy
             if not (
-                0 <= x_min < x_max <= image.width
-                and 0 <= y_min < y_max <= image.height
+                0 <= x_min < x_max <= image.width and 0 <= y_min < y_max <= image.height
             ):
                 raise RuntimeError("Object localizer returned an out-of-image box.")
             normalized.append(

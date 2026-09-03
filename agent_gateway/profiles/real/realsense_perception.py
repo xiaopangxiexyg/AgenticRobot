@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
-from perception_contracts.artifacts import (
+from dataset_contracts.perception_artifacts import (
     DEPTH_FRAME_COMPRESSION_V1,
     DEPTH_FRAME_ENCODING_V1,
     DEPTH_FRAME_MEDIA_TYPE_V1,
@@ -241,7 +241,9 @@ def build_real_perception_source_binding(
     for camera_key, config in configs.items():
         spec = registry_cameras.get(camera_key)
         if not isinstance(spec, Mapping):
-            raise ValueError(f"camera {camera_key!r} is absent from the registry.")
+            raise ValueError(  # noqa: TRY004 - registry validation contract
+                f"camera {camera_key!r} is absent from the registry."
+            )
         if str(spec.get("serial")) != str(config.serial):
             raise ValueError(f"camera {camera_key!r} serial differs from the registry.")
         profile = spec.get("profile")
@@ -249,7 +251,9 @@ def build_real_perception_source_binding(
             int(profile.get(field_name, -1)) != int(getattr(config, field_name))
             for field_name in ("width", "height", "fps")
         ):
-            raise ValueError(f"camera {camera_key!r} profile differs from the registry.")
+            raise ValueError(
+                f"camera {camera_key!r} profile differs from the registry."
+            )
         pose_payload = None
         if config.enable_depth:
             frames = (spec.get("extrinsics") or {}).get("frames")
@@ -277,7 +281,9 @@ def build_real_perception_source_binding(
                 frame["T_camera_to_parent"],
                 field_name=f"camera_registry.{camera_key}.T_camera_to_parent",
             )
-            world_from_camera = world_from_base[side_by_parent[parent]] @ parent_from_camera
+            world_from_camera = (
+                world_from_base[side_by_parent[parent]] @ parent_from_camera
+            )
             static_depth_poses[camera_key] = _pose_matrix(
                 world_from_camera,
                 field_name=f"world_from_depth_camera.{camera_key}",
@@ -301,7 +307,9 @@ def build_real_perception_source_binding(
         domain="dexteleop.real_realsense_perception_source_binding.v1",
     )
     return RealPerceptionSourceBinding(
-        camera_sources={key: RealSenseRGBSource(config) for key, config in configs.items()},
+        camera_sources={
+            key: RealSenseRGBSource(config) for key, config in configs.items()
+        },
         world_from_depth_camera_by_source=static_depth_poses,
         semantic_content_hash=binding_hash,
     )
@@ -329,8 +337,12 @@ class ExclusiveRealPerceptionResources:
             getattr(artifact_store, "close", None)
         ):
             raise TypeError("artifact_store must expose close.")
-        start_cameras = start_realsense_sources if start_cameras is None else start_cameras
-        admit_cameras = admit_realsense_sources if admit_cameras is None else admit_cameras
+        start_cameras = (
+            start_realsense_sources if start_cameras is None else start_cameras
+        )
+        admit_cameras = (
+            admit_realsense_sources if admit_cameras is None else admit_cameras
+        )
         if not callable(start_cameras) or not callable(admit_cameras):
             raise TypeError("camera lifecycle callbacks must be callable.")
         self.lower = lower
@@ -360,14 +372,14 @@ class ExclusiveRealPerceptionResources:
             if lower_attempted:
                 try:
                     self.lower.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - preserve the original startup failure
                     pass
             if cameras_attempted:
                 self._close_cameras()
             if self.artifact_store is not None:
                 try:
                     self.artifact_store.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - preserve the original startup failure
                     pass
             with self._lock:
                 self._closed = True
@@ -399,7 +411,9 @@ class ExclusiveRealPerceptionResources:
             except Exception as exc:  # noqa: BLE001 - complete resource close.
                 errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
         if errors:
-            raise RuntimeError("real perception resource close failed: " + "; ".join(errors))
+            raise RuntimeError(
+                "real perception resource close failed: " + "; ".join(errors)
+            )
 
 
 class CameraOnlyRealPerceptionResources:
@@ -617,7 +631,9 @@ class RealSenseAgentPerceptionProvider:
                 key=lambda item: item[1],
             )
         ):
-            raise ValueError("Real depth provider does not match the registered profile.")
+            raise ValueError(
+                "Real depth provider does not match the registered profile."
+            )
         if profile.source_binding_hash != self.source_binding.semantic_content_hash:
             raise ValueError("Real perception source binding hash changed.")
         self._profile = profile
@@ -659,11 +675,12 @@ class RealSenseAgentPerceptionProvider:
             raise RuntimeError(f"real_perception_serial_mismatch:{source_id}")
         metadata = frame.metadata
         if not isinstance(metadata, Mapping):
-            raise RuntimeError(f"real_perception_frame_identity_missing:{source_id}")
-        if (
-            metadata.get("camera_key") != source_id
-            or str(metadata.get("serial")) != str(source.config.serial)
-        ):
+            raise RuntimeError(  # noqa: TRY004 - runtime capture contract
+                f"real_perception_frame_identity_missing:{source_id}"
+            )
+        if metadata.get("camera_key") != source_id or str(
+            metadata.get("serial")
+        ) != str(source.config.serial):
             raise RuntimeError(f"real_perception_frame_identity_mismatch:{source_id}")
         generation = info.get("generation")
         if (
@@ -686,23 +703,26 @@ class RealSenseAgentPerceptionProvider:
         fields = {"selected_roles", "width", "height", "max_total_bytes"}
         if not isinstance(parameters, Mapping) or set(parameters) != fields:
             raise ValueError("RGB capture parameters must use the exact schema fields.")
-        expected_station_revision = self._expected_revision(
-            expected_station_revision
-        )
+        expected_station_revision = self._expected_revision(expected_station_revision)
         roles_raw = parameters.get("selected_roles")
         if isinstance(roles_raw, (str, bytes)) or not isinstance(roles_raw, Sequence):
             raise TypeError("selected_roles must be an array.")
-        roles = tuple(_required_text(value, field_name="selected_roles[]") for value in roles_raw)
+        roles = tuple(
+            _required_text(value, field_name="selected_roles[]") for value in roles_raw
+        )
         if not roles or len(roles) > 8 or len(set(roles)) != len(roles):
             raise ValueError("selected_roles must contain one to eight unique roles.")
         width = parameters["width"]
         height = parameters["height"]
         max_total_bytes = parameters["max_total_bytes"]
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in (
-            width,
-            height,
-            max_total_bytes,
-        )) or not (
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (
+                width,
+                height,
+                max_total_bytes,
+            )
+        ) or not (
             1 <= width <= 1920
             and 1 <= height <= 1080
             and 1 <= max_total_bytes <= profile.max_artifact_bytes
@@ -765,9 +785,7 @@ class RealSenseAgentPerceptionProvider:
         profile = self._profile
         if profile is None:
             raise RuntimeError("real_perception_provider_not_bound")
-        expected_station_revision = self._expected_revision(
-            expected_station_revision
-        )
+        expected_station_revision = self._expected_revision(expected_station_revision)
         selected_role = _required_text(role, field_name="role")
         source_by_role = {
             real_camera_role_for_source(source_id): (source_id, source)
@@ -791,7 +809,9 @@ class RealSenseAgentPerceptionProvider:
             raise RuntimeError(f"real_depth_dimensions_changed:{source_id}")
         scale = metadata.get("depth_scale_m_per_unit")
         if isinstance(scale, bool) or not isinstance(scale, (int, float)):
-            raise RuntimeError(f"real_depth_scale_unavailable:{source_id}")
+            raise RuntimeError(  # noqa: TRY004 - runtime capture contract
+                f"real_depth_scale_unavailable:{source_id}"
+            )
         scale = float(scale)
         if not math.isfinite(scale) or scale <= 0.0:
             raise RuntimeError(f"real_depth_scale_invalid:{source_id}")
@@ -848,7 +868,9 @@ def _depth_intrinsics(
     shape: tuple[int, ...],
 ) -> Mapping[str, float | int]:
     if not isinstance(payload, Mapping):
-        raise RuntimeError("real_depth_intrinsics_unavailable")
+        raise RuntimeError(  # noqa: TRY004 - runtime capture contract
+            "real_depth_intrinsics_unavailable"
+        )
     if len(shape) != 2:
         raise RuntimeError("real_depth_shape_invalid")
     width, height = int(shape[1]), int(shape[0])

@@ -10,21 +10,16 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from agent_gateway.profiles.real.perception_application import (
-    assemble_camera_only_real_perception_composition,
-)
-from agent_gateway.profiles.real.realsense_perception import CameraOnlyRealPerceptionResources
-from agent_gateway.profiles.real.realsense_perception import RealPerceptionSourceBinding
 from agent_gateway.profiles.real.point_grasp_deployment import (
     REAL_POINT_GRASP_DEPTH_SLOT_ID_V1,
     REAL_POINT_GRASP_RGB_SLOT_ID_V1,
     build_real_point_grasp_registration,
 )
 from agent_gateway.profiles.real.point_grasp_gateway import PointGraspProvider
-from agent_gateway.transport.client_bindings import (
-    compile_agent_gateway_unix_client_bindings,
+from agent_gateway.profiles.real.realsense_perception import (
+    CameraOnlyRealPerceptionResources,
 )
-from perception_contracts.artifacts import (
+from dataset_contracts.perception_artifacts import (
     LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
     LOCALIZATION_INPUT_PNG_ENCODING_V1,
     LOCALIZATION_INPUT_PNG_MEDIA_TYPE_V1,
@@ -33,23 +28,23 @@ from perception_contracts.artifacts import (
     POINT_GRASP_DEPTH_MEDIA_TYPE_V1,
     POINT_GRASP_RGB_SCHEMA_ID_V1,
 )
-from deployments.perception.sam2_vgn_point_grasp import (
-    DEFAULT_DMTAC_M_URDF,
-    DEFAULT_DMTAC_M_URDF_SHA256,
-    DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
-    PointGraspCandidate,
-    PointGraspResult,
-    Sam2VgnPointGraspPlanner,
-    VGN_GIT_URL,
-    VGN_REVIEWED_REVISION,
-    VgnPointGraspModelSpec,
-)
 from deployments.perception.sam2_graspnet_point_grasp import (
     GRASPNET_GIT_URL,
     GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2,
     GRASPNET_REVIEWED_REVISION,
     GraspNetPointGraspModelSpec,
     Sam2GraspNetPointGraspPlanner,
+)
+from deployments.perception.sam2_vgn_point_grasp import (
+    DEFAULT_DMTAC_M_URDF,
+    DEFAULT_DMTAC_M_URDF_SHA256,
+    DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
+    VGN_GIT_URL,
+    VGN_REVIEWED_REVISION,
+    PointGraspCandidate,
+    PointGraspResult,
+    Sam2VgnPointGraspPlanner,
+    VgnPointGraspModelSpec,
 )
 from sim.contracts.scene.spec import DEFAULT_RM65_PHYSICS_URDF
 
@@ -69,7 +64,9 @@ class _FakePlanner:
     def close(self):
         return None
 
-    def plan(self, image, depth, *, pixel_uv, intrinsics, base_from_camera, max_candidates):
+    def plan(
+        self, image, depth, *, pixel_uv, intrinsics, base_from_camera, max_candidates
+    ):
         assert image.size == (12, 10)
         assert depth.shape == (10, 12)
         assert pixel_uv == (6, 5)
@@ -117,7 +114,12 @@ def _parameters(rgb: Path | None, depth: Path | None):
         "local_depth_path": None if depth is None else str(depth),
         "target_pixel_uv": [6, 5],
         "camera_intrinsics": {
-            "width": 12, "height": 10, "fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0,
+            "width": 12,
+            "height": 10,
+            "fx": 10.0,
+            "fy": 10.0,
+            "cx": 6.0,
+            "cy": 5.0,
         },
         "camera_frame_id": "fixed_camera_optical_frame",
         "base_frame_id": "right_arm_base_link",
@@ -132,23 +134,31 @@ def test_point_grasp_registration_is_passive_and_has_two_inputs() -> None:
     assert registration.skill.definition.skill_id == "perception.plan_point_grasp"
     assert route.control_effect_class == "read_only"
     assert route.may_move_robot is False
-    assert {slot.slot_id for slot in registration.skill.io_contract.input_artifact_slots} == {
+    assert {
+        slot.slot_id for slot in registration.skill.io_contract.input_artifact_slots
+    } == {
         REAL_POINT_GRASP_RGB_SLOT_ID_V1,
         REAL_POINT_GRASP_DEPTH_SLOT_ID_V1,
     }
     registration.payload_validator.validate_parameters(_parameters(None, None))
 
 
-def test_point_grasp_local_rgbd_produces_camera_and_base_tcp_poses(tmp_path: Path) -> None:
+def test_point_grasp_local_rgbd_produces_camera_and_base_tcp_poses(
+    tmp_path: Path,
+) -> None:
     rgb = tmp_path / "frame.png"
     Image.new("RGB", (12, 10), color=(32, 64, 96)).save(rgb)
     depth = tmp_path / "depth.npy"
     np.save(depth, np.full((10, 12), 0.5, dtype=np.float32), allow_pickle=False)
     registration = _registration()
     provider = PointGraspProvider(
-        planner=_FakePlanner(), registration=registration, allowed_local_image_roots=(tmp_path,)
+        planner=_FakePlanner(),
+        registration=registration,
+        allowed_local_image_roots=(tmp_path,),
     )
-    request = SimpleNamespace(parameters=_parameters(rgb, depth), input_artifact_bindings=())
+    request = SimpleNamespace(
+        parameters=_parameters(rgb, depth), input_artifact_bindings=()
+    )
     prepared = provider.plan_request(request, artifact_store=SimpleNamespace())
     result = prepared.execution_result
     assert result["candidate_count"] == 1
@@ -156,11 +166,15 @@ def test_point_grasp_local_rgbd_produces_camera_and_base_tcp_poses(tmp_path: Pat
     assert result["candidates"][0]["tcp_xyz_camera_m"] == [0.01, 0.02, 0.5]
     assert result["candidates"][0]["tcp_xyz_base_m"] == [0.11, 0.22, 0.8]
     registration.payload_validator.validate_execution_result(result)
-    registration.payload_validator.validate_execution_result_for_parameters(request.parameters, result)
+    registration.payload_validator.validate_execution_result_for_parameters(
+        request.parameters, result
+    )
     assert Image.open(io.BytesIO(prepared.annotated_jpeg)).size == (12, 10)
 
 
-def test_local_rgb_and_depth_may_use_different_allowlisted_roots(tmp_path: Path) -> None:
+def test_local_rgb_and_depth_may_use_different_allowlisted_roots(
+    tmp_path: Path,
+) -> None:
     rgb_root = tmp_path / "rgb"
     depth_root = tmp_path / "depth"
     rgb_root.mkdir()
@@ -246,105 +260,6 @@ def test_model_resources_start_sam_before_vgn_and_close_in_reverse() -> None:
     ]
 
 
-def test_camera_only_composition_registers_shared_sam2_and_point_grasp(
-    tmp_path: Path,
-) -> None:
-    class _Camera:
-        config = SimpleNamespace(
-            camera_key="front",
-            width=12,
-            height=10,
-            depth_width=12,
-            depth_height=10,
-            align_depth_to_color=True,
-            enable_depth=True,
-            color_space="rgb",
-            serial="front-test",
-        )
-
-        def device_info(self):
-            return {"running": False, "generation": 0, "serial_number": "front-test"}
-
-        def close(self):
-            return None
-
-    class _SamSpec:
-        model_profile_id = "sam2:test"
-        semantic_content_hash = "sam2-model:test"
-
-    class _Sam:
-        model_spec = _SamSpec()
-        semantic_content_hash = "sam2-localizer:test"
-
-        def start(self):
-            return None
-
-        def close(self):
-            return None
-
-        def localize(self, *_args, **_kwargs):
-            return ()
-
-        def segment_point(self, *_args, **_kwargs):
-            return np.ones((10, 12), dtype=bool)
-
-    class _VgnSpec:
-        model_profile_id = "vgn:test"
-        semantic_content_hash = "vgn-model:test"
-
-    class _Planner:
-        backend_id = "vgn"
-        model_spec = _VgnSpec()
-        semantic_content_hash = "sam2-vgn-planner:test"
-
-        def __init__(self, segmenter):
-            self.point_segmenter = segmenter
-
-        def start(self):
-            return None
-
-        def close(self):
-            return None
-
-        def plan(self, *_args, **_kwargs):
-            raise AssertionError("composition test must not run inference")
-
-    sam2 = _Sam()
-    source_binding = RealPerceptionSourceBinding(
-        camera_sources={"front": _Camera()},
-        world_from_depth_camera_by_source={"front": np.eye(4)},
-        semantic_content_hash="fixed-camera-binding:test",
-    )
-    artifact_root = tmp_path / "artifacts"
-    artifact_root.mkdir()
-    composition = assemble_camera_only_real_perception_composition(
-        source_binding=source_binding,
-        socket_path=tmp_path / "gateway.sock",
-        artifact_root=artifact_root,
-        client_bindings=compile_agent_gateway_unix_client_bindings(
-            primary_client_id="test-client", primary_client_uid=1234
-        ),
-        runtime_session_id="point-grasp-composition:test",
-        control_domain_id="read-only:test",
-        scene_geometry_hash="scene:test",
-        object_localizer=sam2,
-        point_grasp_planner=_Planner(sam2),
-    )
-    try:
-        assert composition.localization_registration is not None
-        assert composition.point_grasp_registration is not None
-        assert composition.session.localization_executor is not None
-        assert composition.session.point_grasp_executor is not None
-        assert len(composition.contract_bundle.route_manifest.skill_routes) == 4
-        assert composition.resources.additional_resources == (
-            composition.localization_provider,
-            composition.point_grasp_provider,
-        )
-    finally:
-        composition.session.close()
-        composition.resources.close()
-
-
 def test_vgn_manifest_and_dmtac_m_default_urdf_are_pinned(tmp_path: Path) -> None:
     checkpoint = tmp_path / "vgn_conv.pth"
     checkpoint.write_bytes(b"vgn")
@@ -370,11 +285,15 @@ def test_projective_tsdf_uses_clicked_sam2_mask(tmp_path: Path) -> None:
     checkpoint = tmp_path / "vgn_conv.pth"
     checkpoint.write_bytes(b"vgn")
     spec = VgnPointGraspModelSpec(
-        model_profile_id="test", checkpoint_path=checkpoint,
+        model_profile_id="test",
+        checkpoint_path=checkpoint,
         checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
-        source_revision=VGN_REVIEWED_REVISION, model_type="conv",
+        source_revision=VGN_REVIEWED_REVISION,
+        model_type="conv",
     )
-    segmenter = SimpleNamespace(segment_point=lambda *_args, **_kwargs: None, semantic_content_hash="sam:test")
+    segmenter = SimpleNamespace(
+        segment_point=lambda *_args, **_kwargs: None, semantic_content_hash="sam:test"
+    )
     planner = Sam2VgnPointGraspPlanner(model_spec=spec, point_segmenter=segmenter)
     depth = np.ones((10, 12), dtype=np.float32)
     mask = np.zeros_like(depth, dtype=bool)
@@ -533,7 +452,9 @@ def test_graspnet_point_conditioned_workspace_crops_unrelated_scene_points() -> 
     assert np.max(workspace[:, 2]) < 1.0
 
 
-def test_graspnet_point_conditioned_workspace_falls_back_when_crop_is_too_sparse() -> None:
+def test_graspnet_point_conditioned_workspace_falls_back_when_crop_is_too_sparse() -> (
+    None
+):
     planner = object.__new__(Sam2GraspNetPointGraspPlanner)
     planner.point_conditioned_workspace_margin_m = 0.120
     target = np.zeros((16, 3), dtype=np.float32)

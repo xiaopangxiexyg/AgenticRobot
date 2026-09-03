@@ -21,7 +21,7 @@ from agent_gateway.runtime.artifact_producer import (
     commit_artifact_bytes,
 )
 from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
-from perception_contracts.artifacts import (
+from dataset_contracts.perception_artifacts import (
     LOCALIZATION_INPUT_IMAGE_COMPRESSION_V1,
     LOCALIZATION_INPUT_IMAGE_SCHEMA_ID_V1,
     LOCALIZATION_INPUT_JPEG_ENCODING_V1,
@@ -105,10 +105,19 @@ def test_localization_registration_closes_over_input_and_output_artifacts() -> N
     assert registration.skill.io_contract.input_artifact_slots[0].slot_id == (
         REAL_LOCALIZE_OBJECTS_INPUT_SLOT_ID_V1
     )
-    assert registration.skill.io_contract.input_artifact_slots[0].min_count == 0
+    assert registration.skill.io_contract.input_artifact_slots[0].min_count == 1
     assert registration.skill.io_contract.output_artifact_slots[0].slot_id == (
         REAL_LOCALIZE_OBJECTS_OUTPUT_SLOT_ID_V1
     )
+    parameter_properties = registration.skill.schema_entry.parameter_schema[
+        "properties"
+    ]
+    result_properties = registration.skill.schema_entry.execution_result_schema[
+        "properties"
+    ]
+    assert parameter_properties["input_source"] == {"const": "artifact"}
+    assert parameter_properties["local_image_path"] == {"type": "null"}
+    assert result_properties["input_source"] == {"const": "artifact"}
 
     registration.payload_validator.validate_parameters(
         {
@@ -137,6 +146,11 @@ def test_local_path_mode_is_bounded_to_explicit_test_root(tmp_path: Path) -> Non
     outside = tmp_path / "outside.jpg"
     outside.write_bytes(_jpeg_bytes())
     registration = _registration(local_path_enabled=True)
+    local_source_schema = registration.skill.schema_entry.parameter_schema[
+        "properties"
+    ]["input_source"]
+    assert local_source_schema["type"] == "string"
+    assert local_source_schema["enum"] == ("artifact", "local_path")
     localizer = _FakeLocalizer()
     provider = ObjectLocalizationProvider(
         localizer=localizer,
@@ -165,16 +179,16 @@ def test_local_path_mode_is_bounded_to_explicit_test_root(tmp_path: Path) -> Non
         }
     ]
     assert Image.open(io.BytesIO(prepared.annotated_jpeg)).size == (12, 10)
-    registration.payload_validator.validate_execution_result(
-        prepared.execution_result
-    )
+    registration.payload_validator.validate_execution_result(prepared.execution_result)
 
     request.parameters["local_image_path"] = str(outside)
     with pytest.raises(PermissionError, match="outside"):
         provider.localize_request(request, artifact_store=SimpleNamespace())
 
 
-def test_artifact_mode_reads_committed_bytes_and_preserves_prompt(tmp_path: Path) -> None:
+def test_artifact_mode_reads_committed_bytes_and_preserves_prompt(
+    tmp_path: Path,
+) -> None:
     data = _jpeg_bytes()
     registration = _registration(local_path_enabled=False)
     localizer = _FakeLocalizer()
@@ -217,15 +231,14 @@ def test_artifact_mode_reads_committed_bytes_and_preserves_prompt(tmp_path: Path
 
         prepared = provider.localize_request(request, artifact_store=store)
 
-    assert prepared.execution_result["input_media_content_hash"] == hashlib.sha256(
-        data
-    ).hexdigest()
+    assert (
+        prepared.execution_result["input_media_content_hash"]
+        == hashlib.sha256(data).hexdigest()
+    )
     assert prepared.execution_result["mode"] == "text"
     assert prepared.execution_result["language_prompt"] == "apple"
     assert prepared.execution_result["detections"][0]["label"] == "apple"
-    registration.payload_validator.validate_execution_result(
-        prepared.execution_result
-    )
+    registration.payload_validator.validate_execution_result(prepared.execution_result)
     registration.payload_validator.validate_execution_result_for_parameters(
         request.parameters,
         prepared.execution_result,
@@ -245,11 +258,11 @@ def test_model_asset_manifest_rejects_checkpoint_hash_drift(tmp_path: Path) -> N
         "sources": {
             "sam2": {
                 "git_url": "https://github.com/facebookresearch/sam2.git",
-                "revision": "1" * 40,
+                "revision": "aa9b8722d0585b661ded4b3dff1bd103540554ae",
             },
             "grounding_dino": {
                 "git_url": "https://github.com/IDEA-Research/GroundingDINO.git",
-                "revision": "2" * 40,
+                "revision": "856dde20aee659246248e20734ef9ba5214f5e44",
             },
         },
         "checkpoints": {
@@ -273,4 +286,45 @@ def test_model_asset_manifest_rejects_checkpoint_hash_drift(tmp_path: Path) -> N
 
     sam.write_bytes(b"changed")
     with pytest.raises(ValueError, match="hash mismatch"):
+        Sam2GroundingDinoModelSpec.from_asset_bundle(bundle)
+
+
+def test_model_asset_manifest_rejects_unreviewed_source_revision(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sam = bundle / "sam.pt"
+    grounding = bundle / "grounding.pth"
+    sam.write_bytes(b"sam")
+    grounding.write_bytes(b"grounding")
+    payload = {
+        "schema_version": "dexteleop.perception_model_assets.v1",
+        "model_profile_id": "test-model:v1",
+        "sources": {
+            "sam2": {
+                "git_url": "https://github.com/facebookresearch/sam2.git",
+                "revision": "1" * 40,
+            },
+            "grounding_dino": {
+                "git_url": "https://github.com/IDEA-Research/GroundingDINO.git",
+                "revision": "856dde20aee659246248e20734ef9ba5214f5e44",
+            },
+        },
+        "checkpoints": {
+            "sam2": {
+                "relative_path": sam.name,
+                "sha256": hashlib.sha256(sam.read_bytes()).hexdigest(),
+                "model_config": "configs/sam2.1/sam2.1_hiera_l.yaml",
+            },
+            "grounding_dino": {
+                "relative_path": grounding.name,
+                "sha256": hashlib.sha256(grounding.read_bytes()).hexdigest(),
+                "model_config": "GroundingDINO_SwinT_OGC.py",
+            },
+        },
+    }
+    (bundle / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="SAM2 source revision is not the reviewed"):
         Sam2GroundingDinoModelSpec.from_asset_bundle(bundle)

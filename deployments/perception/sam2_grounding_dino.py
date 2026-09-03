@@ -22,6 +22,8 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 
 SAM2_GIT_URL = "https://github.com/facebookresearch/sam2.git"
 GROUNDING_DINO_GIT_URL = "https://github.com/IDEA-Research/GroundingDINO.git"
+SAM2_REVIEWED_REVISION = "aa9b8722d0585b661ded4b3dff1bd103540554ae"
+GROUNDING_DINO_REVIEWED_REVISION = "856dde20aee659246248e20734ef9ba5214f5e44"
 MODEL_ASSET_MANIFEST_SCHEMA_V1 = "dexteleop.perception_model_assets.v1"
 
 
@@ -33,8 +35,12 @@ def _required(value: object, *, field_name: str) -> str:
 
 def _lower_hex(value: object, *, field_name: str, length: int) -> str:
     text = _required(value, field_name=field_name)
-    if len(text) != length or any(character not in "0123456789abcdef" for character in text):
-        raise ValueError(f"{field_name} must be {length} lowercase hexadecimal characters.")
+    if len(text) != length or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        raise ValueError(
+            f"{field_name} must be {length} lowercase hexadecimal characters."
+        )
     return text
 
 
@@ -121,6 +127,12 @@ class Sam2GroundingDinoModelSpec:
                 field_name,
                 _lower_hex(getattr(self, field_name), field_name=field_name, length=40),
             )
+        if self.sam2_source_revision != SAM2_REVIEWED_REVISION:
+            raise ValueError("SAM2 source revision is not the reviewed commit.")
+        if self.grounding_dino_source_revision != GROUNDING_DINO_REVIEWED_REVISION:
+            raise ValueError(
+                "Grounding DINO source revision is not the reviewed commit."
+            )
         for field_name in ("sam2_model_config", "grounding_dino_model_config"):
             object.__setattr__(
                 self,
@@ -132,12 +144,16 @@ class Sam2GroundingDinoModelSpec:
     def from_asset_bundle(cls, bundle_root: str | Path) -> Sam2GroundingDinoModelSpec:
         root = Path(bundle_root).expanduser().resolve(strict=True)
         if not root.is_dir():
-            raise ValueError("Object-localization model asset root must be a directory.")
+            raise ValueError(
+                "Object-localization model asset root must be a directory."
+            )
         manifest_path = root / "manifest.json"
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot read object-localization asset manifest: {exc}") from exc
+            raise ValueError(
+                f"Cannot read object-localization asset manifest: {exc}"
+            ) from exc
         if not isinstance(payload, dict) or set(payload) != {
             "schema_version",
             "model_profile_id",
@@ -168,7 +184,9 @@ class Sam2GroundingDinoModelSpec:
             if not isinstance(source, dict) or set(source) != {"git_url", "revision"}:
                 raise ValueError(f"Asset manifest source {name!r} is invalid.")
             if source["git_url"] != expected_urls[name]:
-                raise ValueError(f"Asset manifest source URL for {name!r} is not reviewed.")
+                raise ValueError(
+                    f"Asset manifest source URL for {name!r} is not reviewed."
+                )
             revisions[name] = _lower_hex(
                 source["revision"],
                 field_name=f"sources.{name}.revision",
@@ -256,7 +274,9 @@ class GroundedObjectDetection:
             _required(self.label, field_name="label")
 
 
-def _box_iou(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> float:
+def _box_iou(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+) -> float:
     x_min = max(first[0], second[0])
     y_min = max(first[1], second[1])
     x_max = min(first[2], second[2])
@@ -275,7 +295,10 @@ def _bounded_nms(
 ) -> tuple[GroundedObjectDetection, ...]:
     selected: list[GroundedObjectDetection] = []
     for detection in sorted(detections, key=lambda item: (-item.score, item.box_xyxy)):
-        if all(_box_iou(detection.box_xyxy, item.box_xyxy) <= threshold for item in selected):
+        if all(
+            _box_iou(detection.box_xyxy, item.box_xyxy) <= threshold
+            for item in selected
+        ):
             selected.append(detection)
             if len(selected) == maximum:
                 break
@@ -458,7 +481,9 @@ class Sam2GroundingDinoLocalizer:
             maximum=max_detections,
         )
 
-    def segment_point(self, image: Image.Image, *, pixel_uv: tuple[int, int]) -> np.ndarray:
+    def segment_point(
+        self, image: Image.Image, *, pixel_uv: tuple[int, int]
+    ) -> np.ndarray:
         """Return the highest-confidence SAM2 mask prompted by one image pixel."""
 
         if not isinstance(image, Image.Image):
@@ -466,7 +491,10 @@ class Sam2GroundingDinoLocalizer:
         if (
             not isinstance(pixel_uv, tuple)
             or len(pixel_uv) != 2
-            or any(isinstance(value, bool) or not isinstance(value, int) for value in pixel_uv)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in pixel_uv
+            )
         ):
             raise TypeError("pixel_uv must contain two integers.")
         u, v = pixel_uv
@@ -501,10 +529,10 @@ class Sam2GroundingDinoLocalizer:
             if not isinstance(box, (list, tuple)) or len(box) != 4:
                 continue
             x, y, width, height = (float(value) for value in box)
-            x_min = max(0, int(math.floor(x)))
-            y_min = max(0, int(math.floor(y)))
-            x_max = min(image.shape[1], int(math.ceil(x + width)))
-            y_max = min(image.shape[0], int(math.ceil(y + height)))
+            x_min = max(0, math.floor(x))
+            y_min = max(0, math.floor(y))
+            x_max = min(image.shape[1], math.ceil(x + width))
+            y_max = min(image.shape[0], math.ceil(y + height))
             if x_min < x_max and y_min < y_max:
                 result.append(
                     GroundedObjectDetection(
@@ -555,10 +583,10 @@ class Sam2GroundingDinoLocalizer:
                 refined = None
             if refined is None:
                 refined = (
-                    max(0, int(math.floor(input_box[0]))),
-                    max(0, int(math.floor(input_box[1]))),
-                    min(width, int(math.ceil(input_box[2]))),
-                    min(height, int(math.ceil(input_box[3]))),
+                    max(0, math.floor(input_box[0])),
+                    max(0, math.floor(input_box[1])),
+                    min(width, math.ceil(input_box[2])),
+                    min(height, math.ceil(input_box[3])),
                 )
             if refined[0] < refined[2] and refined[1] < refined[3]:
                 result.append(
@@ -573,8 +601,10 @@ class Sam2GroundingDinoLocalizer:
 
 __all__ = [
     "GROUNDING_DINO_GIT_URL",
+    "GROUNDING_DINO_REVIEWED_REVISION",
     "MODEL_ASSET_MANIFEST_SCHEMA_V1",
     "SAM2_GIT_URL",
+    "SAM2_REVIEWED_REVISION",
     "GroundedObjectDetection",
     "Sam2GroundingDinoLocalizer",
     "Sam2GroundingDinoModelSpec",

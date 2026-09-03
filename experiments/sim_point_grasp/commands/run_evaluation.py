@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from experiments.sim_point_grasp.evaluation import (
@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
             "and execute selected DMTAC M grasps through physical Cube-Lift motion."
         )
     )
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -41,7 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-candidates", type=int, default=5)
     parser.add_argument("--target-point-count", type=int, default=1)
-    parser.add_argument("--object-mass-kg", type=float, choices=(0.08, 0.20), default=0.08)
+    parser.add_argument(
+        "--object-mass-kg", type=float, choices=(0.08, 0.20), default=0.08
+    )
     parser.add_argument(
         "--gripper-force-profile",
         choices=("standard", "strong"),
@@ -51,7 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-center-y-m", type=float, default=0.0)
     parser.add_argument("--spawn-x-jitter-m", type=float, default=0.025)
     parser.add_argument("--spawn-y-jitter-m", type=float, default=0.080)
-    parser.add_argument("--spawn-yaw-jitter-rad", type=float, default=0.7853981633974483)
+    parser.add_argument(
+        "--spawn-yaw-jitter-rad", type=float, default=0.7853981633974483
+    )
     parser.add_argument("--pregrasp-offset-m", type=float, default=0.070)
     parser.add_argument(
         "--adaptive-pregrasp-offsets-m",

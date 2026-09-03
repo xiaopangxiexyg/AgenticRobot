@@ -14,7 +14,7 @@ Isaac Gym 单独看第 6 节；MuJoCo 和冻结保留的 SAPIEN 兼容依赖看�
 
 ## 0. 抓姿 Skill 必读：源码、权重与一键环境
 
-`perception.plan_point_grasp` 的现行实现是同一 `dexteleop310` Python 进程内的直接调用：
+point-grasp 离线 CLI 与仿真评测是同一 `dexteleop310` Python 进程内的直接调用：
 MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server-client 通信。不要为它新建
 `graspnet` 或其他第二 Conda 环境。
 
@@ -306,7 +306,7 @@ bash scripts/install_point_grasp_models.sh \
 ```
 
 主环境更新会先按 `environment.yml`/`uv.lock` 同步并清理基础层，因此更新后重新执行第 3 步，
-恢复模型扩展。当前抓姿 CLI、Gateway provider 和仿真评测都不依赖 RPent；上层 planner 的环境与
+恢复模型扩展。当前抓姿 CLI、未注册的 Gateway provider 原型和仿真评测都不依赖 RPent；上层 planner 的环境与
 部署由 RPent 项目单独维护。RTX 4090 的 compute capability 是 8.9；其他
 GPU 应替换为 `python -c 'import torch; p=torch.cuda.get_device_properties(0); print(f"{p.major}.{p.minor}")'`
 的输出。`install_point_grasp_models.sh` 不下载权重。
@@ -315,7 +315,7 @@ RPent 的 core、DexTeleop integration、RLinf、LIBERO、OpenPI server、SAM3 �
 项目各自的环境/profile 管理；不要为了运行本仓 Skill 把它们塞入 `dexteleop310`。AgenticRobot
 的全部九个 extras 都由第二步安装，因此仿真、测试、数据、硬件 import 和模型 client 依赖均存在。
 
-当前经真实端到端评测验证的关键版本如下；这些值同时是安装脚本的 fail-closed 检查目标：
+安装脚本 fail-closed 固定的关键版本如下；这张表本身不构成模型质量、真机或端到端部署证据：
 
 | 层 | 版本/来源 | 特殊处理 |
 | --- | --- | --- |

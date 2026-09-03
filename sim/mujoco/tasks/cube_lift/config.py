@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -20,12 +21,12 @@ from ...actuation import (
     cad_bimanual_dmtac_gripper_profile,
     cube_lift_contact_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
+    point_grasp_cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
     strong_cad_bimanual_dmtac_gripper_profile,
 )
 from ...control import DIRECT_QPOS_DEBUG_EXECUTION_MODE
 from ...grasp_contact import GripperContactSurfaceSpec
-
 
 CUBE_LIFT_TASK_SCHEMA_VERSION = "dexteleop.sim.mujoco.cube_lift_task.v0"
 CUBE_LIFT_ACTUATED_TASK_SCHEMA_VERSION = "dexteleop.sim.mujoco.cube_lift_task.v1"
@@ -92,6 +93,7 @@ def resolve_dmtac_gripper_actuation_profile(name: str):
             identified_bimanual_dmtac_gripper_profile(),
             cube_lift_contact_dmtac_gripper_profile(),
             cad_bimanual_dmtac_gripper_profile(),
+            point_grasp_cad_bimanual_dmtac_gripper_profile(),
             strong_cad_bimanual_dmtac_gripper_profile(),
         )
     }
@@ -104,9 +106,7 @@ def resolve_dmtac_gripper_actuation_profile(name: str):
 def dmtac_gripper_actuation_profile_sha256(
     name: str = DMTAC_GRIPPER_ACTUATION_PROFILE_NAME,
 ) -> str:
-    return _metadata_sha256(
-        resolve_dmtac_gripper_actuation_profile(name).to_metadata()
-    )
+    return _metadata_sha256(resolve_dmtac_gripper_actuation_profile(name).to_metadata())
 
 
 def is_cube_lift_success_reason(reason: object) -> bool:
@@ -130,13 +130,17 @@ def _finite_tuple(
     return result
 
 
-def _unit_interval_mapping(values: Mapping[str, float], *, name: str) -> Mapping[str, float]:
+def _unit_interval_mapping(
+    values: Mapping[str, float], *, name: str
+) -> Mapping[str, float]:
     result: dict[str, float] = {}
     for raw_key, raw_value in values.items():
         key = str(raw_key).strip()
         value = float(raw_value)
         if not key or not math.isfinite(value) or not 0.0 <= value <= 1.0:
-            raise ValueError(f"{name} must map non-empty names to finite [0, 1] values.")
+            raise ValueError(
+                f"{name} must map non-empty names to finite [0, 1] values."
+            )
         result[key] = value
     if not result:
         raise ValueError(f"{name} must not be empty.")
@@ -159,7 +163,7 @@ class CubeLiftRewardConfig:
         object.__setattr__(self, "action_penalty", action_penalty)
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "CubeLiftRewardConfig":
+    def from_dict(cls, payload: Mapping[str, Any]) -> CubeLiftRewardConfig:
         return cls(
             success_bonus=float(payload.get("success_bonus", 5.0)),
             action_penalty=float(payload.get("action_penalty", 0.01)),
@@ -371,13 +375,19 @@ class CubeLiftTaskConfig:
             if self.schema_version != CUBE_LIFT_TASK_SCHEMA_VERSION:
                 raise ValueError("Direct-qpos CubeLift must use the v0 task schema.")
             if self.robot_dynamics != "not_simulated":
-                raise ValueError("Direct-qpos CubeLift must declare robot_dynamics=not_simulated.")
+                raise ValueError(
+                    "Direct-qpos CubeLift must declare robot_dynamics=not_simulated."
+                )
             if self.position_actuation_profile_name is not None:
-                raise ValueError("Direct-qpos CubeLift cannot select an actuation profile.")
+                raise ValueError(
+                    "Direct-qpos CubeLift cannot select an actuation profile."
+                )
             if self.gripper_dynamics != PRESCRIBED_GRIPPER_DYNAMICS:
                 raise ValueError("Direct-qpos CubeLift requires prescribed grippers.")
             if self.gripper_actuation_profile_name is not None:
-                raise ValueError("Direct-qpos CubeLift cannot select a gripper profile.")
+                raise ValueError(
+                    "Direct-qpos CubeLift cannot select a gripper profile."
+                )
         elif self.execution_mode == ACTUATED_POSITION_EXECUTION_MODE:
             if self.schema_version not in {
                 CUBE_LIFT_ACTUATED_TASK_SCHEMA_VERSION,
@@ -401,9 +411,13 @@ class CubeLiftTaskConfig:
                 )
             if self.schema_version == CUBE_LIFT_ACTUATED_TASK_SCHEMA_VERSION:
                 if self.gripper_dynamics != PRESCRIBED_GRIPPER_DYNAMICS:
-                    raise ValueError("Arm-actuated CubeLift v1 requires prescribed grippers.")
+                    raise ValueError(
+                        "Arm-actuated CubeLift v1 requires prescribed grippers."
+                    )
                 if self.gripper_actuation_profile_name is not None:
-                    raise ValueError("Arm-actuated CubeLift v1 cannot select a gripper profile.")
+                    raise ValueError(
+                        "Arm-actuated CubeLift v1 cannot select a gripper profile."
+                    )
             else:
                 if self.gripper_dynamics != MUJOCO_IDENTIFIED_GRIPPER_DYNAMICS:
                     raise ValueError(
@@ -419,34 +433,45 @@ class CubeLiftTaskConfig:
                         f"actual={expected_gripper_hash}."
                     )
         else:
-            raise ValueError(f"Unsupported CubeLift execution_mode {self.execution_mode!r}.")
+            raise ValueError(
+                f"Unsupported CubeLift execution_mode {self.execution_mode!r}."
+            )
         if self.policy_class not in {
             NORMAL_POLICY_CLASS,
             PRIVILEGED_EXPERT_POLICY_CLASS,
             LEGACY_DEBUG_POLICY_CLASS,
         }:
-            raise ValueError(f"Unsupported CubeLift policy_class {self.policy_class!r}.")
+            raise ValueError(
+                f"Unsupported CubeLift policy_class {self.policy_class!r}."
+            )
         if self.grasp_mode not in {
             PHYSICAL_CONTACT_GRASP_MODE,
             CONTACT_LATCH_DEBUG_GRASP_MODE,
         }:
             raise ValueError(f"Unsupported CubeLift grasp_mode {self.grasp_mode!r}.")
-        if self.policy_class in {
-            NORMAL_POLICY_CLASS,
-            PRIVILEGED_EXPERT_POLICY_CLASS,
-        } and self.schema_version != CUBE_LIFT_FULLY_ACTUATED_TASK_SCHEMA_VERSION:
+        if (
+            self.policy_class
+            in {
+                NORMAL_POLICY_CLASS,
+                PRIVILEGED_EXPERT_POLICY_CLASS,
+            }
+            and self.schema_version != CUBE_LIFT_FULLY_ACTUATED_TASK_SCHEMA_VERSION
+        ):
             raise ValueError(
                 "Normal and privileged-expert policies require the same "
                 "fully-actuated task schema v2."
             )
-        if self.policy_class == NORMAL_POLICY_CLASS:
-            if self.grasp_mode != PHYSICAL_CONTACT_GRASP_MODE:
-                raise ValueError("Normal CubeLift policy cannot use the debug grasp latch.")
+        if (
+            self.policy_class == NORMAL_POLICY_CLASS
+            and self.grasp_mode != PHYSICAL_CONTACT_GRASP_MODE
+        ):
+            raise ValueError("Normal CubeLift policy cannot use the debug grasp latch.")
         if self.uses_pose_action and str(self.pose_control_frame).strip() != "tool_tcp":
-            raise ValueError("Physical CubeLift pose actions must control the tool_tcp frame.")
+            raise ValueError(
+                "Physical CubeLift pose actions must control the tool_tcp frame."
+            )
         policy_action_components = tuple(
-            str(component).strip()
-            for component in self.policy_action_components
+            str(component).strip() for component in self.policy_action_components
         )
         if any(not component for component in policy_action_components):
             raise ValueError("policy_action_components cannot contain empty names.")
@@ -468,25 +493,17 @@ class CubeLiftTaskConfig:
             "policy_action_components",
             policy_action_components,
         )
-        policy_action_scale = tuple(
-            float(value) for value in self.policy_action_scale
-        )
-        policy_action_bias = tuple(
-            float(value) for value in self.policy_action_bias
-        )
+        policy_action_scale = tuple(float(value) for value in self.policy_action_scale)
+        policy_action_bias = tuple(float(value) for value in self.policy_action_bias)
         if (policy_action_scale or policy_action_bias) and not policy_action_components:
             raise ValueError(
                 "policy_action_scale/bias require explicit policy_action_components."
             )
         policy_dim = len(policy_action_components)
         if policy_action_scale and len(policy_action_scale) != policy_dim:
-            raise ValueError(
-                "policy_action_scale must match policy_action_components."
-            )
+            raise ValueError("policy_action_scale must match policy_action_components.")
         if policy_action_bias and len(policy_action_bias) != policy_dim:
-            raise ValueError(
-                "policy_action_bias must match policy_action_components."
-            )
+            raise ValueError("policy_action_bias must match policy_action_components.")
         resolved_scale = policy_action_scale or (1.0,) * policy_dim
         resolved_bias = policy_action_bias or (0.0,) * policy_dim
         if any(
@@ -511,9 +528,7 @@ class CubeLiftTaskConfig:
             CONTACT_TASK_OBJECTIVE,
             LIFT_TASK_OBJECTIVE,
         }:
-            raise ValueError(
-                "task_objective must be 'reach', 'contact', or 'lift'."
-            )
+            raise ValueError("task_objective must be 'reach', 'contact', or 'lift'.")
         if (
             self.execution_mode == DIRECT_QPOS_DEBUG_EXECUTION_MODE
             and task_objective != LIFT_TASK_OBJECTIVE
@@ -524,38 +539,28 @@ class CubeLiftTaskConfig:
             )
         reach_target_height = float(self.reach_target_height_offset_m)
         reach_guidance_height = float(self.reach_guidance_height_offset_m)
-        reach_guidance_radius = float(
-            self.reach_guidance_xy_blend_radius_m
-        )
+        reach_guidance_radius = float(self.reach_guidance_xy_blend_radius_m)
         reach_action_min_scale = float(self.reach_action_min_scale)
         reach_action_slow_radius = float(self.reach_action_slow_radius_m)
-        contact_close_translation_scale = float(
-            self.contact_close_translation_scale
-        )
+        contact_close_translation_scale = float(self.contact_close_translation_scale)
         contact_close_z_translation_scale = (
             None
             if self.contact_close_z_translation_scale is None
             else float(self.contact_close_z_translation_scale)
         )
         contact_close_distance = float(self.contact_close_distance_m)
-        contact_close_keep_measured = float(
-            self.contact_close_keep_measured_close
-        )
+        contact_close_keep_measured = float(self.contact_close_keep_measured_close)
         reach_success_distance = float(self.reach_success_distance_m)
         contact_min_close = float(self.contact_success_min_measured_close)
         contact_min_score = float(self.contact_success_min_score)
-        success_min_inner_score = float(
-            self.success_min_bilateral_inner_contact_score
-        )
+        success_min_inner_score = float(self.success_min_bilateral_inner_contact_score)
         success_max_outer_score = float(self.success_max_outer_contact_score)
         if not math.isfinite(reach_target_height) or reach_target_height <= 0.0:
             raise ValueError(
                 "reach_target_height_offset_m must be positive and finite."
             )
         if not math.isfinite(reach_success_distance) or reach_success_distance <= 0.0:
-            raise ValueError(
-                "reach_success_distance_m must be positive and finite."
-            )
+            raise ValueError("reach_success_distance_m must be positive and finite.")
         if (
             not math.isfinite(reach_guidance_height)
             or not math.isfinite(reach_guidance_radius)
@@ -570,8 +575,7 @@ class CubeLiftTaskConfig:
             reach_guidance_height > 0.0 or reach_guidance_radius > 0.0
         )
         if reach_guidance_enabled and (
-            reach_guidance_height <= reach_target_height
-            or reach_guidance_radius <= 0.0
+            reach_guidance_height <= reach_target_height or reach_guidance_radius <= 0.0
         ):
             raise ValueError(
                 "Overhead reach guidance requires a height above "
@@ -593,8 +597,7 @@ class CubeLiftTaskConfig:
             reach_action_min_scale < 1.0 or reach_action_slow_radius > 0.0
         )
         if reach_action_scaling_enabled and (
-            reach_action_min_scale >= 1.0
-            or reach_action_slow_radius <= 0.0
+            reach_action_min_scale >= 1.0 or reach_action_slow_radius <= 0.0
         ):
             raise ValueError(
                 "Distance-dependent reach action scaling requires a minimum "
@@ -604,13 +607,8 @@ class CubeLiftTaskConfig:
             not math.isfinite(contact_close_translation_scale)
             or not 0.0 < contact_close_translation_scale <= 1.0
         ):
-            raise ValueError(
-                "contact_close_translation_scale must lie in (0, 1]."
-            )
-        if (
-            not math.isfinite(contact_close_distance)
-            or contact_close_distance < 0.0
-        ):
+            raise ValueError("contact_close_translation_scale must lie in (0, 1].")
+        if not math.isfinite(contact_close_distance) or contact_close_distance < 0.0:
             raise ValueError(
                 "contact_close_distance_m must be finite and non-negative."
             )
@@ -618,9 +616,7 @@ class CubeLiftTaskConfig:
             not math.isfinite(contact_close_keep_measured)
             or not 0.0 <= contact_close_keep_measured <= 1.0
         ):
-            raise ValueError(
-                "contact_close_keep_measured_close must lie in [0, 1]."
-            )
+            raise ValueError("contact_close_keep_measured_close must lie in [0, 1].")
         contact_close_scaling_enabled = bool(
             contact_close_translation_scale < 1.0
             or contact_close_distance > 0.0
@@ -639,7 +635,8 @@ class CubeLiftTaskConfig:
         if contact_close_z_translation_scale is not None and (
             not contact_close_scaling_enabled
             or not math.isfinite(contact_close_z_translation_scale)
-            or not 0.0 < contact_close_z_translation_scale
+            or not 0.0
+            < contact_close_z_translation_scale
             <= contact_close_translation_scale
         ):
             raise ValueError(
@@ -659,9 +656,7 @@ class CubeLiftTaskConfig:
                 "success_min_bilateral_inner_contact_score must lie in [0, 1]."
             )
         if not 0.0 <= success_max_outer_score <= 1.0:
-            raise ValueError(
-                "success_max_outer_contact_score must lie in [0, 1]."
-            )
+            raise ValueError("success_max_outer_contact_score must lie in [0, 1].")
         object.__setattr__(self, "task_objective", task_objective)
         object.__setattr__(
             self,
@@ -769,8 +764,7 @@ class CubeLiftTaskConfig:
             NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2,
         }:
             raise ValueError(
-                "Unsupported normal_proprio_profile: "
-                f"{normal_proprio_profile!r}."
+                f"Unsupported normal_proprio_profile: {normal_proprio_profile!r}."
             )
         if (
             normal_proprio_profile
@@ -797,14 +791,10 @@ class CubeLiftTaskConfig:
                 "The cube-pose proprio contract currently excludes wrist RGB; "
                 "use a dedicated RGB observation layout before enabling both."
             )
-        if (
-            object_pose_observation_source
-            and normal_proprio_profile
-            not in {
-                NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
-                NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2,
-            }
-        ):
+        if object_pose_observation_source and normal_proprio_profile not in {
+            NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1,
+            NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2,
+        }:
             raise ValueError(
                 "object_pose_observation_source requires the cube-pose "
                 "normal proprio profile."
@@ -813,9 +803,7 @@ class CubeLiftTaskConfig:
             normal_proprio_profile
             == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2
         )
-        if uses_reach_target_delta != bool(
-            reach_target_delta_observation_source
-        ):
+        if uses_reach_target_delta != bool(reach_target_delta_observation_source):
             raise ValueError(
                 "The cube-pose reach-delta profile and "
                 "reach_target_delta_observation_source must be selected "
@@ -827,16 +815,14 @@ class CubeLiftTaskConfig:
             LIFT_TASK_OBJECTIVE,
         }
         if reach_guidance_enabled and (
-            task_objective not in approach_objectives
-            or not uses_reach_target_delta
+            task_objective not in approach_objectives or not uses_reach_target_delta
         ):
             raise ValueError(
                 "Overhead approach guidance requires a Reach/contact/lift objective "
                 "and the deployable reach-target-delta observation profile."
             )
         if reach_action_scaling_enabled and (
-            task_objective not in approach_objectives
-            or not uses_reach_target_delta
+            task_objective not in approach_objectives or not uses_reach_target_delta
         ):
             raise ValueError(
                 "Distance-dependent approach action scaling requires a "
@@ -998,8 +984,12 @@ class CubeLiftTaskConfig:
         base_contract_hash = str(self.base_contract_sha256).strip().lower()
         if not base_contract_path:
             raise ValueError("base_contract_path must be non-empty.")
-        if len(base_contract_hash) != 64 or any(char not in "0123456789abcdef" for char in base_contract_hash):
-            raise ValueError("base_contract_sha256 must be a lowercase SHA-256 hex digest.")
+        if len(base_contract_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in base_contract_hash
+        ):
+            raise ValueError(
+                "base_contract_sha256 must be a lowercase SHA-256 hex digest."
+            )
 
         left_home = _finite_tuple(self.left_home_qpos, size=6, name="left_home_qpos")
         right_home = _finite_tuple(self.right_home_qpos, size=6, name="right_home_qpos")
@@ -1021,20 +1011,27 @@ class CubeLiftTaskConfig:
             name="right_tcp_rotation_delta_rad",
         )
         if any(low >= high for low, high in zip(lower, upper)):
-            raise ValueError("right_qpos_lower must be strictly below right_qpos_upper.")
+            raise ValueError(
+                "right_qpos_lower must be strictly below right_qpos_upper."
+            )
         if any(delta <= 0.0 for delta in joint_delta):
             raise ValueError("right_joint_delta_rad must be strictly positive.")
         if any(delta <= 0.0 for delta in tcp_delta):
             raise ValueError("right_tcp_delta_m must be strictly positive.")
         if any(delta <= 0.0 for delta in tcp_rotation_delta):
             raise ValueError("right_tcp_rotation_delta_rad must be strictly positive.")
-        if any(value < low or value > high for value, low, high in zip(right_home, lower, upper)):
+        if any(
+            value < low or value > high
+            for value, low, high in zip(right_home, lower, upper)
+        ):
             raise ValueError("right_home_qpos must lie within right qpos bounds.")
 
         object_size = _finite_tuple(self.object_size_m, size=3, name="object_size_m")
         if any(value <= 0.0 for value in object_size):
             raise ValueError("object_size_m must be positive.")
-        cube_center = _finite_tuple(self.cube_center_xy_m, size=2, name="cube_center_xy_m")
+        cube_center = _finite_tuple(
+            self.cube_center_xy_m, size=2, name="cube_center_xy_m"
+        )
         lower_xyz = _finite_tuple(
             self.out_of_bounds_xyz_lower_m,
             size=3,
@@ -1059,8 +1056,12 @@ class CubeLiftTaskConfig:
             "grasp_latch_acquire_distance_m",
         )
         scalar_values = {name: float(getattr(self, name)) for name in scalar_names}
-        if not all(math.isfinite(value) and value > 0.0 for value in scalar_values.values()):
-            raise ValueError(f"CubeLift positive finite values required: {scalar_names}.")
+        if not all(
+            math.isfinite(value) and value > 0.0 for value in scalar_values.values()
+        ):
+            raise ValueError(
+                f"CubeLift positive finite values required: {scalar_names}."
+            )
         if scalar_values["physics_hz"] < scalar_values["command_hz"]:
             raise ValueError("physics_hz must be at least command_hz.")
         if scalar_values["command_hz"] < scalar_values["reference_hz"]:
@@ -1068,7 +1069,9 @@ class CubeLiftTaskConfig:
         if scalar_values["reference_hz"] < scalar_values["policy_hz"]:
             raise ValueError("reference_hz must be at least policy_hz.")
         if self.settle_physics_ticks < 0 or self.max_episode_steps <= 0:
-            raise ValueError("settle_physics_ticks must be >= 0 and max_episode_steps > 0.")
+            raise ValueError(
+                "settle_physics_ticks must be >= 0 and max_episode_steps > 0."
+            )
         if self.success_hold_physics_ticks <= 0:
             raise ValueError("success_hold_physics_ticks must be positive.")
         if self.success_min_safety_clear_policy_steps < 0:
@@ -1081,11 +1084,21 @@ class CubeLiftTaskConfig:
             "grasp_latch_release_close": float(self.grasp_latch_release_close),
         }
         if any(not 0.0 <= value <= 1.0 for value in unit_values.values()):
-            raise ValueError(f"CubeLift latch close values must be in [0, 1]: {unit_values}.")
-        if unit_values["grasp_latch_release_close"] >= unit_values["grasp_latch_acquire_close"]:
+            raise ValueError(
+                f"CubeLift latch close values must be in [0, 1]: {unit_values}."
+            )
+        if (
+            unit_values["grasp_latch_release_close"]
+            >= unit_values["grasp_latch_acquire_close"]
+        ):
             raise ValueError("grasp latch release close must be below acquire close.")
-        if unit_values["grasp_latch_acquire_close"] > unit_values["right_gripper_max_close"]:
-            raise ValueError("grasp latch acquire close cannot exceed gripper max close.")
+        if (
+            unit_values["grasp_latch_acquire_close"]
+            > unit_values["right_gripper_max_close"]
+        ):
+            raise ValueError(
+                "grasp latch acquire close cannot exceed gripper max close."
+            )
 
         grippers = _unit_interval_mapping(
             self.initial_gripper_close_by_name,
@@ -1149,8 +1162,7 @@ class CubeLiftTaskConfig:
             success_min_inner_score > 0.0 or success_max_outer_score < 1.0
         ):
             raise ValueError(
-                "Contact-quality success gates require "
-                "gripper_contact_surface_specs."
+                "Contact-quality success gates require gripper_contact_surface_specs."
             )
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "base_contract_path", base_contract_path)
@@ -1162,7 +1174,9 @@ class CubeLiftTaskConfig:
         object.__setattr__(self, "right_joint_delta_rad", joint_delta)
         object.__setattr__(self, "right_tcp_delta_m", tcp_delta)
         object.__setattr__(self, "right_tcp_rotation_delta_rad", tcp_rotation_delta)
-        object.__setattr__(self, "pose_control_frame", str(self.pose_control_frame).strip())
+        object.__setattr__(
+            self, "pose_control_frame", str(self.pose_control_frame).strip()
+        )
         object.__setattr__(
             self,
             "left_tool_profile_path",
@@ -1177,7 +1191,9 @@ class CubeLiftTaskConfig:
         object.__setattr__(self, "wrist_rgb_camera_name", wrist_rgb_camera_name)
         object.__setattr__(self, "wrist_rgb_width", wrist_rgb_width)
         object.__setattr__(self, "wrist_rgb_height", wrist_rgb_height)
-        object.__setattr__(self, "wrist_rgb_spatial_pool_size", wrist_rgb_spatial_pool_size)
+        object.__setattr__(
+            self, "wrist_rgb_spatial_pool_size", wrist_rgb_spatial_pool_size
+        )
         object.__setattr__(self, "normal_proprio_profile", normal_proprio_profile)
         object.__setattr__(self, "object_size_m", object_size)
         object.__setattr__(self, "cube_center_xy_m", cube_center)
@@ -1207,7 +1223,9 @@ class CubeLiftTaskConfig:
             object.__setattr__(self, field_name, value)
         object.__setattr__(self, "settle_physics_ticks", int(self.settle_physics_ticks))
         object.__setattr__(self, "max_episode_steps", int(self.max_episode_steps))
-        object.__setattr__(self, "success_hold_physics_ticks", int(self.success_hold_physics_ticks))
+        object.__setattr__(
+            self, "success_hold_physics_ticks", int(self.success_hold_physics_ticks)
+        )
         object.__setattr__(
             self,
             "success_min_safety_clear_policy_steps",
@@ -1226,9 +1244,7 @@ class CubeLiftTaskConfig:
             or spawn_yaw_jitter < 0.0
             or spawn_yaw_jitter > math.pi
         ):
-            raise ValueError(
-                "cube_spawn_yaw_jitter_rad must lie in [0, pi]."
-            )
+            raise ValueError("cube_spawn_yaw_jitter_rad must lie in [0, pi].")
         object.__setattr__(self, "cube_spawn_xy_jitter_m", spawn_xy_jitter)
         object.__setattr__(
             self,
@@ -1236,8 +1252,7 @@ class CubeLiftTaskConfig:
             spawn_yaw_jitter,
         )
         randomizes_cube_spawn = bool(
-            any(value > 0.0 for value in spawn_xy_jitter)
-            or spawn_yaw_jitter > 0.0
+            any(value > 0.0 for value in spawn_xy_jitter) or spawn_yaw_jitter > 0.0
         )
         if randomizes_cube_spawn and self.policy_class == NORMAL_POLICY_CLASS:
             has_object_derived_actor_input = bool(
@@ -1278,14 +1293,21 @@ class CubeLiftTaskConfig:
         )
         scripted_pregrasp_reset = bool(self.scripted_pregrasp_reset)
         scripted_pregrasp_distance = float(self.scripted_pregrasp_distance_m)
-        if not math.isfinite(scripted_pregrasp_distance) or scripted_pregrasp_distance <= 0.0:
-            raise ValueError("scripted_pregrasp_distance_m must be positive and finite.")
+        if (
+            not math.isfinite(scripted_pregrasp_distance)
+            or scripted_pregrasp_distance <= 0.0
+        ):
+            raise ValueError(
+                "scripted_pregrasp_distance_m must be positive and finite."
+            )
         if scripted_pregrasp_reset and self.scripted_contact_reset:
             raise ValueError(
                 "scripted_pregrasp_reset and scripted_contact_reset are mutually exclusive."
             )
         object.__setattr__(self, "scripted_pregrasp_reset", scripted_pregrasp_reset)
-        object.__setattr__(self, "scripted_pregrasp_distance_m", scripted_pregrasp_distance)
+        object.__setattr__(
+            self, "scripted_pregrasp_distance_m", scripted_pregrasp_distance
+        )
         scripted_pregrasp_action_scale = _finite_tuple(
             self.scripted_pregrasp_action_scale,
             size=7,
@@ -1324,9 +1346,7 @@ class CubeLiftTaskConfig:
         post_contact_phase_enabled = bool(self.post_contact_phase_enabled)
         post_contact_activation_steps = int(self.post_contact_phase_activation_steps)
         if post_contact_activation_steps <= 0:
-            raise ValueError(
-                "post_contact_phase_activation_steps must be positive."
-            )
+            raise ValueError("post_contact_phase_activation_steps must be positive.")
         post_contact_min_close = float(self.post_contact_phase_min_measured_close)
         if not 0.0 <= post_contact_min_close <= self.right_gripper_max_close:
             raise ValueError(
@@ -1393,7 +1413,9 @@ class CubeLiftTaskConfig:
                 "Post-contact action constraints require "
                 "post_contact_phase_enabled=true."
             )
-        object.__setattr__(self, "post_contact_phase_enabled", post_contact_phase_enabled)
+        object.__setattr__(
+            self, "post_contact_phase_enabled", post_contact_phase_enabled
+        )
         object.__setattr__(
             self,
             "post_contact_phase_activation_steps",
@@ -1441,18 +1463,14 @@ class CubeLiftTaskConfig:
             int(self.scripted_contact_loss_grace_steps),
         )
         if self.scripted_contact_loss_grace_steps < 0:
-            raise ValueError(
-                "scripted_contact_loss_grace_steps must be non-negative."
-            )
+            raise ValueError("scripted_contact_loss_grace_steps must be non-negative.")
         scripted_action_scale = _finite_tuple(
             self.scripted_contact_action_scale,
             size=7,
             name="scripted_contact_action_scale",
         )
         if any(value < 0.0 or value > 1.0 for value in scripted_action_scale):
-            raise ValueError(
-                "scripted_contact_action_scale values must lie in [0, 1]."
-            )
+            raise ValueError("scripted_contact_action_scale values must lie in [0, 1].")
         object.__setattr__(
             self,
             "scripted_contact_action_scale",
@@ -1502,9 +1520,7 @@ class CubeLiftTaskConfig:
                 "Scripted-pregrasp action constraints require "
                 "scripted_pregrasp_reset=true."
             )
-        scripted_min_close = float(
-            self.scripted_contact_reset_min_measured_close
-        )
+        scripted_min_close = float(self.scripted_contact_reset_min_measured_close)
         if not 0.0 <= scripted_min_close <= self.right_gripper_max_close:
             raise ValueError(
                 "scripted_contact_reset_min_measured_close must lie within "
@@ -1557,8 +1573,7 @@ class CubeLiftTaskConfig:
     @property
     def reach_action_distance_scaling_enabled(self) -> bool:
         return bool(
-            self.reach_action_min_scale < 1.0
-            and self.reach_action_slow_radius_m > 0.0
+            self.reach_action_min_scale < 1.0 and self.reach_action_slow_radius_m > 0.0
         )
 
     @property
@@ -1648,8 +1663,7 @@ class CubeLiftTaskConfig:
         """Ordered actor input fields, independent of raw task observation."""
 
         return (
-            self.policy_observation_fields
-            or self.available_policy_observation_fields
+            self.policy_observation_fields or self.available_policy_observation_fields
         )
 
     @property
@@ -1686,9 +1700,7 @@ class CubeLiftTaskConfig:
                     "stage": "scripted_contact_reset",
                     "scale": self.scripted_contact_action_scale,
                     "bias": self.scripted_contact_action_bias,
-                    "nonnegative_lift": (
-                        self.scripted_contact_nonnegative_lift_action
-                    ),
+                    "nonnegative_lift": (self.scripted_contact_nonnegative_lift_action),
                     "stateful": False,
                 }
             )
@@ -1698,18 +1710,12 @@ class CubeLiftTaskConfig:
                     "stage": "post_contact_phase",
                     "scale": self.post_contact_action_scale,
                     "bias": self.post_contact_action_bias,
-                    "nonnegative_lift": (
-                        self.post_contact_nonnegative_lift_action
-                    ),
-                    "activation_steps": (
-                        self.post_contact_phase_activation_steps
-                    ),
+                    "nonnegative_lift": (self.post_contact_nonnegative_lift_action),
+                    "activation_steps": (self.post_contact_phase_activation_steps),
                     "minimum_measured_close": (
                         self.post_contact_phase_min_measured_close
                     ),
-                    "loss_grace_steps": (
-                        self.post_contact_phase_loss_grace_steps
-                    ),
+                    "loss_grace_steps": (self.post_contact_phase_loss_grace_steps),
                     "stateful": True,
                 }
             )
@@ -1731,11 +1737,7 @@ class CubeLiftTaskConfig:
             if self.scripted_contact_reset
             else self.scripted_pregrasp_action_scale
         )
-        active = tuple(
-            index
-            for index, scale in enumerate(action_scale)
-            if scale > 0.0
-        )
+        active = tuple(index for index, scale in enumerate(action_scale) if scale > 0.0)
         if not active:
             raise ValueError(
                 "A scripted-contact curriculum must expose at least one "
@@ -1860,13 +1862,13 @@ class CubeLiftTaskConfig:
     @property
     def observation_layout(self) -> str:
         from .spec import (
-            CUBE_LIFT_NORMAL_OBSERVATION_LAYOUT_VERSION,
-            CUBE_LIFT_NORMAL_MOTION_TRACKING_OBSERVATION_LAYOUT_VERSION,
-            CUBE_LIFT_NORMAL_RGB_48_OBSERVATION_LAYOUT_VERSION,
-            CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_48_OBSERVATION_LAYOUT_VERSION,
-            CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_OBSERVATION_LAYOUT_VERSION,
+            CUBE_LIFT_NORMAL_MOTION_TRACKING_NO_EPISODE_CLOCK_OBSERVATION_LAYOUT_VERSION,
+            CUBE_LIFT_NORMAL_MOTION_TRACKING_OBSERVATION_LAYOUT_VERSION,
+            CUBE_LIFT_NORMAL_OBSERVATION_LAYOUT_VERSION,
+            CUBE_LIFT_NORMAL_RGB_48_OBSERVATION_LAYOUT_VERSION,
+            CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_48_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_NO_EPISODE_CLOCK_48_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_NORMAL_RGB_OBSERVATION_LAYOUT_VERSION,
             CUBE_LIFT_PRIVILEGED_OBSERVATION_LAYOUT_VERSION,
@@ -1898,12 +1900,13 @@ class CubeLiftTaskConfig:
                     )
                 )
             if (
-                self.normal_proprio_profile
-                == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1
+                self.normal_proprio_profile == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1
                 and self.wrist_rgb_width == 48
                 and self.wrist_rgb_height == 48
             ):
-                return CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_48_OBSERVATION_LAYOUT_VERSION
+                return (
+                    CUBE_LIFT_NORMAL_RGB_MOTION_TRACKING_48_OBSERVATION_LAYOUT_VERSION
+                )
             if (
                 self.normal_proprio_profile
                 == NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2
@@ -1973,9 +1976,7 @@ class CubeLiftTaskConfig:
         return (
             float(xy[0]),
             float(xy[1]),
-            self.table_top_z_m
-            + self.object_size_m[2] / 2.0
-            + self.spawn_clearance_m,
+            self.table_top_z_m + self.object_size_m[2] / 2.0 + self.spawn_clearance_m,
             math.cos(half_yaw),
             0.0,
             0.0,
@@ -2015,8 +2016,7 @@ class CubeLiftTaskConfig:
         }
         if timing_mismatches:
             raise ValueError(
-                "CubeLift task clock disagrees with base contract: "
-                f"{timing_mismatches}"
+                f"CubeLift task clock disagrees with base contract: {timing_mismatches}"
             )
         object_spec = next(
             (
@@ -2067,25 +2067,17 @@ class CubeLiftTaskConfig:
             "success_termination_reason": self.success_termination_reason,
             "reach_target_height_offset_m": self.reach_target_height_offset_m,
             "reach_guidance_enabled": self.reach_guidance_enabled,
-            "reach_guidance_height_offset_m": (
-                self.reach_guidance_height_offset_m
-            ),
-            "reach_guidance_xy_blend_radius_m": (
-                self.reach_guidance_xy_blend_radius_m
-            ),
+            "reach_guidance_height_offset_m": (self.reach_guidance_height_offset_m),
+            "reach_guidance_xy_blend_radius_m": (self.reach_guidance_xy_blend_radius_m),
             "reach_action_distance_scaling_enabled": (
                 self.reach_action_distance_scaling_enabled
             ),
             "reach_action_min_scale": self.reach_action_min_scale,
-            "reach_action_slow_radius_m": (
-                self.reach_action_slow_radius_m
-            ),
+            "reach_action_slow_radius_m": (self.reach_action_slow_radius_m),
             "contact_close_translation_scaling_enabled": (
                 self.contact_close_translation_scaling_enabled
             ),
-            "contact_close_translation_scale": (
-                self.contact_close_translation_scale
-            ),
+            "contact_close_translation_scale": (self.contact_close_translation_scale),
             "contact_close_z_translation_scale": (
                 self.contact_close_z_translation_scale
             ),
@@ -2115,16 +2107,10 @@ class CubeLiftTaskConfig:
             "success_min_bilateral_inner_contact_score": (
                 self.success_min_bilateral_inner_contact_score
             ),
-            "success_max_outer_contact_score": (
-                self.success_max_outer_contact_score
-            ),
+            "success_max_outer_contact_score": (self.success_max_outer_contact_score),
             "policy_action_layout": self.policy_action_layout,
-            "policy_action_components": list(
-                self.resolved_policy_action_components
-            ),
-            "policy_action_components_explicit": bool(
-                self.policy_action_components
-            ),
+            "policy_action_components": list(self.resolved_policy_action_components),
+            "policy_action_components_explicit": bool(self.policy_action_components),
             "policy_action_dim": self.policy_action_dim,
             "policy_action_scale": list(self.resolved_policy_action_scale),
             "policy_action_bias": list(self.resolved_policy_action_bias),
@@ -2135,12 +2121,8 @@ class CubeLiftTaskConfig:
             "pose_target_anti_windup": self.pose_target_anti_windup,
             "scripted_pregrasp_reset": self.scripted_pregrasp_reset,
             "scripted_pregrasp_distance_m": self.scripted_pregrasp_distance_m,
-            "scripted_pregrasp_action_scale": list(
-                self.scripted_pregrasp_action_scale
-            ),
-            "scripted_pregrasp_action_bias": list(
-                self.scripted_pregrasp_action_bias
-            ),
+            "scripted_pregrasp_action_scale": list(self.scripted_pregrasp_action_scale),
+            "scripted_pregrasp_action_bias": list(self.scripted_pregrasp_action_bias),
             "post_contact_phase_enabled": self.post_contact_phase_enabled,
             "post_contact_phase_activation_steps": (
                 self.post_contact_phase_activation_steps
@@ -2169,18 +2151,12 @@ class CubeLiftTaskConfig:
             "scripted_contact_loss_grace_steps": (
                 self.scripted_contact_loss_grace_steps
             ),
-            "scripted_contact_action_scale": list(
-                self.scripted_contact_action_scale
-            ),
-            "scripted_contact_action_bias": list(
-                self.scripted_contact_action_bias
-            ),
+            "scripted_contact_action_scale": list(self.scripted_contact_action_scale),
+            "scripted_contact_action_bias": list(self.scripted_contact_action_bias),
             "scripted_contact_nonnegative_lift_action": (
                 self.scripted_contact_nonnegative_lift_action
             ),
-            "policy_active_action_indices": list(
-                self.policy_active_action_indices
-            ),
+            "policy_active_action_indices": list(self.policy_active_action_indices),
             "cube_spawn_xy_jitter_m": list(self.cube_spawn_xy_jitter_m),
             "cube_spawn_yaw_jitter_rad": self.cube_spawn_yaw_jitter_rad,
             "randomizes_cube_spawn": self.randomizes_cube_spawn,
@@ -2198,12 +2174,8 @@ class CubeLiftTaskConfig:
             "reach_target_delta_observation_source": (
                 self.reach_target_delta_observation_source or None
             ),
-            "policy_observation_fields": list(
-                self.resolved_policy_observation_fields
-            ),
-            "policy_observation_fields_explicit": bool(
-                self.policy_observation_fields
-            ),
+            "policy_observation_fields": list(self.resolved_policy_observation_fields),
+            "policy_observation_fields_explicit": bool(self.policy_observation_fields),
             "proprio_observation_dim": self.proprio_observation_dim,
             "wrist_rgb_shape": (
                 None if self.wrist_rgb_shape is None else list(self.wrist_rgb_shape)
@@ -2227,10 +2199,12 @@ class CubeLiftTaskConfig:
         source_path: str = "",
         source_sha256: str = "",
         source_dependencies: tuple[str, ...] = (),
-    ) -> "CubeLiftTaskConfig":
+    ) -> CubeLiftTaskConfig:
         reward_payload = payload.get("reward", {})
         if not isinstance(reward_payload, Mapping):
-            raise ValueError("CubeLift reward must be a JSON object.")
+            raise ValueError(  # noqa: TRY004 - configuration validation contract
+                "CubeLift reward must be a JSON object."
+            )
         policy_class = str(payload.get("policy_class", NORMAL_POLICY_CLASS))
         default_grasp_mode = (
             PHYSICAL_CONTACT_GRASP_MODE
@@ -2238,11 +2212,15 @@ class CubeLiftTaskConfig:
             else CONTACT_LATCH_DEBUG_GRASP_MODE
         )
         return cls(
-            schema_version=str(payload.get("schema_version", CUBE_LIFT_TASK_SCHEMA_VERSION)),
+            schema_version=str(
+                payload.get("schema_version", CUBE_LIFT_TASK_SCHEMA_VERSION)
+            ),
             name=str(payload["name"]),
             base_contract_path=str(payload["base_contract_path"]),
             base_contract_sha256=str(payload["base_contract_sha256"]),
-            execution_mode=str(payload.get("execution_mode", DIRECT_QPOS_DEBUG_EXECUTION_MODE)),
+            execution_mode=str(
+                payload.get("execution_mode", DIRECT_QPOS_DEBUG_EXECUTION_MODE)
+            ),
             robot_dynamics=str(payload.get("robot_dynamics", "not_simulated")),
             gripper_dynamics=str(
                 payload.get("gripper_dynamics", PRESCRIBED_GRIPPER_DYNAMICS)
@@ -2276,14 +2254,14 @@ class CubeLiftTaskConfig:
             right_qpos_lower=tuple(payload["right_qpos_lower"]),
             right_qpos_upper=tuple(payload["right_qpos_upper"]),
             right_joint_delta_rad=tuple(payload["right_joint_delta_rad"]),
-            right_tcp_delta_m=tuple(payload.get("right_tcp_delta_m", (0.02, 0.02, 0.02))),
+            right_tcp_delta_m=tuple(
+                payload.get("right_tcp_delta_m", (0.02, 0.02, 0.02))
+            ),
             right_tcp_rotation_delta_rad=tuple(
                 payload.get("right_tcp_rotation_delta_rad", (0.15, 0.15, 0.15))
             ),
             pose_control_frame=str(payload.get("pose_control_frame", "tool_tcp")),
-            policy_action_components=tuple(
-                payload.get("policy_action_components", ())
-            ),
+            policy_action_components=tuple(payload.get("policy_action_components", ())),
             policy_action_scale=tuple(payload.get("policy_action_scale", ())),
             policy_action_bias=tuple(payload.get("policy_action_bias", ())),
             left_tool_profile_path=str(
@@ -2293,10 +2271,14 @@ class CubeLiftTaskConfig:
                 payload.get("right_tool_profile_path", DEFAULT_RIGHT_TOOL_PROFILE_PATH)
             ),
             wrist_rgb_enabled=bool(payload.get("wrist_rgb_enabled", False)),
-            wrist_rgb_camera_name=str(payload.get("wrist_rgb_camera_name", "right_wrist")),
+            wrist_rgb_camera_name=str(
+                payload.get("wrist_rgb_camera_name", "right_wrist")
+            ),
             wrist_rgb_width=int(payload.get("wrist_rgb_width", 32)),
             wrist_rgb_height=int(payload.get("wrist_rgb_height", 32)),
-            wrist_rgb_spatial_pool_size=int(payload.get("wrist_rgb_spatial_pool_size", 1)),
+            wrist_rgb_spatial_pool_size=int(
+                payload.get("wrist_rgb_spatial_pool_size", 1)
+            ),
             normal_proprio_profile=str(
                 payload.get("normal_proprio_profile", NORMAL_PROPRIO_PROFILE_V0)
             ),
@@ -2313,20 +2295,32 @@ class CubeLiftTaskConfig:
             right_gripper_max_close=float(payload.get("right_gripper_max_close", 0.8)),
             left_gripper_name=str(payload.get("left_gripper_name", "left_gripper")),
             right_gripper_name=str(payload.get("right_gripper_name", "right_gripper")),
-            initial_gripper_close_by_name=dict(payload["initial_gripper_close_by_name"]),
+            initial_gripper_close_by_name=dict(
+                payload["initial_gripper_close_by_name"]
+            ),
             object_body_name=str(payload.get("object_body_name", "debug_cube")),
-            object_freejoint_name=str(payload.get("object_freejoint_name", "debug_cube_freejoint")),
+            object_freejoint_name=str(
+                payload.get("object_freejoint_name", "debug_cube_freejoint")
+            ),
             right_grasp_body_name=str(
                 payload.get("right_grasp_body_name", "right_gripper_grasp_center_frame")
             ),
             grasp_latch_left_finger_body_name=str(
-                payload.get("grasp_latch_left_finger_body_name", "right_gripper_left_finger")
+                payload.get(
+                    "grasp_latch_left_finger_body_name", "right_gripper_left_finger"
+                )
             ),
             grasp_latch_right_finger_body_name=str(
-                payload.get("grasp_latch_right_finger_body_name", "right_gripper_right_finger")
+                payload.get(
+                    "grasp_latch_right_finger_body_name", "right_gripper_right_finger"
+                )
             ),
-            grasp_latch_acquire_close=float(payload.get("grasp_latch_acquire_close", 0.45)),
-            grasp_latch_release_close=float(payload.get("grasp_latch_release_close", 0.20)),
+            grasp_latch_acquire_close=float(
+                payload.get("grasp_latch_acquire_close", 0.45)
+            ),
+            grasp_latch_release_close=float(
+                payload.get("grasp_latch_release_close", 0.20)
+            ),
             grasp_latch_acquire_distance_m=float(
                 payload.get("grasp_latch_acquire_distance_m", 0.06)
             ),
@@ -2351,9 +2345,7 @@ class CubeLiftTaskConfig:
             command_hz=float(payload.get("command_hz", DEFAULT_POSITION_COMMAND_HZ)),
             physics_hz=float(payload.get("physics_hz", 1000.0)),
             max_episode_steps=int(payload.get("max_episode_steps", 150)),
-            task_objective=str(
-                payload.get("task_objective", LIFT_TASK_OBJECTIVE)
-            ),
+            task_objective=str(payload.get("task_objective", LIFT_TASK_OBJECTIVE)),
             reach_target_height_offset_m=float(
                 payload.get("reach_target_height_offset_m", 0.03)
             ),
@@ -2363,9 +2355,7 @@ class CubeLiftTaskConfig:
             reach_guidance_xy_blend_radius_m=float(
                 payload.get("reach_guidance_xy_blend_radius_m", 0.0)
             ),
-            reach_action_min_scale=float(
-                payload.get("reach_action_min_scale", 1.0)
-            ),
+            reach_action_min_scale=float(payload.get("reach_action_min_scale", 1.0)),
             reach_action_slow_radius_m=float(
                 payload.get("reach_action_slow_radius_m", 0.0)
             ),
@@ -2393,7 +2383,9 @@ class CubeLiftTaskConfig:
                 payload.get("contact_success_min_score", 0.5)
             ),
             lift_delta_m=float(payload.get("lift_delta_m", 0.08)),
-            success_hold_physics_ticks=int(payload.get("success_hold_physics_ticks", 20)),
+            success_hold_physics_ticks=int(
+                payload.get("success_hold_physics_ticks", 20)
+            ),
             success_requires_bilateral_contact=bool(
                 payload.get("success_requires_bilateral_contact", False)
             ),
@@ -2409,12 +2401,8 @@ class CubeLiftTaskConfig:
             success_max_outer_contact_score=float(
                 payload.get("success_max_outer_contact_score", 1.0)
             ),
-            pose_target_anti_windup=bool(
-                payload.get("pose_target_anti_windup", False)
-            ),
-            scripted_pregrasp_reset=bool(
-                payload.get("scripted_pregrasp_reset", False)
-            ),
+            pose_target_anti_windup=bool(payload.get("pose_target_anti_windup", False)),
+            scripted_pregrasp_reset=bool(payload.get("scripted_pregrasp_reset", False)),
             scripted_pregrasp_distance_m=float(
                 payload.get("scripted_pregrasp_distance_m", 0.035)
             ),
@@ -2445,9 +2433,7 @@ class CubeLiftTaskConfig:
             post_contact_nonnegative_lift_action=bool(
                 payload.get("post_contact_nonnegative_lift_action", False)
             ),
-            scripted_contact_reset=bool(
-                payload.get("scripted_contact_reset", False)
-            ),
+            scripted_contact_reset=bool(payload.get("scripted_contact_reset", False)),
             scripted_contact_reset_hold_steps=int(
                 payload.get("scripted_contact_reset_hold_steps", 5)
             ),
@@ -2479,7 +2465,7 @@ class CubeLiftTaskConfig:
         )
 
     @classmethod
-    def load(cls, path: str | Path) -> "CubeLiftTaskConfig":
+    def load(cls, path: str | Path) -> CubeLiftTaskConfig:
         resolved = resolve_path(path)
         payload, semantic_sha256, dependencies = cls._load_resolved_payload(
             resolved,
@@ -2506,7 +2492,7 @@ class CubeLiftTaskConfig:
         content = resolved.read_bytes()
         payload = json.loads(content.decode("utf-8"))
         if not isinstance(payload, Mapping):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - configuration validation contract
                 f"CubeLift task config {resolved} must contain a JSON object."
             )
         raw_sha256 = hashlib.sha256(content).hexdigest()
@@ -2517,8 +2503,8 @@ class CubeLiftTaskConfig:
         if not extends_path:
             raise ValueError("CubeLift task config extends must be non-empty.")
         parent = resolve_path(extends_path)
-        parent_payload, parent_sha256, parent_dependencies = (
-            cls._load_resolved_payload(parent, stack=(*stack, resolved))
+        parent_payload, parent_sha256, parent_dependencies = cls._load_resolved_payload(
+            parent, stack=(*stack, resolved)
         )
         overlay = dict(payload)
         overlay.pop("extends", None)
@@ -2537,7 +2523,7 @@ class CubeLiftTaskConfig:
                 "dexteleop.cube_lift.task_profile.v1\n"
                 f"parent={parent_sha256}\n"
                 f"overlay={raw_sha256}\n"
-            ).encode("utf-8")
+            ).encode()
         ).hexdigest()
         return (
             merged,
@@ -2554,7 +2540,9 @@ class CubeLiftTaskConfig:
             return None
         profile = rm65_bimanual_udp_feedback_profile()
         if profile.name != self.position_actuation_profile_name:
-            raise RuntimeError("Resolved RM65 actuation profile name changed after validation.")
+            raise RuntimeError(
+                "Resolved RM65 actuation profile name changed after validation."
+            )
         return profile
 
     @property
@@ -2568,37 +2556,39 @@ class CubeLiftTaskConfig:
             str(self.gripper_actuation_profile_name)
         )
         if profile.name != self.gripper_actuation_profile_name:
-            raise RuntimeError("Resolved DM-Tac gripper profile name changed after validation.")
+            raise RuntimeError(
+                "Resolved DM-Tac gripper profile name changed after validation."
+            )
         return profile
 
 
 __all__ = [
     "ACTUATED_POSITION_EXECUTION_MODE",
     "CAD_DMTAC_GRIPPER_ACTUATION_PROFILE_NAME",
+    "CONTACT_LATCH_DEBUG_GRASP_MODE",
+    "CONTACT_TASK_OBJECTIVE",
     "CUBE_LIFT_ACTUATED_TASK_SCHEMA_VERSION",
     "CUBE_LIFT_CONTACT_GRIPPER_ACTUATION_PROFILE_NAME",
     "CUBE_LIFT_FULLY_ACTUATED_TASK_SCHEMA_VERSION",
     "CUBE_LIFT_TASK_SCHEMA_VERSION",
-    "CubeLiftRewardConfig",
-    "CubeLiftTaskConfig",
-    "MUJOCO_POSITION_ACTUATOR_DYNAMICS",
-    "MUJOCO_IDENTIFIED_GRIPPER_DYNAMICS",
-    "PRESCRIBED_GRIPPER_DYNAMICS",
-    "CONTACT_LATCH_DEBUG_GRASP_MODE",
-    "CONTACT_TASK_OBJECTIVE",
     "LEGACY_DEBUG_POLICY_CLASS",
-    "NORMAL_POLICY_CLASS",
     "LIFT_TASK_OBJECTIVE",
-    "NORMAL_PROPRIO_PROFILE_V0",
-    "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1",
-    "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2",
-    "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1",
+    "MUJOCO_IDENTIFIED_GRIPPER_DYNAMICS",
+    "MUJOCO_POSITION_ACTUATOR_DYNAMICS",
+    "NORMAL_POLICY_CLASS",
     "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_REACH_DELTA_V2",
+    "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_CUBE_POSE_V1",
+    "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_NO_EPISODE_CLOCK_V2",
+    "NORMAL_PROPRIO_PROFILE_MOTION_TRACKING_V1",
+    "NORMAL_PROPRIO_PROFILE_V0",
     "PHYSICAL_CONTACT_GRASP_MODE",
+    "PRESCRIBED_GRIPPER_DYNAMICS",
     "PRIVILEGED_EXPERT_POLICY_CLASS",
     "REACH_TASK_OBJECTIVE",
     "SCRIPTED_CONTACT_LOST_REASON",
-    "rm65_position_actuation_profile_sha256",
+    "CubeLiftRewardConfig",
+    "CubeLiftTaskConfig",
     "dmtac_gripper_actuation_profile_sha256",
     "resolve_dmtac_gripper_actuation_profile",
+    "rm65_position_actuation_profile_sha256",
 ]

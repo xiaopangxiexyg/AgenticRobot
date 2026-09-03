@@ -44,22 +44,21 @@ profile explicitly binds a Station application port.
 The optional real perception binding exposes the existing
 `perception.capture_rgb` and `perception.capture_depth` contracts and may add
 the supplied-image `perception.localize_objects` contract when its reviewed
-SAM2/Grounding DINO resource is enabled. It may additionally expose the read-only
-`perception.plan_point_grasp` contract when a reviewed VGN or project-authorized,
-hash-locked GraspNet resource is enabled;
-that Route consumes aligned RGB-D plus a clicked pixel and fixed-camera calibration,
-returns DMTAC M tool-TCP candidates, and must never invoke motion, IK, or gripper IO.
-It owns one reviewed RealSense
+SAM2/Grounding DINO resource is enabled. Point-grasp model adapters and offline
+evaluation must not be registered as a real Gateway Route until RGB-D capture,
+Station revision, camera role, and calibration lineage are deployment-trusted
+rather than supplied by the caller. It owns one reviewed RealSense
 inventory, optional read-only model lifecycle, and one transient Artifact store
 as application resources; a capture executor may only read an already-published
 immutable frame. A Skill invocation must never start, reset, restart, or close
 a camera or model, and it must never call the motion port, command admission,
-dispatch, or HOLD. Local-file image input is test-only, disabled by default,
-and restricted to explicit same-host roots; ordinary input uses Artifact upload.
+dispatch, or HOLD. Production input uses Artifact upload; local files belong to
+the separate offline model CLIs and are not a production Gateway capability.
 Resource startup belongs to the application transaction before the socket is
 published. Shared SAM2 must start before the point-grasp planner and close after it.
-VGN remains the default backend. External model source stays behind pinned Git
-submodule boundaries; checkpoints remain outside Git in reviewed asset bundles. A live frame must
+This ordering applies to offline/experimental compositions and does not enable a
+Gateway Route. VGN remains the default backend. External model source stays behind pinned Git
+submodule boundaries; checkpoints remain outside Git in explicitly verified local asset bundles. A live frame must
 match the configured source key, hardware serial,
 source generation, freshness bound, and Station revision. Depth additionally
 requires a numeric trusted camera-to-world pose for that exact role; a moving

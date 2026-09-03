@@ -205,3 +205,6 @@ def test_real_perception_cli_is_discoverable_without_importing_hardware() -> Non
     assert "never constructs or connects an RM65 backend" in result.stdout
     assert "--camera-config" in result.stdout
     assert "--artifact-root" in result.stdout
+    assert "--enable-object-localization" in result.stdout
+    assert "--enable-point-grasp" not in result.stdout
+    assert "--allow-local-image-root" not in result.stdout

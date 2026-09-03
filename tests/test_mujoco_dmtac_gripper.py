@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from collection_runtime.stream_sink import NativeStreamEpisodeWriter
 from control_station.composition import (
     build_mujoco_component_human_proposal_adapter,
 )
@@ -20,12 +21,12 @@ from control_station.sources.teleop_pose import (
 from dataset_contracts.stream_catalog import NativeStreamContract
 from dataset_interface.streams import load_native_stream_episode
 from robot_motion.action import (
+    SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
     ArmActionSpec,
     CanonicalActionSafetyAnchor,
     CanonicalKeyframeSafetyProfile,
     HandActionSpec,
     HandQposSafetyLimits,
-    SCHEDULED_REFERENCE_SEGMENT_SIM_V1,
     apply_canonical_keyframe_safety,
 )
 from robot_motion.position_control import PositionKeyframeSafetyConfig
@@ -40,6 +41,7 @@ from sim.mujoco.actuation import (
     MujocoDmtacGripperExecutor,
     cad_bimanual_dmtac_gripper_profile,
     identified_bimanual_dmtac_gripper_profile,
+    point_grasp_cad_bimanual_dmtac_gripper_profile,
     rm65_bimanual_udp_feedback_profile,
     strong_cad_bimanual_dmtac_gripper_profile,
 )
@@ -52,13 +54,10 @@ from sim.mujoco.deploy.pose_resolution import MujocoCoupledPoseToQposResolver
 from sim.mujoco.ik import RM65CanonicalIK
 from sim.mujoco.scene import MujocoScene
 from teleop_runtime.action.human_proposal import HumanCommandEmission
-from collection_runtime.stream_sink import NativeStreamEpisodeWriter
-
 
 CONTRACT_PATH = "sim/configs/rm65_bimanual_physics_v1.json"
 LEGACY_URDF_PATH = (
-    "assets/rm65_inspire_gripper_v3/"
-    "rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
+    "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera.urdf"
 )
 
 
@@ -119,18 +118,18 @@ def test_identified_dmtac_profile_freezes_bilateral_stage_semantics() -> None:
         "right_gripper": 0.0640776765,
     }
     response = profile.normalized_position_profile()
-    assert response.parameters("left", direction="close").max_rate_per_sec == pytest.approx(
-        1.4928638795218356
-    )
+    assert response.parameters(
+        "left", direction="close"
+    ).max_rate_per_sec == pytest.approx(1.4928638795218356)
     assert response.parameters("left", direction="open").delay_sec == pytest.approx(
         0.046897892
     )
-    assert response.parameters("right", direction="close").max_rate_per_sec == pytest.approx(
-        1.3773242281700613
-    )
-    assert response.parameters("right", direction="open").acceleration_per_sec2 == pytest.approx(
-        12.7875
-    )
+    assert response.parameters(
+        "right", direction="close"
+    ).max_rate_per_sec == pytest.approx(1.3773242281700613)
+    assert response.parameters(
+        "right", direction="open"
+    ).acceleration_per_sec2 == pytest.approx(12.7875)
     assert response.source_payload_sha256 == (
         "3cbb510090d008d1c58ffc5c5e721ad3a2e3b45cda1285dcacb29ef121860691"
     )
@@ -144,6 +143,28 @@ def test_identified_dmtac_profile_freezes_bilateral_stage_semantics() -> None:
 
 def test_cad_dmtac_profile_preserves_official_six_joint_open_close_semantics() -> None:
     profile = cad_bimanual_dmtac_gripper_profile()
+
+    assert profile.name == "dmtac_bimanual_position_eg2_4b2_cad_20260818.v1"
+    for name, side in (
+        ("left_eg2_4b2_cad", "left"),
+        ("right_eg2_4b2_cad", "right"),
+    ):
+        assert profile.side_by_gripper[name] == side
+        assert len(profile.joint_names_by_gripper[name]) == 6
+        assert profile.open_qpos_by_gripper[name] == (0.0,) * 6
+        assert profile.closed_qpos_by_gripper[name] == (0.864,) * 6
+        assert profile.qpos_from_close(name, 0.0) == (0.0,) * 6
+        assert profile.qpos_from_close(name, 1.0) == (0.864,) * 6
+        assert profile.master_joint_by_gripper[name].endswith("_r_1_joint")
+        assert len(profile.equality_joint_pairs(name)) == 5
+        assert all(
+            master == profile.master_joint_by_gripper[name]
+            for master, _mimic in profile.equality_joint_pairs(name)
+        )
+
+
+def test_point_grasp_cad_dmtac_profile_has_separate_revolute_gain_identity() -> None:
+    profile = point_grasp_cad_bimanual_dmtac_gripper_profile()
 
     assert profile.name == "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
     assert profile.position_kp_n_m == pytest.approx(5.0)
@@ -170,7 +191,7 @@ def test_cad_dmtac_profile_preserves_official_six_joint_open_close_semantics() -
 
 
 def test_strong_cad_dmtac_profile_changes_only_reviewed_force_semantics() -> None:
-    base = cad_bimanual_dmtac_gripper_profile()
+    base = point_grasp_cad_bimanual_dmtac_gripper_profile()
     strong = strong_cad_bimanual_dmtac_gripper_profile()
 
     assert strong.name == "dmtac_bimanual_position_eg2_4b2_cad_20260831.v3_strong"
@@ -183,7 +204,9 @@ def test_strong_cad_dmtac_profile_changes_only_reviewed_force_semantics() -> Non
 
 
 @pytest.mark.slow_sim
-def test_cad_dmtac_scene_compiles_six_actuators_and_explicit_mimic_constraints() -> None:
+def test_cad_dmtac_scene_compiles_six_actuators_and_explicit_mimic_constraints() -> (
+    None
+):
     pytest.importorskip("mujoco")
     scene, _arm_profile, profile = _cad_scene()
 
@@ -524,9 +547,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
                 valid=True,
                 hold=False,
                 status="tracking",
-                q_ref_by_side={
-                    side: scene.get_arm_qpos(side) for side in pose_by_side
-                },
+                q_ref_by_side={side: scene.get_arm_qpos(side) for side in pose_by_side},
                 target_endpoint_pose_world_by_side={
                     side: identity.copy() for side in pose_by_side
                 },
@@ -538,8 +559,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
             )
 
     hand_specs = {
-        side: HandActionSpec.dmtac_gripper(side)
-        for side in ("left", "right")
+        side: HandActionSpec.dmtac_gripper(side) for side in ("left", "right")
     }
     anchor = CanonicalActionSafetyAnchor(
         anchor_id="compound-measured-anchor-0",
@@ -650,9 +670,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
                 side=side,
                 command_type="joint_vector",
                 value=hand_value,
-                metadata={
-                    "hand_action_spec": hand_specs[side].to_metadata()
-                },
+                metadata={"hand_action_spec": hand_specs[side].to_metadata()},
             )
         )
         commands_by_role.append((f"{side}-q6-fixture", hand_command))
@@ -662,13 +680,9 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
         sample_refs: dict[str, ObservationSampleRef] = {}
         for command_snapshot in command.commands.values():
             stream_suffix = (
-                "pose"
-                if command_snapshot.command_type == "cartesian_pose"
-                else "qpos"
+                "pose" if command_snapshot.command_type == "cartesian_pose" else "qpos"
             )
-            stream_id = (
-                f"human.{command_snapshot.effector_name}_{stream_suffix}"
-            )
+            stream_id = f"human.{command_snapshot.effector_name}_{stream_suffix}"
             payload = np.asarray(command_snapshot.value).copy()
             sample_refs[stream_id] = ObservationSampleRef(
                 stream_id=stream_id,
@@ -676,15 +690,11 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
                 sequence=0,
                 measured_at=clock_now - 0.01,
                 measured_clock_domain_id=(
-                    "vive.device_time"
-                    if stream_suffix == "pose"
-                    else "q6.device_time"
+                    "vive.device_time" if stream_suffix == "pose" else "q6.device_time"
                 ),
                 available_at=clock_now - 0.001,
                 available_clock_domain_id="teleop_session.monotonic",
-                payload_object_id=(
-                    f"{role}:payload:{command_snapshot.effector_name}"
-                ),
+                payload_object_id=(f"{role}:payload:{command_snapshot.effector_name}"),
             )
             payload_handles_by_stream[stream_id] = payload
         emission = HumanCommandEmission.capture(
@@ -700,9 +710,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
         producer_id=human_adapter.config.producer_id,
         producer_epoch=human_adapter.config.producer_epoch,
         observation_contract_hash=source_spec.semantic_content_hash,
-        io_layout_hash=(
-            runtime.target_runtime_action_contract.semantic_content_hash
-        ),
+        io_layout_hash=(runtime.target_runtime_action_contract.semantic_content_hash),
     )
     observation = admit_human_observation_cut(
         core=runtime.core,
@@ -731,9 +739,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
         )
         proposal_ids.append(receipt.proposal.proposal_id)
     observation_facts = [
-        fact
-        for fact in runtime.trace_facts
-        if fact.event_type == "observation_cut"
+        fact for fact in runtime.trace_facts if fact.event_type == "observation_cut"
     ]
     assert [fact.fact_id for fact in observation_facts] == [
         observation.record.observation_cut_id
@@ -749,9 +755,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
             ),
             producer_id=source_spec.source_id,
             value_schema=(
-                "float32[4,4]"
-                if stream_id.endswith("_pose")
-                else "float32[6]"
+                "float32[4,4]" if stream_id.endswith("_pose") else "float32[6]"
             ),
             shape=tuple(np.asarray(payload).shape),
             dtype=np.asarray(payload).dtype.str,
@@ -761,21 +765,16 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
                 else "normalized_joint_position"
             ),
             frame=(
-                stream_id.removeprefix("human.").removesuffix("_pose")
-                + "_base"
+                stream_id.removeprefix("human.").removesuffix("_pose") + "_base"
                 if stream_id.endswith("_pose")
                 else None
             ),
             measured_clock_domain_id=sample.measured_clock_domain_id,
-            available_clock_domain_id=(
-                runtime.config.clock_domain_id
-            ),
+            available_clock_domain_id=(runtime.config.clock_domain_id),
             access_role="actor_input",
         )
         for stream_id, payload in payload_handles_by_stream.items()
-        for sample in (
-            observation.record.selected_sample_by_stream[stream_id],
-        )
+        for sample in (observation.record.selected_sample_by_stream[stream_id],)
     }
     output_contracts = {
         "sim.arm_qpos": NativeStreamContract(
@@ -824,9 +823,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
         legacy_episode_index=int(hold_before_activation),
         contracts={**input_contracts, **output_contracts},
     )
-    for stream_id, sample in (
-        observation.record.selected_sample_by_stream.items()
-    ):
+    for stream_id, sample in observation.record.selected_sample_by_stream.items():
         native_writer.append_observation_sample(
             sample,
             observation.payload_handles_by_stream[stream_id],
@@ -841,10 +838,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
             [scene.get_arm_qpos(side) for side in ("left", "right")]
         ).astype(np.float64, copy=False)
         hand_qpos = np.stack(
-            [
-                scene.get_gripper_qpos(f"{side}_gripper")
-                for side in ("left", "right")
-            ]
+            [scene.get_gripper_qpos(f"{side}_gripper") for side in ("left", "right")]
         ).astype(np.float64, copy=False)
         native_writer.append(
             stream_id="sim.arm_qpos",
@@ -920,17 +914,14 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
         "right_hand",
     }
     assert {
-        binding.selected_action_ref
-        for binding in manifest.group_binding_by_id.values()
+        binding.selected_action_ref for binding in manifest.group_binding_by_id.values()
     } == set(proposal_ids)
     assert set(runtime.core.pending_execution_segment_by_group) == {
         "arms",
         "left_hand",
         "right_hand",
     }
-    assert runtime.rig.snapshot()["gripper_execution"][
-        "pending_delayed_targets"
-    ] == 0
+    assert runtime.rig.snapshot()["gripper_execution"]["pending_delayed_targets"] == 0
     if hold_before_activation:
         outcome = runtime.transition_execution_gate(
             "hold",
@@ -948,9 +939,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
             "right_gripper": pytest.approx(0.0),
         }
         captured = _seal_native_capture(None)
-        assert not captured.payload_by_stream_and_sample[
-            "command.hand_close"
-        ]
+        assert not captured.payload_by_stream_and_sample["command.hand_close"]
         runtime.close()
         return
 
@@ -972,9 +961,7 @@ def test_opt_in_compound_runtime_activates_arm_and_hand_groups_together(
         "left_gripper": pytest.approx(0.25),
         "right_gripper": pytest.approx(0.75),
     }
-    captured = _seal_native_capture(
-        np.asarray([0.25, 0.75], dtype=np.float64)
-    )
+    captured = _seal_native_capture(np.asarray([0.25, 0.75], dtype=np.float64))
     np.testing.assert_allclose(
         captured.payload_by_stream_and_sample["command.hand_close"][
             "dmtac-hand-close-command-0"

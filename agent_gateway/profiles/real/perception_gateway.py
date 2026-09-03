@@ -59,14 +59,12 @@ from agent_gateway.transport.unix_transport import (
 from agent_gateway.transport.wire_adapter import BoundAgentGatewayWireAdapter
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
-from .observation_gateway import ObservationOnlyDomainControlPort
 from .localization_deployment import RealObjectLocalizationRegistration
 from .localization_gateway import (
     ObjectLocalizationProvider,
     build_real_object_localization_executor,
 )
-from .point_grasp_deployment import RealPointGraspRegistration
-from .point_grasp_gateway import PointGraspProvider, build_real_point_grasp_executor
+from .observation_gateway import ObservationOnlyDomainControlPort
 from .perception_deployment import (
     REAL_CAPTURE_DEPTH_OUTPUT_SLOT_ID_V1,
     REAL_CAPTURE_RGB_OUTPUT_SLOT_ID_V1,
@@ -92,7 +90,6 @@ class RealPerceptionContractBundle:
 
     registration: RealPerceptionCaptureRegistration
     localization_registration: RealObjectLocalizationRegistration | None
-    point_grasp_registration: RealPointGraspRegistration | None
     definition_catalog: SkillDefinitionCatalog
     schema_catalog: AgentSkillSchemaCatalog
     io_catalog: SkillIOCatalog
@@ -115,13 +112,11 @@ class RealPerceptionContractBundle:
         self.payload_validators.validate_manifest(self.route_manifest)
         if self.route_manifest.current_mode != "real_observe":
             raise ValueError("Camera-only perception requires real_observe mode.")
-        expected_routes = (
-            2
-            + int(self.localization_registration is not None)
-            + int(self.point_grasp_registration is not None)
-        )
+        expected_routes = 2 + int(self.localization_registration is not None)
         if len(self.route_manifest.skill_routes) != expected_routes:
-            raise ValueError("Real perception Route count does not match its resources.")
+            raise ValueError(
+                "Real perception Route count does not match its resources."
+            )
         for field_name in (
             "source_binding_id",
             "frame_graph_hash",
@@ -132,8 +127,7 @@ class RealPerceptionContractBundle:
         frame_binding = self.registration.frame_binding
         if (
             frame_binding is not None
-            and frame_binding.frame_graph.semantic_content_hash
-            != self.frame_graph_hash
+            and frame_binding.frame_graph.semantic_content_hash != self.frame_graph_hash
         ):
             raise ValueError(
                 "Real Depth v2 frame graph differs from the Gateway bundle."
@@ -148,7 +142,6 @@ def build_real_perception_contract_bundle(
     tool_config_hash: str,
     calibration_hash: str,
     localization_registration: RealObjectLocalizationRegistration | None = None,
-    point_grasp_registration: RealPointGraspRegistration | None = None,
 ) -> RealPerceptionContractBundle:
     """Build the passive-only manifest without starting a camera or socket."""
 
@@ -159,10 +152,6 @@ def build_real_perception_contract_bundle(
         RealObjectLocalizationRegistration,
     ):
         raise TypeError("localization_registration must be typed or None.")
-    if point_grasp_registration is not None and not isinstance(
-        point_grasp_registration, RealPointGraspRegistration
-    ):
-        raise TypeError("point_grasp_registration must be typed or None.")
     raw_pairs = [
         (
             registration.rgb,
@@ -185,14 +174,6 @@ def build_real_perception_contract_bundle(
                 localization_registration.skill,
                 localization_registration.binding,
                 localization_registration.availability_hash,
-            )
-        )
-    if point_grasp_registration is not None:
-        raw_pairs.append(
-            (
-                point_grasp_registration.skill,
-                point_grasp_registration.binding,
-                point_grasp_registration.availability_hash,
             )
         )
     registration_pairs = tuple(
@@ -278,17 +259,11 @@ def build_real_perception_contract_bundle(
             ()
             if localization_registration is None
             else (localization_registration.payload_validator,)
-        )
-        + (
-            ()
-            if point_grasp_registration is None
-            else (point_grasp_registration.payload_validator,)
         ),
     )
     return RealPerceptionContractBundle(
         registration=registration,
         localization_registration=localization_registration,
-        point_grasp_registration=point_grasp_registration,
         definition_catalog=definitions,
         schema_catalog=schemas,
         io_catalog=io_catalog,
@@ -422,9 +397,7 @@ def build_real_perception_passive_executors(
         )
         expected_revision = request.expected_station_revision
         if current_station_revision() != expected_revision:
-            raise RuntimeError(
-                "Station revision changed after passive depth capture."
-            )
+            raise RuntimeError("Station revision changed after passive depth capture.")
         frame_binding = registration.frame_binding
         if frame_binding is None:
             result = {
@@ -442,10 +415,8 @@ def build_real_perception_passive_executors(
             }
             receipt_domain = "dexteleop.agent_skill.real_depth_capture_receipt.v1"
         else:
-            camera_pose_reference = (
-                frame_binding.camera_pose_reference_xyz_quat_xyzw(
-                    frame.camera_pose_world_xyz_quat_xyzw
-                )
+            camera_pose_reference = frame_binding.camera_pose_reference_xyz_quat_xyzw(
+                frame.camera_pose_world_xyz_quat_xyzw
             )
             result = {
                 "source_id": frame.source_id,
@@ -457,15 +428,9 @@ def build_real_perception_passive_executors(
                 "depth_unit": "meter",
                 "invalid_depth_value": 0.0,
                 "reference_frame_id": frame_binding.reference_frame_id,
-                "reference_frame_spec_hash": (
-                    frame_binding.reference_frame_spec_hash
-                ),
-                "frame_graph_hash": (
-                    frame_binding.frame_graph.semantic_content_hash
-                ),
-                "camera_pose_reference_xyz_quat_xyzw": list(
-                    camera_pose_reference
-                ),
+                "reference_frame_spec_hash": (frame_binding.reference_frame_spec_hash),
+                "frame_graph_hash": (frame_binding.frame_graph.semantic_content_hash),
+                "camera_pose_reference_xyz_quat_xyzw": list(camera_pose_reference),
                 "intrinsics": dict(frame.intrinsics),
             }
             receipt_domain = "dexteleop.agent_skill.real_depth_capture_receipt.v2"
@@ -547,7 +512,7 @@ def _protocol_runtime(
     capabilities = AgentGatewaySessionCapabilities(
         runtime_session_id=manifest.runtime_session_id,
         artifact_transfer_enabled=True,
-        artifact_access_mechanisms=("chunked_rpc", "local_path"),
+        artifact_access_mechanisms=("chunked_rpc",),
         max_control_request_bytes=2 * 1024 * 1024,
         max_control_response_bytes=2 * 1024 * 1024,
         max_artifact_bytes=artifact_store.max_artifact_bytes,
@@ -682,7 +647,6 @@ class RealPerceptionGatewaySession:
     rgb_executor: PassiveReadSkillExecutor
     depth_executor: PassiveReadSkillExecutor
     localization_executor: PassiveReadSkillExecutor | None
-    point_grasp_executor: PassiveReadSkillExecutor | None
     hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -745,14 +709,13 @@ class RealPerceptionGatewaySession:
             raise RuntimeError("Passive RGB reads did not quiesce during close.")
         if not self.depth_executor.wait_all(timeout_sec=5.0):
             raise RuntimeError("Passive depth reads did not quiesce during close.")
-        if self.localization_executor is not None and not self.localization_executor.wait_all(
-            timeout_sec=65.0
+        if (
+            self.localization_executor is not None
+            and not self.localization_executor.wait_all(timeout_sec=65.0)
         ):
-            raise RuntimeError("Passive object localization did not quiesce during close.")
-        if self.point_grasp_executor is not None and not self.point_grasp_executor.wait_all(
-            timeout_sec=125.0
-        ):
-            raise RuntimeError("Passive point-grasp planning did not quiesce during close.")
+            raise RuntimeError(
+                "Passive object localization did not quiesce during close."
+            )
         return outcome
 
 
@@ -763,7 +726,6 @@ def assemble_real_perception_gateway_session(
     artifact_store: RecoverableAgentArtifactStore,
     allowed_client_ids: tuple[str, ...],
     localization_provider: ObjectLocalizationProvider | None = None,
-    point_grasp_provider: PointGraspProvider | None = None,
     max_retained_operations: int = 16,
     clock: Callable[[], float] = time.time,
 ) -> RealPerceptionGatewaySession:
@@ -820,22 +782,6 @@ def assemble_real_perception_gateway_session(
         ] = localization_executor
     elif localization_provider is not None:
         raise ValueError("Localization provider cannot exist without its registration.")
-    point_grasp_executor = None
-    if bundle.point_grasp_registration is not None:
-        if point_grasp_provider is None:
-            raise ValueError("Point-grasp registration requires its model provider.")
-        point_grasp_executor = build_real_point_grasp_executor(
-            registration=bundle.point_grasp_registration,
-            provider=point_grasp_provider,
-            artifact_store=artifact_store,
-            runtime_session_id=bundle.route_manifest.runtime_session_id,
-            current_station_revision=lambda: producer.current_station_revision,
-            max_retained_operations=max_retained_operations,
-            clock=clock,
-        )
-        ports[bundle.point_grasp_registration.skill.routes[0].semantic_content_hash] = point_grasp_executor
-    elif point_grasp_provider is not None:
-        raise ValueError("Point-grasp provider cannot exist without its registration.")
     registry = SkillExecutorRegistry(
         manifest=bundle.route_manifest,
         bindings=tuple(
@@ -888,9 +834,7 @@ def assemble_real_perception_gateway_session(
             resource_id="perception.cameras",
             resource_kind="camera_bundle",
             route_hashes=camera_route_hashes,
-            health_provider=lambda: (
-                "ready" if producer._status()[1] else "unavailable"
-            ),
+            health_provider=lambda: "ready" if producer._status()[1] else "unavailable",
             control_claimed_provider=lambda: False,
         )
     ]
@@ -913,18 +857,6 @@ def assemble_real_perception_gateway_session(
                 control_claimed_provider=lambda: False,
             )
         )
-    if bundle.point_grasp_registration is not None:
-        resource_bindings.append(
-            HardwareResourceBinding(
-                resource_id="perception.point_grasp_model",
-                resource_kind="local_model",
-                route_hashes=(bundle.point_grasp_registration.skill.routes[0].semantic_content_hash,),
-                health_provider=lambda: (
-                    "ready" if point_grasp_provider is not None and point_grasp_provider.started else "unavailable"
-                ),
-                control_claimed_provider=lambda: False,
-            )
-        )
     hardware_view = HardwareViewProvider(
         manifest=bundle.route_manifest,
         operation_store=operation_store,
@@ -937,7 +869,6 @@ def assemble_real_perception_gateway_session(
         rgb_executor=rgb_executor,
         depth_executor=depth_executor,
         localization_executor=localization_executor,
-        point_grasp_executor=point_grasp_executor,
         hardware_view_provider=hardware_view,
         service=service,
     )

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Mapping, Sequence
 
 from sim.rm65.actuation import (
     DmtacDirectionalPositionParameters,
@@ -35,9 +35,9 @@ class GripperContactTuning:
     friction: tuple[float, float, float] | None = None
     solref: tuple[float, float] | None = None
     solimp: tuple[float, float, float] | None = None
-    post_settle_geom_friction_by_name: Mapping[
-        str, tuple[float, float, float]
-    ] = field(default_factory=dict)
+    post_settle_geom_friction_by_name: Mapping[str, tuple[float, float, float]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         if self.friction is not None:
@@ -58,9 +58,7 @@ class GripperContactTuning:
                 _finite_tuple(self.solimp, name="solimp", length=3),
             )
         post_settle_geoms: dict[str, tuple[float, float, float]] = {}
-        for raw_name, raw_friction in (
-            self.post_settle_geom_friction_by_name.items()
-        ):
+        for raw_name, raw_friction in self.post_settle_geom_friction_by_name.items():
             name = str(raw_name).strip()
             if not name:
                 raise ValueError("post-settle geom names must be non-empty.")
@@ -134,7 +132,9 @@ class GripperActuationProfile:
         prefix = str(self.actuator_prefix).strip()
         status = str(self.calibration_status).strip()
         if not name or not prefix or not status:
-            raise ValueError("profile name, actuator_prefix, and calibration_status are required.")
+            raise ValueError(
+                "profile name, actuator_prefix, and calibration_status are required."
+            )
         joints: dict[str, tuple[str, ...]] = {}
         sides: dict[str, str] = {}
         opens: dict[str, tuple[float, ...]] = {}
@@ -167,11 +167,16 @@ class GripperActuationProfile:
                 name=f"{gripper_name}.closed_qpos",
                 length=len(joint_names),
             )
-            if all(math.isclose(a, b, abs_tol=1e-12) for a, b in zip(open_qpos, closed_qpos)):
+            if all(
+                math.isclose(a, b, abs_tol=1e-12)
+                for a, b in zip(open_qpos, closed_qpos)
+            ):
                 raise ValueError(f"{gripper_name} open and closed qpos must differ.")
             delay = float(self.command_to_actuator_delay_sec_by_gripper[gripper_name])
             if not math.isfinite(delay) or delay < 0.0:
-                raise ValueError("command-to-actuator delays must be finite and non-negative.")
+                raise ValueError(
+                    "command-to-actuator delays must be finite and non-negative."
+                )
             joints[gripper_name] = joint_names
             sides[gripper_name] = side
             opens[gripper_name] = open_qpos
@@ -192,7 +197,11 @@ class GripperActuationProfile:
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{field_name} must be finite and positive.")
             object.__setattr__(self, field_name, value)
-        for field_name in ("send_threshold", "joint_damping_n_s_m", "joint_frictionloss_n"):
+        for field_name in (
+            "send_threshold",
+            "joint_damping_n_s_m",
+            "joint_frictionloss_n",
+        ):
             value = float(getattr(self, field_name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{field_name} must be finite and non-negative.")
@@ -250,9 +259,7 @@ class GripperActuationProfile:
         suffix = "" if index == 0 else f"_mimic{index + 1}"
         return f"{self.actuator_prefix}_{gripper_name}_symmetric{suffix}"
 
-    def equality_joint_pairs(
-        self, gripper_name: str
-    ) -> tuple[tuple[str, str], ...]:
+    def equality_joint_pairs(self, gripper_name: str) -> tuple[tuple[str, str], ...]:
         """Return explicit master-to-mimic joint relations for one gripper."""
 
         gripper = str(gripper_name)
@@ -260,10 +267,14 @@ class GripperActuationProfile:
         if len(joint_names) < 2:
             return ()
         master = self.master_joint_by_gripper[gripper]
-        return tuple((master, joint_name) for joint_name in joint_names if joint_name != master)
+        return tuple(
+            (master, joint_name) for joint_name in joint_names if joint_name != master
+        )
 
     def gripper_for_side(self, side: str) -> str:
-        matches = [name for name, value in self.side_by_gripper.items() if value == str(side)]
+        matches = [
+            name for name, value in self.side_by_gripper.items() if value == str(side)
+        ]
         if len(matches) != 1:
             raise KeyError(f"no unique gripper configured for side {side!r}.")
         return matches[0]
@@ -330,7 +341,8 @@ class GripperActuationProfile:
         metadata = {
             "name": self.name,
             "joint_names_by_gripper": {
-                name: list(joints) for name, joints in self.joint_names_by_gripper.items()
+                name: list(joints)
+                for name, joints in self.joint_names_by_gripper.items()
             },
             "side_by_gripper": dict(self.side_by_gripper),
             "command_hz": self.command_hz,
@@ -390,12 +402,14 @@ def identified_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
             name: response.parameters(side, direction="close").delay_sec
             for name, side in (("left_gripper", "left"), ("right_gripper", "right"))
         },
-        finger_target_velocity_m_s=0.035 * max(
+        finger_target_velocity_m_s=0.035
+        * max(
             parameters.max_rate_per_sec
             for directions in response.parameters_by_side.values()
             for parameters in directions.values()
         ),
-        finger_target_acceleration_m_s2=0.035 * max(
+        finger_target_acceleration_m_s2=0.035
+        * max(
             parameters.acceleration_per_sec2
             for directions in response.parameters_by_side.values()
             for parameters in directions.values()
@@ -442,28 +456,9 @@ def cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
         "l_2_joint",
         "r_2_joint",
     )
-    # The identified legacy profile drives translational finger joints, while
-    # the official 4B2 CAD mechanism exposes six coupled revolute joints.  MJCF
-    # position actuators interpret kp/kv/forcerange in rotational units here;
-    # copying the N/m and N values verbatim therefore produced 1200 N m/rad and
-    # 20 N m *per mimic joint*.  With all six joints constrained to one master,
-    # that launched light objects instead of applying the intended 20 N pad
-    # force.  Convert through the approximately 40 mm CAD linkage lever arm and
-    # divide the generalized stiffness, damping, and torque among the six
-    # explicitly actuated mimic joints.
-    # The analytic conversion gives a conservative lower bound.  The detailed
-    # linkage's equality constraints and mesh contacts need additional servo
-    # authority to close under load; a fixed-seed contact-only sweep selected
-    # the middle stable setting below.  It acquires/holds bilateral contact
-    # without the projectile behavior of the legacy copied gains.
-    rotational_kp = 5.0
-    rotational_kv = 0.10
-    rotational_force_limit = 0.50
-    rotational_joint_damping = 0.02
-    rotational_joint_friction = 0.005
     return replace(
         base,
-        name="dmtac_bimanual_position_eg2_4b2_cad_20260829.v2",
+        name="dmtac_bimanual_position_eg2_4b2_cad_20260818.v1",
         joint_names_by_gripper={
             name: tuple(f"{name}_{suffix}" for suffix in joint_suffixes)
             for name in names
@@ -474,9 +469,7 @@ def cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
         },
         open_qpos_by_gripper={name: (0.0,) * 6 for name in names},
         closed_qpos_by_gripper={name: (0.864,) * 6 for name in names},
-        master_joint_by_gripper={
-            name: f"{name}_r_1_joint" for name in names
-        },
+        master_joint_by_gripper={name: f"{name}_r_1_joint" for name in names},
         command_to_actuator_delay_sec_by_gripper={
             name: base.command_to_actuator_delay_sec_by_gripper[
                 "left_gripper" if side == "left" else "right_gripper"
@@ -486,11 +479,29 @@ def cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
                 ("right_eg2_4b2_cad", "right"),
             )
         },
-        position_kp_n_m=rotational_kp,
-        position_kv_n_s_m=rotational_kv,
-        force_limit_n=rotational_force_limit,
-        joint_damping_n_s_m=rotational_joint_damping,
-        joint_frictionloss_n=rotational_joint_friction,
+        calibration_status=(
+            "official_eg2_4b2_cad_normalized_mimic_kinematics_provisional"
+        ),
+        evidence=(
+            "additive SolidWorks EG2-4B2 CAD export; r_1_joint is the master, "
+            "all five remaining moving joints mimic it with multiplier=1; "
+            "q=0 is open and q=0.864 is closed."
+        ),
+    )
+
+
+def point_grasp_cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
+    """Simulation-only revolute-gain profile for point-grasp experiments."""
+
+    base = cad_bimanual_dmtac_gripper_profile()
+    return replace(
+        base,
+        name="dmtac_bimanual_position_eg2_4b2_cad_20260829.v2",
+        position_kp_n_m=5.0,
+        position_kv_n_s_m=0.10,
+        force_limit_n=0.50,
+        joint_damping_n_s_m=0.02,
+        joint_frictionloss_n=0.005,
         calibration_status=(
             "official_eg2_4b2_cad_normalized_mimic_kinematics_"
             "revolute_unit_conversion_provisional"
@@ -510,14 +521,12 @@ def cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
 def strong_cad_bimanual_dmtac_gripper_profile() -> GripperActuationProfile:
     """Research-only slow-close force variant for the detailed 4B2 CAD hand."""
 
-    base = cad_bimanual_dmtac_gripper_profile()
+    base = point_grasp_cad_bimanual_dmtac_gripper_profile()
     return replace(
         base,
         name="dmtac_bimanual_position_eg2_4b2_cad_20260831.v3_strong",
         force_limit_n=0.75,
-        calibration_status=(
-            "official_eg2_4b2_cad_research_only_strong_close_ablation"
-        ),
+        calibration_status=("official_eg2_4b2_cad_research_only_strong_close_ablation"),
         evidence=(
             f"{base.evidence} Research-only rigid-object ablation raises the "
             "per-coupled-joint rotational force limit from 0.50 to 0.75 N m; "
@@ -565,6 +574,7 @@ __all__ = [
     "cad_bimanual_dmtac_gripper_profile",
     "cube_lift_contact_dmtac_gripper_profile",
     "identified_bimanual_dmtac_gripper_profile",
+    "point_grasp_cad_bimanual_dmtac_gripper_profile",
     "strong_cad_bimanual_dmtac_gripper_profile",
     "temporary_bimanual_dmtac_gripper_profile",
 ]

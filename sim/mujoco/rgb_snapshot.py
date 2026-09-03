@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from perception_contracts.artifacts import RGB_FRAME_MEDIA_TYPE_V1
+from dataset_contracts.perception_artifacts import RGB_FRAME_MEDIA_TYPE_V1
 
 from .scene import MujocoCameraRenderer
 

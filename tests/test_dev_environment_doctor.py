@@ -3,10 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
-
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCTOR_PATH = REPO_ROOT / "scripts" / "dev_environment_doctor.py"
@@ -31,7 +30,9 @@ def test_project_environment_matches_existing_source_roots() -> None:
     assert "collection_runtime" in config.package_roots
     assert "control_composition" in config.package_roots
     assert "rm65_inspire_tac" not in config.package_roots
-    assert all((REPO_ROOT / name / "__init__.py").is_file() for name in config.package_roots)
+    assert all(
+        (REPO_ROOT / name / "__init__.py").is_file() for name in config.package_roots
+    )
 
 
 def test_full_environment_install_does_not_pin_one_worktree() -> None:
@@ -39,7 +40,7 @@ def test_full_environment_install_does_not_pin_one_worktree() -> None:
         encoding="utf-8"
     )
 
-    assert 'pip uninstall --yes dexteleop' in installer
+    assert "pip uninstall --yes dexteleop" in installer
     assert '--editable "$REPO_ROOT"' not in installer
     assert 'UV_DEFAULT_INDEX="$LOCK_INDEX_URL"' in installer
 

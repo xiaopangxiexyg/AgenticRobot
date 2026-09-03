@@ -72,10 +72,13 @@ def test_station_application_core_does_not_import_concrete_data_planes() -> None
 
 def test_agent_gateway_does_not_import_upper_framework_packages() -> None:
     gateway_paths = _python_files(GATEWAY_ROOT)
-    assert _violations(
-        gateway_paths,
-        {"rpent", "rpent_dexteleop"},
-    ) == {}
+    assert (
+        _violations(
+            gateway_paths,
+            {"rpent", "rpent_dexteleop"},
+        )
+        == {}
+    )
 
 
 def test_agent_gateway_core_is_application_and_backend_neutral() -> None:
@@ -84,51 +87,58 @@ def test_agent_gateway_core_is_application_and_backend_neutral() -> None:
         *_python_files(GATEWAY_ROOT / "runtime"),
         *_python_files(GATEWAY_ROOT / "transport"),
     )
-    assert _violations(
-        tuple(gateway_core_paths),
-        {
-            "control_station",
-            "deployments",
-            "hardware",
-            "numpy",
-            "scipy",
-            "sim",
-            "teleop_runtime",
-        },
-    ) == {}
+    assert (
+        _violations(
+            tuple(gateway_core_paths),
+            {
+                "control_station",
+                "deployments",
+                "hardware",
+                "numpy",
+                "scipy",
+                "sim",
+                "teleop_runtime",
+            },
+        )
+        == {}
+    )
 
 
 def test_agent_gateway_skill_definitions_are_target_and_backend_neutral() -> None:
-    assert _violations(
-        _python_files(GATEWAY_ROOT / "skills"),
-        {
-            "control_station",
-            "deployments",
-            "hardware",
-            "numpy",
-            "robot_motion",
-            "scipy",
-            "sim",
-            "teleop_runtime",
-        },
-    ) == {}
+    assert (
+        _violations(
+            _python_files(GATEWAY_ROOT / "skills"),
+            {
+                "control_station",
+                "deployments",
+                "hardware",
+                "numpy",
+                "robot_motion",
+                "scipy",
+                "sim",
+                "teleop_runtime",
+            },
+        )
+        == {}
+    )
 
 
 def test_hitl_core_is_backend_model_topology_and_trace_neutral() -> None:
     hitl_paths = _python_files(STATION_ROOT / "hitl")
-    assert _violations(
-        hitl_paths,
-        {
-            "deployments",
-            "hardware",
-            "sim",
-            "teleop_runtime",
-        },
-    ) == {}
+    assert (
+        _violations(
+            hitl_paths,
+            {
+                "deployments",
+                "hardware",
+                "sim",
+                "teleop_runtime",
+            },
+        )
+        == {}
+    )
 
-    source = "\n".join(
-        path.read_text(encoding="utf-8") for path in hitl_paths
-    ).lower()
+    source = "\n".join(path.read_text(encoding="utf-8") for path in hitl_paths).lower()
     for concrete_name in (
         "left_arm",
         "right_arm",
@@ -248,16 +258,19 @@ def test_gateway_sim_dependencies_are_confined_to_mujoco_profile() -> None:
 
 
 def test_gateway_real_observation_profile_is_io_and_control_neutral() -> None:
-    assert _violations(
-        (GATEWAY_ROOT / "profiles/real/observation_gateway.py",),
-        {
-            "control_station",
-            "hardware",
-            "robot_motion",
-            "sim",
-            "teleop_runtime",
-        },
-    ) == {}
+    assert (
+        _violations(
+            (GATEWAY_ROOT / "profiles/real/observation_gateway.py",),
+            {
+                "control_station",
+                "hardware",
+                "robot_motion",
+                "sim",
+                "teleop_runtime",
+            },
+        )
+        == {}
+    )
 
 
 def test_station_numerical_source_debt_is_explicit_and_cannot_spread() -> None:
@@ -280,6 +293,9 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
     ) == {
         "agent_gateway/profiles/mujoco/motion_skill.py": ["numpy"],
         "agent_gateway/profiles/real/perception_probe.py": ["numpy"],
+        # The unregistered point-grasp prototype is a concrete profile: NumPy
+        # decodes bounded depth arrays and projects annotations at this leaf.
+        "agent_gateway/profiles/real/point_grasp_gateway.py": ["numpy"],
         "agent_gateway/profiles/real/realsense_perception.py": ["numpy"],
         # Concrete perception frame binding uses NumPy only to apply the
         # reviewed scene-to-station transform.  Gateway core remains neutral.

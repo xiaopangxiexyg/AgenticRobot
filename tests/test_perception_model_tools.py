@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import ClassVar
 
+import numpy as np
+import pytest
 from PIL import Image
 
-from deployments.perception import localize_image_cli
+from deployments.perception import localize_image_cli, point_grasp_image_cli
 from deployments.perception.sam2_grounding_dino import GroundedObjectDetection
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "scripts" / "install_perception_models.sh"
@@ -30,7 +34,7 @@ def test_perception_model_installer_is_executable_and_documents_fixed_inputs() -
     assert "aa9b8722d0585b661ded4b3dff1bd103540554ae" in source
     assert "856dde20aee659246248e20734ef9ba5214f5e44" in source
     assert "grounding_dino_torch_2_10_compat.h" in source
-    assert 'DEXTELEOP_ENV_NAME:-dexteleop310' in source
+    assert "DEXTELEOP_ENV_NAME:-dexteleop310" in source
 
 
 def test_point_grasp_installer_targets_canonical_environment() -> None:
@@ -42,7 +46,7 @@ def test_point_grasp_installer_targets_canonical_environment() -> None:
     )
     assert "default: dexteleop310" in completed.stdout
     source = POINT_GRASP_INSTALLER.read_text(encoding="utf-8")
-    assert 'DEXTELEOP_ENV_NAME:-dexteleop310' in source
+    assert "DEXTELEOP_ENV_NAME:-dexteleop310" in source
     assert '"scipy==1.13.1"' in source
     assert "dexteleop_graspnet_baseline.pth" in source
 
@@ -59,9 +63,106 @@ def test_point_grasp_environment_installer_composes_base_and_model_installers() 
     assert "--skip-vendor-sdk" in completed.stdout
     assert "checkpoints are not downloaded" in completed.stdout.lower()
     source = POINT_GRASP_ENV_INSTALLER.read_text(encoding="utf-8")
-    assert 'scripts/install_conda_env.sh' in source
-    assert 'scripts/install_point_grasp_models.sh' in source
-    assert 'model/perception/graspnet-baseline' in source
+    assert "scripts/install_conda_env.sh" in source
+    assert "scripts/install_point_grasp_models.sh" in source
+    assert "model/perception/graspnet-baseline" in source
+
+
+def test_point_grasp_image_cli_is_offline_and_has_no_gateway_dependency() -> None:
+    source = Path(point_grasp_image_cli.__file__).read_text(encoding="utf-8")
+    assert "agent_gateway" not in source
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "deployments.perception.point_grasp_image_cli",
+            "--help",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--calibration-json" in completed.stdout
+    assert "--output-image" in completed.stdout
+
+
+def _point_grasp_cli_arguments(tmp_path: Path) -> SimpleNamespace:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    rgb = tmp_path / "frame.png"
+    Image.new("RGB", (16, 12), color=(32, 64, 96)).save(rgb)
+    depth = tmp_path / "depth.npy"
+    np.save(depth, np.zeros((12, 16), dtype=np.float32), allow_pickle=False)
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(
+        json.dumps(
+            {
+                "camera_frame_id": "camera:test",
+                "base_frame_id": "base:test",
+                "camera_intrinsics": {
+                    "width": 16,
+                    "height": 12,
+                    "fx": 10.0,
+                    "fy": 10.0,
+                    "cx": 8.0,
+                    "cy": 6.0,
+                },
+                "T_base_from_camera": np.eye(4).tolist(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return SimpleNamespace(
+        sam2_asset_bundle=bundle,
+        point_grasp_asset_bundle=bundle,
+        point_grasp_backend="vgn",
+        input_rgb=rgb,
+        input_depth=depth,
+        calibration_json=calibration,
+        target_u=8,
+        target_v=6,
+        max_candidates=5,
+        output_json=tmp_path / "result.json",
+        output_image=tmp_path / "annotated.jpg",
+        device="cpu",
+        overwrite=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "aliased_output", ["input_rgb", "input_depth", "calibration_json"]
+)
+def test_point_grasp_image_cli_never_overwrites_an_input(
+    tmp_path: Path,
+    aliased_output: str,
+) -> None:
+    args = _point_grasp_cli_arguments(tmp_path)
+    args.output_image = getattr(args, aliased_output)
+    if args.output_image.suffix.lower() not in {".jpg", ".jpeg"}:
+        args.output_json = args.output_image
+        args.output_image = tmp_path / "annotated.jpg"
+
+    with pytest.raises(ValueError, match="paths must be distinct"):
+        point_grasp_image_cli.run(args)
+
+
+def test_point_grasp_image_cli_requires_distinct_output_paths(tmp_path: Path) -> None:
+    args = _point_grasp_cli_arguments(tmp_path)
+    args.output_json = args.output_image
+
+    with pytest.raises(ValueError, match="paths must be distinct"):
+        point_grasp_image_cli.run(args)
+
+
+def test_point_grasp_image_cli_bounds_depth_before_loading(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    args = _point_grasp_cli_arguments(tmp_path)
+    monkeypatch.setattr(point_grasp_image_cli, "MAX_DEPTH_BYTES", 1)
+
+    with pytest.raises(ValueError, match="at most 64 MiB"):
+        point_grasp_image_cli.run(args)
 
 
 class _FakeSpec:
@@ -69,12 +170,12 @@ class _FakeSpec:
     semantic_content_hash = "model-spec:test"
 
     @classmethod
-    def from_asset_bundle(cls, _bundle: Path) -> "_FakeSpec":
+    def from_asset_bundle(cls, _bundle: Path) -> _FakeSpec:
         return cls()
 
 
 class _FakeLocalizer:
-    instances: list["_FakeLocalizer"] = []
+    instances: ClassVar[list[_FakeLocalizer]] = []
 
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
@@ -113,7 +214,9 @@ def test_local_image_cli_writes_text_bbox_json_and_annotated_jpeg(
     output_image = tmp_path / "annotated.jpg"
     _FakeLocalizer.instances.clear()
     monkeypatch.setattr(localize_image_cli, "Sam2GroundingDinoModelSpec", _FakeSpec)
-    monkeypatch.setattr(localize_image_cli, "Sam2GroundingDinoLocalizer", _FakeLocalizer)
+    monkeypatch.setattr(
+        localize_image_cli, "Sam2GroundingDinoLocalizer", _FakeLocalizer
+    )
 
     assert (
         localize_image_cli.main(
@@ -166,7 +269,9 @@ def test_local_image_cli_automatic_mode_and_overwrite_guard(
     output_image = tmp_path / "annotated.jpg"
     _FakeLocalizer.instances.clear()
     monkeypatch.setattr(localize_image_cli, "Sam2GroundingDinoModelSpec", _FakeSpec)
-    monkeypatch.setattr(localize_image_cli, "Sam2GroundingDinoLocalizer", _FakeLocalizer)
+    monkeypatch.setattr(
+        localize_image_cli, "Sam2GroundingDinoLocalizer", _FakeLocalizer
+    )
 
     arguments = [
         "--asset-bundle",
