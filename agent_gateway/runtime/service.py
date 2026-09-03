@@ -34,6 +34,7 @@ from .access_policy import (
     SkillExecutionGrant,
     assess_skill_request_access,
 )
+from .artifact_validation import validate_skill_artifact_bindings
 from .executor_registry import SkillExecutorRegistry
 from .operation_port import (
     AgentDomainControlPort,
@@ -49,7 +50,6 @@ from .operation_store import (
     OperationStoreOutcome,
 )
 from .payload_validation import AgentSkillPayloadValidatorRegistry
-from .artifact_validation import validate_skill_artifact_bindings
 from .protocol_runtime import AgentGatewayProtocolRuntime
 
 
@@ -954,12 +954,16 @@ class AgentGatewayService:
             request.skill_version,
         )
         try:
-            validate_skill_artifact_bindings(
-                io_contract=io_contract,
-                direction="output",
-                bindings=output_artifact_bindings,
-                session_capabilities=self.protocol_runtime.session_capabilities,
-            )
+            # Output-slot minimum cardinality is a success postcondition.  A
+            # failed worker must still be able to commit a terminal failure
+            # without fabricating the Route's required success Artifacts.
+            if succeeded or output_artifact_bindings:
+                validate_skill_artifact_bindings(
+                    io_contract=io_contract,
+                    direction="output",
+                    bindings=output_artifact_bindings,
+                    session_capabilities=self.protocol_runtime.session_capabilities,
+                )
             if output_artifact_bindings:
                 store, _broker = self.protocol_runtime.require_artifact_plane()
                 for binding in output_artifact_bindings:

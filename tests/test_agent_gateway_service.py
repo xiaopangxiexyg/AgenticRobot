@@ -18,6 +18,7 @@ from agent_gateway.protocol.contracts import (
     AgentOwnOperationQuery,
     AgentSkillRequest,
 )
+from agent_gateway.protocol.session_contracts import AgentGatewaySessionCapabilities
 from agent_gateway.protocol.skill_catalog import (
     SkillDeploymentBindingRef,
     SkillExecutionRoute,
@@ -25,10 +26,18 @@ from agent_gateway.protocol.skill_catalog import (
     SkillRouteManifest,
     SkillRouteManifestEntry,
 )
+from agent_gateway.protocol.skill_io_contracts import (
+    SkillArtifactSlotSpec,
+    SkillIOCatalog,
+    SkillIOContract,
+)
 from agent_gateway.runtime.access_policy import (
     AgentSkillAccessPolicy,
     issue_skill_execution_grant,
 )
+from agent_gateway.runtime.artifact_store import RecoverableAgentArtifactStore
+from agent_gateway.runtime.artifact_transfer import AgentArtifactTransferBroker
+from agent_gateway.runtime.event_journal import BoundedAgentGatewayEventJournal
 from agent_gateway.runtime.executor_registry import (
     SkillExecutorBinding,
     SkillExecutorRegistry,
@@ -49,6 +58,7 @@ from agent_gateway.runtime.payload_validation import (
     AgentSkillPayloadValidatorRegistry,
     AgentSkillPayloadValidatorSet,
 )
+from agent_gateway.runtime.protocol_runtime import AgentGatewayProtocolRuntime
 from agent_gateway.runtime.service import (
     AgentGatewayService,
     NoIoAgentGatewayService,
@@ -179,6 +189,7 @@ def _manifest(
     capability: SkillExecutionRoute,
     *,
     authoritative_receipt_feature: bool = False,
+    skill_io_catalog_hash: str | None = None,
 ) -> SkillRouteManifest:
     return SkillRouteManifest(
         runtime_session_id="runtime:b2a-service",
@@ -223,6 +234,7 @@ def _manifest(
             "operation_queue",
             "production_entrypoint",
         ),
+        skill_io_catalog_hash=skill_io_catalog_hash,
     )
 
 
@@ -1929,6 +1941,134 @@ def test_passive_read_executor_fails_closed_when_output_artifact_is_rejected() -
     assert failed.reason_code == "passive_read_output_artifacts_rejected"
     assert failed.output_artifact_bindings == ()
     assert domain_port.calls == []
+
+
+def test_required_output_passive_read_can_commit_failure_without_artifact(
+    tmp_path,
+) -> None:
+    clock = _ManualClock()
+    base = _capability()
+    output_slot = SkillArtifactSlotSpec(
+        slot_id="required_output",
+        direction="output",
+        min_count=1,
+        max_count=1,
+        allowed_media_types=("application/octet-stream",),
+        allowed_schema_ids=("fixture.required_output.v1",),
+        allowed_encodings=("raw",),
+        allowed_compressions=("none",),
+        max_artifact_bytes=1024,
+        max_total_bytes=1024,
+    )
+    io_contract = SkillIOContract(
+        skill_id=base.skill_id,
+        skill_version=base.skill_version,
+        skill_definition_hash=base.skill_definition_hash,
+        parameter_schema_hash=base.parameter_schema_hash,
+        execution_result_schema_hash=base.execution_result_schema_hash,
+        task_evaluation_schema_hash=base.task_evaluation_schema_hash,
+        output_artifact_slots=(output_slot,),
+    )
+    capability = replace(
+        base,
+        skill_io_contract_hash=io_contract.semantic_content_hash,
+    )
+    io_catalog = SkillIOCatalog(
+        catalog_id="fixture.required-output",
+        catalog_version="1",
+        io_contracts=(io_contract,),
+    )
+    manifest = _manifest(
+        capability,
+        skill_io_catalog_hash=io_catalog.semantic_content_hash,
+    )
+    capabilities = AgentGatewaySessionCapabilities(
+        runtime_session_id=manifest.runtime_session_id,
+        artifact_transfer_enabled=True,
+        artifact_access_mechanisms=("chunked_rpc",),
+        max_control_request_bytes=2048,
+        max_control_response_bytes=2048,
+        max_artifact_bytes=1024,
+        max_artifact_chunk_bytes=1024,
+        max_artifact_refs_per_operation=1,
+        max_concurrent_uploads=1,
+        max_concurrent_downloads=1,
+        artifact_store_quota_bytes=4096,
+        event_payload_max_bytes=1024,
+        event_retention_count=16,
+    )
+    store = RecoverableAgentArtifactStore(
+        root=tmp_path / "required-output-store",
+        quota_bytes=capabilities.artifact_store_quota_bytes,
+        max_artifact_bytes=capabilities.max_artifact_bytes,
+        max_chunk_bytes=capabilities.max_artifact_chunk_bytes,
+    )
+    broker = AgentArtifactTransferBroker(
+        store=store,
+        session_capabilities=capabilities,
+        max_chunk_bytes=capabilities.max_artifact_chunk_bytes,
+    )
+    runtime = AgentGatewayProtocolRuntime(
+        manifest=manifest,
+        io_catalog=io_catalog,
+        session_capabilities=capabilities,
+        event_journal=BoundedAgentGatewayEventJournal(
+            runtime_session_id=manifest.runtime_session_id,
+            max_events=capabilities.event_retention_count,
+            event_payload_max_bytes=capabilities.event_payload_max_bytes,
+        ),
+        artifact_store=store,
+        artifact_transfer_broker=broker,
+        clock=clock,
+    )
+
+    def failed_read(_request, _operation) -> PassiveReadResult:
+        raise RuntimeError("fixture read failed before producing its Artifact")
+
+    executor = PassiveReadSkillExecutor(
+        port_id="passive-reader:required-output-failure",
+        executor_id="passive-reader-executor:required-output-failure",
+        read=failed_read,
+        current_station_revision=lambda: 4,
+        clock=clock,
+    )
+    domain_port = _AuthoritativeStationPort(clock)
+    service = AgentGatewayService(
+        manifest=manifest,
+        access_policy=_policy(),
+        executor_registry=SkillExecutorRegistry.bind_all_routes_to_port(
+            manifest=manifest,
+            execution_port=executor,
+        ),
+        domain_control_port=domain_port,
+        payload_validators=_payload_validators(capability),
+        operation_store=BoundedInMemoryAgentSkillOperationStore(
+            max_retained_operations=4
+        ),
+        protocol_runtime=runtime,
+        clock=clock,
+    )
+    try:
+        assert service.publish_observation(
+            snapshot=_snapshot(manifest),
+            now=10.0,
+        ).accepted
+        admitted = service.submit_request(
+            request=_request(manifest, capability),
+            current_station_revision=4,
+            now=10.0,
+        )
+        assert admitted.accepted and admitted.operation is not None
+        operation_id = admitted.operation.operation_id
+        assert service.launch_operation(operation_id).accepted
+        assert executor.wait(operation_id, timeout_sec=1.0)
+        failed = service.operation_store.get(operation_id)
+        assert failed is not None and failed.status == "failed"
+        assert failed.reason_code == "passive_read_executor_exception:RuntimeError"
+        assert failed.output_artifact_bindings == ()
+        assert domain_port.calls == []
+    finally:
+        store.close()
 
 
 def test_domain_hold_during_passive_read_never_binds_read_to_motion_port() -> None:
