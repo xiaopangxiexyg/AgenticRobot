@@ -170,6 +170,8 @@ def build_shadow_initialized_control(
         base,
         left_home_qpos=tuple(float(value) for value in snapshot.qpos_by_side["left"]),
         right_home_qpos=tuple(float(value) for value in snapshot.qpos_by_side["right"]),
+        left_initial_gripper_close=float(snapshot.gripper_close_by_side["left"]),
+        right_initial_gripper_close=float(snapshot.gripper_close_by_side["right"]),
     )
     try:
         control = DeskTcpPositionControl.build(cfg)

@@ -663,7 +663,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         sim_config = _simulation_config(profile, snapshot)
         receipt = run_real_shadow_acceptance(
-            snapshot_provider=context.snapshot,
+            # The target and all downstream planning must share the exact
+            # causal state cut captured above.  Reading the hardware again
+            # here can introduce a small qpos drift between
+            # ``target-from-current`` and the trajectory start, making an
+            # otherwise stationary acceptance request appear to require a
+            # collision-prone move.
+            snapshot_provider=lambda: snapshot,
             trajectory_builder=lambda snap: build_registered_tcp_obstacle_trajectory(
                 snap,
                 request,
