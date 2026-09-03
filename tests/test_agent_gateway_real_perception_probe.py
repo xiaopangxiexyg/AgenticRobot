@@ -307,7 +307,13 @@ def test_depth_v2_fails_closed_if_station_changes_before_artifact_commit(
             capture_then_change_station,
         )
         errors = perception_probe._capture_executor_errors(composition)
-        with pytest.raises(RuntimeError, match="exited without a terminal operation"):
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "did not complete: failed:"
+                "passive_read_executor_exception:RuntimeError"
+            ),
+        ):
             perception_probe._run_skill(
                 composition=composition,
                 adapter=adapter,
