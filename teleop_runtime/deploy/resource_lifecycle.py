@@ -200,34 +200,42 @@ class PolicyDeployResourceLifecycle:
             )
         if self.rtc_frontend is not None:
             self.rtc_frontend.start()
+            rtc_shadow = bool(getattr(args, "rtc_real_shadow", False))
+            dispatch_status = (
+                " live observation-only hardware guard enabled."
+                if rtc_shadow and not bool(getattr(args, "send_actions", False))
+                else (
+                    " live hardware dispatch enabled by explicit --send-actions; "
+                    "qpos-init and safety gates remain active."
+                    if rtc_shadow and bool(getattr(args, "send_actions", False))
+                    else (
+                        " explicit action dispatch enabled for synthetic/local "
+                        "backends."
+                        if bool(getattr(args, "send_actions", False))
+                        else " action dispatch disabled."
+                    )
+                )
+            )
             if str(args.rtc_profile) == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1:
                 print(
                     "[raw-RTC] OpenPI/model final-chunk shadow active: "
-                    "send_actions=false, position_lookahead=false, "
-                    "timed-plan admission enabled."
-                    + (
-                        " live observation-only hardware guard enabled."
-                        if bool(getattr(args, "rtc_real_shadow", False))
-                        else ""
-                    ),
+                    "position_lookahead=false, timed-plan admission enabled."
+                    + dispatch_status,
                     flush=True,
                 )
             elif str(args.rtc_profile) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1:
                 print(
                     "[model-RTC] conditioned OpenPI shadow active: "
-                    "send_actions=false, position_lookahead=false, "
-                    "timed-plan admission and prefix conditioning enabled."
-                    + (
-                        " live observation-only hardware guard enabled."
-                        if bool(getattr(args, "rtc_real_shadow", False))
-                        else ""
-                    ),
+                    "position_lookahead=false, timed-plan admission and prefix "
+                    "conditioning enabled."
+                    + dispatch_status,
                     flush=True,
                 )
             else:
                 print(
-                    "[RTC-3c] virtual-policy shadow active: send_actions=false, "
-                    "position_lookahead=false, timed-plan admission enabled.",
+                    "[RTC-3c] virtual-policy shadow active: action dispatch "
+                    "disabled, position_lookahead=false, timed-plan admission "
+                    "enabled.",
                     flush=True,
                 )
     def close(

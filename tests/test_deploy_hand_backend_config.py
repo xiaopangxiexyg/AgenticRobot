@@ -102,6 +102,7 @@ def test_apply_gripper_policy_preserves_shadow_no_write_flags() -> None:
         dmtac_tactile_compute_profile=None,
         dmtac_tactile_sequential_read=True,
         rtc_real_shadow=True,
+        send_actions=False,
     )
     policy = {
         **hand_backend_config.GRIPPER_POLICY_DEFAULTS,
@@ -109,7 +110,16 @@ def test_apply_gripper_policy_preserves_shadow_no_write_flags() -> None:
         "torque": 0.4,
         "tactile_fields": ("raw",),
     }
-    config = DMTacGripperBackendConfig(side="left")
+    config = DMTacGripperBackendConfig(
+        side="left",
+        connect_hardware=True,
+        observation_only=False,
+        send_commands=True,
+        clear_fault_on_start=True,
+        open_on_start=True,
+        tactile_reset_on_start=True,
+        tactile_warmup_frames=3,
+    )
 
     updated = hand_backend_config._apply_gripper_policy_to_dmtac_config(
         config,
@@ -132,3 +142,40 @@ def test_apply_gripper_policy_preserves_shadow_no_write_flags() -> None:
     assert updated.tactile_reset_on_start is False
     assert updated.tactile_warmup_frames == 0
     assert updated.enable_telemetry is True
+
+
+def test_apply_gripper_policy_preserves_active_command_start_flags() -> None:
+    args = argparse.Namespace(
+        dmtac_tactile=False,
+        dmtac_tactile_timeout_ms=None,
+        dmtac_tactile_wait_for_new=None,
+        dmtac_tactile_fields=None,
+        dmtac_tactile_compute_profile=None,
+        dmtac_tactile_sequential_read=False,
+        rtc_real_shadow=True,
+        send_actions=True,
+    )
+    policy = dict(hand_backend_config.GRIPPER_POLICY_DEFAULTS)
+    config = DMTacGripperBackendConfig(
+        side="left",
+        connect_hardware=True,
+        observation_only=False,
+        send_commands=True,
+        clear_fault_on_start=True,
+        open_on_start=True,
+        tactile_reset_on_start=True,
+        tactile_warmup_frames=3,
+    )
+
+    updated = hand_backend_config._apply_gripper_policy_to_dmtac_config(
+        config,
+        args=args,
+        policy=policy,
+    )
+
+    assert updated.observation_only is False
+    assert updated.send_commands is True
+    assert updated.clear_fault_on_start is True
+    assert updated.open_on_start is True
+    assert updated.tactile_reset_on_start is True
+    assert updated.tactile_warmup_frames == 3

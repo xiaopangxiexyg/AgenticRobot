@@ -233,6 +233,27 @@ class OpenPIRealDeploymentProfile:
                     str(startup["camera_start_stagger_sec"]),
                 ]
             )
+            # A live model RTC path still needs the same reviewed dataset-frame
+            # qpos target as the ordinary real deployment.  RTC transport and
+            # action dispatch are separate concerns: with --send-actions this
+            # plan performs the bounded smooth move before policy release; in
+            # the default no-action shadow the controller validates the plan
+            # without sending commands.
+            interactive = self.interactive_startup
+            args.extend(
+                [
+                    "--policy-qpos-init-dataset",
+                    str(root / str(interactive["policy_qpos_init_dataset"])),
+                    "--policy-qpos-init-episode",
+                    str(interactive["policy_qpos_init_episode"]),
+                    "--policy-qpos-init-frame",
+                    str(interactive["policy_qpos_init_frame"]),
+                    "--policy-qpos-init-source",
+                    str(interactive["policy_qpos_init_source"]),
+                ]
+            )
+            if bool(interactive["policy_qpos_init_collision_check"]):
+                args.append("--policy-qpos-init-collision-check")
             return args
 
         startup = self.interactive_startup

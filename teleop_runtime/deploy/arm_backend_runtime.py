@@ -281,11 +281,13 @@ def build_arm_backends(
         action_hz=command_input_hz,
     )
     arm_canfd_follow = effective_arm_canfd_follow(args)
-    observation_only = bool(getattr(args, "rtc_real_shadow", False))
-    if observation_only and bool(getattr(args, "send_actions", False)):
-        raise ValueError(
-            "rtc real shadow backend construction requires send_actions=False"
-        )
+    # A model RTC real-shadow can be either a passive live observation run or
+    # an explicitly authorized active run.  Keep the backend observation-only
+    # only when the caller did not request dispatch; ``--send-actions`` is the
+    # single explicit transition to normal command-capable backend configs.
+    observation_only = bool(getattr(args, "rtc_real_shadow", False)) and not bool(
+        getattr(args, "send_actions", False)
+    )
     if observation_only:
         arm_canfd_follow = False
     backends: dict[str, EffectorBackend] = {}

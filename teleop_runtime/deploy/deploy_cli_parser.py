@@ -193,17 +193,21 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "the existing final-chunk model/server contract; model_rtc_flow_inpaint "
             "uses the artifact-bound conditioned v3 provider. All force 30 Hz "
             "action/decision, 15 Hz observation requests, disable position chunk "
-            "lookahead, and forbid motion output."
+            "lookahead. Action dispatch remains caller-controlled: model-backed "
+            "profiles may be activated with explicit --send-actions after the normal "
+            "qpos-init, execution-profile, observation-firewall, collision, force, "
+            "and ready gates; RTC-3c has no model action source and stays virtual-only."
         ),
     )
     parser.add_argument(
         "--rtc-real-shadow",
         action="store_true",
         help=(
-            "Opt into the explicit live observation/transport no-action shadow. "
-            "Requires the raw or conditioned model RTC profile; hardware backends are "
-            "configured for observation-only startup (no command, force, tool-frame, "
-            "singularity, or background-stream writes). Default is off."
+            "Select the explicit live model RTC transport and observation path. "
+            "Without --send-actions, hardware backends remain observation-only; "
+            "with explicit --send-actions, the normal dataset-frame qpos-init and "
+            "hardware safety/ready gates are retained before action dispatch. "
+            "Requires the raw or conditioned model RTC profile. Default is off."
         ),
     )
     parser.add_argument(

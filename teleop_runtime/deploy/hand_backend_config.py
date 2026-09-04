@@ -252,7 +252,9 @@ def _apply_gripper_policy_to_dmtac_config(
     if not _dmtac_tactile_enabled(args):
         config.connect_tactile = False
         config.tactile_ids = ()
-    if bool(getattr(args, "rtc_real_shadow", False)):
+    if bool(getattr(args, "rtc_real_shadow", False)) and not bool(
+        getattr(args, "send_actions", False)
+    ):
         # Live raw-RTC shadow may read gripper/tactile observations, but its
         # startup must not clear faults, write speed/torque, open the gripper,
         # reset tactile calibration, or accept a command through a bypass API.

@@ -230,7 +230,8 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Inject the checked-in real-runtime arguments for the selected lab "
             "profile. Explicit trailing runtime flags override profile values. "
-            "The profile never enables --send-actions."
+            "The profile never enables --send-actions; callers may explicitly add "
+            "it after the profile's qpos-init and safety defaults."
         ),
     )
     parser.add_argument(
@@ -306,8 +307,10 @@ def main(argv: list[str] | None = None) -> int:
         "--rtc-real-shadow",
         action="store_true",
         help=(
-            "Explicit live observation/transport no-action shadow for a model-backed RTC "
-            "profile. The checked-in real profile omits qpos-init authority in this mode."
+            "Explicit live model RTC transport and observation path. Without "
+            "--send-actions it is observation-only; with explicit --send-actions the "
+            "checked-in profile retains its dataset-frame qpos-init trajectory and "
+            "safety gates before dispatch."
         ),
     )
     parser.add_argument(
