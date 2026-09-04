@@ -468,6 +468,31 @@ def test_mock_real_ports_replay_exact_simulated_points_then_hold() -> None:
     assert ports.monotonic >= 0.12
 
 
+def test_initial_freshness_is_evaluated_after_slow_hardware_snapshot() -> None:
+    trajectory = _trajectory()
+    simulation = _simulation_receipt(trajectory)
+    ports = _ReplayPorts(trajectory)
+    first_call = True
+
+    def delayed_initial_snapshot():
+        nonlocal first_call
+        if first_call:
+            first_call = False
+            ports.wall += 0.35
+        return ports.snapshot()
+
+    receipt = _execute(
+        ports,
+        trajectory,
+        simulation,
+        current_snapshot_provider=delayed_initial_snapshot,
+    )
+
+    assert receipt.status is RegisteredTrajectoryRealReplayStatus.COMPLETED
+    assert receipt.admission.admissible is True
+    assert receipt.executed_point_count == len(trajectory.points)
+
+
 def test_required_terminal_tcp_verifier_is_checked_before_authority_or_dispatch():
     trajectory = _trajectory()
     simulation = _simulation_receipt(trajectory)

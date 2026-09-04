@@ -756,13 +756,17 @@ def execute_registered_shadow_trajectory_with_ports(
         )
 
     try:
-        now = _finite(wall_clock(), name="wall_clock()")
         current = current_snapshot_provider()
         if not isinstance(current, AuthoritativeRobotStateSnapshot):
             raise TypeError(
                 "current_snapshot_provider must return "
                 "AuthoritativeRobotStateSnapshot."
             )
+        # Evaluate freshness after the joined RM65 + gripper cut is complete.
+        # Hardware snapshot collection may block on multiple SDK reads, so a
+        # timestamp sampled before the provider can precede ``available_at``
+        # and incorrectly classify a newly captured cut as stale.
+        now = _finite(wall_clock(), name="wall_clock()")
     except Exception:
         # No admission receipt exists yet, but the lower motion owner must
         # still receive HOLD before the causal read failure escapes.
