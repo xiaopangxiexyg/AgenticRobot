@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from robot_motion.deploy.async_producer import (
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
 )
@@ -122,7 +123,6 @@ def test_model_profile_requires_artifact_and_shadow_for_live_endpoints() -> None
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
-        ("send_actions", True, "forbids --send-actions"),
         ("debug_replay_dataset", "dataset", "do not modify or consume debug replay"),
         ("action_hz_dataset", "dataset", "do not consume replay/reference rate inputs"),
         ("append_action_chunks", True, "timed mutable-future merge"),
@@ -138,7 +138,49 @@ def test_enabled_rtc_profile_rejects_legacy_queue_inputs(
             _args(**{field: value}),
             profile_id=RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
             profile_enabled=True,
+    )
+
+
+def test_rtc3c_keeps_virtual_profile_without_action_dispatch() -> None:
+    with pytest.raises(ValueError, match="does not accept --send-actions"):
+        _validate(
+            _args(send_actions=True),
+            profile_id=RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
+            profile_enabled=True,
         )
+
+
+@pytest.mark.parametrize(
+    "profile_id",
+    (RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1, MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1),
+)
+def test_model_rtc_profiles_allow_explicit_actions_and_qpos_init(
+    profile_id: str,
+) -> None:
+    args = _args(
+        policy_artifact_json="artifact.json",
+        policy_qpos_init_dataset="dataset",
+        send_actions=True,
+    )
+    _validate(
+        args,
+        profile_id=profile_id,
+        profile_enabled=True,
+        real_shadow=True,
+    )
+    assert args.send_actions is True
+    assert args.policy_qpos_init_dataset == "dataset"
+    assert args.policy_qpos_init_parquet is None
+
+
+def test_model_rtc_explicit_actions_without_live_endpoints_remain_synthetic() -> None:
+    args = _args(policy_artifact_json="artifact.json", send_actions=True)
+    _validate(
+        args,
+        profile_id=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+        profile_enabled=True,
+    )
+    assert args.send_actions is True
 
 
 def test_rtc3c_applies_fixed_rates_and_disables_chunk_lookahead() -> None:
@@ -169,27 +211,30 @@ def test_rtc3c_rejects_non_fixed_rates() -> None:
         )
 
 
-def test_real_shadow_requires_model_profile_and_rejects_init_inputs() -> None:
+def test_real_shadow_requires_model_profile_and_preserves_init_inputs() -> None:
     with pytest.raises(ValueError, match="explicit model-backed RTC profile"):
         _validate(_args(), real_shadow=True)
 
-    with pytest.raises(ValueError, match="does not accept deploy-fixed-init"):
-        _validate(
-            _args(
-                policy_artifact_json="artifact.json",
-                deploy_fixed_init_dataset="dataset",
-            ),
-            profile_id=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
-            profile_enabled=True,
-            real_shadow=True,
-        )
-    with pytest.raises(ValueError, match="does not accept policy-qpos-init"):
-        _validate(
-            _args(
-                policy_artifact_json="artifact.json",
-                policy_qpos_init_dataset="dataset",
-            ),
-            profile_id=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
-            profile_enabled=True,
-            real_shadow=True,
-        )
+    policy_qpos_args = _args(
+        policy_artifact_json="artifact.json",
+        policy_qpos_init_dataset="dataset",
+    )
+    _validate(
+        policy_qpos_args,
+        profile_id=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+        profile_enabled=True,
+        real_shadow=True,
+    )
+    assert policy_qpos_args.policy_qpos_init_dataset == "dataset"
+
+    fixed_init_args = _args(
+        policy_artifact_json="artifact.json",
+        deploy_fixed_init_dataset="dataset",
+    )
+    _validate(
+        fixed_init_args,
+        profile_id=RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
+        profile_enabled=True,
+        real_shadow=True,
+    )
+    assert fixed_init_args.deploy_fixed_init_dataset == "dataset"

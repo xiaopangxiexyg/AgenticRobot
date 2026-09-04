@@ -10,6 +10,8 @@ from robot_motion.deploy import (
     POLICY_ASYNC_PRODUCER_ELIGIBLE,
     POLICY_ASYNC_PRODUCER_HOLD,
     POLICY_WORKER_SESSION_RETIRED_WAITING_FOR_COMPLETION,
+    MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
+    RAW_RTC_FINAL_CHUNK_PROFILE_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_V1,
     PolicyAsyncExecutionProfile,
@@ -184,7 +186,7 @@ def test_rtc_3c_profile_freezes_default_off_lookahead_and_cadence() -> None:
 
     with pytest.raises(ValueError, match="lookahead disabled"):
         replace(profile, position_lookahead_enabled=True)
-    with pytest.raises(ValueError, match="send_actions=false"):
+    with pytest.raises(ValueError, match="RTC-3c virtual profile"):
         replace(profile, send_actions=True)
     with pytest.raises(ValueError, match="cadence is fixed"):
         replace(profile, decision_hz=29.0)
@@ -204,6 +206,22 @@ def test_rtc_3c_profile_freezes_default_off_lookahead_and_cadence() -> None:
     assert noninteger.semantic_content_hash == replace(
         noninteger
     ).semantic_content_hash
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [RAW_RTC_FINAL_CHUNK_PROFILE_V1, MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1],
+)
+def test_model_and_raw_profiles_leave_active_dispatch_to_embedding_app(
+    profile: PolicyAsyncExecutionProfile,
+) -> None:
+    active = replace(profile, send_actions=True)
+
+    assert active.send_actions
+    assert not active.position_lookahead_enabled
+    assert active.producer_profile.semantic_content_hash == (
+        profile.producer_profile.semantic_content_hash
+    )
 
 
 def test_request_and_matching_result_share_one_atomic_state_truth() -> None:

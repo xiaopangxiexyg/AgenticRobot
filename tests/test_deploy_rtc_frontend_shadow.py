@@ -294,7 +294,7 @@ def test_rtc_profile_forces_dry_run_cadence_and_disables_lookahead() -> None:
             ),
         )
 
-    with pytest.raises(ValueError, match="forbids --send-actions"):
+    with pytest.raises(ValueError, match="does not accept --send-actions"):
         run_policy.validate_args(
             _parse_deploy_args(
                 "--rtc-profile",
@@ -313,7 +313,7 @@ def test_rtc_profile_forces_dry_run_cadence_and_disables_lookahead() -> None:
         )
 
 
-def test_raw_rtc_profile_is_explicit_model_adapter_shadow_only() -> None:
+def test_raw_rtc_profile_supports_passive_shadow_and_explicit_active_dispatch() -> None:
     profile_id = RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
     args = _parse_deploy_args(
         "--rtc-profile",
@@ -339,16 +339,34 @@ def test_raw_rtc_profile_is_explicit_model_adapter_shadow_only() -> None:
     assert args.position_chunk_lookahead is False
     assert not args.send_actions
 
-    with pytest.raises(ValueError, match="forbids --send-actions"):
-        run_policy.validate_args(
-            _parse_deploy_args(
-                "--rtc-profile",
-                profile_id,
-                "--policy-artifact-json",
-                "/tmp/raw-rtc-policy-artifact.json",
-                "--send-actions",
-            )
-        )
+    active_argv = (
+        "--rtc-profile",
+        profile_id,
+        "--policy-artifact-json",
+        "/tmp/raw-rtc-policy-artifact.json",
+        "--rtc-real-shadow",
+        "--send-actions",
+        "--policy-qpos-init-dataset",
+        "dataset",
+        "--arm-execution-profile",
+        "impedance_40hz",
+        "--active-sides",
+        "left",
+        "right",
+        "--end-effector-sides",
+        "none",
+        "--no-hands",
+        "--left-arm-ip",
+        "192.0.2.10",
+        "--right-arm-ip",
+        "192.0.2.11",
+    )
+    active = _parse_deploy_args(*active_argv)
+    run_policy.validate_args(active, raw_argv=active_argv)
+    assert active.rtc_real_shadow is True
+    assert active.send_actions is True
+    assert active.policy_qpos_init_dataset.name == "dataset"
+    assert active.arm_control_mode == "impedance"
 
 
 def test_conditioned_model_rtc_profile_reuses_shadow_guards() -> None:
@@ -377,16 +395,34 @@ def test_conditioned_model_rtc_profile_reuses_shadow_guards() -> None:
     assert args.position_chunk_lookahead is False
     assert not args.send_actions
 
-    with pytest.raises(ValueError, match="forbids --send-actions"):
-        run_policy.validate_args(
-            _parse_deploy_args(
-                "--rtc-profile",
-                profile_id,
-                "--policy-artifact-json",
-                "/tmp/model-rtc-policy-artifact.json",
-                "--send-actions",
-            )
-        )
+    active_argv = (
+        "--rtc-profile",
+        profile_id,
+        "--policy-artifact-json",
+        "/tmp/model-rtc-policy-artifact.json",
+        "--rtc-real-shadow",
+        "--send-actions",
+        "--policy-qpos-init-dataset",
+        "dataset",
+        "--arm-execution-profile",
+        "impedance_40hz",
+        "--active-sides",
+        "left",
+        "right",
+        "--end-effector-sides",
+        "none",
+        "--no-hands",
+        "--left-arm-ip",
+        "192.0.2.10",
+        "--right-arm-ip",
+        "192.0.2.11",
+    )
+    active = _parse_deploy_args(*active_argv)
+    run_policy.validate_args(active, raw_argv=active_argv)
+    assert active.rtc_real_shadow is True
+    assert active.send_actions is True
+    assert active.policy_qpos_init_dataset.name == "dataset"
+    assert active.arm_control_mode == "impedance"
 
 
 def test_rtc_step_fanout_preserves_identity_and_isolates_passive_branches() -> None:

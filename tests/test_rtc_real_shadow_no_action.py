@@ -95,12 +95,12 @@ def test_rtc_validity_and_bounded_close_overrides_are_explicit_only() -> None:
         run_policy.validate_args(ordinary)
 
 
-def test_openpi_real_shadow_profile_drops_qpos_init_authority() -> None:
+def test_openpi_real_shadow_profile_preserves_qpos_init_authority() -> None:
     ordinary = openpi_real._rm65_bimanual_dmtac_args()
     shadow = openpi_real._rm65_bimanual_dmtac_args(rtc_real_shadow=True)
     assert "--policy-qpos-init-dataset" in ordinary
-    assert "--policy-qpos-init-dataset" not in shadow
-    assert "--policy-qpos-init-collision-check" not in shadow
+    assert "--policy-qpos-init-dataset" in shadow
+    assert "--policy-qpos-init-collision-check" in shadow
     assert "--wait-for-ready-confirm" in ordinary
     assert "--dmtac-no-tactile" in ordinary
     assert "--auto-start" in shadow
@@ -465,6 +465,143 @@ def test_real_shadow_arm_backend_configs_disable_all_output_side_effects() -> No
     assert position_config.force_position_control is False
     assert position_config.configure_singularity_thresholds is False
     assert position_config.canfd_follow is False
+
+
+def test_real_shadow_explicit_send_actions_restores_command_capable_arm_configs() -> None:
+    args, argv = _raw_args(
+        "--rtc-real-shadow",
+        "--send-actions",
+        "--left-arm-ip",
+        "192.0.2.10",
+        "--right-arm-ip",
+        "192.0.2.11",
+        "--active-sides",
+        "left",
+        "right",
+        "--end-effector-sides",
+        "none",
+        "--no-hands",
+        "--arm-execution-profile",
+        "impedance_40hz",
+        "--policy-qpos-init-dataset",
+        "dataset",
+    )
+    run_policy.validate_args(args, raw_argv=argv)
+    backends = run_policy.build_arm_backends(
+        args,
+        ("left", "right"),
+        control_hz=args.arm_control_hz,
+        action_hz=args.action_hz,
+    )
+
+    assert all(backend.config.observation_only is False for backend in backends.values())
+    assert all(
+        backend.config.impedance_overrides["canfd_follow"] is False
+        for backend in backends.values()
+    )
+
+    position_args, position_argv = _raw_args(
+        "--rtc-real-shadow",
+        "--send-actions",
+        "--left-arm-ip",
+        "192.0.2.10",
+        "--right-arm-ip",
+        "192.0.2.11",
+        "--active-sides",
+        "left",
+        "right",
+        "--end-effector-sides",
+        "none",
+        "--no-hands",
+        "--arm-execution-profile",
+        "position_15_60_120hz",
+        "--policy-qpos-init-dataset",
+        "dataset",
+    )
+    run_policy.validate_args(position_args, raw_argv=position_argv)
+    position_backends = run_policy.build_arm_backends(
+        position_args,
+        ("left", "right"),
+        control_hz=position_args.arm_control_hz,
+        action_hz=position_args.action_hz,
+    )
+
+    assert all(
+        backend.config.observation_only is False
+        for backend in position_backends.values()
+    )
+    assert all(backend.config.background_streaming_enabled is True for backend in position_backends.values())
+    assert all(backend.config.configure_singularity_thresholds is True for backend in position_backends.values())
+    assert all(backend.config.canfd_follow is True for backend in position_backends.values())
+
+
+def test_real_shadow_explicit_send_actions_restores_dmtac_command_start_flags() -> None:
+    args, argv = _raw_args(
+        "--rtc-real-shadow",
+        "--send-actions",
+        "--active-sides",
+        "both",
+        "--end-effector-sides",
+        "both",
+        "--enable-hands",
+        "--hand-backend",
+        "dmtac-gripper",
+        "--dmtac-no-tactile",
+        "--no-dmtac-use-config",
+        "--require-dmtac-config",
+        "--left-gripper-port",
+        "/dev/ttyUSB0",
+        "--right-gripper-port",
+        "/dev/ttyUSB1",
+        "--left-arm-ip",
+        "192.0.2.10",
+        "--right-arm-ip",
+        "192.0.2.11",
+        "--arm-execution-profile",
+        "impedance_40hz",
+        "--policy-qpos-init-dataset",
+        "dataset",
+    )
+    run_policy.validate_args(args, raw_argv=argv)
+    configs = run_policy._dmtac_backend_configs(args, ("left", "right"))
+
+    assert set(configs) == {"left", "right"}
+    assert all(config.observation_only is False for config in configs.values())
+    assert all(config.send_commands is True for config in configs.values())
+    assert all(config.clear_fault_on_start is True for config in configs.values())
+    # The reviewed manual-port config keeps the normal default of not opening
+    # the gripper at startup; the active RTC change must not force an override.
+    assert all(config.open_on_start is False for config in configs.values())
+    assert all(config.connect_tactile is False for config in configs.values())
+
+
+def test_real_shadow_explicit_send_actions_restores_inspire_command_config() -> None:
+    args, argv = _raw_args(
+        "--rtc-real-shadow",
+        "--send-actions",
+        "--active-sides",
+        "left",
+        "--end-effector-sides",
+        "left",
+        "--enable-hands",
+        "--hand-backend",
+        "inspire",
+        "--left-hand-ip",
+        "192.0.2.12",
+        "--left-arm-ip",
+        "192.0.2.10",
+        "--arm-execution-profile",
+        "impedance_40hz",
+        "--policy-qpos-init-dataset",
+        "dataset",
+    )
+    run_policy.validate_args(args, raw_argv=argv)
+    backends = run_policy.build_hand_backends(args, ("left",))
+
+    config = backends["left"].config
+    assert config.observation_only is False
+    assert config.connect_hardware is True
+    assert config.enable_telemetry is True
 
 
 @pytest.mark.parametrize(

@@ -84,11 +84,21 @@ def test_registered_profile_reproduces_frozen_rtc_shadow_arguments() -> None:
         "--no-wait-for-ready-confirm",
         "--camera-start-stagger-sec",
         "0.5",
+        "--policy-qpos-init-dataset",
+        str(REPO_ROOT / "datasets/sorted_v22/bimanual-cube-new-success"),
+        "--policy-qpos-init-episode",
+        "0",
+        "--policy-qpos-init-frame",
+        "0",
+        "--policy-qpos-init-source",
+        "auto",
+        "--policy-qpos-init-collision-check",
     ]
 
     assert _rm65_bimanual_dmtac_args(rtc_real_shadow=True) == expected
     assert "--send-actions" not in expected
-    assert "--policy-qpos-init-dataset" not in expected
+    assert "--policy-qpos-init-dataset" in expected
+    assert "--policy-qpos-init-collision-check" in expected
 
 
 def test_profile_identity_is_workspace_independent_and_pinned() -> None:

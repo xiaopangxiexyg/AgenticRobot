@@ -70,8 +70,19 @@ def validate_rtc_cli_args(
             MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
         }:
             raise ValueError(f"Unsupported RTC profile: {rtc_profile_id!r}.")
-        if bool(args.send_actions):
-            raise ValueError("RTC shadow profile forbids --send-actions.")
+        if (
+            rtc_profile_id == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1
+            and bool(args.send_actions)
+        ):
+            # RTC-3c is a synthetic builtin-hold producer.  It has no model
+            # action source that can be admitted to a hardware executor.  The
+            # model-backed profiles below deliberately do not share this
+            # restriction: explicit --send-actions is the caller's dispatch
+            # authority after the normal run_policy safety gates pass.
+            raise ValueError(
+                "RTC-3c virtual profile has no model action source and does not "
+                "accept --send-actions."
+            )
         if args.debug_replay_dataset or args.debug_replay_parquet:
             raise ValueError("RTC profiles do not modify or consume debug replay.")
         if args.action_hz_dataset or args.action_hz_parquet:
@@ -146,21 +157,13 @@ def validate_rtc_cli_args(
         raise ValueError(
             "RTC validity/worker-stop overrides require an explicit --rtc-profile."
         )
-    if rtc_real_shadow:
-        # A live observation shadow has no init/qpos authority.  Keeping a
-        # dataset-frame init controller alive would either block the model on a
-        # target it cannot execute or accidentally reintroduce a dispatch path
-        # if a future caller forgets to pass send_actions=False.
-        if args.deploy_fixed_init_dataset or args.deploy_fixed_init_parquet:
-            raise ValueError(
-                "--rtc-real-shadow does not accept deploy-fixed-init dataset inputs."
-            )
-        if args.policy_qpos_init_dataset or args.policy_qpos_init_parquet:
-            raise ValueError(
-                "--rtc-real-shadow does not accept policy-qpos-init dataset inputs."
-            )
-        if bool(args.send_actions):
-            raise ValueError("--rtc-real-shadow forbids --send-actions.")
+    # ``--rtc-real-shadow`` selects the live model RTC transport and hardware
+    # observation path.  It is intentionally orthogonal to dispatch and
+    # initialization: the caller may keep the default no-action observation
+    # shadow, or explicitly add ``--send-actions`` and the normal qpos-init
+    # inputs.  The latter continues through run_policy's existing execution
+    # profile, strict observation firewall, collision/force guards, and ready
+    # gates; this helper must not silently remove those authorities.
 
 
 __all__ = ["validate_rtc_cli_args"]

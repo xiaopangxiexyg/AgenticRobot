@@ -71,7 +71,12 @@ def build_hand_backends(
             )
 
     tactile_regions = parse_tactile_regions(args.hand_tactile_regions)
-    observation_only = bool(getattr(args, "rtc_real_shadow", False))
+    # ``--rtc-real-shadow`` alone remains passive; explicit ``--send-actions``
+    # restores the normal command-capable hand backend for an active model RTC
+    # deployment after the canonical runtime gates have passed.
+    observation_only = bool(getattr(args, "rtc_real_shadow", False)) and not bool(
+        getattr(args, "send_actions", False)
+    )
     for side in active_sides:
         if backend_mode_by_side[side] != HAND_BACKEND_INSPIRE:
             continue
