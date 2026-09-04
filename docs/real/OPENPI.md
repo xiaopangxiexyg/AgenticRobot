@@ -7,8 +7,11 @@ checkpoint/profile 长命令见
 [`deployments/openpi/cmd_list.md`](../../deployments/openpi/cmd_list.md)。
 
 OpenPI server 使用 OpenPI `.venv` 加载模型；`dexteleop310` 中的 client 负责
-observation、artifact contract、初始化、现场安全门和可选真实下发。两端必须绑定同一个
-checkpoint/artifact；prepared checkpoint 还必须绑定同一份 training profile。
+observation、artifact contract、初始化、现场安全门和可选真实下发。每一端必须用自己的
+checkpoint/artifact 和 prepared profile 建立完整契约，但默认不要求 client 与 server 的
+model id 或 checkpoint step 相同；连接时校验的是 layout、相机、动作、normalization、prompt
+和 RTC capability 等实际 wire/runtime 兼容性。只有显式加入 `--strict-model-identity` 才启用
+model/step 精确匹配。
 
 ## 1. 设置路径并选择绑定
 
@@ -33,14 +36,16 @@ test -f "$CHECKPOINT_DIR/policy_artifact.json"
 
 按 checkpoint 类型选择且只选择一种绑定：
 
-| 类型 | 两端共同参数 |
+| 类型 | 每一端自己的绑定参数 |
 | --- | --- |
 | 标准 artifact | `--checkpoint-dir "$CHECKPOINT_DIR"` |
 | 兼容 artifact | server 用 checkpoint + `--policy-artifact-json FILE`；client 用同一 FILE |
 | prepared | checkpoint + `--prepared-training-profile "$PROFILE"` |
 | prepared model-RTC | prepared 参数 + 同一 `--model-rtc-profile "$RTC_PROFILE"` |
 
-不要把 prepared 的 profile、普通 `--config` 和兼容 artifact 混用。
+不要把 prepared 的 profile、普通 `--config` 和兼容 artifact 混用。为了测试不同 step 或
+兼容模型，分别设置 `SERVER_CHECKPOINT_DIR` 与 `CLIENT_CHECKPOINT_DIR`；不要靠伪造 model id、
+step 或 hash 绕过不兼容错误。
 
 ## 2. 先做不打开设备的检查
 
@@ -137,12 +142,15 @@ Stage1 通常执行绑定的数据集 qpos-init；Stage2–4 只有在当前姿�
 ready、碰撞、力限或观测新鲜度门。不要加入 `--auto-start`、`--start-init_qpos` 或
 `--no-wait-for-ready-confirm` 来缩短正式流程。
 
-## 6. 更换 checkpoint
+## 6. 更换 checkpoint 或 server 模型
 
 1. 停止 client 和 server，确认机器人已经退出策略控制。
-2. 设置新的 `CHECKPOINT_DIR`，重新检查 artifact/profile/receipt。
-3. 从第 2 节重新执行 contract 和 server preflight。
+2. 分别设置新的 server/client checkpoint，重新检查各自 artifact/profile/receipt。
+3. 对 client 重新执行 contract check，对 server 重新执行 server preflight。
 4. 启动新 server，重新检查 metadata，并重新做 no-action。
 
-不得通过手工覆盖 model id、layout hash、step、camera routing 或 action pose mode 来绕过
-artifact/profile 错误。
+默认允许 server 与 client 使用不同 model/step，但二者仍必须通过实际协议、layout、相机、
+normalization、prompt 和 RTC capability 检查。不得通过手工覆盖 model id、layout hash、step、
+camera routing 或 action pose mode 来绕过 artifact/profile 错误。当前 Stage1/Stage2 all-view
+h32 model-RTC 的完整远端命令见 `cmd_list.md` 第 23 节；该路线只开放真实 observation 的
+no-action shadow，不开放 RTC 动作下发。
