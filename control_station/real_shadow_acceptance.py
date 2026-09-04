@@ -107,17 +107,16 @@ class RealShadowAcceptanceReceipt:
             reasons = (self.status.value,)
         if any(not value for value in reasons) or len(reasons) != len(set(reasons)):
             raise ValueError("reason_codes must be non-empty and unique.")
-        if (
-            self.status is RealShadowAcceptanceStatus.SIMULATION_ACCEPTED_NO_MOTION
-            and (
-                self.simulation_receipt is None
-                or self.simulation_receipt.status is not ShadowSimulationStatus.COMPLETED
-                or self.real_replay_receipt is not None
-                or self.real_motion_disposition is not RealMotionDisposition.NONE
-                or not self.terminal_hold_confirmed
-            )
+        if self.status is RealShadowAcceptanceStatus.SIMULATION_ACCEPTED_NO_MOTION and (
+            self.simulation_receipt is None
+            or self.simulation_receipt.status is not ShadowSimulationStatus.COMPLETED
+            or self.real_replay_receipt is not None
+            or self.real_motion_disposition is not RealMotionDisposition.NONE
+            or not self.terminal_hold_confirmed
         ):
-            raise ValueError("no-motion acceptance requires a completed held simulation.")
+            raise ValueError(
+                "no-motion acceptance requires a completed held simulation."
+            )
         if self.status is RealShadowAcceptanceStatus.REAL_REPLAY_COMPLETED and (
             self.real_replay_receipt is None
             or self.real_replay_receipt.status
@@ -273,6 +272,22 @@ def run_real_shadow_acceptance(
     ) = None,
     current_scene_hash_provider: Callable[[], str] | None = None,
     authority: RegisteredTrajectoryExecutionAuthority | None = None,
+    real_authority_factory: (
+        Callable[
+            [
+                RegisteredShadowJointTrajectory,
+                ShadowSimulationReceipt,
+            ],
+            tuple[
+                RegisteredTrajectoryExecutionAuthority,
+                Callable[
+                    [RegisteredTrajectoryExecutionAuthority],
+                    RegisteredTrajectoryAuthorityConsumptionReceipt,
+                ],
+            ],
+        ]
+        | None
+    ) = None,
     consume_execution_authority: (
         Callable[
             [RegisteredTrajectoryExecutionAuthority],
@@ -308,6 +323,8 @@ def run_real_shadow_acceptance(
             raise TypeError(f"{name} must be callable.")
     if not isinstance(real_replay_enabled, bool):
         raise TypeError("real_replay_enabled must be boolean.")
+    if real_authority_factory is not None and not callable(real_authority_factory):
+        raise TypeError("real_authority_factory must be callable when present.")
 
     evidence: list[str] = []
     try:
@@ -348,9 +365,7 @@ def run_real_shadow_acceptance(
             raw_reason_codes = ()
         reason_codes = tuple(
             dict.fromkeys(
-                str(value).strip()
-                for value in raw_reason_codes
-                if str(value).strip()
+                str(value).strip() for value in raw_reason_codes if str(value).strip()
             )
         ) or ("trajectory_preparation_failed",)
         return RealShadowAcceptanceReceipt(
@@ -405,9 +420,7 @@ def run_real_shadow_acceptance(
             model_binding=binding,
         )
         if not isinstance(simulation, ShadowSimulationReceipt):
-            raise TypeError(
-                "simulation_executor must return ShadowSimulationReceipt."
-            )
+            raise TypeError("simulation_executor must return ShadowSimulationReceipt.")
     except Exception as exc:  # noqa: BLE001 - fail closed before any real port.
         evidence.extend(_hold_simulation_after_error(control))
         evidence.append(_error_evidence("simulation_execution", exc))
@@ -498,7 +511,6 @@ def run_real_shadow_acceptance(
             evidence_refs=tuple(evidence),
         )
 
-    now = float(wall_clock())
     authority_reasons: list[str] = []
     current_scene_hash: str | None = None
     if not callable(current_scene_hash_provider):
@@ -513,6 +525,48 @@ def run_real_shadow_acceptance(
                 authority_reasons.append("current_scene_hash_empty")
             elif current_scene_hash != trajectory.scene_hash:
                 authority_reasons.append("current_scene_hash_mismatch")
+
+    # A production caller may issue the single-use authority only after the
+    # exact MuJoCo receipt exists.  This keeps authority issuance causally
+    # downstream of simulation acceptance while preserving the older explicit
+    # ``authority`` + consumer injection path used by tests and applications.
+    if (
+        authority is None
+        and consume_execution_authority is None
+        and callable(real_authority_factory)
+    ):
+        try:
+            issued = real_authority_factory(trajectory, simulation)
+            if (
+                not isinstance(issued, tuple)
+                or len(issued) != 2
+                or not isinstance(issued[0], RegisteredTrajectoryExecutionAuthority)
+                or not callable(issued[1])
+            ):
+                raise TypeError(
+                    "real_authority_factory must return "
+                    "(RegisteredTrajectoryExecutionAuthority, consumer)."
+                )
+            authority, consume_execution_authority = issued
+            evidence.append(
+                _gate_evidence(
+                    "real-replay-authority-issued-after-simulation",
+                    {
+                        "authority_hash": authority.semantic_content_hash,
+                        "simulation_receipt_hash": simulation.semantic_content_hash,
+                    },
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed before ports.
+            reason_code = str(
+                getattr(exc, "reason_code", "execution_authority_issue_failed")
+            ).strip()
+            authority_reasons.append(reason_code or "execution_authority_issue_failed")
+            evidence.append(_error_evidence("authority_issue", exc))
+    # The factory may contain an explicit post-simulation operator gate.  Read
+    # the clock after that gate so time spent inspecting the MuJoCo terminal
+    # pose cannot make a newly issued short-lived authority appear future-dated.
+    now = float(wall_clock())
     if not isinstance(authority, RegisteredTrajectoryExecutionAuthority):
         authority_reasons.append("execution_authority_missing")
     else:
@@ -614,8 +668,7 @@ def run_real_shadow_acceptance(
     completed = bool(
         real_receipt.status is RegisteredTrajectoryRealReplayStatus.COMPLETED
         and real_receipt.admission.admissible
-        and real_receipt.admission.trajectory_hash
-        == trajectory.semantic_content_hash
+        and real_receipt.admission.trajectory_hash == trajectory.semantic_content_hash
         and real_receipt.admission.simulation_receipt_hash
         == simulation.semantic_content_hash
         and real_receipt.executed_point_count == len(trajectory.points)
@@ -638,10 +691,7 @@ def run_real_shadow_acceptance(
     else:
         disposition = RealMotionDisposition.NONE
     real_reasons = [real_receipt.status.value]
-    if (
-        real_receipt.admission.trajectory_hash
-        != trajectory.semantic_content_hash
-    ):
+    if real_receipt.admission.trajectory_hash != trajectory.semantic_content_hash:
         real_reasons.append("real_admission_trajectory_mismatch")
     if (
         real_receipt.admission.simulation_receipt_hash

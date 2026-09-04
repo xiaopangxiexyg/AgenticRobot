@@ -1,15 +1,22 @@
-"""Capture RM65/DMTac state and run one MuJoCo shadow grasp acceptance.
+"""Capture RM65/DMTac state and run one simulation-first grasp acceptance.
 
-This is the operator leaf for the first real-device stage of the grasp Skill.
-It opens the already assigned RM65 arms and DMTac grippers in observation-only
-mode, captures one causal state cut, initializes MuJoCo from that cut, and
-executes the registered joint trajectory only in MuJoCo.  It never exposes a
-real replay flag or sends a motion command to a device.
+The default mode opens the assigned RM65 arms and DMTac grippers in
+observation-only mode, captures one causal state cut, initializes MuJoCo from
+that cut, and executes the registered joint trajectory only in MuJoCo.  The
+explicit ``--execute-real`` mode closes that passive context after a completed
+MuJoCo receipt, starts the active RM65 lower owner, and replays the exact
+registered qpos trajectory through the existing checked dispatch path.  DMTac
+is deliberately measured/passive in both modes: the replay keeps the measured
+opening fixed and never sends a gripper command.
 
 The assignment files are explicit command-line inputs so this probe cannot
 silently fall back to a stale checkout-local hardware assignment.  The normal
 remote command points them at the deployment checkout while all source code is
 read from the isolated Skill worktree.
+
+The optional MuJoCo window and post-simulation terminal confirmation belong to
+this hardware acceptance probe only.  They are not part of the deployed Skill
+runtime protocol.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import json
 import socket
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from enum import Enum
@@ -35,6 +43,20 @@ if str(REPO_ROOT) not in sys.path:
 SIDES = ("left", "right")
 OBSTACLE_FRAME_ID = "rm65_scene_world"
 OBSTACLE_FRAME_SPEC_HASH = "mujoco-desk-collision-world-v1"
+REAL_REPLAY_AUTHORITY_TTL_SEC = 30.0
+REAL_EXECUTION_CONFIRMATION_TEXT = "EXECUTE"
+
+
+class OperatorConfirmationDeclined(RuntimeError):
+    """Typed no-motion outcome for the acceptance-only terminal gate."""
+
+    reason_code = "operator_confirmation_declined"
+
+
+@dataclasses.dataclass
+class _PostSimulationConfirmation:
+    reference: str | None = None
+    declined: bool = False
 
 
 def _jsonable(value: Any) -> Any:
@@ -104,10 +126,11 @@ def _pose_from_cli(args: argparse.Namespace) -> tuple[np.ndarray | None, str]:
 
     modes = int(args.target_pose_json is not None) + int(args.target_xyz_m is not None)
     modes += int(bool(args.target_from_current))
+    modes += int(args.target_offset_xyz_m is not None)
     if modes != 1:
         raise ValueError(
             "choose exactly one of --target-pose-json, --target-xyz-m, "
-            "or --target-from-current"
+            "--target-offset-xyz-m, or --target-from-current"
         )
     if args.target_pose_json is not None:
         if args.target_quat_xyzw is not None or args.target_rpy_deg is not None:
@@ -119,6 +142,18 @@ def _pose_from_cli(args: argparse.Namespace) -> tuple[np.ndarray | None, str]:
                 "orientation options cannot accompany --target-from-current"
             )
         return None, "measured_current_tcp"
+    if args.target_offset_xyz_m is not None:
+        if args.target_quat_xyzw is not None or args.target_rpy_deg is not None:
+            raise ValueError(
+                "orientation options cannot accompany --target-offset-xyz-m; "
+                "the measured TCP orientation is preserved"
+            )
+        offset = np.asarray(args.target_offset_xyz_m, dtype=float).reshape(-1)
+        if offset.shape != (3,) or not np.all(np.isfinite(offset)):
+            raise ValueError("--target-offset-xyz-m must be a finite 3-vector")
+        if float(np.linalg.norm(offset)) <= 1e-9:
+            raise ValueError("--target-offset-xyz-m must request non-zero motion")
+        return None, "measured_current_tcp_plus_base_translation"
     if args.target_quat_xyzw is not None:
         return (
             pose_from_xyz_quat_xyzw(args.target_xyz_m, args.target_quat_xyzw),
@@ -202,7 +237,13 @@ def _simulation_config(profile: Any, snapshot: Any):
     )
 
 
-def _target_from_current(snapshot: Any, profile: Any, *, side: str):
+def _target_from_current(
+    snapshot: Any,
+    profile: Any,
+    *,
+    side: str,
+    translation_offset_m: Sequence[float] | None = None,
+):
     from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
         GraspMotionTarget,
         build_shadow_initialized_control,
@@ -222,12 +263,28 @@ def _target_from_current(snapshot: Any, profile: Any, *, side: str):
         known_qpos = qpos[side]
     finally:
         control.close()
+    if translation_offset_m is not None:
+        offset = np.asarray(translation_offset_m, dtype=float).reshape(3)
+        base_from_dmtac = base_from_dmtac.copy()
+        base_from_dmtac[:3, 3] += offset
+        known_qpos = None
     return GraspMotionTarget(
         side=side,
         target_pose_base_from_dmtac_tcp=base_from_dmtac,
-        source="measured_current_dmtac_tcp",
+        source=(
+            "measured_current_dmtac_tcp"
+            if translation_offset_m is None
+            else "measured_current_dmtac_tcp_plus_base_translation"
+        ),
         known_qpos_rad=known_qpos,
-        metadata={"target_frame": "selected_rm65_arm_base"},
+        metadata={
+            "target_frame": "selected_rm65_arm_base",
+            "translation_offset_m": (
+                None
+                if translation_offset_m is None
+                else tuple(float(value) for value in translation_offset_m)
+            ),
+        },
     )
 
 
@@ -393,6 +450,21 @@ def _passive_arm_backend_factory(config: Any):
     )
 
 
+def _real_arm_backend_factory(config: Any):
+    """Construct the active RM65 backend only after simulation acceptance."""
+
+    from teleop_runtime.backends.arms import RM65ArmBackend
+
+    return RM65ArmBackend(
+        replace(
+            config,
+            observation_only=False,
+            background_streaming_enabled=True,
+            connect_hardware=True,
+        )
+    )
+
+
 def _passive_dmtac_backends(assignment: Mapping[str, Any]):
     from teleop_runtime.backends.grippers import (
         DMTacGripperBackend,
@@ -451,19 +523,27 @@ class _SnapshotContext:
             assemble_exclusive_rm65_skill_lower,
         )
 
-        assignment = load_dmtac_hardware_assignment(
-            dmtac_assignment,
+        self.profile = profile
+        self.dmtac_assignment = str(dmtac_assignment)
+        self._load_assignment = load_dmtac_hardware_assignment
+        self._assemble_lower = assemble_exclusive_rm65_skill_lower
+        self.identity = _build_identity(profile)
+        self._started = False
+        self._active_hardware = False
+        self._build_context(backend_factory=_passive_arm_backend_factory)
+
+    def _build_context(self, *, backend_factory: Any) -> None:
+        assignment = self._load_assignment(
+            self.dmtac_assignment,
             validate_current_usb=True,
             allow_missing=False,
             assume_yes_for_extra=False,
         )
         self.dmtac_backends = _passive_dmtac_backends(assignment)
-        self.lower = assemble_exclusive_rm65_skill_lower(
-            profile=profile,
-            backend_factory=_passive_arm_backend_factory,
+        self.lower = self._assemble_lower(
+            profile=self.profile,
+            backend_factory=backend_factory,
         )
-        self.identity = _build_identity(profile)
-        self._started = False
 
     def start(self) -> None:
         for backend in self.dmtac_backends.values():
@@ -473,6 +553,31 @@ class _SnapshotContext:
         self.lower.ports.start()
         self.lower.startup_admission()
         self._started = True
+
+    @property
+    def active_hardware(self) -> bool:
+        return self._active_hardware
+
+    def promote_to_active_hardware(self) -> None:
+        """Replace passive readers with the active lower owner after Sim passes."""
+
+        if self._active_hardware:
+            return
+        cleanup_errors = self.close()
+        if cleanup_errors:
+            raise RuntimeError(
+                "cannot promote to active RM65 lower after passive cleanup: "
+                + "; ".join(cleanup_errors)
+            )
+        self._build_context(backend_factory=_real_arm_backend_factory)
+        try:
+            self.start()
+        except Exception:
+            # ``start`` performs its own rollback, while this close releases
+            # any DMTac reader that did start before the lower failed.
+            self.close()
+            raise
+        self._active_hardware = True
 
     def snapshot(self):
         from teleop_runtime.skill_deploy.registered_trajectory import (
@@ -507,6 +612,281 @@ class _SnapshotContext:
         return errors
 
 
+def _target_tool_tcp_world(
+    profile: Any,
+    target: Any,
+) -> np.ndarray:
+    """Convert the requested RM65-base TCP pose into the solver world frame."""
+
+    side = str(target.side).strip().lower()
+    world_from_base = np.asarray(
+        profile.scene_world_from_arm_base_by_side[side],
+        dtype=float,
+    ).reshape(4, 4)
+    pose = np.asarray(target.target_pose_base_from_dmtac_tcp, dtype=float).reshape(4, 4)
+    result = world_from_base @ pose
+    result.setflags(write=False)
+    return result
+
+
+def _build_real_ports_factory(
+    *,
+    context: _SnapshotContext,
+    profile: Any,
+    target: Any,
+):
+    """Promote the lower owner lazily and bind exact DMTac/RM65 replay ports."""
+
+    def factory(trajectory: Any):
+        from teleop_runtime.skill_deploy import (
+            RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
+            DMTacRM65RegisteredTrajectoryPorts,
+            DMTacShadowReplayPortProfile,
+        )
+
+        if set(trajectory.moving_sides) != {str(target.side).strip().lower()}:
+            raise ValueError("real replay target side differs from trajectory.")
+        context.promote_to_active_hardware()
+        return DMTacRM65RegisteredTrajectoryPorts(
+            trajectory=trajectory,
+            identity=context.identity,
+            rm65_ports=context.lower.ports,
+            dmtac_backends_by_side=context.dmtac_backends,
+            tool_tcp_world_fk=context.lower.target_builder,
+            target_tool_tcp_world_by_side={
+                str(target.side).strip().lower(): _target_tool_tcp_world(
+                    profile,
+                    target,
+                )
+            },
+            target_reference_frame_id=RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
+            profile=DMTacShadowReplayPortProfile(),
+        )
+
+    return factory
+
+
+def _build_real_authority_factory(
+    *,
+    confirmation: _PostSimulationConfirmation,
+    ttl_sec: float = REAL_REPLAY_AUTHORITY_TTL_SEC,
+    clock=time.time,
+):
+    """Bind the accepted trajectory after the acceptance-only terminal gate."""
+
+    if not isinstance(confirmation, _PostSimulationConfirmation):
+        raise TypeError("confirmation must be _PostSimulationConfirmation.")
+    ttl = float(ttl_sec)
+    if not np.isfinite(ttl) or ttl <= 0.0:
+        raise ValueError("real authority TTL must be finite and positive.")
+    if not callable(clock):
+        raise TypeError("authority clock must be callable.")
+
+    def factory(trajectory: Any, simulation: Any):
+        from teleop_runtime.skill_deploy import (
+            RegisteredTrajectoryExecutionAuthority,
+            SingleUseRegisteredTrajectoryAuthorityConsumer,
+        )
+
+        if confirmation.declined or not str(confirmation.reference or "").strip():
+            raise OperatorConfirmationDeclined(
+                "operator did not confirm real replay after MuJoCo completion"
+            )
+        issued_at = float(clock())
+        run_id = (
+            "real-grasp-skill:"
+            + trajectory.semantic_content_hash[:16]
+            + f":{int(issued_at * 1_000_000)}"
+        )
+        authority = RegisteredTrajectoryExecutionAuthority(
+            authority_id="authority:" + run_id,
+            operator_confirmation_ref=str(confirmation.reference),
+            trajectory_hash=trajectory.semantic_content_hash,
+            simulation_receipt_hash=simulation.semantic_content_hash,
+            run_id=run_id,
+            owner_epoch=1,
+            issued_at=issued_at,
+            expires_at=issued_at + ttl,
+        )
+        consumer = SingleUseRegisteredTrajectoryAuthorityConsumer(
+            authority=authority,
+            clock=clock,
+        )
+        return authority, consumer.consume
+
+    return factory
+
+
+def _target_pose_world_by_side(control: Any, target: Any) -> dict[str, np.ndarray]:
+    """Build display-only target poses without modifying the registered path."""
+
+    qpos = control.rig.measured_qpos_by_side()
+    poses = {
+        side: np.asarray(value, dtype=float).reshape(4, 4).copy()
+        for side, value in control.retargeter.tool_tcp_world_targets_for_qpos_pair(
+            left_qpos=qpos["left"],
+            right_qpos=qpos["right"],
+        ).items()
+    }
+    side = str(target.side).strip().lower()
+    world_from_base = np.linalg.inv(
+        np.asarray(control.world_to_base_by_side[side], dtype=float).reshape(4, 4)
+    )
+    poses[side] = world_from_base @ np.asarray(
+        target.target_pose_base_from_dmtac_tcp,
+        dtype=float,
+    ).reshape(4, 4)
+    return poses
+
+
+def _confirm_real_replay_after_simulation(
+    *,
+    trajectory: Any,
+    simulation: Any,
+    viewer_handle: Any,
+    confirmation: _PostSimulationConfirmation,
+    input_fn=None,
+) -> bool:
+    """Ask once, in the terminal, while the accepted terminal pose is visible."""
+
+    if not bool(viewer_handle.is_running()):
+        confirmation.declined = True
+        return False
+    if input_fn is None:
+        input_fn = input
+    print(
+        "\n[REAL ACCEPTANCE] MuJoCo 已从真机状态完成整条轨迹并在终点保持。\n"
+        "请现场核对机械臂路径、目标和障碍物；此时尚未打开真机运动端口。",
+        flush=True,
+    )
+    try:
+        answer = input_fn(
+            f"确认真机环境可执行同一条轨迹后输入 {REAL_EXECUTION_CONFIRMATION_TEXT}；"
+            "其他输入将终止且不运动真机: "
+        )
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    accepted = str(answer).strip() == REAL_EXECUTION_CONFIRMATION_TEXT
+    confirmation.declined = not accepted
+    if accepted:
+        confirmation.reference = (
+            "interactive-post-mujoco:"
+            + trajectory.semantic_content_hash[:16]
+            + ":"
+            + simulation.semantic_content_hash[:16]
+        )
+        print(
+            "[REAL ACCEPTANCE] 已确认；MuJoCo 窗口关闭后才会连接真机运动端口。",
+            flush=True,
+        )
+    else:
+        print("[REAL ACCEPTANCE] 未确认；真机不会运动。", flush=True)
+    return accepted
+
+
+def _execute_registered_shadow_with_viewer(
+    *,
+    control: Any,
+    trajectory: Any,
+    model_binding: Any,
+    target: Any,
+    obstacle_scene: Any,
+    confirmation: _PostSimulationConfirmation,
+    require_confirmation: bool,
+    playback_hz: float,
+    terminal_display_sec: float,
+    camera_distance: float,
+    camera_azimuth_deg: float,
+    camera_elevation_deg: float,
+    input_fn=None,
+):
+    """Run the exact simulator in wall-clock time inside a passive MuJoCo GUI."""
+
+    from robot_motion.shadow_execution import ShadowSimulationStatus
+    from sim.mujoco.replay.tcp_target_visualization import TcpTargetVisualizer
+    from sim.mujoco.viewer import passive_viewer_handle
+    from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
+        execute_registered_shadow_trajectory,
+    )
+    from sim.sim_real_tests.mujoco.view_arbitrary_grasp_pose_motion import (
+        _ObstacleSceneVisualizer,
+    )
+
+    if not np.isfinite(float(playback_hz)) or float(playback_hz) <= 0.0:
+        raise ValueError("playback_hz must be finite and positive")
+    target_world = _target_pose_world_by_side(control, target)
+    target_visualizer = TcpTargetVisualizer()
+    obstacle_visualizer = _ObstacleSceneVisualizer(obstacle_scene)
+    frame_period = 1.0 / float(playback_hz)
+
+    with passive_viewer_handle(
+        control.scene,
+        show_left_ui=False,
+        show_right_ui=False,
+    ) as viewer_handle:
+        moving_target = target_world[str(target.side).strip().lower()]
+        viewer_handle.cam.lookat[:] = moving_target[:3, 3]
+        viewer_handle.cam.distance = float(camera_distance)
+        viewer_handle.cam.azimuth = float(camera_azimuth_deg)
+        viewer_handle.cam.elevation = float(camera_elevation_deg)
+
+        def sync_overlay() -> None:
+            if not bool(viewer_handle.is_running()):
+                raise RuntimeError("mujoco_viewer_closed_before_simulation_completed")
+            target_visualizer.update(viewer_handle, target_world)
+            obstacle_visualizer.update(viewer_handle)
+            viewer_handle.sync()
+
+        sync_overlay()
+        original_step = control.step_physics
+        simulation_started_at = float(control.scene.data.time)
+        wall_started_at = time.monotonic()
+        next_frame_at = simulation_started_at
+
+        def paced_step():
+            nonlocal next_frame_at
+            result = original_step()
+            simulation_now = float(control.scene.data.time)
+            if simulation_now + 1e-12 < next_frame_at:
+                return result
+            target_wall = wall_started_at + (simulation_now - simulation_started_at)
+            while True:
+                remaining = target_wall - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                sync_overlay()
+                time.sleep(min(0.01, remaining))
+            sync_overlay()
+            next_frame_at = simulation_now + frame_period
+            return result
+
+        control.step_physics = paced_step
+        try:
+            simulation = execute_registered_shadow_trajectory(
+                control=control,
+                trajectory=trajectory,
+                model_binding=model_binding,
+            )
+        finally:
+            delattr(control, "step_physics")
+        sync_overlay()
+        if simulation.status is ShadowSimulationStatus.COMPLETED:
+            if require_confirmation:
+                _confirm_real_replay_after_simulation(
+                    trajectory=trajectory,
+                    simulation=simulation,
+                    viewer_handle=viewer_handle,
+                    confirmation=confirmation,
+                    input_fn=input_fn,
+                )
+            else:
+                deadline = time.monotonic() + max(0.0, float(terminal_display_sec))
+                while time.monotonic() < deadline:
+                    sync_overlay()
+                    time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        return simulation
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm-ip-assignment", required=True)
@@ -515,6 +895,16 @@ def build_parser() -> argparse.ArgumentParser:
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--target-pose-json")
     target.add_argument("--target-from-current", action="store_true")
+    target.add_argument(
+        "--target-offset-xyz-m",
+        type=float,
+        nargs=3,
+        metavar=("DX", "DY", "DZ"),
+        help=(
+            "Translate the measured DMTac TCP by DX/DY/DZ in the selected "
+            "RM65 base frame while preserving its measured orientation."
+        ),
+    )
     target.add_argument("--target-xyz-m", type=float, nargs=3, metavar=("X", "Y", "Z"))
     orientation = parser.add_mutually_exclusive_group()
     orientation.add_argument(
@@ -558,8 +948,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-motion",
         action="store_true",
-        help="Required acknowledgement that this command performs no real replay.",
+        help="Explicitly select the simulation-only path (the safe default).",
     )
+    parser.add_argument(
+        "--execute-real",
+        action="store_true",
+        help=(
+            "Open MuJoCo, replay and hold the exact trajectory, then ask for "
+            "terminal confirmation before connecting real RM65 motion ports."
+        ),
+    )
+    parser.add_argument(
+        "--mujoco-viewer",
+        action="store_true",
+        help=(
+            "Open a realtime MuJoCo window for simulation-only acceptance. "
+            "--execute-real always enables this window."
+        ),
+    )
+    parser.add_argument("--viewer-playback-hz", type=float, default=60.0)
+    parser.add_argument("--viewer-terminal-display-sec", type=float, default=2.0)
+    parser.add_argument("--viewer-camera-distance", type=float, default=1.55)
+    parser.add_argument("--viewer-camera-azimuth-deg", type=float, default=135.0)
+    parser.add_argument("--viewer-camera-elevation-deg", type=float, default=-24.0)
     return parser
 
 
@@ -574,12 +985,56 @@ def _write_output(payload: Mapping[str, Any], path: str | None) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if not args.no_motion:
+    if args.no_motion and args.execute_real:
         print(
-            "ERROR: pass --no-motion; real replay is intentionally unavailable in this probe",
+            "ERROR: choose exactly one of --no-motion or --execute-real",
             file=sys.stderr,
         )
         return 2
+    if not args.no_motion and not args.execute_real:
+        print(
+            "ERROR: pass --no-motion for simulation-only or --execute-real for "
+            "explicit real replay",
+            file=sys.stderr,
+        )
+        return 2
+    if args.execute_real and args.target_from_current:
+        print(
+            "ERROR: --target-from-current is a zero-motion diagnostic and cannot "
+            "be used with --execute-real; provide a real goal",
+            file=sys.stderr,
+        )
+        return 2
+    for name in (
+        "viewer_playback_hz",
+        "viewer_camera_distance",
+    ):
+        value = float(getattr(args, name))
+        if not np.isfinite(value) or value <= 0.0:
+            print(
+                f"ERROR: --{name.replace('_', '-')} must be finite and positive",
+                file=sys.stderr,
+            )
+            return 2
+    if (
+        not np.isfinite(float(args.viewer_terminal_display_sec))
+        or float(args.viewer_terminal_display_sec) < 0.0
+    ):
+        print(
+            "ERROR: --viewer-terminal-display-sec must be finite and non-negative",
+            file=sys.stderr,
+        )
+        return 2
+    for name in (
+        "viewer_camera_azimuth_deg",
+        "viewer_camera_elevation_deg",
+    ):
+        if not np.isfinite(float(getattr(args, name))):
+            print(
+                f"ERROR: --{name.replace('_', '-')} must be finite",
+                file=sys.stderr,
+            )
+            return 2
     if args.obstacle_json is not None and args.obstacle_cube_world_m:
         print(
             "ERROR: choose --obstacle-json or --obstacle-cube-world-m", file=sys.stderr
@@ -613,13 +1068,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             dmtac_assignment=args.dmtac_assignment,
         )
     except Exception as exc:  # noqa: BLE001 - typed operator failure below.
+        error = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        details = getattr(exc, "details", None)
+        if details is not None:
+            error["details"] = _jsonable(details)
         _write_output(
             {
                 "schema": "agenticrobot.real_shadow_acceptance.v1",
-                "mode": "observation_only",
+                "mode": "real_replay" if args.execute_real else "observation_only",
                 "status": "setup_failed",
                 "git": _git_metadata(),
-                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "error": error,
             },
             args.output_json,
         )
@@ -629,7 +1091,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         context.start()
         snapshot = context.snapshot()
         if pose is None:
-            target = _target_from_current(snapshot, profile, side=args.side)
+            target = _target_from_current(
+                snapshot,
+                profile,
+                side=args.side,
+                translation_offset_m=args.target_offset_xyz_m,
+            )
         else:
             from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
                 GraspMotionTarget,
@@ -662,6 +1129,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             minimum_duration_sec=float(args.minimum_duration_sec),
         )
         sim_config = _simulation_config(profile, snapshot)
+        real_ports_factory = (
+            _build_real_ports_factory(
+                context=context,
+                profile=profile,
+                target=target,
+            )
+            if args.execute_real
+            else None
+        )
+        post_simulation_confirmation = _PostSimulationConfirmation()
+        real_authority_factory = (
+            _build_real_authority_factory(
+                confirmation=post_simulation_confirmation,
+            )
+            if args.execute_real
+            else None
+        )
+        viewer_enabled = bool(args.mujoco_viewer or args.execute_real)
         receipt = run_real_shadow_acceptance(
             # The target and all downstream planning must share the exact
             # causal state cut captured above.  Reading the hardware again
@@ -689,17 +1174,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trajectory,
             ),
             simulation_executor=lambda *, control, trajectory, model_binding: (
-                execute_registered_shadow_trajectory(
+                _execute_registered_shadow_with_viewer(
+                    control=control,
+                    trajectory=trajectory,
+                    model_binding=model_binding,
+                    target=target,
+                    obstacle_scene=scene,
+                    confirmation=post_simulation_confirmation,
+                    require_confirmation=bool(args.execute_real),
+                    playback_hz=float(args.viewer_playback_hz),
+                    terminal_display_sec=float(args.viewer_terminal_display_sec),
+                    camera_distance=float(args.viewer_camera_distance),
+                    camera_azimuth_deg=float(args.viewer_camera_azimuth_deg),
+                    camera_elevation_deg=float(args.viewer_camera_elevation_deg),
+                )
+                if viewer_enabled
+                else execute_registered_shadow_trajectory(
                     control=control,
                     trajectory=trajectory,
                     model_binding=model_binding,
                 )
             ),
-            real_replay_enabled=False,
+            real_replay_enabled=bool(args.execute_real),
+            real_ports_factory=real_ports_factory,
+            current_scene_hash_provider=lambda: scene.semantic_content_hash,
+            real_authority_factory=real_authority_factory,
         )
         payload = {
             "schema": "agenticrobot.real_shadow_acceptance.v1",
-            "mode": "observation_only",
+            "mode": "real_replay" if args.execute_real else "observation_only",
             "status": receipt.status.value,
             "real_motion_disposition": receipt.real_motion_disposition.value,
             "terminal_hold_confirmed": receipt.terminal_hold_confirmed,
@@ -709,21 +1212,49 @@ def main(argv: Sequence[str] | None = None) -> int:
             "evidence_refs": receipt.evidence_refs,
             "receipt_hash": receipt.semantic_content_hash,
             "simulation_receipt": receipt.simulation_receipt,
+            "real_replay_receipt": receipt.real_replay_receipt,
             "git": _git_metadata(),
             "target": target,
             "obstacle_scene": scene,
             "sim_config": sim_config,
+            "acceptance_ui": {
+                "mujoco_viewer_enabled": viewer_enabled,
+                "post_simulation_terminal_confirmation_required": bool(
+                    args.execute_real
+                ),
+                "post_simulation_terminal_confirmation_obtained": bool(
+                    post_simulation_confirmation.reference
+                ),
+            },
         }
         _write_output(payload, args.output_json)
-        return 0 if receipt.status.value == "simulation_accepted_no_motion" else 1
+        return (
+            0
+            if receipt.status.value
+            in {
+                "simulation_accepted_no_motion",
+                "real_replay_completed",
+            }
+            else 1
+        )
     except Exception as exc:  # noqa: BLE001 - always close both lower sources.
+        error = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        reason_code = getattr(exc, "reason_code", None)
+        if reason_code is not None:
+            error["reason_code"] = str(reason_code)
+        details = getattr(exc, "details", None)
+        if details is not None:
+            error["details"] = _jsonable(details)
         _write_output(
             {
                 "schema": "agenticrobot.real_shadow_acceptance.v1",
-                "mode": "observation_only",
+                "mode": "real_replay" if args.execute_real else "observation_only",
                 "status": "runtime_failed",
                 "git": _git_metadata(),
-                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "error": error,
             },
             args.output_json,
         )
