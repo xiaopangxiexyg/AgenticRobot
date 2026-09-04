@@ -17,44 +17,20 @@ owner、碰撞场景和安全门禁。
 - 可选的 [GraspNet baseline](https://github.com/graspnet/graspnet-baseline.git) 先用 SAM2 点击 mask
   的米制三维包围盒加 12 cm margin 限定推理工作区，再生成 6DoF 二指抓姿；候选随后仍用
   SAM2 目标表面距离、点击距离和 DMTAC M 几何过滤，完整对齐深度仍用于碰撞门禁；
-- AgenticRobot 用 Git submodule 保存第三方源码边界，不把源码文件 vendor 到父仓历史。安装脚本固定 SAM2
-  `aa9b8722d0585b661ded4b3dff1bd103540554ae` 与 VGN
-  `d7af0622433f52ae88ebe81533f12b46b33e951a`；选择 GraspNet 时固定 commit
-  `280c215129f759ed8649cb4e89fc5dfee55f4f80`。
-
-四个源码仓库分别由各自上游维护，父仓只跟踪官方 URL 和固定 gitlink。权重仍不提交 Git；
-本地 manifest 的 SHA-256 只证明文件与该 manifest 一致，不证明 checkpoint 已经由项目审核。
-使用者必须单独确认模型资产的许可与来源边界。
-
-一键安装源码和 Python inference 依赖：
-
-```bash
-git submodule update --init --recursive -- \
-  model/perception/sam2 model/perception/GroundingDINO \
-  model/perception/vgn model/perception/graspnet-baseline
-conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
-bash scripts/install_point_grasp_models.sh --backend cuda
-```
-
-脚本会先安装/验证 `model/perception/` 下的 SAM2 + Grounding DINO submodule，再从同一目录
-editable 安装 VGN。Skill 只使用 VGN 的 headless 网络部分，不要求 ROS。
-脚本不下载任何 checkpoint。
-
-需要同时安装可选 GraspNet 时，一条命令完成所有源码与 PointNet2 CUDA 扩展安装：
-
-```bash
-conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
-bash scripts/install_point_grasp_models.sh \
-  --backend cuda \
-  --with-graspnet \
-  --cuda-arch-list 8.9
-```
-
-`8.9` 是 RTX 4090 的 CUDA compute capability；其他 GPU 应替换成对应值。若已用本项目脚本安装过
-并验证了固定版本的 SAM2/Grounding DINO，可增加 `--reuse-installed-perception` 避免重复安装。
+第三方源码以 `model/perception/` 下的 Git submodule 进入父仓；固定 revision、
+`dexteleop310` 环境安装、CUDA 架构和只读验证统一见
+[`README_ENV.md`](../../README_ENV.md) 的环境与复现指南，本页不重复通用安装命令。该 Skill 只使用
+VGN 的 headless 网络部分，不要求 ROS；选择 GraspNet 时仍需其 manifest 中的项目授权 acknowledgement，
 旧的 `--accept-graspnet-noncommercial-license` 仅保留为兼容 no-op，新安装不需要传入。
 
-## 下载默认 VGN 权重并组成共享 assets
+权重不提交 Git；本地 manifest 的 SHA-256 只证明文件与该 manifest 一致，不证明 checkpoint 已经由
+项目审核。使用者必须单独确认模型资产的许可与来源边界。
+
+## 准备 VGN/GraspNet 后端权重
+
+项目级基础/感知资产包的下载、解压和 `DEXTELEOP_ASSET_ROOT` 配置统一见项目根
+[`README.md`](../../README.md) 的“运行资产”章节。以下命令假定共享根已经按该章节配置；本页只
+说明 VGN/GraspNet 后端各自的权重和 manifest。
 
 该 Skill 复用下面的 SAM2 bundle：
 
@@ -91,7 +67,6 @@ unzip -l /tmp/vgn-official/data.zip | grep 'data/models/vgn_conv.pth'
 unzip -j /tmp/vgn-official/data.zip 'data/models/vgn_conv.pth' \
   -d /tmp/vgn-official
 
-export DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets
 export POINT_GRASP_BUNDLE="${DEXTELEOP_ASSET_ROOT}/perception/sam2_vgn_point_grasp"
 mkdir -p "${POINT_GRASP_BUNDLE}"
 cp /tmp/vgn-official/vgn_conv.pth "${POINT_GRASP_BUNDLE}/vgn_conv.pth"
@@ -108,16 +83,8 @@ assets/perception/sam2_vgn_point_grasp/
 └── vgn_conv.pth
 ```
 
-随后执行：
-
-```bash
-python scripts/dev_asset_store.py configure --asset-root "${DEXTELEOP_ASSET_ROOT}"
-python scripts/dev_asset_store.py status
-python scripts/dev_local_resources.py audit
-```
-
-回头上传统一网盘资产时，把这两个 `perception/` bundle 与基础 assets 一起打包，并同时发布包的
-SHA-256；不要把 SAM2/VGN Git checkout 打进 `assets.zip`。
+完成后按项目根 README 的“运行资产”章节检查共享根和本地资源清单；不要把
+`model/perception/` Git checkout 打进资产包。
 
 ## GraspNet 后端资产
 
@@ -128,7 +95,8 @@ GraspNet 使用官方 RealSense checkpoint：
 - Google Drive 文件 ID：`1hd0G8LN6tRpi4742XOTEisbTXNZ-1jmk`
 - 必须保持的文件名：`checkpoint-rs.tar`
 
-checkpoint 不进入 Git，但可放入项目统一 assets 根并随审核后的 `assets.zip`/团队网盘资产发布：
+checkpoint 不进入 Git，放入项目统一 assets 根；资产包的获取和发布边界以项目根 README 的
+“运行资产”章节为准：
 
 ```bash
 export GRASPNET_BUNDLE="${DEXTELEOP_ASSET_ROOT}/perception/graspnet-point-grasp"

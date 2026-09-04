@@ -18,6 +18,9 @@ point-grasp 离线 CLI 与仿真评测是同一 `dexteleop310` Python 进程内�
 MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server-client 通信。不要为它新建
 `graspnet` 或其他第二 Conda 环境。
 
+基础运行资产和可选感知/抓姿资产包的下载、解压及共享根配置统一见项目根
+[`README.md`](./README.md) 的“运行资产”章节；本节只保留环境、源码和复现约束。
+
 ### 0.1 源码在哪里？
 
 | 组件 | 当前 worktree 内路径 |
@@ -42,7 +45,7 @@ MuJoCo/相机数据、SAM2、GraspNet、IK 与运动规划不通过模型 server
 | GraspNet | `perception/graspnet-point-grasp/checkpoint-rs.tar` |
 
 每个目录还需对应的 `manifest.json` 及真实 SHA-256。使用 worktree 默认 assets 映射时，根就是本仓
-`assets/`；下载来源见 [`assets.zip`](https://disk.pku.edu.cn/link/AA6DAAF3490F7645A18F32230527E5480B)，解压之后所存放的路径请参考压缩包内说明。
+`assets/`；下载和解压规则以项目根 [`README.md`](./README.md) 的“运行资产”章节为准。
 
 ### 0.3 新机器如何一键安装？
 

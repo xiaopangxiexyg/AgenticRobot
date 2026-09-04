@@ -9,7 +9,7 @@
 
 ## 外部源码
 
-源码以 Git submodule 位于 AgenticRobot 的 `model/perception/`，不放进 `assets.zip`。使用以下官方
+源码以 Git submodule 位于 AgenticRobot 的 `model/perception/`，不放进项目运行资产包。使用以下官方
 Git 仓库：
 
 - [SAM2](https://github.com/facebookresearch/sam2.git)
@@ -49,10 +49,11 @@ editable checkout；缺少 `.git` provenance 的复制目录或与 manifest 不�
 
 ## 下载并准备权重
 
-先下载 README 指定的基础 `assets.zip` 并解压。然后在同一个共享资产根增加可选 bundle：
+项目级基础/感知资产包的下载、解压和 `DEXTELEOP_ASSET_ROOT` 配置统一见项目根
+[`README.md`](../../README.md) 的“运行资产”章节。以下命令假定共享根已经按该章节配置；本页只
+说明如何准备本 Skill 的可选权重 bundle：
 
 ```bash
-export DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets
 mkdir -p "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino"
 
 curl -fL \
@@ -74,23 +75,8 @@ sha256sum \
 会重新计算 checkpoint SHA-256；文件、manifest 或源码身份不一致
 都会拒绝启动。
 
-配置并检查共享资产：
-
-```bash
-python scripts/dev_asset_store.py configure --asset-root "${DEXTELEOP_ASSET_ROOT}"
-python scripts/dev_asset_store.py status
-python scripts/dev_local_resources.py audit
-```
-
-如果要重新上传统一资产包，应在包含完整基础 bundles 的父目录执行打包，而不是只打包两个权重：
-
-```bash
-cd /absolute/path/containing-assets
-zip -r assets.zip assets
-sha256sum assets.zip
-```
-
-随后将 `assets.zip` 和其 SHA-256 上传到约定网盘；网盘地址确定后再更新仓库根 README 的下载链接。
+完成 bundle 后，回到项目根 README 的“运行资产”章节执行一次 `status` 和
+`dev_local_resources.py audit`；本页不重复共享资产登记或资产包发布步骤。
 
 ## 使用一张本地图片验证真实模型
 

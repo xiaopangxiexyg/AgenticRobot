@@ -1,27 +1,62 @@
 # DexTeleop
 
-## 1. 首先下载运行资产（必需）
+## 1. 运行资产（基础与可选扩展）
+
+运行资产是 clone 共享的本地状态，不提交 Git。所有下载、解压和共享根配置在本节维护；Skill
+页面只说明各 bundle 的用途、manifest 和运行命令。不要为每个 linked worktree 重复复制基础约
+3 GB 资产或可选模型权重。
+
+### 基础运行资产（必需）
 
 开始安装、测试或运行前，请先下载永久有效的
-[`assets.zip`](https://disk.pku.edu.cn/link/AACC5274EC91084D4FBF25786B5A9FCE36)，并解压到本机稳定目录。
-解压后，将包含所需 bundle 的 `assets/` 目录配置为本 clone 的共享资产根：
+[`基础 assets.zip`](https://disk.pku.edu.cn/link/AACC5274EC91084D4FBF25786B5A9FCE36)，并按压缩包说明解压到本机稳定目录。
+解压后应得到一个包含 RM65 等基础 bundle 的 `assets/` 目录。
+
+### 感知与抓姿扩展资产（可选）
+
+运行 `SAM2 + Grounding DINO` 物体定位 Skill 或 VGN/GraspNet 点击抓姿 Skill 时，再下载
+[`感知/抓姿 assets.zip`](https://disk.pku.edu.cn/link/AA6DAAF3490F7645A18F32230527E5480B)，并按压缩包说明把可选
+`perception/` bundle 放入同一个共享资产根。各 bundle 的精确文件、manifest 和上游权重来源见
+[`SAM2_GROUNDING_DINO.md`](./docs/agent_gateway/SAM2_GROUNDING_DINO.md) 和
+[`POINT_GRASP.md`](./docs/agent_gateway/POINT_GRASP.md)。
+
+从仓库根目录把包含所需 bundle 的 `assets/` 目录配置为本 clone 的共享资产根，然后检查清单：
 
 ```bash
-python scripts/dev_asset_store.py configure --asset-root /absolute/path/to/assets
+export DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets
+python scripts/dev_asset_store.py configure --asset-root "$DEXTELEOP_ASSET_ROOT"
+python scripts/dev_asset_store.py status
+python scripts/dev_local_resources.py audit
 ```
 
-不要为每个 linked worktree 重复复制基础约 3 GB 资产和可选模型权重。配置一次后，`claim_worktree.py`
-会自动建立兼容映射并验证必需的 RM65 bundle；详细规则见
-[`CONTRIBUTING.md`](./CONTRIBUTING.md)。
+常用 bundle 的相对路径如下：
 
-如果想运行`SAM2 + Grounding DINO 物体定位 Skill`和`抓姿skill`，还需下载另一份[`assets.zip`](https://disk.pku.edu.cn/link/AA6DAAF3490F7645A18F32230527E5480B)并解压，解压之后所存放的路径请参考压缩包内说明。
+| 用途 | `${DEXTELEOP_ASSET_ROOT}` 下的路径 |
+|---|---|
+| RM65 基础模型 | `rm65_inspire_tac/`、`rm65_inspire_gripper_v3/` |
+| SAM2 + Grounding DINO | `perception/sam2_grounding_dino/` |
+| 默认 VGN 点击抓姿 | `perception/sam2_vgn_point_grasp/` |
+| 可选 GraspNet 点击抓姿 | `perception/graspnet-point-grasp/` |
 
-## 2. SAM2 + Grounding DINO 物体定位 Skill（也就是给出bounding box）（可选）
+需要重新发布经审核的完整资产包时，在包含 `assets/` 的父目录打包整个目录并记录 SHA-256；不要只
+打包单个 checkpoint，也不要把 `model/perception/` 下的第三方 Git checkout 放进资产包：
+
+```bash
+cd /absolute/path/containing-assets
+zip -r assets.zip assets
+sha256sum assets.zip
+```
+
+配置一次后，`claim_worktree.py` 会为后续 linked worktree 建立兼容映射并验证必需的 RM65 bundle；
+更完整的共享资产规则见 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
+
+## 2. SAM2 + Grounding DINO 物体定位 Skill（可选）
 
 下面的验证不启动相机、不连接机械臂，也不需要 Agent Gateway。输入只接受 JPEG/PNG，输出 JSON 中的
 bbox 格式固定为 `xyxy_pixel_0based_half_open`，同时生成画框 JPEG：
 
 ```bash
+export PERCEPTION_BUNDLE="${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino"
 mkdir -p /tmp/dexteleop-perception-output
 
 # 1. SAM2 自动发现图片中的物体
@@ -44,11 +79,12 @@ python -m deployments.perception.localize_image_cli \
 Gateway 的启动与 Artifact 上传边界见
 [`SAM2_GROUNDING_DINO.md`](./docs/agent_gateway/SAM2_GROUNDING_DINO.md)。
 
-## 3. SAM2 + GraspNet 点击抓姿 Skill（可选）
+## 3. SAM2 + VGN/GraspNet 点击抓姿 Skill（可选）
 
 用一张本地 RGB-D 做真实 GPU 端到端推理：
 
 ```bash
+export POINT_GRASP_BUNDLE="${DEXTELEOP_ASSET_ROOT}/perception/sam2_vgn_point_grasp"
 python -m deployments.perception.point_grasp_image_cli \
   --sam2-asset-bundle "${DEXTELEOP_ASSET_ROOT}/perception/sam2_grounding_dino" \
   --point-grasp-asset-bundle "${POINT_GRASP_BUNDLE}" \
