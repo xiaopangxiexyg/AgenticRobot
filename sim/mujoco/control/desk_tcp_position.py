@@ -193,6 +193,12 @@ class DeskTcpPositionControlConfig:
     post_ik_qpos_smoothing_fast_alpha: float = 1.0
     left_home_qpos: tuple[float, ...] = tuple(DEFAULT_SIM_HOME_QPOS_BY_SIDE["left"])
     right_home_qpos: tuple[float, ...] = tuple(DEFAULT_SIM_HOME_QPOS_BY_SIDE["right"])
+    # Optional measured gripper openings used by real-state shadow
+    # initialization.  ``None`` preserves the historical open-gripper reset
+    # for ordinary simulation callers; shadow callers provide the authoritative
+    # DMTac values before the initial collision admission check.
+    left_initial_gripper_close: float | None = None
+    right_initial_gripper_close: float | None = None
 
     def __post_init__(self) -> None:
         profile_name = str(self.position_control_profile_name).strip()
@@ -206,6 +212,13 @@ class DeskTcpPositionControlConfig:
             value = np.asarray(getattr(self, name), dtype=float).reshape(-1)
             if value.shape != (6,) or not np.all(np.isfinite(value)):
                 raise ValueError(f"{name} must contain six finite joint values")
+        for name in ("left_initial_gripper_close", "right_initial_gripper_close"):
+            value = getattr(self, name)
+            if value is not None:
+                numeric = float(value)
+                if not np.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+                    raise ValueError(f"{name} must be finite and in [0, 1] when set")
+                object.__setattr__(self, name, numeric)
         if not np.isfinite(float(self.orientation_weight)) or float(
             self.orientation_weight
         ) < 0.0:
@@ -330,6 +343,15 @@ class DeskTcpPositionControl:
                     "right": np.asarray(cfg.right_home_qpos, dtype=float),
                 }
             )
+            initial_gripper_close_by_side = {
+                "left": cfg.left_initial_gripper_close,
+                "right": cfg.right_initial_gripper_close,
+            }
+            if any(value is not None for value in initial_gripper_close_by_side.values()):
+                for gripper_name, side in gripper_profile.side_by_gripper.items():
+                    close = initial_gripper_close_by_side[side]
+                    if close is not None:
+                        scene.set_gripper_close(gripper_name, close)
             projector = scene.collision_projector()
             if projector is not None:
                 check = projector.check_qpos(

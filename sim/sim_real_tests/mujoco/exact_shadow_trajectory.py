@@ -51,6 +51,7 @@ class RealTcpObstacleTrajectoryRequest:
     linear_speed_m_s: float = 0.12
     angular_speed_deg_s: float = 45.0
     minimum_duration_sec: float = 2.0
+    require_obstacle_detour: bool = False
 
     def __post_init__(self) -> None:
         side = str(self.side).strip().lower()
@@ -71,6 +72,12 @@ class RealTcpObstacleTrajectoryRequest:
         source = str(self.source).strip()
         if not source:
             raise ValueError("source must be non-empty.")
+        if not isinstance(self.require_obstacle_detour, bool):
+            raise TypeError("require_obstacle_detour must be boolean.")
+        if self.require_obstacle_detour and not self.obstacle_scene.obstacles:
+            raise ValueError(
+                "require_obstacle_detour needs at least one configured obstacle."
+            )
         known = self.known_qpos_rad
         if known is not None:
             known = np.asarray(known, dtype=float).reshape(-1).copy()
@@ -203,6 +210,9 @@ def build_registered_tcp_obstacle_trajectory(
 ) -> RegisteredShadowJointTrajectory:
     """Plan a real TCP request with Sim endpoint and obstacle semantics."""
 
+    from ..rm65.random_grasp_pose_reachability import (
+        RM65RandomGraspPoseReachabilityConfig,
+    )
     from .arbitrary_grasp_pose_motion import (
         GraspMotionTarget,
         _MujocoFclObstacleOracle,
@@ -210,9 +220,6 @@ def build_registered_tcp_obstacle_trajectory(
         evaluate_motion_target_endpoint,
         plan_obstacle_aware_joint_path,
         revalidate_obstacle_path,
-    )
-    from ..rm65.random_grasp_pose_reachability import (
-        RM65RandomGraspPoseReachabilityConfig,
     )
 
     if not isinstance(snapshot, AuthoritativeRobotStateSnapshot):
@@ -263,6 +270,7 @@ def build_registered_tcp_obstacle_trajectory(
             "minimum_duration_sec": request.minimum_duration_sec,
             "path_strategy": "direct_then_deterministic_birrt",
             "time_parameterization": "per_segment_quintic_stop_at_waypoint",
+            "require_obstacle_detour": request.require_obstacle_detour,
         },
         domain="agenticrobot.real_shadow_acceptance.planner_config.v1",
     )
@@ -313,6 +321,15 @@ def build_registered_tcp_obstacle_trajectory(
             raise MujocoShadowTrajectoryPreparationError(
                 _path_preparation_reason(path.status),
                 additional_reason_codes=(path.reason or path.status.value,),
+                details={"path_receipt": path.to_dict()},
+            )
+        if (
+            request.require_obstacle_detour
+            and path.metadata.get("direct_path") is not False
+        ):
+            raise MujocoShadowTrajectoryPreparationError(
+                "obstacle_detour_not_exercised",
+                additional_reason_codes=(path.reason or "direct_path_clear",),
                 details={"path_receipt": path.to_dict()},
             )
         final_check = revalidate_obstacle_path(path.waypoints, oracle=path_oracle)

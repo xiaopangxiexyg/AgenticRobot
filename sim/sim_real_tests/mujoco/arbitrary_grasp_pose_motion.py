@@ -12,6 +12,7 @@ to hardware.
 
 from __future__ import annotations
 
+import ast
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -48,7 +49,12 @@ from robot_motion.shadow_execution import (
     ShadowSimulationReceipt,
     ShadowSimulationStatus,
 )
+from sim.mujoco.collision_safety import (
+    CollisionCheckResult,
+    KinematicCollisionProjector,
+)
 from sim.mujoco.control.desk_tcp_position import (
+    DEFAULT_SIM_HOME_QPOS_BY_SIDE,
     DeskTcpPositionControl,
     DeskTcpPositionControlConfig,
 )
@@ -90,6 +96,207 @@ class ShadowMujocoInitializationError(RuntimeError):
         super().__init__(self.reason_code)
 
 
+def _collision_details_from_build_error(message: str) -> dict[str, object]:
+    """Recover the structured MuJoCo check from the legacy build exception."""
+
+    prefix = "simulation home qpos is collision-unsafe:"
+    if not message.startswith(prefix):
+        return {}
+    try:
+        value = ast.literal_eval(message[len(prefix) :].strip())
+    except (SyntaxError, ValueError):
+        return {}
+    if not isinstance(value, Mapping):
+        return {}
+    return {"collision_check": dict(value)}
+
+
+def _is_zero_distance_robot_self_query_artifact(
+    details: Mapping[str, object],
+) -> bool:
+    """Recognize the narrow MuJoCo mesh-query failure seen at build time.
+
+    ``mj_geomDistance`` can return an exact zero for a separated robot-self
+    mesh pair.  The build API only exposes the serialized distance result, so
+    require all of the stable fields that identify that case before retrying
+    with a known-safe compile seed.  Real environment/gripper collisions and
+    malformed diagnostics remain fail-closed.
+    """
+
+    check = details.get("collision_check")
+    if not isinstance(check, Mapping):
+        return False
+    try:
+        minimum_distance = float(check.get("minimum_distance_m"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        minimum_distance == 0.0
+        and str(check.get("pair_class", "")) == "2:2"
+        and str(check.get("collision_category", "")) == "robot_self"
+    )
+
+
+def _pair_has_contact(data: Any, collision: CollisionCheckResult) -> bool:
+    """Return whether MuJoCo reports an actual contact for this geom pair."""
+
+    if collision.geom1_id is None or collision.geom2_id is None:
+        return False
+    expected = tuple(sorted((int(collision.geom1_id), int(collision.geom2_id))))
+    for index in range(int(data.ncon)):
+        contact = data.contact[index]
+        observed = tuple(sorted((int(contact.geom1), int(contact.geom2))))
+        if observed == expected:
+            return True
+    return False
+
+
+def _recover_zero_distance_robot_self_query(
+    collision: CollisionCheckResult,
+    *,
+    pair_has_contact: bool,
+    witness_distance_m: float,
+    minimum_clearance_m: float,
+) -> CollisionCheckResult:
+    """Recover only a proven separated robot-self mesh query false zero.
+
+    A contact, a non-zero penetration result, an unknown pair, or a witness
+    shorter than the configured clearance all remain blocked.  This keeps the
+    fallback specific to the observed discontinuous ``0.0`` query artifact.
+    """
+
+    if (
+        collision.safe
+        or collision.minimum_distance_m != 0.0
+        or collision.pair_class != "2:2"
+        or pair_has_contact
+        or not math.isfinite(float(witness_distance_m))
+        or float(witness_distance_m) < float(minimum_clearance_m)
+    ):
+        return collision
+    return replace(
+        collision,
+        safe=True,
+        minimum_distance_m=float(witness_distance_m),
+    )
+
+
+def _recover_projector_zero_distance_result(
+    projector: Any,
+    source_data: Any,
+    target_vector: np.ndarray,
+    collision: CollisionCheckResult,
+    *,
+    minimum_clearance_m: float | None = None,
+) -> CollisionCheckResult:
+    """Repair one separated mesh false-zero using a full MuJoCo witness."""
+
+    if (
+        collision.safe
+        or collision.minimum_distance_m != 0.0
+        or collision.pair_class != "2:2"
+        or collision.geom1_id is None
+        or collision.geom2_id is None
+    ):
+        return collision
+
+    # ``check_qpos`` deliberately uses ``mj_kinematics`` for speed and hence
+    # does not populate MuJoCo's contact list.  Recompute a private full-data
+    # snapshot only for the suspicious exact-zero robot-self result, then use
+    # the geom-distance witness to distinguish a separated mesh from contact.
+    mujoco = projector.mujoco
+    scratch = mujoco.MjData(projector.model)
+    scratch.qpos[:] = source_data.qpos
+    scratch.qpos[projector.controlled_qpos_indices] = np.asarray(
+        target_vector, dtype=float
+    )
+    mujoco.mj_forward(projector.model, scratch)
+    if _pair_has_contact(scratch, collision):
+        return collision
+    fromto = np.empty(6, dtype=np.float64)
+    mujoco.mj_geomDistance(
+        projector.model,
+        scratch,
+        int(collision.geom1_id),
+        int(collision.geom2_id),
+        float(projector.policy.distance_query_limit_m),
+        fromto,
+    )
+    witness_distance = float(np.linalg.norm(fromto[:3] - fromto[3:]))
+    return _recover_zero_distance_robot_self_query(
+        collision,
+        pair_has_contact=False,
+        witness_distance_m=witness_distance,
+        minimum_clearance_m=float(
+            projector.policy.minimum_clearance_m
+            if minimum_clearance_m is None
+            else minimum_clearance_m
+        ),
+    )
+
+
+class _ArtifactAwareKinematicCollisionProjector(KinematicCollisionProjector):
+    """Use the proven full-forward witness in every projector entry point.
+
+    Exact-shadow preflight and the physical command projector both call the
+    projector directly.  Keeping the recovery in ``_check_candidate`` makes
+    those paths agree with grasp planning instead of fixing only one caller.
+    """
+
+    def _check_candidate(
+        self,
+        source_data: Any,
+        controlled_qpos: np.ndarray,
+        *,
+        minimum_clearance_m: float | None = None,
+    ) -> CollisionCheckResult:
+        collision = super()._check_candidate(
+            source_data,
+            controlled_qpos,
+            minimum_clearance_m=minimum_clearance_m,
+        )
+        return _recover_projector_zero_distance_result(
+            self,
+            source_data,
+            controlled_qpos,
+            collision,
+            minimum_clearance_m=minimum_clearance_m,
+        )
+
+
+def _install_artifact_aware_collision_projector(
+    control: DeskTcpPositionControl,
+) -> Any:
+    """Install one projector shared by planning, exact replay, and actuation."""
+
+    projector = control.scene.collision_projector()
+    if projector is None:
+        raise ShadowMujocoInitializationError("mujoco_collision_projector_unavailable")
+    if isinstance(projector, _ArtifactAwareKinematicCollisionProjector):
+        return projector
+    recovered = _ArtifactAwareKinematicCollisionProjector(
+        projector.mujoco,
+        projector.model,
+        projector.controlled_qpos_indices,
+        projector.policy,
+    )
+    # MujocoScene owns this lazy projector.  Replacing its cached instance is
+    # deliberately local to the real-shadow control; the general simulation
+    # scene and deployed hardware runtime are not changed.
+    control.scene._collision_projector = recovered
+    return recovered
+
+
+def _check_mujoco_qpos(
+    control: DeskTcpPositionControl,
+    projector: Any,
+    target_vector: np.ndarray,
+) -> CollisionCheckResult:
+    """Check qpos through the shadow control's artifact-aware projector."""
+
+    return projector.check_qpos(control.scene.data, target_vector)
+
+
 def shadow_control_initialization_observation(
     control: DeskTcpPositionControl,
     snapshot: AuthoritativeRobotStateSnapshot,
@@ -125,8 +332,9 @@ def shadow_control_initialization_observation(
     projector = control.scene.collision_projector()
     if projector is None:
         raise ShadowMujocoInitializationError("mujoco_collision_projector_unavailable")
-    collision = projector.check_qpos(
-        control.scene.data,
+    collision = _check_mujoco_qpos(
+        control,
+        projector,
         control.scene.kinematic_controlled_qpos(),
     )
     maximum_qvel = float(np.max(np.abs(np.asarray(control.scene.data.qvel))))
@@ -165,25 +373,73 @@ def build_shadow_initialized_control(
         raise TypeError("snapshot must be AuthoritativeRobotStateSnapshot.")
     base = config or DeskTcpPositionControlConfig()
     if base.realtime_worker:
-        raise ShadowMujocoInitializationError("realtime_shadow_initialization_forbidden")
+        raise ShadowMujocoInitializationError(
+            "realtime_shadow_initialization_forbidden"
+        )
     cfg = replace(
         base,
         left_home_qpos=tuple(float(value) for value in snapshot.qpos_by_side["left"]),
         right_home_qpos=tuple(float(value) for value in snapshot.qpos_by_side["right"]),
+        left_initial_gripper_close=float(snapshot.gripper_close_by_side["left"]),
+        right_initial_gripper_close=float(snapshot.gripper_close_by_side["right"]),
     )
     try:
         control = DeskTcpPositionControl.build(cfg)
     except RuntimeError as exc:
         if "simulation home qpos is collision-unsafe" in str(exc):
-            raise ShadowMujocoInitializationError(
-                "conservative_open_gripper_initial_collision_blocked",
-                details={"backend_error": str(exc)},
-            ) from exc
-        raise
+            details = _collision_details_from_build_error(str(exc))
+            if _is_zero_distance_robot_self_query_artifact(details):
+                # ``DeskTcpPositionControl.build`` checks the configured home
+                # qpos before returning a control object.  A known MuJoCo
+                # exact-zero robot-self query artifact can prevent that
+                # object from being returned even though the actual contact
+                # pipeline is empty.  Compile once from the canonical safe
+                # simulation homes, then install and revalidate the measured
+                # state below.  No real or simulated motion is issued here.
+                compile_cfg = replace(
+                    base,
+                    left_home_qpos=tuple(
+                        float(value) for value in DEFAULT_SIM_HOME_QPOS_BY_SIDE["left"]
+                    ),
+                    right_home_qpos=tuple(
+                        float(value) for value in DEFAULT_SIM_HOME_QPOS_BY_SIDE["right"]
+                    ),
+                    left_initial_gripper_close=None,
+                    right_initial_gripper_close=None,
+                )
+                try:
+                    control = DeskTcpPositionControl.build(compile_cfg)
+                except Exception as retry_exc:
+                    raise ShadowMujocoInitializationError(
+                        "mujoco_shadow_compile_failed",
+                        details={
+                            "backend_error": str(exc),
+                            **details,
+                            "compile_seed": "canonical_safe_simulation_home",
+                            "compile_retry_error": str(retry_exc),
+                        },
+                    ) from retry_exc
+                # Keep the caller-visible configuration tied to the measured
+                # state.  The temporary compile seed must not leak into later
+                # receipts or diagnostics.
+                control.config = cfg
+            else:
+                # Keep the backend diagnostic verbatim for real/unknown
+                # collisions and expose the measured-state collision class.
+                raise ShadowMujocoInitializationError(
+                    "measured_initial_state_collision_blocked",
+                    details={
+                        "backend_error": str(exc),
+                        **details,
+                    },
+                ) from exc
+        else:
+            raise
     try:
         # No realtime worker exists, so this is an atomic cold-reset boundary.
         # Restarting the rig rebases the arm planners and gripper executors to
         # the exact state installed below instead of retaining default targets.
+        projector = _install_artifact_aware_collision_projector(control)
         control.rig.close()
         control.scene.set_qpos_by_side(snapshot.qpos_by_side)
         profile = control.rig.config.gripper_actuation_profile
@@ -196,13 +452,18 @@ def build_shadow_initialized_control(
             )
         control.scene.data.qvel[:] = 0.0
         control.scene.forward()
-        projector = control.scene.collision_projector()
-        if projector is None:
-            raise ShadowMujocoInitializationError(
-                "mujoco_collision_projector_unavailable"
-            )
-        collision = projector.check_qpos(
-            control.scene.data,
+        # The temporary safe compile seed may have initialized the retargeter
+        # at a different qpos.  Rebase its internal solver and all continuity
+        # state to the authoritative measured arm state before any target is
+        # admitted.
+        control.retargeter.set_current_qpos_pair(
+            left_qpos=snapshot.qpos_by_side["left"],
+            right_qpos=snapshot.qpos_by_side["right"],
+            reset_tracking=True,
+        )
+        collision = _check_mujoco_qpos(
+            control,
+            projector,
             control.scene.kinematic_controlled_qpos(),
         )
         if not collision.safe:
@@ -261,7 +522,11 @@ class _MujocoFclObstacleOracle:
                     for side in SIDES
                 },
             )
-            mujoco = self._projector.check_qpos(self._control.scene.data, target_vector)
+            mujoco = _check_mujoco_qpos(
+                self._control,
+                self._projector,
+                target_vector,
+            )
             payload = mujoco.to_dict()
         except Exception as exc:  # noqa: BLE001 - backend failures fail closed
             return JointConfigurationCheck(
@@ -702,7 +967,7 @@ def _collision_checker(
             base_vector,
             {side: np.asarray(candidate.qpos_rad, dtype=float)},
         )
-        result = projector.check_qpos(control.scene.data, target)
+        result = _check_mujoco_qpos(control, projector, target)
         payload = result.to_dict()
         obstacle_payload: dict[str, object] | None = None
         obstacle_distance: float | None = None
@@ -942,7 +1207,7 @@ def _direct_joint_path_collision_assessment(
         target_vector = control.scene.kinematic_target_vector(
             base_vector, {normalized_side: qpos}
         )
-        collision = projector.check_qpos(control.scene.data, target_vector)
+        collision = _check_mujoco_qpos(control, projector, target_vector)
         payload = collision.to_dict()
         distance = payload.get("minimum_distance_m")
         if distance is not None:
@@ -1156,7 +1421,7 @@ def select_random_reachable_demo_target(
         target_vector = control.scene.kinematic_target_vector(
             base_vector, {normalized_side: candidate}
         )
-        collision = projector.check_qpos(control.scene.data, target_vector)
+        collision = _check_mujoco_qpos(control, projector, target_vector)
         if not collision.safe:
             continue
         path_collision = _direct_joint_path_collision_assessment(

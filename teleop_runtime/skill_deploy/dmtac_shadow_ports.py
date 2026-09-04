@@ -75,6 +75,23 @@ class RM65ToolTcpWorldFk(Protocol):
     ) -> Mapping[str, np.ndarray]: ...
 
 
+class RegisteredTrajectoryToolTcpEnvelopeProjector(Protocol):
+    """Project one tool-TCP world pose through the active lower envelope."""
+
+    def __call__(self, side: str, tool_tcp_world: np.ndarray, /) -> np.ndarray: ...
+
+
+class RegisteredTrajectoryTcpEnvelopeError(RuntimeError):
+    """Typed zero-motion rejection for a registered path outside the TCP envelope."""
+
+    reason_code = "registered_trajectory_tcp_envelope_blocked"
+    real_motion_may_have_executed = False
+
+    def __init__(self, *, details: Mapping[str, object]) -> None:
+        self.details = dict(details)
+        super().__init__(self.reason_code)
+
+
 def _finite(value: object, *, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be numeric.")
@@ -93,6 +110,7 @@ class DMTacShadowReplayPortProfile:
     maximum_gripper_hold_drift: float = 0.02
     terminal_tcp_position_tolerance_m: float = 0.002
     terminal_tcp_orientation_tolerance_deg: float = 0.5
+    require_trajectory_tcp_envelope: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -106,6 +124,8 @@ class DMTacShadowReplayPortProfile:
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative.")
             object.__setattr__(self, name, value)
+        if not isinstance(self.require_trajectory_tcp_envelope, bool):
+            raise TypeError("require_trajectory_tcp_envelope must be boolean.")
 
 
 class DMTacRM65RegisteredTrajectoryPorts:
@@ -121,6 +141,9 @@ class DMTacRM65RegisteredTrajectoryPorts:
         tool_tcp_world_fk: RM65ToolTcpWorldFk,
         target_tool_tcp_world_by_side: Mapping[str, np.ndarray],
         target_reference_frame_id: str,
+        tool_tcp_world_envelope_projector: (
+            RegisteredTrajectoryToolTcpEnvelopeProjector | None
+        ) = None,
         profile: DMTacShadowReplayPortProfile | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -170,6 +193,14 @@ class DMTacRM65RegisteredTrajectoryPorts:
         self.target_tool_tcp_world_by_side = targets
         self.target_reference_frame_id = frame_id
         self.profile = profile or DMTacShadowReplayPortProfile()
+        if (
+            self.profile.require_trajectory_tcp_envelope
+            and not callable(tool_tcp_world_envelope_projector)
+        ):
+            raise RegisteredTrajectoryTcpEnvelopeError(
+                details={"reason": "active_tcp_envelope_projector_missing"}
+            )
+        self.tool_tcp_world_envelope_projector = tool_tcp_world_envelope_projector
         self.clock = clock
         self._point_hashes = {
             point.semantic_content_hash for point in self.trajectory.points
@@ -182,6 +213,71 @@ class DMTacRM65RegisteredTrajectoryPorts:
             RegisteredTrajectoryAuthorityConsumptionReceipt | None
         ) = None
         self._next_point_index = 0
+        self._validate_registered_trajectory_tcp_envelope()
+
+    def _validate_registered_trajectory_tcp_envelope(self) -> None:
+        """Reject the complete path before replay if Active safety would alter it."""
+
+        projector = self.tool_tcp_world_envelope_projector
+        if projector is None:
+            return
+        for point_index, point in enumerate(self.trajectory.points):
+            observed_raw = self.tool_tcp_world_fk.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=point.qpos_by_side["left"],
+                right_qpos=point.qpos_by_side["right"],
+            )
+            if not isinstance(observed_raw, Mapping):
+                raise RegisteredTrajectoryTcpEnvelopeError(
+                    details={
+                        "reason": "tool_tcp_fk_not_mapping",
+                        "point_index": point_index,
+                    }
+                )
+            for side in self.trajectory.moving_sides:
+                if side not in observed_raw:
+                    raise RegisteredTrajectoryTcpEnvelopeError(
+                        details={
+                            "reason": "tool_tcp_fk_side_missing",
+                            "point_index": point_index,
+                            "side": side,
+                        }
+                    )
+                requested = self._pose(
+                    observed_raw[side],
+                    name=f"trajectory_tool_tcp_world.{point_index}.{side}",
+                )
+                try:
+                    projected = self._pose(
+                        projector(side, requested),
+                        name=f"projected_tool_tcp_world.{point_index}.{side}",
+                    )
+                except RegisteredTrajectoryTcpEnvelopeError:
+                    raise
+                except Exception as exc:
+                    raise RegisteredTrajectoryTcpEnvelopeError(
+                        details={
+                            "reason": "active_tcp_envelope_projection_failed",
+                            "point_index": point_index,
+                            "side": side,
+                            "exception_type": type(exc).__name__,
+                            "exception": str(exc),
+                        }
+                    ) from exc
+                position_error_m, orientation_error_deg = pose_delta_metrics(
+                    requested,
+                    projected,
+                )
+                if position_error_m > 1e-9 or orientation_error_deg > 1e-7:
+                    raise RegisteredTrajectoryTcpEnvelopeError(
+                        details={
+                            "reason": "active_tcp_envelope_would_modify_path",
+                            "point_index": point_index,
+                            "side": side,
+                            "time_from_start_sec": point.time_from_start_sec,
+                            "projection_position_delta_m": position_error_m,
+                            "projection_orientation_delta_deg": orientation_error_deg,
+                        }
+                    )
 
     @staticmethod
     def _pose(value: object, *, name: str) -> np.ndarray:
@@ -361,6 +457,40 @@ class DMTacRM65RegisteredTrajectoryPorts:
         trajectory_hash: str,
         /,
     ) -> RegisteredTrajectoryPointDispatchReceipt:
+        """Dispatch the next point after a synchronous measured-state cut."""
+
+        return self._dispatch_registered_point(
+            point,
+            trajectory_hash,
+            synchronous_state_fence=True,
+        )
+
+    def dispatch_point_realtime(
+        self,
+        point: RegisteredJointTrajectoryPoint,
+        trajectory_hash: str,
+        /,
+    ) -> RegisteredTrajectoryPointDispatchReceipt:
+        """Dispatch at the registered lattice through RM65 lower health gates.
+
+        Full RM65+DMTac measurements are performed at admission and terminal
+        tracking by the replay executor. This path deliberately does not put
+        serial gripper reads in the 60 Hz arm-reference loop.
+        """
+
+        return self._dispatch_registered_point(
+            point,
+            trajectory_hash,
+            synchronous_state_fence=False,
+        )
+
+    def _dispatch_registered_point(
+        self,
+        point: RegisteredJointTrajectoryPoint,
+        trajectory_hash: str,
+        *,
+        synchronous_state_fence: bool,
+    ) -> RegisteredTrajectoryPointDispatchReceipt:
         """Dispatch only the next point of one active authority-bound session."""
 
         if not isinstance(point, RegisteredJointTrajectoryPoint):
@@ -399,7 +529,11 @@ class DMTacRM65RegisteredTrajectoryPorts:
                     succeeded=False,
                     evidence_refs=("dmtac-replay-session-reject:" + evidence_hash,),
                 )
-            receipt = self._dispatch_point_in_session(point, trajectory_hash)
+            receipt = self._dispatch_point_in_session(
+                point,
+                trajectory_hash,
+                synchronous_state_fence=synchronous_state_fence,
+            )
             if receipt.succeeded:
                 self._next_point_index += 1
             return receipt
@@ -409,6 +543,8 @@ class DMTacRM65RegisteredTrajectoryPorts:
         point: RegisteredJointTrajectoryPoint,
         trajectory_hash: str,
         /,
+        *,
+        synchronous_state_fence: bool,
     ) -> RegisteredTrajectoryPointDispatchReceipt:
         """Admit and dispatch one exact dual-arm point; never command DMTac."""
 
@@ -419,19 +555,30 @@ class DMTacRM65RegisteredTrajectoryPorts:
         if point.semantic_content_hash not in self._point_hashes:
             raise ValueError("point is not registered by the bound trajectory.")
 
-        arm_cut, snapshot = self._consume_pending_cut()
-        identity_matches = (
-            snapshot.identity.semantic_content_hash
-            == self.trajectory.initial_snapshot.identity.semantic_content_hash
-        )
-        maximum_gripper_drift = max(
-            abs(
-                snapshot.gripper_close_by_side[side]
-                - self.trajectory.initial_snapshot.gripper_close_by_side[side]
-            )
-            for side in _SIDES
-        )
         now = _finite(self.clock(), name="clock()")
+        snapshot_hash: str | None = None
+        if synchronous_state_fence:
+            arm_cut, snapshot = self._consume_pending_cut()
+            observation = arm_cut.observation
+            snapshot_hash = snapshot.semantic_content_hash
+            identity_matches = (
+                snapshot.identity.semantic_content_hash
+                == self.trajectory.initial_snapshot.identity.semantic_content_hash
+            )
+            maximum_gripper_drift = max(
+                abs(
+                    snapshot.gripper_close_by_side[side]
+                    - self.trajectory.initial_snapshot.gripper_close_by_side[side]
+                )
+                for side in _SIDES
+            )
+        else:
+            observation = TeleopObservation(timestamp=now)
+            identity_matches = (
+                self.identity.semantic_content_hash
+                == self.trajectory.initial_snapshot.identity.semantic_content_hash
+            )
+            maximum_gripper_drift = 0.0
         command = TeleopCommand(timestamp=now)
         command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = {
             "operation_id": "registered-shadow:" + trajectory_hash,
@@ -455,7 +602,7 @@ class DMTacRM65RegisteredTrajectoryPorts:
             <= self.profile.maximum_gripper_hold_drift
             and self.rm65_ports.admit_command(
                 command,
-                arm_cut.observation,
+                observation,
                 now,
             )
         )
@@ -474,7 +621,12 @@ class DMTacRM65RegisteredTrajectoryPorts:
                 "lower_succeeded": lower.succeeded,
                 "identity_matches": identity_matches,
                 "maximum_gripper_drift": maximum_gripper_drift,
-                "snapshot_hash": snapshot.semantic_content_hash,
+                "snapshot_hash": snapshot_hash,
+                "state_fence": (
+                    "synchronous_rm65_dmtac_cut"
+                    if synchronous_state_fence
+                    else "rm65_lower_health_no_per_point_dmtac_read"
+                ),
                 "gripper_policy": "measured_dmtac_fixed_opening_no_command",
             },
             domain="agenticrobot.shadow_execution.dmtac_rm65_dispatch.v1",
@@ -549,5 +701,7 @@ __all__ = [
     "DMTacRM65RegisteredTrajectoryPorts",
     "DMTacShadowReplayPortProfile",
     "RM65ToolTcpWorldFk",
+    "RegisteredTrajectoryTcpEnvelopeError",
+    "RegisteredTrajectoryToolTcpEnvelopeProjector",
     "StartedRM65ShadowPorts",
 ]

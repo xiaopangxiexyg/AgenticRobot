@@ -24,6 +24,7 @@ from robot_motion.shadow_execution import (
     ShadowExecutionIdentity,
     ShadowSimulationStatus,
 )
+from sim.mujoco.collision_safety import CollisionCheckResult
 from sim.mujoco.control.desk_tcp_position import (
     DEFAULT_INSPIRE_V3_DUAL_ARM_URDF,
     DEFAULT_SIM_HOME_QPOS_BY_SIDE,
@@ -148,6 +149,167 @@ def test_shadow_control_rejects_realtime_initialization_before_build() -> None:
             _shadow_home_snapshot(),
             config=DeskTcpPositionControlConfig(realtime_worker=True),
         )
+
+
+def test_shadow_control_labels_measured_initial_collision_at_build_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend_error = (
+        "simulation home qpos is collision-unsafe: "
+        "{'geom1': 'left_arm_link3_proxy_collision_0', "
+        "'geom2': 'left_arm_link5_collision_0', "
+        "'collision_category': 'robot_self'}"
+    )
+
+    def reject_collision(_config):
+        raise RuntimeError(backend_error)
+
+    monkeypatch.setattr(motion.DeskTcpPositionControl, "build", reject_collision)
+
+    with pytest.raises(
+        motion.ShadowMujocoInitializationError,
+        match="measured_initial_state_collision_blocked",
+    ) as raised:
+        build_shadow_initialized_control(_shadow_home_snapshot())
+
+    assert raised.value.reason_code == "measured_initial_state_collision_blocked"
+    assert raised.value.details == {
+        "backend_error": backend_error,
+        "collision_check": {
+            "geom1": "left_arm_link3_proxy_collision_0",
+            "geom2": "left_arm_link5_collision_0",
+            "collision_category": "robot_self",
+        },
+    }
+
+
+@pytest.mark.skipif(
+    not DEFAULT_INSPIRE_V3_DUAL_ARM_URDF.is_file(),
+    reason="local canonical Inspire-v3 URDF asset is unavailable",
+)
+def test_shadow_control_retries_known_zero_distance_build_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _shadow_home_snapshot()
+    backend_error = (
+        "simulation home qpos is collision-unsafe: "
+        "{'minimum_distance_m': 0.0, 'pair_class': '2:2', "
+        "'collision_category': 'robot_self', "
+        "'geom1': 'right_arm_link2_collision_0', "
+        "'geom2': 'right_arm_link4_collision_0'}"
+    )
+    original_build = motion.DeskTcpPositionControl.build
+    calls: list[DeskTcpPositionControlConfig] = []
+
+    def reject_measured_once(config):
+        calls.append(config)
+        if len(calls) == 1:
+            raise RuntimeError(backend_error)
+        return original_build(config)
+
+    monkeypatch.setattr(motion.DeskTcpPositionControl, "build", reject_measured_once)
+
+    control = build_shadow_initialized_control(snapshot)
+    try:
+        assert len(calls) == 2
+        assert calls[0].left_home_qpos == tuple(snapshot.qpos_by_side["left"])
+        assert calls[0].right_home_qpos == tuple(snapshot.qpos_by_side["right"])
+        assert calls[1].left_home_qpos == tuple(
+            float(value) for value in DEFAULT_SIM_HOME_QPOS_BY_SIDE["left"]
+        )
+        assert calls[1].right_home_qpos == tuple(
+            float(value) for value in DEFAULT_SIM_HOME_QPOS_BY_SIDE["right"]
+        )
+        assert control.config.left_home_qpos == calls[0].left_home_qpos
+        assert control.config.right_home_qpos == calls[0].right_home_qpos
+        observation = shadow_control_initialization_observation(control, snapshot)
+        assert observation["exact_state_match"] is True
+        assert observation["collision_safe"] is True
+    finally:
+        control.close()
+
+
+def _robot_self_zero_distance_check() -> CollisionCheckResult:
+    return CollisionCheckResult(
+        safe=False,
+        minimum_distance_m=0.0,
+        geom1_id=11,
+        geom2_id=12,
+        geom1_name="right_arm_link2_collision_0",
+        geom2_name="right_arm_link4_collision_0",
+        body1_name="right_arm_link2",
+        body2_name="right_arm_link4",
+        pair_class="2:2",
+    )
+
+
+def test_zero_distance_robot_self_query_recovers_only_with_separated_witness() -> None:
+    recovered = motion._recover_zero_distance_robot_self_query(
+        _robot_self_zero_distance_check(),
+        pair_has_contact=False,
+        witness_distance_m=0.0387,
+        minimum_clearance_m=0.002,
+    )
+
+    assert recovered.safe is True
+    assert recovered.minimum_distance_m == pytest.approx(0.0387)
+
+
+def test_zero_distance_robot_self_query_stays_blocked_on_contact_or_small_gap() -> None:
+    check = _robot_self_zero_distance_check()
+    assert (
+        motion._recover_zero_distance_robot_self_query(
+            check,
+            pair_has_contact=True,
+            witness_distance_m=0.0387,
+            minimum_clearance_m=0.002,
+        )
+        == check
+    )
+    assert (
+        motion._recover_zero_distance_robot_self_query(
+            check,
+            pair_has_contact=False,
+            witness_distance_m=0.001,
+            minimum_clearance_m=0.002,
+        )
+        == check
+    )
+
+
+def test_build_error_artifact_gate_requires_zero_robot_self_distance() -> None:
+    details = {
+        "collision_check": {
+            "minimum_distance_m": 0.0,
+            "pair_class": "2:2",
+            "collision_category": "robot_self",
+        }
+    }
+    assert motion._is_zero_distance_robot_self_query_artifact(details) is True
+    assert (
+        motion._is_zero_distance_robot_self_query_artifact(
+            {
+                "collision_check": {
+                    "minimum_distance_m": -0.001,
+                    "pair_class": "2:2",
+                    "collision_category": "robot_self",
+                }
+            }
+        )
+        is False
+    )
+    assert (
+        motion._is_zero_distance_robot_self_query_artifact(
+            {
+                "collision_check": {
+                    "minimum_distance_m": 0.0,
+                    "pair_class": "1:2",
+                    "collision_category": "robot_environment",
+                }
+            }
+        )
+        is False
+    )
 
 
 def test_pose_builders_share_explicit_base_from_dmtac_tcp_semantics() -> None:
