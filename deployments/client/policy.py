@@ -76,6 +76,22 @@ class LoadedPolicy:
             )
         return creator(**kwargs)
 
+    def create_model_rtc_adapter(self, **kwargs: Any) -> Any:
+        """Forward the optional conditioned model-RTC capability explicitly.
+
+        The common loader returns ``LoadedPolicy`` rather than the concrete
+        model policy object.  Keep the capability opt-in and model-owned while
+        forwarding it through this stable wrapper, just like raw RTC.
+        """
+
+        creator = getattr(self.policy, "create_model_rtc_adapter", None)
+        if not callable(creator):
+            raise TypeError(
+                f"Loaded policy {self.name!r} does not expose "
+                "create_model_rtc_adapter()."
+            )
+        return creator(**kwargs)
+
 
 class HoldPolicy:
     """Built-in policy that returns the latest observed robot state."""

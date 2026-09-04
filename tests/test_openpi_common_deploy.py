@@ -29,7 +29,15 @@ from deployments.openpi.client import (
 from deployments.openpi.client import real as openpi_real_launcher
 from dataset_contracts.v22 import DiscreteCategory, DiscreteTokenSpec, EndEffectorSpec, PolicyIOLayout
 from dataset_contracts import (
+    MODEL_CONTINUATION_FLOW_INPAINT_V1,
+    MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
+    MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,
+    RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
     STATE_INPUT_MODE_MASKED_NORMALIZED_CONCAT,
+    TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
+    ModelContinuationDataContract,
+    ModelContinuationDataContractV2,
+    ModelContinuationRuntimeContractV2,
     PolicyArtifactContract,
     PolicyCameraInput,
     PolicyCameraInputContract,
@@ -852,6 +860,104 @@ class OpenPICommonDeployTest(unittest.TestCase):
         )
         self.assertEqual(wrapped_result, "wrapped-adapter")
         self.assertEqual(creator.call_count, 1)
+
+    def test_openpi_real_launcher_forwards_model_rtc_through_loaded_policy(
+        self,
+    ) -> None:
+        layout = PolicyIOLayout.legacy_v21_q6()
+        legacy_continuation = ModelContinuationDataContract(
+            continuation_mode=MODEL_CONTINUATION_FLOW_INPAINT_V1,
+            continuation_implementation_id="fixture-flow-inpaint-v1",
+            continuation_implementation_parameters_hash="sha256:" + "a" * 64,
+            prediction_horizon_steps=16,
+            minimum_forecast_delay_steps=1,
+            maximum_forecast_delay_steps=12,
+            minimum_prefix_steps=1,
+            maximum_prefix_steps=1,
+            model_action_dim=layout.action_dim,
+            model_action_discrete_dim=layout.action_discrete_dim,
+            component_scope=("left_arm", "right_arm"),
+            supported_action_pose_modes=("absolute",),
+            sampler_constraints=(MODEL_CONTINUATION_SAMPLER_CLAMPED_V1,),
+            training_prefix_source_kinds=(
+                TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
+            ),
+            runtime_prefix_source_roles=(
+                RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
+            ),
+            action_codec_hash="sha256:" + "b" * 64,
+            layout_hash=layout.layout_hash,
+            frame_contract_hash="frame:model-rtc-unit",
+            normalization_hash="normalization:model-rtc-unit-v1",
+            training_projection_implementation_id="fixture-teacher-v1",
+            training_projection_parameters_hash="sha256:" + "c" * 64,
+        )
+        artifact = PolicyArtifactContract(
+            policy_io_layout=layout,
+            model_id="model-rtc-openpi-unit",
+            checkpoint_step=123,
+            camera_input=PolicyCameraInputContract(
+                inputs=(
+                    PolicyCameraInput(
+                        source_key="front",
+                        model_input_key="observation.images.base_0_rgb",
+                        server_camera_slot="base_0_rgb",
+                    ),
+                ),
+            ),
+            model_continuation=ModelContinuationDataContractV2(
+                conditioning_origin=MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
+                runtime=ModelContinuationRuntimeContractV2.from_v1(
+                    legacy_continuation
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            artifact_path = f"{tmp_dir}/policy_artifact.json"
+            with open(artifact_path, "w", encoding="utf-8") as stream:
+                json.dump(artifact.to_dict(), stream)
+            with mock.patch(
+                "teleop_runtime.deploy.run_policy.main",
+                return_value=0,
+            ) as run_main:
+                result = openpi_real_launcher.main(
+                    [
+                        "--policy-artifact-json",
+                        artifact_path,
+                        "--rtc-profile",
+                        MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
+                        "--rtc-real-shadow",
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        factory = run_main.call_args.kwargs["rtc_model_adapter_factory"]
+        creator = mock.Mock(return_value="model-adapter")
+        loaded_policy = LoadedPolicy(
+            policy=SimpleNamespace(create_model_rtc_adapter=creator),
+            name="framework-policy:model-rtc-test",
+        )
+        adapter = factory(
+            policy=loaded_policy,
+            deploy_session_contract=SimpleNamespace(
+                runtime_pose_frame_contract=SimpleNamespace(
+                    contract_hash="frame:runtime-model-rtc-unit",
+                ),
+            ),
+            policy_artifact=artifact,
+            args=SimpleNamespace(policy_action_pose_mode="absolute"),
+            active_sides=("left", "right"),
+        )
+        self.assertEqual(adapter, "model-adapter")
+        self.assertEqual(creator.call_count, 1)
+        self.assertEqual(
+            creator.call_args.kwargs["frame_contract_hash"],
+            "frame:runtime-model-rtc-unit",
+        )
+        self.assertEqual(
+            creator.call_args.kwargs["normalization_hash"],
+            "normalization:model-rtc-unit-v1",
+        )
 
     def test_openpi_real_launcher_selects_typed_results_for_relative_artifact(
         self,
