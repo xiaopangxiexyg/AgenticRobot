@@ -2,7 +2,8 @@
 
 本文档是 AgenticRobot 内 OpenPI 命令的规范入口，回答四个问题：应该走哪条
 训练路线、应该使用哪个环境、每一步会产生什么副作用，以及部署时如何保证 server
-与 client 绑定同一份模型契约。
+与 client 的实际模型契约兼容。默认不要求两端 model id 或 checkpoint step 相同；精确
+identity 检查是显式 opt-in。
 
 具体 checkpoint、实验名和现场长命令保留在
 [`cmd_list.md`](./cmd_list.md)；模型 I/O、相机和动作语义见
@@ -391,8 +392,12 @@ model history 或 chunk，也不跳过 ready、碰撞、力限和观测新鲜度
 - 当前 model-RTC 部署说明只开放 conditioned no-action shadow；不要从普通 client 命令复制
   `--send-actions`。
 - `--rtc-real-shadow` 会打开实时 observation/transport，但配置为 no-action；仍然不是无硬件。
+- client 与 server 可以选择不同的完整 checkpoint/step；每端分别验证自己的 prepared 与
+  model-RTC profile，连接时再验证 layout、相机、动作、normalization、prompt 和 RTC
+  capability。不要把 model/step identity 当默认强绑定，也不要降低这些真实兼容性检查。
 
-RTC 详细命令和回滚路径见 `cmd_list.md` 第 11 节与
+历史 RTC 详细命令和回滚路径见 `cmd_list.md` 第 11 节；当前 Stage1/Stage2 all-view h32
+model-RTC 的远端命令见第 23 节与
 [`client/README.md`](./client/README.md)。
 
 ## 9. 远端操作规则
@@ -428,6 +433,7 @@ RTC 详细命令和回滚路径见 `cmd_list.md` 第 11 节与
 - 第 11～12 节：model-RTC shadow 与 legacy v1；
 - 第 13～18 节：原生、prepared、prompt-family 和恢复训练；
 - 第 19～20 节：Stage1 scenario 与四个独立 Stage checkpoint 部署。
+- 第 21～23 节：h32 四阶段、历史 Stage1 与当前 Stage1/Stage2 all-view model-RTC。
 
 先在本文确定路线和副作用，再进入对应详细章节。checkpoint 清单带有审计日期，只是
 站点快照；使用前必须重新验证远端实际目录和 artifact。
