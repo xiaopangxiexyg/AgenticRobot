@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 import scripts.run_real_shadow_acceptance as acceptance
 from robot_motion.scene_obstacles import ObstacleSceneSnapshot
@@ -181,6 +182,115 @@ def test_execute_real_parser_uses_post_simulation_confirmation() -> None:
     assert authority.simulation_receipt_hash == "simulation:test"
     assert authority.operator_confirmation_ref == "interactive-post-mujoco:test"
     assert callable(consume)
+
+
+def test_relative_target_cli_supports_combined_translation_and_tool_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sim.sim_real_tests.mujoco import arbitrary_grasp_pose_motion
+
+    measured = np.eye(4)
+    measured[:3, :3] = Rotation.from_euler("z", 30.0, degrees=True).as_matrix()
+
+    class FakeControl:
+        def __init__(self):
+            self.scene = SimpleNamespace(get_arm_qpos=lambda _side: np.zeros(6))
+            self.retargeter = SimpleNamespace(
+                tool_tcp_world_targets_for_qpos_pair=lambda **_kwargs: {
+                    "left": measured,
+                    "right": np.eye(4),
+                }
+            )
+            self.world_to_base_by_side = {
+                "left": np.eye(4),
+                "right": np.eye(4),
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(acceptance, "_simulation_config", lambda *_args: object())
+    monkeypatch.setattr(
+        arbitrary_grasp_pose_motion,
+        "build_shadow_initialized_control",
+        lambda *_args, **_kwargs: FakeControl(),
+    )
+    args = acceptance.build_parser().parse_args(
+        [
+            "--arm-ip-assignment",
+            "/tmp/arms.json",
+            "--dmtac-assignment",
+            "/tmp/dmtac.json",
+            "--target-offset-xyz-m",
+            "0.04",
+            "-0.03",
+            "0.02",
+            "--target-offset-rpy-deg",
+            "10",
+            "-15",
+            "20",
+        ]
+    )
+
+    pose, mode = acceptance._pose_from_cli(args)
+    assert pose is None
+    assert mode == "measured_current_tcp_plus_base_translation_and_tool_rotation"
+    target = acceptance._target_from_current(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        side="left",
+        translation_offset_m=args.target_offset_xyz_m,
+        tool_rotation_offset_rpy_deg=args.target_offset_rpy_deg,
+    )
+    np.testing.assert_allclose(
+        target.target_pose_base_from_dmtac_tcp[:3, 3],
+        (0.04, -0.03, 0.02),
+    )
+    np.testing.assert_allclose(
+        target.target_pose_base_from_dmtac_tcp[:3, :3],
+        measured[:3, :3]
+        @ Rotation.from_euler(
+            "xyz", (10.0, -15.0, 20.0), degrees=True
+        ).as_matrix(),
+    )
+
+
+def test_relative_rotation_requires_relative_target_mode() -> None:
+    args = acceptance.build_parser().parse_args(
+        [
+            "--arm-ip-assignment",
+            "/tmp/arms.json",
+            "--dmtac-assignment",
+            "/tmp/dmtac.json",
+            "--target-from-current",
+            "--target-offset-rpy-deg",
+            "0",
+            "0",
+            "5",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires --target-offset-xyz-m"):
+        acceptance._pose_from_cli(args)
+
+
+def test_require_obstacle_detour_rejects_empty_scene_before_hardware_setup() -> None:
+    assert (
+        acceptance.main(
+            [
+                "--arm-ip-assignment",
+                "/does/not/matter.json",
+                "--dmtac-assignment",
+                "/does/not/matter.json",
+                "--target-offset-xyz-m",
+                "0.02",
+                "0",
+                "0",
+                "--require-obstacle-detour",
+                "--no-motion",
+            ]
+        )
+        == 2
+    )
 
 
 def test_authority_factory_rejects_when_terminal_confirmation_was_not_obtained() -> (

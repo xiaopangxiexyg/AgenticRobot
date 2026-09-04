@@ -124,6 +124,12 @@ def _pose_from_cli(args: argparse.Namespace) -> tuple[np.ndarray | None, str]:
         pose_from_xyz_rpy_deg,
     )
 
+    offset_rpy = np.asarray(args.target_offset_rpy_deg, dtype=float).reshape(-1)
+    if offset_rpy.shape != (3,) or not np.all(np.isfinite(offset_rpy)):
+        raise ValueError("--target-offset-rpy-deg must be a finite 3-vector")
+    if args.target_offset_xyz_m is None and float(np.linalg.norm(offset_rpy)) > 1e-9:
+        raise ValueError("--target-offset-rpy-deg requires --target-offset-xyz-m")
+
     modes = int(args.target_pose_json is not None) + int(args.target_xyz_m is not None)
     modes += int(bool(args.target_from_current))
     modes += int(args.target_offset_xyz_m is not None)
@@ -145,15 +151,19 @@ def _pose_from_cli(args: argparse.Namespace) -> tuple[np.ndarray | None, str]:
     if args.target_offset_xyz_m is not None:
         if args.target_quat_xyzw is not None or args.target_rpy_deg is not None:
             raise ValueError(
-                "orientation options cannot accompany --target-offset-xyz-m; "
-                "the measured TCP orientation is preserved"
+                "absolute orientation options cannot accompany --target-offset-xyz-m"
             )
         offset = np.asarray(args.target_offset_xyz_m, dtype=float).reshape(-1)
         if offset.shape != (3,) or not np.all(np.isfinite(offset)):
             raise ValueError("--target-offset-xyz-m must be a finite 3-vector")
-        if float(np.linalg.norm(offset)) <= 1e-9:
-            raise ValueError("--target-offset-xyz-m must request non-zero motion")
-        return None, "measured_current_tcp_plus_base_translation"
+        if (
+            float(np.linalg.norm(offset)) <= 1e-9
+            and float(np.linalg.norm(offset_rpy)) <= 1e-9
+        ):
+            raise ValueError(
+                "relative target must request non-zero translation or rotation"
+            )
+        return None, "measured_current_tcp_plus_base_translation_and_tool_rotation"
     if args.target_quat_xyzw is not None:
         return (
             pose_from_xyz_quat_xyzw(args.target_xyz_m, args.target_quat_xyzw),
@@ -243,6 +253,7 @@ def _target_from_current(
     *,
     side: str,
     translation_offset_m: Sequence[float] | None = None,
+    tool_rotation_offset_rpy_deg: Sequence[float] | None = None,
 ):
     from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
         GraspMotionTarget,
@@ -264,9 +275,23 @@ def _target_from_current(
     finally:
         control.close()
     if translation_offset_m is not None:
+        from scipy.spatial.transform import Rotation
+
         offset = np.asarray(translation_offset_m, dtype=float).reshape(3)
         base_from_dmtac = base_from_dmtac.copy()
         base_from_dmtac[:3, 3] += offset
+        rotation_offset = np.asarray(
+            (
+                (0.0, 0.0, 0.0)
+                if tool_rotation_offset_rpy_deg is None
+                else tool_rotation_offset_rpy_deg
+            ),
+            dtype=float,
+        ).reshape(3)
+        base_from_dmtac[:3, :3] = (
+            base_from_dmtac[:3, :3]
+            @ Rotation.from_euler("xyz", rotation_offset, degrees=True).as_matrix()
+        )
         known_qpos = None
     return GraspMotionTarget(
         side=side,
@@ -274,7 +299,7 @@ def _target_from_current(
         source=(
             "measured_current_dmtac_tcp"
             if translation_offset_m is None
-            else "measured_current_dmtac_tcp_plus_base_translation"
+            else "measured_current_dmtac_tcp_plus_base_translation_and_tool_rotation"
         ),
         known_qpos_rad=known_qpos,
         metadata={
@@ -283,6 +308,11 @@ def _target_from_current(
                 None
                 if translation_offset_m is None
                 else tuple(float(value) for value in translation_offset_m)
+            ),
+            "tool_rotation_offset_rpy_deg": (
+                None
+                if tool_rotation_offset_rpy_deg is None
+                else tuple(float(value) for value in tool_rotation_offset_rpy_deg)
             ),
         },
     )
@@ -647,6 +677,24 @@ def _build_real_ports_factory(
         if set(trajectory.moving_sides) != {str(target.side).strip().lower()}:
             raise ValueError("real replay target side differs from trajectory.")
         context.promote_to_active_hardware()
+        world_from_base_by_side = {
+            side: np.asarray(
+                profile.scene_world_from_arm_base_by_side[side], dtype=float
+            ).reshape(4, 4)
+            for side in SIDES
+        }
+
+        def project_tool_tcp_world(side: str, tool_tcp_world: np.ndarray) -> np.ndarray:
+            world_from_base = world_from_base_by_side[side]
+            base_from_tool = np.linalg.inv(world_from_base) @ tool_tcp_world
+            projected_base_from_tool = (
+                context.lower.target_safety.envelope_filter.project_arm_base_tool_tcp(
+                    side,
+                    base_from_tool,
+                )
+            )
+            return world_from_base @ projected_base_from_tool
+
         return DMTacRM65RegisteredTrajectoryPorts(
             trajectory=trajectory,
             identity=context.identity,
@@ -660,7 +708,10 @@ def _build_real_ports_factory(
                 )
             },
             target_reference_frame_id=RM65_SKILL_SCENE_WORLD_FRAME_ID_V1,
-            profile=DMTacShadowReplayPortProfile(),
+            tool_tcp_world_envelope_projector=project_tool_tcp_world,
+            profile=DMTacShadowReplayPortProfile(
+                require_trajectory_tcp_envelope=True,
+            ),
         )
 
     return factory
@@ -902,7 +953,19 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("DX", "DY", "DZ"),
         help=(
             "Translate the measured DMTac TCP by DX/DY/DZ in the selected "
-            "RM65 base frame while preserving its measured orientation."
+            "RM65 base frame; its orientation is preserved unless "
+            "--target-offset-rpy-deg is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--target-offset-rpy-deg",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.0),
+        metavar=("DROLL", "DPITCH", "DYAW"),
+        help=(
+            "Apply a tool-local XYZ Euler rotation after the measured TCP "
+            "orientation; valid only with --target-offset-xyz-m."
         ),
     )
     target.add_argument("--target-xyz-m", type=float, nargs=3, metavar=("X", "Y", "Z"))
@@ -941,6 +1004,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--obstacle-revision", type=int, default=0)
     parser.add_argument("--obstacle-clearance-m", type=float, default=0.02)
+    parser.add_argument(
+        "--require-obstacle-detour",
+        action="store_true",
+        help=(
+            "Fail before simulation/real motion unless configured obstacles "
+            "block the direct joint path and the planner finds a detour."
+        ),
+    )
     parser.add_argument("--linear-speed-m-s", type=float, default=0.12)
     parser.add_argument("--angular-speed-deg-s", type=float, default=45.0)
     parser.add_argument("--minimum-duration-sec", type=float, default=2.0)
@@ -1040,6 +1111,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ERROR: choose --obstacle-json or --obstacle-cube-world-m", file=sys.stderr
         )
         return 2
+    if args.require_obstacle_detour and not (
+        args.obstacle_json is not None or args.obstacle_cube_world_m
+    ):
+        print(
+            "ERROR: --require-obstacle-detour needs at least one obstacle",
+            file=sys.stderr,
+        )
+        return 2
     try:
         pose, orientation_format = _pose_from_cli(args)
         scene = _scene_from_cli(args)
@@ -1096,6 +1175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 profile,
                 side=args.side,
                 translation_offset_m=args.target_offset_xyz_m,
+                tool_rotation_offset_rpy_deg=args.target_offset_rpy_deg,
             )
         else:
             from sim.sim_real_tests.mujoco.arbitrary_grasp_pose_motion import (
@@ -1127,6 +1207,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             linear_speed_m_s=float(args.linear_speed_m_s),
             angular_speed_deg_s=float(args.angular_speed_deg_s),
             minimum_duration_sec=float(args.minimum_duration_sec),
+            require_obstacle_detour=bool(args.require_obstacle_detour),
         )
         sim_config = _simulation_config(profile, snapshot)
         real_ports_factory = (
@@ -1217,6 +1298,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "target": target,
             "obstacle_scene": scene,
             "sim_config": sim_config,
+            "trajectory_summary": {
+                "configured_obstacle_count": len(request.obstacle_scene.obstacles),
+                "obstacle_detour_required": bool(args.require_obstacle_detour),
+                "obstacle_detour_verified": bool(
+                    args.require_obstacle_detour
+                    and receipt.status.value
+                    in {"simulation_accepted_no_motion", "real_replay_completed"}
+                ),
+            },
             "acceptance_ui": {
                 "mujoco_viewer_enabled": viewer_enabled,
                 "post_simulation_terminal_confirmation_required": bool(

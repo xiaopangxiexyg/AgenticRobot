@@ -22,6 +22,7 @@ from teleop_runtime.skill_deploy.control_runtime import (
 from teleop_runtime.skill_deploy.dmtac_shadow_ports import (
     DMTacRM65RegisteredTrajectoryPorts,
     DMTacShadowReplayPortProfile,
+    RegisteredTrajectoryTcpEnvelopeError,
 )
 from teleop_runtime.skill_deploy.registered_trajectory import (
     RegisteredTrajectoryAuthorityConsumptionReceipt,
@@ -1020,6 +1021,66 @@ def test_dmtac_realtime_dispatch_does_not_read_dmtac_in_arm_loop() -> None:
     assert len(rm65.admitted_commands) == 1
     assert len(rm65.dispatched_commands) == 1
     assert all(backend.read_count == 0 for backend in dmtac.values())
+
+
+def test_dmtac_registered_path_is_envelope_checked_before_any_dispatch() -> None:
+    trajectory = _trajectory()
+    tool_tcp_fk, targets = _terminal_target(trajectory)
+    rm65 = _StartedRM65Ports(trajectory, clock=lambda: 10.0)
+    dmtac = {
+        "left": _backend("left", 0.2, 9.991),
+        "right": _backend("right", 0.3, 9.992),
+    }
+
+    def projector(side, pose):
+        projected = np.asarray(pose, dtype=float).copy()
+        if side == "right" and projected[0, 3] > 0.0:
+            projected[0, 3] = 0.0
+        return projected
+
+    with pytest.raises(RegisteredTrajectoryTcpEnvelopeError) as raised:
+        DMTacRM65RegisteredTrajectoryPorts(
+            trajectory=trajectory,
+            identity=trajectory.initial_snapshot.identity,
+            rm65_ports=rm65,
+            dmtac_backends_by_side=dmtac,
+            tool_tcp_world_fk=tool_tcp_fk,
+            target_tool_tcp_world_by_side=targets,
+            target_reference_frame_id="dual_arm_solver_world",
+            tool_tcp_world_envelope_projector=projector,
+            profile=DMTacShadowReplayPortProfile(
+                require_trajectory_tcp_envelope=True,
+            ),
+            clock=lambda: 10.0,
+        )
+
+    assert raised.value.reason_code == "registered_trajectory_tcp_envelope_blocked"
+    assert raised.value.details["point_index"] == 1
+    assert raised.value.details["reason"] == "active_tcp_envelope_would_modify_path"
+    assert rm65.dispatched_commands == []
+
+
+def test_dmtac_required_envelope_projector_cannot_be_omitted() -> None:
+    trajectory = _trajectory()
+    tool_tcp_fk, targets = _terminal_target(trajectory)
+    with pytest.raises(RegisteredTrajectoryTcpEnvelopeError) as raised:
+        DMTacRM65RegisteredTrajectoryPorts(
+            trajectory=trajectory,
+            identity=trajectory.initial_snapshot.identity,
+            rm65_ports=_StartedRM65Ports(trajectory, clock=lambda: 10.0),
+            dmtac_backends_by_side={
+                "left": _backend("left", 0.2, 9.991),
+                "right": _backend("right", 0.3, 9.992),
+            },
+            tool_tcp_world_fk=tool_tcp_fk,
+            target_tool_tcp_world_by_side=targets,
+            target_reference_frame_id="dual_arm_solver_world",
+            profile=DMTacShadowReplayPortProfile(
+                require_trajectory_tcp_envelope=True,
+            ),
+            clock=lambda: 10.0,
+        )
+    assert raised.value.details["reason"] == "active_tcp_envelope_projector_missing"
 
 
 def test_dmtac_realtime_dispatch_stops_on_lower_arm_admission_rejection() -> None:

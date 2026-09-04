@@ -642,8 +642,12 @@ def run_real_shadow_acceptance(
                 "real_replay_executor must return "
                 "RegisteredTrajectoryRealReplayReceipt."
             )
-    except Exception as exc:  # noqa: BLE001 - motion outcome is conservatively unknown.
+    except Exception as exc:  # noqa: BLE001 - classify only explicit zero-motion errors.
         evidence.append(_error_evidence("real_replay", exc))
+        explicit_zero_motion_rejection = bool(
+            ports is None
+            and getattr(exc, "real_motion_may_have_executed", None) is False
+        )
         real_hold_confirmed = False
         if ports is not None:
             try:
@@ -657,14 +661,35 @@ def run_real_shadow_acceptance(
             except Exception as hold_exc:  # noqa: BLE001 - preserve both failures.
                 evidence.append(_error_evidence("real_replay_error_hold", hold_exc))
         return RealShadowAcceptanceReceipt(
-            status=RealShadowAcceptanceStatus.REAL_REPLAY_FAILED,
+            status=(
+                RealShadowAcceptanceStatus.REAL_REPLAY_REJECTED
+                if explicit_zero_motion_rejection
+                else RealShadowAcceptanceStatus.REAL_REPLAY_FAILED
+            ),
             snapshot_hash=snapshot.semantic_content_hash,
             trajectory_hash=trajectory.semantic_content_hash,
             simulation_receipt=simulation,
             real_replay_receipt=None,
-            real_motion_disposition=RealMotionDisposition.UNKNOWN,
-            terminal_hold_confirmed=real_hold_confirmed,
+            real_motion_disposition=(
+                RealMotionDisposition.NONE
+                if explicit_zero_motion_rejection
+                else RealMotionDisposition.UNKNOWN
+            ),
+            terminal_hold_confirmed=(
+                simulation.terminal_hold_confirmed
+                if explicit_zero_motion_rejection
+                else real_hold_confirmed
+            ),
             evidence_refs=tuple(evidence),
+            reason_codes=(
+                str(
+                    getattr(
+                        exc,
+                        "reason_code",
+                        "explicit_zero_motion_real_replay_rejection",
+                    )
+                ),
+            ),
         )
 
     evidence.extend(real_receipt.evidence_refs)

@@ -75,6 +75,23 @@ class RM65ToolTcpWorldFk(Protocol):
     ) -> Mapping[str, np.ndarray]: ...
 
 
+class RegisteredTrajectoryToolTcpEnvelopeProjector(Protocol):
+    """Project one tool-TCP world pose through the active lower envelope."""
+
+    def __call__(self, side: str, tool_tcp_world: np.ndarray, /) -> np.ndarray: ...
+
+
+class RegisteredTrajectoryTcpEnvelopeError(RuntimeError):
+    """Typed zero-motion rejection for a registered path outside the TCP envelope."""
+
+    reason_code = "registered_trajectory_tcp_envelope_blocked"
+    real_motion_may_have_executed = False
+
+    def __init__(self, *, details: Mapping[str, object]) -> None:
+        self.details = dict(details)
+        super().__init__(self.reason_code)
+
+
 def _finite(value: object, *, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be numeric.")
@@ -93,6 +110,7 @@ class DMTacShadowReplayPortProfile:
     maximum_gripper_hold_drift: float = 0.02
     terminal_tcp_position_tolerance_m: float = 0.002
     terminal_tcp_orientation_tolerance_deg: float = 0.5
+    require_trajectory_tcp_envelope: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -106,6 +124,8 @@ class DMTacShadowReplayPortProfile:
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative.")
             object.__setattr__(self, name, value)
+        if not isinstance(self.require_trajectory_tcp_envelope, bool):
+            raise TypeError("require_trajectory_tcp_envelope must be boolean.")
 
 
 class DMTacRM65RegisteredTrajectoryPorts:
@@ -121,6 +141,9 @@ class DMTacRM65RegisteredTrajectoryPorts:
         tool_tcp_world_fk: RM65ToolTcpWorldFk,
         target_tool_tcp_world_by_side: Mapping[str, np.ndarray],
         target_reference_frame_id: str,
+        tool_tcp_world_envelope_projector: (
+            RegisteredTrajectoryToolTcpEnvelopeProjector | None
+        ) = None,
         profile: DMTacShadowReplayPortProfile | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -170,6 +193,14 @@ class DMTacRM65RegisteredTrajectoryPorts:
         self.target_tool_tcp_world_by_side = targets
         self.target_reference_frame_id = frame_id
         self.profile = profile or DMTacShadowReplayPortProfile()
+        if (
+            self.profile.require_trajectory_tcp_envelope
+            and not callable(tool_tcp_world_envelope_projector)
+        ):
+            raise RegisteredTrajectoryTcpEnvelopeError(
+                details={"reason": "active_tcp_envelope_projector_missing"}
+            )
+        self.tool_tcp_world_envelope_projector = tool_tcp_world_envelope_projector
         self.clock = clock
         self._point_hashes = {
             point.semantic_content_hash for point in self.trajectory.points
@@ -182,6 +213,71 @@ class DMTacRM65RegisteredTrajectoryPorts:
             RegisteredTrajectoryAuthorityConsumptionReceipt | None
         ) = None
         self._next_point_index = 0
+        self._validate_registered_trajectory_tcp_envelope()
+
+    def _validate_registered_trajectory_tcp_envelope(self) -> None:
+        """Reject the complete path before replay if Active safety would alter it."""
+
+        projector = self.tool_tcp_world_envelope_projector
+        if projector is None:
+            return
+        for point_index, point in enumerate(self.trajectory.points):
+            observed_raw = self.tool_tcp_world_fk.tool_tcp_world_targets_for_qpos_pair(
+                left_qpos=point.qpos_by_side["left"],
+                right_qpos=point.qpos_by_side["right"],
+            )
+            if not isinstance(observed_raw, Mapping):
+                raise RegisteredTrajectoryTcpEnvelopeError(
+                    details={
+                        "reason": "tool_tcp_fk_not_mapping",
+                        "point_index": point_index,
+                    }
+                )
+            for side in self.trajectory.moving_sides:
+                if side not in observed_raw:
+                    raise RegisteredTrajectoryTcpEnvelopeError(
+                        details={
+                            "reason": "tool_tcp_fk_side_missing",
+                            "point_index": point_index,
+                            "side": side,
+                        }
+                    )
+                requested = self._pose(
+                    observed_raw[side],
+                    name=f"trajectory_tool_tcp_world.{point_index}.{side}",
+                )
+                try:
+                    projected = self._pose(
+                        projector(side, requested),
+                        name=f"projected_tool_tcp_world.{point_index}.{side}",
+                    )
+                except RegisteredTrajectoryTcpEnvelopeError:
+                    raise
+                except Exception as exc:
+                    raise RegisteredTrajectoryTcpEnvelopeError(
+                        details={
+                            "reason": "active_tcp_envelope_projection_failed",
+                            "point_index": point_index,
+                            "side": side,
+                            "exception_type": type(exc).__name__,
+                            "exception": str(exc),
+                        }
+                    ) from exc
+                position_error_m, orientation_error_deg = pose_delta_metrics(
+                    requested,
+                    projected,
+                )
+                if position_error_m > 1e-9 or orientation_error_deg > 1e-7:
+                    raise RegisteredTrajectoryTcpEnvelopeError(
+                        details={
+                            "reason": "active_tcp_envelope_would_modify_path",
+                            "point_index": point_index,
+                            "side": side,
+                            "time_from_start_sec": point.time_from_start_sec,
+                            "projection_position_delta_m": position_error_m,
+                            "projection_orientation_delta_deg": orientation_error_deg,
+                        }
+                    )
 
     @staticmethod
     def _pose(value: object, *, name: str) -> np.ndarray:
@@ -605,5 +701,7 @@ __all__ = [
     "DMTacRM65RegisteredTrajectoryPorts",
     "DMTacShadowReplayPortProfile",
     "RM65ToolTcpWorldFk",
+    "RegisteredTrajectoryTcpEnvelopeError",
+    "RegisteredTrajectoryToolTcpEnvelopeProjector",
     "StartedRM65ShadowPorts",
 ]

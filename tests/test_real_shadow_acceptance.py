@@ -22,7 +22,7 @@ from robot_motion.rm65.grasp_reachability import (
     GraspReachabilityReceipt,
     GraspReachabilityStatus,
 )
-from robot_motion.scene_obstacles import ObstacleSceneSnapshot
+from robot_motion.scene_obstacles import AxisAlignedBoxObstacle, ObstacleSceneSnapshot
 from robot_motion.shadow_execution import (
     AuthoritativeRobotStateSnapshot,
     RegisteredJointTrajectoryPoint,
@@ -62,6 +62,9 @@ from sim.sim_real_tests.mujoco.exact_shadow_trajectory import (
     execute_registered_shadow_trajectory,
 )
 from teleop_runtime.skill_deploy.control_runtime import RealSkillMotionHoldReceipt
+from teleop_runtime.skill_deploy.dmtac_shadow_ports import (
+    RegisteredTrajectoryTcpEnvelopeError,
+)
 from teleop_runtime.skill_deploy.registered_trajectory import (
     RegisteredTrajectoryAuthorityConsumptionReceipt,
     RegisteredTrajectoryAuthorityConsumptionStatus,
@@ -886,6 +889,40 @@ def test_real_executor_exception_returns_unknown_motion_outcome():
     assert ports.hold_reasons == ["real shadow acceptance replay executor error"]
 
 
+def test_registered_tcp_envelope_rejection_is_explicitly_zero_motion():
+    snapshot = _snapshot()
+    trajectory = _trajectory(snapshot)
+    simulation = _simulation(trajectory)
+    authority = RegisteredTrajectoryExecutionAuthority(
+        authority_id="authority:test",
+        operator_confirmation_ref="operator:test",
+        trajectory_hash=trajectory.semantic_content_hash,
+        simulation_receipt_hash=simulation.semantic_content_hash,
+        run_id="run:test",
+        owner_epoch=1,
+        issued_at=10.0,
+        expires_at=10.1,
+    )
+
+    receipt, _ = _run(
+        snapshot=snapshot,
+        simulation_executor=lambda **_kwargs: simulation,
+        real_replay_enabled=True,
+        real_ports_factory=lambda _trajectory: (_ for _ in ()).throw(
+            RegisteredTrajectoryTcpEnvelopeError(
+                details={"reason": "active_tcp_envelope_would_modify_path"}
+            )
+        ),
+        authority=authority,
+        consume_execution_authority=_consumption,
+    )
+
+    assert receipt.status is RealShadowAcceptanceStatus.REAL_REPLAY_REJECTED
+    assert receipt.real_motion_disposition is RealMotionDisposition.NONE
+    assert receipt.terminal_hold_confirmed is True
+    assert receipt.reason_codes == ("registered_trajectory_tcp_envelope_blocked",)
+
+
 def test_completed_real_receipt_with_wrong_point_count_is_not_accepted():
     observed_receipt: dict[str, RegisteredTrajectoryRealReplayReceipt] = {}
 
@@ -1124,6 +1161,98 @@ def test_real_tcp_builder_registers_direct_or_birrt_path_without_motion(
         trajectory.points[-1].qpos_by_side["right"], np.zeros(6)
     )
     assert control.closed is True
+
+
+@pytest.mark.parametrize(
+    ("direct_path", "accepted"),
+    ((True, False), (False, True)),
+)
+def test_real_tcp_builder_can_require_a_genuine_obstacle_detour(
+    monkeypatch,
+    direct_path: bool,
+    accepted: bool,
+) -> None:
+    snapshot = _snapshot()
+    base = _obstacle_request()
+    scene = ObstacleSceneSnapshot(
+        reference_frame_id=OBSTACLE_SCENE_FRAME_ID,
+        reference_frame_spec_hash=OBSTACLE_SCENE_FRAME_SPEC_HASH,
+        revision=4,
+        obstacles=(
+            AxisAlignedBoxObstacle(
+                obstacle_id="cube-test",
+                center_xyz_m=(0.0, 0.0, 0.4),
+                size_xyz_m=(0.1, 0.1, 0.1),
+            ),
+        ),
+    )
+    request = replace(base, obstacle_scene=scene, require_obstacle_detour=True)
+    control = _PlanningControl(scene.semantic_content_hash)
+    target_qpos = np.full(6, 0.2)
+    middle_qpos = np.full(6, 0.1)
+    active = (
+        (np.zeros(6), target_qpos)
+        if direct_path
+        else (np.zeros(6), middle_qpos, target_qpos)
+    )
+    waypoints = tuple({"left": value, "right": np.zeros(6)} for value in active)
+    path = JointPathPlanResult(
+        status=JointPathStatus.PATH_FOUND,
+        start_qpos_by_component=waypoints[0],
+        target_qpos_by_component=waypoints[-1],
+        movable_components=("left",),
+        waypoints=waypoints,
+        scene_hash=scene.semantic_content_hash,
+        reason="direct_path_clear" if direct_path else "bounded_search_found_path",
+        metadata={"direct_path": direct_path},
+    )
+    monkeypatch.setattr(
+        grasp_motion, "_MujocoFclObstacleOracle", lambda _c, oracle: oracle
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "evaluate_motion_target_endpoint",
+        lambda *_args, **_kwargs: (
+            _reachable_endpoint(target_qpos),
+            SimpleNamespace(),
+            SimpleNamespace(q_min=-np.ones(6), q_max=np.ones(6)),
+        ),
+    )
+    monkeypatch.setattr(
+        grasp_motion, "plan_obstacle_aware_joint_path", lambda *_args, **_kwargs: path
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "revalidate_obstacle_path",
+        lambda *_args, **_kwargs: {"safe": True},
+    )
+    monkeypatch.setattr(
+        grasp_motion,
+        "build_collision_checked_multiwaypoint_joint_fk_reference_plan",
+        lambda *_args, **_kwargs: JointFkReferencePlan(
+            status="safe",
+            pose_desk=tuple(np.eye(4) for _ in active),
+            qpos_rad=active,
+            metadata={"planner": "test"},
+        ),
+    )
+
+    if accepted:
+        trajectory = build_registered_tcp_obstacle_trajectory(
+            snapshot,
+            request,
+            control_factory=lambda *_args: control,
+            wall_clock=lambda: 10.0,
+        )
+        assert len(trajectory.points) == 3
+    else:
+        with pytest.raises(MujocoShadowTrajectoryPreparationError) as raised:
+            build_registered_tcp_obstacle_trajectory(
+                snapshot,
+                request,
+                control_factory=lambda *_args: control,
+            )
+        assert raised.value.reason_code == "obstacle_detour_not_exercised"
 
 
 @pytest.mark.parametrize(
