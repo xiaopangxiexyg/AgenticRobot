@@ -625,27 +625,52 @@ def main(argv: list[str] | None = None) -> int:
             session_contract = factory_kwargs["deploy_session_contract"]
             runtime_args = factory_kwargs["args"]
             artifact = factory_kwargs.get("policy_artifact")
-            frame_contract = getattr(session_contract, "runtime_pose_frame_contract", None)
-            frame_hash = (
-                explicit_frame_hash
-                or getattr(frame_contract, "contract_hash", None)
-                or (
-                    None
-                    if artifact is None or not artifact.pose_frame_contract_hashes
-                    else artifact.pose_frame_contract_hashes[0]
-                )
-            )
-            if frame_hash is None:
-                raise ValueError(
-                    "OpenPI raw-RTC could not resolve a frame identity; pass "
-                    "--rtc-frame-contract-hash for an explicitly bound identity artifact."
-                )
             creator_name = (
                 "create_model_rtc_adapter"
                 if args.rtc_profile
                 == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
                 else "create_raw_rtc_adapter"
             )
+            frame_contract = getattr(session_contract, "runtime_pose_frame_contract", None)
+            if creator_name == "create_model_rtc_adapter":
+                # The model-RTC wire contract is bound to the model-facing
+                # continuation frame recorded in the policy artifact.  The
+                # runtime pose-frame contract can legitimately be a different
+                # raw-device representation used by run_policy for conversion
+                # and safety; it must not override the model continuation
+                # identity here.
+                if artifact is None or artifact.model_continuation is None:
+                    raise ValueError(
+                        "OpenPI model-RTC requires an artifact-bound continuation "
+                        "frame identity."
+                    )
+                continuation_frame_hash = normalize_model_continuation_contract(
+                    artifact.model_continuation
+                ).runtime.frame_contract_hash
+                if (
+                    explicit_frame_hash is not None
+                    and explicit_frame_hash != continuation_frame_hash
+                ):
+                    raise ValueError(
+                        "--rtc-frame-contract-hash disagrees with the model-RTC "
+                        "artifact continuation contract."
+                    )
+                frame_hash = continuation_frame_hash
+            else:
+                frame_hash = (
+                    explicit_frame_hash
+                    or getattr(frame_contract, "contract_hash", None)
+                    or (
+                        None
+                        if artifact is None or not artifact.pose_frame_contract_hashes
+                        else artifact.pose_frame_contract_hashes[0]
+                    )
+                )
+            if frame_hash is None:
+                raise ValueError(
+                    "OpenPI raw-RTC could not resolve a frame identity; pass "
+                    "--rtc-frame-contract-hash for an explicitly bound identity artifact."
+                )
             creator = getattr(policy, creator_name, None)
             if not callable(creator):
                 raise TypeError(

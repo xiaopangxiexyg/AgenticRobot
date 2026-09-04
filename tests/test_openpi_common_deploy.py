@@ -952,7 +952,7 @@ class OpenPICommonDeployTest(unittest.TestCase):
         self.assertEqual(creator.call_count, 1)
         self.assertEqual(
             creator.call_args.kwargs["frame_contract_hash"],
-            "frame:runtime-model-rtc-unit",
+            "frame:model-rtc-unit",
         )
         self.assertEqual(
             creator.call_args.kwargs["normalization_hash"],
