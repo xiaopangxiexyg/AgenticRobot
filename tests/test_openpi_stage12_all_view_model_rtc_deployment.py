@@ -102,6 +102,9 @@ def test_stage12_real_recipe_separates_no_action_and_bounded_active() -> None:
     assert "--policy-qpos-init-frame" in no_action
     assert "--policy-qpos-init-source" in no_action
     assert "--policy-qpos-init-collision-check" in no_action
+    assert "plan-only" in no_action
+    assert "不会声称机械臂已经到达数据集起点" in no_action
+    assert "--no-init-qpos" not in "\n".join(_bash_blocks(no_action))
 
     active = _subsection(
         section,

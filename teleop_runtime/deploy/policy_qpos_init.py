@@ -102,6 +102,13 @@ class DeployPolicyQposInitSettings:
     hand_progress_timeout_sec: float = 2.0
     hand_progress_epsilon: float = 0.02
     hand_reconnect_attempts: int = 1
+    # Observation-only RTC still validates the selected dataset frame, current
+    # qpos, branch search, interpolation and collision checks.  It must not
+    # pretend that the resulting trajectory was executed, however, because
+    # ``send_actions`` is false.  This explicit mode releases policy inference
+    # from a fresh live-observation cut after planning instead of waiting for a
+    # target pose that a no-action run is intentionally unable to reach.
+    validate_plan_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,7 @@ class PolicyQposInitStepResult:
     last_action: np.ndarray | None = None
     completed: bool = False
     requires_fresh_observation: bool = False
+    plan_only: bool = False
     message: str = ""
 
 
@@ -304,6 +312,7 @@ class DeployPolicyQposInitController:
     def running(self) -> bool:
         return self.state in {
             "planning",
+            "plan_validated",
             "moving",
             "final_hold",
             "hand_final_hold",
@@ -323,6 +332,8 @@ class DeployPolicyQposInitController:
         if self.state == "hand_final_hold":
             suffix = "" if not self._last_hand_error_text else f",err={self._last_hand_error_text}"
             return f"policy_qpos_init=hands{suffix}"
+        if self.state == "plan_validated":
+            return "policy_qpos_init=plan_validated"
         if self.state == "failed":
             return "policy_qpos_init=failed:g"
         if self.state == "timeout":
@@ -361,7 +372,10 @@ class DeployPolicyQposInitController:
             self._last_message = message
             return message
         self._next_send_at = float(now)
-        self.state = "moving" if self._step_count > 0 else "final_hold"
+        if bool(self.settings.validate_plan_only):
+            self.state = "plan_validated"
+        else:
+            self.state = "moving" if self._step_count > 0 else "final_hold"
         sources = ", ".join(
             f"{side}={self.plan.target_sources_by_side.get(side, '')}"
             for side in self.active_sides
@@ -383,6 +397,27 @@ class DeployPolicyQposInitController:
     ) -> PolicyQposInitStepResult:
         if self.state in {"idle", "planning", "failed", "timeout", "released"}:
             return PolicyQposInitStepResult()
+        if self.state == "plan_validated":
+            if send_actions:
+                raise RuntimeError(
+                    "qpos-init plan-only validation cannot be combined with "
+                    "send_actions=true"
+                )
+            self.state = "released"
+            self._started_monotonic = None
+            self._next_send_at = 0.0
+            message = (
+                "[PolicyQposInit] dataset-frame qpos-init plan and collision "
+                "checks validated for observation-only RTC; no arm or "
+                "end-effector command was sent."
+            )
+            self._last_message = message
+            return PolicyQposInitStepResult(
+                completed=True,
+                requires_fresh_observation=True,
+                plan_only=True,
+                message=message,
+            )
         hand_backend_map = {} if hand_backends is None else hand_backends
         timeout_message = self._timeout_message(
             arm_backends,

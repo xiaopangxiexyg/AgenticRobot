@@ -287,11 +287,16 @@ python -m deployments.openpi.client.real \
 
 This consumes live arm/hand/camera observations and the existing OpenPI
 transport. Without `--send-actions` it never sends actuator commands, while
-retaining and validating the lab profile's qpos-init plan. With an explicit
-`--send-actions`, the same live RTC path retains dataset-frame qpos-init and
-the existing collision, observation and safety gates; that Active mode needs
-separate hardware authorization. The explicit shadow profile is headless: it
-auto-starts policy observation and defaults to no manual ready confirmation.
+retaining and validating the lab profile's qpos-init source, target, branch
+search, interpolation and collision checks. After planning, no-action uses an
+explicit plan-only reference cut and starts inference from the next fresh live
+observation; it neither waits through a virtual qpos trajectory nor claims the
+hardware reached the dataset start state. With an explicit `--send-actions`,
+the same live RTC path retains and actually executes dataset-frame qpos-init
+under the existing collision, observation and safety gates; that Active mode
+needs separate hardware authorization and cannot inherit plan-only completion.
+The explicit shadow profile is headless: it auto-starts policy observation and
+defaults to no manual ready confirmation.
 For Active use, append `--wait-for-ready-confirm` after the profile arguments
 so the final CLI override restores the operator gate. The profile keeps
 DMTAC tactile disabled unless a separate gate changes that scope. For every

@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 import numpy as np
 
-from robot_motion.deploy.schema import ACTION_DIM
 from robot_motion.deploy.async_producer import RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
-from teleop_runtime.deploy import run_policy
+from robot_motion.deploy.schema import ACTION_DIM
+from teleop_runtime.deploy import run_policy, status_view
 from teleop_runtime.deploy.openpi_application import _rm65_bimanual_dmtac_args
 from teleop_runtime.deploy.policy_qpos_init import (
     DeployPolicyQposInitController,
@@ -121,7 +121,7 @@ def test_active_model_rtc_qpos_init_sends_bounded_smooth_steps_then_releases() -
     assert all(command.metadata["source"] == "replay_qpos_init" for command in backend.commands)
 
 
-def test_passive_model_rtc_shadow_runs_the_same_qpos_plan_without_commands() -> None:
+def test_passive_model_rtc_shadow_validates_qpos_plan_then_releases_without_commands() -> None:
     target = np.full(6, 0.30, dtype=float)
     plan = DeployPolicyQposInitPlan(
         source_path="dataset/frame.parquet",
@@ -151,22 +151,78 @@ def test_passive_model_rtc_shadow_runs_the_same_qpos_plan_without_commands() -> 
                 qpos_init_dt_sec=0.01,
                 qpos_init_collision_check=False,
                 initialize_hands=False,
+                validate_plan_only=True,
             ),
         )
-        controller.begin(arm_backends={"right": backend}, now=1.0)
-        controller.step(
+        message = controller.begin(arm_backends={"right": backend}, now=1.0)
+        result = controller.step(
             now=1.0,
             send_actions=False,
             arm_backends={"right": backend},
         )
-        result = controller.step(
-            now=1.02,
-            send_actions=False,
-            arm_backends={"right": backend},
-        )
 
+    assert "steps=2" in message
     assert result.completed is True
     assert result.requires_fresh_observation is True
+    assert result.plan_only is True
+    assert "no arm or end-effector command was sent" in result.message
     assert controller.state == "released"
     assert backend.commands == []
     np.testing.assert_allclose(backend.qpos, np.zeros(6))
+
+
+def test_qpos_plan_only_mode_rejects_active_dispatch() -> None:
+    plan = DeployPolicyQposInitPlan(
+        source_path="dataset/frame.parquet",
+        source_episode_index=0,
+        frame_index=3,
+        action=np.zeros(ACTION_DIM, dtype=np.float32),
+        target_qpos_by_side={"right": np.full(6, 0.30, dtype=float)},
+        target_sources_by_side={"right": "replay_qpos"},
+    )
+    backend = _FakeArmBackend(np.zeros(6, dtype=float))
+    fake_motion_plan = SimpleNamespace(
+        completed=True,
+        steps=(SimpleNamespace(qpos_by_side={"right": np.full(6, 0.15)}),),
+    )
+
+    with patch(
+        "teleop_runtime.deploy.policy_qpos_init.build_rm65_qpos_init_plan",
+        return_value=fake_motion_plan,
+    ):
+        controller = DeployPolicyQposInitController(
+            plan,
+            active_sides=("right",),
+            settings=DeployPolicyQposInitSettings(
+                qpos_init_collision_check=False,
+                initialize_hands=False,
+                validate_plan_only=True,
+            ),
+        )
+        controller.begin(arm_backends={"right": backend}, now=1.0)
+        with np.testing.assert_raises_regex(
+            RuntimeError,
+            "cannot be combined with send_actions=true",
+        ):
+            controller.step(
+                now=1.0,
+                send_actions=True,
+                arm_backends={"right": backend},
+            )
+
+    assert backend.commands == []
+
+
+def test_qpos_plan_only_controls_do_not_claim_initialization_motion(capsys) -> None:
+    status_view.print_controls(
+        send_actions=False,
+        auto_start=True,
+        wait_for_ready_confirm=False,
+        policy_qpos_init_enabled=True,
+        policy_qpos_init_plan_only=True,
+    )
+
+    output = capsys.readouterr().out
+    assert "paused(auto-start after qpos plan validation)" in output
+    assert "plan-only(validate dataset-frame plan; send no commands)" in output
+    assert "moves to dataset frame qpos" not in output

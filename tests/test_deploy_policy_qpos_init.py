@@ -49,12 +49,31 @@ def test_policy_qpos_init_completion_announcement_is_explicit() -> None:
     ) as log_event:
         _announce_policy_qpos_init_complete(
             wait_for_ready_confirm=True,
+            plan_only=False,
             now=123.0,
         )
 
     assert log_event.call_count == 2
     assert "G INITIALIZATION COMPLETE" in log_event.call_args_list[0].args[1]
     assert "PRESS A" in log_event.call_args_list[1].args[1]
+
+
+def test_policy_qpos_init_plan_only_announcement_does_not_claim_motion() -> None:
+    with patch(
+        "teleop_runtime.deploy.run_policy.console_log_event"
+    ) as log_event:
+        _announce_policy_qpos_init_complete(
+            wait_for_ready_confirm=False,
+            plan_only=True,
+            now=123.0,
+        )
+
+    assert log_event.call_count == 2
+    init_message = log_event.call_args_list[0].args[1]
+    assert "PLAN-ONLY VALIDATION COMPLETE" in init_message
+    assert "no arm or end-effector command was sent" in init_message
+    assert "arms and end effectors reached" not in init_message
+    assert "released automatically" in log_event.call_args_list[1].args[1]
 
 
 class _FakeArmBackend:

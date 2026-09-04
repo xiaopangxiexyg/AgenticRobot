@@ -1323,16 +1323,26 @@ def _validate_debug_replay_arm_control_mode(
 def _announce_policy_qpos_init_complete(
     *,
     wait_for_ready_confirm: bool,
+    plan_only: bool,
     now: float,
 ) -> None:
-    """Print a high-salience boundary between initialization and policy motion."""
+    """Print the audited qpos boundary before policy inference or execution."""
 
-    console_log_event(
-        "Init",
-        "READY: G INITIALIZATION COMPLETE - arms and end effectors reached "
-        "the dataset start state.",
-        now=now,
-    )
+    if plan_only:
+        console_log_event(
+            "Init",
+            "READY: G PLAN-ONLY VALIDATION COMPLETE - dataset-frame qpos-init "
+            "planning and collision checks passed; no arm or end-effector "
+            "command was sent.",
+            now=now,
+        )
+    else:
+        console_log_event(
+            "Init",
+            "READY: G INITIALIZATION COMPLETE - arms and end effectors reached "
+            "the dataset start state.",
+            now=now,
+        )
     if wait_for_ready_confirm:
         console_log_event(
             "Policy",
@@ -2218,6 +2228,10 @@ def main(
                 ),
                 hand_reconnect_attempts=int(
                     args.policy_qpos_init_hand_reconnect_attempts
+                ),
+                validate_plan_only=bool(
+                    getattr(args, "rtc_real_shadow", False)
+                    and not bool(args.send_actions)
                 ),
             ),
         )
@@ -3176,6 +3190,10 @@ def main(
             wait_for_ready_confirm=wait_for_ready_confirm,
             fixed_init_enabled=fixed_init_controller is not None,
             policy_qpos_init_enabled=policy_qpos_init_controller is not None,
+            policy_qpos_init_plan_only=bool(
+                policy_qpos_init_controller is not None
+                and policy_qpos_init_controller.settings.validate_plan_only
+            ),
         )
         submit_legacy_owner_state(
             lifecycle_state="shadow_ready",
@@ -3934,6 +3952,7 @@ def main(
                         policy_qpos_completed_this_step = True
                         _announce_policy_qpos_init_complete(
                             wait_for_ready_confirm=wait_for_ready_confirm,
+                            plan_only=bool(policy_qpos_result.plan_only),
                             now=loop_started_at,
                         )
                         last_status_at = loop_started_at

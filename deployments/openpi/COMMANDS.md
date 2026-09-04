@@ -363,7 +363,10 @@ cd "$DEXTELEOP_ROOT"
 
 这条命令可能打开 RealSense、DMTAC 和真实 observation/backend。它只验证没有 policy
 action dispatch，不是“无硬件检查”。prepared/profile 参数必须与 server 相同；RTC
-real shadow 还需要对应 artifact-bound RTC 参数，详见 `cmd_list.md` 第 11 节。
+real shadow 还需要对应 artifact-bound RTC 参数。若 profile 带 dataset-frame qpos-init，
+no-action 会完整验证目标、branch search、插值和碰撞检查，然后以明确的 `plan-only`
+reference cut 从当前新鲜观测开始推理；它不会发送初始化轨迹，也不会声称已经到达数据集
+起点。详见 `cmd_list.md` 第 11、23 节。
 
 ### 7.6 真实动作入口
 
@@ -393,8 +396,9 @@ model history 或 chunk，也不跳过 ready、碰撞、力限和观测新鲜度
 - model-RTC 必须先做 conditioned no-action shadow；deployment profile 不会自动加入
   `--send-actions`。完成现场安全门后，操作者可在受限 Active 命令中显式加入该参数。
 - `--rtc-real-shadow` 只打开实时 observation/transport；缺少 `--send-actions` 时为 no-action，
-  显式加入后才请求动作 authority。两种模式都保留并验证 qpos-init 配置，只有 Active 才发送
-  初始化轨迹和后续 policy action。
+  显式加入后才请求动作 authority。两种模式都保留并验证 qpos-init 配置；no-action 在计划和
+  碰撞检查通过后使用明确的 plan-only reference cut，只有 Active 才发送初始化轨迹和后续
+  policy action。plan-only 结果不能被 Active 继承为“已初始化”。
 - client 与 server 可以选择不同的完整 checkpoint/step；每端分别验证自己的 prepared 与
   model-RTC profile，连接时再验证 layout、相机、动作、normalization、prompt 和 RTC
   capability。不要把 model/step identity 当默认强绑定，也不要降低这些真实兼容性检查。

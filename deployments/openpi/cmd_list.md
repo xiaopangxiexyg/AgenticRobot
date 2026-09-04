@@ -2154,7 +2154,10 @@ RTC continuation capability。model id/step 可以与 client artifact 不同，�
 ### 23.4 终端 B：100-step 真机 observation no-action shadow
 
 该命令会打开真实 observation 资源，因此运行前仍需现场确认两台 RM65 处于安全静止状态、
-急停可用、三路 RealSense 与 DMTAC 端口归属正确。它没有动作下发权限：
+急停可用、三路 RealSense 与 DMTAC 端口归属正确。它没有动作下发权限。启动时仍会完整读取
+Episode 0/frame 0、根据当前关节状态完成 branch search、插值与碰撞检查，但随后明确走
+`plan-only` reference cut：不会虚拟等待整条 qpos 轨迹，也不会声称机械臂已经到达数据集起点，
+而是从下一份新鲜的当前观测开始 conditioned RTC 推理：
 
 ```bash
 cd "$DEPLOY_ROOT"
@@ -2189,8 +2192,10 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage${STAGE}_shadow_$
 Stage1 与 Stage2 分别启动新 client；切换前先 `Ctrl+C` 正常停止 client/server，确认资源和
 `8078` 已释放，再设置 `STAGE=2` 重跑 23.1～23.4。不要复用前一进程的 queue、RTC history
 或 camera backend。本节的验收边界止于真实 observation + conditioned inference + no-action
-drain；qpos-init 只被保留并校验，不会发送轨迹，也不授权 RTC Active、伺服或任何机械臂/
-夹爪运动。
+drain；qpos-init 的来源、目标、branch search、插值和碰撞门均被保留并校验，但计划只在
+observation-only 模式标记为 `plan-only`，不会发送轨迹或伪造“已到达”收据，也不授权 RTC
+Active、伺服或任何机械臂/夹爪运动。Active 会重新生成并真实执行同一类 qpos-init 计划，
+不能继承这次 plan-only reference cut。
 
 ### 23.5 终端 B：Stage1 小步数 Active（必须另行获得现场运动授权）
 

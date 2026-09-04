@@ -85,11 +85,14 @@ def print_controls(
     wait_for_ready_confirm: bool,
     fixed_init_enabled: bool = False,
     policy_qpos_init_enabled: bool = False,
+    policy_qpos_init_plan_only: bool = False,
 ) -> None:
     print("\n" + "=" * 60)
     print("teleop_runtime policy deployment loop started")
     print(f"  send_actions={'on' if send_actions else 'off(dry-run)'}")
-    if (fixed_init_enabled or policy_qpos_init_enabled) and auto_start:
+    if policy_qpos_init_plan_only and auto_start:
+        initial_policy_state = "paused(auto-start after qpos plan validation)"
+    elif (fixed_init_enabled or policy_qpos_init_enabled) and auto_start:
         initial_policy_state = "paused(auto-start after init)"
     else:
         initial_policy_state = "active" if auto_start else "paused"
@@ -103,11 +106,25 @@ def print_controls(
             "fixed-init, r=manual safety re-arm, A=confirm, q=quit"
         )
     elif policy_qpos_init_enabled:
-        print("  policy_qpos_init=on(g moves to dataset frame qpos, then startup init)")
-        print(
-            "Controls: g=start qpos init / resume, r=manual safety re-arm, "
-            "A=confirm ready, h=pause+clear queue, q=quit"
-        )
+        if policy_qpos_init_plan_only:
+            print(
+                "  policy_qpos_init=plan-only(validate dataset-frame plan; "
+                "send no commands)"
+            )
+        else:
+            print(
+                "  policy_qpos_init=on(g moves to dataset frame qpos, then startup init)"
+            )
+        if policy_qpos_init_plan_only:
+            print(
+                "Controls: g=revalidate qpos plan / resume, r=manual safety "
+                "re-arm, A=confirm ready, h=pause+clear queue, q=quit"
+            )
+        else:
+            print(
+                "Controls: g=start qpos init / resume, r=manual safety re-arm, "
+                "A=confirm ready, h=pause+clear queue, q=quit"
+            )
     else:
         print(
             "Controls: g=start/resume, r=manual safety re-arm, A=confirm "
