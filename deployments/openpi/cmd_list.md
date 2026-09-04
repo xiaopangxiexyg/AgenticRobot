@@ -23,12 +23,13 @@
 | prepared writing stage1 | 旧模型第 9 节；新 scenario 模型第 19 节 | checkpoint 与对应的 stage1 training profile 必须同时绑定 |
 | prepared writing stage2 | 第 10 节 | checkpoint 与 stage2 training profile 必须同时绑定；连续任务使用 `--no-init-qpos` |
 | prepared writing 当前 Stage1–4 组合 | 第 20 节 | 四个独立 checkpoint/profile；Stage1 qpos-init，Stage2–4 当前姿态接管 |
-| trained model-RTC | 第 11 节 | 仅 conditioned no-action shadow；当前没有动作部署入口 |
+| trained model-RTC | 第 11、23 节 | 先做 conditioned no-action；只有显式加入 `--send-actions` 并重新通过 qpos-init、ready 与现场安全门才进入 Active |
 | 老 v1 registry policy | 第 12 节 | legacy registry；不属于 v2 artifact contract |
 | 原生/prepared/prompt-family 训练与恢复 | 第 13～18 节 | 只在明确要训练时使用，不是部署前置步骤；先按 `COMMANDS.md` 第 4～5 节选路线 |
 
 不要把不同路线的 server/client 参数混合。例如 prepared policy 不能改用通用
-`--config`，RTC shadow 不能复制 `--send-actions`。
+`--config`。`--rtc-real-shadow` 只选择实时 observation/transport 路径；是否拥有动作下发权限
+仍由独立的 `--send-actions` 决定。
 
 ### 1.2 通用规则
 
@@ -647,17 +648,20 @@ acquisition 和 plan-cut splice governor 会对首个 absolute Pose 接近段施
 source interval 上限，但这不证明当前状态属于 stage2 训练分布。操作者必须另外确认 stage1 结束
 状态、stage2 首个 chunk、夹爪和笔帽状态均匹配后，才能按 `A`。
 
-## 11. Trained model-RTC：conditioned no-action shadow
+## 11. Trained model-RTC：conditioned no-action 与显式 Active
 
-本节只用于 trained model-RTC 的 conditioned no-action shadow，不是正式动作部署命令。
+本节默认先用于 trained model-RTC 的 conditioned no-action shadow；通过该阶段并不自动授权动作。
+显式 Active 使用同一个 RTC observation/transport 路径，但必须另外加入 `--send-actions`，并保留
+dataset-frame qpos-init、碰撞检查、人工 ready 和其它既有安全门。
 当前训练进程没有完成 150000 step；可验证的最新完整 checkpoint 是 30000。因此下面的
 checkpoint 只能用于实现、时序和协议检查，不能当作最终训练结果。
 
-trained model-RTC 必须同时绑定 prepared training profile、model-RTC training profile、
-checkpoint artifact、training-run manifest、checkpoint receipt、immutable prepared dataset
-binding 和 continuation contract。server 还必须显式传入 `--enable-rtc-continuation`；省略该
-开关时仍保持普通 OpenPI 推理语义。client 侧 RTC profile 强制 `send_actions=false`，不得加入
-`--send-actions`。
+trained model-RTC 的每个端点必须分别验证自身的 prepared training profile、model-RTC
+training profile、checkpoint artifact、training-run manifest、checkpoint receipt、immutable
+prepared dataset binding 和 continuation semantics；这不要求 client/server 的 model id 或
+checkpoint step 相同。server 还必须显式传入 `--enable-rtc-continuation`；省略该开关时仍保持
+普通 OpenPI 推理语义。deployment/RTC profile 永远不会替操作者自动加入 `--send-actions`；
+无该参数时为 no-action，有该参数时才请求 Active authority。
 
 该模型和第 9 节的非 RTC prepared server 都需要大显存，不能在当前单卡上并行加载。启动本节
 server 前，先由现有 server 的 owner 正常停止旧进程，并确认 `8078` 未监听且 GPU 显存已经
@@ -698,13 +702,16 @@ curl --fail --silent http://127.0.0.1:8078/metadata | python -m json.tool
 替换三项 checkpoint/profile binding，并增加 `--rtc-profile
 model_rtc_flow_inpaint_shadow_15_30_60_120_v1`、`--rtc-real-shadow`、
 `--rtc-debug-level summary` 和 `--debug-dir
-/home/user/zc/DexTeleop/logs/openpi_model_rtc_shadow`；删除普通样例中的 qpos-init 参数。
+/home/user/zc/DexTeleop/logs/openpi_model_rtc_shadow`；保留普通样例中的 qpos-init 参数。
 该流程会读取真实双臂、手和 front 相机 observation，并向 server 发 conditioned inference
-请求，但不创建动作下发 authority。需要逐 tick 排查时才把 `summary` 改为 `trace`。
+请求，但因为没有 `--send-actions` 而不创建动作下发 authority。qpos-init 计划仍被解析和校验，
+但 no-action 不会发送该轨迹。需要逐 tick 排查时才把 `summary` 改为 `trace`。
 
-`--rtc-real-shadow` 是进入真实 observation 边界的显式开关：它移除 qpos-init authority，
-禁止 `--send-actions`，并保持 position lookahead disabled。当前没有 trained model-RTC 的动作
-部署入口；不得把第 9 节的 `--send-actions` 参数复制到本节。
+`--rtc-real-shadow` 是进入真实 observation 边界的显式开关：它不移除 qpos-init，也不禁止
+`--send-actions`。首次 Active 必须使用当前 profile 的 dataset-frame qpos-init、显式
+`--wait-for-ready-confirm` 和小的 `--max-steps`，并在新的现场授权后运行；不要用
+`--no-init-qpos` 或 `--no-wait-for-ready-confirm` 绕过启动门。第 23.5 节给出当前 Stage1 的
+受限 Active 命令。
 
 ## 12. Legacy v1：`dual_rm65_dmgripper`
 
@@ -2012,10 +2019,10 @@ python -u -m deployments.openpi.client.real \
 ## 23. 当前 Stage1/Stage2 all-view h32 trained model-RTC 部署测试
 
 本节对应 `front + left_wrist + right_wrist`、h32、absolute 的两个独立 trained model-RTC。
-它只开放真实 observation/transport 的 conditioned no-action shadow：会连接三路 RealSense、
-双臂状态和 DMTAC 状态，也会请求 GPU server 推理，但不会创建 policy action dispatch
-authority。`--rtc-real-shadow` 明确禁止 `--send-actions`；当前没有经过 Active RTC 安全验收的
-动作入口，不能从普通 OpenPI 部署命令复制该参数。
+必须先完成真实 observation/transport 的 conditioned no-action shadow：它会连接三路
+RealSense、双臂状态和 DMTAC 状态，也会请求 GPU server 推理，但因为没有
+`--send-actions` 而不会派发 policy action。`--rtc-real-shadow` 本身只选择实时 RTC 路径；
+在完成全部安全门后显式加入 `--send-actions` 才进入 Active，且不会移除 qpos-init。
 
 2026-09-04 的远端只读复核结果是：Stage1 `100000` checkpoint 已完整提交；Stage2 正式
 `100000` 训练尚未完成。下面 Stage2 默认仍选择最终目标 `100000`，因此在该目录完整出现前会
@@ -2041,6 +2048,9 @@ export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
 export POLICY_SERVER_HOST=127.0.0.1
 export OPENPI_PORT=8078
 export STAGE="${STAGE:-1}"
+export QPOS_INIT_DATASET=/home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success
+export LEFT_GRIPPER_PORT=/dev/ttyUSB1
+export RIGHT_GRIPPER_PORT=/dev/ttyUSB3
 
 case "$STAGE" in
   1)
@@ -2161,6 +2171,15 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage${STAGE}_shadow_$
   --deployment-profile rm65_bimanual_dmtac \
   --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
   --rtc-real-shadow \
+  --policy-action-pose-mode absolute \
+  --policy-qpos-init-dataset "$QPOS_INIT_DATASET" \
+  --policy-qpos-init-episode 0 \
+  --policy-qpos-init-frame 0 \
+  --policy-qpos-init-source auto \
+  --policy-qpos-init-collision-check \
+  --dmtac-no-validate-current-usb \
+  --left-gripper-port "$LEFT_GRIPPER_PORT" \
+  --right-gripper-port "$RIGHT_GRIPPER_PORT" \
   --max-steps 100 \
   --debug \
   --rtc-debug-level summary \
@@ -2170,4 +2189,60 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage${STAGE}_shadow_$
 Stage1 与 Stage2 分别启动新 client；切换前先 `Ctrl+C` 正常停止 client/server，确认资源和
 `8078` 已释放，再设置 `STAGE=2` 重跑 23.1～23.4。不要复用前一进程的 queue、RTC history
 或 camera backend。本节的验收边界止于真实 observation + conditioned inference + no-action
-drain；它不授权 RTC Active、qpos-init、伺服或任何机械臂/夹爪运动。
+drain；qpos-init 只被保留并校验，不会发送轨迹，也不授权 RTC Active、伺服或任何机械臂/
+夹爪运动。
+
+### 23.5 终端 B：Stage1 小步数 Active（必须另行获得现场运动授权）
+
+当前只给出 Stage1 的受限 Active 命令。Stage2 尚未建立经过审查的物理衔接姿态和 qpos-init
+目标，因此本段对 `STAGE=2` fail closed；不得把 Stage1 起点或 `--no-init-qpos` 静默套用到
+Stage2。运行前必须重新确认：两臂和笔/夹爪当前状态允许移动到指定 Episode 0/frame 0，工作区
+无人且无障碍，急停在手，DMTAC/RealSense 归属正确，server metadata 与 23.4 no-action 均通过。
+
+下面命令会真实发动作。它显式保留 dataset-frame qpos-init 和碰撞检查，并把
+`--wait-for-ready-confirm` 放在 profile 参数之后，以覆盖 RTC real-shadow profile 的自动启动
+默认值；初始化轨迹完成并出现 ready 提示后，仍须由现场操作者人工按 `A` 放行 policy。首次只
+运行 10 个 control step，不得自动注入按键：
+
+```bash
+set -euo pipefail
+
+if [ "$STAGE" != 1 ]; then
+  printf 'Stage2 Active is not reviewed; STAGE must be 1, got %s\n' "$STAGE" >&2
+  exit 2
+fi
+
+cd "$DEPLOY_ROOT"
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export DEXTELEOP_PYTHON="$(command -v python)"
+export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage1_active_$(date +%Y%m%dT%H%M%S)"
+
+"$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.real \
+  --host "$POLICY_SERVER_HOST" \
+  --port "$OPENPI_PORT" \
+  --checkpoint-dir "$CLIENT_CHECKPOINT_DIR" \
+  --prepared-training-profile "$PREPARED_PROFILE" \
+  --model-rtc-profile "$MODEL_RTC_PROFILE" \
+  --deployment-profile rm65_bimanual_dmtac \
+  --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
+  --rtc-real-shadow \
+  --policy-action-pose-mode absolute \
+  --policy-qpos-init-dataset "$QPOS_INIT_DATASET" \
+  --policy-qpos-init-episode 0 \
+  --policy-qpos-init-frame 0 \
+  --policy-qpos-init-source auto \
+  --policy-qpos-init-collision-check \
+  --dmtac-no-validate-current-usb \
+  --left-gripper-port "$LEFT_GRIPPER_PORT" \
+  --right-gripper-port "$RIGHT_GRIPPER_PORT" \
+  --send-actions \
+  --wait-for-ready-confirm \
+  --max-steps 10 \
+  --debug \
+  --rtc-debug-level summary \
+  --debug-dir "$RTC_DEBUG_DIR"
+```
+
+此命令只是受限首次 Active 入口，不是运动授权本身。不得追加 `--no-init-qpos`、
+`--no-wait-for-ready-confirm`、`--no-position-collision-check` 或任何自动 ready/按键脚本；若
+qpos-init、观测新鲜度、力/碰撞、RTC drain 或 operator ready 任一门失败，立即停止并保留日志。

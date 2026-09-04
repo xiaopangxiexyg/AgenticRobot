@@ -387,17 +387,20 @@ model history 或 chunk，也不跳过 ready、碰撞、力限和观测新鲜度
 
 - raw-RTC 保持普通 OpenPI `observation -> final action chunk` wire；需要显式
   `raw_rtc_final_chunk_15_30_60_120_v1` 与 normalization/frame identity。
-- trained model-RTC 需要 checkpoint receipt、prepared profile、model-RTC profile 和 server
-  `--enable-rtc-continuation` 四者一致。
-- 当前 model-RTC 部署说明只开放 conditioned no-action shadow；不要从普通 client 命令复制
-  `--send-actions`。
-- `--rtc-real-shadow` 会打开实时 observation/transport，但配置为 no-action；仍然不是无硬件。
+- trained model-RTC 的每个端点都要验证自身 checkpoint receipt、prepared/model-RTC profile
+  和 RTC capability；server 还须显式使用 `--enable-rtc-continuation`。这不是 client/server
+  model id 或 step 的强绑定。
+- model-RTC 必须先做 conditioned no-action shadow；deployment profile 不会自动加入
+  `--send-actions`。完成现场安全门后，操作者可在受限 Active 命令中显式加入该参数。
+- `--rtc-real-shadow` 只打开实时 observation/transport；缺少 `--send-actions` 时为 no-action，
+  显式加入后才请求动作 authority。两种模式都保留并验证 qpos-init 配置，只有 Active 才发送
+  初始化轨迹和后续 policy action。
 - client 与 server 可以选择不同的完整 checkpoint/step；每端分别验证自己的 prepared 与
   model-RTC profile，连接时再验证 layout、相机、动作、normalization、prompt 和 RTC
   capability。不要把 model/step identity 当默认强绑定，也不要降低这些真实兼容性检查。
 
 历史 RTC 详细命令和回滚路径见 `cmd_list.md` 第 11 节；当前 Stage1/Stage2 all-view h32
-model-RTC 的远端命令见第 23 节与
+model-RTC 的 no-action 与 Stage1 小步数 Active 远端命令见第 23 节与
 [`client/README.md`](./client/README.md)。
 
 ## 9. 远端操作规则

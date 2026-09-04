@@ -22,6 +22,15 @@ def _bash_blocks(text: str) -> list[str]:
     return re.findall(r"```bash\n(.*?)\n```", text, flags=re.DOTALL)
 
 
+def _subsection(text: str, heading: str, next_heading: str | None = None) -> str:
+    assert heading in text
+    subsection = text.split(heading, maxsplit=1)[1]
+    if next_heading is not None:
+        assert next_heading in subsection
+        subsection = subsection.split(next_heading, maxsplit=1)[0]
+    return subsection
+
+
 def test_stage12_profiles_keep_the_same_deployable_model_io_contract() -> None:
     training_root = _REPOSITORY / "deployments/openpi/configs/training"
     model_rtc_root = _REPOSITORY / "deployments/openpi/configs/model_rtc"
@@ -67,11 +76,11 @@ def test_stage12_remote_recipe_separates_server_and_client_checkpoint_identity()
     assert "writing-stage2-all-valid-all-view-h32-absolute-model-rtc" in section
 
 
-def test_stage12_real_recipe_is_model_rtc_no_action_only() -> None:
+def test_stage12_real_recipe_separates_no_action_and_bounded_active() -> None:
     section = _section_23()
     blocks = _bash_blocks(section)
 
-    assert len(blocks) >= 5
+    assert len(blocks) >= 6
     combined = "\n".join(blocks)
     assert "--enable-rtc-continuation" in combined
     assert "--model-rtc-profile" in combined
@@ -79,8 +88,38 @@ def test_stage12_real_recipe_is_model_rtc_no_action_only() -> None:
     assert "--contract-check-only" in combined
     assert "--prepared-config-check-only" in combined
     assert "--rtc-real-shadow" in combined
-    assert "--send-actions" not in combined
     assert "--strict-model-identity" not in combined
+
+    no_action = _subsection(
+        section,
+        "### 23.4 终端 B：100-step 真机 observation no-action shadow",
+        "### 23.5 终端 B：Stage1 小步数 Active（必须另行获得现场运动授权）",
+    )
+    assert "--rtc-real-shadow" in no_action
+    assert "--send-actions" not in no_action
+    assert "--policy-qpos-init-dataset" in no_action
+    assert "--policy-qpos-init-episode" in no_action
+    assert "--policy-qpos-init-frame" in no_action
+    assert "--policy-qpos-init-source" in no_action
+    assert "--policy-qpos-init-collision-check" in no_action
+
+    active = _subsection(
+        section,
+        "### 23.5 终端 B：Stage1 小步数 Active（必须另行获得现场运动授权）",
+    )
+    active_blocks = "\n".join(_bash_blocks(active))
+    assert 'if [ "$STAGE" != 1 ]' in active
+    assert "--rtc-real-shadow" in active
+    assert "--send-actions" in active
+    assert "--wait-for-ready-confirm" in active
+    assert "--policy-qpos-init-dataset" in active
+    assert "--policy-qpos-init-episode" in active
+    assert "--policy-qpos-init-frame" in active
+    assert "--policy-qpos-init-source" in active
+    assert "--policy-qpos-init-collision-check" in active
+    assert "--max-steps 10" in active
+    assert "--no-init-qpos" not in active_blocks
+    assert "--no-wait-for-ready-confirm" not in active_blocks
 
 
 def test_stage12_remote_bash_blocks_are_syntactically_valid() -> None:

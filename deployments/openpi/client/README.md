@@ -286,10 +286,14 @@ python -m deployments.openpi.client.real \
 ```
 
 This consumes live arm/hand/camera observations and the existing OpenPI
-transport, but never sends actuator commands. The guard also removes the lab
-profile's qpos-init authority and configures RM65/DMTAC/hand backends for
-observation-only startup. The explicit shadow profile is headless: it
-auto-starts policy observation, disables manual ready confirmation, and keeps
+transport. Without `--send-actions` it never sends actuator commands, while
+retaining and validating the lab profile's qpos-init plan. With an explicit
+`--send-actions`, the same live RTC path retains dataset-frame qpos-init and
+the existing collision, observation and safety gates; that Active mode needs
+separate hardware authorization. The explicit shadow profile is headless: it
+auto-starts policy observation and defaults to no manual ready confirmation.
+For Active use, append `--wait-for-ready-confirm` after the profile arguments
+so the final CLI override restores the operator gate. The profile keeps
 DMTAC tactile disabled unless a separate gate changes that scope. For every
 launch it resets each artifact-selected RealSense by its configured serial,
 waits for that device to reconnect, then starts cameras in camera-config order
