@@ -690,6 +690,9 @@ class _ReplayPorts:
     def dispatch_point(self, *_args):  # pragma: no cover
         raise AssertionError
 
+    def dispatch_point_realtime(self, *_args):  # pragma: no cover
+        raise AssertionError
+
     def hold(self, reason):
         self.hold_reasons.append(reason)
         return RealSkillMotionHoldReceipt(
@@ -842,6 +845,8 @@ def test_exact_authority_delegates_to_existing_real_executor_and_reports_complet
     assert receipt.terminal_hold_domain == "real"
     assert observed["execution_enabled"] is True
     assert observed["current_snapshot_provider"] == ports.current_snapshot
+    assert observed["point_dispatcher"] == ports.dispatch_point_realtime
+    assert observed["synchronous_per_point_snapshot_checks"] is False
     assert observed["terminal_tool_tcp_verifier"] == ports.verify_terminal_tool_tcp
     assert observed["terminal_tool_tcp_verification_required"] is True
 

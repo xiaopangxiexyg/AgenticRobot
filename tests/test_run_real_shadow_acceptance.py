@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,46 @@ from teleop_runtime.skill_deploy.rm65_profile import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 pytestmark = [pytest.mark.unit, pytest.mark.contract]
+
+
+def test_acceptance_dmtac_backends_disable_all_tactile_paths(monkeypatch) -> None:
+    @dataclass(frozen=True)
+    class FakeConfig:
+        observation_only: bool = False
+        send_commands: bool = True
+        clear_fault_on_start: bool = True
+        open_on_start: bool = True
+        connect_tactile: bool = True
+        enable_telemetry: bool = True
+        tactile_reset_on_start: bool = True
+
+    captured = []
+    monkeypatch.setattr(
+        "teleop_runtime.configs.dmtac_hardware.dmtac_backend_configs_from_assignment",
+        lambda *_args, **_kwargs: {
+            "left": FakeConfig(),
+            "right": FakeConfig(),
+        },
+    )
+
+    class FakeBackend:
+        def __init__(self, config):
+            captured.append(config)
+
+    monkeypatch.setattr(
+        "teleop_runtime.backends.grippers.DMTacGripperBackend",
+        FakeBackend,
+    )
+
+    backends = acceptance._passive_dmtac_backends({"schema": "test"})
+
+    assert set(backends) == {"left", "right"}
+    assert len(captured) == 2
+    assert all(config.observation_only is True for config in captured)
+    assert all(config.send_commands is False for config in captured)
+    assert all(config.connect_tactile is False for config in captured)
+    assert all(config.enable_telemetry is False for config in captured)
+    assert all(config.tactile_reset_on_start is False for config in captured)
 
 
 def _profile():

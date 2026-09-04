@@ -361,6 +361,40 @@ class DMTacRM65RegisteredTrajectoryPorts:
         trajectory_hash: str,
         /,
     ) -> RegisteredTrajectoryPointDispatchReceipt:
+        """Dispatch the next point after a synchronous measured-state cut."""
+
+        return self._dispatch_registered_point(
+            point,
+            trajectory_hash,
+            synchronous_state_fence=True,
+        )
+
+    def dispatch_point_realtime(
+        self,
+        point: RegisteredJointTrajectoryPoint,
+        trajectory_hash: str,
+        /,
+    ) -> RegisteredTrajectoryPointDispatchReceipt:
+        """Dispatch at the registered lattice through RM65 lower health gates.
+
+        Full RM65+DMTac measurements are performed at admission and terminal
+        tracking by the replay executor. This path deliberately does not put
+        serial gripper reads in the 60 Hz arm-reference loop.
+        """
+
+        return self._dispatch_registered_point(
+            point,
+            trajectory_hash,
+            synchronous_state_fence=False,
+        )
+
+    def _dispatch_registered_point(
+        self,
+        point: RegisteredJointTrajectoryPoint,
+        trajectory_hash: str,
+        *,
+        synchronous_state_fence: bool,
+    ) -> RegisteredTrajectoryPointDispatchReceipt:
         """Dispatch only the next point of one active authority-bound session."""
 
         if not isinstance(point, RegisteredJointTrajectoryPoint):
@@ -399,7 +433,11 @@ class DMTacRM65RegisteredTrajectoryPorts:
                     succeeded=False,
                     evidence_refs=("dmtac-replay-session-reject:" + evidence_hash,),
                 )
-            receipt = self._dispatch_point_in_session(point, trajectory_hash)
+            receipt = self._dispatch_point_in_session(
+                point,
+                trajectory_hash,
+                synchronous_state_fence=synchronous_state_fence,
+            )
             if receipt.succeeded:
                 self._next_point_index += 1
             return receipt
@@ -409,6 +447,8 @@ class DMTacRM65RegisteredTrajectoryPorts:
         point: RegisteredJointTrajectoryPoint,
         trajectory_hash: str,
         /,
+        *,
+        synchronous_state_fence: bool,
     ) -> RegisteredTrajectoryPointDispatchReceipt:
         """Admit and dispatch one exact dual-arm point; never command DMTac."""
 
@@ -419,19 +459,30 @@ class DMTacRM65RegisteredTrajectoryPorts:
         if point.semantic_content_hash not in self._point_hashes:
             raise ValueError("point is not registered by the bound trajectory.")
 
-        arm_cut, snapshot = self._consume_pending_cut()
-        identity_matches = (
-            snapshot.identity.semantic_content_hash
-            == self.trajectory.initial_snapshot.identity.semantic_content_hash
-        )
-        maximum_gripper_drift = max(
-            abs(
-                snapshot.gripper_close_by_side[side]
-                - self.trajectory.initial_snapshot.gripper_close_by_side[side]
-            )
-            for side in _SIDES
-        )
         now = _finite(self.clock(), name="clock()")
+        snapshot_hash: str | None = None
+        if synchronous_state_fence:
+            arm_cut, snapshot = self._consume_pending_cut()
+            observation = arm_cut.observation
+            snapshot_hash = snapshot.semantic_content_hash
+            identity_matches = (
+                snapshot.identity.semantic_content_hash
+                == self.trajectory.initial_snapshot.identity.semantic_content_hash
+            )
+            maximum_gripper_drift = max(
+                abs(
+                    snapshot.gripper_close_by_side[side]
+                    - self.trajectory.initial_snapshot.gripper_close_by_side[side]
+                )
+                for side in _SIDES
+            )
+        else:
+            observation = TeleopObservation(timestamp=now)
+            identity_matches = (
+                self.identity.semantic_content_hash
+                == self.trajectory.initial_snapshot.identity.semantic_content_hash
+            )
+            maximum_gripper_drift = 0.0
         command = TeleopCommand(timestamp=now)
         command.metadata[REAL_AGENT_MOTION_COMMAND_METADATA_KEY] = {
             "operation_id": "registered-shadow:" + trajectory_hash,
@@ -455,7 +506,7 @@ class DMTacRM65RegisteredTrajectoryPorts:
             <= self.profile.maximum_gripper_hold_drift
             and self.rm65_ports.admit_command(
                 command,
-                arm_cut.observation,
+                observation,
                 now,
             )
         )
@@ -474,7 +525,12 @@ class DMTacRM65RegisteredTrajectoryPorts:
                 "lower_succeeded": lower.succeeded,
                 "identity_matches": identity_matches,
                 "maximum_gripper_drift": maximum_gripper_drift,
-                "snapshot_hash": snapshot.semantic_content_hash,
+                "snapshot_hash": snapshot_hash,
+                "state_fence": (
+                    "synchronous_rm65_dmtac_cut"
+                    if synchronous_state_fence
+                    else "rm65_lower_health_no_per_point_dmtac_read"
+                ),
                 "gripper_policy": "measured_dmtac_fixed_opening_no_command",
             },
             domain="agenticrobot.shadow_execution.dmtac_rm65_dispatch.v1",

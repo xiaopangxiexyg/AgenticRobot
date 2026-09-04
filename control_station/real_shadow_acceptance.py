@@ -67,6 +67,8 @@ class RegisteredTrajectoryReplayPorts(Protocol):
 
     def dispatch_point(self, point, trajectory_hash: str, /): ...
 
+    def dispatch_point_realtime(self, point, trajectory_hash: str, /): ...
+
     def hold(self, reason: str): ...
 
     def verify_terminal_tool_tcp(self, snapshot): ...
@@ -619,7 +621,7 @@ def run_real_shadow_acceptance(
             current_scene_hash=current_scene_hash,
             current_scene_hash_provider=current_scene_hash_provider,
             current_snapshot_provider=ports.current_snapshot,
-            point_dispatcher=ports.dispatch_point,
+            point_dispatcher=ports.dispatch_point_realtime,
             hold_controller=ports.hold,
             terminal_tool_tcp_verifier=getattr(
                 ports,
@@ -633,6 +635,7 @@ def run_real_shadow_acceptance(
             end_replay_session=ports.end_replay_session,
             execution_enabled=True,
             wall_clock=wall_clock,
+            synchronous_per_point_snapshot_checks=False,
         )
         if not isinstance(real_receipt, RegisteredTrajectoryRealReplayReceipt):
             raise TypeError(

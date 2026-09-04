@@ -493,6 +493,70 @@ def test_initial_freshness_is_evaluated_after_slow_hardware_snapshot() -> None:
     assert receipt.executed_point_count == len(trajectory.points)
 
 
+def test_realtime_arm_dispatch_keeps_60hz_lattice_with_slow_boundary_reads() -> None:
+    initial = _snapshot()
+    points = []
+    for index in range(4):
+        qpos = {side: value.copy() for side, value in initial.qpos_by_side.items()}
+        qpos["right"][1] += 0.05 * float(index) / 3.0
+        points.append(
+            RegisteredJointTrajectoryPoint(
+                time_from_start_sec=float(index) / 60.0,
+                qpos_by_side=qpos,
+            )
+        )
+    trajectory = RegisteredShadowJointTrajectory(
+        trajectory_id="trajectory:60hz-realtime-arm-dispatch",
+        created_at=9.96,
+        initial_snapshot=initial,
+        scene_hash="scene:test",
+        target_hash="target:test",
+        planner_config_hash="planner:test",
+        moving_sides=("right",),
+        points=tuple(points),
+    )
+    simulation = _simulation_receipt(trajectory)
+    ports = _ReplayPorts(trajectory)
+
+    def slow_boundary_snapshot():
+        ports.wall += 0.08
+        ports.monotonic += 0.08
+        return ports.snapshot()
+
+    receipt = _execute(
+        ports,
+        trajectory,
+        simulation,
+        current_snapshot_provider=slow_boundary_snapshot,
+        synchronous_per_point_snapshot_checks=False,
+    )
+
+    assert receipt.status is RegisteredTrajectoryRealReplayStatus.COMPLETED
+    assert receipt.executed_point_count == len(trajectory.points)
+    assert ports.snapshot_count < len(trajectory.points) + 1
+
+
+def test_realtime_arm_dispatch_still_rejects_scene_change_before_motion() -> None:
+    trajectory = _trajectory()
+    simulation = _simulation_receipt(trajectory)
+    ports = _ReplayPorts(trajectory)
+
+    receipt = _execute(
+        ports,
+        trajectory,
+        simulation,
+        current_scene_hash_provider=lambda: "scene:changed",
+        synchronous_per_point_snapshot_checks=False,
+    )
+
+    assert (
+        receipt.status
+        is RegisteredTrajectoryRealReplayStatus.PRE_DISPATCH_STATE_REJECTED
+    )
+    assert receipt.executed_point_count == 0
+    assert ports.dispatched == []
+
+
 def test_required_terminal_tcp_verifier_is_checked_before_authority_or_dispatch():
     trajectory = _trajectory()
     simulation = _simulation_receipt(trajectory)
@@ -941,6 +1005,40 @@ def test_dmtac_rm65_ports_join_measured_state_and_dispatch_only_arm_qpos() -> No
     assert all(backend.read_count == 1 for backend in dmtac.values())
 
 
+def test_dmtac_realtime_dispatch_does_not_read_dmtac_in_arm_loop() -> None:
+    trajectory, ports, rm65, dmtac = _dmtac_replay_ports()
+    simulation = _simulation_receipt(trajectory)
+    authority = _authority(trajectory, simulation)
+    ports.begin_replay_session(_ReplayPorts(trajectory).consume(authority))
+
+    receipt = ports.dispatch_point_realtime(
+        trajectory.points[0],
+        trajectory.semantic_content_hash,
+    )
+
+    assert receipt.succeeded is True
+    assert len(rm65.admitted_commands) == 1
+    assert len(rm65.dispatched_commands) == 1
+    assert all(backend.read_count == 0 for backend in dmtac.values())
+
+
+def test_dmtac_realtime_dispatch_stops_on_lower_arm_admission_rejection() -> None:
+    trajectory, ports, rm65, dmtac = _dmtac_replay_ports(admitted=False)
+    simulation = _simulation_receipt(trajectory)
+    authority = _authority(trajectory, simulation)
+    ports.begin_replay_session(_ReplayPorts(trajectory).consume(authority))
+
+    receipt = ports.dispatch_point_realtime(
+        trajectory.points[0],
+        trajectory.semantic_content_hash,
+    )
+
+    assert receipt.succeeded is False
+    assert len(rm65.admitted_commands) == 1
+    assert rm65.dispatched_commands == []
+    assert all(backend.read_count == 0 for backend in dmtac.values())
+
+
 def test_dmtac_rm65_ports_never_dispatch_when_lower_admission_rejects() -> None:
     trajectory, ports, rm65, _ = _dmtac_replay_ports(admitted=False)
     simulation = _simulation_receipt(trajectory)
@@ -1069,7 +1167,7 @@ def test_dmtac_rm65_adapter_completes_injected_exact_replay_without_gripper_comm
         current_scene_hash=trajectory.scene_hash,
         current_scene_hash_provider=lambda: trajectory.scene_hash,
         current_snapshot_provider=ports.current_snapshot,
-        point_dispatcher=ports.dispatch_point,
+        point_dispatcher=ports.dispatch_point_realtime,
         hold_controller=ports.hold,
         terminal_tool_tcp_verifier=ports.verify_terminal_tool_tcp,
         terminal_tool_tcp_verification_required=True,
@@ -1080,6 +1178,7 @@ def test_dmtac_rm65_adapter_completes_injected_exact_replay_without_gripper_comm
         begin_replay_session=ports.begin_replay_session,
         end_replay_session=ports.end_replay_session,
         execution_enabled=True,
+        synchronous_per_point_snapshot_checks=False,
         wall_clock=lambda: clock["wall"],
         monotonic_clock=lambda: clock["monotonic"],
         sleep=sleep,
@@ -1095,7 +1194,7 @@ def test_dmtac_rm65_adapter_completes_injected_exact_replay_without_gripper_comm
         set(command.commands) == {"left_arm", "right_arm"}
         for command in rm65.dispatched_commands
     )
-    assert all(backend.read_count >= 4 for backend in dmtac.values())
+    assert all(backend.read_count >= 3 for backend in dmtac.values())
 
 
 def test_dmtac_rm65_direct_or_out_of_order_dispatch_is_rejected_without_send() -> None:

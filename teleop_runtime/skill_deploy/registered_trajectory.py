@@ -679,6 +679,7 @@ def execute_registered_shadow_trajectory_with_ports(
     wall_clock: Callable[[], float] = time.time,
     monotonic_clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    synchronous_per_point_snapshot_checks: bool = True,
     maximum_snapshot_age_sec: float = 0.2,
     maximum_arm_start_drift_rad: float = 0.01,
     maximum_gripper_start_drift: float = 0.02,
@@ -718,6 +719,8 @@ def execute_registered_shadow_trajectory_with_ports(
         raise TypeError("terminal_tool_tcp_verification_required must be boolean.")
     if not isinstance(execution_enabled, bool):
         raise TypeError("execution_enabled must be boolean.")
+    if not isinstance(synchronous_per_point_snapshot_checks, bool):
+        raise TypeError("synchronous_per_point_snapshot_checks must be boolean.")
     scene_hash = str(current_scene_hash).strip()
     if not scene_hash:
         raise ValueError("current_scene_hash must be non-empty.")
@@ -793,6 +796,18 @@ def execute_registered_shadow_trajectory_with_ports(
             pass
         raise
     evidence = [f"shadow-replay-admission:{admission.semantic_content_hash}"]
+    if not synchronous_per_point_snapshot_checks:
+        evidence.append(
+            "registered-replay-state-check-mode:"
+            + canonical_content_hash(
+                {
+                    "per_point": "lower_arm_health_and_dispatch_admission",
+                    "full_measured_snapshot": "initial_and_terminal_tracking",
+                    "gripper_policy": "measured_opening_boundary_checks_no_command",
+                },
+                domain="agenticrobot.shadow_execution.state_check_mode.v1",
+            )
+        )
 
     session_active = False
     terminal_tcp_receipt: TerminalToolTcpVerificationReceipt | None = None
@@ -1012,6 +1027,7 @@ def execute_registered_shadow_trajectory_with_ports(
 
     executed_count = 0
     dispatch_attempted = False
+    observed = current
     try:
         started = _finite(monotonic_clock(), name="monotonic_clock()")
         for point_index, point in enumerate(trajectory.points):
@@ -1043,46 +1059,49 @@ def execute_registered_shadow_trajectory_with_ports(
                     executed_count=executed_count,
                     hold_reason="registered shadow replay timeline deadline missed",
                 )
-            pre_dispatch = current_snapshot_provider()
-            if not isinstance(pre_dispatch, AuthoritativeRobotStateSnapshot):
-                raise TypeError(
-                    "current_snapshot_provider must return "
-                    "AuthoritativeRobotStateSnapshot."
-                )
-            point_now = _finite(wall_clock(), name="wall_clock()")
             pre_dispatch_reasons: list[str] = []
-            if (
-                pre_dispatch.identity.semantic_content_hash
-                != trajectory.initial_snapshot.identity.semantic_content_hash
-            ):
-                pre_dispatch_reasons.append("identity_changed")
             observed_scene_hash = str(current_scene_hash_provider()).strip()
             if not observed_scene_hash or observed_scene_hash != scene_hash:
                 pre_dispatch_reasons.append("scene_changed")
-            if (
-                point_now < pre_dispatch.available_at
-                or point_now - pre_dispatch.oldest_measurement_at
-                > maximum_snapshot_age_sec
-            ):
-                pre_dispatch_reasons.append("snapshot_stale")
-            expected_start = (
-                trajectory.initial_snapshot.qpos_by_side
-                if point_index == 0
-                else trajectory.points[point_index - 1].qpos_by_side
-            )
-            arm_tracking_drift = max(
-                float(
-                    np.max(
-                        np.abs(
-                            pre_dispatch.qpos_by_side[side]
-                            - expected_start[side]
+            arm_tracking_drift: float | None = None
+            pre_dispatch: AuthoritativeRobotStateSnapshot | None = None
+            if synchronous_per_point_snapshot_checks:
+                pre_dispatch = current_snapshot_provider()
+                if not isinstance(pre_dispatch, AuthoritativeRobotStateSnapshot):
+                    raise TypeError(
+                        "current_snapshot_provider must return "
+                        "AuthoritativeRobotStateSnapshot."
+                    )
+                point_now = _finite(wall_clock(), name="wall_clock()")
+                if (
+                    pre_dispatch.identity.semantic_content_hash
+                    != trajectory.initial_snapshot.identity.semantic_content_hash
+                ):
+                    pre_dispatch_reasons.append("identity_changed")
+                if (
+                    point_now < pre_dispatch.available_at
+                    or point_now - pre_dispatch.oldest_measurement_at
+                    > maximum_snapshot_age_sec
+                ):
+                    pre_dispatch_reasons.append("snapshot_stale")
+                expected_start = (
+                    trajectory.initial_snapshot.qpos_by_side
+                    if point_index == 0
+                    else trajectory.points[point_index - 1].qpos_by_side
+                )
+                arm_tracking_drift = max(
+                    float(
+                        np.max(
+                            np.abs(
+                                pre_dispatch.qpos_by_side[side]
+                                - expected_start[side]
+                            )
                         )
                     )
+                    for side in _SIDES
                 )
-                for side in _SIDES
-            )
-            if arm_tracking_drift > maximum_arm_start_drift_rad:
-                pre_dispatch_reasons.append("arm_tracking_drift")
+                if arm_tracking_drift > maximum_arm_start_drift_rad:
+                    pre_dispatch_reasons.append("arm_tracking_drift")
             if pre_dispatch_reasons:
                 evidence.append(
                     "pre-dispatch-state-rejected:"
@@ -1091,7 +1110,11 @@ def execute_registered_shadow_trajectory_with_ports(
                             "point_index": point_index,
                             "point_hash": point.semantic_content_hash,
                             "reason_codes": tuple(pre_dispatch_reasons),
-                            "snapshot_hash": pre_dispatch.semantic_content_hash,
+                            "snapshot_hash": (
+                                None
+                                if pre_dispatch is None
+                                else pre_dispatch.semantic_content_hash
+                            ),
                             "arm_tracking_drift_rad": arm_tracking_drift,
                         },
                         domain="agenticrobot.shadow_execution.pre_dispatch_state.v1",
@@ -1102,21 +1125,22 @@ def execute_registered_shadow_trajectory_with_ports(
                     executed_count=executed_count,
                     hold_reason="registered shadow replay pre-dispatch state rejected",
                 )
-            pre_dispatch_gripper_drift = max(
-                abs(
-                    pre_dispatch.gripper_close_by_side[side]
-                    - trajectory.initial_snapshot.gripper_close_by_side[side]
+            if pre_dispatch is not None:
+                pre_dispatch_gripper_drift = max(
+                    abs(
+                        pre_dispatch.gripper_close_by_side[side]
+                        - trajectory.initial_snapshot.gripper_close_by_side[side]
+                    )
+                    for side in _SIDES
                 )
-                for side in _SIDES
-            )
-            if pre_dispatch_gripper_drift > maximum_gripper_start_drift:
-                return terminal(
-                    RegisteredTrajectoryRealReplayStatus.GRIPPER_HOLD_DRIFT,
-                    executed_count=executed_count,
-                    hold_reason=(
-                        "registered shadow replay pre-dispatch gripper drift"
-                    ),
-                )
+                if pre_dispatch_gripper_drift > maximum_gripper_start_drift:
+                    return terminal(
+                        RegisteredTrajectoryRealReplayStatus.GRIPPER_HOLD_DRIFT,
+                        executed_count=executed_count,
+                        hold_reason=(
+                            "registered shadow replay pre-dispatch gripper drift"
+                        ),
+                    )
             dispatch_attempted = True
             dispatch = point_dispatcher(point, trajectory.semantic_content_hash)
             if not isinstance(dispatch, RegisteredTrajectoryPointDispatchReceipt):
@@ -1140,25 +1164,13 @@ def execute_registered_shadow_trajectory_with_ports(
             executed_count += 1
             dispatch_attempted = False
             evidence.extend(dispatch.evidence_refs)
-            observed = current_snapshot_provider()
-            if not isinstance(observed, AuthoritativeRobotStateSnapshot):
-                raise TypeError(
-                    "current_snapshot_provider must return "
-                    "AuthoritativeRobotStateSnapshot."
-                )
-            gripper_drift = max(
-                abs(
-                    observed.gripper_close_by_side[side]
-                    - trajectory.initial_snapshot.gripper_close_by_side[side]
-                )
-                for side in _SIDES
-            )
-            if gripper_drift > maximum_gripper_start_drift:
-                return terminal(
-                    RegisteredTrajectoryRealReplayStatus.GRIPPER_HOLD_DRIFT,
-                    executed_count=executed_count,
-                    hold_reason="registered shadow replay gripper hold drift",
-                )
+            # In synchronous diagnostic mode, the next point's fresh cut checks
+            # tracking again. Realtime arm replay instead keeps slow full-state
+            # cuts outside the 60 Hz loop and relies on the lower RM65 health
+            # and dispatch gates here. Both modes return to measured RM65+DMTac
+            # boundary cuts for final convergence and HOLD.
+            if pre_dispatch is not None:
+                observed = pre_dispatch
 
         final_qpos = trajectory.points[-1].qpos_by_side
         previous_final = observed
