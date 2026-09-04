@@ -207,8 +207,14 @@ class PolicyAsyncExecutionProfile:
                 raise ValueError(
                     "RTC final-chunk shadow requires position lookahead disabled."
                 )
-            if self.send_actions:
-                raise ValueError("RTC final-chunk shadow requires send_actions=false.")
+            if (
+                profile_id == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1
+                and self.send_actions
+            ):
+                raise ValueError(
+                    "RTC-3c virtual profile has no model action source and does not "
+                    "accept --send-actions."
+                )
 
     @property
     def semantic_content_hash(self) -> str:

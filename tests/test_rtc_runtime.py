@@ -4,7 +4,10 @@ from dataclasses import replace
 
 import pytest
 
-from robot_motion.deploy.async_producer import PolicyAsyncExecutionProfile
+from robot_motion.deploy.async_producer import (
+    PolicyAsyncExecutionProfile,
+    RAW_RTC_FINAL_CHUNK_PROFILE_V1,
+)
 from robot_motion.deploy.inference import (
     InferenceDelayEstimatorSpec,
     RTC_FLOW_INPAINT_MODE_V1,
@@ -17,11 +20,16 @@ from robot_motion.deploy.rtc_runtime import (
 )
 
 
-def _config(*, request_validity_steps: int = 2) -> RtcPolicyShadowConfig:
-    profile = PolicyAsyncExecutionProfile(
-        profile_id="rtc-runtime-contract-test",
-        rtc_mode=RTC_FLOW_INPAINT_MODE_V1,
-    )
+def _config(
+    *,
+    request_validity_steps: int = 2,
+    profile: PolicyAsyncExecutionProfile | None = None,
+) -> RtcPolicyShadowConfig:
+    if profile is None:
+        profile = PolicyAsyncExecutionProfile(
+            profile_id="rtc-runtime-contract-test",
+            rtc_mode=RTC_FLOW_INPAINT_MODE_V1,
+        )
     delay_spec = InferenceDelayEstimatorSpec(
         spec_id="rtc-runtime-delay-test",
         action_period_sec=1.0 / 30.0,
@@ -84,3 +92,20 @@ def test_timing_contract_is_part_of_the_current_config_identity() -> None:
     assert RTC_3C_FRONTEND_CONFIG_HASH_DOMAIN_V4 not in {
         "",
     }
+
+
+def test_runtime_accepts_application_owned_send_metadata_for_raw_profile() -> None:
+    config = _config(profile=replace(RAW_RTC_FINAL_CHUNK_PROFILE_V1, send_actions=True))
+
+    assert config.profile.send_actions
+    assert not config.profile.position_lookahead_enabled
+
+
+def test_runtime_keeps_lookahead_guard_independent_from_send_metadata() -> None:
+    with pytest.raises(ValueError, match="lookahead disabled"):
+        _config(
+            profile=replace(
+                RAW_RTC_FINAL_CHUNK_PROFILE_V1,
+                position_lookahead_enabled=True,
+            )
+        )

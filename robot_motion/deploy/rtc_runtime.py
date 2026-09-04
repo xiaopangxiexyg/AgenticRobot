@@ -36,6 +36,7 @@ from .async_producer import (
     POLICY_WORKER_SESSION_ACTIVE,
     POLICY_WORKER_SESSION_DRAINED,
     POLICY_WORKER_SESSION_RETIRED_WAITING_FOR_COMPLETION,
+    RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
     RTC_3C_VIRTUAL_SHADOW_PROFILE_V1,
     PolicyAsyncExecutionProfile,
     PolicyAsyncProducerSnapshot,
@@ -228,8 +229,16 @@ class RtcPolicyShadowConfig:
             )
         if not isinstance(self.profile, PolicyAsyncExecutionProfile):
             raise TypeError("profile must be PolicyAsyncExecutionProfile.")
-        if self.profile.position_lookahead_enabled or self.profile.send_actions:
-            raise ValueError("RTC shadow profiles require lookahead/send_actions disabled.")
+        if self.profile.position_lookahead_enabled:
+            raise ValueError("RTC shadow profiles require lookahead disabled.")
+        if (
+            self.profile.profile_id == RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1
+            and self.profile.send_actions
+        ):
+            raise ValueError(
+                "RTC-3c virtual profile has no model action source and does not "
+                "accept --send-actions."
+            )
         for name in (
             "prediction_horizon_steps",
             "minimum_execution_horizon_steps",
