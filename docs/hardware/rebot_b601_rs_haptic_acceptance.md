@@ -6,12 +6,12 @@ MuJoCo 或 GUI 结果都不构成真机使能、运动或安全授权。
 当前实现止于：
 
 - `LOCAL_WORLD_ALIGNED` 末端 wrench、坐标变换与 `J.T @ wrench`；
-- 平移虚拟弹簧和单侧虚拟墙；
-- MuJoCo 理想广义关节力矩、重力补偿、阻尼、overlay 限幅及 watchdog；
+- 平移虚拟弹簧、6D pose 虚拟弹簧和单侧虚拟墙；
+- MuJoCo 理想广义关节力矩、重力补偿、阻尼、overlay 限幅、qvel/qacc 状态门及 watchdog；
 - 可自动判定控制效果的无头仿真。
 
-尚不存在 B601 真机 backend。电机、SocketCAN、真实反馈新鲜度、发送确认、摩擦、
-绝对力矩标定、触感和物理安全均未验证。
+真机 backend 和低带宽 MIT commissioning 路径已经存在，但电机高带宽闭环、真实反馈
+新鲜度、摩擦、绝对力矩标定、触感和最终物理安全 envelope 仍未验证。
 
 ## 1. 固定契约
 
@@ -60,15 +60,20 @@ DEV_PYTHON="$(bash scripts/resolve_dev_python.sh)"
 "$DEV_PYTHON" -m sim.mujoco.rebot_b601_rs.haptic_demo \
   --rebot-source-root hardware/reBotArm_control_py \
   --fixture wall
+"$DEV_PYTHON" -m sim.mujoco.rebot_b601_rs.haptic_demo \
+  --rebot-source-root hardware/reBotArm_control_py \
+  --fixture pose-6d
 ```
 
-两次命令都必须以 `simulation_acceptance.passed=true` 退出，并满足：
+三次命令都必须以 `simulation_acceptance.passed=true` 退出，并满足：
 
 - 完成全部 1 kHz physics tick 和全部 500 Hz command tick；
-- 无 driver fault、非有限状态或关节位置/速度越界；
+- 无 driver fault、非有限状态或关节位置/速度/加速度越界；
 - 最终总力矩始终落在仿真 profile 的硬上限内；
 - 弹簧：初始末端误差至少 20 mm，最终误差不超过初始值的 45%；
 - 虚拟墙：初始穿透至少 20 mm，最终穿透不超过 2 mm；
+- pose：anchor 固定为扰动前当前 FK；逐轴平移扰动在 world 轴表达，逐轴旋转扰动在
+  tool-local 轴表达；`pose-6d` 同时施加两类扰动，translation/rotation 分别判定收敛；
 - 输出同时记录峰值 wrench、请求 overlay、实际总力矩及所有限幅 tick。
 
 `20 ms` 的短运行会正常完成程序，但必须因尚未形成足够闭环效果而返回非零；这用于证明
@@ -93,9 +98,9 @@ JSON 仍是效果判定依据：
 2. 清空工作区，机械臂与负载有可承重支撑，末端不接触桌面或本体；
 3. 操作者握住物理急停，另有观察员；确认急停切断/恢复流程已实际演练；
 4. 同一 CAN 与机械臂只有一个 control-loop owner；关闭官方 demo、遥操、数采和其他控制进程；
-5. 每阶段使用独立日志，包含 host monotonic timestamp、cycle index、每关节 q/qdot/tau、
+5. 每阶段使用独立日志，包含 host monotonic timestamp、cycle index、每关节 q/qdot/qddot/tau、
    命令分量、限幅、反馈年龄、发送错误和 fault transition；
-6. 力矩、力矩变化率、速度、位置、Kp/Kd、wrench 和持续时间上限经过硬件负责人评审；
+6. 力矩、力矩变化率、速度、加速度、位置、Kp/Kd、wrench 和持续时间上限经过硬件负责人评审；
 7. 每次只放开本阶段所需的最小权限，先单关节、后多关节，先无 overlay、后低幅 overlay；
 8. 任一异常立即停止本阶段，不把“重新运行成功”当作根因闭环。
 
@@ -124,7 +129,8 @@ H2 及以后不得标记通过。
 
 1. 仅初始化本地有线 backend，确认电机 ID 与 `joint1..joint6` 一一对应。
 2. 在去使能状态缓慢手动移动一个关节，其余保持静止；逐关节验证 q 的符号、单位、零位和顺序。
-3. 用 host monotonic clock 记录反馈间隔，交叉比较上游 velocity 与位置有限差分。
+3. 用 host monotonic clock 记录反馈间隔，交叉比较上游 velocity 与位置有限差分，并用连续
+   qvel/精确反馈间隔计算 qacc；首帧没有前一 qvel 时必须明确记录 qacc unavailable；
 4. 断开一个反馈源，确认状态成为 `invalid/stale`，而不是静默变成合法的全零样本。
 
 通过条件：六关节身份/符号正确；缺失、重复、倒序和非有限反馈都可检测；没有发送任何 MIT
@@ -202,7 +208,7 @@ hardware acceptance receipt；该收据也不自动授权 HITL 或真实 followe
 ## 6. 任意阶段的立即停止条件
 
 - 运动/力方向与预期相反，或发生不可解释的跳变、振荡、接触；
-- q、qdot、tau、timestamp/age 任一非有限、缺失、倒序或超过上限；
+- q、qdot、qddot、tau、timestamp/age 任一非有限、缺失、倒序或超过上限；
 - 单关节发送失败、部分发送、控制线程异常或其他进程争用 CAN；
 - 反馈年龄达到 watchdog，或错误 frame/invalid 样本没有立即撤销 overlay；
 - 限幅连续触发而操作者没有主动要求更大作用；
@@ -219,7 +225,8 @@ stage, result, operator, observer, timestamp
 AgenticRobot commit/tree, reBotArm gitlink, config path + sha256
 firmware, motor model/id, CAN interface/bitrate, power/payload
 loop requested/measured rate, p50/p95/p99/max interval, watchdog
-per-cycle q/qdot/tau, gravity/damping/overlay/final torque
+per-cycle q/qdot/qddot/tau, gravity/damping/overlay/final torque
+rejected sample joint, raw/normalized q, previous/current qvel, qacc, dt, seq/timestamp
 feedback valid/age, send outcome, limits, fault transitions, stop receipt
 initial/final fixture metric, peak wrench/torque, human observation
 known deviations, evidence path, reviewer/sign-off

@@ -11,11 +11,14 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from robot_motion.rebot_b601_rs import (
     B601_RS_ARM_JOINT_NAMES,
+    B601DampedLeastSquaresIK,
     B601MitReference,
     B601PinocchioModel,
+    B601PoseVirtualSpring,
     B601TranslationalVirtualSpring,
     B601VirtualWall,
     map_world_aligned_ee_wrench_to_joint_torque,
@@ -33,6 +36,15 @@ DEFAULT_SPRING_DAMPING_N_S_PER_M = (8.0, 8.0, 8.0)
 DEFAULT_MAX_FORCE_N = 8.0
 DEFAULT_MAX_OVERLAY_TORQUE_NM = 6.0
 DEFAULT_WALL_PENETRATION_M = 0.025
+POSE_FIXTURES = (
+    "pose-tx",
+    "pose-ty",
+    "pose-tz",
+    "pose-rx",
+    "pose-ry",
+    "pose-rz",
+    "pose-6d",
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -50,7 +62,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fixture",
-        choices=("spring", "wall"),
+        choices=("spring", "wall", *POSE_FIXTURES),
         default="spring",
     )
     parser.add_argument(
@@ -83,16 +95,50 @@ def _fixture_metrics(
     fixture,
     qpos: np.ndarray,
     qvel: np.ndarray,
-) -> tuple[object, float]:
+) -> tuple[object, float, float]:
     pose = model.forward_kinematics(qpos)
     jacobian = model.arm_jacobian(qpos)
-    linear_velocity = jacobian[:3] @ qvel
-    result = fixture.evaluate(pose[:3, 3], linear_velocity)
-    if fixture_name == "spring":
-        metric = float(np.linalg.norm(result.displacement_m))
+    spatial_velocity = jacobian @ qvel
+    if fixture_name in POSE_FIXTURES:
+        result = fixture.evaluate(pose, spatial_velocity)
+        translation_metric = float(np.linalg.norm(result.displacement_m))
+        rotation_metric = float(np.linalg.norm(result.rotation_error_rad))
     else:
-        metric = float(result.penetration_m)
-    return result, metric
+        result = fixture.evaluate(pose[:3, 3], spatial_velocity[:3])
+        translation_metric = (
+            float(np.linalg.norm(result.displacement_m))
+            if fixture_name == "spring"
+            else float(result.penetration_m)
+        )
+        rotation_metric = 0.0
+    return result, translation_metric, rotation_metric
+
+
+def _pose_disturbance_target(
+    anchor_pose: np.ndarray,
+    fixture_name: str,
+) -> tuple[np.ndarray, tuple[float, ...], tuple[float, ...]]:
+    """Create one bounded world-translation/tool-local-rotation disturbance."""
+
+    if fixture_name not in POSE_FIXTURES:
+        raise ValueError("fixture_name is not a pose disturbance")
+    translation = np.zeros(3, dtype=float)
+    rotation_local = np.zeros(3, dtype=float)
+    if fixture_name == "pose-6d":
+        translation[:] = (0.012, -0.009, 0.007)
+        rotation_local[:] = (0.012, -0.010, 0.008)
+    elif fixture_name.startswith("pose-t"):
+        translation["xyz".index(fixture_name[-1])] = 0.015
+    else:
+        rotation_local["xyz".index(fixture_name[-1])] = 0.015
+    target = np.asarray(anchor_pose, dtype=float).copy()
+    target[:3, 3] += translation
+    target[:3, :3] = target[:3, :3] @ Rotation.from_rotvec(rotation_local).as_matrix()
+    return (
+        target,
+        tuple(float(value) for value in translation),
+        tuple(float(value) for value in rotation_local),
+    )
 
 
 def run_haptic_fixture_demo(
@@ -104,8 +150,8 @@ def run_haptic_fixture_demo(
 ) -> tuple[int, dict[str, object]]:
     """Run one closed-loop fixture and return an exit code plus JSON payload."""
 
-    if fixture_name not in {"spring", "wall"}:
-        raise ValueError("fixture_name must be 'spring' or 'wall'")
+    if fixture_name not in {"spring", "wall", *POSE_FIXTURES}:
+        raise ValueError("fixture_name must name a supported spring, wall, or pose fixture")
     if not isinstance(viewer, bool):
         raise TypeError("viewer must be a bool")
     duration = float(duration_sec)
@@ -115,8 +161,34 @@ def run_haptic_fixture_demo(
     model = B601PinocchioModel.from_rebot_source_root(source_root)
     initial_qpos = np.asarray(DEFAULT_HAPTIC_INITIAL_QPOS, dtype=float)
     anchor_qpos = np.asarray(DEFAULT_HAPTIC_ANCHOR_QPOS, dtype=float)
+    anchor_pose = model.forward_kinematics(anchor_qpos)
+    anchor_position = anchor_pose[:3, 3]
+    disturbance_contract: dict[str, object] | None = None
+    if fixture_name in POSE_FIXTURES:
+        target_pose, translation_world, rotation_tool_local = _pose_disturbance_target(
+            anchor_pose,
+            fixture_name,
+        )
+        ik_result = B601DampedLeastSquaresIK(model).solve(
+            target_pose,
+            seed_qpos=anchor_qpos,
+        )
+        if not ik_result.success:
+            raise RuntimeError(
+                f"pose disturbance IK failed: {ik_result.status}; "
+                f"position_error_m={ik_result.position_error_m:.9g}; "
+                f"orientation_error_rad={ik_result.orientation_error_rad:.9g}"
+            )
+        initial_qpos = np.asarray(ik_result.qpos, dtype=float)
+        disturbance_contract = {
+            "application": "kinematic_pre_run_disturbance_after_current_pose_anchor",
+            "translation_world_m": list(translation_world),
+            "rotation_tool_local_rad": list(rotation_tool_local),
+            "ik_status": ik_result.status,
+            "ik_position_error_m": ik_result.position_error_m,
+            "ik_orientation_error_rad": ik_result.orientation_error_rad,
+        }
     initial_position = model.forward_kinematics(initial_qpos)[:3, 3]
-    anchor_position = model.forward_kinematics(anchor_qpos)[:3, 3]
     if fixture_name == "spring":
         fixture = B601TranslationalVirtualSpring(
             anchor_position_m=tuple(float(value) for value in anchor_position),
@@ -130,7 +202,7 @@ def run_haptic_fixture_demo(
             "damping_n_s_per_m": list(DEFAULT_SPRING_DAMPING_N_S_PER_M),
             "max_abs_force_n": [DEFAULT_MAX_FORCE_N] * 3,
         }
-    else:
+    elif fixture_name == "wall":
         wall_normal = np.asarray((1.0, 0.0, 0.0), dtype=float)
         wall_offset = float(wall_normal @ initial_position) - DEFAULT_WALL_PENETRATION_M
         fixture = B601VirtualWall(
@@ -148,6 +220,27 @@ def run_haptic_fixture_demo(
             "damping_n_s_per_m": fixture.damping_n_s_per_m,
             "max_force_n": fixture.max_force_n,
         }
+    else:
+        fixture = B601PoseVirtualSpring(
+            anchor_pose=anchor_pose,
+            translational_stiffness_n_per_m=DEFAULT_SPRING_STIFFNESS_N_PER_M,
+            translational_damping_n_s_per_m=DEFAULT_SPRING_DAMPING_N_S_PER_M,
+            rotational_stiffness_nm_per_rad=(8.0,) * 3,
+            rotational_damping_nm_s_per_rad=(0.8,) * 3,
+            max_abs_force_n=(DEFAULT_MAX_FORCE_N,) * 3,
+            max_abs_torque_nm=(0.5,) * 3,
+        )
+        fixture_contract = {
+            "anchor_source": "current_fk_before_disturbance",
+            "anchor_pose": np.asarray(anchor_pose, dtype=float).tolist(),
+            "translational_stiffness_n_per_m": list(DEFAULT_SPRING_STIFFNESS_N_PER_M),
+            "translational_damping_n_s_per_m": list(DEFAULT_SPRING_DAMPING_N_S_PER_M),
+            "rotational_stiffness_nm_per_rad": [8.0] * 3,
+            "rotational_damping_nm_s_per_rad": [0.8] * 3,
+            "max_abs_force_n": [DEFAULT_MAX_FORCE_N] * 3,
+            "max_abs_torque_nm": [0.5] * 3,
+            "disturbance": disturbance_contract,
+        }
 
     scene = build_b601_mujoco_scene(
         source_root,
@@ -159,6 +252,7 @@ def run_haptic_fixture_demo(
     profile = replace(
         base_profile,
         max_abs_overlay_torque_nm=(DEFAULT_MAX_OVERLAY_TORQUE_NM,) * 6,
+        max_abs_state_acceleration_rad_s2=(250.0,) * 6,
         metadata={
             **base_profile.metadata,
             "fixture_demo": fixture_name,
@@ -173,7 +267,7 @@ def run_haptic_fixture_demo(
     )
     driver.reset(initial_qpos)
 
-    _initial_result, initial_metric = _fixture_metrics(
+    _initial_result, initial_metric, initial_rotation_metric = _fixture_metrics(
         fixture_name=fixture_name,
         model=model,
         fixture=fixture,
@@ -193,10 +287,15 @@ def run_haptic_fixture_demo(
     torque_limited_ticks = 0
     slew_limited_ticks = 0
     peak_force_n = 0.0
+    peak_cartesian_torque_nm = 0.0
     peak_requested_overlay_torque_nm = 0.0
     peak_applied_torque_nm = 0.0
+    peak_abs_qvel_rad_s = 0.0
+    peak_abs_qacc_rad_s2 = 0.0
     maximum_metric = initial_metric
     minimum_metric = initial_metric
+    maximum_rotation_metric = initial_rotation_metric
+    minimum_rotation_metric = initial_rotation_metric
     final_tick = None
     viewer_closed_early = False
     try:
@@ -205,7 +304,7 @@ def run_haptic_fixture_demo(
             if driver.command_due:
                 qpos = scene.get_arm_qpos("b601_rs")
                 qvel = _arm_qvel(scene)
-                fixture_result, metric = _fixture_metrics(
+                fixture_result, metric, rotation_metric = _fixture_metrics(
                     fixture_name=fixture_name,
                     model=model,
                     fixture=fixture,
@@ -231,15 +330,31 @@ def run_haptic_fixture_demo(
                 command_count += 1
                 maximum_metric = max(maximum_metric, metric)
                 minimum_metric = min(minimum_metric, metric)
+                maximum_rotation_metric = max(
+                    maximum_rotation_metric,
+                    rotation_metric,
+                )
+                minimum_rotation_metric = min(
+                    minimum_rotation_metric,
+                    rotation_metric,
+                )
                 peak_force_n = max(
                     peak_force_n,
                     float(np.linalg.norm(fixture_result.wrench.force_n)),
+                )
+                peak_cartesian_torque_nm = max(
+                    peak_cartesian_torque_nm,
+                    float(np.linalg.norm(fixture_result.wrench.torque_nm)),
                 )
                 peak_requested_overlay_torque_nm = max(
                     peak_requested_overlay_torque_nm,
                     float(np.max(np.abs(mapping.joint_torque_nm))),
                 )
-                if fixture_result.force_limited:
+                if fixture_result.force_limited or getattr(
+                    fixture_result,
+                    "torque_limited",
+                    False,
+                ):
                     fixture_limited_ticks += 1
 
             final_tick = driver.step_physics(reference)
@@ -256,6 +371,14 @@ def run_haptic_fixture_demo(
                 peak_applied_torque_nm,
                 float(np.max(np.abs(final_tick.applied_torque_nm))),
             )
+            peak_abs_qvel_rad_s = max(
+                peak_abs_qvel_rad_s,
+                float(np.max(np.abs(final_tick.measured_qvel))),
+            )
+            peak_abs_qacc_rad_s2 = max(
+                peak_abs_qacc_rad_s2,
+                float(np.max(np.abs(final_tick.measured_qacc))),
+            )
             if final_tick.driver_faulted:
                 break
             if viewer_session is not None:
@@ -271,7 +394,7 @@ def run_haptic_fixture_demo(
         raise RuntimeError("haptic fixture demo did not execute a physics tick")
     final_qpos = np.asarray(final_tick.measured_qpos, dtype=float)
     final_qvel = np.asarray(final_tick.measured_qvel, dtype=float)
-    final_result, final_metric = _fixture_metrics(
+    final_result, final_metric, final_rotation_metric = _fixture_metrics(
         fixture_name=fixture_name,
         model=model,
         fixture=fixture,
@@ -280,6 +403,8 @@ def run_haptic_fixture_demo(
     )
     maximum_metric = max(maximum_metric, final_metric)
     minimum_metric = min(minimum_metric, final_metric)
+    maximum_rotation_metric = max(maximum_rotation_metric, final_rotation_metric)
+    minimum_rotation_metric = min(minimum_rotation_metric, final_rotation_metric)
     run_completed = advanced_ticks == requested_steps and not viewer_closed_early
     common_pass = bool(
         run_completed
@@ -301,7 +426,7 @@ def run_haptic_fixture_demo(
             "final_over_initial_max": 0.45,
             "maximum_over_initial_max": 1.05,
         }
-    else:
+    elif fixture_name == "wall":
         effect_pass = bool(
             initial_metric >= 0.02
             and final_metric <= 0.002
@@ -312,6 +437,41 @@ def run_haptic_fixture_demo(
             "initial_minimum_m": 0.02,
             "final_maximum_m": 0.002,
             "maximum_growth_tolerance_m": 0.002,
+        }
+    else:
+        translation_required = fixture_name.startswith("pose-t") or fixture_name == "pose-6d"
+        rotation_required = fixture_name.startswith("pose-r") or fixture_name == "pose-6d"
+        translation_pass = bool(
+            not translation_required
+            or (
+                initial_metric >= 0.005
+                and final_metric <= 0.65 * initial_metric
+                and maximum_metric <= 1.10 * initial_metric
+            )
+        )
+        rotation_pass = bool(
+            not rotation_required
+            or (
+                initial_rotation_metric >= 0.005
+                and final_rotation_metric <= 0.65 * initial_rotation_metric
+                and maximum_rotation_metric <= 1.10 * initial_rotation_metric
+            )
+        )
+        effect_pass = translation_pass and rotation_pass
+        effect_contract = {
+            "metric": "separate_translation_m_and_rotation_rad_to_pose_anchor",
+            "translation_required": translation_required,
+            "rotation_required": rotation_required,
+            "initial_translation_minimum_m": 0.005,
+            "initial_rotation_minimum_rad": 0.005,
+            "final_over_initial_max": 0.65,
+            "maximum_over_initial_max": 1.10,
+            "translation_passed": translation_pass,
+            "rotation_passed": rotation_pass,
+            "initial_rotation_metric": initial_rotation_metric,
+            "final_rotation_metric": final_rotation_metric,
+            "minimum_rotation_metric": minimum_rotation_metric,
+            "maximum_rotation_metric": maximum_rotation_metric,
         }
     accepted = common_pass and effect_pass
     payload: dict[str, object] = {
@@ -344,11 +504,16 @@ def run_haptic_fixture_demo(
             "torque_limited_physics_ticks": torque_limited_ticks,
             "slew_limited_physics_ticks": slew_limited_ticks,
             "peak_force_norm_n": peak_force_n,
+            "peak_cartesian_torque_norm_nm": peak_cartesian_torque_nm,
             "peak_requested_overlay_torque_nm": (peak_requested_overlay_torque_nm),
             "peak_applied_torque_nm": peak_applied_torque_nm,
+            "peak_abs_qvel_rad_s": peak_abs_qvel_rad_s,
+            "peak_abs_qacc_rad_s2": peak_abs_qacc_rad_s2,
             "final_force_n": list(final_result.wrench.force_n),
+            "final_cartesian_torque_nm": list(final_result.wrench.torque_nm),
             "final_qpos_rad": list(final_tick.measured_qpos),
             "final_qvel_rad_s": list(final_tick.measured_qvel),
+            "final_qacc_rad_s2": list(final_tick.measured_qacc),
         },
         "driver": driver.execution_metadata,
         "fidelity": (

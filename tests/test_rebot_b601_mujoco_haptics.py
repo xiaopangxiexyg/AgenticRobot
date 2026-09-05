@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from robot_motion.rebot_b601_rs import B601_RS_URDF_RELATIVE_PATH
-from sim.mujoco.rebot_b601_rs.haptic_demo import run_haptic_fixture_demo
+from sim.mujoco.rebot_b601_rs.haptic_demo import POSE_FIXTURES, run_haptic_fixture_demo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REBOT_SOURCE_ROOT = REPO_ROOT / "hardware" / "reBotArm_control_py"
@@ -47,6 +47,49 @@ def test_headless_fixture_has_bounded_closed_loop_effect(fixture_name: str) -> N
     assert driver["network_transport"] == "out_of_scope"
     assert driver["hardware_safety_claim"] is False
     assert "does not validate a motor" in payload["fidelity"]
+
+
+@pytest.mark.parametrize("fixture_name", POSE_FIXTURES)
+def test_pose_fixture_restores_bounded_axis_or_6d_disturbance(
+    fixture_name: str,
+) -> None:
+    code, payload = run_haptic_fixture_demo(
+        source_root=REBOT_SOURCE_ROOT,
+        fixture_name=fixture_name,
+        duration_sec=1.5,
+        viewer=False,
+    )
+
+    effect = payload["effect_acceptance"]
+    simulation = payload["simulation_acceptance"]
+    fixture = payload["fixture_contract"]
+    assert code == 0
+    assert effect["passed"] is True
+    assert effect["translation_passed"] is True
+    assert effect["rotation_passed"] is True
+    assert simulation["passed"] is True
+    assert simulation["driver_faulted"] is False
+    assert simulation["torque_limited_physics_ticks"] == 0
+    assert simulation["peak_abs_qvel_rad_s"] < 2.0
+    assert simulation["peak_abs_qacc_rad_s2"] < 250.0
+    assert fixture["anchor_source"] == "current_fk_before_disturbance"
+    assert fixture["disturbance"]["rotation_tool_local_rad"] is not None
+
+
+def test_pose_6d_acceptance_reports_translation_and_rotation_separately() -> None:
+    code, payload = run_haptic_fixture_demo(
+        source_root=REBOT_SOURCE_ROOT,
+        fixture_name="pose-6d",
+        duration_sec=1.5,
+        viewer=False,
+    )
+
+    effect = payload["effect_acceptance"]
+    assert code == 0
+    assert effect["translation_required"] is True
+    assert effect["rotation_required"] is True
+    assert effect["initial_metric"] > effect["final_metric"]
+    assert effect["initial_rotation_metric"] > effect["final_rotation_metric"]
 
 
 @pytest.mark.parametrize("fixture_name", ["spring", "wall"])
