@@ -427,6 +427,44 @@ def _model_rtc_fixture(
         json.dumps(receipt.to_dict()),
         encoding="utf-8",
     )
+    params_dir = checkpoint / "params"
+    (params_dir / "array_metadatas").mkdir(parents=True)
+    (params_dir / "d").mkdir()
+    (params_dir / "manifest.ocdbt").write_bytes(b"manifest")
+    (params_dir / "_sharding").write_text("{}", encoding="utf-8")
+    (params_dir / "array_metadatas" / "process_0").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    (params_dir / "_METADATA").write_text(
+        json.dumps({"tree_metadata": {"('params', 'value')": {}}}),
+        encoding="utf-8",
+    )
+    (checkpoint / "training_step").mkdir()
+    (checkpoint / "training_step" / "metadata").write_text(
+        json.dumps(
+            {
+                "format": "openpi_lightweight_train_state_v1",
+                "step": 150000,
+                "optimizer_state": "reset_moments_restore_counts",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint / "_CHECKPOINT_METADATA").write_text(
+        json.dumps(
+            {
+                "item_handlers": {
+                    "assets": "fixture.CallbackHandler",
+                    "params": "fixture.PyTreeCheckpointHandler",
+                    "training_step": "fixture.JsonCheckpointHandler",
+                },
+                "init_timestamp_nsecs": 100,
+                "commit_timestamp_nsecs": 200,
+            }
+        ),
+        encoding="utf-8",
+    )
     return checkpoint, profile_path, model_profile_path, openpi_root, profile
 
 
@@ -840,6 +878,7 @@ class _Data:
 class _Model:
     action_horizon: int
     image_keys: tuple[str, ...]
+    rtc_prefix_mask_conditioning: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

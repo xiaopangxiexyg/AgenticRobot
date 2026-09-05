@@ -23,7 +23,7 @@ def test_deployment_parser_preserves_compatibility_option_surface() -> None:
     compatibility = _fingerprint(run_policy.add_args)
 
     assert extracted == compatibility
-    assert extracted[0:2] == (271, 301)
+    assert extracted[0:2] == (275, 305)
 
 
 def test_deployment_parser_parses_representative_typed_options() -> None:
