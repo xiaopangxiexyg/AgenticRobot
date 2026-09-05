@@ -2056,7 +2056,7 @@ def test_server_metadata_drift_fails_before_inference(
         _backend(artifact, metadata=metadata)
 
 
-def test_artifact_rtc_contract_can_opt_into_strict_model_identity() -> None:
+def test_artifact_rtc_contract_never_binds_server_model_identity() -> None:
     artifact = _continuous_artifact()
     metadata = _server_metadata(artifact)
     metadata["model_id"] = "switched-model"
@@ -2064,11 +2064,12 @@ def test_artifact_rtc_contract_can_opt_into_strict_model_identity() -> None:
     contract = deploy_contract_from_policy_artifact(
         artifact,
         protocol_version=OPENPI_LOCAL_PROTOCOL_VERSION,
-        strict_identity=True,
     )
 
-    with pytest.raises(ValueError, match="model_id_mismatch"):
-        validate_server_metadata(metadata, contract)
+    result = validate_server_metadata(metadata, contract)
+    assert result.server_summary["model_id"] == "switched-model"
+    assert contract.model_id is None
+    assert contract.checkpoint_step is None
 
 
 def test_short_final_chunk_is_rejected_against_declared_horizon() -> None:

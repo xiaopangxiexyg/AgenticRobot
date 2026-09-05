@@ -37,10 +37,15 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def test_model_rtc_profile_keeps_qpos_init_and_requires_explicit_dispatch() -> None:
-    profile_args = _rm65_bimanual_dmtac_args(rtc_real_shadow=True)
+    profile_args = _rm65_bimanual_dmtac_args(
+        rtc_real_shadow=True,
+        send_actions=True,
+    )
     assert "--send-actions" not in profile_args
     assert "--policy-qpos-init-dataset" in profile_args
     assert "--policy-qpos-init-collision-check" in profile_args
+    assert "--wait-for-ready-confirm" in profile_args
+    assert "--no-wait-for-ready-confirm" not in profile_args
 
     argv = tuple(
         profile_args

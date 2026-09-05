@@ -312,9 +312,9 @@ protocol，不连接 websocket、相机、夹爪或机械臂。它不会把 chec
 `--prepared-config-check-only` 在真实 OpenPI registry 中临时构造并校验派生 config。
 两者都不加载模型、不监听端口，也不创建设备 backend；一次只使用一个。
 
-默认不会用 `model_id`/`checkpoint_step` 阻塞上游模型切换。需要审计精确模型实例时，
-在同一命令中增加 `--strict-model-identity`、`--model "$OPENPI_MODEL"` 和
-`--checkpoint-step "$POLICY_STEP"`。
+`model_id`/`checkpoint_step` 不参与上游模型切换的在线准入，也不提供将其提升为强绑定
+的 CLI 开关。需要审计精确模型实例时，读取 policy artifact、server metadata 和运行收据；
+协议、tensor/layout、相机和归一化兼容性门仍必须通过。
 
 ## 7. 统一 no-action 样例
 
@@ -2033,7 +2033,8 @@ client 与 server 的 checkpoint 变量刻意分开。默认二者选择同一�
 强制 model id/checkpoint step 相同；可以把 client 保持在一个已验证 artifact 上，切换到另一个
 兼容 server step/model。两端仍分别校验自己的 prepared/model-RTC profile 和 checkpoint
 receipt，连接时仍严格校验 layout、三路相机、absolute action、normalization、prompt 与 RTC
-capability。不要加入 `--strict-model-identity`，也不要以覆盖 hash 的方式绕过不兼容。
+capability。model/step 只记录在两端 provenance 中；不要以覆盖 hash 的方式绕过真正的
+协议不兼容。
 
 ### 23.1 共同变量与完整性门
 

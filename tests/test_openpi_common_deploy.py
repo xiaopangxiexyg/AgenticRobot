@@ -706,9 +706,6 @@ class OpenPICommonDeployTest(unittest.TestCase):
                     "127.0.0.2",
                     "--port",
                     "9000",
-                    "--model",
-                    "dual_rm65_dmgripper_latest",
-                    "--strict-model-identity",
                     "--active-sides",
                     "both",
                     "--arm-control-mode",
@@ -729,7 +726,8 @@ class OpenPICommonDeployTest(unittest.TestCase):
         kwargs = json.loads(kwargs_json)
         self.assertEqual(kwargs["host"], "127.0.0.2")
         self.assertEqual(kwargs["port"], 9000)
-        self.assertEqual(kwargs["expected_model_id"], "dual_rm65_dmgripper_latest")
+        self.assertNotIn("expected_model_id", kwargs)
+        self.assertNotIn("expected_checkpoint_step", kwargs)
         self.assertIn("--active-sides", launched_args)
         self.assertEqual(
             launched_args[launched_args.index("--arm-control-mode") + 1],
@@ -1227,9 +1225,9 @@ class OpenPICommonDeployTest(unittest.TestCase):
             ],
         )
 
-    def test_openpi_real_launcher_ignores_empty_optional_contract_args(self) -> None:
-        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
-            result = openpi_real_launcher.main(
+    def test_openpi_real_launcher_rejects_removed_identity_args(self) -> None:
+        with self.assertRaises(SystemExit):
+            openpi_real_launcher.main(
                 [
                     "--host",
                     "127.0.0.2",
@@ -1242,16 +1240,9 @@ class OpenPICommonDeployTest(unittest.TestCase):
                 ]
             )
 
-        self.assertEqual(result, 0)
-        launched_args = run_main.call_args.args[0]
-        kwargs_json = launched_args[launched_args.index("--policy-kwargs-json") + 1]
-        kwargs = json.loads(kwargs_json)
-        self.assertNotIn("expected_model_id", kwargs)
-        self.assertNotIn("expected_checkpoint_step", kwargs)
-
-    def test_openpi_real_launcher_ignores_identity_args_without_strict_opt_in(self) -> None:
-        with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:
-            result = openpi_real_launcher.main(
+    def test_openpi_real_launcher_does_not_abbreviate_model_as_rtc_profile(self) -> None:
+        with self.assertRaises(SystemExit):
+            openpi_real_launcher.main(
                 [
                     "--model",
                     "old-model",
@@ -1259,13 +1250,6 @@ class OpenPICommonDeployTest(unittest.TestCase):
                     "150000",
                 ]
             )
-
-        self.assertEqual(result, 0)
-        launched_args = run_main.call_args.args[0]
-        kwargs_json = launched_args[launched_args.index("--policy-kwargs-json") + 1]
-        kwargs = json.loads(kwargs_json)
-        self.assertNotIn("expected_model_id", kwargs)
-        self.assertNotIn("expected_checkpoint_step", kwargs)
 
     def test_openpi_real_launcher_can_show_delegated_runtime_help(self) -> None:
         with mock.patch("teleop_runtime.deploy.run_policy.main", return_value=0) as run_main:

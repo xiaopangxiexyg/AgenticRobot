@@ -10,8 +10,9 @@ OpenPI server 使用 OpenPI `.venv` 加载模型；`dexteleop310` 中的 client 
 observation、artifact contract、初始化、现场安全门和可选真实下发。每一端必须用自己的
 checkpoint/artifact 和 prepared profile 建立完整契约，但默认不要求 client 与 server 的
 model id 或 checkpoint step 相同；连接时校验的是 layout、相机、动作、normalization、prompt
-和 RTC capability 等实际 wire/runtime 兼容性。只有显式加入 `--strict-model-identity` 才启用
-model/step 精确匹配。
+和 RTC capability 等实际 wire/runtime 兼容性。部署入口不提供 model/step 精确匹配开关；
+model id、checkpoint step、artifact hash 和 continuation contract hash 只保留为来源与同一次
+请求/响应的因果收据，不参与跨 client/server 的实例身份准入。
 
 ## 1. 设置路径并选择绑定
 
@@ -142,6 +143,12 @@ Stage1 通常执行绑定的数据集 qpos-init；Stage2–4 只有在当前姿�
 ready、碰撞、力限或观测新鲜度门。不要加入 `--auto-start`、`--start-init_qpos` 或
 `--no-wait-for-ready-confirm` 来缩短正式流程。
 
+model-RTC Active 还会在 qpos-init 完成后保持测量 qpos，丢弃默认 1 次冷启动 completion，
+用随后 3 次 completion 做推理延迟门；默认最大值为 0.4 秒。在该门通过且操作者完成 ready
+确认之前不会下发策略动作。计划 underrun、producer 不可用或延迟超限都会清空待执行计划并
+保持最新测量 qpos；无法建立该 Hold 时升级到更强 Hold 并报错退出。`--max-steps` 验收可配合
+`--min-rtc-emissions-before-exit`，避免“进程正常退出但零有效 emission”的假通过。
+
 ## 6. 更换 checkpoint 或 server 模型
 
 1. 停止 client 和 server，确认机器人已经退出策略控制。
@@ -153,4 +160,5 @@ ready、碰撞、力限或观测新鲜度门。不要加入 `--auto-start`、`--
 normalization、prompt 和 RTC capability 检查。不得通过手工覆盖 model id、layout hash、step、
 camera routing 或 action pose mode 来绕过 artifact/profile 错误。当前 Stage1/Stage2 all-view
 h32 model-RTC 的完整远端命令见 `cmd_list.md` 第 23 节；该路线只开放真实 observation 的
-no-action shadow，不开放 RTC 动作下发。
+no-action shadow。真实动作还必须显式加入 `--send-actions`，完成 dataset-frame qpos-init、
+ready 确认和上述 Active latency gate；profile 本身不会授予动作权限。

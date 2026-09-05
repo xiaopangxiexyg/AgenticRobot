@@ -230,6 +230,33 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--rtc-active-warmup-discard-completions",
+        type=_non_negative_int,
+        default=1,
+        help=(
+            "Conditioned RTC Active preflight completions discarded before "
+            "latency acceptance (default: 1, covering first-call compilation)."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-active-warmup-completions",
+        type=_positive_int,
+        default=3,
+        help=(
+            "Accepted conditioned RTC completions used for the Active latency "
+            "gate before any policy action may be dispatched (default: 3)."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-active-max-inference-latency-sec",
+        type=_positive_float,
+        default=0.4,
+        help=(
+            "Maximum accepted warm inference latency for Active conditioned "
+            "RTC (default: 0.4 s, the 12-step bound at 30 Hz)."
+        ),
+    )
+    parser.add_argument(
         "--policy-artifact-json",
         type=Path,
         default=None,
@@ -903,6 +930,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Compatibility alias for --action-queue-policy append.",
     )
     parser.add_argument("--max-steps", type=_non_negative_int, default=0)
+    parser.add_argument(
+        "--min-rtc-emissions-before-exit",
+        type=_non_negative_int,
+        default=0,
+        help=(
+            "For bounded RTC acceptance runs, fail instead of reporting success "
+            "when --max-steps is reached before this many committed emissions. "
+            "Default 0 preserves ordinary deployment behavior."
+        ),
+    )
     parser.add_argument(
         "--status-sec",
         type=_positive_float,

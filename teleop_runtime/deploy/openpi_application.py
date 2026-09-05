@@ -50,14 +50,22 @@ _IMAGE_WIRE_CLI_TO_CODEC = {
 }
 
 
-def _rm65_bimanual_dmtac_args(*, rtc_real_shadow: bool = False) -> list[str]:
+def _rm65_bimanual_dmtac_args(
+    *,
+    rtc_real_shadow: bool = False,
+    send_actions: bool = False,
+) -> list[str]:
     """Compatibility wrapper for the reviewed versioned lab profile."""
 
-    return openpi_real_deployment_profile_args(
+    args = openpi_real_deployment_profile_args(
         RM65_BIMANUAL_DMTAC_OPENPI_PROFILE_ID,
         rtc_real_shadow=rtc_real_shadow,
         project_root=_PROJECT_ROOT,
     )
+    if rtc_real_shadow and send_actions:
+        args = [value for value in args if value != "--no-wait-for-ready-confirm"]
+        args.append("--wait-for-ready-confirm")
+    return args
 
 
 def _artifact_path_from_checkpoint(checkpoint_dir: Path) -> Path:
@@ -108,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Launch the OpenPI client through the real teleop_runtime backend.",
         add_help=True,
+        allow_abbrev=False,
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -146,29 +155,6 @@ def main(argv: list[str] | None = None) -> int:
             "Fail before sending if no negotiated optimized image codec is "
             "available. JPEG may still roll back to resize-raw; without this "
             "flag, the final rollback is the historical raw ndarray path."
-        ),
-    )
-    parser.add_argument(
-        "--model",
-        "--expected-model-id",
-        dest="expected_model_id",
-        default=None,
-        help="Optional model identity hint; enforced only with --strict-model-identity.",
-    )
-    parser.add_argument(
-        "--checkpoint-step",
-        "--expected-checkpoint-step",
-        dest="expected_checkpoint_step",
-        default=None,
-        help="Optional checkpoint identity hint; enforced only with --strict-model-identity.",
-    )
-    parser.add_argument(
-        "--strict-model-identity",
-        action="store_true",
-        help=(
-            "Require the server model id and checkpoint step to match the "
-            "provided values or policy artifact. By default deployment checks "
-            "protocol compatibility only."
         ),
     )
     parser.add_argument("--action-dim", type=int, default=26)
@@ -494,31 +480,11 @@ def main(argv: list[str] | None = None) -> int:
             }
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0
-    strict_model_id = _optional_text(args.expected_model_id)
-    strict_checkpoint_step = _optional_text(args.expected_checkpoint_step)
-    if args.strict_model_identity and policy_artifact is not None:
-        strict_model_id = strict_model_id or policy_artifact.model_id
-        if strict_checkpoint_step is None and policy_artifact.checkpoint_step is not None:
-            strict_checkpoint_step = str(policy_artifact.checkpoint_step)
-
     policy_kwargs: dict[str, Any] = {
         "host": args.host,
         "port": int(args.port),
         "api_key": _optional_text(args.api_key),
         "prompt": resolved_prompt,
-        # Model identity is intentionally not part of the default downstream
-        # protocol gate. Keep the old exact check available only when a caller
-        # explicitly opts in.
-        "expected_model_id": (
-            strict_model_id
-            if args.strict_model_identity
-            else None
-        ),
-        "expected_checkpoint_step": (
-            strict_checkpoint_step
-            if args.strict_model_identity
-            else None
-        ),
         "action_dim": int(args.action_dim),
         "action_key": str(args.action_key),
         "required_camera_slots": (
@@ -554,8 +520,12 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime_args: list[str] = []
     if args.deployment_profile == "rm65_bimanual_dmtac":
+        send_actions_requested = "--send-actions" in teleop_args
         runtime_args.extend(
-            _rm65_bimanual_dmtac_args(rtc_real_shadow=bool(args.rtc_real_shadow))
+            _rm65_bimanual_dmtac_args(
+                rtc_real_shadow=bool(args.rtc_real_shadow),
+                send_actions=send_actions_requested,
+            )
         )
     runtime_args.extend(teleop_args)
     if args.disconnected_gripper_sides != "none":

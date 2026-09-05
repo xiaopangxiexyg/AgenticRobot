@@ -95,9 +95,122 @@ def test_rtc_validity_and_bounded_close_overrides_are_explicit_only() -> None:
         run_policy.validate_args(ordinary)
 
 
+def test_bounded_rtc_acceptance_requires_explicit_profile_and_limit() -> None:
+    args, argv = _raw_args(
+        "--max-steps",
+        "100",
+        "--min-rtc-emissions-before-exit",
+        "1",
+    )
+    run_policy.validate_args(args, raw_argv=argv)
+    assert args.min_rtc_emissions_before_exit == 1
+
+    unbounded, unbounded_argv = _raw_args(
+        "--min-rtc-emissions-before-exit",
+        "1",
+    )
+    with pytest.raises(ValueError, match="requires bounded --max-steps"):
+        run_policy.validate_args(unbounded, raw_argv=unbounded_argv)
+
+    ordinary = _parser().parse_args(
+        [
+            "--max-steps",
+            "100",
+            "--min-rtc-emissions-before-exit",
+            "1",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires an explicit --rtc-profile"):
+        run_policy.validate_args(ordinary)
+
+
+def test_active_rtc_gap_uses_measured_qpos_hold_and_clears_position_plan() -> None:
+    class _Arm:
+        def __init__(self) -> None:
+            self.reasons: list[str] = []
+
+        def request_policy_inference_soft_hold(self, reason: str):
+            self.reasons.append(reason)
+            return {"active": True, "status": "activated"}
+
+    class _Executor:
+        def __init__(self) -> None:
+            self.clear_count = 0
+
+        def clear(self) -> None:
+            self.clear_count += 1
+
+    left = _Arm()
+    right = _Arm()
+    executor = _Executor()
+
+    receipts = run_policy._hold_active_rtc_gap(
+        reason="rtc_plan_underrun",
+        send_actions=True,
+        arm_backends={"left": left, "right": right},
+        position_deploy_executor=executor,
+    )
+
+    assert executor.clear_count == 1
+    assert left.reasons == ["rtc_plan_underrun"]
+    assert right.reasons == ["rtc_plan_underrun"]
+    assert set(receipts) == {"left", "right"}
+
+
+def test_active_rtc_gap_rejects_backend_without_measured_qpos_hold() -> None:
+    class _UnsupportedArm:
+        def __init__(self) -> None:
+            self.hold_reasons: list[str] = []
+
+        def hold_motion(self, reason: str) -> None:
+            self.hold_reasons.append(reason)
+
+    backend = _UnsupportedArm()
+    with pytest.raises(RuntimeError, match="unsupported for sides: left"):
+        run_policy._hold_active_rtc_gap(
+            reason="rtc_producer_not_eligible",
+            send_actions=True,
+            arm_backends={"left": backend},
+            position_deploy_executor=None,
+        )
+    assert backend.hold_reasons == [
+        "rtc_producer_not_eligible:measured_qpos_hold_failed"
+    ]
+
+
+def test_active_rtc_latency_gate_discards_cold_sample_and_bounds_warm_max() -> None:
+    pending = run_policy._rtc_active_latency_gate_result(
+        [8.0, 0.20, 0.30],
+        discard_completions=1,
+        required_completions=3,
+        maximum_latency_sec=0.4,
+    )
+    assert pending == (False, False, None)
+
+    accepted = run_policy._rtc_active_latency_gate_result(
+        [8.0, 0.20, 0.30, 0.40],
+        discard_completions=1,
+        required_completions=3,
+        maximum_latency_sec=0.4,
+    )
+    assert accepted == (True, True, 0.40)
+
+    rejected = run_policy._rtc_active_latency_gate_result(
+        [8.0, 0.20, 0.41, 0.30],
+        discard_completions=1,
+        required_completions=3,
+        maximum_latency_sec=0.4,
+    )
+    assert rejected == (True, False, 0.41)
+
+
 def test_openpi_real_shadow_profile_preserves_qpos_init_authority() -> None:
     ordinary = openpi_real._rm65_bimanual_dmtac_args()
     shadow = openpi_real._rm65_bimanual_dmtac_args(rtc_real_shadow=True)
+    active = openpi_real._rm65_bimanual_dmtac_args(
+        rtc_real_shadow=True,
+        send_actions=True,
+    )
     assert "--policy-qpos-init-dataset" in ordinary
     assert "--policy-qpos-init-dataset" in shadow
     assert "--policy-qpos-init-collision-check" in shadow
@@ -105,6 +218,8 @@ def test_openpi_real_shadow_profile_preserves_qpos_init_authority() -> None:
     assert "--dmtac-no-tactile" in ordinary
     assert "--auto-start" in shadow
     assert "--no-wait-for-ready-confirm" in shadow
+    assert "--wait-for-ready-confirm" in active
+    assert "--no-wait-for-ready-confirm" not in active
     assert "--dmtac-no-tactile" in shadow
     assert "--camera-startup-hardware-reset" not in ordinary
     assert "--camera-start-stagger-sec" not in ordinary
@@ -115,6 +230,26 @@ def test_openpi_real_shadow_profile_preserves_qpos_init_authority() -> None:
     run_policy.add_args(parser)
     tactile_opt_in = parser.parse_args([*ordinary, "--dmtac-with-tactile"])
     assert tactile_opt_in.dmtac_tactile is True
+
+
+def test_active_real_model_rtc_rejects_no_ready_confirmation() -> None:
+    args, argv = _raw_args(
+        "--rtc-real-shadow",
+        "--send-actions",
+        "--no-wait-for-ready-confirm",
+        "--left-arm-ip",
+        "192.0.2.10",
+        "--active-sides",
+        "left",
+        "--end-effector-sides",
+        "none",
+        "--arm-execution-profile",
+        "impedance_40hz",
+        "--policy-qpos-init-dataset",
+        "dataset",
+    )
+    with pytest.raises(ValueError, match="requires --wait-for-ready-confirm"):
+        run_policy.validate_args(args, raw_argv=argv)
 
 
 def test_real_shadow_manual_dmtac_ports_bypass_stale_assignment_without_command_authority() -> None:

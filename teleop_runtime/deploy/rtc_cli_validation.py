@@ -63,6 +63,16 @@ def validate_rtc_cli_args(
             "--rtc-real-shadow requires an explicit model-backed RTC profile; "
             "it is unavailable for RTC-3c virtual policy or sync deployment."
         )
+    if (
+        rtc_real_shadow
+        and bool(args.send_actions)
+        and getattr(args, "wait_for_ready_confirm", None) is False
+    ):
+        raise ValueError(
+            "Active model RTC requires --wait-for-ready-confirm after the "
+            "dataset-frame qpos initialization; --no-wait-for-ready-confirm "
+            "is observation-only."
+        )
     if rtc_profile_enabled:
         if rtc_profile_id not in {
             RTC_3C_VIRTUAL_SHADOW_PROFILE_ID_V1,
@@ -153,9 +163,18 @@ def validate_rtc_cli_args(
     elif (
         int(getattr(args, "rtc_request_validity_steps", 10)) != 10
         or float(getattr(args, "rtc_worker_stop_timeout_sec", 0.0)) != 0.0
+        or int(getattr(args, "rtc_active_warmup_discard_completions", 1)) != 1
+        or int(getattr(args, "rtc_active_warmup_completions", 3)) != 3
+        or not math.isclose(
+            float(getattr(args, "rtc_active_max_inference_latency_sec", 0.4)),
+            0.4,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
     ):
         raise ValueError(
-            "RTC validity/worker-stop overrides require an explicit --rtc-profile."
+            "RTC validity/worker-stop overrides and Active latency overrides "
+            "require an explicit --rtc-profile."
         )
     # ``--rtc-real-shadow`` selects the live model RTC transport and hardware
     # observation path.  It is intentionally orthogonal to dispatch and

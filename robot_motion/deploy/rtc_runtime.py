@@ -1663,10 +1663,16 @@ class RtcPolicyShadowFrontend:
         *,
         now: float,
         allow_output: bool = True,
+        allow_request: bool | None = None,
     ) -> RtcFrontendStep:
         self._require_running()
         tick_started = time.perf_counter()
         decision_at = _finite(now, field_name="now")
+        request_allowed = (
+            bool(allow_output)
+            if allow_request is None
+            else bool(allow_request)
+        )
         completion = self._worker.poll_completion()
         result_transition = None
         lifecycle_transition = None
@@ -1833,7 +1839,7 @@ class RtcPolicyShadowFrontend:
 
         request_transition = None
         worker_submission = None
-        if allow_output and self._should_request(decision_at):
+        if request_allowed and self._should_request(decision_at):
             policy_observation = self.deploy_runtime.prepare_policy_observation(
                 observation
             )

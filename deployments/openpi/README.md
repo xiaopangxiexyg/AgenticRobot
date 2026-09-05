@@ -152,10 +152,9 @@ JSON 应包含 `ok=true`、`action_pose_mode=relative`、
 pose hash 不匹配或误用 native-v2.3 语义都会直接失败；DexTeleop 不根据 checkpoint
 路径或数据集名称猜测并补写这些字段。
 
-不要手动将 wrist 图像伪装成 `front`，也不要用位置顺序猜测相机。默认握手只要求
-上游 server 与 artifact 的协议兼容；`model_id` 和 `checkpoint_step` 不作为下游
-切换模型实例的硬绑定。需要逐实例审计时，显式使用
-`--strict-model-identity --model ... --checkpoint-step ...`。
+不要手动将 wrist 图像伪装成 `front`，也不要用位置顺序猜测相机。握手只要求
+上游 server 与 artifact 的协议兼容；`model_id` 和 `checkpoint_step` 始终只是
+运行收据中的 provenance，不参与下游准入，也不存在将它们提升为强绑定的 CLI 开关。
 
 ### 旧 wrist-only checkpoint 的物理左右兼容
 
@@ -396,8 +395,8 @@ print(policy.metadata["validation"])
 ```
 
 任何协议字段（16D action、layout hash、camera slot、state/action key 或 schema）
-不匹配都必须先修复；默认的 model id/step 变化不需要绕过校验。需要精确实例审计时
-再显式启用 `--strict-model-identity`。
+不匹配都必须先修复；model id/step 变化不需要绕过校验。精确实例审计应读取双方
+artifact、server metadata 与运行收据，而不是改变在线准入语义。
 
 ## 5. qpos-init 与 v2.2 数据集
 
@@ -530,7 +529,7 @@ cd "$DEXTELEOP_ROOT"
 | 现象 | 含义与处理 |
 | --- | --- |
 | `must have shape (26,), got (16,)` | 使用了旧 qpos-init 代码；同步 `teleop_runtime/deploy/policy_qpos_init.py` 后重新运行第 5 节只读检查。 |
-| `model_id_mismatch` 或 `checkpoint_step_mismatch` | 只有显式启用 `--strict-model-identity` 时才是阻断项；否则检查实际协议字段是否匹配。 |
+| 运行收据中的 model id 或 checkpoint step 与预期不同 | 这是实例 provenance 审计结果，不是在线准入错误；确认操作员选择的 server 实例，并继续检查实际协议字段是否匹配。 |
 | `camera_slots` 或 required image key 不匹配 | 相机配置缺少 wrist logical key，或试图用 front 替代 wrist；修正配置。 |
 | qpos-init 缺少 target | 指定帧没有有效 qpos audit；换经过审查的 episode/frame，或修复数据集。 |
 | `DMTAC ... config is missing` | `latest` assignment、USB 映射或 side 配置不完整；先解决硬件配置，不要允许缺失后继续执行。 |

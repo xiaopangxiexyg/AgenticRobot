@@ -61,11 +61,10 @@ imports these OpenPI adapters. `deployments.openpi.client.real` remains only as
 the supported historical command path; it must not regain a hardware loop or
 real-runtime ownership.
 
-By default `--model` and `--checkpoint-step` are informational hints and are not
-used to reject an upstream model instance. The downstream gate checks the
-declared wire protocol and tensor/camera contract. Add
-`--strict-model-identity` when an exact model/checkpoint audit is explicitly
-required.
+Model id and checkpoint step are instance provenance and are not accepted as
+client admission flags. The downstream gate checks the declared wire protocol
+and tensor/camera contract. Audit an exact instance from the policy artifact,
+server metadata, and runtime receipts without changing online admission.
 
 ## MuJoCo policy adapter
 

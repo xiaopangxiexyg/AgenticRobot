@@ -263,8 +263,10 @@ hash. Input/output float32 dimensions and independent int64 token dimensions
 are derived from that layout; a sidecar cannot redefine them independently.
 `deploy_contract_from_policy_artifact()` turns it into a protocol-level
 `dexteleop_deploy_v2` server handshake. Model id and checkpoint step are
-provenance, not wire compatibility, so they are omitted by default; callers
-performing an explicit instance audit can request `strict_identity=True`.
+provenance, not wire compatibility, so they are always omitted from deployment
+admission. Instance identifiers remain observable in artifacts and receipts;
+they do not prevent a client from switching to another compatible server step
+or model.
 Dataset, server metadata and runtime must still agree on `policy_io_layout_hash`
 and the declared tensor/camera/state protocol.
 
