@@ -41,6 +41,7 @@ from dataset_interface import (
 )
 from deployments.openpi.training import (
     OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1,
+    OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1,
     OPENPI_MODEL_RTC_DELAY_DEBUG_KEY_V1,
     OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1,
     OPENPI_MODEL_RTC_PREFIX_STEPS_DEBUG_KEY_V1,
@@ -152,10 +153,11 @@ def _sample() -> dict[str, np.ndarray]:
     }
 
 
-def test_adapter_adds_only_the_optional_loss_mask_by_default() -> None:
+def test_adapter_adds_paired_prefix_and_suffix_masks_by_default() -> None:
     transform = _transform()
     output = transform(_sample())
     assert OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1 in output
+    assert OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1 in output
     assert OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1 not in output
     assert OPENPI_MODEL_RTC_DELAY_DEBUG_KEY_V1 not in output
     assert OPENPI_MODEL_RTC_PREFIX_STEPS_DEBUG_KEY_V1 not in output
@@ -163,6 +165,11 @@ def test_adapter_adds_only_the_optional_loss_mask_by_default() -> None:
     assert loss_mask.dtype == np.bool_
     assert loss_mask.shape == (4,)
     assert np.count_nonzero(loss_mask) in (2, 3)
+    prefix_mask = output[OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1]
+    assert prefix_mask.dtype == np.bool_
+    assert prefix_mask.shape == (4,)
+    np.testing.assert_array_equal(prefix_mask | loss_mask, np.ones(4, dtype=bool))
+    assert not np.any(prefix_mask & loss_mask)
 
 
 def test_adapter_selection_is_order_independent_and_epoch_explicit() -> None:
@@ -181,11 +188,13 @@ def test_adapter_selection_is_order_independent_and_epoch_explicit() -> None:
 def test_debug_keys_are_opt_in_and_consistent() -> None:
     output = _transform(debug=True)(_sample())
     prefix = output[OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1]
+    production_prefix = output[OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1]
     loss = output[OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1]
     np.testing.assert_array_equal(
         np.asarray(prefix, dtype=bool) | loss,
         np.ones(4, dtype=bool),
     )
+    np.testing.assert_array_equal(prefix, production_prefix)
     assert int(output[OPENPI_MODEL_RTC_DELAY_DEBUG_KEY_V1]) in (1, 2)
     assert int(output[OPENPI_MODEL_RTC_PREFIX_STEPS_DEBUG_KEY_V1]) in (1, 2)
 
@@ -232,6 +241,45 @@ def test_checkpoint_evidence_binds_actual_artifact_and_template(
 ) -> None:
     checkpoint_dir = tmp_path / "120"
     checkpoint_dir.mkdir()
+    (checkpoint_dir / "assets").mkdir()
+    params_dir = checkpoint_dir / "params"
+    (params_dir / "array_metadatas").mkdir(parents=True)
+    (params_dir / "d").mkdir()
+    (params_dir / "manifest.ocdbt").write_bytes(b"manifest")
+    (params_dir / "_sharding").write_text("{}", encoding="utf-8")
+    (params_dir / "array_metadatas" / "process_0").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    (params_dir / "_METADATA").write_text(
+        json.dumps({"tree_metadata": {"('params', 'value')": {}}}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "training_step").mkdir()
+    (checkpoint_dir / "training_step" / "metadata").write_text(
+        json.dumps(
+            {
+                "format": "openpi_lightweight_train_state_v1",
+                "step": 120,
+                "optimizer_state": "reset_moments_restore_counts",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "_CHECKPOINT_METADATA").write_text(
+        json.dumps(
+            {
+                "item_handlers": {
+                    "assets": "fixture.CallbackHandler",
+                    "params": "fixture.PyTreeCheckpointHandler",
+                    "training_step": "fixture.JsonCheckpointHandler",
+                },
+                "init_timestamp_nsecs": 100,
+                "commit_timestamp_nsecs": 200,
+            }
+        ),
+        encoding="utf-8",
+    )
     template = _artifact()
     actual = replace(template, checkpoint_step=120)
     run = ModelContinuationTrainingRunManifest(
@@ -265,6 +313,9 @@ def test_checkpoint_evidence_binds_actual_artifact_and_template(
     assert evidence.artifact == actual
     assert evidence.training_run == run
     assert evidence.checkpoint_receipt == receipt
+    assert evidence.params_leaf_count == 1
+    assert evidence.orbax_item_handlers == ("assets", "params", "training_step")
+    assert not evidence.params_restore_verified
 
     tampered = replace(actual, metadata={"tampered": True})
     (checkpoint_dir / "policy_artifact.json").write_text(

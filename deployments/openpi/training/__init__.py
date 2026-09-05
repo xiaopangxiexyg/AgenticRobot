@@ -9,10 +9,12 @@ from typing import Any
 _EXPORTS = {
     "OPENPI_CAMERA_SEMANTIC_TRANSFORM_ID_V1": (".adapter",),
     "OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1": (".adapter",),
+    "OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1": (".adapter",),
     "OPENPI_MODEL_RTC_DELAY_DEBUG_KEY_V1": (".adapter",),
     "OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1": (".adapter",),
     "OPENPI_MODEL_RTC_PREFIX_STEPS_DEBUG_KEY_V1": (".adapter",),
     "OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V1": (".adapter",),
+    "OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V2": (".adapter",),
     "OpenPIModelRtcDataConfigFactory": (".adapter",),
     "OpenPIModelRtcTrainingTransform": (".adapter",),
     "OpenPICameraSemanticTransform": (".adapter",),

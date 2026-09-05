@@ -52,7 +52,7 @@ from deployments.openpi.artifact_identity import (
     openpi_v22_native_codec_hash,
 )
 from deployments.openpi.model_rtc_profile import (
-    PREPARED_MODEL_RTC_PROFILE_SCHEMA_V1,
+    PREPARED_MODEL_RTC_PROFILE_SCHEMA_V2,
     load_prepared_model_rtc_profile,
 )
 from .adapter import (
@@ -96,15 +96,18 @@ def _openpi_provider_capability(
     from openpi.models import pi0
     from openpi.policies import policy as openpi_policy
 
-    descriptor_property = getattr(
-        pi0.Pi0,
-        "rtc_continuation_implementation",
+    descriptor_factory = getattr(
+        pi0,
+        "rtc_continuation_implementation_descriptor",
         None,
     )
-    descriptor_getter = getattr(descriptor_property, "fget", None)
-    if not callable(descriptor_getter):
-        raise ValueError("OpenPI Pi0 has no RTC implementation descriptor.")
-    descriptor = descriptor_getter(None)
+    if not callable(descriptor_factory):
+        raise ValueError("OpenPI Pi0 has no RTC implementation descriptor factory.")
+    descriptor = descriptor_factory(
+        mask_aware=bool(
+            getattr(config.model, "rtc_prefix_mask_conditioning", False)
+        )
+    )
     if not isinstance(descriptor, Mapping):
         raise ValueError("OpenPI Pi0 RTC implementation descriptor is invalid.")
     implementation_id = str(descriptor.get("implementation_id") or "").strip()
@@ -189,6 +192,8 @@ def _prepared_source_binding(
     binding: OpenPIPreparedSkillBinding,
     binding_root: Path,
     data_sources: tuple[Any, ...],
+    training_input_contract: Mapping[str, Any] | None,
+    camera_input_contract: Mapping[str, Any] | None,
 ) -> ModelContinuationTrainingSourceBinding:
     camera_keys = tuple(key for _slot, key in binding.camera_slot_to_dataset_key)
     source_bindings = tuple(
@@ -211,6 +216,16 @@ def _prepared_source_binding(
         {
             "prepared_binding_hash": binding.binding_hash,
             "source_bindings": [item.to_dict() for item in source_bindings],
+            "training_input_contract": (
+                None
+                if training_input_contract is None
+                else dict(training_input_contract)
+            ),
+            "camera_input_contract": (
+                None
+                if camera_input_contract is None
+                else dict(camera_input_contract)
+            ),
         },
         domain=PREPARED_MODEL_RTC_SOURCE_MEDIA_HASH_DOMAIN_V1,
     )
@@ -247,6 +262,15 @@ def adapt_prepared_skill_model_rtc_config(
     save_interval: int | None,
     adapter_debug: bool,
 ) -> PreparedModelRtcTrainConfig:
+    if model_rtc_profile.get("schema") != PREPARED_MODEL_RTC_PROFILE_SCHEMA_V2:
+        raise ValueError(
+            "New prepared model-RTC training requires a v2 mask-aware profile; "
+            "v1 profiles remain deployment-only historical evidence."
+        )
+    if model_rtc_profile.get("rtc_prefix_mask_conditioning") is not True:
+        raise ValueError(
+            "Prepared model-RTC training requires explicit prefix-mask conditioning."
+        )
     expected_profile_id = str(
         model_rtc_profile["prepared_skill_profile_id"]
     )
@@ -280,7 +304,12 @@ def adapt_prepared_skill_model_rtc_config(
             source_assets_root=source_assets_root,
         )
     )
-    provider = _openpi_provider_capability(base_config, source_artifact)
+    rtc_model = dataclasses.replace(
+        base_config.model,
+        rtc_prefix_mask_conditioning=True,
+    )
+    rtc_base_config = dataclasses.replace(base_config, model=rtc_model)
+    provider = _openpi_provider_capability(rtc_base_config, source_artifact)
     frame_hashes = tuple(source_artifact.pose_frame_contract_hashes)
     if len(frame_hashes) != 1:
         raise ValueError(
@@ -340,6 +369,16 @@ def adapt_prepared_skill_model_rtc_config(
         binding=binding,
         binding_root=binding_root,
         data_sources=tuple(base_config.data.dataset_sources),
+        training_input_contract=(
+            None
+            if not isinstance(base_config.policy_metadata, Mapping)
+            else base_config.policy_metadata.get("training_input_contract")
+        ),
+        camera_input_contract=(
+            None
+            if source_artifact.camera_input is None
+            else source_artifact.camera_input.to_dict()
+        ),
     )
     effective_exp_name = str(
         exp_name or model_rtc_profile["default_exp_name"]
@@ -374,8 +413,10 @@ def adapt_prepared_skill_model_rtc_config(
         "keep_period": base_config.keep_period,
         "batch_size": int(base_config.batch_size),
         "num_workers": int(base_config.num_workers),
+        "save_optimizer_state": bool(base_config.save_optimizer_state),
         "checkpoint_base_dir": str(base_config.checkpoint_base_dir),
         "assets_source_dir": str(source_assets_root),
+        "rtc_prefix_mask_conditioning": True,
         "prepared_skill_binding_hash": binding.binding_hash,
         "resume": bool(resume),
         "overwrite": bool(overwrite),
@@ -417,6 +458,7 @@ def adapt_prepared_skill_model_rtc_config(
         base_config,
         name=output_config_name,
         exp_name=effective_exp_name,
+        model=rtc_model,
         data=output_data,
         num_train_steps=effective_steps,
         save_interval=effective_save_interval,
@@ -445,6 +487,12 @@ def adapt_prepared_skill_model_rtc_config(
         "save_interval": int(config.save_interval),
         "batch_size": int(config.batch_size),
         "num_workers": int(config.num_workers),
+        "save_optimizer_state": bool(config.save_optimizer_state),
+        "resume_optimizer_semantics": (
+            "restored_optimizer_state_v1"
+            if config.save_optimizer_state
+            else "reset_moments_restore_counts_v1"
+        ),
         "source_count": len(tuple(base_config.data.dataset_sources)),
         "source_binding_hash": source_binding.semantic_content_hash,
         "sampling_spec_hash": sampling_spec.semantic_content_hash,
@@ -454,6 +502,9 @@ def adapt_prepared_skill_model_rtc_config(
         "training_run_manifest_hash": manifest.semantic_content_hash,
         "train_config_hash": train_config_hash,
         "ordinary_prepared_config_unchanged": True,
+        "rtc_prefix_mask_conditioning": bool(
+            config.model.rtc_prefix_mask_conditioning
+        ),
         "rtc_transform_order": "after_prepared_global_identity_v1",
         "adapter_debug": bool(adapter_debug),
     }

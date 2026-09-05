@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -47,12 +48,95 @@ class OpenPIModelRtcCheckpointEvidence:
     artifact: PolicyArtifactContract
     training_run: ModelContinuationTrainingRunManifest
     checkpoint_receipt: ModelContinuationCheckpointReceipt
+    orbax_commit_timestamp_nsecs: int
+    orbax_item_handlers: tuple[str, ...]
+    params_leaf_count: int
+    params_restore_verified: bool
+
+
+def _verify_orbax_checkpoint(
+    root: Path,
+    *,
+    expected_step: int,
+    restore_params: bool,
+) -> tuple[int, tuple[str, ...], int, bool]:
+    """Validate committed Orbax structure and optionally perform a full restore."""
+
+    checkpoint_metadata = _json_object(root / "_CHECKPOINT_METADATA")
+    try:
+        initialized_at = int(checkpoint_metadata["init_timestamp_nsecs"])
+        committed_at = int(checkpoint_metadata["commit_timestamp_nsecs"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Orbax checkpoint has invalid commit timestamps.") from exc
+    if initialized_at <= 0 or committed_at < initialized_at:
+        raise ValueError("Orbax checkpoint is not committed after initialization.")
+    handlers = checkpoint_metadata.get("item_handlers")
+    if not isinstance(handlers, Mapping):
+        raise ValueError("Orbax checkpoint item_handlers metadata is missing.")
+    handler_names = tuple(sorted(str(name) for name in handlers))
+    if "params" not in handlers or "assets" not in handlers:
+        raise ValueError("Orbax checkpoint must contain params and assets items.")
+    state_item = "training_step" if "training_step" in handlers else "train_state"
+    if state_item not in handlers:
+        raise ValueError("Orbax checkpoint has neither training_step nor train_state.")
+
+    params_dir = root / "params"
+    params_metadata = _json_object(params_dir / "_METADATA")
+    tree_metadata = params_metadata.get("tree_metadata")
+    if not isinstance(tree_metadata, Mapping) or not tree_metadata:
+        raise ValueError("Orbax params metadata has no parameter leaves.")
+    params_leaf_count = len(tree_metadata)
+    for required in (
+        params_dir / "manifest.ocdbt",
+        params_dir / "_sharding",
+        params_dir / "array_metadatas" / "process_0",
+    ):
+        if not required.is_file() or required.stat().st_size <= 0:
+            raise ValueError(f"Orbax params item is incomplete: {required}")
+    if not (params_dir / "d").is_dir():
+        raise ValueError("Orbax params data directory is missing.")
+    if any("tmp" in path.name.lower() for path in root.iterdir()):
+        raise ValueError("Orbax checkpoint contains a temporary top-level item.")
+
+    if state_item == "training_step":
+        training_step = _json_object(root / "training_step" / "metadata")
+        try:
+            recorded_step = int(training_step["step"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Orbax lightweight training_step is invalid.") from exc
+        if recorded_step != expected_step:
+            raise ValueError(
+                "Orbax training_step differs from the checkpoint directory."
+            )
+    else:
+        train_state_metadata = root / "train_state" / "_METADATA"
+        if not train_state_metadata.is_file():
+            raise ValueError("Orbax train_state metadata is missing.")
+
+    restored = False
+    if restore_params:
+        try:
+            import orbax.checkpoint as ocp
+        except ImportError as exc:
+            raise RuntimeError(
+                "Full params restore verification requires the OpenPI Orbax environment."
+            ) from exc
+        with ocp.PyTreeCheckpointer() as checkpointer:
+            restored_tree = checkpointer.restore(params_dir)
+        if restored_tree is None:
+            raise ValueError("Orbax params full restore returned no tree.")
+        restored = True
+        del restored_tree
+        gc.collect()
+    return committed_at, handler_names, params_leaf_count, restored
 
 
 def verify_openpi_model_rtc_checkpoint(
     checkpoint_dir: str | Path,
+    *,
+    restore_params: bool = False,
 ) -> OpenPIModelRtcCheckpointEvidence:
-    """Verify the actual artifact, template identity and training receipts."""
+    """Verify sidecars plus committed Orbax state; optionally restore params."""
 
     root = Path(checkpoint_dir).expanduser().resolve()
     artifact = load_policy_artifact(root / "policy_artifact.json")
@@ -98,6 +182,16 @@ def verify_openpi_model_rtc_checkpoint(
         raise ValueError(
             "Checkpoint directory, artifact and receipt step identities differ."
         )
+    (
+        orbax_commit_timestamp_nsecs,
+        orbax_item_handlers,
+        params_leaf_count,
+        params_restore_verified,
+    ) = _verify_orbax_checkpoint(
+        root,
+        expected_step=artifact_step,
+        restore_params=bool(restore_params),
+    )
     template = replace(artifact, checkpoint_step=None)
     if _sha256(openpi_rtc_artifact_hash(template)) != (
         run.policy_artifact_template_hash
@@ -111,6 +205,10 @@ def verify_openpi_model_rtc_checkpoint(
         artifact=artifact,
         training_run=run,
         checkpoint_receipt=receipt,
+        orbax_commit_timestamp_nsecs=orbax_commit_timestamp_nsecs,
+        orbax_item_handlers=orbax_item_handlers,
+        params_leaf_count=params_leaf_count,
+        params_restore_verified=params_restore_verified,
     )
 
 

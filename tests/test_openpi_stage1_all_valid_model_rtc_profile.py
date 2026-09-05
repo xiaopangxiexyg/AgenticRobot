@@ -23,7 +23,7 @@ _PREPARED_PROFILE = (
 _MODEL_RTC_PROFILE = (
     _REPOSITORY
     / "deployments/openpi/configs/model_rtc/"
-    / "writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json"
+    / "writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json"
 )
 
 
@@ -53,6 +53,10 @@ def test_stage1_all_view_h32_model_rtc_profile_matches_prepared_profile() -> Non
     assert model_rtc["maximum_prefix_steps"] <= (
         model_rtc["maximum_forecast_delay_steps"]
     ) < prepared["action_horizon"]
+    assert model_rtc["training_implementation"] == (
+        "mask_aware_hard_flow_prefix_v2"
+    )
+    assert model_rtc["rtc_prefix_mask_conditioning"] is True
 
 
 def test_stage1_all_view_h32_model_rtc_sampling_is_explicit_and_hashable() -> None:
@@ -65,6 +69,7 @@ def test_stage1_all_view_h32_model_rtc_sampling_is_explicit_and_hashable() -> No
         "_", "-"
     )
     assert sampling["delay_prefix_pairs"] == [
+        [1, 0],
         [1, 1],
         [2, 1],
         [2, 2],
@@ -112,6 +117,16 @@ def test_model_rtc_mask_root_isolated_from_ordinary_prepared_profile() -> None:
     assert effective["openpi_final_mask_root"] == str(
         snapshot_root
         / "masks/model-rtc-stage1-all-view-h32-v1/derived/final_keep_masks"
+    )
+    assert effective["openpi_final_mask_inventory_receipt"] == str(
+        snapshot_root
+        / "masks/model-rtc-stage1-all-view-h32-v1/receipts/"
+        "prepared_wrist_final_masks/"
+        "writing_stage1_all_valid_all_view_h32_absolute_non_rtc_100k_v1/"
+        "summary-a328b2b81433d4cc.json"
+    )
+    assert effective["openpi_final_mask_inventory_receipt_sha256"] == (
+        "967a35c614e5cc4e962a7a106d69b943db47c4ed8f0babd4a6c479a3e9acba55"
     )
     assert prepared["openpi_final_mask_root"] != effective["openpi_final_mask_root"]
     assert _prepared_profile_for_model_rtc(prepared, None) is prepared

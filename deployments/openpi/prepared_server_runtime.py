@@ -257,6 +257,16 @@ def build_prepared_openpi_config(
             raise ValueError(
                 "Prepared model-RTC base config has no policy_metadata field."
             )
+        mask_aware = bool(
+            resolution.model_rtc_profile.get(
+                "rtc_prefix_mask_conditioning",
+                False,
+            )
+        )
+        config_overrides["model"] = dataclasses.replace(
+            base.model,
+            rtc_prefix_mask_conditioning=mask_aware,
+        )
         policy_metadata = dict(getattr(base, "policy_metadata", None) or {})
         policy_metadata["policy_artifact"] = artifact.to_dict()
         config_overrides["policy_metadata"] = policy_metadata
@@ -317,6 +327,9 @@ def prepared_config_summary(
             None
             if resolution.model_rtc_profile is None
             else str(resolution.model_rtc_profile["profile_id"])
+        ),
+        "rtc_prefix_mask_conditioning": bool(
+            getattr(config.model, "rtc_prefix_mask_conditioning", False)
         ),
     }
     state_only_bridge = OpenPIStateOnlyInputBridge.from_profile_value(

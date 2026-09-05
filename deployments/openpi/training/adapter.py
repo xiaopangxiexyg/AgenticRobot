@@ -37,6 +37,7 @@ from deployments.openpi.artifact_identity import openpi_rtc_artifact_hash
 OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1 = (
     "model_rtc.action_loss_mask"
 )
+OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1 = "model_rtc.prefix_mask"
 OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1 = (
     "model_rtc.debug_prefix_mask"
 )
@@ -48,6 +49,9 @@ OPENPI_MODEL_RTC_PREFIX_STEPS_DEBUG_KEY_V1 = (
 )
 OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V1 = (
     "dexteleop.openpi.masked_flow_prefix_trainer.v1"
+)
+OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V2 = (
+    "dexteleop.openpi.mask_aware_hard_flow_prefix_trainer.v2"
 )
 OPENPI_MODEL_RTC_TRAINER_PARAMETERS_HASH_DOMAIN_V1 = (
     "dexteleop.openpi.masked_flow_prefix_trainer_parameters.v1"
@@ -139,7 +143,7 @@ class OpenPICameraSemanticTransform:
 
 @dataclass
 class OpenPIModelRtcTrainingTransform:
-    """Add the optional OpenPI action-loss mask to one normalized sample."""
+    """Add paired prefix-conditioning and suffix-loss masks to one sample."""
 
     artifact: PolicyArtifactContract
     sampling_spec: ModelContinuationTrainingSamplingSpec
@@ -255,6 +259,10 @@ class OpenPIModelRtcTrainingTransform:
                 "OpenPI padding differs from the continuation contract."
             )
         output[OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1] = loss_mask
+        output[OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1] = prefix_mask.astype(
+            bool,
+            copy=False,
+        )
         if self.debug:
             output[OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1] = prefix_mask
             output[OPENPI_MODEL_RTC_DELAY_DEBUG_KEY_V1] = np.asarray(
@@ -371,8 +379,12 @@ def build_openpi_model_rtc_training_manifest(
             "action_loss_mask_key": (
                 OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1
             ),
+            "prefix_mask_key": OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1,
             "mask_reduction": "sum_loss_times_mask_over_sum_mask_v1",
-            "prefix_projection": "target_equals_teacher_prefix_v1",
+            "prefix_projection": "hard_teacher_flow_path_v1",
+            "prefix_mask_model_input": (
+                "learned_zero_initialized_row_embedding_v1"
+            ),
             "sampling_draw_index": "data_epoch_v1",
             "ordinary_batch_fallback": "unmasked_mean_v1",
         },
@@ -388,7 +400,7 @@ def build_openpi_model_rtc_training_manifest(
         ),
         sampling_spec_hash=sampling_spec.semantic_content_hash,
         trainer_implementation_id=(
-            OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V1
+            OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V2
         ),
         trainer_parameters_hash=trainer_parameters_hash,
         train_config_hash=train_config_hash,
@@ -398,12 +410,14 @@ def build_openpi_model_rtc_training_manifest(
 
 __all__ = [
     "OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1",
+    "OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1",
     "OPENPI_MODEL_RTC_DELAY_DEBUG_KEY_V1",
     "OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1",
     "OPENPI_MODEL_RTC_PREFIX_STEPS_DEBUG_KEY_V1",
     "OPENPI_MODEL_RTC_SAMPLE_IDENTITY_KEY_V1",
     "OPENPI_CAMERA_SEMANTIC_TRANSFORM_ID_V1",
     "OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V1",
+    "OPENPI_MODEL_RTC_TRAINER_IMPLEMENTATION_ID_V2",
     "OpenPIModelRtcDataConfigFactory",
     "OpenPIModelRtcTrainingTransform",
     "OpenPICameraSemanticTransform",

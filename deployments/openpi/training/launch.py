@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import os
@@ -323,6 +324,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
+    from openpi.models import pi0
+    from openpi.policies import policy as openpi_policy
     from openpi.training import config as openpi_config
 
     base = openpi_config.resolve_policy_metadata(
@@ -352,6 +355,43 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
     normalized = require_trained_model_rtc_v1_contract(
         artifact_template.model_continuation
     )
+    rtc_model = dataclasses.replace(
+        base.model,
+        rtc_prefix_mask_conditioning=True,
+    )
+    descriptor = pi0.rtc_continuation_implementation_descriptor(
+        mask_aware=True,
+    )
+    descriptor_parameters = {
+        "schema": openpi_policy.RTC_IMPLEMENTATION_PARAMETERS_SCHEMA_V1,
+        "model_descriptor": dict(descriptor["parameters"]),
+        "effective_num_steps": 10,
+        "internal_padding_rule": (
+            "zero_horizon_then_existing_action_transforms"
+        ),
+        "final_external_projection": (
+            "exact_selected_rows_after_output_transforms"
+        ),
+    }
+    encoded_parameters = json.dumps(
+        descriptor_parameters,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    expected_parameters_hash = (
+        "sha256:" + hashlib.sha256(encoded_parameters).hexdigest()
+    )
+    if (
+        normalized.runtime.continuation_implementation_id
+        != descriptor["implementation_id"]
+        or normalized.runtime.continuation_implementation_parameters_hash
+        != expected_parameters_hash
+    ):
+        raise ValueError(
+            "Trained artifact template does not bind the live mask-aware "
+            "OpenPI RTC implementation. Regenerate the template before training."
+        )
     if artifact_template.model_id != str(args.output_config_name):
         raise ValueError(
             "artifact template model_id must equal --output-config-name."
@@ -484,6 +524,7 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
             if args.num_workers is None
             else int(args.num_workers)
         ),
+        "save_optimizer_state": bool(base.save_optimizer_state),
         "checkpoint_base_dir": (
             str(base.checkpoint_base_dir)
             if args.checkpoint_base_dir is None
@@ -491,6 +532,7 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         ),
         "resume": bool(args.resume),
         "overwrite": bool(args.overwrite),
+        "rtc_prefix_mask_conditioning": True,
     }
     train_config_hash = _train_config_hash(
         base_config=base,
@@ -537,6 +579,7 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         base,
         name=str(args.output_config_name),
         exp_name=str(args.exp_name),
+        model=rtc_model,
         data=OpenPIModelRtcDataConfigFactory(
             base_factory=base.data,
             transform=transform,
@@ -568,6 +611,15 @@ def build_train_config(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         "camera_semantic_resolution_enabled": camera_transform is not None,
         "camera_semantic_audit_hash": camera_semantic_audit_hash,
         "camera_semantic_audit": camera_semantic_audit,
+        "rtc_prefix_mask_conditioning": bool(
+            config.model.rtc_prefix_mask_conditioning
+        ),
+        "save_optimizer_state": bool(config.save_optimizer_state),
+        "resume_optimizer_semantics": (
+            "restored_optimizer_state_v1"
+            if config.save_optimizer_state
+            else "reset_moments_restore_counts_v1"
+        ),
         "action_pose_mode": "absolute",
         "action_horizon": int(base.model.action_horizon),
         "ordinary_openpi_config_registry_modified": False,

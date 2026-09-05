@@ -2106,7 +2106,16 @@ def _final_mask_training_contract(
     )
     if not roots:
         return None
-    return {
+    receipt_value = profile.get("openpi_final_mask_inventory_receipt")
+    receipt_hash_value = profile.get(
+        "openpi_final_mask_inventory_receipt_sha256"
+    )
+    if (receipt_value is None) != (receipt_hash_value is None):
+        raise ValueError(
+            "final-mask inventory receipt path and SHA-256 must be supplied "
+            "together."
+        )
+    contract = {
         "final_mask_root_layout": "source_dataset_id_partitioned_v1",
         "final_mask_roots_by_source": {
             source_id: str(final_root)
@@ -2117,6 +2126,31 @@ def _final_mask_training_contract(
         ),
         "wrist_depth_mask_paths_fallback_allowed": False,
     }
+    if receipt_value is not None:
+        receipt_path = Path(str(receipt_value)).expanduser().resolve()
+        if not receipt_path.is_file():
+            raise FileNotFoundError(
+                f"Final-mask inventory receipt is missing: {receipt_path}."
+            )
+        expected_hash = _sha256_digest(
+            receipt_hash_value,
+            name="openpi_final_mask_inventory_receipt_sha256",
+        )
+        actual_hash = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise ValueError(
+                "Final-mask inventory receipt differs from the model-RTC "
+                f"profile: {receipt_path}."
+            )
+        contract.update(
+            {
+                "final_mask_inventory_receipt": str(receipt_path),
+                "final_mask_inventory_receipt_sha256": (
+                    f"sha256:{actual_hash}"
+                ),
+            }
+        )
+    return contract
 
 
 def _bind_source_partitioned_final_masks_to_dataset(
@@ -2682,18 +2716,20 @@ def _prepared_profile_for_model_rtc(
         raise ValueError(
             "prepared_final_mask_root must be a path string when declared."
         )
+    organized_root_value = str(profile.get("organized_dataset_root") or "")
+    snapshot_root = (
+        Path(organized_root_value).expanduser().resolve().parent.parent
+        if organized_root_value
+        else None
+    )
     root = Path(str(configured)).expanduser()
     if not root.is_absolute():
-        organized_root_value = str(profile.get("organized_dataset_root") or "")
-        if not organized_root_value:
+        if snapshot_root is None:
             raise ValueError(
                 "relative prepared_final_mask_root requires "
                 "organized_dataset_root."
             )
-        root = (
-            Path(organized_root_value).expanduser().resolve().parent.parent
-            / root
-        )
+        root = snapshot_root / root
     if profile.get("openpi_final_mask_root_layout") != (
         "source_dataset_id_partitioned_v1"
     ):
@@ -2702,6 +2738,31 @@ def _prepared_profile_for_model_rtc(
         )
     effective = dict(profile)
     effective["openpi_final_mask_root"] = str(root.resolve())
+    receipt_value = model_rtc_profile.get(
+        "prepared_final_mask_inventory_receipt"
+    )
+    receipt_sha256 = model_rtc_profile.get(
+        "prepared_final_mask_inventory_receipt_sha256"
+    )
+    if (receipt_value is None) != (receipt_sha256 is None):
+        raise ValueError(
+            "prepared final-mask inventory receipt path and SHA-256 must be supplied together."
+        )
+    if receipt_value is not None:
+        receipt_path = Path(str(receipt_value)).expanduser()
+        if not receipt_path.is_absolute():
+            if snapshot_root is None:
+                raise ValueError(
+                    "relative prepared final-mask inventory receipt requires "
+                    "organized_dataset_root."
+                )
+            receipt_path = snapshot_root / receipt_path
+        effective["openpi_final_mask_inventory_receipt"] = str(
+            receipt_path.resolve()
+        )
+        effective["openpi_final_mask_inventory_receipt_sha256"] = str(
+            receipt_sha256
+        )
     return effective
 
 
