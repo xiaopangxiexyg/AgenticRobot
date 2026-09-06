@@ -1514,7 +1514,7 @@ class RealTeleopControlInput:
                             f"长程进度请求已提交：{event}",
                         )
                 elif event.startswith("progress_profile_select:"):
-                    if not self.submit_progress_profile_selection_ui_event(event):
+                    if not self.submit_progress_ui_event(event):
                         self.ui.append_message(
                             "Progress",
                             f"无法解析或已有待处理的 profile 选择：{event}",
@@ -1525,9 +1525,7 @@ class RealTeleopControlInput:
                             f"长程进度 profile 选择已提交：{event}",
                         )
                 elif event.startswith("progress_entry_step_select:"):
-                    if not self.submit_progress_entry_step_selection_ui_event(
-                        event
-                    ):
+                    if not self.submit_progress_ui_event(event):
                         self.ui.append_message(
                             "Progress",
                             f"无法解析或已有待处理的起始子任务选择：{event}",
@@ -1538,9 +1536,7 @@ class RealTeleopControlInput:
                             f"长程进度起始子任务选择已提交：{event}",
                         )
                 elif event.startswith("progress_arm_control_mode_select:"):
-                    if not self.submit_progress_arm_control_mode_selection_ui_event(
-                        event
-                    ):
+                    if not self.submit_progress_ui_event(event):
                         self.ui.append_message(
                             "Progress",
                             f"无法解析或已有待处理的臂控制模式选择：{event}",
@@ -4622,19 +4618,35 @@ class RealTeleopControlInput:
         return True
 
     def submit_progress_ui_event(self, event: str) -> bool:
-        """Translate one admitted browser event into the typed application port."""
+        """Translate and route one admitted browser progress event."""
 
         self._progress_operator_intent_sequence += 1
+        normalized_event = str(event)
+        command_prefix = "real-teleop-progress-gui"
+        if normalized_event.startswith("progress_profile_select:"):
+            command_prefix = "real-teleop-progress-profile-gui"
+        elif normalized_event.startswith("progress_entry_step_select:"):
+            command_prefix = "real-teleop-progress-entry-step-gui"
+        elif normalized_event.startswith("progress_arm_control_mode_select:"):
+            command_prefix = "real-teleop-progress-arm-mode-gui"
         command = self._progress_application_port().command_from_event(
-            event=str(event),
-            command_id=(
-                "real-teleop-progress-gui:"
-                f"{self._progress_operator_intent_sequence}"
-            ),
+            event=normalized_event,
+            command_id=f"{command_prefix}:{self._progress_operator_intent_sequence}",
         )
         if command is None:
             return False
-        return self.submit_progress_operator_intent(command)
+        if isinstance(command, ProgressMutationCommand):
+            return self.submit_progress_operator_intent(command)
+        if isinstance(command, ProgressProfileSelectionCommand):
+            return self.submit_progress_profile_selection_intent(command)
+        if isinstance(command, ProgressEntryStepSelectionCommand):
+            return self.submit_progress_entry_step_selection_intent(command)
+        if isinstance(command, ProgressArmControlModeSelectionCommand):
+            return self.submit_progress_arm_control_mode_selection_intent(command)
+        raise TypeError(
+            "Progress application returned an unsupported command type: "
+            f"{type(command).__qualname__}."
+        )
 
     def publish_progress_control_availability(
         self,
@@ -4682,7 +4694,7 @@ class RealTeleopControlInput:
                 f"{self._progress_operator_intent_sequence}"
             ),
         )
-        if command is None:
+        if not isinstance(command, ProgressMutationCommand):
             return False
         return self.submit_progress_operator_intent(command)
 
@@ -4707,22 +4719,6 @@ class RealTeleopControlInput:
             getattr(self, "_progress_ui_transport_revision", 0)
         ) + 1
         return True
-
-    def submit_progress_profile_selection_ui_event(
-        self,
-        event: str,
-    ) -> bool:
-        self._progress_operator_intent_sequence += 1
-        command = self._progress_application_port().profile_selection_from_event(
-            event=str(event),
-            command_id=(
-                "real-teleop-progress-profile-gui:"
-                f"{self._progress_operator_intent_sequence}"
-            ),
-        )
-        if command is None:
-            return False
-        return self.submit_progress_profile_selection_intent(command)
 
     def submit_progress_arm_control_mode_selection_intent(
         self,
@@ -4785,40 +4781,6 @@ class RealTeleopControlInput:
             getattr(self, "_progress_ui_transport_revision", 0)
         ) + 1
         return True
-
-    def submit_progress_entry_step_selection_ui_event(
-        self,
-        event: str,
-    ) -> bool:
-        self._progress_operator_intent_sequence += 1
-        command = self._progress_application_port().entry_step_selection_from_event(
-            event=str(event),
-            command_id=(
-                "real-teleop-progress-entry-step-gui:"
-                f"{self._progress_operator_intent_sequence}"
-            ),
-        )
-        if command is None:
-            return False
-        return self.submit_progress_entry_step_selection_intent(command)
-
-    def submit_progress_arm_control_mode_selection_ui_event(
-        self,
-        event: str,
-    ) -> bool:
-        self._progress_operator_intent_sequence += 1
-        command = (
-            self._progress_application_port().arm_control_mode_selection_from_event(
-                event=str(event),
-                command_id=(
-                    "real-teleop-progress-arm-mode-gui:"
-                    f"{self._progress_operator_intent_sequence}"
-                ),
-            )
-        )
-        if command is None:
-            return False
-        return self.submit_progress_arm_control_mode_selection_intent(command)
 
     def publish_progress_ui_state(
         self,

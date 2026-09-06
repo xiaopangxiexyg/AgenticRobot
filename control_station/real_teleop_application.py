@@ -23,6 +23,7 @@ from teleop_runtime.real_teleop.progress_adapter import (
     select_real_teleop_progress_entry_step,
 )
 from teleop_runtime.real_teleop.progress_contracts import (
+    ProgressApplicationCommand,
     ProgressApplicationProjection,
     ProgressArmControlModeSelectionCommand,
     ProgressEntryStepSelectionCommand,
@@ -339,59 +340,41 @@ class StationProgressApplication:
         *,
         event: str,
         command_id: str,
-    ) -> ProgressMutationCommand | None:
-        intent = progress_intent_from_event(event, intent_id=command_id)
-        return None if intent is None else progress_command_from_intent(intent)
-
-    def profile_selection_from_event(
-        self,
-        *,
-        event: str,
-        command_id: str,
-    ) -> ProgressProfileSelectionCommand | None:
-        intent = progress_profile_selection_intent_from_event(
+    ) -> ProgressApplicationCommand | None:
+        progress_intent = progress_intent_from_event(event, intent_id=command_id)
+        if progress_intent is not None:
+            return progress_command_from_intent(progress_intent)
+        profile_selection_intent = progress_profile_selection_intent_from_event(
             event,
             intent_id=command_id,
         )
-        if intent is None:
-            return None
-        return ProgressProfileSelectionCommand(
-            command_id=intent.intent_id,
-            profile_id=intent.profile_id,
+        if profile_selection_intent is not None:
+            return ProgressProfileSelectionCommand(
+                command_id=profile_selection_intent.intent_id,
+                profile_id=profile_selection_intent.profile_id,
+            )
+        entry_step_selection_intent = (
+            progress_entry_step_selection_intent_from_event(
+                event,
+                intent_id=command_id,
+            )
         )
-
-    def arm_control_mode_selection_from_event(
-        self,
-        *,
-        event: str,
-        command_id: str,
-    ) -> ProgressArmControlModeSelectionCommand | None:
-        intent = progress_arm_control_mode_selection_intent_from_event(
-            event,
-            intent_id=command_id,
+        if entry_step_selection_intent is not None:
+            return ProgressEntryStepSelectionCommand(
+                command_id=entry_step_selection_intent.intent_id,
+                progress_step_id=entry_step_selection_intent.progress_step_id,
+            )
+        arm_control_mode_selection_intent = (
+            progress_arm_control_mode_selection_intent_from_event(
+                event,
+                intent_id=command_id,
+            )
         )
-        if intent is None:
+        if arm_control_mode_selection_intent is None:
             return None
         return ProgressArmControlModeSelectionCommand(
-            command_id=intent.intent_id,
-            mode=intent.mode,
-        )
-
-    def entry_step_selection_from_event(
-        self,
-        *,
-        event: str,
-        command_id: str,
-    ) -> ProgressEntryStepSelectionCommand | None:
-        intent = progress_entry_step_selection_intent_from_event(
-            event,
-            intent_id=command_id,
-        )
-        if intent is None:
-            return None
-        return ProgressEntryStepSelectionCommand(
-            command_id=intent.intent_id,
-            progress_step_id=intent.progress_step_id,
+            command_id=arm_control_mode_selection_intent.intent_id,
+            mode=arm_control_mode_selection_intent.mode,
         )
 
     def build_startup_progress_ui_payload(

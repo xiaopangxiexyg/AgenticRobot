@@ -623,10 +623,10 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
     intents = control.consume_progress_operator_intents()
     assert [intent.kind for intent in intents] == ["REPORT_FAILURE"]
 
-    assert control.submit_progress_profile_selection_ui_event(
+    assert control.submit_progress_ui_event(
         "progress_profile_select:fixture-progress"
     )
-    assert not control.submit_progress_profile_selection_ui_event(
+    assert not control.submit_progress_ui_event(
         "progress_profile_select:other-progress"
     )
     selections = control.consume_progress_profile_selection_intents()
@@ -637,10 +637,10 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
         ),
     )
 
-    assert control.submit_progress_entry_step_selection_ui_event(
+    assert control.submit_progress_ui_event(
         "progress_entry_step_select:write"
     )
-    assert not control.submit_progress_entry_step_selection_ui_event(
+    assert not control.submit_progress_ui_event(
         "progress_entry_step_select:return"
     )
     assert control.consume_progress_entry_step_selection_intents() == (
@@ -650,7 +650,7 @@ def test_entity_adapter_translates_gui_event_without_running_effects() -> None:
         ),
     )
 
-    assert control.submit_progress_arm_control_mode_selection_ui_event(
+    assert control.submit_progress_ui_event(
         "progress_arm_control_mode_select:strict_profile"
     )
     arm_mode_selections = (
@@ -712,7 +712,7 @@ def test_strict_profile_blocks_manual_fix_and_single_arm_pedal_routes(
         "two_pedal_c",
     ]
     control._progress_operator_intent_sequence = 0
-    assert control.submit_progress_arm_control_mode_selection_ui_event(
+    assert control.submit_progress_ui_event(
         "progress_arm_control_mode_select:profile"
     )
     assert not control._manual_fix_arm_controls_enabled()
