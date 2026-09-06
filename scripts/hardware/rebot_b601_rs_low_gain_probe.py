@@ -115,7 +115,7 @@ _DEFAULT_MIN_STEP_RESPONSE_RATIO = 0.10
 _DEFAULT_MAX_STEP_RESPONSE_RATIO = 1.50
 _DEFAULT_MIN_STEP_RESPONSE_RAD = math.radians(0.1)
 _DEFAULT_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
-_DEFAULT_VELOCITY_ABORT_RAD_S = 0.10
+_DEFAULT_VELOCITY_ABORT_RAD_S = 0.12
 _DEFAULT_ACCELERATION_ABORT_RAD_S2 = 4.0
 _DEFAULT_MAX_ERROR_RAD = 0.15
 _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
@@ -3562,6 +3562,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--velocity-abort-rad-s",
         type=float,
         default=_DEFAULT_VELOCITY_ABORT_RAD_S,
+        help=(
+            "normal-control finite-difference velocity abort threshold; "
+            "independent from the stricter fault-hold stationarity gate"
+        ),
     )
     parser.add_argument(
         "--acceleration-abort-rad-s2",

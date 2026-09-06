@@ -1,0 +1,65 @@
+{
+  "schema": "agenticrobot.b601-rs-operator-attestation.v1",
+  "recorded_at": "2026-09-06T11:43:57+08:00",
+  "recorded_from": "project operator statement in the development session",
+  "source_run": {
+    "artifact_path_at_recording": "/tmp/b601-rs-commissioning/b601_pose_hold_translation_rotation_18f2920d.json",
+    "artifact_sha256": "2cb719e86dbc569b84566307fb9898e1a9b112db77af20c52ba5df31ef273e5f",
+    "claimed_agenticrobot_commit": "18f2920dca49438007b67277a200ca552f9446e4",
+    "commit_binding": "filename_and_contemporaneous_handoff_only; the source JSON did not embed commit/tree",
+    "config_sha256": "be51e877050cc4716188fca3b4f2a41109682513c7715c71594066a133ba5cf9",
+    "urdf_sha256": "2012b5aa3b58878109cb9e3c5deef919a87bd09a67d561662b2904a30dd4397e"
+  },
+  "machine_observation": {
+    "mode": "pose-hold",
+    "status": "FAIL",
+    "acceptance_status": "FAIL",
+    "hardware_acceptance": "NOT_CLAIMED",
+    "commands_sent": 121,
+    "target_rate_hz": 20.0,
+    "feedback_observed_hz": 19.765096535322886,
+    "compute_observed_hz": 19.765044707770123,
+    "tx_observed_hz": 19.76503910842588,
+    "frequency_gates_passed": true,
+    "deadline_misses": 0,
+    "torque_limit_count": 0,
+    "slew_limit_count": 49,
+    "cleanup_safe_stop_completed": true,
+    "stop_reason": "velocity abort: max_abs_fd_velocity=0.098028 > 0.030000 rad/s",
+    "axis_stage_markers_present": false,
+    "qacc_and_rejected_sample_fields_present": false
+  },
+  "operator_attestation": {
+    "scope": "manual single-axis perturbation within the recorded pose-hold run",
+    "result": "ACCEPTED",
+    "statement": "之前已经验收了人工单轴扰动",
+    "axis_breakdown": "NOT_RECORDED",
+    "observer_identity": "NOT_RECORDED"
+  },
+  "synchronized_conclusion": {
+    "human_observation": "ACCEPTED_FOR_RECORDED_SINGLE_AXIS_SCOPE",
+    "formal_run_result": "FAIL",
+    "formal_hardware_acceptance": "NOT_CLAIMED",
+    "not_accepted": [
+      "machine-replayable per-axis acceptance",
+      "combined translation and rotation",
+      "qacc hardware limit",
+      "high-bandwidth haptic feedback",
+      "final impedance gains"
+    ]
+  },
+  "threshold_decision": {
+    "normal_motion_velocity_abort_rad_s": 0.12,
+    "basis": "operator-accepted motion observed at 0.098028 rad/s with approximately 22 percent headroom",
+    "no_touch_velocity_abort_rad_s": 0.05,
+    "acceleration_abort_rad_s2": 4.0,
+    "acceleration_status": "UNCHANGED_UNVERIFIED_COMMISSIONING_SEED",
+    "fault_hold_max_velocity_rad_s": 0.02,
+    "fault_hold_status": "UNCHANGED_INDEPENDENT_STATIONARITY_GATE",
+    "other_limits": "UNCHANGED_PENDING_LIMIT_SPECIFIC_EVIDENCE"
+  },
+  "immutability": {
+    "source_artifact_modified": false,
+    "purpose": "append-only synchronization; never reinterpret or overwrite the source JSON"
+  }
+}
