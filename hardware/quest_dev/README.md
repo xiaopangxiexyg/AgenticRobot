@@ -13,7 +13,7 @@
 - 手柄坐标轴和最多 20 Hz 的 `gripSpace` 只读遥测；
 - host 侧按认证客户端保留 latest-only 样本，reset/end/disconnect 立即失效；
 - 固定在 TCP 上的 Quest 手柄与机器人 TCP 成对位姿离线拟合；
-- 可选 AR5 Redis `GET` 反馈；默认关闭，且当前不会在 Quest 中绘制机器人 TCP。
+- 可选 AR5 Redis `GET` 反馈；默认关闭。只有外部 reviewed binding、当前 Quest epoch 和被动 pose identity 全部匹配时才绘制 TCP axes。
 
 ## 目录结构
 
@@ -31,6 +31,7 @@ hardware/quest_dev/
 │       ├── protocol.py                # robot_tcp 下行协议
 │       ├── paired_pose_calibration.py # 两个固定 SE(3) 的离线拟合
 │       ├── alignment.py               # 已有的对应点 Kabsch 工具
+│       ├── frame_binding.py           # reviewed frame binding 与纯 TCP 投影
 │       └── transforms.py
 ├── web/
 │   ├── app.js                         # 认证后的 WebXR/WSS lifecycle
@@ -186,7 +187,8 @@ node --test hardware/quest_dev/tests/*.test.js
 ## 来源与所有权
 
 - HTTPS/WSS 与 WebXR 基础来自既有 `quest_pose`，遥操作发布和 Redis 写入已移除；
-- visualization 反馈解析来自既有 AR5 只读反馈契约；
+- visualization 反馈解析来自既有 AR5 只读反馈契约；旧裸 Redis pose 仍不可直接投影到 Quest；
+- reviewed binding 的 parser 只验证外部 acceptance receipt，不自动创建或接受标定；
 - `hardware/quest_dev` 只拥有 Quest 接入与 feature-local 诊断，不拥有控制 authority、
   canonical safety、轨迹生成、future selection 或执行生命周期；
 - 模块不会被 AgenticRobot 自动启动，也不跨模块 import `quest_pose`、AR5 runtime、

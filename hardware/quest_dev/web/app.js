@@ -298,6 +298,9 @@
         viewerPose,
         viewProjection,
         controllerPoses,
+        clientInstanceId,
+        xrSessionId,
+        referenceSpaceType,
         referenceSpaceGeneration,
         logEvent,
       });
