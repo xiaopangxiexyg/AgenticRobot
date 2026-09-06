@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SOURCE_WRAPPER = Path(__file__).resolve().parents[1] / "scripts/run_pytest.sh"
 SOURCE_PYTHON_RESOLVER = (
     Path(__file__).resolve().parents[1] / "scripts/resolve_dev_python.sh"
@@ -58,6 +60,12 @@ def _write_probe(path: Path, *, passes: bool = True) -> None:
         f"    assert {assertion}\n",
         encoding="utf-8",
     )
+
+
+def _environment(python: Path) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["DEXTELEOP_PYTHON"] = str(python)
+    return environment
 
 
 def test_wrapper_mounts_declared_asset_root_and_removes_temporary_link(tmp_path: Path) -> None:
@@ -153,3 +161,124 @@ def test_wrapper_rejects_a_relative_asset_root_without_creating_a_link(tmp_path:
     assert completed.returncode != 0
     assert "DEXTELEOP_ASSET_ROOT must be an absolute directory" in completed.stderr
     assert not os.path.lexists(checkout / "assets")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_timeout", "expected_faulthandler"),
+    [
+        ({}, "120", "60"),
+        (
+            {
+                "DEXTELEOP_PYTEST_TIMEOUT_SECONDS": "7.5",
+                "DEXTELEOP_PYTEST_FAULTHANDLER_TIMEOUT_SECONDS": ".25",
+            },
+            "7.5",
+            ".25",
+        ),
+    ],
+)
+def test_wrapper_injects_owned_watchdog_options(
+    tmp_path: Path,
+    overrides: dict[str, str],
+    expected_timeout: str,
+    expected_faulthandler: str,
+) -> None:
+    _checkout, wrapper = _wrapper_checkout(tmp_path)
+    invocation_log = tmp_path / "pytest-arguments.txt"
+    fake_python = tmp_path / "python3.10"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ ${1:-} == -m && ${2:-} == pytest ]]; then\n"
+        "  shift 2\n"
+        '  printf \'%s\\n\' "$@" >"$PYTEST_INVOCATION_LOG"\n'
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    environment = _environment(fake_python)
+    environment["PYTEST_INVOCATION_LOG"] = str(invocation_log)
+    environment.update(overrides)
+
+    completed = subprocess.run(
+        [str(wrapper), "-q", "tests/test_example.py"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    arguments = invocation_log.read_text(encoding="utf-8").splitlines()
+    assert arguments[:6] == [
+        "-p",
+        "pytest_timeout",
+        f"--timeout={expected_timeout}",
+        "--timeout-method=signal",
+        "-o",
+        f"faulthandler_timeout={expected_faulthandler}",
+    ]
+    assert arguments[6].startswith("--basetemp=/tmp/dt-pytest-")
+    assert arguments[-2:] == ["-q", "tests/test_example.py"]
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("DEXTELEOP_PYTEST_TIMEOUT_SECONDS", "0"),
+        ("DEXTELEOP_PYTEST_FAULTHANDLER_TIMEOUT_SECONDS", "not-a-number"),
+    ],
+)
+def test_wrapper_rejects_invalid_watchdog_values(
+    tmp_path: Path,
+    variable: str,
+    value: str,
+) -> None:
+    _checkout, wrapper = _wrapper_checkout(tmp_path)
+    fake_python = tmp_path / "python3.10"
+    fake_python.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    environment = _environment(fake_python)
+    environment[variable] = value
+
+    completed = subprocess.run(
+        [str(wrapper), "-q"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode != 0
+    assert f"{variable} must be a positive number" in completed.stderr
+
+
+def test_wrapper_terminates_a_hung_test_with_diagnostics(tmp_path: Path) -> None:
+    pytest.importorskip("pytest_timeout")
+    _checkout, wrapper = _wrapper_checkout(tmp_path)
+    probe = tmp_path / "test_hung_probe.py"
+    probe.write_text(
+        "import time\n\ndef test_hung_probe():\n    time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    environment = _environment(Path(sys.executable))
+    environment.update(
+        {
+            "DEXTELEOP_PYTEST_TIMEOUT_SECONDS": "0.4",
+            "DEXTELEOP_PYTEST_FAULTHANDLER_TIMEOUT_SECONDS": "0.2",
+        }
+    )
+
+    completed = subprocess.run(
+        [str(wrapper), "-p", "no:cacheprovider", "-q", str(probe)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0
+    assert "timeout" in output.lower()
+    assert "test_hung_probe" in output

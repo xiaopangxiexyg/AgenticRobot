@@ -355,7 +355,7 @@ PY
 | 分组 | 内容 | 主环境中是否安装 |
 | --- | --- | --- |
 | `core` | NumPy、SciPy、Pink/QP 求解和控制循环工具（`pin-pink` 由脚本特殊安装） | 是 |
-| `test` | pytest | 是 |
+| `test` | pytest、pytest-timeout | 是 |
 | `dataset` | Pandas、PyArrow、Pillow | 是 |
 | `annotation` | 独立标注所需的 NumPy、SciPy、OSQP、PyArrow | 是；也可单独安装 |
 | `sim` | MuJoCo、Gymnasium，以及冻结保留入口所需的 SAPIEN 兼容依赖 | 是 |
@@ -446,6 +446,17 @@ PY
 ```
 
 项目测试统一关闭 user-site 和外部 pytest 插件：
+
+`run_pytest.sh` 会显式加载锁定的 `pytest-timeout`：单个测试默认超过 60 秒时先输出
+Python 线程栈，超过 120 秒则失败并继续保留 Harness 的外层限时作为兜底。这两个阈值不会
+改变测试选择、marker、分片或覆盖率；确认某个已审查测试确实需要更长时间时，可仅对该次
+调用设置正数秒值：
+
+```bash
+DEXTELEOP_PYTEST_FAULTHANDLER_TIMEOUT_SECONDS=60 \
+DEXTELEOP_PYTEST_TIMEOUT_SECONDS=240 \
+  bash scripts/run_pytest.sh -q tests/test_known_slow_case.py
+```
 
 ```bash
 # 共享开发基座门禁：环境、锁、源码解析和核心包边界，不连接硬件。
