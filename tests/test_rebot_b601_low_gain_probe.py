@@ -68,6 +68,88 @@ def test_shared_gravity_ramp_preserves_vector_and_keeps_damping_live() -> None:
     )
 
 
+def test_startup_handoff_uses_the_same_rise_time_after_gravity() -> None:
+    assert probe.startup_handoff_fraction(elapsed_sec=0.0, rise_time_sec=0.5) == 0.0
+    assert probe.startup_handoff_fraction(elapsed_sec=0.5, rise_time_sec=0.5) == 0.0
+    assert probe.startup_handoff_fraction(elapsed_sec=0.75, rise_time_sec=0.5) == pytest.approx(
+        0.5
+    )
+    assert probe.startup_handoff_fraction(elapsed_sec=2.0, rise_time_sec=0.5) == 1.0
+
+
+def test_startup_lock_profile_uses_per_joint_yaml_gains_and_final_bounds() -> None:
+    profile = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
+        mit_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
+        torque_limits_nm=(9.0, 9.0, 9.0, 3.5, 3.5, 3.5),
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+
+    assert profile.position_kp_nm_per_rad == (50.0, 150.0, 150.0, 50.0, 50.0, 50.0)
+    assert profile.damping_kd_nm_s_per_rad == (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
+    assert profile.max_torque_rate_nm_s == (18.0, 18.0, 18.0, 7.0, 7.0, 7.0)
+    assert profile.max_abs_overlay_torque_nm == (0.0,) * 6
+    assert profile.metadata["gain_source"] == "rebotarm_rs_yaml.MIT"
+
+
+def test_startup_lock_blend_preserves_gravity_vector_and_handoffs_overlay() -> None:
+    startup = probe.B601MitTorqueBreakdown(
+        position_torque_nm=(1.0,) * 6,
+        damping_torque_nm=(2.0,) * 6,
+        gravity_torque_nm=(4.0, -3.0, 2.0, -1.0, 0.5, -0.25),
+        overlay_requested_nm=(0.0,) * 6,
+        overlay_effective_nm=(0.0,) * 6,
+        requested_torque_nm=(7.0, 7.0, 7.0, 7.0, 7.5, 6.75),
+        overlay_limited=False,
+    )
+    final = probe.B601MitTorqueBreakdown(
+        position_torque_nm=(0.1,) * 6,
+        damping_torque_nm=(0.2,) * 6,
+        gravity_torque_nm=startup.gravity_torque_nm,
+        overlay_requested_nm=(0.3,) * 6,
+        overlay_effective_nm=(0.25,) * 6,
+        requested_torque_nm=(0.55,) * 6,
+        overlay_limited=True,
+    )
+
+    halfway = probe.blend_startup_lock_torque_breakdown(
+        startup,
+        final,
+        gravity_fraction=0.5,
+        handoff_fraction=0.5,
+    )
+    assert halfway.position_torque_nm == pytest.approx((0.55,) * 6)
+    assert halfway.damping_torque_nm == pytest.approx((1.1,) * 6)
+    assert halfway.gravity_torque_nm == pytest.approx(
+        tuple(0.5 * value for value in startup.gravity_torque_nm)
+    )
+    assert halfway.overlay_requested_nm == pytest.approx((0.15,) * 6)
+    assert halfway.overlay_effective_nm == pytest.approx((0.125,) * 6)
+    assert halfway.requested_torque_nm == pytest.approx(
+        tuple(
+            position + damping + gravity + overlay
+            for position, damping, gravity, overlay in zip(
+                halfway.position_torque_nm,
+                halfway.damping_torque_nm,
+                halfway.gravity_torque_nm,
+                halfway.overlay_effective_nm,
+                strict=True,
+            )
+        )
+    )
+
+    completed = probe.blend_startup_lock_torque_breakdown(
+        startup,
+        final,
+        gravity_fraction=1.0,
+        handoff_fraction=1.0,
+    )
+    assert completed.position_torque_nm == final.position_torque_nm
+    assert completed.damping_torque_nm == final.damping_torque_nm
+    assert completed.overlay_effective_nm == final.overlay_effective_nm
+
+
 def test_feedback_stability_summary_reports_raw_finite_difference_excursion() -> None:
     positions = (
         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),

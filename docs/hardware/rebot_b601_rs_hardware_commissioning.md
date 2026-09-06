@@ -46,8 +46,8 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
 - active-report 使用与 `allow_motion` 分离的授权，且不切模式、不使能、不发送 POS_VEL/MIT
   参考。多关节启用部分失败时会对所有已尝试关节反向发送关闭请求；任何未确认关闭的关节会
   保持锁存，`close()` 拒绝释放 backend，避免把不确定的设备上报状态隐藏在析构中；
-- 低增益 probe 的 active set 默认是 `--joint` 指定的一个目标关节加
-  `joint2`/`joint3` 支撑关节；其余 arm 关节不会被使能。异常路径只有在
+- 低增益 probe 的所有正常阻抗/重力模式都固定使用 joint1..joint6；`--joint` 只决定
+  slow-step 目标或单关节增益覆盖，不缩小使能和 MIT dispatch 集合。异常路径只有在
   last-safe 快照通过新鲜度、限位、速度和小 rebase 检查后才锁存 J2/J3，否则直接全部
   arm `safe_stop`。这个保护保持不包含 ID7 夹爪；
 - 任何 motion-capable caller 都必须先从同一 pinned URDF 提供六关节 position limits；本轮
@@ -323,16 +323,22 @@ python scripts/hardware/rebot_b601_rs_frequency_probe.py \
 
 ## P4.1 低增益软件 torque-owner probe（操作者手动运行）
 
-这是 P4 单关节 MIT/重力阻尼验证的 guarded 入口。它仍然是 motion-capable
+这是 P4 低增益 MIT/重力阻尼验证的 guarded 入口。它仍然是 motion-capable
 命令，只能由现场操作者运行；自动化测试不会打开 CAN、使能电机或发送 MIT 帧。
-探针默认只把目标关节和强制支撑关节 `joint2`、`joint3` 放入 active set，明确排除
-ID7 夹爪以及未选中的 arm 关节；因此第一档应从 `--joint joint1` 开始，且必须为
-`joint2`/`joint3` 和未选中的腕部关节提供机械支撑。`hold` 从使能后的当前姿态开始，
-不会跳到预设绝对姿态；它就是静止 `qpos` 阻抗：固定最后一个 arming-settle 合法 q 为
-`q_ref`、固定 `dq_ref=0`，由软件唯一拥有 `Kp(q_ref-q)+Kd(dq_ref-dq)`。`slow-step`
-只在 hold 通过后以相对、有界步长运行。使能后先
-等待四个连续、完整、在限位内且近零速度的反馈快照；这段 arming-settle 期间不发送
-力矩帧，首个力矩参考固定在最后一个通过门禁的当前姿态。
+所有正常模式都使能并调节 joint1..joint6，明确排除 ID7 夹爪；`--joint` 仅决定
+slow-step 目标或单关节增益覆盖。`hold` 从使能后的当前姿态开始，不会跳到预设绝对姿态；
+末端模式的最终位置恢复由末端阻抗经完整 Jacobian 转置完成。使能后的启动状态机为：
+
+```text
+ENABLED_UNARMED → LOCKING → LOCKED → GRAVITY_RAMP → HANDOFF → ACTIVE
+```
+
+`LOCKING` 立即捕获新鲜的 `q0`，用 pinned YAML 的 MIT Kp/Kd 构建软件侧全六关节位置锁，
+首帧和后续锁帧都经过最终总力矩/变化率包络；`LOCKED` 阶段在四个连续反馈样本期间继续
+发送固定 `q_ref=q0` 的锁帧。随后完整六轴重力向量统一爬升，重力达到目标后再用同样的
+`--torque-rise-time-sec` 把临时关节锁平滑交给最终控制器，`pose-hold/cartesian-hold`
+的末端弹簧在 `HANDOFF` 中逐步成为位置恢复主体。启动阶段不依赖未受软件包络约束的
+vendor Kp；MIT 帧的 vendor Kp 保持为零。
 
 ### 异常时的 protective hold（锁存，不是普通回零）
 
@@ -394,14 +400,15 @@ printf '%s\n' 'shell remains active'
 
 本入口默认由软件按
 `tau = alpha(t)*gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
-低增益位置项、基于新鲜 `mechPos (0x7019)` 的有限差分阻尼和可选笛卡尔 overlay，
-其中启动阶段只用一个从 0 到 1 的 `alpha(t)` 同比例缩放完整六轴重力向量，避免逐轴
-slew 造成 J2/J3/J4 补偿比例失衡；阻尼和末端阻抗项立即生效。`--torque-rise-time-sec`
-决定这段统一重力启动时间，并继续作为最终总力矩 slew 包络的时间基准；现场可按机械支撑
-和急停条件配置，不写成固定验收数值。
-然后向 upstream MotorBridge 发送 `kp=kd=0` 的 MIT 帧。为避免 20 Hz 有限差分阻尼产生
-阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度耗散交给电机内部环；driver
-`kp` 仍固定为零，因此末端 `J^T wrench` 仍是唯一位置恢复项。非零 driver Kd 只有在
+位置项、基于 `mechPos (0x7019)` 的有限差分阻尼和可选末端 overlay。启动时 YAML MIT
+Kp/Kd 只作为临时软件位置锁，`alpha(t)` 从 0 到 1 同比例缩放完整六轴重力向量，避免
+逐轴 slew 造成 J2/J3/J4 补偿比例失衡；重力完成后，位置、阻尼和末端阻抗项一起平滑
+交给最终 profile。`--torque-rise-time-sec` 同时决定重力爬升、锁到最终控制器的交接时间，
+以及最终总力矩 slew 包络的时间基准；现场可按机械支撑和急停条件配置，不写成固定验收数值。
+然后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；vendor `kd` 默认也是零。
+为避免 20 Hz 有限差分阻尼产生阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度
+耗散交给电机内部环；driver `kp` 仍固定为零，因此末端 `J^T wrench` 仍是唯一最终位置
+恢复项。非零 driver Kd 只有在
 `--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
 加速度、位置误差、非有限差分、部分发送或 cleanup 不完整会立即结束本次运行。由于当前
@@ -555,8 +562,8 @@ printf '%s\n' 'shell remains active'
 
 这一档把所有 host 有限差分阻尼设为零，由六轴 driver Kd 提供电机局部连续耗散；这些数值
 只是针对已观察到的 20 Hz 阶梯和腕部静摩擦死区的下一档 commissioning 配置，不是代码
-默认值或测试契约。driver Kp 始终为零，旋转刚度仍在末端 6D spring 中，经完整 `J^T`
-调节所有关节。
+默认值或测试契约。启动锁仍暂时使用 YAML MIT Kp/Kd，但只在软件总力矩包络内生效；交接
+完成后 driver Kp 始终为零，旋转刚度仍在末端 6D spring 中，经完整 `J^T` 调节所有关节。
 
 第一档只验收 `pose-hold`：观察任意当前姿态是否成为末端零误差锚点，轻微的末端平移或旋转
 扰动是否产生反向、耗散且受限的恢复 wrench；ID7 夹爪不参与。`active_joint_names` 必须正好
