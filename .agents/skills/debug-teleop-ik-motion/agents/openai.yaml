@@ -1,0 +1,4 @@
+interface:
+  display_name: "Debug Teleop IK Motion"
+  short_description: "Diagnose teleoperation IK and motion faults"
+  default_prompt: "Use $debug-teleop-ik-motion to locate the first authoritative divergence in this motion fault."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Change Agent Gateway"
+  short_description: "Safely change Gateway contracts and profiles"
+  default_prompt: "Use $change-agent-gateway to classify and validate this Gateway contract or profile change."

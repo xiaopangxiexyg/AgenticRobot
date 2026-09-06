@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Access"
+  short_description: "Operate remote hosts and hardware safely"
+  default_prompt: "Use $remote-access to run this remote operation through the reviewed wrappers and safety gates."

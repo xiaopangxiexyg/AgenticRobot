@@ -55,7 +55,18 @@ htmlcov/
 junit*.xml
 test-results/
 playwright-report/
-.agents
+# Ignore machine-local agent state while versioning reviewed repository Skills.
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/change-agent-gateway/
+!.agents/skills/change-agent-gateway/**
+!.agents/skills/debug-teleop-ik-motion/
+!.agents/skills/debug-teleop-ik-motion/**
+!.agents/skills/manage-project-local-resources/
+!.agents/skills/manage-project-local-resources/**
+!.agents/skills/remote-access/
+!.agents/skills/remote-access/**
 .realtime_sync_ssh.exclude
 logs/
 # Canonical local runtime outputs; versioned configs remain package-owned.

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Project Local Resources"
+  short_description: "Audit and manage worktree-local resources"
+  default_prompt: "Use $manage-project-local-resources to audit or change ignored local resources without crossing writer ownership."

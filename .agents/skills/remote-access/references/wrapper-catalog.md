@@ -1,0 +1,57 @@
+# Remote wrapper catalog
+
+Use this reference only after the remote-access workflow has fixed the target
+and requested effect. Wrapper `--help` and `codex_remote/README.md` remain
+authoritative for current arguments.
+
+## Effect classes
+
+| Class | Examples | Gate |
+| --- | --- | --- |
+| Read-only | identity, environment, USB/device inventory, ports, processes, logs, camera listing | Run when relevant through the narrow wrapper |
+| Non-motion write | explicit sync, result pull, debug bundle, camera snapshot | State the target and exact write scope first |
+| Process execution | Python, module, pytest, preview or bounded service | State process, timeout, and cleanup expectations first |
+| Device/host state | USB reset, udev reload, enable/disable, controlled kill, zero-velocity stop | Require explicit current-request authority and fresh safety preflight |
+| Real motion/system control | homing, replay, trajectory, servo, gripper, force control, reboot, shutdown, firmware or bus reset | Require the exact action explicitly; never infer permission from a broader task |
+
+Classify an unlisted or ambiguous operation as the highest plausible risk.
+
+## Wrapper selection
+
+- Identity and environment: `remote_whoami.sh`, `remote_env.sh`.
+- Passive host/device checks: `remote_lsusb.sh`, `remote_dev_nodes.sh`,
+  `remote_groups.sh`, `remote_dmesg_usb.sh`, `remote_ps.sh`.
+- Passive camera/arm connectivity: `remote_camera_list.sh`,
+  `remote_opencv_camera_check.sh`, `remote_arm_ping.sh`,
+  `remote_arm_port_check.sh`.
+- Inspection: `remote_view.sh`, `remote_tail_log.sh`,
+  `remote_sync_check.sh`.
+- Remote execution: `remote_python.sh`, `remote_module.sh`,
+  `remote_pytest.sh`.
+- Explicit transfer: `remote_pull.sh`, `remote_rsync_project.sh`,
+  `remote_collect_debug_bundle.sh`.
+- Protected Harness execution: `remote_harness.sh`, limited to authenticated
+  `runner preflight` and `transfer exchange-run`; its availability grants no
+  request, device, motion, or arbitrary-command authority.
+- Protected Harness deployment: `remote_harness_deploy.sh`, only for an exact
+  commit explicitly authorized by the deployment owner and a fresh Harness
+  plan; it grants no project command, device, or motion authority.
+- Dry-run arm checks: `remote_arm_dry_run.sh`; do not disable its dry-run
+  behavior.
+- Control-risk preflight: `remote_safety_check.sh`.
+
+Use dataset-specific wrappers only for the exact documented dataset audit,
+quarantine, promotion, or storage task. Do not reinterpret them as arbitrary
+remote shell access.
+
+## Target and sync rules
+
+- Pass the user-selected host or alias unchanged across identity, environment,
+  sync, execution, inspection, and retrieval.
+- If the user provides no target, use only the project's configured default
+  alias; do not copy its current IP into durable instructions.
+- When no-delete realtime sync is confirmed active, do not perform routine
+  one-shot project sync. Edit locally and verify explicit paths if stale code is
+  suspected.
+- Inspect remote artifacts in place or retrieve them explicitly. Never assume
+  runtime outputs are synchronized back.

@@ -1,8 +1,9 @@
 # Worktree 本地资源与迁移
 
 本仓库的本地状态不只有 `assets/`。离线数据集、采集记录、运行证据、模型权重、厂商目录、
-机器路径、密钥、日志、测试输出和缓存都可能被 `.gitignore` 隐藏。它们不出现在
-`git status` 中，也不会随分支合并或 `git clone` 自动迁移。
+机器路径、密钥、日志、测试输出、缓存和未版本化的 Agent 状态都可能被 `.gitignore`
+隐藏。它们不出现在 `git status` 中，也不会随分支合并或 `git clone` 自动迁移。只有
+`.agents/skills/` 下明确放行并通过治理测试的项目 Skill 属于版本化源码。
 
 本页与 [`local_resources_manifest_v1.json`](./local_resources_manifest_v1.json) 是这些路径的
 版本化登记。清单记录每类资源的忽略规则探针、允许的 tracked 边界和迁移方式；
@@ -19,7 +20,7 @@
 | `local-vendor` | 模型权重、仿真安装、厂商 checkout | 检查来源与 tracked 边界后逐项绑定或复制 |
 | `local-secret` | `.env*`、`local_paths.json`、设备本地配置 | 从 tracked example 或密钥管理重新创建，不进入迁移回执 |
 | `generated` | venv、cache、build、coverage、临时输出 | 在目标 worktree 重建，不迁移 |
-| `developer-private` | `.codex/`、`.agents/`、`todos/`、编辑器状态 | 保持个人本地，不得成为源码或运行依赖 |
+| `developer-private` | `.codex/`、`.agents/` 中未放行的状态与 Skill、`todos/`、编辑器状态 | 保持个人本地，不得成为源码或运行依赖 |
 | `local-archive` | 根目录 `legacy/` 本地副本 | 严格忽略且不得 Git 跟踪；确需迁移时做验证复制，版本化历史说明只进入 `docs/legacy/` |
 
 软链接只解决“多个 worktree 使用同一个稳定、只读资源根”的路径兼容问题，不是隔离或只读
@@ -32,6 +33,8 @@
   文件和 ignored 文件，绝不能整体替换成软链接；
 - 根 `legacy/` 不属于 mixed root，不允许 tracked 白名单或 `.gitignore` 例外；需要共享的退役
   原因、替代关系和历史说明统一写入 `docs/legacy/`；
+- `.agents/` 是 mixed root：只版本化 `.gitignore` 明确放行的仓库通用 Skill；个人状态、
+  临时提示和其他本地 Skill 继续忽略，版本化 Skill 不得依赖它们；
 - 数据集应优先放在 worktree 外并显式绑定，避免分支删除、worktree 清理或并发写入影响数据。
 
 ## 2. 日常只读检查
