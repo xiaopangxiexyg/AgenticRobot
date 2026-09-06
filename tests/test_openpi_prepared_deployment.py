@@ -67,6 +67,16 @@ def _fixture(
     root: Path,
 ) -> tuple[Path, Path, Path, dict[str, object]]:
     openpi_root = root / "openpi"
+    base_params = openpi_root / "base_params"
+    base_params.mkdir(parents=True)
+    for name in (
+        "_CHECKPOINT_METADATA",
+        "_METADATA",
+        "_sharding",
+        "commit_success.txt",
+        "manifest.ocdbt",
+    ):
+        (base_params / name).touch()
     source_root = root / "dataset"
     (source_root / "meta").mkdir(parents=True)
     (source_root / "meta" / "info.json").write_text(
@@ -106,6 +116,7 @@ def _fixture(
         "openpi_config_name": "prepared-model",
         "openpi_asset_id": "prepared_model_assets",
         "openpi_num_workers": 4,
+        "openpi_weight_loader_params_path": "base_params",
         "default_exp_name": "prepared-exp",
         "default_prompt": "fixture prepared prompt",
     }
@@ -882,6 +893,11 @@ class _Model:
 
 
 @dataclasses.dataclass(frozen=True)
+class _WeightLoader:
+    params_path: str
+
+
+@dataclasses.dataclass(frozen=True)
 class _Config:
     name: str
     data: _Data
@@ -891,6 +907,7 @@ class _Config:
     overwrite: bool
     num_workers: int
     policy_metadata: object = None
+    weight_loader: object = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -957,6 +974,7 @@ def test_rebuilt_config_preserves_all_inference_relevant_prepared_fields(
         resume=True,
         overwrite=True,
         num_workers=99,
+        weight_loader=_WeightLoader("wrong-base-params"),
     )
     augmentation = dataclasses.replace(
         base,
@@ -998,6 +1016,45 @@ def test_rebuilt_config_preserves_all_inference_relevant_prepared_fields(
     assert config.resume is False
     assert config.overwrite is False
     assert config.num_workers == 4
+    assert config.weight_loader == _WeightLoader(
+        str((_openpi_root / "base_params").resolve())
+    )
+
+
+def test_prepared_weight_loader_rejects_incomplete_pinned_params(
+    tmp_path: Path,
+) -> None:
+    params = tmp_path / "base_params"
+    params.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="is incomplete"):
+        prepared_server_runtime._prepared_weight_loader(
+            {"openpi_weight_loader_params_path": str(params)},
+            _WeightLoader("wrong-base-params"),
+            tmp_path,
+        )
+
+
+def test_prepared_weight_loader_requires_replaceable_loader(
+    tmp_path: Path,
+) -> None:
+    params = tmp_path / "base_params"
+    params.mkdir()
+    for name in (
+        "_CHECKPOINT_METADATA",
+        "_METADATA",
+        "_sharding",
+        "commit_success.txt",
+        "manifest.ocdbt",
+    ):
+        (params / name).touch()
+
+    with pytest.raises(TypeError, match="dataclass weight loader"):
+        prepared_server_runtime._prepared_weight_loader(
+            {"openpi_weight_loader_params_path": str(params)},
+            object(),
+            tmp_path,
+        )
 
 
 def test_rebuilt_config_rejects_layout_metadata_drift(tmp_path: Path) -> None:
@@ -1095,6 +1152,7 @@ def test_rebuilt_model_rtc_config_uses_output_identity_and_bound_artifact(
         overwrite=False,
         num_workers=0,
         policy_metadata={"base": "preserved"},
+        weight_loader=_WeightLoader("wrong-base-params"),
     )
 
     class TrainingConfig:
