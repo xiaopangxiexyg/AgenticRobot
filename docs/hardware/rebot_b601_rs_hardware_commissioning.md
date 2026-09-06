@@ -393,8 +393,12 @@ printf '%s\n' 'shell remains active'
 ```
 
 本入口默认由软件按
-`tau = gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
+`tau = alpha(t)*gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
 低增益位置项、基于新鲜 `mechPos (0x7019)` 的有限差分阻尼和可选笛卡尔 overlay，
+其中启动阶段只用一个从 0 到 1 的 `alpha(t)` 同比例缩放完整六轴重力向量，避免逐轴
+slew 造成 J2/J3/J4 补偿比例失衡；阻尼和末端阻抗项立即生效。`--torque-rise-time-sec`
+决定这段统一重力启动时间，并继续作为最终总力矩 slew 包络的时间基准；现场可按机械支撑
+和急停条件配置，不写成固定验收数值。
 然后向 upstream MotorBridge 发送 `kp=kd=0` 的 MIT 帧。为避免 20 Hz 有限差分阻尼产生
 阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度耗散交给电机内部环；driver
 `kp` 仍固定为零，因此末端 `J^T wrench` 仍是唯一位置恢复项。非零 driver Kd 只有在
@@ -517,7 +521,7 @@ if cd "$WT"; then
       --gravity-scale 0.5 \
       --torque-limit-scale 0.15 \
       --apply-driver-torque-limits \
-      --torque-rise-time-sec 2.0 \
+      --torque-rise-time-sec 0.5 \
       --velocity-abort-rad-s 0.5 \
       --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.2 \

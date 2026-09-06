@@ -7,7 +7,12 @@ sensor, or a hardware-readiness claim.
 
 The software owns the complete low-gain torque composition:
 
-``tau = gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq) + J.T F``
+``tau = alpha * gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq) + J.T F``
+
+During startup, the scalar ``alpha`` rises linearly from zero to one for the
+whole gravity vector.  This preserves the relative J1..J6 gravity torques;
+damping remains immediately active and the final total-torque conditioner
+continues to enforce absolute and rate bounds.
 
 ``J.T F`` is zero in the joint ``hold`` and ``slow-step`` modes.  The guarded
 ``cartesian-hold`` mode anchors the current ``gripper_end`` position after a
@@ -1339,6 +1344,40 @@ def condition_torque(
     conditioned = np.clip(clipped, previous - max_delta, previous + max_delta)
     slew_limited = not np.array_equal(conditioned, clipped)
     return tuple(float(value) for value in conditioned), torque_limited, slew_limited
+
+
+def gravity_ramp_fraction(*, elapsed_sec: float, rise_time_sec: float) -> float:
+    """Return one shared linear startup scale for the complete gravity vector."""
+
+    elapsed = _non_negative(elapsed_sec, name="elapsed_sec")
+    rise_time = _positive(rise_time_sec, name="rise_time_sec")
+    return min(1.0, elapsed / rise_time)
+
+
+def apply_shared_gravity_ramp(
+    breakdown: B601MitTorqueBreakdown,
+    *,
+    fraction: float,
+) -> B601MitTorqueBreakdown:
+    """Scale gravity as one vector while leaving damping and impedance live."""
+
+    if not isinstance(breakdown, B601MitTorqueBreakdown):
+        raise TypeError("breakdown must be a B601MitTorqueBreakdown")
+    scale = _bounded(fraction, name="fraction", lower=0.0, upper=1.0)
+    position = np.asarray(breakdown.position_torque_nm, dtype=float)
+    damping = np.asarray(breakdown.damping_torque_nm, dtype=float)
+    gravity = scale * np.asarray(breakdown.gravity_torque_nm, dtype=float)
+    overlay = np.asarray(breakdown.overlay_effective_nm, dtype=float)
+    requested = position + damping + gravity + overlay
+    return B601MitTorqueBreakdown(
+        position_torque_nm=breakdown.position_torque_nm,
+        damping_torque_nm=breakdown.damping_torque_nm,
+        gravity_torque_nm=tuple(float(value) for value in gravity),
+        overlay_requested_nm=breakdown.overlay_requested_nm,
+        overlay_effective_nm=breakdown.overlay_effective_nm,
+        requested_torque_nm=tuple(float(value) for value in requested),
+        overlay_limited=breakdown.overlay_limited,
+    )
 
 
 def build_software_profile(
@@ -2916,13 +2955,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 qvel_rad_s=qvel_ref,
                 joint_torque_overlay_nm=joint_torque_overlay_nm,
             )
-            torque_breakdown = compute_software_torque_breakdown(
+            target_torque_breakdown = compute_software_torque_breakdown(
                 model,
                 reference=reference,
                 measured_qpos_rad=q,
                 measured_qvel_rad_s=qvel,
                 profile=profile,
                 gravity_scale=args.gravity_scale,
+            )
+            gravity_ramp = gravity_ramp_fraction(
+                elapsed_sec=elapsed,
+                rise_time_sec=args.torque_rise_time_sec,
+            )
+            torque_breakdown = apply_shared_gravity_ramp(
+                target_torque_breakdown,
+                fraction=gravity_ramp,
             )
             requested_tau = torque_breakdown.requested_torque_nm
             conditioned_tau, torque_limited, slew_limited = condition_torque(
@@ -2966,6 +3013,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "qacc_fd_rad_s2": qacc,
                     "qref_rad": qref,
                     "qvel_ref_rad_s": qvel_ref,
+                    "gravity_ramp_fraction": gravity_ramp,
+                    "gravity_target_tau_nm": (
+                        target_torque_breakdown.gravity_torque_nm
+                    ),
                     "gravity_tau_nm": torque_breakdown.gravity_torque_nm,
                     "position_tau_nm": torque_breakdown.position_torque_nm,
                     "damping_tau_nm": torque_breakdown.damping_torque_nm,
@@ -3292,6 +3343,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
             "gravity_scale": args.gravity_scale,
+            "gravity_ramp": {
+                "type": "shared_linear_scale",
+                "duration_sec": args.torque_rise_time_sec,
+                "applies_to": "complete_six_joint_gravity_vector",
+                "non_gravity_terms_scaled": False,
+            },
             "torque_limits_nm": torque_limits,
             "torque_limit_scale": args.torque_limit_scale,
             "max_torque_rate_nm_s": profile.max_torque_rate_nm_s,
@@ -3423,6 +3480,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "pose-hold anchors the complete fresh post-enable FK transform and applies bounded world-aligned force and torque through the same J.T wrench path.",
             "Software composes gravity, position, optional finite-difference damping, and a bounded J.T wrench overlay; vendor MIT kp remains zero, while explicit vendor kd may own motor-local damping behind verified 0x700B limits.",
+            "Startup applies one shared linear scale to the complete six-joint gravity vector; damping and impedance remain live before the final absolute and slew-rate torque conditioner.",
             "When explicitly requested, the probe temporarily mirrors every arm joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies every readback before enable, and restores every original value after full safe_stop.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
@@ -3518,6 +3576,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--torque-rise-time-sec",
         type=float,
         default=_DEFAULT_TORQUE_RISE_TIME_SEC,
+        help=(
+            "shared six-joint gravity startup-ramp duration; also sets the "
+            "existing final total-torque slew envelope from each torque limit"
+        ),
     )
     parser.add_argument(
         "--velocity-abort-rad-s",

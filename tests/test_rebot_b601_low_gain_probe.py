@@ -37,6 +37,37 @@ def test_condition_torque_rejects_nonpositive_dt() -> None:
         )
 
 
+def test_shared_gravity_ramp_preserves_vector_and_keeps_damping_live() -> None:
+    target = probe.B601MitTorqueBreakdown(
+        position_torque_nm=(0.0,) * 6,
+        damping_torque_nm=(-0.2,) * 6,
+        gravity_torque_nm=(1.0, -2.0, 4.0, -8.0, 0.5, -0.25),
+        overlay_requested_nm=(0.0,) * 6,
+        overlay_effective_nm=(0.0,) * 6,
+        requested_torque_nm=(0.8, -2.2, 3.8, -8.2, 0.3, -0.45),
+        overlay_limited=False,
+    )
+
+    fraction = probe.gravity_ramp_fraction(elapsed_sec=0.25, rise_time_sec=0.5)
+    ramped = probe.apply_shared_gravity_ramp(target, fraction=fraction)
+
+    assert fraction == pytest.approx(0.5)
+    assert ramped.gravity_torque_nm == pytest.approx(
+        tuple(0.5 * value for value in target.gravity_torque_nm)
+    )
+    assert ramped.damping_torque_nm == target.damping_torque_nm
+    assert ramped.requested_torque_nm == pytest.approx(
+        tuple(
+            damping + gravity
+            for damping, gravity in zip(
+                target.damping_torque_nm,
+                ramped.gravity_torque_nm,
+                strict=True,
+            )
+        )
+    )
+
+
 def test_feedback_stability_summary_reports_raw_finite_difference_excursion() -> None:
     positions = (
         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
