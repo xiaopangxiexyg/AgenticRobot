@@ -2247,6 +2247,7 @@ def _run_latched_fault_hold(
     stop: dict[str, bool],
     max_iterations: int | None = None,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
+    operator_interrupt: bool = False,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -2257,14 +2258,17 @@ def _run_latched_fault_hold(
 ]:
     """Latch joint2/joint3 at a fresh, stationary, validated pose until SIGUSR1.
 
-    The first hold frame is sent before the non-hold joints are disabled.  The
-    loop has no time-based release: only the explicit SIGUSR1 handler may
-    request safe_stop for all registered arm joints.  Each subsequent hold
-    cycle validates a complete feedback snapshot and the fixed-reference
-    drift before computing measured-state damping.  If a hold frame, feedback
-    sample, or initial reference is invalid, the fail-closed fallback is an
-    immediate all-arm safe_stop because a partial hold cannot be claimed as
-    safe.
+    The first hold frame is sent before the non-hold joints are disabled.  For
+    an explicit operator Ctrl-C, that first frame is admitted from the already
+    validated ``last_safe`` snapshot; the interrupted loop's instantaneous
+    velocity is not used to reject the first protective frame.  One feedback
+    sample after the non-hold disable establishes the monitoring baseline, then
+    every subsequent hold cycle validates a complete feedback snapshot and the
+    fixed-reference drift before computing measured-state damping.  The loop
+    has no time-based release: only the explicit SIGUSR1 handler may request
+    safe_stop for all registered arm joints.  If a hold frame, feedback sample,
+    or initial reference is invalid, the fail-closed fallback is an immediate
+    all-arm safe_stop because a partial hold cannot be claimed as safe.
 
     max_iterations exists only for bounded offline tests; production calls
     leave it as None and therefore remain latched until release.
@@ -2299,18 +2303,20 @@ def _run_latched_fault_hold(
             position_limits_rad=position_limits_rad,
             max_age_sec=max_age_sec,
             max_velocity_rad_s=max_velocity_rad_s,
-            fault_qpos_rad=fault_qpos_rad,
-            fault_qvel_rad_s=fault_qvel_rad_s,
+            fault_qpos_rad=None if operator_interrupt else fault_qpos_rad,
+            fault_qvel_rad_s=None if operator_interrupt else fault_qvel_rad_s,
             max_rebase_rad=max_rebase_rad,
         )
         measured_qpos = hold_q
-        if fault_qpos_rad is not None:
+        if fault_qpos_rad is not None and not operator_interrupt:
             measured_qpos, _ = normalize_feedback_boundary_qpos(
                 fault_qpos_rad,
                 name="fault_measured_qpos_rad",
             )
         measured_qvel = (
-            fault_qvel_rad_s if fault_qvel_rad_s is not None else qvel_rad_s
+            fault_qvel_rad_s
+            if fault_qvel_rad_s is not None and not operator_interrupt
+            else qvel_rad_s
         )
         first_hold_receipt, latest_tau = _send_fault_hold_command(
             backend,
@@ -2392,6 +2398,7 @@ def _run_latched_fault_hold(
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
     monitor_observed_at = time.monotonic() - max(0.0, observed_age_sec)
+    monitor_baseline_pending = operator_interrupt
     while not stop.get("full_disable_requested", False):
         if max_iterations is not None and hold_commands >= max_iterations:
             break
@@ -2407,33 +2414,55 @@ def _run_latched_fault_hold(
                     "protective hold feedback is not complete and valid: "
                     f"{state.fault_reason or 'unknown fault'}"
                 )
-            monitor_dt = observed_at - monitor_observed_at
-            if not math.isfinite(monitor_dt) or monitor_dt <= 0.0:
-                raise LowGainProbeError(
-                    "protective hold feedback timestamp did not advance"
-                )
             current_q, _ = normalize_feedback_boundary_qpos(
                 state.positions_rad,
                 name="protective_hold_feedback_qpos_rad",
             )
-            monitor_qvel = tuple(
-                (current - previous) / monitor_dt
-                for current, previous in zip(
+            if monitor_baseline_pending:
+                # The first post-disable sample spans the transition from the
+                # interrupted control loop to the partial protective hold. It
+                # is a position/drift baseline only; deriving velocity over
+                # that transition would turn an otherwise valid first hold
+                # frame into an immediate full-disable fallback. The next
+                # sample is monitored with the normal strict velocity gate.
+                measured_q = _validate_protective_hold_feedback(
                     current_q,
-                    monitor_q,
-                    strict=True,
+                    qvel_rad_s=_ZERO_SIX,
+                    hold_qpos_rad=hold_q,
+                    observed_age_sec=0.0,
+                    position_limits_rad=position_limits_rad,
+                    max_age_sec=max_age_sec,
+                    max_velocity_rad_s=max_velocity_rad_s,
+                    max_rebase_rad=max_rebase_rad,
                 )
-            )
-            measured_q = _validate_protective_hold_feedback(
-                current_q,
-                qvel_rad_s=monitor_qvel,
-                hold_qpos_rad=hold_q,
-                observed_age_sec=0.0,
-                position_limits_rad=position_limits_rad,
-                max_age_sec=max_age_sec,
-                max_velocity_rad_s=max_velocity_rad_s,
-                max_rebase_rad=max_rebase_rad,
-            )
+                monitor_q = measured_q
+                monitor_observed_at = observed_at
+                monitor_baseline_pending = False
+                monitor_qvel = _ZERO_SIX
+            else:
+                monitor_dt = observed_at - monitor_observed_at
+                if not math.isfinite(monitor_dt) or monitor_dt <= 0.0:
+                    raise LowGainProbeError(
+                        "protective hold feedback timestamp did not advance"
+                    )
+                monitor_qvel = tuple(
+                    (current - previous) / monitor_dt
+                    for current, previous in zip(
+                        current_q,
+                        monitor_q,
+                        strict=True,
+                    )
+                )
+                measured_q = _validate_protective_hold_feedback(
+                    current_q,
+                    qvel_rad_s=monitor_qvel,
+                    hold_qpos_rad=hold_q,
+                    observed_age_sec=0.0,
+                    position_limits_rad=position_limits_rad,
+                    max_age_sec=max_age_sec,
+                    max_velocity_rad_s=max_velocity_rad_s,
+                    max_rebase_rad=max_rebase_rad,
+                )
             if stop.get("full_disable_requested", False):
                 break
             receipt, latest_tau = _send_fault_hold_command(
@@ -3410,6 +3439,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             rate_hz=args.rate_hz,
                             stop=stop,
                             driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                            operator_interrupt=(stop_reason == "operator_interrupt"),
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (

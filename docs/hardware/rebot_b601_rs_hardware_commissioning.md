@@ -368,9 +368,12 @@ ACTIVE
    `freshness_verified=false`，不能把它宣传成 vendor freshness；
 3. 快照的六关节有限差分速度均不超过 `--fault-hold-max-velocity-rad-s`（默认
    `0.02 rad/s`），保持参考的 `qvel` 永远是全零；
-4. 如果故障样本仍有完整 q，则故障样本本身也必须在 limits 内、速度不超过同一阈值，
-   且 joint2/joint3 相对 `last_safe_q` 的 rebase 不超过
-   `--fault-hold-max-rebase-rad`（默认 `0.05 rad`）。超出即禁止保持；
+4. 对通信/反馈异常，若故障样本仍有完整 q，则故障样本本身也必须在 limits 内、速度不超过
+   同一阈值，且 joint2/joint3 相对 `last_safe_q` 的 rebase 不超过
+   `--fault-hold-max-rebase-rad`（默认 `0.05 rad`）。超出即禁止保持。对明确的运行中
+   operator Ctrl-C，不把被中断循环的瞬时 q/dq 当作新的故障参考：首帧直接使用已通过上述
+   admission 的 `last_safe_q/last_safe_qvel`，随后先采集一帧失能过渡后的完整位置基线，再按
+   同一速度、漂移和反馈有效性门逐帧监视；后续任何真实失效仍回退全臂 `safe_stop`；
 5. 只有通过上述检查后才会发送第一帧；发送的是固定 `last_safe_q`、零 qvel、vendor
    `kp=0`，并继续经过软件 torque absolute limit 和 torque slew limit。若本次运行显式
    选择 driver Kd，保护保持沿用同一 Kd 和已经回读的 `0x700B` 总力矩上限。q 绝不由
@@ -405,6 +408,12 @@ Kp/Kd 只作为临时软件位置锁，`alpha(t)` 从 0 到 1 同比例缩放完
 逐轴 slew 造成 J2/J3/J4 补偿比例失衡；重力完成后，位置、阻尼和末端阻抗项一起平滑
 交给最终 profile。`--torque-rise-time-sec` 同时决定重力爬升、锁到最终控制器的交接时间，
 以及最终总力矩 slew 包络的时间基准；现场可按机械支撑和急停条件配置，不写成固定验收数值。
+因此，要求“重力补偿”时不能把 `--gravity-scale` 或 `--torque-limit-scale` 当成阻抗首测的
+低增益参数：前者为模型重力的比例，后者同时限制软件输出和可选的 `0x700B` 驱动器总力矩。
+它们必须由当前姿态的模型力矩、负载和机械支撑共同确定；例如此前有效记录使用过
+`--gravity-scale 0.95`、`--torque-limit-scale 0.25`，而 `0.5/0.15` 只提供半重力并把
+J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令配置，不是代码或测试中的
+固定数值限制。
 然后向 upstream MotorBridge 发送 vendor `kp=0` 的 MIT 帧；vendor `kd` 默认也是零。
 为避免 20 Hz 有限差分阻尼产生阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度
 耗散交给电机内部环；driver `kp` 仍固定为零，因此末端 `J^T wrench` 仍是唯一最终位置

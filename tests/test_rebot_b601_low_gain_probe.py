@@ -1023,6 +1023,98 @@ def test_protective_hold_feedback_rejects_drift_from_fixed_reference() -> None:
         )
 
 
+def test_operator_interrupt_ignores_transient_fault_velocity_for_first_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    command_qrefs: list[tuple[float, ...]] = []
+    measured_qvels: list[tuple[float, ...]] = []
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        *,
+        qpos_rad: tuple[float, ...],
+        measured_qvel_rad_s: tuple[float, ...],
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
+        command_qrefs.append(qpos_rad)
+        measured_qvels.append(measured_qvel_rad_s)
+        receipt = probe.B601CommandReceipt(
+            sequence=len(command_qrefs),
+            mode="mit",
+            frame_id="b601_rs/joint_mit_reference",
+            requested_at_sec=1.0,
+            completed_at_sec=1.0,
+            requested_joint_names=("joint2", "joint3"),
+            sent_joint_names=("joint2", "joint3"),
+            failed_joint_names=(),
+            errors=(),
+            accepted=True,
+        )
+        return receipt, (0.0,) * 6
+
+    class FakeBackend:
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            assert request_feedback is True
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            )
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            operation = (
+                "safe_stop"
+                if joint_names == probe._NON_FAULT_HOLD_JOINTS
+                else "full_safe_stop"
+            )
+            return probe.B601ModeReceipt(
+                operation=operation,
+                requested_joint_names=tuple(joint_names),
+                completed_joint_names=tuple(joint_names),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        # This is the interrupted loop sample. It is intentionally too fast
+        # for the strict fault-snapshot gate, but is not used for the first
+        # operator-requested hold frame.
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.37,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=object(),
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=2,
+        operator_interrupt=True,
+    )
+
+    hold_count, _latest_tau, first_receipt, non_hold_receipt, full_receipt, errors = result
+    assert hold_count == 2
+    assert command_qrefs == [q, q]
+    assert measured_qvels == [(0.0,) * 6, (0.0,) * 6]
+    assert first_receipt is not None and first_receipt.accepted
+    assert non_hold_receipt is not None and non_hold_receipt.completed
+    assert full_receipt is None
+    assert errors == []
+
+
 def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
