@@ -101,6 +101,34 @@ class ConfigurationTests(unittest.TestCase):
         resolved = server.resolve_module_path("assets/certs/example.crt")
         self.assertEqual(resolved, MODULE_ROOT / "assets/certs/example.crt")
 
+    def test_realman_left_override_is_explicit_and_keeps_right_disabled(self) -> None:
+        config = server.load_config(MODULE_ROOT / "config.yaml")
+        server.apply_realman_observation_overrides(
+            config,
+            left_ip="192.168.101.21",
+            left_urdf=Path("/reviewed/rm65_arm.urdf"),
+        )
+        feedback = config["features"]["visualization"]["robot_feedback"]
+        self.assertTrue(feedback["enabled"])
+        self.assertEqual(
+            feedback["realman"]["arms"]["rm65_left"],
+            {
+                "enabled": True,
+                "side": "left",
+                "arm_ip": "192.168.101.21",
+                "arm_urdf_path": "/reviewed/rm65_arm.urdf",
+            },
+        )
+        self.assertFalse(feedback["realman"]["arms"]["rm65_right"]["enabled"])
+
+    def test_realman_left_override_requires_both_reviewed_inputs(self) -> None:
+        config = server.load_config(MODULE_ROOT / "config.yaml")
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            server.apply_realman_observation_overrides(
+                config,
+                left_ip="192.168.101.21",
+            )
+
     def test_plain_http_is_forced_to_loopback(self) -> None:
         self.assertEqual(
             server.resolve_bind_host({"host": "0.0.0.0"}, use_https=False),
@@ -657,7 +685,12 @@ class QuestDevHostTests(unittest.TestCase):
             mock.patch.object(
                 server,
                 "parse_args",
-                return_value=mock.Mock(config=config_path, http=True),
+                return_value=mock.Mock(
+                    config=config_path,
+                    http=True,
+                    realman_left_ip=None,
+                    realman_left_urdf=None,
+                ),
             ),
             mock.patch.object(
                 server,
@@ -669,7 +702,12 @@ class QuestDevHostTests(unittest.TestCase):
         ):
             server.main()
 
-        build_host.assert_called_once_with(config_path, force_http=True)
+        build_host.assert_called_once_with(
+            config_path,
+            force_http=True,
+            realman_left_ip=None,
+            realman_left_urdf=None,
+        )
         fake_host.serve_forever.assert_called_once_with()
         self.assertEqual(install_signal.call_count, 2)
         signal_handler = install_signal.call_args_list[0].args[1]

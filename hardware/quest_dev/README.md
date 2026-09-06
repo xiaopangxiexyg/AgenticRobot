@@ -57,6 +57,20 @@ python -m hardware.quest_dev.server
 仓库已有的 `teleop_runtime`、Pinocchio、RM65 SDK 适配器和 RM65 URDF 资源，不能只用
 浏览器基座的最小依赖文件。
 
+默认配置仍关闭真机读取。现场只读联调可通过 CLI 为本次进程显式注入左臂地址和
+六轴 arm-only URDF，不需要改写默认配置：
+
+```bash
+python -m hardware.quest_dev.server \
+  --realman-left-ip 192.168.101.21 \
+  --realman-left-urdf /home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf
+```
+
+两个参数必须同时提供；该覆盖只启用 `RM65ArmBackend(observation_only=True)` 的状态
+读取，并不会启用动作、停止、复位或夹爪路径。`rm65_arm.urdf` 是 6 自由度 arm-only
+模型；`rm65_inspire_tac_left.urdf` 是包含 Inspire 手部的 18 自由度完整模型，不能直接
+作为当前六轴 TCP FK 输入。
+
 在启动 Quest host 前，可以先用一次性探针验证 RealMan 连接、状态读取和本地 FK。探针
 要求显式传入审核过的 RM65 IP 与 URDF；它只创建 `observation_only=True` backend，输出
 机械臂坐标系下的诊断 TCP 位姿，退出时关闭 SDK transport，不发送动作、停止、复位或
@@ -64,8 +78,9 @@ python -m hardware.quest_dev.server
 
 ```bash
 python -m hardware.quest_dev.tools.read_realman_feedback \\
-  --side right \\
-  --arm-ip <reviewed-rm65-ip> \\
+  --side left \\
+  --robot-id rm65_left \\
+  --arm-ip 192.168.101.21 \\
   --arm-urdf "$PWD/assets/rm65_inspire_tac/rm65_arm.urdf" \\
   --samples 3
 ```
