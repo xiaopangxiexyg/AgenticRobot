@@ -11,6 +11,7 @@ import pytest
 pytestmark = pytest.mark.integration
 
 SOURCE_WRAPPER = Path(__file__).resolve().parents[1] / "scripts/run_fast_feedback.sh"
+SOURCE_SHARDING = Path(__file__).resolve().parents[1] / "scripts/pytest_sharding.py"
 UNIT_MARKER = "unit and not optional and not hardware and not slow_sim"
 INTEGRATION_MARKER = (
     "integration and not optional and not hardware and not slow_sim"
@@ -28,6 +29,7 @@ def _wrapper_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
         (tests / name).write_text("", encoding="utf-8")
     wrapper = scripts / "run_fast_feedback.sh"
     shutil.copy2(SOURCE_WRAPPER, wrapper)
+    shutil.copy2(SOURCE_SHARDING, scripts / "pytest_sharding.py")
 
     fake_sync_root = tmp_path / "fake-sync"
     fake_sync_root.mkdir()
@@ -73,6 +75,7 @@ arguments_file="$FAKE_SYNC_ROOT/$name.args"
 printf '%s\\n' "${all_arguments[@]}" >"$arguments_file"
 printf '%s\\n' "$PYTHONPYCACHEPREFIX" >"$FAKE_SYNC_ROOT/$name.python-cache"
 printf '%s\\n' "$SIM_MUJOCO_CACHE_DIR" >"$FAKE_SYNC_ROOT/$name.mujoco-cache"
+umask >"$FAKE_SYNC_ROOT/$name.umask"
 : >"$FAKE_SYNC_ROOT/$tier.started"
 for _ in {1..250}; do
   [[ -e "$FAKE_SYNC_ROOT/$other.started" ]] && break
@@ -182,6 +185,7 @@ def test_wrapper_writes_parallel_tier_evidence_to_declared_run_root(
         assert (fake_sync_root / f"unit-{index}.mujoco-cache").read_text(
             encoding="utf-8"
         ).strip() == str(run_root / f"unit-{index}-mujoco-cache")
+        assert (fake_sync_root / f"unit-{index}.umask").read_text().strip() == "0022"
     assert INTEGRATION_MARKER in integration_arguments
     assert f"cache_dir={run_root / 'integration-pytest-cache'}" in integration_arguments
     assert f"--junitxml={run_root / 'integration.xml'}" in integration_arguments
@@ -193,6 +197,7 @@ def test_wrapper_writes_parallel_tier_evidence_to_declared_run_root(
     assert (fake_sync_root / "integration.mujoco-cache").read_text(
         encoding="utf-8"
     ).strip() == str(run_root / "integration-mujoco-cache")
+    assert (fake_sync_root / "integration.umask").read_text().strip() == "0022"
     shard_paths = [
         set((run_root / f"unit-{index}-paths.txt").read_text().splitlines())
         for index in range(unit_shards)

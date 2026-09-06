@@ -455,8 +455,8 @@ bash scripts/verify_dev_base.sh
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   bash scripts/run_pytest.sh -m 'unit and not optional and not slow_sim' -q
 
-# 日常并行快速反馈：单元与集成两层并行运行；单元层默认再分成两个
-# 文件 shard，各自使用独立 cache/JUnit，最后合并为 unit.xml/unit.log。
+# 日常并行快速反馈：单元与集成两层并行运行；单元层默认按历史耗时
+# 加权分成两个文件 shard，各自使用独立 cache/JUnit，最后合并证据。
 # 若当前 worktree 没有 assets/ 链接，先设置绝对路径的共享只读 assets 根。
 DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets \
   bash scripts/run_fast_feedback.sh
@@ -475,9 +475,13 @@ PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   bash scripts/run_pytest.sh -m 'not optional' -q
 
-# 完整环境中的全部测试。
-PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  bash scripts/run_pytest.sh -q
+# 完整环境中的非硬件验收：默认四个耗时加权 shard，逐进程隔离临时目录、
+# Python/pytest/MuJoCo/XDG 缓存，并聚合 JUnit；用 SHARDS=1 串行复现。
+DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets \
+  bash scripts/run_full_acceptance.sh --durations=50
+DEXTELEOP_FULL_ACCEPTANCE_SHARDS=1 \
+  DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets \
+  bash scripts/run_full_acceptance.sh
 ```
 
 `verify_dev_base.sh` 与 `run_pytest.sh` 都通过 `scripts/resolve_dev_python.sh`
