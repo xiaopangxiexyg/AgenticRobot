@@ -57,6 +57,22 @@ python -m hardware.quest_dev.server
 仓库已有的 `teleop_runtime`、Pinocchio、RM65 SDK 适配器和 RM65 URDF 资源，不能只用
 浏览器基座的最小依赖文件。
 
+在启动 Quest host 前，可以先用一次性探针验证 RealMan 连接、状态读取和本地 FK。探针
+要求显式传入审核过的 RM65 IP 与 URDF；它只创建 `observation_only=True` backend，输出
+机械臂坐标系下的诊断 TCP 位姿，退出时关闭 SDK transport，不发送动作、停止、复位或
+夹爪命令：
+
+```bash
+python -m hardware.quest_dev.tools.read_realman_feedback \\
+  --side right \\
+  --arm-ip <reviewed-rm65-ip> \\
+  --arm-urdf "$PWD/assets/rm65_inspire_tac/rm65_arm.urdf" \\
+  --samples 3
+```
+
+每行的 `fresh=true`、`observation_only=true`、`matrix_robot_from_tcp` 表明 RM65 状态
+读取和 FK 成功；这个探针不会验证 Quest 网络、WebXR 或 Quest-space 标定矩阵。
+
 配置示例（默认仍关闭硬件连接）：
 
 ```yaml
