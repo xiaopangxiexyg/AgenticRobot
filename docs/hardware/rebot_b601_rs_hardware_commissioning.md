@@ -330,12 +330,14 @@ slow-step 目标或单关节增益覆盖。`hold` 从使能后的当前姿态开
 末端模式的最终位置恢复由末端阻抗经完整 Jacobian 转置完成。使能后的启动状态机为：
 
 ```text
-ENABLED_UNARMED → LOCKING → LOCKED → GRAVITY_RAMP → HANDOFF → ACTIVE
+ENABLED_UNARMED → LOCKING → LOCKED → GRAVITY_RAMP (total-torque slew) → HANDOFF → ACTIVE
 ```
 
 `LOCKING` 立即捕获新鲜的 `q0`，用 pinned YAML 的 MIT Kp/Kd 构建软件侧全六关节位置锁，
 首帧和后续锁帧都经过最终总力矩/变化率包络；`LOCKED` 阶段在四个连续反馈样本期间继续
-发送固定 `q_ref=q0` 的锁帧。随后完整六轴重力向量统一爬升，重力达到目标后再用同样的
+发送固定 `q_ref=q0` 的锁帧。完整六轴的目标重力从首个锁帧开始就进入力矩组合，启动阶段
+唯一的渐变是最终总力矩的 slew 包络；不再把重力先乘一个从零开始的独立比例后再做一次
+slew，避免补偿空窗造成末端缓慢下坠。重力与临时关节锁保持连续后，再用同样的
 `--torque-rise-time-sec` 把临时关节锁平滑交给最终控制器，`pose-hold/cartesian-hold`
 的末端弹簧在 `HANDOFF` 中逐步成为位置恢复主体。启动阶段不依赖未受软件包络约束的
 vendor Kp；MIT 帧的 vendor Kp 保持为零。
@@ -352,30 +354,36 @@ vendor Kp；MIT 帧的 vendor Kp 保持为零。
 ```text
 ACTIVE
   ├─ 正常结束 ──> active-set 短暂保持 ──> 全部 arm safe_stop
-  ├─ Ctrl+C/异常且 admission 通过
-  │                 └─> PROTECTIVE_HOLD（只发 joint2/joint3）
-  │                       ├─ SIGUSR1 ──> 全部 arm safe_stop
-  │                       └─ hold dispatch/非保持失能失败
-  │                                      └─> 全部 arm safe_stop
-  └─ 无法证明当前 q 新鲜/合法 ─────────────> 全部 arm safe_stop
+  ├─ Ctrl+C ──> PROTECTIVE_HOLD（优先 last_safe；过期时使用当前合法故障 q；只发 joint2/joint3）
+  ├─ 控制/位置错误且当前 q 完整合法 ──> PROTECTIVE_HOLD（当前故障 q；只发 joint2/joint3）
+  │                                      ├─ 再次 Ctrl-C/SIGUSR1 ──> 全部 arm safe_stop
+  │                                      └─ hold dispatch/反馈/漂移失败 ──> 全部 arm safe_stop
+  └─ 无法证明当前 q 完整、在限位内且速度可处理 ──> 全部 arm safe_stop
 ```
 
 进入 `PROTECTIVE_HOLD` 前，程序必须同时证明：
 
-1. `last_safe_q` 是六关节完整、有限、在 pinned URDF position limits 内的快照；
+1. 对明确的运行中 operator Ctrl-C，优先使用六关节完整、有限、在 pinned URDF position
+   limits 内且未过期的 `last_safe_q`；若它已过期但当前故障帧完整合法，则使用当前故障
+   q。对普通控制/位置错误，直接使用该错误循环刚收到的完整故障快照，避免过期的
+   `last_safe_q` 把可处理的错误升级为全臂失能；
 2. 快照年龄是本进程单调时钟测得且不超过 `--fault-hold-max-age-sec`（默认
    `0.15 s`）；MotorBridge 0.4.9 没有设备源时间戳，所以 JSON 仍明确标记
    `freshness_verified=false`，不能把它宣传成 vendor freshness；
-3. 快照的六关节有限差分速度均不超过 `--fault-hold-max-velocity-rad-s`（默认
-   `0.02 rad/s`），保持参考的 `qvel` 永远是全零；
-4. 对通信/反馈异常，若故障样本仍有完整 q，则故障样本本身也必须在 limits 内、速度不超过
-   同一阈值，且 joint2/joint3 相对 `last_safe_q` 的 rebase 不超过
-   `--fault-hold-max-rebase-rad`（默认 `0.05 rad`）。超出即禁止保持。对明确的运行中
-   operator Ctrl-C，不把被中断循环的瞬时 q/dq 当作新的故障参考：首帧直接使用已通过上述
-   admission 的 `last_safe_q/last_safe_qvel`，随后先采集一帧失能过渡后的完整位置基线，再按
-   同一速度、漂移和反馈有效性门逐帧监视；后续任何真实失效仍回退全臂 `safe_stop`；
-5. 只有通过上述检查后才会发送第一帧；发送的是固定 `last_safe_q`、零 qvel、vendor
-   `kp=0`，并继续经过软件 torque absolute limit 和 torque slew limit。若本次运行显式
+3. Ctrl-C 入口的 `last_safe_q` 六关节有限差分速度均不超过
+   `--fault-hold-max-velocity-rad-s`（默认 `0.02 rad/s`）；普通控制/位置错误入口使用
+   当前故障帧，并要求其速度不超过本次运行的 `--velocity-abort-rad-s`。保持参考本身固定，
+   不把反馈速度写入 q-reference；
+4. 对普通控制/位置错误，故障快照必须在 limits 内、观测新鲜，且速度不超过本次运行的
+   `--velocity-abort-rad-s`；它直接成为 joint2/joint3 的首次保持参考。对明确的运行中
+   operator Ctrl-C，不把被中断循环的瞬时 q/dq 当作新的故障参考：首帧优先使用已通过上述
+   admission 的 `last_safe_q/last_safe_qvel`；仅当它过期而当前完整故障帧仍可处理时，才使用
+   当前故障 q。两种入口随后都先采集一帧失能过渡后的完整
+   位置基线，再按 `--fault-hold-max-velocity-rad-s`、漂移和反馈有效性门逐帧监视；后续
+   任何真实失效仍回退全臂 `safe_stop`；
+5. 只有通过上述检查后才会发送第一帧；发送的是固定故障/last-safe q、故障快照的受限
+   qvel（使用未过期 last-safe 时沿用 last-safe qvel），vendor `kp=0`，并继续经过软件 torque
+   absolute limit 和 torque slew limit。若本次运行显式
    选择 driver Kd，保护保持沿用同一 Kd 和已经回读的 `0x700B` 总力矩上限。q 绝不由
    错误/陈旧样本补零，也不使用最后一次 command 代替最后一次合法状态。
 
@@ -383,7 +391,7 @@ ACTIVE
 立即回退到全部 arm `safe_stop`，不继续假设“部分失能”已经成立。之后每一个保持周期都会
 重新读取完整反馈：反馈不完整/失效、主机观测不再推进、任一关节超出 limits、有限差分速度
 超过阈值，或 joint2/joint3 偏离固定参考超过 `max-rebase`，都会停止继续发保持帧并回退到
-全部 arm `safe_stop`。通过监视时，固定参考仍是故障前的 `last_safe_q`；当前测量 q 只用于
+全部 arm `safe_stop`。通过监视时，固定参考是进入保持时选定的 `last_safe_q` 或当前故障 q；当前测量 q 只用于
 计算受限的重力/阻尼力矩，绝不用于更新参考。保持没有时间自动释放，也不会因为 EOF、普通
 cleanup 或 `close()` 释放；操作者必须在另一终端显式发送 `SIGUSR1`，并确认返回的
 `full_disable_receipt.completed=true`。如果没有可证明的新鲜安全 q，程序直接采用官方通信
@@ -402,12 +410,12 @@ printf '%s\n' 'shell remains active'
 ```
 
 本入口默认由软件按
-`tau = alpha(t)*gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
+`tau = gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
 位置项、基于 `mechPos (0x7019)` 的有限差分阻尼和可选末端 overlay。启动时 YAML MIT
-Kp/Kd 只作为临时软件位置锁，`alpha(t)` 从 0 到 1 同比例缩放完整六轴重力向量，避免
-逐轴 slew 造成 J2/J3/J4 补偿比例失衡；重力完成后，位置、阻尼和末端阻抗项一起平滑
-交给最终 profile。`--torque-rise-time-sec` 同时决定重力爬升、锁到最终控制器的交接时间，
-以及最终总力矩 slew 包络的时间基准；现场可按机械支撑和急停条件配置，不写成固定验收数值。
+Kp/Kd 只作为临时软件位置锁；完整六轴重力从首个锁帧进入，并由最终总力矩 slew 包络
+平滑达到可用幅值，避免重复衰减造成 J2/J3/J4 补偿比例失衡。重力与临时锁连续后，
+位置、阻尼和末端阻抗项一起交给最终 profile。`--torque-rise-time-sec` 决定总力矩 slew
+以及锁到最终控制器的交接时间；现场可按机械支撑和急停条件配置，不写成固定验收数值。
 因此，要求“重力补偿”时不能把 `--gravity-scale` 或 `--torque-limit-scale` 当成阻抗首测的
 低增益参数：前者为模型重力的比例，后者同时限制软件输出和可选的 `0x700B` 驱动器总力矩。
 它们必须由当前姿态的模型力矩、负载和机械支撑共同确定；例如此前有效记录使用过

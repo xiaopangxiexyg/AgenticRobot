@@ -7,12 +7,13 @@ sensor, or a hardware-readiness claim.
 
 The software owns the complete low-gain torque composition:
 
-``tau = alpha * gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq) + J.T F``
+``tau = gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq) + J.T F``
 
-During startup, the scalar ``alpha`` rises linearly from zero to one for the
-whole gravity vector.  This preserves the relative J1..J6 gravity torques;
-damping remains immediately active and the final total-torque conditioner
-continues to enforce absolute and rate bounds.
+During startup, the complete scaled gravity vector is present from the first
+post-enable lock frame.  The final total-torque conditioner is the only
+startup slew, so gravity is not attenuated twice by an independent scalar ramp
+and a total-torque rate limit.  Damping remains immediately active while the
+temporary joint lock hands off to the final controller.
 
 ``J.T F`` is zero in the joint ``hold`` and ``slow-step`` modes.  The guarded
 ``cartesian-hold`` mode anchors the current ``gripper_end`` position after a
@@ -412,6 +413,79 @@ def _validate_fault_hold_snapshot(
                     f"fault hold rebase for {joint} is too large: "
                     f"{delta:.6f} rad > {max_rebase:.6f} rad"
                 )
+    return q
+
+
+def _validate_fault_entry_snapshot(
+    qpos_rad: Sequence[float] | None,
+    *,
+    qvel_rad_s: Sequence[float] | None,
+    observed_age_sec: float,
+    position_limits_rad: Sequence[tuple[float, float]],
+    max_age_sec: float,
+    max_velocity_rad_s: float,
+) -> tuple[float, ...]:
+    """Admit a complete current fault frame as a first protective reference.
+
+    Unlike the stationary ``last_safe`` gate, a handled control fault may
+    arrive while the arm is still moving.  The normal motion watchdog has
+    already rejected anything above ``max_velocity_rad_s`` before this helper
+    is called; this entry gate therefore checks that configured abort limit
+    without applying the much tighter stationary-candidate threshold.
+    """
+
+    if qpos_rad is None:
+        raise LowGainProbeError(
+            "fault hold requires a complete current fault position snapshot"
+        )
+    if qvel_rad_s is None:
+        raise LowGainProbeError(
+            "fault hold requires a complete current fault velocity observation"
+        )
+    q, _ = normalize_feedback_boundary_qpos(
+        qpos_rad,
+        name="fault_entry_qpos_rad",
+    )
+    qvel = _six(qvel_rad_s, name="fault_entry_qvel_rad_s")
+    age = _finite(observed_age_sec, name="fault_entry_observed_age_sec")
+    max_age = _bounded(
+        max_age_sec,
+        name="fault_hold_max_age_sec",
+        lower=0.01,
+        upper=1.0,
+    )
+    if age < 0.0 or age > max_age:
+        raise LowGainProbeError(
+            "fault entry snapshot is stale: "
+            f"age={age:.6f}s > max={max_age:.6f}s"
+        )
+    velocity_limit = _positive(
+        max_velocity_rad_s,
+        name="fault_entry_max_velocity_rad_s",
+    )
+    observed_max_velocity = max(abs(value) for value in qvel)
+    if observed_max_velocity > velocity_limit:
+        raise LowGainProbeError(
+            "fault entry snapshot is moving too quickly: "
+            f"max_abs_velocity={observed_max_velocity:.6f} rad/s > "
+            f"{velocity_limit:.6f} rad/s"
+        )
+    limits = tuple(
+        (float(lower), float(upper)) for lower, upper in position_limits_rad
+    )
+    if len(limits) != 6 or any(
+        not math.isfinite(lower)
+        or not math.isfinite(upper)
+        or lower >= upper
+        for lower, upper in limits
+    ):
+        raise LowGainProbeError("fault entry received invalid position limits")
+    for index, (value, (lower, upper)) in enumerate(zip(q, limits, strict=True)):
+        if not lower <= value <= upper:
+            raise LowGainProbeError(
+                f"fault entry qpos_rad[{index}]={value:.6f} is outside "
+                f"URDF limits [{lower:.6f}, {upper:.6f}]"
+            )
     return q
 
 
@@ -2248,6 +2322,8 @@ def _run_latched_fault_hold(
     max_iterations: int | None = None,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
     operator_interrupt: bool = False,
+    fault_entry: bool = False,
+    fault_entry_max_velocity_rad_s: float | None = None,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -2259,16 +2335,24 @@ def _run_latched_fault_hold(
     """Latch joint2/joint3 at a fresh, stationary, validated pose until SIGUSR1.
 
     The first hold frame is sent before the non-hold joints are disabled.  For
-    an explicit operator Ctrl-C, that first frame is admitted from the already
-    validated ``last_safe`` snapshot; the interrupted loop's instantaneous
-    velocity is not used to reject the first protective frame.  One feedback
-    sample after the non-hold disable establishes the monitoring baseline, then
-    every subsequent hold cycle validates a complete feedback snapshot and the
-    fixed-reference drift before computing measured-state damping.  The loop
-    has no time-based release: only the explicit SIGUSR1 handler may request
-    safe_stop for all registered arm joints.  If a hold frame, feedback sample,
-    or initial reference is invalid, the fail-closed fallback is an immediate
-    all-arm safe_stop because a partial hold cannot be claimed as safe.
+    an explicit operator Ctrl-C, that first frame normally comes from the
+    already validated ``last_safe`` snapshot; the interrupted loop's
+    instantaneous velocity is not used to reject it.  If that candidate has
+    expired while a complete current frame remains available, the current
+    fault-entry gate is used instead.  For a normal control/position fault, a
+    complete current fault snapshot is likewise used as the first fixed
+    reference, provided it is fresh, in limits, and below the configured
+    motion-abort velocity.  This prevents an otherwise valid position-error
+    fault from being converted into an immediate all-arm power loss merely
+    because the older stationary ``last_safe`` candidate has expired.  One
+    feedback sample after the non-hold disable establishes the monitoring
+    baseline, then every subsequent hold cycle validates a complete feedback
+    snapshot and the fixed-reference drift before computing measured-state
+    damping.  The loop has no time-based release: only the explicit SIGUSR1
+    handler may request safe_stop for all registered arm joints.  If a hold
+    frame, feedback sample, or initial reference is invalid, the fail-closed
+    fallback is an immediate all-arm safe_stop because a partial hold cannot be
+    claimed as safe.
 
     max_iterations exists only for bounded offline tests; production calls
     leave it as None and therefore remain latched until release.
@@ -2296,28 +2380,52 @@ def _run_latched_fault_hold(
             errors.append(f"full safe_stop: {exc}")
 
     try:
-        hold_q = _validate_fault_hold_snapshot(
-            qpos_rad,
-            qvel_rad_s=qvel_rad_s,
-            observed_age_sec=observed_age_sec,
-            position_limits_rad=position_limits_rad,
-            max_age_sec=max_age_sec,
-            max_velocity_rad_s=max_velocity_rad_s,
-            fault_qpos_rad=None if operator_interrupt else fault_qpos_rad,
-            fault_qvel_rad_s=None if operator_interrupt else fault_qvel_rad_s,
-            max_rebase_rad=max_rebase_rad,
-        )
-        measured_qpos = hold_q
-        if fault_qpos_rad is not None and not operator_interrupt:
-            measured_qpos, _ = normalize_feedback_boundary_qpos(
-                fault_qpos_rad,
-                name="fault_measured_qpos_rad",
+        if fault_entry:
+            if fault_qpos_rad is None or fault_qvel_rad_s is None:
+                raise LowGainProbeError(
+                    "fault hold requires a complete current fault snapshot"
+                )
+            entry_velocity_limit = (
+                max_velocity_rad_s
+                if fault_entry_max_velocity_rad_s is None
+                else fault_entry_max_velocity_rad_s
             )
-        measured_qvel = (
-            fault_qvel_rad_s
-            if fault_qvel_rad_s is not None and not operator_interrupt
-            else qvel_rad_s
-        )
+            hold_q = _validate_fault_entry_snapshot(
+                fault_qpos_rad,
+                qvel_rad_s=fault_qvel_rad_s,
+                observed_age_sec=observed_age_sec,
+                position_limits_rad=position_limits_rad,
+                max_age_sec=max_age_sec,
+                max_velocity_rad_s=entry_velocity_limit,
+            )
+            measured_qpos = hold_q
+            measured_qvel = _six(
+                fault_qvel_rad_s,
+                name="fault_measured_qvel_rad_s",
+            )
+        else:
+            hold_q = _validate_fault_hold_snapshot(
+                qpos_rad,
+                qvel_rad_s=qvel_rad_s,
+                observed_age_sec=observed_age_sec,
+                position_limits_rad=position_limits_rad,
+                max_age_sec=max_age_sec,
+                max_velocity_rad_s=max_velocity_rad_s,
+                fault_qpos_rad=None if operator_interrupt else fault_qpos_rad,
+                fault_qvel_rad_s=None if operator_interrupt else fault_qvel_rad_s,
+                max_rebase_rad=max_rebase_rad,
+            )
+            measured_qpos = hold_q
+            if fault_qpos_rad is not None and not operator_interrupt:
+                measured_qpos, _ = normalize_feedback_boundary_qpos(
+                    fault_qpos_rad,
+                    name="fault_measured_qpos_rad",
+                )
+            measured_qvel = (
+                fault_qvel_rad_s
+                if fault_qvel_rad_s is not None and not operator_interrupt
+                else qvel_rad_s
+            )
         first_hold_receipt, latest_tau = _send_fault_hold_command(
             backend,
             model,
@@ -2398,7 +2506,7 @@ def _run_latched_fault_hold(
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
     monitor_observed_at = time.monotonic() - max(0.0, observed_age_sec)
-    monitor_baseline_pending = operator_interrupt
+    monitor_baseline_pending = operator_interrupt or fault_entry
     while not stop.get("full_disable_requested", False):
         if max_iterations is not None and hold_commands >= max_iterations:
             break
@@ -2601,6 +2709,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     pose_spring: B601PoseVirtualSpring | None = None
     fault_qpos_for_hold: tuple[float, ...] | None = None
     fault_qvel_for_hold: tuple[float, ...] | None = None
+    fault_observed_at_sec: float | None = None
     last_safe_q: tuple[float, ...] | None = None
     last_safe_qvel: tuple[float, ...] | None = None
     last_safe_observed_at_sec: float | None = None
@@ -2631,6 +2740,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     protective_hold_first_receipt: B601CommandReceipt | None = None
     protective_hold_non_hold_receipt: B601ModeReceipt | None = None
     protective_hold_full_disable_receipt: B601ModeReceipt | None = None
+    protective_hold_reference_source: str | None = None
     startup_lock_first_receipt: B601CommandReceipt | None = None
     startup_lock_commands = 0
     arming_settle_torque_commands = 0
@@ -2818,7 +2928,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             measured_qpos_rad=arming_q,
             measured_qvel_rad_s=arming_qvel,
             profile=startup_lock_profile,
-            gravity_scale=0.0,
+            gravity_scale=args.gravity_scale,
         )
         lock_tau, _lock_torque_limited, _lock_slew_limited = condition_torque(
             lock_breakdown.requested_torque_nm,
@@ -2911,7 +3021,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 measured_qpos_rad=arming_settle_previous_q,
                 measured_qvel_rad_s=arming_settle_last_qvel,
                 profile=startup_lock_profile,
-                gravity_scale=0.0,
+                gravity_scale=args.gravity_scale,
             )
             lock_tau, _lock_torque_limited, _lock_slew_limited = condition_torque(
                 lock_breakdown.requested_torque_nm,
@@ -3042,6 +3152,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 break
             final_q = q
             fault_qpos_for_hold = q
+            fault_observed_at_sec = observed_at_sec
             for index, (value, (lower, upper)) in enumerate(
                 zip(q, position_limits, strict=True)
             ):
@@ -3242,15 +3353,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 profile=profile,
                 gravity_scale=args.gravity_scale,
             )
-            gravity_ramp = gravity_ramp_fraction(
-                elapsed_sec=elapsed,
-                rise_time_sec=args.torque_rise_time_sec,
-            )
+            # Gravity is present at its requested scale from the first active
+            # frame.  The total-torque conditioner below is the single startup
+            # slew; applying a second scalar gravity ramp here would create a
+            # compensation gap and allow the arm to sag during handoff.
+            gravity_ramp = 1.0
             handoff_fraction = startup_handoff_fraction(
                 elapsed_sec=elapsed,
                 rise_time_sec=args.torque_rise_time_sec,
             )
-            if gravity_ramp < 1.0:
+            if elapsed < args.torque_rise_time_sec:
                 set_startup_state("GRAVITY_RAMP")
             elif handoff_fraction < 1.0:
                 set_startup_state("HANDOFF")
@@ -3396,22 +3508,71 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             exceptional_stop = primary_error is not None or stop_reason is not None
             explicit_full_disable = stop.get("full_disable_requested", False)
             if enabled and exceptional_stop and not explicit_full_disable:
-                # A communication/feedback fault without a complete current
-                # sample cannot safely rebase a hold; use the upstream-style
-                # immediate emergency disable fallback instead.
-                can_attempt_hold = (
+                # A complete current fault sample is preferred for a normal
+                # control/position error.  An explicit operator interrupt
+                # normally remains anchored to the previously admitted
+                # stationary sample; if that sample aged out, a complete
+                # current frame is admitted instead so the first Ctrl-C does
+                # not unnecessarily drop the whole arm.
+                operator_interrupt = stop_reason == "operator_interrupt"
+                if last_safe_observed_at_sec is None:
+                    safe_age_sec = math.inf
+                else:
+                    safe_age_sec = max(
+                        0.0,
+                        time.monotonic() - last_safe_observed_at_sec,
+                    )
+                safe_snapshot_available = (
+                    last_safe_q is not None
+                    and last_safe_qvel is not None
+                    and safe_age_sec <= args.fault_hold_max_age_sec
+                )
+                fault_snapshot_available = (
                     fault_qpos_for_hold is not None
-                    or stop_reason == "operator_interrupt"
+                    and fault_qvel_for_hold is not None
+                )
+                # A Ctrl-C normally uses the stationary last-safe snapshot.
+                # If that candidate has aged out while a complete current
+                # frame is still available, use the same bounded current-fault
+                # admission as a handled position error instead of dropping
+                # the whole arm immediately.
+                fault_entry = (
+                    not operator_interrupt or not safe_snapshot_available
+                )
+                can_attempt_hold = (
+                    fault_snapshot_available if fault_entry else safe_snapshot_available
                 )
                 if can_attempt_hold:
-                    if last_safe_observed_at_sec is None:
-                        safe_age_sec = math.inf
-                    else:
-                        safe_age_sec = max(
-                            0.0,
-                            time.monotonic() - last_safe_observed_at_sec,
+                    if fault_entry:
+                        # A handled control/position fault already consumed
+                        # the first protective event.  Treat the latched hold
+                        # as the first stop request so one subsequent Ctrl-C
+                        # (or SIGUSR1) escalates directly to full disable.
+                        stop["requested"] = True
+                    if fault_entry:
+                        if fault_observed_at_sec is None:
+                            fault_age_sec = math.inf
+                        else:
+                            fault_age_sec = max(
+                                0.0,
+                                time.monotonic() - fault_observed_at_sec,
+                            )
+                        hold_qpos = fault_qpos_for_hold
+                        hold_qvel = fault_qvel_for_hold
+                        hold_age_sec = fault_age_sec
+                        protective_hold_reference_source = (
+                            "current_fault_snapshot"
+                            if not operator_interrupt
+                            else "current_fault_snapshot_after_stale_last_safe"
                         )
-                    protective_hold_admission_age_sec = safe_age_sec
+                    else:
+                        hold_qpos = last_safe_q
+                        hold_qvel = last_safe_qvel
+                        hold_age_sec = safe_age_sec
+                        protective_hold_reference_source = "last_safe_snapshot"
+                    if hold_age_sec is None:
+                        hold_age_sec = math.inf
+                    protective_hold_admission_age_sec = hold_age_sec
                     try:
                         (
                             protective_hold_commands,
@@ -3423,9 +3584,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         ) = _run_latched_fault_hold(
                             backend,
                             model,
-                            qpos_rad=last_safe_q,
-                            qvel_rad_s=last_safe_qvel,
-                            observed_age_sec=safe_age_sec,
+                            qpos_rad=hold_qpos,
+                            qvel_rad_s=hold_qvel,
+                            observed_age_sec=hold_age_sec,
                             fault_qpos_rad=fault_qpos_for_hold,
                             fault_qvel_rad_s=fault_qvel_for_hold,
                             position_limits_rad=position_limits,
@@ -3439,7 +3600,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             rate_hz=args.rate_hz,
                             stop=stop,
                             driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
-                            operator_interrupt=(stop_reason == "operator_interrupt"),
+                            operator_interrupt=operator_interrupt,
+                            fault_entry=fault_entry,
+                            fault_entry_max_velocity_rad_s=args.velocity_abort_rad_s,
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
@@ -3595,6 +3758,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "vendor_kp_nm_per_rad": _ZERO_SIX,
             "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
             "gravity_ramp_duration_sec": args.torque_rise_time_sec,
+            "gravity_ramp_note": (
+                "state label covers the final total-torque slew; the requested "
+                "gravity vector is not independently attenuated"
+            ),
             "handoff_duration_sec": args.torque_rise_time_sec,
             "gravity_ramp_semantics": "complete_six_joint_vector",
             "handoff_semantics": (
@@ -3631,6 +3798,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "protective_hold": {
             "latched": protective_hold_latched,
+            "reference_source": protective_hold_reference_source,
             "command_count": protective_hold_commands,
             "first_command_receipt": _command_receipt_payload(
                 protective_hold_first_receipt
@@ -3683,9 +3851,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
             "gravity_scale": args.gravity_scale,
             "gravity_ramp": {
-                "type": "shared_linear_scale",
+                "type": "full_vector_immediate_with_total_torque_slew",
                 "duration_sec": args.torque_rise_time_sec,
                 "applies_to": "complete_six_joint_gravity_vector",
+                "scalar_gravity_at_first_active_frame": args.gravity_scale,
+                "independent_scalar_ramp": False,
                 "non_gravity_terms_scaled": False,
             },
             "torque_limits_nm": torque_limits,
@@ -3815,9 +3985,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Human-run commissioning only; automated tests never execute this active path.",
             "The active set is the target plus explicitly selected support joints; scheme-1 J6 commissioning selects all six arm joints while only the J6 reference changes.",
             "On an exceptional stop, only joint2/joint3 may be latched; joint1/joint4/joint5/joint6 are safe-stopped, and SIGUSR1 is required for full disable.",
-            "Protective hold admits only a host-fresh, in-limit, near-zero-velocity last-safe snapshot and a small fault rebase; otherwise it falls back to full safe_stop.",
+            "Protective hold admits a fresh stationary last-safe snapshot for a normal operator stop, or a complete current in-limit fault snapshot below the motion-abort velocity; otherwise it falls back to full safe_stop.",
             "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
-            "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift before sending a fixed-reference, measured-state torque frame; any failure falls back to full safe_stop.",
+            "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift against the selected fixed reference before sending a measured-state torque frame; any failure falls back to full safe_stop.",
             "Only J2/J3 feedback readings in [-5e-4, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
@@ -3825,7 +3995,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "pose-hold anchors the complete fresh post-enable FK transform and applies bounded world-aligned force and torque through the same J.T wrench path.",
             "Software composes gravity, position, optional finite-difference damping, and a bounded J.T wrench overlay; vendor MIT kp remains zero, while explicit vendor kd may own motor-local damping behind verified 0x700B limits.",
-            "Startup keeps the YAML-derived software joint lock while one shared linear scale is applied to the complete six-joint gravity vector, then linearly hands position/damping/pose terms over to the final controller; every frame remains under the same final absolute and slew-rate conditioner.",
+            "Startup keeps the YAML-derived software joint lock while the requested complete six-joint gravity vector is present from the first lock frame, then linearly hands position/damping/pose terms over to the final controller; every frame remains under the same final absolute and slew-rate conditioner.",
             "When explicitly requested, the probe temporarily mirrors every arm joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies every readback before enable, and restores every original value after full safe_stop.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
@@ -3922,8 +4092,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=_DEFAULT_TORQUE_RISE_TIME_SEC,
         help=(
-            "shared six-joint gravity startup-ramp duration; also sets the "
-            "existing final total-torque slew envelope from each torque limit"
+            "shared six-joint startup total-torque slew and lock-handoff "
+            "duration; gravity is not independently attenuated"
         ),
     )
     parser.add_argument(
