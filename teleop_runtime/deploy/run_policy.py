@@ -46,7 +46,13 @@ from robot_motion.action import (
     ActionComponentCatalog,
     ActionComponentSpec,
     ArmActionSpec,
+    CanonicalActionSafetyAnchor,
+    CanonicalKeyframeSafetyProfile,
+    EndEffectorSafetyCapability,
+    EndEffectorTarget,
     HandActionSpec,
+    RobotAction,
+    RobotActionResolver,
     build_robot_action_v1_runtime_schema,
 )
 from robot_motion.deploy.actions import (
@@ -66,6 +72,12 @@ from robot_motion.deploy.async_producer import (
 from robot_motion.deploy.canonical_action import (
     CanonicalDeployActionPipeline,
     CanonicalDeployActionResult,
+    CanonicalPolicyActionPipeline,
+    CanonicalPolicyActionResult,
+)
+from robot_motion.deploy.canonical_policy_action import (
+    CanonicalPolicyAction,
+    build_canonical_policy_action,
 )
 from robot_motion.deploy.emission_port import (
     PassivePolicyEmissionObserverPort,
@@ -87,16 +99,22 @@ from robot_motion.deploy.runtime import (
     resolve_action_queue_policy,
 )
 from robot_motion.deploy.schema import (
+    ACTION_ARM_POSE_SLICES,
     ACTION_DIM,
+    ACTION_HAND_SLICES,
     ALL_SIDES,
     DEPLOY_ACTION_VECTOR_ACTION_SPACE,
+    STATE_ARM_POSE_SLICES,
     to_serializable,
 )
 from robot_motion.deploy.session_contract import (
+    POLICY_ABSOLUTE_FRAME_CANONICAL_DESK,
     POLICY_CONTRACT_V22_NATIVE,
+    ResolvedDeploySessionContract,
     RuntimeEndEffectorCapability,
     resolve_deploy_session_contract,
 )
+from robot_motion.deploy.v22 import V22DeploymentAdapter
 from robot_motion.pose_frame_profiles import (
     default_rm65_workspace_near_boundary_runtime_pose_frame_contract,
 )
@@ -108,6 +126,7 @@ from robot_motion.position_control import (
     POSITION_COMMAND_PLANNER_CHOICES,
     POSITION_PLAN_SPLICE_DYNAMICS_OFF,
     POSITION_PLAN_SPLICE_DYNAMICS_PROFILE_CHOICES,
+    PositionKeyframeSafetyConfig,
     PositionStreamStartAcquisitionConfig,
     resolve_position_plan_splice_dynamics_config,
 )
@@ -168,6 +187,7 @@ from ..backends.arms import (
 from ..backends.grippers import (
     DMTAC_TACTILE_FIELDS,
     DMTacGripperBackendConfig,
+    GRIPPER_ACTION_MAX,
 )
 from ..backends.hands import (
     DEFAULT_INSPIRE_HAND_MAX_FORCE,
@@ -550,9 +570,76 @@ def _dmtac_backend_configs(
     return dict(resolved)
 
 
+def _runtime_end_effector_safety_capability(
+    *,
+    args: argparse.Namespace,
+    deploy_layout: Any,
+    side: str,
+) -> EndEffectorSafetyCapability | None:
+    """Bind one native policy channel to reviewed backend command limits.
+
+    Native targets must not inherit an unconstrained range from model data.
+    The only currently supported native real-deploy adapter is the canonical
+    scalar DMTAC command space. Other backends remain fail-closed for Active
+    v22-native sessions until they publish an equivalent typed capability.
+    """
+
+    backend = _hand_backend_mode_for_side(args, side)
+    if backend != HAND_BACKEND_DMTAC_GRIPPER:
+        return None
+    effector = deploy_layout.end_effector(side)
+    action_channel = deploy_layout.channel("action", side)
+    state_channel = deploy_layout.channel("state", side)
+    if effector.adapter != "dmtac_gripper_v1":
+        raise ValueError(
+            f"{side} DMTAC runtime requires adapter 'dmtac_gripper_v1', "
+            f"got {effector.adapter!r}."
+        )
+    if (
+        action_channel.value_type != "continuous"
+        or state_channel.value_type != "continuous"
+        or action_channel.dim != 1
+        or state_channel.dim != 1
+    ):
+        raise ValueError(
+            f"{side} DMTAC native deployment requires matching scalar "
+            "continuous action/state channels."
+        )
+    if action_channel.units is None or str(action_channel.units) != "normalized_0_1":
+        raise ValueError(
+            f"{side} DMTAC native deployment requires normalized_0_1 units."
+        )
+    return EndEffectorSafetyCapability(
+        adapter=effector.adapter,
+        value_type="continuous",
+        names=action_channel.names,
+        units=(str(action_channel.units),),
+        lower=(0.0,),
+        upper=(float(GRIPPER_ACTION_MAX),),
+    )
+
+
 def add_args(parser: argparse.ArgumentParser) -> None:
     """Compatibility wrapper for deployment CLI argument registration."""
     _register_deployment_cli_args(parser)
+
+
+def _validate_model_rtc_executor_compatibility(
+    *,
+    rtc_profile_id: str,
+    arm_control_mode: str,
+    send_actions: bool,
+) -> None:
+    if (
+        str(rtc_profile_id) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+        and str(arm_control_mode) == RM65_ARM_CONTROL_MODE_POSITION
+        and bool(send_actions)
+    ):
+        raise ValueError(
+            "conditioned Model-RTC typed canonical actions currently require "
+            "--arm-execution-profile impedance_40hz; the position executor "
+            "accepts only legacy filtered-vector actions."
+        )
 
 
 def validate_args(
@@ -1032,6 +1119,11 @@ def validate_args(
                 "RTC-3c position cadence is fixed at 60 Hz reference / "
                 "120 Hz command."
             )
+    _validate_model_rtc_executor_compatibility(
+        rtc_profile_id=rtc_profile_id,
+        arm_control_mode=args.arm_control_mode,
+        send_actions=bool(args.send_actions),
+    )
     if args.arm_control_mode == RM65_ARM_CONTROL_MODE_POSITION and float(
         args.arm_control_hz
     ) < float(args.position_reference_hz):
@@ -1427,6 +1519,362 @@ def _build_arm_state_reader(
     )
 
 
+class _RuntimeCanonicalPolicyActionResolver(RobotActionResolver):
+    """Resolve typed policy actions to the selected real backend protocol."""
+
+    def __init__(self, session: ResolvedDeploySessionContract) -> None:
+        self._session = session
+
+    def resolve(
+        self,
+        action: RobotAction,
+        *,
+        observation: Any = None,
+        context: Any = None,
+    ) -> TeleopCommand:
+        command = super().resolve(
+            action,
+            observation=observation,
+            context=context,
+        )
+        for side, target in action.end_effector_targets_by_side.items():
+            capability = self._session.runtime_end_effectors.get(side)
+            if capability is None or not capability.enabled:
+                raise RuntimeError(
+                    f"Typed {side} end-effector target has no enabled "
+                    "runtime capability."
+                )
+            effector_command = command.commands.get(f"{side}_hand")
+            if effector_command is None:
+                raise RuntimeError(
+                    f"Typed {side} end-effector target produced no command."
+                )
+            if (
+                capability.backend != HAND_BACKEND_DMTAC_GRIPPER
+                or capability.adapter != "dmtac_gripper_v1"
+                or target.value_type != "continuous"
+                or target.values.shape != (1,)
+            ):
+                raise RuntimeError(
+                    f"Typed {side} end-effector target is unsupported by runtime "
+                    f"backend {capability.backend!r}."
+                )
+            effector_command.metadata["canonical_command_type"] = (
+                effector_command.command_type
+            )
+            effector_command.metadata["runtime_end_effector_backend"] = (
+                capability.backend
+            )
+            effector_command.command_type = "gripper_scalar"
+            effector_command.value = np.asarray(
+                target.values,
+                dtype=np.float32,
+            ).reshape(1)
+        return command
+
+
+class _ModelRtcCanonicalActionPreparer:
+    """Prepare conditioned model-RTC actions for the real runtime boundary.
+
+    The formal RTC emission retains the model's immutable canonical action.
+    This application adapter converts canonical-desk arm poses to runtime raw,
+    anchors safety only to the current measured observation, and then delegates
+    the actual bounds and command resolution to ``CanonicalPolicyActionPipeline``.
+    """
+
+    def __init__(
+        self,
+        *,
+        deploy_session_contract: ResolvedDeploySessionContract,
+        safety_filter: ActionSafetyFilter,
+    ) -> None:
+        layout = deploy_session_contract.policy_io_layout
+        if layout is None:
+            raise ValueError(
+                "Model-RTC typed preparation requires a policy I/O layout."
+            )
+        end_effector_capabilities: dict[str, EndEffectorSafetyCapability] = {}
+        for side in deploy_session_contract.end_effector_sides:
+            runtime = deploy_session_contract.runtime_end_effectors.get(side)
+            if runtime is None or not runtime.enabled or runtime.safety is None:
+                raise ValueError(
+                    f"Model-RTC typed preparation requires {side} runtime "
+                    "end-effector safety capability."
+                )
+            end_effector_capabilities[side] = runtime.safety
+        config = safety_filter.config
+        self._session = deploy_session_contract
+        self._layout = layout
+        self._state_adapter = V22DeploymentAdapter(layout)
+        self.pipeline = CanonicalPolicyActionPipeline(
+            safety_profile=CanonicalKeyframeSafetyProfile(
+                profile_id="model-rtc-real-canonical-keyframe-v1",
+                limits=PositionKeyframeSafetyConfig(
+                    workspace_min=config.workspace_min,
+                    workspace_max=config.workspace_max,
+                    workspace_soft_margin_m=config.workspace_soft_margin_m,
+                    max_translation_step_m=config.max_arm_xyz_step_m,
+                    max_rotation_step_deg=config.max_arm_rot_step_deg,
+                    max_joint_step_rad=config.max_arm_joint_step_rad,
+                    joint_lower_rad=config.arm_joint_lower_rad,
+                    joint_upper_rad=config.arm_joint_upper_rad,
+                ),
+                end_effector_capabilities_by_side=end_effector_capabilities,
+            ),
+            anchor_provider=self._measured_anchor,
+            resolver=_RuntimeCanonicalPolicyActionResolver(
+                deploy_session_contract
+            ),
+        )
+
+    def _runtime_action(
+        self,
+        action: CanonicalPolicyAction,
+    ) -> CanonicalPolicyAction:
+        if self._session.policy_absolute_frame != POLICY_ABSOLUTE_FRAME_CANONICAL_DESK:
+            return action
+        pose_contract = self._session.runtime_pose_frame_contract
+        if pose_contract is None:
+            raise RuntimeError(
+                "Canonical-desk model-RTC action has no runtime pose-frame contract."
+            )
+        runtime_poses = {
+            side: np.asarray(
+                pose_contract.canonical_desk_pose_vector_to_storage(
+                    pose,
+                    side=side,
+                ),
+                dtype=np.float32,
+            )
+            for side, pose in action.action.arm_pose_by_side.items()
+        }
+        runtime_frames = dict(action.action.frame_by_effector)
+        for side in runtime_poses:
+            runtime_frames[f"{side}_arm"] = str(
+                self._layout.arm_reference_frame_by_side[side]
+            )
+        source_receipt = action.canonicalization_receipt
+        runtime_robot_action = replace(
+            action.action,
+            arm_pose_by_side=runtime_poses,
+            frame_by_effector=runtime_frames,
+        )
+        return build_canonical_policy_action(
+            runtime_robot_action,
+            source_pose_mode="absolute",
+            observation_cut_id=source_receipt.observation_cut_id,
+            source_action_hash=action.semantic_content_hash,
+            action_codec_hash=source_receipt.action_codec_hash,
+            frame_contract_hash=source_receipt.frame_contract_hash,
+            layout_hash=source_receipt.layout_hash,
+            normalization_hash=source_receipt.normalization_hash,
+            conversion_contract_hash=canonical_content_hash(
+                {
+                    "adapter": "model_rtc_canonical_desk_to_runtime_raw_v1",
+                    "source_conversion_contract_hash": (
+                        source_receipt.conversion_contract_hash
+                    ),
+                    "source_canonical_policy_action_hash": (
+                        action.semantic_content_hash
+                    ),
+                    "runtime_pose_frame_contract_hash": pose_contract.contract_hash,
+                },
+                domain="dexteleop.model_rtc.runtime_action_conversion.v1",
+            ),
+        )
+
+    def _measured_end_effector_targets(
+        self,
+        action: RobotAction,
+        observation: DeploymentObservation,
+    ) -> dict[str, EndEffectorTarget]:
+        if not action.end_effector_targets_by_side:
+            return {}
+        typed_observation = self._state_adapter.observation_from_deployment(
+            observation
+        )
+        unpacked = self._layout.unpack(
+            "state",
+            continuous=typed_observation.state,
+            discrete=typed_observation.state_discrete,
+        )
+        measured_by_side = unpacked["end_effector_by_side"]
+        targets: dict[str, EndEffectorTarget] = {}
+        for side in action.end_effector_targets_by_side:
+            capability = (
+                self.pipeline.safety_profile.end_effector_capabilities_by_side.get(
+                    side
+                )
+            )
+            if capability is None:
+                raise RuntimeError(
+                    f"Measured {side} end-effector anchor has no safety capability."
+                )
+            state_channel = self._layout.channel("state", side)
+            if state_channel.value_type != capability.value_type:
+                raise RuntimeError(
+                    f"Measured {side} end-effector state/action value types differ."
+                )
+            values = measured_by_side.get(side)
+            if values is None:
+                raise RuntimeError(
+                    f"Measured {side} end-effector state component is unavailable."
+                )
+            targets[side] = EndEffectorTarget(
+                value_type=capability.value_type,
+                values=np.asarray(values),
+                adapter=capability.adapter,
+                names=capability.names,
+                metadata={"units": capability.units},
+            )
+        return targets
+
+    def _measured_anchor(
+        self,
+        action: CanonicalPolicyAction,
+        observation: DeploymentObservation,
+        _target_effective_at: float,
+    ) -> CanonicalActionSafetyAnchor:
+        robot_action = action.action
+        if robot_action.arm_qpos_by_side or robot_action.hand_qpos_by_side:
+            raise RuntimeError(
+                "Model-RTC production preparation only accepts arm-pose and "
+                "typed end-effector actions."
+            )
+        arm_poses: dict[str, np.ndarray] = {}
+        frames: dict[str, str] = {}
+        for side in robot_action.arm_pose_by_side:
+            measured = np.asarray(
+                observation.state[STATE_ARM_POSE_SLICES[side]],
+                dtype=np.float32,
+            ).reshape(7)
+            if not np.all(np.isfinite(measured)):
+                raise RuntimeError(
+                    f"Measured {side} runtime arm pose is unavailable."
+                )
+            frame = robot_action.arm_frame(side)
+            if frame is None or not str(frame).strip():
+                raise RuntimeError(
+                    f"Runtime {side} arm action frame is unavailable."
+                )
+            arm_poses[side] = measured
+            frames[side] = str(frame)
+        return CanonicalActionSafetyAnchor(
+            anchor_id=(
+                "model-rtc-measured-runtime:"
+                f"observation:{observation.step_index}:"
+                f"action:{action.canonical_action_hash}"
+            ),
+            anchor_kind="measured_state",
+            action_space=robot_action.action_space,
+            arm_pose_by_side=arm_poses,
+            end_effector_targets_by_side=(
+                self._measured_end_effector_targets(
+                    robot_action,
+                    observation,
+                )
+            ),
+            frame_by_side=frames,
+        )
+
+    def prepare_canonical(
+        self,
+        action: CanonicalPolicyAction,
+        observation: DeploymentObservation,
+        *,
+        policy_name: str = "",
+        input_action_id: str,
+        target_effective_at: float,
+    ) -> CanonicalPolicyActionResult:
+        return self.pipeline.prepare_canonical(
+            self._runtime_action(action),
+            observation,
+            policy_name=policy_name,
+            input_action_id=input_action_id,
+            target_effective_at=target_effective_at,
+        )
+
+
+def _rtc_action_preparer_for_profile(
+    *,
+    rtc_profile_id: str,
+    canonical_action_pipeline: CanonicalDeployActionPipeline,
+    deploy_session_contract: ResolvedDeploySessionContract,
+    safety_filter: ActionSafetyFilter,
+) -> CanonicalDeployActionPipeline | _ModelRtcCanonicalActionPreparer:
+    """Select typed preparation only for the conditioned Model-RTC profile."""
+
+    if str(rtc_profile_id) != MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1:
+        return canonical_action_pipeline
+    return _ModelRtcCanonicalActionPreparer(
+        deploy_session_contract=deploy_session_contract,
+        safety_filter=safety_filter,
+    )
+
+
+def _position_executor_for_prepared_action(
+    *,
+    rtc_profile_id: str,
+    send_actions: bool,
+    position_deploy_executor: Any | None,
+) -> Any | None:
+    """Keep passive typed Model-RTC out of the legacy vector planner."""
+
+    if (
+        str(rtc_profile_id) == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+        and not bool(send_actions)
+    ):
+        return None
+    return position_deploy_executor
+
+
+def _prepared_action_last_action(
+    prepared_action: CanonicalDeployActionResult | CanonicalPolicyActionResult,
+    observation: DeploymentObservation,
+    *,
+    deploy_layout: Any | None,
+) -> np.ndarray:
+    """Project an accepted action into the legacy observation-only last-action view."""
+
+    if isinstance(prepared_action, CanonicalDeployActionResult):
+        return prepared_action.action.vector.astype(np.float32, copy=True)
+    safe_action = prepared_action.robot_action
+    if safe_action is None:
+        return observation.hold_action()
+    projected = observation.hold_action()
+    for side, pose in safe_action.arm_pose_by_side.items():
+        projected[ACTION_ARM_POSE_SLICES[side]] = np.asarray(
+            pose,
+            dtype=np.float32,
+        )
+    if safe_action.end_effector_targets_by_side:
+        if deploy_layout is None:
+            raise RuntimeError(
+                "Typed end-effector last-action projection requires a policy "
+                "I/O layout."
+            )
+        for side, target in safe_action.end_effector_targets_by_side.items():
+            channel = deploy_layout.channel("action", side)
+            slots = channel.legacy_q6_slot_indices
+            if target.value_type != "continuous" or slots is None:
+                raise RuntimeError(
+                    f"Typed {side} end-effector target has no lossless legacy "
+                    "last-action observation projection."
+                )
+            hand = np.asarray(
+                projected[ACTION_HAND_SLICES[side]],
+                dtype=np.float32,
+            ).copy()
+            if not np.all(np.isfinite(hand)):
+                hand = np.zeros(6, dtype=np.float32)
+            hand[np.asarray(slots, dtype=int)] = np.asarray(
+                target.values,
+                dtype=np.float32,
+            )
+            projected[ACTION_HAND_SLICES[side]] = hand
+    return projected.astype(np.float32, copy=False)
+
+
 def _hold_active_rtc_gap(
     *,
     reason: str | None,
@@ -1729,6 +2177,11 @@ def main(
                 side=side,
                 adapter=deploy_layout.end_effector(side).adapter,
                 backend=_hand_backend_mode_for_side(args, side),
+                safety=_runtime_end_effector_safety_capability(
+                    args=args,
+                    deploy_layout=deploy_layout,
+                    side=side,
+                ),
             )
             for side in end_effector_sides
         }
@@ -1827,11 +2280,16 @@ def main(
             "workspace_near_boundary_frame.",
             flush=True,
         )
-    if deploy_session_contract.policy_contract_mode == POLICY_CONTRACT_V22_NATIVE:
+    if (
+        deploy_session_contract.policy_contract_mode == POLICY_CONTRACT_V22_NATIVE
+        and str(args.rtc_profile)
+        != MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+    ):
         raise RuntimeError(
-            "v22_native typed RobotAction transport is available, but this run_policy loop "
-            "does not yet have a configured native end-effector safety/dispatch adapter. "
-            "Use an explicit legacy_q6_slot_indices bridge for this runtime."
+            "v22_native typed RobotAction transport is available only through "
+            "the conditioned Model-RTC safety/dispatch adapter in this "
+            "run_policy loop. Use that profile or an explicit "
+            "legacy_q6_slot_indices bridge."
         )
     action_queue_policy = _resolve_action_queue_policy(args, debug_replay=debug_replay)
     startup_init_action, startup_init_source = resolve_startup_init_action(args, policy)
@@ -2091,6 +2549,12 @@ def main(
         arms_enabled=bool(args.arms_enabled),
         hands_enabled=bool(hands_enabled),
     )
+    rtc_action_preparer = _rtc_action_preparer_for_profile(
+        rtc_profile_id=str(args.rtc_profile),
+        canonical_action_pipeline=canonical_action_pipeline,
+        deploy_session_contract=deploy_session_contract,
+        safety_filter=safety_filter,
+    )
     rtc_frontend: RtcPolicyShadowFrontend | None = None
     rtc_debug_observer: RtcDebugEventObserver | None = None
 
@@ -2220,7 +2684,7 @@ def main(
             policy_node_id=policy_deploy_runtime.config.policy_node_id,
             deploy_runtime=policy_deploy_runtime,
             policy_name=policy.name,
-            preparer=canonical_action_pipeline,
+            preparer=rtc_action_preparer,
             created_at=time.monotonic(),
             profile=MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_V1,
             request_validity_steps=int(args.rtc_request_validity_steps),
@@ -2924,8 +3388,13 @@ def main(
             )
         return outcome
 
-    prepared_action_executor = PreparedActionExecutor(
+    prepared_action_position_executor = _position_executor_for_prepared_action(
+        rtc_profile_id=str(args.rtc_profile),
+        send_actions=send_actions,
         position_deploy_executor=position_deploy_executor,
+    )
+    prepared_action_executor = PreparedActionExecutor(
+        position_deploy_executor=prepared_action_position_executor,
         send_actions=send_actions,
         arm_backends=arm_backends,
         hand_backends=hand_backends,
@@ -4154,7 +4623,8 @@ def main(
                                     )
                                     if execution.accepted:
                                         position_action_submitted_this_loop = (
-                                            position_deploy_executor is not None
+                                            prepared_action_position_executor
+                                            is not None
                                         )
                                         last_action = (
                                             canonical_action.action.vector.astype(
@@ -4620,7 +5090,7 @@ def main(
                         action_step = policy_deploy_runtime.prepare_emission_result(
                             rtc_step.emission_result,
                             observation,
-                            preparer=canonical_action_pipeline,
+                            preparer=rtc_action_preparer,
                             policy_name=policy.name,
                         )
                         primary_prepare_completed = time.monotonic()
@@ -4793,7 +5263,7 @@ def main(
                     )
                     raw_third_lookahead_action = action_step.raw_third_lookahead_action
                     queue_len_after_pop = action_step.queue_len_after
-                    if raw_action is not None:
+                    if action_step.prepared_action is not None:
                         if action_step.emission is None:
                             emission_error = action_step.emission_error
                             debug_logger.log_event(
@@ -4822,7 +5292,8 @@ def main(
                             )
                         canonical_action = action_step.prepared_action
                         if (
-                            not debug_replay
+                            raw_action is not None
+                            and not debug_replay
                             and action_step.emission is not None
                             and arbiter_shadow_step is not None
                             and arbiter_shadow_step.evaluation is not None
@@ -5024,10 +5495,12 @@ def main(
                                     plan_cut_proposal = None
                                 if execution.accepted:
                                     position_action_submitted_this_loop = (
-                                        position_deploy_executor is not None
+                                        prepared_action_position_executor is not None
                                     )
-                                    last_action = canonical_action.action.vector.astype(
-                                        np.float32, copy=True
+                                    last_action = _prepared_action_last_action(
+                                        canonical_action,
+                                        observation,
+                                        deploy_layout=deploy_layout,
                                     )
                             if debug_logger.enabled:
                                 post_state_started = time.monotonic()
