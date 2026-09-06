@@ -7,7 +7,12 @@ sensor, or a hardware-readiness claim.
 
 The software owns the complete low-gain torque composition:
 
-``tau = gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq) + J.T F``
+``tau = alpha * gravity_scale * g(q) + kp * (q_ref - q) + kd * (dq_ref - dq) + J.T F``
+
+During startup, the scalar ``alpha`` rises linearly from zero to one for the
+whole gravity vector.  This preserves the relative J1..J6 gravity torques;
+damping remains immediately active and the final total-torque conditioner
+continues to enforce absolute and rate bounds.
 
 ``J.T F`` is zero in the joint ``hold`` and ``slow-step`` modes.  The guarded
 ``cartesian-hold`` mode anchors the current ``gripper_end`` position after a
@@ -18,12 +23,14 @@ complete current ``base_link_T_gripper_end`` transform and adds a bounded 6D
 restoring wrench through the same ``J.T @ wrench`` path.  Both task-space modes
 keep software joint stiffness at zero so there is only one spring owner.
 
-The dispatched RobStride MIT ``kp`` and ``kd`` are always zero, so the final
-software torque is the only PD/derivative contribution that this probe owns.
-The software then applies a final absolute torque bound and slew-rate bound
-before calling :meth:`B601RSBackend.send_mit`.  Feedback uses the existing
-explicit ``mechPos`` request path; its source freshness remains unverified by
-MotorBridge 0.4.9 and is reported as such.
+The dispatched RobStride MIT ``kp`` is always zero.  By default ``kd`` is also
+zero and the software owns all damping.  An explicit driver ``kd`` may instead
+provide motor-local damping while software damping is disabled; that path
+requires verified volatile driver torque limits on all six joints.  The host
+still applies its final absolute torque and slew-rate bounds to the gravity and
+task-space wrench it owns before calling :meth:`B601RSBackend.send_mit`.
+Feedback uses the existing explicit ``mechPos`` request path; its source
+freshness remains unverified by MotorBridge 0.4.9 and is reported as such.
 
 This module is motion-capable only after all of ``--allow-motion``,
 ``--auto-disable`` and the exact confirmation string are supplied.  The
@@ -37,15 +44,21 @@ as the legal zero-lower-limit reading.  The raw value is retained in evidence
 records, while values below that narrow boundary and all outgoing references
 remain subject to the exact pinned-URDF limits.
 
-After MIT mode setup and enable, the active path first requires four consecutive
-complete, in-limit, near-zero-velocity feedback snapshots.  No torque command
-is sent during this arming-settle gate; the first torque reference is anchored
-to the final settled snapshot.
+After MIT mode setup and enable, the active path captures a fresh post-enable
+snapshot and immediately sends a bounded, all-six-joint software position lock
+at that snapshot.  The lock frame is repeated while the feedback gate is
+checked, then the complete gravity vector is ramped in with the lock gains
+still active.  A second, same-duration handoff ramps the temporary joint lock
+out while the requested final controller (including pose impedance) ramps in.
+This closes the enable-to-control torque gap without adding an unbounded vendor
+position loop: the startup gains are read from the pinned YAML MIT configuration
+and remain inside the existing final software torque conditioner.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -174,6 +187,13 @@ def _positive(value: object, *, name: str) -> float:
     normalized = _finite(value, name=name)
     if normalized <= 0.0:
         raise ValueError(f"{name} must be positive")
+    return normalized
+
+
+def _non_negative(value: object, *, name: str) -> float:
+    normalized = _finite(value, name=name)
+    if normalized < 0.0:
+        raise ValueError(f"{name} must be non-negative")
     return normalized
 
 
@@ -596,6 +616,36 @@ def _validate_arming_settle_transition(
     return accepted, qvel
 
 
+def _validate_in_limit_qpos(
+    qpos_rad: Sequence[float] | None,
+    *,
+    position_limits_rad: Sequence[tuple[float, float]],
+    name: str,
+) -> tuple[float, ...]:
+    """Normalize and validate a complete position snapshot without a motion gate."""
+
+    if qpos_rad is None:
+        raise LowGainProbeError(f"{name} requires a complete feedback position snapshot")
+    qpos, _ = normalize_feedback_boundary_qpos(qpos_rad, name=name)
+    limits = tuple(
+        (float(lower), float(upper)) for lower, upper in position_limits_rad
+    )
+    if len(limits) != 6 or any(
+        not math.isfinite(lower)
+        or not math.isfinite(upper)
+        or lower >= upper
+        for lower, upper in limits
+    ):
+        raise LowGainProbeError(f"{name} received invalid position limits")
+    for index, (value, (lower, upper)) in enumerate(zip(qpos, limits, strict=True)):
+        if not lower <= value <= upper:
+            raise LowGainProbeError(
+                f"{name}[{index}]={value:.6f} is outside URDF limits "
+                f"[{lower:.6f}, {upper:.6f}]"
+            )
+    return qpos
+
+
 def _validate_protective_hold_feedback(
     qpos_rad: Sequence[float] | None,
     *,
@@ -643,38 +693,18 @@ def _validate_protective_hold_feedback(
     return current
 
 
-def resolve_active_joint_names(
-    target_joint: str,
-    support_joints: Sequence[str] = _FAULT_HOLD_JOINTS,
-) -> tuple[str, ...]:
-    """Resolve the explicit command set for a low-gain probe.
+def resolve_active_joint_names() -> tuple[str, ...]:
+    """Return the complete B601 arm command set used by impedance modes."""
 
-    The target is the only joint whose reference may change in ``slow-step``.
-    Joint2 and joint3 remain mandatory support joints so the first single-joint
-    check cannot accidentally enable a wrist-only subset.  The selected set is
-    still dispatched explicitly; ``--joint`` no longer implies six-joint TX.
-    """
-
-    target = str(target_joint).strip()
-    if target not in _ALL_JOINTS:
-        raise ValueError(f"unknown B601-RS joint: {target_joint}")
-    try:
-        support = tuple(str(name).strip() for name in support_joints)
-    except TypeError as exc:
-        raise ValueError("support_joints must be a sequence of joint names") from exc
-    if any(name not in _ALL_JOINTS for name in support):
-        unknown = sorted(set(support).difference(_ALL_JOINTS))
-        raise ValueError(f"unknown B601-RS support joints: {unknown}")
-    names = tuple(dict.fromkeys((target, *support)))
-    if not set(_FAULT_HOLD_JOINTS).issubset(names):
-        raise ValueError(
-            "joint2 and joint3 are mandatory support joints for the fault hold"
-        )
-    return names
+    return _ALL_JOINTS
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
     if args.mode == "feedback-stability":
+        if getattr(args, "driver_kd", 0.0) != 0.0:
+            raise LowGainProbeError(
+                "feedback-stability rejects --driver-kd; it is observation-only"
+            )
         if getattr(args, "apply_driver_torque_limits", False):
             raise LowGainProbeError(
                 "feedback-stability rejects --apply-driver-torque-limits; "
@@ -699,14 +729,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
             raise LowGainProbeError(
                 "feedback-stability requires --rebot-source-root"
             )
-        _bounded(args.rate_hz, name="rate_hz", lower=1.0, upper=40.0)
-        _bounded(args.duration_sec, name="duration_sec", lower=0.1, upper=60.0)
-        _bounded(
+        _positive(args.rate_hz, name="rate_hz")
+        _positive(args.duration_sec, name="duration_sec")
+        _positive(
             args.fault_hold_max_velocity_rad_s,
             name="fault_hold_max_velocity_rad_s",
-            lower=0.0001,
-            upper=0.5,
-            lower_inclusive=False,
         )
         return
     if args.mode == "driver-torque-limit-roundtrip":
@@ -731,8 +758,8 @@ def _validate_cli(args: argparse.Namespace) -> None:
         _bounded(
             args.torque_limit_scale,
             name="torque_limit_scale",
-            lower=0.01,
-            upper=0.5,
+            lower=0.0,
+            upper=1.0,
             lower_inclusive=False,
         )
         return
@@ -752,57 +779,47 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError(
             "mode must be hold, slow-step, cartesian-hold, or pose-hold"
         )
-    _bounded(args.rate_hz, name="rate_hz", lower=1.0, upper=40.0)
-    _bounded(args.duration_sec, name="duration_sec", lower=0.1, upper=60.0)
-    _bounded(args.warmup_sec, name="warmup_sec", lower=0.1, upper=15.0)
-    _bounded(args.freeze_sec, name="freeze_sec", lower=0.1, upper=10.0)
-    _bounded(args.kp, name="kp", lower=0.0, upper=5.0)
-    _bounded(args.kd, name="kd", lower=0.0, upper=5.0)
+    _positive(args.rate_hz, name="rate_hz")
+    _positive(args.duration_sec, name="duration_sec")
+    _positive(args.warmup_sec, name="warmup_sec")
+    _non_negative(args.freeze_sec, name="freeze_sec")
+    _non_negative(args.kp, name="kp")
+    _non_negative(args.kd, name="kd")
+    driver_kd = _non_negative(
+        getattr(args, "driver_kd", 0.0),
+        name="driver_kd",
+    )
+    if driver_kd > 0.0 and not args.apply_driver_torque_limits:
+        raise LowGainProbeError(
+            "non-zero --driver-kd requires --apply-driver-torque-limits"
+        )
     target_kp = getattr(args, "target_kp", None)
     target_kd = getattr(args, "target_kd", None)
     if target_kp is not None:
-        _bounded(target_kp, name="target_kp", lower=0.0, upper=5.0)
+        _non_negative(target_kp, name="target_kp")
     if target_kd is not None:
-        _bounded(target_kd, name="target_kd", lower=0.0, upper=5.0)
-    _bounded(args.gravity_scale, name="gravity_scale", lower=0.0, upper=1.0)
+        _non_negative(target_kd, name="target_kd")
+    if driver_kd > 0.0 and (
+        args.kd > 0.0 or (target_kd is not None and target_kd > 0.0)
+    ):
+        raise LowGainProbeError(
+            "non-zero --driver-kd requires software --kd 0 and no non-zero "
+            "--target-kd"
+        )
+    _non_negative(args.gravity_scale, name="gravity_scale")
     _bounded(
         args.torque_limit_scale,
         name="torque_limit_scale",
-        lower=0.01,
-        upper=0.5,
+        lower=0.0,
+        upper=1.0,
         lower_inclusive=False,
     )
-    _bounded(
-        args.torque_rise_time_sec,
-        name="torque_rise_time_sec",
-        lower=0.1,
-        upper=10.0,
-    )
-    _bounded(
-        args.velocity_abort_rad_s,
-        name="velocity_abort_rad_s",
-        lower=0.01,
-        upper=0.5,
-    )
-    _bounded(
-        args.acceleration_abort_rad_s2,
-        name="acceleration_abort_rad_s2",
-        lower=0.1,
-        upper=20.0,
-    )
-    _bounded(
-        args.max_error_rad,
-        name="max_error_rad",
-        lower=0.01,
-        upper=0.5,
-    )
+    _positive(args.torque_rise_time_sec, name="torque_rise_time_sec")
+    _positive(args.velocity_abort_rad_s, name="velocity_abort_rad_s")
+    _positive(args.acceleration_abort_rad_s2, name="acceleration_abort_rad_s2")
+    _positive(args.max_error_rad, name="max_error_rad")
     _bounded(args.step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
-    _bounded(
-        args.step_speed_rad_s,
-        name="step_speed_rad_s",
-        lower=0.001,
-        upper=0.05,
-    )
+    _positive(args.step_speed_rad_s, name="step_speed_rad_s")
     _bounded(
         getattr(args, "fault_hold_max_age_sec", _DEFAULT_FAULT_HOLD_MAX_AGE_SEC),
         name="fault_hold_max_age_sec",
@@ -827,113 +844,76 @@ def _validate_cli(args: argparse.Namespace) -> None:
         upper=0.5,
         lower_inclusive=False,
     )
-    _bounded(
+    _non_negative(
         getattr(
             args,
             "cartesian_stiffness_n_per_m",
             _DEFAULT_CARTESIAN_STIFFNESS_N_PER_M,
         ),
         name="cartesian_stiffness_n_per_m",
-        lower=0.0,
-        upper=100.0,
     )
-    _bounded(
+    _non_negative(
         getattr(
             args,
             "cartesian_damping_n_s_per_m",
             _DEFAULT_CARTESIAN_DAMPING_N_S_PER_M,
         ),
         name="cartesian_damping_n_s_per_m",
-        lower=0.0,
-        upper=10.0,
     )
-    _bounded(
+    _positive(
         getattr(args, "cartesian_max_force_n", _DEFAULT_CARTESIAN_MAX_FORCE_N),
         name="cartesian_max_force_n",
-        lower=0.1,
-        upper=5.0,
     )
-    _bounded(
+    _positive(
         getattr(
             args,
             "cartesian_max_displacement_m",
             _DEFAULT_CARTESIAN_MAX_DISPLACEMENT_M,
         ),
         name="cartesian_max_displacement_m",
-        lower=0.001,
-        upper=0.05,
-        lower_inclusive=False,
     )
-    _bounded(
+    _positive(
         getattr(
             args,
             "cartesian_overlay_limit_scale",
             _DEFAULT_CARTESIAN_OVERLAY_LIMIT_SCALE,
         ),
         name="cartesian_overlay_limit_scale",
-        lower=0.01,
-        upper=0.5,
-        lower_inclusive=False,
     )
-    _bounded(
+    _non_negative(
         getattr(
             args,
             "rotational_stiffness_nm_per_rad",
             _DEFAULT_ROTATIONAL_STIFFNESS_NM_PER_RAD,
         ),
         name="rotational_stiffness_nm_per_rad",
-        lower=0.0,
-        upper=5.0,
     )
-    _bounded(
+    _non_negative(
         getattr(
             args,
             "rotational_damping_nm_s_per_rad",
             _DEFAULT_ROTATIONAL_DAMPING_NM_S_PER_RAD,
         ),
         name="rotational_damping_nm_s_per_rad",
-        lower=0.0,
-        upper=1.0,
     )
-    _bounded(
+    _positive(
         getattr(
             args,
             "rotational_max_torque_nm",
             _DEFAULT_ROTATIONAL_MAX_TORQUE_NM,
         ),
         name="rotational_max_torque_nm",
-        lower=0.01,
-        upper=1.0,
-        lower_inclusive=False,
     )
-    _bounded(
+    _positive(
         getattr(
             args,
             "rotational_max_displacement_rad",
             _DEFAULT_ROTATIONAL_MAX_DISPLACEMENT_RAD,
         ),
         name="rotational_max_displacement_rad",
-        lower=math.radians(0.5),
-        upper=math.radians(20.0),
-        lower_inclusive=False,
     )
     if args.mode == "slow-step" and args.step_rad <= 0.0:
         raise ValueError("slow-step mode requires step_rad > 0")
-    active_joint_names = resolve_active_joint_names(
-        args.joint,
-        getattr(args, "support_joints", _FAULT_HOLD_JOINTS),
-    )
-    if args.mode in ("cartesian-hold", "pose-hold"):
-        if args.kp != 0.0 or target_kp not in (None, 0.0):
-            raise ValueError(
-                f"{args.mode} requires --kp 0 and no non-zero --target-kp "
-                "to avoid joint-position stiffness"
-            )
-        if active_joint_names != _ALL_JOINTS:
-            raise ValueError(
-                f"{args.mode} requires the canonical joint1..joint6 active set; "
-                "use joint1 as target and add joint4, joint5, and joint6 as support joints"
-            )
 
 
 def _resolve_model_and_limits(
@@ -964,7 +944,13 @@ def _resolve_effort_limits(
 ) -> tuple[float, ...]:
     """Read URDF effort ceilings and apply a conservative commissioning scale."""
 
-    scale = _bounded(scale, name="torque_limit_scale", lower=0.01, upper=0.5, lower_inclusive=False)
+    scale = _bounded(
+        scale,
+        name="torque_limit_scale",
+        lower=0.0,
+        upper=1.0,
+        lower_inclusive=False,
+    )
     try:
         root = ET.fromstring(urdf_path.read_text(encoding="utf-8"))
     except (OSError, ET.ParseError) as exc:
@@ -1015,12 +1001,9 @@ def summarize_feedback_stability(
         raise ValueError("feedback stability requires at least two complete snapshots")
     if any(current <= previous for previous, current in pairwise(times)):
         raise ValueError("timestamps_sec must be strictly increasing")
-    limit = _bounded(
+    limit = _positive(
         stationarity_velocity_limit_rad_s,
         name="stationarity_velocity_limit_rad_s",
-        lower=0.0001,
-        upper=0.5,
-        lower_inclusive=False,
     )
     deltas = np.diff(np.asarray(samples, dtype=float), axis=0)
     intervals = np.diff(np.asarray(times, dtype=float))
@@ -1236,14 +1219,11 @@ def _run_driver_torque_limit_roundtrip_probe(
     source_root: Path,
     model: B601PinocchioModel,
     position_limits: tuple[tuple[float, float], ...],
-    target_joint: str,
     torque_limits_nm: tuple[float, ...],
 ) -> dict[str, object]:
-    """Verify one volatile ``0x700B`` apply/restore transaction while disabled."""
+    """Verify the six-arm-joint ``0x700B`` transaction while disabled."""
 
-    if target_joint not in _ALL_JOINTS:
-        raise ValueError(f"unknown B601-RS joint: {target_joint}")
-    target_names = (target_joint,)
+    target_names = _ALL_JOINTS
     connected = False
     preflight_disable: B601ModeReceipt | None = None
     cleanup_receipt: B601ModeReceipt | None = None
@@ -1352,8 +1332,8 @@ def _run_driver_torque_limit_roundtrip_probe(
         "urdf_path": str(model.urdf_path),
         "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
         "transport": "motorbridge_wired_local",
-        "target_joint": target_joint,
-        "target_limit_nm": torque_limits_nm[_ALL_JOINTS.index(target_joint)],
+        "joint_names": target_names,
+        "target_limits_nm": torque_limits_nm,
         "parameter": "RobStride limit_torque 0x700B",
         "parameter_persistence": "volatile_not_saved",
         "feedback_validated": feedback_validated,
@@ -1370,7 +1350,7 @@ def _run_driver_torque_limit_roundtrip_probe(
         "hardware_acceptance": "NOT_CLAIMED",
         "notes": [
             "This mode never changes control mode, enables a motor, or sends MIT/POS_VEL commands.",
-            "It writes only the selected arm motor's volatile RobStride limit_torque (0x700B), verifies readback, safe-stops again, and restores the exact observed original value with readback.",
+            "It writes every arm motor's volatile RobStride limit_torque (0x700B), verifies every readback, safe-stops again, and restores every exact observed original value with readback.",
             "A PASS validates the guarded parameter transaction only; it is not a motion, force-control, or haptic acceptance result.",
         ],
     }
@@ -1401,6 +1381,151 @@ def condition_torque(
     return tuple(float(value) for value in conditioned), torque_limited, slew_limited
 
 
+def gravity_ramp_fraction(*, elapsed_sec: float, rise_time_sec: float) -> float:
+    """Return one shared linear startup scale for the complete gravity vector."""
+
+    elapsed = _non_negative(elapsed_sec, name="elapsed_sec")
+    rise_time = _positive(rise_time_sec, name="rise_time_sec")
+    return min(1.0, elapsed / rise_time)
+
+
+def apply_shared_gravity_ramp(
+    breakdown: B601MitTorqueBreakdown,
+    *,
+    fraction: float,
+) -> B601MitTorqueBreakdown:
+    """Scale gravity as one vector while leaving damping and impedance live."""
+
+    if not isinstance(breakdown, B601MitTorqueBreakdown):
+        raise TypeError("breakdown must be a B601MitTorqueBreakdown")
+    scale = _bounded(fraction, name="fraction", lower=0.0, upper=1.0)
+    position = np.asarray(breakdown.position_torque_nm, dtype=float)
+    damping = np.asarray(breakdown.damping_torque_nm, dtype=float)
+    gravity = scale * np.asarray(breakdown.gravity_torque_nm, dtype=float)
+    overlay = np.asarray(breakdown.overlay_effective_nm, dtype=float)
+    requested = position + damping + gravity + overlay
+    return B601MitTorqueBreakdown(
+        position_torque_nm=breakdown.position_torque_nm,
+        damping_torque_nm=breakdown.damping_torque_nm,
+        gravity_torque_nm=tuple(float(value) for value in gravity),
+        overlay_requested_nm=breakdown.overlay_requested_nm,
+        overlay_effective_nm=breakdown.overlay_effective_nm,
+        requested_torque_nm=tuple(float(value) for value in requested),
+        overlay_limited=breakdown.overlay_limited,
+    )
+
+
+def startup_handoff_fraction(*, elapsed_sec: float, rise_time_sec: float) -> float:
+    """Return the second-phase blend from temporary joint lock to final control."""
+
+    elapsed = _non_negative(elapsed_sec, name="elapsed_sec")
+    rise_time = _positive(rise_time_sec, name="rise_time_sec")
+    if elapsed <= rise_time:
+        return 0.0
+    return min(1.0, (elapsed - rise_time) / rise_time)
+
+
+def build_startup_lock_profile(
+    *,
+    mit_kp_nm_per_rad: Sequence[float],
+    mit_kd_nm_s_per_rad: Sequence[float],
+    torque_limits_nm: Sequence[float],
+    torque_rise_time_sec: float,
+    velocity_limit_rad_s: float,
+) -> B601MitControlProfile:
+    """Build the temporary all-joint lock from the pinned YAML MIT gains.
+
+    The gains are configuration inputs, not probe constants.  They are used as
+    software gains so the same absolute and slew conditioners bound the startup
+    lock as the final impedance command; the vendor MIT ``kp`` remains zero.
+    """
+
+    kp = _six(mit_kp_nm_per_rad, name="mit_kp_nm_per_rad")
+    kd = _six(mit_kd_nm_s_per_rad, name="mit_kd_nm_s_per_rad")
+    limits = _six(torque_limits_nm, name="torque_limits_nm")
+    if any(value < 0.0 for value in kp) or any(value < 0.0 for value in kd):
+        raise ValueError("startup MIT gains must be non-negative")
+    if any(value <= 0.0 for value in limits):
+        raise ValueError("torque_limits_nm must be positive")
+    rise_time = _positive(torque_rise_time_sec, name="torque_rise_time_sec")
+    velocity_limit = _positive(velocity_limit_rad_s, name="velocity_limit_rad_s")
+    return B601MitControlProfile(
+        name="b601_rs_startup_yaml_mit_position_lock",
+        position_kp_nm_per_rad=kp,
+        damping_kd_nm_s_per_rad=kd,
+        max_abs_torque_nm=limits,
+        max_torque_rate_nm_s=tuple(value / rise_time for value in limits),
+        max_abs_overlay_torque_nm=_ZERO_SIX,
+        max_abs_reference_velocity_rad_s=(velocity_limit,) * 6,
+        max_abs_state_velocity_rad_s=(velocity_limit,) * 6,
+        metadata={
+            "gain_source": "rebotarm_rs_yaml.MIT",
+            "torque_owner": "software_startup_lock",
+            "vendor_kp": "zero",
+            "vendor_kd": "optional_driver_damping_only",
+        },
+    )
+
+
+def blend_startup_lock_torque_breakdown(
+    startup_lock: B601MitTorqueBreakdown,
+    final_control: B601MitTorqueBreakdown,
+    *,
+    gravity_fraction: float,
+    handoff_fraction: float,
+) -> B601MitTorqueBreakdown:
+    """Blend a bounded startup lock into the final six-joint controller.
+
+    Gravity is always scaled as one complete vector.  Position, damping and
+    task-space overlay terms move together from the temporary lock to the final
+    controller, which prevents a discontinuity when the end-effector spring
+    becomes the position-restoring owner.
+    """
+
+    if not isinstance(startup_lock, B601MitTorqueBreakdown):
+        raise TypeError("startup_lock must be a B601MitTorqueBreakdown")
+    if not isinstance(final_control, B601MitTorqueBreakdown):
+        raise TypeError("final_control must be a B601MitTorqueBreakdown")
+    gravity_scale = _bounded(
+        gravity_fraction,
+        name="gravity_fraction",
+        lower=0.0,
+        upper=1.0,
+    )
+    handoff = _bounded(
+        handoff_fraction,
+        name="handoff_fraction",
+        lower=0.0,
+        upper=1.0,
+    )
+    lock_weight = 1.0 - handoff
+    lock_position = np.asarray(startup_lock.position_torque_nm, dtype=float)
+    final_position = np.asarray(final_control.position_torque_nm, dtype=float)
+    lock_damping = np.asarray(startup_lock.damping_torque_nm, dtype=float)
+    final_damping = np.asarray(final_control.damping_torque_nm, dtype=float)
+    gravity = gravity_scale * np.asarray(final_control.gravity_torque_nm, dtype=float)
+    overlay_requested = handoff * np.asarray(
+        final_control.overlay_requested_nm,
+        dtype=float,
+    )
+    overlay_effective = handoff * np.asarray(
+        final_control.overlay_effective_nm,
+        dtype=float,
+    )
+    position = lock_weight * lock_position + handoff * final_position
+    damping = lock_weight * lock_damping + handoff * final_damping
+    requested = position + damping + gravity + overlay_effective
+    return B601MitTorqueBreakdown(
+        position_torque_nm=tuple(float(value) for value in position),
+        damping_torque_nm=tuple(float(value) for value in damping),
+        gravity_torque_nm=tuple(float(value) for value in gravity),
+        overlay_requested_nm=tuple(float(value) for value in overlay_requested),
+        overlay_effective_nm=tuple(float(value) for value in overlay_effective),
+        requested_torque_nm=tuple(float(value) for value in requested),
+        overlay_limited=final_control.overlay_limited,
+    )
+
+
 def build_software_profile(
     *,
     kp: float,
@@ -1415,8 +1540,8 @@ def build_software_profile(
 ) -> B601MitControlProfile:
     """Build the low-gain software composition profile used by the probe."""
 
-    kp = _bounded(kp, name="kp", lower=0.0, upper=5.0)
-    kd = _bounded(kd, name="kd", lower=0.0, upper=5.0)
+    kp = _non_negative(kp, name="kp")
+    kd = _non_negative(kd, name="kd")
     limits = _six(torque_limits_nm, name="torque_limits_nm")
     overlay_limits = _six(overlay_limits_nm, name="overlay_limits_nm")
     if any(value <= 0.0 for value in limits):
@@ -1435,18 +1560,12 @@ def build_software_profile(
             raise ValueError(f"unknown B601-RS joint: {target_joint}")
         target_index = _ALL_JOINTS.index(target_joint)
         if target_kp is not None:
-            position_gains[target_index] = _bounded(
-                target_kp,
-                name="target_kp",
-                lower=0.0,
-                upper=5.0,
+            position_gains[target_index] = _non_negative(
+                target_kp, name="target_kp"
             )
         if target_kd is not None:
-            damping_gains[target_index] = _bounded(
-                target_kd,
-                name="target_kd",
-                lower=0.0,
-                upper=5.0,
+            damping_gains[target_index] = _non_negative(
+                target_kd, name="target_kd"
             )
     return B601MitControlProfile(
         name="b601_rs_low_gain_software_gravity_damping",
@@ -1459,7 +1578,7 @@ def build_software_profile(
         max_abs_state_velocity_rad_s=(max(velocity_limit, 0.05),) * 6,
         metadata={
             "hardware_safety_claim": False,
-            "torque_owner": "software_composed_tau; vendor_kp_kd_zero",
+            "torque_owner": "software_composed_tau_excludes_vendor_pd",
             "torque_limit_source": "pinned_urdf_effort_scaled",
             "torque_rise_time_sec": rise_time,
             "target_joint": target_joint,
@@ -1502,7 +1621,7 @@ def compute_software_torque_breakdown(
 ) -> B601MitTorqueBreakdown:
     """Compose gravity, joint PD, and bounded overlay torque in software."""
 
-    scale = _bounded(gravity_scale, name="gravity_scale", lower=0.0, upper=1.0)
+    scale = _non_negative(gravity_scale, name="gravity_scale")
     gravity = tuple(
         scale * float(value)
         for value in model.arm_generalized_gravity(measured_qpos_rad)
@@ -1555,12 +1674,8 @@ def compute_cartesian_impedance_overlay(
 
     qpos = _six(qpos_rad, name="qpos_rad")
     qvel = _six(qvel_rad_s, name="qvel_rad_s")
-    displacement_limit = _bounded(
-        max_displacement_m,
-        name="cartesian_max_displacement_m",
-        lower=0.001,
-        upper=0.05,
-        lower_inclusive=False,
+    displacement_limit = _positive(
+        max_displacement_m, name="cartesian_max_displacement_m"
     )
     transform = np.asarray(model.forward_kinematics(qpos), dtype=float)
     if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
@@ -1630,19 +1745,11 @@ def compute_pose_impedance_overlay(
 
     qpos = _six(qpos_rad, name="qpos_rad")
     qvel = _six(qvel_rad_s, name="qvel_rad_s")
-    displacement_limit = _bounded(
-        max_displacement_m,
-        name="cartesian_max_displacement_m",
-        lower=0.001,
-        upper=0.05,
-        lower_inclusive=False,
+    displacement_limit = _positive(
+        max_displacement_m, name="cartesian_max_displacement_m"
     )
-    rotation_limit = _bounded(
-        max_rotation_rad,
-        name="rotational_max_displacement_rad",
-        lower=math.radians(0.5),
-        upper=math.radians(20.0),
-        lower_inclusive=False,
+    rotation_limit = _positive(
+        max_rotation_rad, name="rotational_max_displacement_rad"
     )
     transform = np.asarray(model.forward_kinematics(qpos), dtype=float)
     if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
@@ -1733,7 +1840,7 @@ def plan_reference(
         )
     direction = 1 if int(step_direction) >= 0 else -1
     step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
-    speed = _bounded(step_speed_rad_s, name="step_speed_rad_s", lower=0.001, upper=0.05)
+    speed = _positive(step_speed_rad_s, name="step_speed_rad_s")
     index = _ALL_JOINTS.index(joint)
     target = float(initial[index] + direction * step)
     lower, upper = limits[index]
@@ -1818,29 +1925,14 @@ def evaluate_slow_step_response(
     step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
     if step <= 0.0:
         raise ValueError("slow-step response requires step_rad > 0")
-    minimum_ratio = _bounded(
-        min_response_ratio,
-        name="min_response_ratio",
-        lower=0.0,
-        upper=1.0,
-    )
-    maximum_ratio = _bounded(
-        max_response_ratio,
-        name="max_response_ratio",
-        lower=1.0,
-        upper=5.0,
-    )
-    minimum_rad = _bounded(
-        min_response_rad,
-        name="min_response_rad",
-        lower=0.0,
-        upper=0.1,
-    )
-    support_limit = _bounded(
+    minimum_ratio = _non_negative(min_response_ratio, name="min_response_ratio")
+    maximum_ratio = _positive(max_response_ratio, name="max_response_ratio")
+    if maximum_ratio < minimum_ratio:
+        raise ValueError("max_response_ratio must be >= min_response_ratio")
+    minimum_rad = _non_negative(min_response_rad, name="min_response_rad")
+    support_limit = _non_negative(
         max_support_drift_rad,
         name="max_support_drift_rad",
-        lower=0.0,
-        upper=0.1,
     )
     qpos_samples = tuple(
         np.asarray(_six(sample["qpos_rad"], name="sample_qpos_rad"), dtype=float)
@@ -1924,19 +2016,44 @@ def evaluate_slow_step_response(
 
 def _output_payload(payload: dict[str, object], output: Path | None) -> None:
     encoded = json.dumps(payload, indent=2, sort_keys=True, default=list)
-    print(encoded)
     if output is None:
+        print(encoded)
         return
     output_path = output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(encoded + "\n", encoding="utf-8")
+    summary = {
+        key: payload[key]
+        for key in ("status", "mode", "acceptance_status", "stop_reason", "error")
+        if key in payload
+    }
+    summary["result_path"] = str(output_path)
+    if "runtime_log_path" in payload:
+        summary["runtime_log_path"] = payload["runtime_log_path"]
+    print(json.dumps(summary, sort_keys=True, default=list), flush=True)
+
+
+def _operator_notice(message: str) -> None:
+    """Write an infrequent safety notice to the log and controlling terminal."""
+
+    print(message, flush=True)
+    if sys.stdout.isatty():
+        return
+    try:
+        with _OPERATOR_TTY_PATH.open("w", encoding="utf-8") as operator_stream:
+            print(message, file=operator_stream, flush=True)
+    except OSError:
+        return
 
 
 def _signal_handler(stop: dict[str, bool], signum: int, _frame: object) -> None:
-    """Latch a protective stop; SIGUSR1 is the explicit all-disable request."""
+    """Latch protective hold; a second SIGINT or SIGUSR1 requests full stop."""
 
+    already_requested = stop.get("requested", False)
     stop["requested"] = True
-    if getattr(signal, "SIGUSR1", None) == signum:
+    if getattr(signal, "SIGUSR1", None) == signum or (
+        signum == signal.SIGINT and already_requested
+    ):
         stop["full_disable_requested"] = True
 
 
@@ -1998,6 +2115,7 @@ def _freeze_and_stop(
     freeze_sec: float,
     rate_hz: float,
     joint_names: Sequence[str] = _ALL_JOINTS,
+    driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[int, tuple[float, ...], list[str]]:
     """Hold the last known pose briefly before the explicit safe stop.
 
@@ -2011,6 +2129,10 @@ def _freeze_and_stop(
     max_rate = profile.max_torque_rate_nm_s
     count = 0
     latest_tau = previous_tau
+    driver_kd = _six(
+        driver_kd_nm_s_per_rad,
+        name="driver_kd_nm_s_per_rad",
+    )
     period = 1.0 / rate_hz
     deadline = time.monotonic() + freeze_sec
     while time.monotonic() < deadline:
@@ -2039,7 +2161,7 @@ def _freeze_and_stop(
             receipt = backend.send_mit(
                 reference,
                 kp=_ZERO_SIX,
-                kd=_ZERO_SIX,
+                kd=driver_kd,
                 tau_nm=latest_tau,
                 torque_limits_nm=torque_limits_nm,
                 joint_names=joint_names,
@@ -2067,6 +2189,7 @@ def _send_fault_hold_command(
     previous_tau: tuple[float, ...],
     torque_limits_nm: tuple[float, ...],
     rate_hz: float,
+    driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[B601CommandReceipt, tuple[float, ...]]:
     """Send one bounded fixed-reference MIT frame to joint2 and joint3 only."""
 
@@ -2095,7 +2218,7 @@ def _send_fault_hold_command(
     receipt = backend.send_mit(
         reference,
         kp=_ZERO_SIX,
-        kd=_ZERO_SIX,
+        kd=_six(driver_kd_nm_s_per_rad, name="driver_kd_nm_s_per_rad"),
         tau_nm=conditioned,
         torque_limits_nm=torque_limits_nm,
         joint_names=_FAULT_HOLD_JOINTS,
@@ -2123,6 +2246,7 @@ def _run_latched_fault_hold(
     rate_hz: float,
     stop: dict[str, bool],
     max_iterations: int | None = None,
+    driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -2199,6 +2323,7 @@ def _run_latched_fault_hold(
             previous_tau=latest_tau,
             torque_limits_nm=torque_limits_nm,
             rate_hz=rate_hz,
+            driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
         )
         if not first_hold_receipt.accepted:
             errors.extend(
@@ -2259,11 +2384,10 @@ def _run_latched_fault_hold(
             errors,
         )
 
-    print(
+    _operator_notice(
         "B601 protective hold latched: joint2/joint3 remain at the last valid "
         "position; joint1/joint4/joint5/joint6 are disabled. "
-        f"pid={os.getpid()}; send SIGUSR1 to this process for explicit full disable.",
-        flush=True,
+        f"pid={os.getpid()}; press Ctrl-C again or send SIGUSR1 for full disable."
     )
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
@@ -2323,6 +2447,7 @@ def _run_latched_fault_hold(
                 previous_tau=latest_tau,
                 torque_limits_nm=torque_limits_nm,
                 rate_hz=rate_hz,
+                driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
             )
             if not receipt.accepted:
                 errors.extend(
@@ -2357,6 +2482,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
     _validate_cli(args)
+    driver_kd_nm_s_per_rad = (
+        _non_negative(getattr(args, "driver_kd", 0.0), name="driver_kd"),
+    ) * 6
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
     model, position_limits = _resolve_model_and_limits(source_root)
@@ -2392,7 +2520,6 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             source_root=source_root,
             model=model,
             position_limits=position_limits,
-            target_joint=args.joint,
             torque_limits_nm=torque_limits,
         )
     overlay_limits = (
@@ -2419,14 +2546,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         allow_motion=True,
         position_limits_rad=position_limits,
     )
+    startup_lock_profile = build_startup_lock_profile(
+        mit_kp_nm_per_rad=tuple(joint.mit_kp for joint in config.joints),
+        mit_kd_nm_s_per_rad=tuple(joint.mit_kd for joint in config.joints),
+        torque_limits_nm=torque_limits,
+        torque_rise_time_sec=args.torque_rise_time_sec,
+        velocity_limit_rad_s=args.velocity_abort_rad_s,
+    )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
+    active_joint_names = resolve_active_joint_names()
     support_joint_names = tuple(
-        getattr(args, "support_joints", _FAULT_HOLD_JOINTS)
-    )
-    active_joint_names = resolve_active_joint_names(
-        args.joint,
-        support_joints=support_joint_names,
+        name for name in active_joint_names if name != args.joint
     )
     stop = {"requested": False, "full_disable_requested": False}
     previous_q: tuple[float, ...] | None = None
@@ -2471,6 +2602,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     protective_hold_first_receipt: B601CommandReceipt | None = None
     protective_hold_non_hold_receipt: B601ModeReceipt | None = None
     protective_hold_full_disable_receipt: B601ModeReceipt | None = None
+    startup_lock_first_receipt: B601CommandReceipt | None = None
+    startup_lock_commands = 0
+    arming_settle_torque_commands = 0
+    startup_state_history: list[str] = []
     arming_settle_required_samples = _DEFAULT_ARMING_SETTLE_SAMPLES
     arming_settle_samples = 0
     arming_settle_passed = False
@@ -2481,6 +2616,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     enabled = False
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigusr1 = signal.getsignal(signal.SIGUSR1)
+
+    def set_startup_state(state: str) -> None:
+        if startup_state_history and startup_state_history[-1] == state:
+            return
+        startup_state_history.append(state)
+        _operator_notice(f"[B601] STARTUP {state}")
+
     signal.signal(
         signal.SIGINT,
         lambda signum, frame: _signal_handler(stop, signum, frame),
@@ -2555,7 +2697,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             driver_limit_apply_receipt = (
                 backend.apply_temporary_driver_torque_limits(
                     torque_limits,
-                    joint_names=(args.joint,),
+                    joint_names=active_joint_names,
                 )
             )
             if not driver_limit_apply_receipt.completed:
@@ -2587,6 +2729,15 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 "motor enable failed: " + "; ".join(enable_receipt.errors)
             )
         enabled = True
+        set_startup_state("ENABLED_UNARMED")
+        if stop["full_disable_requested"]:
+            raise LowGainProbeError(
+                "explicit full disable requested immediately after motor enable"
+            )
+        if stop["requested"]:
+            raise LowGainProbeError(
+                "operator interrupt immediately after motor enable"
+            )
         arming_state = backend.poll_feedback(request_feedback=True)
         arming_observed_at_sec = time.monotonic()
         if (
@@ -2603,23 +2754,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         arm_dt = arming_observed_at_sec - warmup_observed_at_sec
         if not math.isfinite(arm_dt) or arm_dt <= 0.0:
             raise LowGainProbeError("non-positive warmup-to-enable observation interval")
-        arming_q, _ = normalize_feedback_boundary_qpos(
+        arming_q = _validate_in_limit_qpos(
             arming_state.positions_rad,
+            position_limits_rad=position_limits,
             name="arming_qpos_rad",
         )
         arming_qvel = tuple(
             (current - previous) / arm_dt
             for current, previous in zip(arming_q, warmup_q, strict=True)
         )
-        arming_q = _validate_fault_hold_snapshot(
-            arming_q,
-            qvel_rad_s=arming_qvel,
-            observed_age_sec=0.0,
-            position_limits_rad=position_limits,
-            max_age_sec=args.fault_hold_max_age_sec,
-            max_velocity_rad_s=args.fault_hold_max_velocity_rad_s,
-            max_rebase_rad=args.fault_hold_max_rebase_rad,
-        )
+        if max(abs(value) for value in arming_qvel) > args.velocity_abort_rad_s:
+            raise LowGainProbeError(
+                "post-enable feedback is moving too quickly for startup lock: "
+                f"max_abs_velocity={max(abs(value) for value in arming_qvel):.6f} "
+                f"> {args.velocity_abort_rad_s:.6f} rad/s"
+            )
         initial_q = arming_q
         final_q = arming_q
         last_safe_q = arming_q
@@ -2627,6 +2776,45 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         last_safe_observed_at_sec = arming_observed_at_sec
         previous_q = arming_q
         previous_feedback_time = arming_state.receive_timestamp_sec
+        set_startup_state("LOCKING")
+        lock_reference = build_reference(
+            sequence=arming_state.sequence,
+            timestamp_sec=arming_state.receive_timestamp_sec,
+            qpos_rad=initial_q,
+            qvel_rad_s=_ZERO_SIX,
+        )
+        lock_breakdown = compute_software_torque_breakdown(
+            model,
+            reference=lock_reference,
+            measured_qpos_rad=arming_q,
+            measured_qvel_rad_s=arming_qvel,
+            profile=startup_lock_profile,
+            gravity_scale=0.0,
+        )
+        lock_tau, _lock_torque_limited, _lock_slew_limited = condition_torque(
+            lock_breakdown.requested_torque_nm,
+            _ZERO_SIX,
+            absolute_limits_nm=torque_limits,
+            max_rate_nm_s=startup_lock_profile.max_torque_rate_nm_s,
+            dt_sec=arm_dt,
+        )
+        startup_lock_first_receipt = backend.send_mit(
+            lock_reference,
+            kp=_ZERO_SIX,
+            kd=driver_kd_nm_s_per_rad,
+            tau_nm=lock_tau,
+            torque_limits_nm=torque_limits,
+            joint_names=active_joint_names,
+        )
+        if not startup_lock_first_receipt.accepted:
+            raise LowGainProbeError(
+                "; ".join(startup_lock_first_receipt.errors)
+                or "startup lock MIT dispatch was incomplete"
+            )
+        startup_lock_commands = 1
+        arming_settle_torque_commands = 1
+        previous_tau = lock_tau
+        set_startup_state("LOCKED")
         arming_settle_started_at_sec = time.monotonic()
         arming_settle_previous_q = arming_q
         arming_settle_previous_feedback_time = arming_state.receive_timestamp_sec
@@ -2663,6 +2851,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     f"last_fault={settle_state.fault_reason or 'unknown'}"
                 )
                 break
+            previous_settle_feedback_time = arming_settle_previous_feedback_time
             try:
                 (
                     arming_settle_previous_q,
@@ -2678,6 +2867,46 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             except (LowGainProbeError, TypeError, ValueError) as exc:
                 stop_reason = f"arming settle rejected: {exc}"
                 break
+            settle_dt = (
+                settle_state.receive_timestamp_sec - previous_settle_feedback_time
+            )
+            lock_reference = build_reference(
+                sequence=settle_state.sequence,
+                timestamp_sec=settle_state.receive_timestamp_sec,
+                qpos_rad=initial_q,
+                qvel_rad_s=_ZERO_SIX,
+            )
+            lock_breakdown = compute_software_torque_breakdown(
+                model,
+                reference=lock_reference,
+                measured_qpos_rad=arming_settle_previous_q,
+                measured_qvel_rad_s=arming_settle_last_qvel,
+                profile=startup_lock_profile,
+                gravity_scale=0.0,
+            )
+            lock_tau, _lock_torque_limited, _lock_slew_limited = condition_torque(
+                lock_breakdown.requested_torque_nm,
+                previous_tau,
+                absolute_limits_nm=torque_limits,
+                max_rate_nm_s=startup_lock_profile.max_torque_rate_nm_s,
+                dt_sec=settle_dt,
+            )
+            lock_receipt = backend.send_mit(
+                lock_reference,
+                kp=_ZERO_SIX,
+                kd=driver_kd_nm_s_per_rad,
+                tau_nm=lock_tau,
+                torque_limits_nm=torque_limits,
+                joint_names=active_joint_names,
+            )
+            if not lock_receipt.accepted:
+                stop_reason = "; ".join(lock_receipt.errors) or (
+                    "arming settle startup lock dispatch was incomplete"
+                )
+                break
+            startup_lock_commands += 1
+            arming_settle_torque_commands += 1
+            previous_tau = lock_tau
             arming_settle_previous_feedback_time = settle_state.receive_timestamp_sec
             arming_settle_last_observed_at_sec = settle_observed_at_sec
             arming_settle_samples += 1
@@ -2693,18 +2922,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             and arming_settle_samples >= arming_settle_required_samples
         )
         if arming_settle_passed:
-            arming_q = arming_settle_previous_q
+            arming_q = initial_q
             arming_qvel = arming_settle_last_qvel
-            initial_q = arming_settle_previous_q
-            final_q = arming_settle_previous_q
-            last_safe_q = arming_settle_previous_q
+            final_q = initial_q
+            last_safe_q = initial_q
             last_safe_qvel = arming_settle_last_qvel
             last_safe_observed_at_sec = arming_settle_last_observed_at_sec
             previous_q = arming_settle_previous_q
             previous_feedback_time = arming_settle_previous_feedback_time
         if stop_reason is None and args.mode in ("cartesian-hold", "pose-hold"):
             arming_transform = np.asarray(
-                model.forward_kinematics(arming_q),
+                model.forward_kinematics(initial_q),
                 dtype=float,
             )
             if (
@@ -2977,13 +3205,47 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 qvel_rad_s=qvel_ref,
                 joint_torque_overlay_nm=joint_torque_overlay_nm,
             )
-            torque_breakdown = compute_software_torque_breakdown(
+            target_torque_breakdown = compute_software_torque_breakdown(
                 model,
                 reference=reference,
                 measured_qpos_rad=q,
                 measured_qvel_rad_s=qvel,
                 profile=profile,
                 gravity_scale=args.gravity_scale,
+            )
+            gravity_ramp = gravity_ramp_fraction(
+                elapsed_sec=elapsed,
+                rise_time_sec=args.torque_rise_time_sec,
+            )
+            handoff_fraction = startup_handoff_fraction(
+                elapsed_sec=elapsed,
+                rise_time_sec=args.torque_rise_time_sec,
+            )
+            if gravity_ramp < 1.0:
+                set_startup_state("GRAVITY_RAMP")
+            elif handoff_fraction < 1.0:
+                set_startup_state("HANDOFF")
+            else:
+                set_startup_state("ACTIVE")
+            startup_lock_reference = build_reference(
+                sequence=state.sequence,
+                timestamp_sec=state.receive_timestamp_sec,
+                qpos_rad=initial_q,
+                qvel_rad_s=_ZERO_SIX,
+            )
+            startup_lock_torque_breakdown = compute_software_torque_breakdown(
+                model,
+                reference=startup_lock_reference,
+                measured_qpos_rad=q,
+                measured_qvel_rad_s=qvel,
+                profile=startup_lock_profile,
+                gravity_scale=args.gravity_scale,
+            )
+            torque_breakdown = blend_startup_lock_torque_breakdown(
+                startup_lock_torque_breakdown,
+                target_torque_breakdown,
+                gravity_fraction=gravity_ramp,
+                handoff_fraction=handoff_fraction,
             )
             requested_tau = torque_breakdown.requested_torque_nm
             conditioned_tau, torque_limited, slew_limited = condition_torque(
@@ -2997,11 +3259,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             ledger.mark("compute", compute_time)
             receipt = backend.send_mit(
                 reference,
-                # Software owns the complete composed torque.  Passing
-                # non-zero vendor gains would double-count PD and bypass the
-                # final total-torque bound above.
+                # Driver Kp stays zero so the end-effector spring remains the
+                # sole position-restoring owner.  Optional driver Kd supplies
+                # only motor-local damping behind verified 0x700B bounds.
                 kp=_ZERO_SIX,
-                kd=_ZERO_SIX,
+                kd=driver_kd_nm_s_per_rad,
                 tau_nm=conditioned_tau,
                 torque_limits_nm=torque_limits,
                 joint_names=active_joint_names,
@@ -3027,6 +3289,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "qacc_fd_rad_s2": qacc,
                     "qref_rad": qref,
                     "qvel_ref_rad_s": qvel_ref,
+                    "startup_state": startup_state_history[-1],
+                    "gravity_ramp_fraction": gravity_ramp,
+                    "startup_handoff_fraction": handoff_fraction,
+                    "startup_lock_position_tau_nm": (
+                        startup_lock_torque_breakdown.position_torque_nm
+                    ),
+                    "startup_lock_damping_tau_nm": (
+                        startup_lock_torque_breakdown.damping_torque_nm
+                    ),
+                    "gravity_target_tau_nm": (
+                        target_torque_breakdown.gravity_torque_nm
+                    ),
                     "gravity_tau_nm": torque_breakdown.gravity_torque_nm,
                     "position_tau_nm": torque_breakdown.position_torque_nm,
                     "damping_tau_nm": torque_breakdown.damping_torque_nm,
@@ -3135,6 +3409,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             torque_limits_nm=torque_limits,
                             rate_hz=args.rate_hz,
                             stop=stop,
+                            driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
@@ -3164,6 +3439,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     freeze_sec=args.freeze_sec,
                     rate_hz=args.rate_hz,
                     joint_names=active_joint_names,
+                    driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                 )
                 cleanup_errors.extend(freeze_errors)
                 issue_full_safe_stop()
@@ -3270,7 +3546,32 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "elapsed_sec": arming_settle_elapsed_sec,
             "velocity_limit_rad_s": arming_settle_velocity_limit_rad_s,
             "last_qvel_rad_s": arming_settle_last_qvel,
-            "torque_commands_sent": 0,
+            "torque_commands_sent": arming_settle_torque_commands,
+            "reference_qpos_rad": initial_q,
+            "first_lock_command_receipt": _command_receipt_payload(
+                startup_lock_first_receipt
+            ),
+        },
+        "startup_state_machine": {
+            "state_history": tuple(startup_state_history),
+            "startup_lock_commands": startup_lock_commands,
+            "startup_lock_gain_source": "rebotarm_rs_yaml.MIT",
+            "startup_lock_software_kp_nm_per_rad": (
+                startup_lock_profile.position_kp_nm_per_rad
+            ),
+            "startup_lock_software_kd_nm_s_per_rad": (
+                startup_lock_profile.damping_kd_nm_s_per_rad
+            ),
+            "vendor_kp_nm_per_rad": _ZERO_SIX,
+            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "gravity_ramp_duration_sec": args.torque_rise_time_sec,
+            "handoff_duration_sec": args.torque_rise_time_sec,
+            "gravity_ramp_semantics": "complete_six_joint_vector",
+            "handoff_semantics": (
+                "temporary_joint_lock_to_final_controller; "
+                "end_effector_impedance_restores_pose"
+            ),
+            "all_six_joint_dispatch": True,
         },
         "motors_enabled_by_probe": enabled,
         "motion_commands_sent": commands_sent > 0,
@@ -3322,7 +3623,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
             "max_rebase_rad": args.fault_hold_max_rebase_rad,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
-            "vendor_kd_nm_s_per_rad": _ZERO_SIX,
+            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
             "reference_velocity_rad_s": _ZERO_SIX,
         },
         "fault_hold_candidate_admission": {
@@ -3351,13 +3652,27 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
             "gravity_scale": args.gravity_scale,
+            "gravity_ramp": {
+                "type": "shared_linear_scale",
+                "duration_sec": args.torque_rise_time_sec,
+                "applies_to": "complete_six_joint_gravity_vector",
+                "non_gravity_terms_scaled": False,
+            },
             "torque_limits_nm": torque_limits,
             "torque_limit_scale": args.torque_limit_scale,
             "max_torque_rate_nm_s": profile.max_torque_rate_nm_s,
             "max_abs_overlay_torque_nm": profile.max_abs_overlay_torque_nm,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
-            "vendor_kd_nm_s_per_rad": _ZERO_SIX,
-            "torque_owner": "software_composed_tau_only",
+            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "torque_owner": (
+                "software_position_gravity_task_wrench; optional_driver_damping"
+            ),
+            "startup_lock_profile": {
+                "software_kp_nm_per_rad": startup_lock_profile.position_kp_nm_per_rad,
+                "software_kd_nm_s_per_rad": startup_lock_profile.damping_kd_nm_s_per_rad,
+                "gain_source": "rebotarm_rs_yaml.MIT",
+                "vendor_kp_nm_per_rad": _ZERO_SIX,
+            },
         },
         "slow_step_response": slow_step_response,
         "joint_impedance": {
@@ -3368,8 +3683,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
-            "vendor_kd_nm_s_per_rad": _ZERO_SIX,
-            "final_total_torque_bounded": True,
+            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "final_total_torque_bounded": (
+                all(value == 0.0 for value in driver_kd_nm_s_per_rad)
+                or bool(getattr(args, "apply_driver_torque_limits", False))
+            ),
+            "final_total_torque_bound_owner": (
+                "driver_limit_torque_0x700B"
+                if any(value > 0.0 for value in driver_kd_nm_s_per_rad)
+                else "software_condition_torque"
+            ),
+            "final_driver_total_torque_bounded": bool(
+                getattr(args, "apply_driver_torque_limits", False)
+            ),
             "absolute_pose_commanded": False,
         },
         "cartesian_impedance": {
@@ -3411,7 +3737,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "max_rotation_rad": args.rotational_max_displacement_rad,
             "overlay_limit_scale": args.cartesian_overlay_limit_scale,
             "requires_all_six_arm_joints": True,
-            "joint_position_stiffness_disabled": True,
+            "joint_position_stiffness_disabled": all(
+                gain == 0.0 for gain in profile.position_kp_nm_per_rad
+            ),
         },
         "torque_limit_count": torque_limit_count,
         "slew_limit_count": slew_limit_count,
@@ -3463,11 +3791,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Only J2/J3 feedback readings in [-5e-4, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
-            "Before any torque command, the active path requires four consecutive complete feedback snapshots after enable; no torque command is sent during this arming-settle gate.",
+            "After enable, the active path captures a fresh q0 and immediately sends an all-six-joint bounded software position lock at q0; lock frames continue during the four-sample arming-settle gate.",
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "pose-hold anchors the complete fresh post-enable FK transform and applies bounded world-aligned force and torque through the same J.T wrench path.",
-            "Software composes gravity, position, finite-difference damping, and an optional bounded J.T wrench overlay, then dispatches vendor MIT kp=kd=0.",
-            "When explicitly requested, the probe temporarily mirrors the target joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies readback before enable, and restores the original value after full safe_stop.",
+            "Software composes gravity, position, optional finite-difference damping, and a bounded J.T wrench overlay; vendor MIT kp remains zero, while explicit vendor kd may own motor-local damping behind verified 0x700B limits.",
+            "Startup keeps the YAML-derived software joint lock while one shared linear scale is applied to the complete six-joint gravity vector, then linearly hands position/damping/pose terms over to the final controller; every frame remains under the same final absolute and slew-rate conditioner.",
+            "When explicitly requested, the probe temporarily mirrors every arm joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies every readback before enable, and restores every original value after full safe_stop.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
             "A slow-step PASS additionally requires a completed reference, correct-direction bounded target response, and bounded support-joint drift. It is not a HARDWARE_PASS or force-sensor validation.",
@@ -3509,14 +3838,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--joint",
         choices=_ALL_JOINTS,
         default="joint1",
-        help="joint whose reference may change; joint2/joint3 remain support joints",
-    )
-    parser.add_argument(
-        "--support-joint",
-        dest="support_joints",
-        action="append",
-        default=list(_FAULT_HOLD_JOINTS),
-        help="additional support joint; joint2 and joint3 are always mandatory",
+        help=(
+            "slow-step target and optional gain-override joint; all impedance "
+            "modes always enable and command joint1..joint6"
+        ),
     )
     parser.add_argument("--step-rad", type=float, default=_DEFAULT_STEP_RAD)
     parser.add_argument(
@@ -3527,6 +3852,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-direction", type=int, choices=(-1, 1), default=1)
     parser.add_argument("--kp", type=float, default=_DEFAULT_KP)
     parser.add_argument("--kd", type=float, default=_DEFAULT_KD)
+    parser.add_argument(
+        "--driver-kd",
+        type=float,
+        default=0.0,
+        help=(
+            "optional all-arm motor-local MIT damping; requires "
+            "--apply-driver-torque-limits and does not add position stiffness"
+        ),
+    )
     parser.add_argument(
         "--target-kp",
         type=float,
@@ -3542,21 +3876,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--torque-limit-scale",
         type=float,
         default=_DEFAULT_TORQUE_LIMIT_SCALE,
-        help="fraction of the pinned URDF effort ceiling; max 0.5 for this probe",
+        help="fraction of the pinned URDF effort ceiling; must be in (0, 1]",
     )
     parser.add_argument(
         "--apply-driver-torque-limits",
         action="store_true",
         help=(
-            "temporarily mirror the target joint's scaled URDF torque envelope "
-            "into volatile RobStride limit_torque (0x700B), with readback and "
-            "restoration"
+            "temporarily mirror all six scaled URDF torque envelopes into "
+            "volatile RobStride limit_torque (0x700B), with per-joint readback "
+            "and restoration"
         ),
     )
     parser.add_argument(
         "--torque-rise-time-sec",
         type=float,
         default=_DEFAULT_TORQUE_RISE_TIME_SEC,
+        help=(
+            "shared six-joint gravity startup-ramp duration; also sets the "
+            "existing final total-torque slew envelope from each torque limit"
+        ),
     )
     parser.add_argument(
         "--velocity-abort-rad-s",
@@ -3653,19 +3991,59 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-disable", action="store_true")
     parser.add_argument("--confirmation", default="")
     parser.add_argument("--output", type=Path, help="write JSON outside the source worktree")
+    parser.add_argument(
+        "--log",
+        type=Path,
+        help="write detailed stdout/stderr; defaults beside --output with a .log suffix",
+    )
     return parser
+
+
+def _resolve_runtime_log_path(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "log", None)
+    if configured is not None:
+        return Path(configured).expanduser().resolve()
+    if args.output is not None:
+        return Path(args.output).expanduser().resolve().with_suffix(".log")
+    return Path(f"/tmp/b601-rs-low-gain-probe-{os.getpid()}.log")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    try:
-        payload = run_probe(args)
-    except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
-        payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
-        _output_payload(payload, args.output)
-        return 2
+    runtime_log_path = _resolve_runtime_log_path(args)
+    runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[B601] mode={args.mode} pid={os.getpid()} log={runtime_log_path}",
+        flush=True,
+    )
+    print(
+        "[B601] STOP: Ctrl-C requests protective hold; Ctrl-C again or "
+        "SIGUSR1 requests full six-joint disable. Physical E-stop remains primary.",
+        flush=True,
+    )
+    with (
+        runtime_log_path.open("a", encoding="utf-8") as runtime_log,
+        contextlib.redirect_stdout(runtime_log),
+        contextlib.redirect_stderr(runtime_log),
+    ):
+        print(
+            f"[B601] run started mode={args.mode} pid={os.getpid()}",
+            flush=True,
+        )
+        try:
+            payload = run_probe(args)
+        except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
+            payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
+            exit_code = 2
+        else:
+            exit_code = 0 if payload.get("status") == "OK" else 1
+        print(
+            f"[B601] run finished status={payload.get('status')} exit={exit_code}",
+            flush=True,
+        )
+    payload["runtime_log_path"] = str(runtime_log_path)
     _output_payload(payload, args.output)
-    return 0 if payload.get("status") == "OK" else 1
+    return exit_code
 
 
 if __name__ == "__main__":

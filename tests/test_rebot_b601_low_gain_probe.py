@@ -37,6 +37,119 @@ def test_condition_torque_rejects_nonpositive_dt() -> None:
         )
 
 
+def test_shared_gravity_ramp_preserves_vector_and_keeps_damping_live() -> None:
+    target = probe.B601MitTorqueBreakdown(
+        position_torque_nm=(0.0,) * 6,
+        damping_torque_nm=(-0.2,) * 6,
+        gravity_torque_nm=(1.0, -2.0, 4.0, -8.0, 0.5, -0.25),
+        overlay_requested_nm=(0.0,) * 6,
+        overlay_effective_nm=(0.0,) * 6,
+        requested_torque_nm=(0.8, -2.2, 3.8, -8.2, 0.3, -0.45),
+        overlay_limited=False,
+    )
+
+    fraction = probe.gravity_ramp_fraction(elapsed_sec=0.25, rise_time_sec=0.5)
+    ramped = probe.apply_shared_gravity_ramp(target, fraction=fraction)
+
+    assert fraction == pytest.approx(0.5)
+    assert ramped.gravity_torque_nm == pytest.approx(
+        tuple(0.5 * value for value in target.gravity_torque_nm)
+    )
+    assert ramped.damping_torque_nm == target.damping_torque_nm
+    assert ramped.requested_torque_nm == pytest.approx(
+        tuple(
+            damping + gravity
+            for damping, gravity in zip(
+                target.damping_torque_nm,
+                ramped.gravity_torque_nm,
+                strict=True,
+            )
+        )
+    )
+
+
+def test_startup_handoff_uses_the_same_rise_time_after_gravity() -> None:
+    assert probe.startup_handoff_fraction(elapsed_sec=0.0, rise_time_sec=0.5) == 0.0
+    assert probe.startup_handoff_fraction(elapsed_sec=0.5, rise_time_sec=0.5) == 0.0
+    assert probe.startup_handoff_fraction(elapsed_sec=0.75, rise_time_sec=0.5) == pytest.approx(
+        0.5
+    )
+    assert probe.startup_handoff_fraction(elapsed_sec=2.0, rise_time_sec=0.5) == 1.0
+
+
+def test_startup_lock_profile_uses_per_joint_yaml_gains_and_final_bounds() -> None:
+    profile = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
+        mit_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
+        torque_limits_nm=(9.0, 9.0, 9.0, 3.5, 3.5, 3.5),
+        torque_rise_time_sec=0.5,
+        velocity_limit_rad_s=5.0,
+    )
+
+    assert profile.position_kp_nm_per_rad == (50.0, 150.0, 150.0, 50.0, 50.0, 50.0)
+    assert profile.damping_kd_nm_s_per_rad == (3.0, 10.0, 10.0, 5.0, 4.0, 4.0)
+    assert profile.max_torque_rate_nm_s == (18.0, 18.0, 18.0, 7.0, 7.0, 7.0)
+    assert profile.max_abs_overlay_torque_nm == (0.0,) * 6
+    assert profile.metadata["gain_source"] == "rebotarm_rs_yaml.MIT"
+
+
+def test_startup_lock_blend_preserves_gravity_vector_and_handoffs_overlay() -> None:
+    startup = probe.B601MitTorqueBreakdown(
+        position_torque_nm=(1.0,) * 6,
+        damping_torque_nm=(2.0,) * 6,
+        gravity_torque_nm=(4.0, -3.0, 2.0, -1.0, 0.5, -0.25),
+        overlay_requested_nm=(0.0,) * 6,
+        overlay_effective_nm=(0.0,) * 6,
+        requested_torque_nm=(7.0, 7.0, 7.0, 7.0, 7.5, 6.75),
+        overlay_limited=False,
+    )
+    final = probe.B601MitTorqueBreakdown(
+        position_torque_nm=(0.1,) * 6,
+        damping_torque_nm=(0.2,) * 6,
+        gravity_torque_nm=startup.gravity_torque_nm,
+        overlay_requested_nm=(0.3,) * 6,
+        overlay_effective_nm=(0.25,) * 6,
+        requested_torque_nm=(0.55,) * 6,
+        overlay_limited=True,
+    )
+
+    halfway = probe.blend_startup_lock_torque_breakdown(
+        startup,
+        final,
+        gravity_fraction=0.5,
+        handoff_fraction=0.5,
+    )
+    assert halfway.position_torque_nm == pytest.approx((0.55,) * 6)
+    assert halfway.damping_torque_nm == pytest.approx((1.1,) * 6)
+    assert halfway.gravity_torque_nm == pytest.approx(
+        tuple(0.5 * value for value in startup.gravity_torque_nm)
+    )
+    assert halfway.overlay_requested_nm == pytest.approx((0.15,) * 6)
+    assert halfway.overlay_effective_nm == pytest.approx((0.125,) * 6)
+    assert halfway.requested_torque_nm == pytest.approx(
+        tuple(
+            position + damping + gravity + overlay
+            for position, damping, gravity, overlay in zip(
+                halfway.position_torque_nm,
+                halfway.damping_torque_nm,
+                halfway.gravity_torque_nm,
+                halfway.overlay_effective_nm,
+                strict=True,
+            )
+        )
+    )
+
+    completed = probe.blend_startup_lock_torque_breakdown(
+        startup,
+        final,
+        gravity_fraction=1.0,
+        handoff_fraction=1.0,
+    )
+    assert completed.position_torque_nm == final.position_torque_nm
+    assert completed.damping_torque_nm == final.damping_torque_nm
+    assert completed.overlay_effective_nm == final.overlay_effective_nm
+
+
 def test_feedback_stability_summary_reports_raw_finite_difference_excursion() -> None:
     positions = (
         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
@@ -248,7 +361,7 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
             )
 
         def safe_stop(self, *, joint_names: tuple[str, ...]) -> object:
-            assert joint_names == ("joint6",)
+            assert joint_names == tuple(probe._ALL_JOINTS)
             self.events.append("safe_stop")
             return probe.B601ModeReceipt(
                 operation="safe_stop",
@@ -266,14 +379,14 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
             joint_names: tuple[str, ...],
         ) -> object:
             assert limits_nm == (3.6, 3.6, 3.6, 1.4, 1.4, 1.4)
-            assert joint_names == ("joint6",)
+            assert joint_names == tuple(probe._ALL_JOINTS)
             self.events.append("apply")
             return probe.B601DriverTorqueLimitReceipt(
                 operation="apply_temporary_driver_torque_limits",
                 requested_joint_names=joint_names,
-                target_limits_nm=(1.4,),
-                prior_limits_nm=(14.0,),
-                verified_limits_nm=(1.4,),
+                target_limits_nm=limits_nm,
+                prior_limits_nm=(36.0, 36.0, 36.0, 14.0, 14.0, 14.0),
+                verified_limits_nm=limits_nm,
                 applied_joint_names=joint_names,
                 restored_joint_names=(),
                 failed_joint_names=(),
@@ -285,12 +398,12 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
             self.events.append("restore")
             return probe.B601DriverTorqueLimitReceipt(
                 operation="restore_driver_torque_limits",
-                requested_joint_names=("joint6",),
-                target_limits_nm=(14.0,),
-                prior_limits_nm=(1.4,),
-                verified_limits_nm=(14.0,),
+                requested_joint_names=tuple(probe._ALL_JOINTS),
+                target_limits_nm=(36.0, 36.0, 36.0, 14.0, 14.0, 14.0),
+                prior_limits_nm=(3.6, 3.6, 3.6, 1.4, 1.4, 1.4),
+                verified_limits_nm=(36.0, 36.0, 36.0, 14.0, 14.0, 14.0),
                 applied_joint_names=(),
-                restored_joint_names=("joint6",),
+                restored_joint_names=tuple(probe._ALL_JOINTS),
                 failed_joint_names=(),
                 errors=(),
                 completed=True,
@@ -311,7 +424,6 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
         source_root=tmp_path,
         model=SimpleNamespace(urdf_path=urdf_path),
         position_limits=((-1.0, 1.0),) * 6,
-        target_joint="joint6",
         torque_limits_nm=(3.6, 3.6, 3.6, 1.4, 1.4, 1.4),
     )
 
@@ -319,9 +431,24 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
     assert result["motors_enabled_by_probe"] is False
     assert result["motion_commands_sent"] is False
     assert result["mode_transitions_sent"] is False
-    assert result["target_limit_nm"] == 1.4
-    assert result["apply_receipt"]["prior_limits_nm"] == (14.0,)
-    assert result["restore_receipt"]["verified_limits_nm"] == (14.0,)
+    assert result["joint_names"] == tuple(probe._ALL_JOINTS)
+    assert result["target_limits_nm"] == (3.6, 3.6, 3.6, 1.4, 1.4, 1.4)
+    assert result["apply_receipt"]["prior_limits_nm"] == (
+        36.0,
+        36.0,
+        36.0,
+        14.0,
+        14.0,
+        14.0,
+    )
+    assert result["restore_receipt"]["verified_limits_nm"] == (
+        36.0,
+        36.0,
+        36.0,
+        14.0,
+        14.0,
+        14.0,
+    )
     assert backend.events == [
         "connect",
         "poll_feedback",
@@ -345,7 +472,7 @@ def test_software_profile_has_single_torque_owner() -> None:
     assert profile.position_kp_nm_per_rad == (0.5,) * 6
     assert profile.damping_kd_nm_s_per_rad == (0.5,) * 6
     assert profile.max_torque_rate_nm_s == (2.0,) * 6
-    assert profile.metadata["torque_owner"] == "software_composed_tau; vendor_kp_kd_zero"
+    assert profile.metadata["torque_owner"] == "software_composed_tau_excludes_vendor_pd"
 
 
 def test_software_profile_overrides_only_the_target_joint_gains() -> None:
@@ -702,27 +829,27 @@ def test_pose_impedance_overlay_aborts_excessive_rotation(
         )
 
 
-def test_active_joint_resolution_keeps_joint2_joint3_support() -> None:
-    assert probe.resolve_active_joint_names("joint1") == (
-        "joint1",
-        "joint2",
-        "joint3",
-    )
-    assert probe.resolve_active_joint_names("joint3") == (
-        "joint3",
-        "joint2",
-    )
-    assert set(
-        probe.resolve_active_joint_names(
-            "joint6",
-            support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
-        )
-    ) == set(probe._ALL_JOINTS)
+def test_active_joint_resolution_always_uses_all_six_arm_joints() -> None:
+    assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
 
-def test_active_joint_resolution_rejects_missing_fault_support() -> None:
-    with pytest.raises(ValueError, match="mandatory support"):
-        probe.resolve_active_joint_names("joint1", support_joints=("joint4",))
+def test_hold_reference_uses_the_complete_settled_six_joint_snapshot() -> None:
+    settled = (0.12, 0.34, 0.56, -0.21, 0.09, -0.45)
+
+    qref, qvel_ref, done = probe.plan_reference(
+        settled,
+        mode="hold",
+        joint="joint1",
+        elapsed_sec=1.0,
+        step_rad=0.02,
+        step_speed_rad_s=0.005,
+        step_direction=1,
+        position_limits_rad=((-3.14, 3.14),) * 6,
+    )
+
+    assert qref == settled
+    assert qvel_ref == (0.0,) * 6
+    assert done is True
 
 
 def _fault_hold_limits() -> tuple[tuple[float, float], ...]:
@@ -1005,6 +1132,16 @@ def test_sigusr1_requests_full_disable() -> None:
     assert stop == {"requested": True, "full_disable_requested": True}
 
 
+def test_second_sigint_requests_full_disable() -> None:
+    stop = {"requested": False, "full_disable_requested": False}
+
+    probe._signal_handler(stop, probe.signal.SIGINT, None)
+    assert stop == {"requested": True, "full_disable_requested": False}
+
+    probe._signal_handler(stop, probe.signal.SIGINT, None)
+    assert stop == {"requested": True, "full_disable_requested": True}
+
+
 def test_drive_enable_countdown_is_logged_and_mirrored(tmp_path) -> None:
     stop = {"requested": False, "full_disable_requested": False}
     log_stream = io.StringIO()
@@ -1182,10 +1319,7 @@ def _slow_step_samples(
 
 
 def test_slow_step_response_requires_real_correct_direction_motion() -> None:
-    active = probe.resolve_active_joint_names(
-        "joint6",
-        support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
-    )
+    active = probe.resolve_active_joint_names()
     passed = probe.evaluate_slow_step_response(
         mode="slow-step",
         target_joint="joint6",
@@ -1223,10 +1357,7 @@ def test_slow_step_response_requires_real_correct_direction_motion() -> None:
 
 
 def test_slow_step_response_rejects_support_joint_drift() -> None:
-    active = probe.resolve_active_joint_names(
-        "joint6",
-        support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
-    )
+    active = probe.resolve_active_joint_names()
     result = probe.evaluate_slow_step_response(
         mode="slow-step",
         target_joint="joint6",
@@ -1263,17 +1394,10 @@ def test_parser_help_is_read_only() -> None:
     assert tuple(B601_RS_ARM_JOINT_NAMES) == tuple(probe._ALL_JOINTS)
     args = parser.parse_args(["--config", "config.yaml", "--rebot-source-root", "source"])
     assert args.joint == "joint1"
-    assert tuple(args.support_joints) == ("joint2", "joint3")
+    assert "--support-joint" not in parser.format_help()
     assert args.target_kp is None
     assert args.target_kd is None
     assert args.apply_driver_torque_limits is False
-    assert args.velocity_abort_rad_s == pytest.approx(0.12)
-    assert args.acceleration_abort_rad_s2 == pytest.approx(4.0)
-    assert args.fault_hold_max_velocity_rad_s == pytest.approx(0.02)
-    assert args.cartesian_stiffness_n_per_m == 20.0
-    assert args.cartesian_max_displacement_m == 0.02
-    assert args.rotational_stiffness_nm_per_rad == 0.5
-    assert args.rotational_max_displacement_rad == pytest.approx(np.deg2rad(5.0))
 
 
 def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
@@ -1334,8 +1458,6 @@ def test_driver_torque_limit_roundtrip_cli_requires_explicit_authority() -> None
         "config.yaml",
         "--rebot-source-root",
         "source",
-        "--joint",
-        "joint6",
     ]
 
     with pytest.raises(probe.LowGainProbeError, match="requires --allow-motion"):
@@ -1362,14 +1484,6 @@ def _parse_cartesian_args(*extra: str) -> object:
             "config.yaml",
             "--rebot-source-root",
             "source",
-            "--kp",
-            "0",
-            "--support-joint",
-            "joint4",
-            "--support-joint",
-            "joint5",
-            "--support-joint",
-            "joint6",
             "--allow-motion",
             "--auto-disable",
             "--confirmation",
@@ -1379,33 +1493,11 @@ def _parse_cartesian_args(*extra: str) -> object:
     )
 
 
-def test_cartesian_cli_requires_all_six_joints_and_zero_joint_stiffness() -> None:
+def test_cartesian_cli_uses_all_six_joints() -> None:
     args = _parse_cartesian_args()
 
     probe._validate_cli(args)
-
-    incomplete = probe.build_parser().parse_args(
-        [
-            "--mode",
-            "cartesian-hold",
-            "--config",
-            "config.yaml",
-            "--rebot-source-root",
-            "source",
-            "--kp",
-            "0",
-            "--allow-motion",
-            "--auto-disable",
-            "--confirmation",
-            probe.CONFIRMATION,
-        ]
-    )
-    with pytest.raises(ValueError, match="canonical joint1..joint6"):
-        probe._validate_cli(incomplete)
-
-    nonzero_kp = _parse_cartesian_args("--kp", "0.1")
-    with pytest.raises(ValueError, match="requires --kp 0"):
-        probe._validate_cli(nonzero_kp)
+    assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
 
 def _parse_pose_args(*extra: str) -> object:
@@ -1417,14 +1509,6 @@ def _parse_pose_args(*extra: str) -> object:
             "config.yaml",
             "--rebot-source-root",
             "source",
-            "--kp",
-            "0",
-            "--support-joint",
-            "joint4",
-            "--support-joint",
-            "joint5",
-            "--support-joint",
-            "joint6",
             "--allow-motion",
             "--auto-disable",
             "--confirmation",
@@ -1434,12 +1518,20 @@ def _parse_pose_args(*extra: str) -> object:
     )
 
 
-def test_pose_cli_requires_all_six_joints_zero_joint_stiffness_and_safe_rotation() -> None:
+def test_pose_cli_uses_all_six_joints() -> None:
     probe._validate_cli(_parse_pose_args())
+    assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
-    with pytest.raises(ValueError, match="requires --kp 0"):
-        probe._validate_cli(_parse_pose_args("--kp", "0.1"))
-    with pytest.raises(ValueError, match="rotational_max_displacement_rad"):
-        probe._validate_cli(
-            _parse_pose_args("--rotational-max-displacement-rad", "0.5")
-        )
+
+def test_driver_damping_requires_verified_driver_torque_limits() -> None:
+    args = _parse_pose_args("--kd", "0", "--driver-kd", "1")
+
+    with pytest.raises(probe.LowGainProbeError, match="driver-torque-limits"):
+        probe._validate_cli(args)
+
+    args.apply_driver_torque_limits = True
+    probe._validate_cli(args)
+
+    args.kd = 1.0
+    with pytest.raises(probe.LowGainProbeError, match="software --kd 0"):
+        probe._validate_cli(args)
