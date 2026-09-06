@@ -78,6 +78,49 @@ def _occlusion_schedule(value: object) -> tuple[tuple[float, float], ...]:
     return tuple(schedule)
 
 
+def _prepared_weight_loader(
+    profile: Mapping[str, Any],
+    weight_loader: Any,
+    checkout: Path,
+) -> Any:
+    """Restore the profile-pinned base loader used to train the checkpoint."""
+
+    configured = str(
+        profile.get("openpi_weight_loader_params_path") or ""
+    ).strip()
+    if not configured:
+        return weight_loader
+    params_path = Path(configured).expanduser()
+    if not params_path.is_absolute():
+        params_path = checkout / params_path
+    params_path = params_path.resolve()
+    if not params_path.is_dir():
+        raise FileNotFoundError(
+            f"Pinned OpenPI base parameter directory is missing: {params_path}."
+        )
+    required = (
+        "_CHECKPOINT_METADATA",
+        "_METADATA",
+        "_sharding",
+        "commit_success.txt",
+        "manifest.ocdbt",
+    )
+    missing = [name for name in required if not (params_path / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Pinned OpenPI base parameter directory is incomplete: "
+            f"path={params_path} missing={missing}."
+        )
+    if not dataclasses.is_dataclass(weight_loader) or not hasattr(
+        weight_loader, "params_path"
+    ):
+        raise TypeError(
+            "openpi_weight_loader_params_path requires a dataclass weight "
+            "loader with params_path."
+        )
+    return dataclasses.replace(weight_loader, params_path=str(params_path))
+
+
 def build_prepared_openpi_config(
     resolution: PreparedDeploymentResolution,
     *,
@@ -250,6 +293,11 @@ def build_prepared_openpi_config(
         "overwrite": False,
         "num_workers": int(
             profile.get("openpi_num_workers", base.num_workers)
+        ),
+        "weight_loader": _prepared_weight_loader(
+            profile,
+            base.weight_loader,
+            Path(str(profile["openpi_checkout"])).expanduser().resolve(),
         ),
     }
     if resolution.model_rtc_profile is not None:
