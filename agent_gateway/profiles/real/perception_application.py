@@ -39,6 +39,10 @@ from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
     build_station_bound_point_grasp_registration,
 )
+from .station_point_grasp_render_deployment import (
+    StationBoundPointGraspRenderRegistration,
+    build_station_bound_point_grasp_render_registration,
+)
 
 
 class CameraOnlyRealPerceptionApplicationState(str, Enum):
@@ -191,6 +195,9 @@ class CameraOnlyRealPerceptionComposition:
     localization_registration: RealObjectLocalizationRegistration | None
     localization_provider: ObjectLocalizationProvider | None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None
+    station_point_grasp_render_registration: (
+        StationBoundPointGraspRenderRegistration | None
+    )
     point_grasp_planner: object | None
     contract_bundle: RealPerceptionContractBundle
     artifact_store: RecoverableAgentArtifactStore
@@ -338,6 +345,7 @@ def assemble_camera_only_real_perception_composition(
             allowed_local_image_roots=(),
         )
     station_point_grasp_registration = None
+    station_point_grasp_render_registration = None
     if point_grasp_planner is not None:
         model_spec = getattr(point_grasp_planner, "model_spec", None)
         model_profile_id = str(getattr(model_spec, "model_profile_id", "")).strip()
@@ -370,6 +378,11 @@ def assemble_camera_only_real_perception_composition(
             station_manifest_hash=station_manifest_hash,
             execution_manifest_hash=execution_manifest_hash,
         )
+        station_point_grasp_render_registration = (
+            build_station_bound_point_grasp_render_registration(
+                point_grasp_registration=station_point_grasp_registration,
+            )
+        )
     tool_config_hash = canonical_content_hash(
         {"tool_configuration": "not_applicable_camera_only"},
         domain="dexteleop.real_perception.no_tool_config.v1",
@@ -383,6 +396,9 @@ def assemble_camera_only_real_perception_composition(
         calibration_hash=source_binding.semantic_content_hash,
         localization_registration=localization_registration,
         station_point_grasp_registration=station_point_grasp_registration,
+        station_point_grasp_render_registration=(
+            station_point_grasp_render_registration
+        ),
     )
     partition = canonical_content_hash(
         {"runtime_session_id": runtime_id},
@@ -449,6 +465,7 @@ def assemble_camera_only_real_perception_composition(
     if planner_hash is not None:
         deployment_profile_payload["point_grasp_planner_hash"] = planner_hash
         deployment_profile_payload["point_grasp_enabled"] = True
+        deployment_profile_payload["point_grasp_candidate_render_enabled"] = True
     deployment_profile_hash = canonical_content_hash(
         deployment_profile_payload,
         domain="dexteleop.real_perception.camera_only_profile.v1",
@@ -460,6 +477,9 @@ def assemble_camera_only_real_perception_composition(
         localization_registration=localization_registration,
         localization_provider=localization_provider,
         station_point_grasp_registration=station_point_grasp_registration,
+        station_point_grasp_render_registration=(
+            station_point_grasp_render_registration
+        ),
         point_grasp_planner=point_grasp_planner,
         contract_bundle=bundle,
         artifact_store=artifact_store,

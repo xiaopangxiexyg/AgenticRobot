@@ -8,6 +8,7 @@ CAPTURE_DEPTH_SKILL_ID_V1 = "perception.capture_depth"
 CAPTURE_RGB_SKILL_ID_V1 = "perception.capture_rgb"
 LOCALIZE_OBJECTS_SKILL_ID_V1 = "perception.localize_objects"
 PLAN_POINT_GRASP_SKILL_ID_V1 = "perception.plan_point_grasp"
+RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1 = "perception.render_point_grasp_candidate"
 
 
 def capture_depth_skill_definition_v1() -> SkillDefinition:
@@ -187,11 +188,42 @@ def plan_point_grasp_skill_definition_v2() -> SkillDefinition:
     )
 
 
+def render_point_grasp_candidate_skill_definition_v1() -> SkillDefinition:
+    """Describe one optional view of one retained point-grasp proposal."""
+
+    return SkillDefinition(
+        skill_id=RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1,
+        skill_version="1",
+        skill_kind="inspection",
+        summary=(
+            "Render exactly one proposal from one retained Station point-grasp "
+            "operation into one deployment-bound aligned RGB-D view without "
+            "moving the robot."
+        ),
+        intended_target_kind="target_agnostic",
+        cross_target_deployment_policy="not_applicable",
+        controlled_component_ids=(),
+        parameter_semantics_id=(
+            "retained_station_point_grasp_operation.candidate_ordinal.view_role.v1"
+        ),
+        execution_result_semantics_id=(
+            "single_candidate_station_bound_grasp_render_artifact.v1"
+        ),
+        task_outcome_semantics_id="passive_point_grasp_rendering.v1",
+        entry_predicate_ids=(
+            "retained_station_point_grasp_result_available.v1",
+            "trusted_live_aligned_rgbd_binding_available.v1",
+        ),
+        task_outcome_predicate_ids=("point_grasp_candidate_rendered.v1",),
+    )
+
+
 __all__ = [
     "CAPTURE_DEPTH_SKILL_ID_V1",
     "CAPTURE_RGB_SKILL_ID_V1",
     "LOCALIZE_OBJECTS_SKILL_ID_V1",
     "PLAN_POINT_GRASP_SKILL_ID_V1",
+    "RENDER_POINT_GRASP_CANDIDATE_SKILL_ID_V1",
     "capture_depth_skill_definition_v1",
     "capture_depth_skill_definition_v2",
     "capture_rgb_skill_definition_v1",
@@ -199,4 +231,5 @@ __all__ = [
     "localize_objects_skill_definition_v1",
     "plan_point_grasp_skill_definition_v1",
     "plan_point_grasp_skill_definition_v2",
+    "render_point_grasp_candidate_skill_definition_v1",
 ]

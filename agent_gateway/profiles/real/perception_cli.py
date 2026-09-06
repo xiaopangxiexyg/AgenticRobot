@@ -319,6 +319,12 @@ def main(argv: list[str] | None = None) -> int:
         }
         if composition.station_point_grasp_registration is not None:
             ready_payload["point_grasp_enabled"] = True
+            render_registration = composition.station_point_grasp_render_registration
+            assert render_registration is not None
+            ready_payload["point_grasp_candidate_render_enabled"] = True
+            ready_payload["point_grasp_render_view_roles"] = list(
+                render_registration.profile.source_by_role
+            )
         print(
             json.dumps(
                 ready_payload,

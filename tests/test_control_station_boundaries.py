@@ -296,6 +296,9 @@ def test_gateway_numerical_dependencies_are_confined_to_concrete_profiles() -> N
         # Offline v1 and deployment-bound live v2 point-grasp stay in one
         # concrete profile leaf: NumPy decodes/projects only at this boundary.
         "agent_gateway/profiles/real/point_grasp_gateway.py": ["numpy"],
+        # Optional single-candidate rendering resolves Station/camera poses
+        # only in the concrete real-perception profile boundary.
+        "agent_gateway/profiles/real/point_grasp_render_gateway.py": ["numpy"],
         "agent_gateway/profiles/real/realsense_perception.py": ["numpy"],
         # Concrete perception frame binding uses NumPy only to apply the
         # reviewed scene-to-station transform.  Gateway core remains neutral.

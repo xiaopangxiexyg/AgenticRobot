@@ -74,12 +74,19 @@ from .point_grasp_gateway import (
     StationBoundPointGraspProvider,
     build_station_bound_point_grasp_executor,
 )
+from .point_grasp_render_gateway import (
+    StationBoundPointGraspRenderProvider,
+    build_station_bound_point_grasp_render_executor,
+)
 from .realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
 )
 from .station_point_grasp_deployment import (
     StationBoundPointGraspRegistration,
+)
+from .station_point_grasp_render_deployment import (
+    StationBoundPointGraspRenderRegistration,
 )
 
 REAL_PERCEPTION_CLOCK_DOMAIN_ID_V1 = "agent-gateway-real-perception-wall-clock"
@@ -98,6 +105,9 @@ class RealPerceptionContractBundle:
     registration: RealPerceptionCaptureRegistration
     localization_registration: RealObjectLocalizationRegistration | None
     station_point_grasp_registration: StationBoundPointGraspRegistration | None
+    station_point_grasp_render_registration: (
+        StationBoundPointGraspRenderRegistration | None
+    )
     definition_catalog: SkillDefinitionCatalog
     schema_catalog: AgentSkillSchemaCatalog
     io_catalog: SkillIOCatalog
@@ -116,6 +126,19 @@ class RealPerceptionContractBundle:
             StationBoundPointGraspRegistration,
         ):
             raise TypeError("station_point_grasp_registration must be typed or None.")
+        if self.station_point_grasp_render_registration is not None and not isinstance(
+            self.station_point_grasp_render_registration,
+            StationBoundPointGraspRenderRegistration,
+        ):
+            raise TypeError(
+                "station_point_grasp_render_registration must be typed or None."
+            )
+        if (self.station_point_grasp_registration is None) != (
+            self.station_point_grasp_render_registration is None
+        ):
+            raise ValueError(
+                "Station point-grasp and candidate-render registrations must coexist."
+            )
         validate_skill_route_catalog_closure(
             definition_catalog=self.definition_catalog,
             schema_catalog=self.schema_catalog,
@@ -129,6 +152,7 @@ class RealPerceptionContractBundle:
             2
             + int(self.localization_registration is not None)
             + int(self.station_point_grasp_registration is not None)
+            + int(self.station_point_grasp_render_registration is not None)
         )
         if len(self.route_manifest.skill_routes) != expected_routes:
             raise ValueError(
@@ -157,6 +181,19 @@ class RealPerceptionContractBundle:
             or point_grasp.profile.frame_graph_hash != self.frame_graph_hash
         ):
             raise ValueError("Station point-grasp frame binding differs from bundle.")
+        render = self.station_point_grasp_render_registration
+        if render is not None and (
+            point_grasp is None
+            or render.profile.point_grasp_route_hash
+            != point_grasp.skill.routes[0].semantic_content_hash
+            or render.profile.point_grasp_profile_hash
+            != point_grasp.profile.semantic_content_hash
+            or render.profile.point_grasp_deployment_binding_hash
+            != point_grasp.binding.semantic_content_hash
+            or render.profile.frame_binding_hash != frame_binding.semantic_content_hash
+            or render.profile.frame_graph_hash != self.frame_graph_hash
+        ):
+            raise ValueError("Point-grasp render binding differs from bundle.")
 
 
 def build_real_perception_contract_bundle(
@@ -168,6 +205,9 @@ def build_real_perception_contract_bundle(
     calibration_hash: str,
     localization_registration: RealObjectLocalizationRegistration | None = None,
     station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
+    station_point_grasp_render_registration: (
+        StationBoundPointGraspRenderRegistration | None
+    ) = None,
 ) -> RealPerceptionContractBundle:
     """Build the passive-only manifest without starting a camera or socket."""
 
@@ -183,6 +223,19 @@ def build_real_perception_contract_bundle(
         StationBoundPointGraspRegistration,
     ):
         raise TypeError("station_point_grasp_registration must be typed or None.")
+    if station_point_grasp_render_registration is not None and not isinstance(
+        station_point_grasp_render_registration,
+        StationBoundPointGraspRenderRegistration,
+    ):
+        raise TypeError(
+            "station_point_grasp_render_registration must be typed or None."
+        )
+    if (station_point_grasp_registration is None) != (
+        station_point_grasp_render_registration is None
+    ):
+        raise ValueError(
+            "Station point-grasp and candidate-render registrations must coexist."
+        )
     raw_pairs = [
         (
             registration.rgb,
@@ -213,6 +266,14 @@ def build_real_perception_contract_bundle(
                 station_point_grasp_registration.skill,
                 station_point_grasp_registration.binding,
                 station_point_grasp_registration.availability_hash,
+            )
+        )
+    if station_point_grasp_render_registration is not None:
+        raw_pairs.append(
+            (
+                station_point_grasp_render_registration.skill,
+                station_point_grasp_render_registration.binding,
+                station_point_grasp_render_registration.availability_hash,
             )
         )
     registration_pairs = tuple(
@@ -295,6 +356,10 @@ def build_real_perception_contract_bundle(
         optional_validators.append(localization_registration.payload_validator)
     if station_point_grasp_registration is not None:
         optional_validators.append(station_point_grasp_registration.payload_validator)
+    if station_point_grasp_render_registration is not None:
+        optional_validators.append(
+            station_point_grasp_render_registration.payload_validator
+        )
     validators = AgentSkillPayloadValidatorRegistry(
         registry_id="dexteleop.agent_payload_validators.real_perception_only:"
         + first.runtime_session_id,
@@ -304,6 +369,9 @@ def build_real_perception_contract_bundle(
         registration=registration,
         localization_registration=localization_registration,
         station_point_grasp_registration=station_point_grasp_registration,
+        station_point_grasp_render_registration=(
+            station_point_grasp_render_registration
+        ),
         definition_catalog=definitions,
         schema_catalog=schemas,
         io_catalog=io_catalog,
@@ -689,6 +757,8 @@ class RealPerceptionGatewaySession:
     localization_executor: PassiveReadSkillExecutor | None
     station_point_grasp_provider: StationBoundPointGraspProvider | None
     station_point_grasp_executor: PassiveReadSkillExecutor | None
+    station_point_grasp_render_provider: StationBoundPointGraspRenderProvider | None
+    station_point_grasp_render_executor: PassiveReadSkillExecutor | None
     hardware_view_provider: HardwareViewProvider
     service: AgentGatewayService
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -765,6 +835,13 @@ class RealPerceptionGatewaySession:
             raise RuntimeError(
                 "Passive Station point-grasp did not quiesce during close."
             )
+        if (
+            self.station_point_grasp_render_executor is not None
+            and not self.station_point_grasp_render_executor.wait_all(timeout_sec=35.0)
+        ):
+            raise RuntimeError(
+                "Passive Station point-grasp rendering did not quiesce during close."
+            )
         return outcome
 
 
@@ -834,6 +911,8 @@ def assemble_real_perception_gateway_session(
         raise ValueError("Localization provider cannot exist without its registration.")
     station_point_grasp_provider = None
     station_point_grasp_executor = None
+    station_point_grasp_render_provider = None
+    station_point_grasp_render_executor = None
     if bundle.station_point_grasp_registration is not None:
         if station_point_grasp_planner is None:
             raise ValueError("Station point-grasp registration requires its planner.")
@@ -861,6 +940,31 @@ def assemble_real_perception_gateway_session(
                 0
             ].semantic_content_hash
         ] = station_point_grasp_executor
+        render_registration = bundle.station_point_grasp_render_registration
+        assert render_registration is not None
+        station_point_grasp_render_provider = StationBoundPointGraspRenderProvider(
+            registration=render_registration,
+            point_grasp_registration=bundle.station_point_grasp_registration,
+            point_grasp_executor=station_point_grasp_executor,
+            perception_provider=provider,
+            frame_binding=frame_binding,
+            runtime_session_id=bundle.route_manifest.runtime_session_id,
+            current_station_revision=lambda: producer.current_station_revision,
+        )
+        station_point_grasp_render_executor = (
+            build_station_bound_point_grasp_render_executor(
+                registration=render_registration,
+                provider=station_point_grasp_render_provider,
+                artifact_store=artifact_store,
+                runtime_session_id=bundle.route_manifest.runtime_session_id,
+                current_station_revision=lambda: producer.current_station_revision,
+                max_retained_operations=max_retained_operations,
+                clock=clock,
+            )
+        )
+        ports[render_registration.skill.routes[0].semantic_content_hash] = (
+            station_point_grasp_render_executor
+        )
     elif station_point_grasp_planner is not None:
         raise ValueError("Point-grasp planner cannot exist without its registration.")
     registry = SkillExecutorRegistry(
@@ -913,6 +1017,12 @@ def assemble_real_perception_gateway_session(
     if bundle.station_point_grasp_registration is not None:
         camera_route_hashes.append(
             bundle.station_point_grasp_registration.skill.routes[
+                0
+            ].semantic_content_hash
+        )
+        assert bundle.station_point_grasp_render_registration is not None
+        camera_route_hashes.append(
+            bundle.station_point_grasp_render_registration.skill.routes[
                 0
             ].semantic_content_hash
         )
@@ -982,6 +1092,8 @@ def assemble_real_perception_gateway_session(
         localization_executor=localization_executor,
         station_point_grasp_provider=station_point_grasp_provider,
         station_point_grasp_executor=station_point_grasp_executor,
+        station_point_grasp_render_provider=station_point_grasp_render_provider,
+        station_point_grasp_render_executor=station_point_grasp_render_executor,
         hardware_view_provider=hardware_view,
         service=service,
     )

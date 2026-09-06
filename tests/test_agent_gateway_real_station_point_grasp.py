@@ -26,9 +26,18 @@ from agent_gateway.profiles.real.station_point_grasp_deployment import (
     REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2,
     build_station_bound_point_grasp_registration,
 )
+from agent_gateway.profiles.real.station_point_grasp_render_deployment import (
+    REAL_STATION_POINT_GRASP_RENDER_OUTPUT_SLOT_ID_V1,
+)
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
+)
+from dataset_contracts.perception_artifacts import (
+    LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
+    LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,
+    LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,
+    POINT_GRASP_ANNOTATED_SCHEMA_ID_V1,
 )
 from deployments.perception.sam2_vgn_point_grasp import (
     PointGraspCandidate,
@@ -347,6 +356,7 @@ def test_point_grasp_is_default_off_and_lifecycle_order_is_reversible(
     )
     try:
         assert default.station_point_grasp_registration is None
+        assert default.station_point_grasp_render_registration is None
         assert [
             entry.route.skill_id
             for entry in default.contract_bundle.route_manifest.skill_routes
@@ -456,6 +466,197 @@ def test_point_grasp_is_default_off_and_lifecycle_order_is_reversible(
     assert operation.output_artifact_bindings[0].slot_id == (
         REAL_STATION_POINT_GRASP_OUTPUT_SLOT_ID_V2
     )
+    render_entry = manifest.route("perception.render_point_grasp_candidate", "1")
+    render_route = render_entry.route
+    assert render_route.control_effect_class == "read_only"
+    assert render_route.privilege_tier == "t0_read_only"
+    assert render_route.cancellation_policy == "cancel_only"
+    assert render_route.supported_modes == ("real_observe",)
+    assert render_route.may_move_robot is False
+    assert render_route.requires_operator_confirmation is False
+    assert render_route.requires_deadman is False
+    render_slot = composition.station_point_grasp_render_registration
+    assert render_slot is not None
+    output_slot = render_slot.skill.io_contract.output_artifact_slots[0]
+    assert output_slot.slot_id == REAL_STATION_POINT_GRASP_RENDER_OUTPUT_SLOT_ID_V1
+    assert output_slot.allowed_schema_ids == (POINT_GRASP_ANNOTATED_SCHEMA_ID_V1,)
+    assert output_slot.allowed_media_types == (
+        LOCALIZATION_ANNOTATED_IMAGE_MEDIA_TYPE_V1,
+    )
+    assert output_slot.allowed_encodings == (LOCALIZATION_ANNOTATED_IMAGE_ENCODING_V1,)
+    assert output_slot.allowed_compressions == (
+        LOCALIZATION_ANNOTATED_IMAGE_COMPRESSION_V1,
+    )
+    render_profile = render_route.allowed_parameter_profiles[0]
+
+    def submit_render(parameters, *, sequence, suffix, station_observation=None):
+        selected_observation = (
+            observation if station_observation is None else station_observation
+        )
+        return adapter.submit_read_only_skill_request(
+            AgentSkillRequest(
+                client_id="rpent:test",
+                request_id=f"request:station-point-grasp-render:{suffix}",
+                idempotency_key=f"idempotency:station-point-grasp-render:{suffix}",
+                client_sequence=sequence,
+                runtime_session_id=manifest.runtime_session_id,
+                skill_route_manifest_hash=manifest.semantic_content_hash,
+                expected_station_revision=int(selected_observation["station_revision"]),
+                skill_id=render_route.skill_id,
+                skill_version=render_route.skill_version,
+                skill_definition_hash=render_route.skill_definition_hash,
+                route_id=render_route.route_id,
+                route_version=render_route.route_version,
+                route_hash=render_route.semantic_content_hash,
+                deployment_binding_hash=(
+                    render_entry.deployment_binding.deployment_binding_hash
+                ),
+                parameter_profile_id=render_profile.parameter_profile_id,
+                parameter_profile_hash=render_profile.parameter_profile_hash,
+                parameters=parameters,
+                observation_snapshot_id=str(selected_observation["snapshot_id"]),
+                requested_mode="real_observe",
+                requested_timeout_ms=20_000,
+            ).to_wire()
+        )
+
+    render_parameters = {
+        "point_grasp_operation_id": operation_id,
+        "candidate_ordinal": 0,
+        "view_role": "main",
+    }
+    rendered = submit_render(render_parameters, sequence=2, suffix="success")
+    assert rendered["accepted"] is True
+    render_operation_id = rendered["operation"]["operation_id"]
+    render_executor = composition.session.station_point_grasp_render_executor
+    assert render_executor is not None
+    assert render_executor.wait(render_operation_id, timeout_sec=2.0)
+    render_operation = composition.session.service.operation_store.get(
+        render_operation_id
+    )
+    assert render_operation is not None
+    assert render_operation.status == "completed"
+    result = render_operation.execution_result
+    assert result is not None
+    assert result["point_grasp_operation_id"] == operation_id
+    assert result["point_grasp_request_hash"] == operation.request_hash
+    assert (
+        result["source_capture_group_id"]
+        == operation.execution_result["capture_group_id"]
+    )
+    assert result["candidate_ordinal"] == 0
+    assert result["view_role"] == "main"
+    assert result["view_source_id"] == "front"
+    assert result["view_station_revision"] == result["source_station_revision"]
+    assert result["depth_occlusion_tested"] is False
+    assert result["downstream_control_effects"] == "forbidden"
+    reference_from_tcp = np.asarray(result["T_reference_from_tool_tcp"]).reshape(4, 4)
+    reference_from_camera = np.asarray(result["T_reference_from_camera"]).reshape(4, 4)
+    camera_from_tcp = np.asarray(result["T_camera_from_tool_tcp"]).reshape(4, 4)
+    np.testing.assert_allclose(
+        np.linalg.inv(reference_from_camera) @ reference_from_tcp,
+        camera_from_tcp,
+    )
+    assert (
+        result["frame_binding_hash"] == composition.frame_binding.semantic_content_hash
+    )
+    assert result["frame_graph_hash"] == (
+        composition.frame_binding.frame_graph.semantic_content_hash
+    )
+    assert result["source_frame_id"] == composition.frame_binding.source_frame_id
+    assert result["reference_frame_id"] == (
+        composition.frame_binding.reference_frame_id
+    )
+    assert len(result["frames"]) == 1
+    frame = result["frames"][0]
+    assert frame == {
+        "ordinal": 0,
+        "role": "main",
+        "width": 4,
+        "height": 3,
+        "media_type": "image/jpeg",
+        "media_content_hash": render_operation.output_artifact_bindings[
+            0
+        ].artifact.sha256,
+    }
+    artifact_binding = render_operation.output_artifact_bindings[0]
+    assert artifact_binding.slot_id == REAL_STATION_POINT_GRASP_RENDER_OUTPUT_SLOT_ID_V1
+    assert artifact_binding.ordinal == 0
+    assert artifact_binding.artifact.schema_id == POINT_GRASP_ANNOTATED_SCHEMA_ID_V1
+    assert artifact_binding.artifact.media_type == "image/jpeg"
+    assert artifact_binding.artifact.encoding == "jpeg.rgb8.v1"
+    assert artifact_binding.artifact.compression == "none"
+    assert source.read_count == 2  # proposal generation and rendered view
+    inconsistent = dict(result)
+    inconsistent_camera_from_tcp = list(result["T_camera_from_tool_tcp"])
+    inconsistent_camera_from_tcp[3] += 0.01
+    inconsistent["T_camera_from_tool_tcp"] = inconsistent_camera_from_tcp
+    with pytest.raises(ValueError, match="transform chain is inconsistent"):
+        render_slot.payload_validator.validate_execution_result(inconsistent)
+
+    unknown = submit_render(
+        render_parameters | {"point_grasp_operation_id": "operation:unknown"},
+        sequence=3,
+        suffix="unknown",
+    )
+    assert unknown["accepted"] is True
+    unknown_id = unknown["operation"]["operation_id"]
+    assert render_executor.wait(unknown_id, timeout_sec=2.0)
+    unknown_operation = composition.session.service.operation_store.get(unknown_id)
+    assert unknown_operation is not None
+    assert unknown_operation.status == "failed"
+    assert unknown_operation.reason_code == "passive_read_executor_exception:ValueError"
+
+    missing_ordinal = submit_render(
+        render_parameters | {"candidate_ordinal": 1},
+        sequence=4,
+        suffix="missing-ordinal",
+    )
+    assert missing_ordinal["accepted"] is True
+    missing_ordinal_id = missing_ordinal["operation"]["operation_id"]
+    assert render_executor.wait(missing_ordinal_id, timeout_sec=2.0)
+    missing_ordinal_operation = composition.session.service.operation_store.get(
+        missing_ordinal_id
+    )
+    assert missing_ordinal_operation is not None
+    assert missing_ordinal_operation.status == "failed"
+
+    injected_matrix = submit_render(
+        render_parameters | {"T_reference_from_tool_tcp": list(np.eye(4).reshape(-1))},
+        sequence=5,
+        suffix="injected-matrix",
+    )
+    assert injected_matrix["accepted"] is False
+    assert injected_matrix["reason_code"] == "parameter_payload_rejected"
+
+    unavailable_role = submit_render(
+        render_parameters | {"view_role": "wrist_left"},
+        sequence=6,
+        suffix="unavailable-role",
+    )
+    assert unavailable_role["accepted"] is False
+    assert unavailable_role["reason_code"] == "parameter_payload_rejected"
+
+    composition.session.observation_producer.revision_tracker.observe(
+        {"forced_test_control_fingerprint": "changed"}
+    )
+    changed_observation = adapter.get_observation_snapshot()
+    assert changed_observation["station_revision"] > observation["station_revision"]
+    stale_source = submit_render(
+        render_parameters,
+        sequence=7,
+        suffix="stale-source",
+        station_observation=changed_observation,
+    )
+    assert stale_source["accepted"] is True
+    stale_source_id = stale_source["operation"]["operation_id"]
+    assert render_executor.wait(stale_source_id, timeout_sec=2.0)
+    stale_source_operation = composition.session.service.operation_store.get(
+        stale_source_id
+    )
+    assert stale_source_operation is not None
+    assert stale_source_operation.status == "failed"
+    assert stale_source_operation.output_artifact_bindings == ()
     composition.application.close()
     assert planner.starts == 1
     assert planner.closes == 1

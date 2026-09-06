@@ -193,6 +193,21 @@ source serial/generation/frame index、采集时间、内参、静态相机标�
 独立、获授权的 motion client 采用某一候选，仍必须重新经过其 Station/frame/tool 身份、一次性授权、
 safety envelope、IK/碰撞/奇异性、dispatch、收敛和 HOLD 门禁。
 
+启用 `perception.plan_point_grasp@2` 时，同一 camera-only profile 还会同时注册可选的
+`perception.render_point_grasp_candidate@1`。Agent 不会被强制看到额外图片；需要检查某个候选时，
+它只提交 `point_grasp_operation_id`、`candidate_ordinal`、`view_role`。调用方不能提交抓姿矩阵、相机
+内参、外参或夹爪宽度。provider 只接受本 session 的 Station point-grasp executor 已成功完成且仍
+保留的 operation，并从该不可变结果解析 ordinal；目标视角则只能选择 deployment catalog 中具有
+可信外参和 color-aligned depth 的角色。未知/已淘汰 operation、该结果中不存在的 ordinal、不同
+Station revision 或未注册角色都会 fail closed。
+
+每次调用重新读取指定视角的一帧 aligned RGB-D，只把一个候选投影到 RGB 上，并返回一个
+`rendered_grasp_candidate` JPEG Artifact。结果中的 source operation/result/candidate hash、两次
+capture group、相机/Station frame identity 和三个齐次矩阵共同闭合来源与投影视角；同时保留
+`frames[0]` 的 role、尺寸、媒体类型和内容 hash，供上层按需取得 Artifact。矩阵是只读输出证据，
+不是 RPent 需要解释或回传的规划输入。该渲染仍只做几何投影，`depth_occlusion_tested=false`，
+不新增选择权、运动权、IK、夹爪或任何下游控制效果。
+
 原有 `perception.plan_point_grasp@1` 与上文离线 CLI 保持兼容：它允许调用方提供本地 RGB-D、内参和
 标定，因此其 `base` 输出不能被称为 deployment-trusted Station pose，也不会由生产
 `real-perception` profile 发布。
@@ -256,11 +271,13 @@ planner semantic content hash。
 排序候选，避免多副线框混在同一图像中。仿真实验进一步为每个“相机 × 候选”输出独立 PNG，
 三视角 montage 也只展示 ordinal 0。
 
-这个接口不依赖 MuJoCo 或 RealSense；本轮只在 MuJoCo 的 `front`、`left_wrist`、
-`right_wrist` 三视角中接通。`front` 使用场景固定相机；两个腕部验证视图保留各自相机原点，
+共享投影器本身不依赖 MuJoCo 或 RealSense。MuJoCo 验证覆盖 `front`、`left_wrist`、
+`right_wrist` 三视角；`front` 使用场景固定相机，两个腕部验证视图保留各自相机原点，
 但使用明确标记为 `visualization_only_look_at_override_from_wrist_origin` 的 MuJoCo free camera
 朝向方块，并从实际 GL camera 反算投影外参。这不是生产腕部标定，也没有修改 URDF 或相机
-registry。真实相机的动态外参获取、图像/投影记录持久化和上层调用协议不在本轮范围内。
+registry。生产 Skill 只广告当前部署已经具备可信 aligned RGB-D 和相机 pose 的角色；因此典型
+静态配置当前只包含 `main`。未来腕部相机在同一 deployment binding 中补齐动态 pose 和 aligned
+depth 后，`wrist_left`/`wrist_right` 才会自动进入可选 `view_role`，不能仅靠调用方字符串启用。
 
 ## 已知局限
 
