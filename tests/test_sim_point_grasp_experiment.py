@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,7 +26,8 @@ from experiments.sim_point_grasp.evaluation import (
 )
 from experiments.sim_point_grasp.visualization import (
     VISUALIZATION_CAMERA_NAMES,
-    render_candidates_in_mujoco_views,
+    _free_camera_spherical_parameters,
+    render_candidate_in_mujoco_views,
 )
 from sim.mujoco.pointcloud import render_intrinsics_from_fovy
 from sim.mujoco.scene import MujocoCameraRenderer
@@ -213,25 +215,20 @@ def test_grasp_overlay_changes_pixels_and_keeps_shape() -> None:
     assert int(output.sum()) > 0
 
 
-def test_multiview_overlay_uses_each_optical_camera_pose_without_scene_steps() -> None:
-    camera_poses = {
-        "front": np.eye(4),
-        "left_wrist": np.eye(4),
-        "right_wrist": np.eye(4),
-    }
-    camera_poses["left_wrist"][0, 3] = -5.0
-    camera_poses["right_wrist"][2, 3] = 2.0
+def test_free_camera_parameters_preserve_origin_and_point_at_target() -> None:
+    distance, azimuth_deg, elevation_deg = _free_camera_spherical_parameters(
+        [1.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0],
+    )
+    assert distance == pytest.approx(math.sqrt(2.0))
+    assert abs(abs(azimuth_deg) - 180.0) < 1e-9
+    assert elevation_deg == pytest.approx(-45.0)
+
+
+def test_single_overlay_uses_actual_render_camera_pose() -> None:
 
     class _Scene:
         camera_names = VISUALIZATION_CAMERA_NAMES
-
-        @staticmethod
-        def camera_metadata():
-            return {name: {"fovy_deg": 60.0} for name in VISUALIZATION_CAMERA_NAMES}
-
-        @staticmethod
-        def camera_link_pose(name):
-            return camera_poses[name]
 
     class _Renderer:
         width = 100
@@ -239,6 +236,16 @@ def test_multiview_overlay_uses_each_optical_camera_pose_without_scene_steps() -
 
         def __init__(self):
             self.rendered = []
+            gl_camera = SimpleNamespace(
+                pos=np.zeros(3),
+                forward=np.asarray([0.0, 0.0, 1.0]),
+                up=np.asarray([0.0, -1.0, 0.0]),
+                frustum_near=0.02,
+                frustum_top=0.02 * math.tan(math.radians(30.0)),
+            )
+            self.renderer = SimpleNamespace(
+                scene=SimpleNamespace(camera=(gl_camera, gl_camera))
+            )
 
         def render(self, name):
             self.rendered.append(name)
@@ -247,7 +254,7 @@ def test_multiview_overlay_uses_each_optical_camera_pose_without_scene_steps() -
     renderer = _Renderer()
     base_from_tcp = np.eye(4)
     base_from_tcp[2, 3] = 1.0
-    images, records = render_candidates_in_mujoco_views(
+    images, records = render_candidate_in_mujoco_views(
         scene=_Scene(),
         renderer=renderer,
         base_from_tcp_candidates=(
@@ -259,14 +266,31 @@ def test_multiview_overlay_uses_each_optical_camera_pose_without_scene_steps() -
             },
         ),
         world_from_base=np.eye(4),
+        camera_names=("front",),
     )
 
-    assert renderer.rendered == list(VISUALIZATION_CAMERA_NAMES)
-    assert set(images) == set(records) == set(VISUALIZATION_CAMERA_NAMES)
+    assert renderer.rendered == ["front"]
+    assert set(images) == set(records) == {"front"}
     assert records["front"]["candidates"][0]["visibility"] == "visible"
-    assert records["left_wrist"]["candidates"][0]["visibility"] == "out_of_frame"
-    assert records["right_wrist"]["candidates"][0]["visibility"] == "behind_camera"
+    assert records["front"]["view_semantics"] == "scene_fixed_camera"
     assert all(not record["depth_occlusion_tested"] for record in records.values())
+
+    with pytest.raises(ValueError, match="Exactly one grasp candidate"):
+        render_candidate_in_mujoco_views(
+            scene=_Scene(),
+            renderer=renderer,
+            base_from_tcp_candidates=tuple(
+                {
+                    "ordinal": ordinal,
+                    "score": 0.9,
+                    "gripper_width_m": 0.04,
+                    "T_base_from_tcp": base_from_tcp.reshape(-1).tolist(),
+                }
+                for ordinal in (0, 1)
+            ),
+            world_from_base=np.eye(4),
+            camera_names=("front",),
+        )
 
 
 @pytest.mark.optional
@@ -293,7 +317,7 @@ def test_mujoco_three_camera_overlay_does_not_advance_simulation() -> None:
         time_before = float(scene.data.time)
         qpos_before = np.asarray(scene.data.qpos).copy()
 
-        images, records = render_candidates_in_mujoco_views(
+        images, records = render_candidate_in_mujoco_views(
             scene=scene,
             renderer=renderer,
             base_from_tcp_candidates=(
@@ -309,7 +333,34 @@ def test_mujoco_three_camera_overlay_does_not_advance_simulation() -> None:
 
         assert tuple(images) == VISUALIZATION_CAMERA_NAMES
         assert tuple(records) == VISUALIZATION_CAMERA_NAMES
-        assert records["front"]["candidates"][0]["visible_segment_count"] > 0
+        assert all(
+            record["candidates"][0]["visible_segment_count"] > 0
+            for record in records.values()
+        )
+        assert records["front"]["view_semantics"] == "scene_fixed_camera"
+        assert all(
+            records[name]["view_semantics"]
+            == "visualization_only_look_at_override_from_wrist_origin"
+            for name in ("left_wrist", "right_wrist")
+        )
+        cube_center = world_from_tcp[:3, 3]
+        for name in ("left_wrist", "right_wrist"):
+            base_from_camera = np.asarray(records[name]["T_base_from_camera"]).reshape(
+                4, 4
+            )
+            world_from_camera = world_from_base @ base_from_camera
+            np.testing.assert_allclose(
+                world_from_camera[:3, 3],
+                scene.camera_link_pose(name)[:3, 3],
+                atol=1e-6,
+            )
+            u, v, _depth = project_world_point(
+                cube_center,
+                world_from_camera=world_from_camera,
+                intrinsics=SimpleNamespace(**records[name]["camera_intrinsics"]),
+            )
+            assert abs(u - renderer.width // 2) <= 1
+            assert abs(v - renderer.height // 2) <= 1
         assert float(scene.data.time) == time_before
         np.testing.assert_array_equal(scene.data.qpos, qpos_before)
     finally:

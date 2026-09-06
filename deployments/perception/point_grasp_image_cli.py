@@ -138,6 +138,7 @@ def _annotated_jpeg(
     planned: object,
     intrinsics: dict[str, float | int],
 ) -> bytes:
+    # JSON retains all ranked proposals; the human preview shows only ordinal 0.
     candidates = tuple(
         DmtacGraspOverlayCandidate.from_pose(
             ordinal=ordinal,
@@ -146,7 +147,7 @@ def _annotated_jpeg(
             reference_from_tcp=candidate.camera_from_tcp,
             selected=ordinal == 0,
         )
-        for ordinal, candidate in enumerate(planned.candidates)
+        for ordinal, candidate in enumerate(planned.candidates[:1])
     )
     output, _projections = render_dmtac_grasp_overlays(
         image,

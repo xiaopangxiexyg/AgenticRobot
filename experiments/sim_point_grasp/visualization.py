@@ -40,17 +40,17 @@ from deployments.perception.sam2_vgn_point_grasp import (
 )
 from experiments.sim_point_grasp.evaluation import (
     build_sim_point_grasp_task_config,
-    optical_camera_pose_world,
     project_world_point,
     save_montage,
 )
 from project_paths import resolve_path
-from sim.mujoco.pointcloud import render_intrinsics_from_fovy
+from sim.mujoco.pointcloud import RenderCameraIntrinsics, render_intrinsics_from_fovy
 from sim.mujoco.scene import MujocoCameraRenderer
 from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
 
 VISUALIZATION_CAMERA_NAMES = ("front", "left_wrist", "right_wrist")
-VISUALIZATION_SCHEMA_V1 = "dexteleop.experiments.sim_point_grasp_visualization.v1"
+VISUALIZATION_WRIST_CAMERA_NAMES = ("left_wrist", "right_wrist")
+VISUALIZATION_SCHEMA_V2 = "dexteleop.experiments.sim_point_grasp_visualization.v2"
 
 
 @dataclass(frozen=True)
@@ -130,7 +130,114 @@ def _state_digest(scene: Any) -> str:
     return digest.hexdigest()
 
 
-def render_candidates_in_mujoco_views(
+def _free_camera_spherical_parameters(
+    camera_position_world: Any,
+    look_at_world: Any,
+) -> tuple[float, float, float]:
+    """Return MuJoCo free-camera distance, azimuth, and elevation."""
+
+    position = np.asarray(camera_position_world, dtype=np.float64).reshape(3)
+    target = np.asarray(look_at_world, dtype=np.float64).reshape(3)
+    offset = position - target
+    distance = float(np.linalg.norm(offset))
+    if not math.isfinite(distance) or distance <= 1e-6:
+        raise ValueError("look-at camera position must differ from its target.")
+    azimuth_deg = math.degrees(math.atan2(-float(offset[1]), -float(offset[0])))
+    elevation_deg = math.degrees(
+        -math.asin(float(np.clip(offset[2] / distance, -1.0, 1.0)))
+    )
+    return distance, azimuth_deg, elevation_deg
+
+
+def _render_scene_optical_pose_world(render_scene: Any) -> np.ndarray:
+    """Recover the central optical pose actually used by MuJoCo rendering."""
+
+    cameras = tuple(render_scene.camera)
+    if len(cameras) < 1:
+        raise RuntimeError("MuJoCo render scene exposes no GL camera.")
+    position = np.mean(
+        np.asarray([camera.pos for camera in cameras], dtype=np.float64), axis=0
+    )
+    forward = np.mean(
+        np.asarray([camera.forward for camera in cameras], dtype=np.float64), axis=0
+    )
+    up = np.mean(
+        np.asarray([camera.up for camera in cameras], dtype=np.float64), axis=0
+    )
+    forward /= np.linalg.norm(forward)
+    optical_x = np.cross(forward, up)
+    optical_x /= np.linalg.norm(optical_x)
+    optical_y = np.cross(forward, optical_x)
+    optical_y /= np.linalg.norm(optical_y)
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = np.column_stack((optical_x, optical_y, forward))
+    pose[:3, 3] = position
+    return pose
+
+
+def _render_scene_intrinsics(
+    render_scene: Any,
+    *,
+    width: int,
+    height: int,
+) -> RenderCameraIntrinsics:
+    camera = render_scene.camera[0]
+    near = float(camera.frustum_near)
+    top = float(camera.frustum_top)
+    if not math.isfinite(near) or not math.isfinite(top) or near <= 0.0 or top <= 0.0:
+        raise RuntimeError("MuJoCo render scene has invalid perspective frustum.")
+    fovy_deg = math.degrees(2.0 * math.atan(top / near))
+    return render_intrinsics_from_fovy(
+        width=int(width),
+        height=int(height),
+        fovy_deg=fovy_deg,
+    )
+
+
+def _render_visualization_camera(
+    *,
+    scene: Any,
+    renderer: MujocoCameraRenderer,
+    camera_name: str,
+    look_at_target_world: Any,
+) -> tuple[np.ndarray, np.ndarray, RenderCameraIntrinsics, str]:
+    """Render one fixed or visualization-only look-at camera."""
+
+    if camera_name not in VISUALIZATION_WRIST_CAMERA_NAMES:
+        pixels = renderer.render(camera_name)
+        view_semantics = "scene_fixed_camera"
+    else:
+        position = np.asarray(scene.camera_link_pose(camera_name), dtype=np.float64)[
+            :3, 3
+        ]
+        distance, azimuth_deg, elevation_deg = _free_camera_spherical_parameters(
+            position,
+            look_at_target_world,
+        )
+        camera = scene.mujoco.MjvCamera()
+        camera.type = scene.mujoco.mjtCamera.mjCAMERA_FREE
+        camera.lookat[:] = np.asarray(look_at_target_world, dtype=np.float64).reshape(3)
+        camera.distance = distance
+        camera.azimuth = azimuth_deg
+        camera.elevation = elevation_deg
+        renderer.renderer.disable_depth_rendering()
+        renderer.renderer.update_scene(scene.data, camera=camera)
+        pixels = np.asarray(renderer.renderer.render()).copy()
+        view_semantics = "visualization_only_look_at_override_from_wrist_origin"
+    render_scene = renderer.renderer.scene
+    return (
+        pixels,
+        _render_scene_optical_pose_world(render_scene),
+        _render_scene_intrinsics(
+            render_scene,
+            width=renderer.width,
+            height=renderer.height,
+        ),
+        view_semantics,
+    )
+
+
+def render_candidate_in_mujoco_views(
     *,
     scene: Any,
     renderer: MujocoCameraRenderer,
@@ -140,8 +247,9 @@ def render_candidates_in_mujoco_views(
     camera_names: Sequence[str] = VISUALIZATION_CAMERA_NAMES,
     front_target_pixel_uv: tuple[int, int] | None = None,
     front_target_bbox_xyxy: tuple[int, int, int, int] | None = None,
+    look_at_target_world: Any | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
-    """Render grasp overlays without stepping or otherwise mutating the scene."""
+    """Render one grasp in each view without stepping or mutating the scene."""
 
     requested = tuple(str(name) for name in camera_names)
     if not requested or len(set(requested)) != len(requested):
@@ -149,6 +257,17 @@ def render_candidates_in_mujoco_views(
     missing = sorted(set(requested) - set(scene.camera_names))
     if missing:
         raise ValueError(f"MuJoCo scene is missing cameras: {missing!r}.")
+    if len(base_from_tcp_candidates) != 1:
+        raise ValueError(
+            "Exactly one grasp candidate must be rendered in each overlay artifact."
+        )
+    if look_at_target_world is None:
+        candidate_pose = np.asarray(
+            base_from_tcp_candidates[0]["T_base_from_tcp"], dtype=np.float64
+        ).reshape(4, 4)
+        look_at_target_world = (
+            np.asarray(world_from_base, dtype=np.float64).reshape(4, 4) @ candidate_pose
+        )[:3, 3]
     base_pose = np.asarray(world_from_base, dtype=np.float64).reshape(4, 4)
     candidates = tuple(
         DmtacGraspOverlayCandidate.from_pose(
@@ -160,19 +279,18 @@ def render_candidates_in_mujoco_views(
         )
         for candidate in base_from_tcp_candidates
     )
-    metadata_by_name = scene.camera_metadata()
     images: dict[str, np.ndarray] = {}
     records: dict[str, dict[str, Any]] = {}
     for camera_name in requested:
-        metadata = metadata_by_name[camera_name]
-        intrinsics = render_intrinsics_from_fovy(
-            width=renderer.width,
-            height=renderer.height,
-            fovy_deg=float(metadata["fovy_deg"]),
+        raw, world_from_camera, intrinsics, view_semantics = (
+            _render_visualization_camera(
+                scene=scene,
+                renderer=renderer,
+                camera_name=camera_name,
+                look_at_target_world=look_at_target_world,
+            )
         )
-        world_from_camera = optical_camera_pose_world(scene, camera_name)
         base_from_camera = np.linalg.inv(base_pose) @ world_from_camera
-        raw = renderer.render(camera_name)
         overlay, projections = render_dmtac_grasp_overlays(
             raw,
             candidates=candidates,
@@ -186,7 +304,15 @@ def render_candidates_in_mujoco_views(
         images[camera_name] = np.asarray(overlay)
         records[camera_name] = {
             "camera_name": camera_name,
-            "camera_frame_semantics": "urdf_optical_frame_x_right_y_down_z_forward",
+            "camera_frame_semantics": "rendered_optical_frame_x_right_y_down_z_forward",
+            "view_semantics": view_semantics,
+            "look_at_target_world_xyz_m": (
+                None
+                if view_semantics == "scene_fixed_camera"
+                else [
+                    float(item) for item in np.asarray(look_at_target_world).reshape(3)
+                ]
+            ),
             "T_base_from_camera": [
                 float(item) for item in base_from_camera.reshape(-1)
             ],
@@ -228,20 +354,28 @@ def visualize_sim_point_grasps(
                 "Visualization scene does not expose front and both wrist cameras."
             )
         state_before = _state_digest(scene)
-        raw_images = renderer.render_all(VISUALIZATION_CAMERA_NAMES)
-        for camera_name, pixels in raw_images.items():
+        cube_center = scene.body_pose(task_config.object_body_name)[:3, 3]
+        raw_camera_poses: dict[str, np.ndarray] = {}
+        raw_camera_intrinsics: dict[str, RenderCameraIntrinsics] = {}
+        raw_camera_semantics: dict[str, str] = {}
+        for camera_name in VISUALIZATION_CAMERA_NAMES:
+            pixels, camera_pose, camera_intrinsics, view_semantics = (
+                _render_visualization_camera(
+                    scene=scene,
+                    renderer=renderer,
+                    camera_name=camera_name,
+                    look_at_target_world=cube_center,
+                )
+            )
+            raw_camera_poses[camera_name] = camera_pose
+            raw_camera_intrinsics[camera_name] = camera_intrinsics
+            raw_camera_semantics[camera_name] = view_semantics
             Image.fromarray(pixels).save(config.output_dir / f"{camera_name}_rgb.png")
         depth = np.ascontiguousarray(renderer.render_depth("front"), dtype=np.float32)
         np.save(config.output_dir / "front_depth_m.npy", depth, allow_pickle=False)
 
-        metadata = scene.camera_metadata()["front"]
-        front_intrinsics = render_intrinsics_from_fovy(
-            width=renderer.width,
-            height=renderer.height,
-            fovy_deg=float(metadata["fovy_deg"]),
-        )
-        world_from_front = optical_camera_pose_world(scene, "front")
-        cube_center = scene.body_pose(task_config.object_body_name)[:3, 3]
+        front_intrinsics = raw_camera_intrinsics["front"]
+        world_from_front = raw_camera_poses["front"]
         u, v, projected_depth = project_world_point(
             cube_center,
             world_from_camera=world_from_front,
@@ -296,22 +430,55 @@ def visualize_sim_point_grasps(
         )
         _write_json(config.output_dir / "skill_result.json", result)
 
-        overlay_images, camera_records = render_candidates_in_mujoco_views(
-            scene=scene,
-            renderer=renderer,
-            base_from_tcp_candidates=result["candidates"],
-            world_from_base=world_from_base,
-            selected_ordinal=int(result["selected_ordinal"]),
-            front_target_pixel_uv=(u, v),
-            front_target_bbox_xyxy=tuple(result["target_mask_bbox_xyxy"]),
-        )
-        montage_frames = []
-        for camera_name in VISUALIZATION_CAMERA_NAMES:
-            pixels = overlay_images[camera_name]
-            Image.fromarray(pixels).save(
-                config.output_dir / f"{camera_name}_grasp_overlay.png"
+        selected_ordinal = int(result["selected_ordinal"])
+        selected_images: dict[str, np.ndarray] = {}
+        camera_records: dict[str, dict[str, Any]] = {}
+        for candidate in result["candidates"]:
+            candidate_ordinal = int(candidate["ordinal"])
+            overlay_images, one_candidate_records = render_candidate_in_mujoco_views(
+                scene=scene,
+                renderer=renderer,
+                base_from_tcp_candidates=(candidate,),
+                world_from_base=world_from_base,
+                selected_ordinal=selected_ordinal,
+                front_target_pixel_uv=(u, v),
+                front_target_bbox_xyxy=tuple(result["target_mask_bbox_xyxy"]),
+                look_at_target_world=cube_center,
             )
-            montage_frames.append((f"{camera_name} grasp overlay", pixels))
+            for camera_name in VISUALIZATION_CAMERA_NAMES:
+                filename = (
+                    f"{camera_name}_candidate_{candidate_ordinal:02d}_grasp_overlay.png"
+                )
+                pixels = overlay_images[camera_name]
+                Image.fromarray(pixels).save(config.output_dir / filename)
+                one_record = one_candidate_records[camera_name]
+                if camera_name not in camera_records:
+                    camera_records[camera_name] = {
+                        key: value
+                        for key, value in one_record.items()
+                        if key != "candidates"
+                    }
+                    camera_records[camera_name]["candidate_artifacts"] = []
+                camera_records[camera_name]["candidate_artifacts"].append(
+                    {
+                        "ordinal": candidate_ordinal,
+                        "artifact_filename": filename,
+                        "projection": one_record["candidates"][0],
+                    }
+                )
+                if candidate_ordinal == selected_ordinal:
+                    selected_images[camera_name] = pixels
+        if set(selected_images) != set(VISUALIZATION_CAMERA_NAMES):
+            raise RuntimeError(
+                "Selected grasp candidate was not rendered in every view."
+            )
+        montage_frames = [
+            (
+                f"{camera_name} selected grasp {selected_ordinal}",
+                selected_images[camera_name],
+            )
+            for camera_name in VISUALIZATION_CAMERA_NAMES
+        ]
         save_montage(config.output_dir / "grasp_multiview_montage.png", montage_frames)
 
         state_after = _state_digest(scene)
@@ -319,15 +486,18 @@ def visualize_sim_point_grasps(
         if not state_unchanged:
             raise RuntimeError("Visualization unexpectedly changed MuJoCo state.")
         report = {
-            "schema_version": VISUALIZATION_SCHEMA_V1,
+            "schema_version": VISUALIZATION_SCHEMA_V2,
             "seed": config.seed,
             "camera_names": list(VISUALIZATION_CAMERA_NAMES),
             "generation_camera": "front",
             "candidate_count": int(result["candidate_count"]),
-            "selected_ordinal": int(result["selected_ordinal"]),
+            "selected_ordinal": selected_ordinal,
             "upward_tcp_selection_policy": PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
             "selected_pose_policy": "provider_rank_after_upward_tcp_symmetry_selection",
             "overlay_semantics": "simple_3d_wireframe_projection_without_depth_occlusion",
+            "single_candidate_per_overlay_artifact": True,
+            "montage_candidate_ordinal": selected_ordinal,
+            "camera_view_semantics": raw_camera_semantics,
             "motion_execution_attempted": False,
             "ik_attempted": False,
             "gripper_actuation_attempted": False,
@@ -358,8 +528,8 @@ def visualize_sim_point_grasps(
 
 __all__ = [
     "VISUALIZATION_CAMERA_NAMES",
-    "VISUALIZATION_SCHEMA_V1",
+    "VISUALIZATION_SCHEMA_V2",
     "SimPointGraspVisualizationConfig",
-    "render_candidates_in_mujoco_views",
+    "render_candidate_in_mujoco_views",
     "visualize_sim_point_grasps",
 ]

@@ -95,6 +95,8 @@ def _annotate(
     prepared: Any,
     intrinsics: dict[str, Any],
 ) -> bytes:
+    # The result carries every ranked proposal; the preview stays legible by
+    # rendering only selected ordinal 0.
     candidates = tuple(
         DmtacGraspOverlayCandidate.from_pose(
             ordinal=ordinal,
@@ -103,7 +105,7 @@ def _annotate(
             reference_from_tcp=candidate.camera_from_tcp,
             selected=ordinal == 0,
         )
-        for ordinal, candidate in enumerate(prepared.candidates)
+        for ordinal, candidate in enumerate(prepared.candidates[:1])
     )
     output, _projections = render_dmtac_grasp_overlays(
         image,
