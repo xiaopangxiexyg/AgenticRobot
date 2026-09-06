@@ -54,7 +54,6 @@ INTEGRATION_MODULES = frozenset(
         "test_collection_pose_frame_storage.py",
         "test_collection_process_writer.py",
         "test_collection_storage_queue.py",
-        "test_control_station_mujoco_human_station.py",
         "test_control_station_mujoco_sim_hil.py",
         "test_control_station_sim_hil_gui.py",
         "test_control_station_vive_calibration.py",

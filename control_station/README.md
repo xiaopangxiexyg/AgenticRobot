@@ -154,15 +154,17 @@ the viewer applies that exact artifact, resets Viewer Home, and clears the
 browser-local trajectory accumulator; no control/runtime Home is changed.
 
 The boundary tests keep current migration debt explicit: dataset projection is
-confined to `control_trace.py`, the existing
-`composition/mujoco_pose_composer.py` profile, and the default-off
+confined to `control_trace.py` and the default-off
 `composition/mujoco_sim_hil.py` profile, OpenPI knowledge to
-`preflight/openpi_rtc.py`, and MuJoCo imports to concrete profiles. Device-free
-synthetic Human production, receiver admission, passive ingress/fanout, and
-the observe-only `TeleopSession(rig=None)` source now live in
-`teleop_runtime.action`; their Station paths are compatibility/profile seams
-only. New debt may not spread while the remaining concrete profiles are
-migrated.
+`preflight/openpi_rtc.py`, and MuJoCo imports to concrete active profiles.
+Device-free synthetic Human production, receiver admission, passive
+ingress/fanout, and the observe-only `TeleopSession(rig=None)` source now live
+in `teleop_runtime.action`; their Station paths are compatibility/profile
+seams only. The former CS-2b/2c/2d, CS-3 passive-shadow, and CS-6 replay/pose
+composer fixtures have no current executable entry and were removed from the
+versioned tree. Their audit and local recovery copy are recorded in
+[`docs/legacy/control_station_profile_retirement_20260906.md`](../docs/legacy/control_station_profile_retirement_20260906.md).
+New debt may not spread while the remaining concrete profiles are migrated.
 
 ## Reuse model
 
@@ -272,36 +274,32 @@ sequence, clock domain, and an immutable semantic payload. A strategy may
 return a pose decision and lineage only; it cannot mutate authority/epochs,
 consume a queue, run safety/IK, or dispatch.
 
-CS-6b1d currently runs `discrete_authority_owner_pose_v1` as a read-only shadow
-beside the existing ActionArbiter and records selection/output-pose parity. It
-does not influence execution. This first strategy intentionally ignores all
-optional contexts and preserves current discrete handoff behavior. A later
-history/future/modality/label strategy is plugged into the same seam, but may
-become authoritative only after a separate versioned proposal/admission,
-ControlTrace, safety, latency/fallback, and shadow-parity gate. Unversioned
-pose averaging or GUI-controlled blend weights remain forbidden.
+The generic pose strategy can run as a read-only shadow beside the existing
+ActionArbiter and record selection/output-pose parity. It does not influence
+execution. The strategy intentionally ignores optional contexts and preserves
+the established discrete handoff behavior. A later
+history/future/modality/label strategy must use the same seam and pass a
+separate versioned proposal/admission, ControlTrace, safety, latency/fallback,
+and shadow-parity gate before it can become authoritative. Unversioned pose
+averaging or GUI-controlled blend weights remain forbidden.
 
-CS-6b1h now also has an explicit opt-in formal-strategy-v2 contract fixture.
-The strategy is injected into `MujocoDeployRuntime` rather than stored in a sim
-configuration, and the Station binding includes its strategy-spec hash under a
-v2 binding domain. The deterministic migration adapter has exact pose/action
-parity with the compatibility composer on the same frozen input snapshot, but
-produces a distinct v4 result and proposal lineage before entering the existing
-single authority, safety, reference, and dispatch chain. With no injected
-strategy, the established v1 binding and behavior remain unchanged. This is
-not yet a default operational profile or permission to run a slow model/RPC in
-the control loop.
+An opt-in formal-strategy-v2 contract fixture can inject the strategy into
+`MujocoDeployRuntime` rather than a sim configuration. Its binding carries the
+strategy-spec hash under a v2 binding domain, and the deterministic migration
+adapter preserves pose/action parity on one frozen input snapshot before the
+existing single authority, safety, reference, and dispatch chain. With no
+injected strategy, the established v1 binding and behavior remain unchanged.
+This is not a default operational profile or permission to run a slow model/RPC
+in the control loop.
 
-The shared pose strategy/composer now accepts an explicit non-empty subset of
-the current v1 arm components (`left_arm`, `right_arm`). A one-arm profile
-projects every candidate to that declared subset before strategy evaluation;
-the decision and composed action must contain exactly the same components.
-The omitted/default declaration remains the historical coupled bimanual
-contract and keeps its strategy/composition spec hash and behavior. This is a
-topology-manifest improvement, not permission to make the current CS-6b1i
-MuJoCo target single-arm: that concrete profile remains bimanual and must fail
-closed until a target binding advertises a matching resolver/safety capability.
-Arbitrary named arms require a later component-schema version.
+The shared pose strategy/composer accepts an explicit non-empty subset of the
+current v1 arm components (`left_arm`, `right_arm`). A one-arm profile projects
+every candidate to that declared subset before strategy evaluation; the
+decision and composed action must contain exactly the same components. The
+omitted/default declaration remains the historical coupled-bimanual contract
+and keeps its strategy/composition spec hash and behavior. A concrete target
+must still fail closed until its binding advertises a matching resolver/safety
+capability. Arbitrary named arms require a later component-schema version.
 
 The default-off `mujoco_sim_hil` application profile adds the first formal
 human+policy compound binding for the existing MuJoCo pose execution target.
@@ -333,12 +331,12 @@ comparable. Cartesian pose uses signed `reference - compared` translation plus
 an SO(3) rotation vector; qpos uses only jointly finite slots. Action-space,
 representation, shape, or pose-frame mismatch fails explicitly.
 
-`ControlCompositionRuntime.evaluate_composition()` now accepts that optional spec,
-returns the observation on `CompositeProposalSubmission`, and emits exact
-protocol-neutral source-difference domain events. The injected dataset adapter
-may project them into hash-linked v2.4 ControlTrace facts. Diagnostic
-failure is returned separately and cannot rewrite the
-composition evaluation. CS-6b1h/1i only forward the opt-in spec and expose the same
+`ControlCompositionRuntime.evaluate_composition()` now accepts that optional
+spec, returns the observation on `CompositeProposalSubmission`, and emits
+exact protocol-neutral source-difference domain events. The injected dataset
+adapter may project them into hash-linked v2.4 ControlTrace facts. Diagnostic
+failure is returned separately and cannot rewrite the composition evaluation.
+Application adapters only forward the opt-in spec and expose the same
 observation on their step result. With the default `None`, no observation,
 extra trace fact, clock read, or legacy binding-hash field is added.
 `guidance_feedback.py` can map one configured pose pair to bounded dimensionless
@@ -399,8 +397,8 @@ composes arbitrary `ObservationSource` and pose `Retargeter` instances into an
 existing `TeleopSession(rig=None, recorder=None)`, forbids recording and
 hardware-arm eligibility, and accepts exactly the finite pose effectors
 declared by `PassiveTeleopPoseSourceSpec` (the default remains the historical
-bimanual RM65 tuple). CS-6b1d may bind this source to the human slot while
-replay remains the only active authority. A typed Station source-connect
+bimanual RM65 tuple). A passive pose source may bind to a human slot while
+another source remains the only active authority. A typed Station source-connect
 operation may start the supplied tracker source, but no command can be
 dispatched and no human proposal is admitted by this passive step. The lower
 module deliberately imports no VIVE, robot, simulator, or model implementation;
@@ -418,7 +416,7 @@ execution capability evidence. Construction is passive; starting a source
 still requires an explicit caller lifecycle operation.
 
 The same module now exposes the opt-in
-`PassiveTeleopComponentSessionSource` for CS-6b2a. It reuses that exact
+`PassiveTeleopComponentSessionSource` for component-level inputs. It reuses that exact
 non-dispatching session lifecycle but validates a data-driven tuple of
 `PassiveTeleopComponentSpec`: arm components must be typed Cartesian poses and
 hand/gripper components must be canonical full-slot qpos with an explicit
@@ -443,69 +441,23 @@ claim that arbitrary effectors or dimensions are already supported. Those
 require the planned generic component-action bridge and schema-visible,
 payload-opaque core rather than more v1 shape branches here.
 
-## Opt-in CS-6b1f sim HIL capture
+## Retired CS-2/CS-3/CS-6 fixture profiles
 
-`build_scoped_cs6b1f_mujoco_pose_human_replay_station()` is the first formal
-human-in-the-loop capture slice. It is an explicit MuJoCo composition, not a
-new entrypoint and not a change to the legacy teleop, replay, deploy, or RTC
-paths. Replay remains the initial authority; a connected passive pose source
-is only observed until the typed `request_human_takeover` transaction reaches
-`human_takeover_ready`. In the sim fixture,
-`VirtualSimHumanTakeoverReadinessProvider` supplies virtual deadman/rebase
-evidence and waits on a post-boundary immutable emission. The emission is
-promoted exactly once through the existing human publication seam, while the
-arm remains pose-native until the target's verified pose-to-qpos resolver.
+The former CS-2b/2c/2d, CS-3 passive-shadow, and CS-6 replay/pose-composer
+modules were test/application-only compositions. They introduced no canonical
+teleop, replay, policy, RTC, authority, safety, IK, dispatch, or recording
+owner, and they had no current production caller. Their versioned source and
+fixture tests are therefore retired; no current command or public builder may
+refer to those profile names.
 
-The profile
-`deployable_sim_scheduled_pose_human_replay_station_v1` reuses the existing
-Station operation coordinator, publication barriers, authoritative MuJoCo
-runtime, ControlTrace/WAL, and external `EpisodeTraceRecorderSink`. The
-composition owns no action queue, replay cursor, producer/authority/dispatch
-epoch, or episode UUID. `hold_before_unbind` is enforced before recorder
-release, and the committed reader rebuilds the same pose decisions and
-resolved execution lineage.
-
-The virtual provider fails closed unless the takeover is already awaiting
-readiness: no post-boundary sample, a stale queued sample, or a late worker
-completion leaves the station in HOLD and cannot reopen the human barrier.
-These cases are covered by the HIL corner regressions; real readiness remains a
-separate provider gate.
-
-## Opt-in CS-6b1i composition session
-
-`control_composition.lifecycle.CompositionSessionRegistry` owns the
-backend-independent logical-session spec registry, per-activation epoch/state
-transitions, re-arm binding, and trace observers. Station's
-`CompositionSessionController` subclasses it only to bind typed Station
-operation results, the publication barrier, and lower HOLD/cancel ordering.
-`build_scoped_cs6b1i_mujoco_pose_composition_session()` is only the first
-MuJoCo binding around the existing CS-6b1h data plane: it supplies concrete
-readiness, lower HOLD/cancel, adapters, input admission, and sim stepping.
-Human/replay slots are explicit
-contributors and never parallel proposal owners; only the composite slot may
-become active after `start_composition_session` returns the evidenced
-`composition_session_ready` status.
-
-Pause, ESTOP, stop, or a non-publishable composition closes the composer
-publication barrier before lower HOLD/cancellation. Fresh input cannot reopen
-the held activation. The opt-in MuJoCo re-arm operation keeps the logical
-session identity but retires the held activation and creates the next epoch
-only after typed cancellation, measurement, producer/authority epoch, READY,
-and fresh-input-barrier evidence. Old proposals and contributor inputs cannot
-cross that boundary, and re-arm itself admits no action. Trace contracts cover
-the re-arm spec/receipt and activation transitions. This remains deterministic
-sim only: no GUI, device start, replay cursor, policy/RTC source, real binding,
-or production entrypoint is added, and no physical deadman/retarget evidence is
-claimed.
-
-The development-only MuJoCo timed-trajectory publisher reuses this same
-session barrier; it does not define another pause/end state machine. It is
-constructed per activation, publishes only an already-produced exact target,
-and cannot cross a barrier generation change. Current-action-only policy
-sources remain on the ordinary per-cut path. An application may bind a real
-timed source later, but its request supplier must be a nonblocking mailbox read;
-model workers, device workers, and chunk cursors stay outside the barrier and
-outside the publisher.
+Current applications use the lower-owned `PolicyActionEmission`,
+`HumanCommandEmission`, `control_composition`, and default-off
+`control_station sim-hil` seams described above. This keeps source selection,
+HOLD/re-arm, safety, target resolution, dispatch, and capture ownership in one
+active path instead of preserving parallel profile adapters. The deletion
+audit, caller inventory, replacement mapping, and recoverable local copy are
+recorded in
+[`docs/legacy/control_station_profile_retirement_20260906.md`](../docs/legacy/control_station_profile_retirement_20260906.md).
 
 Allocation-context publication has a separate backend-neutral, default-off
 Station port. `StationAllocationPublicationPort` binds one
@@ -1040,13 +992,11 @@ before adding a new real target:
 9. Adding a source/target type must not add another authority store, operation
    coordinator, publication barrier, queue, cursor, or episode owner.
 
-The current mixed MuJoCo Station wrapper remains beside its existing CS6b0
-data plane in `composition/mujoco_human_replay.py`. This large module has been
-reviewed for cohesion; it should be split only when a second target proves a
-backend-neutral executable seam, not merely to create per-device files.
-
-Compatibility re-exports are kept during migrations so existing entrypoints
-and tests do not need synchronized rewrites.
+The retired mixed MuJoCo Station wrapper and pose-composer fixtures are no
+longer part of the active source tree. New target/source work must use the
+current typed seams and an explicit profile owner; a compatibility re-export
+is not a substitute for a live caller or a validated migration. Historical
+source is retained only in the local ignored backup and the audit linked above.
 
 ## VIVE coordinate calibration
 

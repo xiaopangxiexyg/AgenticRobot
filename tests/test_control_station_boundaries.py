@@ -185,7 +185,6 @@ def test_station_dataset_projection_debt_is_explicit_and_cannot_spread() -> None
         # Concrete UMI application leaf loads the dataset/model layout contract;
         # device derivation and collection lifecycle remain lower-owned.
         "control_station/umi_application.py": ["dataset_interface"],
-        "control_station/composition/mujoco_pose_composer.py": ["dataset_interface"],
         "control_station/composition/mujoco_sim_hil.py": ["dataset_interface"],
         "control_station/control_trace.py": ["dataset_interface"],
         # Concrete post-capture application binding. Presentation stays in
@@ -224,12 +223,6 @@ def test_station_sim_dependencies_are_confined_to_concrete_profiles() -> None:
             "sim"
         ],
         "control_station/composition/mujoco_human.py": ["sim"],
-        "control_station/composition/mujoco_human_replay.py": ["sim"],
-        "control_station/composition/mujoco_human_station.py": ["sim"],
-        "control_station/composition/mujoco_policy.py": ["sim"],
-        "control_station/composition/mujoco_pose_composer.py": ["sim"],
-        "control_station/composition/mujoco_replay.py": ["sim"],
-        "control_station/composition/mujoco_rtc_policy.py": ["sim"],
         "control_station/composition/mujoco_sim_hil.py": ["sim"],
         "control_station/sim_hil.py": ["sim"],
         "control_station/real_teleop_entrypoint.py": ["sim"],

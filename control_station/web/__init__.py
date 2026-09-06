@@ -11,7 +11,6 @@ from .api import (
 from .server import (
     build_coordinated_control_station_server,
     build_read_only_control_station_server,
-    build_scoped_passive_shadow_control_station_server,
     build_scoped_sim_authority_control_station_server,
     build_typed_intent_control_station_server,
 )
@@ -28,7 +27,6 @@ __all__ = [
     "WebUiKeyInput",
     "build_coordinated_control_station_server",
     "build_read_only_control_station_server",
-    "build_scoped_passive_shadow_control_station_server",
     "build_scoped_sim_authority_control_station_server",
     "build_typed_intent_control_station_server",
 ]
