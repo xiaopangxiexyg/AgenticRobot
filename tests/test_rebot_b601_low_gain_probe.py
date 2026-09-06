@@ -248,7 +248,7 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
             )
 
         def safe_stop(self, *, joint_names: tuple[str, ...]) -> object:
-            assert joint_names == ("joint6",)
+            assert joint_names == tuple(probe._ALL_JOINTS)
             self.events.append("safe_stop")
             return probe.B601ModeReceipt(
                 operation="safe_stop",
@@ -266,14 +266,14 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
             joint_names: tuple[str, ...],
         ) -> object:
             assert limits_nm == (3.6, 3.6, 3.6, 1.4, 1.4, 1.4)
-            assert joint_names == ("joint6",)
+            assert joint_names == tuple(probe._ALL_JOINTS)
             self.events.append("apply")
             return probe.B601DriverTorqueLimitReceipt(
                 operation="apply_temporary_driver_torque_limits",
                 requested_joint_names=joint_names,
-                target_limits_nm=(1.4,),
-                prior_limits_nm=(14.0,),
-                verified_limits_nm=(1.4,),
+                target_limits_nm=limits_nm,
+                prior_limits_nm=(36.0, 36.0, 36.0, 14.0, 14.0, 14.0),
+                verified_limits_nm=limits_nm,
                 applied_joint_names=joint_names,
                 restored_joint_names=(),
                 failed_joint_names=(),
@@ -285,12 +285,12 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
             self.events.append("restore")
             return probe.B601DriverTorqueLimitReceipt(
                 operation="restore_driver_torque_limits",
-                requested_joint_names=("joint6",),
-                target_limits_nm=(14.0,),
-                prior_limits_nm=(1.4,),
-                verified_limits_nm=(14.0,),
+                requested_joint_names=tuple(probe._ALL_JOINTS),
+                target_limits_nm=(36.0, 36.0, 36.0, 14.0, 14.0, 14.0),
+                prior_limits_nm=(3.6, 3.6, 3.6, 1.4, 1.4, 1.4),
+                verified_limits_nm=(36.0, 36.0, 36.0, 14.0, 14.0, 14.0),
                 applied_joint_names=(),
-                restored_joint_names=("joint6",),
+                restored_joint_names=tuple(probe._ALL_JOINTS),
                 failed_joint_names=(),
                 errors=(),
                 completed=True,
@@ -311,7 +311,6 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
         source_root=tmp_path,
         model=SimpleNamespace(urdf_path=urdf_path),
         position_limits=((-1.0, 1.0),) * 6,
-        target_joint="joint6",
         torque_limits_nm=(3.6, 3.6, 3.6, 1.4, 1.4, 1.4),
     )
 
@@ -319,9 +318,24 @@ def test_driver_torque_limit_roundtrip_never_enables_or_sends_motion(tmp_path) -
     assert result["motors_enabled_by_probe"] is False
     assert result["motion_commands_sent"] is False
     assert result["mode_transitions_sent"] is False
-    assert result["target_limit_nm"] == 1.4
-    assert result["apply_receipt"]["prior_limits_nm"] == (14.0,)
-    assert result["restore_receipt"]["verified_limits_nm"] == (14.0,)
+    assert result["joint_names"] == tuple(probe._ALL_JOINTS)
+    assert result["target_limits_nm"] == (3.6, 3.6, 3.6, 1.4, 1.4, 1.4)
+    assert result["apply_receipt"]["prior_limits_nm"] == (
+        36.0,
+        36.0,
+        36.0,
+        14.0,
+        14.0,
+        14.0,
+    )
+    assert result["restore_receipt"]["verified_limits_nm"] == (
+        36.0,
+        36.0,
+        36.0,
+        14.0,
+        14.0,
+        14.0,
+    )
     assert backend.events == [
         "connect",
         "poll_feedback",
@@ -702,27 +716,27 @@ def test_pose_impedance_overlay_aborts_excessive_rotation(
         )
 
 
-def test_active_joint_resolution_keeps_joint2_joint3_support() -> None:
-    assert probe.resolve_active_joint_names("joint1") == (
-        "joint1",
-        "joint2",
-        "joint3",
-    )
-    assert probe.resolve_active_joint_names("joint3") == (
-        "joint3",
-        "joint2",
-    )
-    assert set(
-        probe.resolve_active_joint_names(
-            "joint6",
-            support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
-        )
-    ) == set(probe._ALL_JOINTS)
+def test_active_joint_resolution_always_uses_all_six_arm_joints() -> None:
+    assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
 
-def test_active_joint_resolution_rejects_missing_fault_support() -> None:
-    with pytest.raises(ValueError, match="mandatory support"):
-        probe.resolve_active_joint_names("joint1", support_joints=("joint4",))
+def test_hold_reference_uses_the_complete_settled_six_joint_snapshot() -> None:
+    settled = (0.12, 0.34, 0.56, -0.21, 0.09, -0.45)
+
+    qref, qvel_ref, done = probe.plan_reference(
+        settled,
+        mode="hold",
+        joint="joint1",
+        elapsed_sec=1.0,
+        step_rad=0.02,
+        step_speed_rad_s=0.005,
+        step_direction=1,
+        position_limits_rad=((-3.14, 3.14),) * 6,
+    )
+
+    assert qref == settled
+    assert qvel_ref == (0.0,) * 6
+    assert done is True
 
 
 def _fault_hold_limits() -> tuple[tuple[float, float], ...]:
@@ -1182,10 +1196,7 @@ def _slow_step_samples(
 
 
 def test_slow_step_response_requires_real_correct_direction_motion() -> None:
-    active = probe.resolve_active_joint_names(
-        "joint6",
-        support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
-    )
+    active = probe.resolve_active_joint_names()
     passed = probe.evaluate_slow_step_response(
         mode="slow-step",
         target_joint="joint6",
@@ -1223,10 +1234,7 @@ def test_slow_step_response_requires_real_correct_direction_motion() -> None:
 
 
 def test_slow_step_response_rejects_support_joint_drift() -> None:
-    active = probe.resolve_active_joint_names(
-        "joint6",
-        support_joints=("joint2", "joint3", "joint1", "joint4", "joint5"),
-    )
+    active = probe.resolve_active_joint_names()
     result = probe.evaluate_slow_step_response(
         mode="slow-step",
         target_joint="joint6",
@@ -1263,7 +1271,7 @@ def test_parser_help_is_read_only() -> None:
     assert tuple(B601_RS_ARM_JOINT_NAMES) == tuple(probe._ALL_JOINTS)
     args = parser.parse_args(["--config", "config.yaml", "--rebot-source-root", "source"])
     assert args.joint == "joint1"
-    assert tuple(args.support_joints) == ("joint2", "joint3")
+    assert "--support-joint" not in parser.format_help()
     assert args.target_kp is None
     assert args.target_kd is None
     assert args.apply_driver_torque_limits is False
@@ -1334,8 +1342,6 @@ def test_driver_torque_limit_roundtrip_cli_requires_explicit_authority() -> None
         "config.yaml",
         "--rebot-source-root",
         "source",
-        "--joint",
-        "joint6",
     ]
 
     with pytest.raises(probe.LowGainProbeError, match="requires --allow-motion"):
@@ -1364,12 +1370,6 @@ def _parse_cartesian_args(*extra: str) -> object:
             "source",
             "--kp",
             "0",
-            "--support-joint",
-            "joint4",
-            "--support-joint",
-            "joint5",
-            "--support-joint",
-            "joint6",
             "--allow-motion",
             "--auto-disable",
             "--confirmation",
@@ -1379,29 +1379,11 @@ def _parse_cartesian_args(*extra: str) -> object:
     )
 
 
-def test_cartesian_cli_requires_all_six_joints_and_zero_joint_stiffness() -> None:
+def test_cartesian_cli_uses_all_six_joints_and_requires_zero_joint_stiffness() -> None:
     args = _parse_cartesian_args()
 
     probe._validate_cli(args)
-
-    incomplete = probe.build_parser().parse_args(
-        [
-            "--mode",
-            "cartesian-hold",
-            "--config",
-            "config.yaml",
-            "--rebot-source-root",
-            "source",
-            "--kp",
-            "0",
-            "--allow-motion",
-            "--auto-disable",
-            "--confirmation",
-            probe.CONFIRMATION,
-        ]
-    )
-    with pytest.raises(ValueError, match="canonical joint1..joint6"):
-        probe._validate_cli(incomplete)
+    assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
     nonzero_kp = _parse_cartesian_args("--kp", "0.1")
     with pytest.raises(ValueError, match="requires --kp 0"):
@@ -1419,12 +1401,6 @@ def _parse_pose_args(*extra: str) -> object:
             "source",
             "--kp",
             "0",
-            "--support-joint",
-            "joint4",
-            "--support-joint",
-            "joint5",
-            "--support-joint",
-            "joint6",
             "--allow-motion",
             "--auto-disable",
             "--confirmation",

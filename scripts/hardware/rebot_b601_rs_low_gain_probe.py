@@ -643,34 +643,10 @@ def _validate_protective_hold_feedback(
     return current
 
 
-def resolve_active_joint_names(
-    target_joint: str,
-    support_joints: Sequence[str] = _FAULT_HOLD_JOINTS,
-) -> tuple[str, ...]:
-    """Resolve the explicit command set for a low-gain probe.
+def resolve_active_joint_names() -> tuple[str, ...]:
+    """Return the complete B601 arm command set used by impedance modes."""
 
-    The target is the only joint whose reference may change in ``slow-step``.
-    Joint2 and joint3 remain mandatory support joints so the first single-joint
-    check cannot accidentally enable a wrist-only subset.  The selected set is
-    still dispatched explicitly; ``--joint`` no longer implies six-joint TX.
-    """
-
-    target = str(target_joint).strip()
-    if target not in _ALL_JOINTS:
-        raise ValueError(f"unknown B601-RS joint: {target_joint}")
-    try:
-        support = tuple(str(name).strip() for name in support_joints)
-    except TypeError as exc:
-        raise ValueError("support_joints must be a sequence of joint names") from exc
-    if any(name not in _ALL_JOINTS for name in support):
-        unknown = sorted(set(support).difference(_ALL_JOINTS))
-        raise ValueError(f"unknown B601-RS support joints: {unknown}")
-    names = tuple(dict.fromkeys((target, *support)))
-    if not set(_FAULT_HOLD_JOINTS).issubset(names):
-        raise ValueError(
-            "joint2 and joint3 are mandatory support joints for the fault hold"
-        )
-    return names
+    return _ALL_JOINTS
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
@@ -919,21 +895,13 @@ def _validate_cli(args: argparse.Namespace) -> None:
     )
     if args.mode == "slow-step" and args.step_rad <= 0.0:
         raise ValueError("slow-step mode requires step_rad > 0")
-    active_joint_names = resolve_active_joint_names(
-        args.joint,
-        getattr(args, "support_joints", _FAULT_HOLD_JOINTS),
-    )
-    if args.mode in ("cartesian-hold", "pose-hold"):
-        if args.kp != 0.0 or target_kp not in (None, 0.0):
-            raise ValueError(
-                f"{args.mode} requires --kp 0 and no non-zero --target-kp "
-                "to avoid joint-position stiffness"
-            )
-        if active_joint_names != _ALL_JOINTS:
-            raise ValueError(
-                f"{args.mode} requires the canonical joint1..joint6 active set; "
-                "use joint1 as target and add joint4, joint5, and joint6 as support joints"
-            )
+    if args.mode in ("cartesian-hold", "pose-hold") and (
+        args.kp != 0.0 or target_kp not in (None, 0.0)
+    ):
+        raise ValueError(
+            f"{args.mode} requires --kp 0 and no non-zero --target-kp "
+            "to avoid joint-position stiffness"
+        )
 
 
 def _resolve_model_and_limits(
@@ -1236,14 +1204,11 @@ def _run_driver_torque_limit_roundtrip_probe(
     source_root: Path,
     model: B601PinocchioModel,
     position_limits: tuple[tuple[float, float], ...],
-    target_joint: str,
     torque_limits_nm: tuple[float, ...],
 ) -> dict[str, object]:
-    """Verify one volatile ``0x700B`` apply/restore transaction while disabled."""
+    """Verify the six-arm-joint ``0x700B`` transaction while disabled."""
 
-    if target_joint not in _ALL_JOINTS:
-        raise ValueError(f"unknown B601-RS joint: {target_joint}")
-    target_names = (target_joint,)
+    target_names = _ALL_JOINTS
     connected = False
     preflight_disable: B601ModeReceipt | None = None
     cleanup_receipt: B601ModeReceipt | None = None
@@ -1352,8 +1317,8 @@ def _run_driver_torque_limit_roundtrip_probe(
         "urdf_path": str(model.urdf_path),
         "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
         "transport": "motorbridge_wired_local",
-        "target_joint": target_joint,
-        "target_limit_nm": torque_limits_nm[_ALL_JOINTS.index(target_joint)],
+        "joint_names": target_names,
+        "target_limits_nm": torque_limits_nm,
         "parameter": "RobStride limit_torque 0x700B",
         "parameter_persistence": "volatile_not_saved",
         "feedback_validated": feedback_validated,
@@ -1370,7 +1335,7 @@ def _run_driver_torque_limit_roundtrip_probe(
         "hardware_acceptance": "NOT_CLAIMED",
         "notes": [
             "This mode never changes control mode, enables a motor, or sends MIT/POS_VEL commands.",
-            "It writes only the selected arm motor's volatile RobStride limit_torque (0x700B), verifies readback, safe-stops again, and restores the exact observed original value with readback.",
+            "It writes every arm motor's volatile RobStride limit_torque (0x700B), verifies every readback, safe-stops again, and restores every exact observed original value with readback.",
             "A PASS validates the guarded parameter transaction only; it is not a motion, force-control, or haptic acceptance result.",
         ],
     }
@@ -2392,7 +2357,6 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             source_root=source_root,
             model=model,
             position_limits=position_limits,
-            target_joint=args.joint,
             torque_limits_nm=torque_limits,
         )
     overlay_limits = (
@@ -2421,12 +2385,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
+    active_joint_names = resolve_active_joint_names()
     support_joint_names = tuple(
-        getattr(args, "support_joints", _FAULT_HOLD_JOINTS)
-    )
-    active_joint_names = resolve_active_joint_names(
-        args.joint,
-        support_joints=support_joint_names,
+        name for name in active_joint_names if name != args.joint
     )
     stop = {"requested": False, "full_disable_requested": False}
     previous_q: tuple[float, ...] | None = None
@@ -2555,7 +2516,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             driver_limit_apply_receipt = (
                 backend.apply_temporary_driver_torque_limits(
                     torque_limits,
-                    joint_names=(args.joint,),
+                    joint_names=active_joint_names,
                 )
             )
             if not driver_limit_apply_receipt.completed:
@@ -3467,7 +3428,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "pose-hold anchors the complete fresh post-enable FK transform and applies bounded world-aligned force and torque through the same J.T wrench path.",
             "Software composes gravity, position, finite-difference damping, and an optional bounded J.T wrench overlay, then dispatches vendor MIT kp=kd=0.",
-            "When explicitly requested, the probe temporarily mirrors the target joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies readback before enable, and restores the original value after full safe_stop.",
+            "When explicitly requested, the probe temporarily mirrors every arm joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies every readback before enable, and restores every original value after full safe_stop.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
             "A slow-step PASS additionally requires a completed reference, correct-direction bounded target response, and bounded support-joint drift. It is not a HARDWARE_PASS or force-sensor validation.",
@@ -3509,14 +3470,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--joint",
         choices=_ALL_JOINTS,
         default="joint1",
-        help="joint whose reference may change; joint2/joint3 remain support joints",
-    )
-    parser.add_argument(
-        "--support-joint",
-        dest="support_joints",
-        action="append",
-        default=list(_FAULT_HOLD_JOINTS),
-        help="additional support joint; joint2 and joint3 are always mandatory",
+        help=(
+            "slow-step target and optional gain-override joint; all impedance "
+            "modes always enable and command joint1..joint6"
+        ),
     )
     parser.add_argument("--step-rad", type=float, default=_DEFAULT_STEP_RAD)
     parser.add_argument(
@@ -3548,9 +3505,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply-driver-torque-limits",
         action="store_true",
         help=(
-            "temporarily mirror the target joint's scaled URDF torque envelope "
-            "into volatile RobStride limit_torque (0x700B), with readback and "
-            "restoration"
+            "temporarily mirror all six scaled URDF torque envelopes into "
+            "volatile RobStride limit_torque (0x700B), with per-joint readback "
+            "and restoration"
         ),
     )
     parser.add_argument(

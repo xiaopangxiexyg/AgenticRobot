@@ -450,8 +450,9 @@ run_logged() {
 }
 ```
 
-在任何新的 active J6 试验前，先单独验证驱动器临时总力矩限幅事务。下面模式只对 J6：
-读取一份完整合法反馈、`safe_stop`、把 scaled URDF effort 写入易失的 `0x700B` 并回读，
+在任何新的 active 阻抗试验前，先单独验证六轴驱动器临时总力矩限幅事务。下面模式对
+J1..J6 逐轴读取一份完整合法反馈、`safe_stop`、把 scaled URDF effort 写入易失的
+`0x700B` 并回读，
 再次 `safe_stop`，最后恢复本次运行实际读到的原值并回读。它不切模式、不调用 `enable()`、
 不发 MIT/POS_VEL 命令，因此不会显示 `[DRIVE]` 倒计时；但它会写驱动器参数，仍须前台运行、
 保持机械支撑和可触达急停：
@@ -465,12 +466,11 @@ if cd "$WT"; then
       --mode driver-torque-limit-roundtrip \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
-      --joint joint6 \
       --torque-limit-scale 0.1 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP \
-      --output "$OUT_DIR/b601_driver_torque_limit_roundtrip_joint6.json"; then
+      --output "$OUT_DIR/b601_driver_torque_limit_roundtrip_all_arm.json"; then
     STATUS=0
   else
     STATUS=$?
@@ -485,9 +485,9 @@ printf '%s\n' 'shell remains active'
 
 只有 `status=OK`、两份 `safe_stop` receipt 完整、`apply_receipt.completed=true`、
 `restore_receipt.completed=true`，且 apply 的 `prior_limits_nm` 与 restore 的
-`verified_limits_nm` 一致，才允许在后续 active 命令中加入
-`--apply-driver-torque-limits`。active 路径也只会临时改写 `--joint` 指定的同一个目标关节，
-不会顺带改写支撑关节。这只验收 J6 参数事务，不证明电机会运动或力控有效。
+`verified_limits_nm` 逐轴一致，才允许在后续 active 命令中加入
+`--apply-driver-torque-limits`。active 路径会对 J1..J6 使用同一完整 active set，逐轴应用、
+回读并恢复限制。这只验收六轴参数事务，不证明电机会运动或力控有效。
 
 完成该往返验收后，active `hold` 命令如下。它仍会在前台显示 `[DRIVE] 3/2/1/ENABLE`：
 
@@ -503,28 +503,22 @@ if cd "$WT"; then
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
-      --joint joint6 \
-      --support-joint joint1 \
-      --support-joint joint4 \
-      --support-joint joint5 \
       --kp 0.25 \
       --kd 0.5 \
-      --target-kp 0.5 \
-      --target-kd 0.5 \
       --gravity-scale 0.1 \
       --torque-limit-scale 0.1 \
       --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
-      --velocity-abort-rad-s 0.05 \
+      --velocity-abort-rad-s 0.12 \
       --acceleration-abort-rad-s2 4.0 \
-      --max-error-rad 0.05 \
+      --max-error-rad 0.12 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
       --fault-hold-max-age-sec 0.15 \
       --fault-hold-max-velocity-rad-s 0.02 \
       --fault-hold-max-rebase-rad 0.05 \
-      --output "$OUT_DIR/b601_low_gain_hold_joint6_all_arm.json"; then
+      --output "$OUT_DIR/b601_low_gain_hold_all_arm.json"; then
     STATUS=0
   else
     STATUS=$?
@@ -610,9 +604,6 @@ if cd "$WT"; then
       --freeze-sec 1 \
       --rate-hz 20 \
       --joint joint6 \
-      --support-joint joint1 \
-      --support-joint joint4 \
-      --support-joint joint5 \
       --step-direction 1 \
       --step-rad 0.02 \
       --step-speed-rad-s 0.005 \
@@ -624,7 +615,7 @@ if cd "$WT"; then
       --torque-limit-scale 0.1 \
       --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
-      --velocity-abort-rad-s 0.05 \
+      --velocity-abort-rad-s 0.12 \
       --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.05 \
       --allow-motion \
@@ -699,15 +690,12 @@ if cd "$WT"; then
       --freeze-sec 1 \
       --rate-hz 20 \
       --joint joint1 \
-      --support-joint joint4 \
-      --support-joint joint5 \
-      --support-joint joint6 \
       --kp 0 \
       --kd 0.5 \
       --gravity-scale 0.5 \
       --torque-limit-scale 0.15 \
       --torque-rise-time-sec 2.0 \
-      --velocity-abort-rad-s 0.05 \
+      --velocity-abort-rad-s 0.12 \
       --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.15 \
       --cartesian-stiffness-n-per-m 10 \
@@ -769,15 +757,12 @@ if cd "$WT"; then
       --freeze-sec 1 \
       --rate-hz 20 \
       --joint joint1 \
-      --support-joint joint4 \
-      --support-joint joint5 \
-      --support-joint joint6 \
       --kp 0 \
       --kd 0.5 \
       --gravity-scale 0.5 \
       --torque-limit-scale 0.15 \
       --torque-rise-time-sec 2.0 \
-      --velocity-abort-rad-s 0.05 \
+      --velocity-abort-rad-s 0.12 \
       --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.15 \
       --cartesian-stiffness-n-per-m 10 \
