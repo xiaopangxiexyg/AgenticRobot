@@ -6,6 +6,12 @@
 `selected_ordinal=0` 是当前最佳候选，`backend_id` 明确报告 `vgn` 或 `graspnet`，并输出一张标注
 JPEG 文件。VGN 是默认后端；GraspNet 仅在操作者持有相应授权并提供显式 acknowledgement 时可选。
 
+标注 JPEG 不再只画 TCP 十字。它按 DMTAC M 的 10 mm 指厚、25.5 mm 指高、50 mm 前伸和
+10 mm 掌部近似包络绘制双指/掌部线框，并绘制 TCP `+X/+Y/+Z` 三轴；最佳候选用高亮色，其他
+候选用次级颜色。投影先裁剪相机近裁剪面，再裁剪图像边界，因此部分进入画面的抓姿仍能显示，
+完全位于相机后方或画面外的候选会在图例中明确标为 `behind_camera` 或 `out_of_frame`，不会静默
+消失。该图仍是简单几何叠加，不做深度遮挡测试。
+
 该入口不创建 RM65 backend、不执行 IK、轨迹规划、夹爪命令或机械臂运动。输出中的 base-frame
 姿态只绑定用户提供的本地标定文件，不是 Gateway 可信 Station pose，不能绕过下游正式 motion
 owner、碰撞场景和安全门禁。
@@ -241,6 +247,14 @@ planner semantic content hash。
 - `T_camera_from_tcp`：把 TCP 坐标转换到相机 optical frame；
 - `T_base_from_tcp`：`T_base_from_camera @ T_camera_from_tcp`；
 - `tcp_xyz_*_m` 是对应矩阵平移列的便捷副本。
+
+共享投影实现位于 `deployments.perception.dmtac_grasp_overlay`。给定同一 reference frame 下的
+`T_reference_from_tcp` 与 `T_reference_from_camera`，它按
+`T_camera_from_tcp = inv(T_reference_from_camera) @ T_reference_from_tcp` 得到任意视角中的抓姿，
+返回线段可见数、TCP 像素和 `visible`、`partially_visible`、`behind_camera`、`out_of_frame`
+之一。这个接口不依赖 MuJoCo 或 RealSense；本轮只在 MuJoCo 的 `front`、`left_wrist`、
+`right_wrist` 三视角中接通。真实相机的动态外参获取、图像/投影记录持久化和上层调用协议不在
+本轮范围内。
 
 ## 已知局限
 

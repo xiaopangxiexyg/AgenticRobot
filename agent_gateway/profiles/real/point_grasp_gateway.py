@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.runtime.artifact_producer import (
@@ -40,6 +40,10 @@ from dataset_contracts.perception_artifacts import (
     POINT_GRASP_DEPTH_MEDIA_TYPE_V1,
     POINT_GRASP_DEPTH_SCHEMA_ID_V1,
     POINT_GRASP_RGB_SCHEMA_ID_V1,
+)
+from deployments.perception.dmtac_grasp_overlay import (
+    DmtacGraspOverlayCandidate,
+    render_dmtac_grasp_overlays,
 )
 
 from .localization_gateway import (
@@ -91,41 +95,24 @@ def _annotate(
     prepared: Any,
     intrinsics: dict[str, Any],
 ) -> bytes:
-    output = image.copy()
-    draw = ImageDraw.Draw(output)
-    u, v = pixel_uv
-    draw.ellipse((u - 5, v - 5, u + 5, v + 5), outline=(255, 255, 0), width=3)
-    x0, y0, x1, y1 = prepared.target_mask_bbox_xyxy
-    draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(64, 220, 255), width=2)
-    for ordinal, candidate in enumerate(prepared.candidates):
-        matrix = np.asarray(candidate.camera_from_tcp).reshape(4, 4)
-        point = matrix[:3, 3]
-        if point[2] <= 0:
-            continue
-        candidate_u = round(
-            float(intrinsics["fx"]) * point[0] / point[2] + float(intrinsics["cx"])
+    candidates = tuple(
+        DmtacGraspOverlayCandidate.from_pose(
+            ordinal=ordinal,
+            score=candidate.score,
+            gripper_width_m=candidate.gripper_width_m,
+            reference_from_tcp=candidate.camera_from_tcp,
+            selected=ordinal == 0,
         )
-        candidate_v = round(
-            float(intrinsics["fy"]) * point[1] / point[2] + float(intrinsics["cy"])
-        )
-        if not (0 <= candidate_u < output.width and 0 <= candidate_v < output.height):
-            continue
-        color = (255, 32, 32) if ordinal == 0 else (255, 160, 32)
-        draw.line(
-            (candidate_u - 6, candidate_v, candidate_u + 6, candidate_v),
-            fill=color,
-            width=2,
-        )
-        draw.line(
-            (candidate_u, candidate_v - 6, candidate_u, candidate_v + 6),
-            fill=color,
-            width=2,
-        )
-        draw.text(
-            (candidate_u + 7, candidate_v + 4),
-            f"{ordinal}: {candidate.score:.3f} w={candidate.gripper_width_m:.3f}m",
-            fill=color,
-        )
+        for ordinal, candidate in enumerate(prepared.candidates)
+    )
+    output, _projections = render_dmtac_grasp_overlays(
+        image,
+        candidates=candidates,
+        reference_from_camera=np.eye(4),
+        intrinsics=intrinsics,
+        target_pixel_uv=pixel_uv,
+        target_bbox_xyxy=tuple(prepared.target_mask_bbox_xyxy),
+    )
     stream = io.BytesIO()
     output.save(stream, format="JPEG", quality=90, optimize=True)
     return stream.getvalue()

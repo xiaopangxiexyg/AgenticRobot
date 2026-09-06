@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from agent_gateway.profiles.real import point_grasp_gateway
 from agent_gateway.profiles.real.point_grasp_deployment import (
     REAL_POINT_GRASP_DEPTH_SLOT_ID_V1,
     REAL_POINT_GRASP_RGB_SLOT_ID_V1,
@@ -171,6 +172,41 @@ def test_point_grasp_local_rgbd_produces_camera_and_base_tcp_poses(
         request.parameters, result
     )
     assert Image.open(io.BytesIO(prepared.annotated_jpeg)).size == (12, 10)
+
+
+def test_point_grasp_skill_annotation_uses_dmtac_wireframe_renderer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rgb = tmp_path / "frame.png"
+    Image.new("RGB", (12, 10), color=(32, 64, 96)).save(rgb)
+    depth = tmp_path / "depth.npy"
+    np.save(depth, np.full((10, 12), 0.5, dtype=np.float32), allow_pickle=False)
+    calls = []
+
+    def _render(image, *, candidates, reference_from_camera, intrinsics, **kwargs):
+        calls.append((candidates, reference_from_camera, intrinsics, kwargs))
+        return image.copy(), ()
+
+    monkeypatch.setattr(point_grasp_gateway, "render_dmtac_grasp_overlays", _render)
+    provider = PointGraspProvider(
+        planner=_FakePlanner(),
+        registration=_registration(),
+        allowed_local_image_roots=(tmp_path,),
+    )
+    provider.plan_request(
+        SimpleNamespace(parameters=_parameters(rgb, depth), input_artifact_bindings=()),
+        artifact_store=SimpleNamespace(),
+    )
+
+    assert len(calls) == 1
+    candidates, reference_from_camera, intrinsics, kwargs = calls[0]
+    assert len(candidates) == 1
+    assert candidates[0].selected
+    assert candidates[0].gripper_width_m == 0.05
+    np.testing.assert_array_equal(reference_from_camera, np.eye(4))
+    assert intrinsics["width"] == 12
+    assert kwargs["target_pixel_uv"] == (6, 5)
+    assert kwargs["target_bbox_xyxy"] == (2, 2, 10, 9)
 
 
 def test_local_rgb_and_depth_may_use_different_allowlisted_roots(

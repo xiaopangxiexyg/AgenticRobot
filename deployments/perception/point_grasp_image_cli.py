@@ -9,7 +9,12 @@ import math
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
+
+from deployments.perception.dmtac_grasp_overlay import (
+    DmtacGraspOverlayCandidate,
+    render_dmtac_grasp_overlays,
+)
 
 from .localize_image_cli import MAX_INPUT_PIXELS, _atomic_write, _load_image
 from .sam2_graspnet_point_grasp import (
@@ -133,36 +138,24 @@ def _annotated_jpeg(
     planned: object,
     intrinsics: dict[str, float | int],
 ) -> bytes:
-    output = image.copy()
-    draw = ImageDraw.Draw(output)
-    u, v = pixel_uv
-    draw.ellipse((u - 5, v - 5, u + 5, v + 5), outline=(255, 255, 0), width=3)
-    x0, y0, x1, y1 = planned.target_mask_bbox_xyxy
-    draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(64, 220, 255), width=2)
-    for ordinal, candidate in enumerate(planned.candidates):
-        matrix = np.asarray(candidate.camera_from_tcp, dtype=float).reshape(4, 4)
-        point = matrix[:3, 3]
-        if point[2] <= 0:
-            continue
-        candidate_u = round(
-            float(intrinsics["fx"]) * point[0] / point[2] + float(intrinsics["cx"])
+    candidates = tuple(
+        DmtacGraspOverlayCandidate.from_pose(
+            ordinal=ordinal,
+            score=candidate.score,
+            gripper_width_m=candidate.gripper_width_m,
+            reference_from_tcp=candidate.camera_from_tcp,
+            selected=ordinal == 0,
         )
-        candidate_v = round(
-            float(intrinsics["fy"]) * point[1] / point[2] + float(intrinsics["cy"])
-        )
-        if not (0 <= candidate_u < output.width and 0 <= candidate_v < output.height):
-            continue
-        color = (255, 32, 32) if ordinal == 0 else (255, 160, 32)
-        draw.line(
-            (candidate_u - 6, candidate_v, candidate_u + 6, candidate_v),
-            fill=color,
-            width=2,
-        )
-        draw.line(
-            (candidate_u, candidate_v - 6, candidate_u, candidate_v + 6),
-            fill=color,
-            width=2,
-        )
+        for ordinal, candidate in enumerate(planned.candidates)
+    )
+    output, _projections = render_dmtac_grasp_overlays(
+        image,
+        candidates=candidates,
+        reference_from_camera=np.eye(4),
+        intrinsics=intrinsics,
+        target_pixel_uv=pixel_uv,
+        target_bbox_xyxy=tuple(planned.target_mask_bbox_xyxy),
+    )
     stream = io.BytesIO()
     output.save(stream, format="JPEG", quality=90, optimize=True)
     return stream.getvalue()
