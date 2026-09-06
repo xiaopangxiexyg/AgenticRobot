@@ -267,7 +267,9 @@ def test_shell_entrypoint_is_executable_and_delegates_to_module() -> None:
     javascript = (root / "control_station/quest_calibration/static/app.js").read_text(
         encoding="utf-8"
     )
-    assert "封存候选（当前仅内存）" in html
-    assert "完成窗口（自动排空）" in html
-    assert "completeWindowWithBoundedDrain" in javascript
-    assert "attempt < 20" in javascript
+    assert "终端控制（当前运行模式）" in html
+    assert "按 <code>r</code>" in html
+    assert "按 <code>c</code>" in html
+    assert "封存候选（当前仅内存）" not in html
+    assert "completeWindowWithBoundedDrain" not in javascript
+    assert 'fetch("/intent"' not in javascript

@@ -12,6 +12,7 @@
   captureStatusCard.innerHTML = '<span class="label">Quest capture</span><span class="bad">waiting for terminal</span>';
   statusRoot.appendChild(captureStatusCard);
   const captureStatus = captureStatusCard.querySelector('span:last-child');
+  const overlayCaptureStatus = document.getElementById('xr-overlay-capture-status');
 
   let enabled = false;
   let config = {};
@@ -63,6 +64,10 @@
   function setCaptureStatus(text, ok) {
     captureStatus.textContent = text;
     captureStatus.className = ok ? 'ok' : 'bad';
+    if (overlayCaptureStatus) {
+      overlayCaptureStatus.textContent = text;
+      overlayCaptureStatus.className = ok ? 'ok' : 'bad';
+    }
   }
 
   function captureStatusText(message) {

@@ -32,29 +32,18 @@
     <p>采集状态：<strong id="captureState">-</strong>　已完成窗口：<strong id="completedCount">0</strong></p>
   </section>
   <section class="panel">
-    <h2>1. 选择 Quest 手柄与机械臂侧</h2>
-    <div class="grid">
-      <label>候选手柄<select id="candidate"></select></label>
-      <label>机械臂侧<select id="robotSide"><option value="right">right</option><option value="left">left</option></select></label>
-      <label>Quest reference frame ID<input id="referenceFrame" value="quest-local-floor-generation-0"></label>
-      <label>Controller grip frame ID<input id="movingFrame" value="quest-controller-grip"></label>
-      <label>WebXR frame clock ID<input id="frameClock" value="webxr-frame-clock"></label>
-    </div>
-    <div class="actions"><button id="selectSource">选择并绑定</button></div>
+    <h2>终端控制（当前运行模式）</h2>
+    <p>先在 Quest 页面输入配对码并进入 MR/VR。确认 Quest 与左臂状态已连接后，回到启动终端：</p>
+    <ol>
+      <li>按 <code>r</code> 开始静止窗口，保持当前姿态，再按 <code>r</code> 完成窗口。</li>
+      <li>改变姿态并重复，至少完成 3 个窗口（建议 15 个以上）。</li>
+      <li>按 <code>c</code> 封存已完成窗口并执行 AX=XB 诊断解算。</li>
+    </ol>
+    <div class="muted">本页只显示脱敏状态，不再提供旧的手柄选择、窗口按钮或“封存候选”操作；所有采集动作由终端键盘控制。</div>
   </section>
   <section class="panel">
-    <h2>2. 静止窗口</h2>
-    <label>窗口 ID<input id="windowId" value="stationary-window-001"></label>
-    <div class="actions">
-      <button id="beginWindow">开始窗口</button>
-      <button id="completeWindow">完成窗口（自动排空）</button>
-      <button id="seal">封存候选（当前仅内存）</button>
-      <button class="danger" id="cancel">取消并关闭采集</button>
-    </div>
-    <div class="muted">完成后窗口 ID 自动递增；建议采集至少 15 个覆盖工作空间、绕两个以上非平行轴旋转的静止姿态。</div>
-  </section>
-  <section class="panel">
-    <h2>脱敏状态</h2>
+    <h2>脱敏状态（只读）</h2>
+    <p>Quest 控制器候选：<strong id="candidateSummary">等待 Quest 进入 MR/VR</strong></p>
     <pre id="status">等待状态...</pre>
     <div class="muted">此页面不显示矩阵、原始 pose、事件流、证据数据集或拟合结果。</div>
     <div class="muted">测试结束后请回到启动终端按 Ctrl+C，完成整个会话的有序关闭。</div>

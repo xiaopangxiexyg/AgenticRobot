@@ -9,6 +9,7 @@ const vm = require('node:vm');
 function loadFeature() {
   let implementation = null;
   const status = { className: '', textContent: '' };
+  const overlayStatus = { className: '', textContent: '' };
   const statusCard = {
     className: '',
     innerHTML: '',
@@ -30,7 +31,11 @@ function loadFeature() {
   const context = {
     document: {
       createElement: () => statusCard,
-      getElementById: () => ({ appendChild: () => {} }),
+      getElementById: (id) => (
+        id === 'xr-overlay-capture-status'
+          ? overlayStatus
+          : { appendChild: () => {} }
+      ),
     },
     window: {
       QuestDevFeatures: {
@@ -53,7 +58,7 @@ function loadFeature() {
   );
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), context, { filename });
   implementation.configure({}, { enabled: true, protocolVersion: 2 });
-  return { implementation, status, draws };
+  return { implementation, status, draws, overlayStatus };
 }
 
 function identityMatrix() {
@@ -162,7 +167,7 @@ test('visualization draws TCP axes only for the current accepted Quest epoch', (
 });
 
 test('visualization draws diagnostic robot base and raw-feedback TCP preview', () => {
-  const { implementation, draws, status } = loadFeature();
+  const { implementation, draws, status, overlayStatus } = loadFeature();
   implementation.onXRReady({ gl: {} });
   implementation.handleServerMessage({
     message: {
@@ -201,4 +206,5 @@ test('visualization draws diagnostic robot base and raw-feedback TCP preview', (
   implementation.renderView(matchingContext());
   assert.equal(draws.length, 3);
   assert.match(status.textContent, /robot feedback 1 fresh/);
+  assert.match(overlayStatus.textContent, /diagnostic preview only/);
 });
