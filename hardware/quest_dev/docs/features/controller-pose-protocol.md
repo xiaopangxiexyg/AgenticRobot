@@ -48,5 +48,5 @@ latest pose，并拒绝旧 generation 的后续样本。session end 或 WSS disc
 矩阵为 column-major `T_reference_from_grip`。host 严格校验 finite、齐次末行、
 正交旋转和 determinant `+1`，限制 controller 数量、profiles 长度、序号及到达频率。
 runtime 只保留每个认证客户端的 latest sample；不写文件、不形成轨迹，也不调用任何
-机器人、Redis 或控制接口。需要 pairing bearer 的 `/api/status` 只暴露
+机器人、外部缓存或控制接口。需要 pairing bearer 的 `/api/status` 只暴露
 session/generation/sequence/count 摘要，不暴露 pose matrix。

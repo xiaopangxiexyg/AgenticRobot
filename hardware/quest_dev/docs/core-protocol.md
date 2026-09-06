@@ -65,7 +65,7 @@ Feature 可通过 `server.publish_feature_message(feature_name, payload)` 向所
 
 ## HTTP 接口与状态最小化
 
-- `/api/config`：只返回 browser-safe 配置；不含 token、token env 名、Redis 地址或
+- `/api/config`：只返回 browser-safe 配置；不含 token、token env 名、RM65 IP 或
   host admission 配置；
 - `/api/status`：要求 `Authorization: Bearer <pairing-token>`，只保存连接认证状态、
   消息类型、身份/generation/sequence/count 等摘要；不保存 token、controller matrix

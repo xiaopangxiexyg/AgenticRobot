@@ -33,33 +33,34 @@ class VisualizationRuntime:
         ):
             print("[quest-dev:visualization] robot feedback disabled", flush=True)
             return
-        redis_cfg = feedback_cfg.get("redis", {})
-        sources_cfg = feedback_cfg.get("sources", {})
-        if not isinstance(redis_cfg, dict):
-            raise TypeError(
-                "features.visualization.robot_feedback.redis must be a mapping"
-            )
-        if not isinstance(sources_cfg, dict) or not sources_cfg:
-            raise TypeError(
-                "features.visualization.robot_feedback.sources must be a non-empty mapping"
-            )
         self.frame_bindings = self._load_frame_bindings(feedback_cfg)
-        from .robot_feedback import connect_redis
-
-        sources = {str(robot): str(key) for robot, key in sources_cfg.items()}
-        self.reader = connect_redis(
-            str(redis_cfg.get("host", "localhost")),
-            int(redis_cfg.get("port", 6379)),
-            int(redis_cfg.get("db", 0)),
-            float(redis_cfg.get("socket_timeout_s", 0.2)),
+        from .realman_feedback import (
+            RealManFeedbackReader,
+            parse_realman_arm_specs,
         )
+
+        realman_cfg = feedback_cfg.get("realman", {})
+        if not isinstance(realman_cfg, dict):
+            raise TypeError(
+                "features.visualization.robot_feedback.realman must be a mapping"
+            )
+        specs = parse_realman_arm_specs(realman_cfg)
+        self.reader = RealManFeedbackReader(
+            specs,
+            max_age_s=float(feedback_cfg.get("max_age_s", 0.25)),
+            frame_bindings=self.frame_bindings,
+            control_domain_id=str(
+                realman_cfg.get(
+                    "control_domain_id",
+                    "quest-dev:realman-rm65-observation",
+                )
+            ),
+        )
+        self.reader.start()
         self.thread = threading.Thread(
             target=self._run_feedback_loop,
             kwargs={
-                "sources": sources,
                 "rate_hz": float(feedback_cfg.get("rate_hz", 30)),
-                "max_age_s": float(feedback_cfg.get("max_age_s", 0.25)),
-                "frame_bindings": self.frame_bindings,
             },
             name="quest-dev-visualization-feedback",
             daemon=True,
@@ -71,17 +72,25 @@ class VisualizationRuntime:
             else "; no accepted frame bindings; TCP remains unrenderable"
         )
         print(
-            f"[quest-dev:visualization] read-only robot feedback enabled: "
-            f"{sources}{binding_text}",
+            f"[quest-dev:visualization] direct RealMan RM65 read-only feedback "
+            f"enabled: {tuple(spec.robot_id for spec in specs)}{binding_text}",
             flush=True,
         )
 
     def stop(self) -> None:
         if self.thread is not None:
             self.thread.join(timeout=2.0)
-        close_reader = getattr(self.reader, "close", None)
-        if callable(close_reader):
-            close_reader()
+            if self.thread.is_alive():
+                # Never close an RM65 transport while the reader may still be
+                # inside a vendor SDK request. Leave the resource owned and
+                # report cleanup failure to the host for a later retry.
+                raise RuntimeError(
+                    "RealMan feedback thread did not stop before the 2s "
+                    "cleanup deadline; RM65 transport remains open"
+                )
+        stop_reader = getattr(self.reader, "stop", None)
+        if callable(stop_reader):
+            stop_reader()
 
     @staticmethod
     def _load_frame_bindings(
@@ -132,23 +141,16 @@ class VisualizationRuntime:
     def _run_feedback_loop(
         self,
         *,
-        sources: dict[str, str],
         rate_hz: float,
-        max_age_s: float,
-        frame_bindings: Mapping[str, AcceptedFrameBinding] | None = None,
     ) -> None:
-        from .robot_feedback import poll_robot_feedback
-
         period_s = 1.0 / max(1.0, float(rate_hz))
         last_error: str | None = None
         while not self.stop_event.is_set():
             try:
-                message = poll_robot_feedback(
-                    self.reader,
-                    sources,
-                    max_age_s=float(max_age_s),
-                    frame_bindings=frame_bindings,
-                )
+                # The active runtime owns a direct RealMan reader. It never
+                # accepts browser/control input and never falls back to a
+                # cache or transport adapter.
+                message = self.reader.poll()
                 last_error = None
             except Exception as exc:  # noqa: BLE001 - keep the optional feature isolated.
                 error = f"{type(exc).__name__}: {exc}"

@@ -22,7 +22,7 @@ Core owns：
 - WebXR session/reference-space lifecycle 与 feature hook 调度；
 - browser-safe config 投影和 pose/token-redacted authenticated status。
 
-Core 不拥有 Redis、机器人 schema、标定 acceptance、轨迹、控制、safety 或渲染语义。
+Core 不拥有 RealMan 连接、机器人 schema、标定 acceptance、轨迹、控制、safety 或渲染语义。
 
 每个 `QuestDevHost` 是其 server、stop event 和 feature runtime 的唯一 host-side lifecycle
 owner。它按 YAML 顺序构造并启动每个 enabled feature，失败或退出时按相反顺序停止，再
