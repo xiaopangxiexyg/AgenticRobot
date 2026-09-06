@@ -852,17 +852,16 @@ class FeatureRuntimeTests(unittest.TestCase):
         stop_event = threading.Event()
 
         class Reader:
-            def get(self, key: str) -> str:
-                self.last_key = key
-                return json.dumps(
+            def poll(self) -> dict:
+                return robot_tcp_message(
                     {
-                        "timestamp": 100.0,
-                        "robot": "ar5_1",
-                        "control_ready": False,
-                        "tcp_pose": {
-                            "position": [0, 0, 0],
-                            "orientation_quat_xyzw": [0, 0, 0, 1],
-                        },
+                        "rm65_left": {
+                            "robot": "rm65_left",
+                            "source": "realman_rm65_direct",
+                            "fresh": True,
+                            "control_ready": False,
+                            "alignment_ready": False,
+                        }
                     }
                 )
 
@@ -879,19 +878,11 @@ class FeatureRuntimeTests(unittest.TestCase):
         host = BroadcastServer()
         runtime = VisualizationRuntime(host, {}, stop_event)
         runtime.reader = Reader()
-        with mock.patch(
-            "hardware.quest_dev.features.visualization.robot_feedback.time.time",
-            return_value=100.0,
-        ):
-            runtime._run_feedback_loop(
-                sources={"ar5_1": "ar5:feedback:ar5_1"},
-                rate_hz=30,
-                max_age_s=0.25,
-            )
+        runtime._run_feedback_loop(rate_hz=30)
         self.assertEqual(host.feature, "visualization")
         self.assertEqual(len(host.messages), 1)
-        self.assertTrue(host.messages[0]["robots"]["ar5_1"]["fresh"])
-        self.assertFalse(host.messages[0]["robots"]["ar5_1"]["control_ready"])
+        self.assertTrue(host.messages[0]["robots"]["rm65_left"]["fresh"])
+        self.assertFalse(host.messages[0]["robots"]["rm65_left"]["control_ready"])
 
 
 if __name__ == "__main__":

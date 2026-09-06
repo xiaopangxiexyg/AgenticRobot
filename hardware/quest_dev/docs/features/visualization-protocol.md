@@ -27,13 +27,13 @@ reference-space generation 的首次有效 viewer pose 前方锚定。controller
   "feature_protocol_version": 2,
   "server_timestamp": 1710000000.0,
   "robots": {
-    "ar5_1": {
-      "robot": "ar5_1",
-      "key": "ar5:feedback:ar5_1",
+    "rm65_left": {
+      "robot": "rm65_left",
+      "key": "realman:rm65_left",
       "fresh": true,
       "alignment_ready": false,
       "control_ready": false,
-      "frame": "robot_world",
+      "frame": "left_arm_base",
       "matrix_robot_from_tcp": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.1, 0.2, 0.3, 1]
     }
   }
@@ -61,10 +61,9 @@ reference-space generation 的首次有效 viewer pose 前方锚定。controller
 
 反馈缺失、过期、机器人身份不匹配、pose 非法、binding 缺失或 source/tool/FK/
 coordinate-binding identity 不匹配时，robot item 为不可投影状态，且不含
-matrix_quest_from_tcp。Redis adapter 不会把旧的裸 Redis payload 当作 canonical
-机械臂 pose；canonical passive pose journal publication 通过
-project_pose_publication() 投影，Redis 传输若要启用 Quest 投影必须携带同一份
-nested pose_binding identity。
+matrix_quest_from_tcp。活动路径直接读取 RealMan RM65，并通过
+canonical passive pose journal publication 和 project_pose_publication() 投影；
+不会把外部缓存或旧的裸 pose 当作 canonical 机械臂 pose。
 
 ## 坐标与绘制门槛
 

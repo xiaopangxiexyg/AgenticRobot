@@ -9,7 +9,7 @@ from hardware.quest_dev.features.visualization.frame_binding import (
     QuestFrameIdentity,
     RobotFrameIdentity,
 )
-from hardware.quest_dev.features.visualization.robot_feedback import (
+from hardware.quest_dev.features.visualization.pose_projection import (
     project_pose_publication,
 )
 from robot_motion.action.execution_observation import (
