@@ -186,6 +186,11 @@ trap cleanup EXIT
 prepare_run_root
 prepare_asset_compat_link
 configure_shards
+# Wrapper configuration is private to this invocation.  Do not leak it into
+# pytest shards, whose tests may launch a nested acceptance wrapper.
+unset DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT
+unset DEXTELEOP_FULL_ACCEPTANCE_JUNIT
+unset DEXTELEOP_FULL_ACCEPTANCE_SHARDS
 prepare_shards
 trap on_signal INT TERM
 
