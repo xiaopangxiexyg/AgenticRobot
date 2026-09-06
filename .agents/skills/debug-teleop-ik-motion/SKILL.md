@@ -1,9 +1,15 @@
 ---
 name: debug-teleop-ik-motion
-description: Diagnose or change the AgenticRobot pose-to-command motion path, including teleoperation jitter, sticking, catch-up, wrong-range or continued motion, IK branch and singularity faults, joint limits, interpolation, stateful modifiers, Active-versus-shadow gaps, and replay/deployment Pose-to-QPOS differences. Do not use for primary camera, device discovery, GUI, dataset schema, collision-model authoring, or hardware operation tasks.
+description: Diagnose, review, or change AgenticRobot pose-to-command behavior, including teleoperation jitter, sticking, catch-up, wrong-range or continued motion, IK branch and singularity faults, joint limits, interpolation, stateful modifiers, Active-versus-shadow gaps, and replay/deployment Pose-to-QPOS differences. Use for motion-path logic and evidence, not primary camera or device discovery, GUI, dataset schemas, remote execution, or Gateway wire contracts.
 ---
 
 # Debug Teleoperation IK Motion
+
+Own the motion path from source pose through accepted reference, dispatch, and
+measured feedback. Use `$remote-access` only for a required remote/device
+operation, `$change-agent-gateway` only when a Gateway-owned contract changes,
+and `$manage-project-local-resources` only when evidence placement or migration
+is itself part of the task.
 
 Locate the first authoritative divergence before changing downstream behavior.
 Read [motion contracts](references/motion-contracts.md) for frame, time, IK, and
@@ -75,17 +81,16 @@ change.
    Compare hard validity, pose error, branch behavior, dynamics, deadlines, and
    representative normal motion.
 
-## Incident boundary
+## Execution boundary
 
-- Do not start a device or command motion through this diagnostic Skill. Use
-  `$remote-access` for separately authorized remote/hardware operation.
+- This Skill may inspect or change code and run offline tests, replay, and
+  simulation. Remote processes, devices, and hardware belong to
+  `$remote-access` and the scope of the current request.
 - After unexpected real motion, freeze the implicated Active path, preserve the
   exact commands, configuration, logs, processes, and traces, and return to
   read-only diagnosis.
-- Stop on ambiguous frame/profile/authority, NaN, invalid FK, impossible time,
-  corrupt evidence, or failed hard certificates.
-- Do not tune and retry while the first divergence or missing safety invariant
-  remains open.
+- Treat ambiguous frames, NaN, invalid FK, impossible time, or corrupt evidence
+  as a failed diagnostic input rather than tuning around it.
 
 ## Report
 

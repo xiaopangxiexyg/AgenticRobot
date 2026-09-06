@@ -1,28 +1,30 @@
 ---
 name: change-agent-gateway
-description: Change or review AgenticRobot agent_gateway protocol, runtime, transport, semantic Skills, Routes, Artifact I/O, compatibility shims, or concrete simulation and real profiles. Use when adding or modifying a Gateway capability, schema, registration, executor binding, resource lifecycle, frame binding, admission, cancellation, HOLD, or protocol compatibility behavior.
+description: Change or review a proposed change to AgenticRobot agent_gateway-owned protocol, runtime, transport, semantic Skill, Route, Artifact I/O, compatibility, or concrete profile bindings. Use when a Gateway capability, schema, registration, executor binding, resource lifecycle, frame binding, admission, cancellation, HOLD, or public compatibility contract changes; do not use merely because a task runs remotely or debugs motion outside a Gateway boundary.
 ---
 
 # Change Agent Gateway
 
-Preserve one neutral Gateway core and one lower authority owner. Read
-[the Gateway README](../../../agent_gateway/README.md) and the nearest profile
-documentation for the changed surface.
+Own changes to the Gateway contract and its application bindings. Use
+`$remote-access` for remote execution, `$debug-teleop-ik-motion` for the
+pose-to-command motion path, and `$manage-project-local-resources` for ignored
+resource placement; combine Skills only when the task crosses those boundaries.
+
+Treat `agent_gateway/AGENTS.md` as the invariant contract. Locate relevant
+[Gateway README](../../../agent_gateway/README.md) sections by heading or symbol
+and inspect the current code, registration, profile documentation, and tests for
+the changed surface. Do not load the full README by default.
 
 ## Classify the change
 
 Choose one primary owner before editing:
 
-- `protocol/`: versioned wire types, schemas, hashes, catalogs, and
-  transport-neutral validation.
-- `runtime/`: admission, idempotency, reconciliation, operations, workers,
-  access policy, cancellation, and lower-port requests.
-- `transport/`: authenticated bounded transport over one runtime facade.
-- `skills/`: target-independent semantic definitions and strict I/O schemas.
-- `profiles/`: concrete application resources, Route/deployment binding,
-  executor construction, frames, observation, evaluation, and lifecycle.
-- compatibility path: stateless forwarding only; never a second schema, state,
-  worker, service, or resource owner.
+- `protocol/`: wire types, schemas, hashes, and catalogs.
+- `runtime/`: admission, operation state, reconciliation, and lower-port calls.
+- `transport/`: authenticated transport over the runtime facade.
+- `skills/`: target-independent semantics and strict I/O schemas.
+- `profiles/`: concrete resources, Routes, executors, frames, and lifecycle.
+- compatibility path: stateless forwarding to the current public contract.
 
 If the change spans owners, define the public contract and dependency order
 before implementing downstream bindings.
@@ -35,17 +37,11 @@ before implementing downstream bindings.
 2. Separate semantic Skill choice from trusted Route, deployment, frame,
    resource, safety, and controller binding.
 3. Modify the owning type, schema, registration template, or profile first.
-   Make invalid combinations fail closed at construction or admission.
-4. Preserve exact version/hash domains, idempotency, cancellation, timeout,
-   reconciliation, and lower-receipt semantics. Upgrade the public v2 surface
-   in place unless an explicitly reviewed version transition is requested.
-5. Keep inspection/perception strictly read-only. Keep real motion default-off
-   and require exact operator-derived authorization, request-bound grant, fresh
-   lower state, lower owner readiness, and lower-confirmed terminal HOLD.
-6. Keep application resources outside Skill invocation. Start/admit them before
-   publishing transport; close them through one reversible application
-   lifecycle.
-7. Update current backend or capability information in versioned manifests,
+4. Preserve the scoped AGENTS contracts for protocol identity, admission,
+   effects, lower receipts, resource lifecycle, and compatibility. Make invalid
+   combinations fail at construction or admission rather than in downstream
+   execution.
+5. Update current backend or capability information in versioned manifests,
    registries, or profile documentation, not in `AGENTS.md`.
 
 ## Validation

@@ -1,9 +1,9 @@
 # Agent Gateway Instructions
 
 `agent_gateway` is the upper-framework-neutral attachment and Skill execution
-control plane. Read `agent_gateway/README.md` and use
-`$change-agent-gateway` for protocol, runtime, transport, Skill, Route, Artifact,
-or concrete-profile changes.
+control plane. Use `$change-agent-gateway` for changes on this surface. Inspect
+only the relevant `agent_gateway/README.md` section, current owner code, and
+focused tests instead of loading the entire README by default.
 
 ## Ownership
 

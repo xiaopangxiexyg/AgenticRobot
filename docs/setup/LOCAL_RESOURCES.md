@@ -1,7 +1,7 @@
 # Worktree 本地资源与迁移
 
 本仓库的本地状态不只有 `assets/`。离线数据集、采集记录、运行证据、模型权重、厂商目录、
-机器路径、密钥、日志、测试输出、缓存和未版本化的 Agent 状态都可能被 `.gitignore`
+机器配置、开发证书、日志、测试输出、缓存和未版本化的 Agent 状态都可能被 `.gitignore`
 隐藏。它们不出现在 `git status` 中，也不会随分支合并或 `git clone` 自动迁移。只有
 `.agents/skills/` 下明确放行并通过治理测试的项目 Skill 属于版本化源码。
 
@@ -18,7 +18,7 @@
 | `external-input` | `datasets/`、`data/`、`remote_data/`、历史离线数据 | 保留仓库外 canonical root，通过 `local_paths.json`、环境变量或 profile 绑定 |
 | `mutable-evidence` | `runtime_artifacts/`、未跟踪的 `teleop_records/`、日志和输出 | 停止写入后做 inventory、复制和 hash/count 验证，再切换绑定 |
 | `local-vendor` | 模型权重、仿真安装、厂商 checkout | 检查来源与 tracked 边界后逐项绑定或复制 |
-| `local-secret` | `.env*`、`local_paths.json`、设备本地配置 | 从 tracked example 或密钥管理重新创建，不进入迁移回执 |
+| `machine-local-config` | `.env*`、`local_paths.json`、设备本地配置、开发证书 | 按目标需要复制、从 example 重新创建或重新绑定；始终保持 Git 忽略 |
 | `generated` | venv、cache、build、coverage、临时输出 | 在目标 worktree 重建，不迁移 |
 | `developer-private` | `.codex/`、`.agents/` 中未放行的状态与 Skill、`todos/`、编辑器状态 | 保持个人本地，不得成为源码或运行依赖 |
 | `local-archive` | 根目录 `legacy/` 本地副本 | 严格忽略且不得 Git 跟踪；确需迁移时做验证复制，版本化历史说明只进入 `docs/legacy/` |
@@ -58,7 +58,7 @@ python scripts/dev_local_resources.py audit
 python scripts/dev_local_resources.py audit --json
 ```
 
-命令不会枚举目录内容、计算数据大小或读取密钥。若需要容量、文件数、hash 或内容级 provenance，
+命令不会枚举目录内容、计算数据大小或读取配置内容。若需要容量、文件数、hash 或内容级 provenance，
 应由对应 dataset/runtime artifact 工具在已停止 writer 的源上完成。
 
 ## 3. Worktree 间迁移计划
@@ -114,23 +114,25 @@ MuJoCo 的控制台告警，避免测试在 worktree 根目录留下文件。手
 应先保留；需要长期保存时，应按 runtime evidence 流程转存到显式绑定的运行证据目录，而不是
 提交默认日志文件。
 
-### 3.4 模型、厂商目录和秘密配置
+### 3.4 模型、厂商目录和机器配置
 
 `model/` 保留 tracked `README.md`、`openpi` gitlink 与 `perception/` 下四个外部源码 gitlink；
 `triad_openvr/` 保留 portable wrapper。
 迁移权重或厂商内容时逐个处理 ignored child，并保留来源、版本和 hash。不得整体替换 mixed root。
 
-`.env*`、`local_paths.json` 和设备配置从 example 或密钥管理重新创建。迁移计划和提交信息不得写入
-密钥值、令牌、设备凭据或不必要的本机绝对路径。
+`.env*`、`local_paths.json` 和设备配置按目标机器需要处理：可从 example 重新创建并重新绑定路径，
+也可在受信任的内部开发环境中显式复制以复现相同环境。迁移计划记录来源、目标和处理方式，不记录
+配置 payload；这些文件继续保持 Git 忽略。
 
 `hardware/quest_dev/assets/certs/` 是 mixed root：只跟踪 `.gitkeep`，首次 HTTPS 启动生成的
-`.crt` 和 `.key` 由模块内 `.gitignore` 排除。它们是本机开发证书与私钥，应在目标 worktree
-重新生成，不复制、不提交，也不通过 assets 软链接共享。根 `/assets` 规则只管理仓库根的
-reviewed asset store，不得再次改成会匹配嵌套模块目录的未锚定规则。
+`.crt` 和 `.key` 由模块内 `.gitignore` 排除。目标需要新身份时重新生成；需要维持同一开发端点
+身份时可显式复制并保留文件权限。不要 Git 提交，也不要通过 assets 软链接把可写证书目录变成
+隐式共享状态。根 `/assets` 规则只管理仓库根的 reviewed asset store，不得再次改成会匹配嵌套
+模块目录的未锚定规则。
 
 ## 4. 开发维护规则
 
-新增或修改离线数据、记录、模型、厂商目录、秘密配置、生成输出或个人状态的 `.gitignore`
+新增或修改离线数据、记录、模型、厂商目录、机器配置、生成输出或个人状态的 `.gitignore`
 规则时，必须在同一提交中：
 
 1. 更新 `local_resources_manifest_v1.json`，选择明确分类与迁移方式，并添加不会访问真实内容的

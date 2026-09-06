@@ -18,9 +18,9 @@
     },
     {
       "resource_id": "quest-development-certificates",
-      "classification": "local-secret",
-      "migration": "recreate",
-      "summary": "Quest Dev self-signed TLS certificate and private key generated locally for Browser secure-context development.",
+      "classification": "machine-local-config",
+      "migration": "copy-or-recreate",
+      "summary": "Quest Dev TLS certificate and private key; copy to preserve one development endpoint identity or recreate for a new target.",
       "locations": [
         {
           "label": "Quest Dev certificate directory mixed root",
@@ -424,9 +424,9 @@
     },
     {
       "resource_id": "machine-local-configuration",
-      "classification": "local-secret",
-      "migration": "recreate",
-      "summary": "Machine paths, environment secrets, device-local settings, and debug configuration; recreate from tracked examples without copying credentials.",
+      "classification": "machine-local-config",
+      "migration": "copy-or-recreate",
+      "summary": "Machine paths, environment values, device-local settings, and debug configuration; copy, recreate, or rebind for the target development machine.",
       "locations": [
         {
           "label": "local path bindings",

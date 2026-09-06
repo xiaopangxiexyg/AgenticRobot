@@ -1,8 +1,8 @@
 # Remote wrapper catalog
 
-Use this reference only after the remote-access workflow has fixed the target
-and requested effect. Wrapper `--help` and `codex_remote/README.md` remain
-authoritative for current arguments.
+Use this reference when the dedicated wrapper or effect class is not already
+clear. Wrapper `--help` remains authoritative for current arguments; consult
+only the matching `codex_remote/README.md` section when more context is needed.
 
 ## Effect classes
 
@@ -24,6 +24,8 @@ Classify an unlisted or ambiguous operation as the highest plausible risk.
 - Passive camera/arm connectivity: `remote_camera_list.sh`,
   `remote_opencv_camera_check.sh`, `remote_arm_ping.sh`,
   `remote_arm_port_check.sh`.
+- Camera capture and retrieval: `remote_camera_snapshot.sh`; declare its local
+  output path before running it.
 - Inspection: `remote_view.sh`, `remote_tail_log.sh`,
   `remote_sync_check.sh`.
 - Remote execution: `remote_python.sh`, `remote_module.sh`,
@@ -36,6 +38,10 @@ Classify an unlisted or ambiguous operation as the highest plausible risk.
 - Protected Harness deployment: `remote_harness_deploy.sh`, only for an exact
   commit explicitly authorized by the deployment owner and a fresh Harness
   plan; it grants no project command, device, or motion authority.
+- Before either protected Harness wrapper, read `codex_remote/README.md` section
+  `3.1 远端受保护 Harness`. Resolve site identity, exchange roots, and key paths
+  from the host-private configuration; do not guess them or add them to project
+  source.
 - Dry-run arm checks: `remote_arm_dry_run.sh`; do not disable its dry-run
   behavior.
 - Control-risk preflight: `remote_safety_check.sh`.
@@ -48,8 +54,9 @@ remote shell access.
 
 - Pass the user-selected host or alias unchanged across identity, environment,
   sync, execution, inspection, and retrieval.
-- If the user provides no target, use only the project's configured default
-  alias; do not copy its current IP into durable instructions.
+- If the user provides no target, resolve the project's configured default alias
+  and still pass it explicitly; do not copy its current IP into durable
+  instructions.
 - When no-delete realtime sync is confirmed active, do not perform routine
   one-shot project sync. Edit locally and verify explicit paths if stale code is
   suspected.

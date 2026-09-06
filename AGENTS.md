@@ -9,12 +9,29 @@ documents and Skills for conditional workflows and implementation detail.
 
 - Read `docs/architecture/runtime_domain_boundaries.md` before changing package
   ownership, dependency direction, application assembly, or runtime authority.
-- Read `docs/setup/LOCAL_RESOURCES.md` and
-  `docs/setup/local_resources_manifest_v1.json` before changing ignored local
-  resources, asset links, model/vendor bundles, or runtime-artifact placement.
+- Consult the relevant resource class in `docs/setup/LOCAL_RESOURCES.md` and the
+  matching entries in `docs/setup/local_resources_manifest_v1.json` before
+  changing ignored resources or their bindings; do not load the whole manifest
+  when a focused query is sufficient.
 - Read `README_ENV.md` for Python, dependency, installation, and lockfile work.
 - Use the existing README and CLI `--help` for runnable entrypoints. Do not add
   a second production entrypoint for an existing lifecycle.
+
+## Conditional workflows
+
+- Use `$change-agent-gateway` for Gateway-owned protocol, runtime, transport,
+  semantic Skill, Route, Artifact, compatibility, or profile-binding changes.
+- Use `$debug-teleop-ik-motion` for pose-to-command teleoperation, IK,
+  reference, interpolation, dispatch, or stateful-modifier faults.
+- Use `$manage-project-local-resources` for ignored assets, datasets, model or
+  vendor bundles, machine-local configuration, generated output, and
+  cross-worktree resource movement.
+- Use `$remote-access` when work crosses the local/remote execution boundary for
+  inspection, transfer, processes, devices, or hardware.
+
+For a mixed task, use each applicable Skill but keep these ownership boundaries
+separate: domain Skills own code and data semantics; `$remote-access` owns only
+the remote operation used to inspect, transfer, or execute them.
 
 ## Repository boundaries
 
@@ -46,11 +63,10 @@ moving branch name.
 
 ## Local resources
 
-Use `$manage-project-local-resources` for ignored resources and worktree-local
-links. Run `python scripts/dev_local_resources.py audit` before handoff when
-that surface changes. Only reviewed read-mostly assets may use automatic
-cross-worktree links; mutable runtime or collection evidence remains
-writer-isolated. Tracked code, tests, and profiles must not depend on a
+Run `python scripts/dev_local_resources.py audit` before handoff when ignored
+resources or worktree-local links change. Only reviewed read-mostly assets may
+use automatic cross-worktree links; mutable runtime or collection evidence
+remains writer-isolated. Tracked code, tests, and profiles must not depend on a
 developer-local absolute path.
 
 ## Safety
@@ -59,14 +75,13 @@ developer-local absolute path.
   homing, replay, servo, force-control, reboot, reset, or other device-state
   changes without explicit scope for that action in the current request and
   the applicable safety preflight.
-- Use `$remote-access` and the `codex_remote/` wrappers for remote hosts or
-  hardware. Do not replace their fail-closed checks with ad hoc SSH.
+- Use the `codex_remote/` wrappers for remote hosts or hardware. Do not replace
+  their fail-closed checks with ad hoc SSH.
 - Before an overwrite or transform involving datasets, hardlinks, or media,
   prove source/target identity and an independent backup. Write fresh output,
   validate semantic counts and decodability, then replace atomically.
-- Use `$debug-teleop-ik-motion` for pose-to-command motion faults and stateful
-  modifier analysis. Final composed control output, including persistent terms,
-  requires an explicit bound at its authoritative boundary.
+- Final composed control output, including persistent terms, requires an
+  explicit bound at its authoritative boundary.
 - After unexpected real motion, freeze the implicated Active path and preserve
   the exact command, configuration, logs, and process evidence. Diagnose
   read-only; do not tune or retry until the cause and missing safety gate are
