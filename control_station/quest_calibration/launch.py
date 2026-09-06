@@ -123,6 +123,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--side", choices=("left", "right"), required=True)
+    parser.add_argument(
+        "--controller-handedness",
+        choices=("left", "right", "any"),
+        default="left",
+        help=(
+            "Terminal capture controller filter. The default left keeps the "
+            "selection deterministic for left-arm calibration; use any only "
+            "when exactly one tracked controller is active."
+        ),
+    )
     parser.add_argument("--arm-ip", type=_non_empty, required=True)
     parser.add_argument(
         "--arm-urdf-path",
@@ -311,6 +321,12 @@ def _dry_run_payload(
             "port": args.operator_port,
             "open_browser": not bool(args.no_open_browser),
         },
+        "terminal_capture": {
+            "r": "start or finish one static window",
+            "c": "seal completed windows and run diagnostic AX=XB fit",
+            "controller_handedness": str(args.controller_handedness),
+            "preview_only": True,
+        },
         "deploy_argv": build_deploy_argv(args),
         "safety": {
             "policy": "hold",
@@ -352,6 +368,8 @@ def _announce_quest(
     emit(f"[quest-calibration] Quest 打开: {launch.base_url}")
     emit(f"[quest-calibration] Quest 配对六码: {launch.pairing_code}")
     emit(f"[quest-calibration] 一次性完整网址: {launch.pairing_url}")
+    emit("[quest-calibration] 终端控制：r=开始/结束静止窗口，c=封存并解算")
+    emit("[quest-calibration] 解算结果仅作为 Quest 诊断预览，不安装正式标定")
     emit("[quest-calibration] 完成测试后回到终端按 Ctrl+C")
     emit("[quest-calibration] ================================================")
 
@@ -461,6 +479,21 @@ def run(
                 startup_timeout_s=float(args.quest_startup_timeout_s),
                 callback_drain_timeout_s=float(args.callback_drain_timeout_s),
                 host_join_timeout_s=float(args.host_join_timeout_s),
+                realman_left_ip=(
+                    str(args.arm_ip)
+                    if str(args.side) == "left" and args.arm_urdf_path
+                    else None
+                ),
+                realman_left_urdf=(
+                    Path(args.arm_urdf_path)
+                    if str(args.side) == "left" and args.arm_urdf_path
+                    else None
+                ),
+                controller_handedness=(
+                    None
+                    if str(args.controller_handedness) == "any"
+                    else str(args.controller_handedness)
+                ),
             )
         )
         coordinator = coordinator_builder(

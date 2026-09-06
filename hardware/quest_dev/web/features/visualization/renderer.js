@@ -187,6 +187,17 @@
     );
   }
 
+  // Keep the geometry API explicit at call sites: the same axis primitive is
+  // used for controller, robot-base, and TCP frames, while the caller's
+  // status card identifies which frame is being shown.
+  function drawRobotBaseAxes(gl, renderer, mvp) {
+    drawAxes(gl, renderer, mvp);
+  }
+
+  function drawTcpMarker(gl, renderer, mvp) {
+    drawReferenceMarker(gl, renderer, mvp);
+  }
+
   function destroy(renderer) {
     if (!renderer) return;
     const gl = renderer.gl;
@@ -202,5 +213,7 @@
     destroy,
     drawAxes,
     drawReferenceMarker,
+    drawRobotBaseAxes,
+    drawTcpMarker,
   };
 }(window));
