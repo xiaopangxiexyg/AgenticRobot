@@ -466,7 +466,7 @@ if cd "$WT"; then
       --mode driver-torque-limit-roundtrip \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
-      --torque-limit-scale 0.1 \
+      --torque-limit-scale 0.15 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP \
@@ -491,7 +491,8 @@ printf '%s\n' 'shell remains active'
 
 完成该往返验收后，末端阻抗验收使用 `pose-hold`。它在使能后稳定采样的任意当前姿态建立
 末端 6D 零误差锚点，以末端位姿/速度误差生成 wrench，再通过完整 Jacobian 转置映射为
-J1..J6 力矩；关节空间 Kp/Kd 均为零。命令仍会在前台显示 `[DRIVE] 3/2/1/ENABLE`：
+J1..J6 力矩。关节位置 Kp 为零；六轴使用统一 Kd 抑制首测下坠速度，但不产生关节位置
+平衡点。命令仍会在前台显示 `[DRIVE] 3/2/1/ENABLE`：
 
 ```bash
 
@@ -506,21 +507,21 @@ if cd "$WT"; then
       --freeze-sec 1 \
       --rate-hz 20 \
       --kp 0 \
-      --kd 0 \
-      --gravity-scale 0.1 \
-      --torque-limit-scale 0.1 \
+      --kd 1.0 \
+      --gravity-scale 0.5 \
+      --torque-limit-scale 0.15 \
       --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
       --velocity-abort-rad-s 0.12 \
       --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.2 \
-      --cartesian-stiffness-n-per-m 10 \
-      --cartesian-damping-n-s-per-m 0.8 \
-      --cartesian-max-force-n 1.0 \
+      --cartesian-stiffness-n-per-m 15 \
+      --cartesian-damping-n-s-per-m 3.0 \
+      --cartesian-max-force-n 2.0 \
       --cartesian-max-displacement-m 0.03 \
       --cartesian-overlay-limit-scale 0.5 \
       --rotational-stiffness-nm-per-rad 0.2 \
-      --rotational-damping-nm-s-per-rad 0.03 \
+      --rotational-damping-nm-s-per-rad 0.15 \
       --rotational-max-torque-nm 0.1 \
       --rotational-max-displacement-rad 0.0872665 \
       --allow-motion \
@@ -544,10 +545,10 @@ printf '%s\n' 'shell remains active'
 
 第一档只验收 `pose-hold`：观察任意当前姿态是否成为末端零误差锚点，轻微的末端平移或旋转
 扰动是否产生反向、耗散且受限的恢复 wrench；ID7 夹爪不参与。`active_joint_names` 必须正好
-是 joint1..joint6，`joint_impedance.software_kp_nm_per_rad` 和
-`joint_impedance.software_kd_nm_s_per_rad` 必须全零，`pose_impedance.enabled=true`，且
-`vendor_kp/vendor_kd` 全零。由此确认恢复作用来自末端 6D 阻抗及 `J^T wrench`，不是六个关节
-位置弹簧、驱动器内部 PD 或预设绝对姿态命令。
+是 joint1..joint6，`joint_impedance.software_kp_nm_per_rad` 必须全零，统一的
+`joint_impedance.software_kd_nm_s_per_rad` 应为 1.0，`pose_impedance.enabled=true`，且
+`vendor_kp/vendor_kd` 全零。末端平衡点和恢复刚度来自 6D 阻抗及 `J^T wrench`；统一关节 Kd
+只提供速度耗散，不创建六个关节位置弹簧。
 正常控制的 `--velocity-abort-rad-s` 与故障保持候选门是两个独立安全层：某一帧低于正常
 运动中止阈值、但高于更严格的 `--fault-hold-max-velocity-rad-s` 时，该帧不会替换
 `last_safe`，但也不会单独中止正常 hold。JSON 的 `fault_hold_candidate_admission` 会记录
@@ -750,8 +751,8 @@ arming-settle 门后固定完整的 `base_link_T_gripper_end`，用
 `R_current R_anchor^T` 的最短 world-aligned rotation vector 表示姿态误差，并计算
 `[f, torque] = -K [translation, rotation] - D [linear velocity, angular velocity]`。
 完整 6D wrench 仍只经过现有 `LOCAL_WORLD_ALIGNED J^T` 映射、joint overlay 限幅和最终
-总力矩/slew 包络。该模式强制六个 arm 关节共同使能且 `--kp 0 --kd 0`，避免叠加关节空间
-阻抗；ID7 仍不参与。
+总力矩/slew 包络。该模式强制六个 arm 关节共同使能且 `--kp 0`，允许统一关节 Kd 作为首测
+速度耗散，但禁止单轴增益覆盖；ID7 仍不参与。
 
 首次只允许不触碰保持 4 秒，并采用更低的旋转增益、力矩上限和 2 度姿态硬中止。下面是
 版本化模板，不是自动执行授权；实际交接仍须绑定干净 Task commit/tree、保持前台运行并
@@ -769,7 +770,7 @@ if cd "$WT"; then
       --rate-hz 20 \
       --joint joint1 \
       --kp 0 \
-      --kd 0 \
+      --kd 1.0 \
       --gravity-scale 0.5 \
       --torque-limit-scale 0.15 \
       --torque-rise-time-sec 2.0 \
@@ -777,11 +778,11 @@ if cd "$WT"; then
       --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.15 \
       --cartesian-stiffness-n-per-m 10 \
-      --cartesian-damping-n-s-per-m 0.5 \
+      --cartesian-damping-n-s-per-m 3.0 \
       --cartesian-max-force-n 1.0 \
       --cartesian-max-displacement-m 0.01 \
       --rotational-stiffness-nm-per-rad 0.2 \
-      --rotational-damping-nm-s-per-rad 0.03 \
+      --rotational-damping-nm-s-per-rad 0.15 \
       --rotational-max-torque-nm 0.1 \
       --rotational-max-displacement-rad 0.0349066 \
       --cartesian-overlay-limit-scale 0.10 \

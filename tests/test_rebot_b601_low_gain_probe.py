@@ -1371,7 +1371,7 @@ def _parse_cartesian_args(*extra: str) -> object:
             "--kp",
             "0",
             "--kd",
-            "0",
+            "1.0",
             "--allow-motion",
             "--auto-disable",
             "--confirmation",
@@ -1381,19 +1381,19 @@ def _parse_cartesian_args(*extra: str) -> object:
     )
 
 
-def test_cartesian_cli_uses_all_six_joints_and_zero_joint_impedance() -> None:
+def test_cartesian_cli_uses_all_six_joints_and_allows_uniform_joint_damping() -> None:
     args = _parse_cartesian_args()
 
     probe._validate_cli(args)
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
     nonzero_kp = _parse_cartesian_args("--kp", "0.1")
-    with pytest.raises(ValueError, match="zero joint-space Kp/Kd"):
+    with pytest.raises(ValueError, match="zero joint-position stiffness"):
         probe._validate_cli(nonzero_kp)
 
-    nonzero_kd = _parse_cartesian_args("--kd", "0.1")
-    with pytest.raises(ValueError, match="zero joint-space Kp/Kd"):
-        probe._validate_cli(nonzero_kd)
+    probe._validate_cli(_parse_cartesian_args("--kd", "2.0"))
+    with pytest.raises(ValueError, match="single-joint gain override"):
+        probe._validate_cli(_parse_cartesian_args("--target-kd", "0.1"))
 
 
 def _parse_pose_args(*extra: str) -> object:
@@ -1408,7 +1408,7 @@ def _parse_pose_args(*extra: str) -> object:
             "--kp",
             "0",
             "--kd",
-            "0",
+            "1.0",
             "--allow-motion",
             "--auto-disable",
             "--confirmation",
@@ -1418,14 +1418,15 @@ def _parse_pose_args(*extra: str) -> object:
     )
 
 
-def test_pose_cli_uses_all_six_joints_and_only_end_effector_impedance() -> None:
+def test_pose_cli_uses_all_six_joints_with_uniform_joint_damping() -> None:
     probe._validate_cli(_parse_pose_args())
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
-    with pytest.raises(ValueError, match="zero joint-space Kp/Kd"):
+    with pytest.raises(ValueError, match="zero joint-position stiffness"):
         probe._validate_cli(_parse_pose_args("--kp", "0.1"))
-    with pytest.raises(ValueError, match="zero joint-space Kp/Kd"):
-        probe._validate_cli(_parse_pose_args("--kd", "0.1"))
+    probe._validate_cli(_parse_pose_args("--kd", "2.0"))
+    with pytest.raises(ValueError, match="single-joint gain override"):
+        probe._validate_cli(_parse_pose_args("--target-kd", "0.1"))
     with pytest.raises(ValueError, match="rotational_max_displacement_rad"):
         probe._validate_cli(
             _parse_pose_args("--rotational-max-displacement-rad", "0.5")

@@ -897,13 +897,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError("slow-step mode requires step_rad > 0")
     if args.mode in ("cartesian-hold", "pose-hold") and (
         args.kp != 0.0
-        or args.kd != 0.0
         or target_kp not in (None, 0.0)
         or target_kd not in (None, 0.0)
     ):
         raise ValueError(
-            f"{args.mode} requires zero joint-space Kp/Kd so the restoring "
-            "wrench is owned only by end-effector impedance"
+            f"{args.mode} requires zero joint-position stiffness and no "
+            "single-joint gain override; uniform joint damping is allowed"
         )
 
 
