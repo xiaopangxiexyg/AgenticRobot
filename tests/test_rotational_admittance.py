@@ -358,6 +358,161 @@ def test_rotation_composition_is_world_frame_so3_not_euler_addition() -> None:
 
 
 @pytest.mark.parametrize(
+    ("sample", "now", "reason", "rotation"),
+    [
+        (
+            _sample(source_time=1.05, generation=2),
+            1.05,
+            "tare_generation_mismatch",
+            np.eye(3),
+        ),
+        (
+            _sample(source_time=1.05, frame="arm_base"),
+            1.05,
+            "tare_frame_mismatch",
+            np.eye(3),
+        ),
+        (
+            _sample(source_time=1.05),
+            1.05,
+            "frame_transform_missing",
+            None,
+        ),
+        (
+            _sample(source_time=0.95),
+            1.05,
+            "sample_time_not_increasing",
+            np.eye(3),
+        ),
+        (
+            _sample(source_time=1.15),
+            1.15,
+            "torque_dt_exceeded",
+            np.eye(3),
+        ),
+        (
+            _sample(source_time=1.05),
+            1.30,
+            "sample_stale",
+            np.eye(3),
+        ),
+    ],
+)
+def test_invalid_rotation_sample_contract_freezes_without_snapback(
+    sample: CartesianAdmittanceWrenchSample,
+    now: float,
+    reason: str,
+    rotation: np.ndarray | None,
+) -> None:
+    controller = _controller()
+    controller.rebase_realized_rotation((0.03, 0.0, 0.0), output_time_sec=1.0)
+
+    result = controller.step_new_sample(
+        sample,
+        now_sec=now,
+        rotation_control_from_sample=rotation,
+    )
+
+    assert result.frozen is True
+    assert result.reason == reason
+    assert result.requested_rotvec_rad == pytest.approx((0.03, 0.0, 0.0))
+    assert result.output_rotvec_rad == pytest.approx((0.03, 0.0, 0.0))
+    assert result.angular_velocity_rad_s == (0.0, 0.0, 0.0)
+
+
+def test_rotation_freeze_resume_rearms_before_integration_and_reset_clears() -> None:
+    controller = _controller(_config(torque_filter_tau_sec=0.0))
+    controller.rebase_realized_rotation((0.03, 0.0, 0.0), output_time_sec=1.0)
+    controller.freeze("hold")
+
+    frozen = controller.step_new_sample(
+        _sample(torque=(1.0, 0.0, 0.0), source_time=1.05),
+        now_sec=1.05,
+        rotation_control_from_sample=np.eye(3),
+    )
+    assert frozen.reason == "hold"
+    assert frozen.output_rotvec_rad == pytest.approx((0.03, 0.0, 0.0))
+
+    controller.resume()
+    rearmed = controller.step_new_sample(
+        _sample(torque=(1.0, 0.0, 0.0), source_time=1.50),
+        now_sec=1.50,
+        rotation_control_from_sample=np.eye(3),
+    )
+    assert rearmed.reason == "sample_clock_rearmed"
+    assert rearmed.new_sample_integrated is False
+    assert rearmed.output_rotvec_rad == pytest.approx((0.03, 0.0, 0.0))
+
+    resumed = controller.step_new_sample(
+        _sample(torque=(1.0, 0.0, 0.0), source_time=1.55),
+        now_sec=1.55,
+        rotation_control_from_sample=np.eye(3),
+    )
+    assert resumed.new_sample_integrated is True
+    assert resumed.integration_dt_sec == pytest.approx(0.05)
+
+    controller.reset(
+        tare_sample=_sample(source_time=2.0, generation=2),
+        output_time_sec=2.0,
+    )
+    reset = controller.snapshot(now_sec=2.0)
+    assert reset.frozen is False
+    assert reset.tare_generation == 2
+    assert reset.requested_rotvec_rad == (0.0, 0.0, 0.0)
+    assert reset.output_rotvec_rad == (0.0, 0.0, 0.0)
+
+
+def test_rotation_rebase_and_output_clocks_preserve_exact_fail_closed_state() -> None:
+    controller = _controller(_config(enabled_axes=(True, False, True)))
+    rebased = controller.rebase_realized_rotation(
+        (1.0, 1.0, -1.0),
+        output_time_sec=1.10,
+    )
+
+    assert np.linalg.norm(rebased.output_rotvec_rad) == pytest.approx(0.4)
+    assert rebased.output_rotvec_rad[1] == 0.0
+    with pytest.raises(ValueError, match="must not move backwards"):
+        controller.rebase_realized_rotation(
+            (0.02, 0.0, 0.0),
+            output_time_sec=1.05,
+        )
+
+    duplicate = controller.sample_output(now_sec=1.10)
+    assert duplicate.frozen is False
+    assert duplicate.reason == "duplicate_output_time"
+    rollback = controller.sample_output(now_sec=1.09)
+    assert rollback.frozen is True
+    assert rollback.reason == "output_time_not_increasing"
+    assert rollback.output_rotvec_rad == pytest.approx(rebased.output_rotvec_rad)
+
+
+def test_rotation_future_and_inactive_events_freeze_without_zeroing_output() -> None:
+    future_controller = _controller()
+    future_controller.rebase_realized_rotation(
+        (0.03, 0.0, 0.0),
+        output_time_sec=1.0,
+    )
+    future = future_controller.step_new_sample(
+        _sample(source_time=1.06),
+        now_sec=1.05,
+        rotation_control_from_sample=np.eye(3),
+    )
+    assert future.frozen is True
+    assert future.reason == "sample_from_future"
+    assert future.output_rotvec_rad == pytest.approx((0.03, 0.0, 0.0))
+
+    inactive_controller = _controller()
+    inactive_controller.rebase_realized_rotation(
+        (0.03, 0.0, 0.0),
+        output_time_sec=1.0,
+    )
+    inactive = inactive_controller.sample_output(now_sec=1.05, active=False)
+    assert inactive.frozen is True
+    assert inactive.reason == "inactive"
+    assert inactive.output_rotvec_rad == pytest.approx((0.03, 0.0, 0.0))
+
+
+@pytest.mark.parametrize(
     "kwargs",
     [
         {"enabled_axes": (True, False)},
