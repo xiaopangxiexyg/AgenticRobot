@@ -26,8 +26,10 @@ from .sam2_vgn_point_grasp import (
     DEFAULT_DMTAC_M_URDF,
     DEFAULT_DMTAC_M_URDF_SHA256,
     DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
+    PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
     PointGraspCandidate,
     PointGraspResult,
+    select_upward_parallel_jaw_tcp_pose,
 )
 
 GRASPNET_GIT_URL = "https://github.com/graspnet/graspnet-baseline.git"
@@ -352,6 +354,9 @@ class Sam2GraspNetPointGraspPlanner:
                     "model_width_axis": "+y",
                     "tool_tcp_approach_axis": "+z",
                     "tool_tcp_width_axis": "+x",
+                    "tool_tcp_up_axis": "+y",
+                    "parallel_jaw_wrist_symmetry_deg": [0, 180],
+                    "tcp_orientation_selection": (PARALLEL_JAW_TCP_UPWARD_SELECTION_V1),
                     "model_grasp_depth_mapping": {
                         "prediction_column": 3,
                         "model_finger_length_m": GRASPNET_MODEL_FINGER_LENGTH_M,
@@ -731,6 +736,10 @@ class Sam2GraspNetPointGraspPlanner:
             )
             camera_from_tcp = camera_from_grasp @ grasp_from_tcp
             base_from_tcp = base_from_camera @ camera_from_tcp
+            camera_from_tcp, base_from_tcp = select_upward_parallel_jaw_tcp_pose(
+                camera_from_tcp,
+                base_from_tcp,
+            )
             click_distance = float(
                 np.linalg.norm(camera_from_grasp[:3, 3] - target_camera)
             )

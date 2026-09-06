@@ -4,8 +4,12 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
+from deployments.perception.sam2_vgn_point_grasp import (
+    select_upward_parallel_jaw_tcp_pose,
+)
 from experiments.sim_point_grasp.evaluation import (
     SimPointGraspTrialResult,
     apply_parallel_jaw_wrist_symmetry,
@@ -121,6 +125,49 @@ def test_parallel_jaw_wrist_symmetry_swaps_fingers_but_preserves_approach() -> N
     np.testing.assert_allclose(flipped[:3, 1], -grasp[:3, 1])
     np.testing.assert_allclose(flipped[:3, 2], grasp[:3, 2])
     np.testing.assert_allclose(flipped[:3, 3], grasp[:3, 3])
+
+
+@pytest.mark.optional
+def test_upward_tcp_selection_matches_mujoco_world_up() -> None:
+    pytest.importorskip("mujoco")
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        build_sim_point_grasp_task_config(
+            cube_spawn_xy_jitter_m=(0.025, 0.080),
+            cube_spawn_yaw_jitter_rad=math.pi / 4.0,
+        ),
+        include_training_reward_state=False,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=0)
+        side = env.kernel.config.controlled_side
+        world_from_base = env.kernel.scene.body_pose(f"{side}_arm_base_link")
+        np.testing.assert_allclose(
+            world_from_base[:3, 2],
+            [0.0, 0.0, 1.0],
+            atol=1e-8,
+        )
+        base_from_tcp = np.eye(4)
+        base_from_tcp[:3, :3] = Rotation.from_euler(
+            "x", -90.0, degrees=True
+        ).as_matrix()
+        camera_from_tcp = base_from_tcp.copy()
+
+        _, selected_base_from_tcp = select_upward_parallel_jaw_tcp_pose(
+            camera_from_tcp,
+            base_from_tcp,
+        )
+        world_from_tcp = world_from_base @ selected_base_from_tcp
+
+        assert float(world_from_tcp[:3, 1] @ np.asarray([0.0, 0.0, 1.0])) > 0.999
+        np.testing.assert_allclose(
+            selected_base_from_tcp[:3, 2],
+            base_from_tcp[:3, 2],
+        )
+    finally:
+        env.close()
 
 
 def test_pose_qref_is_inset_without_widening_hard_limits() -> None:
