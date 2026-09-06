@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import threading
 from unittest.mock import call, patch
@@ -122,6 +123,11 @@ def test_bounded_rtc_acceptance_requires_explicit_profile_and_limit() -> None:
     )
     with pytest.raises(ValueError, match="requires an explicit --rtc-profile"):
         run_policy.validate_args(ordinary)
+
+
+def test_retired_prediction_invalidation_is_not_called_from_deploy_loop() -> None:
+    source = inspect.getsource(run_policy.main)
+    assert "invalidate_in_flight_policy_prediction" not in source
 
 
 def test_active_rtc_gap_uses_measured_qpos_hold_and_clears_position_plan() -> None:
