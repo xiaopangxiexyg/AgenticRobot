@@ -1,7 +1,8 @@
 # B601-RS 力觉控制：离线与真机分阶段验收
 
-本文把“当前无真机可验证的结果”和“机械臂接入后的物理验收”分开。任何离线、
-MuJoCo 或 GUI 结果都不构成真机使能、运动或安全授权。
+本文把离线结果、低带宽真机 commissioning 观察和正式分阶段物理验收分开。任何离线、
+MuJoCo 或 GUI 结果都不构成真机使能、运动或安全授权；历史 commissioning 观察也只覆盖
+其明确记录的范围。
 
 当前实现止于：
 
@@ -91,7 +92,9 @@ JSON 仍是效果判定依据：
 
 ## 3. 真机测试的共同前置条件
 
-以下 H1–H8 均为机械臂到货后的验收计划，现在未执行。进入任何使能阶段前必须同时满足：
+正式 H1–H8 验收矩阵尚未全部完成。2026-09-04 已取得只读反馈、no-touch hold 和人工
+单轴扰动的低带宽 commissioning 观察；其边界见下方“历史真机观察同步”。进入任何新的
+使能阶段前仍必须同时满足：
 
 1. 记录 AgenticRobot commit、`hardware/reBotArm_control_py` gitlink、配置文件 SHA-256、
    固件、电机型号/ID、CAN 接口和供电版本；
@@ -103,6 +106,28 @@ JSON 仍是效果判定依据：
 6. 力矩、力矩变化率、速度、加速度、位置、Kp/Kd、wrench 和持续时间上限经过硬件负责人评审；
 7. 每次只放开本阶段所需的最小权限，先单关节、后多关节，先无 overlay、后低幅 overlay；
 8. 任一异常立即停止本阶段，不把“重新运行成功”当作根因闭环。
+
+### 3.1 历史真机观察同步（2026-09-06）
+
+2026-09-04 的 `b601_pose_hold_translation_rotation_18f2920d.json` 在 20 Hz `pose-hold`
+中发送 121 个完整控制周期，feedback/compute/tx 三个频率门均通过，无 deadline miss、
+无绝对力矩 clip，最终六关节 `safe_stop` 完整。操作者于 2026-09-06 补充确认：运行中
+按单轴分别进行的人工扰动已经验收。
+
+原始 JSON 没有逐轴 stage marker，整次运行又在一次正常人工推动达到 `0.098028 rad/s`
+时触发原 `0.03 rad/s` qvel 门，因此原始机器结论必须继续保留为 `FAIL`，不得回写成
+`HARDWARE_PASS`。同步后的准确表达是：
+
+- 人工单轴扰动的现场观察：操作者确认已验收；
+- 逐轴可机器重放的数值验收：证据不完整；
+- 整次运行与正式 H5/H8 结论：仍不是 `HARDWARE_PASS`；
+- 组合 6D、qacc 真机上限、高带宽触觉及最终增益：未验收。
+
+补充凭据见
+[`20260906_manual_single_axis_operator_attestation.json`](evidence/b601_rs/20260906_manual_single_axis_operator_attestation.json)。
+它追加记录人类观察与阈值决定，不替换原始 JSON。正常人工扰动的 qvel 中止门后续采用
+`0.12 rad/s`；no-touch 示例仍显式保持 `0.05 rad/s`。qacc、fault-hold stationarity、
+力矩、slew、位姿和 wrench 包络均未随之放宽。
 
 ## 4. 真机 backend 上线前必须关闭的接口缺口
 

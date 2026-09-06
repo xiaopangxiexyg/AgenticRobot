@@ -1267,6 +1267,9 @@ def test_parser_help_is_read_only() -> None:
     assert args.target_kp is None
     assert args.target_kd is None
     assert args.apply_driver_torque_limits is False
+    assert args.velocity_abort_rad_s == pytest.approx(0.12)
+    assert args.acceleration_abort_rad_s2 == pytest.approx(4.0)
+    assert args.fault_hold_max_velocity_rad_s == pytest.approx(0.02)
     assert args.cartesian_stiffness_n_per_m == 20.0
     assert args.cartesian_max_displacement_m == 0.02
     assert args.rotational_stiffness_nm_per_rad == 0.5

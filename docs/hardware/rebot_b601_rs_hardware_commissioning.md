@@ -90,6 +90,13 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   独立保存 offending joint、raw/normalized q、previous/current qvel、qacc、dt、seq/timestamp，
   并标记 `command_dispatched=false`、`eligible_for_last_safe=false`。默认
   `--acceleration-abort-rad-s2 4.0` 只是待真机整定的 commissioning seed，不是已认证上限。
+- 2026-09-04 的人工单轴扰动被原 `0.03 rad/s` 正常控制门在 `0.098028 rad/s` 中止；
+  操作者于 2026-09-06 补充确认中止前的单轴人工扰动已经验收。正常控制 qvel 默认值和
+  后续人工单轴 commissioning 值据此调整为 `0.12 rad/s`，为已观察值保留约 22% 裕量。
+  no-touch 命令仍显式使用更保守的 `0.05 rad/s`。
+- `0.12 rad/s` 只调整正常控制的 qvel abort。`4.0 rad/s^2` qacc seed、`0.02 rad/s`
+  fault-hold stationarity、总力矩、slew、位姿、wrench 和持续时间门保持不变。原始运行没有
+  qacc/rejected-sample 完整字段，不能用同一条观察推导其他门的放宽值。
 
 数学、重力和 haptic 组合仍由 `robot_motion.rebot_b601_rs` 负责，仿真 effort backend
 仍由 `sim.mujoco.rebot_b601_rs` 负责；本模块不复制 Pinocchio 或 MuJoCo 实现。
@@ -733,6 +740,9 @@ P4.1 的通用字段外，还应确认 `active_joint_names` 覆盖 joint1..joint
 `cartesian_impedance.anchor_source=fresh_post_enable_fk`、`position_tau_nm` 全程为零、
 `power_error_w` 接近数值零，且恢复力始终与 displacement 反向。20 Hz 下只能进行这种慢速
 commissioning；不得据此声明触觉带宽、接触稳定性或最终 impedance gains 已验收。
+人工单轴档只把上方命令的 `--velocity-abort-rad-s` 从 no-touch 的 `0.05` 改为 `0.12`；
+不得同时改变 qacc、fault-hold、力矩/slew、`5 mm` 位移或 wrench 参数。每次运行只允许一个
+平移轴，并在日志中明确写出轴名，避免再次产生无法拆分逐轴结论的聚合 JSON。
 
 ### P4.3 当前末端 SE(3) 锚定的低增益位姿阻抗（操作者手动运行）
 
@@ -804,6 +814,9 @@ printf '%s\n' 'shell remains active'
 姿态扰动，必须另行明确批准，单轴缓慢转动小于 1 度后放手；不得同时推移和扭转、不得
 接触环境或提高上述阈值。20 Hz 同步 `mechPos` 只足以做这种慢速符号/包络验收，不能证明
 动态 6D 阻抗稳定性、触觉频率或最终手感。
+获批的人工单轴姿态档同样只把 `--velocity-abort-rad-s` 改为 `0.12`，其他门保持 no-touch
+模板值，并在每份 JSON/日志中记录唯一的 `rx`、`ry` 或 `rz` 轴名。组合平移与旋转仍不在
+该阈值同步的授权范围内。
 
 ## 已使能力控仍然阻塞的契约
 
