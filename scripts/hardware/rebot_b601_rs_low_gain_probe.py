@@ -895,17 +895,6 @@ def _validate_cli(args: argparse.Namespace) -> None:
     )
     if args.mode == "slow-step" and args.step_rad <= 0.0:
         raise ValueError("slow-step mode requires step_rad > 0")
-    if args.mode in ("cartesian-hold", "pose-hold") and (
-        args.kp != 0.0
-        or target_kp not in (None, 0.0)
-        or target_kd not in (None, 0.0)
-    ):
-        raise ValueError(
-            f"{args.mode} requires zero joint-position stiffness and no "
-            "single-joint gain override; uniform joint damping is allowed"
-        )
-
-
 def _resolve_model_and_limits(
     source_root: Path,
 ) -> tuple[B601PinocchioModel, tuple[tuple[float, float], ...]]:
@@ -3374,7 +3363,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "max_rotation_rad": args.rotational_max_displacement_rad,
             "overlay_limit_scale": args.cartesian_overlay_limit_scale,
             "requires_all_six_arm_joints": True,
-            "joint_position_stiffness_disabled": True,
+            "joint_position_stiffness_disabled": all(
+                gain == 0.0 for gain in profile.position_kp_nm_per_rad
+            ),
         },
         "torque_limit_count": torque_limit_count,
         "slew_limit_count": slew_limit_count,

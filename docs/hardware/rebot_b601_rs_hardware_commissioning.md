@@ -751,8 +751,8 @@ arming-settle 门后固定完整的 `base_link_T_gripper_end`，用
 `R_current R_anchor^T` 的最短 world-aligned rotation vector 表示姿态误差，并计算
 `[f, torque] = -K [translation, rotation] - D [linear velocity, angular velocity]`。
 完整 6D wrench 仍只经过现有 `LOCAL_WORLD_ALIGNED J^T` 映射、joint overlay 限幅和最终
-总力矩/slew 包络。该模式强制六个 arm 关节共同使能且 `--kp 0`，允许统一关节 Kd 作为首测
-速度耗散，但禁止单轴增益覆盖；ID7 仍不参与。
+总力矩/slew 包络。该模式固定由六个 arm 关节共同调节；首测命令选择 `--kp 0` 和统一关节
+Kd 作为速度耗散，但这些调参值不属于代码契约；ID7 仍不参与。
 
 首次只允许不触碰保持 4 秒，并采用更低的旋转增益、力矩上限和 2 度姿态硬中止。下面是
 版本化模板，不是自动执行授权；实际交接仍须绑定干净 Task commit/tree、保持前台运行并
