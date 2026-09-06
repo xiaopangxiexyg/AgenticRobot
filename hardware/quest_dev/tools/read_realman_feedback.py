@@ -88,12 +88,18 @@ def main(argv: list[str] | None = None) -> int:
         max_age_s=args.max_age_s,
     )
     all_fresh = True
+    all_observation_only = True
     try:
         reader.start()
         for sample_index in range(args.samples):
             message = reader.poll()
             record = message["robots"][robot_id]
+            sample_is_observation_only = (
+                record.get("mode") == "observation_only"
+                and record.get("control_ready") is False
+            )
             all_fresh = all_fresh and record.get("fresh") is True
+            all_observation_only = all_observation_only and sample_is_observation_only
             print(
                 json.dumps(
                     {
@@ -110,9 +116,8 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(args.interval_s)
     finally:
         reader.stop()
-    return 0 if all_fresh else 2
+    return 0 if all_fresh and all_observation_only else 2
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
