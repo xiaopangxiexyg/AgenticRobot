@@ -229,7 +229,13 @@
     });
 
   function sessionOptions() {
-    return { optionalFeatures: ['local-floor', 'bounded-floor'] };
+    const overlayRoot = document.getElementById('xr-overlay');
+    const optionalFeatures = ['local-floor', 'bounded-floor'];
+    if (!overlayRoot) return { optionalFeatures };
+    return {
+      optionalFeatures: [...optionalFeatures, 'dom-overlay'],
+      domOverlay: { root: overlayRoot },
+    };
   }
 
   function createXRLayer(session, context, alpha) {
