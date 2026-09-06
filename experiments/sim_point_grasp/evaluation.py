@@ -42,6 +42,7 @@ from deployments.perception.sam2_grounding_dino import (
 )
 from deployments.perception.sam2_vgn_point_grasp import (
     DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
+    PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
 )
 from project_paths import resolve_path
 from robot_motion.rm65 import endpoint_to_tool_transform, load_rm65_tool_profile
@@ -1008,7 +1009,10 @@ def select_reachable_candidate(
             offsets.append(float(value))
     attempts: list[_CandidatePreflight] = []
     for offset_m in offsets:
-        for wrist_symmetry_deg in (0, 180):
+        # The point-grasp generator already resolves the parallel-jaw wrist
+        # symmetry to one upward-facing tool TCP.  Do not recreate the rejected
+        # upside-down TCP during execution feasibility selection.
+        for wrist_symmetry_deg in (0,):
             batch = [
                 _preflight_candidate(
                     env=env,
@@ -1788,7 +1792,8 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
                 "pregrasp_and_grasp_ik_full_scene_collision_only;"
                 "no_close_contact_or_lift_outcome"
             ),
-            "parallel_jaw_wrist_symmetry_deg": [0, 180],
+            "parallel_jaw_wrist_symmetry_deg": [0],
+            "tcp_orientation_selection": PARALLEL_JAW_TCP_UPWARD_SELECTION_V1,
             "adaptive_pregrasp_offsets_m": [
                 config.pregrasp_offset_m,
                 *config.adaptive_pregrasp_offsets_m,

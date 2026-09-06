@@ -45,6 +45,7 @@ from deployments.perception.sam2_vgn_point_grasp import (
     PointGraspResult,
     Sam2VgnPointGraspPlanner,
     VgnPointGraspModelSpec,
+    select_upward_parallel_jaw_tcp_pose,
 )
 from sim.contracts.scene.spec import DEFAULT_RM65_PHYSICS_URDF
 
@@ -418,6 +419,123 @@ def test_graspnet_candidate_axes_are_mapped_to_dmtac_tool_tcp(tmp_path: Path) ->
     # perpendicular to approach (opening y and finger-height z).
     np.testing.assert_allclose(camera[:3, 3], [-0.03, 0.005, 0.52])
     np.testing.assert_allclose(base[:3, 3], [0.07, 0.205, 0.82])
+
+
+def test_parallel_jaw_tcp_symmetry_selects_reference_up_and_preserves_frames() -> None:
+    reference_from_camera = np.eye(4)
+    reference_from_camera[:3, :3] = np.asarray(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    reference_from_camera[:3, 3] = [0.1, 0.2, 0.3]
+    reference_from_tcp = np.eye(4)
+    reference_from_tcp[:3, :3] = np.asarray(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]
+    )
+    reference_from_tcp[:3, 3] = [0.4, -0.2, 0.5]
+    camera_from_tcp = np.linalg.inv(reference_from_camera) @ reference_from_tcp
+
+    selected_camera, selected_reference = select_upward_parallel_jaw_tcp_pose(
+        camera_from_tcp,
+        reference_from_tcp,
+    )
+
+    assert selected_reference[2, 1] > 0.999
+    np.testing.assert_allclose(
+        selected_reference[:3, 2],
+        reference_from_tcp[:3, 2],
+    )
+    np.testing.assert_allclose(
+        selected_reference[:3, 3],
+        reference_from_tcp[:3, 3],
+    )
+    np.testing.assert_allclose(
+        reference_from_camera @ selected_camera,
+        selected_reference,
+    )
+
+
+def test_graspnet_parallel_jaw_symmetry_pair_collapses_to_upward_tcp(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint-rs.tar"
+    checkpoint.write_bytes(b"graspnet")
+    spec = GraspNetPointGraspModelSpec(
+        model_profile_id="graspnet:test",
+        checkpoint_path=checkpoint,
+        checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        source_revision=GRASPNET_REVIEWED_REVISION,
+        model_type="realsense",
+        license_acknowledgement=GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2,
+    )
+    planner = Sam2GraspNetPointGraspPlanner(
+        model_spec=spec,
+        point_segmenter=SimpleNamespace(
+            segment_point=lambda *_args, **_kwargs: None,
+            semantic_content_hash="sam:test",
+        ),
+        device="cuda",
+    )
+    prediction = np.zeros((2, 17), dtype=np.float64)
+    prediction[:, 0] = [0.9, 0.8]
+    prediction[:, 1] = 0.05
+    prediction[:, 3] = 0.03
+    prediction[0, 4:13] = np.eye(3).reshape(-1)
+    prediction[1, 4:13] = np.diag((1.0, -1.0, -1.0)).reshape(-1)
+    prediction[:, 13:16] = [0.0, 0.0, 0.5]
+    prediction[:, 16] = -1
+
+    candidates = planner._rank(
+        prediction,
+        target_points=np.asarray(
+            [[0.0, -0.01, 0.49], [0.0, 0.01, 0.51]],
+            dtype=np.float32,
+        ),
+        target_camera=np.asarray([0.0, 0.0, 0.5]),
+        base_from_camera=np.eye(4),
+        depth=np.zeros((10, 12), dtype=np.float32),
+        intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
+        maximum=5,
+    )
+
+    assert len(candidates) == 1
+    base_from_tcp = np.asarray(candidates[0].base_from_tcp).reshape(4, 4)
+    assert base_from_tcp[2, 1] > 0.999
+
+
+def test_vgn_parallel_jaw_symmetry_pair_collapses_to_upward_tcp() -> None:
+    planner = object.__new__(Sam2VgnPointGraspPlanner)
+    planner.max_gripper_width_m = 0.070
+    planner.max_click_distance_m = 0.080
+    cube_from_grasp = np.eye(4)
+    cube_from_grasp[:3, :3] = np.asarray(
+        [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
+    )
+    symmetric_cube_from_grasp = cube_from_grasp.copy()
+    symmetric_cube_from_grasp[:3, :3] = cube_from_grasp[:3, :3] @ np.diag(
+        (-1.0, -1.0, 1.0)
+    )
+    grasps = [
+        SimpleNamespace(
+            width=0.05,
+            pose=SimpleNamespace(as_matrix=lambda pose=pose: pose.copy()),
+        )
+        for pose in (cube_from_grasp, symmetric_cube_from_grasp)
+    ]
+
+    candidates = planner._rank(
+        grasps,
+        np.asarray([0.9, 0.8]),
+        base_from_cube=np.eye(4),
+        camera_from_cube=np.eye(4),
+        target_camera=np.zeros(3),
+        depth=np.zeros((10, 12), dtype=np.float32),
+        intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
+        maximum=5,
+    )
+
+    assert len(candidates) == 1
+    base_from_tcp = np.asarray(candidates[0].base_from_tcp).reshape(4, 4)
+    assert base_from_tcp[2, 1] > 0.999
 
 
 def test_graspnet_point_conditioned_workspace_crops_unrelated_scene_points() -> None:

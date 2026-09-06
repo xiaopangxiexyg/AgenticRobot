@@ -31,6 +31,7 @@ DEFAULT_DMTAC_M_URDF_SHA256 = (
     "457a2b92c81cc4f6f2f1ada63f1ed7a4a659209c4af4aba7d2dcd8403e3b0620"
 )
 DMTAC_M_MAX_VISIBLE_COLLISION_POINTS = 400
+PARALLEL_JAW_TCP_UPWARD_SELECTION_V1 = "maximize_reference_plus_z_dot_tool_tcp_plus_y"
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -73,6 +74,34 @@ def _rigid_matrix(value: object, *, field_name: str) -> np.ndarray:
     ):
         raise ValueError(f"{field_name} rotation must be right-handed and orthonormal.")
     return matrix
+
+
+def select_upward_parallel_jaw_tcp_pose(
+    camera_from_tcp: np.ndarray,
+    reference_from_tcp: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Choose the upward TCP from one equivalent parallel-jaw pose pair.
+
+    Rotating DMTAC M by 180 degrees about tool-TCP +Z (its approach axis)
+    merely exchanges the two fingers.  Tool-TCP +Y is its height/wrist-up
+    axis, so select the member whose +Y axis has the larger projection on the
+    reference frame's gravity-up +Z axis.  Exact horizontal ties preserve the
+    model pose.  Both frame representations receive the same local rotation.
+    """
+
+    camera = _rigid_matrix(camera_from_tcp, field_name="camera_from_tcp")
+    reference = _rigid_matrix(reference_from_tcp, field_name="reference_from_tcp")
+    if float(reference[2, 1]) < 0.0:
+        wrist_flip = np.diag((-1.0, -1.0, 1.0, 1.0))
+        camera = camera @ wrist_flip
+        reference = reference @ wrist_flip
+    return camera, reference
+
+
+def _rotation_distance_radians(first: np.ndarray, second: np.ndarray) -> float:
+    relative = first.T @ second
+    cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+    return math.acos(cosine)
 
 
 @dataclass(frozen=True)
@@ -261,6 +290,10 @@ class Sam2VgnPointGraspPlanner:
                     "tool_tcp_from_flange_m": [0.0, 0.0, 0.14],
                     "model_grasp_width_axis": "+y",
                     "tool_tcp_width_axis": "+x",
+                    "tool_tcp_approach_axis": "+z",
+                    "tool_tcp_up_axis": "+y",
+                    "parallel_jaw_wrist_symmetry_deg": [0, 180],
+                    "tcp_orientation_selection": (PARALLEL_JAW_TCP_UPWARD_SELECTION_V1),
                 },
                 "simulation_urdf": DEFAULT_DMTAC_M_URDF,
                 "simulation_urdf_sha256": DEFAULT_DMTAC_M_URDF_SHA256,
@@ -529,6 +562,10 @@ class Sam2VgnPointGraspPlanner:
             cube_from_grasp = np.asarray(grasp.pose.as_matrix(), dtype=np.float64)
             camera_from_tcp = camera_from_cube @ cube_from_grasp @ grasp_from_tcp
             base_from_tcp = base_from_cube @ cube_from_grasp @ grasp_from_tcp
+            camera_from_tcp, base_from_tcp = select_upward_parallel_jaw_tcp_pose(
+                camera_from_tcp,
+                base_from_tcp,
+            )
             distance = float(np.linalg.norm(camera_from_tcp[:3, 3] - target_camera))
             if distance > self.max_click_distance_m:
                 continue
@@ -543,6 +580,20 @@ class Sam2VgnPointGraspPlanner:
                 (score, model_score, distance, width, camera_from_tcp, base_from_tcp)
             )
         ranked.sort(key=lambda item: (-item[0], item[2]))
+        selected = []
+        for item in ranked:
+            pose = item[4]
+            duplicate = any(
+                np.linalg.norm(pose[:3, 3] - previous[4][:3, 3]) < 0.015
+                and _rotation_distance_radians(pose[:3, :3], previous[4][:3, :3])
+                < math.radians(15.0)
+                for previous in selected
+            )
+            if duplicate:
+                continue
+            selected.append(item)
+            if len(selected) == maximum:
+                break
         return tuple(
             PointGraspCandidate(
                 score=float(score),
@@ -553,9 +604,7 @@ class Sam2VgnPointGraspPlanner:
                 base_from_tcp=tuple(float(x) for x in base_from_tcp.reshape(-1)),
                 visible_collision_free=True,
             )
-            for score, model_score, distance, width, camera_from_tcp, base_from_tcp in ranked[
-                :maximum
-            ]
+            for score, model_score, distance, width, camera_from_tcp, base_from_tcp in selected
         )
 
     @staticmethod
@@ -603,6 +652,7 @@ __all__ = [
     "DEFAULT_DMTAC_M_URDF",
     "DEFAULT_DMTAC_M_URDF_SHA256",
     "DMTAC_M_MAX_VISIBLE_COLLISION_POINTS",
+    "PARALLEL_JAW_TCP_UPWARD_SELECTION_V1",
     "POINT_GRASP_ASSET_SCHEMA_V1",
     "VGN_GIT_URL",
     "VGN_REVIEWED_REVISION",
@@ -610,4 +660,5 @@ __all__ = [
     "PointGraspResult",
     "Sam2VgnPointGraspPlanner",
     "VgnPointGraspModelSpec",
+    "select_upward_parallel_jaw_tcp_pose",
 ]
