@@ -2972,6 +2972,22 @@ class RealTeleopControlInput:
         self._pose_snapshot_requested = False
         return requested
 
+    def _clear_tracker_side_confirmation(self) -> None:
+        """Return tracker-side confirmation metadata to its idle state."""
+
+        self._tracker_side_confirmation_pending = False
+        self._tracker_side_confirmation_from_hold = False
+        self._tracker_side_confirmation_request_kind = "normal"
+
+    def _clear_tracker_side_request(self) -> None:
+        """Return the fresh-check request metadata to its idle state."""
+
+        self._tracker_side_request_pending = False
+        self._tracker_side_request_from_hold = False
+        self._tracker_side_request_source = ""
+        self._tracker_side_request_kind = "normal"
+        self._tracker_side_request_deadline = 0.0
+
     def _queue_runtime_home_request(
         self,
         *,
@@ -3026,14 +3042,8 @@ class RealTeleopControlInput:
         if had_pending_gate:
             self._calibration_requested = False
             self._calibration_request_from_hold = False
-        self._tracker_side_confirmation_pending = False
-        self._tracker_side_confirmation_from_hold = False
-        self._tracker_side_confirmation_request_kind = "normal"
-        self._tracker_side_request_pending = False
-        self._tracker_side_request_from_hold = False
-        self._tracker_side_request_source = ""
-        self._tracker_side_request_kind = "normal"
-        self._tracker_side_request_deadline = 0.0
+        self._clear_tracker_side_confirmation()
+        self._clear_tracker_side_request()
         self._tracker_side_guard_request_active = False
         self._tracker_side_override_granted = False
         self._two_pedal_fast_home_requested = False
@@ -3239,14 +3249,8 @@ class RealTeleopControlInput:
             return
         from_hold = bool(self._tracker_side_confirmation_from_hold)
         request_kind = str(self._tracker_side_confirmation_request_kind)
-        self._tracker_side_confirmation_pending = False
-        self._tracker_side_confirmation_from_hold = False
-        self._tracker_side_confirmation_request_kind = "normal"
-        self._tracker_side_request_pending = False
-        self._tracker_side_request_from_hold = False
-        self._tracker_side_request_source = ""
-        self._tracker_side_request_kind = "normal"
-        self._tracker_side_request_deadline = 0.0
+        self._clear_tracker_side_confirmation()
+        self._clear_tracker_side_request()
         if request_kind == "two_pedal_fast":
             # Operator deliberation in the mandatory warning popup is not a
             # failed stability acquisition.  Start the one-second switching
@@ -3283,14 +3287,8 @@ class RealTeleopControlInput:
         if not self._tracker_side_confirmation_pending:
             return
         request_kind = str(self._tracker_side_confirmation_request_kind)
-        self._tracker_side_confirmation_pending = False
-        self._tracker_side_confirmation_from_hold = False
-        self._tracker_side_confirmation_request_kind = "normal"
-        self._tracker_side_request_pending = False
-        self._tracker_side_request_from_hold = False
-        self._tracker_side_request_source = ""
-        self._tracker_side_request_kind = "normal"
-        self._tracker_side_request_deadline = 0.0
+        self._clear_tracker_side_confirmation()
+        self._clear_tracker_side_request()
         self._tracker_side_guard_request_active = False
         self._tracker_side_override_granted = False
         self._two_pedal_fast_home_requested = False
@@ -3358,9 +3356,7 @@ class RealTeleopControlInput:
                 resolved_request_kind = str(
                     self._tracker_side_confirmation_request_kind
                 )
-                self._tracker_side_confirmation_pending = False
-                self._tracker_side_confirmation_from_hold = False
-                self._tracker_side_confirmation_request_kind = "normal"
+                self._clear_tracker_side_confirmation()
                 if resolved_request_kind == "two_pedal_fast":
                     self._two_pedal_transition_target_fixed_side = None
                     self._two_pedal_fast_home_deadline = 0.0
@@ -3401,11 +3397,7 @@ class RealTeleopControlInput:
                 from_hold = bool(self._tracker_side_request_from_hold)
                 source = str(self._tracker_side_request_source or "runtime")
                 request_kind = str(self._tracker_side_request_kind)
-                self._tracker_side_request_pending = False
-                self._tracker_side_request_from_hold = False
-                self._tracker_side_request_source = ""
-                self._tracker_side_request_kind = "normal"
-                self._tracker_side_request_deadline = 0.0
+                self._clear_tracker_side_request()
                 self._begin_tracker_side_confirmation(
                     from_hold=from_hold,
                     source=source,
@@ -3415,11 +3407,7 @@ class RealTeleopControlInput:
             if status == "correct":
                 from_hold = bool(self._tracker_side_request_from_hold)
                 request_kind = str(self._tracker_side_request_kind)
-                self._tracker_side_request_pending = False
-                self._tracker_side_request_from_hold = False
-                self._tracker_side_request_source = ""
-                self._tracker_side_request_kind = "normal"
-                self._tracker_side_request_deadline = 0.0
+                self._clear_tracker_side_request()
                 self._tracker_side_check.update(
                     {
                         "home_request_pending": False,
@@ -3459,11 +3447,7 @@ class RealTeleopControlInput:
             return
         request_kind = str(self._tracker_side_request_kind)
         request_from_hold = bool(self._tracker_side_request_from_hold)
-        self._tracker_side_request_pending = False
-        self._tracker_side_request_from_hold = False
-        self._tracker_side_request_source = ""
-        self._tracker_side_request_kind = "normal"
-        self._tracker_side_request_deadline = 0.0
+        self._clear_tracker_side_request()
         self._tracker_side_guard_request_active = False
         self._tracker_side_override_granted = False
         self._two_pedal_fast_home_requested = False
@@ -5542,14 +5526,8 @@ class RealTeleopControlInput:
         self._calibration_requested = False
         self._calibration_request_from_hold = False
         self._last_calibration_started_from_hold = False
-        self._tracker_side_confirmation_pending = False
-        self._tracker_side_confirmation_from_hold = False
-        self._tracker_side_confirmation_request_kind = "normal"
-        self._tracker_side_request_pending = False
-        self._tracker_side_request_from_hold = False
-        self._tracker_side_request_source = ""
-        self._tracker_side_request_kind = "normal"
-        self._tracker_side_request_deadline = 0.0
+        self._clear_tracker_side_confirmation()
+        self._clear_tracker_side_request()
         self._tracker_side_guard_request_active = False
         self._tracker_side_override_granted = False
         self._two_pedal_fast_home_requested = False
@@ -6077,9 +6055,7 @@ class RealTeleopControlInput:
         if self._tracker_side_confirmation_pending:
             self._cancel_tracker_side_warning()
         elif self._tracker_side_request_pending:
-            self._tracker_side_request_pending = False
-            self._tracker_side_request_from_hold = False
-            self._tracker_side_request_source = ""
+            self._clear_tracker_side_request()
             self._tracker_side_check.update(
                 {
                     "home_request_pending": False,

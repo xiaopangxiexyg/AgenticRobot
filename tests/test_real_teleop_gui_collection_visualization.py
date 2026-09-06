@@ -86,6 +86,25 @@ class _BatchedFakeUi(_FakeUi):
         return self.event_batches.pop(0)
 
 
+_TRACKER_SIDE_GATE_IDLE_METADATA = {
+    "confirmation_pending": False,
+    "confirmation_from_hold": False,
+    "confirmation_request_kind": "normal",
+    "request_pending": False,
+    "request_from_hold": False,
+    "request_source": "",
+    "request_kind": "normal",
+    "request_deadline": 0.0,
+}
+
+
+def _tracker_side_gate_metadata(control: object) -> dict[str, object]:
+    return {
+        name: getattr(control, f"_tracker_side_{name}")
+        for name in _TRACKER_SIDE_GATE_IDLE_METADATA
+    }
+
+
 class _FakeCalibration:
     def __init__(self) -> None:
         self.tracker_offsets = {"right_wrist": object()}
@@ -352,6 +371,10 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertTrue(control.consume_calibration_request())
         self.assertFalse(control._tracker_side_confirmation_pending)
         self.assertTrue(control._tracker_side_initial_check_completed)
+        self.assertEqual(
+            _tracker_side_gate_metadata(control),
+            _TRACKER_SIDE_GATE_IDLE_METADATA,
+        )
 
     def test_tracker_side_warning_cancel_keeps_tracker_swap_available(self) -> None:
         ui = _FakeUi()
@@ -373,6 +396,34 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertFalse(control.consume_calibration_request())
         self.assertFalse(control._tracker_side_confirmation_pending)
         self.assertIn("w", control._current_active_controls())
+        self.assertEqual(
+            _tracker_side_gate_metadata(control),
+            _TRACKER_SIDE_GATE_IDLE_METADATA,
+        )
+
+    def test_tracker_swap_clears_pending_fresh_check_metadata(self) -> None:
+        control = real_teleop.RealTeleopControlInput(
+            terminal=_FakeTerminal(),
+            ui=None,
+            args=_args(),
+            components=_components(),
+        )
+        control._tracker_side_request_pending = True
+        control._tracker_side_request_from_hold = True
+        control._tracker_side_request_source = "gui"
+        control._tracker_side_request_kind = "two_pedal_fast"
+        control._tracker_side_request_deadline = 11.0
+
+        control._toggle_vive_tracker_swap()
+
+        self.assertEqual(
+            _tracker_side_gate_metadata(control),
+            _TRACKER_SIDE_GATE_IDLE_METADATA,
+        )
+        self.assertEqual(
+            control._tracker_side_check["confirmation_result"],
+            "cancelled_for_tracker_swap",
+        )
 
     def test_tracker_side_confirmation_survives_transient_tracker_dropout(self) -> None:
         control = real_teleop.RealTeleopControlInput(
@@ -428,6 +479,10 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertFalse(control._tracker_side_request_pending)
         self.assertTrue(control._calibration_requested)
         self.assertEqual(ui.published[-1]["active_controls"], ["q"])
+        self.assertEqual(
+            _tracker_side_gate_metadata(control),
+            _TRACKER_SIDE_GATE_IDLE_METADATA,
+        )
 
     def test_terminal_cannot_bypass_web_tracker_side_confirmation(self) -> None:
         control = real_teleop.RealTeleopControlInput(
@@ -746,6 +801,10 @@ class RealTeleopGuiCollectionVisualizationTests(unittest.TestCase):
         self.assertFalse(control._calibration_requested)
         self.assertEqual(control._two_pedal_alert_level, "red")
         self.assertEqual(control._two_pedal_alert_expires_at, 14.0)
+        self.assertEqual(
+            _tracker_side_gate_metadata(control),
+            _TRACKER_SIDE_GATE_IDLE_METADATA,
+        )
 
     def test_normal_start_fresh_tracker_wait_times_out_to_not_started_state(self) -> None:
         components = _components()
