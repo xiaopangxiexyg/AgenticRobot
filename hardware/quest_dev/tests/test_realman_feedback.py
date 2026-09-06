@@ -8,6 +8,7 @@ from hardware.quest_dev.features.visualization.realman_feedback import (
     _build_backend,
     parse_realman_arm_specs,
 )
+from hardware.quest_dev.tools.read_realman_feedback import build_arg_parser
 
 
 def _spec() -> RealManArmSpec:
@@ -17,6 +18,24 @@ def _spec() -> RealManArmSpec:
         arm_ip="192.0.2.10",
         arm_urdf_path="/tmp/rm65-arm.urdf",
     )
+
+
+def test_read_probe_requires_explicit_realman_endpoint_and_urdf() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--side",
+            "right",
+            "--arm-ip",
+            "192.0.2.20",
+            "--arm-urdf",
+            "/tmp/rm65-arm.urdf",
+        ]
+    )
+
+    assert args.side == "right"
+    assert args.arm_ip == "192.0.2.20"
+    assert args.arm_urdf.name == "rm65-arm.urdf"
+    assert args.samples == 3
 
 
 def test_parse_realman_config_is_direct_and_has_no_cache_transport() -> None:
