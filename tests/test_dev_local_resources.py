@@ -55,7 +55,16 @@ def test_repository_local_resource_policy_matches_gitignore_and_tracking() -> No
         "developer-private-state",
     } <= policies.keys()
     assert policies["development-assets"]["migration"] == "asset-store-link"
-    assert policies["quest-development-certificates"]["migration"] == "recreate"
+    assert policies["quest-development-certificates"]["classification"] == (
+        "machine-local-config"
+    )
+    assert policies["quest-development-certificates"]["migration"] == (
+        "copy-or-recreate"
+    )
+    assert policies["machine-local-configuration"]["classification"] == (
+        "machine-local-config"
+    )
+    assert policies["machine-local-configuration"]["migration"] == "copy-or-recreate"
 
     locations = {
         location["path"]: location
@@ -64,6 +73,8 @@ def test_repository_local_resource_policy_matches_gitignore_and_tracking() -> No
         if location["path"] is not None
     }
     for mixed_root in (
+        ".agents",
+        ".agents/skills",
         "teleop_records",
         "model",
         "hardware/VIVE/triad_openvr",
@@ -84,6 +95,9 @@ def test_repository_local_resource_policy_matches_gitignore_and_tracking() -> No
     assert legacy["tracked_policy"] == "none"
     assert legacy["tracked_count"] == 0
     assert legacy["matched_rule"]["rule"] == "/legacy/"
+
+    assert locations[".agents"]["matched_rule"]["rule"] == ".agents/*"
+    assert locations[".agents/skills"]["matched_rule"]["rule"] == ".agents/skills/*"
 
 
 def test_only_development_assets_are_automatically_linkable(tmp_path: Path) -> None:

@@ -2,10 +2,11 @@
 """Audit and plan worktree-local resource handling without moving any data.
 
 The versioned manifest classifies ignored datasets, records, model artifacts,
-secrets, generated outputs, caches, and developer-local state.  This tool only
-inspects path metadata and Git ignore/tracking contracts.  It never opens or
-traverses resource directory contents and never copies, links, edits, or
-deletes local content; top-level symlink targets are resolved only for status.
+machine-local configuration, generated outputs, caches, and developer-local
+state. This tool only inspects path metadata and Git ignore/tracking contracts.
+It never opens or traverses resource directory contents and never copies,
+links, edits, or deletes local content; top-level symlink targets are resolved
+only for status.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ CLASSIFICATIONS = {
     "shared-read-mostly",
     "external-input",
     "mutable-evidence",
-    "local-secret",
+    "machine-local-config",
     "generated",
     "developer-private",
     "local-vendor",
@@ -39,6 +40,7 @@ MIGRATION_MODES = {
     "external-binding",
     "verified-copy",
     "recreate",
+    "copy-or-recreate",
     "rebuild",
     "do-not-migrate",
     "manual-review",
@@ -492,8 +494,13 @@ def _migration_recommendation(resource: ResourcePolicy) -> str:
             "counts, then switch the explicit binding. Never share a live writable root."
         ),
         "recreate": (
-            "Recreate from a tracked example or machine-specific secret manager; do not copy "
-            "credentials into a worktree or migration receipt."
+            "Recreate from a tracked example or machine-specific source. Keep machine-local "
+            "values outside Git and record only operation metadata."
+        ),
+        "copy-or-recreate": (
+            "For a trusted development target, copy the selected configuration when exact "
+            "replication is useful; otherwise recreate it from an example and rebind "
+            "machine-specific paths. Keep machine-local values outside Git."
         ),
         "rebuild": "Rebuild in the destination; do not migrate this generated state.",
         "do-not-migrate": "Keep this developer-local state local and recreate it if needed.",

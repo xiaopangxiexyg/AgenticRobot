@@ -18,9 +18,9 @@
     },
     {
       "resource_id": "quest-development-certificates",
-      "classification": "local-secret",
-      "migration": "recreate",
-      "summary": "Quest Dev self-signed TLS certificate and private key generated locally for Browser secure-context development.",
+      "classification": "machine-local-config",
+      "migration": "copy-or-recreate",
+      "summary": "Quest Dev TLS certificate and private key; copy to preserve one development endpoint identity or recreate for a new target.",
       "locations": [
         {
           "label": "Quest Dev certificate directory mixed root",
@@ -424,9 +424,9 @@
     },
     {
       "resource_id": "machine-local-configuration",
-      "classification": "local-secret",
-      "migration": "recreate",
-      "summary": "Machine paths, environment secrets, device-local settings, and debug configuration; recreate from tracked examples without copying credentials.",
+      "classification": "machine-local-config",
+      "migration": "copy-or-recreate",
+      "summary": "Machine paths, environment values, device-local settings, and debug configuration; copy, recreate, or rebind for the target development machine.",
       "locations": [
         {
           "label": "local path bindings",
@@ -662,7 +662,7 @@
       "resource_id": "developer-private-state",
       "classification": "developer-private",
       "migration": "do-not-migrate",
-      "summary": "Editor, agent, and personal planning state that cannot become a source or runtime dependency.",
+      "summary": "Editor, unversioned agent, and personal planning state that cannot become a source or runtime dependency; only explicitly allowlisted repository Skills are tracked.",
       "locations": [
         {
           "label": "Codex local state",
@@ -675,8 +675,15 @@
           "label": "agent local state",
           "path": ".agents",
           "probe": ".agents/.dexteleop-local-resource-probe",
-          "expected_rule": ".agents",
-          "tracked_policy": "none"
+          "expected_rule": ".agents/*",
+          "tracked_policy": "mixed"
+        },
+        {
+          "label": "unversioned repository-local Skills",
+          "path": ".agents/skills",
+          "probe": ".agents/skills/.dexteleop-local-resource-probe",
+          "expected_rule": ".agents/skills/*",
+          "tracked_policy": "mixed"
         },
         {
           "label": "personal task plans",
@@ -739,6 +746,51 @@
     }
   ],
   "ignore_exceptions": [
+    {
+      "label": "versioned repository Skills root",
+      "probe": ".agents/skills",
+      "expected_rule": "!.agents/skills/"
+    },
+    {
+      "label": "versioned change-agent-gateway Skill root",
+      "probe": ".agents/skills/change-agent-gateway",
+      "expected_rule": "!.agents/skills/change-agent-gateway/"
+    },
+    {
+      "label": "versioned change-agent-gateway Skill content",
+      "probe": ".agents/skills/change-agent-gateway/.dexteleop-local-resource-probe",
+      "expected_rule": "!.agents/skills/change-agent-gateway/**"
+    },
+    {
+      "label": "versioned debug-teleop-ik-motion Skill root",
+      "probe": ".agents/skills/debug-teleop-ik-motion",
+      "expected_rule": "!.agents/skills/debug-teleop-ik-motion/"
+    },
+    {
+      "label": "versioned debug-teleop-ik-motion Skill content",
+      "probe": ".agents/skills/debug-teleop-ik-motion/.dexteleop-local-resource-probe",
+      "expected_rule": "!.agents/skills/debug-teleop-ik-motion/**"
+    },
+    {
+      "label": "versioned manage-project-local-resources Skill root",
+      "probe": ".agents/skills/manage-project-local-resources",
+      "expected_rule": "!.agents/skills/manage-project-local-resources/"
+    },
+    {
+      "label": "versioned manage-project-local-resources Skill content",
+      "probe": ".agents/skills/manage-project-local-resources/.dexteleop-local-resource-probe",
+      "expected_rule": "!.agents/skills/manage-project-local-resources/**"
+    },
+    {
+      "label": "versioned remote-access Skill root",
+      "probe": ".agents/skills/remote-access",
+      "expected_rule": "!.agents/skills/remote-access/"
+    },
+    {
+      "label": "versioned remote-access Skill content",
+      "probe": ".agents/skills/remote-access/.dexteleop-local-resource-probe",
+      "expected_rule": "!.agents/skills/remote-access/**"
+    },
     {
       "label": "versioned data documentation",
       "probe": "docs/data/.dexteleop-local-resource-probe",

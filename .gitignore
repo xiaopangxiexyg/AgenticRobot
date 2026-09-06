@@ -1,4 +1,5 @@
-# Ignored datasets, records, models, secrets, outputs, and developer-local state
+# Ignored datasets, records, models, machine-local configuration, outputs, and
+# developer-local state
 # are registered in docs/setup/local_resources_manifest_v1.json. When a durable
 # local-resource rule changes, update that manifest, LOCAL_RESOURCES.md, and its
 # focused test in the same commit.
@@ -55,7 +56,18 @@ htmlcov/
 junit*.xml
 test-results/
 playwright-report/
-.agents
+# Ignore machine-local agent state while versioning reviewed repository Skills.
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/change-agent-gateway/
+!.agents/skills/change-agent-gateway/**
+!.agents/skills/debug-teleop-ik-motion/
+!.agents/skills/debug-teleop-ik-motion/**
+!.agents/skills/manage-project-local-resources/
+!.agents/skills/manage-project-local-resources/**
+!.agents/skills/remote-access/
+!.agents/skills/remote-access/**
 .realtime_sync_ssh.exclude
 logs/
 # Canonical local runtime outputs; versioned configs remain package-owned.
@@ -98,7 +110,7 @@ hardware/VIVE/VIVE_sender.zip
 *.egg-info/
 *.whl
 
-# Local secrets, editor metadata, and Python bytecode.
+# Machine-local configuration, editor metadata, and Python bytecode.
 .env
 .env.*
 !.env.example

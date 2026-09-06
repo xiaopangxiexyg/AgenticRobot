@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Access"
+  short_description: "Run and diagnose project remote workflows"
+  default_prompt: "Use $remote-access to classify and perform this remote operation through the matching project wrapper."
