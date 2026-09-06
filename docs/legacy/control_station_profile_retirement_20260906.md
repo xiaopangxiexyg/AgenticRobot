@@ -59,7 +59,7 @@ The ignored backup contains `manifest.tsv` (sizes), `manifest.sha256` (SHA-256
 values), and `README.md`. Verification performed before checkpoint:
 
 ```text
-sha256sum -c legacy/control_station_profile_retirement_20260906/manifest.sha256
+(cd legacy/control_station_profile_retirement_20260906 && sha256sum -c manifest.sha256)
 ```
 
 The command passed. The root `legacy/` directory is Git-ignored and is not a
