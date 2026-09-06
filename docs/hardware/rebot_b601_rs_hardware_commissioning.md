@@ -413,14 +413,16 @@ J6 方案显式使能六个 arm 关节并锚定各自的使能后当前位置，
 命令由操作者在目标 worktree 中运行，我们不在自动流程中代运行。版本化文档保留
 可移植变量；实际交接时必须替换为当前 Task 的绝对路径，并先核对固定的 commit/tree：
 
-硬件探针必须在前台同步运行，以便操作者可立即用 Ctrl+C 或物理急停介入。为减少终端
-输出，可把实际命令（含时间、工作目录和参数）及其完整 stdout/stderr 追加到固定日志
-`/tmp/b601-rs-commissioning/command_and_output.log`；不得使用 `&`、`nohup` 或其他
-后台/脱离终端方式。下面交接命令中的 `run_logged` 仅负责记录，不会改变前台执行语义。
+硬件探针必须在前台同步运行，以便操作者可立即用 Ctrl+C 或物理急停介入。探针把驱动器
+stdout/stderr 和详细诊断写入 `--log`；未显式给出时，日志默认与 `--output` 同名并使用
+`.log` 后缀。终端只保留启动/急停说明、使能倒计时、保护状态和结束摘要。不得使用 `&`、
+`nohup` 或其他后台/脱离终端方式。下面的 `run_logged` 只把命令身份和退出码追加到固定的
+`command_and_output.log`，探针本身仍在前台输出核心状态。
 所有会调用 `enable()` 的模式在反馈预热、位置/速度边界、preflight `safe_stop` 和 MIT
 模式准备全部通过后，都会把简短的 `[DRIVE] 3/2/1/ENABLE` 同时写入固定日志并镜像到
 当前控制终端；倒计时期间按 Ctrl+C 会输出 `[DRIVE] CANCELLED` 并在调用 `enable()` 前
-结束。只读 `feedback-stability` 不显示该倒计时：
+结束。运行中第一次 Ctrl+C 请求保护保持，第二次 Ctrl+C 请求六关节全停；`SIGUSR1` 仍可
+直接请求六关节全停。只读 `feedback-stability` 不显示使能倒计时：
 
 ```bash
 WT=/path/to/isolated/AgenticRobot-worktree
@@ -439,7 +441,7 @@ run_logged() {
     printf ' %q' "$@"
     printf '\n'
   } >>"$LOG"
-  "$@" >>"$LOG" 2>&1
+  "$@"
   STATUS=$?
   {
     printf 'exit_code=%s\n' "$STATUS"

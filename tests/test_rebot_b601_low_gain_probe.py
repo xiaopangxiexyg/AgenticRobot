@@ -1019,6 +1019,16 @@ def test_sigusr1_requests_full_disable() -> None:
     assert stop == {"requested": True, "full_disable_requested": True}
 
 
+def test_second_sigint_requests_full_disable() -> None:
+    stop = {"requested": False, "full_disable_requested": False}
+
+    probe._signal_handler(stop, probe.signal.SIGINT, None)
+    assert stop == {"requested": True, "full_disable_requested": False}
+
+    probe._signal_handler(stop, probe.signal.SIGINT, None)
+    assert stop == {"requested": True, "full_disable_requested": True}
+
+
 def test_drive_enable_countdown_is_logged_and_mirrored(tmp_path) -> None:
     stop = {"requested": False, "full_disable_requested": False}
     log_stream = io.StringIO()

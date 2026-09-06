@@ -46,6 +46,7 @@ to the final settled snapshot.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -682,14 +683,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
             raise LowGainProbeError(
                 "feedback-stability requires --rebot-source-root"
             )
-        _bounded(args.rate_hz, name="rate_hz", lower=1.0, upper=40.0)
-        _bounded(args.duration_sec, name="duration_sec", lower=0.1, upper=60.0)
-        _bounded(
+        _positive(args.rate_hz, name="rate_hz")
+        _positive(args.duration_sec, name="duration_sec")
+        _positive(
             args.fault_hold_max_velocity_rad_s,
             name="fault_hold_max_velocity_rad_s",
-            lower=0.0001,
-            upper=0.5,
-            lower_inclusive=False,
         )
         return
     if args.mode == "driver-torque-limit-roundtrip":
@@ -735,10 +733,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError(
             "mode must be hold, slow-step, cartesian-hold, or pose-hold"
         )
-    _bounded(args.rate_hz, name="rate_hz", lower=1.0, upper=40.0)
-    _bounded(args.duration_sec, name="duration_sec", lower=0.1, upper=60.0)
-    _bounded(args.warmup_sec, name="warmup_sec", lower=0.1, upper=15.0)
-    _bounded(args.freeze_sec, name="freeze_sec", lower=0.1, upper=10.0)
+    _positive(args.rate_hz, name="rate_hz")
+    _positive(args.duration_sec, name="duration_sec")
+    _positive(args.warmup_sec, name="warmup_sec")
+    _non_negative(args.freeze_sec, name="freeze_sec")
     _non_negative(args.kp, name="kp")
     _non_negative(args.kd, name="kd")
     target_kp = getattr(args, "target_kp", None)
@@ -756,24 +754,9 @@ def _validate_cli(args: argparse.Namespace) -> None:
         lower_inclusive=False,
     )
     _positive(args.torque_rise_time_sec, name="torque_rise_time_sec")
-    _bounded(
-        args.velocity_abort_rad_s,
-        name="velocity_abort_rad_s",
-        lower=0.01,
-        upper=0.5,
-    )
-    _bounded(
-        args.acceleration_abort_rad_s2,
-        name="acceleration_abort_rad_s2",
-        lower=0.1,
-        upper=20.0,
-    )
-    _bounded(
-        args.max_error_rad,
-        name="max_error_rad",
-        lower=0.01,
-        upper=0.5,
-    )
+    _positive(args.velocity_abort_rad_s, name="velocity_abort_rad_s")
+    _positive(args.acceleration_abort_rad_s2, name="acceleration_abort_rad_s2")
+    _positive(args.max_error_rad, name="max_error_rad")
     _bounded(args.step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
     _bounded(
         args.step_speed_rad_s,
@@ -956,12 +939,9 @@ def summarize_feedback_stability(
         raise ValueError("feedback stability requires at least two complete snapshots")
     if any(current <= previous for previous, current in pairwise(times)):
         raise ValueError("timestamps_sec must be strictly increasing")
-    limit = _bounded(
+    limit = _positive(
         stationarity_velocity_limit_rad_s,
         name="stationarity_velocity_limit_rad_s",
-        lower=0.0001,
-        upper=0.5,
-        lower_inclusive=False,
     )
     deltas = np.diff(np.asarray(samples, dtype=float), axis=0)
     intervals = np.diff(np.asarray(times, dtype=float))
@@ -1738,29 +1718,14 @@ def evaluate_slow_step_response(
     step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
     if step <= 0.0:
         raise ValueError("slow-step response requires step_rad > 0")
-    minimum_ratio = _bounded(
-        min_response_ratio,
-        name="min_response_ratio",
-        lower=0.0,
-        upper=1.0,
-    )
-    maximum_ratio = _bounded(
-        max_response_ratio,
-        name="max_response_ratio",
-        lower=1.0,
-        upper=5.0,
-    )
-    minimum_rad = _bounded(
-        min_response_rad,
-        name="min_response_rad",
-        lower=0.0,
-        upper=0.1,
-    )
-    support_limit = _bounded(
+    minimum_ratio = _non_negative(min_response_ratio, name="min_response_ratio")
+    maximum_ratio = _positive(max_response_ratio, name="max_response_ratio")
+    if maximum_ratio < minimum_ratio:
+        raise ValueError("max_response_ratio must be >= min_response_ratio")
+    minimum_rad = _non_negative(min_response_rad, name="min_response_rad")
+    support_limit = _non_negative(
         max_support_drift_rad,
         name="max_support_drift_rad",
-        lower=0.0,
-        upper=0.1,
     )
     qpos_samples = tuple(
         np.asarray(_six(sample["qpos_rad"], name="sample_qpos_rad"), dtype=float)
@@ -1844,19 +1809,44 @@ def evaluate_slow_step_response(
 
 def _output_payload(payload: dict[str, object], output: Path | None) -> None:
     encoded = json.dumps(payload, indent=2, sort_keys=True, default=list)
-    print(encoded)
     if output is None:
+        print(encoded)
         return
     output_path = output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(encoded + "\n", encoding="utf-8")
+    summary = {
+        key: payload[key]
+        for key in ("status", "mode", "acceptance_status", "stop_reason", "error")
+        if key in payload
+    }
+    summary["result_path"] = str(output_path)
+    if "runtime_log_path" in payload:
+        summary["runtime_log_path"] = payload["runtime_log_path"]
+    print(json.dumps(summary, sort_keys=True, default=list), flush=True)
+
+
+def _operator_notice(message: str) -> None:
+    """Write an infrequent safety notice to the log and controlling terminal."""
+
+    print(message, flush=True)
+    if sys.stdout.isatty():
+        return
+    try:
+        with _OPERATOR_TTY_PATH.open("w", encoding="utf-8") as operator_stream:
+            print(message, file=operator_stream, flush=True)
+    except OSError:
+        return
 
 
 def _signal_handler(stop: dict[str, bool], signum: int, _frame: object) -> None:
-    """Latch a protective stop; SIGUSR1 is the explicit all-disable request."""
+    """Latch protective hold; a second SIGINT or SIGUSR1 requests full stop."""
 
+    already_requested = stop.get("requested", False)
     stop["requested"] = True
-    if getattr(signal, "SIGUSR1", None) == signum:
+    if getattr(signal, "SIGUSR1", None) == signum or (
+        signum == signal.SIGINT and already_requested
+    ):
         stop["full_disable_requested"] = True
 
 
@@ -2179,11 +2169,10 @@ def _run_latched_fault_hold(
             errors,
         )
 
-    print(
+    _operator_notice(
         "B601 protective hold latched: joint2/joint3 remain at the last valid "
         "position; joint1/joint4/joint5/joint6 are disabled. "
-        f"pid={os.getpid()}; send SIGUSR1 to this process for explicit full disable.",
-        flush=True,
+        f"pid={os.getpid()}; press Ctrl-C again or send SIGUSR1 for full disable."
     )
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
@@ -3567,19 +3556,59 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-disable", action="store_true")
     parser.add_argument("--confirmation", default="")
     parser.add_argument("--output", type=Path, help="write JSON outside the source worktree")
+    parser.add_argument(
+        "--log",
+        type=Path,
+        help="write detailed stdout/stderr; defaults beside --output with a .log suffix",
+    )
     return parser
+
+
+def _resolve_runtime_log_path(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "log", None)
+    if configured is not None:
+        return Path(configured).expanduser().resolve()
+    if args.output is not None:
+        return Path(args.output).expanduser().resolve().with_suffix(".log")
+    return Path(f"/tmp/b601-rs-low-gain-probe-{os.getpid()}.log")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    try:
-        payload = run_probe(args)
-    except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
-        payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
-        _output_payload(payload, args.output)
-        return 2
+    runtime_log_path = _resolve_runtime_log_path(args)
+    runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[B601] mode={args.mode} pid={os.getpid()} log={runtime_log_path}",
+        flush=True,
+    )
+    print(
+        "[B601] STOP: Ctrl-C requests protective hold; Ctrl-C again or "
+        "SIGUSR1 requests full six-joint disable. Physical E-stop remains primary.",
+        flush=True,
+    )
+    with (
+        runtime_log_path.open("a", encoding="utf-8") as runtime_log,
+        contextlib.redirect_stdout(runtime_log),
+        contextlib.redirect_stderr(runtime_log),
+    ):
+        print(
+            f"[B601] run started mode={args.mode} pid={os.getpid()}",
+            flush=True,
+        )
+        try:
+            payload = run_probe(args)
+        except (LowGainProbeError, B601HardwareError, OSError, ValueError) as exc:
+            payload = {"status": "ERROR", "mode": args.mode, "error": str(exc)}
+            exit_code = 2
+        else:
+            exit_code = 0 if payload.get("status") == "OK" else 1
+        print(
+            f"[B601] run finished status={payload.get('status')} exit={exit_code}",
+            flush=True,
+        )
+    payload["runtime_log_path"] = str(runtime_log_path)
     _output_payload(payload, args.output)
-    return 0 if payload.get("status") == "OK" else 1
+    return exit_code
 
 
 if __name__ == "__main__":
