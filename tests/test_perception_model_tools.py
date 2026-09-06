@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -163,6 +164,40 @@ def test_point_grasp_image_cli_bounds_depth_before_loading(
 
     with pytest.raises(ValueError, match="at most 64 MiB"):
         point_grasp_image_cli.run(args)
+
+
+def test_point_grasp_cli_annotation_renders_only_selected_candidate(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def _render(image, *, candidates, **kwargs):
+        calls.append((candidates, kwargs))
+        return image.copy(), ()
+
+    monkeypatch.setattr(point_grasp_image_cli, "render_dmtac_grasp_overlays", _render)
+    pose = tuple(np.eye(4).reshape(-1))
+    candidate = SimpleNamespace(
+        score=0.9,
+        gripper_width_m=0.04,
+        camera_from_tcp=pose,
+    )
+    planned = SimpleNamespace(
+        candidates=(candidate, candidate),
+        target_mask_bbox_xyxy=(2, 2, 10, 9),
+    )
+
+    encoded = point_grasp_image_cli._annotated_jpeg(
+        Image.new("RGB", (16, 12)),
+        (8, 6),
+        planned,
+        {"width": 16, "height": 12, "fx": 10.0, "fy": 10.0, "cx": 8.0, "cy": 6.0},
+    )
+
+    assert Image.open(io.BytesIO(encoded)).size == (16, 12)
+    assert len(calls) == 1
+    assert len(calls[0][0]) == 1
+    assert calls[0][0][0].selected
 
 
 class _FakeSpec:

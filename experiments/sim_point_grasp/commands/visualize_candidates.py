@@ -17,8 +17,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run front-camera MuJoCo RGB-D through SAM2 + GraspNet and project "
-            "the ranked DMTAC M wireframes into front, left_wrist, and "
-            "right_wrist images. No IK, robot motion, or gripper action is run."
+            "each ranked DMTAC M wireframe into separate front, left_wrist, "
+            "and right_wrist images. Wrist views use visualization-only "
+            "look-at cameras aimed at the cube. No IK, robot motion, or "
+            "gripper action is run."
         )
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")

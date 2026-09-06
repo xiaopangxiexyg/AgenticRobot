@@ -94,6 +94,31 @@ class _FakePlanner:
         )
 
 
+class _TwoCandidateFakePlanner(_FakePlanner):
+    def plan(self, *args, **kwargs):
+        planned = super().plan(*args, **kwargs)
+        first = planned.candidates[0]
+        second_camera = np.asarray(first.camera_from_tcp).reshape(4, 4).copy()
+        second_camera[0, 3] += 0.01
+        second_base = np.asarray(first.base_from_tcp).reshape(4, 4).copy()
+        second_base[0, 3] += 0.01
+        second = PointGraspCandidate(
+            score=0.8,
+            model_score=0.85,
+            click_distance_m=0.03,
+            gripper_width_m=0.04,
+            camera_from_tcp=tuple(second_camera.reshape(-1)),
+            base_from_tcp=tuple(second_base.reshape(-1)),
+            visible_collision_free=True,
+        )
+        return PointGraspResult(
+            target_point_camera_m=planned.target_point_camera_m,
+            target_point_base_m=planned.target_point_base_m,
+            target_mask_bbox_xyxy=planned.target_mask_bbox_xyxy,
+            candidates=(first, second),
+        )
+
+
 def _registration(local_path_enabled=True):
     return build_real_point_grasp_registration(
         backend_id="vgn",
@@ -189,15 +214,16 @@ def test_point_grasp_skill_annotation_uses_dmtac_wireframe_renderer(
 
     monkeypatch.setattr(point_grasp_gateway, "render_dmtac_grasp_overlays", _render)
     provider = PointGraspProvider(
-        planner=_FakePlanner(),
+        planner=_TwoCandidateFakePlanner(),
         registration=_registration(),
         allowed_local_image_roots=(tmp_path,),
     )
-    provider.plan_request(
+    prepared = provider.plan_request(
         SimpleNamespace(parameters=_parameters(rgb, depth), input_artifact_bindings=()),
         artifact_store=SimpleNamespace(),
     )
 
+    assert prepared.execution_result["candidate_count"] == 2
     assert len(calls) == 1
     candidates, reference_from_camera, intrinsics, kwargs = calls[0]
     assert len(candidates) == 1

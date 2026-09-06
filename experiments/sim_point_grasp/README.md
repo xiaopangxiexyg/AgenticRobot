@@ -8,11 +8,13 @@ not a production Skill route and not a real-robot entrypoint.
 Use the visualization command when the goal is to inspect generated poses, not
 to test grasp execution. It resets and settles the scene once, runs the `front`
 RGB-D frame through the formal SAM2 + GraspNet provider, and projects every
-ranked, upward-normalized DMTAC M pose into `front`, `left_wrist`, and
-`right_wrist`. It never calls IK, candidate reachability preflight, `env.step`,
-arm control, or gripper control after the reset. The report hashes MuJoCo time,
-qpos, qvel, and ctrl before and after inference/rendering and fails if that state
-changes.
+ranked, upward-normalized DMTAC M pose into separate `front`, `left_wrist`, and
+`right_wrist` artifacts. Each overlay contains exactly one grasp. The summary
+montage contains only the provider-selected grasp across all three views, while
+the other ranked candidates remain available as individual PNGs. It never calls
+IK, candidate reachability preflight, `env.step`, arm control, or gripper control
+after the reset. The report hashes MuJoCo time, qpos, qvel, and ctrl before and
+after inference/rendering and fails if that state changes.
 
 ```bash
 conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
@@ -26,13 +28,22 @@ python -m experiments.sim_point_grasp.commands.visualize_candidates \
 ```
 
 The new output directory contains the three raw RGB images, `front_depth_m.npy`,
-the provider's `front_skill_annotation.jpg`, `skill_result.json`, one PNG overlay
-per camera, `grasp_multiview_montage.png`, and `visualization_report.json`.
-Each camera record contains its optical-frame intrinsics, `T_base_from_camera`,
-every derived `T_camera_from_tcp`, and an explicit visibility classification.
-This is a simple overlay: geometry hidden by scene depth is intentionally still
-drawn. A wrist view that cannot see the grasp is reported as `out_of_frame` or
-`behind_camera`, not treated as an error and not made artificially visible.
+the provider's selected-only `front_skill_annotation.jpg`, `skill_result.json`,
+one `<camera>_candidate_<ordinal>_grasp_overlay.png` per camera/candidate pair,
+the selected-only `grasp_multiview_montage.png`, and
+`visualization_report.json` (schema
+`dexteleop.experiments.sim_point_grasp_visualization.v2`). Each camera record contains its actual rendered
+optical-frame intrinsics, `T_base_from_camera`, per-candidate artifact name,
+derived `T_camera_from_tcp`, and an explicit visibility classification. This is
+a simple overlay: geometry hidden by scene depth is intentionally still drawn.
+
+`front` uses the scene's fixed head-camera pose. For this validation command
+only, each wrist view keeps the current simulated wrist-camera origin but uses a
+MuJoCo free camera aimed at the randomized cube center. The report labels these
+views `visualization_only_look_at_override_from_wrist_origin`; they are not wrist
+camera calibration and do not change the URDF, camera registry, or production
+extrinsics. The pose used for overlay projection is recovered from MuJoCo's
+actual rendered GL camera, so the wireframe and RGB view share the same camera.
 
 The model-backed command requires the pinned assets and CUDA described in
 `docs/agent_gateway/POINT_GRASP.md`. A custom nonexistent output directory can

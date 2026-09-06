@@ -252,9 +252,15 @@ planner semantic content hash。
 `T_reference_from_tcp` 与 `T_reference_from_camera`，它按
 `T_camera_from_tcp = inv(T_reference_from_camera) @ T_reference_from_tcp` 得到任意视角中的抓姿，
 返回线段可见数、TCP 像素和 `visible`、`partially_visible`、`behind_camera`、`out_of_frame`
-之一。这个接口不依赖 MuJoCo 或 RealSense；本轮只在 MuJoCo 的 `front`、`left_wrist`、
-`right_wrist` 三视角中接通。真实相机的动态外参获取、图像/投影记录持久化和上层调用协议不在
-本轮范围内。
+之一。Skill 与离线 CLI 的 annotated preview 只渲染已选中的 ordinal 0，JSON 结果仍保留全部
+排序候选，避免多副线框混在同一图像中。仿真实验进一步为每个“相机 × 候选”输出独立 PNG，
+三视角 montage 也只展示 ordinal 0。
+
+这个接口不依赖 MuJoCo 或 RealSense；本轮只在 MuJoCo 的 `front`、`left_wrist`、
+`right_wrist` 三视角中接通。`front` 使用场景固定相机；两个腕部验证视图保留各自相机原点，
+但使用明确标记为 `visualization_only_look_at_override_from_wrist_origin` 的 MuJoCo free camera
+朝向方块，并从实际 GL camera 反算投影外参。这不是生产腕部标定，也没有修改 URDF 或相机
+registry。真实相机的动态外参获取、图像/投影记录持久化和上层调用协议不在本轮范围内。
 
 ## 已知局限
 
