@@ -20,6 +20,8 @@ features:
     enabled: true
     client:
       show_robot_tcp_axes: true
+      show_robot_base_axes: true
+      show_robot_tcp_marker: true
       axis_length_m: 0.18
       show_controller_axes: true
       show_reference_marker: true

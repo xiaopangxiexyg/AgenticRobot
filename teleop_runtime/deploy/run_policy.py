@@ -432,6 +432,7 @@ from .tactile_cli_validation import validate_tactile_cli_args
 from .quest_paired_pose_capture import (
     QuestPairedPoseCaptureApplicationPort,
     QuestPairedPoseCaptureFactory,
+    QuestTerminalCaptureController,
     bind_passive_robot_pose_journal_source,
     require_quest_paired_pose_capture_application,
 )
@@ -2519,6 +2520,7 @@ def main(
         )
     )
     quest_paired_pose_capture: QuestPairedPoseCaptureApplicationPort | None = None
+    quest_terminal_capture: QuestTerminalCaptureController | None = None
     quest_paired_pose_poll_enabled = False
     quest_paired_pose_capture_error: str | None = None
     quest_paired_pose_factory_attempted = False
@@ -3769,13 +3771,34 @@ def main(
                 created_quest_capture,
                 robot_pose_journal=robot_pose_journal,
             )
+            if len(active_sides) != 1:
+                raise ValueError(
+                    "terminal Quest capture requires exactly one active arm side"
+                )
+            quest_capture_id = getattr(
+                quest_paired_pose_capture_factory.config,
+                "capture_id",
+                "quest",
+            )
+            quest_terminal_capture = QuestTerminalCaptureController(
+                application=created_quest_capture,
+                robot_side=next(iter(active_sides)),
+                preferred_handedness=getattr(
+                    getattr(quest_paired_pose_capture_factory, "config", None),
+                    "controller_handedness",
+                    None,
+                ),
+                window_id_prefix=f"{quest_capture_id}-window",
+            )
             quest_paired_pose_poll_enabled = True
             print(
                 "[QuestPairedPoseCapture] READY: unique Quest host is bound "
-                "to the existing passive robot journal; controller/side/frame "
-                "selection remains explicit.",
+                "to the existing passive robot journal; terminal controls: "
+                "r=start/finish static window, c=finalize and solve. "
+                "RealMan remains observation-only.",
                 flush=True,
             )
+            quest_terminal_capture.application.publish_capture_status()
         print_controls(
             send_actions=send_actions,
             auto_start=bool(args.auto_start),
@@ -3902,6 +3925,12 @@ def main(
                 if preview_keys and key is None:
                     key = preview_keys[0]
                 key = None if key is None else key.lower()
+                if quest_terminal_capture is not None and key in {"r", "c"}:
+                    quest_terminal_capture.handle_key(key)
+                    # Passive Quest capture owns r/c only for this explicit
+                    # observation composition.  Do not let r fall through to
+                    # the deployment safety re-arm branch.
+                    key = None
                 rearm_requested = bool(key == "r")
                 if rearm_requested and position_force_guard_fault_latched:
                     policy_active = False
@@ -4099,7 +4128,10 @@ def main(
                     and quest_paired_pose_poll_enabled
                 ):
                     try:
-                        quest_paired_pose_capture.poll()
+                        if quest_terminal_capture is not None:
+                            quest_terminal_capture.poll()
+                        else:
+                            quest_paired_pose_capture.poll()
                     except Exception as exc:  # noqa: BLE001 - passive observer only.
                         quest_paired_pose_capture_error = (
                             "quest_paired_pose_capture_poll_failed:"

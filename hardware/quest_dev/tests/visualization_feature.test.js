@@ -20,6 +20,8 @@ function loadFeature() {
     destroy: () => {},
     drawAxes: (...args) => draws.push(args),
     drawReferenceMarker: () => {},
+    drawRobotBaseAxes: (...args) => draws.push(args),
+    drawTcpMarker: (...args) => draws.push(args),
   };
   const xrMath = {
     mat4Multiply: (_a, b) => b,
@@ -157,4 +159,46 @@ test('visualization draws TCP axes only for the current accepted Quest epoch', (
   implementation.onReferenceSpaceReset();
   implementation.renderView(context);
   assert.equal(draws.length, 1);
+});
+
+test('visualization draws diagnostic robot base and raw-feedback TCP preview', () => {
+  const { implementation, draws, status } = loadFeature();
+  implementation.onXRReady({ gl: {} });
+  implementation.handleServerMessage({
+    message: {
+      type: 'calibration_preview',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      preview: true,
+      accepted: false,
+      alignment_status: 'diagnostic_preview',
+      robot: 'rm65_left',
+      robot_frame: 'left_arm_base',
+      tcp_frame: 'tool_tcp',
+      quest_session_id: 'xr-session-1',
+      reference_space_type: 'local-floor',
+      reference_space_generation: 0,
+      matrix_quest_from_robot_base: identityMatrix(),
+    },
+  });
+  implementation.handleServerMessage({
+    message: {
+      type: 'robot_tcp',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      robots: {
+        rm65_left: {
+          robot: 'rm65_left',
+          fresh: true,
+          alignment_ready: false,
+          matrix_robot_from_tcp: identityMatrix(),
+        },
+      },
+    },
+  });
+  implementation.renderView(matchingContext());
+  assert.equal(draws.length, 3);
+  assert.match(status.textContent, /robot feedback 1 fresh/);
 });
