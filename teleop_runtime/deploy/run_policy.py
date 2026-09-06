@@ -4783,7 +4783,6 @@ def main(
                             + type(action_step.emission_error).__name__
                         )
                         policy_deploy_runtime.clear_action_queue()
-                        invalidate_in_flight_policy_prediction()
                         if bool(args.pause_on_policy_error):
                             policy_active = False
                     queue_len_before_pop = action_step.queue_len_before
