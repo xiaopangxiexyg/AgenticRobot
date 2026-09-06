@@ -84,9 +84,19 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   torque/slew 包络或更负值的 fail-closed 行为；例如 `q < -5e-4 rad` 仍会被原有限位门
   拒绝。JSON 样本同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
   `boundary_normalized_joint_names`，便于复核实际读数。
+- active low-gain probe 用相邻 normalized q 与精确 host receive `dt` 计算 qvel，再用连续
+  qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0`、非有限值、
+  qvel 或 qacc 越限都在任何 MIT dispatch 前拒绝。JSON 的 `motion_guard.rejected_sample`
+  独立保存 offending joint、raw/normalized q、previous/current qvel、qacc、dt、seq/timestamp，
+  并标记 `command_dispatched=false`、`eligible_for_last_safe=false`。默认
+  `--acceleration-abort-rad-s2 4.0` 只是待真机整定的 commissioning seed，不是已认证上限。
 
 数学、重力和 haptic 组合仍由 `robot_motion.rebot_b601_rs` 负责，仿真 effort backend
 仍由 `sim.mujoco.rebot_b601_rs` 负责；本模块不复制 Pinocchio 或 MuJoCo 实现。
+离线 `haptic_demo` 的 `pose-tx/ty/tz` 从扰动前当前 FK 锚定后施加 world-axis 平移，
+`pose-rx/ry/rz` 施加 tool-local 旋转，`pose-6d` 同时施加两类扰动；输出分别判定
+translation/rotation 收敛，并记录 force/torque clip、joint torque/slew、qvel/qacc 和
+driver fault。该 ideal-effort 结果只验证控制数学与稳定趋势，不映射为真机力值或手感。
 
 ## 频率指标契约
 
@@ -380,7 +390,7 @@ printf '%s\n' 'shell remains active'
 然后向 upstream
 MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
-位置误差、非有限差分、部分发送或 cleanup 不完整会立即结束本次运行。由于当前
+加速度、位置误差、非有限差分、部分发送或 cleanup 不完整会立即结束本次运行。由于当前
 `mechPos` 是同步参数读取且 MotorBridge 没有源序号/时间戳，本探针的默认 20 Hz
 只是低速 commissioning 节拍，不是高频 haptic loop，也不声明 freshness、力传感器
 或真实重力参数已验收。Pinocchio 重力模型使用中性辅助夹爪坐标，实际夹爪负载和
@@ -499,6 +509,7 @@ if cd "$WT"; then
       --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
       --velocity-abort-rad-s 0.05 \
+      --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.05 \
       --allow-motion \
       --auto-disable \
@@ -531,6 +542,9 @@ printf '%s\n' 'shell remains active'
 拒绝次数与最后原因。若随后发生真实故障，保护保持仍会重新验证当前帧、旧 `last_safe`
 的年龄和 J2/J3 rebase；任一条件不满足仍立即执行六关节 `safe_stop`，不得通过提高故障
 保持速度阈值绕过。
+`--acceleration-abort-rad-s2` 又是独立于 qvel 和 fault-hold stationarity 的第三层；不得因
+放宽正常人工推动的 qvel 阈值而同步放宽 qacc 或 `0.02 rad/s` 的保护保持静止门。首次恢复
+人工扰动前必须先审查 `motion_guard`，并为该硬件、负载和采样噪声重新批准 qacc 阈值。
 并在 JSON 中确认 `status=OK`、`acceptance_status=PASS`、
 `cleanup_receipt.completed=true`、`cleanup_errors=[]`、`stop_reason=null`，以及
 `frequency_acceptance.feedback/compute/tx.*.passed=true`。输出中的
@@ -604,6 +618,7 @@ if cd "$WT"; then
       --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
       --velocity-abort-rad-s 0.05 \
+      --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.05 \
       --allow-motion \
       --auto-disable \
@@ -686,6 +701,7 @@ if cd "$WT"; then
       --torque-limit-scale 0.15 \
       --torque-rise-time-sec 2.0 \
       --velocity-abort-rad-s 0.05 \
+      --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.15 \
       --cartesian-stiffness-n-per-m 10 \
       --cartesian-damping-n-s-per-m 0.5 \
@@ -752,6 +768,7 @@ if cd "$WT"; then
       --torque-limit-scale 0.15 \
       --torque-rise-time-sec 2.0 \
       --velocity-abort-rad-s 0.05 \
+      --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.15 \
       --cartesian-stiffness-n-per-m 10 \
       --cartesian-damping-n-s-per-m 0.5 \

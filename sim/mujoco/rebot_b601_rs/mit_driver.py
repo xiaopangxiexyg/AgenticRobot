@@ -103,6 +103,7 @@ def default_b601_mit_profile(
         max_abs_overlay_torque_nm=_ZERO_SIX,
         max_abs_reference_velocity_rad_s=(2.0,) * 6,
         max_abs_state_velocity_rad_s=(2.0,) * 6,
+        max_abs_state_acceleration_rad_s2=(100.0,) * 6,
         metadata={
             "parameter_source": (
                 "pinned_urdf_effort_ceiling_plus_conservative_pre_hardware_damping_seed"
@@ -137,8 +138,10 @@ class B601EffortTick:
     reference_timed_out: bool
     control_qpos: tuple[float, ...]
     control_qvel: tuple[float, ...]
+    control_qacc: tuple[float, ...]
     measured_qpos: tuple[float, ...]
     measured_qvel: tuple[float, ...]
+    measured_qacc: tuple[float, ...]
     measured_time_sec: float
     torque_breakdown: B601MitTorqueBreakdown | None
     clipped_torque_nm: tuple[float, ...]
@@ -367,6 +370,9 @@ class B601MujocoEffortDriver:
                 "max_abs_state_velocity_rad_s": (
                     self.profile.max_abs_state_velocity_rad_s
                 ),
+                "max_abs_state_acceleration_rad_s2": (
+                    self.profile.max_abs_state_acceleration_rad_s2
+                ),
                 "metadata": dict(self.profile.metadata),
             },
             "final_effort_conditioning": "clip_then_slew_then_clip",
@@ -375,9 +381,12 @@ class B601MujocoEffortDriver:
                 if self.enable_gravity_compensation
                 else "zero"
             ),
-            "state_guard": "latched_position_velocity_and_finite_state_guard",
+            "state_guard": (
+                "latched_position_velocity_acceleration_and_finite_state_guard"
+            ),
             "tick_state_semantics": (
-                "control_qpos_qvel_are_pre_step;measured_qpos_qvel_are_post_step"
+                "control_qpos_qvel_qacc_are_pre_step;"
+                "measured_qpos_qvel_qacc_are_post_step"
             ),
             "hardware_safety_claim": False,
         }
@@ -435,6 +444,7 @@ class B601MujocoEffortDriver:
         self._latch_state_fault_if_needed()
         qpos = self._measured_qpos()
         qvel = self._measured_qvel()
+        qacc = self._measured_qacc()
 
         if reference is not None:
             if not isinstance(reference, B601MitReference):
@@ -555,6 +565,7 @@ class B601MujocoEffortDriver:
 
         measured_qpos = self._measured_qpos()
         measured_qvel = self._measured_qvel()
+        measured_qacc = self._measured_qacc()
         state_finite, state_within_limits, _reason = self._state_status()
         return B601EffortTick(
             physics_tick=tick_index,
@@ -584,8 +595,10 @@ class B601MujocoEffortDriver:
             reference_timed_out=reference_timed_out,
             control_qpos=tuple(float(value) for value in qpos),
             control_qvel=tuple(float(value) for value in qvel),
+            control_qacc=tuple(float(value) for value in qacc),
             measured_qpos=tuple(float(value) for value in measured_qpos),
             measured_qvel=tuple(float(value) for value in measured_qvel),
+            measured_qacc=tuple(float(value) for value in measured_qacc),
             measured_time_sec=self.physics_time_sec,
             torque_breakdown=breakdown,
             clipped_torque_nm=tuple(float(value) for value in clipped),
@@ -874,13 +887,21 @@ class B601MujocoEffortDriver:
             dtype=float,
         ).copy()
 
+    def _measured_qacc(self) -> np.ndarray:
+        return np.asarray(
+            self.scene.data.qacc[self._qvel_addresses],
+            dtype=float,
+        ).copy()
+
     def _state_status(self) -> tuple[bool, bool, str | None]:
         qpos = self._measured_qpos()
         qvel = self._measured_qvel()
+        qacc = self._measured_qacc()
         finite = bool(
             self.scene.state_is_finite()
             and np.all(np.isfinite(qpos))
             and np.all(np.isfinite(qvel))
+            and np.all(np.isfinite(qacc))
             and np.all(np.isfinite(self.scene.data.qacc_warmstart))
             and np.all(np.isfinite(self.scene.data.qfrc_applied))
             and np.all(np.isfinite(self.scene.data.xfrc_applied))
@@ -922,6 +943,25 @@ class B601MujocoEffortDriver:
                     f"joint_velocity_limit_violation:"
                     f"{B601_RS_ARM_JOINT_NAMES[velocity_index]}:"
                     f"velocity_rad_s={abs(float(qvel[velocity_index])):.9g}"
+                ),
+            )
+        acceleration_limit = np.asarray(
+            self.profile.max_abs_state_acceleration_rad_s2,
+            dtype=float,
+        )
+        acceleration_excursion = np.abs(qacc) - acceleration_limit
+        acceleration_index = int(np.argmax(acceleration_excursion))
+        maximum_acceleration_excursion = float(
+            acceleration_excursion[acceleration_index]
+        )
+        if maximum_acceleration_excursion > 0.0:
+            return (
+                True,
+                False,
+                (
+                    f"joint_acceleration_limit_violation:"
+                    f"{B601_RS_ARM_JOINT_NAMES[acceleration_index]}:"
+                    f"acceleration_rad_s2={abs(float(qacc[acceleration_index])):.9g}"
                 ),
             )
         return True, True, None

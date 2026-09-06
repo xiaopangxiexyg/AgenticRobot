@@ -17,6 +17,7 @@ from robot_motion.rebot_b601_rs import (
     transform_spatial_twist,
     transform_spatial_wrench,
 )
+from scripts.hardware import rebot_b601_rs_low_gain_probe as low_gain_probe
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REBOT_SOURCE_ROOT = REPO_ROOT / "hardware" / "reBotArm_control_py"
@@ -38,6 +39,91 @@ def _rotation_z(angle_rad: float) -> np.ndarray:
         [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]],
         dtype=float,
     )
+
+
+def test_feedback_motion_guard_first_sample_has_no_synthetic_acceleration() -> None:
+    qacc, rejection = low_gain_probe.evaluate_feedback_motion_guard(
+        sequence=7,
+        feedback_timestamp_sec=12.05,
+        dt_sec=0.05,
+        raw_qpos_rad=(0.0,) * 6,
+        normalized_qpos_rad=(0.0,) * 6,
+        previous_qvel_rad_s=None,
+        current_qvel_rad_s=(0.01,) * 6,
+        velocity_abort_rad_s=0.12,
+        acceleration_abort_rad_s2=4.0,
+    )
+
+    assert qacc is None
+    assert rejection is None
+
+
+def test_feedback_motion_guard_rejects_acceleration_with_complete_evidence() -> None:
+    raw_q = (0.0, -0.0002, 0.1, 0.2, 0.3, 0.4)
+    normalized_q = (0.0, 0.0, 0.1, 0.2, 0.3, 0.4)
+    previous_qvel = (0.0,) * 6
+    current_qvel = (0.0, 0.11, 0.0, 0.0, 0.0, 0.0)
+
+    qacc, rejection = low_gain_probe.evaluate_feedback_motion_guard(
+        sequence=19,
+        feedback_timestamp_sec=42.0,
+        dt_sec=0.05,
+        raw_qpos_rad=raw_q,
+        normalized_qpos_rad=normalized_q,
+        previous_qvel_rad_s=previous_qvel,
+        current_qvel_rad_s=current_qvel,
+        velocity_abort_rad_s=0.12,
+        acceleration_abort_rad_s2=2.0,
+    )
+
+    assert qacc == pytest.approx((0.0, 2.2, 0.0, 0.0, 0.0, 0.0))
+    assert rejection is not None
+    assert rejection["guard"] == "acceleration"
+    assert rejection["offending_joint"] == "joint2"
+    assert rejection["sequence"] == 19
+    assert rejection["raw_qpos_rad"] == raw_q
+    assert rejection["normalized_qpos_rad"] == normalized_q
+    assert rejection["previous_qvel_rad_s"] == previous_qvel
+    assert rejection["current_qvel_rad_s"] == current_qvel
+    assert rejection["qacc_fd_rad_s2"] == pytest.approx(qacc)
+    assert rejection["command_dispatched"] is False
+    assert rejection["eligible_for_last_safe"] is False
+
+
+def test_feedback_motion_guard_velocity_rejection_keeps_computed_qacc() -> None:
+    qacc, rejection = low_gain_probe.evaluate_feedback_motion_guard(
+        sequence=20,
+        feedback_timestamp_sec=42.05,
+        dt_sec=0.05,
+        raw_qpos_rad=(0.0,) * 6,
+        normalized_qpos_rad=(0.0,) * 6,
+        previous_qvel_rad_s=(0.0,) * 6,
+        current_qvel_rad_s=(0.0, 0.0, 0.0, 0.13, 0.0, 0.0),
+        velocity_abort_rad_s=0.12,
+        acceleration_abort_rad_s2=4.0,
+    )
+
+    assert qacc == pytest.approx((0.0, 0.0, 0.0, 2.6, 0.0, 0.0))
+    assert rejection is not None
+    assert rejection["guard"] == "velocity"
+    assert rejection["offending_joint"] == "joint4"
+    assert rejection["qacc_fd_rad_s2"] == pytest.approx(qacc)
+
+
+@pytest.mark.parametrize("dt_sec", [0.0, -0.01, np.nan])
+def test_feedback_motion_guard_rejects_invalid_feedback_dt(dt_sec: float) -> None:
+    with pytest.raises(ValueError, match="feedback_dt_sec"):
+        low_gain_probe.evaluate_feedback_motion_guard(
+            sequence=1,
+            feedback_timestamp_sec=1.0,
+            dt_sec=dt_sec,
+            raw_qpos_rad=(0.0,) * 6,
+            normalized_qpos_rad=(0.0,) * 6,
+            previous_qvel_rad_s=(0.0,) * 6,
+            current_qvel_rad_s=(0.0,) * 6,
+            velocity_abort_rad_s=0.12,
+            acceleration_abort_rad_s2=4.0,
+        )
 
 
 def test_wrench_transform_rotates_force_and_shifts_torque_origin() -> None:

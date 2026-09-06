@@ -152,6 +152,7 @@ class B601MitControlProfile:
     max_abs_overlay_torque_nm: tuple[float, ...] = _ZERO_SIX
     max_abs_reference_velocity_rad_s: tuple[float, ...] = (2.0,) * 6
     max_abs_state_velocity_rad_s: tuple[float, ...] = (2.0,) * 6
+    max_abs_state_acceleration_rad_s2: tuple[float, ...] = (100.0,) * 6
     joint_names: tuple[str, ...] = B601_RS_ARM_JOINT_NAMES
     metadata: Mapping[str, object] = field(default_factory=dict)
 
@@ -222,6 +223,15 @@ class B601MitControlProfile:
             _six_non_negative(
                 self.max_abs_state_velocity_rad_s,
                 name="max_abs_state_velocity_rad_s",
+                strictly_positive=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_abs_state_acceleration_rad_s2",
+            _six_non_negative(
+                self.max_abs_state_acceleration_rad_s2,
+                name="max_abs_state_acceleration_rad_s2",
                 strictly_positive=True,
             ),
         )

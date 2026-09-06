@@ -116,6 +116,7 @@ _DEFAULT_MAX_STEP_RESPONSE_RATIO = 1.50
 _DEFAULT_MIN_STEP_RESPONSE_RAD = math.radians(0.1)
 _DEFAULT_MAX_SUPPORT_DRIFT_RAD = math.radians(0.5)
 _DEFAULT_VELOCITY_ABORT_RAD_S = 0.10
+_DEFAULT_ACCELERATION_ABORT_RAD_S2 = 4.0
 _DEFAULT_MAX_ERROR_RAD = 0.15
 _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
 _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
@@ -440,6 +441,105 @@ def _evaluate_fault_hold_candidate(
     return accepted, None
 
 
+def evaluate_feedback_motion_guard(
+    *,
+    sequence: int,
+    feedback_timestamp_sec: float,
+    dt_sec: float,
+    raw_qpos_rad: Sequence[float],
+    normalized_qpos_rad: Sequence[float],
+    previous_qvel_rad_s: Sequence[float] | None,
+    current_qvel_rad_s: Sequence[float],
+    velocity_abort_rad_s: float,
+    acceleration_abort_rad_s2: float,
+) -> tuple[tuple[float, ...] | None, dict[str, object] | None]:
+    """Evaluate finite-difference velocity/acceleration before dispatch.
+
+    The first accepted control sample has no previous velocity observation and
+    therefore reports ``qacc_fd_rad_s2=None``. A rejected sample is returned
+    separately and must not enter the commanded sample list or last-safe state.
+    """
+
+    timestamp = _finite(feedback_timestamp_sec, name="feedback_timestamp_sec")
+    dt = _positive(dt_sec, name="feedback_dt_sec")
+    raw_q = _six(raw_qpos_rad, name="raw_qpos_rad")
+    normalized_q = _six(normalized_qpos_rad, name="normalized_qpos_rad")
+    current_qvel = _six(current_qvel_rad_s, name="current_qvel_rad_s")
+    velocity_limit = _positive(
+        velocity_abort_rad_s,
+        name="velocity_abort_rad_s",
+    )
+    acceleration_limit = _positive(
+        acceleration_abort_rad_s2,
+        name="acceleration_abort_rad_s2",
+    )
+    previous_qvel: tuple[float, ...] | None = None
+    qacc: tuple[float, ...] | None = None
+    if previous_qvel_rad_s is not None:
+        previous_qvel = _six(previous_qvel_rad_s, name="previous_qvel_rad_s")
+        qacc = tuple(
+            (current - previous) / dt
+            for current, previous in zip(
+                current_qvel,
+                previous_qvel,
+                strict=True,
+            )
+        )
+        if any(not math.isfinite(value) for value in qacc):
+            raise ValueError("qacc_fd_rad_s2 must contain six finite values")
+
+    guard_name: str | None = None
+    offending_index: int | None = None
+    observed_value: float | None = None
+    limit_value: float | None = None
+    velocity_index = int(np.argmax(np.abs(np.asarray(current_qvel, dtype=float))))
+    maximum_velocity = abs(current_qvel[velocity_index])
+    if maximum_velocity > velocity_limit:
+        guard_name = "velocity"
+        offending_index = velocity_index
+        observed_value = maximum_velocity
+        limit_value = velocity_limit
+    elif qacc is not None:
+        acceleration_index = int(np.argmax(np.abs(np.asarray(qacc, dtype=float))))
+        maximum_acceleration = abs(qacc[acceleration_index])
+        if maximum_acceleration > acceleration_limit:
+            guard_name = "acceleration"
+            offending_index = acceleration_index
+            observed_value = maximum_acceleration
+            limit_value = acceleration_limit
+
+    if guard_name is None:
+        return qacc, None
+    assert offending_index is not None
+    assert observed_value is not None
+    assert limit_value is not None
+    units = "rad/s" if guard_name == "velocity" else "rad/s^2"
+    field = "qvel" if guard_name == "velocity" else "qacc"
+    reason = (
+        f"{guard_name} abort: {B601_RS_ARM_JOINT_NAMES[offending_index]} "
+        f"abs_{field}={observed_value:.6f} > {limit_value:.6f} {units}"
+    )
+    return qacc, {
+        "reason": reason,
+        "guard": guard_name,
+        "offending_joint": B601_RS_ARM_JOINT_NAMES[offending_index],
+        "offending_joint_index": offending_index,
+        "observed_abs_value": observed_value,
+        "limit": limit_value,
+        "units": units,
+        "sequence": int(sequence),
+        "feedback_timestamp_sec": timestamp,
+        "feedback_dt_sec": dt,
+        "raw_qpos_rad": raw_q,
+        "normalized_qpos_rad": normalized_q,
+        "previous_qvel_rad_s": previous_qvel,
+        "current_qvel_rad_s": current_qvel,
+        "qacc_fd_rad_s2": qacc,
+        "command_dispatched": False,
+        "eligible_for_last_safe": False,
+    }
+
+
 def _validate_arming_settle_transition(
     current_qpos_rad: Sequence[float] | None,
     *,
@@ -683,6 +783,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
         name="velocity_abort_rad_s",
         lower=0.01,
         upper=0.5,
+    )
+    _bounded(
+        args.acceleration_abort_rad_s2,
+        name="acceleration_abort_rad_s2",
+        lower=0.1,
+        upper=20.0,
     )
     _bounded(
         args.max_error_rad,
@@ -2325,6 +2431,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     stop = {"requested": False, "full_disable_requested": False}
     previous_q: tuple[float, ...] | None = None
     previous_feedback_time: float | None = None
+    previous_guard_qvel: tuple[float, ...] | None = None
     previous_tau = _ZERO_SIX
     initial_q: tuple[float, ...] | None = None
     final_q: tuple[float, ...] | None = None
@@ -2346,6 +2453,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     fault_hold_candidate_accepted_count = 0
     fault_hold_candidate_rejected_count = 0
     fault_hold_candidate_last_rejection: str | None = None
+    rejected_motion_sample: dict[str, object] | None = None
+    rejected_motion_sample_count = 0
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
     primary_error: Exception | None = None
@@ -2696,6 +2805,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 dt = state.receive_timestamp_sec - previous_feedback_time
                 if not math.isfinite(dt) or dt <= 0.0:
                     stop_reason = "non-increasing feedback timestamp"
+                    rejected_motion_sample = {
+                        "reason": stop_reason,
+                        "guard": "feedback_dt",
+                        "sequence": int(state.sequence),
+                        "feedback_timestamp_sec": state.receive_timestamp_sec,
+                        "feedback_dt_sec": dt if math.isfinite(dt) else None,
+                        "feedback_dt_observed": repr(dt),
+                        "raw_qpos_rad": raw_q,
+                        "normalized_qpos_rad": q,
+                        "previous_qvel_rad_s": previous_guard_qvel,
+                        "current_qvel_rad_s": None,
+                        "qacc_fd_rad_s2": None,
+                        "command_dispatched": False,
+                        "eligible_for_last_safe": False,
+                    }
+                    rejected_motion_sample_count += 1
                     break
                 qvel = tuple(
                     (current - previous) / dt
@@ -2704,6 +2829,59 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             fault_qvel_for_hold = tuple(float(value) for value in qvel)
             if any(not math.isfinite(value) for value in qvel):
                 stop_reason = "non-finite finite-difference velocity"
+                rejected_motion_sample = {
+                    "reason": stop_reason,
+                    "guard": "sample_validation",
+                    "sequence": int(state.sequence),
+                    "feedback_timestamp_sec": state.receive_timestamp_sec,
+                    "feedback_dt_sec": dt,
+                    "raw_qpos_rad": raw_q,
+                    "normalized_qpos_rad": q,
+                    "previous_qvel_rad_s": previous_guard_qvel,
+                    "current_qvel_rad_s": tuple(
+                        value if math.isfinite(value) else None for value in qvel
+                    ),
+                    "current_qvel_observed": tuple(repr(value) for value in qvel),
+                    "qacc_fd_rad_s2": None,
+                    "command_dispatched": False,
+                    "eligible_for_last_safe": False,
+                }
+                rejected_motion_sample_count += 1
+                break
+            try:
+                qacc, motion_rejection = evaluate_feedback_motion_guard(
+                    sequence=state.sequence,
+                    feedback_timestamp_sec=state.receive_timestamp_sec,
+                    dt_sec=dt,
+                    raw_qpos_rad=raw_q,
+                    normalized_qpos_rad=q,
+                    previous_qvel_rad_s=previous_guard_qvel,
+                    current_qvel_rad_s=qvel,
+                    velocity_abort_rad_s=args.velocity_abort_rad_s,
+                    acceleration_abort_rad_s2=args.acceleration_abort_rad_s2,
+                )
+            except (TypeError, ValueError) as exc:
+                stop_reason = f"invalid feedback motion sample: {exc}"
+                rejected_motion_sample = {
+                    "reason": stop_reason,
+                    "guard": "sample_validation",
+                    "sequence": int(state.sequence),
+                    "feedback_timestamp_sec": state.receive_timestamp_sec,
+                    "feedback_dt_sec": dt,
+                    "raw_qpos_rad": raw_q,
+                    "normalized_qpos_rad": q,
+                    "previous_qvel_rad_s": previous_guard_qvel,
+                    "current_qvel_rad_s": qvel,
+                    "qacc_fd_rad_s2": None,
+                    "command_dispatched": False,
+                    "eligible_for_last_safe": False,
+                }
+                rejected_motion_sample_count += 1
+                break
+            if motion_rejection is not None:
+                rejected_motion_sample = motion_rejection
+                rejected_motion_sample_count += 1
+                stop_reason = str(motion_rejection["reason"])
                 break
             if args.mode == "slow-step" and initial_q is not None:
                 try:
@@ -2841,10 +3019,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "sequence": state.sequence,
                     "elapsed_sec": elapsed,
                     "feedback_timestamp_sec": state.receive_timestamp_sec,
+                    "feedback_dt_sec": dt,
                     "raw_qpos_rad": raw_q,
                     "qpos_rad": q,
                     "boundary_normalized_joint_names": normalized_joint_names,
                     "qvel_fd_rad_s": qvel,
+                    "qacc_fd_rad_s2": qacc,
                     "qref_rad": qref,
                     "qvel_ref_rad_s": qvel_ref,
                     "gravity_tau_nm": torque_breakdown.gravity_torque_nm,
@@ -2868,6 +3048,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             )
             previous_q = q
             previous_feedback_time = state.receive_timestamp_sec
+            previous_guard_qvel = tuple(float(value) for value in qvel)
             previous_tau = conditioned_tau
             if safe_candidate_q is not None:
                 last_safe_q = safe_candidate_q
@@ -3152,6 +3333,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
             "semantics": "rejected_sample_retains_previous_last_safe",
         },
+        "motion_guard": {
+            "velocity_abort_rad_s": args.velocity_abort_rad_s,
+            "acceleration_abort_rad_s2": args.acceleration_abort_rad_s2,
+            "acceleration_threshold_status": "commissioning_seed_not_hardware_certified",
+            "qvel_source": "normalized_qpos_finite_difference_over_feedback_dt",
+            "qacc_source": "consecutive_qvel_finite_difference_over_feedback_dt",
+            "first_sample_qacc_semantics": "unavailable_without_previous_control_qvel",
+            "rejected_sample_count": rejected_motion_sample_count,
+            "rejected_sample": rejected_motion_sample,
+            "rejected_sample_command_semantics": "not_dispatched",
+            "rejected_sample_last_safe_semantics": "ineligible",
+        },
         "initial_qpos_rad": initial_q,
         "final_qpos_rad": final_q,
         "profile": {
@@ -3369,6 +3562,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--velocity-abort-rad-s",
         type=float,
         default=_DEFAULT_VELOCITY_ABORT_RAD_S,
+    )
+    parser.add_argument(
+        "--acceleration-abort-rad-s2",
+        type=float,
+        default=_DEFAULT_ACCELERATION_ABORT_RAD_S2,
+        help=(
+            "finite-difference acceleration abort threshold; the default is "
+            "an unverified commissioning seed, not a hardware-certified limit"
+        ),
     )
     parser.add_argument("--max-error-rad", type=float, default=_DEFAULT_MAX_ERROR_RAD)
     parser.add_argument(
