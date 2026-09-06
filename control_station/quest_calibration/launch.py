@@ -19,12 +19,20 @@ from pathlib import Path
 from typing import Protocol
 
 from hardware.quest_dev.features.visualization.paired_pose_capture import (
+    PairedPoseCaptureEvidence,
     StaticWindowCaptureProfile,
 )
 from hardware.quest_dev.server import load_config, validate_pairing_token
+from runtime_artifact_paths import RuntimeArtifactLayout
 from teleop_runtime.deploy.quest_paired_pose_capture import (
     QuestPairedPoseCaptureFactory,
     QuestPairedPoseCaptureLaunchConfig,
+)
+from teleop_runtime.deploy.quest_paired_pose_evidence_store import (
+    QuestPairedPoseDiagnosticFit,
+    fit_quest_paired_pose_evidence,
+    publish_quest_paired_pose_diagnostic_fit,
+    publish_sealed_quest_paired_pose_evidence,
 )
 from teleop_runtime.deploy.run_policy import main as run_policy_main
 
@@ -108,13 +116,23 @@ def build_parser() -> argparse.ArgumentParser:
             "RM65 no-action pose-observation composition."
         ),
         epilog=(
-            "This launcher does not send arm actions, persist evidence, accept a "
-            "calibration, install a frame, or render policy futures. Ctrl+C is "
-            "the normal full-session shutdown."
+            "This launcher does not send arm actions, accept a calibration, "
+            "install a frame, or render policy futures. Candidate publication "
+            "requires an explicit --publish-* flag. Ctrl+C is the normal "
+            "full-session shutdown."
         ),
     )
     parser.add_argument("--side", choices=("left", "right"), required=True)
     parser.add_argument("--arm-ip", type=_non_empty, required=True)
+    parser.add_argument(
+        "--arm-urdf-path",
+        type=_non_empty,
+        default=None,
+        help=(
+            "Explicit six-axis RM65 arm-only URDF used for TCP FK; recommended "
+            "for real calibration so the source model is unambiguous."
+        ),
+    )
     parser.add_argument(
         "--capture-id",
         type=_non_empty,
@@ -177,6 +195,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the resolved no-action composition without starting devices.",
     )
+    parser.add_argument(
+        "--publish-sealed-evidence",
+        action="store_true",
+        help=(
+            "After a clean run, publish the explicitly sealed candidate capture "
+            "to the content-addressed runtime artifact layout."
+        ),
+    )
+    parser.add_argument(
+        "--publish-diagnostic-fit",
+        action="store_true",
+        help=(
+            "Also publish the offline candidate diagnostic fit after sealed "
+            "evidence publication; this never accepts or installs calibration."
+        ),
+    )
+    parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit runtime-artifact root for --publish-*; otherwise use the "
+            "configured local artifact layout."
+        ),
+    )
     return parser
 
 
@@ -211,7 +254,7 @@ def _resolved_pairing_code(args: argparse.Namespace) -> str | None:
 
 def build_deploy_argv(args: argparse.Namespace) -> list[str]:
     side = str(args.side)
-    return [
+    argv = [
         "--policy",
         "hold",
         "--rm65-pose-observation",
@@ -228,6 +271,10 @@ def build_deploy_argv(args: argparse.Namespace) -> list[str]:
         "--arm-state-refresh-hz",
         str(args.arm_state_refresh_hz),
     ]
+    arm_urdf_path = getattr(args, "arm_urdf_path", None)
+    if arm_urdf_path:
+        argv.extend(["--arm-urdf-path", str(arm_urdf_path)])
+    return argv
 
 
 def _dry_run_payload(
@@ -243,6 +290,11 @@ def _dry_run_payload(
         "capture_id": capture_id,
         "capture_profile": profile.as_dict(),
         "quest_config": str(args.quest_config),
+        "arm": {
+            "side": str(args.side),
+            "ip": str(args.arm_ip),
+            "urdf_path": getattr(args, "arm_urdf_path", None),
+        },
         "quest_pairing": {
             "mode": (
                 "trusted_lan_easy"
@@ -265,7 +317,10 @@ def _dry_run_payload(
             "send_actions": False,
             "end_effectors": False,
             "cameras": False,
-            "artifact_publication": False,
+            "artifact_publication": bool(
+                getattr(args, "publish_sealed_evidence", False)
+                or getattr(args, "publish_diagnostic_fit", False)
+            ),
             "calibration_acceptance": False,
         },
     }
@@ -299,6 +354,56 @@ def _announce_quest(
     emit(f"[quest-calibration] 一次性完整网址: {launch.pairing_url}")
     emit("[quest-calibration] 完成测试后回到终端按 Ctrl+C")
     emit("[quest-calibration] ================================================")
+
+
+def _artifact_layout(args: argparse.Namespace) -> RuntimeArtifactLayout:
+    root = getattr(args, "artifact_root", None)
+    if root is None:
+        return RuntimeArtifactLayout.configured()
+    return RuntimeArtifactLayout(root=Path(root).expanduser())
+
+
+def _publish_requested_artifacts(
+    factory: object,
+    args: argparse.Namespace,
+    *,
+    emit: Callable[[str], None],
+) -> None:
+    publish_evidence = bool(getattr(args, "publish_sealed_evidence", False))
+    publish_fit = bool(getattr(args, "publish_diagnostic_fit", False))
+    if not publish_evidence and not publish_fit:
+        return
+    application = getattr(factory, "application", None)
+    evidence = getattr(application, "evidence", None)
+    if not isinstance(evidence, PairedPoseCaptureEvidence):
+        raise TypeError(
+            "requested Quest artifact publication, but no sealed candidate "
+            "evidence is available; click seal before stopping"
+        )
+    layout = _artifact_layout(args)
+    evidence_commit = publish_sealed_quest_paired_pose_evidence(
+        layout=layout,
+        evidence=evidence,
+    )
+    emit(
+        "[quest-calibration] published candidate evidence: "
+        f"{evidence_commit.path} "
+        f"evidence_hash={evidence_commit.evidence_semantic_content_hash}"
+    )
+    if not publish_fit:
+        return
+    diagnostic_fit = fit_quest_paired_pose_evidence(evidence)
+    if not isinstance(diagnostic_fit, QuestPairedPoseDiagnosticFit):
+        raise TypeError("Quest evidence store returned an invalid diagnostic fit")
+    diagnostic_commit = publish_quest_paired_pose_diagnostic_fit(
+        layout=layout,
+        diagnostic_fit=diagnostic_fit,
+    )
+    emit(
+        "[quest-calibration] published candidate diagnostic fit: "
+        f"{diagnostic_commit.path} "
+        f"fit_hash={diagnostic_commit.diagnostic_fit_semantic_content_hash}"
+    )
 
 
 def run(
@@ -380,12 +485,23 @@ def run(
         emit(f"[quest-calibration] 桌面操作页: {coordinator.url}")
         emit("[quest-calibration] 正在等待 RM65 观测链路与 Quest 页面...")
         announcer.start()
-        return int(
+        result = int(
             policy_runner(
                 argv=build_deploy_argv(args),
                 quest_paired_pose_capture_factory=factory,
             )
         )
+        if result == 0:
+            _publish_requested_artifacts(factory, args, emit=emit)
+        elif bool(
+            getattr(args, "publish_sealed_evidence", False)
+            or getattr(args, "publish_diagnostic_fit", False)
+        ):
+            emit(
+                "[quest-calibration] skipped artifact publication because the "
+                f"observation run returned status {result}"
+            )
+        return result
     finally:
         stop_event.set()
         if coordinator is not None:

@@ -104,6 +104,20 @@ def test_deploy_arguments_are_closed_over_the_no_action_profile() -> None:
         assert forbidden not in argv
 
 
+def test_explicit_arm_urdf_is_forwarded_to_the_observation_deploy() -> None:
+    args = _args(
+        "--arm-urdf-path",
+        "/home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf",
+    )
+
+    argv = build_deploy_argv(args)
+
+    assert argv[-2:] == [
+        "--arm-urdf-path",
+        "/home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf",
+    ]
+
+
 def test_dry_run_prints_resolved_contract_without_constructing_runtime() -> None:
     output: list[str] = []
 
