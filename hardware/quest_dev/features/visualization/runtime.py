@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
+from .frame_binding import (
+    AcceptedFrameBinding,
+    load_accepted_frame_binding,
+    parse_accepted_frame_binding,
+)
 from .protocol import FEATURE_NAME, feedback_error_message
 
 
@@ -17,6 +24,7 @@ class VisualizationRuntime:
         self.stop_event = stop_event
         self.reader: Any = None
         self.thread: threading.Thread | None = None
+        self.frame_bindings: dict[str, AcceptedFrameBinding] = {}
 
     def start(self) -> None:
         feedback_cfg = self.config.get("robot_feedback", {})
@@ -35,6 +43,7 @@ class VisualizationRuntime:
             raise TypeError(
                 "features.visualization.robot_feedback.sources must be a non-empty mapping"
             )
+        self.frame_bindings = self._load_frame_bindings(feedback_cfg)
         from .robot_feedback import connect_redis
 
         sources = {str(robot): str(key) for robot, key in sources_cfg.items()}
@@ -50,13 +59,20 @@ class VisualizationRuntime:
                 "sources": sources,
                 "rate_hz": float(feedback_cfg.get("rate_hz", 30)),
                 "max_age_s": float(feedback_cfg.get("max_age_s", 0.25)),
+                "frame_bindings": self.frame_bindings,
             },
             name="quest-dev-visualization-feedback",
             daemon=True,
         )
         self.thread.start()
+        binding_text = (
+            f"; accepted frame bindings: {tuple(sorted(self.frame_bindings))}"
+            if self.frame_bindings
+            else "; no accepted frame bindings; TCP remains unrenderable"
+        )
         print(
-            f"[quest-dev:visualization] read-only robot feedback enabled: {sources}",
+            f"[quest-dev:visualization] read-only robot feedback enabled: "
+            f"{sources}{binding_text}",
             flush=True,
         )
 
@@ -67,12 +83,59 @@ class VisualizationRuntime:
         if callable(close_reader):
             close_reader()
 
+    @staticmethod
+    def _load_frame_bindings(
+        feedback_cfg: Mapping[str, Any],
+    ) -> dict[str, AcceptedFrameBinding]:
+        raw_bindings = feedback_cfg.get("frame_bindings", {})
+        raw_paths = feedback_cfg.get("frame_binding_paths", {})
+        if not isinstance(raw_bindings, Mapping):
+            raise TypeError(
+                "features.visualization.robot_feedback.frame_bindings must be a mapping"
+            )
+        if not isinstance(raw_paths, Mapping):
+            raise TypeError(
+                "features.visualization.robot_feedback.frame_binding_paths must be a mapping"
+            )
+        bindings: dict[str, AcceptedFrameBinding] = {}
+        for raw_robot, raw_payload in raw_bindings.items():
+            robot = str(raw_robot)
+            if robot in bindings:
+                raise ValueError(f"duplicate accepted frame binding for {robot!r}")
+            if not isinstance(raw_payload, Mapping):
+                raise TypeError(
+                    f"frame_bindings[{robot!r}] must be an accepted binding mapping"
+                )
+            binding = parse_accepted_frame_binding(raw_payload)
+            if binding.robot.robot_id != robot:
+                raise ValueError(
+                    f"frame binding robot identity differs from key {robot!r}"
+                )
+            bindings[robot] = binding
+        for raw_robot, raw_path in raw_paths.items():
+            robot = str(raw_robot)
+            if robot in bindings:
+                raise ValueError(
+                    f"frame binding {robot!r} is configured both inline and by path"
+                )
+            path = Path(str(raw_path)).expanduser()
+            if not path.is_absolute():
+                path = Path(__file__).resolve().parents[2] / path
+            binding = load_accepted_frame_binding(path)
+            if binding.robot.robot_id != robot:
+                raise ValueError(
+                    f"frame binding file robot identity differs from key {robot!r}"
+                )
+            bindings[robot] = binding
+        return bindings
+
     def _run_feedback_loop(
         self,
         *,
         sources: dict[str, str],
         rate_hz: float,
         max_age_s: float,
+        frame_bindings: Mapping[str, AcceptedFrameBinding] | None = None,
     ) -> None:
         from .robot_feedback import poll_robot_feedback
 
@@ -81,7 +144,10 @@ class VisualizationRuntime:
         while not self.stop_event.is_set():
             try:
                 message = poll_robot_feedback(
-                    self.reader, sources, max_age_s=float(max_age_s)
+                    self.reader,
+                    sources,
+                    max_age_s=float(max_age_s),
+                    frame_bindings=frame_bindings,
                 )
                 last_error = None
             except Exception as exc:  # noqa: BLE001 - keep the optional feature isolated.

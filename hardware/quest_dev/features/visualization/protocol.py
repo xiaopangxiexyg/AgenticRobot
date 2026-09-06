@@ -13,7 +13,7 @@ except ImportError:  # pragma: no cover - direct module compatibility.
 
 
 FEATURE_NAME = "visualization"
-FEATURE_PROTOCOL_VERSION = 1
+FEATURE_PROTOCOL_VERSION = 2
 
 
 def robot_tcp_message(robots: Mapping[str, dict[str, Any]]) -> dict[str, Any]:

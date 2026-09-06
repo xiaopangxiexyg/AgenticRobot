@@ -147,6 +147,11 @@ nested/outer hashes 与候选态哨兵，但不会重新运行 solver。报告�
 重载；这只证明报告内容自洽，并不证明其引用的 capture 文件当前存在。任何后续 acceptance
 流程都必须另外取得并严格核验完整 capture evidence。该报告不是 acceptance，也不写
 accepted calibration profile/receipt。
+
+现在 hardware.quest_dev.features.visualization.frame_binding 定义了严格的
+quest_dev.visualization.accepted_frame_binding.v1 解析和 T_quest_from_tcp 纯投影边界。
+它只接受外部 reviewed acceptance receipt 的完整 binding；不会从 candidate-only fit
+自动创建 receipt、修改 fit 的 accepted 字段或安装 frame graph。
 这里的核验仅证明结构和内部数值自洽；reload 不会从所引用的 capture 重算 fit，也不会
 证明报告中的 transform、residual 或 observability metrics 确实由该 capture 产生。
 
@@ -195,9 +200,11 @@ reference-space reset、重新安装手柄或 tool profile 改变都必须使旧
 
 - 尚无真实 Quest + RM65 多姿态采集、噪声与重装数据的验证证据；
 - mount 刚性检查、held-out/leave-one-window-out 验证和鲁棒 refinement；
-- reviewed acceptance profile、持久化 acceptance receipt 和失效生命周期；
-- accepted transform 的只读 frame 安装与 future-trajectory 投影/Quest 渲染。
+- reviewed acceptance decision、持久化 acceptance receipt 和失效生命周期；binding parser 已实现，但当前没有真实 receipt 可供配置；
+- 将 canonical passive journal publication 连接到实际 policy host 的应用层接线；
+- accepted transform 之外的 future-trajectory 投影/Quest 渲染；
 
-因此当前链路能封存并持久化 capture evidence、离线拟合，并显式持久化/严格重载
-candidate-only diagnostic report；现有证据仍仅为 offline synthetic/contract evidence，
-不能作为真实标定完成、变换可安装或 future visualization 已就绪的证明。
+因此当前链路能封存并持久化 capture evidence、离线拟合，严格解析外部 accepted
+binding，并在 binding 存在时提供只读 TCP projection；当前远端没有真实 Quest + RM65
+acceptance receipt，现有证据仍仅为 offline synthetic/contract evidence，不能作为
+真实标定完成或 future visualization 已就绪的证明。

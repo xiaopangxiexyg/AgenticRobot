@@ -21,6 +21,48 @@
     status.className = ok ? 'ok' : 'bad';
   }
 
+  function questReferenceEpochId(context) {
+    if (
+      typeof context.xrSessionId !== 'string'
+      || typeof context.referenceSpaceType !== 'string'
+      || !Number.isInteger(context.referenceSpaceGeneration)
+    ) {
+      return null;
+    }
+    return (
+      `${context.xrSessionId}:${context.referenceSpaceType}:`
+      + `${context.referenceSpaceGeneration}`
+    );
+  }
+
+  function hasFiniteMatrix(value) {
+    return (
+      Array.isArray(value)
+      && value.length === 16
+      && value.every((item) => Number.isFinite(Number(item)))
+    );
+  }
+
+  function renderableRobotRecord(record, context) {
+    if (
+      !record
+      || record.fresh !== true
+      || record.alignment_ready !== true
+      || !hasFiniteMatrix(record.matrix_quest_from_tcp)
+    ) {
+      return false;
+    }
+    const binding = record.frame_binding;
+    const epochId = questReferenceEpochId(context);
+    if (!binding || !epochId) return false;
+    return (
+      binding.quest_session_id === context.xrSessionId
+      && binding.reference_space_type === context.referenceSpaceType
+      && binding.reference_space_generation === context.referenceSpaceGeneration
+      && binding.quest_reference_epoch_id === epochId
+    );
+  }
+
   global.QuestDevFeatures.register('visualization', {
     configure(featureConfig, context) {
       enabled = context.enabled;
@@ -62,19 +104,25 @@
     handleServerMessage(context) {
       const message = context.message;
       if (message.feature !== 'visualization' || message.type !== 'robot_tcp') return;
-      if (message.type === 'robot_tcp') {
-        if (
-          message.protocol_version !== coreProtocolVersion
-          || message.feature_protocol_version !== 1
-        ) {
-          latestRobotMessage = null;
-          setStatus('robot feedback protocol mismatch', false);
-          return;
-        }
-        latestRobotMessage = message;
-        const freshCount = Object.values(message.robots || {}).filter((item) => item.fresh).length;
-        setStatus(`robot feedback ${freshCount} fresh; alignment pending`, freshCount > 0);
+      if (
+        message.protocol_version !== coreProtocolVersion
+        || message.feature_protocol_version !== 2
+      ) {
+        latestRobotMessage = null;
+        setStatus('robot feedback protocol mismatch', false);
+        return;
       }
+      latestRobotMessage = message;
+      const freshCount = Object.values(message.robots || {})
+        .filter((item) => item && item.fresh === true)
+        .length;
+      const boundCount = Object.values(message.robots || {})
+        .filter((item) => item && item.alignment_ready === true)
+        .length;
+      setStatus(
+        `robot feedback ${freshCount} fresh; ${boundCount} Quest-bound`,
+        boundCount > 0,
+      );
     },
 
     renderView(context) {
@@ -99,9 +147,21 @@
           global.QuestDevVisualizationRenderer.drawAxes(context.gl, renderer, mvp);
         }
       }
-      // Robot TCP rendering intentionally waits for a validated
-      // T_quest_from_robot alignment owned by this feature.
-      void latestRobotMessage;
+      if (config.show_robot_tcp_axes !== false && latestRobotMessage) {
+        for (const record of Object.values(latestRobotMessage.robots || {})) {
+          if (!renderableRobotRecord(record, context)) continue;
+          const tcpMatrix = new Float32Array(record.matrix_quest_from_tcp);
+          const mvp = global.QuestDevXRMath.mat4Multiply(
+            context.viewProjection,
+            tcpMatrix,
+          );
+          global.QuestDevVisualizationRenderer.drawAxes(
+            context.gl,
+            renderer,
+            mvp,
+          );
+        }
+      }
     },
 
     onReferenceSpaceReset() {
