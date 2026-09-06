@@ -3,6 +3,41 @@
 Status: `incubating` experiment. This is an offline MuJoCo evaluation command,
 not a production Skill route and not a real-robot entrypoint.
 
+## Visualization-only three-camera flow
+
+Use the visualization command when the goal is to inspect generated poses, not
+to test grasp execution. It resets and settles the scene once, runs the `front`
+RGB-D frame through the formal SAM2 + GraspNet provider, and projects every
+ranked, upward-normalized DMTAC M pose into `front`, `left_wrist`, and
+`right_wrist`. It never calls IK, candidate reachability preflight, `env.step`,
+arm control, or gripper control after the reset. The report hashes MuJoCo time,
+qpos, qvel, and ctrl before and after inference/rendering and fails if that state
+changes.
+
+```bash
+conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
+export MUJOCO_GL=egl
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+python -m experiments.sim_point_grasp.commands.visualize_candidates \
+  --seed 0 \
+  --max-candidates 5
+```
+
+The new output directory contains the three raw RGB images, `front_depth_m.npy`,
+the provider's `front_skill_annotation.jpg`, `skill_result.json`, one PNG overlay
+per camera, `grasp_multiview_montage.png`, and `visualization_report.json`.
+Each camera record contains its optical-frame intrinsics, `T_base_from_camera`,
+every derived `T_camera_from_tcp`, and an explicit visibility classification.
+This is a simple overlay: geometry hidden by scene depth is intentionally still
+drawn. A wrist view that cannot see the grasp is reported as `out_of_frame` or
+`behind_camera`, not treated as an error and not made artificially visible.
+
+The model-backed command requires the pinned assets and CUDA described in
+`docs/agent_gateway/POINT_GRASP.md`. A custom nonexistent output directory can
+be supplied with `--output-dir`; existing directories are never overwritten.
+
 The command composes the existing physical Cube-Lift scene with the existing
 read-only `perception.plan_point_grasp.v1` provider:
 

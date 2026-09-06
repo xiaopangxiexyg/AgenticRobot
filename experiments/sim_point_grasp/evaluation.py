@@ -32,6 +32,10 @@ from agent_gateway.skills.perception.point_grasp_schemas import (
     validate_point_grasp_result_for_parameters_v1,
     validate_point_grasp_result_v1,
 )
+from deployments.perception.dmtac_grasp_overlay import (
+    DmtacGraspOverlayCandidate,
+    render_dmtac_grasp_overlays,
+)
 from deployments.perception.sam2_graspnet_point_grasp import (
     GraspNetPointGraspModelSpec,
     Sam2GraspNetPointGraspPlanner,
@@ -726,20 +730,6 @@ def _minimum_controlled_joint_margin_rad(env: FastCubeLiftEnv) -> float | None:
     return float(np.min(margins))
 
 
-def _project_camera_point(
-    point: np.ndarray,
-    intrinsics: Mapping[str, float | int],
-) -> tuple[int, int] | None:
-    xyz = np.asarray(point, dtype=float).reshape(3)
-    if xyz[2] <= 1e-6:
-        return None
-    u = round(float(intrinsics["fx"]) * xyz[0] / xyz[2] + float(intrinsics["cx"]))
-    v = round(float(intrinsics["fy"]) * xyz[1] / xyz[2] + float(intrinsics["cy"]))
-    if not (0 <= u < int(intrinsics["width"]) and 0 <= v < int(intrinsics["height"])):
-        return None
-    return u, v
-
-
 def draw_grasp_overlay(
     rgb: np.ndarray,
     *,
@@ -749,44 +739,24 @@ def draw_grasp_overlay(
     click_uv: tuple[int, int],
     bbox_xyxy: tuple[int, int, int, int],
 ) -> np.ndarray:
-    """Draw TCP axes and an approximate two-finger footprint in image space."""
+    """Compatibility wrapper around the shared DMTAC M wireframe renderer."""
 
-    image = Image.fromarray(np.asarray(rgb, dtype=np.uint8)).convert("RGB")
-    draw = ImageDraw.Draw(image)
-    draw.ellipse(
-        (click_uv[0] - 5, click_uv[1] - 5, click_uv[0] + 5, click_uv[1] + 5),
-        outline=(255, 255, 0),
-        width=3,
+    image, _projections = render_dmtac_grasp_overlays(
+        rgb,
+        candidates=(
+            DmtacGraspOverlayCandidate.from_pose(
+                ordinal=0,
+                score=1.0,
+                gripper_width_m=gripper_width_m,
+                reference_from_tcp=camera_from_tcp,
+                selected=True,
+            ),
+        ),
+        reference_from_camera=np.eye(4),
+        intrinsics=intrinsics,
+        target_pixel_uv=click_uv,
+        target_bbox_xyxy=bbox_xyxy,
     )
-    x0, y0, x1, y1 = bbox_xyxy
-    draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(40, 220, 255), width=3)
-    transform = np.asarray(camera_from_tcp, dtype=float).reshape(4, 4)
-
-    def pixel(local: tuple[float, float, float]) -> tuple[int, int] | None:
-        camera = transform @ np.r_[np.asarray(local, dtype=float), 1.0]
-        return _project_camera_point(camera[:3], intrinsics)
-
-    origin = pixel((0.0, 0.0, 0.0))
-    if origin is not None:
-        for local, color, label in (
-            ((0.035, 0.0, 0.0), (255, 40, 40), "x/open"),
-            ((0.0, 0.035, 0.0), (40, 220, 40), "y"),
-            ((0.0, 0.0, 0.050), (40, 100, 255), "z/approach"),
-        ):
-            endpoint = pixel(local)
-            if endpoint is not None:
-                draw.line((*origin, *endpoint), fill=color, width=4)
-                draw.text((endpoint[0] + 3, endpoint[1] + 3), label, fill=color)
-        half_width = float(gripper_width_m) / 2.0
-        for sign in (-1.0, 1.0):
-            jaw = pixel((sign * half_width, 0.0, 0.0))
-            finger = pixel((sign * half_width, 0.0, 0.050))
-            if jaw is not None and finger is not None:
-                draw.line((*jaw, *finger), fill=(255, 128, 20), width=5)
-        left = pixel((-half_width, 0.0, 0.0))
-        right = pixel((half_width, 0.0, 0.0))
-        if left is not None and right is not None:
-            draw.line((*left, *right), fill=(255, 128, 20), width=3)
     return np.asarray(image)
 
 

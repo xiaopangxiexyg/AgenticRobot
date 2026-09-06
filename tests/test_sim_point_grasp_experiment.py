@@ -23,7 +23,12 @@ from experiments.sim_point_grasp.evaluation import (
     sample_mask_prompt_pixels,
     save_summary_sheet,
 )
+from experiments.sim_point_grasp.visualization import (
+    VISUALIZATION_CAMERA_NAMES,
+    render_candidates_in_mujoco_views,
+)
 from sim.mujoco.pointcloud import render_intrinsics_from_fovy
+from sim.mujoco.scene import MujocoCameraRenderer
 from sim.mujoco.tasks.cube_lift.pose_action import inset_joint_position_target
 
 
@@ -206,6 +211,110 @@ def test_grasp_overlay_changes_pixels_and_keeps_shape() -> None:
     )
     assert output.shape == rgb.shape
     assert int(output.sum()) > 0
+
+
+def test_multiview_overlay_uses_each_optical_camera_pose_without_scene_steps() -> None:
+    camera_poses = {
+        "front": np.eye(4),
+        "left_wrist": np.eye(4),
+        "right_wrist": np.eye(4),
+    }
+    camera_poses["left_wrist"][0, 3] = -5.0
+    camera_poses["right_wrist"][2, 3] = 2.0
+
+    class _Scene:
+        camera_names = VISUALIZATION_CAMERA_NAMES
+
+        @staticmethod
+        def camera_metadata():
+            return {name: {"fovy_deg": 60.0} for name in VISUALIZATION_CAMERA_NAMES}
+
+        @staticmethod
+        def camera_link_pose(name):
+            return camera_poses[name]
+
+    class _Renderer:
+        width = 100
+        height = 80
+
+        def __init__(self):
+            self.rendered = []
+
+        def render(self, name):
+            self.rendered.append(name)
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+    renderer = _Renderer()
+    base_from_tcp = np.eye(4)
+    base_from_tcp[2, 3] = 1.0
+    images, records = render_candidates_in_mujoco_views(
+        scene=_Scene(),
+        renderer=renderer,
+        base_from_tcp_candidates=(
+            {
+                "ordinal": 0,
+                "score": 0.9,
+                "gripper_width_m": 0.04,
+                "T_base_from_tcp": base_from_tcp.reshape(-1).tolist(),
+            },
+        ),
+        world_from_base=np.eye(4),
+    )
+
+    assert renderer.rendered == list(VISUALIZATION_CAMERA_NAMES)
+    assert set(images) == set(records) == set(VISUALIZATION_CAMERA_NAMES)
+    assert records["front"]["candidates"][0]["visibility"] == "visible"
+    assert records["left_wrist"]["candidates"][0]["visibility"] == "out_of_frame"
+    assert records["right_wrist"]["candidates"][0]["visibility"] == "behind_camera"
+    assert all(not record["depth_occlusion_tested"] for record in records.values())
+
+
+@pytest.mark.optional
+def test_mujoco_three_camera_overlay_does_not_advance_simulation() -> None:
+    pytest.importorskip("mujoco")
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        build_sim_point_grasp_task_config(
+            cube_spawn_xy_jitter_m=(0.0, 0.0),
+            cube_spawn_yaw_jitter_rad=0.0,
+        ),
+        include_training_reward_state=False,
+        use_model_cache=False,
+    )
+    renderer = MujocoCameraRenderer(env.kernel.scene, width=640, height=480)
+    try:
+        env.reset(seed=0)
+        scene = env.kernel.scene
+        side = env.kernel.config.controlled_side
+        world_from_base = scene.body_pose(f"{side}_arm_base_link")
+        world_from_tcp = scene.body_pose(env.kernel.config.object_body_name)
+        base_from_tcp = np.linalg.inv(world_from_base) @ world_from_tcp
+        time_before = float(scene.data.time)
+        qpos_before = np.asarray(scene.data.qpos).copy()
+
+        images, records = render_candidates_in_mujoco_views(
+            scene=scene,
+            renderer=renderer,
+            base_from_tcp_candidates=(
+                {
+                    "ordinal": 0,
+                    "score": 0.9,
+                    "gripper_width_m": 0.04,
+                    "T_base_from_tcp": base_from_tcp.reshape(-1).tolist(),
+                },
+            ),
+            world_from_base=world_from_base,
+        )
+
+        assert tuple(images) == VISUALIZATION_CAMERA_NAMES
+        assert tuple(records) == VISUALIZATION_CAMERA_NAMES
+        assert records["front"]["candidates"][0]["visible_segment_count"] > 0
+        assert float(scene.data.time) == time_before
+        np.testing.assert_array_equal(scene.data.qpos, qpos_before)
+    finally:
+        renderer.close()
+        env.close()
 
 
 def test_evaluation_task_randomizes_observable_scene_and_requires_contact() -> None:
