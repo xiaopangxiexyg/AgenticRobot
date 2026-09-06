@@ -502,7 +502,7 @@ if cd "$WT"; then
       --mode pose-hold \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
-      --duration-sec 8 \
+      --duration-sec 60 \
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
@@ -512,18 +512,18 @@ if cd "$WT"; then
       --torque-limit-scale 0.15 \
       --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
-      --velocity-abort-rad-s 0.12 \
+      --velocity-abort-rad-s 0.5 \
       --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.2 \
       --cartesian-stiffness-n-per-m 15 \
       --cartesian-damping-n-s-per-m 3.0 \
-      --cartesian-max-force-n 2.0 \
-      --cartesian-max-displacement-m 0.03 \
-      --cartesian-overlay-limit-scale 0.5 \
+      --cartesian-max-force-n 30.0 \
+      --cartesian-max-displacement-m 0.3 \
+      --cartesian-overlay-limit-scale 1 \
       --rotational-stiffness-nm-per-rad 0.2 \
       --rotational-damping-nm-s-per-rad 0.15 \
-      --rotational-max-torque-nm 0.1 \
-      --rotational-max-displacement-rad 0.0872665 \
+      --rotational-max-torque-nm 20 \
+      --rotational-max-displacement-rad 1 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
@@ -754,66 +754,10 @@ arming-settle 门后固定完整的 `base_link_T_gripper_end`，用
 总力矩/slew 包络。该模式固定由六个 arm 关节共同调节；首测命令选择 `--kp 0` 和统一关节
 Kd 作为速度耗散，但这些调参值不属于代码契约；ID7 仍不参与。
 
-首次只允许不触碰保持 4 秒，并采用更低的旋转增益、力矩上限和 2 度姿态硬中止。下面是
-版本化模板，不是自动执行授权；实际交接仍须绑定干净 Task commit/tree、保持前台运行并
-记录完整命令/输出日志：
-
-```bash
-if cd "$WT"; then
-  if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
-      --mode pose-hold \
-      --config "$CFG" \
-      --rebot-source-root "$SRC" \
-      --duration-sec 4 \
-      --warmup-sec 2 \
-      --freeze-sec 1 \
-      --rate-hz 20 \
-      --joint joint1 \
-      --kp 0 \
-      --kd 1.0 \
-      --gravity-scale 0.5 \
-      --torque-limit-scale 0.15 \
-      --torque-rise-time-sec 2.0 \
-      --velocity-abort-rad-s 0.12 \
-      --acceleration-abort-rad-s2 4.0 \
-      --max-error-rad 0.15 \
-      --cartesian-stiffness-n-per-m 10 \
-      --cartesian-damping-n-s-per-m 3.0 \
-      --cartesian-max-force-n 1.0 \
-      --cartesian-max-displacement-m 0.01 \
-      --rotational-stiffness-nm-per-rad 0.2 \
-      --rotational-damping-nm-s-per-rad 0.15 \
-      --rotational-max-torque-nm 0.1 \
-      --rotational-max-displacement-rad 0.0349066 \
-      --cartesian-overlay-limit-scale 0.10 \
-      --allow-motion \
-      --auto-disable \
-      --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
-      --fault-hold-max-age-sec 0.15 \
-      --fault-hold-max-velocity-rad-s 0.02 \
-      --fault-hold-max-rebase-rad 0.05 \
-      --output "$OUT_DIR/b601_pose_hold_no_touch.json"; then
-    STATUS=0
-  else
-    STATUS=$?
-  fi
-  printf 'probe exit code: %s\n' "$STATUS"
-  printf 'command and output log: %s\n' "$LOG"
-else
-  printf '%s\n' 'ERROR: worktree not found'
-fi
-printf '%s\n' 'shell remains active'
-```
-
-不触碰档先确认 `pose_impedance.enabled=true`、anchor 是 fresh post-enable FK、
-`joint_position_stiffness_disabled=true`、所有样本的 translation/rotation error 均未触发
-硬中止、`power_error_w` 接近数值零，并且 `position_tau_nm` 全程为零。之后如需人工施加
-姿态扰动，必须另行明确批准，单轴缓慢转动小于 1 度后放手；不得同时推移和扭转、不得
-接触环境或提高上述阈值。20 Hz 同步 `mechPos` 只足以做这种慢速符号/包络验收，不能证明
-动态 6D 阻抗稳定性、触觉频率或最终手感。
-获批的人工单轴姿态档同样只把 `--velocity-abort-rad-s` 改为 `0.12`，其他门保持 no-touch
-模板值，并在每份 JSON/日志中记录唯一的 `rx`、`ry` 或 `rz` 轴名。组合平移与旋转仍不在
-该阈值同步的授权范围内。
+首测统一使用 P4.1 的一条 `pose-hold` 命令，不再维护另一组写死的 no-touch 参数模板。
+结果应确认 `pose_impedance.enabled=true`、anchor 来自 fresh post-enable FK、J1..J6 全部
+参与、最终关节力矩和 slew 包络生效，并且 `power_error_w` 保持在数值误差范围内。现场调参
+保留在运行命令和输出 JSON 中，不进入代码或单元测试契约。
 
 ## 已使能力控仍然阻塞的契约
 

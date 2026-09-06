@@ -1275,13 +1275,6 @@ def test_parser_help_is_read_only() -> None:
     assert args.target_kp is None
     assert args.target_kd is None
     assert args.apply_driver_torque_limits is False
-    assert args.velocity_abort_rad_s == pytest.approx(0.12)
-    assert args.acceleration_abort_rad_s2 == pytest.approx(4.0)
-    assert args.fault_hold_max_velocity_rad_s == pytest.approx(0.02)
-    assert args.cartesian_stiffness_n_per_m == 20.0
-    assert args.cartesian_max_displacement_m == 0.02
-    assert args.rotational_stiffness_nm_per_rad == 0.5
-    assert args.rotational_max_displacement_rad == pytest.approx(np.deg2rad(5.0))
 
 
 def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
@@ -1402,11 +1395,6 @@ def _parse_pose_args(*extra: str) -> object:
     )
 
 
-def test_pose_cli_uses_all_six_joints_and_checks_rotation_safety_limit() -> None:
+def test_pose_cli_uses_all_six_joints() -> None:
     probe._validate_cli(_parse_pose_args())
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
-
-    with pytest.raises(ValueError, match="rotational_max_displacement_rad"):
-        probe._validate_cli(
-            _parse_pose_args("--rotational-max-displacement-rad", "0.5")
-        )

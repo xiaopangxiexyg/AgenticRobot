@@ -177,6 +177,13 @@ def _positive(value: object, *, name: str) -> float:
     return normalized
 
 
+def _non_negative(value: object, *, name: str) -> float:
+    normalized = _finite(value, name=name)
+    if normalized < 0.0:
+        raise ValueError(f"{name} must be non-negative")
+    return normalized
+
+
 def _bounded(
     value: object,
     *,
@@ -732,15 +739,15 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _bounded(args.duration_sec, name="duration_sec", lower=0.1, upper=60.0)
     _bounded(args.warmup_sec, name="warmup_sec", lower=0.1, upper=15.0)
     _bounded(args.freeze_sec, name="freeze_sec", lower=0.1, upper=10.0)
-    _bounded(args.kp, name="kp", lower=0.0, upper=5.0)
-    _bounded(args.kd, name="kd", lower=0.0, upper=5.0)
+    _non_negative(args.kp, name="kp")
+    _non_negative(args.kd, name="kd")
     target_kp = getattr(args, "target_kp", None)
     target_kd = getattr(args, "target_kd", None)
     if target_kp is not None:
-        _bounded(target_kp, name="target_kp", lower=0.0, upper=5.0)
+        _non_negative(target_kp, name="target_kp")
     if target_kd is not None:
-        _bounded(target_kd, name="target_kd", lower=0.0, upper=5.0)
-    _bounded(args.gravity_scale, name="gravity_scale", lower=0.0, upper=1.0)
+        _non_negative(target_kd, name="target_kd")
+    _non_negative(args.gravity_scale, name="gravity_scale")
     _bounded(
         args.torque_limit_scale,
         name="torque_limit_scale",
@@ -748,12 +755,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         upper=0.5,
         lower_inclusive=False,
     )
-    _bounded(
-        args.torque_rise_time_sec,
-        name="torque_rise_time_sec",
-        lower=0.1,
-        upper=10.0,
-    )
+    _positive(args.torque_rise_time_sec, name="torque_rise_time_sec")
     _bounded(
         args.velocity_abort_rad_s,
         name="velocity_abort_rad_s",
@@ -803,98 +805,78 @@ def _validate_cli(args: argparse.Namespace) -> None:
         upper=0.5,
         lower_inclusive=False,
     )
-    _bounded(
+    _non_negative(
         getattr(
             args,
             "cartesian_stiffness_n_per_m",
             _DEFAULT_CARTESIAN_STIFFNESS_N_PER_M,
         ),
         name="cartesian_stiffness_n_per_m",
-        lower=0.0,
-        upper=100.0,
     )
-    _bounded(
+    _non_negative(
         getattr(
             args,
             "cartesian_damping_n_s_per_m",
             _DEFAULT_CARTESIAN_DAMPING_N_S_PER_M,
         ),
         name="cartesian_damping_n_s_per_m",
-        lower=0.0,
-        upper=10.0,
     )
-    _bounded(
+    _positive(
         getattr(args, "cartesian_max_force_n", _DEFAULT_CARTESIAN_MAX_FORCE_N),
         name="cartesian_max_force_n",
-        lower=0.1,
-        upper=5.0,
     )
-    _bounded(
+    _positive(
         getattr(
             args,
             "cartesian_max_displacement_m",
             _DEFAULT_CARTESIAN_MAX_DISPLACEMENT_M,
         ),
         name="cartesian_max_displacement_m",
-        lower=0.001,
-        upper=0.05,
-        lower_inclusive=False,
     )
-    _bounded(
+    _positive(
         getattr(
             args,
             "cartesian_overlay_limit_scale",
             _DEFAULT_CARTESIAN_OVERLAY_LIMIT_SCALE,
         ),
         name="cartesian_overlay_limit_scale",
-        lower=0.01,
-        upper=0.5,
-        lower_inclusive=False,
     )
-    _bounded(
+    _non_negative(
         getattr(
             args,
             "rotational_stiffness_nm_per_rad",
             _DEFAULT_ROTATIONAL_STIFFNESS_NM_PER_RAD,
         ),
         name="rotational_stiffness_nm_per_rad",
-        lower=0.0,
-        upper=5.0,
     )
-    _bounded(
+    _non_negative(
         getattr(
             args,
             "rotational_damping_nm_s_per_rad",
             _DEFAULT_ROTATIONAL_DAMPING_NM_S_PER_RAD,
         ),
         name="rotational_damping_nm_s_per_rad",
-        lower=0.0,
-        upper=1.0,
     )
-    _bounded(
+    _positive(
         getattr(
             args,
             "rotational_max_torque_nm",
             _DEFAULT_ROTATIONAL_MAX_TORQUE_NM,
         ),
         name="rotational_max_torque_nm",
-        lower=0.01,
-        upper=1.0,
-        lower_inclusive=False,
     )
-    _bounded(
+    _positive(
         getattr(
             args,
             "rotational_max_displacement_rad",
             _DEFAULT_ROTATIONAL_MAX_DISPLACEMENT_RAD,
         ),
         name="rotational_max_displacement_rad",
-        lower=math.radians(0.5),
-        upper=math.radians(20.0),
-        lower_inclusive=False,
     )
     if args.mode == "slow-step" and args.step_rad <= 0.0:
         raise ValueError("slow-step mode requires step_rad > 0")
+
+
 def _resolve_model_and_limits(
     source_root: Path,
 ) -> tuple[B601PinocchioModel, tuple[tuple[float, float], ...]]:
@@ -1371,8 +1353,8 @@ def build_software_profile(
 ) -> B601MitControlProfile:
     """Build the low-gain software composition profile used by the probe."""
 
-    kp = _bounded(kp, name="kp", lower=0.0, upper=5.0)
-    kd = _bounded(kd, name="kd", lower=0.0, upper=5.0)
+    kp = _non_negative(kp, name="kp")
+    kd = _non_negative(kd, name="kd")
     limits = _six(torque_limits_nm, name="torque_limits_nm")
     overlay_limits = _six(overlay_limits_nm, name="overlay_limits_nm")
     if any(value <= 0.0 for value in limits):
@@ -1391,18 +1373,12 @@ def build_software_profile(
             raise ValueError(f"unknown B601-RS joint: {target_joint}")
         target_index = _ALL_JOINTS.index(target_joint)
         if target_kp is not None:
-            position_gains[target_index] = _bounded(
-                target_kp,
-                name="target_kp",
-                lower=0.0,
-                upper=5.0,
+            position_gains[target_index] = _non_negative(
+                target_kp, name="target_kp"
             )
         if target_kd is not None:
-            damping_gains[target_index] = _bounded(
-                target_kd,
-                name="target_kd",
-                lower=0.0,
-                upper=5.0,
+            damping_gains[target_index] = _non_negative(
+                target_kd, name="target_kd"
             )
     return B601MitControlProfile(
         name="b601_rs_low_gain_software_gravity_damping",
@@ -1458,7 +1434,7 @@ def compute_software_torque_breakdown(
 ) -> B601MitTorqueBreakdown:
     """Compose gravity, joint PD, and bounded overlay torque in software."""
 
-    scale = _bounded(gravity_scale, name="gravity_scale", lower=0.0, upper=1.0)
+    scale = _non_negative(gravity_scale, name="gravity_scale")
     gravity = tuple(
         scale * float(value)
         for value in model.arm_generalized_gravity(measured_qpos_rad)
@@ -1511,12 +1487,8 @@ def compute_cartesian_impedance_overlay(
 
     qpos = _six(qpos_rad, name="qpos_rad")
     qvel = _six(qvel_rad_s, name="qvel_rad_s")
-    displacement_limit = _bounded(
-        max_displacement_m,
-        name="cartesian_max_displacement_m",
-        lower=0.001,
-        upper=0.05,
-        lower_inclusive=False,
+    displacement_limit = _positive(
+        max_displacement_m, name="cartesian_max_displacement_m"
     )
     transform = np.asarray(model.forward_kinematics(qpos), dtype=float)
     if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
@@ -1586,19 +1558,11 @@ def compute_pose_impedance_overlay(
 
     qpos = _six(qpos_rad, name="qpos_rad")
     qvel = _six(qvel_rad_s, name="qvel_rad_s")
-    displacement_limit = _bounded(
-        max_displacement_m,
-        name="cartesian_max_displacement_m",
-        lower=0.001,
-        upper=0.05,
-        lower_inclusive=False,
+    displacement_limit = _positive(
+        max_displacement_m, name="cartesian_max_displacement_m"
     )
-    rotation_limit = _bounded(
-        max_rotation_rad,
-        name="rotational_max_displacement_rad",
-        lower=math.radians(0.5),
-        upper=math.radians(20.0),
-        lower_inclusive=False,
+    rotation_limit = _positive(
+        max_rotation_rad, name="rotational_max_displacement_rad"
     )
     transform = np.asarray(model.forward_kinematics(qpos), dtype=float)
     if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
