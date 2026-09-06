@@ -52,19 +52,33 @@ def test_station_progress_application_returns_only_lower_commands() -> None:
         command_id="station:failure:9",
         kind="REPORT_FAILURE",
     )
-    assert application.profile_selection_from_event(
+    assert application.command_from_event(
         event="progress_profile_select:writing-v1",
         command_id="station:profile:3",
     ) == ProgressProfileSelectionCommand(
         command_id="station:profile:3",
         profile_id="writing-v1",
     )
-    assert application.entry_step_selection_from_event(
+    assert application.command_from_event(
         event="progress_entry_step_select:right_write",
         command_id="station:entry:4",
     ) == ProgressEntryStepSelectionCommand(
         command_id="station:entry:4",
         progress_step_id="right_write",
+    )
+    assert application.command_from_event(
+        event="progress_arm_control_mode_select:strict_profile",
+        command_id="station:arm-mode:5",
+    ) == ProgressArmControlModeSelectionCommand(
+        command_id="station:arm-mode:5",
+        mode="strict_profile",
+    )
+    assert (
+        application.command_from_event(
+            event="episode_start",
+            command_id="station:unrelated:6",
+        )
+        is None
     )
 
 

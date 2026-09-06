@@ -138,6 +138,14 @@ class ProgressArmControlModeSelectionCommand:
         return self.command_id
 
 
+ProgressApplicationCommand = (
+    ProgressMutationCommand
+    | ProgressProfileSelectionCommand
+    | ProgressEntryStepSelectionCommand
+    | ProgressArmControlModeSelectionCommand
+)
+
+
 @dataclass(frozen=True)
 class ProgressEventBindings:
     """Opaque Station event identities needed by physical input routing."""
@@ -278,28 +286,7 @@ class ProgressApplicationPort(Protocol):
         *,
         event: str,
         command_id: str,
-    ) -> ProgressMutationCommand | None: ...
-
-    def profile_selection_from_event(
-        self,
-        *,
-        event: str,
-        command_id: str,
-    ) -> ProgressProfileSelectionCommand | None: ...
-
-    def entry_step_selection_from_event(
-        self,
-        *,
-        event: str,
-        command_id: str,
-    ) -> ProgressEntryStepSelectionCommand | None: ...
-
-    def arm_control_mode_selection_from_event(
-        self,
-        *,
-        event: str,
-        command_id: str,
-    ) -> ProgressArmControlModeSelectionCommand | None: ...
+    ) -> ProgressApplicationCommand | None: ...
 
     def build_startup_progress_ui_payload(
         self,
@@ -339,6 +326,7 @@ __all__ = [
     "PROGRESS_ARM_CONTROL_MODE_IGNORE",
     "PROGRESS_ARM_CONTROL_MODE_PROFILE",
     "PROGRESS_ARM_CONTROL_MODE_STRICT",
+    "ProgressApplicationCommand",
     "ProgressApplicationProjection",
     "ProgressApplicationPort",
     "ProgressArmControlModeSelectionCommand",
