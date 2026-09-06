@@ -335,8 +335,9 @@ an explicit trusted-LAN easy pairing code while retaining protocol
 authentication. It is still an operator trial rather than a canonical policy
 deployment entrypoint and has not been exercised against real Quest + RM65
 hardware. Its stationary-window profile is candidate admission only; `seal`
-remains in-memory and does not publish an artifact. The remaining ordered
-slices are:
+remains in-memory by default, while explicit launcher publication flags can
+write candidate evidence and a diagnostic fit without accepting or installing
+a frame. The remaining ordered slices are:
 
 1. Exercise the one-command operator trial under the real-hardware safety
    procedure, while preserving policy deploy as the sole factory/application

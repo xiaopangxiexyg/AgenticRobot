@@ -291,8 +291,9 @@ socket or construct a device backend:
 
 ```bash
 bash scripts/run_quest_calibration.sh \
-  --side right \
-  --arm-ip <reviewed-rm65-ip> \
+  --side left \
+  --arm-ip 192.168.101.21 \
+  --arm-urdf-path /home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf \
   --trusted-lan \
   --dry-run
 ```
@@ -301,8 +302,9 @@ For the live observation trial, remove only `--dry-run`:
 
 ```bash
 bash scripts/run_quest_calibration.sh \
-  --side right \
-  --arm-ip <reviewed-rm65-ip> \
+  --side left \
+  --arm-ip 192.168.101.21 \
+  --arm-urdf-path /home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf \
   --trusted-lan
 ```
 
@@ -338,18 +340,21 @@ the ordinary RM65 backend startup is zero-write: the current backend may still
 perform its pre-existing tool, singularity, or worker configuration. Use the
 real-hardware safety procedure before removing `--dry-run`.
 
-Clicking `seal` constructs candidate evidence only in the running application's
-memory. This launcher does not publish artifacts, run the diagnostic fit,
-accept a calibration, or install a frame. Exit only after recording any status
-or hash needed for the trial; durable evidence publication remains a separate
-future operator action.
+Clicking `seal` constructs candidate evidence in the running application's
+memory. By default the launcher still does not publish artifacts, run the
+diagnostic fit, accept a calibration, or install a frame. For an explicit
+candidate-only publication, add `--publish-sealed-evidence` (and optionally
+`--publish-diagnostic-fit`) to the launcher. Publication happens only after a
+clean observation run and a sealed evidence object is present; it remains a
+candidate artifact and never installs a frame or accepts calibration.
 
 The equivalent Python entrypoint is:
 
 ```bash
 python -m control_station.quest_calibration.launch \
-  --side right \
-  --arm-ip <reviewed-rm65-ip> \
+  --side left \
+  --arm-ip 192.168.101.21 \
+  --arm-urdf-path /home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf \
   --trusted-lan
 ```
 

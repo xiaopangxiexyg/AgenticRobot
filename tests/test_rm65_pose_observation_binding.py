@@ -31,6 +31,7 @@ from teleop_runtime.deploy.rm65_pose_observation import (
 from teleop_runtime.deploy.run_policy import (
     _build_arm_state_reader,
     add_args,
+    build_arm_backends,
     main,
     validate_args,
 )
@@ -369,6 +370,33 @@ def test_rm65_pose_observation_cli_is_default_off_and_accepts_bounded_profile() 
     assert args.rm65_pose_observation is True
     assert args.arm_control_mode == "position"
     assert args.send_actions is False
+
+
+def test_rm65_pose_observation_builds_an_observation_only_backend() -> None:
+    args = _parse_and_validate(
+        [
+            "--rm65-pose-observation",
+            "--active-sides",
+            "left",
+            "--left-arm-ip",
+            "192.0.2.18",
+        ]
+    )
+    # This test stops at backend construction; avoid requiring the developer
+    # asset link that the live operator command supplies explicitly.
+    args.arm_urdf_path = "/tmp/rm65-arm-only.urdf"
+
+    backend = build_arm_backends(
+        args,
+        ("left",),
+        control_hz=args.arm_control_hz,
+    )["left"]
+
+    assert backend.config.observation_only is True
+    assert backend.config.background_streaming_enabled is False
+    assert backend.config.force_position_control is False
+    assert backend.config.configure_singularity_thresholds is False
+    assert backend.config.canfd_follow is False
 
 
 @pytest.mark.parametrize(

@@ -11,8 +11,10 @@
 - 把人工划定的静止窗口整理为内存中的候选成对位姿数据。
 
 当前入口不会发送机械臂动作，不会执行 Home、Servo、Replay 或标定运动，也不会自动
-发布证据、运行拟合、验收标定、安装坐标系或渲染 policy future。`seal` 只封存当前进程
-内存中的候选；退出进程后，这些候选不会自动变成持久化标定结果。
+验收标定、安装坐标系或渲染 policy future。`seal` 先封存当前进程内存中的候选；只有
+显式加上 `--publish-sealed-evidence`（或 `--publish-diagnostic-fit`）时，干净退出后才
+会把候选证据/诊断拟合写入 content-addressed runtime artifact。它们仍然不是标定验收
+结果，也不会自动安装坐标系。
 
 ## 一、开始前检查
 
@@ -32,10 +34,12 @@
 
 ```bash
 read -rp "请输入确认过的 RM65 IP: " QUEST_ARM_IP
+QUEST_ARM_URDF=/home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf
 
 bash scripts/run_quest_calibration.sh \
-  --side right \
+  --side left \
   --arm-ip "$QUEST_ARM_IP" \
+  --arm-urdf-path "$QUEST_ARM_URDF" \
   --trusted-lan \
   --dry-run
 ```
@@ -65,8 +69,9 @@ bash scripts/run_quest_calibration.sh \
 
 ```bash
 bash scripts/run_quest_calibration.sh \
-  --side right \
+  --side left \
   --arm-ip "$QUEST_ARM_IP" \
+  --arm-urdf-path "$QUEST_ARM_URDF" \
   --trusted-lan
 ```
 
@@ -74,8 +79,9 @@ bash scripts/run_quest_calibration.sh \
 
 ```bash
 python -m control_station.quest_calibration.launch \
-  --side right \
+  --side left \
   --arm-ip "$QUEST_ARM_IP" \
+  --arm-urdf-path "$QUEST_ARM_URDF" \
   --trusted-lan
 ```
 
@@ -151,7 +157,8 @@ Quest 接收器、桌面页面和 RM65 观测资源。不要直接关闭终端�
 
 ## 九、当前边界和下一步
 
-本说明对应的是“连接 + 最简单几何体/手柄姿态 + 静止窗口候选”的操作阶段。完成真实
-测试后，下一阶段才是由独立任务负责：持久化候选证据、离线 AX=XB 诊断拟合、人工验收、
-安装 `T_quest_from_robot`，最后才讨论把 policy 预期轨迹投影到 Quest。任何前一阶段的
-成功都不能自动证明后一阶段已经完成。
+本说明对应的是“连接 + 最简单几何体/手柄姿态 + 静止窗口候选”的操作阶段。若在
+干净退出前显式加入 `--publish-sealed-evidence --publish-diagnostic-fit`，可得到候选
+证据和离线 AX=XB 诊断报告；下一阶段仍需人工验收、安装 `T_quest_from_robot`，最后才
+讨论把 policy 预期轨迹投影到 Quest。任何前一阶段的成功都不能自动证明后一阶段已经
+完成。
