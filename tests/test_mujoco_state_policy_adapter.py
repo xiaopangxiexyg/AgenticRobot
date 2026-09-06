@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -150,6 +151,20 @@ class _StaticObservationSource:
 
     def capture(self):
         return self.observation
+
+
+class _LiveObservationSource:
+    def __init__(self, observation):
+        self.observation = observation
+        self.step_index = int(observation.step_index)
+
+    def capture(self):
+        self.step_index += 1
+        return replace(
+            self.observation,
+            timestamp=time.monotonic(),
+            step_index=self.step_index,
+        )
 
 
 def _fake_stream_bridge():
@@ -441,7 +456,7 @@ def test_state_policy_output_reaches_existing_bimanual_mujoco_target():
 
         human_action = adapter.predict(observation).actions[0]
         trace = StateBCStreamingRunner(
-            observation_source=_StaticObservationSource(observation),
+            observation_source=_LiveObservationSource(observation),
             policy_adapter=adapter,
             rtc_policy=rtc_policy,
             transition=bridge.transition,

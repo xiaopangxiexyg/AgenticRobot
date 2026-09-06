@@ -123,7 +123,6 @@ class _SimHILApplicationTransitionMixin:
                 )
             if execution_status in {
                 "compound_resolution_failure_hold",
-                "execution_hold_active",
                 "action_adaptation_rejected_keep_existing",
                 "execution_cancellation_incomplete",
             }:
@@ -131,6 +130,10 @@ class _SimHILApplicationTransitionMixin:
                     "New source activation was not executable: "
                     f"{last_status}."
                 )
+            # A completed source-transition fence keeps the backend in HOLD
+            # until one fresh target from the new authority is dispatched.
+            # This is not handoff success, but it is retryable within the
+            # existing bounded activation timeout.
             if execution_status != "dispatched":
                 continue
             dispatch = getattr(execution, "target_dispatch_result", None)
