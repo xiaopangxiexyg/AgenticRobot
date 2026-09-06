@@ -712,8 +712,8 @@ def _validate_cli(args: argparse.Namespace) -> None:
         _bounded(
             args.torque_limit_scale,
             name="torque_limit_scale",
-            lower=0.01,
-            upper=0.5,
+            lower=0.0,
+            upper=1.0,
             lower_inclusive=False,
         )
         return
@@ -749,8 +749,8 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _bounded(
         args.torque_limit_scale,
         name="torque_limit_scale",
-        lower=0.01,
-        upper=0.5,
+        lower=0.0,
+        upper=1.0,
         lower_inclusive=False,
     )
     _positive(args.torque_rise_time_sec, name="torque_rise_time_sec")
@@ -758,12 +758,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _positive(args.acceleration_abort_rad_s2, name="acceleration_abort_rad_s2")
     _positive(args.max_error_rad, name="max_error_rad")
     _bounded(args.step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
-    _bounded(
-        args.step_speed_rad_s,
-        name="step_speed_rad_s",
-        lower=0.001,
-        upper=0.05,
-    )
+    _positive(args.step_speed_rad_s, name="step_speed_rad_s")
     _bounded(
         getattr(args, "fault_hold_max_age_sec", _DEFAULT_FAULT_HOLD_MAX_AGE_SEC),
         name="fault_hold_max_age_sec",
@@ -888,7 +883,13 @@ def _resolve_effort_limits(
 ) -> tuple[float, ...]:
     """Read URDF effort ceilings and apply a conservative commissioning scale."""
 
-    scale = _bounded(scale, name="torque_limit_scale", lower=0.01, upper=0.5, lower_inclusive=False)
+    scale = _bounded(
+        scale,
+        name="torque_limit_scale",
+        lower=0.0,
+        upper=1.0,
+        lower_inclusive=False,
+    )
     try:
         root = ET.fromstring(urdf_path.read_text(encoding="utf-8"))
     except (OSError, ET.ParseError) as exc:
@@ -1633,7 +1634,7 @@ def plan_reference(
         )
     direction = 1 if int(step_direction) >= 0 else -1
     step = _bounded(step_rad, name="step_rad", lower=0.0, upper=_MAX_STEP_RAD)
-    speed = _bounded(step_speed_rad_s, name="step_speed_rad_s", lower=0.001, upper=0.05)
+    speed = _positive(step_speed_rad_s, name="step_speed_rad_s")
     index = _ALL_JOINTS.index(joint)
     target = float(initial[index] + direction * step)
     lower, upper = limits[index]
@@ -3445,7 +3446,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--torque-limit-scale",
         type=float,
         default=_DEFAULT_TORQUE_LIMIT_SCALE,
-        help="fraction of the pinned URDF effort ceiling; max 0.5 for this probe",
+        help="fraction of the pinned URDF effort ceiling; must be in (0, 1]",
     )
     parser.add_argument(
         "--apply-driver-torque-limits",
