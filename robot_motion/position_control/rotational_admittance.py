@@ -17,73 +17,16 @@ from typing import Iterable
 
 import numpy as np
 
+from ._bounded_admittance_lifecycle import (
+    BoundedVectorLifecycle,
+    _clamp_bounded_vector,
+    _finite_time,
+    _finite_vector,
+    _nonnegative_vector,
+    _positive_vector,
+    _rotation_matrix,
+)
 from .cartesian_admittance import CartesianAdmittanceWrenchSample
-
-
-def _finite_vector(
-    values: Iterable[float],
-    *,
-    size: int,
-    name: str,
-) -> np.ndarray:
-    vector = np.asarray(tuple(values), dtype=float).reshape(-1)
-    if vector.shape != (size,) or not np.all(np.isfinite(vector)):
-        raise ValueError(f"{name} must contain {size} finite values")
-    return vector
-
-
-def _positive_vector(values: Iterable[float], *, name: str) -> tuple[float, ...]:
-    vector = _finite_vector(values, size=3, name=name)
-    if np.any(vector <= 0.0):
-        raise ValueError(f"{name} must contain positive values")
-    return tuple(float(value) for value in vector)
-
-
-def _nonnegative_vector(
-    values: Iterable[float],
-    *,
-    name: str,
-) -> tuple[float, ...]:
-    vector = _finite_vector(values, size=3, name=name)
-    if np.any(vector < 0.0):
-        raise ValueError(f"{name} must contain non-negative values")
-    return tuple(float(value) for value in vector)
-
-
-def _finite_time(value: float, *, name: str) -> float:
-    resolved = float(value)
-    if not math.isfinite(resolved):
-        raise ValueError(f"{name} must be finite")
-    return resolved
-
-
-def _rotation_matrix(value: np.ndarray, *, name: str) -> np.ndarray:
-    rotation = np.asarray(value, dtype=float)
-    if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
-        raise ValueError(f"{name} must be a finite 3x3 matrix")
-    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0.0):
-        raise ValueError(f"{name} must be orthonormal")
-    if not math.isclose(float(np.linalg.det(rotation)), 1.0, abs_tol=1e-6):
-        raise ValueError(f"{name} must be a proper rotation")
-    return rotation
-
-
-def _clamp_rotvec_bound(
-    values: np.ndarray,
-    *,
-    component_limits: np.ndarray,
-    enabled_axes: np.ndarray,
-) -> np.ndarray:
-    vector = np.where(enabled_axes, np.asarray(values, dtype=float), 0.0)
-    limits = np.asarray(component_limits, dtype=float)
-    vector = np.where(enabled_axes, np.clip(vector, -limits, limits), 0.0)
-    if not np.any(enabled_axes):
-        return np.zeros(3, dtype=float)
-    norm_limit = float(np.max(limits[enabled_axes]))
-    vector_norm = float(np.linalg.norm(vector))
-    if vector_norm > norm_limit:
-        vector = vector * (norm_limit / vector_norm)
-    return vector
 
 
 def rotation_matrix_from_rotvec(rotvec_rad: Iterable[float]) -> np.ndarray:
@@ -238,24 +181,7 @@ class BoundedRotationalAdmittance:
 
     def __init__(self, config: RotationalAdmittanceConfig | None = None):
         self.config = config if config is not None else RotationalAdmittanceConfig()
-        self._requested = np.zeros(3, dtype=float)
-        self._output = np.zeros(3, dtype=float)
-        self._velocity = np.zeros(3, dtype=float)
-        self._output_velocity = np.zeros(3, dtype=float)
-        self._tare_values: np.ndarray | None = None
-        self._tare_frame: str | None = None
-        self._tare_generation: int | None = None
-        self._last_sample_identity: tuple[int, float] | None = None
-        self._last_sample_source_time: float | None = None
-        self._last_output_time: float | None = None
-        self._frozen = True
-        self._reason = "not_tared"
-        self._new_sample_integrated = False
-        self._integration_dt_sec: float | None = None
-        self._deadbanded_torque = np.zeros(3, dtype=float)
-        self._filtered_torque = np.zeros(3, dtype=float)
-        self._filter_initialized = False
-        self._passive_return_active = False
+        self._lifecycle = BoundedVectorLifecycle()
 
     @property
     def enabled(self) -> bool:
@@ -267,56 +193,21 @@ class BoundedRotationalAdmittance:
         tare_sample: CartesianAdmittanceWrenchSample,
         output_time_sec: float | None = None,
     ) -> RotationalAdmittanceSnapshot:
-        self._requested.fill(0.0)
-        self._output.fill(0.0)
-        self._velocity.fill(0.0)
-        self._output_velocity.fill(0.0)
-        self._tare_values = np.asarray(tare_sample.values_n_nm, dtype=float)
-        self._tare_frame = tare_sample.frame
-        self._tare_generation = tare_sample.tare_generation
-        self._last_sample_identity = tare_sample.identity
-        self._last_sample_source_time = tare_sample.source_time_sec
-        self._last_output_time = (
-            None
-            if output_time_sec is None
-            else _finite_time(output_time_sec, name="output_time_sec")
+        self._lifecycle.reset(
+            tare_values=tare_sample.values_n_nm,
+            tare_frame=tare_sample.frame,
+            tare_generation=tare_sample.tare_generation,
+            sample_identity=tare_sample.identity,
+            sample_source_time=tare_sample.source_time_sec,
+            output_time_sec=output_time_sec,
         )
-        self._frozen = False
-        self._reason = "reset"
-        self._new_sample_integrated = False
-        self._integration_dt_sec = None
-        self._deadbanded_torque.fill(0.0)
-        self._filtered_torque.fill(0.0)
-        self._filter_initialized = False
-        self._passive_return_active = False
         return self.snapshot(now_sec=output_time_sec)
 
     def freeze(self, reason: str) -> None:
-        self._velocity.fill(0.0)
-        self._output_velocity.fill(0.0)
-        self._deadbanded_torque.fill(0.0)
-        self._filtered_torque.fill(0.0)
-        self._filter_initialized = False
-        self._passive_return_active = False
-        self._frozen = True
-        self._reason = str(reason).strip() or "frozen"
-        self._new_sample_integrated = False
-        self._integration_dt_sec = None
+        self._lifecycle.freeze(reason)
 
     def resume(self) -> None:
-        if self._tare_generation is None:
-            self.freeze("not_tared")
-            return
-        self._last_sample_identity = None
-        self._last_sample_source_time = None
-        self._velocity.fill(0.0)
-        self._output_velocity.fill(0.0)
-        self._deadbanded_torque.fill(0.0)
-        self._filtered_torque.fill(0.0)
-        self._filter_initialized = False
-        self._passive_return_active = False
-        self._frozen = False
-        self._reason = "resumed_awaiting_sample"
+        self._lifecycle.resume()
 
     def rebase_realized_rotation(
         self,
@@ -325,28 +216,17 @@ class BoundedRotationalAdmittance:
         output_time_sec: float | None = None,
         preserve_requested: bool = False,
     ) -> RotationalAdmittanceSnapshot:
-        enabled = np.asarray(self.config.enabled_axes, dtype=bool)
-        value = _clamp_rotvec_bound(
-            _finite_vector(rotvec_rad, size=3, name="rotvec_rad"),
-            component_limits=np.asarray(self.config.max_offset_rad, dtype=float),
-            enabled_axes=enabled,
+        self._lifecycle.rebase(
+            rotvec_rad,
+            value_name="rotvec_rad",
+            component_limits=self.config.max_offset_rad,
+            enabled_axes=self.config.enabled_axes,
+            output_time_sec=output_time_sec,
+            preserve_requested=preserve_requested,
+            backwards_error=(
+                "rotation rebase output_time_sec must not move backwards"
+            ),
         )
-        output_time = None
-        if output_time_sec is not None:
-            output_time = _finite_time(output_time_sec, name="output_time_sec")
-            if self._last_output_time is not None and output_time < self._last_output_time:
-                raise ValueError("rotation rebase output_time_sec must not move backwards")
-        if not preserve_requested:
-            self._requested = value.copy()
-        self._output = value.copy()
-        self._velocity.fill(0.0)
-        self._output_velocity.fill(0.0)
-        self._passive_return_active = False
-        if output_time is not None:
-            self._last_output_time = output_time
-        self._reason = "realized_rebase"
-        self._new_sample_integrated = False
-        self._integration_dt_sec = None
         return self.snapshot(now_sec=output_time_sec)
 
     def _integrate_profile_substep(
@@ -364,13 +244,14 @@ class BoundedRotationalAdmittance:
         filter pole does not reproduce the intermediate return/load decision.
         """
 
+        state = self._lifecycle
         enabled = np.asarray(self.config.enabled_axes, dtype=bool)
-        if not self._filter_initialized:
+        if not state.filter_initialized:
             filtered = torque_control.copy()
         elif self.config.torque_filter_tau_sec > 0.0:
             alpha = 1.0 - math.exp(-dt / self.config.torque_filter_tau_sec)
-            filtered = self._filtered_torque + alpha * (
-                torque_control - self._filtered_torque
+            filtered = state.filtered_input + alpha * (
+                torque_control - state.filtered_input
             )
         else:
             filtered = torque_control.copy()
@@ -382,7 +263,7 @@ class BoundedRotationalAdmittance:
         )
         deadbanded = np.where(enabled, deadbanded, 0.0)
 
-        previous = self._requested.copy()
+        previous = state.requested.copy()
         stiffness = np.asarray(self.config.stiffness_nm_rad, dtype=float)
         target = np.zeros(3, dtype=float)
         target[enabled] = deadbanded[enabled] / stiffness[enabled]
@@ -401,7 +282,7 @@ class BoundedRotationalAdmittance:
             target[axis] = previous[axis] * reference_decay
             return_applied[axis] = True
 
-        target = _clamp_rotvec_bound(
+        target = _clamp_bounded_vector(
             target,
             component_limits=np.asarray(self.config.max_offset_rad, dtype=float),
             enabled_axes=enabled,
@@ -416,22 +297,22 @@ class BoundedRotationalAdmittance:
                 velocity_limit,
                 np.asarray(self.config.max_return_velocity_rad_s, dtype=float),
             )
-        step = _clamp_rotvec_bound(
+        step = _clamp_bounded_vector(
             target - previous,
             component_limits=velocity_limit * dt,
             enabled_axes=enabled,
         )
-        requested = _clamp_rotvec_bound(
+        requested = _clamp_bounded_vector(
             previous + step,
             component_limits=np.asarray(self.config.max_offset_rad, dtype=float),
             enabled_axes=enabled,
         )
-        self._requested = requested
-        self._velocity = (requested - previous) / dt
-        self._deadbanded_torque = deadbanded
-        self._filtered_torque = filtered
-        self._filter_initialized = True
-        self._passive_return_active = passive_return
+        state.requested = requested
+        state.velocity = (requested - previous) / dt
+        state.deadbanded_input = deadbanded
+        state.filtered_input = filtered
+        state.filter_initialized = True
+        state.passive_return_active = passive_return
 
     def step_new_sample(
         self,
@@ -442,46 +323,22 @@ class BoundedRotationalAdmittance:
         active: bool = True,
     ) -> RotationalAdmittanceSnapshot:
         now = _finite_time(now_sec, name="now_sec")
-        self._new_sample_integrated = False
-        self._integration_dt_sec = None
-        if not active:
-            self.freeze("inactive")
+        state = self._lifecycle
+        dt = state.prepare_sample(
+            sample_identity=sample.identity,
+            sample_source_time=sample.source_time_sec,
+            sample_frame=sample.frame,
+            sample_tare_generation=sample.tare_generation,
+            now_sec=now,
+            active=active,
+            enabled=self.enabled,
+            stale_after_sec=self.config.stale_after_sec,
+            max_input_dt_sec=self.config.max_torque_dt_sec,
+            dt_exceeded_reason="torque_dt_exceeded",
+        )
+        if dt is None:
             return self.snapshot(now_sec=now)
-        if self._frozen:
-            return self.snapshot(now_sec=now)
-        if not self.enabled:
-            self._reason = "disabled"
-            return self.snapshot(now_sec=now)
-        if self._tare_values is None or self._tare_generation is None:
-            self.freeze("not_tared")
-            return self.snapshot(now_sec=now)
-        if sample.tare_generation != self._tare_generation:
-            self.freeze("tare_generation_mismatch")
-            return self.snapshot(now_sec=now)
-        if sample.frame != self._tare_frame:
-            self.freeze("tare_frame_mismatch")
-            return self.snapshot(now_sec=now)
-        if sample.source_time_sec > now:
-            self.freeze("sample_from_future")
-            return self.snapshot(now_sec=now)
-        if now - sample.source_time_sec > self.config.stale_after_sec:
-            self.freeze("sample_stale")
-            return self.snapshot(now_sec=now)
-        if sample.identity == self._last_sample_identity:
-            self._reason = "duplicate_sample"
-            return self.snapshot(now_sec=now)
-        if self._last_sample_source_time is None:
-            self._last_sample_identity = sample.identity
-            self._last_sample_source_time = sample.source_time_sec
-            self._reason = "sample_clock_rearmed"
-            return self.snapshot(now_sec=now)
-        if sample.source_time_sec <= self._last_sample_source_time:
-            self.freeze("sample_time_not_increasing")
-            return self.snapshot(now_sec=now)
-        dt = sample.source_time_sec - self._last_sample_source_time
-        if dt > self.config.max_torque_dt_sec:
-            self.freeze("torque_dt_exceeded")
-            return self.snapshot(now_sec=now)
+        assert state.tare_values is not None
 
         if sample.frame == self.config.control_frame:
             rotation = np.eye(3)
@@ -496,7 +353,7 @@ class BoundedRotationalAdmittance:
 
         tared_torque = (
             np.asarray(sample.values_n_nm[3:], dtype=float)
-            - self._tare_values[3:]
+            - state.tare_values[3:]
         )
         torque_control = rotation @ tared_torque
         torque_control *= np.asarray(self.config.torque_sign, dtype=float)
@@ -507,11 +364,11 @@ class BoundedRotationalAdmittance:
                 torque_control=torque_control,
                 dt=substep_dt,
             )
-        self._last_sample_identity = sample.identity
-        self._last_sample_source_time = sample.source_time_sec
-        self._reason = "sample_integrated"
-        self._new_sample_integrated = True
-        self._integration_dt_sec = dt
+        state.finish_sample(
+            sample_identity=sample.identity,
+            sample_source_time=sample.source_time_sec,
+            integration_dt_sec=dt,
+        )
         return self.snapshot(now_sec=now)
 
     def sample_output(
@@ -521,128 +378,38 @@ class BoundedRotationalAdmittance:
         active: bool = True,
     ) -> RotationalAdmittanceSnapshot:
         now = _finite_time(now_sec, name="now_sec")
-        self._new_sample_integrated = False
-        self._integration_dt_sec = None
-        if not active:
-            self.freeze("inactive")
-            return self.snapshot(now_sec=now)
-        if self._frozen:
-            return self.snapshot(now_sec=now)
-        if self._last_sample_source_time is None:
-            self._reason = "awaiting_fresh_sample"
-            return self.snapshot(now_sec=now)
-        if now - self._last_sample_source_time > self.config.stale_after_sec:
-            self.freeze("sample_stale")
-            return self.snapshot(now_sec=now)
-        if self._last_output_time is None:
-            self._last_output_time = now
-            self._reason = "output_clock_armed"
-            return self.snapshot(now_sec=now)
-        if now == self._last_output_time:
-            self._reason = "duplicate_output_time"
-            return self.snapshot(now_sec=now)
-        if now < self._last_output_time:
-            self.freeze("output_time_not_increasing")
-            return self.snapshot(now_sec=now)
-
-        dt = now - self._last_output_time
-        enabled = np.asarray(self.config.enabled_axes, dtype=bool)
-        output_target = self._requested
-        if (
-            self.config.output_follow_tau_sec > 0.0
-            and self._passive_return_active
-        ):
-            output_target = np.zeros(3, dtype=float)
-            for axis in range(3):
-                if not enabled[axis] or abs(self._output[axis]) <= 1e-15:
-                    continue
-                requested = self._requested[axis]
-                current = self._output[axis]
-                if requested * current > 0.0:
-                    output_target[axis] = math.copysign(
-                        min(abs(requested), abs(current)),
-                        current,
-                    )
-        raw_delta = output_target - self._output
-        if self.config.output_follow_tau_sec > 0.0:
-            raw_delta = raw_delta * (
-                1.0 - math.exp(-dt / self.config.output_follow_tau_sec)
-            )
-        delta = _clamp_rotvec_bound(
-            raw_delta,
-            component_limits=np.asarray(self.config.max_output_slew_rad_s) * dt,
-            enabled_axes=enabled,
+        self._lifecycle.sample_output(
+            now_sec=now,
+            active=active,
+            stale_after_sec=self.config.stale_after_sec,
+            enabled_axes=self.config.enabled_axes,
+            output_follow_tau_sec=self.config.output_follow_tau_sec,
+            output_slew_limits=self.config.max_output_slew_rad_s,
+            acceleration_limits=(
+                self.config.max_output_angular_acceleration_rad_s2
+            ),
+            absolute_limits=self.config.max_offset_rad,
         )
-        acceleration_limit = np.asarray(
-            self.config.max_output_angular_acceleration_rad_s2,
-            dtype=float,
-        )
-        if np.any(acceleration_limit[enabled] > 0.0):
-            desired_velocity = delta / dt
-            velocity_delta = _clamp_rotvec_bound(
-                desired_velocity - self._output_velocity,
-                component_limits=acceleration_limit * dt,
-                enabled_axes=enabled,
-            )
-            output_velocity = _clamp_rotvec_bound(
-                self._output_velocity + velocity_delta,
-                component_limits=np.asarray(
-                    self.config.max_output_slew_rad_s,
-                    dtype=float,
-                ),
-                enabled_axes=enabled,
-            )
-            delta = output_velocity * dt
-        previous_output = self._output.copy()
-        candidate_output = _clamp_rotvec_bound(
-            self._output + delta,
-            component_limits=np.asarray(self.config.max_offset_rad, dtype=float),
-            enabled_axes=enabled,
-        )
-        if (
-            np.any(acceleration_limit[enabled] > 0.0)
-            and self._passive_return_active
-        ):
-            candidate_output = np.where(
-                candidate_output * previous_output > 0.0,
-                np.sign(previous_output)
-                * np.minimum(
-                    np.abs(candidate_output),
-                    np.abs(previous_output),
-                ),
-                0.0,
-            )
-            if float(np.linalg.norm(candidate_output)) > float(
-                np.linalg.norm(previous_output)
-            ):
-                candidate_output = previous_output
-        self._output = candidate_output
-        self._output_velocity = (self._output - previous_output) / dt
-        self._last_output_time = now
-        self._reason = "output_sampled"
         return self.snapshot(now_sec=now)
 
     def snapshot(self, *, now_sec: float | None = None) -> RotationalAdmittanceSnapshot:
-        age = None
-        if now_sec is not None and self._last_sample_source_time is not None:
-            now = _finite_time(now_sec, name="now_sec")
-            age = max(0.0, now - self._last_sample_source_time)
+        state = self._lifecycle
         return RotationalAdmittanceSnapshot(
-            requested_rotvec_rad=tuple(float(value) for value in self._requested),
-            output_rotvec_rad=tuple(float(value) for value in self._output),
-            angular_velocity_rad_s=tuple(float(value) for value in self._velocity),
-            last_sample_identity=self._last_sample_identity,
-            last_sample_age_sec=age,
-            tare_generation=self._tare_generation,
-            frozen=self._frozen,
-            reason=self._reason,
-            new_sample_integrated=self._new_sample_integrated,
-            integration_dt_sec=self._integration_dt_sec,
+            requested_rotvec_rad=tuple(float(value) for value in state.requested),
+            output_rotvec_rad=tuple(float(value) for value in state.output),
+            angular_velocity_rad_s=tuple(float(value) for value in state.velocity),
+            last_sample_identity=state.last_sample_identity,
+            last_sample_age_sec=state.sample_age(now_sec=now_sec),
+            tare_generation=state.tare_generation,
+            frozen=state.frozen,
+            reason=state.reason,
+            new_sample_integrated=state.new_sample_integrated,
+            integration_dt_sec=state.integration_dt_sec,
             deadbanded_torque_control_nm=tuple(
-                float(value) for value in self._deadbanded_torque
+                float(value) for value in state.deadbanded_input
             ),
             filtered_torque_control_nm=tuple(
-                float(value) for value in self._filtered_torque
+                float(value) for value in state.filtered_input
             ),
         )
 
