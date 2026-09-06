@@ -1370,6 +1370,8 @@ def _parse_cartesian_args(*extra: str) -> object:
             "source",
             "--kp",
             "0",
+            "--kd",
+            "0",
             "--allow-motion",
             "--auto-disable",
             "--confirmation",
@@ -1379,15 +1381,19 @@ def _parse_cartesian_args(*extra: str) -> object:
     )
 
 
-def test_cartesian_cli_uses_all_six_joints_and_requires_zero_joint_stiffness() -> None:
+def test_cartesian_cli_uses_all_six_joints_and_zero_joint_impedance() -> None:
     args = _parse_cartesian_args()
 
     probe._validate_cli(args)
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
     nonzero_kp = _parse_cartesian_args("--kp", "0.1")
-    with pytest.raises(ValueError, match="requires --kp 0"):
+    with pytest.raises(ValueError, match="zero joint-space Kp/Kd"):
         probe._validate_cli(nonzero_kp)
+
+    nonzero_kd = _parse_cartesian_args("--kd", "0.1")
+    with pytest.raises(ValueError, match="zero joint-space Kp/Kd"):
+        probe._validate_cli(nonzero_kd)
 
 
 def _parse_pose_args(*extra: str) -> object:
@@ -1401,6 +1407,8 @@ def _parse_pose_args(*extra: str) -> object:
             "source",
             "--kp",
             "0",
+            "--kd",
+            "0",
             "--allow-motion",
             "--auto-disable",
             "--confirmation",
@@ -1410,11 +1418,14 @@ def _parse_pose_args(*extra: str) -> object:
     )
 
 
-def test_pose_cli_requires_all_six_joints_zero_joint_stiffness_and_safe_rotation() -> None:
+def test_pose_cli_uses_all_six_joints_and_only_end_effector_impedance() -> None:
     probe._validate_cli(_parse_pose_args())
+    assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
-    with pytest.raises(ValueError, match="requires --kp 0"):
+    with pytest.raises(ValueError, match="zero joint-space Kp/Kd"):
         probe._validate_cli(_parse_pose_args("--kp", "0.1"))
+    with pytest.raises(ValueError, match="zero joint-space Kp/Kd"):
+        probe._validate_cli(_parse_pose_args("--kd", "0.1"))
     with pytest.raises(ValueError, match="rotational_max_displacement_rad"):
         probe._validate_cli(
             _parse_pose_args("--rotational-max-displacement-rad", "0.5")

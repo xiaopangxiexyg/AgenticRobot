@@ -407,7 +407,7 @@ MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort cei
 移动到示例姿态。操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，
 现场没有第二个 CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；当前
 J6 方案显式使能六个 arm 关节并锚定各自的使能后当前位置，但只有 J6 的 reference 可以
-变化。后述 `cartesian-hold` 和 `pose-hold` 同样必须显式批准六个 arm 关节共同使能。不要在夹爪接触桌面或其他物体时
+变化。后述 `cartesian-hold` 和 `pose-hold` 固定由六个 arm 关节共同使能和调节。不要在夹爪接触桌面或其他物体时
 运行；`safe_stop` 失能后负载可能下落，停止过程中仍需保持支撑。下面命令使用
 状态分支和显式 status 打印，不使用会让交接终端提前退出的 `set -euo pipefail`；
 命令由操作者在目标 worktree 中运行，我们不在自动流程中代运行。版本化文档保留
@@ -489,36 +489,47 @@ printf '%s\n' 'shell remains active'
 `--apply-driver-torque-limits`。active 路径会对 J1..J6 使用同一完整 active set，逐轴应用、
 回读并恢复限制。这只验收六轴参数事务，不证明电机会运动或力控有效。
 
-完成该往返验收后，active `hold` 命令如下。它仍会在前台显示 `[DRIVE] 3/2/1/ENABLE`：
+完成该往返验收后，末端阻抗验收使用 `pose-hold`。它在使能后稳定采样的任意当前姿态建立
+末端 6D 零误差锚点，以末端位姿/速度误差生成 wrench，再通过完整 Jacobian 转置映射为
+J1..J6 力矩；关节空间 Kp/Kd 均为零。命令仍会在前台显示 `[DRIVE] 3/2/1/ENABLE`：
 
 ```bash
 
 mkdir -p "$OUT_DIR"
 if cd "$WT"; then
   if run_logged env PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/hardware/rebot_b601_rs_low_gain_probe.py \
-      --mode hold \
+      --mode pose-hold \
       --config "$CFG" \
       --rebot-source-root "$SRC" \
-      --duration-sec 4 \
+      --duration-sec 8 \
       --warmup-sec 2 \
       --freeze-sec 1 \
       --rate-hz 20 \
-      --kp 0.25 \
-      --kd 0.5 \
+      --kp 0 \
+      --kd 0 \
       --gravity-scale 0.1 \
       --torque-limit-scale 0.1 \
       --apply-driver-torque-limits \
       --torque-rise-time-sec 2.0 \
       --velocity-abort-rad-s 0.12 \
       --acceleration-abort-rad-s2 4.0 \
-      --max-error-rad 0.12 \
+      --max-error-rad 0.2 \
+      --cartesian-stiffness-n-per-m 10 \
+      --cartesian-damping-n-s-per-m 0.8 \
+      --cartesian-max-force-n 1.0 \
+      --cartesian-max-displacement-m 0.03 \
+      --cartesian-overlay-limit-scale 0.5 \
+      --rotational-stiffness-nm-per-rad 0.2 \
+      --rotational-damping-nm-s-per-rad 0.03 \
+      --rotational-max-torque-nm 0.1 \
+      --rotational-max-displacement-rad 0.0872665 \
       --allow-motion \
       --auto-disable \
       --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
       --fault-hold-max-age-sec 0.15 \
       --fault-hold-max-velocity-rad-s 0.02 \
       --fault-hold-max-rebase-rad 0.05 \
-      --output "$OUT_DIR/b601_low_gain_hold_all_arm.json"; then
+      --output "$OUT_DIR/b601_ee_pose_impedance_all_arm.json"; then
     STATUS=0
   else
     STATUS=$?
@@ -531,12 +542,12 @@ fi
 printf '%s\n' 'shell remains active'
 ```
 
-第一档只验收 `hold`：观察 J1..J6 是否都锚定在使能后当前位置、重力方向是否合理、阻尼
-是否耗散而非振荡；ID7 夹爪不参与。`active_joint_names` 的集合必须正好是 joint1..joint6，
-且没有任何关节 reference 变化。输出 JSON 的 `joint_impedance.enabled=true`、
-`reference_source=fresh_post_enable_settled_qpos`、`reference_velocity_rad_s` 全零且
-`vendor_kp/vendor_kd` 全零，共同确认这是单一软件 torque owner 下的静止 qpos 阻抗，
-而不是驱动器内部 PD 或预设姿态命令。
+第一档只验收 `pose-hold`：观察任意当前姿态是否成为末端零误差锚点，轻微的末端平移或旋转
+扰动是否产生反向、耗散且受限的恢复 wrench；ID7 夹爪不参与。`active_joint_names` 必须正好
+是 joint1..joint6，`joint_impedance.software_kp_nm_per_rad` 和
+`joint_impedance.software_kd_nm_s_per_rad` 必须全零，`pose_impedance.enabled=true`，且
+`vendor_kp/vendor_kd` 全零。由此确认恢复作用来自末端 6D 阻抗及 `J^T wrench`，不是六个关节
+位置弹簧、驱动器内部 PD 或预设绝对姿态命令。
 正常控制的 `--velocity-abort-rad-s` 与故障保持候选门是两个独立安全层：某一帧低于正常
 运动中止阈值、但高于更严格的 `--fault-hold-max-velocity-rad-s` 时，该帧不会替换
 `last_safe`，但也不会单独中止正常 hold。JSON 的 `fault_hold_candidate_admission` 会记录
@@ -667,7 +678,7 @@ slow-step 的 `acceptance_status=PASS` 现在同时要求
 `B601TranslationalVirtualSpring`、Pinocchio `LOCAL_WORLD_ALIGNED` Jacobian 和统一的
 `J^T F` 映射；锚点是六关节使能后第一份完整、合法、近静止反馈对应的
 `base_link_T_gripper_end` 平移，不读取或追踪任何预设绝对 pose。第一版不控制姿态/转动，
-因此必须 `--kp 0`，并显式使能全部六个 arm 关节；ID7 夹爪仍不参与。
+因此必须 `--kp 0 --kd 0`，全部六个 arm 关节固定参与调节；ID7 夹爪仍不参与。
 
 笛卡尔力先按轴限幅，再由 MIT profile 对 joint overlay 独立限幅，最后与重力和关节阻尼
 相加并通过总力矩绝对限幅和 slew-rate 限幅。每帧 JSON 记录 anchor、TCP displacement、
@@ -691,7 +702,7 @@ if cd "$WT"; then
       --rate-hz 20 \
       --joint joint1 \
       --kp 0 \
-      --kd 0.5 \
+      --kd 0 \
       --gravity-scale 0.5 \
       --torque-limit-scale 0.15 \
       --torque-rise-time-sec 2.0 \
@@ -739,8 +750,8 @@ arming-settle 门后固定完整的 `base_link_T_gripper_end`，用
 `R_current R_anchor^T` 的最短 world-aligned rotation vector 表示姿态误差，并计算
 `[f, torque] = -K [translation, rotation] - D [linear velocity, angular velocity]`。
 完整 6D wrench 仍只经过现有 `LOCAL_WORLD_ALIGNED J^T` 映射、joint overlay 限幅和最终
-总力矩/slew 包络。该模式强制六个 arm 关节共同使能且 `--kp 0`，避免同时存在关节位置
-弹簧和任务空间弹簧；ID7 仍不参与。
+总力矩/slew 包络。该模式强制六个 arm 关节共同使能且 `--kp 0 --kd 0`，避免叠加关节空间
+阻抗；ID7 仍不参与。
 
 首次只允许不触碰保持 4 秒，并采用更低的旋转增益、力矩上限和 2 度姿态硬中止。下面是
 版本化模板，不是自动执行授权；实际交接仍须绑定干净 Task commit/tree、保持前台运行并
@@ -758,7 +769,7 @@ if cd "$WT"; then
       --rate-hz 20 \
       --joint joint1 \
       --kp 0 \
-      --kd 0.5 \
+      --kd 0 \
       --gravity-scale 0.5 \
       --torque-limit-scale 0.15 \
       --torque-rise-time-sec 2.0 \
