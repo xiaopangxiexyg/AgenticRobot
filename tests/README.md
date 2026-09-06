@@ -38,10 +38,7 @@ python -m pytest -q -m "integration and not optional and not hardware and not sl
 # Parallel bounded edit feedback (unit + integration, isolated caches/reports):
 bash scripts/run_fast_feedback.sh
 # Complete compatibility and integration-commit acceptance:
-python -m pytest -q -m "unit and not optional and not hardware"
-python -m pytest -q -m "contract and not optional and not hardware"
-python -m pytest -q -m "integration and not optional and not hardware"
-python -m pytest -q -m "not hardware"
+bash scripts/run_full_acceptance.sh --durations=50
 ```
 
 The current `pytest.ini` default discovers the root `tests/` directory.
@@ -69,15 +66,14 @@ persistence soaks may qualify.
 A module-level marker is valid only when every collected node in that module
 has been measured into the same tier. A filename, loop bound, optional
 dependency, or `mujoco` import alone is not sufficient evidence. Do not share
-`.pytest_cache` between worktrees or enable repository-wide test parallelism
-without first proving that the selected tests are hermetic and
-resource-independent.  `scripts/run_fast_feedback.sh` is the reviewed
-parallel entrypoint for the two bounded selectors.  It splits the unit
-selector into two deterministic test-module shards by default, starts those
+`.pytest_cache` between worktrees or invoke independent pytest processes over
+overlapping modules. `scripts/run_fast_feedback.sh` is the reviewed parallel
+entrypoint for the two bounded selectors. It splits the unit selector into two
+duration-weighted, deterministic test-module shards by default, starts those
 shards alongside the integration child, and merges the shard reports back to
-the historical `unit.log` and `unit.xml` evidence paths.  Each child gets its
-own pytest cache and JUnit report under `/tmp`, and the complete acceptance
-gates remain unchanged.  Set `DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS=1` to
+the historical `unit.log` and `unit.xml` evidence paths. Each child gets its
+own pytest cache and JUnit report under `/tmp`. Set
+`DEXTELEOP_FAST_FEEDBACK_UNIT_SHARDS=1` to
 reproduce one unit process.  A three-shard run has been validated on the
 current 32-CPU development host; choose it only when the machine's CPU and
 memory budget supports the extra pytest process.  Four shards remain
@@ -90,6 +86,19 @@ before invoking it; the wrapper creates one shared temporary link for all
 children and removes only that link after the run.  Additional pytest options
 may be appended, but the marker, cache, JUnit, and basetemp options remain
 owned by the wrapper.
+
+`scripts/run_full_acceptance.sh` is the complete non-hardware integration gate.
+It assigns every discovered `tests/test_*.py` module exactly once using a
+checked-in sparse timing profile plus a deterministic source-size fallback.
+The default four shards have separate pytest, Python, MuJoCo, XDG, Matplotlib,
+Numba, `TMPDIR`, basetemp, log, and JUnit state. The wrapper waits for every
+child, rejects duplicate JUnit identities, and writes `full-acceptance.xml`
+plus `shard-plan.json` under a new artifact root. Set
+`DEXTELEOP_FULL_ACCEPTANCE_SHARDS=1` for serial reproduction. Harness callers
+may set new absolute `DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT` and
+`DEXTELEOP_FULL_ACCEPTANCE_JUNIT` paths so the aggregate evidence remains in
+the protected Run directory. Explicit test targets are rejected because this
+entrypoint represents complete-suite acceptance.
 
 ## Marker semantics
 

@@ -11,6 +11,7 @@ set -euo pipefail
 # caller such as Harness needs the logs and JUnit reports under its Run root.
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+umask 022
 
 die() {
   echo "[dexteleop-fast-feedback] ERROR: $*" >&2
@@ -123,10 +124,7 @@ configure_unit_shards() {
 }
 
 prepare_unit_shards() {
-  local -a test_files=()
   local index=0
-  local assigned_count=0
-  local test_file
 
   UNIT_SHARD_PATHS=()
   UNIT_SHARD_LOGS=()
@@ -145,19 +143,13 @@ prepare_unit_shards() {
     : >"${UNIT_SHARD_PATHS[index]}"
   done
 
-  mapfile -t test_files < <(
-    find "$REPO_ROOT/tests" -type f -name 'test_*.py' -print | LC_ALL=C sort
-  )
-  ((${#test_files[@]} > 0)) || die "no pytest modules found under $REPO_ROOT/tests"
-
-  for test_file in "${test_files[@]}"; do
-    index=$((assigned_count % UNIT_SHARD_COUNT))
-    printf '%s\n' "$test_file" >>"${UNIT_SHARD_PATHS[index]}"
-    assigned_count=$((assigned_count + 1))
-  done
-  if ((assigned_count != ${#test_files[@]})); then
-    die "internal unit shard accounting mismatch: assigned=$assigned_count files=${#test_files[@]}"
-  fi
+  python3 "$REPO_ROOT/scripts/pytest_sharding.py" plan \
+    --repository "$REPO_ROOT" \
+    --tests-root "$REPO_ROOT/tests" \
+    --output-dir "$RUN_ROOT" \
+    --shards "$UNIT_SHARD_COUNT" \
+    --profile fast \
+    --prefix unit || die "could not build a complete weighted unit shard plan"
 }
 
 stop_children() {
