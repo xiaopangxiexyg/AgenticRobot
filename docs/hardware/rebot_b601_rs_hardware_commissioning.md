@@ -366,7 +366,8 @@ ACTIVE
    且 joint2/joint3 相对 `last_safe_q` 的 rebase 不超过
    `--fault-hold-max-rebase-rad`（默认 `0.05 rad`）。超出即禁止保持；
 5. 只有通过上述检查后才会发送第一帧；发送的是固定 `last_safe_q`、零 qvel、vendor
-   `kp=kd=0`，并继续经过软件 torque absolute limit 和 torque slew limit。q 绝不由
+   `kp=0`，并继续经过软件 torque absolute limit 和 torque slew limit。若本次运行显式
+   选择 driver Kd，保护保持沿用同一 Kd 和已经回读的 `0x700B` 总力矩上限。q 绝不由
    错误/陈旧样本补零，也不使用最后一次 command 代替最后一次合法状态。
 
 第一帧保持成功后，程序先对非保持 arm 关节发逐关节 `safe_stop`；该 receipt 不完整时
@@ -391,11 +392,13 @@ fi
 printf '%s\n' 'shell remains active'
 ```
 
-本入口固定单一 torque owner：软件按
+本入口默认由软件按
 `tau = gravity_scale*g(q) + Kp*(q_ref-q) + Kd*(dq_ref-dq) + J^T F` 组合重力前馈、
 低增益位置项、基于新鲜 `mechPos (0x7019)` 的有限差分阻尼和可选笛卡尔 overlay，
-然后向 upstream
-MotorBridge 发送 `kp=kd=0` 的 MIT 帧。最终总力矩先做 URDF effort ceiling 的
+然后向 upstream MotorBridge 发送 `kp=kd=0` 的 MIT 帧。为避免 20 Hz 有限差分阻尼产生
+阶梯，可显式令软件 `--kd 0` 并用 `--driver-kd` 把纯速度耗散交给电机内部环；driver
+`kp` 仍固定为零，因此末端 `J^T wrench` 仍是唯一位置恢复项。非零 driver Kd 只有在
+`--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
 加速度、位置误差、非有限差分、部分发送或 cleanup 不完整会立即结束本次运行。由于当前
 `mechPos` 是同步参数读取且 MotorBridge 没有源序号/时间戳，本探针的默认 20 Hz
@@ -509,7 +512,8 @@ if cd "$WT"; then
       --freeze-sec 1 \
       --rate-hz 20 \
       --kp 0 \
-      --kd 1.0 \
+      --kd 0 \
+      --driver-kd 1.0 \
       --gravity-scale 0.5 \
       --torque-limit-scale 0.15 \
       --apply-driver-torque-limits \
@@ -518,12 +522,12 @@ if cd "$WT"; then
       --acceleration-abort-rad-s2 4.0 \
       --max-error-rad 0.2 \
       --cartesian-stiffness-n-per-m 15 \
-      --cartesian-damping-n-s-per-m 3.0 \
+      --cartesian-damping-n-s-per-m 0 \
       --cartesian-max-force-n 30.0 \
       --cartesian-max-displacement-m 0.3 \
       --cartesian-overlay-limit-scale 1 \
-      --rotational-stiffness-nm-per-rad 0.2 \
-      --rotational-damping-nm-s-per-rad 0.15 \
+      --rotational-stiffness-nm-per-rad 1.0 \
+      --rotational-damping-nm-s-per-rad 0 \
       --rotational-max-torque-nm 20 \
       --rotational-max-displacement-rad 1 \
       --allow-motion \
@@ -545,12 +549,17 @@ fi
 printf '%s\n' 'shell remains active'
 ```
 
+这一档把所有 host 有限差分阻尼设为零，由六轴 driver Kd 提供电机局部连续耗散；这些数值
+只是针对已观察到的 20 Hz 阶梯和腕部静摩擦死区的下一档 commissioning 配置，不是代码
+默认值或测试契约。driver Kp 始终为零，旋转刚度仍在末端 6D spring 中，经完整 `J^T`
+调节所有关节。
+
 第一档只验收 `pose-hold`：观察任意当前姿态是否成为末端零误差锚点，轻微的末端平移或旋转
 扰动是否产生反向、耗散且受限的恢复 wrench；ID7 夹爪不参与。`active_joint_names` 必须正好
 是 joint1..joint6，`joint_impedance.software_kp_nm_per_rad` 必须全零，统一的
-`joint_impedance.software_kd_nm_s_per_rad` 应为 1.0，`pose_impedance.enabled=true`，且
-`vendor_kp/vendor_kd` 全零。末端平衡点和恢复刚度来自 6D 阻抗及 `J^T wrench`；统一关节 Kd
-只提供速度耗散，不创建六个关节位置弹簧。
+`pose_impedance.enabled=true`，且 `vendor_kp` 全零。软件 Kd 与 driver Kd 只能按运行命令
+明确分配；为改善连续性而启用 driver Kd 时，软件 Kd 应为零，driver Kd 只提供速度耗散，
+不创建六个关节位置弹簧。末端平衡点和恢复刚度仍只来自 6D 阻抗及 `J^T wrench`。
 正常控制的 `--velocity-abort-rad-s` 与故障保持候选门是两个独立安全层：某一帧低于正常
 运动中止阈值、但高于更严格的 `--fault-hold-max-velocity-rad-s` 时，该帧不会替换
 `last_safe`，但也不会单独中止正常 hold。JSON 的 `fault_hold_candidate_admission` 会记录
@@ -769,13 +778,12 @@ Kd 作为速度耗散，但这些调参值不属于代码契约；ID7 仍不参�
 在 `0x701B` 的真实设备量纲、符号和 freshness 经独立验证前，控制侧仍应使用新鲜位置的
 有界差分速度。当前不能用约 20 Hz 的同步参数读取直接闭合 125 Hz 重力/阻尼控制。
 
-另外，`compute_b601_mit_torque()` 已经在软件中组合 position、damping、gravity 和 overlay；
-若把该总力矩作为 `tau` 发送，同时给驱动器非零 `kp/kd`，会重复计算 PD。反过来，若使用
-upstream 的驱动器 PD 加 `g(q)` 前馈，`0x700B` 临时限幅能提供驱动器侧绝对上限，却不能
-单独证明内部 PD/前馈的精确合成、方向、动态或软件 slew envelope。进入非零驱动器 PD 前
-仍必须先确定并实现唯一 torque ownership，并取得高频、可验证 freshness 的 q 与差分 dq，
-再补齐 watchdog、最终 torque/slew 限制和单关节安全验收。P4.1/P4.2 的已使能 MIT 命令只用于
-现场低速 commissioning，不构成高频 haptic/force-control 验收入口。
+另外，`compute_b601_mit_torque()` 若已经组合软件 damping，再同时给驱动器非零 Kd，会重复
+计算阻尼。当前只允许一种明确拆分：软件 Kd 为零，driver Kp 为零，driver Kd 单独拥有
+电机局部速度耗散，软件拥有 gravity 和 `J^T wrench`，驱动器 `0x700B` 拥有最终总力矩
+绝对上限。非零 driver Kp、软件与驱动器双重 Kd、以及把约 20 Hz host loop 宣称为高频
+haptic 仍然禁止。真正高带宽 task-space impedance 仍需可验证 freshness 的异步 q/dq
+解码路径。
 
 ## 操作者手动 enabled 位置频率入口（本轮不执行）
 

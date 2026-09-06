@@ -359,7 +359,7 @@ def test_software_profile_has_single_torque_owner() -> None:
     assert profile.position_kp_nm_per_rad == (0.5,) * 6
     assert profile.damping_kd_nm_s_per_rad == (0.5,) * 6
     assert profile.max_torque_rate_nm_s == (2.0,) * 6
-    assert profile.metadata["torque_owner"] == "software_composed_tau; vendor_kp_kd_zero"
+    assert profile.metadata["torque_owner"] == "software_composed_tau_excludes_vendor_pd"
 
 
 def test_software_profile_overrides_only_the_target_joint_gains() -> None:
@@ -1408,3 +1408,17 @@ def _parse_pose_args(*extra: str) -> object:
 def test_pose_cli_uses_all_six_joints() -> None:
     probe._validate_cli(_parse_pose_args())
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
+
+
+def test_driver_damping_requires_verified_driver_torque_limits() -> None:
+    args = _parse_pose_args("--kd", "0", "--driver-kd", "1")
+
+    with pytest.raises(probe.LowGainProbeError, match="driver-torque-limits"):
+        probe._validate_cli(args)
+
+    args.apply_driver_torque_limits = True
+    probe._validate_cli(args)
+
+    args.kd = 1.0
+    with pytest.raises(probe.LowGainProbeError, match="software --kd 0"):
+        probe._validate_cli(args)

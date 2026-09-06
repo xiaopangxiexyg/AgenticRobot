@@ -18,12 +18,14 @@ complete current ``base_link_T_gripper_end`` transform and adds a bounded 6D
 restoring wrench through the same ``J.T @ wrench`` path.  Both task-space modes
 keep software joint stiffness at zero so there is only one spring owner.
 
-The dispatched RobStride MIT ``kp`` and ``kd`` are always zero, so the final
-software torque is the only PD/derivative contribution that this probe owns.
-The software then applies a final absolute torque bound and slew-rate bound
-before calling :meth:`B601RSBackend.send_mit`.  Feedback uses the existing
-explicit ``mechPos`` request path; its source freshness remains unverified by
-MotorBridge 0.4.9 and is reported as such.
+The dispatched RobStride MIT ``kp`` is always zero.  By default ``kd`` is also
+zero and the software owns all damping.  An explicit driver ``kd`` may instead
+provide motor-local damping while software damping is disabled; that path
+requires verified volatile driver torque limits on all six joints.  The host
+still applies its final absolute torque and slew-rate bounds to the gravity and
+task-space wrench it owns before calling :meth:`B601RSBackend.send_mit`.
+Feedback uses the existing explicit ``mechPos`` request path; its source
+freshness remains unverified by MotorBridge 0.4.9 and is reported as such.
 
 This module is motion-capable only after all of ``--allow-motion``,
 ``--auto-disable`` and the exact confirmation string are supplied.  The
@@ -659,6 +661,10 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 
 def _validate_cli(args: argparse.Namespace) -> None:
     if args.mode == "feedback-stability":
+        if getattr(args, "driver_kd", 0.0) != 0.0:
+            raise LowGainProbeError(
+                "feedback-stability rejects --driver-kd; it is observation-only"
+            )
         if getattr(args, "apply_driver_torque_limits", False):
             raise LowGainProbeError(
                 "feedback-stability rejects --apply-driver-torque-limits; "
@@ -739,12 +745,27 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _non_negative(args.freeze_sec, name="freeze_sec")
     _non_negative(args.kp, name="kp")
     _non_negative(args.kd, name="kd")
+    driver_kd = _non_negative(
+        getattr(args, "driver_kd", 0.0),
+        name="driver_kd",
+    )
+    if driver_kd > 0.0 and not args.apply_driver_torque_limits:
+        raise LowGainProbeError(
+            "non-zero --driver-kd requires --apply-driver-torque-limits"
+        )
     target_kp = getattr(args, "target_kp", None)
     target_kd = getattr(args, "target_kd", None)
     if target_kp is not None:
         _non_negative(target_kp, name="target_kp")
     if target_kd is not None:
         _non_negative(target_kd, name="target_kd")
+    if driver_kd > 0.0 and (
+        args.kd > 0.0 or (target_kd is not None and target_kd > 0.0)
+    ):
+        raise LowGainProbeError(
+            "non-zero --driver-kd requires software --kd 0 and no non-zero "
+            "--target-kd"
+        )
     _non_negative(args.gravity_scale, name="gravity_scale")
     _bounded(
         args.torque_limit_scale,
@@ -1372,7 +1393,7 @@ def build_software_profile(
         max_abs_state_velocity_rad_s=(max(velocity_limit, 0.05),) * 6,
         metadata={
             "hardware_safety_claim": False,
-            "torque_owner": "software_composed_tau; vendor_kp_kd_zero",
+            "torque_owner": "software_composed_tau_excludes_vendor_pd",
             "torque_limit_source": "pinned_urdf_effort_scaled",
             "torque_rise_time_sec": rise_time,
             "target_joint": target_joint,
@@ -1909,6 +1930,7 @@ def _freeze_and_stop(
     freeze_sec: float,
     rate_hz: float,
     joint_names: Sequence[str] = _ALL_JOINTS,
+    driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[int, tuple[float, ...], list[str]]:
     """Hold the last known pose briefly before the explicit safe stop.
 
@@ -1922,6 +1944,10 @@ def _freeze_and_stop(
     max_rate = profile.max_torque_rate_nm_s
     count = 0
     latest_tau = previous_tau
+    driver_kd = _six(
+        driver_kd_nm_s_per_rad,
+        name="driver_kd_nm_s_per_rad",
+    )
     period = 1.0 / rate_hz
     deadline = time.monotonic() + freeze_sec
     while time.monotonic() < deadline:
@@ -1950,7 +1976,7 @@ def _freeze_and_stop(
             receipt = backend.send_mit(
                 reference,
                 kp=_ZERO_SIX,
-                kd=_ZERO_SIX,
+                kd=driver_kd,
                 tau_nm=latest_tau,
                 torque_limits_nm=torque_limits_nm,
                 joint_names=joint_names,
@@ -1978,6 +2004,7 @@ def _send_fault_hold_command(
     previous_tau: tuple[float, ...],
     torque_limits_nm: tuple[float, ...],
     rate_hz: float,
+    driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[B601CommandReceipt, tuple[float, ...]]:
     """Send one bounded fixed-reference MIT frame to joint2 and joint3 only."""
 
@@ -2006,7 +2033,7 @@ def _send_fault_hold_command(
     receipt = backend.send_mit(
         reference,
         kp=_ZERO_SIX,
-        kd=_ZERO_SIX,
+        kd=_six(driver_kd_nm_s_per_rad, name="driver_kd_nm_s_per_rad"),
         tau_nm=conditioned,
         torque_limits_nm=torque_limits_nm,
         joint_names=_FAULT_HOLD_JOINTS,
@@ -2034,6 +2061,7 @@ def _run_latched_fault_hold(
     rate_hz: float,
     stop: dict[str, bool],
     max_iterations: int | None = None,
+    driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -2110,6 +2138,7 @@ def _run_latched_fault_hold(
             previous_tau=latest_tau,
             torque_limits_nm=torque_limits_nm,
             rate_hz=rate_hz,
+            driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
         )
         if not first_hold_receipt.accepted:
             errors.extend(
@@ -2233,6 +2262,7 @@ def _run_latched_fault_hold(
                 previous_tau=latest_tau,
                 torque_limits_nm=torque_limits_nm,
                 rate_hz=rate_hz,
+                driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
             )
             if not receipt.accepted:
                 errors.extend(
@@ -2267,6 +2297,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     """Run the guarded active probe; callers must provide explicit authority."""
 
     _validate_cli(args)
+    driver_kd_nm_s_per_rad = (
+        _non_negative(getattr(args, "driver_kd", 0.0), name="driver_kd"),
+    ) * 6
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
     model, position_limits = _resolve_model_and_limits(source_root)
@@ -2903,11 +2936,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             ledger.mark("compute", compute_time)
             receipt = backend.send_mit(
                 reference,
-                # Software owns the complete composed torque.  Passing
-                # non-zero vendor gains would double-count PD and bypass the
-                # final total-torque bound above.
+                # Driver Kp stays zero so the end-effector spring remains the
+                # sole position-restoring owner.  Optional driver Kd supplies
+                # only motor-local damping behind verified 0x700B bounds.
                 kp=_ZERO_SIX,
-                kd=_ZERO_SIX,
+                kd=driver_kd_nm_s_per_rad,
                 tau_nm=conditioned_tau,
                 torque_limits_nm=torque_limits,
                 joint_names=active_joint_names,
@@ -3041,6 +3074,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             torque_limits_nm=torque_limits,
                             rate_hz=args.rate_hz,
                             stop=stop,
+                            driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
@@ -3070,6 +3104,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     freeze_sec=args.freeze_sec,
                     rate_hz=args.rate_hz,
                     joint_names=active_joint_names,
+                    driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                 )
                 cleanup_errors.extend(freeze_errors)
                 issue_full_safe_stop()
@@ -3228,7 +3263,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
             "max_rebase_rad": args.fault_hold_max_rebase_rad,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
-            "vendor_kd_nm_s_per_rad": _ZERO_SIX,
+            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
             "reference_velocity_rad_s": _ZERO_SIX,
         },
         "fault_hold_candidate_admission": {
@@ -3262,8 +3297,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "max_torque_rate_nm_s": profile.max_torque_rate_nm_s,
             "max_abs_overlay_torque_nm": profile.max_abs_overlay_torque_nm,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
-            "vendor_kd_nm_s_per_rad": _ZERO_SIX,
-            "torque_owner": "software_composed_tau_only",
+            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "torque_owner": (
+                "software_position_gravity_task_wrench; optional_driver_damping"
+            ),
         },
         "slow_step_response": slow_step_response,
         "joint_impedance": {
@@ -3274,8 +3311,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": profile.damping_kd_nm_s_per_rad,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
-            "vendor_kd_nm_s_per_rad": _ZERO_SIX,
-            "final_total_torque_bounded": True,
+            "vendor_kd_nm_s_per_rad": driver_kd_nm_s_per_rad,
+            "final_total_torque_bounded": (
+                all(value == 0.0 for value in driver_kd_nm_s_per_rad)
+                or bool(getattr(args, "apply_driver_torque_limits", False))
+            ),
+            "final_total_torque_bound_owner": (
+                "driver_limit_torque_0x700B"
+                if any(value > 0.0 for value in driver_kd_nm_s_per_rad)
+                else "software_condition_torque"
+            ),
+            "final_driver_total_torque_bounded": bool(
+                getattr(args, "apply_driver_torque_limits", False)
+            ),
             "absolute_pose_commanded": False,
         },
         "cartesian_impedance": {
@@ -3374,7 +3422,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "Before any torque command, the active path requires four consecutive complete feedback snapshots after enable; no torque command is sent during this arming-settle gate.",
             "cartesian-hold anchors fresh post-enable FK position, controls translation only, and requires all six arm joints.",
             "pose-hold anchors the complete fresh post-enable FK transform and applies bounded world-aligned force and torque through the same J.T wrench path.",
-            "Software composes gravity, position, finite-difference damping, and an optional bounded J.T wrench overlay, then dispatches vendor MIT kp=kd=0.",
+            "Software composes gravity, position, optional finite-difference damping, and a bounded J.T wrench overlay; vendor MIT kp remains zero, while explicit vendor kd may own motor-local damping behind verified 0x700B limits.",
             "When explicitly requested, the probe temporarily mirrors every arm joint's software total-torque envelope into volatile RobStride limit_torque (0x700B), verifies every readback before enable, and restores every original value after full safe_stop.",
             "Gravity uses B601PinocchioModel with Pinocchio-neutral auxiliary gripper coordinates; actual gripper load is not identified.",
             "The explicit mechPos path is synchronous and normally around the observed low-bandwidth feedback rate; this is not a high-rate haptic loop.",
@@ -3431,6 +3479,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-direction", type=int, choices=(-1, 1), default=1)
     parser.add_argument("--kp", type=float, default=_DEFAULT_KP)
     parser.add_argument("--kd", type=float, default=_DEFAULT_KD)
+    parser.add_argument(
+        "--driver-kd",
+        type=float,
+        default=0.0,
+        help=(
+            "optional all-arm motor-local MIT damping; requires "
+            "--apply-driver-torque-limits and does not add position stiffness"
+        ),
+    )
     parser.add_argument(
         "--target-kp",
         type=float,
