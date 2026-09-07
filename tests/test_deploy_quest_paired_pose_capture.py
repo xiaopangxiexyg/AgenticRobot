@@ -794,6 +794,45 @@ def test_get_pose_loss_empty_sample_does_not_create_or_poison_candidate() -> Non
     app.close()
 
 
+def test_get_pose_loss_after_candidate_disallows_selection_until_pose_returns() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    candidate = app.candidates()[0]
+
+    empty_sample = _sample_payload(
+        sample_sequence=1,
+        received_monotonic_ns=clock(),
+    )
+    empty_sample["controllers"] = []
+    runtime._handle_pose_sample(1, empty_sample)
+    app.poll()
+
+    # The candidate remains a historical discovery record, but the latest
+    # source state is empty and must not authorize capture selection.
+    assert app.candidates() == (candidate,)
+    with pytest.raises(RuntimeError, match="no longer currently tracked"):
+        app.select_unique_candidate(
+            robot_side="right",
+            preferred_handedness="right",
+        )
+    assert app.snapshot_status()["state"] == "waiting_for_selection"
+    assert app.snapshot_status()["terminal_reason"] is None
+
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=2,
+            received_monotonic_ns=clock(),
+        ),
+    )
+    app.poll()
+    _, binding = _select_right(app)
+    assert binding.quest.controller_source_session_id == (
+        candidate.controller_source_session_id
+    )
+    app.close()
+
+
 def test_selected_invalidation_makes_poll_fail_closed() -> None:
     _, clock, _, _, _, runtime, app = _application()
     _emit_candidate(runtime, clock)
