@@ -33,6 +33,14 @@ task-space wrench it owns before calling :meth:`B601RSBackend.send_mit`.
 Feedback uses the existing explicit ``mechPos`` request path; its source
 freshness remains unverified by MotorBridge 0.4.9 and is reported as such.
 
+``gravity-calibration`` hands the startup lock to a normal draggable
+gravity/damping controller.  Once ACTIVE, the operator may move joint1..joint6,
+release the arm, and press ``R`` without Enter.  That fresh feedback pose becomes
+the fixed software position reference for one recording window (20 seconds by
+default); completion removes the position term and returns to draggable gravity
+compensation so multiple poses can be collected in one run.  The configured
+``--kp`` is used only while a recording window is active.
+
 When the operator presses Ctrl-C once, the probe enters a latched protective
 hold for all six arm joints (the gripper motor, joint7, is outside this
 backend).  This is deliberately not a position lock: software Kp is zero,
@@ -80,9 +88,12 @@ import math
 import os
 import signal
 import sys
+import termios
 import time
+import tty
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
 from typing import TextIO
@@ -156,6 +167,7 @@ _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
 _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
 _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
 _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD = 1.0
+_DEFAULT_CALIBRATION_DURATION_SEC = 20.0
 _DEFAULT_ARMING_SETTLE_SAMPLES = 4
 _DRIVE_ENABLE_COUNTDOWN_SECONDS = 3
 _OPERATOR_TTY_PATH = Path("/dev/tty")
@@ -172,6 +184,173 @@ _DEFAULT_ROTATIONAL_MAX_DISPLACEMENT_RAD = math.radians(5.0)
 
 class LowGainProbeError(RuntimeError):
     """A guarded probe precondition, safety stop, or vendor operation failed."""
+
+
+class OperatorKeyReader:
+    """Read single operator keys from the controlling terminal without Enter."""
+
+    def __init__(self, tty_path: Path = _OPERATOR_TTY_PATH) -> None:
+        self._fd: int | None = None
+        self._saved_attributes: list[object] | None = None
+        try:
+            self._fd = os.open(tty_path, os.O_RDONLY | os.O_NONBLOCK)
+            self._saved_attributes = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+            termios.tcflush(self._fd, termios.TCIFLUSH)
+        except OSError as exc:
+            self.close()
+            raise LowGainProbeError(
+                "gravity-calibration requires an interactive controlling terminal "
+                "for the R capture key"
+            ) from exc
+
+    def flush(self) -> None:
+        if self._fd is not None:
+            termios.tcflush(self._fd, termios.TCIFLUSH)
+
+    def poll_record_request(self) -> bool:
+        if self._fd is None:
+            return False
+        try:
+            pressed = os.read(self._fd, 64)
+        except BlockingIOError:
+            return False
+        except OSError as exc:
+            raise LowGainProbeError(
+                "failed to read the gravity-calibration operator terminal"
+            ) from exc
+        return b"r" in pressed.lower()
+
+    def close(self) -> None:
+        fd = self._fd
+        saved_attributes = self._saved_attributes
+        self._fd = None
+        self._saved_attributes = None
+        if fd is None:
+            return
+        if saved_attributes is not None:
+            with contextlib.suppress(OSError, termios.error):
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved_attributes)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+@dataclass
+class GravityCalibrationCapture:
+    """Own the FREE_DRAG/RECORDING reference and capture-window evidence."""
+
+    record_duration_sec: float
+    state: str = "FREE_DRAG"
+    reference_qpos_rad: tuple[float, ...] | None = None
+    started_elapsed_sec: float | None = None
+    active_record_index: int | None = None
+    records: list[dict[str, object]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.record_duration_sec = _positive(
+            self.record_duration_sec,
+            name="calibration_duration_sec",
+        )
+
+    def trigger(
+        self,
+        qpos_rad: Sequence[float],
+        *,
+        elapsed_sec: float,
+        sample_start_index: int,
+    ) -> dict[str, object] | None:
+        if self.state != "FREE_DRAG":
+            return None
+        reference = _six(qpos_rad, name="calibration_reference_qpos_rad")
+        started = _non_negative(elapsed_sec, name="calibration_trigger_elapsed_sec")
+        record_index = len(self.records) + 1
+        record: dict[str, object] = {
+            "index": record_index,
+            "trigger_elapsed_sec": started,
+            "reference_qpos_rad": reference,
+            "sample_start_index": int(sample_start_index),
+            "sample_end_index": None,
+            "completed": False,
+            "observed_duration_sec": 0.0,
+            "completion_reason": None,
+        }
+        self.records.append(record)
+        self.state = "RECORDING"
+        self.reference_qpos_rad = reference
+        self.started_elapsed_sec = started
+        self.active_record_index = record_index
+        return record
+
+    def complete_if_due(
+        self,
+        *,
+        elapsed_sec: float,
+        sample_end_index: int,
+    ) -> dict[str, object] | None:
+        if self.state != "RECORDING" or self.started_elapsed_sec is None:
+            return None
+        elapsed = _non_negative(elapsed_sec, name="calibration_elapsed_sec")
+        if elapsed - self.started_elapsed_sec < self.record_duration_sec:
+            return None
+        return self._finish(
+            elapsed_sec=elapsed,
+            sample_end_index=sample_end_index,
+            completed=True,
+            reason="duration_complete",
+        )
+
+    def interrupt(
+        self,
+        *,
+        elapsed_sec: float,
+        sample_end_index: int,
+        reason: str,
+    ) -> dict[str, object] | None:
+        if self.state != "RECORDING":
+            return None
+        return self._finish(
+            elapsed_sec=max(0.0, float(elapsed_sec)),
+            sample_end_index=sample_end_index,
+            completed=False,
+            reason=reason,
+        )
+
+    def reference(self, current_qpos_rad: Sequence[float]) -> tuple[float, ...]:
+        current = _six(current_qpos_rad, name="calibration_current_qpos_rad")
+        if self.state == "RECORDING":
+            if self.reference_qpos_rad is None:
+                raise ValueError("recording calibration reference is missing")
+            return self.reference_qpos_rad
+        return current
+
+    def record_elapsed_sec(self, elapsed_sec: float) -> float | None:
+        if self.state != "RECORDING" or self.started_elapsed_sec is None:
+            return None
+        return max(0.0, float(elapsed_sec) - self.started_elapsed_sec)
+
+    def _finish(
+        self,
+        *,
+        elapsed_sec: float,
+        sample_end_index: int,
+        completed: bool,
+        reason: str,
+    ) -> dict[str, object]:
+        if self.started_elapsed_sec is None or self.active_record_index is None:
+            raise ValueError("active calibration record is incomplete")
+        record = self.records[self.active_record_index - 1]
+        record["sample_end_index"] = int(sample_end_index)
+        record["completed"] = completed
+        record["observed_duration_sec"] = max(
+            0.0,
+            elapsed_sec - self.started_elapsed_sec,
+        )
+        record["completion_reason"] = reason
+        self.state = "FREE_DRAG"
+        self.reference_qpos_rad = None
+        self.started_elapsed_sec = None
+        self.active_record_index = None
+        return record
 
 
 def _percentile(values: Sequence[float], percentile: float) -> float:
@@ -952,9 +1131,16 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise LowGainProbeError("low-gain mode requires --config")
     if not args.rebot_source_root:
         raise LowGainProbeError("low-gain mode requires --rebot-source-root")
-    if args.mode not in ("hold", "slow-step", "cartesian-hold", "pose-hold"):
+    if args.mode not in (
+        "hold",
+        "slow-step",
+        "cartesian-hold",
+        "pose-hold",
+        "gravity-calibration",
+    ):
         raise ValueError(
-            "mode must be hold, slow-step, cartesian-hold, or pose-hold"
+            "mode must be hold, slow-step, cartesian-hold, pose-hold, or "
+            "gravity-calibration"
         )
     _positive(args.rate_hz, name="rate_hz")
     _positive(args.duration_sec, name="duration_sec")
@@ -962,6 +1148,15 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _non_negative(args.freeze_sec, name="freeze_sec")
     _non_negative(args.kp, name="kp")
     _non_negative(args.kd, name="kd")
+    if args.mode == "gravity-calibration":
+        _positive(
+            getattr(
+                args,
+                "calibration_duration_sec",
+                _DEFAULT_CALIBRATION_DURATION_SEC,
+            ),
+            name="calibration_duration_sec",
+        )
     _non_negative(
         getattr(
             args,
@@ -3273,6 +3468,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     # the first-Ctrl-C/last-safe stationary admission gate.
     arming_settle_velocity_limit_rad_s = args.velocity_abort_rad_s
     arming_settle_last_qvel: tuple[float, ...] | None = None
+    calibration_capture = (
+        GravityCalibrationCapture(args.calibration_duration_sec)
+        if args.mode == "gravity-calibration"
+        else None
+    )
+    calibration_keys: OperatorKeyReader | None = None
+    calibration_ready = False
+    last_control_elapsed_sec = 0.0
     connected = False
     enabled = False
     old_sigint = signal.getsignal(signal.SIGINT)
@@ -3293,6 +3496,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         lambda signum, frame: _signal_handler(stop, signum, frame),
     )
     try:
+        if calibration_capture is not None:
+            # Establish the interactive input path before opening the backend or
+            # changing any drive state.
+            calibration_keys = OperatorKeyReader()
         backend.connect()
         connected = True
         warmup_deadline = time.monotonic() + args.warmup_sec
@@ -3839,16 +4046,68 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             else:
                 fault_hold_candidate_accepted_count += 1
             elapsed = time.monotonic() - started
-            qref, qvel_ref, step_done = plan_reference(
-                initial_q,
-                mode=args.mode,
-                joint=args.joint,
+            last_control_elapsed_sec = elapsed
+            handoff_fraction = startup_handoff_fraction(
                 elapsed_sec=elapsed,
-                step_rad=args.step_rad,
-                step_speed_rad_s=args.step_speed_rad_s,
-                step_direction=args.step_direction,
-                position_limits_rad=position_limits,
+                rise_time_sec=args.torque_rise_time_sec,
             )
+            if elapsed < args.torque_rise_time_sec:
+                set_startup_state("GRAVITY_RAMP")
+            elif handoff_fraction < 1.0:
+                set_startup_state("HANDOFF")
+            else:
+                set_startup_state("ACTIVE")
+            if calibration_capture is not None:
+                if handoff_fraction >= 1.0 and not calibration_ready:
+                    if calibration_keys is None:
+                        raise LowGainProbeError(
+                            "gravity-calibration operator terminal is unavailable"
+                        )
+                    calibration_keys.flush()
+                    calibration_ready = True
+                    _operator_notice(
+                        "[B601] CALIBRATION FREE_DRAG: move joint1..joint6, "
+                        "release external force, then press R to record "
+                        f"{calibration_capture.record_duration_sec:g}s."
+                    )
+                completed_record = calibration_capture.complete_if_due(
+                    elapsed_sec=elapsed,
+                    sample_end_index=len(samples),
+                )
+                if completed_record is not None:
+                    _operator_notice(
+                        "[B601] CALIBRATION COMPLETE "
+                        f"#{completed_record['index']}: returned to FREE_DRAG."
+                    )
+                if (
+                    calibration_ready
+                    and calibration_keys is not None
+                    and calibration_keys.poll_record_request()
+                ):
+                    new_record = calibration_capture.trigger(
+                        q,
+                        elapsed_sec=elapsed,
+                        sample_start_index=len(samples),
+                    )
+                    if new_record is not None:
+                        _operator_notice(
+                            "[B601] CALIBRATION RECORDING "
+                            f"#{new_record['index']}: reference captured; do not touch."
+                        )
+                qref = calibration_capture.reference(q)
+                qvel_ref = _ZERO_SIX
+                step_done = True
+            else:
+                qref, qvel_ref, step_done = plan_reference(
+                    initial_q,
+                    mode=args.mode,
+                    joint=args.joint,
+                    elapsed_sec=elapsed,
+                    step_rad=args.step_rad,
+                    step_speed_rad_s=args.step_speed_rad_s,
+                    step_direction=args.step_direction,
+                    position_limits_rad=position_limits,
+                )
             max_error = max(
                 abs(current - reference)
                 for index, (current, reference) in enumerate(
@@ -3910,16 +4169,6 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             # slew; applying a second scalar gravity ramp here would create a
             # compensation gap and allow the arm to sag during handoff.
             gravity_ramp = 1.0
-            handoff_fraction = startup_handoff_fraction(
-                elapsed_sec=elapsed,
-                rise_time_sec=args.torque_rise_time_sec,
-            )
-            if elapsed < args.torque_rise_time_sec:
-                set_startup_state("GRAVITY_RAMP")
-            elif handoff_fraction < 1.0:
-                set_startup_state("HANDOFF")
-            else:
-                set_startup_state("ACTIVE")
             startup_lock_reference = build_reference(
                 sequence=state.sequence,
                 timestamp_sec=state.receive_timestamp_sec,
@@ -3985,6 +4234,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     "startup_state": startup_state_history[-1],
                     "gravity_ramp_fraction": gravity_ramp,
                     "startup_handoff_fraction": handoff_fraction,
+                    "calibration_state": (
+                        calibration_capture.state
+                        if calibration_capture is not None
+                        else None
+                    ),
+                    "calibration_record_index": (
+                        calibration_capture.active_record_index
+                        if calibration_capture is not None
+                        else None
+                    ),
+                    "calibration_record_elapsed_sec": (
+                        calibration_capture.record_elapsed_sec(elapsed)
+                        if calibration_capture is not None
+                        else None
+                    ),
                     "startup_lock_position_tau_nm": (
                         startup_lock_torque_breakdown.position_torque_nm
                     ),
@@ -4037,6 +4301,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     except Exception as exc:  # noqa: BLE001 - report unexpected probe failure
         primary_error = exc
     finally:
+        if calibration_keys is not None:
+            calibration_keys.close()
         full_stop_attempts = 0
 
         def issue_full_safe_stop() -> None:
@@ -4268,6 +4534,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGUSR1, old_sigusr1)
 
+    if calibration_capture is not None and calibration_capture.state == "RECORDING":
+        calibration_capture.interrupt(
+            elapsed_sec=last_control_elapsed_sec,
+            sample_end_index=len(samples),
+            reason=stop_reason or "probe_duration_complete",
+        )
+
     if primary_error is not None:
         detail = str(primary_error)
         if cleanup_errors:
@@ -4384,6 +4657,35 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "freeze_commands_sent": freeze_commands,
         "duration_sec": args.duration_sec,
         "rate_hz": args.rate_hz,
+        "gravity_calibration": {
+            "enabled": calibration_capture is not None,
+            "interaction": "FREE_DRAG -> R -> RECORDING -> FREE_DRAG",
+            "record_duration_sec": (
+                calibration_capture.record_duration_sec
+                if calibration_capture is not None
+                else None
+            ),
+            "records": (
+                calibration_capture.records
+                if calibration_capture is not None
+                else []
+            ),
+            "completed_record_count": (
+                sum(
+                    bool(record["completed"])
+                    for record in calibration_capture.records
+                )
+                if calibration_capture is not None
+                else 0
+            ),
+            "final_state": (
+                calibration_capture.state
+                if calibration_capture is not None
+                else None
+            ),
+            "free_drag_reference_semantics": "current_feedback_pose_each_cycle",
+            "recording_reference_semantics": "qpos_captured_on_R",
+        },
         "stop_reason": stop_reason,
         "cleanup_errors": tuple(cleanup_errors),
         "preflight_disable_receipt": _mode_receipt_payload(preflight_disable),
@@ -4515,8 +4817,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "slow_step_response": slow_step_response,
         "joint_impedance": {
-            "enabled": args.mode == "hold",
-            "reference_source": "fresh_post_enable_settled_qpos",
+            "enabled": args.mode in ("hold", "gravity-calibration"),
+            "reference_source": (
+                "interactive_current_or_R_captured_qpos"
+                if args.mode == "gravity-calibration"
+                else "fresh_post_enable_settled_qpos"
+            ),
             "reference_qpos_rad": initial_q if args.mode == "hold" else None,
             "reference_velocity_rad_s": _ZERO_SIX,
             "software_kp_nm_per_rad": profile.position_kp_nm_per_rad,
@@ -4662,6 +4968,7 @@ def build_parser() -> argparse.ArgumentParser:
             "slow-step",
             "cartesian-hold",
             "pose-hold",
+            "gravity-calibration",
             "feedback-stability",
             "driver-torque-limit-roundtrip",
         ),
@@ -4675,6 +4982,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="pinned reBotArm_control_py source root containing the URDF",
     )
     parser.add_argument("--duration-sec", type=float, default=_DEFAULT_DURATION_SEC)
+    parser.add_argument(
+        "--calibration-duration-sec",
+        type=float,
+        default=_DEFAULT_CALIBRATION_DURATION_SEC,
+        help=(
+            "fixed-reference recording duration after each R key in "
+            "gravity-calibration mode"
+        ),
+    )
     parser.add_argument("--warmup-sec", type=float, default=_DEFAULT_WARMUP_SEC)
     parser.add_argument("--freeze-sec", type=float, default=_DEFAULT_FREEZE_SEC)
     parser.add_argument("--rate-hz", type=float, default=_DEFAULT_RATE_HZ)

@@ -458,6 +458,31 @@ J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令�
 或真实重力参数已验收。Pinocchio 重力模型使用中性辅助夹爪坐标，实际夹爪负载和
 摩擦仍须后续标定。
 
+### 交互式多姿态重力残差采集
+
+`gravity-calibration` 独立于已经验收的 `hold`、`pose-hold` 和 protective-hold。
+它完成同一套 `LOCKING → GRAVITY_RAMP → HANDOFF → ACTIVE` 启动后，首先进入
+`FREE_DRAG`：六个 arm 关节保持实时模型重力补偿和命令指定的单一阻尼 owner，每周期
+使用当前反馈作为参考，因此软件位置力矩为零。操作者可在此阶段安全拖动到待测姿态。
+
+拖到目标姿态后应先完全松手，确认机械臂和反馈已经静止，再按一次 `R`（无需 Enter）。
+程序用收到按键的同一合法反馈帧捕获六关节参考并进入 `RECORDING`；此时 `--kp` 产生固定
+参考的位置维持力矩，`--calibration-duration-sec` 决定窗口长度，默认 20 秒。窗口结束后
+自动回到 `FREE_DRAG`，不失能、不重新执行启动过程，操作者可换到下一姿态再次按 `R`。
+记录期间再次按 `R` 不重置窗口。`R` 只控制采集，不是安全按钮；任意阶段第一次 Ctrl-C
+仍进入全臂重力加阻尼 protective-hold，第二次 Ctrl-C 或 SIGUSR1 才请求全臂失能。
+
+终端只显示 `FREE_DRAG`、`RECORDING #N`、`COMPLETE #N` 和原有安全状态。JSON 的
+`gravity_calibration.records` 保存每段参考位置、起止 sample index、实际持续时间和完成
+原因；每帧额外保存 `calibration_state`、`calibration_record_index` 和窗口内时间。完整
+q、有限差分速度/加速度、重力项、位置残差项、请求/限幅后力矩仍保存在 `samples`，因此
+可以按每个 record 的 `[sample_start_index, sample_end_index)` 精确提取稳定窗口，而无需把
+临时残差阈值写进代码或测试。
+
+该模式必须在具有 controlling terminal 的前台运行；程序在连接 backend 前建立单键输入，
+无法取得终端时不会打开 CAN 或改变电机状态。退出正常控制路径时会先恢复终端属性，再进入
+既有 protective-hold/cleanup。不要使用后台运行、管道吞掉控制终端或自动发送按键。
+
 运行前必须确认：机械臂处于当前安全、可支撑且有足够间隙的姿态；不得为了探针主动
 移动到示例姿态。操作者手扶或有机械支撑，物理急停可立即触达，`can0` 为 1 Mbit/s，
 现场没有第二个 CAN 控制 owner。`hold/slow-step` 每次只批准一个目标关节的低幅验证；当前

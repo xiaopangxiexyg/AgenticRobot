@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import io
+import os
+import pty
+import termios
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,6 +39,72 @@ def test_condition_torque_rejects_nonpositive_dt() -> None:
             max_rate_nm_s=(1.0,) * 6,
             dt_sec=0.0,
         )
+
+
+def test_gravity_calibration_capture_repeats_free_drag_and_fixed_windows() -> None:
+    capture = probe.GravityCalibrationCapture(20.0)
+    first_pose = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    moved_pose = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
+
+    assert capture.reference(first_pose) == first_pose
+    first = capture.trigger(
+        first_pose,
+        elapsed_sec=5.0,
+        sample_start_index=12,
+    )
+    assert first is not None
+    assert first["index"] == 1
+    assert capture.state == "RECORDING"
+    assert capture.reference(moved_pose) == first_pose
+    assert (
+        capture.trigger(moved_pose, elapsed_sec=6.0, sample_start_index=13)
+        is None
+    )
+    assert capture.complete_if_due(elapsed_sec=24.99, sample_end_index=410) is None
+
+    completed = capture.complete_if_due(elapsed_sec=25.0, sample_end_index=412)
+    assert completed is first
+    assert completed["completed"] is True
+    assert completed["completion_reason"] == "duration_complete"
+    assert completed["sample_end_index"] == 412
+    assert completed["observed_duration_sec"] == pytest.approx(20.0)
+    assert capture.state == "FREE_DRAG"
+    assert capture.reference(moved_pose) == moved_pose
+
+    second = capture.trigger(
+        moved_pose,
+        elapsed_sec=30.0,
+        sample_start_index=500,
+    )
+    assert second is not None
+    assert second["index"] == 2
+    interrupted = capture.interrupt(
+        elapsed_sec=34.0,
+        sample_end_index=580,
+        reason="operator_interrupt",
+    )
+    assert interrupted is second
+    assert interrupted["completed"] is False
+    assert interrupted["completion_reason"] == "operator_interrupt"
+    assert capture.state == "FREE_DRAG"
+
+
+def test_operator_key_reader_reads_r_without_enter_and_restores_terminal() -> None:
+    master_fd, slave_fd = pty.openpty()
+    tty_path = Path(os.ttyname(slave_fd))
+    original = termios.tcgetattr(slave_fd)
+    reader = probe.OperatorKeyReader(tty_path)
+    try:
+        os.write(master_fd, b"R")
+        assert reader.poll_record_request() is True
+        assert reader.poll_record_request() is False
+    finally:
+        reader.close()
+        restored = termios.tcgetattr(slave_fd)
+        os.close(master_fd)
+        os.close(slave_fd)
+
+    assert restored == original
 
 
 def test_shared_gravity_ramp_preserves_vector_and_keeps_damping_live() -> None:
@@ -2208,6 +2278,22 @@ def test_parser_help_is_read_only() -> None:
     assert args.target_kp is None
     assert args.target_kd is None
     assert args.apply_driver_torque_limits is False
+    calibration_args = parser.parse_args(
+        [
+            "--mode",
+            "gravity-calibration",
+            "--config",
+            "config.yaml",
+            "--rebot-source-root",
+            "source",
+            "--allow-motion",
+            "--auto-disable",
+            "--confirmation",
+            probe.CONFIRMATION,
+        ]
+    )
+    assert calibration_args.calibration_duration_sec == pytest.approx(20.0)
+    probe._validate_cli(calibration_args)
 
 
 def test_feedback_stability_cli_is_explicitly_observation_only() -> None:
