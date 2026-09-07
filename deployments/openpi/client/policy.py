@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import threading
+from dataclasses import dataclass
 from typing import Any, Mapping
 
+from dataset_contracts.model_continuation import (
+    MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
+    normalize_model_continuation_contract,
+)
+from dataset_contracts.policy_artifact import (
+    PolicyArtifactContract,
+    policy_artifact_from_metadata,
+)
+from dataset_contracts.v22 import PolicyIOLayout
 from deployments.client.contracts import (
-    DEXTELEOP_DEPLOY_SCHEMA_VERSION,
     DEXTELEOP_DEPLOY_SCHEMA_V2,
+    DEXTELEOP_DEPLOY_SCHEMA_VERSION,
     DeployPolicyContract,
     validate_server_metadata,
 )
@@ -14,8 +23,6 @@ from deployments.client.remote_policy import (
     RemoteModelPolicy,
     RemotePolicyConfig,
 )
-from dataset_contracts.v22 import PolicyIOLayout
-from dataset_contracts.policy_artifact import PolicyArtifactContract, policy_artifact_from_metadata
 from deployments.openpi.image_wire import OpenPIImageWireClientConfig
 from robot_motion.deploy.v22 import V22DeploymentAdapter
 
@@ -25,7 +32,6 @@ from .observation_adapter import (
     prepared_allowed_prompts,
 )
 from .transport import OpenPIWebsocketTransport
-
 
 OPENPI_LOCAL_PROTOCOL_VERSION = "openpi.local_policy.websocket.v1"
 
@@ -65,6 +71,7 @@ class OpenPIClientPolicyConfig:
     # model-specific adapter implements a client-owned executor.
     normalization_contract: Mapping[str, Any] | None = None
     image_wire_config: OpenPIImageWireClientConfig | Mapping[str, Any] | None = None
+    rtc_inference_steps: int = 10
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "port", int(self.port))
@@ -226,6 +233,16 @@ class OpenPIClientPolicyConfig:
         object.__setattr__(self, "image_key_map", image_key_map)
         object.__setattr__(self, "retry_interval_s", float(self.retry_interval_s))
         object.__setattr__(self, "defer_connect", bool(self.defer_connect))
+        rtc_inference_steps = self.rtc_inference_steps
+        if isinstance(rtc_inference_steps, bool) or not isinstance(
+            rtc_inference_steps, int
+        ):
+            raise ValueError("rtc_inference_steps must be an integer.")
+        if rtc_inference_steps not in (8, 10):
+            raise ValueError(
+                "rtc_inference_steps must be one of the versioned values (8, 10)."
+            )
+        object.__setattr__(self, "rtc_inference_steps", rtc_inference_steps)
         object.__setattr__(self, "allowed_prompts", requested_allowed_prompts)
         object.__setattr__(
             self,
@@ -516,7 +533,9 @@ class OpenPIClientPolicy:
             RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1,
         )
 
+        from .rtc_artifact_binding import bind_openpi_trained_rtc_sampler
         from .rtc_conditioned import (
+            OPENPI_CONDITIONED_RTC_METADATA_KEY_V1,
             OpenPIConditionedRtcBackendV3,
             OpenPIConditionedRtcConfig,
         )
@@ -527,25 +546,71 @@ class OpenPIClientPolicy:
                 "OpenPI model-RTC requires an artifact-bound continuation "
                 "contract."
             )
-        base_backend = self.create_raw_rtc_adapter(
-            frame_contract_hash=frame_contract_hash,
-            normalization_hash=normalization_hash,
-            active_sides=active_sides,
-            action_pose_mode=action_pose_mode,
-            minimum_execution_horizon_steps=(
-                minimum_execution_horizon_steps
-            ),
-            result_action_representation="typed_canonical_v1",
+        remote_policy = self._ensure_remote_policy()
+        source_contract = normalize_model_continuation_contract(
+            artifact.model_continuation
         )
-        return OpenPIConditionedRtcBackendV3(
+        runtime_artifact = artifact
+        sampler_binding = None
+        if (
+            source_contract.conditioning_origin
+            == MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
+        ):
+            provider = remote_policy.server_metadata.get(
+                OPENPI_CONDITIONED_RTC_METADATA_KEY_V1
+            )
+            if not isinstance(provider, Mapping):
+                raise ValueError(
+                    "OpenPI server lacks the RTC provider capability required "
+                    "for a trained sampler binding."
+                )
+            sampler_binding = bind_openpi_trained_rtc_sampler(
+                source_artifact=artifact,
+                provider_capability=provider,
+                deployment_num_steps=self.config.rtc_inference_steps,
+            )
+            runtime_artifact = sampler_binding.bound_artifact
+        elif self.config.rtc_inference_steps != 10:
+            raise ValueError(
+                "An 8-step RTC deployment requires a trained-prefix artifact."
+            )
+        resolved_sides = (
+            self.config.active_sides
+            if active_sides is None
+            else tuple(str(side) for side in active_sides)
+        )
+        from .rtc import OpenPIFinalChunkRtcBackend, OpenPIFinalChunkRtcConfig
+
+        base_backend = OpenPIFinalChunkRtcBackend(
+            transport=remote_policy.transport,
+            remote_policy=remote_policy,
+            config=OpenPIFinalChunkRtcConfig(
+                artifact=runtime_artifact,
+                frame_contract_hash=frame_contract_hash,
+                normalization_hash=normalization_hash,
+                active_sides=resolved_sides,
+                action_pose_mode=action_pose_mode,
+                minimum_execution_horizon_steps=(
+                    minimum_execution_horizon_steps
+                ),
+                prompt=self.config.prompt,
+                result_action_representation="typed_canonical_v1",
+            ),
+        )
+        backend = OpenPIConditionedRtcBackendV3(
             base_backend=base_backend,
             config=OpenPIConditionedRtcConfig.from_artifact(
-                artifact,
+                runtime_artifact,
                 selected_prefix_schedule=(
                     RTC_PREFIX_SCHEDULE_EXPLICIT_SELECTED_STEPS_V1
                 ),
             ),
         )
+        if sampler_binding is not None:
+            self.metadata["rtc_trained_sampler_binding"] = (
+                sampler_binding.receipt_dict()
+            )
+        return backend
 
     def predict(self, observation: Any):
         remote_policy = self._ensure_remote_policy()
@@ -584,6 +649,7 @@ def create_policy(
     policy_artifact: PolicyArtifactContract | Mapping[str, Any] | None = None,
     normalization_contract: Mapping[str, Any] | None = None,
     image_wire_config: OpenPIImageWireClientConfig | Mapping[str, Any] | None = None,
+    rtc_inference_steps: int = 10,
 ) -> OpenPIClientPolicy:
     return OpenPIClientPolicy(
         OpenPIClientPolicyConfig(
@@ -621,6 +687,7 @@ def create_policy(
             policy_artifact=policy_artifact,
             normalization_contract=normalization_contract,
             image_wire_config=image_wire_config,
+            rtc_inference_steps=rtc_inference_steps,
         )
     )
 

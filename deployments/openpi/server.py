@@ -11,25 +11,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
+from pathlib import Path
 
 from dataset_contracts.normalization import (
     NormalizationContract,
     NormalizationContractError,
 )
-from deployments.policy_artifact import load_policy_artifact
 from deployments.openpi.camera_semantics import (
     validate_declared_camera_semantics,
     validate_legacy_swapped_wrist_artifact,
 )
+from deployments.openpi.image_wire import OpenPIImageWireServerConfig
 from deployments.openpi.prepared_deployment import (
     prepare_checkpoint_deployment_artifact,
     validate_prepared_deployment_artifact,
 )
-from deployments.openpi.image_wire import OpenPIImageWireServerConfig
+from deployments.policy_artifact import load_policy_artifact
 
 
 def _non_negative_cpu_id(text: str) -> int:
@@ -319,8 +319,20 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=(
-            "Explicit OpenPI checkout. Otherwise infer it from a checkpoints/ "
-            "ancestor, then fall back to the initialized model/openpi submodule."
+            "Training-profile OpenPI checkout. Otherwise infer it from a "
+            "checkpoints/ ancestor, then fall back to the initialized "
+            "model/openpi submodule."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-runtime-openpi-root",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit deployment runtime checkout for the 8-step trained "
+            "model-RTC derivation. It must resolve to this AgenticRobot "
+            "snapshot's pinned model/openpi submodule; the training checkout "
+            "and prepared profile remain unchanged."
         ),
     )
     parser.add_argument("--config", default=None, help="Training config override.")
@@ -347,6 +359,16 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Explicitly enable the upstream OpenPI conditioned inference "
             "operation. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-inference-steps",
+        type=int,
+        choices=(8, 10),
+        default=10,
+        help=(
+            "Versioned conditioned-RTC sampler budget. The trained/default "
+            "contract is 10; 8 is an explicit latency deployment derivation."
         ),
     )
     parser.add_argument(
@@ -440,6 +462,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--prepared-config-check-only and --dry-run are mutually exclusive."
         )
+    if not args.enable_rtc_continuation and args.rtc_inference_steps != 10:
+        parser.error(
+            "--rtc-inference-steps 8 requires --enable-rtc-continuation."
+        )
+    if args.rtc_inference_steps == 10 and args.rtc_runtime_openpi_root is not None:
+        parser.error(
+            "--rtc-runtime-openpi-root is only valid with "
+            "--rtc-inference-steps 8."
+        )
     prepared_resolution = None
     if prepared_training_profile is not None:
         if not prepared_training_profile.is_file():
@@ -478,8 +509,31 @@ def main(argv: list[str] | None = None) -> int:
                 "--openpi-root differs from the prepared training profile: "
                 f"{openpi_root} != {profile_openpi_root}"
             )
-    server_script = openpi_root / "scripts/serve_dexteleop_policy.py"
-    base_registry = openpi_root / "configs/dexteleop_policy_registry.json"
+    if (
+        args.rtc_inference_steps == 8
+        and model_rtc_profile is not None
+        and args.rtc_runtime_openpi_root is None
+    ):
+        parser.error(
+            "8-step prepared model-RTC requires --rtc-runtime-openpi-root."
+        )
+    runtime_openpi_root = openpi_root
+    if args.rtc_runtime_openpi_root is not None:
+        if prepared_resolution is None or model_rtc_profile is None:
+            parser.error(
+                "--rtc-runtime-openpi-root requires a prepared trained "
+                "model-RTC checkpoint."
+            )
+        runtime_openpi_root = args.rtc_runtime_openpi_root.expanduser().resolve()
+        bundled_openpi_root = _bundled_openpi_root().resolve()
+        if runtime_openpi_root != bundled_openpi_root:
+            parser.error(
+                "--rtc-runtime-openpi-root must resolve to the current "
+                "AgenticRobot snapshot's pinned model/openpi submodule: "
+                f"{runtime_openpi_root} != {bundled_openpi_root}"
+            )
+    server_script = runtime_openpi_root / "scripts/serve_dexteleop_policy.py"
+    base_registry = runtime_openpi_root / "configs/dexteleop_policy_registry.json"
     if not server_script.is_file():
         parser.error(f"OpenPI server script does not exist: {server_script}")
     if not base_registry.is_file():
@@ -524,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
             "--prepared-training-profile",
             str(prepared_training_profile),
             "--openpi-root",
+            str(runtime_openpi_root),
+            "--training-openpi-root",
             str(openpi_root),
             "--model",
             model_id,
@@ -542,6 +598,10 @@ def main(argv: list[str] | None = None) -> int:
         command.append("--record")
     if args.enable_rtc_continuation:
         command.append("--enable-rtc-continuation")
+    if args.rtc_inference_steps != 10:
+        command.extend(
+            ("--rtc-inference-steps", str(args.rtc_inference_steps))
+        )
     if image_wire_config.enabled:
         command.extend(
             (
@@ -561,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_pythonpath = _pythonpath_with_project(
         project_root,
         os.environ.get("PYTHONPATH"),
-        openpi_root=openpi_root,
+        openpi_root=runtime_openpi_root,
     )
     if args.dry_run:
         print(
@@ -570,6 +630,7 @@ def main(argv: list[str] | None = None) -> int:
                     "model_id": model_id,
                     "openpi_root": str(openpi_root),
                     "openpi_root_source": openpi_root_source,
+                    "runtime_openpi_root": str(runtime_openpi_root),
                     "command": command,
                     "environment": {"PYTHONPATH": runtime_pythonpath},
                     "excluded_cpu_ids": sorted(
@@ -626,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
     os.environ["PYTHONPATH"] = runtime_pythonpath
-    os.chdir(openpi_root)
+    os.chdir(runtime_openpi_root)
     os.execv(sys.executable, command)
     return 0
 

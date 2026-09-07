@@ -12,22 +12,22 @@ import json
 from pathlib import Path
 from typing import Any
 
-from deployments.policy_artifact import load_policy_artifact
-from deployments.openpi.client.preflight import preflight_policy_artifact
+from dataset_contracts.model_continuation import (
+    MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
+    normalize_model_continuation_contract,
+)
+from dataset_interface.camera_semantics import load_camera_role_binding
+from deployments.openpi.camera_semantics import validate_declared_camera_semantics
 from deployments.openpi.client.observation_adapter import (
     resolve_prepared_prompt_selection,
 )
-from deployments.openpi.camera_semantics import validate_declared_camera_semantics
+from deployments.openpi.client.preflight import preflight_policy_artifact
 from deployments.openpi.image_wire import (
     OPENPI_IMAGE_WIRE_JPEG_V1,
     OPENPI_IMAGE_WIRE_LEGACY_RAW_V1,
     OPENPI_IMAGE_WIRE_RESIZE_RAW_V1,
 )
-from dataset_interface.camera_semantics import load_camera_role_binding
-from dataset_contracts.model_continuation import (
-    MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
-    normalize_model_continuation_contract,
-)
+from deployments.policy_artifact import load_policy_artifact
 from robot_motion.deploy.async_producer import (
     MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1,
     RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1,
@@ -39,7 +39,6 @@ from .openpi_deployment_profile import (
     available_openpi_real_deployment_profiles,
     openpi_real_deployment_profile_args,
 )
-
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEPLOYMENT_PROFILES = available_openpi_real_deployment_profiles()
@@ -300,6 +299,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--rtc-inference-steps",
+        type=int,
+        choices=(8, 10),
+        default=10,
+        help=(
+            "Versioned trained model-RTC sampler budget. 10 preserves the "
+            "checkpoint contract; 8 creates a verified deployment-only binding."
+        ),
+    )
+    parser.add_argument(
         "--rtc-normalization-hash",
         default=None,
         help=(
@@ -370,6 +379,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.image_wire_strict and args.image_wire_codec == "legacy-raw":
         parser.error("--image-wire-strict requires an optimized image-wire codec.")
+    if (
+        args.rtc_inference_steps != 10
+        and args.rtc_profile
+        != MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+    ):
+        parser.error(
+            "--rtc-inference-steps 8 requires the conditioned model-RTC profile."
+        )
 
     if (
         args.rtc_profile == RAW_RTC_FINAL_CHUNK_PROFILE_ID_V1
@@ -424,6 +441,17 @@ def main(argv: list[str] | None = None) -> int:
                     "policy artifact camera_role_binding_hash differs from "
                     "--camera-role-registry."
                 )
+    if args.rtc_inference_steps != 10 and (
+        policy_artifact is None
+        or policy_artifact.model_continuation is None
+        or normalize_model_continuation_contract(
+            policy_artifact.model_continuation
+        ).conditioning_origin
+        != MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
+    ):
+        parser.error(
+            "--rtc-inference-steps 8 requires a trained-prefix model-RTC artifact."
+        )
     try:
         resolved_prompt, resolved_prompt_stage = resolve_prepared_prompt_selection(
             None if policy_artifact is None else policy_artifact.metadata,
@@ -468,6 +496,11 @@ def main(argv: list[str] | None = None) -> int:
                 "--policy-artifact-json."
             )
         report = preflight_policy_artifact(policy_artifact).to_dict()
+        if (
+            args.rtc_profile
+            == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+        ):
+            report["rtc_inference_steps"] = int(args.rtc_inference_steps)
         if resolved_prompt is not None:
             report["prompt_selection"] = {
                 "source": (
@@ -507,6 +540,13 @@ def main(argv: list[str] | None = None) -> int:
             "preferred_codec": _IMAGE_WIRE_CLI_TO_CODEC[args.image_wire_codec],
             "allow_legacy_fallback": not bool(args.image_wire_strict),
         }
+    if (
+        args.rtc_profile
+        == MODEL_RTC_FLOW_INPAINT_SHADOW_PROFILE_ID_V1
+    ):
+        policy_kwargs["rtc_inference_steps"] = int(
+            args.rtc_inference_steps
+        )
     policy_kwargs = {key: value for key, value in policy_kwargs.items() if value is not None}
 
     if resolved_prompt_stage is not None:

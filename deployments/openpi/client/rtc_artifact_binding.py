@@ -9,6 +9,8 @@ starts a worker, or owns plan/execution state.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
@@ -16,6 +18,7 @@ from dataset_contracts.canonical_encoding import canonical_content_hash
 from dataset_contracts.model_continuation import (
     MODEL_CONTINUATION_FLOW_INPAINT_V1,
     MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1,
+    MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1,
     RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
     ModelContinuationDataContractV2,
     ModelContinuationRuntimeContractV2,
@@ -33,13 +36,20 @@ from .rtc_conditioned import (
     openpi_conditioned_provider_capability_hash,
 )
 
-
 OPENPI_INFERENCE_ONLY_RTC_BINDING_SCHEMA_V1 = (
     "openpi_inference_only_rtc_artifact_binding_v1"
 )
 OPENPI_INFERENCE_ONLY_RTC_BINDING_HASH_DOMAIN_V1 = (
     "dexteleop.openpi.inference_only_rtc_artifact_binding.v1"
 )
+OPENPI_TRAINED_RTC_SAMPLER_BINDING_SCHEMA_V1 = (
+    "openpi_trained_rtc_sampler_binding_v1"
+)
+OPENPI_TRAINED_RTC_SAMPLER_BINDING_HASH_DOMAIN_V1 = (
+    "dexteleop.openpi.trained_rtc_sampler_binding.v1"
+)
+OPENPI_RTC_TRAINED_NUM_STEPS_V1 = 10
+OPENPI_RTC_DEPLOYMENT_NUM_STEPS_V1 = (8, 10)
 
 
 def _nonnegative_int(value: object, *, name: str) -> int:
@@ -56,6 +66,22 @@ def _required(value: object, *, name: str) -> str:
     if not normalized:
         raise ValueError(f"{name} must be non-empty.")
     return normalized
+
+
+def _positive_int(value: object, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
+    return value
+
+
+def _sha256_json(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -173,6 +199,163 @@ class OpenPIInferenceOnlyRtcArtifactBinding:
                 MODEL_CONTINUATION_ORIGIN_INFERENCE_ONLY_V1
             ),
             "training": None,
+            "semantic_content_hash": self.semantic_content_hash,
+        }
+
+
+@dataclass(frozen=True)
+class OpenPITrainedRtcSamplerBinding:
+    """A deployment-only sampler derivation of one trained RTC artifact."""
+
+    source_artifact: PolicyArtifactContract
+    bound_artifact: PolicyArtifactContract
+    provider_capability_hash: str
+    source_artifact_hash: str
+    bound_artifact_hash: str
+    source_continuation_contract_hash: str
+    bound_continuation_contract_hash: str
+    source_implementation_parameters_hash: str
+    bound_implementation_parameters_hash: str
+    trained_num_steps: int
+    deployment_num_steps: int
+    implementation_parameters: Mapping[str, Any]
+    schema: str = OPENPI_TRAINED_RTC_SAMPLER_BINDING_SCHEMA_V1
+
+    def __post_init__(self) -> None:
+        if self.schema != OPENPI_TRAINED_RTC_SAMPLER_BINDING_SCHEMA_V1:
+            raise ValueError("Unsupported OpenPI trained RTC sampler binding schema.")
+        source = self.source_artifact.model_continuation
+        bound = self.bound_artifact.model_continuation
+        if not isinstance(source, ModelContinuationDataContractV2) or not isinstance(
+            bound, ModelContinuationDataContractV2
+        ):
+            raise ValueError("OpenPI trained sampler binding requires v2 contracts.")
+        for name, continuation in (("source", source), ("bound", bound)):
+            if (
+                continuation.conditioning_origin
+                != MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
+                or continuation.training is None
+            ):
+                raise ValueError(
+                    f"OpenPI {name} sampler binding must retain trained-prefix evidence."
+                )
+        if self.source_artifact_hash != openpi_rtc_artifact_hash(
+            self.source_artifact
+        ):
+            raise ValueError("OpenPI source artifact hash mismatch.")
+        if self.bound_artifact_hash != openpi_rtc_artifact_hash(
+            self.bound_artifact
+        ):
+            raise ValueError("OpenPI bound artifact hash mismatch.")
+        if self.source_continuation_contract_hash != source.contract_hash:
+            raise ValueError("OpenPI source continuation contract hash mismatch.")
+        if self.bound_continuation_contract_hash != bound.contract_hash:
+            raise ValueError("OpenPI bound continuation contract hash mismatch.")
+        if (
+            self.source_implementation_parameters_hash
+            != source.runtime.continuation_implementation_parameters_hash
+        ):
+            raise ValueError("OpenPI source implementation parameters hash mismatch.")
+        if (
+            self.bound_implementation_parameters_hash
+            != bound.runtime.continuation_implementation_parameters_hash
+        ):
+            raise ValueError("OpenPI bound implementation parameters hash mismatch.")
+        if self.trained_num_steps != OPENPI_RTC_TRAINED_NUM_STEPS_V1:
+            raise ValueError("OpenPI trained sampler baseline must remain 10 steps.")
+        if self.deployment_num_steps not in OPENPI_RTC_DEPLOYMENT_NUM_STEPS_V1:
+            raise ValueError("Unsupported OpenPI RTC deployment step count.")
+        parameters = dict(self.implementation_parameters)
+        if parameters.get("effective_num_steps") != self.deployment_num_steps:
+            raise ValueError("OpenPI deployment parameters step count mismatch.")
+        if _sha256_json(parameters) != self.bound_implementation_parameters_hash:
+            raise ValueError("OpenPI deployment parameters hash mismatch.")
+        baseline_parameters = dict(parameters)
+        baseline_parameters["effective_num_steps"] = self.trained_num_steps
+        if _sha256_json(baseline_parameters) != self.source_implementation_parameters_hash:
+            raise ValueError(
+                "OpenPI deployment parameters differ from training beyond step count."
+            )
+        expected_bound = replace(
+            self.source_artifact,
+            model_continuation=replace(
+                source,
+                runtime=replace(
+                    source.runtime,
+                    continuation_implementation_parameters_hash=(
+                        self.bound_implementation_parameters_hash
+                    ),
+                ),
+            ),
+        )
+        if expected_bound.to_dict() != self.bound_artifact.to_dict():
+            raise ValueError(
+                "OpenPI bound artifact differs outside the RTC sampler hash."
+            )
+        object.__setattr__(self, "implementation_parameters", parameters)
+        object.__setattr__(
+            self,
+            "provider_capability_hash",
+            _required(
+                self.provider_capability_hash,
+                name="provider_capability_hash",
+            ),
+        )
+
+    @property
+    def semantic_content_hash(self) -> str:
+        return canonical_content_hash(
+            {
+                "schema": self.schema,
+                "source_artifact_hash": self.source_artifact_hash,
+                "bound_artifact_hash": self.bound_artifact_hash,
+                "provider_capability_hash": self.provider_capability_hash,
+                "source_continuation_contract_hash": (
+                    self.source_continuation_contract_hash
+                ),
+                "bound_continuation_contract_hash": (
+                    self.bound_continuation_contract_hash
+                ),
+                "source_implementation_parameters_hash": (
+                    self.source_implementation_parameters_hash
+                ),
+                "bound_implementation_parameters_hash": (
+                    self.bound_implementation_parameters_hash
+                ),
+                "trained_num_steps": self.trained_num_steps,
+                "deployment_num_steps": self.deployment_num_steps,
+                "implementation_parameters": dict(
+                    self.implementation_parameters
+                ),
+            },
+            domain=OPENPI_TRAINED_RTC_SAMPLER_BINDING_HASH_DOMAIN_V1,
+        )
+
+    def receipt_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "model_id": self.bound_artifact.model_id,
+            "checkpoint_step": self.bound_artifact.checkpoint_step,
+            "source_artifact_hash": self.source_artifact_hash,
+            "bound_artifact_hash": self.bound_artifact_hash,
+            "provider_capability_hash": self.provider_capability_hash,
+            "source_continuation_contract_hash": (
+                self.source_continuation_contract_hash
+            ),
+            "bound_continuation_contract_hash": (
+                self.bound_continuation_contract_hash
+            ),
+            "source_implementation_parameters_hash": (
+                self.source_implementation_parameters_hash
+            ),
+            "bound_implementation_parameters_hash": (
+                self.bound_implementation_parameters_hash
+            ),
+            "trained_num_steps": self.trained_num_steps,
+            "deployment_num_steps": self.deployment_num_steps,
+            "implementation_parameters": dict(self.implementation_parameters),
+            "allowed_delta": "effective_num_steps_only_v1",
+            "training_contract_unchanged": True,
             "semantic_content_hash": self.semantic_content_hash,
         }
 
@@ -321,10 +504,167 @@ def bind_openpi_inference_only_rtc_artifact(
     )
 
 
+def bind_openpi_trained_rtc_sampler(
+    *,
+    source_artifact: PolicyArtifactContract,
+    provider_capability: Mapping[str, Any],
+    deployment_num_steps: int,
+) -> OpenPITrainedRtcSamplerBinding:
+    """Derive a trained artifact for one explicitly selected sampler budget.
+
+    The provider must publish its canonical implementation parameters.  By
+    replacing only ``effective_num_steps`` with the fixed trained value (10)
+    and reproducing the source contract hash, this function proves that the
+    live implementation differs from the checkpoint contract only in the
+    versioned deployment step count.  It never mutates the checkpoint artifact.
+    """
+
+    if not isinstance(source_artifact, PolicyArtifactContract):
+        raise TypeError("source_artifact must be a PolicyArtifactContract.")
+    if not isinstance(provider_capability, Mapping):
+        raise TypeError("provider_capability must be a mapping.")
+    requested_steps = _positive_int(
+        deployment_num_steps,
+        name="deployment_num_steps",
+    )
+    if requested_steps not in OPENPI_RTC_DEPLOYMENT_NUM_STEPS_V1:
+        raise ValueError(
+            "deployment_num_steps must be one of the versioned values "
+            f"{OPENPI_RTC_DEPLOYMENT_NUM_STEPS_V1}."
+        )
+    continuation = source_artifact.model_continuation
+    if not isinstance(continuation, ModelContinuationDataContractV2):
+        raise ValueError("OpenPI trained sampler binding requires a v2 contract.")
+    if (
+        continuation.conditioning_origin
+        != MODEL_CONTINUATION_ORIGIN_TRAINED_PREFIX_V1
+        or continuation.training is None
+    ):
+        raise ValueError(
+            "OpenPI sampler rebind is permitted only for a trained-prefix artifact."
+        )
+    runtime = continuation.runtime
+
+    expected_capability_hash = openpi_conditioned_provider_capability_hash(
+        provider_capability
+    )
+    if _required(
+        provider_capability.get("provider_capability_hash"),
+        name="provider_capability_hash",
+    ) != expected_capability_hash:
+        raise ValueError("OpenPI provider capability hash mismatch.")
+    if (
+        provider_capability.get("provider_capability_schema")
+        != OPENPI_CONDITIONED_PROVIDER_CAPABILITY_SCHEMA_V1
+        or provider_capability.get("wire_protocol")
+        != OPENPI_CONDITIONED_RTC_WIRE_V1
+        or provider_capability.get("enabled") is not True
+        or provider_capability.get("conditioning_transform_owner")
+        != "provider_v1"
+    ):
+        raise ValueError("OpenPI provider capability protocol mismatch.")
+    if _positive_int(
+        provider_capability.get("external_action_dim"),
+        name="external_action_dim",
+    ) != runtime.model_action_dim:
+        raise ValueError("OpenPI provider external action dimension mismatch.")
+    if _positive_int(
+        provider_capability.get("prediction_horizon_steps"),
+        name="prediction_horizon_steps",
+    ) != runtime.prediction_horizon_steps:
+        raise ValueError("OpenPI provider prediction horizon mismatch.")
+    if _required(
+        provider_capability.get("continuation_implementation_id"),
+        name="continuation_implementation_id",
+    ) != runtime.continuation_implementation_id:
+        raise ValueError("OpenPI continuation implementation identity mismatch.")
+    sampler_constraint = _required(
+        provider_capability.get("sampler_constraint"),
+        name="sampler_constraint",
+    )
+    if sampler_constraint not in runtime.sampler_constraints:
+        raise ValueError("OpenPI sampler constraint mismatch.")
+    supports_bootstrap = provider_capability.get(
+        "supports_unconditioned_bootstrap"
+    )
+    if not isinstance(supports_bootstrap, bool):
+        raise ValueError("OpenPI provider bootstrap capability must be boolean.")
+    if runtime.supports_unconditioned_bootstrap and not supports_bootstrap:
+        raise ValueError("OpenPI provider does not support trained bootstrap.")
+
+    raw_parameters = provider_capability.get(
+        "continuation_implementation_parameters"
+    )
+    if not isinstance(raw_parameters, Mapping):
+        raise ValueError(
+            "OpenPI provider must publish canonical implementation parameters."
+        )
+    parameters = dict(raw_parameters)
+    effective_steps = _positive_int(
+        parameters.get("effective_num_steps"),
+        name="effective_num_steps",
+    )
+    if effective_steps != requested_steps:
+        raise ValueError(
+            "OpenPI provider effective_num_steps differs from the requested deployment."
+        )
+    bound_parameters_hash = _sha256_json(parameters)
+    if _required(
+        provider_capability.get(
+            "continuation_implementation_parameters_hash"
+        ),
+        name="continuation_implementation_parameters_hash",
+    ) != bound_parameters_hash:
+        raise ValueError("OpenPI provider implementation parameters hash mismatch.")
+    baseline_parameters = dict(parameters)
+    baseline_parameters["effective_num_steps"] = OPENPI_RTC_TRAINED_NUM_STEPS_V1
+    source_parameters_hash = (
+        runtime.continuation_implementation_parameters_hash
+    )
+    if _sha256_json(baseline_parameters) != source_parameters_hash:
+        raise ValueError(
+            "OpenPI provider differs from the trained implementation beyond step count."
+        )
+
+    bound_continuation = replace(
+        continuation,
+        runtime=replace(
+            runtime,
+            continuation_implementation_parameters_hash=(
+                bound_parameters_hash
+            ),
+        ),
+    )
+    bound_artifact = replace(
+        source_artifact,
+        model_continuation=bound_continuation,
+    )
+    return OpenPITrainedRtcSamplerBinding(
+        source_artifact=source_artifact,
+        bound_artifact=bound_artifact,
+        provider_capability_hash=expected_capability_hash,
+        source_artifact_hash=openpi_rtc_artifact_hash(source_artifact),
+        bound_artifact_hash=openpi_rtc_artifact_hash(bound_artifact),
+        source_continuation_contract_hash=continuation.contract_hash,
+        bound_continuation_contract_hash=bound_continuation.contract_hash,
+        source_implementation_parameters_hash=source_parameters_hash,
+        bound_implementation_parameters_hash=bound_parameters_hash,
+        trained_num_steps=OPENPI_RTC_TRAINED_NUM_STEPS_V1,
+        deployment_num_steps=requested_steps,
+        implementation_parameters=parameters,
+    )
+
+
 __all__ = [
     "OPENPI_INFERENCE_ONLY_RTC_BINDING_HASH_DOMAIN_V1",
     "OPENPI_INFERENCE_ONLY_RTC_BINDING_SCHEMA_V1",
+    "OPENPI_RTC_DEPLOYMENT_NUM_STEPS_V1",
+    "OPENPI_RTC_TRAINED_NUM_STEPS_V1",
+    "OPENPI_TRAINED_RTC_SAMPLER_BINDING_HASH_DOMAIN_V1",
+    "OPENPI_TRAINED_RTC_SAMPLER_BINDING_SCHEMA_V1",
     "OpenPIInferenceOnlyRtcArtifactBinding",
     "OpenPIInferenceOnlyRtcBindingSpec",
+    "OpenPITrainedRtcSamplerBinding",
     "bind_openpi_inference_only_rtc_artifact",
+    "bind_openpi_trained_rtc_sampler",
 ]

@@ -693,15 +693,24 @@ def test_prepared_model_rtc_server_dry_run_binds_dynamic_output_config(
     checkpoint, profile_path, model_profile_path, openpi_root, _profile = (
         _model_rtc_fixture(tmp_path)
     )
-    (openpi_root / "scripts").mkdir()
-    (openpi_root / "scripts" / "serve_dexteleop_policy.py").write_text(
+    runtime_openpi_root = tmp_path / "runtime-openpi"
+    (runtime_openpi_root / "scripts").mkdir(parents=True)
+    (runtime_openpi_root / "scripts" / "serve_dexteleop_policy.py").write_text(
         "# fixture\n",
         encoding="utf-8",
     )
-    (openpi_root / "configs").mkdir()
-    (openpi_root / "configs" / "dexteleop_policy_registry.json").write_text(
+    (runtime_openpi_root / "configs").mkdir()
+    (
+        runtime_openpi_root / "configs" / "dexteleop_policy_registry.json"
+    ).write_text(
         '{"models": {}}\n',
         encoding="utf-8",
+    )
+    (runtime_openpi_root / "src" / "openpi").mkdir(parents=True)
+    monkeypatch.setattr(
+        openpi_server,
+        "_bundled_openpi_root",
+        lambda: runtime_openpi_root,
     )
     monkeypatch.setattr(openpi_server.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(
@@ -721,13 +730,29 @@ def test_prepared_model_rtc_server_dry_run_binds_dynamic_output_config(
             "--model-rtc-profile",
             str(model_profile_path),
             "--enable-rtc-continuation",
+            "--rtc-inference-steps",
+            "8",
+            "--rtc-runtime-openpi-root",
+            str(runtime_openpi_root),
             "--dry-run",
         ]
     ) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["model_rtc_profile"] == str(model_profile_path)
+    assert report["openpi_root"] == str(openpi_root)
+    assert report["runtime_openpi_root"] == str(runtime_openpi_root)
     assert "--model-rtc-profile" in report["command"]
-    assert report["command"][-1] == "--enable-rtc-continuation"
+    assert report["command"][-2:] == ["--rtc-inference-steps", "8"]
+    command = report["command"]
+    assert command[command.index("--openpi-root") + 1] == str(
+        runtime_openpi_root
+    )
+    assert command[command.index("--training-openpi-root") + 1] == str(
+        openpi_root
+    )
+    assert report["environment"]["PYTHONPATH"].split(os.pathsep)[1] == str(
+        (runtime_openpi_root / "src").resolve()
+    )
     registry_path = Path(
         report["command"][report["command"].index("--registry") + 1]
     )
@@ -735,6 +760,49 @@ def test_prepared_model_rtc_server_dry_run_binds_dynamic_output_config(
     entry = registry["models"]["prepared-model-rtc"]
     assert entry["config"] == "prepared-model-rtc"
     assert entry["normalization_contract_status"] == "explicit"
+
+
+def test_prepared_model_rtc_eight_step_server_requires_pinned_runtime_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint, profile_path, model_profile_path, openpi_root, _profile = (
+        _model_rtc_fixture(tmp_path)
+    )
+    (openpi_root / "scripts").mkdir()
+    (openpi_root / "scripts" / "serve_dexteleop_policy.py").write_text(
+        "# training fixture without the deployment CLI\n",
+        encoding="utf-8",
+    )
+    (openpi_root / "configs").mkdir()
+    (openpi_root / "configs" / "dexteleop_policy_registry.json").write_text(
+        '{"models": {}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(openpi_server.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        prepared_deployment.tempfile,
+        "gettempdir",
+        lambda: str(tmp_path),
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        openpi_server.main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--openpi-root",
+                str(openpi_root),
+                "--prepared-training-profile",
+                str(profile_path),
+                "--model-rtc-profile",
+                str(model_profile_path),
+                "--enable-rtc-continuation",
+                "--rtc-inference-steps",
+                "8",
+                "--dry-run",
+            ]
+        )
 
 
 def test_prepared_server_config_check_only_delegates_without_legacy_path(
@@ -811,6 +879,38 @@ class Args:
 
     assert sys.modules[module_name] is module
     assert module.Args().port == 8078
+
+
+def test_prepared_runtime_source_separation_is_only_for_pinned_eight_step_rtc(
+    tmp_path: Path,
+) -> None:
+    training_root = (tmp_path / "training-openpi").resolve()
+    runtime_root = (tmp_path / "runtime-openpi").resolve()
+    model_rtc_profile = tmp_path / "model-rtc.json"
+
+    prepared_server_runtime._validate_runtime_openpi_binding(
+        runtime_root=runtime_root,
+        training_root=training_root,
+        model_rtc_profile=model_rtc_profile,
+        rtc_inference_steps=8,
+        bundled_root=runtime_root,
+    )
+    with pytest.raises(ValueError, match="only allowed for the 8-step"):
+        prepared_server_runtime._validate_runtime_openpi_binding(
+            runtime_root=runtime_root,
+            training_root=training_root,
+            model_rtc_profile=model_rtc_profile,
+            rtc_inference_steps=10,
+            bundled_root=runtime_root,
+        )
+    with pytest.raises(ValueError, match="pinned model/openpi"):
+        prepared_server_runtime._validate_runtime_openpi_binding(
+            runtime_root=runtime_root,
+            training_root=training_root,
+            model_rtc_profile=model_rtc_profile,
+            rtc_inference_steps=8,
+            bundled_root=tmp_path / "different-openpi",
+        )
 
 
 def test_prepared_server_operator_stop_is_traceback_free(
@@ -1230,12 +1330,15 @@ def test_prepared_model_rtc_client_contract_check_verifies_both_profiles(
             str(model_profile_path),
             "--rtc-profile",
             "model_rtc_flow_inpaint_shadow_15_30_60_120_v1",
+            "--rtc-inference-steps",
+            "8",
             "--contract-check-only",
         ]
     ) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["ok"] is True
     assert report["model_id"] == "prepared-model-rtc"
+    assert report["rtc_inference_steps"] == 8
     assert report["server_contract"]["normalization_hash"]
 
 

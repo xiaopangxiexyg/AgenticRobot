@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
-from pathlib import Path
 import sys
+from dataclasses import replace
+from pathlib import Path
 from types import ModuleType
 
 import numpy as np
 import pytest
 
-import deployments.openpi.training.launch as training_launch
 import deployments.openpi.server as openpi_server
+import deployments.openpi.training.launch as training_launch
 from dataset_contracts import (
     DEXTELEOP_DATASET_SCHEMA_V23,
     MODEL_CONTINUATION_FLOW_INPAINT_V1,
@@ -20,12 +20,12 @@ from dataset_contracts import (
     POSE_CHUNK_TAIL_PAD_LAST,
     RUNTIME_PREFIX_PRODUCER_LOCAL_OVERLAP_V1,
     TRAINING_PREFIX_TRAJECTORY_OVERLAP_TEACHER_V1,
+    ModelContinuationCheckpointReceipt,
     ModelContinuationDataContract,
     ModelContinuationDataContractV2,
     ModelContinuationRuntimeContractV2,
-    ModelContinuationCheckpointReceipt,
-    ModelContinuationTrainingRunManifest,
     ModelContinuationTrainingContractV2,
+    ModelContinuationTrainingRunManifest,
     ModelContinuationTrainingSourceBinding,
     PolicyArtifactContract,
     PoseActionChunkContract,
@@ -39,17 +39,17 @@ from dataset_interface import (
     TEACHER_OVERLAP_PROJECTION_PARAMETERS_HASH_V1,
     ModelContinuationTrainingSamplingSpec,
 )
+from deployments.openpi.client.rtc import openpi_rtc_artifact_hash
 from deployments.openpi.training import (
     OPENPI_MODEL_RTC_ACTION_LOSS_MASK_KEY_V1,
-    OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1,
     OPENPI_MODEL_RTC_DELAY_DEBUG_KEY_V1,
     OPENPI_MODEL_RTC_PREFIX_MASK_DEBUG_KEY_V1,
+    OPENPI_MODEL_RTC_PREFIX_MASK_KEY_V1,
     OPENPI_MODEL_RTC_PREFIX_STEPS_DEBUG_KEY_V1,
     OpenPIModelRtcTrainingTransform,
-    verify_openpi_model_rtc_checkpoint,
     build_openpi_v22_absolute_model_rtc_artifact_template,
+    verify_openpi_model_rtc_checkpoint,
 )
-from deployments.openpi.client.rtc import openpi_rtc_artifact_hash
 
 
 def _artifact() -> PolicyArtifactContract:
@@ -495,3 +495,24 @@ def test_checkpoint_server_rtc_continuation_is_explicit_and_default_off(
     )
     enabled_command = json.loads(capsys.readouterr().out)["command"]
     assert enabled_command[-1] == "--enable-rtc-continuation"
+    assert "--rtc-inference-steps" not in enabled_command
+
+    assert (
+        openpi_server.main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--openpi-root",
+                str(openpi_root),
+                "--config",
+                "fixture-base",
+                "--enable-rtc-continuation",
+                "--rtc-inference-steps",
+                "8",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    eight_step_command = json.loads(capsys.readouterr().out)["command"]
+    assert eight_step_command[-2:] == ["--rtc-inference-steps", "8"]
