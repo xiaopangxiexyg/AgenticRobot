@@ -230,7 +230,6 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     camera_registry_path: str | Path | None = None,
     artifact_root: str | Path | None = None,
     camera_mount_urdf_path: str | Path | None = None,
-    camera_asset_root: str | Path | None = None,
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
     debug_render_object_coordinates: bool = False,
@@ -314,15 +313,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         )
     if grasp_enabled and not perception_enabled:
         raise ValueError("Point-grasp requires the composed camera resources.")
-    camera_mount_supplied = camera_mount_urdf_path is not None
-    camera_asset_root_supplied = camera_asset_root is not None
-    if (
-        camera_mount_supplied != camera_asset_root_supplied
-        or grasp_enabled != camera_mount_supplied
-    ):
+    if grasp_enabled != (camera_mount_urdf_path is not None):
         raise ValueError(
-            "Point-grasp three-view rendering requires one explicit camera mount "
-            "URDF and its asset root."
+            "Point-grasp three-view rendering requires one explicit camera mount URDF."
         )
     if debug_render_object_coordinates and not grasp_enabled:
         raise ValueError(
@@ -576,13 +569,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         perception_frame_binding = station_frame_binding
         if grasp_enabled:
             assert camera_mount_urdf_path is not None
-            assert camera_asset_root is not None
             rgb_camera_geometry = build_rm65_rgb_camera_geometry(
                 source_binding=perception_source_binding,
                 target_builder=lower.target_builder,
                 camera_registry_path=camera_registry_path,
                 camera_mount_urdf_path=camera_mount_urdf_path,
-                camera_asset_root=camera_asset_root,
                 scene_world_from_arm_base_by_side=(
                     lower.profile.scene_world_from_arm_base_by_side
                 ),

@@ -15,7 +15,7 @@ import threading
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 
@@ -125,23 +125,34 @@ def _fixed_transform_from_ancestor(
 def _placement_matches_selected_urdf(
     value: object,
     *,
-    urdf_path: Path,
-    asset_root: Path,
+    logical_urdf_path: Path,
+    physical_urdf_path: Path,
 ) -> bool:
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value or value.strip() != value:
         return False
-    declared = Path(value)
     try:
+        declared = Path(value)
         if declared.is_absolute():
-            return declared.resolve(strict=True) == urdf_path
-        if not declared.parts or declared.parts[0] != "assets":
+            return declared.resolve(strict=True) == physical_urdf_path
+
+        # A relative declaration is a canonical repository-logical path.  Its
+        # raw spelling must be checked before Path can collapse dot segments or
+        # duplicate separators.  Backslashes are not valid POSIX separators in
+        # the versioned registry contract.
+        if "\\" in value:
             return False
-        relative = Path(*declared.parts[1:])
-        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        logical_declaration = PurePosixPath(value)
+        if logical_declaration.as_posix() != value:
             return False
-        candidate = (asset_root / relative).resolve(strict=True)
-        candidate.relative_to(asset_root)
-        return candidate == urdf_path
+        declared_parts = logical_declaration.parts
+        if (
+            len(declared_parts) < 2
+            or declared_parts[0] != "assets"
+            or any(part in {"", ".", ".."} for part in declared_parts)
+        ):
+            return False
+        selected_parts = PurePosixPath(logical_urdf_path.as_posix()).parts
+        return tuple(selected_parts[-len(declared_parts) :]) == declared_parts
     except (OSError, RuntimeError, ValueError):
         return False
 
@@ -152,8 +163,8 @@ def _require_registry_placement(
     source_id: str,
     camera_frame: str,
     expected_parent: str,
-    urdf_path: Path,
-    asset_root: Path,
+    logical_urdf_path: Path,
+    physical_urdf_path: Path,
 ) -> None:
     placements = frame_spec.get("placements")
     matches = tuple(
@@ -164,8 +175,8 @@ def _require_registry_placement(
         and str(item.get("parent_frame")) == expected_parent
         and _placement_matches_selected_urdf(
             item.get("urdf"),
-            urdf_path=urdf_path,
-            asset_root=asset_root,
+            logical_urdf_path=logical_urdf_path,
+            physical_urdf_path=physical_urdf_path,
         )
     )
     if len(matches) != 1:
@@ -378,29 +389,21 @@ def build_rm65_rgb_camera_geometry(
     target_builder: object,
     camera_registry_path: str | Path,
     camera_mount_urdf_path: str | Path,
-    camera_asset_root: str | Path,
     scene_world_from_arm_base_by_side: Mapping[str, np.ndarray],
     scene_world_from_canonical_station: np.ndarray,
 ) -> RM65RgbCameraGeometry:
     """Resolve all camera mounts from one Station-compatible selected URDF."""
 
     registry_path = Path(camera_registry_path).resolve(strict=True)
-    urdf_path = Path(camera_mount_urdf_path).resolve(strict=True)
-    asset_root = Path(camera_asset_root).resolve(strict=True)
-    if (
-        not registry_path.is_file()
-        or not urdf_path.is_file()
-        or not asset_root.is_dir()
-    ):
-        raise ValueError(
-            "camera registry and mount URDF must be regular files and camera "
-            "asset root must be a directory"
-        )
+    logical_urdf_path = Path(camera_mount_urdf_path).absolute()
+    physical_urdf_path = logical_urdf_path.resolve(strict=True)
+    if not registry_path.is_file() or not physical_urdf_path.is_file():
+        raise ValueError("camera registry and mount URDF must be regular files")
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     cameras = registry.get("cameras")
     if not isinstance(cameras, Mapping):
         raise TypeError("camera registry lacks cameras")
-    urdf_bytes = urdf_path.read_bytes()
+    urdf_bytes = physical_urdf_path.read_bytes()
     root = ET.fromstring(urdf_bytes)
     if set(scene_world_from_arm_base_by_side) != {"left", "right"}:
         raise ValueError("scene arm-base poses must contain exactly left and right")
@@ -452,8 +455,8 @@ def build_rm65_rgb_camera_geometry(
             source_id=source_id,
             camera_frame=camera_frame,
             expected_parent=expected_parent,
-            urdf_path=urdf_path,
-            asset_root=asset_root,
+            logical_urdf_path=logical_urdf_path,
+            physical_urdf_path=physical_urdf_path,
         )
         parent_from_camera = _fixed_transform_from_ancestor(
             urdf_root=root,
@@ -504,8 +507,8 @@ def build_rm65_rgb_camera_geometry(
             source_id=source_id,
             camera_frame=camera_frame,
             expected_parent=expected_parent,
-            urdf_path=urdf_path,
-            asset_root=asset_root,
+            logical_urdf_path=logical_urdf_path,
+            physical_urdf_path=physical_urdf_path,
         )
         parent_from_camera = _fixed_transform_from_ancestor(
             urdf_root=root,
