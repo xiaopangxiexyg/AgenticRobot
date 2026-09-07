@@ -86,6 +86,14 @@ Grant。它的公共目标始终是 `canonical_station` 下的实际 DMTAC `tool
 实时 observation/schema 绑定 frame graph、Station frame、tool config 和 calibration hash，
 不允许调用方用字符串把 arm-base 或 camera pose 冒充 Station pose。
 
+需要从当前姿态做较远但仍受原有 envelope 约束的诊断移动时，可用
+`--relative-delta-xyz-m DX DY DZ` 替代绝对目标或相机 proposal。该偏移沿
+`canonical_station` 的 XYZ 轴解释；客户端只从同一份提交所绑定的 fresh observation
+snapshot 取一次实测 TCP，增加平移并保持实测姿态，随后提交原有绝对
+`move_tcp_to_pose` 参数。它不新增 Route 或放宽下层 10 cm 相对范围、workspace、IK、碰撞、
+dispatch、收敛与终态 HOLD 门禁。首次真机远移建议单轴 5--8 cm、
+`--speed-scale 0.15`--`0.20`，并同时启用下述 motion trace。
+
 若抓姿生成器使用同一 Gateway session 内 Station-aware Depth v2 的输出，可把直接数值参数
 替换为 `--camera-grasp-proposal /absolute/path/grasp-proposal.json`。该文件使用
 `dexteleop.real.camera_relative_grasp_proposal.v1`，必须逐项绑定当前 runtime session、Route

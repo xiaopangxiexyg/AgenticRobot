@@ -166,6 +166,7 @@ class _FakeAbsolutePoseClient(_FakeClient):
         0.0,
         1.0,
     ]
+    measured_pose: ClassVar[list[float]] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
 
     def call(self, method, payload):
         self.calls.append((method, payload))
@@ -284,7 +285,7 @@ class _FakeAbsolutePoseClient(_FakeClient):
                 "calibration_hash": "calibration:absolute-pose",
                 "measurement_summary": {
                     "pose_xyz_quat_xyzw_by_component": {
-                        "right_arm": [0.0] * 7
+                        "right_arm": list(self.measured_pose)
                     },
                     "reference_frame_id": "canonical_station",
                     "reference_frame_spec_hash": "station-frame:absolute-pose",
@@ -325,6 +326,27 @@ class _FakeAbsolutePoseClient(_FakeClient):
 
 class _FakeCameraGraspClient(_FakeAbsolutePoseClient):
     expected_pose: ClassVar[list[float]] = [0.3, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0]
+
+
+class _FakeRelativePoseClient(_FakeAbsolutePoseClient):
+    measured_pose: ClassVar[list[float]] = [
+        0.25,
+        -0.10,
+        0.30,
+        0.0,
+        0.0,
+        0.0,
+        2.0,
+    ]
+    expected_pose: ClassVar[list[float]] = [
+        0.25,
+        -0.02,
+        0.30,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
 
 
 def test_one_shot_client_unwraps_owned_operation_outcome(monkeypatch) -> None:
@@ -385,6 +407,44 @@ def test_one_shot_client_submits_absolute_dmtac_tcp_in_canonical_station(
 
     assert operation["status"] == "completed"
     assert _FakeClient.instances[0].closed is True
+
+
+def test_one_shot_client_resolves_relative_station_delta_from_same_snapshot(
+    monkeypatch,
+) -> None:
+    _FakeClient.instances.clear()
+    monkeypatch.setattr(one_shot_client, "_Client", _FakeRelativePoseClient)
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path="/tmp/relative-pose.sock",
+        side="right",
+        action="move_tcp_to_pose",
+        target_xyz_m=None,
+        target_quat_xyzw=None,
+        camera_grasp_proposal=None,
+        relative_delta_xyz_m=(0.0, 0.08, 0.0),
+        speed_scale=0.2,
+        client_id="dexteleop-local-primitive-operator",
+        timeout_sec=1.0,
+        operation_timeout_sec=None,
+    )
+
+    operation = one_shot_client.execute_one_shot(args)
+
+    assert operation["status"] == "completed"
+    client = _FakeClient.instances[0]
+    snapshot_call_index = next(
+        index
+        for index, (method, _) in enumerate(client.calls)
+        if method == "get_observation_snapshot"
+    )
+    submit_call_index = next(
+        index
+        for index, (method, _) in enumerate(client.calls)
+        if method == "submit_skill_request"
+    )
+    assert snapshot_call_index < submit_call_index
+    assert client.closed is True
 
 
 def test_absolute_pose_client_requires_a_complete_pose_before_connect(
@@ -513,3 +573,41 @@ def test_camera_grasp_is_mutually_exclusive_with_direct_target(tmp_path) -> None
         assert "mutually exclusive" in str(error)
     else:
         raise AssertionError("camera and direct target modes must be exclusive")
+
+
+def test_relative_delta_is_mutually_exclusive_with_direct_target() -> None:
+    args = Namespace(
+        action="move_tcp_to_pose",
+        target_xyz_m=(0.1, 0.2, 0.3),
+        target_quat_xyzw=(0.0, 0.0, 0.0, 1.0),
+        camera_grasp_proposal=None,
+        relative_delta_xyz_m=(0.0, 0.08, 0.0),
+        speed_scale=0.2,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        one_shot_client._absolute_tcp_input_from_args(args)
+
+
+def test_relative_delta_rejects_zero_without_connecting(monkeypatch) -> None:
+    _FakeClient.instances.clear()
+    monkeypatch.setattr(one_shot_client, "_Client", _FakeAbsolutePoseClient)
+    args = Namespace(
+        confirm="EXECUTE_AUTHORIZED_REAL_TCP_PRIMITIVE",
+        socket_path="/tmp/relative-pose.sock",
+        side="left",
+        action="move_tcp_to_pose",
+        target_xyz_m=None,
+        target_quat_xyzw=None,
+        camera_grasp_proposal=None,
+        relative_delta_xyz_m=(0.0, 0.0, 0.0),
+        speed_scale=0.2,
+        client_id="dexteleop-local-primitive-operator",
+        timeout_sec=1.0,
+        operation_timeout_sec=None,
+    )
+
+    with pytest.raises(ValueError, match="must be nonzero"):
+        one_shot_client.execute_one_shot(args)
+
+    assert _FakeClient.instances == []
