@@ -65,6 +65,42 @@ def test_run_policy_keeps_the_extracted_validator_facade() -> None:
     assert run_policy.validate_rtc_cli_args is rtc_cli_validation.validate_rtc_cli_args
 
 
+def test_active_rtc_max_steps_counts_accepted_dispatches_not_warmup_ticks() -> None:
+    assert not run_policy._bounded_policy_step_limit_reached(
+        max_steps=10,
+        control_loop_steps=57,
+        rtc_active_dispatch_counting=True,
+        accepted_rtc_dispatch_steps=0,
+    )
+    assert not run_policy._bounded_policy_step_limit_reached(
+        max_steps=10,
+        control_loop_steps=66,
+        rtc_active_dispatch_counting=True,
+        accepted_rtc_dispatch_steps=9,
+    )
+    assert run_policy._bounded_policy_step_limit_reached(
+        max_steps=10,
+        control_loop_steps=67,
+        rtc_active_dispatch_counting=True,
+        accepted_rtc_dispatch_steps=10,
+    )
+
+
+def test_non_active_modes_keep_max_steps_control_loop_semantics() -> None:
+    assert not run_policy._bounded_policy_step_limit_reached(
+        max_steps=10,
+        control_loop_steps=9,
+        rtc_active_dispatch_counting=False,
+        accepted_rtc_dispatch_steps=100,
+    )
+    assert run_policy._bounded_policy_step_limit_reached(
+        max_steps=10,
+        control_loop_steps=10,
+        rtc_active_dispatch_counting=False,
+        accepted_rtc_dispatch_steps=0,
+    )
+
+
 def test_off_profile_defaults_debug_level_and_rejects_overrides() -> None:
     args = _args()
     _validate(args)

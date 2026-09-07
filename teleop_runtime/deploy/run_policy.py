@@ -1946,6 +1946,26 @@ def _rtc_active_latency_gate_result(
     return True, observed_max <= maximum, observed_max
 
 
+def _bounded_policy_step_limit_reached(
+    *,
+    max_steps: int,
+    control_loop_steps: int,
+    rtc_active_dispatch_counting: bool,
+    accepted_rtc_dispatch_steps: int,
+) -> bool:
+    """Apply ``--max-steps`` to dispatches only for hardware Active RTC."""
+
+    limit = int(max_steps)
+    loop_steps = int(control_loop_steps)
+    dispatch_steps = int(accepted_rtc_dispatch_steps)
+    if loop_steps < 0 or dispatch_steps < 0:
+        raise ValueError("Bounded policy step counters must be non-negative.")
+    if limit <= 0:
+        return False
+    observed = dispatch_steps if rtc_active_dispatch_counting else loop_steps
+    return observed >= limit
+
+
 def _prepare_position_lookahead_chain(
     raw_actions: tuple[NormalizedAction, ...],
     observation: DeploymentObservation,
@@ -2809,6 +2829,7 @@ def main(
     )
     rtc_active_latency_gate_passed = not rtc_active_latency_gate_required
     rtc_active_latency_samples: list[float] = []
+    accepted_rtc_dispatch_steps = 0
     step_index = 0
     loop_rate = LoopRate()
     last_status_at = 0.0
@@ -5494,6 +5515,8 @@ def main(
                                         )
                                     plan_cut_proposal = None
                                 if execution.accepted:
+                                    if rtc_active_latency_gate_required:
+                                        accepted_rtc_dispatch_steps += 1
                                     position_action_submitted_this_loop = (
                                         prepared_action_position_executor is not None
                                     )
@@ -5829,7 +5852,9 @@ def main(
                                 "rtc_worker="
                                 f"{rtc_frontend.state.worker_session_state.lower()} "
                                 "rtc_emissions="
-                                f"{rtc_frontend.selected_emission_count}"
+                                f"{rtc_frontend.selected_emission_count} "
+                                "rtc_active_dispatch_steps="
+                                f"{accepted_rtc_dispatch_steps}"
                                 if rtc_frontend is not None
                                 else ""
                             ),
@@ -5851,7 +5876,12 @@ def main(
                     last_status_at = loop_started_at
 
                 step_index += 1
-                if int(args.max_steps) > 0 and step_index >= int(args.max_steps):
+                if _bounded_policy_step_limit_reached(
+                    max_steps=int(args.max_steps),
+                    control_loop_steps=step_index,
+                    rtc_active_dispatch_counting=rtc_active_latency_gate_required,
+                    accepted_rtc_dispatch_steps=accepted_rtc_dispatch_steps,
+                ):
                     required_emissions = int(
                         getattr(args, "min_rtc_emissions_before_exit", 0)
                     )

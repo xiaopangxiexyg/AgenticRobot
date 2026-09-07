@@ -197,6 +197,17 @@ class OpenPIClientPolicyConfig:
                 if self.image_key_map is None
                 else {str(key): str(value) for key, value in self.image_key_map.items()}
             )
+        wire_observation_config = OpenPIObservationAdapterConfig(
+            image_key_map=image_key_map,
+            required_image_keys=required_image_keys,
+            include_debug_metadata=False,
+        )
+        assert wire_observation_config.image_key_map is not None
+        assert wire_observation_config.required_image_keys is not None
+        normalized_image_key_map = wire_observation_config.image_key_map
+        normalized_required_image_keys = (
+            wire_observation_config.required_image_keys
+        )
         object.__setattr__(self, "policy_io_layout", layout)
         object.__setattr__(self, "policy_artifact", artifact)
         if artifact is not None:
@@ -221,7 +232,10 @@ class OpenPIClientPolicyConfig:
             "image_wire_config",
             OpenPIImageWireClientConfig.from_value(
                 self.image_wire_config,
-                image_keys=required_camera_slots,
+                image_keys=tuple(
+                    normalized_image_key_map[source_key]
+                    for source_key in normalized_required_image_keys
+                ),
             ),
         )
         if requested_normalization_contract is not None:
