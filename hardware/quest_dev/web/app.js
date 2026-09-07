@@ -260,21 +260,6 @@
     }
   }
 
-  function controllerSample(frame, referenceSpace, source, sourceSessionId) {
-    if (!source.gripSpace) return null;
-    const pose = frame.getPose(source.gripSpace, referenceSpace);
-    if (!pose) return null;
-    return {
-      pose,
-      sourceSessionId,
-      handedness: source.handedness || 'none',
-      targetRayMode: source.targetRayMode || 'tracked-pointer',
-      profiles: Array.from(source.profiles || []),
-      emulatedPosition: pose.emulatedPosition === true,
-      matrixReferenceFromGrip: Array.from(pose.transform.matrix),
-    };
-  }
-
   function renderFrame(
     session,
     viewerPose,
@@ -396,6 +381,10 @@
         if (xrSession !== session) return;
         const previousGeneration = referenceSpaceGeneration;
         referenceSpaceGeneration += 1;
+        // Poses are expressed in the old reference-space generation. Keep no
+        // display cache across reset; raw capture is independently fenced by
+        // the controller-pose runtime and remains fail-closed.
+        controllerPoseDisplay.reset();
         window.QuestDevFeatures.onReferenceSpaceReset({
           referenceSpace,
           previousGeneration,
@@ -421,9 +410,28 @@
       function onFrame(time, frame) {
         if (xrSession !== session) return;
         session.requestAnimationFrame(onFrame);
-        const viewerPose = frame.getViewerPose(referenceSpace);
+        let viewerPose = null;
+        let viewerPoseDiagnostic = null;
+        try {
+          viewerPose = frame.getViewerPose(referenceSpace);
+        } catch (error) {
+          viewerPoseDiagnostic = {
+            available: false,
+            reason: 'viewer_pose_error',
+            errorName: error && typeof error.name === 'string'
+              ? error.name.slice(0, 80)
+              : undefined,
+          };
+        }
+        if (!viewerPose && !viewerPoseDiagnostic) {
+          viewerPoseDiagnostic = {
+            available: false,
+            reason: 'viewer_pose_unavailable',
+          };
+        }
         const controllerPoses = [];
         const displayControllerPoses = [];
+        const controllerDiagnostics = [];
         const activeSourceIds = new Set();
         const sourceOccurrences = new Map();
         for (const source of session.inputSources) {
@@ -432,14 +440,20 @@
           sourceOccurrences.set(fingerprint, occurrence + 1);
           const sourceSessionId = controllerSourceIdentity.idFor(source, occurrence);
           activeSourceIds.add(sourceSessionId);
-          const sample = controllerSample(
+          const sampled = window.QuestDevControllerPoseSampling.sampleControllerPose(
             frame,
             referenceSpace,
             source,
             sourceSessionId,
           );
+          const sample = sampled.sample;
+          controllerDiagnostics.push(sampled.diagnostic);
           if (sample) controllerPoses.push(sample);
-          const displayPose = controllerPoseDisplay.observe(sourceSessionId, sample);
+          const displayPose = controllerPoseDisplay.observe(
+            sourceSessionId,
+            sample,
+            sampled.diagnostic,
+          );
           if (displayPose) displayControllerPoses.push(displayPose);
         }
         controllerPoseDisplay.prune(activeSourceIds);
@@ -448,6 +462,9 @@
           frame,
           viewerPose,
           controllerPoses,
+          controllerDiagnostics,
+          viewerPoseAvailable: Boolean(viewerPose),
+          viewerPoseDiagnostic,
           clientInstanceId,
           xrSessionId,
           referenceSpaceType,

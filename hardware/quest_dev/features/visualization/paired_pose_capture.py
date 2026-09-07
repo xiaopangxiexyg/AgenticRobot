@@ -1475,9 +1475,14 @@ class ManualStaticPairedPoseCapture:
         if (
             controller.handedness != quest.handedness
             or controller.target_ray_mode != quest.target_ray_mode
-            or controller.profiles != quest.profiles
         ):
             self._terminal("selected Quest controller identity metadata drifted")
+        # WebXR profile strings describe current input capabilities and can
+        # change after the same XRInputSource is first exposed. They remain in
+        # event/evidence metadata, but are not source identity and therefore do
+        # not terminate an otherwise consistent selected source.
+        if len(controller.profiles) != len(set(controller.profiles)):
+            self._terminal("selected Quest controller profiles are invalid")
         # A temporary WebXR tracking loss may expose an emulated controller
         # position.  Keep the ordered event for evidence and sequence fences,
         # but exclude its pose from the calibration dataset.  The window-level

@@ -49,3 +49,18 @@ test('controller identity survives XRInputSource wrapper replacement', () => {
   tracker.reset();
   assert.equal(tracker.idFor(source(), 0), 'input-1');
 });
+
+test('controller identity ignores profiles that change during XR startup', () => {
+  const tracker = loadIdentity().createTracker();
+  const generic = tracker.idFor(source({ profiles: [] }), 0);
+  const concrete = tracker.idFor(
+    source({ profiles: ['oculus-touch-controller'] }),
+    0,
+  );
+  assert.equal(generic, 'input-1');
+  assert.equal(concrete, generic);
+  assert.equal(
+    tracker.fingerprint(source({ profiles: ['another-profile'] })),
+    tracker.fingerprint(source({ profiles: [] })),
+  );
+});
