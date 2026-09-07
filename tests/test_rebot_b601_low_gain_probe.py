@@ -188,7 +188,7 @@ def test_feedback_boundary_normalization_is_per_joint_and_preserves_raw_values()
 
 
 def test_feedback_boundary_normalization_does_not_admit_more_negative_values() -> None:
-    for index, value in ((1, -6.0001e-3), (2, -1.0001e-3)):
+    for index, value in ((1, -6.0001e-3), (2, -3.0001e-3)):
         raw_values = [0.0] * 6
         raw_values[index] = value
         raw = tuple(raw_values)
@@ -207,7 +207,7 @@ def test_feedback_boundary_normalization_does_not_admit_more_negative_values() -
 
 
 def test_feedback_boundary_normalization_admits_j3_and_keeps_other_joints_unchanged() -> None:
-    raw = (0.1, 0.0, -6.82e-4, -0.002, -0.003, -0.004)
+    raw = (0.1, 0.0, -2.216e-3, -0.002, -0.003, -0.004)
 
     normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
 
@@ -298,7 +298,7 @@ def test_feedback_stability_probe_normalizes_only_admitted_j2_j3_boundary(tmp_pa
                 positions_rad=(
                     0.0,
                     -4.517e-3,
-                    -6.82e-4,
+                    -2.216e-3,
                     0.0,
                     0.0,
                     0.0,
@@ -346,9 +346,9 @@ def test_feedback_stability_probe_normalizes_only_admitted_j2_j3_boundary(tmp_pa
     assert boundary["applied_joint_counts"] == {"joint2": 3, "joint3": 3}
     assert boundary["intervals_rad"] == {
         "joint2": (-6.0e-3, 0.0),
-        "joint3": (-1.0e-3, 0.0),
+        "joint3": (-3.0e-3, 0.0),
     }
-    assert result["samples"][0]["raw_qpos_rad"][1:3] == (-4.517e-3, -6.82e-4)
+    assert result["samples"][0]["raw_qpos_rad"][1:3] == (-4.517e-3, -2.216e-3)
     assert result["samples"][0]["qpos_rad"][1:3] == (0.0, 0.0)
     assert result["samples"][0]["boundary_normalized_joint_names"] == (
         "joint2",
