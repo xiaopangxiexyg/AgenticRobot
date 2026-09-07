@@ -445,6 +445,40 @@ def _warn_if_tcp_outside_safety_limits(
         print(f"WARNING: {warning}; source={source}. Verify this TCP before robot motion.")
 
 
+def _next_background_stream_schedule_after_send(
+    *,
+    next_scheduled: float,
+    sdk_result_monotonic: float,
+    sdk_send_gap_sec: float | None,
+    skipped_tick_count: int,
+    period_sec: float,
+    no_catch_up_after_send: bool,
+) -> float:
+    """Rebase after a real stall while preserving ordinary absolute cadence."""
+
+    scheduled = float(next_scheduled)
+    completed = float(sdk_result_monotonic)
+    period = float(period_sec)
+    if not all(math.isfinite(value) for value in (scheduled, completed, period)):
+        raise ValueError("background stream scheduler values must be finite.")
+    if period <= 0.0:
+        raise ValueError("background stream period must be positive.")
+    if not no_catch_up_after_send:
+        return scheduled
+    long_send_gap = bool(
+        sdk_send_gap_sec is not None
+        and math.isfinite(float(sdk_send_gap_sec))
+        and float(sdk_send_gap_sec) >= 1.5 * period
+    )
+    if (
+        int(skipped_tick_count) > 0
+        or completed >= scheduled
+        or long_send_gap
+    ):
+        return max(scheduled, completed + period)
+    return scheduled
+
+
 @dataclass
 class RM65ArmBackendConfig:
     arm_ip: str
@@ -477,6 +511,10 @@ class RM65ArmBackendConfig:
     background_streaming_warning_ratio: float = 0.9
     background_streaming_target_max_age_sec: float = 0.25
     background_streaming_shutdown_timeout_sec: float = 1.0
+    # Default-off compatibility switch.  The exclusive real Skill enables it
+    # so a missed CANFD slot is followed by one full-rate interval instead of
+    # an immediate catch-up send with a materially different qcmd.
+    background_streaming_no_catch_up_after_send: bool = False
     # Keep the backend-wide default compatible for teleop/replay callers.
     # Policy deployment explicitly selects latest_nonblocking so a slow SDK
     # call cannot make 60 Hz reference admission wait on the 120 Hz worker.
@@ -641,6 +679,10 @@ class RM65ArmBackendConfig:
             raise ValueError("background_streaming_target_max_age_sec must be positive.")
         if float(self.background_streaming_shutdown_timeout_sec) <= 0.0:
             raise ValueError("background_streaming_shutdown_timeout_sec must be positive.")
+        if not isinstance(self.background_streaming_no_catch_up_after_send, bool):
+            raise TypeError(
+                "background_streaming_no_catch_up_after_send must be a boolean."
+            )
         target_admission_mode = str(
             self.background_streaming_target_admission_mode
         ).strip().lower()
@@ -6053,6 +6095,18 @@ class RM65ArmBackend(EffectorBackend):
                                 self._stream_sdk_inflight_target_sequence = None
                 else:
                     transport_block_reason = "arm_not_connected"
+
+            if sdk_result_monotonic_time is not None:
+                next_scheduled = _next_background_stream_schedule_after_send(
+                    next_scheduled=next_scheduled,
+                    sdk_result_monotonic=sdk_result_monotonic_time,
+                    sdk_send_gap_sec=sdk_send_gap_sec,
+                    skipped_tick_count=tick_timing.skipped_tick_count,
+                    period_sec=period_sec,
+                    no_catch_up_after_send=(
+                        self.config.background_streaming_no_catch_up_after_send
+                    ),
+                )
 
             if trajectory_proposal is not None and not bool(accepted):
                 self._stream_planner.reject(trajectory_proposal)

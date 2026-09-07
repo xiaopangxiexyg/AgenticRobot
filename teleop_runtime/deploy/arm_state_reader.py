@@ -6,7 +6,7 @@ import inspect
 import math
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -432,6 +432,7 @@ class ArmStateReader:
         ]
         | None = None,
         pose_state_read_by_side: Mapping[str, ArmPoseStateReader] | None = None,
+        concurrent_refresh_executor: Executor | None = None,
         receipt_clock: ClockDomainDescriptor | None = None,
         receipt_monotonic_ns_clock: Any = time.monotonic_ns,
     ):
@@ -461,6 +462,11 @@ class ArmStateReader:
                 "pose_projection_by_side values must be ArmPoseObservationProjection."
             )
         self.pose_state_read_by_side = dict(pose_state_read_by_side or {})
+        if concurrent_refresh_executor is not None and not callable(
+            getattr(concurrent_refresh_executor, "submit", None)
+        ):
+            raise TypeError("concurrent_refresh_executor must expose submit().")
+        self.concurrent_refresh_executor = concurrent_refresh_executor
         unknown_state_read_sides = set(self.pose_state_read_by_side) - set(
             self.pose_projection_by_side
         )
@@ -624,10 +630,14 @@ class ArmStateReader:
                 if side in concurrent_sides and concurrent_ready[side]
             )
             if ready_sides:
-                with ThreadPoolExecutor(
-                    max_workers=len(ready_sides),
-                    thread_name_prefix="arm-state-refresh",
-                ) as executor:
+                executor = self.concurrent_refresh_executor
+                owns_executor = executor is None
+                if executor is None:
+                    executor = ThreadPoolExecutor(
+                        max_workers=len(ready_sides),
+                        thread_name_prefix="arm-state-refresh",
+                    )
+                try:
                     futures = {
                         side: executor.submit(refresh_one, side)
                         for side in ready_sides
@@ -637,6 +647,9 @@ class ArmStateReader:
                         if refresh_error is not None:
                             concurrent_refresh_errors[side] = refresh_error
                         self._last_refresh_at[side] = now
+                finally:
+                    if owns_executor:
+                        executor.shutdown(wait=True)
         states: dict[str, dict[str, Any]] = {}
         refresh_period = 0.0 if self.refresh_hz <= 0.0 else 1.0 / self.refresh_hz
         for side, backend in self.backends.items():

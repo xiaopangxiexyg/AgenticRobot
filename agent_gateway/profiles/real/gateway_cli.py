@@ -754,6 +754,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=trace_session_dir,
                 reference_hz=resolved.position_profile.rates.reference_hz,
                 command_hz=resolved.position_profile.rates.command_hz,
+                measurement_hz=composition.lower.ports.profile.state_refresh_hz,
                 max_duration_sec=args.motion_trace_max_duration_sec,
                 metadata={
                     "entrypoint": "python -m agent_gateway real-rm65",

@@ -26,7 +26,7 @@ import numpy as np
 from .control_runtime import RealSkillControlTraceSample
 from .motion_port import REAL_AGENT_MOTION_COMMAND_METADATA_KEY
 
-SKILL_MOTION_TRACE_SCHEMA = "dexteleop.exclusive_rm65_skill_motion_trace.v1"
+SKILL_MOTION_TRACE_SCHEMA = "dexteleop.exclusive_rm65_skill_motion_trace.v2"
 SKILL_MOTION_TRACE_DATA_NAME = "motion_trace.npz"
 SKILL_MOTION_TRACE_MANIFEST_NAME = "manifest.json"
 SKILL_MOTION_TRACE_SUMMARY_NAME = "summary.json"
@@ -35,6 +35,27 @@ DEFAULT_SKILL_MOTION_TRACE_MAX_DURATION_SEC = 120.0
 _SIDES = ("left", "right")
 _I64_MISSING = np.iinfo(np.int64).min
 _I32_MISSING = np.iinfo(np.int32).min
+_HARDWARE_READ_TIMING_FIELDS = (
+    ("hardware_read_total_wall_ms", "total_wall_ms"),
+    ("hardware_read_total_thread_cpu_ms", "total_thread_cpu_ms"),
+    ("hardware_read_lock_wait_wall_ms", "hardware_read_lock_wait_wall_ms"),
+    (
+        "hardware_read_lock_wait_thread_cpu_ms",
+        "hardware_read_lock_wait_thread_cpu_ms",
+    ),
+    ("hardware_read_sdk_call_wall_ms", "sdk_call_wall_ms"),
+    ("hardware_read_sdk_call_thread_cpu_ms", "sdk_call_thread_cpu_ms"),
+    (
+        "hardware_read_parse_validation_wall_ms",
+        "parse_validation_wall_ms",
+    ),
+    (
+        "hardware_read_parse_validation_thread_cpu_ms",
+        "parse_validation_thread_cpu_ms",
+    ),
+    ("hardware_read_retry_sleep_wall_ms", "retry_sleep_wall_ms"),
+    ("hardware_read_attempt_count", "attempt_count"),
+)
 
 _REFERENCE_DTYPE = np.dtype(
     [
@@ -44,7 +65,13 @@ _REFERENCE_DTYPE = np.dtype(
         ("cycle_finished_monotonic_ns", "<i8"),
         ("measurement_wall_time_ns", "<i8"),
         ("measurement_available_wall_time_ns", "<i8"),
+        ("measurement_span_ms", "<f8"),
+        ("measurement_available_delay_ms", "<f8"),
         ("source_sequence", "<i8", (2,)),
+        *[
+            (trace_field, "<f8", (2,))
+            for trace_field, _ in _HARDWARE_READ_TIMING_FIELDS
+        ],
         ("measured_pose_revision", "<i8"),
         ("measured_qpos_rad", "<f8", (2, 6)),
         ("measured_tool_tcp_pose_world", "<f8", (2, 4, 4)),
@@ -209,6 +236,7 @@ class SkillMotionTraceConfig:
     output_dir: Path
     reference_hz: float
     command_hz: float
+    measurement_hz: float | None = None
     max_duration_sec: float = DEFAULT_SKILL_MOTION_TRACE_MAX_DURATION_SEC
     metadata: Mapping[str, object] = field(default_factory=dict)
 
@@ -218,6 +246,11 @@ class SkillMotionTraceConfig:
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
             object.__setattr__(self, name, value)
+        if self.measurement_hz is not None:
+            measurement_hz = float(self.measurement_hz)
+            if not math.isfinite(measurement_hz) or measurement_hz <= 0.0:
+                raise ValueError("measurement_hz must be finite and positive.")
+            object.__setattr__(self, "measurement_hz", measurement_hz)
         object.__setattr__(self, "output_dir", Path(self.output_dir))
 
     @property
@@ -285,6 +318,7 @@ class SkillMotionTraceRecorder:
                 "backend_send_gap_ms",
                 "backend_sdk_call_ms",
                 "backend_deadline_lag_ms",
+                *(trace_field for trace_field, _ in _HARDWARE_READ_TIMING_FIELDS),
             ):
                 row[name].fill(float("nan"))
             row["source_sequence"].fill(_I64_MISSING)
@@ -305,6 +339,8 @@ class SkillMotionTraceRecorder:
                 "dispatch_ms",
                 "control_cycle_ms",
                 "measurement_age_at_dispatch_ms",
+                "measurement_span_ms",
+                "measurement_available_delay_ms",
             ):
                 row[name] = float("nan")
             row["ik_iterations"] = _I32_MISSING
@@ -331,11 +367,28 @@ class SkillMotionTraceRecorder:
                 row["measurement_available_wall_time_ns"] = _seconds_to_ns(
                     cut.available_at
                 )
+                row["measurement_available_delay_ms"] = max(
+                    0.0,
+                    float(cut.available_at) - float(cut.measured_at),
+                ) * 1000.0
+                cut_metadata = _mapping(cut.observation.metadata)
+                row["measurement_span_ms"] = (
+                    _number(cut_metadata.get("hardware_measurement_span_sec"))
+                    * 1000.0
+                )
+                hardware_timing_by_side = _mapping(
+                    cut_metadata.get("hardware_read_phase_timing_by_side")
+                )
                 for side_index, side in enumerate(_SIDES):
                     row["source_sequence"][side_index] = _integer(
                         cut.source_sequence_by_side.get(side)
                     )
                     row["measured_qpos_rad"][side_index] = cut.qpos_by_side[side]
+                    side_timing = _mapping(hardware_timing_by_side.get(side))
+                    for trace_field, source_field in _HARDWARE_READ_TIMING_FIELDS:
+                        row[trace_field][side_index] = _number(
+                            side_timing.get(source_field)
+                        )
             else:
                 row["measurement_wall_time_ns"] = _I64_MISSING
                 row["measurement_available_wall_time_ns"] = _I64_MISSING
@@ -766,9 +819,44 @@ class SkillMotionTraceRecorder:
             "max_rotation_error_deg": None if not rotations else max(rotations),
         }
 
+    @staticmethod
+    def _unique_measurement_mask(reference: np.ndarray) -> np.ndarray:
+        unique = np.zeros(reference.shape[0], dtype=bool)
+        previous_sequence: tuple[int, int] | None = None
+        for index, row in enumerate(reference):
+            sequence = tuple(int(value) for value in row["source_sequence"])
+            timestamp_ns = int(row["measurement_wall_time_ns"])
+            if timestamp_ns <= 0 or any(value == _I64_MISSING for value in sequence):
+                continue
+            if sequence != previous_sequence:
+                unique[index] = True
+                previous_sequence = sequence
+        return unique
+
     def _summary(self) -> dict[str, object]:
         reference = self._reference[: self._reference_next]
         ik = self._ik[: self._ik_next]
+        unique_measurements = reference[self._unique_measurement_mask(reference)]
+        measurement_intervals_ms = self._successive_gap_ms(
+            unique_measurements["measurement_wall_time_ns"]
+        )
+        measurement_duration_ns = (
+            0
+            if unique_measurements.shape[0] < 2
+            else int(unique_measurements["measurement_wall_time_ns"][-1])
+            - int(unique_measurements["measurement_wall_time_ns"][0])
+        )
+        achieved_measurement_hz = (
+            None
+            if measurement_duration_ns <= 0
+            else (unique_measurements.shape[0] - 1)
+            / (measurement_duration_ns / 1_000_000_000.0)
+        )
+        measurement_stall_threshold_ms = (
+            None
+            if self.config.measurement_hz is None
+            else 2000.0 / self.config.measurement_hz
+        )
         outcomes = Counter(
             bytes(value).rstrip(b"\x00").decode("utf-8", errors="replace")
             for value in reference["outcome"]
@@ -827,6 +915,30 @@ class SkillMotionTraceRecorder:
             "measured_dynamics": {},
             "actuator_dynamics": {},
             "actuator_timing": {},
+            "measurement_timing": {
+                "target_hz": self.config.measurement_hz,
+                "unique_measurement_count": int(unique_measurements.shape[0]),
+                "achieved_hz": achieved_measurement_hz,
+                "interval_ms": self._percentiles(measurement_intervals_ms),
+                "stall_threshold_ms": measurement_stall_threshold_ms,
+                "stall_count": (
+                    None
+                    if measurement_stall_threshold_ms is None
+                    else int(
+                        np.sum(
+                            measurement_intervals_ms
+                            > measurement_stall_threshold_ms
+                        )
+                    )
+                ),
+                "available_delay_ms": self._percentiles(
+                    unique_measurements["measurement_available_delay_ms"]
+                ),
+                "measurement_span_ms": self._percentiles(
+                    unique_measurements["measurement_span_ms"]
+                ),
+                "hardware_read_timing_by_side": {},
+            },
             "trace_health": self.snapshot(),
         }
         for side_index, side in enumerate(_SIDES):
@@ -834,14 +946,16 @@ class SkillMotionTraceRecorder:
                 reference["qref_rad"][:, side_index],
                 reference["cycle_finished_monotonic_ns"],
             )
-            sequences = reference["source_sequence"][:, side_index]
-            unique = np.ones(sequences.shape[0], dtype=bool)
-            if sequences.shape[0] > 1:
-                unique[1:] = sequences[1:] != sequences[:-1]
             result["measured_dynamics"][side] = self._dynamics(
-                reference["measured_qpos_rad"][unique, side_index],
-                reference["measurement_wall_time_ns"][unique],
+                unique_measurements["measured_qpos_rad"][:, side_index],
+                unique_measurements["measurement_wall_time_ns"],
             )
+            result["measurement_timing"]["hardware_read_timing_by_side"][side] = {
+                source_field: self._percentiles(
+                    unique_measurements[trace_field][:, side_index]
+                )
+                for trace_field, source_field in _HARDWARE_READ_TIMING_FIELDS
+            }
             actuator = self._actuator[side][: self._actuator_next[side]]
             accepted = actuator["sdk_accepted"].astype(bool)
             accepted_rows = actuator[accepted]
@@ -851,6 +965,27 @@ class SkillMotionTraceRecorder:
             )
             gaps_ms = self._successive_gap_ms(
                 accepted_rows["sdk_result_monotonic_ns"]
+            )
+            moving_steps = (
+                np.empty(0, dtype=bool)
+                if accepted_rows.shape[0] < 2
+                else np.nanmax(
+                    np.abs(np.diff(accepted_rows["q_cmd_rad"], axis=0)),
+                    axis=1,
+                )
+                > 1e-9
+            )
+            command_period_ms = 1000.0 / self.config.command_hz
+            long_gap = gaps_ms >= 1.5 * command_period_ms
+            post_stall_gap_ms = (
+                np.empty(0, dtype=float)
+                if gaps_ms.shape[0] < 2
+                else gaps_ms[1:][long_gap[:-1]]
+            )
+            post_stall_moving = (
+                np.empty(0, dtype=bool)
+                if moving_steps.shape[0] < 2
+                else moving_steps[1:][long_gap[:-1]]
             )
             result["actuator_timing"][side] = {
                 "attempt_count": int(actuator.shape[0]),
@@ -867,6 +1002,21 @@ class SkillMotionTraceRecorder:
                         actuator["wakeup_monotonic_ns"],
                         actuator["scheduled_monotonic_ns"],
                     )
+                ),
+                "long_gap_threshold_ms": 1.5 * command_period_ms,
+                "post_stall_minimum_gap_ms": (
+                    None
+                    if post_stall_gap_ms.shape[0] == 0
+                    else float(np.min(post_stall_gap_ms))
+                ),
+                "post_stall_burst_count": int(
+                    np.sum(
+                        (post_stall_gap_ms < 0.5 * command_period_ms)
+                        & post_stall_moving
+                    )
+                ),
+                "moving_send_under_4ms_count": int(
+                    np.sum((gaps_ms < 4.0) & moving_steps)
                 ),
             }
         if ik.shape[0]:
@@ -946,6 +1096,7 @@ class SkillMotionTraceRecorder:
             "config": {
                 "reference_hz": self.config.reference_hz,
                 "command_hz": self.config.command_hz,
+                "measurement_hz": self.config.measurement_hz,
                 "max_duration_sec": self.config.max_duration_sec,
                 "reference_capacity": self.config.reference_capacity,
                 "command_capacity_per_side": self.config.command_capacity_per_side,

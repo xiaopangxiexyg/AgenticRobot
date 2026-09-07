@@ -69,7 +69,27 @@ def _sample(*, index: int) -> RealSkillControlTraceSample:
         "right": np.full(6, 0.1),
     }
     cut = RealSkillMotionObservationCut(
-        observation=TeleopObservation(timestamp=10.0 + index * 0.01),
+        observation=TeleopObservation(
+            timestamp=10.0 + index * 0.01,
+            metadata={
+                "hardware_measurement_span_sec": 0.002,
+                "hardware_read_phase_timing_by_side": {
+                    side: {
+                        "total_wall_ms": 8.0 + index + side_index,
+                        "total_thread_cpu_ms": 0.5,
+                        "hardware_read_lock_wait_wall_ms": 0.1,
+                        "hardware_read_lock_wait_thread_cpu_ms": 0.01,
+                        "sdk_call_wall_ms": 7.0 + index + side_index,
+                        "sdk_call_thread_cpu_ms": 0.3,
+                        "parse_validation_wall_ms": 0.2,
+                        "parse_validation_thread_cpu_ms": 0.1,
+                        "retry_sleep_wall_ms": 0.0,
+                        "attempt_count": 1.0,
+                    }
+                    for side_index, side in enumerate(("left", "right"))
+                },
+            },
+        ),
         qpos_by_side=measured,
         measured_at=10.0 + index * 0.01,
         available_at=10.001 + index * 0.01,
@@ -138,6 +158,7 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
             output_dir=output,
             reference_hz=60.0,
             command_hz=120.0,
+            measurement_hz=30.0,
             max_duration_sec=1.0,
             metadata={"test": "long-distance"},
         )
@@ -187,6 +208,11 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
         assert arrays["left_actuator"].shape == (3,)
         assert arrays["right_actuator"].shape == (3,)
         assert arrays["reference"][2]["ik_time_budget_exceeded"] == 1
+        assert arrays["reference"][1]["measurement_span_ms"] == pytest.approx(2.0)
+        np.testing.assert_allclose(
+            arrays["reference"][1]["hardware_read_sdk_call_wall_ms"],
+            [8.0, 9.0],
+        )
         np.testing.assert_allclose(
             arrays["reference"][1]["target_tool_tcp_pose_world"][:3, 3],
             [0.0, 0.0, 0.2],
@@ -198,6 +224,15 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
     assert summary["ik_time_budget_exceeded_count"] == 1
     assert summary["ik_branch_switch_count"] == 0
     assert summary["actuator_timing"]["left"]["accepted_count"] == 3
+    assert summary["actuator_timing"]["left"]["post_stall_burst_count"] == 0
+    assert summary["actuator_timing"]["left"]["moving_send_under_4ms_count"] == 0
+    assert summary["measurement_timing"]["target_hz"] == 30.0
+    assert summary["measurement_timing"]["unique_measurement_count"] == 3
+    assert summary["measurement_timing"]["achieved_hz"] == pytest.approx(100.0)
+    assert summary["measurement_timing"]["stall_count"] == 0
+    assert summary["measurement_timing"]["hardware_read_timing_by_side"][
+        "left"
+    ]["sdk_call_wall_ms"]["max"] == pytest.approx(9.0)
     assert np.isclose(
         summary["target_vs_measured_tcp"]["final_translation_error_m"],
         0.06,
@@ -205,6 +240,9 @@ def test_skill_motion_trace_records_aligned_reference_ik_and_actuator_rows(
     assert json.loads((output / "manifest.json").read_text())["result"][
         "closed"
     ] is True
+    assert json.loads((output / "manifest.json").read_text())["schema"].endswith(
+        ".v2"
+    )
 
 
 def test_skill_motion_trace_overflow_drops_diagnostics_without_growing(
@@ -262,3 +300,40 @@ def test_motion_trace_summary_ignores_missing_or_non_monotonic_timestamps(
         np.asarray([1_000_000_000, 1_000_000_000, 900_000_000, 2_000_000_000]),
     )
     assert dynamics["max_joint_step_deg"] == pytest.approx(np.degrees(2.0))
+
+
+def test_motion_trace_summary_counts_post_stall_moving_burst(tmp_path) -> None:
+    recorder = SkillMotionTraceRecorder(
+        SkillMotionTraceConfig(
+            output_dir=tmp_path / "post-stall-burst",
+            reference_hz=60.0,
+            command_hz=120.0,
+            max_duration_sec=1.0,
+        )
+    )
+    for sequence, result_time in enumerate((1.0, 1.020, 1.021, 1.030), start=1):
+        assert recorder.record_actuator_command(
+            "left",
+            sequence,
+            1,
+            1,
+            sequence,
+            result_time - 0.002,
+            result_time - 0.0015,
+            sequence,
+            10.0 + result_time,
+            result_time - 0.001,
+            result_time,
+            np.full(6, sequence * 0.001),
+            0,
+            True,
+            sequence,
+        )
+    recorder.close()
+
+    timing = inspect_trace(tmp_path / "post-stall-burst")["summary"][
+        "actuator_timing"
+    ]["left"]
+    assert timing["post_stall_minimum_gap_ms"] == pytest.approx(1.0)
+    assert timing["post_stall_burst_count"] == 1
+    assert timing["moving_send_under_4ms_count"] == 1
