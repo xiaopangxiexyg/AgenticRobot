@@ -60,6 +60,10 @@ coverage of those suites.
 | Simulation/control dynamics | Deterministic replay or simulator cases with declared inputs | Relevant complete simulation acceptance; report hardware separately |
 
 Use coverage, when available in the test environment, to locate missed changed
+branches. For a bug fix, reproduce the fault when practical and check that the
+regression assertion distinguishes the faulty behavior from the intended result.
+Existing behavioral tests can suffice for a refactor; mock external boundaries
+without mocking away the behavior being verified. Select relevant failure
 branches: invalid input, cancellation, timeout, stale state, persistence failure,
 and recovery. Do not prescribe an arbitrary repository percentage or create
 duplicate tests to raise it. A minimal environment's optional skips are useful

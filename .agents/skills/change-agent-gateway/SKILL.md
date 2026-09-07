@@ -28,6 +28,8 @@ Choose one primary owner before editing:
 
 If the change spans owners, define the public contract and dependency order
 before implementing downstream bindings.
+Identify the actual producer and consumer on both sides, including RPent when
+affected. An unchanged schema alone does not prove unchanged runtime behavior.
 
 ## Workflow
 
@@ -61,3 +63,9 @@ Run tests through `bash scripts/run_pytest.sh ...`.
 
 Report the exact boundary tested. In-memory or contract validation does not
 establish simulator, deployment, or real-hardware readiness.
+
+For a cross-owner contract change, include evidence from the producer and the
+affected consumer, including relevant rejection, timeout, or cancellation paths.
+Give the reviewer the fixed diff and that evidence. Fix findings in the owning
+worktree and recheck affected contracts before handing off a new candidate;
+unresolved contract choices return to the semantic owner.
