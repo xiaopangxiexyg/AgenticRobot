@@ -719,7 +719,7 @@ def _validate_arming_settle_transition(
     current_timestamp_sec: float,
     previous_timestamp_sec: float,
     position_limits_rad: Sequence[tuple[float, float]],
-    max_velocity_rad_s: float = _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S,
+    max_velocity_rad_s: float = _DEFAULT_VELOCITY_ABORT_RAD_S,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
     """Validate one post-enable feedback transition before torque is allowed.
 
