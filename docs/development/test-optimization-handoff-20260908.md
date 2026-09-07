@@ -40,7 +40,7 @@ AgenticRobot 每次合并前的测试耗时过长，尤其是完整 acceptance �
 | 目标线基准 | 4743d20a97fa07acc47d4217c39be4040c22b62e |
 | 本次复核观察到的目标线 tip | c0140d0fbf362bf9b3e94e840548a007b0a0039f |
 | 候选分支 | task/root/full-acceptance-six-shard-optin-20260908 |
-| 实现提交（本文档的父提交） | 04221f5e38f1ac1914085446b72e0b2088c3e424 |
+| 已完成绿色实现提交 | c5da17c07b7cb90c324afa4c88da3d12d4c01b91 |
 | 当前交接 tip（含本文档） | 以 branch description 和交接前 `git rev-parse HEAD` 为准 |
 | 候选工作区 | /tmp/ar-full-acceptance-six-shard-optin-20260908 |
 | 候选所有者 | root |
@@ -60,7 +60,7 @@ docs/README.md
 docs/development/test-optimization-handoff-20260908.md
 ```
 
-候选不拥有 README_ENV.md、Harness Profile/runner map、marker 选择逻辑、MuJoCo 缓存实现、硬件、设备、远端执行、development、main 或 push。当前状态为 `active`；形成干净提交并在同一提交上完成验证前，不得恢复为 ready。
+候选不拥有 README_ENV.md、Harness Profile/runner map、marker 选择逻辑、MuJoCo 缓存实现、硬件、设备、远端执行、development、main 或 push。绿色实现提交形成后已满足 `ready-for-integration`；任何后续提交仍必须重新验证受影响范围并重新固定 branch description。
 
 并行候选仍包括：
 
@@ -149,6 +149,22 @@ env DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 | JUnit 各 shard 时间合计 | 1078.372 s |
 
 各 shard 实际时间约为 129.177、207.313、185.209、181.613、186.435、188.625 秒。历史四分片最大已知负载约 262 秒；按这两个快照粗略比较，六分片节省约 51 秒、约 19%。集成前必须在最终组合提交上重新测量，不能将该数字当作 SLA。
+
+### 4.4 绿色实现运行
+
+绿色实现提交 `c5da17c07b7cb90c324afa4c88da3d12d4c01b91` 在 socket-capable 本机上下文完成六分片非硬件全量：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 墙钟时间 | 206.84 s |
+| 测试模块 | 795 |
+| aggregate testcase | 9102 |
+| failures / errors | 0 / 0 |
+| skipped | 16 |
+| JUnit 各 shard 时间合计 | 1121.373 s |
+| 最长 shard | 203.06 s |
+
+artifact 位于 `/tmp/ar-full-acceptance-c5da17c0-six-shard-final-20260908`。六个 shard 均为 status 0，aggregate JUnit 无重复 testcase。共享 Run 缓存包含 4 个内容指纹目录、约 190 MiB；历史逐 shard 缓存合计约 332 MiB，因此本机 artifact 占用下降约 43%。
 
 ### 4.4 主机资源与默认值
 
@@ -329,6 +345,6 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 
 ## 11. 当前结论
 
-本批完成了低风险的 5/6 分片 opt-in、同一次 Run 内共享 MuJoCo 内容缓存、OSQP 显式状态返回策略，以及一个由全量验收暴露的测试导入顺序修复。实现前六分片历史运行墙钟约 211 秒；共享缓存后的两次运行约 204 秒，但分别受沙箱 socket 限制和导入顺序失败影响，仍不能作为绿色证据。默认值保持 4 是有意的安全决策。
+本批完成了低风险的 5/6 分片 opt-in、同一次 Run 内共享 MuJoCo 内容缓存、OSQP 显式状态返回策略，以及一个由全量验收暴露的测试导入顺序修复。绿色实现运行覆盖 795 个模块、9102 个 testcase，0 failures、0 errors，墙钟 206.84 秒；默认值保持 4 是有意的安全决策。
 
-本次复核时 development 已漂移到 c0140d0fbf362bf9b3e94e840548a007b0a0039f，因此候选不能直接套用旧验证结果，必须在当前固定候选提交上重新评估。后续任何代码、测试或文档改动都会使验证记录失效，必须重新提交、更新 branch description 的 write scope/tip/validation，并重新交接。除非完整非硬件 acceptance 通过、完成集成前检查并取得明确授权，不能合并到 development、推送远端或声称受保护 acceptance 已通过。
+本次复核时 development 为 c0140d0fbf362bf9b3e94e840548a007b0a0039f；它自 merge-base 起未修改候选的 9 个文件，隔离 merge-tree 无冲突标记。候选已标记 `ready-for-integration`，但尚未合并或 push。集成者仍必须从固定 development 创建隔离 integration worktree、合入固定候选 tip、验证组合提交，并在获得明确授权后才可推进 development 或远端。
