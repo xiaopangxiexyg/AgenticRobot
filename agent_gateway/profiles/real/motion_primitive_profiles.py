@@ -65,16 +65,19 @@ from robot_motion.primitives import (
 )
 from teleop_runtime.skill_deploy.motion_port import RealAgentMotionPortConfig
 
+from .localization_deployment import RealObjectLocalizationRegistration
 from .observation_gateway import (
     RealTcpPoseObserveAttachmentSpec,
     RealTcpPoseObserveContractBundle,
     build_real_tcp_pose_observe_contract_bundle,
 )
 from .perception_deployment import RealPerceptionCaptureRegistration
-
-REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1 = (
-    "real.rm65.agent_skill_tcp_cardinal_step"
+from .station_point_grasp_deployment import StationBoundPointGraspRegistration
+from .station_point_grasp_render_deployment import (
+    StationBoundPointGraspRenderRegistration,
 )
+
+REAL_AGENT_TCP_CARDINAL_STEP_ROUTE_ID_V1 = "real.rm65.agent_skill_tcp_cardinal_step"
 REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 = "real.rm65.agent_skill_tcp_pose_target"
 REAL_AGENT_TCP_POSE_TARGET_EXECUTOR_ID_V1 = (
     "control-station.real-agent-tcp-pose-target.v1"
@@ -92,9 +95,7 @@ REAL_AGENT_PUBLIC_TCP_POSE_SCHEMA_HASH_DOMAIN_V1 = (
     "dexteleop.real_agent_motion.public_tcp_pose_schema.v1"
 )
 REAL_AGENT_TCP_FIXED_CARDINAL_STEP_ROUTE_ID_BY_SKILL_ID_V1 = {
-    skill_id: (
-        "real.rm65.agent_skill_" + skill_id.removeprefix("motion.")
-    )
+    skill_id: ("real.rm65.agent_skill_" + skill_id.removeprefix("motion."))
     for skill_id in FIXED_CARDINAL_TCP_STEP_SKILL_IDS_V1
 }
 REAL_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1 = {
@@ -108,9 +109,7 @@ REAL_AGENT_TCP_FIXED_CARDINAL_STEP_EXECUTOR_ID_BY_SKILL_ID_V1 = {
 REAL_AGENT_TCP_FIXED_CARDINAL_STEP_DIRECTION_BY_SKILL_ID_V1 = dict(
     FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1
 )
-REAL_AGENT_TCP_LEVEL_FORWARD_ROUTE_ID_V1 = (
-    "real.rm65.agent_skill_tcp_level_forward"
-)
+REAL_AGENT_TCP_LEVEL_FORWARD_ROUTE_ID_V1 = "real.rm65.agent_skill_tcp_level_forward"
 REAL_AGENT_TCP_LEVEL_FORWARD_LEFT_30_ROUTE_ID_V1 = (
     "real.rm65.agent_skill_tcp_level_forward_left_30"
 )
@@ -141,9 +140,7 @@ REAL_AGENT_TCP_FIXED_ORIENTATION_EXECUTOR_ID_BY_SKILL_ID_V1 = {
 }
 REAL_AGENT_TCP_FIXED_ORIENTATION_PARAMETER_PROFILE_ID_BY_SKILL_ID_V1 = {
     skill_id: (
-        "real-tool-tcp-"
-        + skill_id.removeprefix("motion.").replace("_", "-")
-        + "-v1"
+        "real-tool-tcp-" + skill_id.removeprefix("motion.").replace("_", "-") + "-v1"
     )
     for skill_id in FIXED_LEVEL_TCP_ORIENTATION_SKILL_IDS_V1
 }
@@ -244,8 +241,7 @@ class RealAgentTcpCardinalStepProfile:
         object.__setattr__(self, "side", side)
         primitives = tuple(self.primitives)
         if any(
-            not isinstance(item, TCPPoseDisplacementPrimitive)
-            for item in primitives
+            not isinstance(item, TCPPoseDisplacementPrimitive) for item in primitives
         ):
             raise TypeError("primitives must contain TCP displacement primitives.")
         directions = tuple(item.direction.value for item in primitives)
@@ -552,6 +548,11 @@ class RealAgentPrimitiveContractBundle:
     attachment: RealTcpPoseObserveAttachmentSpec
     tcp_pose_observe: RealTcpPoseObserveContractBundle
     perception_capture: RealPerceptionCaptureRegistration | None = None
+    localization_registration: RealObjectLocalizationRegistration | None = None
+    station_point_grasp_registration: StationBoundPointGraspRegistration | None = None
+    station_point_grasp_render_registration: (
+        StationBoundPointGraspRenderRegistration | None
+    ) = None
 
     def __post_init__(self) -> None:
         validate_skill_route_catalog_closure(
@@ -563,9 +564,10 @@ class RealAgentPrimitiveContractBundle:
         self.payload_validators.validate_manifest(self.route_manifest)
         pose_target_enabled = self.pose_target_profile is not None
         expected_binding_count = 11 if pose_target_enabled else 10
-        if len(self.orientation_profiles) != 3 or len(
-            self.deployment_bindings
-        ) != expected_binding_count:
+        if (
+            len(self.orientation_profiles) != 3
+            or len(self.deployment_bindings) != expected_binding_count
+        ):
             raise ValueError(
                 "Real primitive bundle requires one generic cardinal, six "
                 "fixed-cardinal and three orientation bindings, plus exactly one "
@@ -629,8 +631,26 @@ class RealAgentPrimitiveContractBundle:
             raise ValueError("Real primitive profile frame bindings disagree.")
         if self.attachment.frame_graph_hash != self.frame_graph.semantic_content_hash:
             raise ValueError("Real primitive attachment frame graph mismatch.")
-        expected_route_count = (12 if pose_target_enabled else 11) + (
-            2 if self.perception_capture is not None else 0
+        optional_grasp = (
+            self.localization_registration,
+            self.station_point_grasp_registration,
+            self.station_point_grasp_render_registration,
+        )
+        if any(item is not None for item in optional_grasp) and not all(
+            item is not None for item in optional_grasp
+        ):
+            raise ValueError(
+                "Real localization, point-grasp, and render registrations must coexist."
+            )
+        if (
+            all(item is not None for item in optional_grasp)
+            and self.perception_capture is None
+        ):
+            raise ValueError("Real point-grasp Routes require perception capture.")
+        expected_route_count = (
+            (12 if pose_target_enabled else 11)
+            + (2 if self.perception_capture is not None else 0)
+            + (3 if self.localization_registration is not None else 0)
         )
         if len(self.route_manifest.skill_routes) != expected_route_count:
             raise ValueError("Real perception registration and manifest disagree.")
@@ -687,14 +707,14 @@ def _payload_validator(
             }
             if pose_target
             else {
-            "component_id",
-            "reference_frame_id",
-            "reference_frame_spec_hash",
-            "controlled_frame_id",
-            "frame_graph_hash",
-            "tool_config_hash",
-            "calibration_hash",
-            "primitive_hash",
+                "component_id",
+                "reference_frame_id",
+                "reference_frame_spec_hash",
+                "controlled_frame_id",
+                "frame_graph_hash",
+                "tool_config_hash",
+                "calibration_hash",
+                "primitive_hash",
             }
         )
     )
@@ -702,9 +722,7 @@ def _payload_validator(
     def validate_parameters(payload: Mapping[str, Any]) -> None:
         payload_fields = set(payload) if isinstance(payload, Mapping) else set()
         allowed_parameter_fields = (
-            parameter_fields | {"speed_scale"}
-            if pose_target
-            else parameter_fields
+            parameter_fields | {"speed_scale"} if pose_target else parameter_fields
         )
         if (
             not isinstance(payload, Mapping)
@@ -716,9 +734,7 @@ def _payload_validator(
                 "cardinal_tcp_step"
                 if cardinal
                 else (
-                    "tcp_pose_target"
-                    if pose_target
-                    else "fixed_level_tcp_orientation"
+                    "tcp_pose_target" if pose_target else "fixed_level_tcp_orientation"
                 )
             ),
             "parameters": payload,
@@ -743,9 +759,7 @@ def _payload_validator(
         }
         if not pose_target:
             exact["component_id"] = profile.component_id
-            exact[
-                "primitive_catalog_hash" if cardinal else "primitive_hash"
-            ] = (
+            exact["primitive_catalog_hash" if cardinal else "primitive_hash"] = (
                 profile.primitive_catalog_hash
                 if cardinal
                 else profile.primitive.semantic_content_hash
@@ -805,11 +819,7 @@ def _payload_validator(
         validator_id=(
             "payload-validator:real-agent-primitive:"
             + profile.semantic_content_hash
-            + (
-                ""
-                if fixed_cardinal_direction is None
-                else ":" + route.skill_id
-            )
+            + ("" if fixed_cardinal_direction is None else ":" + route.skill_id)
         ),
         skill_id=route.skill_id,
         skill_version=route.skill_version,
@@ -833,6 +843,11 @@ def build_real_agent_primitive_contract_bundle(
     safety_envelope_refs: tuple[SkillDeploymentSafetyEnvelopeRef, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
+    localization_registration: RealObjectLocalizationRegistration | None = None,
+    station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
+    station_point_grasp_render_registration: (
+        StationBoundPointGraspRenderRegistration | None
+    ) = None,
 ) -> RealAgentPrimitiveContractBundle:
     """Build exact motion and optional passive Routes without runtime effects."""
 
@@ -866,15 +881,9 @@ def build_real_agent_primitive_contract_bundle(
         execution_frame = frame_graph.frame_by_id[port_config.execution_frame_id]
     except KeyError as exc:
         raise ValueError("Lower execution frame is absent from the graph.") from exc
-    if (
-        execution_frame.semantic_content_hash
-        != port_config.execution_frame_spec_hash
-    ):
+    if execution_frame.semantic_content_hash != port_config.execution_frame_spec_hash:
         raise ValueError("Motion-port execution-frame spec is not the graph member.")
-    if (
-        attachment.execution_reference_frame_id
-        != port_config.execution_frame_id
-    ):
+    if attachment.execution_reference_frame_id != port_config.execution_frame_id:
         raise ValueError("Real observation execution_frame_id mismatch.")
     if (
         attachment.execution_reference_frame_spec_hash
@@ -913,30 +922,25 @@ def build_real_agent_primitive_contract_bundle(
                 domain=REAL_AGENT_PUBLIC_TCP_POSE_SCHEMA_HASH_DOMAIN_V1,
             ),
             execution_reference_frame_id=port_config.execution_frame_id,
-            execution_reference_frame_spec_hash=(
-                port_config.execution_frame_spec_hash
-            ),
+            execution_reference_frame_spec_hash=(port_config.execution_frame_spec_hash),
         )
     elif attachment.reference_frame_id != primitive_frame.frame_id:
         raise ValueError(
             "Real observation public frame must be the primitive Station frame."
         )
-    elif (
-        attachment.reference_frame_spec_hash
-        != primitive_frame.semantic_content_hash
-    ):
+    elif attachment.reference_frame_spec_hash != primitive_frame.semantic_content_hash:
         raise ValueError("Real observation public Station-frame spec mismatch.")
     frame_graph.resolve(
         attachment.execution_reference_frame_id,
         attachment.reference_frame_id,
     )
 
-    if set(attachment.component_ids) != set(
-        port_config.component_id_by_side.values()
-    ):
+    if set(attachment.component_ids) != set(port_config.component_id_by_side.values()):
         raise ValueError("Observation and motion-port component sets disagree.")
     if len(attachment.component_ids) != 1:
-        raise ValueError("The v1 real primitive profile binds exactly one arm component.")
+        raise ValueError(
+            "The v1 real primitive profile binds exactly one arm component."
+        )
     component_id = attachment.component_ids[0]
     side = next(
         side
@@ -1115,8 +1119,7 @@ def build_real_agent_primitive_contract_bundle(
         max_operation_duration_ms=30_000,
     )
     pose_target_enabled = any(
-        REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 in ref.allowed_route_ids
-        for ref in refs
+        REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1 in ref.allowed_route_ids for ref in refs
     )
     fixed_cardinal_routes = tuple(
         route_for(
@@ -1159,7 +1162,9 @@ def build_real_agent_primitive_contract_bundle(
     if not pose_target_enabled:
         expected_route_ids.remove(REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1)
     if {route.route_id for route in all_routes} != expected_route_ids:
-        raise RuntimeError("Real motion Route construction and safety allowlist drifted.")
+        raise RuntimeError(
+            "Real motion Route construction and safety allowlist drifted."
+        )
     for route in all_routes:
         if not any(route.route_id in ref.allowed_route_ids for ref in refs):
             raise ValueError(
@@ -1265,11 +1270,35 @@ def build_real_agent_primitive_contract_bundle(
         for route in all_routes
     )
     binding_by_route_hash = {item.route_hash: item for item in bindings}
-    perception_registrations = (
+    optional_grasp = (
+        localization_registration,
+        station_point_grasp_registration,
+        station_point_grasp_render_registration,
+    )
+    if any(item is not None for item in optional_grasp) and not all(
+        item is not None for item in optional_grasp
+    ):
+        raise ValueError(
+            "Real localization, point-grasp, and render registrations must coexist."
+        )
+    if localization_registration is not None and perception_capture is None:
+        raise ValueError("Real point-grasp Routes require perception capture.")
+    perception_registrations = list(
         ()
         if perception_capture is None
         else (perception_capture.rgb, perception_capture.depth)
     )
+    if localization_registration is not None:
+        assert station_point_grasp_registration is not None
+        assert station_point_grasp_render_registration is not None
+        perception_registrations.extend(
+            (
+                localization_registration.skill,
+                station_point_grasp_registration.skill,
+                station_point_grasp_render_registration.skill,
+            )
+        )
+    perception_registrations = tuple(perception_registrations)
     tcp_pose_definition = tcp_pose_observe.definition_catalog.skill_definitions[0]
     tcp_pose_schema = tcp_pose_observe.schema_catalog.schema_entries[0]
     tcp_pose_entry = tcp_pose_observe.route_manifest.skill_routes[0]
@@ -1338,6 +1367,34 @@ def build_real_agent_primitive_contract_bundle(
                     ),
                 )
             )
+    if localization_registration is not None:
+        assert station_point_grasp_registration is not None
+        assert station_point_grasp_render_registration is not None
+        for registration, deployment_binding, availability_hash in (
+            (
+                localization_registration.skill,
+                localization_registration.binding,
+                localization_registration.availability_hash,
+            ),
+            (
+                station_point_grasp_registration.skill,
+                station_point_grasp_registration.binding,
+                station_point_grasp_registration.availability_hash,
+            ),
+            (
+                station_point_grasp_render_registration.skill,
+                station_point_grasp_render_registration.binding,
+                station_point_grasp_render_registration.availability_hash,
+            ),
+        ):
+            route_items.append(
+                SkillRouteManifestEntry(
+                    route=registration.routes[0],
+                    deployment_binding=deployment_binding.to_ref(),
+                    evaluation_plan_hash=None,
+                    availability_hash=availability_hash,
+                )
+            )
     artifact_contract_by_skill = {
         (item.definition.skill_id, item.definition.skill_version): item.io_contract
         for item in perception_registrations
@@ -1402,9 +1459,7 @@ def build_real_agent_primitive_contract_bundle(
             + attachment.runtime_session_id
         ),
         validators=(
-            tcp_pose_observe.payload_validators.validator_for(
-                tcp_pose_entry.route
-            ),
+            tcp_pose_observe.payload_validators.validator_for(tcp_pose_entry.route),
             *(
                 (
                     _payload_validator(
@@ -1421,9 +1476,7 @@ def build_real_agent_primitive_contract_bundle(
                     route=route,
                     profile=cardinal_profile,
                     fixed_cardinal_direction=(
-                        FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[
-                            route.skill_id
-                        ]
+                        FIXED_CARDINAL_TCP_STEP_DIRECTION_BY_SKILL_ID_V1[route.skill_id]
                     ),
                 )
                 for route in fixed_cardinal_routes
@@ -1440,6 +1493,15 @@ def build_real_agent_primitive_contract_bundle(
                 ()
                 if perception_capture is None
                 else perception_capture.payload_validators
+            ),
+            *(
+                ()
+                if localization_registration is None
+                else (
+                    localization_registration.payload_validator,
+                    station_point_grasp_registration.payload_validator,
+                    station_point_grasp_render_registration.payload_validator,
+                )
             ),
         ),
     )
@@ -1458,6 +1520,11 @@ def build_real_agent_primitive_contract_bundle(
         attachment=attachment,
         tcp_pose_observe=tcp_pose_observe,
         perception_capture=perception_capture,
+        localization_registration=localization_registration,
+        station_point_grasp_registration=station_point_grasp_registration,
+        station_point_grasp_render_registration=(
+            station_point_grasp_render_registration
+        ),
     )
 
 

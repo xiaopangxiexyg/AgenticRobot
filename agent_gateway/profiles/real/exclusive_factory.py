@@ -18,13 +18,11 @@ from robot_motion.coordinate_frames import CoordinateFrameGraph
 from robot_motion.runtime import TeleopCommand, TeleopObservation
 from teleop_runtime.skill_deploy.control_runtime import (
     ExclusiveRealSkillControlRuntime,
+    RealSkillMeasuredQposObserver,
     RealSkillMotionDispatchReceipt,
     RealSkillMotionHoldReceipt,
     RealSkillMotionObservationCut,
     RealSkillMotionTargetSynchronizer,
-)
-from teleop_runtime.skill_deploy.rm65_ports import (
-    ExclusiveRM65SkillDeployPorts,
 )
 from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionOwnerIdentity,
@@ -32,7 +30,12 @@ from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPortConfig,
     RealAgentMotionTargetBuilder,
 )
+from teleop_runtime.skill_deploy.rm65_ports import (
+    ExclusiveRM65SkillDeployPorts,
+)
 
+from .localization_deployment import RealObjectLocalizationRegistration
+from .localization_gateway import ObjectLocalizationProvider
 from .motion_gateway_session import (
     RealAgentPrimitiveGatewaySession,
     assemble_real_agent_primitive_gateway_session,
@@ -47,6 +50,10 @@ from .observation_gateway import (
 )
 from .perception_deployment import RealPerceptionCaptureRegistration
 from .realsense_perception import RealSenseAgentPerceptionProvider
+from .station_point_grasp_deployment import StationBoundPointGraspRegistration
+from .station_point_grasp_render_deployment import (
+    StationBoundPointGraspRenderRegistration,
+)
 
 
 @dataclass(frozen=True)
@@ -128,8 +135,16 @@ def assemble_exclusive_real_agent_primitive_deployment(
     command_admission: Callable[[TeleopCommand, TeleopObservation, float], bool],
     command_dispatch: Callable[[TeleopCommand], RealSkillMotionDispatchReceipt],
     hold_controller: Callable[[str], RealSkillMotionHoldReceipt],
+    measured_qpos_observer: RealSkillMeasuredQposObserver | None = None,
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
+    localization_registration: RealObjectLocalizationRegistration | None = None,
+    localization_provider: ObjectLocalizationProvider | None = None,
+    station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
+    station_point_grasp_render_registration: (
+        StationBoundPointGraspRenderRegistration | None
+    ) = None,
+    station_point_grasp_planner: object | None = None,
     perception_provider_factory: (
         Callable[
             [RealAgentMotionPort, Callable[[], int]],
@@ -153,6 +168,11 @@ def assemble_exclusive_real_agent_primitive_deployment(
         safety_envelope_refs=safety_envelope_refs,
         convergence_profile=convergence_profile,
         perception_capture=perception_capture,
+        localization_registration=localization_registration,
+        station_point_grasp_registration=station_point_grasp_registration,
+        station_point_grasp_render_registration=(
+            station_point_grasp_render_registration
+        ),
     )
     port = RealAgentMotionPort(
         config=port_config,
@@ -175,6 +195,7 @@ def assemble_exclusive_real_agent_primitive_deployment(
         command_admission=command_admission,
         command_dispatch=command_dispatch,
         hold_controller=hold_controller,
+        measured_qpos_observer=measured_qpos_observer,
         clock=clock,
     )
     gateway = assemble_real_agent_primitive_gateway_session(
@@ -184,6 +205,8 @@ def assemble_exclusive_real_agent_primitive_deployment(
         allowed_client_ids=allowed_client_ids,
         max_retained_operations=max_retained_operations,
         perception_provider=perception_provider,
+        localization_provider=localization_provider,
+        station_point_grasp_planner=station_point_grasp_planner,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
         revision_tracker=revision_tracker,
@@ -208,6 +231,13 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
     allowed_client_ids: tuple[str, ...],
     convergence_profile: RealAgentPrimitiveConvergenceProfile | None = None,
     perception_capture: RealPerceptionCaptureRegistration | None = None,
+    localization_registration: RealObjectLocalizationRegistration | None = None,
+    localization_provider: ObjectLocalizationProvider | None = None,
+    station_point_grasp_registration: StationBoundPointGraspRegistration | None = None,
+    station_point_grasp_render_registration: (
+        StationBoundPointGraspRenderRegistration | None
+    ) = None,
+    station_point_grasp_planner: object | None = None,
     perception_provider_factory: (
         Callable[
             [RealAgentMotionPort, Callable[[], int]],
@@ -215,6 +245,7 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         ]
         | None
     ) = None,
+    measured_qpos_observer: RealSkillMeasuredQposObserver | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     max_retained_operations: int = 16,
@@ -242,8 +273,16 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
         command_admission=rm65_ports.admit_command,
         command_dispatch=rm65_ports.dispatch,
         hold_controller=rm65_ports.hold,
+        measured_qpos_observer=measured_qpos_observer,
         convergence_profile=convergence_profile,
         perception_capture=perception_capture,
+        localization_registration=localization_registration,
+        localization_provider=localization_provider,
+        station_point_grasp_registration=station_point_grasp_registration,
+        station_point_grasp_render_registration=(
+            station_point_grasp_render_registration
+        ),
+        station_point_grasp_planner=station_point_grasp_planner,
         perception_provider_factory=perception_provider_factory,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
@@ -255,6 +294,6 @@ def assemble_exclusive_rm65_agent_primitive_deployment(
 
 __all__ = [
     "ExclusiveRealAgentPrimitiveDeployment",
-    "assemble_exclusive_rm65_agent_primitive_deployment",
     "assemble_exclusive_real_agent_primitive_deployment",
+    "assemble_exclusive_rm65_agent_primitive_deployment",
 ]

@@ -85,9 +85,7 @@ def test_cli_rejects_retired_one_shot_confirmation_before_hardware_resolution(
     )
 
     with pytest.raises(SystemExit):
-        gateway_cli.main(
-            _argv(confirmation="AUTHORIZE_ONE_REAL_TCP_PRIMITIVE")
-        )
+        gateway_cli.main(_argv(confirmation="AUTHORIZE_ONE_REAL_TCP_PRIMITIVE"))
 
     assert called is False
 
@@ -124,6 +122,40 @@ def test_cli_accepts_a_list_of_reviewed_actions_for_persistent_session() -> None
         "level_forward_right_30",
     )
     assert not hasattr(parsed, "calibration_profile")
+
+
+def test_cli_defaults_to_the_detailed_v4_camera_mount_urdf() -> None:
+    parsed = gateway_cli.build_parser().parse_args(
+        [
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-point-grasp",
+        ]
+    )
+    effective = gateway_cli._effective_camera_mount_urdf(parsed)
+
+    assert effective == gateway_cli.DEFAULT_RM65_CAMERA_MOUNT_URDF
+    assert effective.name == (
+        "rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf"
+    )
+
+
+def test_point_grasp_defaults_to_v4_registry_without_changing_camera_only() -> None:
+    parser = gateway_cli.build_parser()
+    camera_only = parser.parse_args(
+        _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    )
+    point_grasp = parser.parse_args(
+        [
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-point-grasp",
+        ]
+    )
+
+    assert gateway_cli._effective_camera_registry(camera_only) is None
+    assert (
+        gateway_cli._effective_camera_registry(point_grasp)
+        == gateway_cli.DEFAULT_RM65_CAMERA_REGISTRY_V4
+    )
 
 
 def test_cli_accepts_distinct_repeatable_ssh_read_only_identities() -> None:
@@ -168,6 +200,64 @@ def test_cli_rejects_partial_perception_attachment_before_profile_resolution(
                 REPO_ROOT
                 / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
             ),
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        gateway_cli.main(argv)
+
+    assert called is False
+
+
+def test_cli_rejects_point_grasp_bundle_without_opt_in_before_profile_resolution(
+    monkeypatch,
+) -> None:
+    called = False
+
+    def should_not_resolve(profile):
+        nonlocal called
+        called = True
+        raise AssertionError("point-grasp flags must fail before profile resolution")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        should_not_resolve,
+    )
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    argv.extend(
+        [
+            "--point-grasp-asset-bundle",
+            str(REPO_ROOT),
+        ]
+    )
+
+    with pytest.raises(SystemExit):
+        gateway_cli.main(argv)
+
+    assert called is False
+
+
+def test_cli_rejects_camera_mount_urdf_without_point_grasp_opt_in(
+    monkeypatch,
+) -> None:
+    called = False
+
+    def should_not_resolve(profile):
+        nonlocal called
+        called = True
+        raise AssertionError("camera mount must fail before profile resolution")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        should_not_resolve,
+    )
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    argv.extend(
+        [
+            "--camera-mount-urdf",
+            str(gateway_cli.DEFAULT_RM65_CAMERA_MOUNT_URDF),
         ]
     )
 
@@ -322,14 +412,9 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         "gateway_ready",
         "gateway_stopped",
     ]
-    assert (
-        events[0]["authorization_scope"]
-        == "persistent_session_matching_action"
-    )
+    assert events[0]["authorization_scope"] == "persistent_session_matching_action"
     assert events[1]["lower_hold_proved"] is True
     assert captured["lower"] is lower
     assert captured["authorized_side"] == "right"
     assert captured["authorized_action"] == "forward"
-    assert captured["ssh_read_only_client_id_by_uid"] == {
-        1101: "rpent.remote.alice"
-    }
+    assert captured["ssh_read_only_client_id_by_uid"] == {1101: "rpent.remote.alice"}

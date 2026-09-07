@@ -40,6 +40,11 @@ from .exclusive_factory import (
     ExclusiveRealAgentPrimitiveDeployment,
     assemble_exclusive_rm65_agent_primitive_deployment,
 )
+from .localization_deployment import (
+    RealObjectLocalizationRegistration,
+    build_real_object_localization_registration,
+)
+from .localization_gateway import ObjectLocalizationProvider
 from .motion_primitive_profiles import (
     real_agent_motion_route_ids_v1,
 )
@@ -64,6 +69,18 @@ from .realsense_perception import (
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
     build_real_perception_source_binding,
+)
+from .rm65_camera_geometry import (
+    RM65RgbCameraGeometry,
+    build_rm65_rgb_camera_geometry,
+)
+from .station_point_grasp_deployment import (
+    StationBoundPointGraspRegistration,
+    build_station_bound_point_grasp_registration,
+)
+from .station_point_grasp_render_deployment import (
+    StationBoundPointGraspRenderRegistration,
+    build_station_bound_point_grasp_render_registration,
 )
 
 RM65_SKILL_EXECUTION_FRAME_ID_V1 = RM65_SKILL_SCENE_WORLD_FRAME_ID_V1
@@ -115,6 +132,14 @@ class ExclusiveRM65AgentPrimitiveComposition:
     perception_source_binding: RealPerceptionSourceBinding | None
     perception_frame_binding: RealPerceptionFrameBinding | None
     perception_capture: RealPerceptionCaptureRegistration | None
+    rgb_camera_geometry: RM65RgbCameraGeometry | None
+    localization_registration: RealObjectLocalizationRegistration | None
+    localization_provider: ObjectLocalizationProvider | None
+    station_point_grasp_registration: StationBoundPointGraspRegistration | None
+    station_point_grasp_render_registration: (
+        StationBoundPointGraspRenderRegistration | None
+    )
+    point_grasp_planner: object | None
     socket_path: Path
     authorized_side: str
     authorized_action: str | None
@@ -138,16 +163,48 @@ class ExclusiveRM65AgentPrimitiveComposition:
         if self.perception_capture is None:
             if self.resources is not self.lower.ports:
                 raise ValueError("motion-only composition must own lower resources.")
-            if self.perception_source_binding is not None or self.perception_frame_binding is not None:
-                raise ValueError("motion-only composition cannot retain perception bindings.")
+            if (
+                self.perception_source_binding is not None
+                or self.perception_frame_binding is not None
+            ):
+                raise ValueError(
+                    "motion-only composition cannot retain perception bindings."
+                )
+            if any(
+                item is not None
+                for item in (
+                    self.rgb_camera_geometry,
+                    self.localization_registration,
+                    self.localization_provider,
+                    self.station_point_grasp_registration,
+                    self.station_point_grasp_render_registration,
+                    self.point_grasp_planner,
+                )
+            ):
+                raise ValueError(
+                    "motion-only composition cannot retain grasp resources."
+                )
         elif not isinstance(self.resources, ExclusiveRealPerceptionResources):
             raise ValueError("perception composition requires aggregate resources.")
         elif (
             self.perception_source_binding is None
             or self.perception_frame_binding is None
-            or self.perception_capture.frame_binding is not self.perception_frame_binding
+            or self.perception_capture.frame_binding
+            is not self.perception_frame_binding
         ):
             raise ValueError("perception composition requires one exact frame binding.")
+        grasp_items = (
+            self.rgb_camera_geometry,
+            self.localization_registration,
+            self.localization_provider,
+            self.station_point_grasp_registration,
+            self.station_point_grasp_render_registration,
+            self.point_grasp_planner,
+        )
+        if any(item is not None for item in grasp_items) and not all(
+            item is not None for item in grasp_items
+        ):
+            raise ValueError("RM65 point-grasp resources must be assembled together.")
         if self.application.startup_admission is not self.lower.startup_admission:
             raise ValueError("application must use the exact lower startup gate.")
 
@@ -172,6 +229,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     camera_config_path: str | Path | None = None,
     camera_registry_path: str | Path | None = None,
     artifact_root: str | Path | None = None,
+    camera_mount_urdf_path: str | Path | None = None,
+    object_localizer: object | None = None,
+    point_grasp_planner: object | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> ExclusiveRM65AgentPrimitiveComposition:
@@ -192,7 +252,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 "authorized_action and authorized_actions are mutually exclusive."
             )
         requested_actions = tuple(authorized_actions)
-    normalized_actions = tuple(sorted({str(item).strip() for item in requested_actions}))
+    normalized_actions = tuple(
+        sorted({str(item).strip() for item in requested_actions})
+    )
     if not normalized_actions or any(
         item not in REAL_AGENT_PRIMITIVE_ACTIONS for item in normalized_actions
     ):
@@ -241,6 +303,23 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "camera_config_path, camera_registry_path, and artifact_root must be "
             "provided together."
         )
+    grasp_enabled = point_grasp_planner is not None
+    if (object_localizer is None) != (point_grasp_planner is None):
+        raise ValueError(
+            "object_localizer and point_grasp_planner must be supplied together."
+        )
+    if grasp_enabled and not perception_enabled:
+        raise ValueError("Point-grasp requires the composed camera resources.")
+    if grasp_enabled != (camera_mount_urdf_path is not None):
+        raise ValueError(
+            "Point-grasp three-view rendering requires one explicit camera mount URDF."
+        )
+    if (
+        grasp_enabled
+        and getattr(point_grasp_planner, "point_segmenter", None)
+        is not object_localizer
+    ):
+        raise ValueError("Point-grasp must share the exact object-localizer instance.")
 
     envelope_profile = lower.target_safety.envelope_profile
     side_envelope = envelope_profile.side_config_by_side.get(side)
@@ -264,9 +343,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "tcp_pose_flange_m_rad_by_side": {
                 name: tuple(
                     float(value)
-                    for value in profile.tool_tcp_pose_flange_m_rad_by_side[
-                        name
-                    ]
+                    for value in profile.tool_tcp_pose_flange_m_rad_by_side[name]
                 )
                 for name in ("left", "right")
             },
@@ -304,9 +381,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     station_frame_binding = build_real_perception_station_frame_binding(
         collision_scene_profile=profile.collision_scene_profile,
         scene_mount_hash=scene_mount_hash,
-        scene_world_from_canonical_station=(
-            profile.scene_world_from_canonical_station
-        ),
+        scene_world_from_canonical_station=(profile.scene_world_from_canonical_station),
     )
     frame_graph = station_frame_binding.frame_graph
     execution_frame = frame_graph.frame_by_id[RM65_SKILL_EXECUTION_FRAME_ID_V1]
@@ -394,7 +469,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     )
     maximum_age_ms = min(
         200,
-        max(1, int(round(lower.ports.profile.max_measurement_age_sec * 1000.0))),
+        max(1, round(lower.ports.profile.max_measurement_age_sec * 1000.0)),
     )
     attachment = RealTcpPoseObserveAttachmentSpec(
         runtime_session_id=runtime_id,
@@ -451,6 +526,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     perception_source_binding = None
     perception_frame_binding = None
     perception_capture = None
+    rgb_camera_geometry = None
+    localization_registration = None
+    localization_provider = None
+    station_point_grasp_registration = None
+    station_point_grasp_render_registration = None
     artifact_store = None
     provider_factory = None
     resources: object = lower.ports
@@ -469,9 +549,24 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             ),
         )
         perception_frame_binding = station_frame_binding
+        if grasp_enabled:
+            assert camera_mount_urdf_path is not None
+            rgb_camera_geometry = build_rm65_rgb_camera_geometry(
+                source_binding=perception_source_binding,
+                target_builder=lower.target_builder,
+                camera_registry_path=camera_registry_path,
+                camera_mount_urdf_path=camera_mount_urdf_path,
+                scene_world_from_arm_base_by_side=(
+                    lower.profile.scene_world_from_arm_base_by_side
+                ),
+                scene_world_from_canonical_station=(
+                    lower.profile.scene_world_from_canonical_station
+                ),
+            )
         catalog_provider = RealSenseAgentPerceptionProvider(
             source_binding=perception_source_binding,
             current_station_revision=lambda: 0,
+            rgb_camera_geometry=rgb_camera_geometry,
         )
         perception_capture = build_real_perception_capture_registration_v2(
             rgb_source_catalog=catalog_provider.rgb_source_catalog(),
@@ -484,6 +579,103 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             source_binding_hash=perception_source_binding.semantic_content_hash,
             frame_binding=perception_frame_binding,
         )
+        if grasp_enabled:
+            assert object_localizer is not None
+            assert point_grasp_planner is not None
+            assert rgb_camera_geometry is not None
+            localization_spec = getattr(object_localizer, "model_spec", None)
+            localization_model_id = str(
+                getattr(localization_spec, "model_profile_id", "")
+            ).strip()
+            localization_model_hash = str(
+                getattr(localization_spec, "semantic_content_hash", "")
+            ).strip()
+            localizer_hash = str(
+                getattr(object_localizer, "semantic_content_hash", "")
+            ).strip()
+            planner_spec = getattr(point_grasp_planner, "model_spec", None)
+            planner_model_id = str(
+                getattr(planner_spec, "model_profile_id", "")
+            ).strip()
+            planner_model_hash = str(
+                getattr(planner_spec, "semantic_content_hash", "")
+            ).strip()
+            planner_hash = str(
+                getattr(point_grasp_planner, "semantic_content_hash", "")
+            ).strip()
+            backend_id = str(getattr(point_grasp_planner, "backend_id", "")).strip()
+            if not all(
+                (
+                    localization_model_id,
+                    localization_model_hash,
+                    localizer_hash,
+                    planner_model_id,
+                    planner_model_hash,
+                    planner_hash,
+                    backend_id,
+                )
+            ):
+                raise ValueError("Point-grasp models lack verified profile identity.")
+            localization_registration = build_real_object_localization_registration(
+                model_profile_id=localization_model_id,
+                model_profile_hash=localization_model_hash,
+                inference_implementation_hash=localizer_hash,
+                local_path_enabled=False,
+                runtime_session_id=runtime_id,
+                control_domain_id=domain_id,
+                target_binding_id=target_binding_id,
+                station_manifest_hash=station_manifest_hash,
+                execution_manifest_hash=execution_manifest_hash,
+                current_mode="real_active",
+            )
+            localization_provider = ObjectLocalizationProvider(
+                localizer=object_localizer,
+                registration=localization_registration,
+                allowed_local_image_roots=(),
+            )
+            station_point_grasp_registration = (
+                build_station_bound_point_grasp_registration(
+                    aligned_rgbd_source_catalog=tuple(
+                        dict(item)
+                        for item in catalog_provider.aligned_rgbd_source_catalog()
+                    ),
+                    source_binding_hash=(
+                        perception_source_binding.semantic_content_hash
+                    ),
+                    frame_binding_hash=perception_frame_binding.semantic_content_hash,
+                    frame_graph_hash=frame_graph.semantic_content_hash,
+                    source_frame_id=perception_frame_binding.source_frame_id,
+                    source_frame_spec_hash=(
+                        perception_frame_binding.source_frame_spec_hash
+                    ),
+                    reference_frame_id=perception_frame_binding.reference_frame_id,
+                    reference_frame_spec_hash=(
+                        perception_frame_binding.reference_frame_spec_hash
+                    ),
+                    backend_id=backend_id,
+                    model_profile_id=planner_model_id,
+                    model_profile_hash=planner_model_hash,
+                    inference_implementation_hash=planner_hash,
+                    runtime_session_id=runtime_id,
+                    control_domain_id=domain_id,
+                    target_binding_id=target_binding_id,
+                    station_manifest_hash=station_manifest_hash,
+                    execution_manifest_hash=execution_manifest_hash,
+                    current_mode="real_active",
+                )
+            )
+            station_point_grasp_render_registration = (
+                build_station_bound_point_grasp_render_registration(
+                    point_grasp_registration=station_point_grasp_registration,
+                    render_rgb_source_catalog=tuple(
+                        dict(item)
+                        for item in catalog_provider.rgb_geometry_source_catalog()
+                    ),
+                    camera_geometry_binding_hash=(
+                        rgb_camera_geometry.semantic_content_hash
+                    ),
+                )
+            )
         partition = _hash(
             {"runtime_session_id": runtime_id},
             domain="dexteleop.agent_gateway.artifact_store_partition.v1",
@@ -504,14 +696,23 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                 max_inter_camera_skew_ms=(
                     perception_capture.profile.max_inter_camera_skew_ms
                 ),
+                rgb_camera_geometry=rgb_camera_geometry,
                 clock=clock,
             )
 
-        resources = ExclusiveRealPerceptionResources(
-            lower=lower.ports,
-            camera_sources=perception_source_binding.camera_sources,
-            artifact_store=artifact_store,
+    def measured_qpos_observer(cut, *, derived_available_at):
+        if rgb_camera_geometry is None:
+            return
+        rgb_camera_geometry.publish_measured_qpos(
+            qpos_by_side=cut.qpos_by_side,
+            measured_at=cut.measured_at,
+            # FK is derived only after this control cycle has consumed and
+            # synchronized the lower qpos cut.  It cannot inherit the earlier
+            # source availability timestamp.
+            available_at=derived_available_at,
+            evidence_refs=cut.evidence_refs,
         )
+
     try:
         deployment = assemble_exclusive_rm65_agent_primitive_deployment(
             target_builder=lower.target_builder,
@@ -523,9 +724,21 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             safety_envelope_refs=(envelope_ref,),
             allowed_client_ids=client_bindings.allowed_client_ids,
             perception_capture=perception_capture,
+            localization_registration=localization_registration,
+            localization_provider=localization_provider,
+            station_point_grasp_registration=station_point_grasp_registration,
+            station_point_grasp_render_registration=(
+                station_point_grasp_render_registration
+            ),
+            station_point_grasp_planner=point_grasp_planner,
             perception_provider_factory=provider_factory,
+            measured_qpos_observer=(
+                measured_qpos_observer if rgb_camera_geometry is not None else None
+            ),
             artifact_store=artifact_store,
-            owns_artifact_store=artifact_store is not None,
+            # The aggregate application resource closes the shared store after
+            # Gateway executors/models and cameras have settled.
+            owns_artifact_store=False,
             max_retained_operations=max_retained_operations,
             clock=clock,
             sleep=sleep,
@@ -534,6 +747,21 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         if artifact_store is not None:
             artifact_store.close()
         raise
+    if perception_source_binding is not None:
+        additional_resources = tuple(
+            resource
+            for resource in (
+                localization_provider,
+                deployment.gateway_session.station_point_grasp_provider,
+            )
+            if resource is not None
+        )
+        resources = ExclusiveRealPerceptionResources(
+            lower=lower.ports,
+            camera_sources=perception_source_binding.camera_sources,
+            artifact_store=artifact_store,
+            additional_resources=additional_resources,
+        )
     authorization = RealAgentPrimitiveOneShotAuthorization(
         gateway_session=deployment.gateway_session,
         side=side,
@@ -576,6 +804,14 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         perception_source_binding=perception_source_binding,
         perception_frame_binding=perception_frame_binding,
         perception_capture=perception_capture,
+        rgb_camera_geometry=rgb_camera_geometry,
+        localization_registration=localization_registration,
+        localization_provider=localization_provider,
+        station_point_grasp_registration=station_point_grasp_registration,
+        station_point_grasp_render_registration=(
+            station_point_grasp_render_registration
+        ),
+        point_grasp_planner=point_grasp_planner,
         socket_path=endpoint,
         authorized_side=side,
         authorized_action=authorization.action,
@@ -588,9 +824,9 @@ def assemble_exclusive_rm65_agent_primitive_composition(
 
 
 __all__ = [
-    "ExclusiveRM65AgentPrimitiveComposition",
     "RM65_SKILL_CLOCK_DOMAIN_ID_V1",
     "RM65_SKILL_EXECUTION_FRAME_ID_V1",
     "RM65_SKILL_STATION_FRAME_ID_V1",
+    "ExclusiveRM65AgentPrimitiveComposition",
     "assemble_exclusive_rm65_agent_primitive_composition",
 ]

@@ -184,6 +184,7 @@ def build_real_object_localization_registration(
     target_binding_id: str,
     station_manifest_hash: str,
     execution_manifest_hash: str,
+    current_mode: str = "real_observe",
 ) -> RealObjectLocalizationRegistration:
     """Build one closed read-only localization registration."""
 
@@ -243,6 +244,8 @@ def build_real_object_localization_registration(
             ),
         ),
     )
+    if current_mode not in {"real_observe", "real_active"}:
+        raise ValueError("localization current_mode is unsupported")
     route = SkillExecutionRoute(
         skill_id=definition.skill_id,
         skill_version=definition.skill_version,
@@ -255,7 +258,7 @@ def build_real_object_localization_registration(
         allowed_parameter_profiles=schema.parameter_profiles,
         control_effect_class="read_only",
         privilege_tier="t0_read_only",
-        supported_modes=("real_observe",),
+        supported_modes=(current_mode,),
         target_kind="real",
         may_move_robot=False,
         may_open_publication=False,

@@ -64,6 +64,17 @@ class RealSkillMotionTargetSynchronizer(Protocol):
     ) -> None: ...
 
 
+class RealSkillMeasuredQposObserver(Protocol):
+    """Passive projection invoked by the sole lower control-cycle owner."""
+
+    def __call__(
+        self,
+        cut: RealSkillMotionObservationCut,
+        *,
+        derived_available_at: float,
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class RealSkillMotionObservationCut:
     """One already-read lower observation and its exact dual-arm qpos cut."""
@@ -177,6 +188,7 @@ class ExclusiveRealSkillControlRuntime:
         motion_port: RealAgentMotionPort,
         observation_provider: Callable[[], RealSkillMotionObservationCut],
         synchronize_target_builder: RealSkillMotionTargetSynchronizer,
+        measured_qpos_observer: RealSkillMeasuredQposObserver | None = None,
         command_admission: Callable[[TeleopCommand, TeleopObservation, float], bool],
         command_dispatch: Callable[[TeleopCommand], RealSkillMotionDispatchReceipt],
         hold_controller: Callable[[str], RealSkillMotionHoldReceipt],
@@ -199,6 +211,9 @@ class ExclusiveRealSkillControlRuntime:
         self.motion_port = motion_port
         self._observation_provider = observation_provider
         self._synchronize_target_builder = synchronize_target_builder
+        if measured_qpos_observer is not None and not callable(measured_qpos_observer):
+            raise TypeError("measured_qpos_observer must be callable or None.")
+        self._measured_qpos_observer = measured_qpos_observer
         self._command_admission = command_admission
         self._command_dispatch = command_dispatch
         self._hold_controller = hold_controller
@@ -238,9 +253,7 @@ class ExclusiveRealSkillControlRuntime:
         return "hold", "hold"
 
     def hold_skill_motion(self, reason: str) -> bool:
-        receipt = self._hold_controller(
-            _required(reason, field_name="hold_reason")
-        )
+        receipt = self._hold_controller(_required(reason, field_name="hold_reason"))
         if not isinstance(receipt, RealSkillMotionHoldReceipt):
             raise TypeError("hold_controller must return RealSkillMotionHoldReceipt.")
         with self._lock:
@@ -304,6 +317,11 @@ class ExclusiveRealSkillControlRuntime:
             available_at=control_cut_at,
             source_evidence_refs=cut.evidence_refs,
         )
+        if self._measured_qpos_observer is not None:
+            self._measured_qpos_observer(
+                cut,
+                derived_available_at=control_cut_at,
+            )
         self._resume_confirmed_hold_for_pending_activation()
         snapshot = self.motion_port.apply_control_owner_requests(
             owner=self,

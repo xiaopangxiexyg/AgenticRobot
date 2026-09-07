@@ -201,12 +201,28 @@ safety envelope、IK/碰撞/奇异性、dispatch、收敛和 HOLD 门禁。
 可信外参和 color-aligned depth 的角色。未知/已淘汰 operation、该结果中不存在的 ordinal、不同
 Station revision 或未注册角色都会 fail closed。
 
-每次调用重新读取指定视角的一帧 aligned RGB-D，只把一个候选投影到 RGB 上，并返回一个
+camera-only profile 每次调用重新读取指定视角的一帧 aligned RGB-D，只把一个候选投影到 RGB 上，并返回一个
 `rendered_grasp_candidate` JPEG Artifact。结果中的 source operation/result/candidate hash、两次
 capture group、相机/Station frame identity 和三个齐次矩阵共同闭合来源与投影视角；同时保留
 `frames[0]` 的 role、尺寸、媒体类型和内容 hash，供上层按需取得 Artifact。矩阵是只读输出证据，
 不是 RPent 需要解释或回传的规划输入。该渲染仍只做几何投影，`depth_occlusion_tested=false`，
 不新增选择权、运动权、IK、夹爪或任何下游控制效果。
+
+`real-rm65` 的显式 `--enable-point-grasp` 组合扩展了同一个契约，但不会伪造腕部静态外参。该组合
+在启动前要求并交叉校验 camera registry、Station/双臂 base 链和一个包含三相机安装链的 URDF；
+主相机使用该 URDF 中的固定链，两个腕部相机位姿只由唯一 lower control cycle 消费的新鲜双臂
+measured qpos 和既有 coupled FK owner 发布。render 请求只读取已经发布的不可变 pose cut，调用方
+不能注入相机位姿。默认 mount URDF 为：
+
+```text
+assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf
+```
+
+本流程使用 `robot_motion/configs/rm65_camera_registry_v4.json`：它登记 v4 主相机标定和上述详细
+URDF placement，同时保留现场已验证的左右腕相机 serial 绑定。组合成功时 render 的可选角色严格为
+`main`、`wrist_left`、`wrist_right`；腕部 pose 缺失、过期、晚于当前时刻或与图像采集时间偏差过大
+都会 fail closed。启动这个组合会连接双 RM65 并建立 startup HOLD，因此不能把它当作 camera-only
+验收入口；离线测试也不构成真机坐标或运动验收。
 
 原有 `perception.plan_point_grasp@1` 与上文离线 CLI 保持兼容：它允许调用方提供本地 RGB-D、内参和
 标定，因此其 `base` 输出不能被称为 deployment-trusted Station pose，也不会由生产
@@ -275,9 +291,9 @@ planner semantic content hash。
 `right_wrist` 三视角；`front` 使用场景固定相机，两个腕部验证视图保留各自相机原点，
 但使用明确标记为 `visualization_only_look_at_override_from_wrist_origin` 的 MuJoCo free camera
 朝向方块，并从实际 GL camera 反算投影外参。这不是生产腕部标定，也没有修改 URDF 或相机
-registry。生产 Skill 只广告当前部署已经具备可信 aligned RGB-D 和相机 pose 的角色；因此典型
-静态配置当前只包含 `main`。未来腕部相机在同一 deployment binding 中补齐动态 pose 和 aligned
-depth 后，`wrist_left`/`wrist_right` 才会自动进入可选 `view_role`，不能仅靠调用方字符串启用。
+registry。生产 Skill 只广告当前部署已经具备可信 RGB 和相机 pose 的角色。camera-only profile
+仍只有具备静态外参和 aligned depth 的 `main`；组合 `real-rm65` 则由同一 lower owner 提供两个腕部
+的动态 FK pose，因此可额外广告 `wrist_left`/`wrist_right`。任何角色都不能仅靠调用方字符串启用。
 
 ## 已知局限
 

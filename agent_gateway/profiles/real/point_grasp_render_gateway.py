@@ -170,7 +170,7 @@ class StationBoundPointGraspRenderProvider:
             ordinal=ordinal,
             expected_station_revision=expected_revision,
         )
-        capture = self.perception_provider.capture_aligned_rgbd(
+        capture = self.perception_provider.capture_rgb_geometry(
             role=view_role,
             expected_station_revision=expected_revision,
         )
@@ -239,7 +239,11 @@ class StationBoundPointGraspRenderProvider:
             "view_frame_index": capture.frame_index,
             "view_capture_group_id": capture.capture_group_id,
             "view_rgb_content_hash": capture.rgb_content_hash,
-            "view_depth_content_hash": capture.depth_content_hash,
+            "view_geometry_binding_hash": capture.geometry_binding_hash,
+            "view_geometry_cut_hash": capture.geometry_cut_hash,
+            "view_pose_measured_at": capture.pose_measured_at,
+            "view_pose_available_at": capture.pose_available_at,
+            "view_pose_evidence_refs": list(capture.pose_evidence_refs),
             "source_binding_hash": capture.source_binding_hash,
             "frame_binding_hash": self.frame_binding.semantic_content_hash,
             "frame_graph_hash": self.frame_binding.frame_graph.semantic_content_hash,

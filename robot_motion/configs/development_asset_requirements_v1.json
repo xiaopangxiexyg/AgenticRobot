@@ -25,6 +25,17 @@
       ]
     },
     {
+      "bundle_id": "rm65.inspire_gripper_v4_models",
+      "relative_path": "rm65_inspire_gripper_v4",
+      "required_by_default": true,
+      "required_paths": [
+        "rm65_dual_arm_wrist_cameras_v4_head_camera.urdf",
+        "rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf",
+        "rm65_arm_wrist_camera_4b2_cad.urdf",
+        "meshes/rm65_base_link.stl"
+      ]
+    },
+    {
       "bundle_id": "inspire_gripper.tools",
       "relative_path": "inspire_gripper",
       "required_by_default": false,

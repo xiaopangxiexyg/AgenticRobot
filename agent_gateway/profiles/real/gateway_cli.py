@@ -19,6 +19,14 @@ from agent_gateway.transport.unix_transport import (
     validate_agent_gateway_unix_group_parent,
     validate_agent_gateway_unix_server_preflight,
 )
+from deployments.perception import (
+    GraspNetPointGraspModelSpec,
+    Sam2GraspNetPointGraspPlanner,
+    Sam2GroundingDinoLocalizer,
+    Sam2GroundingDinoModelSpec,
+    Sam2VgnPointGraspPlanner,
+    VgnPointGraspModelSpec,
+)
 from robot_motion.rm65 import RM65_BIMANUAL_POSITION_V1_NAME
 from teleop_runtime.skill_deploy import (
     ExclusiveRM65SkillDeploymentProfile,
@@ -34,6 +42,15 @@ from .rm65_composition import (
 from .session_authorization import (
     REAL_AGENT_PRIMITIVE_ACTIONS,
     REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_RM65_CAMERA_MOUNT_URDF = (
+    _REPO_ROOT / "assets/rm65_inspire_gripper_v4/"
+    "rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf"
+)
+DEFAULT_RM65_CAMERA_REGISTRY_V4 = (
+    _REPO_ROOT / "robot_motion/configs/rm65_camera_registry_v4.json"
 )
 
 
@@ -75,6 +92,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="absolute existing non-world-writable directory for the v2 Artifact CAS",
     )
     parser.add_argument(
+        "--enable-point-grasp",
+        action="store_true",
+        help="enable main-view proposal generation and three-view candidate rendering",
+    )
+    parser.add_argument("--object-localization-asset-bundle", type=Path)
+    parser.add_argument("--object-localization-device", default="cuda")
+    parser.add_argument(
+        "--point-grasp-backend", choices=("vgn", "graspnet"), default="vgn"
+    )
+    parser.add_argument("--point-grasp-asset-bundle", type=Path)
+    parser.add_argument("--point-grasp-device", default="cuda")
+    parser.add_argument(
+        "--camera-mount-urdf",
+        type=Path,
+        help=(
+            "reviewed URDF containing the Station, head camera, and both wrist "
+            "optical-frame chains; defaults to the detailed RM65 v4 asset"
+        ),
+    )
+    parser.add_argument(
         "--position-profile",
         default=RM65_BIMANUAL_POSITION_V1_NAME,
         help="trusted lower RM65 position-control profile name",
@@ -102,9 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm",
         required=True,
-        help=(
-            "must exactly equal " + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
-        ),
+        help=("must exactly equal " + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
     )
     parser.add_argument("--client-id", default="rpent.dexteleop")
     parser.add_argument("--client-uid", type=int, default=os.getuid())
@@ -144,6 +179,22 @@ def _absolute_existing_file(
     if not resolved.is_file():
         parser.error(f"{flag} is not a file: {resolved}")
     return resolved
+
+
+def _effective_camera_registry(args: argparse.Namespace) -> Path | None:
+    if args.camera_registry is not None:
+        return args.camera_registry
+    if args.enable_point_grasp:
+        return DEFAULT_RM65_CAMERA_REGISTRY_V4
+    return None
+
+
+def _effective_camera_mount_urdf(args: argparse.Namespace) -> Path | None:
+    if args.camera_mount_urdf is not None:
+        return args.camera_mount_urdf
+    if args.enable_point_grasp:
+        return DEFAULT_RM65_CAMERA_MOUNT_URDF
+    return None
 
 
 def _absolute_socket_path(
@@ -205,9 +256,7 @@ def _ready_payload(
         "event": "gateway_ready",
         "socket_path": str(composition.socket_path),
         "client_id": composition.client_id,
-        "read_only_client_ids": list(
-            getattr(composition, "read_only_client_ids", ())
-        ),
+        "read_only_client_ids": list(getattr(composition, "read_only_client_ids", ())),
         "socket_mode": format(getattr(composition, "socket_mode", 0o600), "04o"),
         "target_kind": manifest.target_kind,
         "current_mode": manifest.current_mode,
@@ -241,6 +290,16 @@ def _ready_payload(
                 "rgb_roles": list(perception_capture.profile.rgb_roles),
                 "depth_roles": list(perception_capture.profile.depth_roles),
                 "control_effect_class": "read_only",
+                "point_grasp_enabled": (
+                    composition.station_point_grasp_registration is not None
+                ),
+                "point_grasp_render_view_roles": (
+                    []
+                    if composition.station_point_grasp_render_registration is None
+                    else list(
+                        composition.station_point_grasp_render_registration.profile.source_by_role
+                    )
+                ),
             }
         ),
         "routes": [
@@ -268,14 +327,10 @@ def _stopped_payload(
         "motion_command_dispatched": snapshot.dispatch_count > 0,
         "dispatch_count": snapshot.dispatch_count,
         "lower_hold_proved": lower_hold_proved,
-        "lower_hold_evidence_refs": (
-            [] if hold is None else list(hold.evidence_refs)
-        ),
+        "lower_hold_evidence_refs": ([] if hold is None else list(hold.evidence_refs)),
         "safe_shutdown": lower_hold_proved,
         "safe_shutdown_basis": (
-            "lower_hold_receipt"
-            if lower_hold_proved
-            else "missing_lower_hold_proof"
+            "lower_hold_receipt" if lower_hold_proved else "missing_lower_hold_proof"
         ),
     }
 
@@ -285,8 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.confirm != REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN:
         parser.error(
-            "--confirm must exactly equal "
-            + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
+            "--confirm must exactly equal " + REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN
         )
     if (args.authorized_action is None) == (args.authorized_actions is None):
         parser.error(
@@ -310,14 +364,40 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--grant-lifetime-sec must be in (0, 30]")
 
     socket_path = _absolute_socket_path(parser, args.socket_path)
+    camera_registry_arg = _effective_camera_registry(args)
     perception_supplied = tuple(
         value is not None
-        for value in (args.camera_config, args.camera_registry, args.artifact_root)
+        for value in (args.camera_config, camera_registry_arg, args.artifact_root)
     )
     if any(perception_supplied) and not all(perception_supplied):
         parser.error(
             "--camera-config, --camera-registry, and --artifact-root must be "
             "provided together"
+        )
+    if args.enable_point_grasp and not all(perception_supplied):
+        parser.error("--enable-point-grasp requires the composed camera options")
+    camera_mount_urdf_arg = _effective_camera_mount_urdf(args)
+    point_grasp_values = (
+        args.object_localization_asset_bundle,
+        args.point_grasp_asset_bundle,
+        camera_mount_urdf_arg,
+    )
+    if not args.enable_point_grasp and any(
+        value is not None
+        for value in (
+            args.object_localization_asset_bundle,
+            args.point_grasp_asset_bundle,
+            args.camera_mount_urdf,
+        )
+    ):
+        parser.error("point-grasp model bundle options require --enable-point-grasp")
+    if args.enable_point_grasp != all(
+        value is not None for value in point_grasp_values
+    ):
+        parser.error(
+            "--enable-point-grasp requires --object-localization-asset-bundle, "
+            "--point-grasp-asset-bundle, and --camera-mount-urdf; those options "
+            "are invalid without --enable-point-grasp"
         )
     try:
         validate_agent_gateway_unix_server_preflight(
@@ -373,10 +453,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     camera_registry = (
         None
-        if args.camera_registry is None
+        if camera_registry_arg is None
         else _absolute_existing_file(
             parser,
-            args.camera_registry,
+            camera_registry_arg,
             flag="--camera-registry",
         )
     )
@@ -389,6 +469,53 @@ def main(argv: list[str] | None = None) -> int:
             flag="--artifact-root",
         )
     )
+    object_localizer = None
+    point_grasp_planner = None
+    camera_mount_urdf = None
+    if args.enable_point_grasp:
+        object_bundle = _absolute_managed_directory(
+            parser,
+            args.object_localization_asset_bundle,
+            flag="--object-localization-asset-bundle",
+        )
+        point_grasp_bundle = _absolute_managed_directory(
+            parser,
+            args.point_grasp_asset_bundle,
+            flag="--point-grasp-asset-bundle",
+        )
+        camera_mount_urdf = _absolute_existing_file(
+            parser,
+            camera_mount_urdf_arg,
+            flag="--camera-mount-urdf",
+        )
+        try:
+            localization_spec = Sam2GroundingDinoModelSpec.from_asset_bundle(
+                object_bundle
+            )
+            object_localizer = Sam2GroundingDinoLocalizer(
+                model_spec=localization_spec,
+                device=args.object_localization_device,
+            )
+            if args.point_grasp_backend == "vgn":
+                point_grasp_spec = VgnPointGraspModelSpec.from_asset_bundle(
+                    point_grasp_bundle
+                )
+                point_grasp_planner = Sam2VgnPointGraspPlanner(
+                    model_spec=point_grasp_spec,
+                    point_segmenter=object_localizer,
+                    device=args.point_grasp_device,
+                )
+            else:
+                point_grasp_spec = GraspNetPointGraspModelSpec.from_asset_bundle(
+                    point_grasp_bundle
+                )
+                point_grasp_planner = Sam2GraspNetPointGraspPlanner(
+                    model_spec=point_grasp_spec,
+                    point_segmenter=object_localizer,
+                    device=args.point_grasp_device,
+                )
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"invalid point-grasp model bundle: {error}")
     embodiment_instance_id = (
         args.embodiment_instance_id
         if args.embodiment_instance_id is not None
@@ -400,9 +527,7 @@ def main(argv: list[str] | None = None) -> int:
         authorized_side=args.authorized_side,
         authorized_action=args.authorized_action,
         authorized_actions=(
-            None
-            if args.authorized_actions is None
-            else tuple(args.authorized_actions)
+            None if args.authorized_actions is None else tuple(args.authorized_actions)
         ),
         confirmation_token=args.confirm,
         client_id=args.client_id,
@@ -421,6 +546,9 @@ def main(argv: list[str] | None = None) -> int:
         camera_config_path=camera_config,
         camera_registry_path=camera_registry,
         artifact_root=artifact_root,
+        camera_mount_urdf_path=camera_mount_urdf,
+        object_localizer=object_localizer,
+        point_grasp_planner=point_grasp_planner,
     )
 
     ready = threading.Event()
@@ -439,8 +567,7 @@ def main(argv: list[str] | None = None) -> int:
         stop_requested.set()
 
     previous_handlers = {
-        signum: signal.getsignal(signum)
-        for signum in (signal.SIGINT, signal.SIGTERM)
+        signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
     }
     for signum in previous_handlers:
         signal.signal(signum, request_stop)
@@ -462,8 +589,7 @@ def main(argv: list[str] | None = None) -> int:
         if not ready.is_set():
             raise RuntimeError("real RM65 Skill application stopped before ready")
         if (
-            composition.application.state
-            != ExclusiveRealSkillApplicationState.RUNNING
+            composition.application.state != ExclusiveRealSkillApplicationState.RUNNING
             or not application_thread.is_alive()
         ):
             raise RuntimeError("real RM65 Skill application lost readiness")
@@ -498,4 +624,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["build_parser", "main"]
+__all__ = [
+    "DEFAULT_RM65_CAMERA_MOUNT_URDF",
+    "DEFAULT_RM65_CAMERA_REGISTRY_V4",
+    "build_parser",
+    "main",
+]

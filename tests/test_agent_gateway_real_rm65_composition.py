@@ -4,11 +4,16 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from agent_gateway.profiles.real import rm65_composition as composition_module
+from agent_gateway.profiles.real.gateway_cli import (
+    DEFAULT_RM65_CAMERA_MOUNT_URDF,
+    DEFAULT_RM65_CAMERA_REGISTRY_V4,
+)
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     REAL_AGENT_TCP_POSE_TARGET_ROUTE_ID_V1,
 )
@@ -105,6 +110,47 @@ class _TargetBuilder:
     def tool_tcp_world_targets_for_qpos_pair(self, **kwargs):
         raise AssertionError("default-off composition must not read state")
 
+    def solver_world_targets_for_qpos_pair(self, **kwargs):
+        raise AssertionError("default-off composition must not read state")
+
+
+class _Localizer:
+    model_spec = SimpleNamespace(
+        model_profile_id="test.sam2-grounding-dino",
+        semantic_content_hash="localization-model:test",
+    )
+    semantic_content_hash = "localization-implementation:test"
+
+    def start(self) -> None:
+        raise AssertionError("default-off composition must not start models")
+
+    def close(self) -> None:
+        return None
+
+    def localize(self, *_args, **_kwargs):
+        raise AssertionError("default-off composition must not infer")
+
+
+class _PointGraspPlanner:
+    model_spec = SimpleNamespace(
+        model_profile_id="test.vgn-point-grasp",
+        semantic_content_hash="point-grasp-model:test",
+    )
+    semantic_content_hash = "point-grasp-implementation:test"
+    backend_id = "vgn"
+
+    def __init__(self, point_segmenter) -> None:
+        self.point_segmenter = point_segmenter
+
+    def start(self) -> None:
+        raise AssertionError("default-off composition must not start models")
+
+    def close(self) -> None:
+        return None
+
+    def plan(self, *_args, **_kwargs):
+        raise AssertionError("default-off composition must not infer")
+
 
 class _ForceGuard:
     motion_ready = False
@@ -137,19 +183,16 @@ def _lower(monkeypatch, *, envelope_side: str = "right"):
             arm_ip_assignment_path=REPO_ROOT / "README.md",
             tool_profile_path_by_side={
                 "left": (
-                    REPO_ROOT
-                    / "hardware/rm65/utils/configs/calibrations/"
+                    REPO_ROOT / "hardware/rm65/utils/configs/calibrations/"
                     "rm65_left_inspire.json"
                 ),
                 "right": (
-                    REPO_ROOT
-                    / "hardware/rm65/utils/configs/calibrations/"
+                    REPO_ROOT / "hardware/rm65/utils/configs/calibrations/"
                     "rm65_right_inspire.json"
                 ),
             },
             envelope_profile_path=(
-                REPO_ROOT
-                / "teleop_runtime/configs/skill_deploy/"
+                REPO_ROOT / "teleop_runtime/configs/skill_deploy/"
                 f"agent_primitive_{envelope_side}_relative_tight_v1.json"
             ),
         )
@@ -257,15 +300,13 @@ def test_composition_matches_mujoco_canonical_station_axes_and_pose(
     )
 
     sim_contract = load_pose_frame_contract(DEFAULT_STATION_POSE_CONTRACT_PATH)
-    scene = build_rm65_dual_arm_scene_profile(
-        lower.profile.collision_scene_profile
-    )
+    scene = build_rm65_dual_arm_scene_profile(lower.profile.collision_scene_profile)
     scene_world_from_base = load_world_from_arm_base_transforms(scene)
     sim_station_from_base = (
         sim_contract.source.effective_raw_to_canonical_desk_transform("right")
     )
-    sim_world_from_station = (
-        scene_world_from_base["right"] @ np.linalg.inv(sim_station_from_base)
+    sim_world_from_station = scene_world_from_base["right"] @ np.linalg.inv(
+        sim_station_from_base
     )
 
     np.testing.assert_allclose(
@@ -281,9 +322,7 @@ def test_composition_matches_mujoco_canonical_station_axes_and_pose(
         "up": ((0.0, 0.0, 1.0), (0.0, 0.0, 1.0)),
         "down": ((0.0, 0.0, -1.0), (0.0, 0.0, -1.0)),
     }
-    for direction, (canonical_delta, expected_world_delta) in (
-        direction_by_name.items()
-    ):
+    for direction, (canonical_delta, expected_world_delta) in direction_by_name.items():
         np.testing.assert_allclose(
             execution_from_station[:3, :3] @ canonical_delta,
             expected_world_delta,
@@ -297,15 +336,17 @@ def test_composition_matches_mujoco_canonical_station_axes_and_pose(
             err_msg=direction,
         )
 
-    station_frame = composition.frame_graph.frame_by_id[
-        RM65_SKILL_STATION_FRAME_ID_V1
-    ]
+    station_frame = composition.frame_graph.frame_by_id[RM65_SKILL_STATION_FRAME_ID_V1]
     canonical_anchor = np.eye(4, dtype=float)
     canonical_anchor[:3, 3] = (0.25, -0.10, 0.35)
-    fixed_heading = level_tcp_orientation("forward_left_30").apply(
-        canonical_anchor,
-        reference_frame_spec=station_frame,
-    ).target_pose
+    fixed_heading = (
+        level_tcp_orientation("forward_left_30")
+        .apply(
+            canonical_anchor,
+            reference_frame_spec=station_frame,
+        )
+        .target_pose
+    )
     np.testing.assert_allclose(
         execution_from_station @ fixed_heading,
         sim_world_from_station @ fixed_heading,
@@ -330,8 +371,7 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         control_domain_id="exclusive-real-skill:perception-test",
         embodiment_instance_id="dual-rm65:perception-test",
         camera_config_path=(
-            REPO_ROOT
-            / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
+            REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
         ),
         camera_registry_path=(
             REPO_ROOT / "robot_motion/configs/rm65_camera_registry.json"
@@ -378,27 +418,27 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         )
 
         registry = json.loads(
-            (
-                REPO_ROOT / "robot_motion/configs/rm65_camera_registry.json"
-            ).read_text(encoding="utf-8")
+            (REPO_ROOT / "robot_motion/configs/rm65_camera_registry.json").read_text(
+                encoding="utf-8"
+            )
         )
         parent_from_camera = np.asarray(
-            registry["cameras"]["front"]["extrinsics"]["frames"]
-            ["head_camera_frame"]["T_camera_to_parent"],
+            registry["cameras"]["front"]["extrinsics"]["frames"]["head_camera_frame"][
+                "T_camera_to_parent"
+            ],
             dtype=float,
         )
         expected_world_from_camera = (
-            lower.profile.scene_world_from_arm_base_by_side["left"]
-            @ parent_from_camera
+            lower.profile.scene_world_from_arm_base_by_side["left"] @ parent_from_camera
         )
         np.testing.assert_allclose(
-            composition.perception_source_binding
-            .world_from_depth_camera_by_source["front"],
+            composition.perception_source_binding.world_from_depth_camera_by_source[
+                "front"
+            ],
             expected_world_from_camera,
         )
         pose_station_camera = (
-            composition.perception_frame_binding
-            .camera_pose_reference_xyz_quat_xyzw(
+            composition.perception_frame_binding.camera_pose_reference_xyz_quat_xyzw(
                 pose_matrix_to_xyzquat(expected_world_from_camera)
             )
         )
@@ -416,7 +456,9 @@ def test_composition_opt_in_binds_real_rgb_depth_and_artifact_plane_without_star
         session.artifact_store.close()
 
 
-def test_composition_requires_complete_perception_attachment(monkeypatch, tmp_path) -> None:
+def test_composition_requires_complete_perception_attachment(
+    monkeypatch, tmp_path
+) -> None:
     lower, _guard = _lower(monkeypatch)
     with pytest.raises(ValueError, match="provided together"):
         assemble_exclusive_rm65_agent_primitive_composition(
@@ -432,6 +474,59 @@ def test_composition_requires_complete_perception_attachment(monkeypatch, tmp_pa
             embodiment_instance_id="dual-rm65:perception-test",
             artifact_root=tmp_path,
         )
+
+
+def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lower, guard = _lower(monkeypatch)
+    localizer = _Localizer()
+    planner = _PointGraspPlanner(localizer)
+
+    composition = assemble_exclusive_rm65_agent_primitive_composition(
+        lower=lower,
+        socket_path=REPO_ROOT / "temp/test-real-rm65-grasp.sock",
+        authorized_side="right",
+        authorized_action="move_tcp_to_pose",
+        confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+        client_id="rpent:test",
+        client_uid=1000,
+        runtime_session_id="real-rm65:grasp-test",
+        control_domain_id="exclusive-real-skill:grasp-test",
+        embodiment_instance_id="dual-rm65:grasp-test",
+        camera_config_path=(
+            REPO_ROOT / "teleop_runtime/configs/devices/agent_gateway_realsense.json"
+        ),
+        camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+        artifact_root=tmp_path,
+        camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        object_localizer=localizer,
+        point_grasp_planner=planner,
+    )
+    session = composition.deployment.gateway_session
+    try:
+        routes = {
+            entry.route.skill_id: entry.route.control_effect_class
+            for entry in session.contract_bundle.route_manifest.skill_routes
+        }
+        assert routes["perception.plan_point_grasp"] == "read_only"
+        assert routes["perception.render_point_grasp_candidate"] == "read_only"
+        assert routes["motion.move_tcp_to_pose"] == "motion"
+        assert composition.station_point_grasp_registration is not None
+        assert composition.station_point_grasp_render_registration is not None
+        assert tuple(
+            composition.station_point_grasp_render_registration.profile.source_by_role
+        ) == ("main", "wrist_left", "wrist_right")
+        assert session.station_point_grasp_executor is not None
+        assert session.station_point_grasp_render_executor is not None
+        assert session.owns_artifact_store is False
+        assert composition.resources.artifact_store is session.artifact_store
+        assert all(backend.starts == 0 for backend in lower.arm_backends.values())
+        assert guard.starts == 0
+    finally:
+        assert session.artifact_store is not None
+        session.artifact_store.close()
 
 
 def test_composition_rejects_envelope_for_another_side(monkeypatch) -> None:
@@ -489,9 +584,7 @@ def test_composition_rejects_socket_config_before_application_start(
     with pytest.raises(ValueError, match="parent directory must already exist"):
         assemble_exclusive_rm65_agent_primitive_composition(
             lower=lower,
-            socket_path=(
-                REPO_ROOT / "temp/absent-real-rm65-parent/gateway.sock"
-            ),
+            socket_path=(REPO_ROOT / "temp/absent-real-rm65-parent/gateway.sock"),
             authorized_side="right",
             authorized_action="forward",
             confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,

@@ -1,0 +1,113 @@
+{
+  "schema_version": "dexteleop.camera_registry.v1",
+  "description": "RM65 v4 RealSense registry for the real Agent Gateway. The front placement is the reviewed 2026-09-04 hand-eye calibration; wrist role serials retain the deployed Agent Gateway assignment.",
+  "cameras": {
+    "front": {
+      "serial": "213222079798",
+      "model": "RealSense",
+      "stream": "color",
+      "profile": {
+        "width": 640,
+        "height": 480,
+        "fps": 15,
+        "format": "yuyv"
+      },
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "head_camera_frame": {
+            "parent_frame": "left_arm_base_link",
+            "transform_convention": "T_camera_to_parent maps camera-frame points into the parent frame; URDF fixed joint origin stores the same child-in-parent pose.",
+            "T_camera_to_parent": [
+              [-0.9999259770386348, -0.009416328705005438, 0.007705400512024749, -0.25086651954015393],
+              [-0.01174456229133508, 0.9124366598835629, -0.4090493942754502, -0.008203907417017375],
+              [-0.003178946353175947, -0.4091096117842343, -0.9124797092789717, 0.8596353732683993],
+              [0, 0, 0, 1]
+            ],
+            "source": {
+              "type": "handeye",
+              "path": "teleop_records/headeye/20260904_141926_rm65_handeye.json",
+              "matrix": "T_camera_to_base",
+              "calibration_arm": "left",
+              "camera_serial": "213222079798",
+              "created_at_utc": "2026-09-04T06:27:34Z",
+              "sha256": "32842bf3f0d259940eb97e001909ddedb01465ee58323700680ff50a7ce82f7e",
+              "samples": 26,
+              "translation_rms_m": 0.004553476109769817,
+              "rotation_rms_deg": 1.6362744862490226,
+              "quality_warnings": [
+                "translation residual is high; reject blurry/outlier samples and recalibrate.",
+                "rotation residual is high; use clearer target views and more tilted poses."
+              ]
+            },
+            "placements": [
+              {
+                "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera.urdf",
+                "frame": "head_camera_frame",
+                "parent_frame": "left_arm_base_link"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf",
+                "frame": "head_camera_frame",
+                "parent_frame": "left_arm_base_link"
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {"mount": "single_front"}
+    },
+    "left_wrist": {
+      "serial": "260522278055",
+      "model": "RealSense D405",
+      "stream": "color",
+      "profile": {"width": 640, "height": 480, "fps": 15, "format": "yuyv"},
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "left_camera_rgb": {
+            "placements": [
+              {
+                "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera.urdf",
+                "frame": "left_camera_rgb",
+                "parent_frame": "left_arm_link6"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf",
+                "frame": "left_camera_rgb",
+                "parent_frame": "left_arm_link6"
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {"mount": "single_left_wrist"}
+    },
+    "right_wrist": {
+      "serial": "261122273924",
+      "model": "RealSense D405",
+      "stream": "color",
+      "profile": {"width": 640, "height": 480, "fps": 15, "format": "yuyv"},
+      "intrinsics": null,
+      "extrinsics": {
+        "frames": {
+          "right_camera_rgb": {
+            "placements": [
+              {
+                "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera.urdf",
+                "frame": "right_camera_rgb",
+                "parent_frame": "right_arm_link6"
+              },
+              {
+                "urdf": "assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf",
+                "frame": "right_camera_rgb",
+                "parent_frame": "right_arm_link6"
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {"mount": "single_right_wrist"}
+    }
+  }
+}

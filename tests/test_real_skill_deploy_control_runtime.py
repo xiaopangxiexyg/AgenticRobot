@@ -187,6 +187,49 @@ def test_independent_runtime_owns_dispatch_and_lower_confirmed_hold() -> None:
     assert runtime.lifecycle == RealSkillControlLifecycle.CLOSED
 
 
+def test_measured_qpos_projection_uses_post_synchronization_availability() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    observed: list[tuple[RealSkillMotionObservationCut, float]] = []
+    source_cut = RealSkillMotionObservationCut(
+        observation=TeleopObservation(timestamp=2.0),
+        qpos_by_side={"left": np.ones(6), "right": np.full(6, 2.0)},
+        measured_at=1.9,
+        available_at=1.95,
+        evidence_refs=("hardware-qpos-cut:projection",),
+    )
+
+    def observe(cut, *, derived_available_at):
+        assert np.array_equal(builder.qpos_by_side["left"], cut.qpos_by_side["left"])
+        assert np.array_equal(builder.qpos_by_side["right"], cut.qpos_by_side["right"])
+        observed.append((cut, derived_available_at))
+
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=lambda: source_cut,
+        synchronize_target_builder=builder.synchronize,
+        measured_qpos_observer=observe,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: RealSkillMotionDispatchReceipt(
+            succeeded=True,
+            evidence_refs=("unused-dispatch:projection",),
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("unused-hold:projection",),
+        ),
+    )
+    runtime.start()
+
+    runtime.step(now=2.25)
+
+    assert observed == [(source_cut, 2.25)]
+    measured = port.latest_measured_pose()
+    assert measured is not None
+    assert measured.measured_at == 1.9
+    assert measured.available_at == 2.25
+
+
 def test_confirmed_hold_reopens_only_for_a_new_pending_activation() -> None:
     builder = _TargetBuilder()
     port = _port(builder)
@@ -363,9 +406,7 @@ def test_fail_closed_does_not_require_another_observation() -> None:
     assert receipt.succeeded is True
     assert runtime.lifecycle == RealSkillControlLifecycle.HOLD
     assert port.snapshot().phase == RealAgentMotionPhase.HELD
-    assert holds == [
-        "real Agent motion operation operation:test: control_cycle_failed"
-    ]
+    assert holds == ["real Agent motion operation operation:test: control_cycle_failed"]
 
 
 def test_fail_closed_is_a_dispatch_barrier_for_an_inflight_cycle() -> None:
@@ -450,8 +491,7 @@ def test_realteleop_motion_port_path_is_object_identical_compatibility_export() 
 
     assert compatibility.RealAgentMotionPort is canonical.RealAgentMotionPort
     assert (
-        compatibility.RealAgentMotionActivation
-        is canonical.RealAgentMotionActivation
+        compatibility.RealAgentMotionActivation is canonical.RealAgentMotionActivation
     )
 
 

@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 from PIL import Image
@@ -183,6 +183,62 @@ class RealAlignedRgbdCapture:
 
 
 @dataclass(frozen=True)
+class RealRgbCameraGeometryCut:
+    """One deployment-owned camera pose matched to a published RGB frame."""
+
+    source_id: str
+    source_from_camera: tuple[float, ...]
+    measured_at: float
+    available_at: float
+    geometry_binding_hash: str
+    geometry_cut_hash: str
+    evidence_refs: tuple[str, ...]
+
+
+@runtime_checkable
+class RealRgbCameraGeometryProvider(Protocol):
+    """Trusted static/dynamic camera geometry prepared by the application."""
+
+    @property
+    def semantic_content_hash(self) -> str: ...
+
+    def source_catalog(self) -> tuple[Mapping[str, object], ...]: ...
+
+    def pose_cut(
+        self,
+        *,
+        source_id: str,
+        frame_acquired_at: float,
+        now: float,
+    ) -> RealRgbCameraGeometryCut: ...
+
+
+@dataclass(frozen=True)
+class RealRgbGeometryCapture:
+    """One live RGB frame and its deployment-owned optical-frame pose."""
+
+    source_id: str
+    role: str
+    acquired_at: float
+    station_revision: int
+    source_generation: int
+    frame_index: int
+    capture_group_id: str
+    source_binding_hash: str
+    width: int
+    height: int
+    intrinsics: Mapping[str, float | int]
+    source_from_camera: tuple[float, ...]
+    rgb: np.ndarray
+    rgb_content_hash: str
+    geometry_binding_hash: str
+    geometry_cut_hash: str
+    pose_measured_at: float
+    pose_available_at: float
+    pose_evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RealPerceptionSourceBinding:
     """Preflighted camera inventory and trusted static depth poses."""
 
@@ -347,6 +403,7 @@ class ExclusiveRealPerceptionResources:
         lower: _LifecycleResource,
         camera_sources: Mapping[str, object],
         artifact_store: _CloseResource | None = None,
+        additional_resources: tuple[_LifecycleResource, ...] = (),
         start_cameras: Callable[[Mapping[str, Any]], None] | None = None,
         admit_cameras: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
@@ -360,6 +417,13 @@ class ExclusiveRealPerceptionResources:
             getattr(artifact_store, "close", None)
         ):
             raise TypeError("artifact_store must expose close.")
+        resources = tuple(additional_resources)
+        if any(
+            not callable(getattr(resource, "start", None))
+            or not callable(getattr(resource, "close", None))
+            for resource in resources
+        ):
+            raise TypeError("additional_resources must expose start and close.")
         start_cameras = (
             start_realsense_sources if start_cameras is None else start_cameras
         )
@@ -371,6 +435,7 @@ class ExclusiveRealPerceptionResources:
         self.lower = lower
         self.camera_sources = dict(camera_sources)
         self.artifact_store = artifact_store
+        self.additional_resources = resources
         self._start_cameras = start_cameras
         self._admit_cameras = admit_cameras
         self._lock = threading.Lock()
@@ -385,10 +450,14 @@ class ExclusiveRealPerceptionResources:
                 return
         cameras_attempted = False
         lower_attempted = False
+        attempted_resources: list[_LifecycleResource] = []
         try:
             cameras_attempted = True
             self._start_cameras(self.camera_sources)
             self._admit_cameras(self.camera_sources)
+            for resource in self.additional_resources:
+                attempted_resources.append(resource)
+                resource.start()
             lower_attempted = True
             self.lower.start()
         except Exception:
@@ -396,6 +465,11 @@ class ExclusiveRealPerceptionResources:
                 try:
                     self.lower.close()
                 except Exception:  # noqa: BLE001, S110 - preserve the original startup failure
+                    pass
+            for resource in reversed(attempted_resources):
+                try:
+                    resource.close()
+                except Exception:  # noqa: BLE001, S110 - preserve startup failure
                     pass
             if cameras_attempted:
                 self._close_cameras()
@@ -427,6 +501,11 @@ class ExclusiveRealPerceptionResources:
             self.lower.close()
         except Exception as exc:  # noqa: BLE001 - cameras still must close.
             errors.append(f"lower:{type(exc).__name__}:{exc}")
+        for resource in reversed(self.additional_resources):
+            try:
+                resource.close()
+            except Exception as exc:  # noqa: BLE001 - finish all cleanup stages.
+                errors.append(f"additional_resource:{type(exc).__name__}:{exc}")
         errors.extend(self._close_cameras())
         if self.artifact_store is not None:
             try:
@@ -573,6 +652,7 @@ class RealSenseAgentPerceptionProvider:
         current_station_revision: Callable[[], int],
         max_frame_age_ms: int = 200,
         max_inter_camera_skew_ms: int = 100,
+        rgb_camera_geometry: RealRgbCameraGeometryProvider | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not isinstance(source_binding, RealPerceptionSourceBinding):
@@ -589,6 +669,11 @@ class RealSenseAgentPerceptionProvider:
         self._current_station_revision = current_station_revision
         self.max_frame_age_ms = max_frame_age_ms
         self.max_inter_camera_skew_ms = max_inter_camera_skew_ms
+        if rgb_camera_geometry is not None and not isinstance(
+            rgb_camera_geometry, RealRgbCameraGeometryProvider
+        ):
+            raise TypeError("rgb_camera_geometry must implement the trusted provider")
+        self.rgb_camera_geometry = rgb_camera_geometry
         self._clock = clock
         self._profile: RealPerceptionCaptureProfile | None = None
 
@@ -633,6 +718,28 @@ class RealSenseAgentPerceptionProvider:
                 str(item["source_id"])
             ].config.align_depth_to_color
         )
+
+    def rgb_geometry_source_catalog(self) -> tuple[Mapping[str, object], ...]:
+        """Expose only RGB roles with deployment-owned camera geometry."""
+
+        if self.rgb_camera_geometry is None:
+            return self.aligned_rgbd_source_catalog()
+        catalog = tuple(self.rgb_camera_geometry.source_catalog())
+        rgb_by_source = {
+            str(item["source_id"]): item for item in self.rgb_source_catalog()
+        }
+        if not catalog or any(
+            str(item.get("source_id")) not in rgb_by_source
+            or str(item.get("role"))
+            != str(rgb_by_source[str(item.get("source_id"))]["role"])
+            or int(item.get("native_width", -1))
+            != int(rgb_by_source[str(item.get("source_id"))]["native_width"])
+            or int(item.get("native_height", -1))
+            != int(rgb_by_source[str(item.get("source_id"))]["native_height"])
+            for item in catalog
+        ):
+            raise RuntimeError("RGB camera geometry catalog differs from live sources")
+        return catalog
 
     def bind_profile(self, profile: RealPerceptionCaptureProfile) -> None:
         rgb_sources = tuple(
@@ -1022,6 +1129,126 @@ class RealSenseAgentPerceptionProvider:
             depth_content_hash=depth_content_hash,
         )
 
+    def capture_rgb_geometry(
+        self,
+        *,
+        role: str,
+        expected_station_revision: int,
+    ) -> RealRgbGeometryCapture:
+        """Read one RGB frame and resolve its trusted static or measured pose."""
+
+        profile = self._profile
+        if profile is None:
+            raise RuntimeError("real_perception_provider_not_bound")
+        expected_station_revision = self._expected_revision(expected_station_revision)
+        selected_role = _required_text(role, field_name="role")
+        catalog = self.rgb_geometry_source_catalog()
+        source_by_role = {str(item["role"]): str(item["source_id"]) for item in catalog}
+        if selected_role not in source_by_role:
+            raise ValueError("RGB geometry role is not registered.")
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("rgb_geometry_capture_station_revision_mismatch")
+        source_id = source_by_role[selected_role]
+        source = self.source_binding.camera_sources[source_id]
+        now = _finite_timestamp(self._clock(), field_name="capture clock")
+        frame, source_at, info = self._frame(source_id, now=now)
+        rgb = np.asarray(frame.image)
+        expected_shape = (int(source.config.height), int(source.config.width), 3)
+        if rgb.shape != expected_shape or rgb.dtype != np.uint8:
+            raise RuntimeError(f"real_rgb_frame_contract_mismatch:{source_id}")
+        if source.config.color_space == "bgr":
+            rgb = rgb[..., ::-1]
+        rgb = np.ascontiguousarray(rgb).copy()
+        intrinsics = _depth_intrinsics(info.get("intrinsics"), rgb.shape[:2])
+        generation = info.get("generation")
+        frame_index = getattr(frame, "frame_index", None)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
+            or isinstance(frame_index, bool)
+            or not isinstance(frame_index, int)
+            or frame_index < 0
+        ):
+            raise RuntimeError(f"real_rgb_frame_sequence_invalid:{source_id}")
+        rgb_content_hash = canonical_content_hash(
+            {
+                "dtype": "uint8",
+                "shape": list(rgb.shape),
+                "byte_sha256": hashlib.sha256(rgb.tobytes(order="C")).hexdigest(),
+            },
+            domain="dexteleop.real_rgb_geometry.rgb_content.v1",
+        )
+        if self.rgb_camera_geometry is None:
+            source_from_camera = self.source_binding.world_from_depth_camera_by_source[
+                source_id
+            ]
+            geometry_binding_hash = self.source_binding.semantic_content_hash
+            geometry_cut_hash = canonical_content_hash(
+                {
+                    "source_id": source_id,
+                    "source_from_camera": source_from_camera.tolist(),
+                    "source_binding_hash": geometry_binding_hash,
+                },
+                domain="dexteleop.real_rgb_geometry.static_cut.v1",
+            )
+            geometry = RealRgbCameraGeometryCut(
+                source_id=source_id,
+                source_from_camera=tuple(
+                    float(v) for v in source_from_camera.reshape(-1)
+                ),
+                measured_at=source_at,
+                available_at=source_at,
+                geometry_binding_hash=geometry_binding_hash,
+                geometry_cut_hash=geometry_cut_hash,
+                evidence_refs=("real-rgb-static-camera:" + geometry_cut_hash,),
+            )
+        else:
+            geometry = self.rgb_camera_geometry.pose_cut(
+                source_id=source_id,
+                frame_acquired_at=source_at,
+                now=now,
+            )
+        capture_hash = canonical_content_hash(
+            {
+                "source_binding_hash": self.source_binding.semantic_content_hash,
+                "source_id": source_id,
+                "role": selected_role,
+                "serial": str(info.get("serial_number")),
+                "source_generation": generation,
+                "frame_index": frame_index,
+                "acquired_at": source_at,
+                "station_revision": expected_station_revision,
+                "rgb_content_hash": rgb_content_hash,
+                "geometry_cut_hash": geometry.geometry_cut_hash,
+            },
+            domain="dexteleop.real_rgb_geometry.capture_group.v1",
+        )
+        if self._current_station_revision() != expected_station_revision:
+            raise RuntimeError("rgb_geometry_capture_station_revision_changed")
+        rgb.setflags(write=False)
+        return RealRgbGeometryCapture(
+            source_id=source_id,
+            role=selected_role,
+            acquired_at=source_at,
+            station_revision=expected_station_revision,
+            source_generation=generation,
+            frame_index=frame_index,
+            capture_group_id="real-rgb-geometry:" + capture_hash,
+            source_binding_hash=self.source_binding.semantic_content_hash,
+            width=int(rgb.shape[1]),
+            height=int(rgb.shape[0]),
+            intrinsics=MappingProxyType(dict(intrinsics)),
+            source_from_camera=geometry.source_from_camera,
+            rgb=rgb,
+            rgb_content_hash=rgb_content_hash,
+            geometry_binding_hash=geometry.geometry_binding_hash,
+            geometry_cut_hash=geometry.geometry_cut_hash,
+            pose_measured_at=geometry.measured_at,
+            pose_available_at=geometry.available_at,
+            pose_evidence_refs=geometry.evidence_refs,
+        )
+
 
 def _encode_rgb_jpeg(image: np.ndarray, *, width: int, height: int) -> bytes:
     if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
@@ -1077,7 +1304,10 @@ __all__ = [
     "ExclusiveRealPerceptionResources",
     "RealAlignedRgbdCapture",
     "RealPerceptionSourceBinding",
+    "RealRgbCameraGeometryCut",
+    "RealRgbCameraGeometryProvider",
     "RealRgbCapture",
+    "RealRgbGeometryCapture",
     "RealSenseAgentPerceptionProvider",
     "admit_realsense_sources",
     "build_real_perception_source_binding",

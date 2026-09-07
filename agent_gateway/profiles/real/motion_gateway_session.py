@@ -62,12 +62,24 @@ from teleop_runtime.skill_deploy.motion_port import (
     RealAgentMotionPort,
 )
 
+from .localization_gateway import (
+    ObjectLocalizationProvider,
+    build_real_object_localization_executor,
+)
 from .motion_primitive_profiles import (
     RealAgentPrimitiveContractBundle,
 )
 from .motion_primitive_skill import RealAgentPrimitiveSkillLifecycle
 from .observation_gateway import RealControlOwnerState
 from .perception_gateway import build_real_perception_passive_executors
+from .point_grasp_gateway import (
+    StationBoundPointGraspProvider,
+    build_station_bound_point_grasp_executor,
+)
+from .point_grasp_render_gateway import (
+    StationBoundPointGraspRenderProvider,
+    build_station_bound_point_grasp_render_executor,
+)
 from .realsense_perception import RealSenseAgentPerceptionProvider
 
 
@@ -192,12 +204,8 @@ class RealAgentPrimitiveObservationProducer:
         }
         attachment_values = {
             "public reference_frame_id": attachment.reference_frame_id,
-            "public reference_frame_spec_hash": (
-                attachment.reference_frame_spec_hash
-            ),
-            "execution reference_frame_id": (
-                attachment.execution_reference_frame_id
-            ),
+            "public reference_frame_spec_hash": (attachment.reference_frame_spec_hash),
+            "execution reference_frame_id": (attachment.execution_reference_frame_id),
             "execution reference_frame_spec_hash": (
                 attachment.execution_reference_frame_spec_hash
             ),
@@ -207,16 +215,12 @@ class RealAgentPrimitiveObservationProducer:
                 raise ValueError(f"Real observation {field_name} mismatch.")
         checks = {
             "execution_frame_id": profile.execution_reference_frame_id,
-            "execution_frame_spec_hash": (
-                profile.execution_reference_frame_spec_hash
-            ),
+            "execution_frame_spec_hash": (profile.execution_reference_frame_spec_hash),
         }
         for field_name, expected in checks.items():
             if getattr(config, field_name) != expected:
                 raise ValueError(f"Real motion port {field_name} mismatch.")
-        if set(config.component_id_by_side.values()) != set(
-            attachment.component_ids
-        ):
+        if set(config.component_id_by_side.values()) != set(attachment.component_ids):
             raise ValueError("Real motion port component binding mismatch.")
         if config.component_id_by_side.get(profile.side) != profile.component_id:
             raise ValueError("Real motion port component/side binding mismatch.")
@@ -254,9 +258,7 @@ class RealAgentPrimitiveObservationProducer:
             public_pose, resolution = (
                 self.contract_bundle.frame_graph.transform_pose_matrix(
                     execution_pose,
-                    source_reference_frame_id=(
-                        attachment.execution_reference_frame_id
-                    ),
+                    source_reference_frame_id=(attachment.execution_reference_frame_id),
                     target_reference_frame_id=attachment.reference_frame_id,
                 )
             )
@@ -267,9 +269,7 @@ class RealAgentPrimitiveObservationProducer:
                     name=f"real_agent_public_observation.{component_id}",
                 )
             ]
-            frame_resolution_hashes[component_id] = (
-                resolution.semantic_content_hash
-            )
+            frame_resolution_hashes[component_id] = resolution.semantic_content_hash
         station_revision = self._observe_control_state()
         snapshot_hash = canonical_content_hash(
             {
@@ -374,9 +374,7 @@ class RealAgentPrimitiveObservationProducer:
         )
         attachment = self.contract_bundle.attachment
         requested_components = tuple(sorted(parameters["component_ids"]))
-        all_poses = snapshot.measurement_summary[
-            "pose_xyz_quat_xyzw_by_component"
-        ]
+        all_poses = snapshot.measurement_summary["pose_xyz_quat_xyzw_by_component"]
         poses = {
             component_id: list(all_poses[component_id])
             for component_id in requested_components
@@ -422,8 +420,7 @@ class RealAgentPrimitiveObservationProducer:
                 for component_id in requested_components
             },
             "representation_by_component": {
-                component_id: "cartesian_pose"
-                for component_id in requested_components
+                component_id: "cartesian_pose" for component_id in requested_components
             },
             "observation_binding_id": attachment.observation_binding_id,
             "observation_plan_hash": attachment.observation_plan_hash,
@@ -525,6 +522,12 @@ class RealAgentPrimitiveGatewaySession:
     perception_provider: RealSenseAgentPerceptionProvider | None
     rgb_executor: PassiveReadSkillExecutor | None
     depth_executor: PassiveReadSkillExecutor | None
+    localization_provider: ObjectLocalizationProvider | None
+    localization_executor: PassiveReadSkillExecutor | None
+    station_point_grasp_provider: StationBoundPointGraspProvider | None
+    station_point_grasp_executor: PassiveReadSkillExecutor | None
+    station_point_grasp_render_provider: StationBoundPointGraspRenderProvider | None
+    station_point_grasp_render_executor: PassiveReadSkillExecutor | None
     artifact_store: RecoverableAgentArtifactStore | None
     owns_artifact_store: bool
     hardware_view_provider: HardwareViewProvider
@@ -543,8 +546,25 @@ class RealAgentPrimitiveGatewaySession:
             raise ValueError("Real perception registration and provider disagree.")
         if enabled != (self.artifact_store is not None):
             raise ValueError("Real perception requires an exact Artifact store.")
-        if enabled != (self.rgb_executor is not None and self.depth_executor is not None):
+        if enabled != (
+            self.rgb_executor is not None and self.depth_executor is not None
+        ):
             raise ValueError("Real perception requires both passive executors.")
+        grasp_enabled = self.contract_bundle.localization_registration is not None
+        if grasp_enabled != all(
+            item is not None
+            for item in (
+                self.localization_provider,
+                self.localization_executor,
+                self.station_point_grasp_provider,
+                self.station_point_grasp_executor,
+                self.station_point_grasp_render_provider,
+                self.station_point_grasp_render_executor,
+            )
+        ):
+            raise ValueError(
+                "Real point-grasp registration and runtime resources disagree."
+            )
         if self.owns_artifact_store and self.artifact_store is None:
             raise ValueError("Owned Artifact store must be present.")
         if not isinstance(self.state_executor, PassiveReadSkillExecutor):
@@ -643,6 +663,9 @@ class RealAgentPrimitiveGatewaySession:
                     self.state_executor,
                     self.rgb_executor,
                     self.depth_executor,
+                    self.localization_executor,
+                    self.station_point_grasp_executor,
+                    self.station_point_grasp_render_executor,
                 )
             )
             if not passive_reads_settled:
@@ -753,12 +776,10 @@ def _real_perception_control_claimed(
     for source in provider.source_binding.camera_sources.values():
         device_info = getattr(source, "device_info", None)
         if not callable(device_info):
-            raise RuntimeError("Real perception source has no status provider.")
+            raise TypeError("Real perception source has no status provider.")
         info = device_info()
-        if not isinstance(info, Mapping) or not isinstance(
-            info.get("running"), bool
-        ):
-            raise RuntimeError("Real perception source status is unavailable.")
+        if not isinstance(info, Mapping) or not isinstance(info.get("running"), bool):
+            raise TypeError("Real perception source status is unavailable.")
         running.append(info["running"])
     return any(running)
 
@@ -768,6 +789,7 @@ def _real_hardware_view_provider(
     contract_bundle: RealAgentPrimitiveContractBundle,
     port: RealAgentMotionPort,
     perception_provider: RealSenseAgentPerceptionProvider | None,
+    localization_provider: ObjectLocalizationProvider | None,
     operation_store: BoundedInMemoryAgentSkillOperationStore,
     clock: Callable[[], float],
 ) -> HardwareViewProvider:
@@ -814,9 +836,29 @@ def _real_hardware_view_provider(
                 health_provider=lambda: _real_perception_feed_health(
                     perception_provider
                 ),
-                control_claimed_provider=lambda: (
-                    _real_perception_control_claimed(perception_provider)
+                control_claimed_provider=lambda: _real_perception_control_claimed(
+                    perception_provider
                 ),
+            )
+        )
+    if localization_provider is not None:
+        model_route_hashes = tuple(
+            entry.route.semantic_content_hash
+            for entry in contract_bundle.route_manifest.skill_routes
+            if entry.route.skill_id
+            in {"perception.localize_objects", "perception.plan_point_grasp"}
+        )
+        if not model_route_hashes:
+            raise ValueError("Real localization provider has no model Routes.")
+        bindings.append(
+            HardwareResourceBinding(
+                resource_id="perception.object_localization_model",
+                resource_kind="local_model",
+                route_hashes=model_route_hashes,
+                health_provider=lambda: (
+                    "ready" if localization_provider.started else "unavailable"
+                ),
+                control_claimed_provider=lambda: False,
             )
         )
     return HardwareViewProvider(
@@ -834,6 +876,8 @@ def assemble_real_agent_primitive_gateway_session(
     allowed_client_ids: tuple[str, ...],
     max_retained_operations: int = 16,
     perception_provider: RealSenseAgentPerceptionProvider | None = None,
+    localization_provider: ObjectLocalizationProvider | None = None,
+    station_point_grasp_planner: object | None = None,
     artifact_store: RecoverableAgentArtifactStore | None = None,
     owns_artifact_store: bool = False,
     revision_tracker: AgentStationRevisionTracker | None = None,
@@ -848,18 +892,15 @@ def assemble_real_agent_primitive_gateway_session(
     if not isinstance(port, RealAgentMotionPort):
         raise TypeError("port must be typed.")
     clients = tuple(
-        sorted(
-            {
-                _required(item, field_name="client_id")
-                for item in allowed_client_ids
-            }
-        )
+        sorted({_required(item, field_name="client_id") for item in allowed_client_ids})
     )
     if not clients:
         raise ValueError("allowed_client_ids must not be empty.")
-    if isinstance(max_retained_operations, bool) or not isinstance(
-        max_retained_operations, int
-    ) or max_retained_operations <= 0:
+    if (
+        isinstance(max_retained_operations, bool)
+        or not isinstance(max_retained_operations, int)
+        or max_retained_operations <= 0
+    ):
         raise ValueError("max_retained_operations must be positive.")
     if not isinstance(owns_artifact_store, bool):
         raise TypeError("owns_artifact_store must be boolean.")
@@ -876,14 +917,17 @@ def assemble_real_agent_primitive_gateway_session(
         raise ValueError("Real perception registration requires its Artifact store.")
     if owns_artifact_store and artifact_store is None:
         raise ValueError("Owned Artifact store must be injected.")
+    grasp_enabled = contract_bundle.localization_registration is not None
+    if grasp_enabled != (localization_provider is not None):
+        raise ValueError("Localization registration requires its exact provider.")
+    if grasp_enabled != (station_point_grasp_planner is not None):
+        raise ValueError("Point-grasp registration requires its exact planner.")
     if max_session_admissions_per_route is not None and (
         isinstance(max_session_admissions_per_route, bool)
         or not isinstance(max_session_admissions_per_route, int)
         or max_session_admissions_per_route <= 0
     ):
-        raise ValueError(
-            "max_session_admissions_per_route must be positive or None."
-        )
+        raise ValueError("max_session_admissions_per_route must be positive or None.")
     producer = RealAgentPrimitiveObservationProducer(
         contract_bundle=contract_bundle,
         port=port,
@@ -927,9 +971,9 @@ def assemble_real_agent_primitive_gateway_session(
         clock=clock,
         max_retained_operations=max_retained_operations,
     )
-    execution_port_by_route_hash[
-        state_entry.route.semantic_content_hash
-    ] = state_executor
+    execution_port_by_route_hash[state_entry.route.semantic_content_hash] = (
+        state_executor
+    )
     motion_entries = tuple(
         entry
         for entry in contract_bundle.route_manifest.skill_routes
@@ -1002,6 +1046,11 @@ def assemble_real_agent_primitive_gateway_session(
         execution_port_by_route_hash[route.semantic_content_hash] = executor
     rgb_executor = None
     depth_executor = None
+    localization_executor = None
+    station_point_grasp_provider = None
+    station_point_grasp_executor = None
+    station_point_grasp_render_provider = None
+    station_point_grasp_render_executor = None
     if perception_provider is not None and artifact_store is not None:
         registration = contract_bundle.perception_capture
         assert registration is not None
@@ -1020,6 +1069,77 @@ def assemble_real_agent_primitive_gateway_session(
                 registration.depth.routes[0].semantic_content_hash: depth_executor,
             }
         )
+        if contract_bundle.localization_registration is not None:
+            assert localization_provider is not None
+            assert station_point_grasp_planner is not None
+            localization_registration = contract_bundle.localization_registration
+            point_grasp_registration = contract_bundle.station_point_grasp_registration
+            render_registration = (
+                contract_bundle.station_point_grasp_render_registration
+            )
+            assert point_grasp_registration is not None
+            assert render_registration is not None
+            frame_binding = contract_bundle.perception_capture.frame_binding
+            if frame_binding is None:
+                raise ValueError("Station point-grasp requires a v2 frame binding.")
+            localization_executor = build_real_object_localization_executor(
+                registration=localization_registration,
+                provider=localization_provider,
+                artifact_store=artifact_store,
+                runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                current_station_revision=lambda: producer.current_station_revision,
+                max_retained_operations=max_retained_operations,
+                clock=clock,
+            )
+            station_point_grasp_provider = StationBoundPointGraspProvider(
+                planner=station_point_grasp_planner,
+                registration=point_grasp_registration,
+                perception_provider=perception_provider,
+                frame_binding=frame_binding,
+                current_station_revision=lambda: producer.current_station_revision,
+            )
+            station_point_grasp_executor = build_station_bound_point_grasp_executor(
+                registration=point_grasp_registration,
+                provider=station_point_grasp_provider,
+                artifact_store=artifact_store,
+                runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                current_station_revision=lambda: producer.current_station_revision,
+                max_retained_operations=max_retained_operations,
+                clock=clock,
+            )
+            station_point_grasp_render_provider = StationBoundPointGraspRenderProvider(
+                registration=render_registration,
+                point_grasp_registration=point_grasp_registration,
+                point_grasp_executor=station_point_grasp_executor,
+                perception_provider=perception_provider,
+                frame_binding=frame_binding,
+                runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                current_station_revision=lambda: producer.current_station_revision,
+            )
+            station_point_grasp_render_executor = (
+                build_station_bound_point_grasp_render_executor(
+                    registration=render_registration,
+                    provider=station_point_grasp_render_provider,
+                    artifact_store=artifact_store,
+                    runtime_session_id=contract_bundle.attachment.runtime_session_id,
+                    current_station_revision=lambda: producer.current_station_revision,
+                    max_retained_operations=max_retained_operations,
+                    clock=clock,
+                )
+            )
+            execution_port_by_route_hash.update(
+                {
+                    localization_registration.skill.routes[
+                        0
+                    ].semantic_content_hash: localization_executor,
+                    point_grasp_registration.skill.routes[
+                        0
+                    ].semantic_content_hash: station_point_grasp_executor,
+                    render_registration.skill.routes[
+                        0
+                    ].semantic_content_hash: station_point_grasp_render_executor,
+                }
+            )
     registry = SkillExecutorRegistry(
         manifest=contract_bundle.route_manifest,
         bindings=tuple(
@@ -1114,6 +1234,7 @@ def assemble_real_agent_primitive_gateway_session(
         contract_bundle=contract_bundle,
         port=port,
         perception_provider=perception_provider,
+        localization_provider=localization_provider,
         operation_store=service.operation_store,
         clock=clock,
     )
@@ -1126,6 +1247,12 @@ def assemble_real_agent_primitive_gateway_session(
         perception_provider=perception_provider,
         rgb_executor=rgb_executor,
         depth_executor=depth_executor,
+        localization_provider=localization_provider,
+        localization_executor=localization_executor,
+        station_point_grasp_provider=station_point_grasp_provider,
+        station_point_grasp_executor=station_point_grasp_executor,
+        station_point_grasp_render_provider=station_point_grasp_render_provider,
+        station_point_grasp_render_executor=station_point_grasp_render_executor,
         artifact_store=artifact_store,
         owns_artifact_store=owns_artifact_store,
         hardware_view_provider=hardware_view_provider,

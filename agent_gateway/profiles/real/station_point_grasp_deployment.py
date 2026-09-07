@@ -241,6 +241,7 @@ def build_station_bound_point_grasp_registration(
     target_binding_id: str,
     station_manifest_hash: str,
     execution_manifest_hash: str,
+    current_mode: str = "real_observe",
 ) -> StationBoundPointGraspRegistration:
     """Build one closed, proposal-only live point-grasp registration."""
 
@@ -299,6 +300,8 @@ def build_station_bound_point_grasp_registration(
             ),
         ),
     )
+    if current_mode not in {"real_observe", "real_active"}:
+        raise ValueError("point-grasp current_mode is unsupported")
     route = SkillExecutionRoute(
         skill_id=definition.skill_id,
         skill_version=definition.skill_version,
@@ -311,7 +314,7 @@ def build_station_bound_point_grasp_registration(
         allowed_parameter_profiles=schema.parameter_profiles,
         control_effect_class="read_only",
         privilege_tier="t0_read_only",
-        supported_modes=("real_observe",),
+        supported_modes=(current_mode,),
         target_kind="real",
         may_move_robot=False,
         may_open_publication=False,

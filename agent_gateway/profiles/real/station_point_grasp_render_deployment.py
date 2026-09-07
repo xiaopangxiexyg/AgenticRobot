@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from agent_gateway.protocol.skill_catalog import (
@@ -53,7 +54,8 @@ def _required(value: object, *, field_name: str) -> str:
 class StationBoundPointGraspRenderProfile:
     """Exact candidate source and camera geometry allowed by the render Route."""
 
-    aligned_rgbd_sources: tuple[tuple[str, str, int, int], ...]
+    render_rgb_sources: tuple[tuple[str, str, int, int], ...]
+    camera_geometry_binding_hash: str
     point_grasp_route_hash: str
     point_grasp_profile_hash: str
     point_grasp_deployment_binding_hash: str
@@ -81,21 +83,24 @@ class StationBoundPointGraspRenderProfile:
             "reference_frame_id",
             "reference_frame_spec_hash",
             "profile_id",
+            "camera_geometry_binding_hash",
         ):
             object.__setattr__(
                 self,
                 field_name,
                 _required(getattr(self, field_name), field_name=field_name),
             )
-        sources = tuple(sorted(self.aligned_rgbd_sources, key=lambda item: item[1]))
+        sources = tuple(sorted(self.render_rgb_sources, key=lambda item: item[1]))
         if not sources:
-            raise ValueError("At least one aligned RGB-D source is required.")
+            raise ValueError(
+                "At least one RGB source with trusted geometry is required."
+            )
         if any(not isinstance(item, tuple) or len(item) != 4 for item in sources):
-            raise ValueError("Aligned RGB-D source entries must be 4-tuples.")
+            raise ValueError("Render RGB source entries must be 4-tuples.")
         if len({item[0] for item in sources}) != len(sources):
-            raise ValueError("Aligned RGB-D source IDs must be unique.")
+            raise ValueError("Render RGB source IDs must be unique.")
         if len({item[1] for item in sources}) != len(sources):
-            raise ValueError("Aligned RGB-D roles must be unique.")
+            raise ValueError("Render RGB roles must be unique.")
         for source_id, role, width, height in sources:
             _required(source_id, field_name="source_id")
             _required(role, field_name="role")
@@ -104,7 +109,7 @@ class StationBoundPointGraspRenderProfile:
                 for value in (width, height)
             ):
                 raise ValueError("Aligned RGB-D dimensions must be positive integers.")
-        object.__setattr__(self, "aligned_rgbd_sources", sources)
+        object.__setattr__(self, "render_rgb_sources", sources)
         if not 1 <= self.max_candidates <= 5:
             raise ValueError("max_candidates must be in [1, 5].")
         if not 1 <= self.max_annotated_bytes <= 64 * 1024 * 1024:
@@ -114,14 +119,14 @@ class StationBoundPointGraspRenderProfile:
     def source_by_role(self) -> dict[str, str]:
         return {
             role: source_id
-            for source_id, role, _width, _height in self.aligned_rgbd_sources
+            for source_id, role, _width, _height in self.render_rgb_sources
         }
 
     @property
     def dimensions_by_role(self) -> dict[str, tuple[int, int]]:
         return {
             role: (width, height)
-            for _source_id, role, width, height in self.aligned_rgbd_sources
+            for _source_id, role, width, height in self.render_rgb_sources
         }
 
     @property
@@ -129,7 +134,8 @@ class StationBoundPointGraspRenderProfile:
         return canonical_content_hash(
             {
                 "profile_id": self.profile_id,
-                "aligned_rgbd_sources": self.aligned_rgbd_sources,
+                "render_rgb_sources": self.render_rgb_sources,
+                "camera_geometry_binding_hash": self.camera_geometry_binding_hash,
                 "point_grasp_route_hash": self.point_grasp_route_hash,
                 "point_grasp_profile_hash": self.point_grasp_profile_hash,
                 "point_grasp_deployment_binding_hash": (
@@ -146,7 +152,7 @@ class StationBoundPointGraspRenderProfile:
                 "max_annotated_bytes": self.max_annotated_bytes,
                 "candidate_source": "retained_completed_station_point_grasp_operation",
                 "render_count": 1,
-                "view_geometry_owner": "deployment_aligned_rgbd_binding",
+                "view_geometry_owner": "deployment_rgb_camera_geometry_binding",
                 "downstream_control_effects": "forbidden",
             },
             domain="dexteleop.agent_skill.station_point_grasp_render_profile.v1",
@@ -213,6 +219,8 @@ class StationBoundPointGraspRenderRegistration:
 def build_station_bound_point_grasp_render_registration(
     *,
     point_grasp_registration: StationBoundPointGraspRegistration,
+    render_rgb_source_catalog: tuple[Mapping[str, object], ...] | None = None,
+    camera_geometry_binding_hash: str | None = None,
 ) -> StationBoundPointGraspRenderRegistration:
     """Build the optional render Route from the exact proposal Route binding."""
 
@@ -221,8 +229,35 @@ def build_station_bound_point_grasp_render_registration(
     source_profile = point_grasp_registration.profile
     source_binding = point_grasp_registration.binding
     source_route = point_grasp_registration.skill.routes[0]
+    selected_catalog = (
+        tuple(
+            {
+                "source_id": source_id,
+                "role": role,
+                "native_width": width,
+                "native_height": height,
+            }
+            for source_id, role, width, height in source_profile.aligned_rgbd_sources
+        )
+        if render_rgb_source_catalog is None
+        else tuple(render_rgb_source_catalog)
+    )
+    render_sources = tuple(
+        (
+            str(item["source_id"]),
+            str(item["role"]),
+            int(item["native_width"]),
+            int(item["native_height"]),
+        )
+        for item in selected_catalog
+    )
     profile = StationBoundPointGraspRenderProfile(
-        aligned_rgbd_sources=source_profile.aligned_rgbd_sources,
+        render_rgb_sources=render_sources,
+        camera_geometry_binding_hash=(
+            source_profile.source_binding_hash
+            if camera_geometry_binding_hash is None
+            else camera_geometry_binding_hash
+        ),
         point_grasp_route_hash=source_route.semantic_content_hash,
         point_grasp_profile_hash=source_profile.semantic_content_hash,
         point_grasp_deployment_binding_hash=source_binding.semantic_content_hash,
@@ -279,7 +314,7 @@ def build_station_bound_point_grasp_render_registration(
         allowed_parameter_profiles=schema.parameter_profiles,
         control_effect_class="read_only",
         privilege_tier="t0_read_only",
-        supported_modes=("real_observe",),
+        supported_modes=source_route.supported_modes,
         target_kind="real",
         may_move_robot=False,
         may_open_publication=False,
@@ -334,6 +369,7 @@ def build_station_bound_point_grasp_render_registration(
                 source_by_role=profile.source_by_role,
                 dimensions_by_role=profile.dimensions_by_role,
                 source_binding_hash=profile.source_binding_hash,
+                camera_geometry_binding_hash=(profile.camera_geometry_binding_hash),
                 frame_binding_hash=profile.frame_binding_hash,
                 frame_graph_hash=profile.frame_graph_hash,
                 source_frame_id=profile.source_frame_id,
@@ -350,7 +386,7 @@ def build_station_bound_point_grasp_render_registration(
     )
     availability_hash = canonical_content_hash(
         {
-            "status": "configured_requires_retained_point_grasp_and_live_aligned_rgbd",
+            "status": "configured_requires_retained_point_grasp_and_live_rgb_geometry",
             "route_hash": route.semantic_content_hash,
             "deployment_binding_hash": binding.semantic_content_hash,
             "profile_hash": profile.semantic_content_hash,

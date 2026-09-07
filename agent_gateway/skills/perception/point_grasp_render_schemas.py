@@ -135,15 +135,27 @@ def point_grasp_candidate_render_schema_entry_v1(
             "view_frame_index": {"type": "integer", "minimum": 0},
             "view_capture_group_id": {
                 "type": "string",
-                "pattern": "^real-aligned-rgbd:[0-9a-f]{64}$",
+                "pattern": "^real-rgb-geometry:[0-9a-f]{64}$",
             },
             "view_rgb_content_hash": {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$",
             },
-            "view_depth_content_hash": {
+            "view_geometry_binding_hash": {
+                "type": "string",
+                "minLength": 1,
+            },
+            "view_geometry_cut_hash": {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$",
+            },
+            "view_pose_measured_at": {"type": "number"},
+            "view_pose_available_at": {"type": "number"},
+            "view_pose_evidence_refs": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1},
             },
             "source_binding_hash": {"type": "string", "minLength": 1},
             "frame_binding_hash": {"type": "string", "minLength": 1},
@@ -205,7 +217,11 @@ def point_grasp_candidate_render_schema_entry_v1(
             "view_frame_index",
             "view_capture_group_id",
             "view_rgb_content_hash",
-            "view_depth_content_hash",
+            "view_geometry_binding_hash",
+            "view_geometry_cut_hash",
+            "view_pose_measured_at",
+            "view_pose_available_at",
+            "view_pose_evidence_refs",
             "source_binding_hash",
             "frame_binding_hash",
             "frame_graph_hash",
@@ -374,7 +390,7 @@ def validate_point_grasp_candidate_render_parameters_v1(
     if ordinal >= max_candidates:
         raise ValueError("candidate_ordinal exceeds the deployment bound.")
     if _text(payload["view_role"], field="view_role", maximum=128) not in roles:
-        raise ValueError("view_role is not a registered aligned RGB-D role.")
+        raise ValueError("view_role is not a registered RGB geometry role.")
 
 
 def validate_point_grasp_candidate_render_result_v1(
@@ -383,6 +399,7 @@ def validate_point_grasp_candidate_render_result_v1(
     source_by_role: Mapping[str, str],
     dimensions_by_role: Mapping[str, tuple[int, int]],
     source_binding_hash: str,
+    camera_geometry_binding_hash: str,
     frame_binding_hash: str,
     frame_graph_hash: str,
     source_frame_id: str,
@@ -407,7 +424,11 @@ def validate_point_grasp_candidate_render_result_v1(
         "view_frame_index",
         "view_capture_group_id",
         "view_rgb_content_hash",
-        "view_depth_content_hash",
+        "view_geometry_binding_hash",
+        "view_geometry_cut_hash",
+        "view_pose_measured_at",
+        "view_pose_available_at",
+        "view_pose_evidence_refs",
         "source_binding_hash",
         "frame_binding_hash",
         "frame_graph_hash",
@@ -441,14 +462,31 @@ def validate_point_grasp_candidate_render_result_v1(
         "point_grasp_result_hash",
         "point_grasp_candidate_hash",
         "view_rgb_content_hash",
-        "view_depth_content_hash",
+        "view_geometry_cut_hash",
     ):
         _sha256(payload[field], field=field)
-    for field in ("source_capture_group_id", "view_capture_group_id"):
-        value = _text(payload[field], field=field, maximum=83)
-        if not value.startswith("real-aligned-rgbd:"):
-            raise ValueError(f"{field} has the wrong domain.")
-        _sha256(value.removeprefix("real-aligned-rgbd:"), field=f"{field} hash")
+    source_group = _text(
+        payload["source_capture_group_id"],
+        field="source_capture_group_id",
+        maximum=83,
+    )
+    if not source_group.startswith("real-aligned-rgbd:"):
+        raise ValueError("source_capture_group_id has the wrong domain.")
+    _sha256(
+        source_group.removeprefix("real-aligned-rgbd:"),
+        field="source_capture_group_id hash",
+    )
+    view_group = _text(
+        payload["view_capture_group_id"],
+        field="view_capture_group_id",
+        maximum=82,
+    )
+    if not view_group.startswith("real-rgb-geometry:"):
+        raise ValueError("view_capture_group_id has the wrong domain.")
+    _sha256(
+        view_group.removeprefix("real-rgb-geometry:"),
+        field="view_capture_group_id hash",
+    )
     for field in (
         "source_station_revision",
         "candidate_ordinal",
@@ -466,6 +504,7 @@ def validate_point_grasp_candidate_render_result_v1(
         raise ValueError("Rendered view source identity changed.")
     for field, expected_value in (
         ("source_binding_hash", source_binding_hash),
+        ("view_geometry_binding_hash", camera_geometry_binding_hash),
         ("frame_binding_hash", frame_binding_hash),
         ("frame_graph_hash", frame_graph_hash),
         ("source_frame_id", source_frame_id),
@@ -475,13 +514,30 @@ def validate_point_grasp_candidate_render_result_v1(
     ):
         if payload[field] != expected_value:
             raise ValueError(f"Point-grasp candidate render {field} changed.")
-    acquired_at = payload["view_acquired_at"]
-    if (
-        isinstance(acquired_at, bool)
-        or not isinstance(acquired_at, (int, float))
-        or not math.isfinite(float(acquired_at))
+    timestamps = {}
+    for field in (
+        "view_acquired_at",
+        "view_pose_measured_at",
+        "view_pose_available_at",
     ):
-        raise ValueError("view_acquired_at must be finite.")
+        value = payload[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"{field} must be finite.")
+        timestamps[field] = float(value)
+    if timestamps["view_pose_available_at"] < timestamps["view_pose_measured_at"]:
+        raise ValueError("Rendered camera pose availability precedes measurement.")
+    evidence_refs = payload["view_pose_evidence_refs"]
+    if (
+        not isinstance(evidence_refs, (list, tuple))
+        or not evidence_refs
+        or len(evidence_refs) != len(set(evidence_refs))
+        or any(not isinstance(item, str) or not item for item in evidence_refs)
+    ):
+        raise ValueError("Rendered camera pose requires unique evidence refs.")
     width, height = dimensions_by_role[role]
     intrinsics = payload["camera_intrinsics"]
     required_intrinsics = {"width", "height", "fx", "fy", "cx", "cy", "fovy_deg"}

@@ -587,6 +587,39 @@ from a teleoperation Home record. A capture invocation itself has no downstream
 control effect. Repository offline tests establish neither live camera nor
 robot execution for either profile.
 
+The combined three-view point-grasp profile is an explicit opt-in. It uses the
+reviewed v4 head-camera placement and derives both wrist-camera poses from the
+fresh measured dual-arm qpos consumed by the sole lower control loop:
+
+```bash
+python -m agent_gateway real-rm65 \
+  --socket-path /absolute/private/gateway.sock \
+  --arm-ip-assignment /absolute/rm65_arm_ips.json \
+  --left-tool-profile /absolute/left_tool.json \
+  --right-tool-profile /absolute/right_tool.json \
+  --envelope-profile /absolute/right_skill_envelope.json \
+  --camera-config /absolute/AgenticRobot/teleop_runtime/configs/devices/agent_gateway_realsense.json \
+  --camera-registry /absolute/AgenticRobot/robot_motion/configs/rm65_camera_registry_v4.json \
+  --camera-mount-urdf /absolute/AgenticRobot/assets/rm65_inspire_gripper_v4/rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf \
+  --artifact-root /absolute/private/artifact_cache \
+  --enable-point-grasp \
+  --object-localization-asset-bundle /absolute/assets/perception/sam2_grounding_dino \
+  --point-grasp-backend vgn \
+  --point-grasp-asset-bundle /absolute/assets/perception/sam2_vgn_point_grasp \
+  --authorized-side right \
+  --authorized-action move_tcp_to_pose \
+  --confirm AUTHORIZE_PERSISTENT_REAL_TCP_PRIMITIVES
+```
+
+For the point-grasp opt-in, the detailed v4 URDF shown above is the default
+`--camera-mount-urdf` and the v4 registry shown above is used when
+`--camera-registry` is omitted; the explicit arguments keep deployment evidence
+self-describing. The generic camera-only profile still requires an explicit
+registry. URDF, registry,
+Station, arm-base, and live pose-cut disagreement is rejected before a rendered
+candidate is returned. This profile connects both arms and requires startup
+HOLD even when a client invokes only read-only Skills.
+
 The CLI is a concrete lower deployment leaf, not an Agent API. All files and
 the selected side/action are trusted operator inputs. The process exposes no
 transport until optional cameras have passed consecutive-frame freshness
