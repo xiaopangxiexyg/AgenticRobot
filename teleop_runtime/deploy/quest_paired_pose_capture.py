@@ -65,6 +65,7 @@ QUEST_CONTROLLER_CANDIDATE_SCHEMA = "dexteleop.quest_controller_capture_candidat
 QUEST_CONTROLLER_CANDIDATE_HASH_DOMAIN = (
     "dexteleop.quest_controller_capture_candidate.v1"
 )
+DEFAULT_STATIC_WINDOW_DURATION_S = 3.0
 
 QuestPoseEvent = ControllerPoseAcceptedEvent | ControllerPoseInvalidationEvent
 
@@ -1222,6 +1223,12 @@ class QuestPairedPoseCaptureApplication:
         if fit is None:
             raise TypeError("diagnostic_fit must expose fit")
         binding = evidence.binding
+        preview_tcp_matrix = None
+        samples = getattr(evidence.dataset, "samples", ())
+        if samples:
+            preview_tcp_matrix = matrix_to_column_major(
+                samples[-1].first.matrix_reference_from_moving
+            )
         payload = calibration_preview_message(
             robot=f"rm65_{self._selected_robot_side or 'unknown'}",
             capture_id=self.capture_id,
@@ -1238,6 +1245,7 @@ class QuestPairedPoseCaptureApplication:
             ),
             robot_frame=binding.robot.reference_frame_id,
             tcp_frame=binding.robot.moving_frame_id,
+            matrix_robot_from_tcp=preview_tcp_matrix,
         )
         publisher = getattr(self.runtime.server, "publish_feature_message", None)
         if callable(publisher):
@@ -1595,7 +1603,9 @@ class QuestTerminalCaptureController:
     desktop operator page used previously.  It owns no keyboard reader; the
     deployment loop passes it keys from its existing ``NonBlockingKeyboard``
     instance, so safety/re-arm and passive-capture input cannot race over
-    stdin.
+    stdin.  Each ``r`` starts one fixed-duration window.  Completion is
+    scheduled from :meth:`poll`, so the existing deployment loop remains the
+    only owner of terminal input and application progress.
     """
 
     def __init__(
@@ -1605,6 +1615,8 @@ class QuestTerminalCaptureController:
         robot_side: str,
         preferred_handedness: str | None = None,
         window_id_prefix: str = "static-window",
+        window_duration_s: float = DEFAULT_STATIC_WINDOW_DURATION_S,
+        monotonic_ns_clock: Callable[[], int] | None = None,
         emit: Callable[[str], None] = print,
         fit_function: Callable[[PairedPoseCaptureEvidence], Any] | None = None,
     ) -> None:
@@ -1636,10 +1648,25 @@ class QuestTerminalCaptureController:
             window_id_prefix,
             name="window_id_prefix",
         )
+        duration_s = _positive_timeout(window_duration_s, name="window_duration_s")
+        clock = monotonic_ns_clock
+        if clock is None:
+            journal = getattr(application, "robot_pose_journal", None)
+            clock = getattr(journal, "monotonic_ns_clock", None)
+            if clock is None:
+                clock = time.monotonic_ns
+        if not callable(clock):
+            raise TypeError("monotonic_ns_clock must be callable")
         self.emit = emit
         self.fit_function = fit_function
+        self.window_duration_s = duration_s
+        self._window_duration_ns = round(duration_s * 1_000_000_000.0)
+        if self._window_duration_ns <= 0:
+            raise ValueError("window_duration_s is too small for a nanosecond clock")
+        self._monotonic_ns_clock = clock
         self._window_index = 0
         self._pending_action: str | None = None
+        self._window_deadline_ns: int | None = None
         self._terminal_error: str | None = None
         self._last_status_key: tuple[Any, ...] | None = None
         self._diagnostic_fit: Any | None = None
@@ -1707,23 +1734,65 @@ class QuestTerminalCaptureController:
         self._window_index += 1
         return f"{self.window_id_prefix}-{self._window_index:03d}"
 
+    def _now_monotonic_ns(self) -> int:
+        value = int(self._monotonic_ns_clock())
+        if value < 0:
+            raise ValueError("monotonic_ns_clock returned a negative value")
+        return value
+
+    @staticmethod
+    def _capture_from_status(status: Mapping[str, Any]) -> Mapping[str, Any]:
+        capture = status.get("capture")
+        return capture if isinstance(capture, Mapping) else {}
+
+    def _window_is_due(self) -> bool:
+        deadline_ns = self._window_deadline_ns
+        if deadline_ns is None:
+            return False
+        return self._now_monotonic_ns() >= deadline_ns
+
+    def _schedule_due_window_completion(self) -> None:
+        """Turn an elapsed fixed window into the existing bounded drain action."""
+
+        if self._pending_action is not None or self._window_deadline_ns is None:
+            return
+        status = self.application.snapshot_status()
+        capture = self._capture_from_status(status)
+        if capture.get("active_window_id") is None:
+            self._window_deadline_ns = None
+            return
+        if not self._window_is_due():
+            return
+        self._window_deadline_ns = None
+        self._pending_action = "complete"
+        self.emit(
+            f"[Quest] {self.window_duration_s:g}s static window elapsed; "
+            "completing automatically and "
+            "draining Quest/RealMan samples..."
+        )
+        self._publish_status(force=True)
+
     def _complete_pending_window(self, *, seal_after: bool) -> bool:
         try:
             receipt = self.application.complete_window()
         except StaticWindowRejectedError as error:
             self._pending_action = None
+            self._window_deadline_ns = None
             self._emit_error("static window rejected", error)
             return False
         except QuestPairedPoseCaptureTerminalError as error:
             self._pending_action = None
+            self._window_deadline_ns = None
             self._terminal_error = str(error)
             self._emit_error("capture became terminal", error)
             return False
         except Exception as error:  # noqa: BLE001 - operator-visible passive error.
             self._pending_action = None
+            self._window_deadline_ns = None
             self._emit_error("window completion failed", error)
             return False
         if receipt is None:
+            self._window_deadline_ns = None
             self._pending_action = (
                 "seal_after_complete" if seal_after else "complete"
             )
@@ -1731,6 +1800,7 @@ class QuestTerminalCaptureController:
             self._publish_status(force=True)
             return False
         self._pending_action = None
+        self._window_deadline_ns = None
         self.emit(
             "[Quest] window completed: "
             f"{receipt.window_id}; samples="
@@ -1813,6 +1883,7 @@ class QuestTerminalCaptureController:
             self._emit_error("passive capture became terminal", error)
             return self._publish_status()
         self._publish_status()
+        self._schedule_due_window_completion()
         self._try_pending_action()
         return status
 
@@ -1836,26 +1907,47 @@ class QuestTerminalCaptureController:
         try:
             self._ensure_selected()
             status = self.application.snapshot_status()
-            capture = status.get("capture")
-            capture = capture if isinstance(capture, Mapping) else {}
+            capture = self._capture_from_status(status)
             active_window = capture.get("active_window_id")
             if normalized == "r":
+                if active_window is not None and self._window_is_due():
+                    self._pending_action = "complete"
+                    self._window_deadline_ns = None
+                    self._complete_pending_window(seal_after=False)
+                    status = self.application.snapshot_status()
+                    capture = self._capture_from_status(status)
+                    active_window = capture.get("active_window_id")
+                    if self._pending_action is not None or active_window is not None:
+                        return True
                 if active_window is None:
                     window_id = self._next_window_id()
                     self.application.begin_window(window_id=window_id)
+                    self._window_deadline_ns = (
+                        self._now_monotonic_ns() + self._window_duration_ns
+                    )
                     self.emit(
                         "[Quest] window started: "
-                        f"{window_id}; hold the arm/controller still, "
-                        "press r again to finish"
+                        f"{window_id}; hold the arm/controller still for "
+                        f"{self.window_duration_s:g}s; it will finish automatically"
                     )
                     self._publish_status(force=True)
                 else:
-                    self._pending_action = "complete"
-                    self._complete_pending_window(seal_after=False)
+                    self.emit(
+                        "[Quest] r ignored: current static window is still "
+                        f"recording for {self.window_duration_s:g}s; wait for "
+                        "automatic completion"
+                    )
                 return True
             if active_window is not None:
-                self._pending_action = "seal_after_complete"
-                self._complete_pending_window(seal_after=True)
+                if not self._window_is_due():
+                    self.emit(
+                        "[Quest] c ignored: current static window has not reached "
+                        f"{self.window_duration_s:g}s; wait for automatic completion"
+                    )
+                else:
+                    self._pending_action = "seal_after_complete"
+                    self._window_deadline_ns = None
+                    self._complete_pending_window(seal_after=True)
             else:
                 self._seal_and_solve()
             return True

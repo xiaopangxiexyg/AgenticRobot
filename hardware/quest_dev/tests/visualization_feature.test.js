@@ -208,3 +208,31 @@ test('visualization draws diagnostic robot base and raw-feedback TCP preview', (
   assert.match(status.textContent, /robot feedback 1 fresh/);
   assert.match(overlayStatus.textContent, /diagnostic preview only/);
 });
+
+test('diagnostic preview draws the captured TCP before live feedback arrives', () => {
+  const { implementation, draws, overlayStatus } = loadFeature();
+  implementation.onXRReady({ gl: {} });
+  implementation.handleServerMessage({
+    message: {
+      type: 'calibration_preview',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      preview: true,
+      accepted: false,
+      alignment_status: 'diagnostic_preview',
+      robot: 'rm65_left',
+      robot_frame: 'left_arm_base',
+      tcp_frame: 'tool_tcp',
+      quest_session_id: 'xr-session-1',
+      reference_space_type: 'local-floor',
+      reference_space_generation: 0,
+      matrix_quest_from_robot_base: identityMatrix(),
+      matrix_robot_from_tcp: identityMatrix(),
+    },
+  });
+
+  implementation.renderView(matchingContext());
+  assert.equal(draws.length, 3);
+  assert.match(overlayStatus.textContent, /base axes \+ TCP marker/);
+});

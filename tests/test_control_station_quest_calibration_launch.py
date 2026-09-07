@@ -135,6 +135,9 @@ def test_dry_run_prints_resolved_contract_without_constructing_runtime() -> None
 
     assert result == 0
     assert payload["mode"] == "quest_rm65_passive_calibration_trial"
+    assert payload["terminal_capture"]["r"] == (
+        "start one fixed 3s static window; repeat after auto-completion"
+    )
     assert payload["quest_pairing"] == {
         "fixed_code": TRUSTED_LAN_EASY_PAIRING_CODE,
         "mode": "trusted_lan_easy",
@@ -270,6 +273,7 @@ def test_shell_entrypoint_is_executable_and_delegates_to_module() -> None:
     assert "终端控制（当前运行模式）" in html
     assert "按 <code>r</code>" in html
     assert "按 <code>c</code>" in html
+    assert "固定 3 秒" in html
     assert "封存候选（当前仅内存）" not in html
     assert "completeWindowWithBoundedDrain" not in javascript
     assert 'fetch("/intent"' not in javascript

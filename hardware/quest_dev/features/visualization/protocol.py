@@ -58,7 +58,7 @@ def capture_status_message(
         "feature_protocol_version": FEATURE_PROTOCOL_VERSION,
         "capture": dict(capture),
         "operator_controls": {
-            "start_or_finish_window": "r",
+            "start_fixed_3s_window_and_repeat": "r",
             "finalize_and_solve": "c",
         },
     }
@@ -80,18 +80,26 @@ def calibration_preview_message(
     matrix_quest_from_robot_base: Sequence[float],
     robot_frame: str,
     tcp_frame: str,
+    matrix_robot_from_tcp: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Publish a candidate-only Quest-space robot-frame preview.
 
     ``accepted`` deliberately remains false.  The preview is bound to the
     exact Quest session/reference-space epoch used by the diagnostic fit and
-    is never an accepted frame binding or a control input.
+    is never an accepted frame binding or a control input.  An optional
+    robot-from-TCP matrix lets the browser draw the last captured endpoint
+    before the next live read-only feedback packet arrives.
     """
 
     matrix = [float(value) for value in matrix_quest_from_robot_base]
     if len(matrix) != 16:
         raise ValueError("matrix_quest_from_robot_base must contain 16 values")
-    return {
+    tcp_matrix = None
+    if matrix_robot_from_tcp is not None:
+        tcp_matrix = [float(value) for value in matrix_robot_from_tcp]
+        if len(tcp_matrix) != 16:
+            raise ValueError("matrix_robot_from_tcp must contain 16 values")
+    payload: dict[str, Any] = {
         "type": "calibration_preview",
         "feature": FEATURE_NAME,
         "protocol_version": PROTOCOL_VERSION,
@@ -114,3 +122,6 @@ def calibration_preview_message(
         "robot_frame": str(robot_frame),
         "tcp_frame": str(tcp_frame),
     }
+    if tcp_matrix is not None:
+        payload["matrix_robot_from_tcp"] = tcp_matrix
+    return payload

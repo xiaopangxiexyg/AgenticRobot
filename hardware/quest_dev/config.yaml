@@ -49,7 +49,9 @@ features:
             side: right
             arm_ip: ""
       # Reviewed bindings are intentionally absent by default. Without one,
-      # robot_tcp remains diagnostic-only and the browser draws no TCP axes.
+      # live robot_tcp remains diagnostic-only; after terminal c, the
+      # candidate preview may still draw the captured TCP pose next to the
+      # diagnostic robot-base axes, without installing an accepted binding.
       frame_bindings: {}
       # Paths are resolved relative to hardware/quest_dev when not absolute.
       # A loaded file must be the canonical accepted_frame_binding.v1 payload.
