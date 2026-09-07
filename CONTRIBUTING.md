@@ -1,77 +1,21 @@
-# DexTeleop 多人开发约定
+# AgenticRobot 开发约定
 
-本仓库以同一源码仓中的 Conda 开发环境为交付边界，不要求把 DexTeleop 构建成可安装产品。
-依赖由 `environment.yml`、`pyproject.toml`、`uv.lock` 和安装脚本共同锁定；源码始终从当前
-worktree 根目录运行。
+AgenticRobot 提供可独立复用的控制、运动、采集、数据、仿真、部署与下层 Gateway。
+上层规划和 Memory 属于 RPent；开发协作与证据管理属于 Harness。
+包的边界见 [运行域说明](docs/architecture/runtime_domain_boundaries.md)。
 
-## 1. 开始任务前认领 worktree
+## 1. 选择开发入口
 
-开始修改前先确认当前 worktree 和并行状态。首次在一个 clone 上开发时，把解压后的共享
-`assets/` 根目录记录一次（这是机器本地 Git 配置，不进入提交）：
+默认从已安装 Harness 的项目调用指南创建隔离 Task，遵守其生成的 AGENTS、scope、
+writer lease 和验证流程。不要再为同一 Task 运行 claim_worktree 或维护 Git 分支描述。
 
-```bash
-git worktree list
-git status --short --branch
-export DEXTELEOP_ASSET_ROOT=/absolute/path/to/assets
-python scripts/dev_asset_store.py configure \
-  --asset-root "$DEXTELEOP_ASSET_ROOT"
-```
+独立 Git 开发可按 [轻量 Git 工作流](docs/development/git-workflow.md) 执行；
+该流程由本仓库维护，可用于 RPent 等仓库。它不依赖 Harness，也不要求先下载机器人
+资产。创建任务前说明选用哪种方式，保留既有工作区和所有者的修改。
 
-以后统一通过认领工具创建 worktree；它会在创建分支前验证资产，写入所有权描述，并在新
-worktree 中建立被 Git 忽略的 `assets` 兼容链接：
+## 2. 环境与资源按需准备
 
-```bash
-python scripts/claim_worktree.py \
-  --branch task/<owner>/<task-name>-<YYYYMMDD> \
-  --path /absolute/path/to/worktree \
-  --base <baseline> \
-  --owner <owner> \
-  --write-scope '<planned files or packages>' \
-  --semantic-scope '<public contract or semantics affected>' \
-  --validation '<planned offline validation>'
-```
-
-向协作者说明 worktree 绝对路径、分支、baseline commit 和计划修改的目录。一个任务只在已
-认领的 worktree 中修改；不要在主 worktree 临时改完后再搬运，也不要 reset、clean 或 stash
-其他人的未提交工作。需要修改共享热点文件时，先缩小文件范围并确认没有重叠认领。
-
-`claim_worktree.py` 不会覆盖已有目录、已有分支或已有 `assets` 路径；初始化后半段失败时也
-不会擅自删除已经建立的 worktree。用下面的只读命令诊断当前绑定，或为早期手工创建的
-worktree 补齐链接：
-
-```bash
-python scripts/dev_asset_store.py status
-python scripts/dev_asset_store.py link-worktree --worktree /absolute/path/to/worktree
-```
-
-共享链接是路径兼容层，不是文件系统只读证明。普通开发不得修改共享资产；需要编辑或生成
-资产时，应另行认领明确的可写资产工作区并完成 provenance/hash 评审，不能通过任一 worktree
-的 `assets` 链接直接改 canonical store。Runtime 的资产身份与 hash 仍由 TargetRuntime 合同
-负责，开发机 Git 配置和绝对路径不得进入 Skill、profile 或提交。
-
-个人任务列表和临时推演可以放在根目录 `todos/`，该目录不进入 Git。需要跨 worktree 评审或
-被正式文档引用的计划应放入实际 owner 的 `docs/**/plans/`，可复用脚本则放入 `scripts/`
-或所属 package，不能让 tracked 代码、测试或文档依赖本地 `todos/`。
-
-`assets/` 之外的离线数据、运行记录、模型权重、秘密配置和生成输出不能假定会随 worktree
-自动出现。开始开发或迁移前运行：
-
-```bash
-python scripts/dev_local_resources.py audit
-python scripts/dev_local_resources.py plan \
-  --source-worktree /absolute/path/to/source \
-  --target-worktree /absolute/path/to/target
-```
-
-完整分类和迁移边界见
-[`docs/setup/LOCAL_RESOURCES.md`](./docs/setup/LOCAL_RESOURCES.md)。其中只有 reviewed、read-mostly
-的 `assets/` 使用自动软链接；`runtime_artifacts/` 和采集记录保持 writer 隔离；
-`teleop_records/`、`model/`、`hardware/VIVE/triad_openvr/` 含 tracked 例外，禁止整体链接或覆盖。
-修改本地资源相关 `.gitignore` 规则时，必须同步更新版本化清单、说明和 focused test。
-
-## 2. 共享 Conda 环境
-
-创建或修复完整依赖环境：
+Python、依赖和锁文件以 [README_ENV.md](README_ENV.md) 为准。完整开发环境：
 
 ```bash
 bash scripts/install_conda_env.sh --skip-vendor-sdk
@@ -79,39 +23,41 @@ conda activate "${DEXTELEOP_ENV_NAME:-dexteleop310}"
 python scripts/dev_environment_doctor.py
 ```
 
-同一台机器的多个 worktree 可以共享这个 Conda 环境。安装脚本不会把 DexTeleop 本身以
-editable 方式绑定到某个 worktree；每个终端必须先 `cd` 到自己认领的 worktree 根目录再运行
-`python -m ...` 或测试。诊断器若发现旧 editable 映射会给出警告，但仍会验证根目录运行时
-是否确实解析到当前 worktree；重新运行安装脚本会移除该旧映射。
+同机 worktree 可以共享经过协调的 Conda 环境，但源码必须从自己的根目录解析；
+不要让 editable 安装绑定到另一 worktree，也不要在共享环境中擅自更新依赖。
+缺失机器人资产对纯文档/代码任务只是诊断警告；运行需要资产的检查前使用
+`python scripts/dev_environment_doctor.py --require-development-assets`。
 
-诊断器默认把开发资产缺失报告为 `WARN`，因为纯数据或文档任务不一定需要 RM65 模型。要运行
-RM65 仿真、IK 或相关验收时使用 `python scripts/dev_environment_doctor.py
---require-development-assets`，缺失或错绑会在启动前 fail closed。
+只有涉及本地资源、链接或迁移时才读
+[资源说明](docs/setup/LOCAL_RESOURCES.md) 的相关分类，并运行
+`python scripts/dev_local_resources.py audit`。共享 assets 是 read-mostly 路径兼容层，
+不能通过链接修改 canonical store；mutable 采集和运行证据必须 writer 隔离。
 
-厂商 DM-Tac SDK 不随 linked worktree 复制。需要硬件开发时，把共享 SDK 放在仓库之外并设置：
+## 3. 实现与验证
 
-```bash
-export DEXTELEOP_DMTAC_SDK_ROOT=/absolute/path/to/DM_Tac_SDK_Publish_1.2.10
-bash scripts/install_conda_env.sh --update
-```
-
-不要在仍被其他任务使用时手工增删共享环境中的包。依赖变更应同时更新声明和 `uv.lock`，由
-一名认领者运行安装脚本验证；其他 worktree 随后统一更新环境。
-
-## 3. 提交前的无硬件检查
-
-从当前 worktree 根目录执行：
+先定位职责和已有实现，保留一个清楚的实现路径。为当前复用或真实边界抽象，内部
+调用者随重构更新；只有已知外部消费者需要时才保留兼容层，并说明退出条件。
+验证外部输入和状态边界，避免沿内部调用链重复同一校验。
 
 ```bash
+# 本地修改的行为、失败路径与相关契约：
+bash scripts/run_pytest.sh -q <affected-test-paths>
+git diff --check
+# 环境/公共边界变更时：
 bash scripts/verify_dev_base.sh
 ```
 
-该检查只覆盖环境、包边界和静态/进程内测试，不连接设备，也不授权真机、仿真运动或数据
-改写。修改具体模块时，还应运行该模块最小相关测试。真实设备测试必须继续遵守
-[`tests/README.md`](./tests/README.md) 的显式硬件门禁。
+[测试说明](tests/README.md) 定义快速反馈、完整集成验收和显式硬件门禁。
+文档编辑验证链接与命令即可；逻辑变更覆盖正常、边界、失败/取消/恢复及真实消费者。
+重构检查公开行为和集合范围；禁止通过删减断言、静默 skip 或重复测试制造绿色结果。
+覆盖率用于发现未覆盖路径，不能替代对正确性和安全边界的判断。
 
-## 4. 合并交接
+## 4. Review 与交接
 
-交接时说明分支、baseline、修改范围、已运行检查和未验证边界。合并者只集成已认领的提交，
-不要用整目录复制覆盖并行 worktree。发现冲突时依据当前代码和合同重新判断，不把旧计划或
-个人 `todos` 当作高于实现与测试的规范。
+检查实际 diff 是否解决当前请求、有无多余抽象或旁支清理。按可独立评审的职责组织
+提交；必要的测试和文档随实现一起提交。说明固定 base/tip、主要变化、已跑检查、
+环境及未验证边界。完整验收绑定待集成的组合提交，避免每个普通工作区反复跑同一
+高成本套件。合并/推送另按对应授权和选定工作流执行。
+
+本地临时推演可在 ignored `todos/`；需要共享的长期设计放在 owner 的文档目录。
+不要默认产生逐步过程报告或平行的任务状态文件。

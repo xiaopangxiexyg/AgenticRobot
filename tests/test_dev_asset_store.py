@@ -141,7 +141,7 @@ def test_claim_worktree_records_owner_and_links_shared_assets(tmp_path: Path) ->
             "--owner",
             "test",
             "--write-scope",
-            "asset tooling tests",
+            "scripts/**",
             "--semantic-scope",
             "development paths only",
             "--validation",
@@ -171,9 +171,17 @@ def test_claim_worktree_records_owner_and_links_shared_assets(tmp_path: Path) ->
         "--get",
         f"branch.{branch}.description",
     )
-    assert f"base={base}" in description
-    assert "owner=test" in description
-    assert "state=active" in description
+    spec = importlib.util.spec_from_file_location(
+        "worktree_coordination", REPO_ROOT / "scripts" / "worktree_coordination.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    fields, errors = module.parse_description(description)
+    assert errors == []
+    assert fields["base"] == [base]
+    assert fields["owner"] == ["test"]
+    assert fields["state"] == ["active"]
+    assert fields["tip"] == ["pending"]
 
 
 def test_link_refuses_to_replace_a_different_existing_asset_path(

@@ -51,15 +51,21 @@ the remote operation used to inspect, transfer, or execute them.
 Import and placement rules are executable contracts. Extend the focused
 boundary test when changing one; do not duplicate the full package map here.
 
-## Concurrent work
+## Development ownership
 
-Use the workspace `$integrate-shared-worktrees` Skill when it is available and
-linked worktrees or cross-clone handoff are involved. Before substantive edits
-and again before handoff or integration,
-inventory every worktree's branch, tip, status, and declared scope. Treat peer
-worktrees as read-only: never reset, clean, stash, move, remove, or edit them.
-Readiness binds one clean immutable commit and its recorded evidence, not a
-moving branch name.
+Use Harness by default: its installed project guide, generated Task contract,
+scope, writer lease, and evidence records govern managed work. Do not also run
+`claim_worktree.py` or maintain a second branch-description record for that Task.
+Independent local development may use the lightweight Git workflow defined in
+`docs/development/git-workflow.md` and `$integrate-shared-worktrees`; explicitly
+identify this mode once. It requires no Harness installation or robot assets.
+Coordinate with any existing owner before overlapping work, including managed
+Tasks; switching mode is a handoff, never a way around an unresolved gate.
+
+Inspect ownership and relevant peer scopes before writing and before handoff;
+refresh when peers or the base change. Do not rescan unchanged historical
+worktrees at every command. Peer worktrees remain read-only. Readiness binds
+one clean commit and its evidence, not a moving branch name.
 
 ## Local resources
 
@@ -90,6 +96,9 @@ developer-local absolute path.
 ## Verification
 
 Run repository tests through `bash scripts/run_pytest.sh ...`; the wrapper owns
-the supported environment and short AF_UNIX test paths. Run the smallest
-relevant suites and `git diff --check`. Report offline, simulation, remote, and
-real-hardware evidence separately; none implies another.
+the supported environment and short AF_UNIX test paths. Use `tests/README.md`
+to select focused feedback, affected contracts, and integration acceptance.
+Cover changed failure modes and boundaries; avoid tests that merely restate
+implementation text or duplicate the same behavior. Run `git diff --check`.
+Report offline, simulation, remote, and real-hardware evidence separately;
+none implies another.

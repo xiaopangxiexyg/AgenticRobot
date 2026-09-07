@@ -53,9 +53,10 @@ paths and transport grants are short-lived access mechanisms, not durable
 identity. The Gateway store is a transient handoff cache, never the dataset,
 Experience, or Memory store.
 
-Upgrade the single public v2 contract in place. Do not add a parallel legacy
-transport or consumer mode. Keep historic paths as stateless forwarding shims
-only when compatibility is still required.
+The current public contract is v2. Keep one canonical implementation for it;
+do not silently change existing versioned semantics. A required breaking change
+needs an explicit version and consumer migration decision. Add legacy modes or
+stateless forwarding shims only for identified consumers and a bounded migration.
 
 ## Verification
 

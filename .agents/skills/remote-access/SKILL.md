@@ -1,6 +1,6 @@
 ---
 name: remote-access
-description: Operate, diagnose, or change AgenticRobot remote-access workflows through the codex_remote wrappers. Use when a task crosses the local/remote boundary for identity, environment, sync, tests, logs, camera capture, device checks, process execution, result retrieval, wrapper maintenance, or an explicitly requested remote robot action; do not use for local-only code, motion-path logic, Gateway contracts, or local-resource layout.
+description: Use AgenticRobot codex_remote wrappers for remote inspection, transfer, execution, device checks, or wrapper maintenance. Applies when crossing the local/remote boundary; local domain logic remains with its owner.
 ---
 
 # Remote Access
@@ -55,5 +55,6 @@ helper and tests, and only the relevant section of
 - Keep host-specific configuration and credentials outside the repository;
   copying them between trusted development machines is a separate, explicit
   local-resource or provisioning operation.
-- Modify the wrappers or their policy only when that surface is explicitly
-  requested; preserve fail-closed defaults and run focused syntax/tests.
+- Necessary wrapper maintenance follows the task's authorized scope. Apply
+  `codex_remote/AGENTS.md` before editing; preserve fail-closed defaults and
+  obtain an explicit decision for changes to allowed effects or safety policy.
