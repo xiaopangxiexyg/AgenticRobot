@@ -25,7 +25,20 @@ def pose_payload(
     generation: int = 0,
     matrix: list[float] | None = None,
     monotonic_ns: int = 1_000_000_000,
+    controllers: list[dict] | None = None,
 ) -> dict:
+    raw_controllers = controllers
+    if raw_controllers is None:
+        raw_controllers = [
+            {
+                "source_session_id": "input-1",
+                "handedness": "right",
+                "target_ray_mode": "tracked-pointer",
+                "profiles": ["oculus-touch-v3"],
+                "emulated_position": False,
+                "matrix_reference_from_grip": matrix or identity_matrix(x=0.25),
+            }
+        ]
     return {
         "type": "controller_pose_sample",
         "feature": "controller_pose",
@@ -36,16 +49,7 @@ def pose_payload(
         "reference_space": {"type": "local-floor", "generation": generation},
         "sample_sequence": sequence,
         "xr_frame_time_ms": 1234.5,
-        "controllers": [
-            {
-                "source_session_id": "input-1",
-                "handedness": "right",
-                "target_ray_mode": "tracked-pointer",
-                "profiles": ["oculus-touch-v3"],
-                "emulated_position": False,
-                "matrix_reference_from_grip": matrix or identity_matrix(x=0.25),
-            }
-        ],
+        "controllers": raw_controllers,
         "server_timestamp": 100.0,
         "server_monotonic_ns": monotonic_ns,
     }
@@ -152,6 +156,18 @@ class ControllerPoseRuntimeTests(unittest.TestCase):
             1, pose_payload(sequence=3, monotonic_ns=1_030_000_000)
         )
         self.assertEqual(self.runtime.latest_sample(client_id=1).sample_sequence, 3)
+
+    def test_empty_controller_sample_from_get_pose_loss_is_admitted(self) -> None:
+        self.server.handlers["controller_pose_sample"](
+            1,
+            pose_payload(sequence=1, controllers=[]),
+        )
+
+        latest = self.runtime.latest_sample(client_id=1)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.controllers, ())
+        self.assertEqual(self.runtime.accepted_count, 1)
+        self.assertEqual(self.runtime.rejected_count, 0)
 
     def test_reset_clears_latest_and_rejects_old_generation(self) -> None:
         self.server.handlers["controller_pose_sample"](1, pose_payload(sequence=1))

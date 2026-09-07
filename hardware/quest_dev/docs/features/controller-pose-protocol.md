@@ -50,3 +50,9 @@ latest pose，并拒绝旧 generation 的后续样本。session end 或 WSS disc
 runtime 只保留每个认证客户端的 latest sample；不写文件、不形成轨迹，也不调用任何
 机器人、外部缓存或控制接口。需要 pairing bearer 的 `/api/status` 只暴露
 session/generation/sequence/count 摘要，不暴露 pose matrix。
+
+`profiles` 是当前 `XRInputSource` 的能力诊断字段，不是稳定硬件身份。Quest Browser
+可能在 XR 启动或追踪建立后从通用 profile 更新为具体 profile；浏览器和 host 都使用
+`handedness + targetRayMode + session-local occurrence` 维持 `input-N` 身份，profile
+变化不会生成第二个控制器候选，也不会使已选被动采集终止。session、reference-space
+generation、handedness 或 target-ray mode 发生变化仍会按身份边界拒绝或失效。

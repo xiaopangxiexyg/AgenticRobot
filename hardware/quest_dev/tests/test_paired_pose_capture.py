@@ -226,6 +226,7 @@ def _quest_event(
     target_ray_mode: str = "tracked-pointer",
     profiles: list[str] | None = None,
     emulated_position: bool = False,
+    include_controller: bool = True,
     xr_frame_time_ms: float | None = None,
 ) -> ControllerPoseAcceptedEvent:
     payload = {
@@ -242,16 +243,22 @@ def _quest_event(
             if xr_frame_time_ms is None
             else xr_frame_time_ms
         ),
-        "controllers": [
-            {
-                "source_session_id": controller_source_session_id,
-                "handedness": handedness,
-                "target_ray_mode": target_ray_mode,
-                "profiles": profiles or ["oculus-touch-v3"],
-                "emulated_position": emulated_position,
-                "matrix_reference_from_grip": _controller_matrix(x_m=x_m),
-            }
-        ],
+        "controllers": (
+            [
+                {
+                    "source_session_id": controller_source_session_id,
+                    "handedness": handedness,
+                    "target_ray_mode": target_ray_mode,
+                    "profiles": (
+                        ["oculus-touch-v3"] if profiles is None else profiles
+                    ),
+                    "emulated_position": emulated_position,
+                    "matrix_reference_from_grip": _controller_matrix(x_m=x_m),
+                }
+            ]
+            if include_controller
+            else []
+        ),
     }
     sample = parse_controller_pose_sample(
         payload,
@@ -1209,6 +1216,43 @@ def test_quest_sequence_time_and_controller_metadata_regression_are_terminal(
     }
     with pytest.raises(CaptureTerminalError, match=message):
         capture.ingest_quest_event(_quest_event(**values))
+
+
+def test_missing_selected_controller_pose_is_ignored_without_terminal_capture() -> None:
+    capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=_binding())
+
+    capture.ingest_quest_event(
+        _quest_event(
+            event_sequence=0,
+            sample_sequence=1,
+            include_controller=False,
+            received_monotonic_ns=1_100_000_000,
+        )
+    )
+
+    assert capture.snapshot_status()["terminal_reason"] is None
+
+
+def test_quest_profile_metadata_can_change_without_changing_selected_source() -> None:
+    capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=_binding())
+    capture.ingest_quest_event(
+        _quest_event(
+            event_sequence=0,
+            sample_sequence=2,
+            profiles=["generic-trigger"],
+            received_monotonic_ns=1_100_000_000,
+        )
+    )
+    capture.ingest_quest_event(
+        _quest_event(
+            event_sequence=1,
+            sample_sequence=3,
+            profiles=["oculus-touch-v3", "generic-trigger"],
+            received_monotonic_ns=1_200_000_000,
+        )
+    )
+
+    assert capture.snapshot_status()["terminal_reason"] is None
 
 
 def test_robot_source_sequence_regression_and_quest_clock_drift_are_terminal() -> None:

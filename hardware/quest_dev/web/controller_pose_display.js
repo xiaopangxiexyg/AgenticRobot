@@ -1,11 +1,12 @@
 (function exposeQuestDevControllerPoseDisplay(global) {
   'use strict';
 
-  function displayPose(sample, trackingState, displayOnly) {
+  function displayPose(sample, trackingState, displayOnly, trackingReason) {
     return {
       ...sample,
       displayOnly,
       trackingState,
+      trackingReason,
     };
   }
 
@@ -17,13 +18,13 @@
         lastTrackedBySource.clear();
       },
 
-      observe(sourceSessionId, sample) {
+      observe(sourceSessionId, sample, diagnostic) {
         const sourceId = String(sourceSessionId || '').trim();
         if (!sourceId) throw new TypeError('controller source session ID is required');
 
         if (sample && sample.emulatedPosition === false) {
           lastTrackedBySource.set(sourceId, sample);
-          return displayPose(sample, 'tracked', false);
+          return displayPose(sample, 'tracked', false, 'tracked');
         }
 
         const lastTracked = lastTrackedBySource.get(sourceId);
@@ -42,13 +43,20 @@
             },
             sample ? 'emulated' : 'untracked',
             true,
+            diagnostic && diagnostic.reason
+              ? diagnostic.reason
+              : sample
+                ? 'emulated_position'
+                : 'pose_unavailable',
           );
         }
 
         // There is no safe measured transform yet.  An available emulated pose
         // can still be rendered as a diagnostic, but it is always marked as
         // display-only and is never sent through the capture feature.
-        return sample ? displayPose(sample, 'emulated', true) : null;
+        return sample
+          ? displayPose(sample, 'emulated', true, 'emulated_position')
+          : null;
       },
 
       prune(activeSourceIds) {

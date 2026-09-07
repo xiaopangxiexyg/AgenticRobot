@@ -7,8 +7,12 @@
     }
     const handedness = String(source.handedness || 'none');
     const targetRayMode = String(source.targetRayMode || 'tracked-pointer');
-    const profiles = Array.from(source.profiles || [], (value) => String(value)).sort();
-    return [handedness, targetRayMode, profiles.join('\u001f')].join('\u001e');
+    // WebXR profiles are diagnostic capability metadata, not a stable source
+    // identity. Quest Browser may replace the generic profile with a concrete
+    // controller profile after tracking starts. Including profiles here would
+    // mint a new input-N ID for the same physical controller and split one
+    // selected source into multiple passive-capture candidates.
+    return [handedness, targetRayMode].join('\u001e');
   }
 
   function createTracker() {

@@ -92,19 +92,25 @@ The Quest binding pins the exact:
 - client instance and XR session IDs;
 - reference-space type and generation;
 - controller `source_session_id`;
-- handedness, target-ray mode, and the bound profiles assertion.
+- handedness and target-ray mode; the first observed profiles are retained as
+  diagnostic evidence but are not an identity assertion.
 
 The controller is selected by the binding, never by array index or by taking
 the first controller in a sample. Its pose must be non-emulated. Missing the
 selected controller rejects that raw sample; it does not authorize switching to
 another controller. A reference-space reset, session end, disconnect, runtime
-stop, controller identity drift, or emulated pose fails closed. A
+stop, or controller identity drift terminates the bound capture. An emulated
+pose or temporarily missing selected controller stays out of the calibration
+dataset; a window with too few real samples is rejected. A
 `next_reference_space_generation` on an invalidation event requires a new
 capture binding and cannot extend the current capture.
 
 `source_session_id` and WebXR profile strings are session-local observations,
-not hardware serial numbers and not identities that may be reused across a page
-reload or XR session.
+not hardware serial numbers. Profile strings may change while one source is
+initializing, so they are not used to mint a second candidate or to terminate
+an otherwise consistent selected source. A page reload, new XR session,
+reference-space generation, handedness, or target-ray-mode change still starts
+a new identity boundary.
 
 ## Exclusive event watermarks
 

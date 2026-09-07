@@ -69,3 +69,23 @@ test('display tracker drops cached poses when an input source leaves XR', () => 
   tracker.reset();
   assert.equal(tracker.observe('input-2', null), null);
 });
+
+test('display tracker drops old-generation poses after a reference-space reset', () => {
+  const tracker = loadTracker();
+  const tracked = tracker.observe('input-1', sample({ x: 4 }));
+  assert.equal(tracked.trackingState, 'tracked');
+  tracker.reset();
+  assert.equal(tracker.observe('input-1', null), null);
+});
+
+test('display tracker exposes the raw loss reason while retaining a display-only pose', () => {
+  const tracker = loadTracker();
+  tracker.observe('input-1', sample({ x: 4 }));
+  const missing = tracker.observe(
+    'input-1',
+    null,
+    { trackingState: 'untracked', reason: 'pose_unavailable' },
+  );
+  assert.equal(missing.trackingState, 'untracked');
+  assert.equal(missing.trackingReason, 'pose_unavailable');
+});

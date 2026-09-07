@@ -342,6 +342,7 @@ def _sample_payload(
     source_session_id: str = "controller-source-1",
     handedness: str = "right",
     target_ray_mode: str = "tracked-pointer",
+    profiles: list[str] | None = None,
     emulated_position: bool = False,
 ) -> dict:
     return {
@@ -359,7 +360,9 @@ def _sample_payload(
                 "source_session_id": source_session_id,
                 "handedness": handedness,
                 "target_ray_mode": target_ray_mode,
-                "profiles": ["oculus-touch-v3"],
+                "profiles": (
+                    ["oculus-touch-v3"] if profiles is None else profiles
+                ),
                 "emulated_position": emulated_position,
                 "matrix_reference_from_grip": list(IDENTITY_MATRIX),
             }
@@ -729,6 +732,64 @@ def test_out_of_order_old_candidate_callback_cannot_resurrect_epoch() -> None:
     app._on_quest_event(accepted)
 
     assert app.candidates() == ()
+    assert app.snapshot_status()["terminal_reason"] is None
+    app.close()
+
+
+def test_dynamic_profiles_do_not_duplicate_one_quest_candidate() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=1,
+            received_monotonic_ns=clock(),
+            profiles=["oculus-touch-v3", "generic-trigger"],
+        ),
+    )
+
+    candidates = app.candidates()
+    assert len(candidates) == 1
+    assert candidates[0].profiles == ("oculus-touch-v3",)
+
+    _select_right(app)
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=1,
+            received_monotonic_ns=clock(),
+            profiles=["oculus-touch-v3", "generic-trigger"],
+        ),
+    )
+    app.poll()
+    assert app.snapshot_status()["terminal_reason"] is None
+    app.close()
+
+
+def test_get_pose_loss_empty_sample_does_not_create_or_poison_candidate() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    runtime._handle_session_state(1, _session_payload())
+    empty_sample = _sample_payload(
+        sample_sequence=0,
+        received_monotonic_ns=clock(),
+    )
+    empty_sample["controllers"] = []
+    runtime._handle_pose_sample(1, empty_sample)
+    app.poll()
+
+    assert app.candidates() == ()
+    assert app.snapshot_status()["terminal_reason"] is None
+
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=1,
+            received_monotonic_ns=clock(),
+        ),
+    )
+    app.poll()
+
+    assert len(app.candidates()) == 1
     assert app.snapshot_status()["terminal_reason"] is None
     app.close()
 

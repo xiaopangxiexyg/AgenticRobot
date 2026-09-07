@@ -193,8 +193,15 @@ curl -H "Authorization: Bearer $QUEST_DEV_PAIRING_TOKEN" \
 ## 最小几何体与手柄遥测
 
 进入 MR/VR 后，visualization feature 在首次有效 viewer pose 前方放置一个黄色线框
-立方体，并绘制手柄 RGB 坐标轴。reference space 发生 `reset` 时旧锚点立即失效，下一
+立方体，并绘制手柄 RGB 坐标轴。reference space 发生 `reset` 时旧锚点和手柄显示缓存立即失效，下一
 帧在新 generation 中重新锚定。参数位于 `features.visualization.client`。
+
+Quest 页面会把手柄采样状态区分为 `tracked`、`emulated`、`missing_grip_space`、
+`pose_unavailable` 和 `pose_error`。其中 `pose_unavailable` 就是 WebXR
+`frame.getPose(gripSpace, referenceSpace)` 返回空；它不会被缓存位姿伪装成有效标定样本。
+显示可以短暂保留上一帧真实位姿，但该列表与发送给 `controller_pose`/被动标定的原始
+列表严格分离。viewer pose 暂不可用时，采集仍可继续接收真实 grip pose，但本帧不会绘制
+任何坐标轴。
 
 `controller_pose` feature 上传 `T_reference_from_grip`，但不保存轨迹，也不提供动作、
 目标或控制字段。协议见

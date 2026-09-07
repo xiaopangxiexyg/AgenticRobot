@@ -305,6 +305,10 @@ class QuestControllerCandidate:
 
     @property
     def identity_key(self) -> tuple[object, ...]:
+        # ``profiles`` is retained in the candidate/evidence payload as
+        # diagnostic metadata, but Quest Browser may change it while the same
+        # XRInputSource becomes more specific. It must not create a second
+        # candidate for the same session-local source.
         return (
             self.server_instance_id,
             self.client_id,
@@ -315,7 +319,6 @@ class QuestControllerCandidate:
             self.controller_source_session_id,
             self.handedness,
             self.target_ray_mode,
-            self.profiles,
         )
 
     def as_dict(self) -> dict[str, object]:
