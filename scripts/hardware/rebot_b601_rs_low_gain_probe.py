@@ -41,6 +41,12 @@ default); completion removes the position term and returns to draggable gravity
 compensation so multiple poses can be collected in one run.  The configured
 ``--kp`` is used only while a recording window is active.
 
+Reaching ``--duration-sec`` ends the active experiment, but does not authorize
+drive disable.  Like the first Ctrl-C or an ordinary handled control fault, it
+enters the same latched all-arm gravity/damping protective hold.  A subsequent
+Ctrl-C/SIGUSR1 is still required for the final six-joint safe stop unless both
+live and cached complete-frame dispatch have become impossible.
+
 When the operator presses Ctrl-C once, the probe enters a latched protective
 hold for all six arm joints (the gripper motor, joint7, is outside this
 backend).  This is deliberately not a position lock: software Kp is zero,
@@ -371,6 +377,56 @@ class GravityCalibrationCapture:
         self.started_elapsed_sec = None
         self.active_record_index = None
         return record
+
+
+def evaluate_gravity_calibration_capture(
+    capture: GravityCalibrationCapture | None,
+) -> dict[str, object]:
+    """Summarize whether an interactive capture is complete enough to accept."""
+
+    if capture is None:
+        return {
+            "status": "NOT_APPLICABLE",
+            "completed_record_count": 0,
+            "incomplete_record_count": 0,
+            "reasons": (),
+        }
+    completed_count = sum(bool(record["completed"]) for record in capture.records)
+    incomplete_count = len(capture.records) - completed_count
+    reasons: list[str] = []
+    if completed_count == 0:
+        reasons.append("no complete calibration recording window")
+    if incomplete_count:
+        reasons.append(
+            f"{incomplete_count} calibration recording window(s) are incomplete"
+        )
+    return {
+        "status": "PASS" if not reasons else "FAIL",
+        "completed_record_count": completed_count,
+        "incomplete_record_count": incomplete_count,
+        "reasons": tuple(reasons),
+    }
+
+
+def complete_active_duration(
+    *,
+    stop: dict[str, bool],
+    calibration_capture: GravityCalibrationCapture | None,
+    elapsed_sec: float,
+    sample_end_index: int,
+) -> str:
+    """End ACTIVE without treating the duration boundary as disable authority."""
+
+    if calibration_capture is not None and calibration_capture.state == "RECORDING":
+        calibration_capture.interrupt(
+            elapsed_sec=elapsed_sec,
+            sample_end_index=sample_end_index,
+            reason="probe_duration_complete",
+        )
+    # Duration completion itself is the first protective event.  A subsequent
+    # Ctrl-C can therefore request the explicit final stop.
+    stop["requested"] = True
+    return "duration_complete"
 
 
 def _percentile(values: Sequence[float], percentile: float) -> float:
@@ -2548,6 +2604,18 @@ def _signal_handler(stop: dict[str, bool], signum: int, _frame: object) -> None:
         stop["full_disable_requested"] = True
 
 
+def resolve_shutdown_action(
+    *,
+    enabled: bool,
+    full_disable_requested: bool,
+) -> str:
+    """Choose the only permitted first action when leaving active control."""
+
+    if enabled and not full_disable_requested:
+        return "protective_hold"
+    return "safe_stop"
+
+
 def _drive_enable_countdown(
     stop: dict[str, bool],
     *,
@@ -2592,80 +2660,6 @@ def _drive_enable_countdown(
     finally:
         if operator_stream is not None:
             operator_stream.close()
-
-
-def _freeze_and_stop(
-    backend: B601RSBackend,
-    model: B601PinocchioModel,
-    *,
-    qpos_rad: tuple[float, ...] | None,
-    profile: B601MitControlProfile,
-    gravity_scale: float,
-    previous_tau: tuple[float, ...],
-    torque_limits_nm: tuple[float, ...],
-    freeze_sec: float,
-    rate_hz: float,
-    joint_names: Sequence[str] = _ALL_JOINTS,
-    driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
-) -> tuple[int, tuple[float, ...], list[str]]:
-    """Hold the last known pose briefly before the explicit safe stop.
-
-    joint_names is explicit so a single-joint commissioning run never
-    re-enables or dispatches a frame to an unselected motor during cleanup.
-    """
-
-    if qpos_rad is None or freeze_sec <= 0.0:
-        return 0, previous_tau, []
-    errors: list[str] = []
-    max_rate = profile.max_torque_rate_nm_s
-    count = 0
-    latest_tau = previous_tau
-    driver_kd = _six(
-        driver_kd_nm_s_per_rad,
-        name="driver_kd_nm_s_per_rad",
-    )
-    period = 1.0 / rate_hz
-    deadline = time.monotonic() + freeze_sec
-    while time.monotonic() < deadline:
-        try:
-            reference = build_reference(
-                sequence=0,
-                timestamp_sec=time.monotonic(),
-                qpos_rad=qpos_rad,
-                qvel_rad_s=_ZERO_SIX,
-            )
-            requested = compute_software_torque(
-                model,
-                reference=reference,
-                measured_qpos_rad=qpos_rad,
-                measured_qvel_rad_s=_ZERO_SIX,
-                profile=profile,
-                gravity_scale=gravity_scale,
-            )
-            latest_tau, _torque_limited, _slew_limited = condition_torque(
-                requested,
-                latest_tau,
-                absolute_limits_nm=torque_limits_nm,
-                max_rate_nm_s=max_rate,
-                dt_sec=period,
-            )
-            receipt = backend.send_mit(
-                reference,
-                kp=_ZERO_SIX,
-                kd=driver_kd,
-                tau_nm=latest_tau,
-                torque_limits_nm=torque_limits_nm,
-                joint_names=joint_names,
-            )
-            if not receipt.accepted:
-                errors.extend(receipt.errors or ("freeze MIT dispatch was incomplete",))
-                break
-            count += 1
-            time.sleep(period)
-        except Exception as exc:  # noqa: BLE001 - report cleanup failure
-            errors.append(f"freeze: {exc}")
-            break
-    return count, latest_tau, errors
 
 
 def _send_fault_hold_command(
@@ -3476,6 +3470,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     rejected_motion_sample_count = 0
     samples: list[dict[str, object]] = []
     stop_reason: str | None = None
+    control_completion_reason: str | None = None
     primary_error: Exception | None = None
     preflight_disable: B601ModeReceipt | None = None
     mode_receipt: B601ModeReceipt | None = None
@@ -3491,6 +3486,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     protective_hold_non_hold_receipt: B601ModeReceipt | None = None
     protective_hold_full_disable_receipt: B601ModeReceipt | None = None
     protective_hold_reference_source: str | None = None
+    protective_hold_entry_reason: str | None = None
     protective_hold_degraded: dict[str, object] = {
         "entry_count": 0,
         "recovery_count": 0,
@@ -4340,6 +4336,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             if completed_at > next_deadline:
                 schedule_overruns += 1
                 next_deadline = completed_at
+        if stop_reason is None:
+            control_completion_reason = complete_active_duration(
+                stop=stop,
+                calibration_capture=calibration_capture,
+                elapsed_sec=last_control_elapsed_sec,
+                sample_end_index=len(samples),
+            )
+            _operator_notice(
+                "[B601] CONTROL DURATION COMPLETE: entering protective hold; "
+                "Ctrl-C or SIGUSR1 requests final full disable."
+            )
     except LowGainProbeError as exc:
         primary_error = exc
     except (B601HardwareError, OSError, TypeError, ValueError) as exc:
@@ -4373,17 +4380,34 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 cleanup_errors.append(f"safe_stop: {exc}")
 
         if connected:
-            exceptional_stop = primary_error is not None or stop_reason is not None
             explicit_full_disable = stop.get("full_disable_requested", False)
+            shutdown_action = resolve_shutdown_action(
+                enabled=enabled,
+                full_disable_requested=explicit_full_disable,
+            )
             protective_hold_remains_latched = False
-            if enabled and exceptional_stop and not explicit_full_disable:
+            if shutdown_action == "protective_hold":
                 # A complete current fault sample is preferred for a normal
                 # control/position error.  An explicit operator interrupt
                 # normally remains anchored to the previously admitted
                 # stationary sample; if that sample aged out, a complete
                 # current frame is admitted instead so the first Ctrl-C does
                 # not unnecessarily drop the whole arm.
-                operator_interrupt = stop_reason == "operator_interrupt"
+                operator_interrupt = bool(
+                    stop.get("requested", False)
+                    and control_completion_reason is None
+                    and (
+                        stop_reason is None
+                        or stop_reason.startswith("operator_interrupt")
+                    )
+                )
+                duration_complete = control_completion_reason == "duration_complete"
+                protective_hold_entry_reason = (
+                    control_completion_reason
+                    or stop_reason
+                    or (str(primary_error) if primary_error is not None else None)
+                    or "enabled_control_exit"
+                )
                 if last_safe_observed_at_sec is None:
                     safe_age_sec = math.inf
                 else:
@@ -4406,11 +4430,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 # admission as a handled position error instead of dropping
                 # the whole arm immediately.
                 degraded_entry_reason: str | None = None
-                if operator_interrupt and safe_snapshot_available:
+                if (operator_interrupt or duration_complete) and safe_snapshot_available:
                     fault_entry = False
                     can_attempt_hold = True
                 elif fault_snapshot_available:
                     fault_entry = True
+                    can_attempt_hold = True
+                elif safe_snapshot_available:
+                    # Startup and other enabled-path exceptions can occur
+                    # before the active loop has produced a fault snapshot.
+                    # A still-fresh admitted pose can nevertheless seed a live
+                    # gravity/damping hold instead of forcing drive disable.
+                    fault_entry = False
                     can_attempt_hold = True
                 elif previous_q is not None and last_verified_gravity_tau is not None:
                     # Loss of the current RX/control sample does not prove loss
@@ -4455,15 +4486,23 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         hold_qvel = fault_qvel_for_hold
                         hold_age_sec = fault_age_sec
                         protective_hold_reference_source = (
-                            "current_fault_snapshot"
-                            if not operator_interrupt
-                            else "current_fault_snapshot_after_stale_last_safe"
+                            "current_snapshot_after_stale_duration_last_safe"
+                            if duration_complete
+                            else (
+                                "current_fault_snapshot"
+                                if not operator_interrupt
+                                else "current_fault_snapshot_after_stale_last_safe"
+                            )
                         )
                     else:
                         hold_qpos = last_safe_q
                         hold_qvel = last_safe_qvel
                         hold_age_sec = safe_age_sec
-                        protective_hold_reference_source = "last_safe_snapshot"
+                        protective_hold_reference_source = (
+                            "duration_complete_last_safe_snapshot"
+                            if duration_complete
+                            else "last_safe_snapshot"
+                        )
                     if hold_age_sec is None:
                         hold_age_sec = math.inf
                     protective_hold_admission_age_sec = hold_age_sec
@@ -4495,7 +4534,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             stop=stop,
                             driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
                             hold_profile=protective_hold_profile,
-                            operator_interrupt=operator_interrupt,
+                            # A duration boundary, like an operator transition,
+                            # needs a new monitoring baseline on the first hold
+                            # feedback sample.
+                            operator_interrupt=(
+                                operator_interrupt or duration_complete
+                            ),
                             fault_entry=fault_entry,
                             fault_entry_max_velocity_rad_s=args.velocity_abort_rad_s,
                             monitor_velocity_rad_s=args.velocity_abort_rad_s,
@@ -4527,6 +4571,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             and not stop.get("full_disable_requested", False)
                         )
                     except Exception as exc:  # noqa: BLE001 - preserve safety evidence
+                        # Expected RX, numeric, model, and dispatch failures are
+                        # handled inside _run_latched_fault_hold.  Reaching this
+                        # boundary means the hold implementation itself failed.
                         cleanup_errors.append(f"protective hold: {exc}")
                         protective_hold_remains_latched = False
                 else:
@@ -4539,22 +4586,6 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     protective_hold_remains_latched = False
                 if not protective_hold_remains_latched:
                     issue_full_safe_stop()
-            elif enabled and not exceptional_stop:
-                freeze_commands, previous_tau, freeze_errors = _freeze_and_stop(
-                    backend,
-                    model,
-                    qpos_rad=last_safe_q,
-                    profile=profile,
-                    gravity_scale=args.gravity_scale,
-                    previous_tau=previous_tau,
-                    torque_limits_nm=torque_limits,
-                    freeze_sec=args.freeze_sec,
-                    rate_hz=args.rate_hz,
-                    joint_names=active_joint_names,
-                    driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
-                )
-                cleanup_errors.extend(freeze_errors)
-                issue_full_safe_stop()
             else:
                 issue_full_safe_stop()
             if getattr(args, "apply_driver_torque_limits", False):
@@ -4616,6 +4647,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         and driver_limit_cleanup_ok
         and not cleanup_errors
     )
+    calibration_acceptance = evaluate_gravity_calibration_capture(
+        calibration_capture
+    )
+    calibration_passed = calibration_acceptance["status"] in (
+        "PASS",
+        "NOT_APPLICABLE",
+    )
     control_passed = (
         stop_reason is None
         and commands_sent > 0
@@ -4632,7 +4670,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         active_joint_names=active_joint_names,
     )
     response_passed = bool(slow_step_response["passed"])
-    acceptance_passed = control_passed and response_passed
+    acceptance_passed = control_passed and response_passed and calibration_passed
     max_abs_requested = max(
         (max(abs(value) for value in sample["requested_tau_nm"]) for sample in samples),
         default=0.0,
@@ -4707,6 +4745,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "commands_sent": commands_sent,
         "freeze_commands_sent": freeze_commands,
         "duration_sec": args.duration_sec,
+        "control_completion_reason": control_completion_reason,
         "rate_hz": args.rate_hz,
         "gravity_calibration": {
             "enabled": calibration_capture is not None,
@@ -4721,14 +4760,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 if calibration_capture is not None
                 else []
             ),
-            "completed_record_count": (
-                sum(
-                    bool(record["completed"])
-                    for record in calibration_capture.records
-                )
-                if calibration_capture is not None
-                else 0
-            ),
+            "completed_record_count": calibration_acceptance[
+                "completed_record_count"
+            ],
+            "incomplete_record_count": calibration_acceptance[
+                "incomplete_record_count"
+            ],
+            "acceptance_status": calibration_acceptance["status"],
+            "acceptance_reasons": calibration_acceptance["reasons"],
             "final_state": (
                 calibration_capture.state
                 if calibration_capture is not None
@@ -4759,6 +4798,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "protective_hold": {
             "latched": protective_hold_latched,
+            "entry_reason": protective_hold_entry_reason,
             "joint_names": _FAULT_HOLD_JOINTS,
             "reference_source": protective_hold_reference_source,
             "command_count": protective_hold_commands,
@@ -4988,7 +5028,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "notes": [
             "Human-run commissioning only; automated tests never execute this active path.",
             "The active set is the target plus explicitly selected support joints; scheme-1 J6 commissioning selects all six arm joints while only the J6 reference changes.",
-            "On an exceptional stop, joint1..joint6 remain in the protective gravity/damping hold; joint7 is outside this backend, and SIGUSR1 or a second Ctrl-C requests full disable.",
+            "After enable, duration completion, an ordinary control exit, or the first Ctrl-C keeps joint1..joint6 in the protective gravity/damping hold; joint7 is outside this backend, and SIGUSR1 or the next Ctrl-C requests full disable.",
             "Protective hold normally admits a fresh stationary last-safe snapshot for an operator stop or a complete current in-limit fault snapshot; if RX/control has already failed, it can enter degraded hold from the pose and pure-gravity cache paired with the last complete six-joint dispatch.",
             "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
             "While latched, a valid cycle updates gravity from current feedback; RX, numeric, motion-monitor, or model failure keeps sending cached gravity with zero Kp and configured motor-local damping while feedback recovery is retried.",
@@ -5048,7 +5088,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--warmup-sec", type=float, default=_DEFAULT_WARMUP_SEC)
-    parser.add_argument("--freeze-sec", type=float, default=_DEFAULT_FREEZE_SEC)
+    parser.add_argument(
+        "--freeze-sec",
+        type=float,
+        default=_DEFAULT_FREEZE_SEC,
+        help=(
+            "legacy command-line compatibility value; an enabled probe now "
+            "enters latched protective hold instead of timed freeze-and-disable"
+        ),
+    )
     parser.add_argument("--rate-hz", type=float, default=_DEFAULT_RATE_HZ)
     parser.add_argument(
         "--joint",
@@ -5219,7 +5267,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="orientation-error-norm abort threshold for pose-hold",
     )
     parser.add_argument("--allow-motion", action="store_true")
-    parser.add_argument("--auto-disable", action="store_true")
+    parser.add_argument(
+        "--auto-disable",
+        action="store_true",
+        help=(
+            "required acknowledgement that an explicit final stop may disable "
+            "the arm; duration completion itself enters protective hold"
+        ),
+    )
     parser.add_argument("--confirmation", default="")
     parser.add_argument("--output", type=Path, help="write JSON outside the source worktree")
     parser.add_argument(

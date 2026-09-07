@@ -89,6 +89,83 @@ def test_gravity_calibration_capture_repeats_free_drag_and_fixed_windows() -> No
     assert interrupted["completion_reason"] == "operator_interrupt"
     assert capture.state == "FREE_DRAG"
 
+    acceptance = probe.evaluate_gravity_calibration_capture(capture)
+    assert acceptance["status"] == "FAIL"
+    assert acceptance["completed_record_count"] == 1
+    assert acceptance["incomplete_record_count"] == 1
+
+
+def test_gravity_calibration_acceptance_requires_a_complete_window() -> None:
+    capture = probe.GravityCalibrationCapture(20.0)
+
+    acceptance = probe.evaluate_gravity_calibration_capture(capture)
+
+    assert acceptance == {
+        "status": "FAIL",
+        "completed_record_count": 0,
+        "incomplete_record_count": 0,
+        "reasons": ("no complete calibration recording window",),
+    }
+
+
+def test_gravity_calibration_acceptance_passes_only_complete_windows() -> None:
+    capture = probe.GravityCalibrationCapture(20.0)
+    capture.trigger((0.0,) * 6, elapsed_sec=1.0, sample_start_index=0)
+    capture.complete_if_due(elapsed_sec=21.0, sample_end_index=400)
+
+    acceptance = probe.evaluate_gravity_calibration_capture(capture)
+
+    assert acceptance == {
+        "status": "PASS",
+        "completed_record_count": 1,
+        "incomplete_record_count": 0,
+        "reasons": (),
+    }
+
+
+def test_enabled_shutdown_always_attempts_hold_before_disable() -> None:
+    assert (
+        probe.resolve_shutdown_action(
+            enabled=True,
+            full_disable_requested=False,
+        )
+        == "protective_hold"
+    )
+    assert (
+        probe.resolve_shutdown_action(
+            enabled=True,
+            full_disable_requested=True,
+        )
+        == "safe_stop"
+    )
+    assert (
+        probe.resolve_shutdown_action(
+            enabled=False,
+            full_disable_requested=False,
+        )
+        == "safe_stop"
+    )
+
+
+def test_duration_completion_latches_hold_and_interrupts_active_record() -> None:
+    stop = {"requested": False, "full_disable_requested": False}
+    capture = probe.GravityCalibrationCapture(20.0)
+    record = capture.trigger((0.0,) * 6, elapsed_sec=285.0, sample_start_index=10)
+
+    reason = probe.complete_active_duration(
+        stop=stop,
+        calibration_capture=capture,
+        elapsed_sec=300.0,
+        sample_end_index=310,
+    )
+
+    assert reason == "duration_complete"
+    assert stop == {"requested": True, "full_disable_requested": False}
+    assert record is not None
+    assert record["completed"] is False
+    assert record["completion_reason"] == "probe_duration_complete"
+    assert capture.state == "FREE_DRAG"
+
 
 def test_operator_key_reader_reads_r_without_enter_and_restores_terminal() -> None:
     master_fd, slave_fd = pty.openpty()
@@ -2335,7 +2412,10 @@ def test_effort_limits_are_read_from_urdf_and_scaled(tmp_path) -> None:
 
 def test_parser_help_is_read_only() -> None:
     parser = probe.build_parser()
-    assert "--allow-motion" in parser.format_help()
+    help_text = parser.format_help()
+    assert "--allow-motion" in help_text
+    assert "duration completion itself enters" in help_text
+    assert "protective hold" in help_text
     assert tuple(B601_RS_ARM_JOINT_NAMES) == tuple(probe._ALL_JOINTS)
     args = parser.parse_args(["--config", "config.yaml", "--rebot-source-root", "source"])
     assert args.joint == "joint1"

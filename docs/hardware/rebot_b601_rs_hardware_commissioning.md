@@ -359,7 +359,7 @@ Kp 为零，不存在固定位置弹簧。现场人员可以在保持重力平�
 
 ```text
 ACTIVE
-  ├─ 正常结束 ──> active-set 短暂保持 ──> 全部 arm safe_stop
+  ├─ --duration-sec 到期 ──> PROTECTIVE_HOLD（不会定时失能）
   ├─ 第一次 Ctrl+C ──> PROTECTIVE_HOLD（joint1..joint6 重力+阻尼，允许拖动）
   ├─ 控制/位置错误且当前 q 完整合法 ──> PROTECTIVE_HOLD（同一全臂控制）
   └─ 当前 RX/计算已不可用但存在已验证缓存 ──> DEGRADED_HOLD（缓存重力+电机阻尼）
@@ -423,6 +423,13 @@ driver Kd 为零，程序会明确记录 `motor_local_damping_available=false`�
 `safe_stop()` 仍是 vendor 的逐关节 disable，不是原子六轴动作；失能后重载机械臂可能下坠，
 所以机械承托和物理急停仍是最终安全边界，软件不能宣称总线失联后仍可维持重力补偿。
 
+`--duration-sec` 只限定 `GRAVITY_RAMP/HANDOFF/ACTIVE` 主控制与采集阶段，不是失能倒计时。
+到期时程序输出 `CONTROL DURATION COMPLETE`，将这次到期视为第一次保护事件并进入上述全臂重力加阻尼
+保持；随后一次 Ctrl-C 或 SIGUSR1 才是最终失能请求。历史参数 `--freeze-sec` 仍为命令行
+兼容项，但 duration 到期不再执行“短暂 freeze 后 safe_stop”。若到期时正处于一个标定
+记录窗口，该窗口会立即标为 incomplete，整次标定 acceptance 为 FAIL；此前已完整结束的
+窗口仍保留为独立证据。
+
 释放命令示例（不会让交接 shell 退出）：
 
 ```bash
@@ -454,7 +461,9 @@ J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令�
 恢复项。非零 driver Kd 只有在
 `--apply-driver-torque-limits` 成功完成六轴写入和回读后才允许使能。最终总力矩先做 URDF effort ceiling 的
 `torque-limit-scale`（默认 0.25）绝对限幅，再做 torque slew 限制；超出速度、
-加速度、位置误差、非有限差分、部分发送或 cleanup 不完整会立即结束本次运行。由于当前
+加速度、位置误差、非有限差分或部分发送会结束 ACTIVE 阶段并优先进入 protective/degraded
+hold，而不是直接失能；只有明确最终停止或 live 与缓存完整六轴发送都失败才允许
+safe_stop。由于当前
 `mechPos` 是同步参数读取且 MotorBridge 没有源序号/时间戳，本探针的默认 20 Hz
 只是低速 commissioning 节拍，不是高频 haptic loop，也不声明 freshness、力传感器
 或真实重力参数已验收。Pinocchio 重力模型使用中性辅助夹爪坐标，实际夹爪负载和
@@ -473,6 +482,9 @@ J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令�
 自动回到 `FREE_DRAG`，不失能、不重新执行启动过程，操作者可换到下一姿态再次按 `R`。
 记录期间再次按 `R` 不重置窗口。`R` 只控制采集，不是安全按钮；任意阶段第一次 Ctrl-C
 仍进入全臂重力加阻尼 protective-hold，第二次 Ctrl-C 或 SIGUSR1 才请求全臂失能。
+如果命令使用 `--kp 0`，捕获的参考位置不会产生位置残差力矩：这类窗口可用于检查姿态、
+漂移和模型重力输出，但不能据此反推缺失的静态重力力矩，也不构成已经求解出的重力参数。
+当前样本同样不含经过标定的关节实测力矩或电流，因此不能单独完成质量/质心辨识。
 
 终端只显示 `FREE_DRAG`、`RECORDING #N`、`COMPLETE #N` 和原有安全状态。JSON 的
 `gravity_calibration.records` 保存每段参考位置、起止 sample index、实际持续时间和完成
@@ -480,6 +492,10 @@ J1--J3 限到约 5.4 N·m，不能宣称完整重力平衡。这是现场命令�
 q、有限差分速度/加速度、重力项、位置残差项、请求/限幅后力矩仍保存在 `samples`，因此
 可以按每个 record 的 `[sample_start_index, sample_end_index)` 精确提取稳定窗口，而无需把
 临时残差阈值写进代码或测试。
+
+`gravity_calibration.acceptance_status` 只有在至少存在一个完整窗口、且所有已触发窗口都
+完整结束时才为 `PASS`；零完整窗口或任何 incomplete 窗口都会使标定整体验收失败。这里的
+失败不会丢弃完整窗口，也不会授权全臂失能。
 
 该模式必须在具有 controlling terminal 的前台运行；程序在连接 backend 前建立单键输入，
 无法取得终端时不会打开 CAN 或改变电机状态。退出正常控制路径时会先恢复终端属性，再进入
@@ -871,6 +887,10 @@ haptic 仍然禁止。真正高带宽 task-space impedance 仍需可验证 fresh
 会在每次 active poll 前对六个 arm 电机请求反馈并读取 `mechPos (0x7019)`，设置 POS_VEL、
 使能所选 arm 电机、发送保持当前位置的命令，并在退出时显式失能。反馈/参数读取不是运动
 命令；由于 MotorBridge 缺少源序号，输出仍会标记 feedback freshness 未验证。
+
+该独立 frequency probe 当前不复用 low-gain probe 的重力缓存或 protective-hold，duration/
+异常退出仍会直接对所选关节执行 `safe_stop`。因此它不能用于无机械承托的负载机械臂；本节
+继续标记“本轮不执行”，直到另一个明确范围为它设计并验证等价的全臂保持退出链。
 
 ```bash
 export REBOT_RS_CONFIG=/path/to/reBotArm_control_py/config/rebotarm_rs.yaml
