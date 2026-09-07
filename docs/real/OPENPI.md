@@ -135,7 +135,7 @@ gate 都通过后，才能在已经验证的同一条 client 命令末尾增加�
 --send-actions
 ```
 
-完整命令必须按 policy 类型从 `cmd_list.md` 第 8、9、10、19 或 20 节选择。
+完整命令必须按 policy 类型从 `cmd_list.md` 第 8、9、10、19、20 或 23 节选择。
 `rm65_bimanual_dmtac` profile 本身不会开启动作。
 
 Stage1 通常执行绑定的数据集 qpos-init；Stage2–4 只有在当前姿态就是已确认的连续衔接
@@ -168,7 +168,8 @@ receipt，并要求把步数恢复为 10 后精确复现训练契约哈希；任
 
 默认允许 server 与 client 使用不同 model/step，但二者仍必须通过实际协议、layout、相机、
 normalization、prompt 和 RTC capability 检查。不得通过手工覆盖 model id、layout hash、step、
-camera routing 或 action pose mode 来绕过 artifact/profile 错误。当前 Stage1/Stage2 all-view
-h32 model-RTC 的完整远端命令见 `cmd_list.md` 第 23 节；该路线只开放真实 observation 的
+camera routing 或 action pose mode 来绕过 artifact/profile 错误。当前 corrected Stage1 v2
+`25006` 与 historical Stage2 v1 `100000` 的完整远端命令见 `cmd_list.md` 第 23 节；
+该路线只开放真实 observation 的
 no-action shadow。真实动作还必须显式加入 `--send-actions`，完成 dataset-frame qpos-init、
 ready 确认和上述 Active latency gate；profile 本身不会授予动作权限。

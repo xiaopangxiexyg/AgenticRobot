@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import re
 import subprocess
-
+from pathlib import Path
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
 _COMMANDS = _REPOSITORY / "deployments/openpi/cmd_list.md"
@@ -13,7 +12,10 @@ _RTC_PROFILE = "model_rtc_flow_inpaint_shadow_15_30_60_120_v1"
 
 def _section_23() -> str:
     document = _COMMANDS.read_text(encoding="utf-8")
-    marker = "## 23. 当前 Stage1/Stage2 all-view h32 trained model-RTC 部署测试"
+    marker = (
+        "## 23. 当前 corrected Stage1 v2 / historical Stage2 v1 "
+        "all-view h32 trained model-RTC 部署测试"
+    )
     assert marker in document
     return document.split(marker, maxsplit=1)[1]
 
@@ -35,6 +37,10 @@ def test_stage12_profiles_keep_the_same_deployable_model_io_contract() -> None:
     training_root = _REPOSITORY / "deployments/openpi/configs/training"
     model_rtc_root = _REPOSITORY / "deployments/openpi/configs/model_rtc"
     expected_layout = "sha256:2567572f0f9170281b3e775ed13ecba903fbdeb199fd88a5bb1b7b1f4e96db16"
+    model_rtc_profiles = {
+        1: "writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json",
+        2: "writing_stage2_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json",
+    }
 
     for stage in (1, 2):
         prepared = json.loads(
@@ -44,10 +50,7 @@ def test_stage12_profiles_keep_the_same_deployable_model_io_contract() -> None:
             ).read_text(encoding="utf-8")
         )
         model_rtc = json.loads(
-            (
-                model_rtc_root
-                / f"writing_stage{stage}_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json"
-            ).read_text(encoding="utf-8")
+            (model_rtc_root / model_rtc_profiles[stage]).read_text(encoding="utf-8")
         )
 
         assert prepared["camera_selection"] == [
@@ -62,6 +65,22 @@ def test_stage12_profiles_keep_the_same_deployable_model_io_contract() -> None:
         assert "checkpoint_dir" not in model_rtc
         assert "continuation_contract_hash" not in model_rtc
 
+    stage1_model_rtc = json.loads(
+        (model_rtc_root / model_rtc_profiles[1]).read_text(encoding="utf-8")
+    )
+    assert stage1_model_rtc["schema"].endswith(".v2")
+    assert stage1_model_rtc["training_implementation"] == (
+        "mask_aware_hard_flow_prefix_v2"
+    )
+    assert stage1_model_rtc["rtc_prefix_mask_conditioning"] is True
+
+    stage2_model_rtc = json.loads(
+        (model_rtc_root / model_rtc_profiles[2]).read_text(encoding="utf-8")
+    )
+    assert stage2_model_rtc["schema"].endswith(".v1")
+    assert "training_implementation" not in stage2_model_rtc
+    assert "rtc_prefix_mask_conditioning" not in stage2_model_rtc
+
 
 def test_stage12_remote_recipe_separates_server_and_client_checkpoint_identity() -> None:
     section = _section_23()
@@ -70,10 +89,24 @@ def test_stage12_remote_recipe_separates_server_and_client_checkpoint_identity()
     assert "CLIENT_CHECKPOINT_DIR" in section
     assert "SERVER_CKPT_STEP" in section
     assert "CLIENT_CKPT_STEP" in section
-    assert "writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json" in section
+    assert "writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json" in section
     assert "writing_stage2_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json" in section
-    assert "writing-stage1-all-valid-all-view-h32-absolute-model-rtc" in section
+    assert "writing-stage1-all-valid-all-view-h32-absolute-model-rtc-systemic-v3" in section
     assert "writing-stage2-all-valid-all-view-h32-absolute-model-rtc" in section
+    assert "DEFAULT_CKPT_STEP=25006" in section
+    assert "DEFAULT_CKPT_STEP=100000" in section
+    assert "EXPECTED_DEPLOY_COMMIT" in section
+    assert "TRAINING_OPENPI_COMMIT" in section
+    assert "RTC_RUNTIME_OPENPI_ROOT" in section
+
+    stage1_case = re.search(
+        r'case "\$STAGE" in\n  1\)(.*?)    ;;',
+        section,
+        flags=re.DOTALL,
+    )
+    assert stage1_case is not None
+    assert "prepared_model_rtc_v2.json" in stage1_case.group(1)
+    assert "prepared_model_rtc_v1.json" not in stage1_case.group(1)
 
 
 def test_stage12_real_recipe_separates_no_action_and_bounded_active() -> None:
