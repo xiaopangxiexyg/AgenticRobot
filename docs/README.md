@@ -1,4 +1,4 @@
-# DexTeleop 文档
+# AgenticRobot 文档
 
 文档按运行领域组织。每个领域目录的 `README.md` 是该领域**当前主命令的唯一汇总入口**；
 同目录其他文件解释参数、数据语义、安全边界、验收和特殊变体，不再复制同一条主命令。
@@ -6,6 +6,7 @@
 | 领域 | 简洁运行入口 | 详细文档 |
 |---|---|---|
 | 环境安装与基础检查 | [setup](./setup/README.md) | [环境与复现权威说明](../README_ENV.md) |
+| 开发与代码交接 | [贡献约定](../CONTRIBUTING.md) | [独立 Git 工作流](./development/git-workflow.md)、[分层测试](../tests/README.md)；默认开发管理入口为 Harness |
 | 真机遥操、数采、Replay、Deploy | [real](./real/README.md) | [参数数组](./real/teleop_args.sh)、[遥操数采与长程 Progress Profile](./real/TELEOP_COLLECTION.md)、[Rule-based 书写数采](./real/RULE_BASED_WRITING_COLLECTION.md)、[Replay](./real/REPLAY.md)、[Deploy](./real/DEPLOY.md)、[UMI](./real/UMI.md)、[OpenPI](./real/OPENPI.md) |
 | MuJoCo 与仿真 | [sim](./sim/README.md) | [MuJoCo/仿真说明](./sim/MUJOCO.md)、[State-BC Sim-HIL 计划](./sim/plans/state-bc-sim-hil.md) |
 | 外部 Agent Skill 接入 | [agent_gateway](./agent_gateway/README.md) | [局域网 SSH 只读接入](./agent_gateway/SSH_READ_ONLY.md)、[协议与 package 技术说明](../agent_gateway/README.md) |
@@ -62,7 +63,7 @@
   ```
 
   已经执行过 `conda init` 的交互式 shell 可以省略 `eval` 行。后续一律使用当前环境中的
-  `python`、`python -m pytest` 和 `python -m pip`；只有需要把解释器路径传给子进程时，才用
+  `python` 和 `python -m pip`，pytest 使用 `bash scripts/run_pytest.sh`；只有需要把解释器路径传给子进程时，才用
   `DEXTELEOP_PYTHON="$(command -v python)"` 动态取得，不能猜 Conda 安装前缀。
 - OpenPI 模型 server 不属于这个 Conda 环境，继续使用它自己的 `uv` / `.venv`；相关文档用
   `OPENPI_ROOT` 表达路径。`.venv-annotation` 和 `isaacgym38` 也按各自环境章节激活，不能与
@@ -86,7 +87,7 @@
 | Direct replay 入口检查 | `python -m teleop_runtime.replay --help` | R0 |
 | MuJoCo replay 检查 | `python -m sim.mujoco.replay --help` | R0 |
 | Agent Gateway 入口检查 | `python -m agent_gateway --help` | R0 |
-| 最快单元测试 | `PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -m 'unit and not optional' -q` | R0 |
+| 快速单元测试 | `bash scripts/run_pytest.sh -m 'unit and not optional and not hardware and not slow_sim' -q` | R0 |
 | 统一设备只读检查 | `python -m teleop_runtime.configure_devices --check` | H1 |
 
 真机遥操、正式数采、replay 和动作 deploy 的完整命令不放在速查表中，避免跳过 profile、

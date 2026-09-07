@@ -68,6 +68,8 @@ playwright-report/
 !.agents/skills/manage-project-local-resources/**
 !.agents/skills/remote-access/
 !.agents/skills/remote-access/**
+!.agents/skills/integrate-shared-worktrees/
+!.agents/skills/integrate-shared-worktrees/**
 .realtime_sync_ssh.exclude
 logs/
 # Canonical local runtime outputs; versioned configs remain package-owned.
