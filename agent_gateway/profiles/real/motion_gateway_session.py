@@ -239,11 +239,11 @@ class RealAgentPrimitiveObservationProducer:
         maximum_age = self.contract_bundle.convergence_profile.max_measurement_age_ms
         if age_ms > maximum_age:
             raise RuntimeError("Lower measured TCP-pose cut is stale.")
-        if owner.captured_at > cut.available_at:
-            raise ValueError(
-                "Lower owner state was captured after the measured cut became "
-                "available."
-            )
+        # The owner state is refreshed on every control cut while measured TCP
+        # poses advance only with a new lower hardware source sequence.  A newer
+        # owner cut can therefore be combined with an older, still-fresh
+        # measurement.  The combined snapshot becomes available at the later
+        # timestamp while source freshness remains anchored to measured_at.
         available_at = max(cut.available_at, owner.captured_at)
         if available_at > now:
             raise RuntimeError("Lower real observation inputs are not yet available.")
