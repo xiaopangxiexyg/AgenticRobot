@@ -476,22 +476,129 @@ safe_stop。由于当前
 `FREE_DRAG`：六个 arm 关节保持实时模型重力补偿和命令指定的单一阻尼 owner，每周期
 使用当前反馈作为参考，因此软件位置力矩为零。操作者可在此阶段安全拖动到待测姿态。
 
-拖到目标姿态后应先完全松手，确认机械臂和反馈已经静止，再按一次 `R`（无需 Enter）。
-程序用收到按键的同一合法反馈帧捕获六关节参考并进入 `RECORDING`；此时 `--kp` 产生固定
-参考的位置维持力矩，`--calibration-duration-sec` 决定窗口长度，默认 20 秒。窗口结束后
-自动回到 `FREE_DRAG`，不失能、不重新执行启动过程，操作者可换到下一姿态再次按 `R`。
-记录期间再次按 `R` 不重置窗口。`R` 只控制采集，不是安全按钮；任意阶段第一次 Ctrl-C
-仍进入全臂重力加阻尼 protective-hold，第二次 Ctrl-C 或 SIGUSR1 才请求全臂失能。
+拖到目标姿态后应先完全松手，确认机械臂和反馈已经静止。正式配对采集时，从一侧接近
+目标姿态后按 `P`，再按一次 `R`（均无需 Enter）；从另一侧重新接近同一姿态后按 `N`，
+再按 `R`。`P/N` 是操作者对相反接近路径的显式标签，不是关节方向或控制命令。
+程序用收到 `R` 按键的同一合法反馈帧捕获六关节参考并进入 `SETTLING`；此时参考已经固定，
+但尚未计入正式样本。`--calibration-settling-sec`（默认 2 秒）让非零 `--kp` 在固定
+参考下自然建立可观测的位置残差；稳定阶段结束后才进入 `RECORDING`，其长度由
+`--calibration-duration-sec`（默认 20 秒）决定。窗口结束后自动回到 `FREE_DRAG`，不失能、
+不重新执行启动过程，操作者可换到下一姿态再次按 `P/N`、`R`。记录期间再次按 `R` 不重置窗口。
+未先按 `P` 或 `N` 的 `R` 仍可生成诊断窗口，但不会被正式双向拟合接受。
+`R` 只控制采集，不是安全按钮；任意阶段第一次 Ctrl-C 仍进入全臂重力加阻尼
+protective-hold，第二次 Ctrl-C 或 SIGUSR1 才请求全臂失能。
 如果命令使用 `--kp 0`，捕获的参考位置不会产生位置残差力矩：这类窗口可用于检查姿态、
 漂移和模型重力输出，但不能据此反推缺失的静态重力力矩，也不构成已经求解出的重力参数。
 当前样本同样不含经过标定的关节实测力矩或电流，因此不能单独完成质量/质心辨识。
 
-终端只显示 `FREE_DRAG`、`RECORDING #N`、`COMPLETE #N` 和原有安全状态。JSON 的
-`gravity_calibration.records` 保存每段参考位置、起止 sample index、实际持续时间和完成
-原因；每帧额外保存 `calibration_state`、`calibration_record_index` 和窗口内时间。完整
-q、有限差分速度/加速度、重力项、位置残差项、请求/限幅后力矩仍保存在 `samples`，因此
-可以按每个 record 的 `[sample_start_index, sample_end_index)` 精确提取稳定窗口，而无需把
-临时残差阈值写进代码或测试。
+### 离线归约、配对和拟合
+
+真机采集完成后，不要直接把所有 20 Hz 帧当作独立姿态，也不要把第 1～4 组 `--kp 0`
+窗口送入拟合。使用同一探针的无硬件模式 `gravity-calibration-fit` 完成以下步骤：
+
+1. 只提取完整 `RECORDING` 区间；每个区间用 q、速度、重力项和位置项的中位数归约为一个
+   带 MAD 的姿态观测。含非有限值、绝对力矩限幅或 slew 限幅的窗口会被标为无效。
+2. 按参考姿态把从相反方向接近的两个窗口配对。方向是操作者动作，程序不能从静态 JSON
+   反推，因此正式流程必须在每次 `R` 前按 `P` 或 `N` 写入方向标签；配对器会在 JSON 有
+   `pair_id` 时优先使用显式 ID，否则使用命令提供的姿态距离容差，并且只接受显式的
+   `positive/negative` 相反标签。没有标签的近邻配对只能用 `--calibration-allow-unpaired`
+   做诊断候选，不能宣称正式标定通过。
+3. 以 `r = position_tau`、`g0 = gravity_tau / gravity_scale` 拟合有效重力修正。默认模型
+   是一个全局重力比例修正加六个恒定关节偏置；第一轮只应看全局比例，只有独立验证仍有
+   明显姿态相关残差时才保留偏置项。若残差随姿态变化且确认末端存在未建模负载，再显式选择
+   `global-scale-payload`；它用 FK/Jacobian 回归非负负载质量和末端坐标系下的一阶矩，
+   不修改 URDF。所有模型的输出都是“有效重力 overlay”，不是未经力矩比例/电流标定的真实
+   质量/质心测量。
+4. 对姿态候选按回归矩阵秩、奇异值和对数体积贪心选择；达到所需信息量后停止，不再用
+   同一姿态追加大量重复窗口。至少保留一组未参与拟合的独立验证姿态。
+
+拟合只写入带 `b601.gravity-calibration-overlay.v1` schema 的候选 JSON，并绑定数据集 SHA、
+URDF SHA、配置 SHA、选中姿态、秩/条件数和训练/验证残差。`activation` 明确为
+`candidate_only_until_independent_validation`；在验证通过前不会自动改变 URDF 或运行时模型。
+没有非零软件 Kp、没有成对姿态或没有独立验证数据时，报告为 `CANDIDATE/FAIL`，即使采集
+文件本身的控制状态为 `OK` 也不能宣称完成标定。
+
+下面是正式的两批采集和离线拟合命令模板。先完成驱动器限幅 round-trip，再分别采集训练
+姿态和独立验证姿态；`duration-sec` 只是本批次的最长人工操作时间，到达时会进入
+protective-hold，不会自动全臂失能。每个窗口的操作顺序为：拖到姿态、完全松手、按 `P` 或 `N` 再按 `R`、
+等待终端提示 `RECORDING` 后保持不触碰，完成后再从相反方向回到同一姿态并使用另一标签重复。
+建议训练批次
+使用 6 个姿态各做正/负两次（12 个窗口），验证批次使用 3～4 个全新姿态各做一对；
+J2 约 1.9～2.1 rad 的区域必须覆盖一次，但不得为了覆盖它主动越过机械安全范围。
+
+```bash
+WT=/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260906-b601-gravity-startup-handoff-r1/AgenticRobot
+PY=/home/zc/anaconda3/envs/dexteleop310/bin/python3.10
+CFG=/home/zc/HandMotion/Developing/reBotArm_control_py/config/rebotarm_rs.yaml
+SRC=/home/zc/HandMotion/Developing/reBotArm_control_py
+OUT_DIR=/tmp/b601-rs-gravity-calibration-r1
+mkdir -p "$OUT_DIR"
+
+cd "$WT" || exit 86
+env PYTHONDONTWRITEBYTECODE=1 "$PY" \
+  scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  --mode gravity-calibration \
+  --config "$CFG" \
+  --rebot-source-root "$SRC" \
+  --duration-sec 900 \
+  --warmup-sec 2 \
+  --freeze-sec 1 \
+  --rate-hz 20 \
+  --calibration-settling-sec 2 \
+  --calibration-duration-sec 20 \
+  --kp 5.0 \
+  --kd 1.0 \
+  --gravity-scale 1.0 \
+  --torque-limit-scale 0.40 \
+  --apply-driver-torque-limits \
+  --torque-rise-time-sec 0.5 \
+  --velocity-abort-rad-s 5 \
+  --acceleration-abort-rad-s2 40 \
+  --max-error-rad 2 \
+  --allow-motion \
+  --auto-disable \
+  --confirmation B601_RS_LOW_GAIN_MIT_GRAVITY_DAMPING \
+  --fault-hold-max-age-sec 0.15 \
+  --fault-hold-max-velocity-rad-s 0.02 \
+  --fault-hold-max-rebase-rad 0.05 \
+  --output "$OUT_DIR/b601_gravity_calibration_train.json" \
+  --log "$OUT_DIR/b601_gravity_calibration_train.log"
+```
+
+运行验证批次时保持完全相同的参数，只把输出改为
+`b601_gravity_calibration_validation.json` 和对应 `.log`；不要把训练姿态复制到验证批次。
+完成两批采集并执行第二次 Ctrl-C 让 protective-hold 正常收尾后，运行以下无硬件拟合：
+
+```bash
+env PYTHONDONTWRITEBYTECODE=1 "$PY" \
+  scripts/hardware/rebot_b601_rs_low_gain_probe.py \
+  --mode gravity-calibration-fit \
+  --config "$CFG" \
+  --rebot-source-root "$SRC" \
+  --calibration-input "$OUT_DIR/b601_gravity_calibration_train.json" \
+  --calibration-validation-input "$OUT_DIR/b601_gravity_calibration_validation.json" \
+  --calibration-model global-scale-joint-bias \
+  --calibration-pose-tolerance-rad 0.08 \
+  --calibration-max-poses 12 \
+  --calibration-max-velocity-rad-s 0.03 \
+  --calibration-max-position-span-rad 0.02 \
+  --calibration-overlay-output "$OUT_DIR/b601_gravity_overlay_candidate.json" \
+  --calibration-report-output "$OUT_DIR/b601_gravity_calibration_report.json" \
+  --output "$OUT_DIR/b601_gravity_calibration_fit.json" \
+  --log "$OUT_DIR/b601_gravity_calibration_fit.log"
+```
+
+只有拟合报告显示完整秩、没有无效窗口、训练与独立验证残差均下降，且人工复核无启动前倾、
+反向抬升、饱和或异常停机，才可另行批准 overlay 的运行时接入。该命令不会自动写回 URDF
+或配置；`activation` 保持 candidate-only，失败结果仍会写报告供排查。
+
+终端只显示 `FREE_DRAG`、`SETTLING`、`RECORDING #N`、`COMPLETE #N` 和原有安全状态。
+JSON 的 `gravity_calibration.records` 保存触发索引、稳定阶段索引、正式记录起止 sample
+index、实际持续时间和完成原因；每帧额外保存 `calibration_state`、
+`calibration_record_index` 和窗口内时间。完整 q、有限差分速度/加速度、重力项、位置残差
+项、请求/限幅后力矩仍保存在 `samples`，因此可以按每个 record 的
+`[sample_start_index, sample_end_index)` 精确提取稳定窗口，而无需把临时残差阈值写进代码
+或测试。
 
 `gravity_calibration.acceptance_status` 只有在至少存在一个完整窗口、且所有已触发窗口都
 完整结束时才为 `PASS`；零完整窗口或任何 incomplete 窗口都会使标定整体验收失败。这里的

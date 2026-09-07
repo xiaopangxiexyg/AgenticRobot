@@ -123,6 +123,305 @@ def test_gravity_calibration_acceptance_passes_only_complete_windows() -> None:
     }
 
 
+def test_gravity_calibration_capture_has_settling_before_recording() -> None:
+    capture = probe.GravityCalibrationCapture(
+        2.0,
+        settling_duration_sec=1.0,
+    )
+    record = capture.trigger(
+        (0.1,) * 6,
+        elapsed_sec=5.0,
+        sample_start_index=10,
+    )
+    assert record is not None
+    assert capture.state == "SETTLING"
+    assert record["sample_start_index"] is None
+    assert capture.start_recording_if_due(
+        elapsed_sec=5.99,
+        sample_start_index=20,
+    ) is None
+    started = capture.start_recording_if_due(
+        elapsed_sec=6.0,
+        sample_start_index=30,
+    )
+    assert started is record
+    assert capture.state == "RECORDING"
+    assert record["sample_start_index"] == 30
+    completed = capture.complete_if_due(elapsed_sec=8.0, sample_end_index=70)
+    assert completed is record
+    assert record["recording_duration_sec"] == pytest.approx(2.0)
+
+
+def _synthetic_calibration_payload(*, software_kp: float = 5.0) -> dict[str, object]:
+    gravity_vectors = (
+        (0.0, 2.0, 4.0, 1.0, 0.1, -0.1),
+        (0.0, 3.0, 2.0, 1.5, -0.2, 0.2),
+    )
+    references = (
+        (0.0, 0.8, 0.9, 0.1, 0.0, 0.0),
+        (0.2, 1.2, 0.6, 0.4, 0.1, -0.2),
+    )
+    # residual = 0.1 * nominal gravity + a fixed joint bias
+    bias = np.asarray((0.0, 0.05, -0.03, 0.02, 0.01, -0.01))
+    samples: list[dict[str, object]] = []
+    records: list[dict[str, object]] = []
+    for pose_index, (gravity, reference) in enumerate(
+        zip(gravity_vectors, references, strict=True)
+    ):
+        residual = 0.1 * (np.asarray(gravity) / 0.5) + bias
+        for direction in range(2):
+            start = len(samples)
+            for offset in range(3):
+                samples.append(
+                    {
+                        "elapsed_sec": float(len(samples)) * 0.05,
+                        "qpos_rad": reference,
+                        "qref_rad": reference,
+                        "qvel_fd_rad_s": (0.0,) * 6,
+                        "gravity_tau_nm": gravity,
+                        "position_tau_nm": tuple(residual),
+                        "requested_tau_nm": gravity,
+                        "conditioned_tau_nm": gravity,
+                        "torque_limited": False,
+                        "slew_limited": False,
+                    }
+                )
+            records.append(
+                {
+                    "index": len(records) + 1,
+                    "completed": True,
+                    "sample_start_index": start,
+                    "sample_end_index": len(samples),
+                    "reference_qpos_rad": reference,
+                    "approach_direction": "positive" if direction == 0 else "negative",
+                }
+            )
+    return {
+        "mode": "gravity-calibration",
+        "profile": {
+            "gravity_scale": 0.5,
+            "software_kp_nm_per_rad": (software_kp,) * 6,
+        },
+        "gravity_calibration": {"records": records},
+        "samples": samples,
+    }
+
+
+def test_calibration_window_reduction_and_bidirectional_fit() -> None:
+    payload = _synthetic_calibration_payload()
+    reduced = probe.reduce_gravity_calibration_windows(payload)
+    assert reduced["completed_record_count"] == 4
+    assert all(window["valid"] for window in reduced["windows"])
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale-joint-bias",
+    )
+    assert fit["status"] == "PASS"
+    assert fit["gravity_scale_correction"] == pytest.approx(0.1, abs=1e-10)
+    assert fit["joint_bias_nm"] == pytest.approx(
+        (0.0, 0.05, -0.03, 0.02, 0.01, -0.01),
+        abs=1e-10,
+    )
+    assert fit["pairing"]["pair_count"] == 2
+    assert fit["direction_verified_pair_count"] == 2
+
+
+def test_calibration_validation_uses_bidirectional_holdout_pairs() -> None:
+    payload = _synthetic_calibration_payload()
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale-joint-bias",
+    )
+
+    validation = probe.evaluate_gravity_calibration_model(
+        fit,
+        payload,
+        pose_tolerance_rad=0.01,
+    )
+
+    assert validation["status"] == "PASS"
+    assert validation["observation_count"] == 2
+    assert validation["pairing"]["verified_pair_count"] == 2
+    assert validation["residual_reduced"] is True
+
+
+def test_calibration_fit_rejects_zero_kp_residual_observation() -> None:
+    payload = _synthetic_calibration_payload(software_kp=0.0)
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale",
+    )
+    assert fit["status"] == "FAIL"
+    assert "software Kp is zero" in fit["reasons"][0]
+
+
+def test_formal_fit_rejects_geometric_pair_without_opposite_direction_labels() -> None:
+    payload = _synthetic_calibration_payload()
+    for record in payload["gravity_calibration"]["records"]:
+        record["approach_direction"] = None
+
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale",
+    )
+
+    assert fit["status"] == "FAIL"
+    assert fit["pairing"]["pair_count"] == 0
+    assert fit["pairing"]["direction_rejected_count"] == 2
+    assert "bidirectional" in fit["reasons"][0]
+
+
+def test_pose_selection_deduplicates_repeated_reference_windows() -> None:
+    observations = [
+        {
+            "reference_qpos_rad": (0.0,) * 6,
+            "gravity_tau_nm": (3.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        },
+        {
+            "reference_qpos_rad": (0.01,) * 6,
+            "gravity_tau_nm": (1.0, 0.1, 0.0, 0.0, 0.0, 0.0),
+        },
+        {
+            "reference_qpos_rad": (0.4,) * 6,
+            "gravity_tau_nm": (2.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+        },
+    ]
+
+    selection = probe.select_calibration_poses(
+        observations,
+        model="global-scale",
+        pose_tolerance_rad=0.08,
+    )
+
+    assert len(selection["selected_indices"]) == 2
+    assert selection["duplicate_rejected_indices"] == (1,)
+    assert selection["rejected_indices"] == (1,)
+
+
+def test_global_scale_payload_fit_recovers_mass_and_first_moment(tmp_path) -> None:
+    class FakePayloadModel:
+        urdf_path = tmp_path / "payload.urdf"
+        gravity_mps2 = (0.0, 0.0, -9.81)
+
+        def forward_kinematics(self, qpos_rad: object) -> np.ndarray:
+            q = np.asarray(qpos_rad, dtype=float)
+            a, b, c = 0.2 * q[0], -0.1 * q[1], 0.15 * q[2]
+            ca, sa = np.cos(a), np.sin(a)
+            cb, sb = np.cos(b), np.sin(b)
+            cc, sc = np.cos(c), np.sin(c)
+            rx = np.asarray(((1.0, 0.0, 0.0), (0.0, ca, -sa), (0.0, sa, ca)))
+            ry = np.asarray(((cb, 0.0, sb), (0.0, 1.0, 0.0), (-sb, 0.0, cb)))
+            rz = np.asarray(((cc, -sc, 0.0), (sc, cc, 0.0), (0.0, 0.0, 1.0)))
+            transform = np.eye(4)
+            transform[:3, :3] = rx @ ry @ rz
+            return transform
+
+        def arm_jacobian(self, qpos_rad: object) -> np.ndarray:
+            q = np.asarray(qpos_rad, dtype=float)
+            jacobian = np.asarray(
+                (
+                    (1.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+                    (0.2, 1.0, 0.1, 0.2, 0.3, 0.4),
+                    (0.3, 0.2, 1.0, 0.1, 0.2, 0.3),
+                    (0.4, 0.3, 0.2, 1.0, 0.1, 0.2),
+                    (0.5, 0.4, 0.3, 0.2, 1.0, 0.1),
+                    (0.6, 0.5, 0.4, 0.3, 0.2, 1.0),
+                )
+            )
+            for index in range(6):
+                jacobian += (0.03 * q[index]) * np.roll(
+                    np.eye(6),
+                    index,
+                    axis=1,
+                )
+            return jacobian
+
+    model = FakePayloadModel()
+    model.urdf_path.write_text("<robot name='payload'/>", encoding="utf-8")
+    payload_params = np.asarray((0.4, 0.02, -0.01, 0.03))
+    samples: list[dict[str, object]] = []
+    records: list[dict[str, object]] = []
+    for pose_index in range(8):
+        reference = (
+            0.1 + 0.2 * pose_index,
+            0.5 + 0.1 * pose_index,
+            1.0 + 0.07 * pose_index,
+            0.2 + 0.05 * pose_index,
+            -0.3 + 0.08 * pose_index,
+            0.1 - 0.03 * pose_index,
+        )
+        gravity = np.asarray(
+            (
+                1.0 + 0.3 * pose_index,
+                2.0 - 0.2 * pose_index,
+                3.0 + 0.4 * pose_index,
+                0.5 + 0.2 * pose_index,
+                -0.1 + 0.1 * pose_index,
+                0.3 - 0.15 * pose_index,
+            )
+        )
+        residual = 0.2 * gravity + probe.payload_gravity_torque_regressor(
+            model,
+            reference,
+        ) @ payload_params
+        for direction in ("positive", "negative"):
+            start = len(samples)
+            for _offset in range(3):
+                samples.append(
+                    {
+                        "elapsed_sec": len(samples) * 0.05,
+                        "qpos_rad": reference,
+                        "qref_rad": reference,
+                        "qvel_fd_rad_s": (0.0,) * 6,
+                        "gravity_tau_nm": tuple(gravity),
+                        "position_tau_nm": tuple(residual),
+                        "requested_tau_nm": tuple(gravity),
+                        "conditioned_tau_nm": tuple(gravity),
+                        "torque_limited": False,
+                        "slew_limited": False,
+                    }
+                )
+            records.append(
+                {
+                    "index": len(records) + 1,
+                    "completed": True,
+                    "sample_start_index": start,
+                    "sample_end_index": len(samples),
+                    "reference_qpos_rad": reference,
+                    "approach_direction": direction,
+                }
+            )
+    payload = {
+        "mode": "gravity-calibration",
+        "profile": {
+            "gravity_scale": 1.0,
+            "software_kp_nm_per_rad": (5.0,) * 6,
+        },
+        "gravity_calibration": {"records": records},
+        "samples": samples,
+    }
+
+    fit = probe.fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=0.01,
+        model="global-scale-payload",
+        kinematic_model=model,
+    )
+
+    assert fit["status"] == "PASS"
+    assert fit["fit"]["rank"] == 5
+    assert fit["gravity_scale_correction"] == pytest.approx(0.2)
+    assert fit["payload_mass_kg"] == pytest.approx(0.4)
+    assert fit["payload_first_moment_kg_m"] == pytest.approx(
+        (0.02, -0.01, 0.03)
+    )
+    assert fit["formal_direction_verified"] is True
+
+
 def test_enabled_shutdown_always_attempts_hold_before_disable() -> None:
     assert (
         probe.resolve_shutdown_action(
@@ -183,6 +482,21 @@ def test_operator_key_reader_reads_r_without_enter_and_restores_terminal() -> No
         os.close(slave_fd)
 
     assert restored == original
+
+
+def test_operator_key_reader_carries_approach_label_into_r_capture() -> None:
+    master_fd, slave_fd = pty.openpty()
+    tty_path = Path(os.ttyname(slave_fd))
+    reader = probe.OperatorKeyReader(tty_path)
+    try:
+        os.write(master_fd, b"pR")
+        assert reader.poll_capture_request() == (True, "positive")
+        os.write(master_fd, b"nR")
+        assert reader.poll_capture_request() == (True, "negative")
+    finally:
+        reader.close()
+        os.close(master_fd)
+        os.close(slave_fd)
 
 
 def test_shared_gravity_ramp_preserves_vector_and_keeps_damping_live() -> None:
@@ -2438,6 +2752,7 @@ def test_parser_help_is_read_only() -> None:
         ]
     )
     assert calibration_args.calibration_duration_sec == pytest.approx(20.0)
+    assert calibration_args.calibration_settling_sec == pytest.approx(2.0)
     probe._validate_cli(calibration_args)
 
 

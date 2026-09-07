@@ -35,11 +35,15 @@ freshness remains unverified by MotorBridge 0.4.9 and is reported as such.
 
 ``gravity-calibration`` hands the startup lock to a normal draggable
 gravity/damping controller.  Once ACTIVE, the operator may move joint1..joint6,
-release the arm, and press ``R`` without Enter.  That fresh feedback pose becomes
-the fixed software position reference for one recording window (20 seconds by
-default); completion removes the position term and returns to draggable gravity
-compensation so multiple poses can be collected in one run.  The configured
-``--kp`` is used only while a recording window is active.
+release the arm, label the approach path with ``P`` or ``N``, and press ``R``
+without Enter.  That fresh feedback pose becomes
+the fixed software position reference for a settling interval followed by one
+recording window (20 seconds by default); completion removes the position term
+and returns to draggable gravity compensation so multiple poses can be collected
+in one run.  The configured ``--kp`` is used while the fixed reference is
+settling and recording.  ``gravity-calibration-fit`` is an offline-only mode: it
+reduces complete windows, pairs repeated poses, selects informative poses, and
+fits a candidate effective-gravity overlay without opening CAN.
 
 Reaching ``--duration-sec`` ends the active experiment, but does not authorize
 drive disable.  Like the first Ctrl-C or an ordinary handled control fault, it
@@ -102,7 +106,7 @@ import termios
 import time
 import tty
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
@@ -194,6 +198,8 @@ _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
 _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
 _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD = 1.0
 _DEFAULT_CALIBRATION_DURATION_SEC = 20.0
+_DEFAULT_CALIBRATION_SETTLING_SEC = 2.0
+_DEFAULT_CALIBRATION_POSE_TOLERANCE_RAD = 0.08
 _DEFAULT_ARMING_SETTLE_SAMPLES = 4
 _DRIVE_ENABLE_COUNTDOWN_SECONDS = 3
 _OPERATOR_TTY_PATH = Path("/dev/tty")
@@ -218,6 +224,7 @@ class OperatorKeyReader:
     def __init__(self, tty_path: Path = _OPERATOR_TTY_PATH) -> None:
         self._fd: int | None = None
         self._saved_attributes: list[object] | None = None
+        self._pending_approach_direction: str | None = None
         try:
             self._fd = os.open(tty_path, os.O_RDONLY | os.O_NONBLOCK)
             self._saved_attributes = termios.tcgetattr(self._fd)
@@ -235,17 +242,48 @@ class OperatorKeyReader:
             termios.tcflush(self._fd, termios.TCIFLUSH)
 
     def poll_record_request(self) -> bool:
+        """Return whether ``R`` was pressed, preserving the legacy API.
+
+        Formal calibration should use :meth:`poll_capture_request` so the
+        operator can label the approach path with ``P`` or ``N`` immediately
+        before ``R``.  Keeping this wrapper avoids changing the small terminal
+        reader contract used by existing callers and tests.
+        """
+
+        requested, _direction = self.poll_capture_request()
+        return requested
+
+    def poll_capture_request(self) -> tuple[bool, str | None]:
+        """Read one non-blocking key batch and return ``(R, approach)``.
+
+        ``P`` and ``N`` label the manually chosen positive/negative approach
+        path for the next recording.  The label is consumed by ``R``; an
+        unlabelled ``R`` remains valid for diagnostic capture but cannot form
+        a formally bidirectional pair during offline fitting.
+        """
+
         if self._fd is None:
-            return False
+            return False, None
         try:
             pressed = os.read(self._fd, 64)
         except BlockingIOError:
-            return False
+            return False, None
         except OSError as exc:
             raise LowGainProbeError(
                 "failed to read the gravity-calibration operator terminal"
             ) from exc
-        return b"r" in pressed.lower()
+        direction: str | None = None
+        requested = False
+        for key in pressed.lower():
+            if key == ord("p"):
+                self._pending_approach_direction = "positive"
+            elif key == ord("n"):
+                self._pending_approach_direction = "negative"
+            elif key == ord("r"):
+                requested = True
+                direction = self._pending_approach_direction
+                self._pending_approach_direction = None
+        return requested, direction
 
     def close(self) -> None:
         fd = self._fd
@@ -263,12 +301,22 @@ class OperatorKeyReader:
 
 @dataclass
 class GravityCalibrationCapture:
-    """Own the FREE_DRAG/RECORDING reference and capture-window evidence."""
+    """Own the FREE_DRAG/SETTLING/RECORDING capture state machine.
+
+    ``SETTLING`` is intentionally separate from ``RECORDING``.  The operator
+    captures a pose only after releasing the arm, then the fixed reference is
+    allowed to settle under the non-zero software Kp.  Samples collected while
+    the reference is settling are retained in the run evidence but are not
+    included in the reduced calibration observation.  A zero settling duration
+    keeps the historical helper behaviour used by older callers/tests.
+    """
 
     record_duration_sec: float
+    settling_duration_sec: float = 0.0
     state: str = "FREE_DRAG"
     reference_qpos_rad: tuple[float, ...] | None = None
     started_elapsed_sec: float | None = None
+    recording_started_elapsed_sec: float | None = None
     active_record_index: int | None = None
     records: list[dict[str, object]] = field(default_factory=list)
 
@@ -277,6 +325,10 @@ class GravityCalibrationCapture:
             self.record_duration_sec,
             name="calibration_duration_sec",
         )
+        self.settling_duration_sec = _non_negative(
+            self.settling_duration_sec,
+            name="calibration_settling_sec",
+        )
 
     def trigger(
         self,
@@ -284,27 +336,73 @@ class GravityCalibrationCapture:
         *,
         elapsed_sec: float,
         sample_start_index: int,
+        approach_direction: str | None = None,
     ) -> dict[str, object] | None:
         if self.state != "FREE_DRAG":
             return None
         reference = _six(qpos_rad, name="calibration_reference_qpos_rad")
         started = _non_negative(elapsed_sec, name="calibration_trigger_elapsed_sec")
+        if approach_direction is not None:
+            approach_direction = str(approach_direction).strip().lower()
+            if approach_direction not in ("positive", "negative"):
+                raise ValueError(
+                    "calibration approach_direction must be positive or negative"
+                )
         record_index = len(self.records) + 1
         record: dict[str, object] = {
             "index": record_index,
             "trigger_elapsed_sec": started,
             "reference_qpos_rad": reference,
-            "sample_start_index": int(sample_start_index),
+            "approach_direction": approach_direction,
+            # ``sample_start_index`` is filled when RECORDING starts.  Keep the
+            # trigger index separately so the settling interval can be audited.
+            "trigger_sample_index": int(sample_start_index),
+            "sample_start_index": None,
             "sample_end_index": None,
             "completed": False,
             "observed_duration_sec": 0.0,
+            "settling_duration_sec": self.settling_duration_sec,
+            "settling_sample_start_index": int(sample_start_index),
+            "recording_started_elapsed_sec": None,
             "completion_reason": None,
+            "valid": None,
+            "invalid_reason": None,
         }
         self.records.append(record)
-        self.state = "RECORDING"
+        self.state = (
+            "SETTLING" if self.settling_duration_sec > 0.0 else "RECORDING"
+        )
         self.reference_qpos_rad = reference
         self.started_elapsed_sec = started
+        self.recording_started_elapsed_sec = (
+            started if self.state == "RECORDING" else None
+        )
         self.active_record_index = record_index
+        if self.state == "RECORDING":
+            record["sample_start_index"] = int(sample_start_index)
+            record["recording_started_elapsed_sec"] = started
+        return record
+
+    def start_recording_if_due(
+        self,
+        *,
+        elapsed_sec: float,
+        sample_start_index: int,
+    ) -> dict[str, object] | None:
+        """Transition a captured reference from SETTLING to RECORDING."""
+
+        if self.state != "SETTLING" or self.started_elapsed_sec is None:
+            return None
+        elapsed = _non_negative(elapsed_sec, name="calibration_elapsed_sec")
+        if elapsed - self.started_elapsed_sec < self.settling_duration_sec:
+            return None
+        if self.active_record_index is None:
+            raise ValueError("settling calibration record is missing")
+        record = self.records[self.active_record_index - 1]
+        self.state = "RECORDING"
+        self.recording_started_elapsed_sec = elapsed
+        record["sample_start_index"] = int(sample_start_index)
+        record["recording_started_elapsed_sec"] = elapsed
         return record
 
     def complete_if_due(
@@ -313,10 +411,10 @@ class GravityCalibrationCapture:
         elapsed_sec: float,
         sample_end_index: int,
     ) -> dict[str, object] | None:
-        if self.state != "RECORDING" or self.started_elapsed_sec is None:
+        if self.state != "RECORDING" or self.recording_started_elapsed_sec is None:
             return None
         elapsed = _non_negative(elapsed_sec, name="calibration_elapsed_sec")
-        if elapsed - self.started_elapsed_sec < self.record_duration_sec:
+        if elapsed - self.recording_started_elapsed_sec < self.record_duration_sec:
             return None
         return self._finish(
             elapsed_sec=elapsed,
@@ -332,7 +430,7 @@ class GravityCalibrationCapture:
         sample_end_index: int,
         reason: str,
     ) -> dict[str, object] | None:
-        if self.state != "RECORDING":
+        if self.state not in ("SETTLING", "RECORDING"):
             return None
         return self._finish(
             elapsed_sec=max(0.0, float(elapsed_sec)),
@@ -347,12 +445,16 @@ class GravityCalibrationCapture:
             if self.reference_qpos_rad is None:
                 raise ValueError("recording calibration reference is missing")
             return self.reference_qpos_rad
+        if self.state == "SETTLING":
+            if self.reference_qpos_rad is None:
+                raise ValueError("settling calibration reference is missing")
+            return self.reference_qpos_rad
         return current
 
     def record_elapsed_sec(self, elapsed_sec: float) -> float | None:
-        if self.state != "RECORDING" or self.started_elapsed_sec is None:
+        if self.state != "RECORDING" or self.recording_started_elapsed_sec is None:
             return None
-        return max(0.0, float(elapsed_sec) - self.started_elapsed_sec)
+        return max(0.0, float(elapsed_sec) - self.recording_started_elapsed_sec)
 
     def _finish(
         self,
@@ -365,16 +467,32 @@ class GravityCalibrationCapture:
         if self.started_elapsed_sec is None or self.active_record_index is None:
             raise ValueError("active calibration record is incomplete")
         record = self.records[self.active_record_index - 1]
+        if record["sample_start_index"] is None:
+            # A stop during SETTLING has no valid recording samples.  Use the
+            # trigger index as a closed empty interval for deterministic audit.
+            record["sample_start_index"] = int(record["trigger_sample_index"])
         record["sample_end_index"] = int(sample_end_index)
         record["completed"] = completed
+        record["valid"] = completed
+        if not completed:
+            record["invalid_reason"] = reason
         record["observed_duration_sec"] = max(
             0.0,
             elapsed_sec - self.started_elapsed_sec,
+        )
+        record["recording_duration_sec"] = (
+            max(
+                0.0,
+                elapsed_sec - self.recording_started_elapsed_sec,
+            )
+            if self.recording_started_elapsed_sec is not None
+            else 0.0
         )
         record["completion_reason"] = reason
         self.state = "FREE_DRAG"
         self.reference_qpos_rad = None
         self.started_elapsed_sec = None
+        self.recording_started_elapsed_sec = None
         self.active_record_index = None
         return record
 
@@ -408,6 +526,1358 @@ def evaluate_gravity_calibration_capture(
     }
 
 
+def _calibration_sample_vector(
+    sample: Mapping[str, object],
+    key: str,
+    *,
+    name: str | None = None,
+) -> np.ndarray:
+    """Read one finite six-joint vector from a captured sample."""
+
+    value = sample.get(key)
+    if value is None:
+        raise ValueError(f"calibration sample is missing {key}")
+    return np.asarray(_six(value, name=name or key), dtype=float)
+
+
+def _calibration_interval(
+    sample_count: int,
+    sample_start_index: int,
+    sample_end_index: int,
+) -> tuple[int, int]:
+    """Validate a half-open calibration sample interval."""
+
+    def integer_index(value: object, *, name: str) -> int:
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        try:
+            exact = float(value) == float(normalized)
+        except (TypeError, ValueError, OverflowError):
+            exact = False
+        if not exact:
+            raise ValueError(f"{name} must be an integer")
+        return normalized
+
+    start = integer_index(sample_start_index, name="sample_start_index")
+    end = integer_index(sample_end_index, name="sample_end_index")
+    if start < 0 or end <= start or end > sample_count:
+        raise ValueError(
+            "calibration sample interval must satisfy "
+            f"0 <= start < end <= {sample_count}"
+        )
+    return start, end
+
+
+def evaluate_calibration_window(
+    samples: Sequence[Mapping[str, object]],
+    *,
+    sample_start_index: int,
+    sample_end_index: int,
+    max_velocity_rad_s: float | None = None,
+    max_position_span_rad: float | None = None,
+    reject_torque_saturation: bool = True,
+) -> dict[str, object]:
+    """Reduce and quality-check one fixed-reference recording window.
+
+    The function deliberately does not invent a universal stability threshold.
+    A caller may provide commissioning-specific velocity/span criteria; when a
+    criterion is omitted it is reported as ``NOT_CONFIGURED`` instead of being
+    silently tightened in code.  Every frame in the interval is still required
+    to be finite and complete.  The returned medians represent one physical
+    pose observation; individual 20 Hz frames are not treated as independent
+    poses by the fitter.
+    """
+
+    start, end = _calibration_interval(
+        len(samples),
+        sample_start_index,
+        sample_end_index,
+    )
+    window = tuple(samples[start:end])
+    if not window:
+        raise ValueError("calibration window must contain at least one sample")
+
+    qpos = np.vstack(
+        [_calibration_sample_vector(sample, "qpos_rad") for sample in window]
+    )
+    qvel = np.vstack(
+        [_calibration_sample_vector(sample, "qvel_fd_rad_s") for sample in window]
+    )
+    gravity = np.vstack(
+        [_calibration_sample_vector(sample, "gravity_tau_nm") for sample in window]
+    )
+    position = np.vstack(
+        [_calibration_sample_vector(sample, "position_tau_nm") for sample in window]
+    )
+    requested = np.vstack(
+        [_calibration_sample_vector(sample, "requested_tau_nm") for sample in window]
+    )
+    conditioned = np.vstack(
+        [
+            _calibration_sample_vector(sample, "conditioned_tau_nm")
+            for sample in window
+        ]
+    )
+    if any(
+        not np.all(np.isfinite(values))
+        for values in (qpos, qvel, gravity, position, requested, conditioned)
+    ):
+        raise ValueError("calibration window contains non-finite numeric values")
+
+    qref_value = window[0].get("qref_rad")
+    if qref_value is None:
+        raise ValueError("calibration window is missing qref_rad")
+    qref = np.asarray(_six(qref_value, name="qref_rad"), dtype=float)
+    if any(
+        not np.allclose(
+            _calibration_sample_vector(sample, "qref_rad"),
+            qref,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        for sample in window
+    ):
+        raise ValueError("calibration qref changed inside a recording window")
+
+    reasons: list[str] = []
+    max_velocity = float(np.max(np.abs(qvel)))
+    position_span = np.max(qpos, axis=0) - np.min(qpos, axis=0)
+    max_span = float(np.max(position_span))
+    torque_limited_count = sum(bool(sample.get("torque_limited")) for sample in window)
+    slew_limited_count = sum(bool(sample.get("slew_limited")) for sample in window)
+    if max_velocity_rad_s is None:
+        velocity_gate: dict[str, object] = {
+            "status": "NOT_CONFIGURED",
+            "limit_rad_s": None,
+            "observed_max_rad_s": max_velocity,
+        }
+    else:
+        velocity_limit = _positive(
+            max_velocity_rad_s,
+            name="calibration_max_velocity_rad_s",
+        )
+        velocity_passed = max_velocity <= velocity_limit
+        velocity_gate = {
+            "status": "PASS" if velocity_passed else "FAIL",
+            "limit_rad_s": velocity_limit,
+            "observed_max_rad_s": max_velocity,
+        }
+        if not velocity_passed:
+            reasons.append(
+                "finite-difference velocity exceeds calibration stability criterion"
+            )
+    if max_position_span_rad is None:
+        span_gate: dict[str, object] = {
+            "status": "NOT_CONFIGURED",
+            "limit_rad": None,
+            "observed_max_span_rad": max_span,
+        }
+    else:
+        span_limit = _positive(
+            max_position_span_rad,
+            name="calibration_max_position_span_rad",
+        )
+        span_passed = max_span <= span_limit
+        span_gate = {
+            "status": "PASS" if span_passed else "FAIL",
+            "limit_rad": span_limit,
+            "observed_max_span_rad": max_span,
+        }
+        if not span_passed:
+            reasons.append("position span exceeds calibration stability criterion")
+    if reject_torque_saturation and torque_limited_count:
+        reasons.append("calibration window contains absolute torque saturation")
+    if reject_torque_saturation and slew_limited_count:
+        reasons.append("calibration window contains torque slew saturation")
+
+    def median_vector(values: np.ndarray) -> tuple[float, ...]:
+        return tuple(float(value) for value in np.median(values, axis=0))
+
+    def mad_vector(values: np.ndarray) -> tuple[float, ...]:
+        med = np.median(values, axis=0)
+        return tuple(
+            float(value)
+            for value in np.median(np.abs(values - med), axis=0)
+        )
+
+    elapsed_values = [
+        _finite(sample.get("elapsed_sec"), name="calibration_sample_elapsed_sec")
+        for sample in window
+        if sample.get("elapsed_sec") is not None
+    ]
+    duration_sec = (
+        max(elapsed_values) - min(elapsed_values) if len(elapsed_values) >= 2 else None
+    )
+    return {
+        "status": "PASS" if not reasons else "INVALID",
+        "valid": not reasons,
+        "sample_start_index": start,
+        "sample_end_index": end,
+        "sample_count": len(window),
+        "duration_sec": duration_sec,
+        "reference_qpos_rad": tuple(float(value) for value in qref),
+        "qpos_median_rad": median_vector(qpos),
+        "qpos_mad_rad": mad_vector(qpos),
+        "qpos_span_rad": tuple(float(value) for value in position_span),
+        "qvel_median_rad_s": median_vector(qvel),
+        "qvel_mad_rad_s": mad_vector(qvel),
+        "gravity_tau_median_nm": median_vector(gravity),
+        "gravity_tau_mad_nm": mad_vector(gravity),
+        "position_tau_median_nm": median_vector(position),
+        "position_tau_mad_nm": mad_vector(position),
+        "requested_tau_median_nm": median_vector(requested),
+        "conditioned_tau_median_nm": median_vector(conditioned),
+        "max_abs_velocity_rad_s": max_velocity,
+        "max_position_span_rad": max_span,
+        "stability_velocity_gate": velocity_gate,
+        "stability_position_span_gate": span_gate,
+        "torque_limited_count": torque_limited_count,
+        "slew_limited_count": slew_limited_count,
+        "reasons": tuple(reasons),
+        "approach_direction": window[0].get("approach_direction"),
+    }
+
+
+def reduce_gravity_calibration_windows(
+    payload: Mapping[str, object],
+    *,
+    max_velocity_rad_s: float | None = None,
+    max_position_span_rad: float | None = None,
+    reject_torque_saturation: bool = True,
+) -> dict[str, object]:
+    """Extract complete records and reduce each to one pose observation."""
+
+    calibration = payload.get("gravity_calibration")
+    if not isinstance(calibration, Mapping):
+        raise TypeError("payload is missing gravity_calibration metadata")
+    records = calibration.get("records")
+    samples = payload.get("samples")
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        raise TypeError("gravity_calibration.records must be a sequence")
+    if not isinstance(samples, Sequence) or isinstance(samples, (str, bytes)):
+        raise TypeError("payload.samples must be a sequence")
+    reduced: list[dict[str, object]] = []
+    invalid: list[dict[str, object]] = []
+    completed_count = 0
+    for raw_record in records:
+        if not isinstance(raw_record, Mapping):
+            invalid.append({"reason": "record is not an object"})
+            continue
+        if not bool(raw_record.get("completed")):
+            invalid.append(
+                {
+                    "index": raw_record.get("index"),
+                    "reason": raw_record.get("completion_reason")
+                    or "recording window is incomplete",
+                }
+            )
+            continue
+        completed_count += 1
+        start = raw_record.get("sample_start_index")
+        end = raw_record.get("sample_end_index")
+        if start is None or end is None:
+            invalid.append(
+                {
+                    "index": raw_record.get("index"),
+                    "reason": "complete record has no sample interval",
+                }
+            )
+            continue
+        try:
+            start_index, end_index = _calibration_interval(
+                len(samples),
+                start,
+                end,
+            )
+            summary = evaluate_calibration_window(
+                samples,
+                sample_start_index=start_index,
+                sample_end_index=end_index,
+                max_velocity_rad_s=max_velocity_rad_s,
+                max_position_span_rad=max_position_span_rad,
+                reject_torque_saturation=reject_torque_saturation,
+            )
+        except (TypeError, ValueError) as exc:
+            invalid.append(
+                {
+                    "index": raw_record.get("index"),
+                    "reason": str(exc),
+                }
+            )
+            continue
+        summary["record_index"] = raw_record.get("index")
+        summary["trigger_elapsed_sec"] = raw_record.get("trigger_elapsed_sec")
+        summary["settling_duration_sec"] = raw_record.get("settling_duration_sec", 0.0)
+        summary["recording_started_elapsed_sec"] = raw_record.get(
+            "recording_started_elapsed_sec"
+        )
+        summary["pair_id"] = raw_record.get("pair_id")
+        summary["approach_direction"] = raw_record.get("approach_direction")
+        if bool(summary["valid"]):
+            reduced.append(summary)
+        else:
+            invalid.append(summary)
+    return {
+        "windows": reduced,
+        "invalid_records": invalid,
+        "completed_record_count": completed_count,
+        "valid_record_count": len(reduced),
+    }
+
+
+def pair_gravity_calibration_windows(
+    windows: Sequence[Mapping[str, object]],
+    *,
+    pose_tolerance_rad: float,
+    require_opposite_direction: bool = False,
+) -> dict[str, object]:
+    """Pair opposite-direction captures of the same pose by reference pose.
+
+    Direction is an operator action and is not inferable from a static JSON
+    window.  Explicit ``pair_id`` values are preferred; otherwise this helper
+    greedily pairs the nearest unpaired references within the caller-supplied
+    tolerance.  When ``require_opposite_direction`` is true, only windows
+    explicitly labelled ``positive`` and ``negative`` can form a pair.  The
+    default remains geometric-only for diagnostics and backwards-compatible
+    helper use; the formal fitter enables the strict mode.
+    """
+
+    tolerance = _positive(
+        pose_tolerance_rad,
+        name="calibration_pose_tolerance_rad",
+    )
+    normalized: list[dict[str, object]] = []
+    for index, window in enumerate(windows):
+        qref = np.asarray(
+            _six(window.get("reference_qpos_rad"), name="reference_qpos_rad"),
+            dtype=float,
+        )
+        normalized.append({"index": index, "window": window, "qref": qref})
+
+    by_pair_id: dict[object, list[dict[str, object]]] = {}
+    unlabelled: list[dict[str, object]] = []
+    for item in normalized:
+        pair_id = item["window"].get("pair_id")
+        if pair_id is None:
+            unlabelled.append(item)
+        else:
+            by_pair_id.setdefault(pair_id, []).append(item)
+
+    pairs: list[dict[str, object]] = []
+    unpaired: list[dict[str, object]] = []
+    direction_rejected_count = 0
+
+    def directions_are_opposite(
+        first_window: Mapping[str, object],
+        second_window: Mapping[str, object],
+    ) -> bool:
+        first_direction = first_window.get("approach_direction")
+        second_direction = second_window.get("approach_direction")
+        return (
+            first_direction in ("positive", "negative")
+            and second_direction in ("positive", "negative")
+            and first_direction != second_direction
+        )
+
+    for pair_id, items in by_pair_id.items():
+        if len(items) == 2:
+            if require_opposite_direction and not directions_are_opposite(
+                items[0]["window"], items[1]["window"]
+            ):
+                direction_rejected_count += 1
+                unpaired.extend(item["window"] for item in items)
+                continue
+            pairs.append(
+                {
+                    "pair_id": pair_id,
+                    "window_indices": tuple(int(item["index"]) for item in items),
+                    "windows": tuple(item["window"] for item in items),
+                    "pairing": "explicit_pair_id",
+                    "direction_verified": directions_are_opposite(
+                        items[0]["window"], items[1]["window"]
+                    ),
+                }
+            )
+        else:
+            unpaired.extend(item["window"] for item in items)
+
+    remaining = list(unlabelled)
+    while remaining:
+        first = remaining.pop(0)
+        if not remaining:
+            unpaired.append(first["window"])
+            break
+        candidate_items = [
+            item
+            for item in remaining
+            if not require_opposite_direction
+            or directions_are_opposite(first["window"], item["window"])
+        ]
+        if not candidate_items:
+            if require_opposite_direction and remaining:
+                nearest_any_distance = min(
+                    float(np.max(np.abs(first["qref"] - item["qref"])))
+                    for item in remaining
+                )
+                if nearest_any_distance <= tolerance:
+                    direction_rejected_count += 1
+            unpaired.append(first["window"])
+            continue
+        distances = [
+            float(np.max(np.abs(first["qref"] - item["qref"])))
+            for item in candidate_items
+        ]
+        nearest_index = int(np.argmin(np.asarray(distances, dtype=float)))
+        nearest_distance = distances[nearest_index]
+        if nearest_distance <= tolerance:
+            second = candidate_items[nearest_index]
+            remaining.remove(second)
+            pairs.append(
+                {
+                    "pair_id": None,
+                    "window_indices": (int(first["index"]), int(second["index"])),
+                    "windows": (first["window"], second["window"]),
+                    "pairing": "nearest_reference_pose",
+                    "reference_distance_rad": nearest_distance,
+                    "direction_verified": directions_are_opposite(
+                        first["window"], second["window"]
+                    ),
+                }
+            )
+        else:
+            unpaired.append(first["window"])
+
+    return {
+        "pairs": tuple(pairs),
+        "unpaired": tuple(unpaired),
+        "pair_count": len(pairs),
+        "unpaired_count": len(unpaired),
+        "pose_tolerance_rad": tolerance,
+        "require_opposite_direction": require_opposite_direction,
+        "direction_rejected_count": direction_rejected_count,
+        "verified_pair_count": sum(
+            bool(pair.get("direction_verified")) for pair in pairs
+        ),
+    }
+
+
+def _calibration_pair_observation(
+    pair: Mapping[str, object],
+) -> dict[str, object]:
+    windows = pair.get("windows")
+    if not isinstance(windows, Sequence) or len(windows) != 2:
+        raise ValueError("calibration pair must contain exactly two windows")
+
+    def average(key: str) -> tuple[float, ...]:
+        values = np.vstack(
+            [
+                np.asarray(_six(window.get(key), name=key), dtype=float)
+                for window in windows
+            ]
+        )
+        return tuple(float(value) for value in np.mean(values, axis=0))
+
+    first = windows[0]
+    return {
+        "pair_id": pair.get("pair_id"),
+        "pairing": pair.get("pairing"),
+        "record_indices": tuple(window.get("record_index") for window in windows),
+        "reference_qpos_rad": average("reference_qpos_rad"),
+        "gravity_tau_nm": average("gravity_tau_median_nm"),
+        "position_tau_nm": average("position_tau_median_nm"),
+        "position_tau_mad_nm": average("position_tau_mad_nm"),
+        "approach_directions": tuple(
+            window.get("approach_direction") for window in windows
+        ),
+        "direction_verified": all(
+            window.get("approach_direction") is not None for window in windows
+        )
+        and len(
+            {
+                window.get("approach_direction") for window in windows
+            }
+        )
+        == 2,
+        "source_window_count": 2,
+        "source_record": first.get("record_index"),
+    }
+
+
+def payload_gravity_torque_regressor(
+    model: B601PinocchioModel,
+    q_arm: Sequence[float],
+) -> np.ndarray:
+    """Return the 6-by-4 static torque basis for an unknown tool payload.
+
+    Columns are ``[mass_kg, first_moment_x, first_moment_y,
+    first_moment_z]`` with first moments expressed in the ``gripper_end``
+    frame.  The basis uses the existing world-aligned end-effector Jacobian;
+    it does not mutate the URDF or contact the vendor backend.
+    """
+
+    q = _six(q_arm, name="payload_regressor_q_arm")
+    transform = np.asarray(model.forward_kinematics(q), dtype=float)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("payload regressor FK returned an invalid transform")
+    rotation = transform[:3, :3]
+    try:
+        gravity = np.asarray(
+            tuple(float(value) for value in model.gravity_mps2),
+            dtype=float,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("gravity_mps2 must contain three finite values") from exc
+    if gravity.shape != (3,) or not np.all(np.isfinite(gravity)):
+        raise ValueError("gravity_mps2 must contain three finite values")
+    wrench_basis = np.zeros((6, 4), dtype=float)
+    wrench_basis[:3, 0] = gravity
+    for column in range(3):
+        wrench_basis[3:, column + 1] = np.cross(rotation[:, column], gravity)
+    # Pinocchio's static equation is g - J.T f_ext, so an added payload's
+    # gravity contribution is -J.T times its downward gravity wrench.
+    regressor = -np.asarray(model.arm_jacobian(q), dtype=float).T @ wrench_basis
+    if regressor.shape != (6, 4) or not np.all(np.isfinite(regressor)):
+        raise ValueError("payload gravity regressor is invalid")
+    return regressor
+
+
+def select_calibration_poses(
+    pose_observations: Sequence[Mapping[str, object]],
+    *,
+    max_pose_count: int | None = None,
+    model: str = "global-scale-joint-bias",
+    kinematic_model: B601PinocchioModel | None = None,
+    pose_tolerance_rad: float | None = None,
+) -> dict[str, object]:
+    """Select information-rich, non-duplicate poses.
+
+    The greedy SVD/log-volume criterion ranks candidates by the information
+    added to the regression.  Once a candidate is selected, any remaining
+    reference pose within ``pose_tolerance_rad`` is rejected as a duplicate.
+    This makes a long run of repeated windows contribute one physical pose,
+    rather than silently turning repeated 20 Hz observations into artificial
+    identifiability.
+    """
+
+    if model not in (
+        "global-scale",
+        "global-scale-joint-bias",
+        "global-scale-payload",
+    ):
+        raise ValueError("unknown calibration model")
+    if model == "global-scale-payload" and kinematic_model is None:
+        raise ValueError(
+            "global-scale-payload pose selection requires a kinematic model"
+        )
+    if pose_tolerance_rad is not None:
+        pose_tolerance = _positive(
+            pose_tolerance_rad,
+            name="calibration_pose_tolerance_rad",
+        )
+    else:
+        pose_tolerance = None
+    feature_width = {
+        "global-scale": 1,
+        "global-scale-joint-bias": 7,
+        "global-scale-payload": 5,
+    }[model]
+    if max_pose_count is None:
+        selected_limit = len(pose_observations)
+    else:
+        if isinstance(max_pose_count, bool) or int(max_pose_count) <= 0:
+            raise ValueError("max_pose_count must be positive when provided")
+        selected_limit = min(int(max_pose_count), len(pose_observations))
+    if not pose_observations or selected_limit == 0:
+        return {
+            "selected_indices": (),
+            "rejected_indices": tuple(range(len(pose_observations))),
+            "duplicate_rejected_indices": (),
+            "pose_dedup_tolerance_rad": pose_tolerance,
+            "rank": 0,
+            "singular_values": (),
+            "condition_number": math.inf,
+            "criterion": "greedy_svd_log_volume_with_pose_dedup",
+        }
+
+    features: list[np.ndarray] = []
+    references: list[np.ndarray] = []
+    for observation in pose_observations:
+        references.append(
+            np.asarray(
+                _six(observation.get("reference_qpos_rad"), name="reference_qpos_rad"),
+                dtype=float,
+            )
+        )
+        gravity = np.asarray(
+            _six(observation.get("gravity_tau_nm"), name="gravity_tau_nm"),
+            dtype=float,
+        )
+        block = np.zeros((6, feature_width), dtype=float)
+        block[:, 0] = gravity
+        if model == "global-scale-joint-bias":
+            block[:, 1:] = np.eye(6, dtype=float)
+        elif model == "global-scale-payload":
+            block[:, 1:] = payload_gravity_torque_regressor(
+                kinematic_model,
+                observation.get("reference_qpos_rad"),
+            )
+        features.append(block)
+
+    selected: list[int] = []
+    remaining = set(range(len(features)))
+    duplicate_rejected: set[int] = set()
+    best_signature: tuple[int, float] | None = None
+    while remaining and len(selected) < selected_limit:
+        candidate_scores: list[tuple[tuple[int, float], int, np.ndarray]] = []
+        for index in remaining:
+            candidate_indices = selected + [index]
+            matrix = np.vstack([features[item] for item in candidate_indices])
+            singular_values = np.linalg.svd(matrix, compute_uv=False)
+            tolerance = max(matrix.shape) * np.finfo(float).eps * (
+                float(singular_values[0]) if singular_values.size else 0.0
+            )
+            rank = int(np.count_nonzero(singular_values > tolerance))
+            positive = singular_values[singular_values > tolerance]
+            volume = float(np.sum(np.log(positive))) if positive.size else -math.inf
+            candidate_scores.append(((rank, volume), index, singular_values))
+        candidate_scores.sort(key=lambda item: (item[0][0], item[0][1], -item[1]), reverse=True)
+        signature, chosen, singular_values = candidate_scores[0]
+        if best_signature is not None and signature == best_signature and len(selected) > 0:
+            # Once every remaining candidate has the same information volume,
+            # retaining more near-duplicate poses adds no identifiability.
+            break
+        selected.append(chosen)
+        remaining.remove(chosen)
+        if pose_tolerance is not None:
+            duplicate_indices = {
+                index
+                for index in remaining
+                if float(np.max(np.abs(references[index] - references[chosen])))
+                <= pose_tolerance
+            }
+            remaining.difference_update(duplicate_indices)
+            duplicate_rejected.update(duplicate_indices)
+        best_signature = signature
+
+    matrix = (
+        np.vstack([features[item] for item in selected])
+        if selected
+        else np.empty((0, feature_width))
+    )
+    singular_values = (
+        np.linalg.svd(matrix, compute_uv=False) if matrix.size else np.asarray(())
+    )
+    if singular_values.size:
+        tolerance = max(matrix.shape) * np.finfo(float).eps * float(singular_values[0])
+        rank = int(np.count_nonzero(singular_values > tolerance))
+        condition = (
+            math.inf
+            if rank == 0 or singular_values[-1] <= tolerance
+            else float(singular_values[0] / singular_values[-1])
+        )
+    else:
+        rank = 0
+        condition = math.inf
+    return {
+        "selected_indices": tuple(selected),
+        "rejected_indices": tuple(sorted(remaining | duplicate_rejected)),
+        "duplicate_rejected_indices": tuple(sorted(duplicate_rejected)),
+        "pose_dedup_tolerance_rad": pose_tolerance,
+        "rank": rank,
+        "singular_values": tuple(float(value) for value in singular_values),
+        "condition_number": condition,
+        "criterion": "greedy_svd_log_volume_with_pose_dedup",
+    }
+
+
+def fit_gravity_calibration(
+    payload: Mapping[str, object],
+    *,
+    pose_tolerance_rad: float,
+    model: str = "global-scale-joint-bias",
+    kinematic_model: B601PinocchioModel | None = None,
+    max_pose_count: int | None = None,
+    max_velocity_rad_s: float | None = None,
+    max_position_span_rad: float | None = None,
+    require_bidirectional: bool = True,
+) -> dict[str, object]:
+    """Fit an auditable effective gravity correction from reduced windows."""
+
+    if model not in (
+        "global-scale",
+        "global-scale-joint-bias",
+        "global-scale-payload",
+    ):
+        raise ValueError(
+            "calibration model must be global-scale, global-scale-joint-bias, "
+            "or global-scale-payload"
+        )
+    if model == "global-scale-payload" and kinematic_model is None:
+        raise ValueError("global-scale-payload fitting requires a kinematic model")
+    reduced = reduce_gravity_calibration_windows(
+        payload,
+        max_velocity_rad_s=max_velocity_rad_s,
+        max_position_span_rad=max_position_span_rad,
+    )
+    windows = reduced["windows"]
+    invalid_record_count = len(reduced["invalid_records"])
+    if not windows:
+        return {
+            "status": "FAIL",
+            "model": model,
+            "reasons": ("no valid complete calibration windows",),
+            "reduction": reduced,
+        }
+    paired = pair_gravity_calibration_windows(
+        windows,
+        pose_tolerance_rad=pose_tolerance_rad,
+        require_opposite_direction=require_bidirectional,
+    )
+    if require_bidirectional and not paired["pairs"]:
+        return {
+            "status": "FAIL",
+            "model": model,
+            "reasons": ("no bidirectional pose pair was identified",),
+            "reduction": reduced,
+            "pairing": paired,
+        }
+    observations = [
+        _calibration_pair_observation(pair) for pair in paired["pairs"]
+    ]
+    if not require_bidirectional:
+        observations.extend(
+            {
+                "pair_id": None,
+                "pairing": "unpaired_single_window",
+                "record_indices": (window.get("record_index"),),
+                "reference_qpos_rad": window.get("reference_qpos_rad"),
+                "gravity_tau_nm": window.get("gravity_tau_median_nm"),
+                "position_tau_nm": window.get("position_tau_median_nm"),
+                "position_tau_mad_nm": window.get("position_tau_mad_nm"),
+                "approach_directions": (window.get("approach_direction"),),
+                "direction_verified": False,
+                "source_window_count": 1,
+            }
+            for window in paired["unpaired"]
+        )
+    selection = select_calibration_poses(
+        observations,
+        max_pose_count=max_pose_count,
+        model=model,
+        kinematic_model=kinematic_model,
+        pose_tolerance_rad=pose_tolerance_rad,
+    )
+    selected = [observations[index] for index in selection["selected_indices"]]
+    if not selected:
+        return {
+            "status": "FAIL",
+            "model": model,
+            "reasons": ("pose selection returned no observations",),
+            "reduction": reduced,
+            "pairing": paired,
+            "pose_selection": selection,
+        }
+
+    profile = payload.get("profile")
+    if not isinstance(profile, Mapping):
+        return {
+            "status": "FAIL",
+            "model": model,
+            "reasons": ("payload is missing profile metadata",),
+            "reduction": reduced,
+            "pairing": paired,
+            "pose_selection": selection,
+        }
+    try:
+        nominal_scale = _positive(profile.get("gravity_scale"), name="gravity_scale")
+        software_kp = _six(
+            profile.get("software_kp_nm_per_rad"),
+            name="software_kp_nm_per_rad",
+        )
+    except (TypeError, ValueError) as exc:
+        return {
+            "status": "FAIL",
+            "model": model,
+            "reasons": (str(exc),),
+            "reduction": reduced,
+            "pairing": paired,
+            "pose_selection": selection,
+        }
+    if not any(abs(value) > 0.0 for value in software_kp):
+        return {
+            "status": "FAIL",
+            "model": model,
+            "reasons": (
+                "software Kp is zero; position residual is unobservable",
+            ),
+            "reduction": reduced,
+            "pairing": paired,
+            "pose_selection": selection,
+        }
+
+    rows: list[list[float]] = []
+    target: list[float] = []
+    for observation in selected:
+        gravity = np.asarray(
+            _six(observation["gravity_tau_nm"], name="gravity_tau_nm"),
+            dtype=float,
+        )
+        residual = np.asarray(
+            _six(observation["position_tau_nm"], name="position_tau_nm"),
+            dtype=float,
+        )
+        nominal_gravity = gravity / nominal_scale
+        if model == "global-scale":
+            rows.extend([[float(value)] for value in nominal_gravity])
+        elif model == "global-scale-joint-bias":
+            for joint_index, value in enumerate(nominal_gravity):
+                row = [0.0] * 7
+                row[0] = float(value)
+                row[joint_index + 1] = 1.0
+                rows.append(row)
+        else:
+            payload_basis = payload_gravity_torque_regressor(
+                kinematic_model,
+                observation.get("reference_qpos_rad"),
+            )
+            for joint_index, value in enumerate(nominal_gravity):
+                row = [float(value)] + [float(item) for item in payload_basis[joint_index]]
+                rows.append(row)
+        target.extend(float(value) for value in residual)
+    design = np.asarray(rows, dtype=float)
+    observed = np.asarray(target, dtype=float)
+    if not np.all(np.isfinite(design)) or not np.all(np.isfinite(observed)):
+        return {
+            "status": "FAIL",
+            "model": model,
+            "reasons": ("calibration design or residual contains non-finite values",),
+            "reduction": reduced,
+            "pairing": paired,
+            "pose_selection": selection,
+        }
+    if np.linalg.norm(observed) <= np.finfo(float).eps:
+        return {
+            "status": "FAIL",
+            "model": model,
+            "reasons": (
+                "position residual is numerically zero; no gravity correction is observable",
+            ),
+            "reduction": reduced,
+            "pairing": paired,
+            "pose_selection": selection,
+        }
+
+    solution, _residuals, rank, singular_values = np.linalg.lstsq(
+        design,
+        observed,
+        rcond=None,
+    )
+    delta_scale = float(solution[0])
+    bias = np.zeros(6, dtype=float)
+    payload_parameters = np.zeros(4, dtype=float)
+    if model == "global-scale-joint-bias":
+        bias[:] = solution[1:]
+    elif model == "global-scale-payload":
+        payload_parameters[:] = solution[1:]
+        if payload_parameters[0] < 0.0:
+            # Mass is physically non-negative.  Hold it at the boundary and
+            # re-solve the remaining first-moment/global-scale columns.
+            payload_parameters[0] = 0.0
+            free_solution, *_ = np.linalg.lstsq(
+                design[:, (0, 2, 3, 4)],
+                observed,
+                rcond=None,
+            )
+            delta_scale = float(free_solution[0])
+            payload_parameters[1:] = free_solution[1:]
+    if delta_scale < -nominal_scale:
+        delta_scale = -nominal_scale
+        if model == "global-scale-joint-bias":
+            corrected = observed - design[:, 0] * delta_scale
+            for joint_index in range(6):
+                bias[joint_index] = float(
+                    np.mean(
+                        corrected[joint_index :: 6]
+                    )
+                )
+        elif model == "global-scale-payload":
+            payload_parameters[1:] = np.linalg.lstsq(
+                design[:, 2:],
+                observed - design[:, 0] * delta_scale,
+                rcond=None,
+            )[0]
+    prediction = design[:, 0] * delta_scale
+    if model == "global-scale-joint-bias":
+        prediction += np.asarray(
+            [bias[index % 6] for index in range(len(observed))],
+            dtype=float,
+        )
+    elif model == "global-scale-payload":
+        prediction += design[:, 1:] @ payload_parameters
+    residual_after = observed - prediction
+    tolerance = max(design.shape) * np.finfo(float).eps * float(singular_values[0])
+    effective_rank = int(np.count_nonzero(singular_values > tolerance))
+    condition_number = (
+        math.inf
+        if not singular_values.size or singular_values[-1] <= tolerance
+        else float(singular_values[0] / singular_values[-1])
+    )
+    per_joint_before = np.sqrt(
+        np.mean(np.asarray(observed).reshape(-1, 6) ** 2, axis=0)
+    )
+    per_joint_after = np.sqrt(
+        np.mean(np.asarray(residual_after).reshape(-1, 6) ** 2, axis=0)
+    )
+    rms_before = float(np.sqrt(np.mean(observed**2)))
+    rms_after = float(np.sqrt(np.mean(residual_after**2)))
+    expected_rank = {
+        "global-scale": 1,
+        "global-scale-joint-bias": 7,
+        "global-scale-payload": 5,
+    }[model]
+    formal_direction_ok = require_bidirectional and all(
+        bool(observation["direction_verified"]) for observation in selected
+    )
+    fit_reasons: list[str] = []
+    if invalid_record_count:
+        fit_reasons.append(
+            f"{invalid_record_count} calibration record(s) are incomplete or invalid"
+        )
+    if not formal_direction_ok:
+        fit_reasons.append("selected observations are not explicitly bidirectional")
+    if effective_rank < expected_rank:
+        fit_reasons.append(
+            f"regression rank {effective_rank} is below expected rank {expected_rank}"
+        )
+    if rms_after >= rms_before:
+        fit_reasons.append("training residual did not decrease")
+    fit_passed = not fit_reasons
+    return {
+        "status": "PASS" if fit_passed else "CANDIDATE",
+        "model": model,
+        "reasons": tuple(fit_reasons),
+        "nominal_gravity_scale": nominal_scale,
+        "gravity_scale_correction": delta_scale,
+        "effective_gravity_scale": nominal_scale + delta_scale,
+        "joint_bias_nm": tuple(float(value) for value in bias),
+        "payload_mass_kg": (
+            float(payload_parameters[0]) if model == "global-scale-payload" else None
+        ),
+        "payload_first_moment_kg_m": (
+            tuple(float(value) for value in payload_parameters[1:])
+            if model == "global-scale-payload"
+            else None
+        ),
+        "payload_com_m": (
+            tuple(
+                float(value / payload_parameters[0])
+                for value in payload_parameters[1:]
+            )
+            if model == "global-scale-payload" and payload_parameters[0] > 0.0
+            else None
+        ),
+        "software_kp_nm_per_rad": software_kp,
+        "observation_count": len(selected),
+        "source_window_count": sum(
+            int(observation["source_window_count"]) for observation in selected
+        ),
+        "paired_observation_count": sum(
+            int(observation["source_window_count"]) == 2 for observation in selected
+        ),
+        "direction_verified_pair_count": sum(
+            bool(observation["direction_verified"]) for observation in selected
+        ),
+        "pose_selection": selection,
+        "fit": {
+            "rank": effective_rank,
+            "least_squares_rank": int(rank),
+            "expected_rank": expected_rank,
+            "singular_values": tuple(float(value) for value in singular_values),
+            "condition_number": condition_number,
+            "rms_residual_before_nm": rms_before,
+            "rms_residual_after_nm": rms_after,
+            "residual_reduced": rms_after < rms_before,
+            "invalid_record_count": invalid_record_count,
+            "per_joint_rms_before_nm": tuple(float(value) for value in per_joint_before),
+            "per_joint_rms_after_nm": tuple(float(value) for value in per_joint_after),
+        },
+        "reduction": reduced,
+        "pairing": paired,
+        "selected_observations": tuple(selected),
+        "unpaired_used": not require_bidirectional and bool(paired["unpaired"]),
+        "formal_direction_verified": formal_direction_ok,
+    }
+
+
+def evaluate_gravity_calibration_model(
+    fit: Mapping[str, object],
+    payload: Mapping[str, object],
+    *,
+    kinematic_model: B601PinocchioModel | None = None,
+    pose_tolerance_rad: float = _DEFAULT_CALIBRATION_POSE_TOLERANCE_RAD,
+    max_velocity_rad_s: float | None = None,
+    max_position_span_rad: float | None = None,
+    require_bidirectional: bool = True,
+) -> dict[str, object]:
+    """Evaluate a fitted correction on an independent capture payload."""
+
+    if fit.get("status") not in ("PASS", "CANDIDATE"):
+        return {"status": "NOT_APPLICABLE", "reason": "fit did not produce a model"}
+    model = str(fit.get("model"))
+    nominal_scale = _positive(
+        fit.get("nominal_gravity_scale"),
+        name="nominal_gravity_scale",
+    )
+    delta = _finite(fit.get("gravity_scale_correction"), name="gravity_scale_correction")
+    bias = np.asarray(
+        _six(fit.get("joint_bias_nm"), name="joint_bias_nm"),
+        dtype=float,
+    )
+    if model == "global-scale-payload":
+        first_moment_value = fit.get("payload_first_moment_kg_m")
+        try:
+            first_moment = tuple(
+                _finite(value, name="payload_first_moment_kg_m")
+                for value in first_moment_value
+            )
+        except TypeError as exc:
+            raise ValueError(
+                "payload_first_moment_kg_m must contain three finite values"
+            ) from exc
+        if len(first_moment) != 3:
+            raise ValueError(
+                "payload_first_moment_kg_m must contain three finite values"
+            )
+        payload_parameters = np.asarray(
+            (_finite(fit.get("payload_mass_kg"), name="payload_mass_kg"),)
+            + first_moment,
+            dtype=float,
+        )
+    else:
+        payload_parameters = np.zeros(4, dtype=float)
+    if model == "global-scale-payload" and kinematic_model is None:
+        return {
+            "status": "FAIL",
+            "reason": "payload validation requires a kinematic model",
+        }
+    reduced = reduce_gravity_calibration_windows(
+        payload,
+        max_velocity_rad_s=max_velocity_rad_s,
+        max_position_span_rad=max_position_span_rad,
+    )
+    windows = reduced["windows"]
+    invalid_record_count = len(reduced["invalid_records"])
+    if not windows:
+        return {
+            "status": "FAIL",
+            "reason": "validation payload has no valid windows",
+            "reduction": reduced,
+        }
+    paired = pair_gravity_calibration_windows(
+        windows,
+        pose_tolerance_rad=pose_tolerance_rad,
+        require_opposite_direction=require_bidirectional,
+    )
+    if require_bidirectional and not paired["pairs"]:
+        return {
+            "status": "FAIL",
+            "reason": "validation has no explicitly bidirectional pose pair",
+            "reduction": reduced,
+            "pairing": paired,
+        }
+    observations = [
+        _calibration_pair_observation(pair) for pair in paired["pairs"]
+    ]
+    if not require_bidirectional:
+        observations.extend(
+            {
+                "reference_qpos_rad": window.get("reference_qpos_rad"),
+                "gravity_tau_nm": window.get("gravity_tau_median_nm"),
+                "position_tau_nm": window.get("position_tau_median_nm"),
+                "source_window_count": 1,
+                "direction_verified": False,
+            }
+            for window in paired["unpaired"]
+        )
+    if not observations:
+        return {
+            "status": "FAIL",
+            "reason": "validation pose pairing returned no observations",
+            "reduction": reduced,
+            "pairing": paired,
+        }
+    before: list[np.ndarray] = []
+    after: list[np.ndarray] = []
+    for observation in observations:
+        gravity = np.asarray(
+            _six(observation["gravity_tau_nm"], name="gravity_tau_nm"),
+            dtype=float,
+        )
+        residual = np.asarray(
+            _six(observation["position_tau_nm"], name="position_tau_nm"),
+            dtype=float,
+        )
+        nominal_gravity = gravity / nominal_scale
+        correction = nominal_gravity * delta
+        if model == "global-scale-joint-bias":
+            correction = correction + bias
+        elif model == "global-scale-payload":
+            correction = correction + payload_gravity_torque_regressor(
+                kinematic_model,
+                observation.get("reference_qpos_rad"),
+            ) @ payload_parameters
+        before.append(residual)
+        after.append(residual - correction)
+    before_array = np.vstack(before)
+    after_array = np.vstack(after)
+    rms_before = float(np.sqrt(np.mean(before_array**2)))
+    rms_after = float(np.sqrt(np.mean(after_array**2)))
+    residual_reduced = rms_after < rms_before
+    validation_reasons: list[str] = []
+    if invalid_record_count:
+        validation_reasons.append(
+            f"{invalid_record_count} validation record(s) are incomplete or invalid"
+        )
+    if not residual_reduced:
+        validation_reasons.append("validation residual did not decrease")
+    return {
+        "status": "PASS" if not validation_reasons else "FAIL",
+        "window_count": len(windows),
+        "observation_count": len(observations),
+        "rms_residual_before_nm": rms_before,
+        "rms_residual_after_nm": rms_after,
+        "residual_reduced": residual_reduced,
+        "reasons": tuple(validation_reasons),
+        "invalid_record_count": invalid_record_count,
+        "pairing": paired,
+        "per_joint_rms_before_nm": tuple(
+            float(value) for value in np.sqrt(np.mean(before_array**2, axis=0))
+        ),
+        "per_joint_rms_after_nm": tuple(
+            float(value) for value in np.sqrt(np.mean(after_array**2, axis=0))
+        ),
+        "reduction": reduced,
+    }
+
+
+def _load_json_object(path: Path, *, name: str) -> dict[str, object]:
+    """Load a JSON object for the offline calibration path."""
+
+    try:
+        decoded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LowGainProbeError(f"cannot read {name}: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise LowGainProbeError(f"{name} must contain a JSON object")
+    return decoded
+
+
+def _write_json_object(path: Path, payload: Mapping[str, object]) -> None:
+    """Write one calibration artifact, creating only its requested directory."""
+
+    destination = Path(path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise LowGainProbeError(
+            f"cannot write calibration artifact {destination}: {exc}"
+        ) from exc
+
+
+def _calibration_source_identity(
+    payload: Mapping[str, object],
+    *,
+    config_path: Path,
+    model: B601PinocchioModel,
+) -> dict[str, object]:
+    """Compare capture provenance with the currently pinned offline inputs."""
+
+    expected = {
+        "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+    }
+    observed = {
+        key: payload.get(key)
+        for key in expected
+    }
+    mismatches = {
+        key: {
+            "expected": expected[key],
+            "observed": observed[key],
+        }
+        for key in expected
+        if observed[key] is not None and observed[key] != expected[key]
+    }
+    missing = tuple(key for key in expected if observed[key] is None)
+    return {
+        "status": (
+            "FAIL" if mismatches else ("CANDIDATE" if missing else "PASS")
+        ),
+        "expected": expected,
+        "observed": observed,
+        "missing": missing,
+        "mismatches": mismatches,
+    }
+
+
+def _run_gravity_calibration_fit(
+    *,
+    args: argparse.Namespace,
+    model: B601PinocchioModel,
+    source_root: Path,
+) -> dict[str, object]:
+    """Fit and report an effective gravity correction without opening CAN."""
+
+    input_path = Path(args.calibration_input).expanduser().resolve(strict=True)
+    payload = _load_json_object(input_path, name="calibration input")
+    train_identity = _calibration_source_identity(
+        payload,
+        config_path=Path(args.config).expanduser().resolve(strict=True),
+        model=model,
+    )
+    if train_identity["status"] == "FAIL":
+        raise LowGainProbeError(
+            "calibration input provenance does not match the pinned config/URDF: "
+            f"{train_identity['mismatches']}"
+        )
+    fit = fit_gravity_calibration(
+        payload,
+        pose_tolerance_rad=args.calibration_pose_tolerance_rad,
+        model=args.calibration_model,
+        kinematic_model=model,
+        max_pose_count=args.calibration_max_poses,
+        max_velocity_rad_s=args.calibration_max_velocity_rad_s,
+        max_position_span_rad=args.calibration_max_position_span_rad,
+        require_bidirectional=not args.calibration_allow_unpaired,
+    )
+    validation_path = getattr(args, "calibration_validation_input", None)
+    validation: dict[str, object]
+    validation_identity: dict[str, object] | None = None
+    validation_dataset_sha256: str | None = None
+    if validation_path is None:
+        validation = {
+            "status": "NOT_PROVIDED",
+            "reason": "independent validation capture was not supplied",
+        }
+    else:
+        validation_resolved = (
+            Path(validation_path).expanduser().resolve(strict=True)
+        )
+        validation_payload = _load_json_object(
+            validation_resolved,
+            name="calibration validation input",
+        )
+        validation_identity = _calibration_source_identity(
+            validation_payload,
+            config_path=Path(args.config).expanduser().resolve(strict=True),
+            model=model,
+        )
+        if validation_identity["status"] == "FAIL":
+            raise LowGainProbeError(
+                "calibration validation provenance does not match the pinned "
+                f"config/URDF: {validation_identity['mismatches']}"
+            )
+        validation_dataset_sha256 = hashlib.sha256(
+            validation_resolved.read_bytes()
+        ).hexdigest()
+        validation = evaluate_gravity_calibration_model(
+            fit,
+            validation_payload,
+            kinematic_model=model,
+            pose_tolerance_rad=args.calibration_pose_tolerance_rad,
+            max_velocity_rad_s=args.calibration_max_velocity_rad_s,
+            max_position_span_rad=args.calibration_max_position_span_rad,
+            require_bidirectional=not args.calibration_allow_unpaired,
+        )
+    fit_status = str(fit.get("status"))
+    acceptance_status = (
+        "PASS"
+        if (
+            fit_status == "PASS"
+            and validation.get("status") == "PASS"
+            and train_identity["status"] == "PASS"
+            and (
+                validation_identity is None
+                or validation_identity["status"] == "PASS"
+            )
+        )
+        else "CANDIDATE"
+    )
+    dataset_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    overlay = {
+        "schema": "b601.gravity-calibration-overlay.v1",
+        "activation": "candidate_only_until_independent_validation",
+        "model": fit.get("model"),
+        "nominal_gravity_scale": fit.get("nominal_gravity_scale"),
+        "gravity_scale_correction": fit.get("gravity_scale_correction"),
+        "effective_gravity_scale": fit.get("effective_gravity_scale"),
+        "joint_bias_nm": fit.get("joint_bias_nm"),
+        "payload_mass_kg": fit.get("payload_mass_kg"),
+        "payload_first_moment_kg_m": fit.get("payload_first_moment_kg_m"),
+        "payload_com_m": fit.get("payload_com_m"),
+        "source": {
+            "dataset_path": str(input_path),
+            "dataset_sha256": dataset_sha256,
+            "urdf_path": str(model.urdf_path),
+            "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+            "rebot_source_root": str(source_root),
+            "config_sha256": train_identity["expected"]["config_sha256"],
+            "validation_dataset_sha256": validation_dataset_sha256,
+        },
+        "fit": fit.get("fit"),
+        "validation": validation,
+        "source_identity": {
+            "training": train_identity,
+            "validation": validation_identity,
+        },
+        "pose_selection": fit.get("pose_selection"),
+        "selected_observations": fit.get("selected_observations"),
+    }
+    overlay_path = Path(args.calibration_overlay_output).expanduser().resolve()
+    _write_json_object(overlay_path, overlay)
+    report_path = getattr(args, "calibration_report_output", None)
+    if report_path is not None:
+        _write_json_object(
+            Path(report_path),
+            {
+                "schema": "b601.gravity-calibration-report.v1",
+                "acceptance_status": acceptance_status,
+                "fit": fit,
+                "validation": validation,
+                "overlay_path": str(overlay_path),
+                "dataset_sha256": dataset_sha256,
+            },
+        )
+    return {
+        "status": "OK" if acceptance_status == "PASS" else "FAIL",
+        "mode": "gravity-calibration-fit",
+        "acceptance_status": acceptance_status,
+        "input_path": str(input_path),
+        "overlay_path": str(overlay_path),
+        "report_path": (
+            str(Path(report_path).expanduser().resolve())
+            if report_path is not None
+            else None
+        ),
+        "dataset_sha256": dataset_sha256,
+        "source_identity": {
+            "training": train_identity,
+            "validation": validation_identity,
+        },
+        "fit": fit,
+        "validation": validation,
+        "hardware_acceptance": "NOT_CLAIMED",
+    }
+
+
 def complete_active_duration(
     *,
     stop: dict[str, bool],
@@ -417,7 +1887,10 @@ def complete_active_duration(
 ) -> str:
     """End ACTIVE without treating the duration boundary as disable authority."""
 
-    if calibration_capture is not None and calibration_capture.state == "RECORDING":
+    if calibration_capture is not None and calibration_capture.state in (
+        "SETTLING",
+        "RECORDING",
+    ):
         calibration_capture.interrupt(
             elapsed_sec=elapsed_sec,
             sample_end_index=sample_end_index,
@@ -1139,6 +2612,53 @@ def resolve_active_joint_names() -> tuple[str, ...]:
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
+    if args.mode == "gravity-calibration-fit":
+        if getattr(args, "allow_motion", False):
+            raise LowGainProbeError(
+                "gravity-calibration-fit is offline and rejects --allow-motion"
+            )
+        if getattr(args, "auto_disable", False):
+            raise LowGainProbeError(
+                "gravity-calibration-fit is offline and rejects --auto-disable"
+            )
+        calibration_input = getattr(args, "calibration_input", None)
+        if calibration_input is None:
+            raise LowGainProbeError(
+                "gravity-calibration-fit requires --calibration-input"
+            )
+        if not Path(calibration_input).expanduser().is_file():
+            raise LowGainProbeError(
+                "gravity-calibration-fit calibration input does not exist: "
+                f"{calibration_input}"
+            )
+        if getattr(args, "calibration_overlay_output", None) is None:
+            raise LowGainProbeError(
+                "gravity-calibration-fit requires --calibration-overlay-output"
+            )
+        _positive(
+            getattr(
+                args,
+                "calibration_pose_tolerance_rad",
+                _DEFAULT_CALIBRATION_POSE_TOLERANCE_RAD,
+            ),
+            name="calibration_pose_tolerance_rad",
+        )
+        if (
+            getattr(args, "calibration_max_poses", None) is not None
+            and (
+                isinstance(args.calibration_max_poses, bool)
+                or int(args.calibration_max_poses) <= 0
+            )
+        ):
+            raise ValueError("calibration_max_poses must be positive")
+        for name in (
+            "calibration_max_velocity_rad_s",
+            "calibration_max_position_span_rad",
+        ):
+            value = getattr(args, name, None)
+            if value is not None:
+                _positive(value, name=name)
+        return
     if args.mode == "feedback-stability":
         if getattr(args, "driver_kd", 0.0) != 0.0:
             raise LowGainProbeError(
@@ -1220,6 +2740,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "cartesian-hold",
         "pose-hold",
         "gravity-calibration",
+        "gravity-calibration-fit",
     ):
         raise ValueError(
             "mode must be hold, slow-step, cartesian-hold, pose-hold, or "
@@ -1239,6 +2760,14 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 _DEFAULT_CALIBRATION_DURATION_SEC,
             ),
             name="calibration_duration_sec",
+        )
+        _non_negative(
+            getattr(
+                args,
+                "calibration_settling_sec",
+                _DEFAULT_CALIBRATION_SETTLING_SEC,
+            ),
+            name="calibration_settling_sec",
         )
     _non_negative(
         getattr(
@@ -3359,6 +4888,12 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     config_path = Path(args.config).expanduser().resolve(strict=True)
     source_root = Path(args.rebot_source_root).expanduser().resolve(strict=True)
     model, position_limits = _resolve_model_and_limits(source_root)
+    if args.mode == "gravity-calibration-fit":
+        return _run_gravity_calibration_fit(
+            args=args,
+            model=model,
+            source_root=source_root,
+        )
     if args.mode == "feedback-stability":
         config = B601RSBackendConfig.from_rs_yaml(
             config_path,
@@ -3511,7 +5046,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     arming_settle_velocity_limit_rad_s = args.velocity_abort_rad_s
     arming_settle_last_qvel: tuple[float, ...] | None = None
     calibration_capture = (
-        GravityCalibrationCapture(args.calibration_duration_sec)
+        GravityCalibrationCapture(
+            args.calibration_duration_sec,
+            settling_duration_sec=args.calibration_settling_sec,
+        )
         if args.mode == "gravity-calibration"
         else None
     )
@@ -4109,8 +5647,19 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                     calibration_ready = True
                     _operator_notice(
                         "[B601] CALIBRATION FREE_DRAG: move joint1..joint6, "
-                        "release external force, then press R to record "
-                        f"{calibration_capture.record_duration_sec:g}s."
+                        "release external force, press P or N to label the "
+                        "approach path, then press R to record "
+                        f"{calibration_capture.record_duration_sec:g}s. "
+                        "Unlabelled R is diagnostic only."
+                    )
+                started_record = calibration_capture.start_recording_if_due(
+                    elapsed_sec=elapsed,
+                    sample_start_index=len(samples),
+                )
+                if started_record is not None:
+                    _operator_notice(
+                        "[B601] CALIBRATION RECORDING "
+                        f"#{started_record['index']}: settling complete; do not touch."
                     )
                 completed_record = calibration_capture.complete_if_due(
                     elapsed_sec=elapsed,
@@ -4121,20 +5670,24 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         "[B601] CALIBRATION COMPLETE "
                         f"#{completed_record['index']}: returned to FREE_DRAG."
                     )
-                if (
-                    calibration_ready
-                    and calibration_keys is not None
-                    and calibration_keys.poll_record_request()
-                ):
+                capture_request = (False, None)
+                if calibration_ready and calibration_keys is not None:
+                    capture_request = calibration_keys.poll_capture_request()
+                if capture_request[0]:
                     new_record = calibration_capture.trigger(
                         q,
                         elapsed_sec=elapsed,
                         sample_start_index=len(samples),
+                        approach_direction=capture_request[1],
                     )
                     if new_record is not None:
+                        direction_note = (
+                            new_record["approach_direction"] or "unlabelled"
+                        )
                         _operator_notice(
-                            "[B601] CALIBRATION RECORDING "
-                            f"#{new_record['index']}: reference captured; do not touch."
+                            "[B601] CALIBRATION CAPTURED "
+                            f"#{new_record['index']}: approach={direction_note}; "
+                            "reference fixed; settling."
                         )
                 qref = calibration_capture.reference(q)
                 qvel_ref = _ZERO_SIX
@@ -4611,7 +6164,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGUSR1, old_sigusr1)
 
-    if calibration_capture is not None and calibration_capture.state == "RECORDING":
+    if calibration_capture is not None and calibration_capture.state in (
+        "SETTLING",
+        "RECORDING",
+    ):
         calibration_capture.interrupt(
             elapsed_sec=last_control_elapsed_sec,
             sample_end_index=len(samples),
@@ -4749,9 +6305,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "rate_hz": args.rate_hz,
         "gravity_calibration": {
             "enabled": calibration_capture is not None,
-            "interaction": "FREE_DRAG -> R -> RECORDING -> FREE_DRAG",
+            "interaction": "FREE_DRAG -> R -> SETTLING -> RECORDING -> FREE_DRAG",
             "record_duration_sec": (
                 calibration_capture.record_duration_sec
+                if calibration_capture is not None
+                else None
+            ),
+            "settling_duration_sec": (
+                calibration_capture.settling_duration_sec
                 if calibration_capture is not None
                 else None
             ),
@@ -4774,7 +6335,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 else None
             ),
             "free_drag_reference_semantics": "current_feedback_pose_each_cycle",
-            "recording_reference_semantics": "qpos_captured_on_R",
+            "recording_reference_semantics": "qpos_captured_on_R_after_settling",
+            "settling_reference_semantics": "qpos_captured_on_R_fixed_with_nonzero_software_kp",
+            "sample_reduction_semantics": (
+                "one_median_observation_per_window; frames are not independent poses"
+            ),
         },
         "stop_reason": stop_reason,
         "cleanup_errors": tuple(cleanup_errors),
@@ -5054,7 +6619,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "B601-RS low-gain gravity/damping commissioning; motion-capable and "
-            "human-run only."
+            "human-run only, with an offline gravity-calibration-fit mode."
         )
     )
     parser.add_argument(
@@ -5065,6 +6630,7 @@ def build_parser() -> argparse.ArgumentParser:
             "cartesian-hold",
             "pose-hold",
             "gravity-calibration",
+            "gravity-calibration-fit",
             "feedback-stability",
             "driver-torque-limit-roundtrip",
         ),
@@ -5086,6 +6652,74 @@ def build_parser() -> argparse.ArgumentParser:
             "fixed-reference recording duration after each R key in "
             "gravity-calibration mode"
         ),
+    )
+    parser.add_argument(
+        "--calibration-settling-sec",
+        type=float,
+        default=_DEFAULT_CALIBRATION_SETTLING_SEC,
+        help=(
+            "time after R during which the fixed reference settles under the "
+            "non-zero calibration Kp; these samples are excluded from the fit"
+        ),
+    )
+    parser.add_argument(
+        "--calibration-input",
+        type=Path,
+        help="completed gravity-calibration JSON for offline fitting",
+    )
+    parser.add_argument(
+        "--calibration-validation-input",
+        type=Path,
+        help="independent gravity-calibration JSON used for holdout evaluation",
+    )
+    parser.add_argument(
+        "--calibration-overlay-output",
+        type=Path,
+        help="candidate gravity overlay JSON written by gravity-calibration-fit",
+    )
+    parser.add_argument(
+        "--calibration-report-output",
+        type=Path,
+        help="optional full calibration fit report JSON",
+    )
+    parser.add_argument(
+        "--calibration-model",
+        choices=(
+            "global-scale",
+            "global-scale-joint-bias",
+            "global-scale-payload",
+        ),
+        default="global-scale-joint-bias",
+        help=(
+            "effective gravity correction parameterization for offline fitting; "
+            "payload adds an unknown non-negative tool mass and first moment"
+        ),
+    )
+    parser.add_argument(
+        "--calibration-pose-tolerance-rad",
+        type=float,
+        default=_DEFAULT_CALIBRATION_POSE_TOLERANCE_RAD,
+        help="maximum per-joint reference difference used to infer a pose pair",
+    )
+    parser.add_argument(
+        "--calibration-max-poses",
+        type=int,
+        help="optional cap on selected information-rich pose observations",
+    )
+    parser.add_argument(
+        "--calibration-max-velocity-rad-s",
+        type=float,
+        help="optional per-window stability velocity criterion for fitting",
+    )
+    parser.add_argument(
+        "--calibration-max-position-span-rad",
+        type=float,
+        help="optional per-window stability position-span criterion for fitting",
+    )
+    parser.add_argument(
+        "--calibration-allow-unpaired",
+        action="store_true",
+        help="allow single-direction windows as a diagnostic candidate; not formal acceptance",
     )
     parser.add_argument("--warmup-sec", type=float, default=_DEFAULT_WARMUP_SEC)
     parser.add_argument(
@@ -5302,11 +6936,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"[B601] mode={args.mode} pid={os.getpid()} log={runtime_log_path}",
         flush=True,
     )
-    print(
-        "[B601] STOP: Ctrl-C requests protective hold; Ctrl-C again or "
-        "SIGUSR1 requests full six-joint disable. Physical E-stop remains primary.",
-        flush=True,
-    )
+    if args.mode == "gravity-calibration-fit":
+        print("[B601] OFFLINE: no CAN connection or motor state change.", flush=True)
+    else:
+        print(
+            "[B601] STOP: Ctrl-C requests protective hold; Ctrl-C again or "
+            "SIGUSR1 requests full six-joint disable. Physical E-stop remains primary.",
+            flush=True,
+        )
     with (
         runtime_log_path.open("a", encoding="utf-8") as runtime_log,
         contextlib.redirect_stdout(runtime_log),
