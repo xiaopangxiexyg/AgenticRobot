@@ -1922,6 +1922,22 @@ def _hold_active_rtc_gap(
     return receipts
 
 
+def _rtc_active_completion_latency_sec(
+    *,
+    inference_started_at: float,
+    released_at: float,
+) -> float:
+    """Return one trustworthy end-to-end Active RTC latency sample."""
+
+    started = float(inference_started_at)
+    released = float(released_at)
+    if not math.isfinite(started) or not math.isfinite(released):
+        raise ValueError("RTC Active completion timestamps must be finite.")
+    if released < started:
+        raise ValueError("RTC Active completion release predates inference start.")
+    return released - started
+
+
 def _rtc_active_latency_gate_result(
     samples_sec: list[float] | tuple[float, ...],
     *,
@@ -4970,12 +4986,11 @@ def main(
                             and rtc_step.result_transition is not None
                             and rtc_step.result_transition.receipt.accepted
                         ):
-                            latency_sec = max(
-                                0.0,
-                                float(rtc_step.completion.released_at)
-                                - float(
+                            latency_sec = _rtc_active_completion_latency_sec(
+                                inference_started_at=(
                                     rtc_step.completion.result.inference_started_at
                                 ),
+                                released_at=rtc_step.completion.released_at,
                             )
                             rtc_active_latency_samples.append(latency_sec)
                             gate_complete, gate_accepted, observed_max = (
