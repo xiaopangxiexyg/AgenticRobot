@@ -4986,12 +4986,35 @@ def main(
                             and rtc_step.result_transition is not None
                             and rtc_step.result_transition.receipt.accepted
                         ):
-                            latency_sec = _rtc_active_completion_latency_sec(
-                                inference_started_at=(
-                                    rtc_step.completion.result.inference_started_at
-                                ),
-                                released_at=rtc_step.completion.released_at,
-                            )
+                            try:
+                                latency_sec = _rtc_active_completion_latency_sec(
+                                    inference_started_at=(
+                                        rtc_step.completion.result.inference_started_at
+                                    ),
+                                    released_at=rtc_step.completion.released_at,
+                                )
+                            except (TypeError, ValueError) as exc:
+                                invalid_timing_reason = (
+                                    "rtc_active_completion_timestamp_invalid"
+                                )
+                                try:
+                                    hold_rtc_if_eligible(
+                                        now=control_loop_started_at,
+                                        reason=invalid_timing_reason,
+                                    )
+                                finally:
+                                    _hold_active_rtc_gap(
+                                        reason=invalid_timing_reason,
+                                        send_actions=send_actions,
+                                        arm_backends=arm_backends,
+                                        position_deploy_executor=(
+                                            position_deploy_executor
+                                        ),
+                                    )
+                                raise RuntimeError(
+                                    "RTC Active latency gate rejected invalid "
+                                    "completion timestamps."
+                                ) from exc
                             rtc_active_latency_samples.append(latency_sec)
                             gate_complete, gate_accepted, observed_max = (
                                 _rtc_active_latency_gate_result(
