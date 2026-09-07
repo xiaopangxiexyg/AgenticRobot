@@ -134,6 +134,36 @@ def _is_bounded_first_frame_startup_failure(
     )
 
 
+def _configured_camera_startup_retry_attempts(source: object) -> int:
+    config = getattr(source, "config", None)
+    raw_attempts = getattr(config, "startup_software_retry_attempts", 0)
+    if isinstance(raw_attempts, bool):
+        raise TypeError("camera startup_software_retry_attempts must be an integer")
+    try:
+        attempts = int(raw_attempts)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "camera startup_software_retry_attempts must be an integer"
+        ) from exc
+    if attempts < 0:
+        raise ValueError("camera startup_software_retry_attempts must be >= 0")
+    return attempts
+
+
+def _deferred_camera_startup_retry_budget(source: object, detail: str) -> int:
+    """Return retries owned by the serial batch, never by one source start call."""
+
+    configured = _configured_camera_startup_retry_attempts(source)
+    if _is_bounded_first_frame_startup_failure(source, detail):
+        # Preserve the existing one deferred recovery attempt for every formal
+        # bounded-first-frame source. A larger reviewed per-camera budget (for
+        # example the front camera's two attempts) remains authoritative.
+        return max(1, configured)
+    if configured > 0 and RealSenseRGBSource._is_startup_connection_error(detail):
+        return configured
+    return 0
+
+
 def _camera_startup_items(
     camera_sources: Mapping[str, RealSenseRGBSource],
 ) -> tuple[tuple[str, RealSenseRGBSource], ...]:
@@ -465,7 +495,8 @@ def _start_camera_source_with_containment(
 
     def start_native() -> None:
         try:
-            # The formal multi-camera caller owns the single deferred retry.
+            # The formal multi-camera caller owns the configured deferred
+            # retry rounds.
             # Keep direct RealSenseRGBSource.start() callers compatible with
             # their configured software retry budget.
             if (
@@ -585,15 +616,19 @@ def _start_camera_sources_best_effort(
     startup_progress: CameraStartupProgress | None = None,
     startup_timeout_sec: float = CAMERA_STARTUP_OPERATION_TIMEOUT_SEC,
 ) -> dict[str, str]:
-    """Attempt every camera, then retry bounded first-frame failures once.
+    """Attempt every camera, then run configured retries in serial rounds.
 
     The first pass remains deliberately serial.  A failed RealSense pipeline
     is retried only after the other configured cameras have completed their
-    first startup attempt and a short cooldown has elapsed.  This mirrors the
-    successful manual reconnect timing without parallel pipeline negotiation
-    or a USB hardware reset. A native startup timeout is terminal for the
-    batch: the blocked source is faulted, remaining sources are not opened,
-    and no immediate ``close``/retry is attempted on that source.
+    first startup attempt and a short cooldown has elapsed. Bounded-first-frame
+    failures retain at least one deferred attempt; a larger configured
+    ``startup_software_retry_attempts`` budget is consumed here instead of
+    reopening one device immediately while siblings are still negotiating.
+    This mirrors the successful manual reconnect timing without parallel
+    pipeline negotiation or a USB hardware reset. A native startup timeout is
+    terminal for the batch: the blocked source is faulted, remaining sources
+    are not opened, and no immediate ``close``/retry is attempted on that
+    source.
     """
     _reset_camera_startup_sequences(camera_sources)
     errors: dict[str, str] = {}
@@ -691,32 +726,44 @@ def _start_camera_sources_best_effort(
     # first-frame failure queue a second start against that potentially wedged
     # SDK state; the batch remains fail-closed and its caller can rebuild the
     # process after the failed attempt is recorded.
-    deferred_retry_keys = (
-        []
+    remaining_retry_attempts = (
+        {}
         if startup_aborted_after_timeout is not None
-        else [
-            str(camera_key)
-            for camera_key, source in startup_items
-            if str(camera_key) in errors
-            and _is_bounded_first_frame_startup_failure(
+        else {
+            str(camera_key): _deferred_camera_startup_retry_budget(
                 source,
                 first_pass_errors[str(camera_key)],
             )
-        ]
+            for camera_key, source in startup_items
+            if str(camera_key) in errors
+        }
     )
+    remaining_retry_attempts = {
+        camera_key: attempts
+        for camera_key, attempts in remaining_retry_attempts.items()
+        if attempts > 0
+    }
     retry_cooldown_elapsed_sec = 0.0
     recovered_keys: list[str] = []
-    if deferred_retry_keys:
+    retry_round = 0
+    while remaining_retry_attempts:
+        retry_round += 1
+        deferred_retry_keys = [
+            str(camera_key)
+            for camera_key, _source in startup_items
+            if remaining_retry_attempts.get(str(camera_key), 0) > 0
+        ]
         cooldown_sec = max(0.0, float(deferred_retry_cooldown_sec))
         _log(
             "Camera",
-            "bounded first-frame deferred retry scheduled after serial first pass: "
-            f"cameras={deferred_retry_keys} cooldown={cooldown_sec:.2f}s",
+            "deferred serial startup retry scheduled: "
+            f"round={retry_round} cameras={deferred_retry_keys} "
+            f"remaining={remaining_retry_attempts} cooldown={cooldown_sec:.2f}s",
         )
         if cooldown_sec > 0.0:
             cooldown_started = time.perf_counter()
             time.sleep(cooldown_sec)
-            retry_cooldown_elapsed_sec = time.perf_counter() - cooldown_started
+            retry_cooldown_elapsed_sec += time.perf_counter() - cooldown_started
         retry_aborted_after_timeout: str | None = None
         for camera_key in deferred_retry_keys:
             source = camera_sources[camera_key]
@@ -733,7 +780,9 @@ def _start_camera_sources_best_effort(
                     f"WARNING: camera {camera_key} deferred retry not attempted: "
                     f"{errors[camera_key]}",
                 )
+                remaining_retry_attempts.pop(camera_key, None)
                 continue
+            remaining_retry_attempts[camera_key] -= 1
             if startup_progress is not None:
                 startup_progress.update(
                     progress_key,
@@ -751,18 +800,28 @@ def _start_camera_sources_best_effort(
                     timeout_sec=startup_timeout_sec,
                 )
             except Exception as exc:  # noqa: BLE001 - preserve GUI/device admission.
-                retry_elapsed_sec[camera_key] = time.perf_counter() - retry_started
+                retry_elapsed_sec[camera_key] = retry_elapsed_sec.get(
+                    camera_key, 0.0
+                ) + (time.perf_counter() - retry_started)
                 retry_detail = f"{type(exc).__name__}: {exc}"
                 errors[camera_key] = (
                     "deferred_startup_retry_failed:"
-                    f"first={first_pass_errors[camera_key]};retry={retry_detail}"
+                    f"round={retry_round}:first={first_pass_errors[camera_key]};"
+                    f"retry={retry_detail}"
                 )
                 if isinstance(exc, TimeoutError):
                     retry_aborted_after_timeout = camera_key
                     errors[camera_key] = (
                         "deferred_startup_retry_timeout:"
-                        f"first={first_pass_errors[camera_key]};retry={retry_detail}"
+                        f"round={retry_round}:first={first_pass_errors[camera_key]};"
+                        f"retry={retry_detail}"
                     )
+                    remaining_retry_attempts.pop(camera_key, None)
+                elif (
+                    not RealSenseRGBSource._is_startup_connection_error(retry_detail)
+                    or remaining_retry_attempts[camera_key] <= 0
+                ):
+                    remaining_retry_attempts.pop(camera_key, None)
                 _log(
                     "Camera",
                     f"WARNING: camera {camera_key} deferred retry unavailable: "
@@ -771,8 +830,11 @@ def _start_camera_sources_best_effort(
                 if startup_progress is not None:
                     startup_progress.fail(progress_key, errors[camera_key])
             else:
-                retry_elapsed_sec[camera_key] = time.perf_counter() - retry_started
+                retry_elapsed_sec[camera_key] = retry_elapsed_sec.get(
+                    camera_key, 0.0
+                ) + (time.perf_counter() - retry_started)
                 errors.pop(camera_key, None)
+                remaining_retry_attempts.pop(camera_key, None)
                 recovered_keys.append(camera_key)
                 _log(
                     "Camera",
@@ -785,6 +847,8 @@ def _start_camera_sources_best_effort(
                         progress_key,
                         message="延迟串行重试成功，视频流已启动",
                     )
+        if retry_aborted_after_timeout is not None:
+            remaining_retry_attempts.clear()
     _log_camera_startup_batch_timing(
         batch_started=batch_started,
         source_elapsed_sec=source_elapsed_sec,

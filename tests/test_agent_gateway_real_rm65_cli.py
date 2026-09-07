@@ -458,6 +458,17 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     motion_port = SimpleNamespace(
         snapshot=lambda: SimpleNamespace(dispatch_count=0),
     )
+    passive_executor = SimpleNamespace(
+        failure_diagnostics=(
+            {
+                "executor_id": "camera-reader:test",
+                "operation_id": "operation:rgb:test",
+                "exception_type": "RuntimeError",
+                "message": "rgb_capture_inter_camera_skew_exceeded",
+                "failed_at": 10.25,
+            },
+        )
+    )
     runtime = SimpleNamespace(
         motion_port=motion_port,
         last_hold_receipt=hold,
@@ -498,7 +509,10 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         ),
         deployment=SimpleNamespace(
             gateway_session=SimpleNamespace(
-                contract_bundle=SimpleNamespace(route_manifest=manifest)
+                contract_bundle=SimpleNamespace(route_manifest=manifest),
+                executors_by_skill_id={
+                    "perception.capture_rgb": passive_executor,
+                },
             ),
             control_runtime=runtime,
         ),
@@ -549,6 +563,16 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert events[1]["control_fault"] is None
     assert events[1]["measurement_sampler"]["sample_count"] == 7
     assert events[1]["control_cycle"]["cycle_count"] == 9
+    assert events[1]["passive_read_failures"] == [
+        {
+            "skill_id": "perception.capture_rgb",
+            "executor_id": "camera-reader:test",
+            "operation_id": "operation:rgb:test",
+            "exception_type": "RuntimeError",
+            "message": "rgb_capture_inter_camera_skew_exceeded",
+            "failed_at": 10.25,
+        }
+    ]
     assert captured["lower"] is lower
     assert captured["authorized_side"] == "right"
     assert captured["authorized_action"] == "forward"

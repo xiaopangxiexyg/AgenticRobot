@@ -21,6 +21,7 @@ from agent_gateway.profiles.real.perception_frames import (
     build_real_perception_station_frame_binding,
 )
 from agent_gateway.profiles.real.realsense_perception import (
+    CameraOnlyRealPerceptionResources,
     ExclusiveRealPerceptionResources,
     RealPerceptionSourceBinding,
     RealSenseAgentPerceptionProvider,
@@ -508,6 +509,105 @@ def test_resource_transaction_closes_partial_lower_start() -> None:
         resources.start()
     assert lower.closes == 1
     assert source.closes == 1
+
+
+def test_resource_transaction_retries_only_incomplete_close_stages(monkeypatch) -> None:
+    events: list[str] = []
+
+    class _Resource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.starts = 0
+            self.closes = 0
+
+        def start(self) -> None:
+            self.starts += 1
+
+        def close(self) -> None:
+            self.closes += 1
+            events.append(f"{self.name}.close:{self.closes}")
+
+    lower = _Resource("lower")
+    model = _Resource("model")
+    store = _Resource("store")
+    camera_close_calls = 0
+
+    def close_cameras(_sources) -> None:
+        nonlocal camera_close_calls
+        camera_close_calls += 1
+        events.append(f"cameras.close:{camera_close_calls}")
+        if camera_close_calls == 1:
+            raise RuntimeError("injected camera close failure")
+
+    monkeypatch.setattr(
+        realsense_perception,
+        "_formal_close_camera_sources",
+        close_cameras,
+    )
+    resources = ExclusiveRealPerceptionResources(
+        lower=lower,
+        camera_sources={"front": object()},
+        artifact_store=store,
+        additional_resources=(model,),
+        start_cameras=lambda _sources: None,
+        admit_cameras=lambda _sources: None,
+    )
+    resources.start()
+
+    with pytest.raises(RuntimeError, match="injected camera close failure"):
+        resources.close()
+    resources.close()
+    resources.close()
+
+    assert lower.closes == 1
+    assert model.closes == 1
+    assert store.closes == 1
+    assert camera_close_calls == 2
+    assert events == [
+        "lower.close:1",
+        "model.close:1",
+        "cameras.close:1",
+        "store.close:1",
+        "cameras.close:2",
+    ]
+
+
+def test_camera_only_resources_retry_only_incomplete_close_stages(monkeypatch) -> None:
+    model = SimpleNamespace(starts=0, closes=0)
+    store = SimpleNamespace(closes=0)
+    model.start = lambda: setattr(model, "starts", model.starts + 1)
+    model.close = lambda: setattr(model, "closes", model.closes + 1)
+    store.close = lambda: setattr(store, "closes", store.closes + 1)
+    camera_close_calls = 0
+
+    def close_cameras(_sources) -> None:
+        nonlocal camera_close_calls
+        camera_close_calls += 1
+        if camera_close_calls == 1:
+            raise RuntimeError("injected camera close failure")
+
+    monkeypatch.setattr(
+        realsense_perception,
+        "_formal_close_camera_sources",
+        close_cameras,
+    )
+    resources = CameraOnlyRealPerceptionResources(
+        camera_sources={"front": object()},
+        artifact_store=store,
+        additional_resources=(model,),
+        start_cameras=lambda _sources: None,
+        admit_cameras=lambda _sources: None,
+    )
+    resources.start()
+
+    with pytest.raises(RuntimeError, match="injected camera close failure"):
+        resources.close()
+    resources.close()
+    resources.close()
+
+    assert model.closes == 1
+    assert store.closes == 1
+    assert camera_close_calls == 2
 
 
 def test_gateway_camera_startup_delegates_to_formal_teleop_lifecycle(

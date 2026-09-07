@@ -226,6 +226,7 @@ class PassiveReadSkillExecutor:
         self._execution_receipts: OrderedDict[
             str, PassiveReadExecutionReceipt
         ] = OrderedDict()
+        self._failure_diagnostics: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._port_receipts: list[AgentGatewayAuthoritativePortReceipt] = []
         self._next_call_sequence = 0
 
@@ -244,6 +245,13 @@ class PassiveReadSkillExecutor:
     def execution_receipts(self) -> tuple[PassiveReadExecutionReceipt, ...]:
         with self._lock:
             return tuple(self._execution_receipts.values())
+
+    @property
+    def failure_diagnostics(self) -> tuple[Mapping[str, Any], ...]:
+        """Return bounded local diagnostics without changing wire reason codes."""
+
+        with self._lock:
+            return tuple(dict(item) for item in self._failure_diagnostics.values())
 
     def completion_for(self, operation_id: str) -> Any | None:
         normalized = _required(operation_id, field_name="operation_id")
@@ -495,6 +503,17 @@ class PassiveReadSkillExecutor:
                 self._completion_by_operation[running.operation_id] = outcome
                 self._trim_records_locked()
         except Exception as error:  # noqa: BLE001 - convert reader failure to CAS.
+            message = " ".join(str(error).split())
+            diagnostic = {
+                "executor_id": self.executor_id,
+                "operation_id": admitted.operation_id,
+                "exception_type": type(error).__name__,
+                "message": message[:512],
+                "failed_at": self._time(),
+            }
+            with self._lock:
+                self._failure_diagnostics[admitted.operation_id] = diagnostic
+                self._trim_records_locked()
             current = service.operation_store.get(admitted.operation_id)
             if isinstance(current, AgentSkillOperation) and not current.terminal:
                 outcome = service.complete_operation(
@@ -544,6 +563,7 @@ class PassiveReadSkillExecutor:
         for records in (
             self._completion_by_operation,
             self._execution_receipts,
+            self._failure_diagnostics,
         ):
             while len(records) > self._max_retained_operations:
                 records.popitem(last=False)

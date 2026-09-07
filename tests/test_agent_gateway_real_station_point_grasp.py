@@ -701,9 +701,15 @@ def test_point_grasp_is_default_off_and_lifecycle_order_is_reversible(
     assert stale_source_operation is not None
     assert stale_source_operation.status == "failed"
     assert stale_source_operation.output_artifact_bindings == ()
+    # Planning and the repeated render requests above share the one application
+    # camera resource transaction; Skill calls must never restart it.
+    assert events.count("cameras.start") == 1
+    assert events.count("cameras.close") == 0
     composition.application.close()
     assert planner.starts == 1
     assert planner.closes == 1
+    assert events.count("cameras.start") == 1
+    assert events.count("cameras.close") == 1
     assert events[-4:] == [
         "gateway.close",
         "planner.close",
