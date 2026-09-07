@@ -2,6 +2,10 @@
 set -euo pipefail
 
 # Run the complete non-hardware suite in deterministic, module-isolated shards.
+# Mutable pytest/runtime state stays shard-private.  The content-addressed
+# MuJoCo model cache is shared only within this exact Run: its implementation
+# owns process locking, atomic publication, and hash validation, so identical
+# models are compiled once without creating cross-Run state.
 # DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT may name a new absolute artifact directory.
 # DEXTELEOP_FULL_ACCEPTANCE_JUNIT may name the final aggregate JUnit report.
 
@@ -101,6 +105,7 @@ configure_shards() {
 
 prepare_shards() {
   local index
+  mkdir -- "$RUN_ROOT/mujoco-cache"
   python3 "$REPO_ROOT/scripts/pytest_sharding.py" plan \
     --repository "$REPO_ROOT" \
     --tests-root "$REPO_ROOT/tests" \
@@ -167,7 +172,7 @@ run_shard() {
   ((${#shard_paths[@]} > 0)) || die "empty shard path list: $name"
   PYTHONNOUSERSITE=1 \
   PYTHONPYCACHEPREFIX="$RUN_ROOT/${name}-python-bytecode" \
-  SIM_MUJOCO_CACHE_DIR="$RUN_ROOT/${name}-mujoco-cache" \
+  SIM_MUJOCO_CACHE_DIR="$RUN_ROOT/mujoco-cache" \
   XDG_CACHE_HOME="$RUN_ROOT/${name}-xdg-cache" \
   MPLCONFIGDIR="$RUN_ROOT/${name}-matplotlib-cache" \
   NUMBA_CACHE_DIR="$RUN_ROOT/${name}-numba-cache" \

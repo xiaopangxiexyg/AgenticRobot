@@ -450,7 +450,10 @@ def plan_jerk_limited_joint_horizon(
             adaptive_rho=True,
             adaptive_rho_interval=25,
         )
-        result = solver.solve()
+        # OSQP 1.1.3 warns because its future default will raise on non-solved
+        # statuses.  Preserve the existing status-result contract explicitly:
+        # the authoritative checks below classify every accepted status.
+        result = solver.solve(raise_error=False)
         if result.x is None:
             raise RuntimeError(
                 f"joint horizon QP failed for joint {joint + 1}: "
@@ -771,7 +774,7 @@ def plan_jerk_limited_joint_horizon_batched(
         adaptive_rho=True,
         adaptive_rho_interval=25,
     )
-    result = solver.solve()
+    result = solver.solve(raise_error=False)
     if result.x is None or result.info.status_val not in {1, 2, 7}:
         raise RuntimeError(
             "batched joint horizon QP failed: "
@@ -1301,7 +1304,7 @@ class JointHorizonBatchedWorkspace:
                 l=np.concatenate(lowers),
                 u=np.concatenate(uppers),
             )
-            result = self._solver.solve()
+            result = self._solver.solve(raise_error=False)
         if result.x is None or result.info.status_val not in {1, 2, 7}:
             raise RuntimeError(
                 "reused batched joint horizon QP failed: "

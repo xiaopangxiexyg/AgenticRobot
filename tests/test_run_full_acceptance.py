@@ -104,7 +104,7 @@ def _run_wrapper(
     )
 
 
-def _assert_complete_isolated_run(
+def _assert_complete_run(
     sync_root: Path, run_root: Path, *, shard_count: int
 ) -> None:
     manifest = json.loads((run_root / "shard-plan.json").read_text())
@@ -117,7 +117,6 @@ def _assert_complete_isolated_run(
         "tmpdir": "tmp",
         "xdg-cache": "xdg-cache",
         "python-cache": "python-bytecode",
-        "mujoco-cache": "mujoco-cache",
         "matplotlib-cache": "matplotlib-cache",
         "numba-cache": "numba-cache",
     }
@@ -131,6 +130,11 @@ def _assert_complete_isolated_run(
             for index in range(shard_count)
         }
         assert observed == expected
+    assert {
+        (sync_root / f"shard-{index}.mujoco-cache").read_text().strip()
+        for index in range(shard_count)
+    } == {str(run_root / "mujoco-cache")}
+    assert (run_root / "mujoco-cache").is_dir()
     for index in range(shard_count):
         arguments = (sync_root / f"shard-{index}.args").read_text().splitlines()
         assert "not hardware" in arguments
@@ -148,7 +152,7 @@ def _assert_complete_isolated_run(
     }
 
 
-def test_wrapper_defaults_to_four_complete_isolated_shards(
+def test_wrapper_defaults_to_four_complete_shards(
     tmp_path: Path,
 ) -> None:
     checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
@@ -159,7 +163,7 @@ def test_wrapper_defaults_to_four_complete_isolated_shards(
     completed = _run_wrapper(wrapper, sync_root, assets, run_root)
 
     assert completed.returncode == 0, completed.stderr
-    _assert_complete_isolated_run(sync_root, run_root, shard_count=4)
+    _assert_complete_run(sync_root, run_root, shard_count=4)
     assert not os.path.lexists(checkout / "assets")
 
 
@@ -177,7 +181,7 @@ def test_wrapper_supports_explicit_additional_shards(
     )
 
     assert completed.returncode == 0, completed.stderr
-    _assert_complete_isolated_run(sync_root, run_root, shard_count=shard_count)
+    _assert_complete_run(sync_root, run_root, shard_count=shard_count)
     assert not os.path.lexists(checkout / "assets")
 
 

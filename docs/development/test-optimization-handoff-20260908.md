@@ -21,14 +21,15 @@ AgenticRobot 每次合并前的测试耗时过长，尤其是完整 acceptance �
 
 ### 1.2 本批次安全目标
 
-本批次只实现一个可回退的低风险优化：
+本批次实现三项可回退、且不减少测试节点的低风险优化：
 
 1. 完整非硬件 acceptance 默认仍为 4 个 shard。
 2. 资源经过人工确认的主机可以显式选择 5 或 6 个 shard。
-3. 每个 shard 仍执行完整集合中的互不重复模块，并保留独立缓存、临时目录、日志和 JUnit。
+3. 每个 shard 仍执行完整集合中的互不重复模块，并保留独立 pytest/bytecode/XDG/Matplotlib/Numba 缓存、临时目录、日志和 JUnit；只在同一 exact Run 内共享由进程锁、原子发布和哈希校验保护的内容寻址 MuJoCo 模型缓存。
 4. 聚合 JUnit 仍拒绝重复 testcase；任一子进程失败仍使 wrapper 失败。
-5. 不改变 marker、测试选择、节点集合、Harness Profile、远端执行、硬件边界或默认命令。
-6. 不根据 nproc 自动决定 shard 数，也不把一次主机测量当成所有机器的默认保证。
+5. 对已固定的 OSQP 1.1.3 显式传入 `raise_error=False`，保留由调用方检查求解状态的既有契约，同时消除每次求解重复产生的 future-default warning。
+6. 不改变 marker、测试选择、节点集合、Harness Profile、远端执行、硬件边界或默认命令。
+7. 不根据 nproc 自动决定 shard 数，也不把一次主机测量当成所有机器的默认保证。
 
 ## 2. 当前候选与所有权
 
@@ -37,29 +38,27 @@ AgenticRobot 每次合并前的测试耗时过长，尤其是完整 acceptance �
 | 目标仓库 | /home/zc/HandMotion/Developing/AgenticRobot-development-mainline |
 | 目标线 | development |
 | 目标线基准 | 4743d20a97fa07acc47d4217c39be4040c22b62e |
-| 交接时观察到的目标线 tip | 3fa54d58b2b21aa0bcdb53c4f76afb2288003c55 |
+| 本次复核观察到的目标线 tip | c0140d0fbf362bf9b3e94e840548a007b0a0039f |
 | 候选分支 | task/root/full-acceptance-six-shard-optin-20260908 |
 | 实现提交（本文档的父提交） | 04221f5e38f1ac1914085446b72e0b2088c3e424 |
 | 当前交接 tip（含本文档） | 以 branch description 和交接前 `git rev-parse HEAD` 为准 |
 | 候选工作区 | /tmp/ar-full-acceptance-six-shard-optin-20260908 |
 | 候选所有者 | root |
-| 目标线状态 | 创建候选时未改变；交接复核期间已前移到 3fa54d58，候选尚未合并、未 push |
+| 目标线状态 | 创建候选后已继续前移；本次复核时干净，候选尚未合并、未 push |
 
-候选原有代码范围：
+候选当前 write scope：
 
 ```
 scripts/run_full_acceptance.sh
+robot_motion/position_control/horizon_governor.py
 tests/test_run_full_acceptance.py
+tests/test_mujoco_fast_runtime.py
+tests/test_robot_motion_position_horizon_governor.py
 tests/README.md
-```
-
-本文档加入后，write scope 会扩展为再包含：
-
-```
 docs/development/test-optimization-handoff-20260908.md
 ```
 
-候选不拥有 README_ENV.md、Harness Profile/runner map、marker 选择逻辑、硬件、设备、远端执行、development、main 或 push。加入本文档会使原 ready 记录失效，必须重新提交、重新验证并重新固定 tip。
+候选不拥有 README_ENV.md、Harness Profile/runner map、marker 选择逻辑、MuJoCo 缓存实现、硬件、设备、远端执行、development、main 或 push。当前状态为 `active`；形成干净提交并在同一提交上完成验证前，不得恢复为 ready。
 
 并行候选仍包括：
 
@@ -82,7 +81,7 @@ scripts/run_full_acceptance.sh 当前行为：
 
 已有 scripts/pytest_sharding.py 按 sparse timing profile 加稳定源文件大小 fallback 做确定性、加权的模块分配；本批不改变它。
 
-每个子进程仍拥有独立的 pytest、Python bytecode、MuJoCo、XDG、Matplotlib、Numba、TMPDIR/basetemp、日志和 JUnit 状态。wrapper 等待全部子进程，再输出日志并合并 JUnit；不会因一个 shard 先失败而丢弃其他 shard 的证据。
+每个子进程仍拥有独立的 pytest、Python bytecode、XDG、Matplotlib、Numba、TMPDIR/basetemp、日志和 JUnit 状态。MuJoCo 模型缓存只在本次 Run 根内共享；`ModelArtifactCache` 以内容指纹区分模型，并通过 `flock`、原子替换和 manifest/MJB/MJCF 哈希校验串行发布同一 artifact。不同 Run 不共享该缓存。wrapper 等待全部子进程，再输出日志并合并 JUnit；不会因一个 shard 先失败而丢弃其他 shard 的证据。
 
 ### 3.2 回归测试
 
@@ -91,13 +90,19 @@ tests/test_run_full_acceptance.py 覆盖：
 - 未设置环境变量时确实启动 4 个 shard；
 - 显式 5 和 6 各启动准确数量；
 - 7 和非整数值在启动子进程前拒绝；
-- 六类缓存和临时目录精确隔离；
+- pytest、Python bytecode、XDG、Matplotlib、Numba 和临时目录逐 shard 精确隔离，MuJoCo 模型缓存逐 Run 精确共享；
 - pytest cache、JUnit、not hardware marker 和额外参数仍由 wrapper 管理；
 - aggregate JUnit testcase 唯一且覆盖所有 shard；
 - 第 6 个 shard 失败时退出码为 1，其他 shard 的 XML 仍保留；
 - assets 临时链接的创建、校验和清理语义不变。
 
 tests/README.md 已说明：默认仍为 4，5/6 只用于资源已验证的主机，7+ 不支持，不建议自动按 nproc 扩容。
+
+### 3.3 OSQP warning 边界
+
+`robot_motion/position_control/horizon_governor.py` 的三个求解入口继续接受 OSQP 返回的状态对象，并由既有调用方对 `x` 和 `status_val` 做严格判定。显式 `raise_error=False` 只是把 OSQP 1.1.3 当前默认行为写成稳定调用契约，避免未来默认值提醒在数千次求解中反复格式化和收集；它不把失败改成成功，也不放宽允许状态集合。
+
+回归测试以 fake solver 断言该关键字必须显式为 `False`，并在 `PendingDeprecationWarning` 提升为 error 的条件下运行相关 horizon 测试。
 
 ## 4. 性能模型与证据
 
@@ -129,7 +134,7 @@ env DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
   bash scripts/run_full_acceptance.sh --durations=10
 ```
 
-结果：
+历史结果（共享 Run 缓存和 OSQP 显式策略实现前）：
 
 | 指标 | 结果 |
 | --- | ---: |
@@ -261,7 +266,7 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 
 - 不减少完整 acceptance 节点，不改变 marker 语义，不用 skip/xfail 或放宽断言换速度。
 - 分片按模块唯一分配；不能手工并发重叠模块。
-- 不跨 shard 共享 pytest、MuJoCo、TMPDIR、Python bytecode 或 JUnit。
+- 不跨 shard 共享 pytest、TMPDIR、Python bytecode、XDG、Matplotlib、Numba 或 JUnit；仅共享本次 Run 的内容寻址 MuJoCo 模型缓存，禁止跨 Run 复用。
 - 聚合报告拒绝重复 testcase，并保留失败 shard 的日志/XML。
 - 默认并发度保持保守；新并发只能显式 opt-in，并以实际资源验证为依据。
 
@@ -284,7 +289,7 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 4. reBotArm 固定 gitlink 是否按允许流程物化；
 5. 资产根、Python 3.10/dexteleop310、MuJoCo/EGL、CPU/RAM/swap 和 socket 能力；
 6. 聚焦 9 项测试与 diff-check；
-7. 最终组合提交先用默认 4 做完整 acceptance，再在资源确认后追加显式 6；
+7. 最终组合提交至少完成一次完整非硬件 acceptance；默认 4 是通用门禁，显式 6 是本候选在资源已确认主机上的性能与并发安全验证；
 8. 保存 artifact root、每 shard 状态、aggregate JUnit、失败和未验证范围。
 
 当前四项已知失败未关闭前，不能声称 full acceptance PASSED。
@@ -305,7 +310,7 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 1. agenticrobot-integration 固定两分片，并证明 node-ID 集合完全一致；
 2. 将 deployment/RTC broad integration 从普通 task feedback 移到 integration phase，但不减少最终覆盖；
 3. Harness fast feedback 在认证 runner 上显式使用 3 个 unit shard；
-4. 在语义验证后研究 warning 收集、MuJoCo cache 复用或 collection 初始化优化；
+4. 在语义验证后研究 collection 初始化优化或其他高频 warning 来源；
 5. 不跨实例共享 settled snapshot；scripted contact/pregrasp 存在 solver warm-state 风险；
 6. 单独处理 descend-close 的顺序/solver/reset 敏感性；
 7. 单独修复并验证 reBotArm gitlink 资源物化。
@@ -323,6 +328,6 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 
 ## 11. 当前结论
 
-本批完成了低风险的 5/6 分片 opt-in 实现。聚焦验证稳定通过；六分片真实运行墙钟约 211 秒，显示资源充足主机上约 20% 的实际墙钟收益。由于完整运行仍有 gitlink 资源缺失和既有 MuJoCo 失败，且本机 swap 已满，默认值保持 4 是有意的安全决策。
+本批完成了低风险的 5/6 分片 opt-in、同一次 Run 内共享 MuJoCo 内容缓存，以及 OSQP 显式状态返回策略。聚焦回归已通过；实现前的六分片历史运行墙钟约 211 秒，但仍有 gitlink 资源缺失和既有 MuJoCo 顺序敏感失败，因此不能作为当前候选的绿色证据。默认值保持 4 是有意的安全决策。
 
-本次复核时 development 已漂移到 3fa54d58b2b21aa0bcdb53c4f76afb2288003c55，因此候选不能直接套用旧验证结果，必须在新的目标线上重新评估。后续任何代码、测试或文档改动都会使该 ready 记录失效，必须重新提交、更新 branch description 的 write scope/tip/validation，并重新交接。除非完成集成前检查并取得明确授权，不能合并到 development、推送远端或声称受保护 acceptance 已通过。
+本次复核时 development 已漂移到 c0140d0fbf362bf9b3e94e840548a007b0a0039f，因此候选不能直接套用旧验证结果，必须在当前固定候选提交上重新评估。后续任何代码、测试或文档改动都会使验证记录失效，必须重新提交、更新 branch description 的 write scope/tip/validation，并重新交接。除非完整非硬件 acceptance 通过、完成集成前检查并取得明确授权，不能合并到 development、推送远端或声称受保护 acceptance 已通过。

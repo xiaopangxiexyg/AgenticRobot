@@ -111,10 +111,13 @@ owned by the wrapper.
 `scripts/run_full_acceptance.sh` is the complete non-hardware integration gate.
 It assigns every discovered `tests/test_*.py` module exactly once using a
 checked-in sparse timing profile plus a deterministic source-size fallback.
-The default remains four shards, each with separate pytest, Python, MuJoCo,
-XDG, Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. The wrapper
-waits for every child, rejects duplicate JUnit identities, and writes
-`full-acceptance.xml` plus `shard-plan.json` under a new artifact root. Set
+The default remains four shards. Each shard has separate pytest, Python, XDG,
+Matplotlib, Numba, `TMPDIR`, basetemp, log, and JUnit state. Shards in one exact
+Run share only its content-addressed MuJoCo model cache; that cache uses process
+locking, atomic publication, and hash validation, and it is never reused across
+Run roots. The wrapper waits for every child, rejects duplicate JUnit
+identities, and writes `full-acceptance.xml` plus `shard-plan.json` under a new
+artifact root. Set
 `DEXTELEOP_FULL_ACCEPTANCE_SHARDS=1` for serial reproduction. Explicit five-
 and six-shard runs are supported only on hosts whose CPU and memory headroom
 has been validated; values above six are rejected because the measured suite
