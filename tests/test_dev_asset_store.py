@@ -3,10 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
-
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSET_TOOL_PATH = REPO_ROOT / "scripts" / "dev_asset_store.py"
@@ -14,7 +13,9 @@ CLAIM_TOOL_PATH = REPO_ROOT / "scripts" / "claim_worktree.py"
 
 
 def _load_asset_tool():
-    spec = importlib.util.spec_from_file_location("dev_asset_store_test_module", ASSET_TOOL_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "dev_asset_store_test_module", ASSET_TOOL_PATH
+    )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -66,9 +67,7 @@ def test_store_status_requires_only_default_bundles(tmp_path: Path) -> None:
     status = asset_tool.inspect_asset_store(store, source="test")
 
     assert status.available is True
-    assert all(
-        item.available for item in status.bundles if item.required_by_default
-    )
+    assert all(item.available for item in status.bundles if item.required_by_default)
     assert any(
         not item.available for item in status.bundles if not item.required_by_default
     )
@@ -176,6 +175,108 @@ def test_claim_worktree_records_owner_and_links_shared_assets(tmp_path: Path) ->
     assert f"base={base}" in description
     assert "owner=test" in description
     assert "state=active" in description
+
+
+def test_claim_worktree_without_assets_keeps_pure_code_development_available(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repository(repo)
+    worktree = tmp_path / "claimed-worktree"
+    branch = "task/test/no-assets-20260907"
+    environment = os.environ.copy()
+    environment.pop("DEXTELEOP_ASSET_ROOT", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CLAIM_TOOL_PATH),
+            "--repo-root",
+            str(repo),
+            "--branch",
+            branch,
+            "--path",
+            str(worktree),
+            "--base",
+            base,
+            "--owner",
+            "test",
+            "--write-scope",
+            "docs/**",
+            "--semantic-scope",
+            "pure documentation",
+            "--validation",
+            "diff check",
+            "--json",
+        ],
+        cwd=repo,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is True
+    assert payload["asset_root"] is None
+    assert payload["asset_link_result"] == "not-requested-or-unavailable"
+    assert payload["asset_warning"]
+    assert not (worktree / "assets").exists()
+    assert _run_git(repo, "rev-parse", branch) == base
+
+
+def test_claim_worktree_require_assets_fails_before_creation(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repository(repo)
+    worktree = tmp_path / "claimed-worktree"
+    branch = "task/test/required-assets-20260907"
+    environment = os.environ.copy()
+    environment.pop("DEXTELEOP_ASSET_ROOT", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CLAIM_TOOL_PATH),
+            "--repo-root",
+            str(repo),
+            "--branch",
+            branch,
+            "--path",
+            str(worktree),
+            "--base",
+            base,
+            "--owner",
+            "test",
+            "--write-scope",
+            "sim/**",
+            "--semantic-scope",
+            "asset-dependent simulation",
+            "--validation",
+            "asset-backed simulation checks",
+            "--require-assets",
+            "--json",
+        ],
+        cwd=repo,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is False
+    assert "asset store" in payload["error"]
+    assert not worktree.exists()
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=repo,
+            check=False,
+        ).returncode
+        == 1
+    )
 
 
 def test_link_refuses_to_replace_a_different_existing_asset_path(

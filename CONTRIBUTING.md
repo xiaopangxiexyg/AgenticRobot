@@ -6,8 +6,9 @@ worktree 根目录运行。
 
 ## 1. 开始任务前认领 worktree
 
-开始修改前先确认当前 worktree 和并行状态。首次在一个 clone 上开发时，把解压后的共享
-`assets/` 根目录记录一次（这是机器本地 Git 配置，不进入提交）：
+开始修改前先确认当前 worktree 和并行状态。纯代码、测试和文档开发不要求 Harness 或
+机器人资产，可直接认领独立 worktree。只有本次任务需要仿真、模型或设备资产时，才把
+解压后的共享 `assets/` 根目录记录到机器本地 Git 配置：
 
 ```bash
 git worktree list
@@ -17,8 +18,9 @@ python scripts/dev_asset_store.py configure \
   --asset-root "$DEXTELEOP_ASSET_ROOT"
 ```
 
-以后统一通过认领工具创建 worktree；它会在创建分支前验证资产，写入所有权描述，并在新
-worktree 中建立被 Git 忽略的 `assets` 兼容链接：
+以后统一通过认领工具创建 worktree；它会写入所有权描述，并在资产可用时建立被 Git 忽略的
+`assets` 兼容链接。缺少资产只产生警告，不阻止纯代码任务；资产是本次验证前提时增加
+`--require-assets`，工具会在创建分支前 fail closed：
 
 ```bash
 python scripts/claim_worktree.py \
