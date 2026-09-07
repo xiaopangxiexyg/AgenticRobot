@@ -3,7 +3,10 @@ from __future__ import annotations
 import numpy as np
 
 from deployments.perception.dmtac_grasp_overlay import (
+    DMTAC_M_FINGER_LENGTH_M,
+    DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
     DmtacGraspOverlayCandidate,
+    _wireframe_segments,
     camera_from_reference_poses,
     project_dmtac_grasp,
     render_dmtac_grasp_overlays,
@@ -47,6 +50,21 @@ def test_reference_camera_transform_preserves_pose_chain() -> None:
         reference_from_tcp,
         atol=1e-12,
     )
+
+
+def test_wireframe_is_expressed_about_actual_tool_tcp() -> None:
+    segments = _wireframe_segments(0.04)
+    finger_points = [
+        point
+        for kind, first, second in segments
+        if kind in {"left_finger", "right_finger"}
+        for point in (first, second)
+    ]
+    z_values = np.asarray([point[2] for point in finger_points])
+
+    assert z_values.min() == DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
+    assert z_values.max() == (DMTAC_M_PALM_FROM_TOOL_TCP_Z_M + DMTAC_M_FINGER_LENGTH_M)
+    assert z_values.min() < 0.0 < z_values.max()
 
 
 def test_projection_classifies_full_partial_outside_and_behind() -> None:

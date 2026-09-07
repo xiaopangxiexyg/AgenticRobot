@@ -29,6 +29,9 @@ from dataset_contracts.perception_artifacts import (
     POINT_GRASP_DEPTH_MEDIA_TYPE_V1,
     POINT_GRASP_RGB_SCHEMA_ID_V1,
 )
+from deployments.perception.dmtac_grasp_overlay import (
+    DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+)
 from deployments.perception.sam2_graspnet_point_grasp import (
     GRASPNET_GIT_URL,
     GRASPNET_PROJECT_AUTHORIZATION_ACKNOWLEDGEMENT_V2,
@@ -380,7 +383,7 @@ def test_dmtac_visible_collision_gate_accepts_four_hundred_points_but_rejects_fo
     depth = np.zeros((25, 20), dtype=np.float32)
     depth[2:22, :] = 1.0
     camera_from_tcp = np.eye(4, dtype=np.float64)
-    camera_from_tcp[2, 3] = 1.0
+    camera_from_tcp[2, 3] = 1.0 - DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
     intrinsics = {"fx": 1000.0, "fy": 1000.0, "cx": 10.0, "cy": 10.0}
 
     assert DMTAC_M_MAX_VISIBLE_COLLISION_POINTS == 400
@@ -475,12 +478,13 @@ def test_graspnet_candidate_axes_are_mapped_to_dmtac_tool_tcp(tmp_path: Path) ->
     base = np.asarray(candidates[0].base_from_tcp).reshape(4, 4)
     np.testing.assert_allclose(camera[:3, 0], [0.0, 1.0, 0.0])
     np.testing.assert_allclose(camera[:3, 2], [1.0, 0.0, 0.0])
-    # depth=0.03 and the official 0.06 m finger length place tool_tcp at
-    # the model palm/finger boundary, 0.03 m behind the grasp seed.
+    # depth=0.03 and the official 0.06 m finger length first place the model
+    # palm/finger boundary 0.03 m behind the grasp seed.  The calibrated
+    # DMTAC actual tool_tcp is then 0.042999 m forward of that boundary.
     # Robust target-cloud extents also center the grasp on both axes
     # perpendicular to approach (opening y and finger-height z).
-    np.testing.assert_allclose(camera[:3, 3], [-0.03, 0.005, 0.52])
-    np.testing.assert_allclose(base[:3, 3], [0.07, 0.205, 0.82])
+    np.testing.assert_allclose(camera[:3, 3], [0.012999, 0.005, 0.52])
+    np.testing.assert_allclose(base[:3, 3], [0.112999, 0.205, 0.82])
 
 
 def test_parallel_jaw_tcp_symmetry_selects_reference_up_and_preserves_frames() -> None:
@@ -590,6 +594,7 @@ def test_vgn_parallel_jaw_symmetry_pair_collapses_to_upward_tcp() -> None:
         base_from_cube=np.eye(4),
         camera_from_cube=np.eye(4),
         target_camera=np.zeros(3),
+        target_points_camera=np.zeros((16, 3), dtype=np.float64),
         depth=np.zeros((10, 12), dtype=np.float32),
         intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
         maximum=5,
@@ -598,6 +603,35 @@ def test_vgn_parallel_jaw_symmetry_pair_collapses_to_upward_tcp() -> None:
     assert len(candidates) == 1
     base_from_tcp = np.asarray(candidates[0].base_from_tcp).reshape(4, 4)
     assert base_from_tcp[2, 1] > 0.999
+
+
+def test_vgn_candidate_maps_palm_pose_to_actual_tcp_and_centers_target_cloud() -> None:
+    planner = object.__new__(Sam2VgnPointGraspPlanner)
+    planner.max_gripper_width_m = 0.070
+    planner.max_click_distance_m = 0.080
+    grasp = SimpleNamespace(
+        width=0.05,
+        pose=SimpleNamespace(as_matrix=lambda: np.eye(4)),
+    )
+    target = np.asarray([0.020, 0.010, 0.042999], dtype=np.float64)
+    target_points = np.tile(target, (16, 1))
+
+    candidates = planner._rank(
+        [grasp],
+        np.asarray([0.9]),
+        base_from_cube=np.eye(4),
+        camera_from_cube=np.eye(4),
+        target_camera=target,
+        target_points_camera=target_points,
+        depth=np.zeros((10, 12), dtype=np.float32),
+        intrinsics={"fx": 10.0, "fy": 10.0, "cx": 6.0, "cy": 5.0},
+        maximum=1,
+    )
+
+    assert len(candidates) == 1
+    camera_from_tcp = np.asarray(candidates[0].camera_from_tcp).reshape(4, 4)
+    np.testing.assert_allclose(camera_from_tcp[:3, 3], target, atol=1e-12)
+    assert candidates[0].click_distance_m == pytest.approx(0.0, abs=1e-12)
 
 
 def test_graspnet_point_conditioned_workspace_crops_unrelated_scene_points() -> None:

@@ -20,6 +20,14 @@ from scipy.spatial.transform import Rotation
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from .dmtac_grasp_overlay import (
+    DMTAC_M_FINGER_LENGTH_M,
+    DMTAC_M_FINGER_THICKNESS_M,
+    DMTAC_M_PAD_HEIGHT_M,
+    DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+    DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
+)
+
 VGN_GIT_URL = "https://github.com/ethz-asl/vgn.git"
 POINT_GRASP_ASSET_SCHEMA_V1 = "dexteleop.perception_point_grasp_assets.v1"
 VGN_REVIEWED_REVISION = "d7af0622433f52ae88ebe81533f12b46b33e951a"
@@ -31,6 +39,8 @@ DEFAULT_DMTAC_M_URDF_SHA256 = (
     "457a2b92c81cc4f6f2f1ada63f1ed7a4a659209c4af4aba7d2dcd8403e3b0620"
 )
 DMTAC_M_MAX_VISIBLE_COLLISION_POINTS = 400
+DMTAC_M_TARGET_OPENING_CENTER_MAX_SHIFT_M = 0.035
+DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M = 0.050
 PARALLEL_JAW_TCP_UPWARD_SELECTION_V1 = "maximize_reference_plus_z_dot_tool_tcp_plus_y"
 
 
@@ -287,7 +297,19 @@ class Sam2VgnPointGraspPlanner:
                     "profile": "DMTAC_M",
                     "maximum_opening_m": self.max_gripper_width_m,
                     "maximum_visible_collision_points": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
-                    "tool_tcp_from_flange_m": [0.0, 0.0, 0.14],
+                    "tool_tcp_from_flange_m": [
+                        0.0,
+                        0.0,
+                        DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
+                    ],
+                    "palm_from_tool_tcp_z_m": DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+                    "finger_length_m": DMTAC_M_FINGER_LENGTH_M,
+                    "target_opening_center_max_shift_m": (
+                        DMTAC_M_TARGET_OPENING_CENTER_MAX_SHIFT_M
+                    ),
+                    "target_height_center_max_shift_m": (
+                        DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M
+                    ),
                     "model_grasp_width_axis": "+y",
                     "tool_tcp_width_axis": "+x",
                     "tool_tcp_approach_axis": "+z",
@@ -406,6 +428,11 @@ class Sam2VgnPointGraspPlanner:
         base_from_cube[:3, 3] = point_base[:3] - self.cube_size_m / 2.0
         camera_from_cube = np.linalg.inv(transform_base_camera) @ base_from_cube
         tsdf = self._projective_tsdf(depth, mask, values, camera_from_cube)
+        target_points_camera = self._masked_points_camera(
+            depth,
+            mask,
+            values,
+        )
         with self._lock:
             grasps, scores = self._detect(tsdf)
         candidates = self._rank(
@@ -414,6 +441,7 @@ class Sam2VgnPointGraspPlanner:
             base_from_cube=base_from_cube,
             camera_from_cube=camera_from_cube,
             target_camera=point_camera[:3],
+            target_points_camera=target_points_camera,
             depth=depth,
             intrinsics=values,
             maximum=int(max_candidates),
@@ -536,6 +564,47 @@ class Sam2VgnPointGraspPlanner:
         grid[valid] = (np.clip(sdf / truncation, -1.0, 1.0) + 1.0) * 0.5
         return grid.reshape(1, self.resolution, self.resolution, self.resolution)
 
+    @staticmethod
+    def _masked_points_camera(
+        depth: np.ndarray,
+        mask: np.ndarray,
+        intrinsics: Mapping[str, float],
+    ) -> np.ndarray:
+        rows, columns = np.nonzero(mask & (depth > 0.0))
+        if len(rows) < 16:
+            raise RuntimeError(
+                "Clicked SAM2 region has fewer than 16 valid metric-depth points."
+            )
+        if len(rows) > 50_000:
+            selected = np.linspace(0, len(rows) - 1, 50_000, dtype=np.int64)
+            rows = rows[selected]
+            columns = columns[selected]
+        z = depth[rows, columns].astype(np.float64)
+        return np.column_stack(
+            (
+                (columns - intrinsics["cx"]) * z / intrinsics["fx"],
+                (rows - intrinsics["cy"]) * z / intrinsics["fy"],
+                z,
+            )
+        )
+
+    @staticmethod
+    def _center_tcp_on_target(
+        camera_from_tcp: np.ndarray,
+        target_points_camera: np.ndarray,
+    ) -> np.ndarray:
+        centered = camera_from_tcp.copy()
+        for axis_index, maximum_shift in (
+            (0, DMTAC_M_TARGET_OPENING_CENTER_MAX_SHIFT_M),
+            (1, DMTAC_M_TARGET_HEIGHT_CENTER_MAX_SHIFT_M),
+        ):
+            axis = centered[:3, axis_index]
+            coordinates = (target_points_camera - centered[:3, 3]) @ axis
+            low, high = np.percentile(coordinates, (5.0, 95.0))
+            shift = float(np.clip((low + high) * 0.5, -maximum_shift, maximum_shift))
+            centered[:3, 3] += axis * shift
+        return centered
+
     def _rank(
         self,
         grasps: Any,
@@ -544,16 +613,25 @@ class Sam2VgnPointGraspPlanner:
         base_from_cube: np.ndarray,
         camera_from_cube: np.ndarray,
         target_camera: np.ndarray,
+        target_points_camera: np.ndarray,
         depth: np.ndarray,
         intrinsics: Mapping[str, float],
         maximum: int,
     ) -> tuple[PointGraspCandidate, ...]:
-        # VGN uses +Y as jaw width and +Z as approach. DMTAC M's reviewed
-        # tool_tcp uses +X as jaw width and +Z as approach.
+        # VGN uses +Y as jaw width and +Z as approach, with its origin at the
+        # palm/finger boundary. DMTAC M uses +X as jaw width and +Z as
+        # approach, but its calibrated actual tool_tcp is 42.999 mm forward of
+        # that boundary. Both the axis mapping and physical translation are
+        # therefore required.
         grasp_from_tcp = np.eye(4, dtype=np.float64)
         grasp_from_tcp[:3, :3] = np.asarray(
             [[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float64
         )
+        grasp_from_tcp[:3, 3] = np.asarray(
+            [0.0, 0.0, -DMTAC_M_PALM_FROM_TOOL_TCP_Z_M],
+            dtype=np.float64,
+        )
+        base_from_camera = base_from_cube @ np.linalg.inv(camera_from_cube)
         ranked = []
         for grasp, raw_score in zip(grasps, scores, strict=True):
             width = float(grasp.width)
@@ -561,7 +639,11 @@ class Sam2VgnPointGraspPlanner:
                 continue
             cube_from_grasp = np.asarray(grasp.pose.as_matrix(), dtype=np.float64)
             camera_from_tcp = camera_from_cube @ cube_from_grasp @ grasp_from_tcp
-            base_from_tcp = base_from_cube @ cube_from_grasp @ grasp_from_tcp
+            camera_from_tcp = self._center_tcp_on_target(
+                camera_from_tcp,
+                target_points_camera,
+            )
+            base_from_tcp = base_from_camera @ camera_from_tcp
             camera_from_tcp, base_from_tcp = select_upward_parallel_jaw_tcp_pose(
                 camera_from_tcp,
                 base_from_tcp,
@@ -628,18 +710,19 @@ class Sam2VgnPointGraspPlanner:
         )
         tcp_from_camera = np.linalg.inv(camera_from_tcp)
         local = points @ tcp_from_camera[:3, :3].T + tcp_from_camera[:3, 3]
-        # Actual DMTAC M visible-envelope approximation: 25.5 mm pad height,
-        # 10 mm finger thickness, 50 mm forward finger depth.
-        height = 0.0255
-        finger = 0.010
-        depth_m = 0.050
+        # Actual DMTAC M visible envelope expressed about the calibrated
+        # tool_tcp, not the palm/finger boundary used by VGN.
+        height = DMTAC_M_PAD_HEIGHT_M
+        finger = DMTAC_M_FINGER_THICKNESS_M
+        palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
+        fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
         within_height = np.abs(local[:, 1]) < height / 2.0
-        forward = (local[:, 2] > 0.0) & (local[:, 2] < depth_m)
+        forward = (local[:, 2] > palm_z) & (local[:, 2] < fingertip_z)
         left = (local[:, 0] > width / 2.0) & (local[:, 0] < width / 2.0 + finger)
         right = (local[:, 0] < -width / 2.0) & (local[:, 0] > -width / 2.0 - finger)
         palm = (
-            (local[:, 2] > -finger)
-            & (local[:, 2] <= 0.0)
+            (local[:, 2] > palm_z - finger)
+            & (local[:, 2] <= palm_z)
             & (np.abs(local[:, 0]) < width / 2.0 + finger)
         )
         return (

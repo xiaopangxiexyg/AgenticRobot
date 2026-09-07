@@ -21,6 +21,29 @@ GRASP_VISIBILITY_STATES = frozenset(
     {"visible", "partially_visible", "behind_camera", "out_of_frame"}
 )
 
+# The reviewed DMTAC M adapter maps the VGN palm/finger boundary to the
+# confirmed 140 mm tool_tcp by a 42.999 mm local approach-axis translation.
+# The 97.001 mm source is an internal marker in the current zero-translation
+# 4B2 proxy attachment, not an independent flange-mating calibration.  Keep
+# the resulting reviewed transform in this geometry owner so planning,
+# collision checks, and overlays cannot silently use different TCP origins.
+DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M = 0.140
+DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD = (
+    0.0,
+    0.0,
+    DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
+    0.0,
+    0.0,
+    0.0,
+)
+DMTAC_M_CAD_PALM_FROM_ATTACHMENT_Z_M = 0.097001
+DMTAC_M_PALM_FROM_TOOL_TCP_Z_M = (
+    DMTAC_M_CAD_PALM_FROM_ATTACHMENT_Z_M - DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M
+)
+DMTAC_M_FINGER_LENGTH_M = 0.050
+DMTAC_M_FINGER_THICKNESS_M = 0.010
+DMTAC_M_PAD_HEIGHT_M = 0.0255
+
 
 def _rigid_transform(value: Any, *, field_name: str) -> np.ndarray:
     matrix = np.asarray(value, dtype=np.float64)
@@ -196,18 +219,20 @@ def _box_segments(
 def _wireframe_segments(
     width_m: float,
 ) -> tuple[tuple[str, np.ndarray, np.ndarray], ...]:
-    # Matches the visible-collision geometry used by the point-grasp planner:
-    # 10 mm fingers, 25.5 mm pad height, 50 mm forward depth, and a 10 mm palm.
+    # Geometry is expressed about the actual calibrated tool_tcp.  The palm
+    # boundary is behind it; the fingertips extend slightly beyond it.
     half_opening = width_m / 2.0
-    finger_thickness = 0.010
-    half_height = 0.0255 / 2.0
+    finger_thickness = DMTAC_M_FINGER_THICKNESS_M
+    half_height = DMTAC_M_PAD_HEIGHT_M / 2.0
+    palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
+    fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
     segments: list[tuple[str, np.ndarray, np.ndarray]] = []
     segments.extend(
         _box_segments(
             kind="left_finger",
             x_bounds=(-half_opening - finger_thickness, -half_opening),
             y_bounds=(-half_height, half_height),
-            z_bounds=(0.0, 0.050),
+            z_bounds=(palm_z, fingertip_z),
         )
     )
     segments.extend(
@@ -215,7 +240,7 @@ def _wireframe_segments(
             kind="right_finger",
             x_bounds=(half_opening, half_opening + finger_thickness),
             y_bounds=(-half_height, half_height),
-            z_bounds=(0.0, 0.050),
+            z_bounds=(palm_z, fingertip_z),
         )
     )
     segments.extend(
@@ -226,7 +251,7 @@ def _wireframe_segments(
                 half_opening + finger_thickness,
             ),
             y_bounds=(-half_height, half_height),
-            z_bounds=(-finger_thickness, 0.0),
+            z_bounds=(palm_z - finger_thickness, palm_z),
         )
     )
     axis_x = max(0.035, half_opening + finger_thickness + 0.005)

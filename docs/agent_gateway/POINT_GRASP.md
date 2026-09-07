@@ -6,8 +6,9 @@
 `selected_ordinal=0` 是当前最佳候选，`backend_id` 明确报告 `vgn` 或 `graspnet`，并输出一张标注
 JPEG 文件。VGN 是默认后端；GraspNet 仅在操作者持有相应授权并提供显式 acknowledgement 时可选。
 
-标注 JPEG 不再只画 TCP 十字。它按 DMTAC M 的 10 mm 指厚、25.5 mm 指高、50 mm 前伸和
-10 mm 掌部近似包络绘制双指/掌部线框，并绘制 TCP `+X/+Y/+Z` 三轴；最佳候选用高亮色，其他
+标注 JPEG 不再只画 TCP 十字。它按 DMTAC M 的 10 mm 指厚、25.5 mm 指高、50 mm 指长和
+10 mm 掌部近似包络绘制双指/掌部线框，并绘制 TCP `+X/+Y/+Z` 三轴；几何以实际 `tool_tcp`
+为原点，掌/指边界位于其局部 Z 轴后方 42.999 mm。最佳候选用高亮色，其他
 候选用次级颜色。投影先裁剪相机近裁剪面，再裁剪图像边界，因此部分进入画面的抓姿仍能显示，
 完全位于相机后方或画面外的候选会在图例中明确标为 `behind_camera` 或 `out_of_frame`，不会静默
 消失。该图仍是简单几何叠加，不做深度遮挡测试。
@@ -224,6 +225,11 @@ URDF placement，同时保留现场已验证的左右腕相机 serial 绑定。�
 都会 fail closed。启动这个组合会连接双 RM65 并建立 startup HOLD，因此不能把它当作 camera-only
 验收入口；离线测试也不构成真机坐标或运动验收。
 
+双臂 observation 不再串行等待两个控制器后才检查第一臂的新鲜度，而是对两个独立 RM65 backend
+并行发起硬件读取，再在同一个 causal cutoff 下选择结果。每臂 `0.2 s` freshness 上限保持不变；
+失败诊断同时保留两臂 measurement age、timestamp span 和各自 SDK read-phase timing，不能靠放宽
+阈值掩盖慢读取或控制器异常。
+
 原有 `perception.plan_point_grasp@1` 与上文离线 CLI 保持兼容：它允许调用方提供本地 RGB-D、内参和
 标定，因此其 `base` 输出不能被称为 deployment-trusted Station pose，也不会由生产
 `real-perception` profile 发布。
@@ -240,10 +246,19 @@ assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_ca
 `457a2b92c81cc4f6f2f1ada63f1ed7a4a659209c4af4aba7d2dcd8403e3b0620`。真实工具配置来自
 `hardware/rm65/utils/configs/calibrations/rm65_left_DMTAC_M.json` 和
 `rm65_right_DMTAC_M.json`；`tool_tcp` 相对法兰 z=0.14 m。适配器按 DMTAC M 最大开口 0.070 m
-过滤候选，并把 VGN 的 +Y 开口轴映射到 DMTAC `tool_tcp` 的 +X 开口轴；GraspNet 的 +X
+过滤候选。当前 v3/v4 4B2 proxy attachment 的内部掌/指边界标记为 z=0.097001 m，且当前模型把
+attachment translation 设为零；与已确认的 0.14 m TCP profile 一起形成了适配器显式锁定的
+0.042999 m 局部接近轴变换。该 marker 不是独立的法兰安装面实测值；若真实安装或工具 profile
+变化，必须更新并重新核查整个受信工具绑定，不能在 RPent/Station Z 轴上追加经验补偿。VGN 的
+掌部原点除了轴映射外，还必须应用上述变换才能成为实际 `tool_tcp`；这个变换
+同时用于候选、碰撞包络和渲染。VGN 候选还使用 SAM2 目标点云在开口轴和指高轴的 5%/95%
+分位中点做有界居中，避免把点击目标上方的掌部原点误报成 TCP。组合真机入口会核验所选臂的
+工具配置严格匹配该 DMTAC_M TCP，其他工具 fail-closed，而不在 RPent 中补偿高度。
+
+GraspNet 的 +X
 接近、+Y 开口、+Z 高度轴则分别映射到 DMTAC `tool_tcp` 的 +Z 接近、+X 开口、+Y 高度轴。
 GraspNet 输出第 3 列的 grasp depth 不能丢弃：实现按官方 0.060 m 指长，把 model seed 沿
-`depth - 0.060` 平移到 DMTAC 掌/指边界；同时使用 SAM2 目标点云沿开口轴的 5%/95% 分位
+`depth - 0.060` 平移到 DMTAC 掌/指边界，再继续平移到实际 `tool_tcp`；同时使用 SAM2 目标点云沿开口轴的 5%/95% 分位
 中点做最多 0.020 m 的居中校正，并沿指高轴做最多 0.030 m 的同类居中校正。三项语义均纳入
 planner semantic content hash。
 可见点云碰撞门禁使用 DMTAC M 的指体/掌体近似包络；落入该实体包络的采样点不超过 400 个时

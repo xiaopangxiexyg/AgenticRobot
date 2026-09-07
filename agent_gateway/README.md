@@ -501,6 +501,16 @@ or execute motion. Its visible-scene collision flag is not a complete
 scene/robot/path safety proof. The caller-calibrated v1 Route remains available
 only to the separate offline tooling.
 
+The DMTAC M adapter distinguishes the VGN/GraspNet palm-finger boundary from
+the calibrated actual `tool_tcp`. The current zero-translation 4B2 proxy
+attachment has a 97.001 mm internal boundary marker, while the selected DMTAC
+M TCP is 140 mm from the flange; the adapter explicitly locks the resulting
+42.999 mm local approach-axis mapping. That proxy marker is not a separate
+physical mating-plane measurement. Candidate output, visible collision
+geometry, and overlays all apply the same mapping. The combined RM65 profile
+rejects point-grasp startup when the selected arm tool profile does not match
+that reviewed TCP; RPent never supplies or repairs this tool geometry.
+
 Real RGB and Depth use the shared v2 result contracts. RGB preserves each
 camera worker's source timestamp and bounds the selected frames by the minimum
 and maximum source timestamps; it does not claim that separate RealSense reads

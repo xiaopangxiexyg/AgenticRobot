@@ -22,6 +22,13 @@ from scipy.spatial import cKDTree
 
 from dataset_contracts.canonical_encoding import canonical_content_hash
 
+from .dmtac_grasp_overlay import (
+    DMTAC_M_FINGER_LENGTH_M,
+    DMTAC_M_FINGER_THICKNESS_M,
+    DMTAC_M_PAD_HEIGHT_M,
+    DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
+    DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
+)
 from .sam2_vgn_point_grasp import (
     DEFAULT_DMTAC_M_URDF,
     DEFAULT_DMTAC_M_URDF_SHA256,
@@ -349,7 +356,12 @@ class Sam2GraspNetPointGraspPlanner:
                     "profile": "DMTAC_M",
                     "maximum_opening_m": self.max_gripper_width_m,
                     "maximum_visible_collision_points": DMTAC_M_MAX_VISIBLE_COLLISION_POINTS,
-                    "tool_tcp_from_flange_m": [0.0, 0.0, 0.14],
+                    "tool_tcp_from_flange_m": [
+                        0.0,
+                        0.0,
+                        DMTAC_M_TOOL_TCP_FROM_FLANGE_Z_M,
+                    ],
+                    "palm_from_tool_tcp_z_m": DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
                     "model_approach_axis": "+x",
                     "model_width_axis": "+y",
                     "tool_tcp_approach_axis": "+z",
@@ -360,7 +372,9 @@ class Sam2GraspNetPointGraspPlanner:
                     "model_grasp_depth_mapping": {
                         "prediction_column": 3,
                         "model_finger_length_m": GRASPNET_MODEL_FINGER_LENGTH_M,
-                        "tool_tcp_origin": "model_palm_finger_boundary",
+                        "model_output_origin": "grasp_seed",
+                        "physical_palm_origin": "model_palm_finger_boundary",
+                        "output_origin": "calibrated_actual_tool_tcp",
                     },
                 },
                 "asset_authorization": self.model_spec.license_acknowledgement,
@@ -724,13 +738,15 @@ class Sam2GraspNetPointGraspPlanner:
             # GraspNet's translation is the grasp seed.  In its official
             # collision geometry the fingers occupy local approach X in
             # [depth - 0.06, depth] and the palm ends at depth - 0.06.
-            # DMTAC tool_tcp is the palm/finger boundary with fingers extending
-            # along +Z, so the model depth is a required translation, not
-            # merely auxiliary confidence metadata.
+            # First resolve the GraspNet seed to its model palm/finger boundary,
+            # then continue to the calibrated DMTAC actual tool_tcp.  Omitting
+            # the second translation makes a palm pose masquerade as tool_tcp.
             grasp_from_tcp = np.eye(4, dtype=np.float64)
             grasp_from_tcp[:3, :3] = grasp_from_tcp_rotation
             grasp_from_tcp[:3, 3] = (
-                grasp_depth - GRASPNET_MODEL_FINGER_LENGTH_M,
+                grasp_depth
+                - GRASPNET_MODEL_FINGER_LENGTH_M
+                - DMTAC_M_PALM_FROM_TOOL_TCP_Z_M,
                 0.0,
                 0.0,
             )
@@ -838,16 +854,17 @@ class Sam2GraspNetPointGraspPlanner:
         )
         tcp_from_camera = np.linalg.inv(camera_from_tcp)
         local = points @ tcp_from_camera[:3, :3].T + tcp_from_camera[:3, 3]
-        height = 0.0255
-        finger = 0.010
-        depth_m = 0.050
+        height = DMTAC_M_PAD_HEIGHT_M
+        finger = DMTAC_M_FINGER_THICKNESS_M
+        palm_z = DMTAC_M_PALM_FROM_TOOL_TCP_Z_M
+        fingertip_z = palm_z + DMTAC_M_FINGER_LENGTH_M
         within_height = np.abs(local[:, 1]) < height / 2.0
-        forward = (local[:, 2] > 0.0) & (local[:, 2] < depth_m)
+        forward = (local[:, 2] > palm_z) & (local[:, 2] < fingertip_z)
         left = (local[:, 0] > width / 2.0) & (local[:, 0] < width / 2.0 + finger)
         right = (local[:, 0] < -width / 2.0) & (local[:, 0] > -width / 2.0 - finger)
         palm = (
-            (local[:, 2] > -finger)
-            & (local[:, 2] <= 0.0)
+            (local[:, 2] > palm_z - finger)
+            & (local[:, 2] <= palm_z)
             & (np.abs(local[:, 0]) < width / 2.0 + finger)
         )
         return (

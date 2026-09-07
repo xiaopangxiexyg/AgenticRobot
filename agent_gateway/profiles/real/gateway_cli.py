@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from agent_gateway.transport.client_bindings import (
     compile_agent_gateway_unix_client_bindings,
 )
@@ -26,6 +28,9 @@ from deployments.perception import (
     Sam2GroundingDinoModelSpec,
     Sam2VgnPointGraspPlanner,
     VgnPointGraspModelSpec,
+)
+from deployments.perception.dmtac_grasp_overlay import (
+    DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
 )
 from robot_motion.rm65 import RM65_BIMANUAL_POSITION_V1_NAME
 from teleop_runtime.skill_deploy import (
@@ -445,6 +450,21 @@ def main(argv: list[str] | None = None) -> int:
             collision_scene_profile=args.collision_scene_profile,
         )
     )
+    if args.enable_point_grasp:
+        selected_tool_tcp = resolved.tool_tcp_pose_flange_m_rad_by_side[
+            args.authorized_side
+        ]
+        if not np.allclose(
+            selected_tool_tcp,
+            DMTAC_M_REVIEWED_TOOL_TCP_POSE_FLANGE_M_RAD,
+            atol=1e-9,
+            rtol=0.0,
+        ):
+            parser.error(
+                "--enable-point-grasp requires the reviewed DMTAC_M actual "
+                "tool_tcp pose [0, 0, 0.14, 0, 0, 0] for --authorized-side; "
+                "candidate geometry cannot be reinterpreted for another tool"
+            )
     lower = assemble_exclusive_rm65_skill_lower(profile=resolved)
     camera_config = (
         None

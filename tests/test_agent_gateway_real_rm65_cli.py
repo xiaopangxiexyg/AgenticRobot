@@ -267,6 +267,65 @@ def test_cli_rejects_camera_mount_urdf_without_point_grasp_opt_in(
     assert called is False
 
 
+def test_cli_rejects_point_grasp_when_selected_tool_tcp_is_not_reviewed_dmtac(
+    monkeypatch,
+    tmp_path: Path,
+    short_unix_socket_path_factory,
+) -> None:
+    resolved = SimpleNamespace(
+        semantic_content_hash="a" * 64,
+        tool_tcp_pose_flange_m_rad_by_side={
+            "left": [0.0, 0.0, 0.14, 0.0, 0.0, 0.0],
+            "right": [0.0, 0.0, 0.12, 0.0, 0.0, 0.0],
+        },
+    )
+    lower_assembled = False
+
+    def should_not_assemble(*, profile):
+        del profile
+        nonlocal lower_assembled
+        lower_assembled = True
+        raise AssertionError(
+            "mismatched tool geometry must fail before hardware assembly"
+        )
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        lambda _profile: resolved,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "assemble_exclusive_rm65_skill_lower",
+        should_not_assemble,
+    )
+    socket_path = short_unix_socket_path_factory("tool-geometry")
+    socket_path.parent.chmod(0o2750)
+    argv = _argv(
+        confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN,
+        socket_path=socket_path,
+    )
+    argv.extend(
+        [
+            "--camera-config",
+            str(REPO_ROOT / "pyproject.toml"),
+            "--artifact-root",
+            str(tmp_path),
+            "--enable-point-grasp",
+            "--object-localization-asset-bundle",
+            str(REPO_ROOT),
+            "--point-grasp-asset-bundle",
+            str(REPO_ROOT),
+        ]
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main(argv)
+
+    assert captured.value.code == 2
+    assert lower_assembled is False
+
+
 def test_cli_rejects_overlong_socket_before_profile_or_hardware_assembly(
     monkeypatch,
     capsys,
