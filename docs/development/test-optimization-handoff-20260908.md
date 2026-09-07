@@ -54,7 +54,9 @@ robot_motion/position_control/horizon_governor.py
 tests/test_run_full_acceptance.py
 tests/test_mujoco_fast_runtime.py
 tests/test_robot_motion_position_horizon_governor.py
+tests/test_mujoco_temp_pipeline.py
 tests/README.md
+docs/README.md
 docs/development/test-optimization-handoff-20260908.md
 ```
 
@@ -158,13 +160,13 @@ env DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 - 使用前确认 CPU、内存、swap、其他并行任务和资产余量；
 - 资源异常时回退到 4 或 1，保留 artifact 后诊断。
 
-## 5. 已知失败及解释
+## 5. 历史失败与当前处理
 
-socket-capable 六分片运行剩余 4 项失败：
+实现过程中出现过以下失败；它们都必须保留原始 artifact，并在最终固定提交上复验。
 
 ### 5.1 reBotArm gitlink 未物化
 
-3 项 B601 MuJoCo 测试因 hardware/reBotArm_control_py 只有固定 gitlink（5ba28acef46237eb6a7560658bbc43b06cf8a259），但 URDF 内容没有物化而失败。这是资源/工作区状态问题，不是分片逻辑通过证据。
+早期六分片运行有 3 项 B601 MuJoCo 测试因 hardware/reBotArm_control_py 只有固定 gitlink（5ba28acef46237eb6a7560658bbc43b06cf8a259），但 URDF 内容没有物化而失败。这是资源/工作区状态问题，不是分片逻辑通过证据。当前候选工作区已用 `git submodule update --init hardware/reBotArm_control_py` 物化该精确 gitlink，未修改 gitlink 内容。
 
 安全处理：
 
@@ -173,15 +175,15 @@ socket-capable 六分片运行剩余 4 项失败：
 3. 不从任意 Harness 临时 worktree 复制 vendor，不修改 gitlink 制造绿色；
 4. 初始化后重跑受影响测试和完整 acceptance。
 
-### 5.2 既有 MuJoCo 断言
+### 5.2 MuJoCo 测试导入顺序
 
-tests/test_mujoco_temp_pipeline.py::test_descend_close_task_is_feasible_without_hidden_xy_actions 在六分片全量和完整模块运行中失败；完整模块结果为 1 failed, 113 passed，单独运行该节点时通过。这更像既有模块顺序、solver warm-state、资源争用或 reset 敏感性，不是本批仅增加 5/6 合法值的直接回归。
+`tests/test_mujoco_temp_pipeline.py::test_descend_close_task_is_feasible_without_hidden_xy_actions` 曾在整模块和六分片中稳定失败，但单独运行通过。最小复现只需要先运行 `test_temp_training_defaults_to_fully_actuated_task`：该测试在导入 `sim.mujoco_temp_pipeline` 包之前先导入 PyTorch，绕过包入口已有的环境 C++ runtime 预加载边界，使后续 Pinocchio-backed pose planning 使用不同的确定性轨迹。
 
-本批不修改 MuJoCo 行为、不改变断言、不添加 skip/xfail。应由 MuJoCo owner 单独分析；关闭前不能把当前全量称为绿色。
+修复只把测试导入顺序改成与正式 `python -m sim.mujoco_temp_pipeline.train` 入口一致：先导入包内纯配置，再检查 PyTorch。没有修改 MuJoCo 行为、任务配置、seed、步数、成功阈值，也没有添加 skip/xfail。原最小失败对已变为 2 passed，完整模块为 133 passed；仍需最终同 SHA 六分片确认。
 
 ### 5.3 沙箱 socket 失败
 
-普通沙箱运行还出现 loopback/AF_UNIX 创建失败：PermissionError: [Errno 1] Operation not permitted。socket-capable 复跑后这些失败消失。该结果只证明环境能力差异；原始 artifact 应保留为环境证据，正式 readiness 只使用控制平面和能力匹配的运行结果。
+普通沙箱运行还出现 49 项 loopback/AF_UNIX 创建失败：PermissionError: [Errno 1] Operation not permitted。socket-capable 同 SHA 复跑后这些失败全部消失，只剩上节已定位的导入顺序失败。该结果只证明环境能力差异；原始 artifact 应保留为环境证据，正式 readiness 只使用控制平面和能力匹配的运行结果。
 
 ### 5.4 无硬件证据
 
@@ -213,7 +215,7 @@ bash scripts/run_pytest.sh -q \
 git diff --check
 ```
 
-本候选聚焦结果为 9 passed，连续运行 3 次，每次约 0.49 秒。
+本轮聚焦结果为 wrapper/并发缓存 9 passed、horizon/trajectory 33 passed（并把 `PendingDeprecationWarning` 提升为 error）、文档导航 9 passed。导入顺序最小复现修复后为 2 passed，完整 temp-pipeline 模块为 133 passed。
 
 真实计划必须使用新建的空目录：
 
@@ -292,7 +294,7 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 7. 最终组合提交至少完成一次完整非硬件 acceptance；默认 4 是通用门禁，显式 6 是本候选在资源已确认主机上的性能与并发安全验证；
 8. 保存 artifact root、每 shard 状态、aggregate JUnit、失败和未验证范围。
 
-当前四项已知失败未关闭前，不能声称 full acceptance PASSED。
+历史失败已分别定位并在聚焦范围关闭；最终固定提交的 socket-capable full acceptance 通过前，仍不能声称 full acceptance PASSED。
 
 ### 8.2 回滚
 
@@ -312,8 +314,7 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 3. Harness fast feedback 在认证 runner 上显式使用 3 个 unit shard；
 4. 在语义验证后研究 collection 初始化优化或其他高频 warning 来源；
 5. 不跨实例共享 settled snapshot；scripted contact/pregrasp 存在 solver warm-state 风险；
-6. 单独处理 descend-close 的顺序/solver/reset 敏感性；
-7. 单独修复并验证 reBotArm gitlink 资源物化。
+6. 将固定 reBotArm gitlink 的 runner 物化前置条件纳入 Harness 资源合同；本候选只完成本地精确物化验证。
 
 ## 10. 交接呈现格式
 
@@ -328,6 +329,6 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 
 ## 11. 当前结论
 
-本批完成了低风险的 5/6 分片 opt-in、同一次 Run 内共享 MuJoCo 内容缓存，以及 OSQP 显式状态返回策略。聚焦回归已通过；实现前的六分片历史运行墙钟约 211 秒，但仍有 gitlink 资源缺失和既有 MuJoCo 顺序敏感失败，因此不能作为当前候选的绿色证据。默认值保持 4 是有意的安全决策。
+本批完成了低风险的 5/6 分片 opt-in、同一次 Run 内共享 MuJoCo 内容缓存、OSQP 显式状态返回策略，以及一个由全量验收暴露的测试导入顺序修复。实现前六分片历史运行墙钟约 211 秒；共享缓存后的两次运行约 204 秒，但分别受沙箱 socket 限制和导入顺序失败影响，仍不能作为绿色证据。默认值保持 4 是有意的安全决策。
 
 本次复核时 development 已漂移到 c0140d0fbf362bf9b3e94e840548a007b0a0039f，因此候选不能直接套用旧验证结果，必须在当前固定候选提交上重新评估。后续任何代码、测试或文档改动都会使验证记录失效，必须重新提交、更新 branch description 的 write scope/tip/validation，并重新交接。除非完整非硬件 acceptance 通过、完成集成前检查并取得明确授权，不能合并到 development、推送远端或声称受保护 acceptance 已通过。
