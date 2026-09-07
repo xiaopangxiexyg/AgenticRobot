@@ -49,7 +49,13 @@ def _source_binding(registry_path: Path):
     )
 
 
-def _build_geometry(*, registry_path: Path, station_override=None, target_builder=None):
+def _build_geometry(
+    *,
+    registry_path: Path,
+    station_override=None,
+    target_builder=None,
+    camera_mount_urdf_path: Path = DEFAULT_RM65_CAMERA_MOUNT_URDF,
+):
     arm_bases, station = _scene_geometry()
     return build_rm65_rgb_camera_geometry(
         source_binding=_source_binding(registry_path),
@@ -59,7 +65,7 @@ def _build_geometry(*, registry_path: Path, station_override=None, target_builde
             else target_builder
         ),
         camera_registry_path=registry_path,
-        camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        camera_mount_urdf_path=camera_mount_urdf_path,
         scene_world_from_arm_base_by_side=arm_bases,
         scene_world_from_canonical_station=(
             station if station_override is None else station_override
@@ -85,6 +91,117 @@ def test_v4_default_geometry_closes_over_all_three_deployed_camera_roles() -> No
         ("left_wrist", "wrist_left"),
         ("right_wrist", "wrist_right"),
     )
+
+
+def test_v4_geometry_keeps_logical_urdf_identity_through_asset_symlink(
+    tmp_path,
+) -> None:
+    physical_asset_root = tmp_path / "read-only-input"
+    relative = DEFAULT_RM65_CAMERA_MOUNT_URDF.relative_to(REPO_ROOT / "assets")
+    physical_selected = physical_asset_root / relative
+    physical_selected.parent.mkdir(parents=True)
+    physical_selected.write_bytes(DEFAULT_RM65_CAMERA_MOUNT_URDF.read_bytes())
+    worktree_assets = tmp_path / "worktree" / "assets"
+    worktree_assets.parent.mkdir()
+    worktree_assets.symlink_to(physical_asset_root, target_is_directory=True)
+
+    geometry = _build_geometry(
+        registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+        camera_mount_urdf_path=worktree_assets / relative,
+    )
+
+    assert tuple(item["role"] for item in geometry.source_catalog()) == (
+        "main",
+        "wrist_left",
+        "wrist_right",
+    )
+
+
+def test_v4_geometry_rejects_same_urdf_bytes_at_another_logical_path(tmp_path) -> None:
+    selected_root = tmp_path / "worktree" / "assets"
+    relative = DEFAULT_RM65_CAMERA_MOUNT_URDF.relative_to(REPO_ROOT / "assets")
+    selected = selected_root / "another-bundle" / relative.name
+    selected.parent.mkdir(parents=True)
+    selected.write_bytes(DEFAULT_RM65_CAMERA_MOUNT_URDF.read_bytes())
+
+    with pytest.raises(ValueError, match="does not bind 'front' once"):
+        _build_geometry(
+            registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
+            camera_mount_urdf_path=selected,
+        )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        "assets/./{relative}",
+        "assets//{relative}",
+        "assets/../outside/{filename}",
+        "assets\\{relative_backslash}",
+        " assets/{relative}",
+        "assets/{relative}/",
+    ),
+)
+def test_v4_geometry_rejects_noncanonical_relative_registry_urdf(
+    tmp_path,
+    malformed: str,
+) -> None:
+    registry = json.loads(DEFAULT_RM65_CAMERA_REGISTRY_V4.read_text(encoding="utf-8"))
+    relative = str(DEFAULT_RM65_CAMERA_MOUNT_URDF.relative_to(REPO_ROOT / "assets"))
+    selected = "assets/" + relative
+    replacement = malformed.format(
+        relative=relative,
+        relative_backslash=relative.replace("/", "\\"),
+        filename=DEFAULT_RM65_CAMERA_MOUNT_URDF.name,
+    )
+    for camera in registry["cameras"].values():
+        for frame in camera["extrinsics"]["frames"].values():
+            for placement in frame.get("placements", ()):
+                if placement["urdf"] == selected:
+                    placement["urdf"] = replacement
+    changed = tmp_path / "noncanonical_registry.json"
+    changed.write_text(json.dumps(registry), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not bind 'front' once"):
+        _build_geometry(registry_path=changed)
+
+
+def test_v4_geometry_rejects_duplicate_selected_registry_placement(tmp_path) -> None:
+    registry = json.loads(DEFAULT_RM65_CAMERA_REGISTRY_V4.read_text(encoding="utf-8"))
+    placements = registry["cameras"]["front"]["extrinsics"]["frames"][
+        "head_camera_frame"
+    ]["placements"]
+    selected = next(
+        item
+        for item in placements
+        if item["urdf"] == "assets/" + str(
+            DEFAULT_RM65_CAMERA_MOUNT_URDF.relative_to(REPO_ROOT / "assets")
+        )
+    )
+    placements.append(dict(selected))
+    changed = tmp_path / "duplicate_registry.json"
+    changed.write_text(json.dumps(registry), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not bind 'front' once"):
+        _build_geometry(registry_path=changed)
+
+
+def test_v4_geometry_keeps_absolute_registry_paths_strict(tmp_path) -> None:
+    registry = json.loads(DEFAULT_RM65_CAMERA_REGISTRY_V4.read_text(encoding="utf-8"))
+    logical_selected = "assets/" + str(
+        DEFAULT_RM65_CAMERA_MOUNT_URDF.relative_to(REPO_ROOT / "assets")
+    )
+    for camera in registry["cameras"].values():
+        for frame in camera["extrinsics"]["frames"].values():
+            for placement in frame.get("placements", ()):
+                if placement["urdf"] == logical_selected:
+                    placement["urdf"] = str(DEFAULT_RM65_CAMERA_MOUNT_URDF.resolve())
+    changed = tmp_path / "absolute_registry.json"
+    changed.write_text(json.dumps(registry), encoding="utf-8")
+
+    geometry = _build_geometry(registry_path=changed)
+
+    assert len(geometry.source_catalog()) == 3
 
 
 def test_v4_geometry_rejects_registry_pose_that_differs_from_selected_urdf(
