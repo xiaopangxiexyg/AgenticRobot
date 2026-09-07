@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import os
 import pty
 import termios
@@ -344,6 +345,63 @@ def test_feedback_boundary_normalization_admits_j3_and_keeps_other_joints_unchan
     assert normalized_joint_names == ("joint3",)
 
 
+def test_feedback_boundary_normalization_admits_j4_precision_window_only() -> None:
+    j4_lower = -math.pi / 2.0
+    raw = (0.1, 0.2, 0.3, j4_lower - 0.001, -0.3, 0.4)
+
+    normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+    assert normalized[3] == pytest.approx(j4_lower)
+    assert normalized_joint_names == ("joint4",)
+    assert normalized[:3] == raw[:3]
+    assert normalized[4:] == raw[4:]
+
+
+def test_feedback_boundary_normalization_rejects_j4_beyond_redundancy() -> None:
+    j4_lower = -math.pi / 2.0
+    raw = (0.1, 0.2, 0.3, j4_lower - 0.001 - 1e-9, -0.3, 0.4)
+
+    normalized, normalized_joint_names = probe.normalize_feedback_boundary_qpos(raw)
+
+    assert normalized == raw
+    assert normalized_joint_names == ()
+    with pytest.raises(probe.LowGainProbeError, match="outside URDF limits"):
+        probe._validate_in_limit_qpos(
+            raw,
+            position_limits_rad=(
+                (-2.8, 2.8),
+                (0.0, 3.14),
+                (0.0, 3.14),
+                (j4_lower, math.pi / 2.0),
+                (-1.57, 1.57),
+                (-3.14, 3.14),
+            ),
+            name="j4_boundary_qpos_rad",
+        )
+
+
+def test_resolve_model_and_limits_uses_precise_j4_nominal_boundary(monkeypatch, tmp_path) -> None:
+    class FakeModel:
+        urdf_path = tmp_path / "b601.urdf"
+
+        @classmethod
+        def from_rebot_source_root(cls, source_root):
+            return cls()
+
+        def arm_position_limits(self):
+            return (
+                np.asarray((-2.8, 0.0, 0.0, -1.57, -1.57, -3.14)),
+                np.asarray((2.8, 3.14, 3.14, 1.57, 1.57, 3.14)),
+            )
+
+    monkeypatch.setattr(probe, "B601PinocchioModel", FakeModel)
+    _model, limits = probe._resolve_model_and_limits(tmp_path)
+
+    assert limits[3] == pytest.approx((-math.pi / 2.0, math.pi / 2.0))
+    assert limits[:3] == ((-2.8, 2.8), (0.0, 3.14), (0.0, 3.14))
+    assert limits[4:] == ((-1.57, 1.57), (-3.14, 3.14))
+
+
 def test_feedback_position_guard_records_out_of_limit_sample_without_dispatch() -> None:
     raw = (0.1, 0.2, 0.3, 2.448736388725043e24, 0.5, 0.6)
     rejection = probe.evaluate_feedback_position_guard(
@@ -523,10 +581,17 @@ def test_feedback_stability_probe_normalizes_only_admitted_j2_j3_boundary(tmp_pa
     assert result["status"] == "OK"
     boundary = result["feedback_boundary_normalization"]
     assert boundary["applied_sample_count"] == 3
-    assert boundary["applied_joint_counts"] == {"joint2": 3, "joint3": 3}
+    assert boundary["applied_joint_counts"] == {
+        "joint2": 3,
+        "joint3": 3,
+        "joint4": 0,
+    }
     assert boundary["intervals_rad"] == {
         "joint2": (-6.0e-3, 0.0),
         "joint3": (-3.0e-3, 0.0),
+        "joint4": pytest.approx(
+            (-math.pi / 2.0 - 1.0e-3, -math.pi / 2.0)
+        ),
     }
     assert result["samples"][0]["raw_qpos_rad"][1:3] == (-4.517e-3, -2.216e-3)
     assert result["samples"][0]["qpos_rad"][1:3] == (0.0, 0.0)
@@ -1058,7 +1123,7 @@ def _fault_hold_limits() -> tuple[tuple[float, float], ...]:
         (-2.8, 2.8),
         (0.0, 3.14),
         (0.0, 3.14),
-        (-1.57, 1.57),
+        (-math.pi / 2.0, math.pi / 2.0),
         (-1.57, 1.57),
         (-3.14, 3.14),
     )

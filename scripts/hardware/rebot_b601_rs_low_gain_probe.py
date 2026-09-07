@@ -63,9 +63,13 @@ only; they never construct a hardware backend.
 At feedback admission, the observed J2 zero-state boundary is represented with
 a calibrated ``[-6e-3, 0)`` rad projection to the URDF lower limit.  The latest
 zero-state and post-fault captures extend the same treatment to J3 with a
-calibrated ``[-3e-3, 0)`` compatibility window.  Raw values are retained in
-evidence records, while values below each joint's boundary and all outgoing
-references remain subject to the exact pinned-URDF limits.
+calibrated ``[-3e-3, 0)`` compatibility window.  J4's rounded ``-1.57/1.57``
+URDF entries are represented by the authoritative ``+/-pi/2`` nominal limits
+inside this probe, with a separate ``0.001`` rad lower-bound feedback window
+projected to ``-pi/2``.  Raw values are retained in evidence records.  Values
+beyond each joint's compatibility window remain fail-closed, and outgoing
+references are still bounded by the effective nominal limits without applying
+this feedback projection.
 
 After MIT mode setup and enable, the active path captures a fresh post-enable
 snapshot and immediately sends a bounded, all-six-joint software position lock
@@ -133,7 +137,7 @@ DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
 _FAULT_HOLD_JOINTS = _ALL_JOINTS
-_FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3")
+_FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3", "joint4")
 # J2 was observed at -4.943 mrad and -4.517 mrad in two independent
 # zero-state, read-only captures.  J3 was observed at -0.682 mrad in the latest
 # zero-state capture and -2.216 mrad after the gravity fault.  Keep small,
@@ -142,6 +146,22 @@ _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3")
 _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD = {
     "joint2": 6.0e-3,
     "joint3": 3.0e-3,
+    "joint4": 1.0e-3,
+}
+# The compatibility windows are immediately below each joint's nominal lower
+# boundary.  J2/J3 are zero-referenced joints; J4's nominal lower boundary is
+# the precise -pi/2 rating rather than the URDF's rounded -1.57 entry.
+_FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD = {
+    "joint2": 0.0,
+    "joint3": 0.0,
+    "joint4": -math.pi / 2.0,
+}
+# The source URDF stores J4 as +/-1.57 (rounded to two decimals), while the
+# vendor rating and commissioning documentation specify +/-90 degrees.  Keep
+# the source URDF immutable and use this precise nominal boundary only for the
+# probe's effective feedback/command-limit representation.
+_AUTHORITATIVE_POSITION_LIMIT_OVERRIDES_RAD = {
+    "joint4": (-math.pi / 2.0, math.pi / 2.0),
 }
 _NON_FAULT_HOLD_JOINTS: tuple[str, ...] = ()
 _DEFAULT_RATE_HZ = 20.0
@@ -418,14 +438,16 @@ def normalize_feedback_boundary_qpos(
     *,
     name: str = "feedback_qpos_rad",
 ) -> tuple[tuple[float, ...], tuple[str, ...]]:
-    """Normalize only the admitted J2/J3 encoder boundary observations.
+    """Normalize only the explicitly admitted encoder boundary observations.
 
-    RobStride ``mechPos`` may report a negative value immediately below the
-    zero lower limit after zeroing.  J2 uses the measured ``-6e-3 <= q < 0``
-    boundary and J3 uses the measured ``-3e-3 <= q < 0`` boundary.  Every
-    other joint and every more-negative value is returned unchanged so the
-    caller's existing exact URDF-limit check still rejects it.  The raw value
-    must be retained by callers that write an evidence record.
+    RobStride ``mechPos`` may report a value just below a physical/model lower
+    boundary after zeroing or at a rounded nominal limit.  J2 uses the measured
+    ``-6e-3 <= q < 0`` boundary, J3 uses ``-3e-3 <= q < 0``, and J4 uses a
+    separate ``0.001`` rad window immediately below its precise ``-pi/2``
+    nominal boundary.  Every other joint and every more-negative value is
+    returned unchanged so the caller's existing exact position-limit check
+    still rejects it.  The raw value must be retained by callers that write an
+    evidence record.
     """
 
     q = _six(qpos_rad, name=name)
@@ -434,8 +456,13 @@ def normalize_feedback_boundary_qpos(
     for index, joint_name in enumerate(_ALL_JOINTS):
         value = q[index]
         boundary = _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD.get(joint_name)
-        if boundary is not None and -boundary <= value < 0.0:
-            normalized[index] = 0.0
+        reference = _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD.get(joint_name)
+        if (
+            boundary is not None
+            and reference is not None
+            and reference - boundary <= value < reference
+        ):
+            normalized[index] = reference
             normalized_joint_names.append(joint_name)
     return tuple(normalized), tuple(normalized_joint_names)
 
@@ -1306,9 +1333,18 @@ def _resolve_model_and_limits(
         raise LowGainProbeError(
             f"cannot resolve pinned B601-RS URDF limits: {exc}"
         ) from exc
-    limits = tuple(
+    limits_list = [
         (float(lo), float(hi)) for lo, hi in zip(lower, upper, strict=True)
-    )
+    ]
+    # The pinned source URDF rounds J4's +/-90-degree rating to +/-1.57.  Use
+    # the precise nominal boundary in this probe without modifying the source
+    # model; the feedback-admission layer below still supplies only the
+    # separately documented 0.001 rad measurement window.
+    for index, joint_name in enumerate(_ALL_JOINTS):
+        override = _AUTHORITATIVE_POSITION_LIMIT_OVERRIDES_RAD.get(joint_name)
+        if override is not None:
+            limits_list[index] = override
+    limits = tuple(limits_list)
     if len(limits) != 6 or any(
         not math.isfinite(lo) or not math.isfinite(hi) or lo >= hi
         for lo, hi in limits
@@ -1520,6 +1556,11 @@ def _run_feedback_stability_probe(
         "rebot_source_root": str(source_root),
         "urdf_path": str(model.urdf_path),
         "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+        "position_limits_rad": position_limits,
+        "position_limit_semantics": (
+            "pinned URDF limits with precise J4 +/-pi/2 nominal override; "
+            "feedback-only boundary windows are reported separately"
+        ),
         "transport": "motorbridge_wired_local",
         "joint_names": _ALL_JOINTS,
         "active_joint_names": (),
@@ -1551,9 +1592,14 @@ def _run_feedback_stability_probe(
             "joints": _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS,
             "intervals_rad": {
                 joint_name: (
-                    -_FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD[joint_name],
-                    0.0,
+                    _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD[joint_name]
+                    - _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD[joint_name],
+                    _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD[joint_name],
                 )
+                for joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
+            },
+            "projection_rad": {
+                joint_name: _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD[joint_name]
                 for joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
             },
             "interval_semantics": "inclusive_lower_exclusive_upper",
@@ -1588,7 +1634,7 @@ def _run_feedback_stability_probe(
             "This mode only requests vendor feedback and reads mechPos; it never changes mode, enables, disables, or sends MIT/POS_VEL control frames.",
             "Run only after the operator has independently made the arm safe; this probe does not alter the existing enable state.",
             "The stationarity gate is diagnostic evidence for protective-hold review, not permission to relax the active safety threshold.",
-            "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; raw readings are retained per sample, and more-negative values remain outside the strict URDF limit.",
+            "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Raw readings are retained per sample, and values beyond each compatibility window remain outside the strict effective limit.",
             "MotorBridge 0.4.9 provides no source timestamp or sequence, so freshness remains unverified.",
         ],
     }
@@ -4605,6 +4651,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "rebot_source_root": str(source_root),
         "urdf_path": str(model.urdf_path),
         "urdf_sha256": hashlib.sha256(model.urdf_path.read_bytes()).hexdigest(),
+        "position_limits_rad": position_limits,
+        "position_limit_semantics": (
+            "pinned URDF limits with precise J4 +/-pi/2 nominal override; "
+            "feedback-only boundary windows are reported separately"
+        ),
         "transport": "motorbridge_wired_local",
         "joint_names": _ALL_JOINTS,
         "active_joint_names": active_joint_names,
@@ -4906,9 +4957,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "joints": _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS,
             "intervals_rad": {
                 joint_name: (
-                    -_FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD[joint_name],
-                    0.0,
+                    _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD[joint_name]
+                    - _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD[joint_name],
+                    _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD[joint_name],
                 )
+                for joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
+            },
+            "projection_rad": {
+                joint_name: _FEEDBACK_BOUNDARY_NORMALIZATION_REFERENCE_RAD[joint_name]
                 for joint_name in _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS
             },
             "interval_semantics": "inclusive_lower_exclusive_upper",
@@ -4938,7 +4994,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "While latched, a valid cycle updates gravity from current feedback; RX, numeric, motion-monitor, or model failure keeps sending cached gravity with zero Kp and configured motor-local damping while feedback recovery is retried.",
             "A complete six-joint MIT command is retried once; only failure of both live and cached complete-frame dispatch, absence of any verified cache, or an explicit second stop request permits full safe_stop.",
             "Protective hold has software Kp=0 and one derivative owner per joint: explicit driver Kd suppresses the default software damping for that joint; no two damping terms are stacked.",
-            "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
+            "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; J4 readings in [-pi/2-1e-3, -pi/2) rad are represented as -pi/2. Raw active samples are retained, and values beyond each compatibility window remain outside the strict effective limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
             "After enable, the active path captures a fresh q0 and immediately sends an all-six-joint bounded software position lock at q0; lock frames continue during the four-sample arming-settle gate.",

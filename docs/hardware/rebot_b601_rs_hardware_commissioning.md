@@ -48,7 +48,7 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   保持锁存，`close()` 拒绝释放 backend，避免把不确定的设备上报状态隐藏在析构中；
 - 低增益 probe 的所有正常阻抗/重力模式都固定使用 joint1..joint6；`--joint` 只决定
   slow-step 目标或单关节增益覆盖，不缩小使能和 MIT dispatch 集合。异常路径只有在
-  last-safe 快照通过新鲜度、限位、速度和小 rebase 检查后才锁存 J2/J3，否则直接全部
+  last-safe 快照通过新鲜度、限位、速度和小 rebase 检查后才锁存六个 arm 关节，否则直接全部
   arm `safe_stop`。这个保护保持不包含 ID7 夹爪；
 - 任何 motion-capable caller 都必须先从同一 pinned URDF 提供六关节 position limits；本轮
   位置频率 probe 会在 enable 前从 `--rebot-source-root`（默认由 config 路径推导）解析并
@@ -80,10 +80,12 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   不允许据此直接放宽保护阈值。
 - 反馈进入限位/速度/阻抗计算前，J2 的已标定边界
   `-6e-3 <= q < 0 rad`、J3 的已观测边界 `-3e-3 <= q < 0 rad` 会被表示为合法的
-  `0 rad`。这是反馈状态的有界投影，不修改 pinned URDF 的 `[0, 3.14]` 位置限位，
-  也不改变出站参考、torque/slew 包络或更负值的 fail-closed 行为；J1/J4/J5/J6
-  不执行该投影。JSON 样本同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
-  `boundary_normalized_joint_names`，便于复核实际读数。
+  `0 rad`。J4 的运行坐标额定边界按权威 `+/-pi/2` 表示（源 URDF 的
+  `-1.57/1.57` 仅是两位小数的记录），并额外接纳
+  `-pi/2-0.001 <= q < -pi/2 rad`，投影到精确的 `-pi/2`。这些都是反馈状态的
+  有界投影，不修改源 URDF 或真实机械硬限位；反馈窗口本身不改变出站参考或
+  torque/slew 包络。超过各自窗口的读数仍 fail-closed。JSON 样本同时保留 `raw_qpos_rad`、归一化后的
+  `qpos_rad` 和 `boundary_normalized_joint_names`，便于复核实际读数。
 - active low-gain probe 用相邻 normalized q 与精确 host receive `dt` 计算 qvel，再用连续
   qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0`、非有限值、
   qvel 或 qacc 越限都在任何 MIT dispatch 前拒绝。JSON 的 `motion_guard.rejected_sample`
@@ -641,7 +643,7 @@ printf '%s\n' 'shell remains active'
 运动中止阈值、但高于更严格的 `--fault-hold-max-velocity-rad-s` 时，该帧不会替换
 `last_safe`，但也不会单独中止正常 hold。JSON 的 `fault_hold_candidate_admission` 会记录
 拒绝次数与最后原因。若随后发生真实故障，保护保持仍会重新验证当前帧、旧 `last_safe`
-的年龄和 J2/J3 rebase；任一条件不满足仍立即执行六关节 `safe_stop`，不得通过提高故障
+的年龄和反馈边界 rebase；任一条件不满足仍立即执行六关节 `safe_stop`，不得通过提高故障
 保持速度阈值绕过。
 `--acceleration-abort-rad-s2` 又是独立于 qvel 和 fault-hold stationarity 的第三层；不得因
 放宽正常人工推动的 qvel 阈值而同步放宽 qacc 或 `0.02 rad/s` 的保护保持静止门。首次恢复
