@@ -251,6 +251,7 @@ def _command() -> TeleopCommand:
 
 def test_rm65_ports_read_only_authoritative_dual_hardware_qpos() -> None:
     ports, _, target_builder = _ports()
+    assert ports.arm_state_reader.compute_tcp_pose is False
     ports.start()
 
     cut = ports.observe()
@@ -341,6 +342,53 @@ def test_rm65_ports_avoid_serial_read_induced_staleness() -> None:
 
     assert cut.available_at - cut.measured_at < 0.05
     assert cut.observation.metadata["hardware_measurement_span_sec"] < 0.05
+
+
+def test_rm65_ports_qpos_sampler_excludes_slow_backend_fk() -> None:
+    ports, backends, _ = _ports(max_measurement_age_sec=0.2)
+    ports.start()
+    ports.clock = time.time
+    ports.arm_state_reader.clock = time.time
+    derived_state_calls = {"left": 0, "right": 0}
+
+    for side, backend in backends.items():
+        original_get_state = backend.get_state
+
+        def get_state(
+            *,
+            include_derived_pose=True,
+            include_timing_percentiles=True,
+            include_pose_source_attestation=None,
+            selected_side=side,
+            selected_get_state=original_get_state,
+        ):
+            if include_derived_pose:
+                derived_state_calls[selected_side] += 1
+                time.sleep(0.12)
+            return selected_get_state()
+
+        def refresh_state_from_hardware(
+            *,
+            include_derived_pose=True,
+            include_timing_percentiles=True,
+            include_pose_source_attestation=None,
+            selected_backend=backend,
+            selected_get_state=get_state,
+        ):
+            selected_backend.measured_at = time.time()
+            return selected_get_state(
+                include_derived_pose=include_derived_pose,
+                include_timing_percentiles=include_timing_percentiles,
+                include_pose_source_attestation=include_pose_source_attestation,
+            )
+
+        backend.get_state = get_state
+        backend.refresh_state_from_hardware = refresh_state_from_hardware
+
+    cut = ports.observe()
+
+    assert cut.available_at - cut.measured_at < 0.05
+    assert derived_state_calls == {"left": 0, "right": 0}
 
 
 def test_background_sampler_keeps_control_observe_nonblocking_during_read() -> None:

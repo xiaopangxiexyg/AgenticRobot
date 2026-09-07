@@ -641,6 +641,60 @@ def test_newer_owner_cut_combines_with_still_fresh_deduplicated_measurement() ->
     assert snapshot.measurement_freshness_ms == 10
 
 
+def test_newer_owner_cut_does_not_revive_a_stale_measurement() -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:stale-deduplicated",),
+    )
+    clock.value += (
+        bundle.convergence_profile.max_measurement_age_ms / 1_000.0
+    ) + 0.001
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(
+            bundle,
+            captured_at=clock(),
+        ),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+
+    with pytest.raises(RuntimeError, match="measured TCP-pose cut is stale"):
+        gateway.observation_producer.capture_snapshot(
+            active_operation_id=None,
+        )
+
+
+def test_future_owner_cut_remains_rejected() -> None:
+    bundle, port, _ = _runtime_fixture()
+    clock = _Clock()
+    port.publish_measured_pose(
+        pose_world_by_component={COMPONENT_ID: np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:future-owner",),
+    )
+    gateway = assemble_real_agent_primitive_gateway_session(
+        contract_bundle=bundle,
+        port=port,
+        owner_state_provider=lambda: _owner_state(
+            bundle,
+            captured_at=clock() + 0.001,
+        ),
+        allowed_client_ids=(CLIENT_ID,),
+        clock=clock,
+    )
+
+    with pytest.raises(RuntimeError, match="inputs are not yet available"):
+        gateway.observation_producer.capture_snapshot(
+            active_operation_id=None,
+        )
+
 @pytest.mark.parametrize(("skill_id", "direction"), PRIMITIVE_CASES)
 def test_real_gateway_executes_each_reviewed_primitive_through_grant_and_hold(
     skill_id: str,

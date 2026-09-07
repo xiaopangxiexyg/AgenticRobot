@@ -191,7 +191,11 @@ class ExclusiveRM65SkillDeployPorts:
         self.arm_state_reader = ArmStateReader(
             backends,
             refresh_hz=self.profile.state_refresh_hz,
-            compute_tcp_pose=True,
+            # The control owner needs authoritative qpos only. Coupled FK is
+            # performed after a new source sequence is consumed; computing
+            # backend TCP poses here would age the hardware cut before the
+            # freshness gate can inspect it.
+            compute_tcp_pose=False,
             clock=clock,
         )
         self._sync_lock = threading.Lock()

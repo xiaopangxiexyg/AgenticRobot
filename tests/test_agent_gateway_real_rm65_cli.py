@@ -458,13 +458,24 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     motion_port = SimpleNamespace(
         snapshot=lambda: SimpleNamespace(dispatch_count=0),
     )
-    passive_executor = SimpleNamespace(
+    camera_executor = SimpleNamespace(
         failure_diagnostics=(
             {
                 "executor_id": "camera-reader:test",
                 "operation_id": "operation:rgb:test",
                 "exception_type": "RuntimeError",
                 "message": "rgb_capture_inter_camera_skew_exceeded",
+                "failed_at": 10.25,
+            },
+        )
+    )
+    point_grasp_executor = SimpleNamespace(
+        failure_diagnostics=(
+            {
+                "executor_id": "point-grasp-planner:test",
+                "operation_id": "operation:point-grasp:test",
+                "exception_type": "RuntimeError",
+                "message": "point-grasp inference failed",
                 "failed_at": 10.25,
             },
         )
@@ -511,7 +522,9 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             gateway_session=SimpleNamespace(
                 contract_bundle=SimpleNamespace(route_manifest=manifest),
                 executors_by_skill_id={
-                    "perception.capture_rgb": passive_executor,
+                    "motion.step_tcp_cardinal": SimpleNamespace(),
+                    "perception.capture_rgb": camera_executor,
+                    "perception.plan_point_grasp": point_grasp_executor,
                 },
             ),
             control_runtime=runtime,
@@ -570,6 +583,14 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             "operation_id": "operation:rgb:test",
             "exception_type": "RuntimeError",
             "message": "rgb_capture_inter_camera_skew_exceeded",
+            "failed_at": 10.25,
+        },
+        {
+            "skill_id": "perception.plan_point_grasp",
+            "executor_id": "point-grasp-planner:test",
+            "operation_id": "operation:point-grasp:test",
+            "exception_type": "RuntimeError",
+            "message": "point-grasp inference failed",
             "failed_at": 10.25,
         }
     ]
