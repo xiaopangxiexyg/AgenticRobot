@@ -9,18 +9,45 @@ GUI coordinator requires reviewing its ownership and side effects.
 
 from __future__ import annotations
 
+import argparse
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 import inspect
+import json
+from pathlib import Path
+import time
 
+import numpy as np
+
+from dataset_contracts.capture_modalities import CaptureModalityContract
+from dataset_contracts.gripper_force import GripperForceDatasetContract
+from dataset_interface.gripper_force import bind_gripper_force_contract
+from robot_motion.runtime import run_best_effort_cleanup
+
+from ..backends.grippers import DMTacGripperBackend
+from ..collection.camera_preview import CameraPreviewer
 from ..collection.episode_curation import EpisodeCurationSession
+from ..gui import collection_tasks as gui_collection_tasks
 from ..operator_ui_ports import (
     OperatorUiPort,
     RealTeleopInputBatchPrioritizer,
 )
+from ..sources.camera import RealSenseRGBSource
+from ..special_tasks.fix_arm import FixArmPoseSnapshotRecorder
+from .components import RealTeleopComponents
+from .dataset_layout import (
+    default_task_id_from_name as _default_task_id_from_name,
+    expand_cli_path as _expand_cli_path,
+)
+from .debug_timing import debug_timing_modules as _debug_timing_modules
+from .defaults import (
+    DEFAULT_INIT_ARM_QPOS_SPEED_SCALE,
+    DEFAULT_RUNTIME_HOME_FRESH_DATA_TIMEOUT_SEC,
+)
 from .foot_pad_controls import (
     FOOT_PAD_FIVE_PROGRESS_EVENTS,
     FOOT_PAD_TWO_PEDAL_STYLE_COUNTS,
+    FootPadSpecialArmInput,
     SPECIAL_ARM_CONTROL_MODE_FOOT_PAD,
     SPECIAL_ARM_CONTROL_MODE_MANUAL,
     persist_five_pedal_test_receipt,
@@ -42,61 +69,73 @@ from .progress_contracts import (
 )
 from .gripper_policy import (
     GripperForceRequestError,
+    clear_gripper_policy_cache as _clear_gripper_policy_cache,
     parse_gripper_force_request,
+    resolved_gripper_policies_by_side as _resolved_gripper_policies_by_side,
+    resolved_gripper_policy as _resolved_gripper_policy,
+)
+from .gripper_status import _build_gripper_status
+from .gui_special_arm_status import (
+    fix_arm_ui_state as _fix_arm_ui_state,
+    init_arm_ui_state as _init_arm_ui_state,
+)
+from .gui_vive_calibration import (
+    vive_calibration_profile_ui_state as _vive_calibration_profile_ui_state,
+)
+from .hand_runtime import (
+    _gripper_backend_for_side,
+    _gripper_gui_available,
+    _gripper_input_source_from_components,
+    _gripper_retargeter_for_side,
+    _hand_backend_for_side,
+    _hand_q6_source_from_components,
+    _has_q6_gripper_control,
+)
+from .movement import (
+    MOVEMENT_MULTIPLE_DEFAULT,
+    MOVEMENT_MULTIPLE_GUI_EVENTS,
+    MOVEMENT_MULTIPLE_GUI_MIN,
+    MOVEMENT_MULTIPLE_GUI_STEP,
+    apply_movement_multiple as _apply_movement_multiple,
+    movement_multiple_ui_state as _movement_multiple_ui_state,
+    movement_multiple_value as _movement_multiple_value,
 )
 from .plus_curation_runtime import RealTeleopPlusCurationRuntime
+from .q6_hold_gesture import (
+    Q6HoldRecalibrationGesture,
+    Q6HoldRecalibrationGestureConfig,
+)
+from .runtime_home import DEFAULT_RUNTIME_HOME_START_DELAY_SEC
+from .side_mapping import (
+    tracker_source_side_for_logical_side as _tracker_source_side_for_logical_side,
+)
+from .special_arm_runtime import (
+    MAX_INIT_ARM_QPOS_SPEED_SCALE,
+    MIN_INIT_ARM_QPOS_SPEED_SCALE,
+    _init_arm_qpos_speed_scale_for_side,
+    _release_gui_qpos_init_transit,
+)
+from .status_payloads import (
+    _build_camera_status,
+    _build_ik_warning_payload,
+    _build_pose_quality_display_payload,
+    _build_tactile_camera_status,
+    _with_expected_wrist_depth_camera_statuses,
+)
+from .terminal_input import TerminalClutchInput
 from .tracker_side_check import evaluate_tracker_side_assignment
-from .defaults import DEFAULT_RUNTIME_HOME_FRESH_DATA_TIMEOUT_SEC
+from .wrist_depth_freshness import WristDepthFreshnessMonitor
 
 
 _SUPPORT_NAMES = (
-    "CameraPreviewer",
-    "CaptureModalityContract",
-    "DEFAULT_INIT_ARM_QPOS_SPEED_SCALE",
-    "DEFAULT_RUNTIME_HOME_START_DELAY_SEC",
-    "DMTacGripperBackend",
-    "GripperForceDatasetContract",
     "EPISODE_GUI_EVENTS",
-    "FixArmPoseSnapshotRecorder",
-    "FootPadSpecialArmInput",
     "GuiControlEvents",
     "GuiControlState",
-    "MOVEMENT_MULTIPLE_DEFAULT",
-    "MOVEMENT_MULTIPLE_GUI_EVENTS",
-    "MOVEMENT_MULTIPLE_GUI_MIN",
-    "MOVEMENT_MULTIPLE_GUI_STEP",
-    "MAX_INIT_ARM_QPOS_SPEED_SCALE",
-    "Mapping",
-    "MIN_INIT_ARM_QPOS_SPEED_SCALE",
     "POSE_SNAPSHOT_GUI_EVENT",
-    "Q6HoldRecalibrationGesture",
-    "Q6HoldRecalibrationGestureConfig",
-    "RealSenseRGBSource",
-    "RealTeleopComponents",
-    "SPECIAL_ARM_CONTROL_MODE_FOOT_PAD",
-    "SPECIAL_ARM_CONTROL_MODE_MANUAL",
-    "Sequence",
-    "TerminalClutchInput",
     "VIVE_CALIBRATION_GUI_EVENTS",
-    "WristDepthFreshnessMonitor",
-    "_apply_movement_multiple",
     "_apply_vive_tracker_mapping",
-    "_build_camera_status",
-    "_build_gripper_status",
-    "_build_ik_warning_payload",
-    "_build_pose_quality_display_payload",
-    "_build_tactile_camera_status",
     "_calibrate_gui_vive_coordinate_profile",
-    "_clear_gripper_policy_cache",
     "_collection_task_ui_state",
-    "_debug_timing_modules",
-    "_default_task_id_from_name",
-    "_expand_cli_path",
-    "_fix_arm_ui_state",
-    "_gripper_backend_for_side",
-    "_gripper_gui_available",
-    "_gripper_input_source_from_components",
-    "_gripper_retargeter_for_side",
     "_gui_collection_task_controls",
     "_gui_current_active_controls",
     "_gui_episode_busy",
@@ -113,39 +152,18 @@ _SUPPORT_NAMES = (
     "_gui_teleop_controls",
     "_gui_visualization_controls",
     "_gui_vive_calibration_controls",
-    "_hand_backend_for_side",
-    "_hand_q6_source_from_components",
-    "_has_q6_gripper_control",
-    "_init_arm_ui_state",
-    "_init_arm_qpos_speed_scale_for_side",
     "_load_gui_vive_calibration_profile",
     "_log",
-    "_movement_multiple_ui_state",
-    "_movement_multiple_value",
     "_publish_raw_tracker_pose_state",
     "_refresh_formal_dataset_layout",
-    "_release_gui_qpos_init_transit",
-    "_resolved_gripper_policies_by_side",
-    "_resolved_gripper_policy",
     "_save_gui_vive_calibration_profile",
     "_start_gui_qpos_init",
     "_task_definition_for_key",
     "_toggle_collection_round_trip_phase",
-    "_tracker_source_side_for_logical_side",
-    "_vive_calibration_profile_ui_state",
     "_vive_pose_source_from_components",
-    "_with_expected_wrist_depth_camera_statuses",
-    "argparse",
     "bind_capture_modality_contract",
-    "bind_gripper_force_contract",
     "build_real_teleop_progress_application",
-    "gui_collection_tasks",
-    "json",
-    "np",
-    "Path",
     "prioritize_input_batch",
-    "run_best_effort_cleanup",
-    "time",
 )
 
 
