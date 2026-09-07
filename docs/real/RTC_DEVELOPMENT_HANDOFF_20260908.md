@@ -30,13 +30,14 @@
 | 当前独立 worktree | /home/zc/HandMotion/Developing/temp/worktrees/codex-rtc-strict-latency-gate-20260907 |
 | 候选基线 | c35e903178805cc05c64f7624e43852b64a34a3a |
 | 代码候选（文档提交前） | bc041c0d1b05cca98150d376d43e93e1ace309de |
-| 主线 development（本轮未修改） | 4743d20a97fa07acc47d4217c39be4040c22b62e |
+| 主线 development（共享 ref，非本轮修改） | 3fa54d58b2b21aa0bcdb53c4f76afb2288003c55（此前只读快照为 4743d20…；接手前必须重查） |
 | worktree 状态 | 文档开始前干净且 ready-for-integration；新增本文档期间为 active/dirty，验证后重新固定最终 tip |
 | Harness | 不调用、不修改、不激活、不 promotion、不集成 |
 | 远端/训练/服务/真机 | 本轮均未执行 |
 
-文档提交会改变候选 tip。因此，接收者必须以文档提交后的完整 Git SHA 和分支 description
-为准，不能继续使用上表“文档提交前”的 SHA 作为最终集成输入。
+文档提交会改变候选 tip；共享仓库的 development ref 也可能由其他工作区移动。因此，接收者
+必须以交接时重新读取的完整 Git SHA、目标线 SHA 和分支 description 为准，不能继续使用上表
+“文档提交前”的 SHA 或旧 development 快照作为最终集成输入。
 
 ## 1. 用户要求与任务边界
 
