@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -194,6 +195,9 @@ def _ports(
     force_guard_close_failures: int = 0,
     backend_close_failures: dict[str, int] | None = None,
     backend_hold_failures: dict[str, int] | None = None,
+    background_measurement_sampling: bool = False,
+    state_refresh_hz: float = 30.0,
+    max_measurement_age_sec: float = 0.2,
 ):
     now = time.time()
     events: list[str] = []
@@ -219,8 +223,9 @@ def _ports(
         target_builder=target_builder,
         position_force_guard=force_guard,
         profile=ExclusiveRM65SkillPortProfile(
-            state_refresh_hz=30.0,
-            max_measurement_age_sec=0.2,
+            state_refresh_hz=state_refresh_hz,
+            max_measurement_age_sec=max_measurement_age_sec,
+            background_measurement_sampling=background_measurement_sampling,
         ),
         clock=lambda: now,
     )
@@ -336,6 +341,87 @@ def test_rm65_ports_avoid_serial_read_induced_staleness() -> None:
 
     assert cut.available_at - cut.measured_at < 0.05
     assert cut.observation.metadata["hardware_measurement_span_sec"] < 0.05
+
+
+def test_background_sampler_keeps_control_observe_nonblocking_during_read() -> None:
+    ports, _, _ = _ports(
+        background_measurement_sampling=True,
+        state_refresh_hz=100.0,
+    )
+    ports.clock = time.time
+    ports.arm_state_reader.clock = time.time
+    ports.start()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingReader:
+        def snapshot(
+            self,
+            _now: float,
+            *,
+            cut_after_refresh: bool,
+            concurrent_refresh_sides: tuple[str, ...] = (),
+        ):
+            assert cut_after_refresh is True
+            assert concurrent_refresh_sides == ("left", "right")
+            entered.set()
+            assert release.wait(timeout=1.0)
+            measured_at = time.time()
+            return {
+                side: {
+                    "hardware_qpos": np.full(
+                        6, 0.1 if side == "left" else 0.2
+                    ),
+                    "hardware_measurement_timestamp": measured_at,
+                    "hardware_measurement_sequence": (
+                        14 if side == "left" else 15
+                    ),
+                    "hardware_measurement_valid": True,
+                    "hardware_read_success": True,
+                }
+                for side in ("left", "right")
+            }
+
+    ports.arm_state_reader = _BlockingReader()
+    assert entered.wait(timeout=1.0)
+
+    started = time.monotonic()
+    cut = ports.observe()
+    elapsed = time.monotonic() - started
+    release.set()
+    deadline = time.monotonic() + 1.0
+    while (
+        ports.measurement_sampler_snapshot()["sample_count"] < 2
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
+    ports.close()
+
+    assert elapsed < 0.03
+    assert dict(cut.source_sequence_by_side) == {"left": 4, "right": 5}
+
+
+def test_background_sampler_latches_real_measurement_stall() -> None:
+    ports, _, _ = _ports(
+        background_measurement_sampling=True,
+        state_refresh_hz=100.0,
+        max_measurement_age_sec=0.05,
+    )
+    ports.clock = time.time
+    ports.arm_state_reader.clock = time.time
+    ports.start()
+    deadline = time.monotonic() + 1.0
+    snapshot = ports.measurement_sampler_snapshot()
+    while snapshot["fault"] is None and time.monotonic() < deadline:
+        time.sleep(0.005)
+        snapshot = ports.measurement_sampler_snapshot()
+
+    with pytest.raises(RuntimeError, match="measurement sampler failed"):
+        ports.observe()
+    ports.close()
+
+    assert snapshot["fault"] is not None
+    assert "stale" in str(snapshot["fault"])
 
 
 def test_rm65_ports_use_checked_dispatch_and_lower_hold() -> None:

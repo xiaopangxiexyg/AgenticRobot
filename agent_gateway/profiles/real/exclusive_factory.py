@@ -196,6 +196,9 @@ def assemble_exclusive_real_agent_primitive_deployment(
         command_dispatch=command_dispatch,
         hold_controller=hold_controller,
         measured_qpos_observer=measured_qpos_observer,
+        max_measurement_age_sec=(
+            observation_attachment.max_measurement_age_ms / 1_000.0
+        ),
         clock=clock,
     )
     gateway = assemble_real_agent_primitive_gateway_session(

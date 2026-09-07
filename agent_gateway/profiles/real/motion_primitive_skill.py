@@ -160,14 +160,18 @@ class RealAgentPrimitiveSkillLifecycle:
         if operation.operation_id != self.operation.operation_id:
             raise ValueError("Real primitive operation changed.")
 
-    def _latest_measured(self, *, now: float):
+    def _latest_measured(self, *, now: float, wait_for_fresh: bool = False):
         cut = self.port.latest_measured_pose()
         if cut is None:
+            if wait_for_fresh:
+                return None
             raise RuntimeError("No lower measured TCP-pose cut is available.")
         if self.profile.component_id not in cut.pose_world_by_component:
             raise RuntimeError("Measured TCP-pose cut omits the selected component.")
         age_ms = max(0.0, (float(now) - cut.measured_at) * 1_000.0)
         if age_ms > self.contract_bundle.convergence_profile.max_measurement_age_ms:
+            if wait_for_fresh:
+                return None
             raise RuntimeError("Lower measured TCP-pose cut is stale.")
         return cut
 
@@ -515,13 +519,20 @@ class RealAgentPrimitiveSkillLifecycle:
                     reason_code="real_primitive_lower_not_active",
                     evidence_refs=evidence,
                 )
-            try:
-                cut = self._latest_measured(now=float(self.clock()))
-            except RuntimeError:
-                return self._failed_execution(
-                    reason_code="real_primitive_measurement_unavailable_or_stale",
-                    evidence_refs=evidence,
+            cut = self._latest_measured(
+                now=float(self.clock()),
+                wait_for_fresh=True,
+            )
+            if cut is None:
+                # A derived TCP cut can temporarily lag while the sole lower
+                # control owner finishes an expensive IK/collision cycle.  The
+                # lower measurement sampler/control loop owns the 200 ms source
+                # freshness fault and HOLD; this evaluator must not race it by
+                # terminating a healthy operation from an older derived cut.
+                self.sleep(
+                    self.contract_bundle.convergence_profile.poll_interval_sec
                 )
+                continue
             if cut.revision != last_revision:
                 latest_cut = cut
                 last_revision = cut.revision

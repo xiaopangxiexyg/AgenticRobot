@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -31,8 +32,10 @@ class _TargetBuilder:
             "left": np.zeros(6),
             "right": np.zeros(6),
         }
+        self.sync_count = 0
 
     def synchronize(self, qpos_by_side) -> None:
+        self.sync_count += 1
         self.qpos_by_side = {
             side: np.asarray(value, dtype=float).copy()
             for side, value in qpos_by_side.items()
@@ -230,6 +233,127 @@ def test_measured_qpos_projection_uses_post_synchronization_availability() -> No
     assert measured.available_at == 2.25
 
 
+def test_reused_hardware_source_sequence_does_not_publish_fake_measurements() -> None:
+    builder = _TargetBuilder()
+    port = _port(builder)
+    sequence = {"left": 4, "right": 5}
+
+    def cut() -> RealSkillMotionObservationCut:
+        return RealSkillMotionObservationCut(
+            observation=TeleopObservation(timestamp=2.0),
+            qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
+            measured_at=1.99,
+            available_at=2.0,
+            evidence_refs=(f"hardware-qpos-cut:{sequence}",),
+            source_sequence_by_side=sequence,
+        )
+
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=cut,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: RealSkillMotionDispatchReceipt(
+            succeeded=True,
+            evidence_refs=("unused-dispatch:sequence",),
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("unused-hold:sequence",),
+        ),
+    )
+    runtime.start()
+
+    runtime.step(now=2.0)
+    first = port.latest_measured_pose()
+    runtime.step(now=2.05)
+    duplicate = port.latest_measured_pose()
+    sequence["left"] += 1
+    sequence["right"] += 1
+    runtime.step(now=2.1)
+    advanced = port.latest_measured_pose()
+
+    assert first is not None
+    assert duplicate is first
+    assert advanced is not None and advanced.revision == first.revision + 1
+    assert builder.sync_count == 2
+
+
+def test_reference_computed_past_measurement_deadline_is_not_dispatched() -> None:
+    class _SlowFirstTargetBuilder(_TargetBuilder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.slow = True
+
+        def build_command_for_target_pair(self, target):
+            if self.slow:
+                self.slow = False
+                time.sleep(0.22)
+            return super().build_command_for_target_pair(target)
+
+    builder = _SlowFirstTargetBuilder()
+    port = _port(builder)
+    dispatched: list[TeleopCommand] = []
+    source_sequence = 1
+
+    def cut() -> RealSkillMotionObservationCut:
+        now = time.time()
+        return RealSkillMotionObservationCut(
+            observation=TeleopObservation(timestamp=now),
+            qpos_by_side={"left": np.zeros(6), "right": np.zeros(6)},
+            measured_at=now,
+            available_at=now,
+            evidence_refs=(f"hardware-qpos-cut:{source_sequence}",),
+            source_sequence_by_side={
+                "left": source_sequence,
+                "right": source_sequence,
+            },
+        )
+
+    runtime = ExclusiveRealSkillControlRuntime(
+        motion_port=port,
+        observation_provider=cut,
+        synchronize_target_builder=builder.synchronize,
+        command_admission=lambda command, observation, now: True,
+        command_dispatch=lambda command: (
+            dispatched.append(command)
+            or RealSkillMotionDispatchReceipt(
+                succeeded=True,
+                evidence_refs=("rm65-dispatch:fresh-only",),
+            )
+        ),
+        hold_controller=lambda reason: RealSkillMotionHoldReceipt(
+            succeeded=True,
+            evidence_refs=("rm65-hold:slow-ik",),
+        ),
+        clock=time.time,
+    )
+    runtime.start()
+    now = time.time()
+    port.submit_activation(
+        _activation(
+            suffix="slow-ik",
+            submitted_at=now,
+            expires_at=now + 10.0,
+        )
+    )
+
+    expired = runtime.step()
+    source_sequence += 1
+    fresh = runtime.step()
+
+    assert expired.command_present is True
+    assert expired.dispatch_attempted is False
+    assert expired.dispatch_succeeded is False
+    assert fresh.dispatch_succeeded is True
+    assert len(dispatched) == 1
+    timing = runtime.control_cycle_snapshot()
+    assert timing["cycle_count"] == 2
+    assert timing["expired_reference_skip_count"] == 1
+    assert timing["consecutive_expired_reference_skips"] == 0
+    assert timing["max_cycle_sec"] >= 0.2
+
+
 def test_confirmed_hold_reopens_only_for_a_new_pending_activation() -> None:
     builder = _TargetBuilder()
     port = _port(builder)
@@ -254,6 +378,7 @@ def test_confirmed_hold_reopens_only_for_a_new_pending_activation() -> None:
                 evidence_refs=(f"rm65-hold:{len(hold_reasons)}",),
             )
         ),
+        max_measurement_age_sec=10.0,
     )
     runtime.start()
     port.submit_activation(_activation(suffix="first"))

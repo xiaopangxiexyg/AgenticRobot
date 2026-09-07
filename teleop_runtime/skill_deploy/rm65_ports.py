@@ -81,6 +81,7 @@ class ExclusiveRM65SkillPortProfile:
 
     state_refresh_hz: float = 30.0
     max_measurement_age_sec: float = 0.2
+    background_measurement_sampling: bool = True
     dispatch_audit_mode: str = POSITION_REFERENCE_DISPATCH_AUDIT_POST
 
     def __post_init__(self) -> None:
@@ -96,6 +97,8 @@ class ExclusiveRM65SkillPortProfile:
                 f"{POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES}."
             )
         object.__setattr__(self, "dispatch_audit_mode", mode)
+        if not isinstance(self.background_measurement_sampling, bool):
+            raise TypeError("background_measurement_sampling must be a boolean.")
 
 
 def _bounded_backend_state(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -206,6 +209,12 @@ class ExclusiveRM65SkillDeployPorts:
         self._shutdown_hold_error: str | None = None
         self._terminal_close_error: str | None = None
         self._startup_hold_receipt: RealSkillMotionHoldReceipt | None = None
+        self._measurement_lock = threading.Lock()
+        self._measurement_stop = threading.Event()
+        self._measurement_thread: threading.Thread | None = None
+        self._latest_observation_cut: RealSkillMotionObservationCut | None = None
+        self._measurement_fault: str | None = None
+        self._measurement_sample_count = 0
 
     @property
     def resources_started(self) -> bool:
@@ -259,6 +268,10 @@ class ExclusiveRM65SkillDeployPorts:
                 self._force_guard_started = True
                 self.position_force_guard.start(arm_stale_watchdog=True)
                 self._require_force_guard_motion_ready()
+                with self._resource_lock:
+                    self._resources_started = True
+                if self.profile.background_measurement_sampling:
+                    self._start_measurement_sampler()
             except Exception as startup_exc:
                 with self._resource_lock:
                     self._resources_started = False
@@ -316,7 +329,11 @@ class ExclusiveRM65SkillDeployPorts:
         if self._shutdown_hold_error is not None:
             errors.append(self._shutdown_hold_error)
 
-        if self._force_guard_started:
+        measurement_sampler_stopped = self._stop_measurement_sampler()
+        if not measurement_sampler_stopped:
+            errors.append("measurement_sampler_join_timeout")
+
+        if measurement_sampler_stopped and self._force_guard_started:
             try:
                 self.position_force_guard.close()
             except Exception as exc:  # noqa: BLE001 - still close both arms.
@@ -324,7 +341,7 @@ class ExclusiveRM65SkillDeployPorts:
             else:
                 self._force_guard_started = False
 
-        for side in ("right", "left"):
+        for side in ("right", "left") if measurement_sampler_stopped else ():
             if side not in self._backend_close_pending:
                 continue
             try:
@@ -359,7 +376,138 @@ class ExclusiveRM65SkillDeployPorts:
                 "RM65 Skill position force guard is not motion-ready."
             )
 
+    def _start_measurement_sampler(self) -> None:
+        """Publish one initial cut, then keep one lower-owned sampler alive."""
+
+        initial = self._read_hardware_cut()
+        self._publish_measurement_sample(initial)
+        thread = threading.Thread(
+            target=self._run_measurement_sampler,
+            name="exclusive-rm65-measurement-sampler",
+            daemon=False,
+        )
+        self._measurement_thread = thread
+        thread.start()
+
+    def _run_measurement_sampler(self) -> None:
+        period = 1.0 / self.profile.state_refresh_hz
+        deadline = time.monotonic() + period
+        while not self._measurement_stop.wait(
+            max(0.0, deadline - time.monotonic())
+        ):
+            try:
+                cut = self._read_hardware_cut()
+                self._publish_measurement_sample(cut)
+            except Exception as exc:  # noqa: BLE001 - consumed fail-closed by owner.
+                with self._measurement_lock:
+                    self._measurement_fault = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                self._measurement_stop.set()
+                return
+            # Do not burst through missed deadlines after a slow SDK read.
+            deadline = time.monotonic() + period
+
+    def _publish_measurement_sample(
+        self,
+        cut: RealSkillMotionObservationCut,
+    ) -> None:
+        with self._measurement_lock:
+            previous = self._latest_observation_cut
+            current_sequences = dict(cut.source_sequence_by_side)
+            if previous is not None and current_sequences:
+                previous_sequences = dict(previous.source_sequence_by_side)
+                regressed = [
+                    side
+                    for side in ("left", "right")
+                    if current_sequences[side] < previous_sequences[side]
+                ]
+                if regressed:
+                    raise RuntimeError(
+                        "hardware measurement source sequence regressed for "
+                        + ",".join(regressed)
+                        + "."
+                    )
+                if current_sequences == previous_sequences:
+                    same_measurement = bool(
+                        cut.measured_at == previous.measured_at
+                        and all(
+                            np.array_equal(
+                                cut.qpos_by_side[side],
+                                previous.qpos_by_side[side],
+                            )
+                            for side in ("left", "right")
+                        )
+                    )
+                    if not same_measurement:
+                        raise RuntimeError(
+                            "hardware measurement changed without a new source "
+                            "sequence."
+                        )
+                    return
+            self._latest_observation_cut = cut
+            self._measurement_sample_count += 1
+
+    def _stop_measurement_sampler(self) -> bool:
+        self._measurement_stop.set()
+        thread = self._measurement_thread
+        if thread is None or thread is threading.current_thread():
+            return thread is None
+        thread.join(timeout=max(1.0, 4.0 / self.profile.state_refresh_hz))
+        return not thread.is_alive()
+
+    def measurement_sampler_snapshot(self) -> dict[str, object]:
+        """Return bounded timing/fault evidence without backend I/O."""
+
+        with self._measurement_lock:
+            cut = self._latest_observation_cut
+            fault = self._measurement_fault
+            count = self._measurement_sample_count
+        now = float(self.clock())
+        return {
+            "enabled": self.profile.background_measurement_sampling,
+            "thread_alive": bool(
+                self._measurement_thread is not None
+                and self._measurement_thread.is_alive()
+            ),
+            "sample_count": count,
+            "fault": fault,
+            "latest_measurement_age_sec": (
+                None if cut is None else max(0.0, now - cut.measured_at)
+            ),
+            "latest_available_age_sec": (
+                None if cut is None else max(0.0, now - cut.available_at)
+            ),
+            "source_sequence_by_side": (
+                {} if cut is None else dict(cut.source_sequence_by_side)
+            ),
+        }
+
     def observe(self) -> RealSkillMotionObservationCut:
+        """Consume the latest fresh cut; background mode performs no device I/O."""
+
+        if not self.profile.background_measurement_sampling:
+            return self._read_hardware_cut()
+        if not self.resources_started:
+            raise RuntimeError("exclusive RM65 Skill resources are not started.")
+        with self._measurement_lock:
+            cut = self._latest_observation_cut
+            fault = self._measurement_fault
+        if fault is not None:
+            raise RuntimeError("RM65 measurement sampler failed: " + fault)
+        if cut is None:
+            raise RuntimeError("RM65 measurement sampler has not published a cut.")
+        age_sec = max(0.0, float(self.clock()) - cut.measured_at)
+        if age_sec > self.profile.max_measurement_age_sec:
+            diagnostic = self.measurement_sampler_snapshot()
+            raise RuntimeError(
+                f"RM65 sampled hardware qpos cut is stale: {age_sec:.6f}s; "
+                "sampler_diagnostic="
+                + json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+            )
+        return cut
+
+    def _read_hardware_cut(self) -> RealSkillMotionObservationCut:
         """Read one fresh dual hardware cut; command/preview qpos is forbidden."""
 
         if not self.resources_started:
@@ -378,6 +526,7 @@ class ExclusiveRM65SkillDeployPorts:
         qpos_by_side: dict[str, np.ndarray] = {}
         measured_at_by_side: dict[str, float] = {}
         evidence_payload: dict[str, Any] = {}
+        source_sequence_by_side: dict[str, int] = {}
         for side in ("left", "right"):
             state = states.get(side)
             if not isinstance(state, Mapping):
@@ -456,6 +605,7 @@ class ExclusiveRM65SkillDeployPorts:
                 )
             qpos_by_side[side] = qpos.copy()
             measured_at_by_side[side] = measured_at
+            source_sequence_by_side[side] = sequence
             evidence_payload[side] = {
                 "measurement_timestamp": measured_at,
                 "measurement_sequence": sequence,
@@ -487,6 +637,7 @@ class ExclusiveRM65SkillDeployPorts:
             measured_at=min(measured_at_by_side.values()),
             available_at=available_at,
             evidence_refs=("rm65-hardware-qpos-cut:" + evidence_hash,),
+            source_sequence_by_side=source_sequence_by_side,
         )
 
     def synchronize_target_builder(

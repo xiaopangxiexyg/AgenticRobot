@@ -381,6 +381,7 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
 
     class _Application:
         state = gateway_cli.ExclusiveRealSkillApplicationState.CREATED
+        control_fault = None
 
         def serve_forever(self, *, ready_callback=None):
             assert ready_callback is not None
@@ -414,7 +415,23 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     motion_port = SimpleNamespace(
         snapshot=lambda: SimpleNamespace(dispatch_count=0),
     )
-    runtime = SimpleNamespace(motion_port=motion_port, last_hold_receipt=hold)
+    runtime = SimpleNamespace(
+        motion_port=motion_port,
+        last_hold_receipt=hold,
+        control_cycle_snapshot=lambda: {
+            "cycle_count": 9,
+            "latest_cycle_sec": 0.01,
+            "max_cycle_sec": 0.02,
+            "expired_reference_skip_count": 0,
+            "consecutive_expired_reference_skips": 0,
+            "latest_expired_measurement_age_sec": None,
+            "max_measurement_age_sec": 0.2,
+            "last_published_source_sequence_by_side": {
+                "left": 10,
+                "right": 11,
+            },
+        },
+    )
     socket_path = short_unix_socket_path_factory("real-cli")
     socket_path.parent.chmod(0o2750)
     composition = SimpleNamespace(
@@ -422,7 +439,20 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
         client_id="rpent.dexteleop",
         authorized_side="right",
         authorized_action="forward",
-        lower=SimpleNamespace(profile=resolved),
+        lower=SimpleNamespace(
+            profile=resolved,
+            ports=SimpleNamespace(
+                measurement_sampler_snapshot=lambda: {
+                    "enabled": True,
+                    "thread_alive": False,
+                    "sample_count": 7,
+                    "fault": None,
+                    "latest_measurement_age_sec": 0.01,
+                    "latest_available_age_sec": 0.005,
+                    "source_sequence_by_side": {"left": 10, "right": 11},
+                }
+            ),
+        ),
         deployment=SimpleNamespace(
             gateway_session=SimpleNamespace(
                 contract_bundle=SimpleNamespace(route_manifest=manifest)
@@ -473,6 +503,9 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     ]
     assert events[0]["authorization_scope"] == "persistent_session_matching_action"
     assert events[1]["lower_hold_proved"] is True
+    assert events[1]["control_fault"] is None
+    assert events[1]["measurement_sampler"]["sample_count"] == 7
+    assert events[1]["control_cycle"]["cycle_count"] == 9
     assert captured["lower"] is lower
     assert captured["authorized_side"] == "right"
     assert captured["authorized_action"] == "forward"

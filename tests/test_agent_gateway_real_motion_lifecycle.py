@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from agent_gateway.profiles.real.motion_gateway_session import (
+    assemble_real_agent_primitive_gateway_session,
+)
 from agent_gateway.profiles.real.motion_primitive_profiles import (
     build_real_agent_primitive_contract_bundle,
     real_agent_motion_route_ids_v1,
-)
-from agent_gateway.profiles.real.motion_gateway_session import (
-    assemble_real_agent_primitive_gateway_session,
 )
 from agent_gateway.profiles.real.motion_primitive_skill import (
     RealAgentPrimitiveSkillLifecycle,
@@ -359,6 +359,78 @@ def test_real_lifecycle_resolves_dispatches_converges_and_confirms_hold() -> Non
     assert port.snapshot().phase == RealAgentMotionPhase.HELD
     assert port.snapshot().dispatch_count >= 3
     assert len(owner.holds) == 1
+
+
+def test_real_lifecycle_waits_for_lower_owner_after_derived_cut_stalls() -> None:
+    bundle, port, builder = _runtime_fixture()
+    clock = _Clock()
+    owner = _OwnerSession()
+    request, operation, route, binding = _request_and_operation(bundle, clock=clock)
+    port.publish_measured_pose(
+        pose_world_by_component={"right_arm": np.eye(4, dtype=float)},
+        measured_at=clock(),
+        available_at=clock(),
+        source_evidence_refs=("real-hardware-cut:before-ik-stall",),
+    )
+    publish_sequence = 0
+
+    def lower_owner_sleep(duration: float) -> None:
+        nonlocal publish_sequence
+        clock.value += duration
+        snapshot = port.apply_owner_requests(session=owner, now=clock())
+        if snapshot.phase != RealAgentMotionPhase.ACTIVE:
+            return
+        command = port.command_for_observation(
+            TeleopObservation(timestamp=clock()),
+            clock(),
+        )
+        assert isinstance(command, TeleopCommand)
+        port.observe_session_step(command=command, command_dispatched=True)
+        assert builder.last_target is not None
+        publish_sequence += 1
+        port.publish_measured_pose(
+            pose_world_by_component={
+                "right_arm": builder.last_target.target_pose_by_side["right"],
+            },
+            measured_at=clock(),
+            available_at=clock(),
+            source_evidence_refs=(
+                f"real-hardware-cut:after-ik-stall:{publish_sequence}",
+            ),
+        )
+
+    lifecycle = RealAgentPrimitiveSkillLifecycle(
+        port=port,
+        contract_bundle=bundle,
+        route=route,
+        binding=binding,
+        profile=bundle.cardinal_profile,
+        request=request,
+        operation=operation,
+        clock=clock,
+        sleep=lower_owner_sleep,
+    )
+    activation = lifecycle.activate(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+    assert activation.succeeded is True
+
+    # Reproduce the original race: the evaluator observes the last derived
+    # pose after its 200 ms age, while the lower owner is about to publish the
+    # next physical cut.  This is a wait condition, not an evaluator-owned
+    # terminal failure.
+    clock.value += 0.25
+    completion = lifecycle.run(
+        request=request,
+        operation=operation,
+        cancel_requested=lambda: False,
+    )
+
+    assert completion.succeeded is True
+    assert completion.reason_code == "real_primitive_completed_after_lower_hold"
+    assert publish_sequence >= 3
 
 
 def test_absolute_tool_tcp_target_transforms_once_and_propagates_speed_scale() -> None:

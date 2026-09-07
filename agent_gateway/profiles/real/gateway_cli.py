@@ -325,12 +325,24 @@ def _stopped_payload(
 ) -> dict[str, Any]:
     snapshot = composition.deployment.control_runtime.motion_port.snapshot()
     hold = composition.deployment.control_runtime.last_hold_receipt
+    control_fault = composition.application.control_fault
     lower_hold_proved = bool(hold is not None and hold.succeeded)
     return {
         "event": "gateway_stopped",
         "application_state": composition.application.state.value,
         "motion_command_dispatched": snapshot.dispatch_count > 0,
         "dispatch_count": snapshot.dispatch_count,
+        "control_fault": (
+            None
+            if control_fault is None
+            else f"{type(control_fault).__name__}: {control_fault}"[:512]
+        ),
+        "measurement_sampler": (
+            composition.lower.ports.measurement_sampler_snapshot()
+        ),
+        "control_cycle": (
+            composition.deployment.control_runtime.control_cycle_snapshot()
+        ),
         "lower_hold_proved": lower_hold_proved,
         "lower_hold_evidence_refs": ([] if hold is None else list(hold.evidence_refs)),
         "safe_shutdown": lower_hold_proved,

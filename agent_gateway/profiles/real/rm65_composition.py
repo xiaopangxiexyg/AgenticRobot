@@ -422,8 +422,15 @@ def assemble_exclusive_rm65_agent_primitive_composition(
         {
             "source_binding_id": source_binding_id,
             "backend_inventory_hash": backend_inventory_hash,
-            "read_semantics": "cached_authoritative_dual_hardware_qpos",
+            "read_semantics": (
+                "independently_sampled_cached_authoritative_dual_hardware_qpos"
+                if lower.ports.profile.background_measurement_sampling
+                else "synchronous_authoritative_dual_hardware_qpos"
+            ),
             "state_refresh_hz": lower.ports.profile.state_refresh_hz,
+            "max_measurement_age_sec": (
+                lower.ports.profile.max_measurement_age_sec
+            ),
         },
         domain="dexteleop.real_skill.rm65_source_binding.v1",
     )
@@ -432,7 +439,11 @@ def assemble_exclusive_rm65_agent_primitive_composition(
             "source_binding_hash": source_binding_hash,
             "projection": "coupled_fk_to_tool_tcp_world",
             "component_ids": (f"{side}_arm",),
-            "pull_semantics": "gateway_request_or_skill_cycle",
+            "pull_semantics": (
+                "continuous_lower_sampling_plus_skill_cycle_consumption"
+                if lower.ports.profile.background_measurement_sampling
+                else "gateway_request_or_skill_cycle"
+            ),
         },
         domain="dexteleop.real_skill.rm65_observation_plan.v1",
     )

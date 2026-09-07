@@ -12,7 +12,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Protocol
@@ -84,6 +84,7 @@ class RealSkillMotionObservationCut:
     measured_at: float
     available_at: float
     evidence_refs: tuple[str, ...]
+    source_sequence_by_side: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.observation, TeleopObservation):
@@ -113,10 +114,27 @@ class RealSkillMotionObservationCut:
         )
         if not refs:
             raise ValueError("an observation cut requires lower evidence.")
+        source_sequences = dict(self.source_sequence_by_side)
+        if source_sequences and set(source_sequences) != {"left", "right"}:
+            raise ValueError(
+                "source_sequence_by_side must be empty or contain left and right."
+            )
+        normalized_sequences: dict[str, int] = {}
+        for side, value in source_sequences.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"source_sequence_by_side[{side!r}] must be a positive integer."
+                )
+            normalized_sequences[str(side)] = value
         object.__setattr__(self, "qpos_by_side", MappingProxyType(qpos))
         object.__setattr__(self, "measured_at", measured_at)
         object.__setattr__(self, "available_at", available_at)
         object.__setattr__(self, "evidence_refs", refs)
+        object.__setattr__(
+            self,
+            "source_sequence_by_side",
+            MappingProxyType(normalized_sequences),
+        )
 
 
 @dataclass(frozen=True)
@@ -192,6 +210,7 @@ class ExclusiveRealSkillControlRuntime:
         command_admission: Callable[[TeleopCommand, TeleopObservation, float], bool],
         command_dispatch: Callable[[TeleopCommand], RealSkillMotionDispatchReceipt],
         hold_controller: Callable[[str], RealSkillMotionHoldReceipt],
+        max_measurement_age_sec: float = 0.2,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not isinstance(motion_port, RealAgentMotionPort):
@@ -217,6 +236,12 @@ class ExclusiveRealSkillControlRuntime:
         self._command_admission = command_admission
         self._command_dispatch = command_dispatch
         self._hold_controller = hold_controller
+        self._max_measurement_age_sec = _finite(
+            max_measurement_age_sec,
+            field_name="max_measurement_age_sec",
+        )
+        if self._max_measurement_age_sec <= 0.0:
+            raise ValueError("max_measurement_age_sec must be positive.")
         self._clock = clock
         self._lock = threading.Lock()
         # Serialize an entire lower control cut against fail-closed/HOLD.  A
@@ -225,6 +250,13 @@ class ExclusiveRealSkillControlRuntime:
         self._cycle_lock = threading.Lock()
         self._lifecycle = RealSkillControlLifecycle.CREATED
         self._last_hold_receipt: RealSkillMotionHoldReceipt | None = None
+        self._last_published_source_sequence_by_side: dict[str, int] | None = None
+        self._control_cycle_count = 0
+        self._latest_control_cycle_sec = 0.0
+        self._max_control_cycle_sec = 0.0
+        self._expired_reference_skip_count = 0
+        self._consecutive_expired_reference_skips = 0
+        self._latest_expired_measurement_age_sec: float | None = None
 
     @property
     def lifecycle(self) -> RealSkillControlLifecycle:
@@ -235,6 +267,29 @@ class ExclusiveRealSkillControlRuntime:
     def last_hold_receipt(self) -> RealSkillMotionHoldReceipt | None:
         with self._lock:
             return self._last_hold_receipt
+
+    def control_cycle_snapshot(self) -> dict[str, object]:
+        """Return bounded control timing evidence without lower or device I/O."""
+
+        with self._lock:
+            return {
+                "cycle_count": self._control_cycle_count,
+                "latest_cycle_sec": self._latest_control_cycle_sec,
+                "max_cycle_sec": self._max_control_cycle_sec,
+                "expired_reference_skip_count": (
+                    self._expired_reference_skip_count
+                ),
+                "consecutive_expired_reference_skips": (
+                    self._consecutive_expired_reference_skips
+                ),
+                "latest_expired_measurement_age_sec": (
+                    self._latest_expired_measurement_age_sec
+                ),
+                "max_measurement_age_sec": self._max_measurement_age_sec,
+                "last_published_source_sequence_by_side": dict(
+                    self._last_published_source_sequence_by_side or {}
+                ),
+            }
 
     def start(self) -> str:
         with self._lock:
@@ -288,10 +343,28 @@ class ExclusiveRealSkillControlRuntime:
             return True
 
     def step(self, *, now: float | None = None) -> RealSkillControlStep:
-        with self._cycle_lock:
-            return self._step(now=now)
+        cycle_started = time.monotonic()
+        try:
+            with self._cycle_lock:
+                return self._step(now=now, cycle_started=cycle_started)
+        finally:
+            elapsed = max(0.0, time.monotonic() - cycle_started)
+            with self._lock:
+                self._control_cycle_count += 1
+                self._latest_control_cycle_sec = elapsed
+                self._max_control_cycle_sec = max(
+                    self._max_control_cycle_sec,
+                    elapsed,
+                )
 
-    def _step(self, *, now: float | None = None) -> RealSkillControlStep:
+    def _step(
+        self,
+        *,
+        now: float | None = None,
+        cycle_started: float | None = None,
+    ) -> RealSkillControlStep:
+        if cycle_started is None:
+            cycle_started = time.monotonic()
         current_time = _finite(
             self._clock() if now is None else now,
             field_name="now",
@@ -307,21 +380,40 @@ class ExclusiveRealSkillControlRuntime:
                 "observation_provider must return RealSkillMotionObservationCut."
             )
         control_cut_at = max(current_time, cut.available_at)
-        self._synchronize_target_builder(cut.qpos_by_side)
-        self.motion_port.publish_measured_qpos_pair(
-            qpos_by_side=cut.qpos_by_side,
-            measured_at=cut.measured_at,
-            # The source cut may already have been available before this
-            # cycle.  The derived TCP cut only becomes available to this
-            # control owner when the cycle consumes it.
-            available_at=control_cut_at,
-            source_evidence_refs=cut.evidence_refs,
-        )
-        if self._measured_qpos_observer is not None:
-            self._measured_qpos_observer(
-                cut,
-                derived_available_at=control_cut_at,
+        source_sequences = dict(cut.source_sequence_by_side)
+        publish_measurement = True
+        previous_sequences = self._last_published_source_sequence_by_side
+        if source_sequences and previous_sequences is not None:
+            regressed = [
+                side
+                for side in ("left", "right")
+                if source_sequences[side] < previous_sequences[side]
+            ]
+            if regressed:
+                raise RuntimeError(
+                    "lower measurement source sequence regressed for "
+                    + ",".join(regressed)
+                    + "."
+                )
+            publish_measurement = source_sequences != previous_sequences
+        if publish_measurement:
+            self._synchronize_target_builder(cut.qpos_by_side)
+            self.motion_port.publish_measured_qpos_pair(
+                qpos_by_side=cut.qpos_by_side,
+                measured_at=cut.measured_at,
+                # The source cut may already have been available before this
+                # cycle.  The derived TCP cut only becomes available to this
+                # control owner when the cycle consumes it.
+                available_at=control_cut_at,
+                source_evidence_refs=cut.evidence_refs,
             )
+            if source_sequences:
+                self._last_published_source_sequence_by_side = source_sequences
+            if self._measured_qpos_observer is not None:
+                self._measured_qpos_observer(
+                    cut,
+                    derived_available_at=control_cut_at,
+                )
         self._resume_confirmed_hold_for_pending_activation()
         snapshot = self.motion_port.apply_control_owner_requests(
             owner=self,
@@ -373,6 +465,33 @@ class ExclusiveRealSkillControlRuntime:
                 dispatch_succeeded=False,
                 dispatch_evidence_refs=(),
             )
+        dispatch_ready_at = control_cut_at + max(
+            0.0,
+            time.monotonic() - cycle_started,
+        )
+        measurement_age_sec = max(0.0, dispatch_ready_at - cut.measured_at)
+        if measurement_age_sec > self._max_measurement_age_sec:
+            # An expensive IK/collision cycle must never dispatch a reference
+            # built from a cut that expired while it was being computed.  The
+            # next cycle can consume a newer independently sampled cut.
+            self.motion_port.observe_session_step(
+                command=command,
+                command_dispatched=False,
+            )
+            with self._lock:
+                self._expired_reference_skip_count += 1
+                self._consecutive_expired_reference_skips += 1
+                self._latest_expired_measurement_age_sec = measurement_age_sec
+            return RealSkillControlStep(
+                lifecycle=self.lifecycle,
+                port_snapshot=self.motion_port.snapshot(),
+                command_present=True,
+                dispatch_attempted=False,
+                dispatch_succeeded=False,
+                dispatch_evidence_refs=(),
+            )
+        with self._lock:
+            self._consecutive_expired_reference_skips = 0
         receipt = self._command_dispatch(command)
         if not isinstance(receipt, RealSkillMotionDispatchReceipt):
             raise TypeError(
