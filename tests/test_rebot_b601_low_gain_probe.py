@@ -93,7 +93,7 @@ def test_startup_lock_profile_uses_per_joint_yaml_gains_and_final_bounds() -> No
     assert profile.metadata["gain_source"] == "rebotarm_rs_yaml.MIT"
 
 
-def test_protective_hold_uses_one_damping_owner_per_joint() -> None:
+def test_protective_hold_uses_zero_position_stiffness_and_one_damping_owner() -> None:
     startup = probe.build_startup_lock_profile(
         mit_kp_nm_per_rad=(50.0, 150.0, 150.0, 50.0, 50.0, 50.0),
         mit_kd_nm_s_per_rad=(3.0, 10.0, 10.0, 5.0, 4.0, 4.0),
@@ -107,14 +107,15 @@ def test_protective_hold_uses_one_damping_owner_per_joint() -> None:
         driver_kd_nm_s_per_rad=(0.0, 0.5, 0.5, 0.0, 0.0, 0.5),
     )
 
-    assert hold.position_kp_nm_per_rad == startup.position_kp_nm_per_rad
-    assert hold.damping_kd_nm_s_per_rad == (3.0, 0.0, 0.0, 5.0, 4.0, 0.0)
+    assert hold.position_kp_nm_per_rad == (0.0,) * 6
+    assert hold.damping_kd_nm_s_per_rad == (1.0, 0.0, 0.0, 1.0, 1.0, 0.0)
     assert hold.max_abs_torque_nm == startup.max_abs_torque_nm
     assert hold.max_torque_rate_nm_s == startup.max_torque_rate_nm_s
     assert hold.metadata["software_damping_disabled_where_driver_kd_nonzero"] is True
+    assert hold.metadata["position_stiffness_disabled"] is True
 
 
-def test_protective_hold_keeps_yaml_damping_without_driver_kd() -> None:
+def test_protective_hold_uses_default_damping_without_driver_kd() -> None:
     startup = probe.build_startup_lock_profile(
         mit_kp_nm_per_rad=(50.0,) * 6,
         mit_kd_nm_s_per_rad=(3.0,) * 6,
@@ -128,7 +129,27 @@ def test_protective_hold_keeps_yaml_damping_without_driver_kd() -> None:
         driver_kd_nm_s_per_rad=(0.0,) * 6,
     )
 
-    assert hold.damping_kd_nm_s_per_rad == startup.damping_kd_nm_s_per_rad
+    assert hold.damping_kd_nm_s_per_rad == (1.0,) * 6
+
+
+def test_protective_hold_default_damping_can_be_selected_for_drag_test() -> None:
+    startup = probe.build_startup_lock_profile(
+        mit_kp_nm_per_rad=(50.0,) * 6,
+        mit_kd_nm_s_per_rad=(3.0,) * 6,
+        torque_limits_nm=(2.0,) * 6,
+        torque_rise_time_sec=1.0,
+        velocity_limit_rad_s=1.0,
+    )
+
+    hold = probe.build_protective_hold_profile(
+        startup,
+        driver_kd_nm_s_per_rad=(0.0,) * 6,
+        default_damping_kd_nm_s_per_rad=1.4,
+    )
+
+    assert hold.position_kp_nm_per_rad == (0.0,) * 6
+    assert hold.damping_kd_nm_s_per_rad == (1.4,) * 6
+    assert hold.metadata["default_software_damping_kd_nm_s_per_rad"] == 1.4
 
 
 def test_startup_lock_blend_preserves_gravity_vector_and_handoffs_overlay() -> None:
@@ -938,6 +959,11 @@ def test_active_joint_resolution_always_uses_all_six_arm_joints() -> None:
     assert probe.resolve_active_joint_names() == tuple(probe._ALL_JOINTS)
 
 
+def test_protective_hold_uses_all_six_arm_joints_and_excludes_no_arm_joint() -> None:
+    assert probe._FAULT_HOLD_JOINTS == tuple(probe._ALL_JOINTS)
+    assert probe._NON_FAULT_HOLD_JOINTS == ()
+
+
 def test_hold_reference_uses_the_complete_settled_six_joint_snapshot() -> None:
     settled = (0.12, 0.34, 0.56, -0.21, 0.09, -0.45)
 
@@ -1117,15 +1143,113 @@ def test_fault_hold_snapshot_rejects_fault_position_without_velocity() -> None:
         )
 
 
-def test_protective_hold_feedback_rejects_drift_from_fixed_reference() -> None:
-    with pytest.raises(probe.LowGainProbeError, match="drift"):
+def test_protective_hold_feedback_allows_in_limit_manual_drag() -> None:
+    current = probe._validate_protective_hold_feedback(
+        (0.1, 0.76, 1.1, 0.0, -0.1, 0.2),
+        qvel_rad_s=(0.0, 0.4, 0.0, 0.0, 0.0, 0.0),
+        hold_qpos_rad=(0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
+        observed_age_sec=0.0,
+        position_limits_rad=_fault_hold_limits(),
+        max_velocity_rad_s=1.0,
+    )
+
+    assert current == (0.1, 0.76, 1.1, 0.0, -0.1, 0.2)
+
+
+def test_protective_hold_feedback_rejects_motion_above_hold_monitor_limit() -> None:
+    with pytest.raises(probe.LowGainProbeError, match="velocity abort"):
         probe._validate_protective_hold_feedback(
             (0.1, 0.76, 1.1, 0.0, -0.1, 0.2),
-            qvel_rad_s=(0.0,) * 6,
+            qvel_rad_s=(0.0, 1.01, 0.0, 0.0, 0.0, 0.0),
             hold_qpos_rad=(0.1, 0.7, 1.1, 0.0, -0.1, 0.2),
             observed_age_sec=0.0,
             position_limits_rad=_fault_hold_limits(),
+            max_velocity_rad_s=1.0,
         )
+
+
+def test_latched_protective_hold_references_current_pose_after_manual_drag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q0 = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    q1 = (0.1, 0.71, 1.1, 0.0, -0.1, 0.2)
+    command_qrefs: list[tuple[float, ...]] = []
+    measured_qvels: list[tuple[float, ...]] = []
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        *,
+        qpos_rad: tuple[float, ...],
+        measured_qvel_rad_s: tuple[float, ...],
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
+        command_qrefs.append(qpos_rad)
+        measured_qvels.append(measured_qvel_rad_s)
+        receipt = probe.B601CommandReceipt(
+            sequence=len(command_qrefs),
+            mode="mit",
+            frame_id="b601_rs/joint_mit_reference",
+            requested_at_sec=1.0,
+            completed_at_sec=1.0,
+            requested_joint_names=tuple(probe._ALL_JOINTS),
+            sent_joint_names=tuple(probe._ALL_JOINTS),
+            failed_joint_names=(),
+            errors=(),
+            accepted=True,
+        )
+        return receipt, (0.0,) * 6
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.poll_count = 0
+
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            assert request_feedback is True
+            self.poll_count += 1
+            q = q0 if self.poll_count < 2 else q1
+            return SimpleNamespace(
+                valid=True,
+                stale=False,
+                positions_rad=q,
+                fault_reason=None,
+            )
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            raise AssertionError(f"unexpected safe_stop for {joint_names}")
+
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        qpos_rad=q0,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q0,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=object(),
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=3,
+        operator_interrupt=True,
+        monitor_velocity_rad_s=1.0,
+    )
+
+    hold_count, _latest_tau, _first, non_hold, full, errors = result
+    assert hold_count == 3
+    assert command_qrefs[:2] == [q0, q0]
+    assert command_qrefs[2] == q1
+    assert measured_qvels[2][1] > 0.0
+    assert non_hold is None
+    assert full is None
+    assert errors == []
 
 
 def test_operator_interrupt_ignores_transient_fault_velocity_for_first_hold(
@@ -1215,12 +1339,12 @@ def test_operator_interrupt_ignores_transient_fault_velocity_for_first_hold(
     assert command_qrefs == [q, q]
     assert measured_qvels == [(0.0,) * 6, (0.0,) * 6]
     assert first_receipt is not None and first_receipt.accepted
-    assert non_hold_receipt is not None and non_hold_receipt.completed
+    assert non_hold_receipt is None
     assert full_receipt is None
     assert errors == []
 
 
-def test_latched_fault_hold_uses_explicit_startup_lock_profile(
+def test_latched_fault_hold_uses_explicit_protective_hold_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
@@ -1291,7 +1415,7 @@ def test_latched_fault_hold_uses_explicit_startup_lock_profile(
     hold_count, _latest_tau, _first, non_hold, full, errors = result
     assert hold_count == 1
     assert profiles == [startup_lock_profile]
-    assert non_hold is not None and non_hold.completed
+    assert non_hold is None
     assert full is None
     assert errors == []
 
@@ -1385,7 +1509,7 @@ def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
     assert command_qrefs == [current_q, current_q]
     assert measured_qvels == [current_qvel, (0.0,) * 6]
     assert first_receipt is not None and first_receipt.accepted
-    assert non_hold_receipt is not None and non_hold_receipt.completed
+    assert non_hold_receipt is None
     assert full_receipt is None
     assert errors == []
 
@@ -1476,7 +1600,7 @@ def test_latched_fault_hold_falls_back_to_full_disable_on_invalid_feedback(
     assert hold_count == 1
     assert command_qrefs == [q]
     assert first_receipt is not None and first_receipt.accepted
-    assert non_hold_receipt is not None and non_hold_receipt.completed
+    assert non_hold_receipt is None
     assert full_receipt is not None and full_receipt.completed
     assert any("feedback is not complete and valid" in error for error in errors)
 

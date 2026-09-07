@@ -344,62 +344,51 @@ slew，避免补偿空窗造成末端缓慢下坠。重力与临时关节锁保�
 的末端弹簧在 `HANDOFF` 中逐步成为位置恢复主体。启动阶段不依赖未受软件包络约束的
 vendor Kp；MIT 帧的 vendor Kp 保持为零。
 
-### 异常时的 protective hold（锁存，不是普通回零）
+### 异常时的 protective hold（全臂可拖动重力保持）
 
-这条路径借鉴 reBot 官方的故障处置边界：通信异常不尝试回零而立即失能；普通退出才
-允许平滑回零。我们的特殊需求是在满足更严格的 admission 条件时，把 `joint2`/`joint3`
-锁在故障前最后一个安全姿态，同时把 `joint1`/`joint4`/`joint5`/`joint6` 失能。
-夹爪 ID7 不在当前 backend 的注册范围内，不能把下面的“全臂失能”理解成夹爪也已失能。
+这条路径不是把某几个关节强制锁死，也不是回到预设姿态。第一次 Ctrl-C 或可处理的控制
+错误会让 `joint1..joint6` 继续保持 MIT 使能，在当前姿态持续计算完整六轴重力补偿，并叠加
+一档可拖动的移动阻尼；夹爪 ID7 不在当前 backend 注册范围内，因此不参与这条控制链。软件
+Kp 为零，不存在固定位置弹簧。现场人员可以在保持重力平衡的同时拖动整条机械臂。
 
 状态转换固定为：
 
 ```text
 ACTIVE
   ├─ 正常结束 ──> active-set 短暂保持 ──> 全部 arm safe_stop
-  ├─ Ctrl+C ──> PROTECTIVE_HOLD（优先 last_safe；过期时使用当前合法故障 q；只发 joint2/joint3）
-  ├─ 控制/位置错误且当前 q 完整合法 ──> PROTECTIVE_HOLD（当前故障 q；只发 joint2/joint3）
+  ├─ 第一次 Ctrl+C ──> PROTECTIVE_HOLD（joint1..joint6 重力+阻尼，允许拖动）
+  ├─ 控制/位置错误且当前 q 完整合法 ──> PROTECTIVE_HOLD（同一全臂控制）
   │                                      ├─ 再次 Ctrl-C/SIGUSR1 ──> 全部 arm safe_stop
-  │                                      └─ hold dispatch/反馈/漂移失败 ──> 全部 arm safe_stop
-  └─ 无法证明当前 q 完整、在限位内且速度可处理 ──> 全部 arm safe_stop
+  │                                      └─ 反馈/数值/发送失败 ──> 全部 arm safe_stop
+  └─ 无法证明当前 q 完整、在限位内且可处理 ──> 全部 arm safe_stop
 ```
 
 进入 `PROTECTIVE_HOLD` 前，程序必须同时证明：
 
 1. 对明确的运行中 operator Ctrl-C，优先使用六关节完整、有限、在 pinned URDF position
-   limits 内且未过期的 `last_safe_q`；若它已过期但当前故障帧完整合法，则使用当前故障
-   q。对普通控制/位置错误，直接使用该错误循环刚收到的完整故障快照，避免过期的
+   limits 内且未过期的 `last_safe_q`；若它已过期但当前故障帧完整合法，则使用当前故障 q。
+   对普通控制/位置错误，直接使用该错误循环刚收到的完整故障快照，避免过期的
    `last_safe_q` 把可处理的错误升级为全臂失能；
-2. 快照年龄是本进程单调时钟测得且不超过 `--fault-hold-max-age-sec`（默认
-   `0.15 s`）；MotorBridge 0.4.9 没有设备源时间戳，所以 JSON 仍明确标记
-   `freshness_verified=false`，不能把它宣传成 vendor freshness；
-3. Ctrl-C 入口的 `last_safe_q` 六关节有限差分速度均不超过
-   `--fault-hold-max-velocity-rad-s`（默认 `0.02 rad/s`）；普通控制/位置错误入口使用
-   当前故障帧，并要求其速度不超过本次运行的 `--velocity-abort-rad-s`。保持参考本身固定，
-   不把反馈速度写入 q-reference；
-4. 对普通控制/位置错误，故障快照必须在 limits 内、观测新鲜，且速度不超过本次运行的
-   `--velocity-abort-rad-s`；它直接成为 joint2/joint3 的首次保持参考。对明确的运行中
-   operator Ctrl-C，不把被中断循环的瞬时 q/dq 当作新的故障参考：首帧优先使用已通过上述
-   admission 的 `last_safe_q/last_safe_qvel`；仅当它过期而当前完整故障帧仍可处理时，才使用
-   当前故障 q。两种入口随后都先采集一帧失能过渡后的完整
-   位置基线，再按 `--fault-hold-max-velocity-rad-s`、漂移和反馈有效性门逐帧监视；后续
-   任何真实失效仍回退全臂 `safe_stop`；
-5. 只有通过上述检查后才会发送第一帧；发送的是固定故障/last-safe q、故障快照的受限
-   qvel（使用未过期 last-safe 时沿用 last-safe qvel），vendor `kp=0`，软件侧使用 pinned
-   YAML MIT Kp 作为临时位置锁，并继续经过软件 torque absolute limit 和 torque slew
-   limit。每个关节只保留一个阻尼所有者：若本次运行显式选择 driver Kd，保护保持对该关节
-   关闭 YAML 软件 Kd，并沿用同一 driver Kd 和已经回读的 `0x700B` 总力矩上限；未选择
-   driver Kd 的关节才保留 YAML 软件 Kd。q 绝不由
-   错误/陈旧样本补零，也不使用最后一次 command 代替最后一次合法状态。
+2. 首帧快照年龄按本进程单调时钟测量，并受 `--fault-hold-max-age-sec` 约束；MotorBridge
+   0.4.9 没有设备源时间戳，所以 JSON 仍明确标记 `freshness_verified=false`，不能宣传成
+   vendor freshness；
+3. 首帧 admission 仍使用 `--fault-hold-max-velocity-rad-s` 的静止候选门，普通故障入口
+   则使用本次运行的 `--velocity-abort-rad-s`。这只决定是否能安全进入保持，不限制进入保持
+   后的正常人工拖动；保持阶段按 `--velocity-abort-rad-s` 和 `--acceleration-abort-rad-s2`
+   监视真正不可处理的运动；
+4. 只有通过上述检查后才发送第一帧。发送集始终是完整 `joint1..joint6`，vendor `kp=0`。
+   protective-hold profile 的软件 Kp=0；未选择非零 driver Kd 时，软件使用
+   `--protective-hold-kd`（默认 `1.0 N·m·s/rad`）作为中等阻尼；显式选择 driver Kd 时，
+   该关节由 driver 单独负责阻尼，软件 Kd 自动为零。两条路径都继续经过现有软件绝对力矩和
+   slew 包络，以及已回读的 `0x700B` 总力矩上限（如有）；
+5. 保持循环每次读取完整反馈，检查有限性、URDF 位置限位、时间推进、运动监视和 MIT 发送
+   回执。当前反馈 q 成为下一帧参考并重新计算 `g(q)`；它不会与首次 q 比较，也不会触发
+   `max-rebase` 漂移失能。这样既能抑制重力下坠，又不会因为有意拖动而与操作者对抗。
 
-第一帧保持成功后，程序先对非保持 arm 关节发逐关节 `safe_stop`；该 receipt 不完整时
-立即回退到全部 arm `safe_stop`，不继续假设“部分失能”已经成立。之后每一个保持周期都会
-重新读取完整反馈：反馈不完整/失效、主机观测不再推进、任一关节超出 limits、有限差分速度
-超过阈值，或 joint2/joint3 偏离固定参考超过 `max-rebase`，都会停止继续发保持帧并回退到
-全部 arm `safe_stop`。通过监视时，固定参考是进入保持时选定的 `last_safe_q` 或当前故障 q；当前测量 q 只用于
-计算受限的重力/单一阻尼力矩，绝不用于更新参考。保持没有时间自动释放，也不会因为 EOF、普通
-cleanup 或 `close()` 释放；操作者必须在另一终端显式发送 `SIGUSR1`，并确认返回的
-`full_disable_receipt.completed=true`。如果没有可证明的新鲜安全 q，程序直接采用官方通信
-故障同类的“无回零立即失能”fallback。
+保持没有时间自动释放，也不会因为 EOF、普通 cleanup 或 `close()` 释放。操作者必须在另一
+终端显式发送 `SIGUSR1`，或在前台再次按 Ctrl-C，并确认返回的
+`full_disable_receipt.completed=true`。如果快照、反馈、数值或发送无法证明可处理，程序直接
+采用“全臂 safe_stop”fallback；这与正常人工拖动是两条不同的判定路径。
 
 释放命令示例（不会让交接 shell 退出）：
 

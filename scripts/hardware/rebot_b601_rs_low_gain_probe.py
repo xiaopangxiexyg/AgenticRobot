@@ -33,6 +33,15 @@ task-space wrench it owns before calling :meth:`B601RSBackend.send_mit`.
 Feedback uses the existing explicit ``mechPos`` request path; its source
 freshness remains unverified by MotorBridge 0.4.9 and is reported as such.
 
+When the operator presses Ctrl-C once, the probe enters a latched protective
+hold for all six arm joints (the gripper motor, joint7, is outside this
+backend).  This is deliberately not a position lock: software Kp is zero,
+gravity is recomputed from the current measured pose every cycle, and one
+moderate damping owner opposes motion.  The current feedback pose is used only
+as the next MIT reference so a human can drag the arm while gravity remains
+compensated.  A second Ctrl-C/SIGUSR1, or an actual feedback, numeric, or
+dispatch failure, requests the full six-joint safe stop.
+
 This module is motion-capable only after all of ``--allow-motion``,
 ``--auto-disable`` and the exact confirmation string are supplied.  The
 ``feedback-stability`` mode is a separate observation-only path: it uses the
@@ -109,7 +118,7 @@ FEEDBACK_STABILITY_CONFIRMATION = "B601_RS_FEEDBACK_STABILITY_READ_ONLY"
 DRIVER_TORQUE_LIMIT_CONFIRMATION = "B601_RS_DRIVER_TORQUE_LIMIT_ROUNDTRIP"
 _ZERO_SIX = (0.0,) * 6
 _ALL_JOINTS = B601_RS_ARM_JOINT_NAMES
-_FAULT_HOLD_JOINTS = ("joint2", "joint3")
+_FAULT_HOLD_JOINTS = _ALL_JOINTS
 _FEEDBACK_BOUNDARY_NORMALIZATION_JOINTS = ("joint2", "joint3")
 # J2 was observed at -4.943 mrad and -4.517 mrad in two independent
 # zero-state, read-only captures.  J3 was observed at -0.682 mrad in the latest
@@ -120,9 +129,7 @@ _FEEDBACK_BOUNDARY_NORMALIZATION_MAX_NEGATIVE_RAD = {
     "joint2": 6.0e-3,
     "joint3": 3.0e-3,
 }
-_NON_FAULT_HOLD_JOINTS = tuple(
-    name for name in _ALL_JOINTS if name not in _FAULT_HOLD_JOINTS
-)
+_NON_FAULT_HOLD_JOINTS: tuple[str, ...] = ()
 _DEFAULT_RATE_HZ = 20.0
 _DEFAULT_DURATION_SEC = 8.0
 _DEFAULT_WARMUP_SEC = 2.0
@@ -145,6 +152,7 @@ _DEFAULT_MAX_ERROR_RAD = 0.15
 _DEFAULT_FAULT_HOLD_MAX_AGE_SEC = 0.15
 _DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S = 0.02
 _DEFAULT_FAULT_HOLD_MAX_REBASE_RAD = 0.05
+_DEFAULT_PROTECTIVE_HOLD_DAMPING_KD = 1.0
 _DEFAULT_ARMING_SETTLE_SAMPLES = 4
 _DRIVE_ENABLE_COUNTDOWN_SECONDS = 3
 _OPERATOR_TTY_PATH = Path("/dev/tty")
@@ -318,10 +326,10 @@ def _validate_fault_hold_snapshot(
 ) -> tuple[float, ...]:
     """Admit only a fresh, stationary, in-limit snapshot for protective hold.
 
-    The returned tuple is the immutable q-reference for the joint2/joint3
-    latch.  A missing or invalid snapshot is never substituted with zeros or
-    with the most recent command.  ``observed_age_sec`` is measured by this
-    process's monotonic clock; it is deliberately not presented as vendor
+    The returned tuple is the initial six-joint snapshot admitted for a
+    protective hold.  A missing or invalid snapshot is never substituted with
+    zeros or with the most recent command.  ``observed_age_sec`` is measured by
+    this process's monotonic clock; it is deliberately not presented as vendor
     source freshness because MotorBridge 0.4.9 provides no source timestamp.
     """
 
@@ -510,8 +518,8 @@ def _evaluate_fault_hold_candidate(
 
     Candidate admission is deliberately separate from the normal control-loop
     velocity watchdog. A sample may remain legal for bounded control while
-    being unsuitable as a future joint2/joint3 fault-hold reference. In that
-    case the immutable last-safe reference is retained; the strict validator
+    being unsuitable as a future protective-hold admission reference. In that
+    case the immutable last-safe candidate is retained; the strict validator
     is still rerun if a protective hold is actually requested.
     """
 
@@ -803,37 +811,54 @@ def _validate_protective_hold_feedback(
 ) -> tuple[float, ...]:
     """Validate one complete feedback sample while the protective hold runs.
 
-    ``hold_qpos_rad`` is immutable: this helper never updates it.  Feedback
-    is used only as a measured state for damping and as a drift watchdog.  A
-    held joint that leaves the small admitted neighbourhood is escalated to
-    the caller's full-disable fallback rather than being silently rebased.
+    The first Ctrl-C snapshot is retained for admission evidence, but it is not
+    a fixed position target.  Every in-limit measured pose may become the next
+    gravity-compensation reference, which is what makes the hold draggable.
+    ``hold_qpos_rad`` and ``max_rebase_rad`` remain in the helper signature so
+    callers and older evidence readers can pass the original admission data;
+    they are deliberately not used as a drift watchdog.  A real feedback,
+    age, or velocity failure still escalates to the caller's full-disable
+    fallback.
     """
 
-    current = _validate_fault_hold_snapshot(
+    # Validate the initial reference shape for evidence compatibility, but do
+    # not compare subsequent positions against it: manual dragging is an
+    # intended protective-hold operation.
+    _six(hold_qpos_rad, name="protective_hold_qpos_rad")
+    _ = max_rebase_rad
+    current = _validate_in_limit_qpos(
         qpos_rad,
-        qvel_rad_s=qvel_rad_s,
-        observed_age_sec=observed_age_sec,
         position_limits_rad=position_limits_rad,
-        max_age_sec=max_age_sec,
-        max_velocity_rad_s=max_velocity_rad_s,
-        max_rebase_rad=max_rebase_rad,
+        name="protective_hold_feedback_qpos_rad",
     )
-    hold_q = _six(hold_qpos_rad, name="protective_hold_qpos_rad")
-    max_rebase = _bounded(
-        max_rebase_rad,
-        name="fault_hold_max_rebase_rad",
-        lower=0.001,
-        upper=0.5,
-        lower_inclusive=False,
+    if qvel_rad_s is None:
+        raise LowGainProbeError(
+            "protective hold requires a complete feedback velocity observation"
+        )
+    qvel = _six(qvel_rad_s, name="protective_hold_feedback_qvel_rad_s")
+    age = _finite(observed_age_sec, name="protective_hold_observed_age_sec")
+    max_age = _bounded(
+        max_age_sec,
+        name="fault_hold_max_age_sec",
+        lower=0.01,
+        upper=1.0,
     )
-    for joint in _FAULT_HOLD_JOINTS:
-        index = _ALL_JOINTS.index(joint)
-        delta = abs(current[index] - hold_q[index])
-        if delta > max_rebase:
-            raise LowGainProbeError(
-                f"protective hold drift for {joint} is too large: "
-                f"{delta:.6f} rad > {max_rebase:.6f} rad"
-            )
+    if age < 0.0 or age > max_age:
+        raise LowGainProbeError(
+            "protective hold feedback is stale: "
+            f"age={age:.6f}s > max={max_age:.6f}s"
+        )
+    velocity_limit = _positive(
+        max_velocity_rad_s,
+        name="protective_hold_velocity_limit_rad_s",
+    )
+    observed_max_velocity = max(abs(value) for value in qvel)
+    if observed_max_velocity > velocity_limit:
+        raise LowGainProbeError(
+            "protective hold velocity abort: "
+            f"max_abs_velocity={observed_max_velocity:.6f} rad/s > "
+            f"{velocity_limit:.6f} rad/s"
+        )
     return current
 
 
@@ -929,6 +954,14 @@ def _validate_cli(args: argparse.Namespace) -> None:
     _non_negative(args.freeze_sec, name="freeze_sec")
     _non_negative(args.kp, name="kp")
     _non_negative(args.kd, name="kd")
+    _non_negative(
+        getattr(
+            args,
+            "protective_hold_kd",
+            _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+        ),
+        name="protective_hold_kd",
+    )
     driver_kd = _non_negative(
         getattr(args, "driver_kd", 0.0),
         name="driver_kd",
@@ -1618,21 +1651,21 @@ def build_protective_hold_profile(
     startup_profile: B601MitControlProfile,
     *,
     driver_kd_nm_s_per_rad: Sequence[float],
+    default_damping_kd_nm_s_per_rad: float = _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
 ) -> B601MitControlProfile:
-    """Select one damping owner for the reduced protective hold.
+    """Build the draggable all-arm gravity/damping protective hold.
 
     The normal active controller may use either software damping or an
-    explicitly selected RobStride driver ``Kd``.  The temporary startup lock
-    is built from the YAML gains, but reusing its software ``Kd`` while a
-    non-zero driver ``Kd`` is active would apply two independent derivative
-    terms to the same measured motion.  That is especially visible in the
-    20-Hz protective-hold loop: a small manual displacement can produce a
-    large finite-difference velocity and an abrupt opposing torque.
+    explicitly selected RobStride driver ``Kd``.  Protective hold intentionally
+    removes the startup position lock (software ``Kp=0``) and keeps one
+    moderate damping owner while gravity is recomputed from each measured
+    pose.  This prevents the first Ctrl-C state from fighting an operator who
+    is trying to reposition the arm.
 
-    Keep the YAML position lock and all existing absolute/slew bounds.  For
-    each joint, the explicitly selected driver damping owns the derivative
-    term; joints without driver damping retain the YAML software damping.
-    No gain or numeric safety threshold is introduced here.
+    For each joint, explicitly selected driver damping owns the derivative
+    term; joints without driver damping use ``default_damping_kd`` in the
+    host-composed torque.  The startup profile still supplies the absolute and
+    slew bounds, so this helper introduces no additional safety threshold.
     """
 
     if not isinstance(startup_profile, B601MitControlProfile):
@@ -1641,25 +1674,29 @@ def build_protective_hold_profile(
         driver_kd_nm_s_per_rad,
         name="driver_kd_nm_s_per_rad",
     )
+    default_damping_kd = _non_negative(
+        default_damping_kd_nm_s_per_rad,
+        name="default_damping_kd_nm_s_per_rad",
+    )
     software_kd = tuple(
-        0.0 if driver_value > 0.0 else startup_value
-        for startup_value, driver_value in zip(
-            startup_profile.damping_kd_nm_s_per_rad,
-            driver_kd,
-            strict=True,
-        )
+        0.0 if driver_value > 0.0 else default_damping_kd
+        for driver_value in driver_kd
     )
     metadata = dict(startup_profile.metadata)
     metadata.update(
         {
-            "torque_owner": "software_position_gravity_plus_single_damping_owner",
+            "gain_source": "protective_hold_default_or_explicit_driver_kd",
+            "torque_owner": "software_gravity_plus_single_damping_owner",
             "software_damping_disabled_where_driver_kd_nonzero": True,
             "driver_kd_nm_s_per_rad": driver_kd,
+            "position_stiffness_disabled": True,
+            "default_software_damping_kd_nm_s_per_rad": default_damping_kd,
+            "reference_semantics": "current_feedback_pose_each_cycle",
         }
     )
     return B601MitControlProfile(
-        name="b601_rs_protective_hold_lock",
-        position_kp_nm_per_rad=startup_profile.position_kp_nm_per_rad,
+        name="b601_rs_protective_hold_gravity_damping",
+        position_kp_nm_per_rad=_ZERO_SIX,
         damping_kd_nm_s_per_rad=software_kd,
         max_abs_torque_nm=startup_profile.max_abs_torque_nm,
         max_torque_rate_nm_s=startup_profile.max_torque_rate_nm_s,
@@ -2396,7 +2433,13 @@ def _send_fault_hold_command(
     rate_hz: float,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
 ) -> tuple[B601CommandReceipt, tuple[float, ...]]:
-    """Send one bounded fixed-reference MIT frame to joint2 and joint3 only."""
+    """Send one bounded all-arm gravity/damping MIT frame.
+
+    ``qpos_rad`` is the current measured pose used as the next reference.  The
+    protective-hold profile has zero software Kp, so this reference does not
+    create a position lock; it keeps the complete MIT frame self-consistent
+    while the measured pose changes under manual dragging.
+    """
 
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     reference = build_reference(
@@ -2456,6 +2499,8 @@ def _run_latched_fault_hold(
     operator_interrupt: bool = False,
     fault_entry: bool = False,
     fault_entry_max_velocity_rad_s: float | None = None,
+    monitor_velocity_rad_s: float | None = None,
+    monitor_acceleration_rad_s2: float | None = None,
 ) -> tuple[
     int,
     tuple[float, ...],
@@ -2464,31 +2509,22 @@ def _run_latched_fault_hold(
     B601ModeReceipt | None,
     list[str],
 ]:
-    """Latch joint2/joint3 at a fresh, stationary, validated pose until SIGUSR1.
+    """Latch all six arm joints in a draggable gravity/damping hold.
 
-    The first hold frame is sent before the non-hold joints are disabled.  The
-    optional ``hold_profile`` supplies the software position/damping lock used
-    while the reduced joint set is latched; callers normally pass the
-    YAML-derived startup lock so a final runtime profile with ``kp=kd=0`` does
-    not leave the held joints with gravity feed-forward only.  For
-    an explicit operator Ctrl-C, that first frame normally comes from the
-    already validated ``last_safe`` snapshot; the interrupted loop's
-    instantaneous velocity is not used to reject it.  If that candidate has
-    expired while a complete current frame remains available, the current
-    fault-entry gate is used instead.  For a normal control/position fault, a
-    complete current fault snapshot is likewise used as the first fixed
-    reference, provided it is fresh, in limits, and below the configured
-    motion-abort velocity.  This prevents an otherwise valid position-error
-    fault from being converted into an immediate all-arm power loss merely
-    because the older stationary ``last_safe`` candidate has expired.  One
-    feedback sample after the non-hold disable establishes the monitoring
-    baseline, then every subsequent hold cycle validates a complete feedback
-    snapshot and the fixed-reference drift before computing measured-state
-    damping.  The loop has no time-based release: only the explicit SIGUSR1
-    handler may request safe_stop for all registered arm joints.  If a hold
-    frame, feedback sample, or initial reference is invalid, the fail-closed
-    fallback is an immediate all-arm safe_stop because a partial hold cannot be
-    claimed as safe.
+    The first hold frame normally comes from the already validated
+    ``last_safe`` snapshot; the interrupted loop's instantaneous velocity is
+    not used to reject it.  If that candidate has expired while a complete
+    current frame remains available, the current fault-entry gate is used
+    instead.  For a normal control/position fault, a complete current fault
+    snapshot is likewise used as the first reference, provided it is fresh, in
+    limits, and below the configured motion-abort velocity.  The profile passed
+    as ``hold_profile`` has software Kp=0 and one damping owner.  Each later
+    feedback sample becomes the next reference, and gravity is recomputed from
+    that pose, so an operator can drag the arm without a fixed-position fight.
+    A configured velocity/acceleration monitor still catches genuinely
+    unprocessable motion; invalid feedback or dispatch failure immediately
+    falls back to an all-arm safe stop.  The loop has no time-based release:
+    only the explicit SIGUSR1 handler or a second Ctrl-C requests that stop.
 
     max_iterations exists only for bounded offline tests; production calls
     leave it as None and therefore remain latched until release.
@@ -2497,6 +2533,20 @@ def _run_latched_fault_hold(
     errors: list[str] = []
     latest_tau = previous_tau
     command_profile = profile if hold_profile is None else hold_profile
+    monitor_velocity_limit = _positive(
+        max_velocity_rad_s
+        if monitor_velocity_rad_s is None
+        else monitor_velocity_rad_s,
+        name="protective_hold_velocity_limit_rad_s",
+    )
+    monitor_acceleration_limit = (
+        None
+        if monitor_acceleration_rad_s2 is None
+        else _positive(
+            monitor_acceleration_rad_s2,
+            name="protective_hold_acceleration_limit_rad_s2",
+        )
+    )
     hold_commands = 0
     first_hold_receipt: B601CommandReceipt | None = None
     non_hold_disable_receipt: B601ModeReceipt | None = None
@@ -2603,47 +2653,23 @@ def _run_latched_fault_hold(
             errors,
         )
 
-    try:
-        non_hold_disable_receipt = backend.safe_stop(
-            joint_names=_NON_FAULT_HOLD_JOINTS,
-        )
-        if not non_hold_disable_receipt.completed:
-            errors.extend(
-                f"non-hold safe_stop: {error}"
-                for error in non_hold_disable_receipt.errors
-            )
-            if not non_hold_disable_receipt.errors:
-                errors.append("non-hold safe_stop incomplete without vendor error")
-            full_disable_fallback()
-            return (
-                hold_commands,
-                latest_tau,
-                first_hold_receipt,
-                non_hold_disable_receipt,
-                full_disable_receipt,
-                errors,
-            )
-    except Exception as exc:  # noqa: BLE001 - preserve safety evidence
-        errors.append(f"non-hold safe_stop: {exc}")
-        full_disable_fallback()
-        return (
-            hold_commands,
-            latest_tau,
-            first_hold_receipt,
-            non_hold_disable_receipt,
-            full_disable_receipt,
-            errors,
-        )
+    # The protective hold owns the complete arm set.  There is intentionally
+    # no partial ``safe_stop`` here: disabling joints 1/4/5/6 would turn a
+    # draggable gravity hold into an asymmetric, unstable load path.
 
     _operator_notice(
-        "B601 protective hold latched: joint2/joint3 remain at the last valid "
-        "position; joint1/joint4/joint5/joint6 are disabled. "
+        "B601 protective hold latched: joint1..joint6 remain enabled with "
+        "gravity compensation and damping; joint7 is not part of this backend. "
         f"pid={os.getpid()}; press Ctrl-C again or send SIGUSR1 for full disable."
     )
     period = 1.0 / _positive(rate_hz, name="rate_hz")
     monitor_q = _six(measured_qpos, name="fault_measured_qpos_rad")
     monitor_observed_at = time.monotonic() - max(0.0, observed_age_sec)
     monitor_baseline_pending = operator_interrupt or fault_entry
+    monitor_previous_qvel = _six(
+        measured_qvel,
+        name="fault_measured_qvel_rad_s",
+    )
     while not stop.get("full_disable_requested", False):
         if max_iterations is not None and hold_commands >= max_iterations:
             break
@@ -2664,12 +2690,12 @@ def _run_latched_fault_hold(
                 name="protective_hold_feedback_qpos_rad",
             )
             if monitor_baseline_pending:
-                # The first post-disable sample spans the transition from the
-                # interrupted control loop to the partial protective hold. It
-                # is a position/drift baseline only; deriving velocity over
-                # that transition would turn an otherwise valid first hold
-                # frame into an immediate full-disable fallback. The next
-                # sample is monitored with the normal strict velocity gate.
+                # The first post-interrupt sample spans the transition from
+                # the active loop to protective hold. It is a measured-state
+                # baseline only; deriving velocity over that transition would
+                # turn an otherwise valid first hold frame into an immediate
+                # fallback. The next sample is monitored with the configured
+                # protective-hold motion limits.
                 measured_q = _validate_protective_hold_feedback(
                     current_q,
                     qvel_rad_s=_ZERO_SIX,
@@ -2677,7 +2703,7 @@ def _run_latched_fault_hold(
                     observed_age_sec=0.0,
                     position_limits_rad=position_limits_rad,
                     max_age_sec=max_age_sec,
-                    max_velocity_rad_s=max_velocity_rad_s,
+                    max_velocity_rad_s=monitor_velocity_limit,
                     max_rebase_rad=max_rebase_rad,
                 )
                 monitor_q = measured_q
@@ -2698,6 +2724,26 @@ def _run_latched_fault_hold(
                         strict=True,
                     )
                 )
+                if monitor_acceleration_limit is not None:
+                    monitor_qacc = tuple(
+                        (current - previous) / monitor_dt
+                        for current, previous in zip(
+                            monitor_qvel,
+                            monitor_previous_qvel,
+                            strict=True,
+                        )
+                    )
+                    if any(not math.isfinite(value) for value in monitor_qacc):
+                        raise LowGainProbeError(
+                            "protective hold finite-difference acceleration is not finite"
+                        )
+                    observed_max_acceleration = max(abs(value) for value in monitor_qacc)
+                    if observed_max_acceleration > monitor_acceleration_limit:
+                        raise LowGainProbeError(
+                            "protective hold acceleration abort: "
+                            f"max_abs_acceleration={observed_max_acceleration:.6f} "
+                            f"rad/s^2 > {monitor_acceleration_limit:.6f} rad/s^2"
+                        )
                 measured_q = _validate_protective_hold_feedback(
                     current_q,
                     qvel_rad_s=monitor_qvel,
@@ -2705,7 +2751,7 @@ def _run_latched_fault_hold(
                     observed_age_sec=0.0,
                     position_limits_rad=position_limits_rad,
                     max_age_sec=max_age_sec,
-                    max_velocity_rad_s=max_velocity_rad_s,
+                    max_velocity_rad_s=monitor_velocity_limit,
                     max_rebase_rad=max_rebase_rad,
                 )
             if stop.get("full_disable_requested", False):
@@ -2713,7 +2759,7 @@ def _run_latched_fault_hold(
             receipt, latest_tau = _send_fault_hold_command(
                 backend,
                 model,
-                qpos_rad=hold_q,
+                qpos_rad=measured_q,
                 measured_qpos_rad=measured_q,
                 measured_qvel_rad_s=monitor_qvel,
                 profile=command_profile,
@@ -2731,6 +2777,10 @@ def _run_latched_fault_hold(
                 break
             hold_commands += 1
             monitor_q = measured_q
+            monitor_previous_qvel = _six(
+                monitor_qvel,
+                name="protective_hold_monitor_qvel_rad_s",
+            )
             monitor_observed_at = observed_at
         except Exception as exc:  # noqa: BLE001 - preserve safety evidence
             errors.append(f"fault hold: {exc}")
@@ -2830,6 +2880,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     protective_hold_profile = build_protective_hold_profile(
         startup_lock_profile,
         driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+        default_damping_kd_nm_s_per_rad=getattr(
+            args,
+            "protective_hold_kd",
+            _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+        ),
     )
     backend = B601RSBackend(config)
     ledger = FrequencyLedger()
@@ -3768,13 +3823,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             operator_interrupt=operator_interrupt,
                             fault_entry=fault_entry,
                             fault_entry_max_velocity_rad_s=args.velocity_abort_rad_s,
+                            monitor_velocity_rad_s=args.velocity_abort_rad_s,
+                            monitor_acceleration_rad_s2=args.acceleration_abort_rad_s2,
                         )
                         cleanup_errors.extend(hold_errors)
                         protective_hold_latched = (
                             protective_hold_first_receipt is not None
-                            and protective_hold_non_hold_receipt is not None
-                            and protective_hold_non_hold_receipt.completed
                             and protective_hold_commands > 0
+                            and (
+                                protective_hold_non_hold_receipt is None
+                                or protective_hold_non_hold_receipt.completed
+                            )
                         )
                         if protective_hold_full_disable_receipt is not None:
                             cleanup_receipt = protective_hold_full_disable_receipt
@@ -3975,11 +4034,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         },
         "protective_hold": {
             "latched": protective_hold_latched,
+            "joint_names": _FAULT_HOLD_JOINTS,
             "reference_source": protective_hold_reference_source,
             "command_count": protective_hold_commands,
             "first_command_receipt": _command_receipt_payload(
                 protective_hold_first_receipt
             ),
+            "non_hold_disable_required": bool(_NON_FAULT_HOLD_JOINTS),
             "non_hold_disable_receipt": _mode_receipt_payload(
                 protective_hold_non_hold_receipt
             ),
@@ -3995,6 +4056,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             ),
             "admission_age_sec": protective_hold_admission_age_sec,
             "max_age_sec": args.fault_hold_max_age_sec,
+            "admission_max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
+            # Kept as an alias for existing evidence consumers; this is the
+            # stationary-admission gate, not the draggable-hold motion limit.
             "max_velocity_rad_s": args.fault_hold_max_velocity_rad_s,
             "max_rebase_rad": args.fault_hold_max_rebase_rad,
             "vendor_kp_nm_per_rad": _ZERO_SIX,
@@ -4002,9 +4066,18 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "software_kp_nm_per_rad": protective_hold_profile.position_kp_nm_per_rad,
             "software_kd_nm_s_per_rad": protective_hold_profile.damping_kd_nm_s_per_rad,
             "damping_owner": (
-                "driver_kd_where_nonzero_else_yaml_software_kd"
+                "driver_kd_where_nonzero_else_protective_hold_software_kd"
             ),
+            "default_software_damping_kd_nm_s_per_rad": getattr(
+                args,
+                "protective_hold_kd",
+                _DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+            ),
+            "reference_semantics": "current_feedback_pose_each_cycle",
+            "position_lock": False,
             "reference_velocity_rad_s": _ZERO_SIX,
+            "motion_velocity_limit_rad_s": args.velocity_abort_rad_s,
+            "motion_acceleration_limit_rad_s2": args.acceleration_abort_rad_s2,
         },
         "fault_hold_candidate_admission": {
             "accepted_count": fault_hold_candidate_accepted_count,
@@ -4169,11 +4242,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         "notes": [
             "Human-run commissioning only; automated tests never execute this active path.",
             "The active set is the target plus explicitly selected support joints; scheme-1 J6 commissioning selects all six arm joints while only the J6 reference changes.",
-            "On an exceptional stop, only joint2/joint3 may be latched; joint1/joint4/joint5/joint6 are safe-stopped, and SIGUSR1 is required for full disable.",
+            "On an exceptional stop, joint1..joint6 remain in the protective gravity/damping hold; joint7 is outside this backend, and SIGUSR1 or a second Ctrl-C requests full disable.",
             "Protective hold admits a fresh stationary last-safe snapshot for a normal operator stop, or a complete current in-limit fault snapshot below the motion-abort velocity; otherwise it falls back to full safe_stop.",
             "A control sample that fails only fault-hold candidate admission is not promoted to last-safe; normal control remains governed by its separate velocity abort and all other watchdogs.",
-            "While latched, every hold cycle validates a complete feedback snapshot and held-joint drift against the selected fixed reference before sending a measured-state torque frame; any failure falls back to full safe_stop.",
-            "Protective hold uses one derivative owner per joint: explicit driver Kd suppresses the YAML software Kd for that joint; no two damping terms are stacked.",
+            "While latched, every hold cycle validates a complete feedback snapshot and motion limits, then uses the current pose as the next gravity-compensation reference; any failure falls back to full safe_stop.",
+            "Protective hold has software Kp=0 and one derivative owner per joint: explicit driver Kd suppresses the default software damping for that joint; no two damping terms are stacked.",
             "J2 feedback readings in [-6e-3, 0) rad and J3 readings in [-3e-3, 0) rad are represented as 0 rad at admission; raw active samples are retained, and more-negative values remain outside the strict URDF limit.",
             "Gripper motor ID7 is outside this backend and is not included in any all-arm receipt.",
             "The probe never chooses an absolute pose. hold starts at the post-enable settled pose; slow-step uses a bounded relative step with a 20 degree command and observed-excursion hard limit.",
@@ -4257,6 +4330,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="optional software damping gain override for --joint only",
     )
+    parser.add_argument(
+        "--protective-hold-kd",
+        type=float,
+        default=_DEFAULT_PROTECTIVE_HOLD_DAMPING_KD,
+        help=(
+            "software damping used by the draggable Ctrl-C protective hold "
+            "when no non-zero --driver-kd is selected"
+        ),
+    )
     parser.add_argument("--gravity-scale", type=float, default=_DEFAULT_GRAVITY_SCALE)
     parser.add_argument(
         "--torque-limit-scale",
@@ -4311,13 +4393,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--fault-hold-max-velocity-rad-s",
         type=float,
         default=_DEFAULT_FAULT_HOLD_MAX_VELOCITY_RAD_S,
-        help="maximum absolute observed velocity for a protective hold",
+        help=(
+            "maximum absolute observed velocity for the stationary protective-"
+            "hold admission snapshot"
+        ),
     )
     parser.add_argument(
         "--fault-hold-max-rebase-rad",
         type=float,
         default=_DEFAULT_FAULT_HOLD_MAX_REBASE_RAD,
-        help="maximum joint2/joint3 fault-to-last-safe rebase distance",
+        help=(
+            "maximum fault-to-last-safe rebase distance used by admission; "
+            "not a drag limit once protective hold is active"
+        ),
     )
     parser.add_argument(
         "--cartesian-stiffness-n-per-m",
