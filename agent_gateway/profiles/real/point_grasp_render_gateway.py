@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from agent_gateway.protocol.artifact_contracts import AgentArtifactBinding
 from agent_gateway.protocol.contracts import AgentSkillOperation
@@ -49,6 +49,126 @@ from .station_point_grasp_render_deployment import (
 class PreparedPointGraspCandidateRender:
     execution_result: dict[str, Any]
     annotated_jpeg: bytes
+
+
+_DEBUG_TARGET_AXIS_LENGTH_M = 0.05
+_DEBUG_TARGET_COLORS = {
+    "target": (0, 255, 255),
+    "x": (255, 64, 64),
+    "y": (64, 255, 64),
+    "z": (64, 128, 255),
+    "text": (255, 255, 255),
+}
+
+
+def _project_reference_point(
+    point_reference_m: np.ndarray,
+    *,
+    camera_from_reference: np.ndarray,
+    intrinsics: Mapping[str, Any],
+) -> tuple[float, float] | None:
+    point_h = np.append(np.asarray(point_reference_m, dtype=np.float64), 1.0)
+    point_camera = camera_from_reference @ point_h
+    depth = float(point_camera[2])
+    if not np.isfinite(depth) or depth <= 1e-6:
+        return None
+    fx = float(intrinsics["fx"])
+    fy = float(intrinsics["fy"])
+    cx = float(intrinsics["cx"])
+    cy = float(intrinsics["cy"])
+    u = fx * float(point_camera[0]) / depth + cx
+    v = fy * float(point_camera[1]) / depth + cy
+    if not np.isfinite((u, v)).all():
+        return None
+    return u, v
+
+
+def _render_target_coordinate_debug_overlay(
+    image: Image.Image,
+    *,
+    target_point_reference_m: Any,
+    reference_from_camera: Any,
+    intrinsics: Mapping[str, Any],
+) -> Image.Image:
+    """Draw the depth-localized target with canonical Station axes.
+
+    This is deliberately a position diagnostic.  The axes use the Station
+    orientation because point-grasp localization does not estimate an object
+    orientation.
+    """
+
+    target = np.asarray(target_point_reference_m, dtype=np.float64)
+    if target.shape != (3,) or not np.all(np.isfinite(target)):
+        raise ValueError("target_point_reference_m must contain three finite values.")
+    reference_from_camera_matrix = np.asarray(reference_from_camera, dtype=np.float64)
+    if reference_from_camera_matrix.shape != (4, 4) or not np.all(
+        np.isfinite(reference_from_camera_matrix)
+    ):
+        raise ValueError("reference_from_camera must be a finite 4x4 matrix.")
+    width = int(intrinsics["width"])
+    height = int(intrinsics["height"])
+    if image.size != (width, height):
+        raise ValueError("image dimensions differ from camera intrinsics.")
+    camera_from_reference = np.linalg.inv(reference_from_camera_matrix)
+    origin = _project_reference_point(
+        target,
+        camera_from_reference=camera_from_reference,
+        intrinsics=intrinsics,
+    )
+    rendered = image.copy()
+    draw = ImageDraw.Draw(rendered)
+    label = "TARGET Station XYZ " + " ".join(f"{value:+.3f}" for value in target)
+    draw.rectangle((0, 0, min(width - 1, 330), min(height - 1, 13)), fill=(0, 0, 0))
+    draw.text((2, 2), label, fill=_DEBUG_TARGET_COLORS["text"])
+    if origin is None:
+        draw.text((2, min(height - 1, 15)), "TARGET behind camera", fill=(255, 191, 0))
+        return rendered
+    u, v = origin
+    if not (0.0 <= u < width and 0.0 <= v < height):
+        draw.text((2, min(height - 1, 15)), "TARGET outside image", fill=(255, 191, 0))
+        return rendered
+    center = (round(u), round(v))
+    radius = 6
+    draw.ellipse(
+        (
+            center[0] - radius,
+            center[1] - radius,
+            center[0] + radius,
+            center[1] + radius,
+        ),
+        outline=_DEBUG_TARGET_COLORS["target"],
+        width=2,
+    )
+    draw.line(
+        (center[0] - 9, center[1], center[0] + 9, center[1]),
+        fill=_DEBUG_TARGET_COLORS["target"],
+        width=2,
+    )
+    draw.line(
+        (center[0], center[1] - 9, center[0], center[1] + 9),
+        fill=_DEBUG_TARGET_COLORS["target"],
+        width=2,
+    )
+    for axis_index, axis_name in enumerate(("x", "y", "z")):
+        endpoint_reference = target.copy()
+        endpoint_reference[axis_index] += _DEBUG_TARGET_AXIS_LENGTH_M
+        endpoint = _project_reference_point(
+            endpoint_reference,
+            camera_from_reference=camera_from_reference,
+            intrinsics=intrinsics,
+        )
+        if endpoint is None:
+            continue
+        endpoint_u, endpoint_v = endpoint
+        clipped_endpoint = (
+            round(min(max(endpoint_u, 0.0), width - 1.0)),
+            round(min(max(endpoint_v, 0.0), height - 1.0)),
+        )
+        color = _DEBUG_TARGET_COLORS[axis_name]
+        draw.line((center, clipped_endpoint), fill=color, width=3)
+        if 0.0 <= endpoint_u < width and 0.0 <= endpoint_v < height:
+            draw.text(clipped_endpoint, axis_name.upper(), fill=color)
+    return rendered
 
 
 class StationBoundPointGraspRenderProvider:
@@ -202,6 +322,13 @@ class StationBoundPointGraspRenderProvider:
             reference_from_camera=reference_from_camera,
             intrinsics=capture.intrinsics,
         )
+        if self.registration.profile.debug_target_coordinate_overlay:
+            image = _render_target_coordinate_debug_overlay(
+                image,
+                target_point_reference_m=point_grasp_result["target_point_reference_m"],
+                reference_from_camera=reference_from_camera,
+                intrinsics=capture.intrinsics,
+            )
         if len(projections) != 1 or projections[0].ordinal != ordinal:
             raise RuntimeError(
                 "Renderer did not return exactly the requested candidate."

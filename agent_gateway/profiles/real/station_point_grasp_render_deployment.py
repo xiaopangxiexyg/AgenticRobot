@@ -68,6 +68,7 @@ class StationBoundPointGraspRenderProfile:
     reference_frame_spec_hash: str
     max_candidates: int
     max_annotated_bytes: int
+    debug_target_coordinate_overlay: bool = False
     profile_id: str = "real-station-point-grasp-candidate-render-v1"
 
     def __post_init__(self) -> None:
@@ -114,6 +115,8 @@ class StationBoundPointGraspRenderProfile:
             raise ValueError("max_candidates must be in [1, 5].")
         if not 1 <= self.max_annotated_bytes <= 64 * 1024 * 1024:
             raise ValueError("max_annotated_bytes exceeds the reviewed bound.")
+        if not isinstance(self.debug_target_coordinate_overlay, bool):
+            raise TypeError("debug_target_coordinate_overlay must be bool.")
 
     @property
     def source_by_role(self) -> dict[str, str]:
@@ -150,6 +153,17 @@ class StationBoundPointGraspRenderProfile:
                 "reference_frame_spec_hash": self.reference_frame_spec_hash,
                 "max_candidates": self.max_candidates,
                 "max_annotated_bytes": self.max_annotated_bytes,
+                **(
+                    {
+                        "debug_target_coordinate_overlay": True,
+                        "debug_target_coordinate_frame": (
+                            "canonical_station_xyz_at_target"
+                        ),
+                        "debug_target_coordinate_axis_length_m": 0.05,
+                    }
+                    if self.debug_target_coordinate_overlay
+                    else {}
+                ),
                 "candidate_source": "retained_completed_station_point_grasp_operation",
                 "render_count": 1,
                 "view_geometry_owner": "deployment_rgb_camera_geometry_binding",
@@ -221,6 +235,7 @@ def build_station_bound_point_grasp_render_registration(
     point_grasp_registration: StationBoundPointGraspRegistration,
     render_rgb_source_catalog: tuple[Mapping[str, object], ...] | None = None,
     camera_geometry_binding_hash: str | None = None,
+    debug_target_coordinate_overlay: bool = False,
 ) -> StationBoundPointGraspRenderRegistration:
     """Build the optional render Route from the exact proposal Route binding."""
 
@@ -270,6 +285,7 @@ def build_station_bound_point_grasp_render_registration(
         reference_frame_spec_hash=source_profile.reference_frame_spec_hash,
         max_candidates=source_profile.max_candidates,
         max_annotated_bytes=source_profile.max_annotated_bytes,
+        debug_target_coordinate_overlay=debug_target_coordinate_overlay,
     )
     definition = render_point_grasp_candidate_skill_definition_v1()
     schema = point_grasp_candidate_render_schema_entry_v1(

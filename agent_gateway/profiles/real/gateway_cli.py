@@ -101,6 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="enable main-view proposal generation and three-view candidate rendering",
     )
+    parser.add_argument(
+        "--debug-render-object-coordinates",
+        action="store_true",
+        help=(
+            "debug only: overlay the depth-localized target point and canonical "
+            "Station XYZ axes on point-grasp renderings"
+        ),
+    )
     parser.add_argument("--object-localization-asset-bundle", type=Path)
     parser.add_argument("--object-localization-device", default="cuda")
     parser.add_argument(
@@ -305,6 +313,11 @@ def _ready_payload(
                         composition.station_point_grasp_render_registration.profile.source_by_role
                     )
                 ),
+                "point_grasp_debug_object_coordinates": (
+                    False
+                    if composition.station_point_grasp_render_registration is None
+                    else composition.station_point_grasp_render_registration.profile.debug_target_coordinate_overlay
+                ),
             }
         ),
         "routes": [
@@ -393,6 +406,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.enable_point_grasp and not all(perception_supplied):
         parser.error("--enable-point-grasp requires the composed camera options")
+    if args.debug_render_object_coordinates and not args.enable_point_grasp:
+        parser.error("--debug-render-object-coordinates requires --enable-point-grasp")
     camera_mount_urdf_arg = _effective_camera_mount_urdf(args)
     point_grasp_values = (
         args.object_localization_asset_bundle,
@@ -581,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
         camera_mount_urdf_path=camera_mount_urdf,
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,
+        debug_render_object_coordinates=args.debug_render_object_coordinates,
     )
 
     ready = threading.Event()

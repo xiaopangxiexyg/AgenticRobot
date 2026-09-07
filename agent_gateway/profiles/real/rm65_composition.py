@@ -232,6 +232,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     camera_mount_urdf_path: str | Path | None = None,
     object_localizer: object | None = None,
     point_grasp_planner: object | None = None,
+    debug_render_object_coordinates: bool = False,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> ExclusiveRM65AgentPrimitiveComposition:
@@ -239,6 +240,8 @@ def assemble_exclusive_rm65_agent_primitive_composition(
 
     if not isinstance(lower, ExclusiveRM65SkillLowerAssembly):
         raise TypeError("lower must be an ExclusiveRM65SkillLowerAssembly.")
+    if not isinstance(debug_render_object_coordinates, bool):
+        raise TypeError("debug_render_object_coordinates must be bool.")
     side = str(authorized_side).strip().lower()
     if side not in {"left", "right"}:
         raise ValueError("authorized_side must be left or right.")
@@ -313,6 +316,10 @@ def assemble_exclusive_rm65_agent_primitive_composition(
     if grasp_enabled != (camera_mount_urdf_path is not None):
         raise ValueError(
             "Point-grasp three-view rendering requires one explicit camera mount URDF."
+        )
+    if debug_render_object_coordinates and not grasp_enabled:
+        raise ValueError(
+            "Debug object-coordinate rendering requires point-grasp resources."
         )
     if (
         grasp_enabled
@@ -685,6 +692,7 @@ def assemble_exclusive_rm65_agent_primitive_composition(
                     camera_geometry_binding_hash=(
                         rgb_camera_geometry.semantic_content_hash
                     ),
+                    debug_target_coordinate_overlay=(debug_render_object_coordinates),
                 )
             )
         partition = _hash(

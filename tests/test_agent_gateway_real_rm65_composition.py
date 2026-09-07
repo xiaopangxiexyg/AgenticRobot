@@ -505,6 +505,7 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
         object_localizer=localizer,
         point_grasp_planner=planner,
+        debug_render_object_coordinates=True,
     )
     session = composition.deployment.gateway_session
     try:
@@ -520,6 +521,10 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         assert tuple(
             composition.station_point_grasp_render_registration.profile.source_by_role
         ) == ("main", "wrist_left", "wrist_right")
+        assert (
+            composition.station_point_grasp_render_registration.profile.debug_target_coordinate_overlay
+            is True
+        )
         assert session.station_point_grasp_executor is not None
         assert session.station_point_grasp_render_executor is not None
         assert session.owns_artifact_store is False

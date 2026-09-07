@@ -158,6 +158,49 @@ def test_point_grasp_defaults_to_v4_registry_without_changing_camera_only() -> N
     )
 
 
+def test_object_coordinate_render_debug_is_explicit_and_default_off() -> None:
+    parser = gateway_cli.build_parser()
+    default = parser.parse_args(
+        _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    )
+    enabled = parser.parse_args(
+        [
+            *_argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN),
+            "--enable-point-grasp",
+            "--debug-render-object-coordinates",
+        ]
+    )
+
+    assert default.debug_render_object_coordinates is False
+    assert enabled.debug_render_object_coordinates is True
+
+
+def test_cli_rejects_object_coordinate_debug_without_point_grasp(
+    monkeypatch,
+) -> None:
+    called = False
+
+    def should_not_resolve(profile):
+        del profile
+        nonlocal called
+        called = True
+        raise AssertionError("debug flag validation must precede profile resolution")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "resolve_exclusive_rm65_skill_deployment_profile",
+        should_not_resolve,
+    )
+    argv = _argv(confirmation=REAL_AGENT_PRIMITIVE_SESSION_CONFIRM_TOKEN)
+    argv.append("--debug-render-object-coordinates")
+
+    with pytest.raises(SystemExit) as captured:
+        gateway_cli.main(argv)
+
+    assert captured.value.code == 2
+    assert called is False
+
+
 def test_cli_accepts_distinct_repeatable_ssh_read_only_identities() -> None:
     parsed = gateway_cli.build_parser().parse_args(
         [
