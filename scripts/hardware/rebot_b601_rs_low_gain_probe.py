@@ -640,6 +640,70 @@ def evaluate_feedback_motion_guard(
     }
 
 
+def evaluate_feedback_position_guard(
+    *,
+    sequence: int,
+    feedback_timestamp_sec: float,
+    raw_qpos_rad: Sequence[float],
+    normalized_qpos_rad: Sequence[float],
+    position_limits_rad: Sequence[tuple[float, float]],
+    previous_qvel_rad_s: Sequence[float] | None = None,
+) -> dict[str, object] | None:
+    """Reject an out-of-limit position before it can enter active state.
+
+    Feedback admission is deliberately separate from the motion watchdog.  A
+    finite but implausible ``mechPos`` value must be retained as evidence and
+    must never replace ``final_q``, a fault-hold snapshot, or ``last_safe``.
+    URDF limits remain the sole position boundary; this helper adds no
+    independent magnitude threshold.
+    """
+
+    timestamp = _finite(feedback_timestamp_sec, name="feedback_timestamp_sec")
+    raw_q = _six(raw_qpos_rad, name="raw_qpos_rad")
+    normalized_q = _six(normalized_qpos_rad, name="normalized_qpos_rad")
+    limits = tuple(
+        (_finite(lower, name="position_limit_lower"),
+         _finite(upper, name="position_limit_upper"))
+        for lower, upper in position_limits_rad
+    )
+    if len(limits) != 6 or any(lower >= upper for lower, upper in limits):
+        raise ValueError("position_limits_rad must contain six valid intervals")
+    previous_qvel = (
+        None
+        if previous_qvel_rad_s is None
+        else _six(previous_qvel_rad_s, name="previous_qvel_rad_s")
+    )
+    for index, (value, (lower, upper)) in enumerate(
+        zip(normalized_q, limits, strict=True)
+    ):
+        if lower <= value <= upper:
+            continue
+        reason = (
+            f"feedback qpos_rad[{index}]={value:.6f} is outside "
+            f"URDF limits [{lower:.6f}, {upper:.6f}]"
+        )
+        return {
+            "reason": reason,
+            "guard": "position_limits",
+            "offending_joint": B601_RS_ARM_JOINT_NAMES[index],
+            "offending_joint_index": index,
+            "observed_value": value,
+            "lower_limit": lower,
+            "upper_limit": upper,
+            "sequence": int(sequence),
+            "feedback_timestamp_sec": timestamp,
+            "feedback_dt_sec": None,
+            "raw_qpos_rad": raw_q,
+            "normalized_qpos_rad": normalized_q,
+            "previous_qvel_rad_s": previous_qvel,
+            "current_qvel_rad_s": None,
+            "qacc_fd_rad_s2": None,
+            "command_dispatched": False,
+            "eligible_for_last_safe": False,
+        }
+    return None
+
+
 def _validate_arming_settle_transition(
     current_qpos_rad: Sequence[float] | None,
     *,
@@ -3132,6 +3196,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         while stop_reason is None and time.monotonic() - started < args.duration_sec:
             fault_qpos_for_hold = None
             fault_qvel_for_hold = None
+            fault_observed_at_sec = None
             if stop["full_disable_requested"]:
                 stop_reason = "explicit_full_disable"
                 break
@@ -3158,21 +3223,42 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                 )
             except (TypeError, ValueError) as exc:
                 stop_reason = f"invalid feedback position: {exc}"
+                rejected_motion_sample = {
+                    "reason": stop_reason,
+                    "guard": "position_sample",
+                    "sequence": int(state.sequence),
+                    "feedback_timestamp_sec": state.receive_timestamp_sec,
+                    "feedback_dt_sec": None,
+                    "raw_qpos_observed": repr(state.positions_rad),
+                    "normalized_qpos_rad": None,
+                    "previous_qvel_rad_s": previous_guard_qvel,
+                    "current_qvel_rad_s": None,
+                    "qacc_fd_rad_s2": None,
+                    "command_dispatched": False,
+                    "eligible_for_last_safe": False,
+                }
+                rejected_motion_sample_count += 1
                 break
+            position_rejection = evaluate_feedback_position_guard(
+                sequence=state.sequence,
+                feedback_timestamp_sec=state.receive_timestamp_sec,
+                raw_qpos_rad=raw_q,
+                normalized_qpos_rad=q,
+                position_limits_rad=position_limits,
+                previous_qvel_rad_s=previous_guard_qvel,
+            )
+            if position_rejection is not None:
+                rejected_motion_sample = position_rejection
+                rejected_motion_sample_count += 1
+                stop_reason = str(position_rejection["reason"])
+                break
+            # Only an in-limit, finite sample may become the active state or a
+            # candidate protective-hold snapshot.  An invalid finite value is
+            # evidence only; it must never contaminate the final pose or hold
+            # admission path.
             final_q = q
             fault_qpos_for_hold = q
             fault_observed_at_sec = observed_at_sec
-            for index, (value, (lower, upper)) in enumerate(
-                zip(q, position_limits, strict=True)
-            ):
-                if not lower <= value <= upper:
-                    stop_reason = (
-                        f"feedback qpos_rad[{index}]={value:.6f} is outside "
-                        f"URDF limits [{lower:.6f}, {upper:.6f}]"
-                    )
-                    break
-            if stop_reason is not None:
-                break
             if previous_q is None:
                 qvel = _ZERO_SIX
                 dt = period

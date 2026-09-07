@@ -215,6 +215,57 @@ def test_feedback_boundary_normalization_admits_j3_and_keeps_other_joints_unchan
     assert normalized_joint_names == ("joint3",)
 
 
+def test_feedback_position_guard_records_out_of_limit_sample_without_dispatch() -> None:
+    raw = (0.1, 0.2, 0.3, 2.448736388725043e24, 0.5, 0.6)
+    rejection = probe.evaluate_feedback_position_guard(
+        sequence=742,
+        feedback_timestamp_sec=484802.391661432,
+        raw_qpos_rad=raw,
+        normalized_qpos_rad=raw,
+        position_limits_rad=(
+            (-2.8, 2.8),
+            (0.0, 3.14),
+            (0.0, 3.14),
+            (-1.57, 1.57),
+            (-1.57, 1.57),
+            (-3.14, 3.14),
+        ),
+        previous_qvel_rad_s=(0.0,) * 6,
+    )
+
+    assert rejection is not None
+    assert rejection["guard"] == "position_limits"
+    assert rejection["offending_joint"] == "joint4"
+    assert rejection["offending_joint_index"] == 3
+    assert rejection["observed_value"] == raw[3]
+    assert rejection["raw_qpos_rad"] == raw
+    assert rejection["normalized_qpos_rad"] == raw
+    assert rejection["sequence"] == 742
+    assert rejection["command_dispatched"] is False
+    assert rejection["eligible_for_last_safe"] is False
+    assert rejection["feedback_dt_sec"] is None
+
+
+def test_feedback_position_guard_accepts_only_the_pinned_position_limits() -> None:
+    assert (
+        probe.evaluate_feedback_position_guard(
+            sequence=1,
+            feedback_timestamp_sec=1.0,
+            raw_qpos_rad=(0.1, -4.0e-3, -2.0e-3, 0.0, 0.0, 0.0),
+            normalized_qpos_rad=(0.1, 0.0, 0.0, 0.0, 0.0, 0.0),
+            position_limits_rad=(
+                (-2.8, 2.8),
+                (0.0, 3.14),
+                (0.0, 3.14),
+                (-1.57, 1.57),
+                (-1.57, 1.57),
+                (-3.14, 3.14),
+            ),
+        )
+        is None
+    )
+
+
 def test_feedback_stability_probe_never_enters_motion_path(tmp_path) -> None:
     class FakeBackend:
         config = SimpleNamespace(channel="can0")

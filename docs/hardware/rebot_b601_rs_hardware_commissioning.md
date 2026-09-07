@@ -90,6 +90,8 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   独立保存 offending joint、raw/normalized q、previous/current qvel、qacc、dt、seq/timestamp，
   并标记 `command_dispatched=false`、`eligible_for_last_safe=false`。默认
   `--acceleration-abort-rad-s2 4.0` 只是待真机整定的 commissioning seed，不是已认证上限。
+  其中位置限位检查先于更新 `final_q`、当前故障快照和 `last-safe`；有限但越过 URDF 的
+  反馈只进入 `rejected_sample`，不会被用于重力、阻抗或保护保持计算。
 - 2026-09-04 的人工单轴扰动被原 `0.03 rad/s` 正常控制门在 `0.098028 rad/s` 中止；
   操作者于 2026-09-06 补充确认中止前的单轴人工扰动已经验收。正常控制 qvel 默认值和
   后续人工单轴 commissioning 值据此调整为 `0.12 rad/s`，为已观察值保留约 22% 裕量。
