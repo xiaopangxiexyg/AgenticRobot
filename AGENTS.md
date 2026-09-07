@@ -95,10 +95,17 @@ developer-local absolute path.
 
 ## Verification
 
+Identify changed behavior, invariants, consumers, and failure paths; self-review
+correctness, responsibilities, and duplication. Independently review high-impact
+contract, safety, persistence, concurrency, or instruction changes; fix findings
+and recheck affected behavior. Undecided semantics go to their owner. Low-risk
+edits need no extra reviewer.
+
 Run repository tests through `bash scripts/run_pytest.sh ...`; the wrapper owns
 the supported environment and short AF_UNIX test paths. Use `tests/README.md`
 to select focused feedback, affected contracts, and integration acceptance.
 Cover changed failure modes and boundaries; avoid tests that merely restate
 implementation text or duplicate the same behavior. Run `git diff --check`.
+Include behavior, consumers, review findings and resolution, and gaps in the handoff.
 Report offline, simulation, remote, and real-hardware evidence separately;
 none implies another.
