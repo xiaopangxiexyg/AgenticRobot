@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from teleop_runtime.deploy.quest_paired_pose_capture import (
+    QuestControllerTrackingUnavailableError,
     QuestPairedPoseCaptureApplication,
     QuestTerminalCaptureController,
 )
@@ -151,14 +152,35 @@ def test_retryable_selection_rejection_does_not_latch_terminal_capture() -> None
         lambda **_kwargs: None
     )
 
-    def reject_selection(**_kwargs):
-        raise RuntimeError(
-            "selected Quest controller candidate is no longer currently tracked"
+    attempts = [0]
+
+    def reject_then_select(**_kwargs):
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise QuestControllerTrackingUnavailableError(
+                "pose_unavailable (WebXR getPose returned null)"
+            )
+        state["selected_candidate_hash"] = "candidate-hash"
+        state["state"] = "bound"
+        return SimpleNamespace(
+            quest=SimpleNamespace(
+                controller_source_session_id="input-1",
+                handedness="left",
+            )
         )
 
     application.select_unique_candidate = (  # type: ignore[method-assign]
-        reject_selection
+        reject_then_select
     )
+    application.poll = lambda: application.snapshot_status()  # type: ignore[method-assign]
+
+    started: list[str] = []
+
+    def begin_window(*, window_id: str) -> None:
+        started.append(window_id)
+        state["capture"]["active_window_id"] = window_id
+
+    application.begin_window = begin_window  # type: ignore[method-assign]
 
     output: list[str] = []
     controller = QuestTerminalCaptureController(
@@ -171,4 +193,9 @@ def test_retryable_selection_rejection_does_not_latch_terminal_capture() -> None
 
     assert controller.handle_key("r") is True
     assert controller.terminal_error is None
-    assert any("capture operation rejected" in line for line in output)
+    assert any("r armed" in line for line in output)
+    assert started == []
+
+    controller.poll()
+    assert started == ["static-window-001"]
+    assert any("window started" in line for line in output)

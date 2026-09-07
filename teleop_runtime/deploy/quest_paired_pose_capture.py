@@ -66,6 +66,7 @@ QUEST_CONTROLLER_CANDIDATE_HASH_DOMAIN = (
     "dexteleop.quest_controller_capture_candidate.v1"
 )
 DEFAULT_STATIC_WINDOW_DURATION_S = 3.0
+DEFAULT_CURRENT_TRACKING_MAX_AGE_S = 0.5
 
 QuestPoseEvent = ControllerPoseAcceptedEvent | ControllerPoseInvalidationEvent
 
@@ -80,6 +81,16 @@ class QuestPairedPoseCaptureCleanupError(RuntimeError):
 
 class QuestPairedPoseCaptureStartupError(RuntimeError):
     """The unique Quest host/application failed before becoming caller-owned."""
+
+
+class QuestControllerSelectionUnavailableError(RuntimeError):
+    """A retryable controller discovery/tracking condition blocks selection."""
+
+
+class QuestControllerTrackingUnavailableError(
+    QuestControllerSelectionUnavailableError
+):
+    """The discovered controller has no current real grip pose."""
 
 
 def _required_text(value: object, *, name: str) -> str:
@@ -711,7 +722,7 @@ class QuestPairedPoseCaptureApplication:
             )
         if not candidates:
             qualifier = "" if handedness is None else f" with handedness={handedness!r}"
-            raise RuntimeError(
+            raise QuestControllerSelectionUnavailableError(
                 "no active Quest tracked-pointer candidate"
                 f"{qualifier}; pair the Quest page and enter MR/VR first"
             )
@@ -921,10 +932,13 @@ class QuestPairedPoseCaptureApplication:
                 ]
             except KeyError:
                 raise KeyError("selected robot side is not bound") from None
-            if not self._candidate_is_currently_tracked_locked(candidate):
-                raise RuntimeError(
-                    "selected Quest controller candidate is no longer currently "
-                    "tracked; wait for a real grip pose and press r again"
+            tracking_rejection = self._candidate_tracking_rejection_locked(candidate)
+            if tracking_rejection is not None:
+                raise QuestControllerTrackingUnavailableError(
+                    "selected Quest controller "
+                    f"{candidate.controller_source_session_id} is not currently "
+                    f"usable: {tracking_rejection}. A visible system controller "
+                    "model or short-lived cached axis is not calibration evidence"
                 )
             subscription = self._rotate_subscription_for_capture_locked(candidate)
             baseline = -1
@@ -986,24 +1000,32 @@ class QuestPairedPoseCaptureApplication:
                 raise QuestPairedPoseCaptureTerminalError(self._terminal_reason)
             return binding
 
-    def _candidate_is_currently_tracked_locked(
+    def _candidate_tracking_rejection_locked(
         self,
         candidate: QuestControllerCandidate,
-    ) -> bool:
-        """Require a current real pose before rotating discovery into capture.
+    ) -> str | None:
+        """Explain why a historical candidate lacks a current real grip pose.
 
         Candidate projection is intentionally historical: it records that a
         source was once observed after the discovery cut.  A later
         ``getPose() == null`` event is accepted as an ordered empty sample, so
         the historical candidate must not by itself authorize selection.  The
-        runtime's latest sample is the narrow, pose-bearing freshness check;
-        the capture reducer still remains fail-closed if tracking is lost
-        immediately after this check.
+        runtime's latest sample and pose-redacted diagnostic form the narrow
+        freshness check. The capture reducer remains fail-closed if tracking
+        is lost immediately after this check.
         """
 
         latest = self.runtime.latest_sample(client_id=candidate.client_id)
         if latest is None:
-            return False
+            return "no accepted controller-pose sample exists for this XR client"
+        now_ns = int(self.runtime.monotonic_ns_clock())
+        age_ns = max(0, now_ns - int(latest.received_monotonic_ns))
+        maximum_age_ns = round(DEFAULT_CURRENT_TRACKING_MAX_AGE_S * 1_000_000_000)
+        if age_ns > maximum_age_ns:
+            return (
+                f"latest controller telemetry is stale ({age_ns / 1e9:.3f}s old; "
+                f"limit={DEFAULT_CURRENT_TRACKING_MAX_AGE_S:.3f}s)"
+            )
         if (
             latest.client_instance_id != candidate.client_instance_id
             or latest.xr_session_id != candidate.xr_session_id
@@ -1011,17 +1033,61 @@ class QuestPairedPoseCaptureApplication:
             or latest.reference_space_generation
             != candidate.reference_space_generation
         ):
-            return False
+            return "XR session or reference-space generation changed"
         matches = tuple(
             controller
             for controller in latest.controllers
             if controller.source_session_id == candidate.controller_source_session_id
         )
+        if len(matches) > 1:
+            return "latest sample repeats the selected source identity"
+        if matches:
+            controller = matches[0]
+            if controller.handedness != candidate.handedness:
+                return "controller handedness changed"
+            if controller.target_ray_mode != candidate.target_ray_mode:
+                return "controller target-ray mode changed"
+            if controller.emulated_position is True:
+                return (
+                    "emulated_position (WebXR is estimating rather than measuring "
+                    "the grip position)"
+                )
+            return None
+
+        diagnostics = tuple(
+            diagnostic
+            for diagnostic in latest.controller_diagnostics
+            if diagnostic.source_session_id
+            == candidate.controller_source_session_id
+        )
+        if len(diagnostics) > 1:
+            return "latest sample repeats the selected tracking diagnostic"
+        if diagnostics:
+            diagnostic = diagnostics[0]
+            details = {
+                "missing_grip_space": "XRInputSource.gripSpace is absent",
+                "pose_unavailable": (
+                    "WebXR getPose(gripSpace, referenceSpace) returned null"
+                ),
+                "pose_transform_unavailable": (
+                    "WebXR grip pose has no 4x4 transform"
+                ),
+                "pose_matrix_invalid": "WebXR grip pose matrix is not finite",
+                "pose_error": "WebXR getPose raised an exception",
+            }.get(diagnostic.reason, "WebXR did not provide a real grip pose")
+            error_suffix = (
+                ""
+                if diagnostic.error_name is None
+                else f"; error={diagnostic.error_name}"
+            )
+            return f"{diagnostic.reason} ({details}{error_suffix})"
+        active = ",".join(
+            f"{item.source_session_id}:{item.handedness}:{item.reason}"
+            for item in latest.controller_diagnostics
+        )
         return (
-            len(matches) == 1
-            and matches[0].handedness == candidate.handedness
-            and matches[0].target_ray_mode == candidate.target_ray_mode
-            and matches[0].emulated_position is False
+            "selected source is absent from the latest XR input-source set"
+            + ("" if not active else f"; current sources={active}")
         )
 
     def _validate_robot_selection_cut_locked(
@@ -1716,6 +1782,7 @@ class QuestTerminalCaptureController:
         self._terminal_error: str | None = None
         self._last_status_key: tuple[Any, ...] | None = None
         self._diagnostic_fit: Any | None = None
+        self._waiting_selection_reason: str | None = None
 
     @property
     def diagnostic_fit(self) -> Any | None:
@@ -1739,6 +1806,7 @@ class QuestTerminalCaptureController:
             capture.get("sealed"),
             status.get("evidence_hash"),
             status.get("terminal_reason"),
+            self._pending_action,
         )
 
     def _publish_status(
@@ -1779,6 +1847,19 @@ class QuestTerminalCaptureController:
     def _next_window_id(self) -> str:
         self._window_index += 1
         return f"{self.window_id_prefix}-{self._window_index:03d}"
+
+    def _begin_next_window(self) -> None:
+        window_id = self._next_window_id()
+        self.application.begin_window(window_id=window_id)
+        self._window_deadline_ns = (
+            self._now_monotonic_ns() + self._window_duration_ns
+        )
+        self.emit(
+            "[Quest] window started: "
+            f"{window_id}; hold the arm/controller still for "
+            f"{self.window_duration_s:g}s; it will finish automatically"
+        )
+        self._publish_status(force=True)
 
     def _now_monotonic_ns(self) -> int:
         value = int(self._monotonic_ns_clock())
@@ -1910,7 +1991,33 @@ class QuestTerminalCaptureController:
 
     def _try_pending_action(self) -> None:
         pending = self._pending_action
-        if pending == "complete":
+        if pending == "select_and_begin":
+            try:
+                self._ensure_selected()
+                self._begin_next_window()
+            except QuestControllerSelectionUnavailableError as error:
+                reason = str(error)
+                if reason != self._waiting_selection_reason:
+                    self.emit(f"[Quest] waiting for real grip tracking: {reason}")
+                    self._waiting_selection_reason = reason
+                    self._publish_status(
+                        terminal_message=f"waiting for real grip tracking: {reason}",
+                        force=True,
+                    )
+                return
+            except QuestPairedPoseCaptureTerminalError as error:
+                self._pending_action = None
+                self._terminal_error = str(error)
+                self._emit_error("capture became terminal", error)
+                return
+            except Exception as error:  # noqa: BLE001 - keep main loop alive.
+                self._pending_action = None
+                self._emit_error("deferred capture start failed", error)
+                return
+            self._pending_action = None
+            self._waiting_selection_reason = None
+            self._publish_status(force=True)
+        elif pending == "complete":
             self._complete_pending_window(seal_after=False)
         elif pending == "seal_after_complete" and self._complete_pending_window(
             seal_after=True
@@ -1966,17 +2073,7 @@ class QuestTerminalCaptureController:
                     if self._pending_action is not None or active_window is not None:
                         return True
                 if active_window is None:
-                    window_id = self._next_window_id()
-                    self.application.begin_window(window_id=window_id)
-                    self._window_deadline_ns = (
-                        self._now_monotonic_ns() + self._window_duration_ns
-                    )
-                    self.emit(
-                        "[Quest] window started: "
-                        f"{window_id}; hold the arm/controller still for "
-                        f"{self.window_duration_s:g}s; it will finish automatically"
-                    )
-                    self._publish_status(force=True)
+                    self._begin_next_window()
                 else:
                     self.emit(
                         "[Quest] r ignored: current static window is still "
@@ -2000,6 +2097,22 @@ class QuestTerminalCaptureController:
         except QuestPairedPoseCaptureTerminalError as error:
             self._terminal_error = str(error)
             self._emit_error("terminal capture operation failed", error)
+            return True
+        except QuestControllerSelectionUnavailableError as error:
+            if normalized == "r":
+                self._pending_action = "select_and_begin"
+                self._waiting_selection_reason = str(error)
+                self.emit(
+                    "[Quest] r armed; waiting for a current real grip pose. "
+                    "The 3s window will start automatically when tracking returns: "
+                    f"{error}"
+                )
+                self._publish_status(
+                    terminal_message=f"waiting for real grip tracking: {error}",
+                    force=True,
+                )
+            else:
+                self._emit_error("capture operation rejected", error)
             return True
         except (KeyError, RuntimeError, ValueError) as error:
             # Candidate ambiguity, a temporarily lost grip pose, and an
@@ -2352,6 +2465,8 @@ __all__ = [
     "QuestCaptureFrameFacts",
     "QuestCaptureSelectionIntent",
     "QuestControllerCandidate",
+    "QuestControllerSelectionUnavailableError",
+    "QuestControllerTrackingUnavailableError",
     "QuestPairedPoseCaptureApplication",
     "QuestPairedPoseCaptureApplicationPort",
     "QuestPairedPoseCaptureCleanupError",

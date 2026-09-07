@@ -89,3 +89,26 @@ test('display tracker exposes the raw loss reason while retaining a display-only
   assert.equal(missing.trackingState, 'untracked');
   assert.equal(missing.trackingReason, 'pose_unavailable');
 });
+
+test('display tracker expires a cached pose so visible axes match current tracking', () => {
+  const context = { window: {} };
+  const filename = path.join(
+    __dirname,
+    '..',
+    'web',
+    'controller_pose_display.js',
+  );
+  vm.runInNewContext(fs.readFileSync(filename, 'utf8'), context, { filename });
+  const tracker = context.window.QuestDevControllerPoseDisplay.createTracker({
+    maximumHoldMs: 250,
+  });
+  tracker.observe('input-1', sample({ x: 4 }), undefined, 1000);
+  assert.notEqual(
+    tracker.observe('input-1', null, { reason: 'pose_unavailable' }, 1250),
+    null,
+  );
+  assert.equal(
+    tracker.observe('input-1', null, { reason: 'pose_unavailable' }, 1251),
+    null,
+  );
+});

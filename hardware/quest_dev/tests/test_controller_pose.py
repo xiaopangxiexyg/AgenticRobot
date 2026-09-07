@@ -26,6 +26,7 @@ def pose_payload(
     matrix: list[float] | None = None,
     monotonic_ns: int = 1_000_000_000,
     controllers: list[dict] | None = None,
+    controller_diagnostics: list[dict] | None = None,
 ) -> dict:
     raw_controllers = controllers
     if raw_controllers is None:
@@ -39,7 +40,7 @@ def pose_payload(
                 "matrix_reference_from_grip": matrix or identity_matrix(x=0.25),
             }
         ]
-    return {
+    payload = {
         "type": "controller_pose_sample",
         "feature": "controller_pose",
         "protocol_version": PROTOCOL_VERSION,
@@ -53,6 +54,9 @@ def pose_payload(
         "server_timestamp": 100.0,
         "server_monotonic_ns": monotonic_ns,
     }
+    if controller_diagnostics is not None:
+        payload["controller_diagnostics"] = controller_diagnostics
+    return payload
 
 
 def session_payload(*, state: str = "started", generation: int = 0) -> dict:
@@ -103,6 +107,47 @@ class ControllerPoseProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "forbidden"):
             parse_controller_pose_sample(
                 payload,
+                received_wall_time_s=100.0,
+                received_monotonic_ns=1,
+            )
+
+    def test_untracked_reason_is_admitted_without_a_pose(self) -> None:
+        sample = parse_controller_pose_sample(
+            pose_payload(
+                controllers=[],
+                controller_diagnostics=[
+                    {
+                        "source_session_id": "input-1",
+                        "handedness": "left",
+                        "target_ray_mode": "tracked-pointer",
+                        "tracking_state": "untracked",
+                        "reason": "pose_unavailable",
+                    }
+                ],
+            ),
+            received_wall_time_s=100.0,
+            received_monotonic_ns=1,
+        )
+        self.assertEqual(sample.controllers, ())
+        self.assertEqual(
+            sample.controller_diagnostics[0].reason,
+            "pose_unavailable",
+        )
+
+    def test_pose_and_tracking_diagnostic_cannot_contradict(self) -> None:
+        with self.assertRaisesRegex(ValueError, "untracked diagnostic"):
+            parse_controller_pose_sample(
+                pose_payload(
+                    controller_diagnostics=[
+                        {
+                            "source_session_id": "input-1",
+                            "handedness": "right",
+                            "target_ray_mode": "tracked-pointer",
+                            "tracking_state": "untracked",
+                            "reason": "pose_unavailable",
+                        }
+                    ],
+                ),
                 received_wall_time_s=100.0,
                 received_monotonic_ns=1,
             )
@@ -230,6 +275,10 @@ class ControllerPoseRuntimeTests(unittest.TestCase):
         status = self.runtime.snapshot_status()
         self.assertEqual(status["mode"], "latest_only")
         self.assertEqual(status["clients"]["1"]["controller_count"], 1)
+        self.assertEqual(
+            status["clients"]["1"]["controller_tracking"][0]["reason"],
+            "tracked",
+        )
         self.assertNotIn("matrix", str(status))
 
     def test_observer_receives_only_admitted_samples_and_ordered_invalidation(

@@ -128,6 +128,14 @@
           emulated_position: controller.emulatedPosition,
           matrix_reference_from_grip: controller.matrixReferenceFromGrip,
         })),
+        controller_diagnostics: (context.controllerDiagnostics || []).map((item) => ({
+          source_session_id: item.sourceSessionId,
+          handedness: item.handedness,
+          target_ray_mode: item.targetRayMode,
+          tracking_state: item.trackingState,
+          reason: item.reason,
+          ...(item.errorName ? { error_name: item.errorName } : {}),
+        })),
       });
       setStatus(
         `sequence ${sampleSequence}; ${context.controllerPoses.length} pose(s); ${statusText}`,

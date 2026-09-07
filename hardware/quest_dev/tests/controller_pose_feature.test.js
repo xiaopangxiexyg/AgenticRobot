@@ -70,6 +70,8 @@ test('pose_unavailable is visible while raw capture receives an empty controller
   const context = frameContext({
     controllerDiagnostics: [{
       sourceSessionId: 'input-1',
+      handedness: 'left',
+      targetRayMode: 'tracked-pointer',
       trackingState: 'untracked',
       reason: 'pose_unavailable',
     }],
@@ -78,6 +80,19 @@ test('pose_unavailable is visible while raw capture receives an empty controller
 
   assert.equal(context.sent.length, 1);
   assert.deepEqual(context.sent[0].controllers, []);
+  assert.equal(context.sent[0].controller_diagnostics.length, 1);
+  assert.equal(
+    context.sent[0].controller_diagnostics[0].source_session_id,
+    'input-1',
+  );
+  assert.equal(
+    context.sent[0].controller_diagnostics[0].tracking_state,
+    'untracked',
+  );
+  assert.equal(
+    context.sent[0].controller_diagnostics[0].reason,
+    'pose_unavailable',
+  );
   assert.match(status.textContent, /pose_unavailable=1/);
   assert.equal(status.className, 'bad');
   assert.equal(context.logs.length, 1);
@@ -97,6 +112,8 @@ test('viewer pose loss is diagnosed independently and does not remove a real gri
     }],
     controllerDiagnostics: [{
       sourceSessionId: 'input-1',
+      handedness: 'left',
+      targetRayMode: 'tracked-pointer',
       trackingState: 'tracked',
       reason: 'tracked',
     }],
@@ -107,6 +124,7 @@ test('viewer pose loss is diagnosed independently and does not remove a real gri
 
   assert.equal(context.sent.length, 1);
   assert.equal(context.sent[0].controllers.length, 1);
+  assert.equal(context.sent[0].controller_diagnostics[0].tracking_state, 'tracked');
   assert.match(status.textContent, /viewer_pose_unavailable=1/);
   assert.equal(status.className, 'bad');
 });

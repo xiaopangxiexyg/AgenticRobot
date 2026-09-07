@@ -774,6 +774,15 @@ def test_get_pose_loss_empty_sample_does_not_create_or_poison_candidate() -> Non
         received_monotonic_ns=clock(),
     )
     empty_sample["controllers"] = []
+    empty_sample["controller_diagnostics"] = [
+        {
+            "source_session_id": "controller-source-1",
+            "handedness": "right",
+            "target_ray_mode": "tracked-pointer",
+            "tracking_state": "untracked",
+            "reason": "pose_unavailable",
+        }
+    ]
     runtime._handle_pose_sample(1, empty_sample)
     app.poll()
 
@@ -804,13 +813,22 @@ def test_get_pose_loss_after_candidate_disallows_selection_until_pose_returns() 
         received_monotonic_ns=clock(),
     )
     empty_sample["controllers"] = []
+    empty_sample["controller_diagnostics"] = [
+        {
+            "source_session_id": candidate.controller_source_session_id,
+            "handedness": candidate.handedness,
+            "target_ray_mode": candidate.target_ray_mode,
+            "tracking_state": "untracked",
+            "reason": "pose_unavailable",
+        }
+    ]
     runtime._handle_pose_sample(1, empty_sample)
     app.poll()
 
     # The candidate remains a historical discovery record, but the latest
     # source state is empty and must not authorize capture selection.
     assert app.candidates() == (candidate,)
-    with pytest.raises(RuntimeError, match="no longer currently tracked"):
+    with pytest.raises(RuntimeError, match="getPose.*returned null"):
         app.select_unique_candidate(
             robot_side="right",
             preferred_handedness="right",
@@ -830,6 +848,42 @@ def test_get_pose_loss_after_candidate_disallows_selection_until_pose_returns() 
     assert binding.quest.controller_source_session_id == (
         candidate.controller_source_session_id
     )
+    app.close()
+
+
+def test_stale_latest_pose_cannot_start_capture() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    clock.value += 1_000_000_000
+
+    with pytest.raises(RuntimeError, match=r"telemetry is stale \(1\.100s old"):
+        app.select_unique_candidate(
+            robot_side="right",
+            preferred_handedness="right",
+        )
+    assert app.snapshot_status()["terminal_reason"] is None
+    app.close()
+
+
+def test_emulated_latest_pose_reports_why_selection_is_unusable() -> None:
+    _, clock, _, _, _, runtime, app = _application()
+    _emit_candidate(runtime, clock)
+    runtime._handle_pose_sample(
+        1,
+        _sample_payload(
+            sample_sequence=1,
+            received_monotonic_ns=clock(),
+            emulated_position=True,
+        ),
+    )
+    app.poll()
+
+    with pytest.raises(RuntimeError, match="emulated_position.*estimating"):
+        app.select_unique_candidate(
+            robot_side="right",
+            preferred_handedness="right",
+        )
+    assert app.snapshot_status()["terminal_reason"] is None
     app.close()
 
 
