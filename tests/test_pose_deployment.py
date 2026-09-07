@@ -634,6 +634,58 @@ def test_arm_state_reader_does_not_publish_actual_tcp_pose_after_failed_read() -
     assert state["actual_tcp_pose_source"] is None
 
 
+def test_arm_state_reader_qpos_only_mode_skips_backend_derived_state() -> None:
+    class _RawQposBackend(_MeasuredDeployArmBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.refresh_options: list[dict[str, bool]] = []
+            self.state_options: list[dict[str, bool]] = []
+            self.compute_calls = 0
+
+        def _raw_state(self) -> dict[str, object]:
+            return {
+                "current_qpos": self.command_qpos.copy(),
+                "hardware_qpos": self.hardware_qpos.copy(),
+                "hardware_measurement_timestamp": self.measurement_timestamp,
+                "hardware_measurement_sequence": 3,
+                "hardware_measurement_valid": True,
+                "hardware_read_success": True,
+            }
+
+        def refresh_state_from_hardware(self, **options) -> dict[str, object]:
+            self.refresh_options.append(dict(options))
+            return self._raw_state()
+
+        def get_state(self, **options) -> dict[str, object]:
+            self.state_options.append(dict(options))
+            return self._raw_state()
+
+        def compute_tcp_pose(self, *, qpos=None) -> np.ndarray:
+            self.compute_calls += 1
+            raise AssertionError("qpos-only sampling must not run FK")
+
+    backend = _RawQposBackend()
+    reader = ArmStateReader(
+        {"right": backend},
+        refresh_hz=30.0,
+        compute_tcp_pose=False,
+    )
+
+    state = reader.snapshot(time.time() + 1.0)["right"]
+
+    expected_options = {
+        "include_derived_pose": False,
+        "include_timing_percentiles": False,
+        "include_pose_source_attestation": False,
+    }
+    assert backend.refresh_options == [expected_options]
+    assert backend.state_options == [expected_options]
+    assert backend.compute_calls == 0
+    np.testing.assert_allclose(state["hardware_qpos"], backend.hardware_qpos)
+    assert state["actual_tcp_pose"] is None
+    assert state["actual_tcp_pose_source"] is None
+
+
 def test_arm_state_reader_post_refresh_cut_is_live_only() -> None:
     def build_reader():
         clock_value = [100.0]

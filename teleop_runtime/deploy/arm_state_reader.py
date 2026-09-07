@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -82,6 +83,51 @@ class ArmPoseStateReadResult:
 
 
 ArmPoseStateReader = Callable[[EffectorBackend], ArmPoseStateReadResult]
+
+
+def _read_backend_state(
+    method: Callable[..., Any],
+    *,
+    raw_hardware_qpos_only: bool,
+) -> Any:
+    """Call one backend read without materializing unused derived state.
+
+    The generic deployment reader historically called backend methods without
+    arguments, so non-RM65 backends and older test doubles remain valid. The
+    real RM65 backend exposes explicit switches for FK, timing-percentile, and
+    pose-attestation work. A qpos-only owner can disable those switches before
+    the call rather than paying their cost and discarding the result.
+    """
+
+    if not raw_hardware_qpos_only:
+        return method()
+    optional_arguments = {
+        "include_derived_pose": False,
+        "include_timing_percentiles": False,
+        "include_pose_source_attestation": False,
+    }
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return method()
+    accepts_arbitrary_keywords = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    supported_arguments = {
+        name: value
+        for name, value in optional_arguments.items()
+        if accepts_arbitrary_keywords
+        or (
+            name in parameters
+            and parameters[name].kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        )
+    }
+    return method(**supported_arguments)
 
 
 @dataclass(frozen=True)
@@ -564,7 +610,10 @@ class ArmStateReader:
                         None,
                     )
                     if callable(refresh):
-                        refresh()
+                        _read_backend_state(
+                            refresh,
+                            raw_hardware_qpos_only=not self.compute_tcp_pose,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     return f"refresh_failed:{type(exc).__name__}:{exc}"
                 return None
@@ -629,7 +678,10 @@ class ArmStateReader:
                 try:
                     refresh = getattr(backend, "refresh_state_from_hardware", None)
                     if callable(refresh):
-                        refresh()
+                        _read_backend_state(
+                            refresh,
+                            raw_hardware_qpos_only=not self.compute_tcp_pose,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     refresh_error = f"refresh_failed:{type(exc).__name__}:{exc}"
                     if projection is not None:
@@ -650,7 +702,12 @@ class ArmStateReader:
             try:
                 pose_state_read = self.pose_state_read_by_side.get(side)
                 if pose_state_read is None:
-                    state = dict(backend.get_state())
+                    state = dict(
+                        _read_backend_state(
+                            backend.get_state,
+                            raw_hardware_qpos_only=not self.compute_tcp_pose,
+                        )
+                    )
                 else:
                     state_read = pose_state_read(backend)
                     if not isinstance(state_read, ArmPoseStateReadResult):
