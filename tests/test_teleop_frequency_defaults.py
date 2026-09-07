@@ -1665,6 +1665,99 @@ def test_real_teleop_camera_best_effort_defers_bounded_retry_until_after_first_p
     assert "recovered=front" in timing_messages[0]
 
 
+def test_real_teleop_camera_best_effort_consumes_configured_deferred_retry_budget() -> (
+    None
+):
+    calls: list[str] = []
+
+    class _Source:
+        def __init__(self, name: str, *, failures: int, retries: int) -> None:
+            self.name = name
+            self.startup_timing: dict[str, float] = {}
+            self.config = SimpleNamespace(
+                startup_warmup_policy="bounded_first_frame",
+                startup_software_retry_attempts=retries,
+            )
+            self.failures = failures
+            self.start_count = 0
+
+        def start(self) -> None:
+            self.start_count += 1
+            calls.append(f"start:{self.name}:{self.start_count}")
+            if self.start_count <= self.failures:
+                raise RuntimeError("Device or resource busy")
+
+        def close(self) -> None:
+            calls.append(f"close:{self.name}")
+
+    front = _Source("front", failures=2, retries=2)
+    wrist = _Source("right_wrist", failures=0, retries=0)
+
+    with patch.object(camera_runtime.time, "sleep") as sleep_mock:
+        errors = camera_runtime._start_camera_sources_best_effort(
+            {"front": front, "right_wrist": wrist},
+            stagger_sec=0.0,
+            deferred_retry_cooldown_sec=1.0,
+        )
+
+    assert errors == {}
+    assert calls == [
+        "start:front:1",
+        "start:right_wrist:1",
+        "close:front",
+        "start:front:2",
+        "close:front",
+        "start:front:3",
+    ]
+    assert sleep_mock.call_args_list == [call(1.0), call(1.0)]
+
+
+def test_real_teleop_camera_retry_timeout_aborts_all_remaining_retry_rounds() -> None:
+    calls: list[str] = []
+
+    class _Source:
+        def __init__(self, name: str, *, timeout_on_retry: bool = False) -> None:
+            self.name = name
+            self.startup_timing: dict[str, float] = {}
+            self.config = SimpleNamespace(
+                startup_warmup_policy="bounded_first_frame",
+                startup_software_retry_attempts=2,
+            )
+            self.timeout_on_retry = timeout_on_retry
+            self.start_count = 0
+
+        def start(self) -> None:
+            self.start_count += 1
+            calls.append(f"start:{self.name}:{self.start_count}")
+            if self.timeout_on_retry and self.start_count == 2:
+                raise TimeoutError("native SDK worker remains blocked")
+            raise RuntimeError("Device or resource busy")
+
+        def close(self) -> None:
+            calls.append(f"close:{self.name}")
+
+    front = _Source("front")
+    wrist = _Source("right_wrist", timeout_on_retry=True)
+
+    with patch.object(camera_runtime.time, "sleep"):
+        errors = camera_runtime._start_camera_sources_best_effort(
+            {"front": front, "right_wrist": wrist},
+            stagger_sec=0.0,
+            deferred_retry_cooldown_sec=0.0,
+        )
+
+    assert calls == [
+        "start:front:1",
+        "start:right_wrist:1",
+        "close:front",
+        "start:front:2",
+        "close:right_wrist",
+        "start:right_wrist:2",
+    ]
+    assert set(errors) == {"front", "right_wrist"}
+    assert errors["right_wrist"].startswith("deferred_startup_retry_timeout:")
+
+
 def test_real_teleop_camera_best_effort_keeps_second_pass_failure_visible() -> None:
     class _Source:
         config = SimpleNamespace(startup_warmup_policy="bounded_first_frame")

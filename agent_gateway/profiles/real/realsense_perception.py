@@ -439,24 +439,36 @@ class ExclusiveRealPerceptionResources:
         self._start_cameras = start_cameras
         self._admit_cameras = admit_cameras
         self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._start_attempted = False
         self._started = False
         self._closed = False
+        self._lower_closed = False
+        self._additional_closed = [False] * len(self.additional_resources)
+        self._cameras_closed = False
+        self._artifact_store_closed = self.artifact_store is None
 
     def start(self) -> None:
         with self._lock:
             if self._closed:
                 raise RuntimeError("closed real perception resources cannot restart.")
-            if self._started:
-                return
+            if self._start_attempted:
+                if self._started:
+                    return
+                raise RuntimeError(
+                    "real perception resource startup is already in progress or "
+                    "failed; cannot restart."
+                )
+            self._start_attempted = True
         cameras_attempted = False
         lower_attempted = False
-        attempted_resources: list[_LifecycleResource] = []
+        attempted_resource_indexes: list[int] = []
         try:
             cameras_attempted = True
             self._start_cameras(self.camera_sources)
             self._admit_cameras(self.camera_sources)
-            for resource in self.additional_resources:
-                attempted_resources.append(resource)
+            for index, resource in enumerate(self.additional_resources):
+                attempted_resource_indexes.append(index)
                 resource.start()
             lower_attempted = True
             self.lower.start()
@@ -466,11 +478,22 @@ class ExclusiveRealPerceptionResources:
                     self.lower.close()
                 except Exception:  # noqa: BLE001, S110 - preserve the original startup failure
                     pass
-            for resource in reversed(attempted_resources):
+                else:
+                    self._lower_closed = True
+            else:
+                self._lower_closed = True
+            for index in reversed(attempted_resource_indexes):
+                resource = self.additional_resources[index]
                 try:
                     resource.close()
                 except Exception:  # noqa: BLE001, S110 - preserve startup failure
                     pass
+                else:
+                    self._additional_closed[index] = True
+            for index in range(
+                len(attempted_resource_indexes), len(self.additional_resources)
+            ):
+                self._additional_closed[index] = True
             if cameras_attempted:
                 self._close_cameras()
             if self.artifact_store is not None:
@@ -478,44 +501,79 @@ class ExclusiveRealPerceptionResources:
                     self.artifact_store.close()
                 except Exception:  # noqa: BLE001, S110 - preserve the original startup failure
                     pass
+                else:
+                    self._artifact_store_closed = True
             with self._lock:
-                self._closed = True
+                self._closed = bool(
+                    self._lower_closed
+                    and all(self._additional_closed)
+                    and self._cameras_closed
+                    and self._artifact_store_closed
+                )
             raise
         with self._lock:
             self._started = True
 
     def _close_cameras(self) -> list[str]:
+        with self._lock:
+            if self._cameras_closed:
+                return []
         try:
             _formal_close_camera_sources(self.camera_sources)
         except Exception as exc:  # noqa: BLE001 - formal cleanup already tried all cameras.
             return [f"cameras:{type(exc).__name__}:{exc}"]
+        with self._lock:
+            self._cameras_closed = True
         return []
 
     def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        errors = []
-        try:
-            self.lower.close()
-        except Exception as exc:  # noqa: BLE001 - cameras still must close.
-            errors.append(f"lower:{type(exc).__name__}:{exc}")
-        for resource in reversed(self.additional_resources):
-            try:
-                resource.close()
-            except Exception as exc:  # noqa: BLE001 - finish all cleanup stages.
-                errors.append(f"additional_resource:{type(exc).__name__}:{exc}")
-        errors.extend(self._close_cameras())
-        if self.artifact_store is not None:
-            try:
-                self.artifact_store.close()
-            except Exception as exc:  # noqa: BLE001 - complete resource close.
-                errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
-        if errors:
-            raise RuntimeError(
-                "real perception resource close failed: " + "; ".join(errors)
-            )
+        with self._close_lock:
+            with self._lock:
+                if self._closed:
+                    return
+            errors = []
+            if not self._lower_closed:
+                try:
+                    self.lower.close()
+                except Exception as exc:  # noqa: BLE001 - cameras still must close.
+                    errors.append(f"lower:{type(exc).__name__}:{exc}")
+                else:
+                    self._lower_closed = True
+            for index in reversed(range(len(self.additional_resources))):
+                if self._additional_closed[index]:
+                    continue
+                resource = self.additional_resources[index]
+                try:
+                    resource.close()
+                except Exception as exc:  # noqa: BLE001 - finish all cleanup stages.
+                    errors.append(
+                        f"additional_resource[{index}]:{type(exc).__name__}:{exc}"
+                    )
+                else:
+                    self._additional_closed[index] = True
+            errors.extend(self._close_cameras())
+            if not self._artifact_store_closed:
+                assert self.artifact_store is not None
+                try:
+                    self.artifact_store.close()
+                except Exception as exc:  # noqa: BLE001 - complete resource close.
+                    errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
+                else:
+                    self._artifact_store_closed = True
+            with self._lock:
+                self._closed = bool(
+                    self._lower_closed
+                    and all(self._additional_closed)
+                    and self._cameras_closed
+                    and self._artifact_store_closed
+                )
+                complete = self._closed
+            if not complete and not errors:
+                errors.append("close_transaction_incomplete")
+            if errors:
+                raise RuntimeError(
+                    "real perception resource close failed: " + "; ".join(errors)
+                )
 
 
 class CameraOnlyRealPerceptionResources:
@@ -555,8 +613,13 @@ class CameraOnlyRealPerceptionResources:
         self._start_cameras = start_cameras
         self._admit_cameras = admit_cameras
         self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._start_attempted = False
         self._started = False
         self._closed = False
+        self._additional_closed = [False] * len(self.additional_resources)
+        self._cameras_closed = False
+        self._artifact_store_closed = False
 
     @property
     def started(self) -> bool:
@@ -567,31 +630,50 @@ class CameraOnlyRealPerceptionResources:
         with self._lock:
             if self._closed:
                 raise RuntimeError("closed camera-only resources cannot restart.")
-            if self._started:
-                return
-        attempted_resources = []
+            if self._start_attempted:
+                if self._started:
+                    return
+                raise RuntimeError(
+                    "camera-only resource startup is already in progress or failed; "
+                    "cannot restart."
+                )
+            self._start_attempted = True
+        attempted_resource_indexes = []
         try:
             self._start_cameras(self.camera_sources)
             self._admit_cameras(self.camera_sources)
-            for resource in self.additional_resources:
-                attempted_resources.append(resource)
+            for index, resource in enumerate(self.additional_resources):
+                attempted_resource_indexes.append(index)
                 resource.start()
         except Exception as start_error:
             cleanup_errors = []
-            for resource in reversed(attempted_resources):
+            for index in reversed(attempted_resource_indexes):
+                resource = self.additional_resources[index]
                 try:
                     resource.close()
                 except Exception as exc:  # noqa: BLE001 - aggregate startup cleanup.
                     cleanup_errors.append(
-                        f"additional_resource:{type(exc).__name__}:{exc}"
+                        f"additional_resource[{index}]:{type(exc).__name__}:{exc}"
                     )
+                else:
+                    self._additional_closed[index] = True
+            for index in range(
+                len(attempted_resource_indexes), len(self.additional_resources)
+            ):
+                self._additional_closed[index] = True
             cleanup_errors.extend(self._close_cameras())
             try:
                 self.artifact_store.close()
             except Exception as exc:  # noqa: BLE001 - preserve all cleanup evidence.
                 cleanup_errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
+            else:
+                self._artifact_store_closed = True
             with self._lock:
-                self._closed = True
+                self._closed = bool(
+                    all(self._additional_closed)
+                    and self._cameras_closed
+                    and self._artifact_store_closed
+                )
             if cleanup_errors:
                 raise RuntimeError(
                     "camera-only perception startup cleanup failed: "
@@ -602,32 +684,57 @@ class CameraOnlyRealPerceptionResources:
             self._started = True
 
     def _close_cameras(self) -> list[str]:
+        with self._lock:
+            if self._cameras_closed:
+                return []
         try:
             _formal_close_camera_sources(self.camera_sources)
         except Exception as exc:  # noqa: BLE001 - formal close covers all cameras.
             return [f"cameras:{type(exc).__name__}:{exc}"]
+        with self._lock:
+            self._cameras_closed = True
         return []
 
     def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        errors = []
-        for resource in reversed(self.additional_resources):
-            try:
-                resource.close()
-            except Exception as exc:  # noqa: BLE001 - complete remaining cleanup.
-                errors.append(f"additional_resource:{type(exc).__name__}:{exc}")
-        errors.extend(self._close_cameras())
-        try:
-            self.artifact_store.close()
-        except Exception as exc:  # noqa: BLE001 - cameras were already attempted.
-            errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
-        if errors:
-            raise RuntimeError(
-                "camera-only perception resource close failed: " + "; ".join(errors)
-            )
+        with self._close_lock:
+            with self._lock:
+                if self._closed:
+                    return
+            errors = []
+            for index in reversed(range(len(self.additional_resources))):
+                if self._additional_closed[index]:
+                    continue
+                resource = self.additional_resources[index]
+                try:
+                    resource.close()
+                except Exception as exc:  # noqa: BLE001 - finish all cleanup stages.
+                    errors.append(
+                        f"additional_resource[{index}]:{type(exc).__name__}:{exc}"
+                    )
+                else:
+                    self._additional_closed[index] = True
+            errors.extend(self._close_cameras())
+            if not self._artifact_store_closed:
+                try:
+                    self.artifact_store.close()
+                except Exception as exc:  # noqa: BLE001 - cameras were already attempted.
+                    errors.append(f"artifact_store:{type(exc).__name__}:{exc}")
+                else:
+                    self._artifact_store_closed = True
+            with self._lock:
+                self._closed = bool(
+                    all(self._additional_closed)
+                    and self._cameras_closed
+                    and self._artifact_store_closed
+                )
+                complete = self._closed
+            if not complete and not errors:
+                errors.append("close_transaction_incomplete")
+            if errors:
+                raise RuntimeError(
+                    "camera-only perception resource close failed: "
+                    + "; ".join(errors)
+                )
 
 
 def start_realsense_sources(camera_sources: Mapping[str, Any]) -> None:
