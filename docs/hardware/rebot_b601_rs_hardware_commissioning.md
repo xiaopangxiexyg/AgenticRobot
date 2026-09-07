@@ -384,9 +384,9 @@ ACTIVE
    位置基线，再按 `--fault-hold-max-velocity-rad-s`、漂移和反馈有效性门逐帧监视；后续
    任何真实失效仍回退全臂 `safe_stop`；
 5. 只有通过上述检查后才会发送第一帧；发送的是固定故障/last-safe q、故障快照的受限
-   qvel（使用未过期 last-safe 时沿用 last-safe qvel），vendor `kp=0`，并继续经过软件 torque
-   absolute limit 和 torque slew limit。若本次运行显式
-   选择 driver Kd，保护保持沿用同一 Kd 和已经回读的 `0x700B` 总力矩上限。q 绝不由
+   qvel（使用未过期 last-safe 时沿用 last-safe qvel），vendor `kp=0`，软件侧使用 pinned
+   YAML MIT Kp/Kd 作为临时位置锁，并继续经过软件 torque absolute limit 和 torque slew
+   limit。若本次运行显式选择 driver Kd，保护保持沿用同一 Kd 和已经回读的 `0x700B` 总力矩上限。q 绝不由
    错误/陈旧样本补零，也不使用最后一次 command 代替最后一次合法状态。
 
 第一帧保持成功后，程序先对非保持 arm 关节发逐关节 `safe_stop`；该 receipt 不完整时

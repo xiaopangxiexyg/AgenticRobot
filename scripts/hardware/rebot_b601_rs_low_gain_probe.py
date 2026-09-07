@@ -2394,6 +2394,7 @@ def _run_latched_fault_hold(
     stop: dict[str, bool],
     max_iterations: int | None = None,
     driver_kd_nm_s_per_rad: Sequence[float] = _ZERO_SIX,
+    hold_profile: B601MitControlProfile | None = None,
     operator_interrupt: bool = False,
     fault_entry: bool = False,
     fault_entry_max_velocity_rad_s: float | None = None,
@@ -2407,7 +2408,11 @@ def _run_latched_fault_hold(
 ]:
     """Latch joint2/joint3 at a fresh, stationary, validated pose until SIGUSR1.
 
-    The first hold frame is sent before the non-hold joints are disabled.  For
+    The first hold frame is sent before the non-hold joints are disabled.  The
+    optional ``hold_profile`` supplies the software position/damping lock used
+    while the reduced joint set is latched; callers normally pass the
+    YAML-derived startup lock so a final runtime profile with ``kp=kd=0`` does
+    not leave the held joints with gravity feed-forward only.  For
     an explicit operator Ctrl-C, that first frame normally comes from the
     already validated ``last_safe`` snapshot; the interrupted loop's
     instantaneous velocity is not used to reject it.  If that candidate has
@@ -2433,6 +2438,7 @@ def _run_latched_fault_hold(
 
     errors: list[str] = []
     latest_tau = previous_tau
+    command_profile = profile if hold_profile is None else hold_profile
     hold_commands = 0
     first_hold_receipt: B601CommandReceipt | None = None
     non_hold_disable_receipt: B601ModeReceipt | None = None
@@ -2505,7 +2511,7 @@ def _run_latched_fault_hold(
             qpos_rad=hold_q,
             measured_qpos_rad=_six(measured_qpos, name="fault_measured_qpos_rad"),
             measured_qvel_rad_s=_six(measured_qvel, name="fault_measured_qvel_rad_s"),
-            profile=profile,
+            profile=command_profile,
             gravity_scale=gravity_scale,
             previous_tau=latest_tau,
             torque_limits_nm=torque_limits_nm,
@@ -2652,7 +2658,7 @@ def _run_latched_fault_hold(
                 qpos_rad=hold_q,
                 measured_qpos_rad=measured_q,
                 measured_qvel_rad_s=monitor_qvel,
-                profile=profile,
+                profile=command_profile,
                 gravity_scale=gravity_scale,
                 previous_tau=latest_tau,
                 torque_limits_nm=torque_limits_nm,
@@ -3602,6 +3608,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
         if connected:
             exceptional_stop = primary_error is not None or stop_reason is not None
             explicit_full_disable = stop.get("full_disable_requested", False)
+            protective_hold_remains_latched = False
             if enabled and exceptional_stop and not explicit_full_disable:
                 # A complete current fault sample is preferred for a normal
                 # control/position error.  An explicit operator interrupt
@@ -3695,6 +3702,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                             rate_hz=args.rate_hz,
                             stop=stop,
                             driver_kd_nm_s_per_rad=driver_kd_nm_s_per_rad,
+                            hold_profile=startup_lock_profile,
                             operator_interrupt=operator_interrupt,
                             fault_entry=fault_entry,
                             fault_entry_max_velocity_rad_s=args.velocity_abort_rad_s,
@@ -3708,13 +3716,25 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
                         )
                         if protective_hold_full_disable_receipt is not None:
                             cleanup_receipt = protective_hold_full_disable_receipt
+                        # A successful operator hold is intentionally
+                        # long-lived. The second Ctrl-C/SIGUSR1 or a hold
+                        # validation failure is what authorizes full disable.
+                        protective_hold_remains_latched = (
+                            protective_hold_latched
+                            and not hold_errors
+                            and protective_hold_full_disable_receipt is None
+                            and not stop.get("full_disable_requested", False)
+                        )
                     except Exception as exc:  # noqa: BLE001 - preserve safety evidence
                         cleanup_errors.append(f"protective hold: {exc}")
+                        protective_hold_remains_latched = False
                 else:
                     cleanup_errors.append(
                         "protective hold refused: no complete current fault snapshot"
                     )
-                issue_full_safe_stop()
+                    protective_hold_remains_latched = False
+                if not protective_hold_remains_latched:
+                    issue_full_safe_stop()
             elif enabled and not exceptional_stop:
                 freeze_commands, previous_tau, freeze_errors = _freeze_and_stop(
                     backend,

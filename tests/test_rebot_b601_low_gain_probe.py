@@ -1182,6 +1182,82 @@ def test_operator_interrupt_ignores_transient_fault_velocity_for_first_hold(
     assert errors == []
 
 
+def test_latched_fault_hold_uses_explicit_startup_lock_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    profiles: list[object] = []
+
+    def fake_send_hold(
+        _backend: object,
+        _model: object,
+        *,
+        profile: object,
+        **_kwargs: object,
+    ) -> tuple[probe.B601CommandReceipt, tuple[float, ...]]:
+        profiles.append(profile)
+        receipt = probe.B601CommandReceipt(
+            sequence=1,
+            mode="mit",
+            frame_id="b601_rs/joint_mit_reference",
+            requested_at_sec=1.0,
+            completed_at_sec=1.0,
+            requested_joint_names=("joint2", "joint3"),
+            sent_joint_names=("joint2", "joint3"),
+            failed_joint_names=(),
+            errors=(),
+            accepted=True,
+        )
+        return receipt, (0.0,) * 6
+
+    class FakeBackend:
+        def poll_feedback(self, *, request_feedback: bool) -> object:
+            raise AssertionError("max_iterations should stop before polling")
+
+        def safe_stop(self, *, joint_names: tuple[str, ...]) -> probe.B601ModeReceipt:
+            return probe.B601ModeReceipt(
+                operation="safe_stop",
+                requested_joint_names=tuple(joint_names),
+                completed_joint_names=tuple(joint_names),
+                failed_joint_names=(),
+                errors=(),
+                completed=True,
+            )
+
+    final_profile = object()
+    startup_lock_profile = object()
+    monkeypatch.setattr(probe, "_send_fault_hold_command", fake_send_hold)
+    result = probe._run_latched_fault_hold(
+        FakeBackend(),
+        object(),
+        qpos_rad=q,
+        qvel_rad_s=(0.0,) * 6,
+        observed_age_sec=0.01,
+        fault_qpos_rad=q,
+        fault_qvel_rad_s=(0.0,) * 6,
+        position_limits_rad=_fault_hold_limits(),
+        max_age_sec=0.15,
+        max_velocity_rad_s=0.02,
+        max_rebase_rad=0.05,
+        profile=final_profile,
+        gravity_scale=1.0,
+        previous_tau=(0.0,) * 6,
+        torque_limits_nm=(1.0,) * 6,
+        rate_hz=20.0,
+        stop={"requested": True, "full_disable_requested": False},
+        max_iterations=1,
+        hold_profile=startup_lock_profile,
+        operator_interrupt=True,
+    )
+
+    hold_count, _latest_tau, _first, non_hold, full, errors = result
+    assert hold_count == 1
+    assert profiles == [startup_lock_profile]
+    assert non_hold is not None and non_hold.completed
+    assert full is None
+    assert errors == []
+
+
 def test_fault_entry_uses_current_snapshot_when_last_safe_is_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
