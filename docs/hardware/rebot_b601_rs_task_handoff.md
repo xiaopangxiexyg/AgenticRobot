@@ -483,7 +483,11 @@ test 当成每次合并后的真机必需步骤。合并后的直接 Python 运�
 本次核查发现分支描述仍记录旧 tip `292dbfa69dfa903455e60a825ebdfd2ab16605b9`，且状态
 `awaiting-human-validation` 不被当前 inventory 识别。新增本文并提交后，必须把 branch
 description 的 `tip`、`write-scope`（加入本文）、`state`、`validation` 更新为实际值；不要
-把旧描述复制给下一位开发者。
+把旧描述复制给下一位开发者。当前候选与依赖分支
+`task/AR-20260906-b601-gravity-startup-protective-stop-r0` 在三条 B601 路径上有
+inventory exact-overlap，这是因为候选有序地包含该依赖的已验证基线；它不是允许同时编辑
+同一路径的授权。集成前仍须固定两个实际 SHA、检查 ancestry 和组合 diff，不能编辑或清理
+依赖 worktree。
 
 ## 13. 可直接复用的验证命令
 
