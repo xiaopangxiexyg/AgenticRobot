@@ -37,12 +37,13 @@ AgenticRobot 每次合并前的测试耗时过长，尤其是完整 acceptance �
 | 目标仓库 | /home/zc/HandMotion/Developing/AgenticRobot-development-mainline |
 | 目标线 | development |
 | 目标线基准 | 4743d20a97fa07acc47d4217c39be4040c22b62e |
+| 交接时观察到的目标线 tip | 3fa54d58b2b21aa0bcdb53c4f76afb2288003c55 |
 | 候选分支 | task/root/full-acceptance-six-shard-optin-20260908 |
 | 实现提交（本文档的父提交） | 04221f5e38f1ac1914085446b72e0b2088c3e424 |
-| 当前交接 tip（含本文档） | fcffb732afb74a63b1df69c179a56a96f341e53a |
+| 当前交接 tip（含本文档） | 以 branch description 和交接前 `git rev-parse HEAD` 为准 |
 | 候选工作区 | /tmp/ar-full-acceptance-six-shard-optin-20260908 |
 | 候选所有者 | root |
-| 目标线状态 | development 未改变，未合并、未 push |
+| 目标线状态 | 创建候选时未改变；交接复核期间已前移到 3fa54d58，候选尚未合并、未 push |
 
 候选原有代码范围：
 
@@ -324,4 +325,4 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 
 本批完成了低风险的 5/6 分片 opt-in 实现。聚焦验证稳定通过；六分片真实运行墙钟约 211 秒，显示资源充足主机上约 20% 的实际墙钟收益。由于完整运行仍有 gitlink 资源缺失和既有 MuJoCo 失败，且本机 swap 已满，默认值保持 4 是有意的安全决策。
 
-当前交接 tip 为 fcffb732afb74a63b1df69c179a56a96f341e53a；后续任何代码、测试或文档改动都会使该 ready 记录失效，必须重新提交、更新 branch description 的 write scope/tip/validation，并重新交接。除非完成集成前检查并取得明确授权，不能合并到 development、推送远端或声称受保护 acceptance 已通过。
+本次复核时 development 已漂移到 3fa54d58b2b21aa0bcdb53c4f76afb2288003c55，因此候选不能直接套用旧验证结果，必须在新的目标线上重新评估。后续任何代码、测试或文档改动都会使该 ready 记录失效，必须重新提交、更新 branch description 的 write scope/tip/validation，并重新交接。除非完成集成前检查并取得明确授权，不能合并到 development、推送远端或声称受保护 acceptance 已通过。
