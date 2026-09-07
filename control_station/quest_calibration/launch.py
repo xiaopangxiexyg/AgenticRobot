@@ -322,7 +322,7 @@ def _dry_run_payload(
             "open_browser": not bool(args.no_open_browser),
         },
         "terminal_capture": {
-            "r": "start or finish one static window",
+            "r": "start one fixed 3s static window; repeat after auto-completion",
             "c": "seal completed windows and run diagnostic AX=XB fit",
             "controller_handedness": str(args.controller_handedness),
             "preview_only": True,
@@ -368,7 +368,10 @@ def _announce_quest(
     emit(f"[quest-calibration] Quest 打开: {launch.base_url}")
     emit(f"[quest-calibration] Quest 配对六码: {launch.pairing_code}")
     emit(f"[quest-calibration] 一次性完整网址: {launch.pairing_url}")
-    emit("[quest-calibration] 终端控制：r=开始/结束静止窗口，c=封存并解算")
+    emit(
+        "[quest-calibration] 终端控制：r=自动记录3秒窗口（重复进入下一次），"
+        "c=封存并解算"
+    )
     emit("[quest-calibration] 解算结果仅作为 Quest 诊断预览，不安装正式标定")
     emit("[quest-calibration] 完成测试后回到终端按 Ctrl+C")
     emit("[quest-calibration] ================================================")

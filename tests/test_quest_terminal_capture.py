@@ -26,6 +26,7 @@ def test_terminal_r_and_c_reuse_the_capture_application_without_owning_stdin() -
     calls: list[tuple[str, object]] = []
     status_messages: list[str | None] = []
     preview_calls: list[object] = []
+    now_ns = [0]
 
     def snapshot_status():
         return {
@@ -64,6 +65,7 @@ def test_terminal_r_and_c_reuse_the_capture_application_without_owning_stdin() -
         return object()
 
     application.snapshot_status = snapshot_status  # type: ignore[method-assign]
+    application.poll = lambda: snapshot_status()  # type: ignore[method-assign]
     application.select_unique_candidate = select_unique_candidate  # type: ignore[method-assign]
     application.begin_window = begin_window  # type: ignore[method-assign]
     application.complete_window = complete_window  # type: ignore[method-assign]
@@ -87,14 +89,34 @@ def test_terminal_r_and_c_reuse_the_capture_application_without_owning_stdin() -
         application=application,
         robot_side="left",
         preferred_handedness="left",
+        monotonic_ns_clock=lambda: now_ns[0],
         emit=output.append,
         fit_function=lambda _evidence: diagnostic_fit,
     )
 
     assert controller.handle_key("r") is True
     assert calls[0][0] == "begin_window"
+    now_ns[0] = 2_000_000_000
     assert controller.handle_key("r") is True
+    assert [name for name, _value in calls] == ["begin_window"]
+    assert any("still recording" in line for line in output)
+
+    # The fixed three-second boundary is owned by the existing deployment
+    # poll, not by a second stdin/timer thread.
+    now_ns[0] = 3_000_000_000
+    controller.poll()
     assert calls[1][0] == "complete_window"
+
+    # Once the automatic completion is visible, the next r starts the next
+    # window; it no longer finishes the previous one.
+    assert controller.handle_key("r") is True
+    assert calls[2] == ("begin_window", "static-window-002")
+    assert state["capture"]["active_window_id"] == "static-window-002"
+
+    # Finish this test window through the same automatic path before c.
+    now_ns[0] = 6_000_000_000
+    controller.poll()
+    assert calls[3][0] == "complete_window"
 
     # c completes/seals the already-recorded three-window set and publishes
     # only a diagnostic preview.  No stdin reader is created by the controller.

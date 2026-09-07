@@ -3790,7 +3790,8 @@ def main(
             print(
                 "[QuestPairedPoseCapture] READY: unique Quest host is bound "
                 "to the existing passive robot journal; terminal controls: "
-                "r=start/finish static window, c=finalize and solve. "
+                "r=record fixed 3s static window (repeat for next), "
+                "c=finalize and solve. "
                 "RealMan remains observation-only.",
                 flush=True,
             )

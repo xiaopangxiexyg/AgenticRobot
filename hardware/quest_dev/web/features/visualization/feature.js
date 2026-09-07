@@ -78,7 +78,7 @@
       : candidates.map((candidate) => (
         `${candidate.handedness || 'none'}:${String(candidate.candidate_hash || '').slice(0, 8)}`
       )).join(', ');
-    const controls = 'r=start/finish, c=seal+solve';
+    const controls = 'r=auto 3s window (repeat), c=seal+solve';
     const terminal = message.terminal_message ? ` | ${message.terminal_message}` : '';
     return `${controls} | ${capture.state || 'waiting'} | candidates=${candidateText}${terminal}`;
   }
@@ -174,7 +174,7 @@
         }
         latestCalibrationPreview = message;
         setCaptureStatus(
-          `diagnostic preview only | ${message.robot_frame || 'robot base'} -> ${message.tcp_frame || 'TCP'}`,
+          `diagnostic preview only | base axes + TCP marker | ${message.robot_frame || 'robot base'} -> ${message.tcp_frame || 'TCP'}`,
           true,
         );
         return;
@@ -252,14 +252,23 @@
             baseMvp,
           );
         }
+        let robotTcpMatrix = null;
         if (
           previewRecord
           && previewRecord.fresh === true
           && hasFiniteMatrix(previewRecord.matrix_robot_from_tcp)
         ) {
+          robotTcpMatrix = new Float32Array(previewRecord.matrix_robot_from_tcp);
+        } else if (hasFiniteMatrix(preview.matrix_robot_from_tcp)) {
+          // The diagnostic message includes the last captured robot pose so c
+          // can show the TCP immediately, even before the next live feedback
+          // packet arrives.  Fresh read-only feedback supersedes this fallback.
+          robotTcpMatrix = new Float32Array(preview.matrix_robot_from_tcp);
+        }
+        if (robotTcpMatrix) {
           const tcpMatrix = global.QuestDevXRMath.mat4Multiply(
             baseMatrix,
-            new Float32Array(previewRecord.matrix_robot_from_tcp),
+            robotTcpMatrix,
           );
           const tcpMvp = global.QuestDevXRMath.mat4Multiply(
             context.viewProjection,
