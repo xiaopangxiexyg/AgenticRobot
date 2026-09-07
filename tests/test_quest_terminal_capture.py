@@ -125,3 +125,50 @@ def test_terminal_r_and_c_reuse_the_capture_application_without_owning_stdin() -
     assert preview_calls == [diagnostic_fit]
     assert any("preview only" in line for line in output)
     assert status_messages
+
+
+def test_retryable_selection_rejection_does_not_latch_terminal_capture() -> None:
+    application = object.__new__(QuestPairedPoseCaptureApplication)
+    state = {
+        "selected_candidate_hash": None,
+        "candidate_count": 1,
+        "state": "waiting_for_selection",
+        "capture": {
+            "active_window_id": None,
+            "completed_window_count": 0,
+            "draining": False,
+            "sealed": False,
+        },
+        "evidence_hash": None,
+        "terminal_reason": None,
+    }
+
+    application.snapshot_status = lambda: {
+        **state,
+        "capture": dict(state["capture"]),
+    }  # type: ignore[method-assign]
+    application.publish_capture_status = (  # type: ignore[method-assign]
+        lambda **_kwargs: None
+    )
+
+    def reject_selection(**_kwargs):
+        raise RuntimeError(
+            "selected Quest controller candidate is no longer currently tracked"
+        )
+
+    application.select_unique_candidate = (  # type: ignore[method-assign]
+        reject_selection
+    )
+
+    output: list[str] = []
+    controller = QuestTerminalCaptureController(
+        application=application,
+        robot_side="left",
+        preferred_handedness="left",
+        monotonic_ns_clock=lambda: 0,
+        emit=output.append,
+    )
+
+    assert controller.handle_key("r") is True
+    assert controller.terminal_error is None
+    assert any("capture operation rejected" in line for line in output)

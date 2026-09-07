@@ -921,6 +921,11 @@ class QuestPairedPoseCaptureApplication:
                 ]
             except KeyError:
                 raise KeyError("selected robot side is not bound") from None
+            if not self._candidate_is_currently_tracked_locked(candidate):
+                raise RuntimeError(
+                    "selected Quest controller candidate is no longer currently "
+                    "tracked; wait for a real grip pose and press r again"
+                )
             subscription = self._rotate_subscription_for_capture_locked(candidate)
             baseline = -1
             matches = tuple(
@@ -980,6 +985,44 @@ class QuestPairedPoseCaptureApplication:
             if self._terminal_reason is not None:
                 raise QuestPairedPoseCaptureTerminalError(self._terminal_reason)
             return binding
+
+    def _candidate_is_currently_tracked_locked(
+        self,
+        candidate: QuestControllerCandidate,
+    ) -> bool:
+        """Require a current real pose before rotating discovery into capture.
+
+        Candidate projection is intentionally historical: it records that a
+        source was once observed after the discovery cut.  A later
+        ``getPose() == null`` event is accepted as an ordered empty sample, so
+        the historical candidate must not by itself authorize selection.  The
+        runtime's latest sample is the narrow, pose-bearing freshness check;
+        the capture reducer still remains fail-closed if tracking is lost
+        immediately after this check.
+        """
+
+        latest = self.runtime.latest_sample(client_id=candidate.client_id)
+        if latest is None:
+            return False
+        if (
+            latest.client_instance_id != candidate.client_instance_id
+            or latest.xr_session_id != candidate.xr_session_id
+            or latest.reference_space_type != candidate.reference_space_type
+            or latest.reference_space_generation
+            != candidate.reference_space_generation
+        ):
+            return False
+        matches = tuple(
+            controller
+            for controller in latest.controllers
+            if controller.source_session_id == candidate.controller_source_session_id
+        )
+        return (
+            len(matches) == 1
+            and matches[0].handedness == candidate.handedness
+            and matches[0].target_ray_mode == candidate.target_ray_mode
+            and matches[0].emulated_position is False
+        )
 
     def _validate_robot_selection_cut_locked(
         self,
@@ -1958,8 +2001,14 @@ class QuestTerminalCaptureController:
             self._terminal_error = str(error)
             self._emit_error("terminal capture operation failed", error)
             return True
+        except (KeyError, RuntimeError, ValueError) as error:
+            # Candidate ambiguity, a temporarily lost grip pose, and an
+            # operator boundary rejection are retryable.  They must not be
+            # reported as a terminal capture failure or latch the session.
+            self._emit_error("capture operation rejected", error)
+            return True
         except Exception as error:  # noqa: BLE001 - keep deployment loop alive.
-            self._emit_error("terminal capture operation failed", error)
+            self._emit_error("capture operation failed", error)
             return True
 
 
