@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from experiments.sim_point_grasp.evaluation import (
@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
             "and execute selected DMTAC M grasps through physical Cube-Lift motion."
         )
     )
-    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -37,6 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("assets/perception/graspnet-point-grasp"),
     )
     parser.add_argument("--trials", type=int, default=10)
+    parser.add_argument(
+        "--arm-side",
+        choices=("left", "right"),
+        default="right",
+        help="Physical RM65 arm that executes the selected grasp.",
+    )
     parser.add_argument("--seed-start", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-candidates", type=int, default=5)
@@ -85,6 +91,7 @@ def run(args: argparse.Namespace) -> dict:
         output_dir=args.output_dir,
         sam2_asset_bundle=args.sam2_asset_bundle,
         graspnet_asset_bundle=args.graspnet_asset_bundle,
+        arm_side=args.arm_side,
         trials=args.trials,
         seed_start=args.seed_start,
         device=args.device,
@@ -120,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "attempted_trials": report["attempted_trials"],
+                "arm_side": report["scene"]["controlled_side"],
                 "success_count": report["success_count"],
                 "success_rate": report["success_rate"],
                 "failure_count_by_stage": report["failure_count_by_stage"],

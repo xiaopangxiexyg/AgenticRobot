@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "data_type": "rm65_calibration_profile",
+  "name": "DMTAC_M_4b2_cad_tool_tcp",
+  "arm": "left",
+  "tool_name": "DMTAC_M_4b2_cad",
+  "created_at": 1787961600.0,
+  "updated_at": 1787961600.0,
+  "notes": "Simulation-only TCP aligned to the reviewed 4B2 CAD URDF. TCP +X follows the two-finger opening axis, +Z follows approach, the lateral offset is measured from ee_link_2/ee_link_3, and the calibrated DMTAC M 140 mm depth is retained. GraspNet model depth is applied separately by the perception planner.",
+  "paths": {
+    "source_urdf": "assets/rm65_inspire_gripper_v3/rm65_dual_arm_wrist_cameras_v3_head_camera_4b2_cad_with_legacy_housing.urdf"
+  },
+  "payload": {},
+  "tcp": {
+    "schema_version": 1,
+    "frame_name": "tool_tcp",
+    "pose_flange_m_rad": [
+      0.02452431,
+      -0.000020035,
+      0.14,
+      0.0,
+      0.0,
+      1.5707963267948966
+    ],
+    "position_flange_m": [
+      0.02452431,
+      -0.000020035,
+      0.14
+    ],
+    "rotation_flange_rpy_rad": [
+      0.0,
+      0.0,
+      1.5707963267948966
+    ],
+    "position_source": "reviewed_4b2_cad_lateral_center_plus_calibrated_dmtac_m_depth",
+    "rotation_policy": "tcp_x_matches_finger_opening_axis_tcp_z_matches_approach",
+    "confirmed": true,
+    "updated_at": 1787961600.0
+  },
+  "impedance": {}
+}

@@ -208,16 +208,17 @@ def _lower(monkeypatch, *, envelope_side: str = "right"):
     return lower, guard
 
 
-def test_composition_binds_existing_gateway_to_one_lower_graph_without_start(
-    monkeypatch,
+@pytest.mark.parametrize("authorized_side", ("left", "right"))
+def test_composition_binds_selected_side_to_one_lower_graph_without_start(
+    monkeypatch, authorized_side: str
 ) -> None:
-    lower, guard = _lower(monkeypatch)
-    socket_path = REPO_ROOT / "temp/test-real-rm65-composition.sock"
+    lower, guard = _lower(monkeypatch, envelope_side=authorized_side)
+    socket_path = REPO_ROOT / f"temp/test-real-rm65-{authorized_side}-composition.sock"
 
     composition = assemble_exclusive_rm65_agent_primitive_composition(
         lower=lower,
         socket_path=socket_path,
-        authorized_side="right",
+        authorized_side=authorized_side,
         authorized_action="forward",
         confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
         client_id="rpent:test",
@@ -236,9 +237,10 @@ def test_composition_binds_existing_gateway_to_one_lower_graph_without_start(
     )
     assert composition.application.resources is lower.ports
     assert composition.application.startup_admission is lower.startup_admission
-    assert composition.port_config.active_sides == ("right",)
+    assert composition.port_config.active_sides == (authorized_side,)
     assert composition.port_config.exclusive_command_claim is True
-    assert composition.attachment.component_ids == ("right_arm",)
+    assert composition.attachment.component_ids == (f"{authorized_side}_arm",)
+    assert composition.authorized_side == authorized_side
     assert composition.attachment.reference_frame_id == (
         RM65_SKILL_EXECUTION_FRAME_ID_V1
     )

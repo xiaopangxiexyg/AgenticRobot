@@ -58,6 +58,7 @@ class SimPointGraspVisualizationConfig:
     output_dir: Path
     sam2_asset_bundle: Path
     graspnet_asset_bundle: Path
+    arm_side: str = "right"
     seed: int = 0
     device: str = "cuda"
     max_candidates: int = 5
@@ -71,6 +72,10 @@ class SimPointGraspVisualizationConfig:
             if not path.is_dir():
                 raise ValueError(f"{field_name} must be an existing directory.")
             object.__setattr__(self, field_name, path)
+        arm_side = str(self.arm_side).strip().lower()
+        if arm_side not in {"left", "right"}:
+            raise ValueError("arm_side must be left or right.")
+        object.__setattr__(self, "arm_side", arm_side)
         if isinstance(self.seed, bool) or not isinstance(self.seed, (int, np.integer)):
             raise TypeError("seed must be an integer.")
         object.__setattr__(self, "seed", int(self.seed))
@@ -109,9 +114,11 @@ def _make_provider(
         model_profile_hash=grasp_spec.semantic_content_hash,
         inference_implementation_hash=planner.semantic_content_hash,
         local_path_enabled=True,
-        runtime_session_id="sim-point-grasp-visualization",
+        runtime_session_id=f"sim-point-grasp-visualization-{config.arm_side}",
         control_domain_id="offline-mujoco-visualization-only",
-        target_binding_id="simulated-front-rgbd-three-camera-overlay",
+        target_binding_id=(
+            f"simulated-front-rgbd-three-camera-overlay-{config.arm_side}-arm"
+        ),
         station_manifest_hash="not-applicable-offline-simulation",
         execution_manifest_hash="sim-point-grasp-visualization-v1",
     )
@@ -332,6 +339,7 @@ def visualize_sim_point_grasps(
         raise ValueError(f"Visualization output already exists: {config.output_dir}")
     config.output_dir.mkdir(parents=True)
     task_config = build_sim_point_grasp_task_config(
+        controlled_side=config.arm_side,
         cube_spawn_xy_jitter_m=(0.025, 0.080),
         cube_spawn_yaw_jitter_rad=math.pi / 4.0,
     )
@@ -488,6 +496,8 @@ def visualize_sim_point_grasps(
         report = {
             "schema_version": VISUALIZATION_SCHEMA_V2,
             "seed": config.seed,
+            "controlled_side": task_config.controlled_side,
+            "fixed_side": task_config.fixed_side,
             "camera_names": list(VISUALIZATION_CAMERA_NAMES),
             "generation_camera": "front",
             "candidate_count": int(result["candidate_count"]),

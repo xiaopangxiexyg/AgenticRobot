@@ -43,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("assets/perception/graspnet-point-grasp"),
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--arm-side",
+        choices=("left", "right"),
+        default="right",
+        help="Arm-base frame used for grasp generation and overlay transforms.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-candidates", type=int, default=5)
     return parser
@@ -54,6 +60,7 @@ def run(args: argparse.Namespace) -> dict:
             output_dir=args.output_dir,
             sam2_asset_bundle=args.sam2_asset_bundle,
             graspnet_asset_bundle=args.graspnet_asset_bundle,
+            arm_side=args.arm_side,
             seed=args.seed,
             device=args.device,
             max_candidates=args.max_candidates,
@@ -71,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "candidate_count": report["candidate_count"],
+                "arm_side": report["controlled_side"],
                 "selected_ordinal": report["selected_ordinal"],
                 "camera_names": report["camera_names"],
                 "simulation_state_unchanged": report["simulation_state_unchanged"],

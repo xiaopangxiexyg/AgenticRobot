@@ -79,6 +79,20 @@ EVALUATION_RIGHT_TOOL_PROFILE = Path(
 EVALUATION_RIGHT_TOOL_PROFILE_SHA256 = (
     "c9746da4094a36c252dd96c901ccca9bc0f4f419154b8fb9ea786b321a14dc5a"
 )
+EVALUATION_LEFT_TOOL_PROFILE = Path(
+    "experiments/sim_point_grasp/configs/rm65_left_DMTAC_M_4b2_cad_tool_tcp.json"
+)
+EVALUATION_LEFT_TOOL_PROFILE_SHA256 = (
+    "f4b93291261356b227805948a08d3420296bc53755b6d57084c85a96bb38210b"
+)
+EVALUATION_TOOL_PROFILE_BY_SIDE = {
+    "left": EVALUATION_LEFT_TOOL_PROFILE,
+    "right": EVALUATION_RIGHT_TOOL_PROFILE,
+}
+EVALUATION_TOOL_PROFILE_SHA256_BY_SIDE = {
+    "left": EVALUATION_LEFT_TOOL_PROFILE_SHA256,
+    "right": EVALUATION_RIGHT_TOOL_PROFILE_SHA256,
+}
 EVALUATION_OBJECT_SIZE_M = (0.04, 0.04, 0.10)
 EVALUATION_OBJECT_CENTER_XY_M = (-0.272, 0.0)
 EVALUATION_GRIPPER_PROFILE_NAME = "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
@@ -102,6 +116,7 @@ class SimPointGraspEvaluationConfig:
     output_dir: Path
     sam2_asset_bundle: Path
     graspnet_asset_bundle: Path
+    arm_side: str = "right"
     trials: int = 10
     seed_start: int = 0
     device: str = "cuda"
@@ -135,6 +150,10 @@ class SimPointGraspEvaluationConfig:
             if not path.is_dir():
                 raise ValueError(f"{field_name} must be an existing directory.")
             object.__setattr__(self, field_name, path)
+        arm_side = str(self.arm_side).strip().lower()
+        if arm_side not in EVALUATION_TOOL_PROFILE_BY_SIDE:
+            raise ValueError("arm_side must be left or right.")
+        object.__setattr__(self, "arm_side", arm_side)
         if not 1 <= int(self.trials) <= 100:
             raise ValueError("trials must be in [1, 100].")
         if not 1 <= int(self.max_candidates) <= 5:
@@ -243,6 +262,7 @@ class SimPointGraspTrialResult:
     selected_wrist_symmetry_deg: int = 0
     candidate_selection_policy: str = "provider_selected_ordinal"
     candidate_preflight: list[dict[str, Any]] = field(default_factory=list)
+    arm_side: str = "right"
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema_version": TRIAL_SCHEMA_V1, **asdict(self)}
@@ -429,6 +449,7 @@ class _TrialVideo:
 
 def build_sim_point_grasp_task_config(
     *,
+    controlled_side: str = "right",
     object_mass_kg: float = 0.08,
     gripper_force_profile: str = "standard",
     cube_center_xy_m: tuple[float, float] = EVALUATION_OBJECT_CENTER_XY_M,
@@ -436,9 +457,13 @@ def build_sim_point_grasp_task_config(
     cube_spawn_yaw_jitter_rad: float,
     max_episode_steps: int | None = None,
 ) -> CubeLiftTaskConfig:
-    """Return the physical Cube-Lift profile with observable random spawn."""
+    """Return one side-specific physical Cube-Lift point-grasp profile."""
 
     base = CubeLiftTaskConfig.load(DEFAULT_TASK_CONFIG)
+    side = str(controlled_side).strip().lower()
+    if side not in EVALUATION_TOOL_PROFILE_BY_SIDE:
+        raise ValueError("controlled_side must be left or right.")
+    fixed_side = "right" if side == "left" else "left"
     if float(object_mass_kg) == 0.08:
         contract_relative = EVALUATION_LIGHT_SCENE_CONTRACT
         expected_contract_sha256 = EVALUATION_LIGHT_SCENE_CONTRACT_SHA256
@@ -462,24 +487,40 @@ def build_sim_point_grasp_task_config(
             "Simulation point-grasp scene contract hash changed: "
             f"expected={expected_contract_sha256}, actual={contract_sha256}."
         )
-    tool_profile_path = resolve_path(EVALUATION_RIGHT_TOOL_PROFILE)
-    tool_profile_sha256 = hashlib.sha256(tool_profile_path.read_bytes()).hexdigest()
-    if tool_profile_sha256 != EVALUATION_RIGHT_TOOL_PROFILE_SHA256:
-        raise ValueError(
-            "Simulation point-grasp CAD TCP profile hash changed: "
-            f"expected={EVALUATION_RIGHT_TOOL_PROFILE_SHA256}, "
-            f"actual={tool_profile_sha256}."
-        )
+    for profile_side, relative_path in EVALUATION_TOOL_PROFILE_BY_SIDE.items():
+        tool_profile_path = resolve_path(relative_path)
+        tool_profile_sha256 = hashlib.sha256(tool_profile_path.read_bytes()).hexdigest()
+        expected_sha256 = EVALUATION_TOOL_PROFILE_SHA256_BY_SIDE[profile_side]
+        if tool_profile_sha256 != expected_sha256:
+            raise ValueError(
+                f"Simulation point-grasp {profile_side} CAD TCP profile hash changed: "
+                f"expected={expected_sha256}, actual={tool_profile_sha256}."
+            )
     episode_steps = (
         base.max_episode_steps if max_episode_steps is None else int(max_episode_steps)
     )
     if episode_steps <= 0:
         raise ValueError("max_episode_steps must be positive.")
+    home_by_physical_side = {
+        "left": base.left_home_qpos,
+        "right": base.right_home_qpos,
+    }
+    gripper_by_physical_side = {
+        "left": "left_eg2_4b2_cad",
+        "right": "right_eg2_4b2_cad",
+    }
+    grasp_prefix = f"{side}_eg2_4b2_cad"
     return replace(
         base,
-        name="rm65_right_cube_lift_sam2_graspnet_evaluation_v1",
+        name=f"rm65_{side}_cube_lift_sam2_graspnet_evaluation_v1",
         base_contract_path=str(contract_relative),
         base_contract_sha256=contract_sha256,
+        controlled_side=side,
+        fixed_side=fixed_side,
+        # These two legacy fields are fixed-slot and controlled-slot homes,
+        # respectively. Swap their physical-side values for the left-arm task.
+        left_home_qpos=home_by_physical_side[fixed_side],
+        right_home_qpos=home_by_physical_side[side],
         object_size_m=EVALUATION_OBJECT_SIZE_M,
         wrist_rgb_camera_name=CAMERA_NAME,
         cube_center_xy_m=tuple(float(value) for value in cube_center_xy_m),
@@ -488,16 +529,18 @@ def build_sim_point_grasp_task_config(
         success_requires_bilateral_contact=True,
         gripper_actuation_profile_name=gripper_profile_name,
         gripper_actuation_profile_sha256=gripper_profile_sha256,
-        left_gripper_name="left_eg2_4b2_cad",
-        right_gripper_name="right_eg2_4b2_cad",
+        # Gripper fields likewise retain fixed-slot/controlled-slot ordering.
+        left_gripper_name=gripper_by_physical_side[fixed_side],
+        right_gripper_name=gripper_by_physical_side[side],
         initial_gripper_close_by_name={
             "left_eg2_4b2_cad": 0.0,
             "right_eg2_4b2_cad": 0.0,
         },
+        left_tool_profile_path=str(EVALUATION_LEFT_TOOL_PROFILE),
         right_tool_profile_path=str(EVALUATION_RIGHT_TOOL_PROFILE),
-        right_grasp_body_name="right_eg2_4b2_cad_ee_link_4",
-        grasp_latch_left_finger_body_name="right_eg2_4b2_cad_ee_link_2",
-        grasp_latch_right_finger_body_name="right_eg2_4b2_cad_ee_link_3",
+        right_grasp_body_name=f"{grasp_prefix}_ee_link_4",
+        grasp_latch_left_finger_body_name=f"{grasp_prefix}_ee_link_2",
+        grasp_latch_right_finger_body_name=f"{grasp_prefix}_ee_link_3",
         pose_target_anti_windup=True,
         max_episode_steps=episode_steps,
         # Once real bilateral contact is observed, keep the accepted physical
@@ -685,9 +728,12 @@ def _current_tool_pose_arm_base(scene: Any, config: CubeLiftTaskConfig) -> np.nd
     side = config.controlled_side
     base = scene.body_pose(f"{side}_arm_base_link")
     endpoint = scene.body_pose(scene.arm_specs[side].controlled_body)
-    profile = load_rm65_tool_profile(
-        resolve_path(config.right_tool_profile_path), side=side
+    profile_path = (
+        config.left_tool_profile_path
+        if side == "left"
+        else config.right_tool_profile_path
     )
+    profile = load_rm65_tool_profile(resolve_path(profile_path), side=side)
     return np.linalg.inv(base) @ endpoint @ endpoint_to_tool_transform(profile)
 
 
@@ -902,21 +948,10 @@ def _preflight_candidate(
         wrist_symmetry_deg,
     )
     pregrasp = build_pregrasp_pose(grasp, pregrasp_offset_m)
-    pregrasp_reached, reason = _drive_pose(
-        env=env,
-        desired_pose=pregrasp,
-        trace=trace,
-        renderer=None,
-        video=None,
-        maximum_steps=config.phase_step_limit,
-        position_tolerance_m=config.pose_position_tolerance_m,
-        orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
-    )
-    grasp_reached = False
-    if pregrasp_reached:
-        grasp_reached, reason = _drive_pose(
+    try:
+        pregrasp_reached, reason = _drive_pose(
             env=env,
-            desired_pose=grasp,
+            desired_pose=pregrasp,
             trace=trace,
             renderer=None,
             video=None,
@@ -924,6 +959,27 @@ def _preflight_candidate(
             position_tolerance_m=config.pose_position_tolerance_m,
             orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
         )
+    except RuntimeError as exc:
+        # A lower-owned hard collision rejection is one candidate's preflight
+        # outcome, not permission to abort evaluation of every remaining pose.
+        pregrasp_reached = False
+        reason = f"pregrasp_runtime_rejection:{exc}"
+    grasp_reached = False
+    if pregrasp_reached:
+        try:
+            grasp_reached, reason = _drive_pose(
+                env=env,
+                desired_pose=grasp,
+                trace=trace,
+                renderer=None,
+                video=None,
+                maximum_steps=config.phase_step_limit,
+                position_tolerance_m=config.pose_position_tolerance_m,
+                orientation_tolerance_rad=config.pose_orientation_tolerance_rad,
+            )
+        except RuntimeError as exc:
+            grasp_reached = False
+            reason = f"grasp_runtime_rejection:{exc}"
     return _CandidatePreflight(
         ordinal=int(ordinal),
         pregrasp_offset_m=float(pregrasp_offset_m),
@@ -1055,9 +1111,9 @@ def _make_provider(
         model_profile_hash=grasp_spec.semantic_content_hash,
         inference_implementation_hash=planner.semantic_content_hash,
         local_path_enabled=True,
-        runtime_session_id="sim-point-grasp-evaluation",
+        runtime_session_id=f"sim-point-grasp-evaluation-{config.arm_side}",
         control_domain_id="offline-mujoco-evaluation",
-        target_binding_id="simulated-fixed-head-rgbd",
+        target_binding_id=f"simulated-fixed-head-rgbd-{config.arm_side}-arm",
         station_manifest_hash="not-applicable-offline-simulation",
         execution_manifest_hash="sim-point-grasp-evaluation-v1",
     )
@@ -1561,6 +1617,7 @@ def _trial(
         selected_wrist_symmetry_deg=selected_wrist_symmetry_deg,
         candidate_selection_policy=config.candidate_selection_policy,
         candidate_preflight=candidate_preflight,
+        arm_side=config.arm_side,
     )
     _write_json(trial_dir / "trial_result.json", trial_result.to_dict())
     return trial_result
@@ -1583,6 +1640,7 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
         + 5
     )
     task_config = build_sim_point_grasp_task_config(
+        controlled_side=config.arm_side,
         object_mass_kg=config.object_mass_kg,
         gripper_force_profile=config.gripper_force_profile,
         cube_center_xy_m=config.cube_center_xy_m,
@@ -1678,6 +1736,8 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
             )
     report = {
         "schema_version": RESULT_SCHEMA_V1,
+        "controlled_side": task_config.controlled_side,
+        "fixed_side": task_config.fixed_side,
         "attempted_trials": len(results),
         "success_count": success_count,
         "success_rate": success_count / max(len(results), 1),
@@ -1710,6 +1770,8 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
             "depth_unit": "meter",
         },
         "scene": {
+            "controlled_side": task_config.controlled_side,
+            "fixed_side": task_config.fixed_side,
             "contract_path": str(task_config.base_contract_path),
             "contract_sha256": task_config.base_contract_sha256,
             "urdf_path": str(scene_contract.scene.urdf_path),
@@ -1739,6 +1801,20 @@ def evaluate_sim_point_grasps(config: SimPointGraspEvaluationConfig) -> dict[str
             "gripper_actuation_profile_sha256": (
                 task_config.gripper_actuation_profile_sha256
             ),
+            "fixed_gripper_name": task_config.left_gripper_name,
+            "controlled_gripper_name": task_config.right_gripper_name,
+            "tool_profile_path_by_side": {
+                "left": task_config.left_tool_profile_path,
+                "right": task_config.right_tool_profile_path,
+            },
+            "controlled_tool_profile_path": str(
+                EVALUATION_TOOL_PROFILE_BY_SIDE[task_config.controlled_side]
+            ),
+            "controlled_tool_profile_sha256": (
+                EVALUATION_TOOL_PROFILE_SHA256_BY_SIDE[task_config.controlled_side]
+            ),
+            # Retain the v1 right-side report fields for existing right-default
+            # evidence readers. Generic consumers should use the fields above.
             "right_gripper_name": task_config.right_gripper_name,
             "right_tool_profile_path": task_config.right_tool_profile_path,
             "right_tool_profile_sha256": EVALUATION_RIGHT_TOOL_PROFILE_SHA256,

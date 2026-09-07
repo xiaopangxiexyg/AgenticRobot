@@ -268,6 +268,9 @@ planner semantic content hash。
 并使用经过转动关节单位换算的六关节 mimic 驱动配置
 `dmtac_bimanual_position_eg2_4b2_cad_20260829.v2`；不得回退到
 `rm65_dual_arm_wrist_cameras_v3_head_camera.urdf` 中的简化平行夹爪代理。
+命令通过 `--arm-side left|right` 明确选择受控臂，并将另一侧保持在镜像 home；所选侧同时决定
+`base_frame_id`、CAD TCP、IK 目标、抓取体、两指接触体和夹爪执行。`right` 仅作为兼容默认值，
+不是 Skill 的单臂限制。
 旧 CAD profile 把直线夹爪的 `1200 N/m`、`20 N` 直接解释为每个转动 mimic 关节的
 `1200 N·m/rad`、`20 N·m`，会把轻物体弹飞；v2 使用接触消融后受限的转动参数
 `kp=5`、`kv=0.1`、每关节 force limit `0.5`，并保留原始物体质量与摩擦。
@@ -285,7 +288,9 @@ planner semantic content hash。
 当前近距离消融的物体中心为世界坐标 `(-0.272, 0.0) m`，比历史中心 `(-0.472, 0.0) m`
 沿 +X 向固定头部相机靠近 20 cm；X/Y 默认扰动仍为 2.5/8 cm。20 次回归的点击像素
 深度为 0.572--0.601 m（均值 0.585 m），20/20 都返回候选，但严格抓取成功仍为 0/20。
-该实验另用哈希锁定的 `rm65_right_DMTAC_M_4b2_cad_tool_tcp.json`，保留标定的 0.14 m 深度，
+该实验另用分别标记物理侧别、哈希锁定的
+`rm65_left_DMTAC_M_4b2_cad_tool_tcp.json` 与
+`rm65_right_DMTAC_M_4b2_cad_tool_tcp.json`。两者保留标定的 0.14 m 深度，
 并把 TCP +X 旋转到 CAD 的真实张合方向、补偿约 24.5 mm 的 CAD 横向中心偏置。
 
 输出矩阵均为 4×4 row-major 齐次变换，平移单位米：

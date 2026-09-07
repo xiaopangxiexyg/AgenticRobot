@@ -3,6 +3,11 @@
 Status: `incubating` experiment. This is an offline MuJoCo evaluation command,
 not a production Skill route and not a real-robot entrypoint.
 
+Both physical arm choices are available through `--arm-side left|right`.
+`right` remains the compatibility default. The selected arm supplies the
+`base_frame_id`, tool TCP, IK target, grasp body, finger contacts, and gripper
+actuation; the other arm is held at its mirrored home pose.
+
 ## Visualization-only three-camera flow
 
 Use the visualization command when the goal is to inspect generated poses, not
@@ -23,6 +28,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 python -m experiments.sim_point_grasp.commands.visualize_candidates \
+  --arm-side left \
   --seed 0 \
   --max-candidates 5
 ```
@@ -64,8 +70,8 @@ read-only `perception.plan_point_grasp.v1` provider:
 4. call the formal `PointGraspProvider`, validate its public request/result,
    apply GraspNet's insertion depth and SAM2 target-cloud width centering, then
    preflight candidates through the same IK and full-scene collision chain;
-5. try parallel-jaw-equivalent 0/180-degree wrist forms and 7/5/3.5 cm
-   pregrasp offsets, execute the selected CAD-aligned DMTAC M `tool_tcp` goal,
+5. retain the generator's upward-selected parallel-jaw TCP and try 7/5/3.5 cm
+   pregrasp offsets, execute the selected side-specific CAD-aligned DMTAC M `tool_tcp` goal,
    close the physical gripper, then lift 10 cm;
 6. let `CubeLiftKernel` own canonical RM65 IK, collision projection, fitted
    actuators, contacts, termination, and success evaluation.
@@ -87,6 +93,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 python -m experiments.sim_point_grasp.commands.run_evaluation \
+  --arm-side left \
   --trials 10 \
   --seed-start 0
 ```
@@ -108,12 +115,13 @@ Useful options:
 ```bash
 python -m experiments.sim_point_grasp.commands.run_evaluation --help
 python -m experiments.sim_point_grasp.commands.run_evaluation \
-  --trials 3 --seed-start 20 --no-video \
+  --arm-side left --trials 3 --seed-start 20 --no-video \
   --output-dir /tmp/sim-point-grasp-smoke
 ```
 
 The command never connects to a camera or robot. It refuses to overwrite an
-existing output directory.
+existing output directory. Run left and right evidence into separate output
+directories; every run and trial record identifies its selected arm.
 
 The default selection policy is `reachability_aware`. Use
 `--candidate-selection-policy provider_selected_ordinal` only for a baseline

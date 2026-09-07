@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation
 from deployments.perception.sam2_vgn_point_grasp import (
     select_upward_parallel_jaw_tcp_pose,
 )
+from experiments.sim_point_grasp import evaluation as evaluation_module
 from experiments.sim_point_grasp.evaluation import (
     SimPointGraspTrialResult,
     apply_parallel_jaw_wrist_symmetry,
@@ -124,6 +125,44 @@ def test_pregrasp_backs_away_on_candidate_approach_axis() -> None:
     np.testing.assert_allclose(pregrasp[:3, 3], grasp[:3, 3] - grasp[:3, 2] * 0.07)
 
 
+def test_candidate_preflight_records_lower_runtime_rejection(monkeypatch) -> None:
+    env = SimpleNamespace(
+        reset=lambda *, seed: (None, {"seed": seed}),
+    )
+    config = SimpleNamespace(
+        phase_step_limit=10,
+        pose_position_tolerance_m=0.01,
+        pose_orientation_tolerance_rad=0.1,
+    )
+    monkeypatch.setattr(
+        evaluation_module,
+        "_drive_pose",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("hard collision")),
+    )
+    monkeypatch.setattr(
+        evaluation_module,
+        "_minimum_controlled_joint_margin_rad",
+        lambda _env: None,
+    )
+
+    result = evaluation_module._preflight_candidate(
+        env=env,
+        candidate={
+            "T_base_from_tcp": np.eye(4).reshape(-1).tolist(),
+            "model_score": 0.8,
+            "score": 0.7,
+        },
+        ordinal=2,
+        pregrasp_offset_m=0.05,
+        wrist_symmetry_deg=0,
+        seed=4,
+        config=config,
+    )
+
+    assert not result.executable
+    assert result.reason == "pregrasp_runtime_rejection:hard collision"
+
+
 def test_parallel_jaw_wrist_symmetry_swaps_fingers_but_preserves_approach() -> None:
     grasp = np.eye(4)
     grasp[:3, 3] = [0.1, 0.2, 0.3]
@@ -135,12 +174,14 @@ def test_parallel_jaw_wrist_symmetry_swaps_fingers_but_preserves_approach() -> N
 
 
 @pytest.mark.optional
-def test_upward_tcp_selection_matches_mujoco_world_up() -> None:
+@pytest.mark.parametrize("arm_side", ("left", "right"))
+def test_upward_tcp_selection_matches_mujoco_world_up(arm_side: str) -> None:
     pytest.importorskip("mujoco")
     from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
 
     env = FastCubeLiftEnv(
         build_sim_point_grasp_task_config(
+            controlled_side=arm_side,
             cube_spawn_xy_jitter_m=(0.025, 0.080),
             cube_spawn_yaw_jitter_rad=math.pi / 4.0,
         ),
@@ -294,12 +335,16 @@ def test_single_overlay_uses_actual_render_camera_pose() -> None:
 
 
 @pytest.mark.optional
-def test_mujoco_three_camera_overlay_does_not_advance_simulation() -> None:
+@pytest.mark.parametrize("arm_side", ("left", "right"))
+def test_mujoco_three_camera_overlay_does_not_advance_simulation(
+    arm_side: str,
+) -> None:
     pytest.importorskip("mujoco")
     from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
 
     env = FastCubeLiftEnv(
         build_sim_point_grasp_task_config(
+            controlled_side=arm_side,
             cube_spawn_xy_jitter_m=(0.0, 0.0),
             cube_spawn_yaw_jitter_rad=0.0,
         ),
@@ -368,8 +413,73 @@ def test_mujoco_three_camera_overlay_does_not_advance_simulation() -> None:
         env.close()
 
 
-def test_evaluation_task_randomizes_observable_scene_and_requires_contact() -> None:
+@pytest.mark.optional
+@pytest.mark.parametrize(
+    ("arm_side", "fixed_side", "controlled_gripper", "fixed_gripper"),
+    (
+        ("left", "right", "left_eg2_4b2_cad", "right_eg2_4b2_cad"),
+        ("right", "left", "right_eg2_4b2_cad", "left_eg2_4b2_cad"),
+    ),
+)
+def test_mujoco_pose_action_moves_only_selected_arm_and_gripper(
+    arm_side: str,
+    fixed_side: str,
+    controlled_gripper: str,
+    fixed_gripper: str,
+) -> None:
+    pytest.importorskip("mujoco")
+    from sim.mujoco.tasks.cube_lift.fast_env import FastCubeLiftEnv
+
+    env = FastCubeLiftEnv(
+        build_sim_point_grasp_task_config(
+            controlled_side=arm_side,
+            cube_spawn_xy_jitter_m=(0.0, 0.0),
+            cube_spawn_yaw_jitter_rad=0.0,
+            max_episode_steps=20,
+        ),
+        include_training_reward_state=False,
+        use_model_cache=False,
+    )
+    try:
+        env.reset(seed=0)
+        scene = env.kernel.scene
+        arm_before = {
+            side: scene.get_arm_qpos(side).copy() for side in ("left", "right")
+        }
+        action = np.asarray((0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2), dtype=np.float32)
+        for _ in range(3):
+            _observation, _reward, terminated, truncated, info = env.step(action)
+            assert not terminated
+            assert not truncated
+            assert info["pose_ik_success"] is True
+        arm_after = {
+            side: scene.get_arm_qpos(side).copy() for side in ("left", "right")
+        }
+        assert np.linalg.norm(arm_after[arm_side] - arm_before[arm_side]) > 1e-3
+        np.testing.assert_allclose(
+            arm_after[fixed_side], arm_before[fixed_side], atol=1e-12
+        )
+        assert scene.get_gripper_close(controlled_gripper) > 0.0
+        assert scene.get_gripper_close(fixed_gripper) == pytest.approx(0.0)
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize(
+    ("arm_side", "fixed_side", "fixed_gripper", "controlled_gripper"),
+    (
+        ("left", "right", "right_eg2_4b2_cad", "left_eg2_4b2_cad"),
+        ("right", "left", "left_eg2_4b2_cad", "right_eg2_4b2_cad"),
+    ),
+)
+def test_evaluation_task_randomizes_observable_scene_and_requires_contact(
+    arm_side: str,
+    fixed_side: str,
+    fixed_gripper: str,
+    controlled_gripper: str,
+) -> None:
     config = build_sim_point_grasp_task_config(
+        controlled_side=arm_side,
         cube_spawn_xy_jitter_m=(0.01, 0.02),
         cube_spawn_yaw_jitter_rad=math.pi / 6.0,
     )
@@ -386,14 +496,25 @@ def test_evaluation_task_randomizes_observable_scene_and_requires_contact() -> N
     assert config.gripper_actuation_profile_name == (
         "dmtac_bimanual_position_eg2_4b2_cad_20260829.v2"
     )
-    assert config.left_gripper_name == "left_eg2_4b2_cad"
-    assert config.right_gripper_name == "right_eg2_4b2_cad"
-    assert config.right_grasp_body_name == "right_eg2_4b2_cad_ee_link_4"
+    assert config.controlled_side == arm_side
+    assert config.fixed_side == fixed_side
+    assert config.left_gripper_name == fixed_gripper
+    assert config.right_gripper_name == controlled_gripper
+    assert config.right_grasp_body_name == f"{arm_side}_eg2_4b2_cad_ee_link_4"
+    assert config.left_tool_profile_path.endswith(
+        "rm65_left_DMTAC_M_4b2_cad_tool_tcp.json"
+    )
     assert config.right_tool_profile_path.endswith(
         "rm65_right_DMTAC_M_4b2_cad_tool_tcp.json"
     )
-    assert config.grasp_latch_left_finger_body_name == ("right_eg2_4b2_cad_ee_link_2")
-    assert config.grasp_latch_right_finger_body_name == ("right_eg2_4b2_cad_ee_link_3")
+    assert config.grasp_latch_left_finger_body_name == (
+        f"{arm_side}_eg2_4b2_cad_ee_link_2"
+    )
+    assert config.grasp_latch_right_finger_body_name == (
+        f"{arm_side}_eg2_4b2_cad_ee_link_3"
+    )
+    assert config.to_metadata()["controlled_side"] == arm_side
+    assert config.to_metadata()["fixed_side"] == fixed_side
     assert "sim_point_grasp/configs" in config.base_contract_path
     contract = config.base_contract()
     assert contract.scene.collision.safety_minimum_clearance_m == 0.0

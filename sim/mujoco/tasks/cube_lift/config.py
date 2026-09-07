@@ -194,6 +194,9 @@ class CubeLiftTaskConfig:
     grasp_mode: str = PHYSICAL_CONTACT_GRASP_MODE
     controlled_side: str = "right"
     fixed_side: str = "left"
+    # The historical left/right field names below also identify fixed/controlled
+    # slots in the CubeLift action contract. Physical side identity is carried
+    # by controlled_side/fixed_side and the side-specific scene bindings.
     left_home_qpos: tuple[float, ...] = (0.0,) * 6
     right_home_qpos: tuple[float, ...] = (0.0,) * 6
     right_qpos_lower: tuple[float, ...] = (0.0,) * 6
@@ -520,8 +523,15 @@ class CubeLiftTaskConfig:
             )
         object.__setattr__(self, "policy_action_scale", policy_action_scale)
         object.__setattr__(self, "policy_action_bias", policy_action_bias)
-        if (self.controlled_side, self.fixed_side) != ("right", "left"):
-            raise ValueError("CubeLift controls right and holds left.")
+        controlled_side = str(self.controlled_side).strip().lower()
+        fixed_side = str(self.fixed_side).strip().lower()
+        if {controlled_side, fixed_side} != {"left", "right"}:
+            raise ValueError(
+                "CubeLift controlled_side/fixed_side must assign left and right "
+                "exactly once."
+            )
+        object.__setattr__(self, "controlled_side", controlled_side)
+        object.__setattr__(self, "fixed_side", fixed_side)
         task_objective = str(self.task_objective).strip().lower()
         if task_objective not in {
             REACH_TASK_OBJECTIVE,
@@ -2060,6 +2070,8 @@ class CubeLiftTaskConfig:
             "gripper_actuation_profile_sha256": self.gripper_actuation_profile_sha256,
             "policy_class": self.policy_class,
             "grasp_mode": self.grasp_mode,
+            "controlled_side": self.controlled_side,
+            "fixed_side": self.fixed_side,
             "observation_mode": self.observation_mode,
             "action_layout": self.action_layout,
             "pose_control_frame": self.pose_control_frame,
