@@ -148,7 +148,8 @@ model-RTC Active 还会在 qpos-init 完成后保持测量 qpos，丢弃默认 1
 严格小于该值。在该门通过且操作者完成 ready
 确认之前不会下发策略动作。计划 underrun、producer 不可用或延迟超限都会清空待执行计划并
 保持最新测量 qpos；无法建立该 Hold 时升级到更强 Hold 并报错退出。`--max-steps` 验收可配合
-`--min-rtc-emissions-before-exit`，避免“进程正常退出但零有效 emission”的假通过。
+`--min-rtc-emissions-before-exit`；第 23 节的有界 no-action 和 Active 验收都显式要求至少 1 个
+committed emission，避免“进程正常退出但零有效 emission”的假通过。
 
 trained model-RTC sampler 默认保持 10 step。若 10-step warm latency 无法通过 `<0.4 s` 门，
 可在同一轮 server 与 client 命令中都显式加入 `--rtc-inference-steps 8`。这不是修改 checkpoint

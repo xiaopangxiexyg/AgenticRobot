@@ -135,6 +135,7 @@ def test_stage12_real_recipe_separates_no_action_and_bounded_active() -> None:
     assert "--policy-qpos-init-frame" in no_action
     assert "--policy-qpos-init-source" in no_action
     assert "--policy-qpos-init-collision-check" in no_action
+    assert "--min-rtc-emissions-before-exit 1" in no_action
     assert "plan-only" in no_action
     assert "不会声称机械臂已经到达数据集起点" in no_action
     assert "--no-init-qpos" not in "\n".join(_bash_blocks(no_action))
@@ -153,7 +154,11 @@ def test_stage12_real_recipe_separates_no_action_and_bounded_active() -> None:
     assert "--policy-qpos-init-frame" in active
     assert "--policy-qpos-init-source" in active
     assert "--policy-qpos-init-collision-check" in active
+    assert "--rtc-active-warmup-discard-completions 1" in active
+    assert "--rtc-active-warmup-completions 3" in active
+    assert "--rtc-active-max-inference-latency-sec 0.4" in active
     assert "--max-steps 10" in active
+    assert "--min-rtc-emissions-before-exit 1" in active
     assert "--no-init-qpos" not in active_blocks
     assert "--no-wait-for-ready-confirm" not in active_blocks
 

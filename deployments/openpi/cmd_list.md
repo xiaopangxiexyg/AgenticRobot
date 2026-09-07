@@ -2211,6 +2211,7 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage${STAGE}_shadow_$
   --left-gripper-port "$LEFT_GRIPPER_PORT" \
   --right-gripper-port "$RIGHT_GRIPPER_PORT" \
   --max-steps 100 \
+  --min-rtc-emissions-before-exit 1 \
   --debug \
   --rtc-debug-level summary \
   --debug-dir "$RTC_DEBUG_DIR"
@@ -2234,7 +2235,8 @@ Stage2。运行前必须重新确认：两臂和笔/夹爪当前状态允许移�
 下面命令会真实发动作。它显式保留 dataset-frame qpos-init 和碰撞检查，并把
 `--wait-for-ready-confirm` 放在 profile 参数之后，以覆盖 RTC real-shadow profile 的自动启动
 默认值；初始化轨迹完成并出现 ready 提示后，仍须由现场操作者人工按 `A` 放行 policy。首次只
-运行 10 个 control step，不得自动注入按键：
+运行 10 个 control step，并显式固定 1 次冷启动丢弃、3 次 warm completion 与严格
+`<0.4 s` 延迟门；不得自动注入按键：
 
 ```bash
 set -euo pipefail
@@ -2259,6 +2261,9 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage1_active_$(date +
   --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
   --rtc-inference-steps 8 \
   --rtc-real-shadow \
+  --rtc-active-warmup-discard-completions 1 \
+  --rtc-active-warmup-completions 3 \
+  --rtc-active-max-inference-latency-sec 0.4 \
   --policy-action-pose-mode absolute \
   --policy-qpos-init-dataset "$QPOS_INIT_DATASET" \
   --policy-qpos-init-episode 0 \
@@ -2271,6 +2276,7 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage1_active_$(date +
   --send-actions \
   --wait-for-ready-confirm \
   --max-steps 10 \
+  --min-rtc-emissions-before-exit 1 \
   --debug \
   --rtc-debug-level summary \
   --debug-dir "$RTC_DEBUG_DIR"
