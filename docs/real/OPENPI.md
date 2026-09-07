@@ -153,7 +153,9 @@ trained model-RTC sampler 默认保持 10 step。若 10-step warm latency 无法
 可在同一轮 server 与 client 命令中都显式加入 `--rtc-inference-steps 8`。这不是修改 checkpoint
 或训练 profile：client 会根据 loaded provider 的完整实现参数生成 deployment-only binding
 receipt，并要求把步数恢复为 10 后精确复现训练契约哈希；任何其它参数漂移或两端步数不一致
-都会在动作派发前失败。不要通过放宽 `--rtc-active-max-inference-sec` 代替该绑定。
+都会在动作派发前失败。server 还必须用 `--rtc-runtime-openpi-root` 显式选择当前不可变部署
+快照中 gitlink 固定的 `model/openpi`，而 `--openpi-root` 仍指向 profile 固定的训练 checkout；
+两者不能靠修改旧训练 checkout 合并。不要通过放宽 `--rtc-active-max-inference-sec` 代替该绑定。
 
 ## 6. 更换 checkpoint 或 server 模型
 

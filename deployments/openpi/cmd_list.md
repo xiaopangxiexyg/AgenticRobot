@@ -676,7 +676,10 @@ conditioned model-RTC 默认仍使用训练契约的 10 个 sampler step。只�
 显式传入 `--rtc-inference-steps 8` 时才选择版本化的低延迟部署派生；client 会用 loaded
 provider 的完整实现参数反算 10-step 训练哈希，并证明除 `effective_num_steps` 外没有任何
 实现、维度、horizon、frame、normalization 或 training contract 变化。两端不一致会在创建
-RTC backend 时 fail closed，不会进入 action dispatch。
+RTC backend 时 fail closed，不会进入 action dispatch。8-step server 还必须显式传入
+`--rtc-runtime-openpi-root`，且该路径只能解析到当前不可变 AgenticRobot 部署快照中由父仓
+gitlink 固定的 `model/openpi`；`--openpi-root` 继续绑定原训练 profile checkout。这样不会修改
+训练 checkout，也不会把未提交补丁伪装成训练源码。
 
 终端 A：在确认旧 server 已停止、GPU 显存足够后启动 conditioned server：
 
@@ -694,6 +697,7 @@ python -m deployments.openpi.server \
   --openpi-root /home/user/zc/openpi \
   --enable-rtc-continuation \
   --rtc-inference-steps 8 \
+  --rtc-runtime-openpi-root /home/user/zc/DexTeleop/model/openpi \
   --host 0.0.0.0 \
   --port 8078
 ```
@@ -2098,6 +2102,7 @@ test -f "$PREPARED_PROFILE"
 test -f "$MODEL_RTC_PROFILE"
 test -d "$OPENPI_ROOT/.git" -o -f "$OPENPI_ROOT/.git"
 test "$(git -C "$OPENPI_ROOT" rev-parse HEAD)" = e21cb9612de936fcf13c7757b27df1c086c6c59e
+test -f "$DEPLOY_ROOT/model/openpi/scripts/serve_dexteleop_policy.py"
 ```
 
 该门只检查必要文件与冻结 OpenPI source identity；随后仍必须执行两端各自的语义检查。
@@ -2126,6 +2131,7 @@ PYTHONDONTWRITEBYTECODE=1 "$OPENPI_PYTHON" -u -m deployments.openpi.server \
   --openpi-root "$OPENPI_ROOT" \
   --enable-rtc-continuation \
   --rtc-inference-steps 8 \
+  --rtc-runtime-openpi-root "$DEPLOY_ROOT/model/openpi" \
   --prepared-config-check-only
 ```
 
@@ -2147,6 +2153,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
   --openpi-root "$OPENPI_ROOT" \
   --enable-rtc-continuation \
   --rtc-inference-steps 8 \
+  --rtc-runtime-openpi-root "$DEPLOY_ROOT/model/openpi" \
   --host 0.0.0.0 \
   --port "$OPENPI_PORT"
 ```

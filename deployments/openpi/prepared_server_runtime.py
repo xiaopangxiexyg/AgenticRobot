@@ -51,6 +51,35 @@ def _load_module(path: Path, name: str) -> Any:
     return module
 
 
+def _validate_runtime_openpi_binding(
+    *,
+    runtime_root: Path,
+    training_root: Path,
+    model_rtc_profile: Path | None,
+    rtc_inference_steps: int,
+    bundled_root: Path | None = None,
+) -> None:
+    """Allow source separation only for the pinned 8-step RTC runtime."""
+
+    if runtime_root == training_root:
+        return
+    expected_runtime_root = (
+        Path(__file__).resolve().parents[2] / "model" / "openpi"
+        if bundled_root is None
+        else bundled_root
+    ).resolve()
+    if (
+        model_rtc_profile is None
+        or rtc_inference_steps != 8
+        or runtime_root != expected_runtime_root
+    ):
+        raise ValueError(
+            "a distinct --openpi-root is only allowed for the 8-step "
+            "trained model-RTC deployment and must be this AgenticRobot "
+            "snapshot's pinned model/openpi submodule."
+        )
+
+
 def _mixing_sources(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     mixing = payload.get("dataset_mixing")
     if not isinstance(mixing, Mapping):
@@ -450,6 +479,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prepared-training-profile", type=Path, required=True)
     parser.add_argument("--model-rtc-profile", type=Path, default=None)
     parser.add_argument("--openpi-root", type=Path, required=True)
+    parser.add_argument(
+        "--training-openpi-root",
+        type=Path,
+        default=None,
+        help=(
+            "Profile-pinned training checkout when --openpi-root selects the "
+            "8-step deployment runtime. Defaults to --openpi-root."
+        ),
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--host", default="0.0.0.0")
@@ -502,6 +540,11 @@ def main(argv: list[str] | None = None) -> int:
 
     checkpoint_dir = args.checkpoint_dir.expanduser().resolve()
     openpi_root = args.openpi_root.expanduser().resolve()
+    training_openpi_root = (
+        openpi_root
+        if args.training_openpi_root is None
+        else args.training_openpi_root.expanduser().resolve()
+    )
     resolution = validate_prepared_deployment_artifact(
         checkpoint_dir,
         args.prepared_training_profile,
@@ -529,10 +572,19 @@ def main(argv: list[str] | None = None) -> int:
     profile_openpi_root = Path(
         str(resolution.profile["openpi_checkout"])
     ).expanduser().resolve()
-    if profile_openpi_root != openpi_root:
+    if profile_openpi_root != training_openpi_root:
         parser.error(
-            "--openpi-root differs from the prepared training profile."
+            "--training-openpi-root differs from the prepared training profile."
         )
+    try:
+        _validate_runtime_openpi_binding(
+            runtime_root=openpi_root,
+            training_root=training_openpi_root,
+            model_rtc_profile=args.model_rtc_profile,
+            rtc_inference_steps=args.rtc_inference_steps,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     import openpi.training.config as training_config
     from openpi.policies import dexteleop_v23_policy
