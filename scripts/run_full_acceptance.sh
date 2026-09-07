@@ -94,8 +94,8 @@ prepare_asset_compat_link() {
 configure_shards() {
   SHARD_COUNT="${DEXTELEOP_FULL_ACCEPTANCE_SHARDS:-4}"
   case "$SHARD_COUNT" in
-    1|2|3|4) ;;
-    *) die "DEXTELEOP_FULL_ACCEPTANCE_SHARDS must be an integer from 1 to 4: $SHARD_COUNT" ;;
+    1|2|3|4|5|6) ;;
+    *) die "DEXTELEOP_FULL_ACCEPTANCE_SHARDS must be an integer from 1 to 6: $SHARD_COUNT" ;;
   esac
 }
 

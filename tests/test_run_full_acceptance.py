@@ -49,6 +49,10 @@ name="${name%.xml}"
 printf '%s\\n' "${all_arguments[@]}" >"$FAKE_SYNC_ROOT/$name.args"
 printf '%s\\n' "$TMPDIR" >"$FAKE_SYNC_ROOT/$name.tmpdir"
 printf '%s\\n' "$XDG_CACHE_HOME" >"$FAKE_SYNC_ROOT/$name.xdg-cache"
+printf '%s\\n' "$PYTHONPYCACHEPREFIX" >"$FAKE_SYNC_ROOT/$name.python-cache"
+printf '%s\\n' "$SIM_MUJOCO_CACHE_DIR" >"$FAKE_SYNC_ROOT/$name.mujoco-cache"
+printf '%s\\n' "$MPLCONFIGDIR" >"$FAKE_SYNC_ROOT/$name.matplotlib-cache"
+printf '%s\\n' "$NUMBA_CACHE_DIR" >"$FAKE_SYNC_ROOT/$name.numba-cache"
 printf '%s\\n' "$MUJOCO_GL" >"$FAKE_SYNC_ROOT/$name.mujoco-gl"
 umask >"$FAKE_SYNC_ROOT/$name.umask"
 : >"$FAKE_SYNC_ROOT/$name.started"
@@ -75,20 +79,22 @@ def _run_wrapper(
     asset_root: Path,
     run_root: Path,
     *,
-    shard_count: int = 4,
+    shard_count: int | str | None = None,
     fail_shard: str = "",
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
+    environment.pop("DEXTELEOP_FULL_ACCEPTANCE_SHARDS", None)
     environment.update(
         {
             "DEXTELEOP_ASSET_ROOT": str(asset_root),
             "DEXTELEOP_FULL_ACCEPTANCE_RUN_ROOT": str(run_root),
-            "DEXTELEOP_FULL_ACCEPTANCE_SHARDS": str(shard_count),
             "FAKE_FAIL_SHARD": fail_shard,
-            "FAKE_SHARD_COUNT": str(shard_count),
+            "FAKE_SHARD_COUNT": str(4 if shard_count is None else shard_count),
             "FAKE_SYNC_ROOT": str(sync_root),
         }
     )
+    if shard_count is not None:
+        environment["DEXTELEOP_FULL_ACCEPTANCE_SHARDS"] = str(shard_count)
     return subprocess.run(
         [str(wrapper), "--durations=3"],
         check=False,
@@ -98,7 +104,51 @@ def _run_wrapper(
     )
 
 
-def test_wrapper_runs_complete_isolated_shards_and_merges_evidence(
+def _assert_complete_isolated_run(
+    sync_root: Path, run_root: Path, *, shard_count: int
+) -> None:
+    manifest = json.loads((run_root / "shard-plan.json").read_text())
+    assert manifest["shard_count"] == shard_count
+    planned = [
+        module for shard in manifest["shards"] for module in shard["test_modules"]
+    ]
+    assert len(planned) == len(set(planned)) == 9
+    isolated_paths = {
+        "tmpdir": "tmp",
+        "xdg-cache": "xdg-cache",
+        "python-cache": "python-bytecode",
+        "mujoco-cache": "mujoco-cache",
+        "matplotlib-cache": "matplotlib-cache",
+        "numba-cache": "numba-cache",
+    }
+    for evidence_suffix, run_suffix in isolated_paths.items():
+        observed = {
+            (sync_root / f"shard-{index}.{evidence_suffix}").read_text().strip()
+            for index in range(shard_count)
+        }
+        expected = {
+            str(run_root / f"shard-{index}-{run_suffix}")
+            for index in range(shard_count)
+        }
+        assert observed == expected
+    for index in range(shard_count):
+        arguments = (sync_root / f"shard-{index}.args").read_text().splitlines()
+        assert "not hardware" in arguments
+        assert "--durations=3" in arguments
+        assert f"cache_dir={run_root / f'shard-{index}-pytest-cache'}" in arguments
+        assert f"--junitxml={run_root / f'shard-{index}.xml'}" in arguments
+        assert (sync_root / f"shard-{index}.mujoco-gl").read_text().strip() == "egl"
+        assert (sync_root / f"shard-{index}.umask").read_text().strip() == "0022"
+    aggregate = ET.parse(run_root / "full-acceptance.xml").getroot()
+    cases = aggregate.findall(".//testcase")
+    assert aggregate.attrib["tests"] == str(shard_count)
+    assert aggregate.attrib["failures"] == "0"
+    assert {case.attrib["name"] for case in cases} == {
+        f"shard-{index}" for index in range(shard_count)
+    }
+
+
+def test_wrapper_defaults_to_four_complete_isolated_shards(
     tmp_path: Path,
 ) -> None:
     checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
@@ -109,30 +159,44 @@ def test_wrapper_runs_complete_isolated_shards_and_merges_evidence(
     completed = _run_wrapper(wrapper, sync_root, assets, run_root)
 
     assert completed.returncode == 0, completed.stderr
-    manifest = json.loads((run_root / "shard-plan.json").read_text())
-    assert manifest["shard_count"] == 4
-    planned = [
-        module for shard in manifest["shards"] for module in shard["test_modules"]
-    ]
-    assert len(planned) == len(set(planned)) == 9
-    tmpdirs = {
-        (sync_root / f"shard-{index}.tmpdir").read_text().strip() for index in range(4)
-    }
-    xdg_caches = {
-        (sync_root / f"shard-{index}.xdg-cache").read_text().strip()
-        for index in range(4)
-    }
-    assert len(tmpdirs) == len(xdg_caches) == 4
-    for index in range(4):
-        arguments = (sync_root / f"shard-{index}.args").read_text().splitlines()
-        assert "not hardware" in arguments
-        assert "--durations=3" in arguments
-        assert f"--junitxml={run_root / f'shard-{index}.xml'}" in arguments
-        assert (sync_root / f"shard-{index}.mujoco-gl").read_text().strip() == "egl"
-        assert (sync_root / f"shard-{index}.umask").read_text().strip() == "0022"
-    aggregate = ET.parse(run_root / "full-acceptance.xml").getroot()
-    assert aggregate.attrib["tests"] == "4"
-    assert aggregate.attrib["failures"] == "0"
+    _assert_complete_isolated_run(sync_root, run_root, shard_count=4)
+    assert not os.path.lexists(checkout / "assets")
+
+
+@pytest.mark.parametrize("shard_count", [5, 6])
+def test_wrapper_supports_explicit_additional_shards(
+    tmp_path: Path, shard_count: int
+) -> None:
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    run_root = tmp_path / f"full-{shard_count}"
+
+    completed = _run_wrapper(
+        wrapper, sync_root, assets, run_root, shard_count=shard_count
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    _assert_complete_isolated_run(sync_root, run_root, shard_count=shard_count)
+    assert not os.path.lexists(checkout / "assets")
+
+
+@pytest.mark.parametrize("shard_count", ["7", "auto"])
+def test_wrapper_rejects_unsupported_shard_counts(
+    tmp_path: Path, shard_count: str
+) -> None:
+    checkout, wrapper, sync_root = _wrapper_checkout(tmp_path)
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    run_root = tmp_path / f"invalid-{shard_count}"
+
+    completed = _run_wrapper(
+        wrapper, sync_root, assets, run_root, shard_count=shard_count
+    )
+
+    assert completed.returncode == 2
+    assert "must be an integer from 1 to 6" in completed.stderr
+    assert not list(sync_root.glob("*.started"))
     assert not os.path.lexists(checkout / "assets")
 
 
@@ -144,11 +208,18 @@ def test_wrapper_propagates_failure_after_preserving_other_shards(
     assets.mkdir()
     run_root = tmp_path / "failed"
 
-    completed = _run_wrapper(wrapper, sync_root, assets, run_root, fail_shard="shard-2")
+    completed = _run_wrapper(
+        wrapper,
+        sync_root,
+        assets,
+        run_root,
+        shard_count=6,
+        fail_shard="shard-5",
+    )
 
     assert completed.returncode == 1
-    assert "full acceptance shard 2 (status=7)" in completed.stdout
-    assert all((run_root / f"shard-{index}.xml").is_file() for index in range(4))
+    assert "full acceptance shard 5 (status=7)" in completed.stdout
+    assert all((run_root / f"shard-{index}.xml").is_file() for index in range(6))
     assert (run_root / "full-acceptance.xml").is_file()
     assert not os.path.lexists(checkout / "assets")
 
