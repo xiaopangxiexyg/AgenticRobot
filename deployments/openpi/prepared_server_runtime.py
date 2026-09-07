@@ -16,15 +16,15 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from deployments.openpi.prepared_deployment import (
-    PreparedDeploymentResolution,
-    validate_prepared_deployment_artifact,
-)
 from deployments.openpi.image_wire import (
     OPENPI_IMAGE_WIRE_TRAINING_METADATA_KEY_V1,
     OpenPIImageWireServerConfig,
     build_openpi_image_wire_capability,
     install_openpi_image_wire_server_adapter,
+)
+from deployments.openpi.prepared_deployment import (
+    PreparedDeploymentResolution,
+    validate_prepared_deployment_artifact,
 )
 from deployments.openpi.state_only import (
     OpenPIStateOnlyInputBridge,
@@ -458,6 +458,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--enable-rtc-continuation", action="store_true")
     parser.add_argument(
+        "--rtc-inference-steps",
+        type=int,
+        choices=(8, 10),
+        default=10,
+        help=(
+            "Versioned conditioned-RTC sampler budget; 10 preserves the "
+            "trained default and 8 selects the latency deployment binding."
+        ),
+    )
+    parser.add_argument(
         "--image-wire-profile",
         choices=("off", "resize-raw", "jpeg"),
         default="off",
@@ -479,6 +489,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if not args.enable_rtc_continuation and args.rtc_inference_steps != 10:
+        parser.error(
+            "--rtc-inference-steps 8 requires --enable-rtc-continuation."
+        )
     image_wire_config = OpenPIImageWireServerConfig(
         profile=args.image_wire_profile,
         target_height=args.image_wire_height,
@@ -594,16 +608,23 @@ def main(argv: list[str] | None = None) -> int:
             openpi_root / "scripts" / "serve_dexteleop_policy.py",
             "_dexteleop_prepared_openpi_server",
         )
-        server_args = server_module.Args(
-            model=str(args.model),
-            registry=args.registry.expanduser().resolve(),
-            host=str(args.host),
-            port=int(args.port),
-            checkpoint_dir=None,
-            default_prompt=resolved_default_prompt,
-            record=bool(args.record),
-            enable_rtc_continuation=bool(args.enable_rtc_continuation),
-        )
+        server_kwargs = {
+            "model": str(args.model),
+            "registry": args.registry.expanduser().resolve(),
+            "host": str(args.host),
+            "port": int(args.port),
+            "checkpoint_dir": None,
+            "default_prompt": resolved_default_prompt,
+            "record": bool(args.record),
+            "enable_rtc_continuation": bool(
+                args.enable_rtc_continuation
+            ),
+        }
+        if args.rtc_inference_steps != 10:
+            server_kwargs["rtc_inference_steps"] = int(
+                args.rtc_inference_steps
+            )
+        server_args = server_module.Args(**server_kwargs)
         with install_openpi_image_wire_server_adapter(
             server_module.websocket_policy_server,
             image_wire_config,

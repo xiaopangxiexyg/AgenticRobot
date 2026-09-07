@@ -11,25 +11,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
+from pathlib import Path
 
 from dataset_contracts.normalization import (
     NormalizationContract,
     NormalizationContractError,
 )
-from deployments.policy_artifact import load_policy_artifact
 from deployments.openpi.camera_semantics import (
     validate_declared_camera_semantics,
     validate_legacy_swapped_wrist_artifact,
 )
+from deployments.openpi.image_wire import OpenPIImageWireServerConfig
 from deployments.openpi.prepared_deployment import (
     prepare_checkpoint_deployment_artifact,
     validate_prepared_deployment_artifact,
 )
-from deployments.openpi.image_wire import OpenPIImageWireServerConfig
+from deployments.policy_artifact import load_policy_artifact
 
 
 def _non_negative_cpu_id(text: str) -> int:
@@ -350,6 +350,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--rtc-inference-steps",
+        type=int,
+        choices=(8, 10),
+        default=10,
+        help=(
+            "Versioned conditioned-RTC sampler budget. The trained/default "
+            "contract is 10; 8 is an explicit latency deployment derivation."
+        ),
+    )
+    parser.add_argument(
         "--image-wire-profile",
         choices=("off", "resize-raw", "jpeg"),
         default="off",
@@ -439,6 +449,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.prepared_config_check_only and args.dry_run:
         parser.error(
             "--prepared-config-check-only and --dry-run are mutually exclusive."
+        )
+    if not args.enable_rtc_continuation and args.rtc_inference_steps != 10:
+        parser.error(
+            "--rtc-inference-steps 8 requires --enable-rtc-continuation."
         )
     prepared_resolution = None
     if prepared_training_profile is not None:
@@ -542,6 +556,10 @@ def main(argv: list[str] | None = None) -> int:
         command.append("--record")
     if args.enable_rtc_continuation:
         command.append("--enable-rtc-continuation")
+    if args.rtc_inference_steps != 10:
+        command.extend(
+            ("--rtc-inference-steps", str(args.rtc_inference_steps))
+        )
     if image_wire_config.enabled:
         command.extend(
             (

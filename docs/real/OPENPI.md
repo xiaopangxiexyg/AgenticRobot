@@ -149,6 +149,12 @@ model-RTC Active 还会在 qpos-init 完成后保持测量 qpos，丢弃默认 1
 保持最新测量 qpos；无法建立该 Hold 时升级到更强 Hold 并报错退出。`--max-steps` 验收可配合
 `--min-rtc-emissions-before-exit`，避免“进程正常退出但零有效 emission”的假通过。
 
+trained model-RTC sampler 默认保持 10 step。若 10-step warm latency 无法通过 0.4 秒门，
+可在同一轮 server 与 client 命令中都显式加入 `--rtc-inference-steps 8`。这不是修改 checkpoint
+或训练 profile：client 会根据 loaded provider 的完整实现参数生成 deployment-only binding
+receipt，并要求把步数恢复为 10 后精确复现训练契约哈希；任何其它参数漂移或两端步数不一致
+都会在动作派发前失败。不要通过放宽 `--rtc-active-max-inference-sec` 代替该绑定。
+
 ## 6. 更换 checkpoint 或 server 模型
 
 1. 停止 client 和 server，确认机器人已经退出策略控制。

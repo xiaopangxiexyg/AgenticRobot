@@ -672,6 +672,12 @@ server 前，先由现有 server 的 owner 正常停止旧进程，并确认 `80
 `--model-rtc-profile`，并增加 `--rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1`。
 server 侧 preflight 还必须保留 `--enable-rtc-continuation`。
 
+conditioned model-RTC 默认仍使用训练契约的 10 个 sampler step。只有 client 与 server 同时
+显式传入 `--rtc-inference-steps 8` 时才选择版本化的低延迟部署派生；client 会用 loaded
+provider 的完整实现参数反算 10-step 训练哈希，并证明除 `effective_num_steps` 外没有任何
+实现、维度、horizon、frame、normalization 或 training contract 变化。两端不一致会在创建
+RTC backend 时 fail closed，不会进入 action dispatch。
+
 终端 A：在确认旧 server 已停止、GPU 显存足够后启动 conditioned server：
 
 ```bash
@@ -687,6 +693,7 @@ python -m deployments.openpi.server \
   --model-rtc-profile /home/user/zc/DexTeleop/deployments/openpi/configs/model_rtc/writing_stage1_0804_0806_front_h16_absolute_prepared_model_rtc_v1.json \
   --openpi-root /home/user/zc/openpi \
   --enable-rtc-continuation \
+  --rtc-inference-steps 8 \
   --host 0.0.0.0 \
   --port 8078
 ```
@@ -2109,6 +2116,7 @@ PYTHONDONTWRITEBYTECODE=1 "$DEXTELEOP_PYTHON" -u -m deployments.openpi.client.re
   --prepared-training-profile "$PREPARED_PROFILE" \
   --model-rtc-profile "$MODEL_RTC_PROFILE" \
   --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
+  --rtc-inference-steps 8 \
   --contract-check-only
 
 PYTHONDONTWRITEBYTECODE=1 "$OPENPI_PYTHON" -u -m deployments.openpi.server \
@@ -2117,6 +2125,7 @@ PYTHONDONTWRITEBYTECODE=1 "$OPENPI_PYTHON" -u -m deployments.openpi.server \
   --model-rtc-profile "$MODEL_RTC_PROFILE" \
   --openpi-root "$OPENPI_ROOT" \
   --enable-rtc-continuation \
+  --rtc-inference-steps 8 \
   --prepared-config-check-only
 ```
 
@@ -2137,6 +2146,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
   --model-rtc-profile "$MODEL_RTC_PROFILE" \
   --openpi-root "$OPENPI_ROOT" \
   --enable-rtc-continuation \
+  --rtc-inference-steps 8 \
   --host 0.0.0.0 \
   --port "$OPENPI_PORT"
 ```
@@ -2174,6 +2184,7 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage${STAGE}_shadow_$
   --model-rtc-profile "$MODEL_RTC_PROFILE" \
   --deployment-profile rm65_bimanual_dmtac \
   --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
+  --rtc-inference-steps 8 \
   --rtc-real-shadow \
   --policy-action-pose-mode absolute \
   --policy-qpos-init-dataset "$QPOS_INIT_DATASET" \
@@ -2231,6 +2242,7 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage1_active_$(date +
   --model-rtc-profile "$MODEL_RTC_PROFILE" \
   --deployment-profile rm65_bimanual_dmtac \
   --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
+  --rtc-inference-steps 8 \
   --rtc-real-shadow \
   --policy-action-pose-mode absolute \
   --policy-qpos-init-dataset "$QPOS_INIT_DATASET" \

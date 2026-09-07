@@ -721,13 +721,15 @@ def test_prepared_model_rtc_server_dry_run_binds_dynamic_output_config(
             "--model-rtc-profile",
             str(model_profile_path),
             "--enable-rtc-continuation",
+            "--rtc-inference-steps",
+            "8",
             "--dry-run",
         ]
     ) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["model_rtc_profile"] == str(model_profile_path)
     assert "--model-rtc-profile" in report["command"]
-    assert report["command"][-1] == "--enable-rtc-continuation"
+    assert report["command"][-2:] == ["--rtc-inference-steps", "8"]
     registry_path = Path(
         report["command"][report["command"].index("--registry") + 1]
     )
@@ -1230,12 +1232,15 @@ def test_prepared_model_rtc_client_contract_check_verifies_both_profiles(
             str(model_profile_path),
             "--rtc-profile",
             "model_rtc_flow_inpaint_shadow_15_30_60_120_v1",
+            "--rtc-inference-steps",
+            "8",
             "--contract-check-only",
         ]
     ) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["ok"] is True
     assert report["model_id"] == "prepared-model-rtc"
+    assert report["rtc_inference_steps"] == 8
     assert report["server_contract"]["normalization_hash"]
 
 
