@@ -26,6 +26,9 @@
   const controllerSourceIdentity = (
     window.QuestDevControllerSourceIdentity.createTracker()
   );
+  const controllerPoseDisplay = (
+    window.QuestDevControllerPoseDisplay.createTracker()
+  );
   let gl = null;
   let clientConfig = {
     protocol_version: 2,
@@ -272,7 +275,12 @@
     };
   }
 
-  function renderFrame(session, viewerPose, controllerPoses) {
+  function renderFrame(
+    session,
+    viewerPose,
+    controllerPoses,
+    displayControllerPoses,
+  ) {
     const layer = session.renderState.baseLayer;
     if (!layer || !viewerPose) return;
     gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
@@ -295,6 +303,7 @@
         viewerPose,
         viewProjection,
         controllerPoses,
+        displayControllerPoses,
         clientInstanceId,
         xrSessionId,
         referenceSpaceType,
@@ -338,6 +347,7 @@
       referenceSpaceType = reference.type;
       referenceSpaceGeneration = 0;
       controllerSourceIdentity.reset();
+      controllerPoseDisplay.reset();
 
       session.addEventListener('end', () => {
         if (xrSession !== session) return;
@@ -358,6 +368,7 @@
         referenceSpaceType = null;
         referenceSpaceGeneration = 0;
         controllerSourceIdentity.reset();
+        controllerPoseDisplay.reset();
         updateStartButton();
         setStatus(xrStatus, 'ended', false);
       }, { once: true });
@@ -412,19 +423,26 @@
         session.requestAnimationFrame(onFrame);
         const viewerPose = frame.getViewerPose(referenceSpace);
         const controllerPoses = [];
+        const displayControllerPoses = [];
+        const activeSourceIds = new Set();
         const sourceOccurrences = new Map();
         for (const source of session.inputSources) {
           const fingerprint = controllerSourceIdentity.fingerprint(source);
           const occurrence = sourceOccurrences.get(fingerprint) || 0;
           sourceOccurrences.set(fingerprint, occurrence + 1);
+          const sourceSessionId = controllerSourceIdentity.idFor(source, occurrence);
+          activeSourceIds.add(sourceSessionId);
           const sample = controllerSample(
             frame,
             referenceSpace,
             source,
-            controllerSourceIdentity.idFor(source, occurrence),
+            sourceSessionId,
           );
           if (sample) controllerPoses.push(sample);
+          const displayPose = controllerPoseDisplay.observe(sourceSessionId, sample);
+          if (displayPose) displayControllerPoses.push(displayPose);
         }
+        controllerPoseDisplay.prune(activeSourceIds);
         window.QuestDevFeatures.onXRFrame({
           time,
           frame,
@@ -438,7 +456,12 @@
           send,
           logEvent,
         });
-        renderFrame(session, viewerPose, controllerPoses);
+        renderFrame(
+          session,
+          viewerPose,
+          controllerPoses,
+          displayControllerPoses,
+        );
       }
 
       session.requestAnimationFrame(onFrame);
@@ -453,6 +476,7 @@
         referenceSpaceType = null;
         referenceSpaceGeneration = 0;
         controllerSourceIdentity.reset();
+        controllerPoseDisplay.reset();
       }
       throw error;
     } finally {

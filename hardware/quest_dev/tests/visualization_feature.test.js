@@ -166,6 +166,20 @@ test('visualization draws TCP axes only for the current accepted Quest epoch', (
   assert.equal(draws.length, 1);
 });
 
+test('visualization renders the display-only controller list, not raw capture data', () => {
+  const { implementation, draws } = loadFeature();
+  implementation.onXRReady({ gl: {} });
+  const rawMatrix = ['raw-controller-matrix'];
+  const displayMatrix = ['cached-controller-matrix'];
+  implementation.renderView({
+    ...matchingContext(),
+    controllerPoses: [{ pose: { transform: { matrix: rawMatrix } } }],
+    displayControllerPoses: [{ pose: { transform: { matrix: displayMatrix } } }],
+  });
+  assert.equal(draws.length, 1);
+  assert.strictEqual(draws[0][2], displayMatrix);
+});
+
 test('visualization draws diagnostic robot base and raw-feedback TCP preview', () => {
   const { implementation, draws, status, overlayStatus } = loadFeature();
   implementation.onXRReady({ gl: {} });
