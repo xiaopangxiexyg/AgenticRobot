@@ -1,0 +1,16 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "dmtac_rm65_full_trajectory_replay_v1_stages",
+  "profile_version": "1",
+  "task_progress_profile_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "execute_task",
+      "stage_id": "execute_task.full_replay",
+      "display_name": "完整 Episode Replay",
+      "description": "从来源 Episode 第 0 帧到末帧完整复现并记录。",
+      "ordinal": 1
+    }
+  ]
+}

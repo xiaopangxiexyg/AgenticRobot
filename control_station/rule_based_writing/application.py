@@ -1,0 +1,1334 @@
+"""Typed operator intents and rebuildable UI state for rule-based writing.
+
+This application leaf translates the dedicated rule controls to the existing
+RealTeleop writer and safety-loop intents.  It does not own robot dispatch,
+writer persistence, or the rule cursor.
+"""
+
+from __future__ import annotations
+
+import queue
+import math
+import threading
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Mapping
+
+
+class RuleBasedWritingIntent(str, Enum):
+    START = "rule_start"
+    STOP = "rule_stop"
+    DEVICE_RETRY = "device_retry"
+    RUNTIME_HOME_RETRY = "runtime_home_retry"
+    RELEASE_GRIPPERS = "release_grippers"
+    CLOSE_GRIPPERS = "close_grippers"
+    DEBUG_TOGGLE = "debug_toggle"
+    QUIT = "q"
+
+
+@dataclass
+class RuleBasedWritingUiState:
+    revision: int = 0
+    phase: str = "preparing"
+    title: str = "规则采集环境准备中"
+    detail: str = "正在连接设备并建立安全控制链路。"
+    can_start: bool = False
+    can_stop: bool = False
+    step_id: str | None = None
+    directive_kind: str | None = None
+    sequence_index: int | None = None
+    stage_label: str | None = None
+    stage_index: int | None = None
+    stage_frame_index: int | None = None
+    stage_frame_total: int | None = None
+    recorded_sample_count: int = 0
+    planned_sample_count: int = 0
+    collection_position: str | None = None
+    initial_alignment_speed_scale: float | None = None
+    rule_configuration: dict[str, object] = field(default_factory=dict)
+    collection_mode: str = "rule_based_writing"
+    rule_configuration_batch: list[dict[str, object]] = field(default_factory=list)
+    batch_index: int = 0
+    batch_count: int = 1
+    batch_completed_count: int = 0
+    batch_cycle_complete: bool = False
+    configuration_available: bool = False
+    configuration_pending: bool = False
+    configuration_error: str = ""
+    can_configure: bool = False
+    recording_ready: bool = False
+    writer_blocked: bool = False
+    writer_warning: str = ""
+    writer_retry_pending: bool = False
+    gripper_sides: list[str] = field(default_factory=list)
+    control_topology: str = "双臂（无夹爪）"
+    gripper_control_available: bool = False
+    gripper_action_pending: bool = False
+    rule_start_available: bool = False
+    session_state: str = ""
+    readiness_reason: str = ""
+    startup_blockers: dict[str, str] = field(default_factory=dict)
+    can_retry_devices: bool = False
+    device_retry_pending: bool = False
+    can_runtime_home: bool = False
+    runtime_home_pending: bool = False
+    gripper_action_status: str = ""
+    can_release_grippers: bool = False
+    can_close_grippers: bool = False
+    debug_mode_enabled: bool = False
+    debug_mode_pending: bool = False
+    debug_log_path: str = ""
+    can_toggle_debug: bool = False
+    height_calibration_enabled: bool = False
+    height_calibrated_z_m: float | None = None
+    height_lower_tolerance_m: float = 0.001
+    height_upper_tolerance_m: float = 0.001
+    height_lower_bound_z_m: float | None = None
+    height_upper_bound_z_m: float | None = None
+    height_calibration_available: bool = False
+    height_calibration_clear_available: bool = False
+    height_calibration_pending: bool = False
+    height_calibration_error: str = ""
+    can_capture_height: bool = False
+    can_clear_height: bool = False
+    held: bool = False
+    completed: bool = False
+    aborted: bool = False
+    shutdown: bool = False
+    messages: list[dict[str, str]] = field(default_factory=list)
+
+
+class RuleBasedWritingApplication:
+    """Own the dedicated rule UI state and its typed operator-intent queues."""
+
+    _VISIBLE_MESSAGE_TAGS = frozenset(
+        {
+            "RuleBased",
+            "RuleBasedWriting",
+            "Camera",
+            "Dataset",
+            "DMTAC",
+            "Device",
+            "Calibration",
+            "CameraSelfCheck",
+            "TactileCompression",
+            "ArmState",
+            "StartupHomeContinuity",
+            "Hold",
+            "Progress",
+            "PositionForceGuard",
+            "JointHardLimit",
+            "JointHorizon",
+            "TCPPoseEnvelope",
+            "EmergencyStop",
+            "Shutdown",
+            "IKDebugLog",
+        }
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = RuleBasedWritingUiState()
+        self._runtime_events: queue.Queue[str] = queue.Queue()
+        self._rule_intents: queue.Queue[RuleBasedWritingIntent] = queue.Queue()
+        self._configuration_requests: queue.Queue[dict[str, object]] = queue.Queue()
+        self._height_calibration_requests: queue.Queue[dict[str, object]] = queue.Queue()
+        self._configuration_options: dict[str, object] = {}
+        self._runtime_controls: frozenset[str] = frozenset()
+        self._runtime_controls_seen = False
+        self._device_retry_waiting_for_hold = False
+        self._rule_runtime_bound = False
+        # Binding the extension only wires the UI to the runtime.  It is not a
+        # readiness receipt: the extension publishes its first status only
+        # after the shared Session/Rig admission path has been evaluated.  Keep
+        # the UI in ``preparing`` until that authoritative projection arrives
+        # so a transient bind cannot show a misleading ready banner with a
+        # disabled start button.
+        self._rule_status_seen = False
+        self._completion_stop_queued = False
+        # Generic runtime publications and the rule extension status are
+        # independent projections.  Keep their blocker sets separate so an
+        # empty readiness report cannot erase a camera/writer failure, while a
+        # later non-empty readiness report can still replace an old hand fault.
+        self._runtime_startup_blockers: dict[str, str] = {}
+        self._rule_readiness_blockers: dict[str, str] = {}
+
+    def _touch(self) -> None:
+        self._state.revision += 1
+
+    def _rebuild_startup_blockers_locked(self) -> None:
+        merged = dict(self._runtime_startup_blockers)
+        merged.update(self._rule_readiness_blockers)
+        self._state.startup_blockers = merged
+
+    def observe_runtime_publication(self, updates: Mapping[str, object]) -> None:
+        """Consume the generic projection without exposing its controls or progress."""
+
+        with self._lock:
+            device_retry_hold_rejected = False
+            capture_stage = str(updates.get("capture_stage", "") or "")
+            capture_phase = str(updates.get("capture_phase", "") or "").lower()
+            if bool(updates.get("home_ready", False)):
+                self._state.runtime_home_pending = False
+            elif capture_stage == "runtime_home":
+                if capture_phase in {"preparing", "capturing"}:
+                    self._state.runtime_home_pending = True
+                elif capture_phase in {"ready", "idle", "failed"}:
+                    self._state.runtime_home_pending = False
+            if "active_controls" in updates:
+                controls = updates.get("active_controls") or ()
+                self._runtime_controls = frozenset(str(item) for item in controls)
+                self._runtime_controls_seen = True
+                self._advance_device_retry_transaction_locked()
+            if (
+                self._state.device_retry_pending
+                and self._device_retry_waiting_for_hold
+                and updates.get("hardware_hold_confirmed") is False
+            ):
+                self._state.device_retry_pending = False
+                self._device_retry_waiting_for_hold = False
+                self._state.phase = "blocked"
+                self._state.title = "安全停臂未确认"
+                self._state.detail = str(
+                    updates.get("control_hint")
+                    or "底层 Hold 或位置命令流释放未获完整确认；设备重连未执行。"
+                )
+                device_retry_hold_rejected = True
+            if "startup_blockers" in updates:
+                raw_blockers = updates.get("startup_blockers")
+                self._runtime_startup_blockers = (
+                    {str(key): str(value) for key, value in raw_blockers.items()}
+                    if isinstance(raw_blockers, Mapping)
+                    else {}
+                )
+                self._rebuild_startup_blockers_locked()
+            if "debug_ik_logging" in updates:
+                self._state.debug_mode_enabled = bool(
+                    updates.get("debug_ik_logging", False)
+                )
+                self._state.debug_mode_pending = False
+            if "ik_debug_log_path" in updates:
+                self._state.debug_log_path = str(
+                    updates.get("ik_debug_log_path", "") or ""
+                )
+            if device_retry_hold_rejected:
+                self._rebuild_controls()
+                self._touch()
+                return
+            if self._state.device_retry_pending:
+                self._project_device_retry_transaction_locked()
+            elif self._state.runtime_home_pending:
+                self._set_runtime_home_pending_locked()
+            elif self._state.startup_blockers:
+                self._set_readiness_blocked_locked()
+            elif self._state.phase == "preparing" and self._rule_runtime_bound:
+                self._project_prestart_readiness_locked()
+            self._rebuild_controls()
+            self._touch()
+
+    def bind_rule_runtime(self) -> None:
+        with self._lock:
+            self._rule_runtime_bound = True
+            self._project_prestart_readiness_locked()
+            self._rebuild_controls()
+            self._touch()
+
+    def submit_intent(self, intent: RuleBasedWritingIntent) -> bool:
+        if not isinstance(intent, RuleBasedWritingIntent):
+            raise TypeError("intent must be RuleBasedWritingIntent.")
+        with self._lock:
+            if intent is RuleBasedWritingIntent.START:
+                if not self._state.can_start:
+                    return False
+                retry_writer_only = bool(self._state.writer_blocked)
+                if not retry_writer_only:
+                    self._completion_stop_queued = False
+                    self._rule_intents.put(intent)
+                self._runtime_events.put("episode_start")
+                self._state.phase = "armed"
+                self._state.writer_retry_pending = retry_writer_only
+                self._state.title = (
+                    "正在重试正式 Writer" if retry_writer_only else "规则采集启动中"
+                )
+                self._state.detail = (
+                    "正在按当前 GUI 配置重新准备 writer；就绪前不会输出规则运动命令。"
+                    if retry_writer_only
+                    else "正在准备 writer；就绪前不会输出规则运动命令。"
+                )
+            elif intent is RuleBasedWritingIntent.STOP:
+                if not self._state.can_stop:
+                    return False
+                self._rule_intents.put(intent)
+                self._runtime_events.put("episode_stop:rule_based_hold_cancel")
+                self._runtime_events.put("h")
+                self._state.phase = "stopping"
+                self._state.title = "规则采集停止中"
+                self._state.detail = "正在进入 Hold 并取消本轮规则采集。"
+            elif intent is RuleBasedWritingIntent.DEVICE_RETRY:
+                if not self._state.can_retry_devices:
+                    return False
+                self._state.device_retry_pending = True
+                self._state.phase = "preparing"
+                if self._device_retry_directly_admitted_locked():
+                    self._device_retry_waiting_for_hold = False
+                    self._runtime_events.put("device_retry")
+                    self._set_device_retry_running_locked()
+                else:
+                    self._device_retry_waiting_for_hold = True
+                    self._runtime_events.put("h")
+                    self._state.title = "正在安全停臂后重连"
+                    self._state.detail = (
+                        "已停止接纳规则命令；正在等待底层 Hold 与位置命令流释放回执，"
+                        "确认后将自动重连失败设备。"
+                    )
+            elif intent is RuleBasedWritingIntent.RUNTIME_HOME_RETRY:
+                if not self._state.can_runtime_home:
+                    return False
+                self._runtime_events.put("runtime_home_retry")
+                self._state.runtime_home_pending = True
+                self._state.phase = "preparing"
+                self._state.title = "正在重新确认安全初始化"
+                self._state.detail = (
+                    "请保持机械臂处于安全位置；正在重新采集 runtime Home，"
+                    "完成前不会开始规则运动。"
+                )
+            elif intent in {
+                RuleBasedWritingIntent.RELEASE_GRIPPERS,
+                RuleBasedWritingIntent.CLOSE_GRIPPERS,
+            }:
+                if not (
+                    self._state.can_release_grippers
+                    if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
+                    else self._state.can_close_grippers
+                ):
+                    return False
+                self._rule_intents.put(intent)
+                self._state.gripper_action_pending = True
+                self._state.gripper_action_status = (
+                    "正在松开夹爪…"
+                    if intent is RuleBasedWritingIntent.RELEASE_GRIPPERS
+                    else "正在闭紧夹爪…"
+                )
+                self._state.detail = self._state.gripper_action_status
+            elif intent is RuleBasedWritingIntent.DEBUG_TOGGLE:
+                if not self._state.can_toggle_debug:
+                    return False
+                # Reuse the existing asynchronous real-control diagnostic
+                # recorder.  The lower runtime remains the authority that
+                # starts/stops disk I/O and publishes the resulting state.
+                self._runtime_events.put("d")
+                self._state.debug_mode_pending = True
+            else:
+                self._runtime_events.put("q")
+                self._state.phase = "stopping"
+                self._state.title = "程序退出中"
+                self._state.detail = "正在停止机械臂并关闭运行资源。"
+            self._rebuild_controls()
+            self._touch()
+            return True
+
+    def configure_rule_options(
+        self,
+        options: Mapping[str, object],
+        selected: Mapping[str, object],
+    ) -> None:
+        """Publish immutable between-attempt choices owned by the rule extension."""
+
+        normalized_options = dict(options)
+        normalized_selected = self._validate_configuration(
+            selected,
+            options=normalized_options,
+        )
+        with self._lock:
+            self._configuration_options = normalized_options
+            self._state.collection_mode = str(
+                normalized_options.get("collection_mode")
+                or self._state.collection_mode
+            )
+            self._state.rule_configuration = normalized_selected
+            self._state.configuration_error = ""
+            self._rebuild_controls()
+            self._touch()
+
+    def submit_configuration(self, payload: Mapping[str, object]) -> bool:
+        """Queue one validated configuration batch while collection is idle."""
+
+        with self._lock:
+            if not self._state.can_configure or self._state.configuration_pending:
+                return False
+            try:
+                configuration = self._validate_configuration_request(
+                    payload,
+                    options=self._configuration_options,
+                )
+            except (TypeError, ValueError) as exc:
+                self._state.configuration_error = str(exc)
+                self._touch()
+                return False
+            self._configuration_requests.put(configuration)
+            self._state.configuration_pending = True
+            self._state.configuration_error = ""
+            self._state.phase = "configuring"
+            self._state.title = "正在更新规则组合"
+            self._state.detail = "正在后台读取并验证所选来源；完成前不会输出运动命令。"
+            self._rebuild_controls()
+            self._touch()
+            return True
+
+    def complete_configuration(
+        self,
+        *,
+        selected: Mapping[str, object] | None,
+        error: str | None,
+    ) -> None:
+        with self._lock:
+            self._state.configuration_pending = False
+            if error:
+                self._state.configuration_error = str(error)
+                self._state.title = "规则组合更新失败"
+                self._state.detail = str(error)
+            else:
+                if selected is not None:
+                    raw_batch = selected.get("batch")
+                    if isinstance(raw_batch, (list, tuple)) and raw_batch:
+                        batch = [dict(item) for item in raw_batch]
+                        self._state.rule_configuration_batch = batch
+                        self._state.rule_configuration = dict(batch[0])
+                    else:
+                        self._state.rule_configuration_batch = [dict(selected)]
+                        self._state.rule_configuration = dict(selected)
+                self._state.configuration_error = ""
+                if self._state.startup_blockers:
+                    self._set_readiness_blocked_locked()
+                elif self._state.writer_blocked:
+                    self._state.title = "正式 Writer 已阻塞"
+                    self._state.detail = (
+                        "参数已更新并通过验证；点击“按当前配置重试 Writer”。"
+                    )
+                else:
+                    self._project_prestart_readiness_locked()
+            if self._state.writer_blocked:
+                self._state.phase = "blocked"
+            elif not self._state.startup_blockers and self._state.phase not in {
+                "armed",
+                "running",
+                "completed",
+                "aborted",
+            }:
+                self._project_prestart_readiness_locked()
+            self._rebuild_controls()
+            self._touch()
+
+    def submit_height_calibration(self, payload: Mapping[str, object]) -> bool:
+        """Queue one command-inert right-TCP height maintenance request."""
+
+        with self._lock:
+            operation = str(payload.get("operation") or "").strip().lower()
+            if operation == "capture":
+                if not self._state.can_capture_height:
+                    return False
+                try:
+                    lower_mm = float(payload.get("lower_tolerance_mm", 1.0))
+                    upper_mm = float(payload.get("upper_tolerance_mm", 1.0))
+                except (TypeError, ValueError):
+                    return False
+                if (
+                    not math.isfinite(lower_mm)
+                    or not math.isfinite(upper_mm)
+                    or not 0.1 <= lower_mm <= 20.0
+                    or not 0.1 <= upper_mm <= 20.0
+                ):
+                    return False
+                request = {
+                    "operation": "capture",
+                    "lower_tolerance_m": lower_mm / 1000.0,
+                    "upper_tolerance_m": upper_mm / 1000.0,
+                }
+            elif operation == "clear":
+                if not self._state.can_clear_height:
+                    return False
+                request = {"operation": "clear"}
+            else:
+                return False
+            self._height_calibration_requests.put(request)
+            self._state.height_calibration_pending = True
+            self._state.height_calibration_error = ""
+            self._rebuild_controls()
+            self._touch()
+            return True
+
+    def complete_height_calibration(self, *, error: str | None) -> None:
+        with self._lock:
+            self._state.height_calibration_pending = False
+            self._state.height_calibration_error = str(error or "")
+            self._rebuild_controls()
+            self._touch()
+
+    @staticmethod
+    def _option_values(options: Mapping[str, object], key: str) -> set[str]:
+        raw = options.get(key, ())
+        if not isinstance(raw, (list, tuple)):
+            return set()
+        values: set[str] = set()
+        for item in raw:
+            value = item.get("value") if isinstance(item, Mapping) else item
+            if value is not None:
+                values.add(str(value))
+        return values
+
+    @classmethod
+    def _validate_configuration_request(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        options: Mapping[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(payload, Mapping):
+            raise TypeError("规则组合必须是对象。")
+        if "batch" not in payload:
+            return cls._validate_configuration(payload, options=options)
+        if set(payload) != {"batch"}:
+            raise ValueError("批次请求只能包含 batch 字段。")
+        raw_batch = payload.get("batch")
+        if not isinstance(raw_batch, (list, tuple)) or not raw_batch:
+            raise ValueError("采集批次至少需要一个组合。")
+        if len(raw_batch) > 128:
+            raise ValueError("单个采集批次最多允许 128 个组合。")
+        return {
+            "batch": [
+                cls._validate_configuration(item, options=options)
+                for item in raw_batch
+            ]
+        }
+
+    @classmethod
+    def _validate_configuration(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        options: Mapping[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(payload, Mapping):
+            raise TypeError("规则组合必须是对象。")
+        configured_core = options.get("configuration_core_fields")
+        if configured_core is None:
+            core_required = {
+                "pen_down_candidate_id",
+                "write_candidate_id",
+                "pen_up_candidate_id",
+                "trajectory_id",
+                "direction",
+                "writing_size_m",
+                "initial_alignment_speed_scale",
+            }
+        elif not isinstance(configured_core, (list, tuple)):
+            raise ValueError("核心配置字段定义尚未就绪。")
+        else:
+            core_required = {str(key) for key in configured_core}
+        extra_fields = options.get("runtime_configuration_fields", ())
+        if not isinstance(extra_fields, (list, tuple)):
+            raise ValueError("运行参数字段定义尚未就绪。")
+        required = core_required | {str(key) for key in extra_fields}
+        unknown = sorted(set(payload) - required)
+        missing = sorted(required - set(payload))
+        if unknown or missing:
+            raise ValueError(f"规则组合字段无效：missing={missing}, unknown={unknown}。")
+        result: dict[str, object] = {}
+        source_options = options.get("source_candidates_by_phase", {})
+        if not isinstance(source_options, Mapping):
+            raise ValueError("规则来源选项尚未就绪。")
+        for phase in ("pen_down", "write", "pen_up"):
+            key = f"{phase}_candidate_id"
+            if key not in required:
+                continue
+            value = str(payload[key])
+            allowed = cls._option_values(source_options, phase)
+            if value not in allowed:
+                raise ValueError(f"{phase} 来源不在当前已验证范围内。")
+            result[key] = value
+        for key, option_key in (
+            ("trajectory_id", "trajectory_ids"),
+            ("direction", "directions"),
+        ):
+            if key not in required:
+                continue
+            value = str(payload[key])
+            if value not in cls._option_values(options, option_key):
+                raise ValueError(f"{key} 不是可用选项。")
+            result[key] = value
+        bounds = options.get("numeric_bounds", {})
+        if not isinstance(bounds, Mapping):
+            raise ValueError("规则数值范围尚未就绪。")
+        integer_fields = {str(key) for key in options.get("integer_fields", ())}
+        numeric_fields = tuple(
+            key for key in required if key in bounds
+        )
+        for key in numeric_fields:
+            try:
+                value = float(payload[key])
+                lower, upper = bounds[key]
+                lower = float(lower)
+                upper = float(upper)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"{key} 必须是有效数值。") from exc
+            if not lower <= value <= upper:
+                raise ValueError(f"{key} 必须位于 [{lower}, {upper}]。")
+            if key in integer_fields:
+                if not value.is_integer():
+                    raise ValueError(f"{key} 必须是整数。")
+                result[key] = int(value)
+            else:
+                result[key] = value
+        choice_fields = options.get("choice_fields", {})
+        if not isinstance(choice_fields, Mapping):
+            raise ValueError("运行选项字段定义尚未就绪。")
+        for key, option_key in choice_fields.items():
+            key = str(key)
+            if key not in required:
+                continue
+            value = str(payload[key])
+            if value not in cls._option_values(options, str(option_key)):
+                raise ValueError(f"{key} 不是可用选项。")
+            result[key] = value
+        select_fields = options.get("select_fields", {})
+        if not isinstance(select_fields, Mapping):
+            raise ValueError("运行枚举参数尚未就绪。")
+        for key, values in select_fields.items():
+            key = str(key)
+            if key not in required:
+                continue
+            value = str(payload[key])
+            allowed = cls._option_values({key: values}, key)
+            if value not in allowed:
+                raise ValueError(f"{key} 不是可用选项。")
+            result[key] = value
+        boolean_fields = {str(key) for key in options.get("boolean_fields", ())}
+        for key in boolean_fields:
+            if key not in required or not isinstance(payload[key], bool):
+                raise ValueError(f"{key} 必须是布尔值。")
+            result[key] = bool(payload[key])
+        text_fields = {str(key) for key in options.get("text_fields", ())}
+        for key in text_fields:
+            if key not in required:
+                continue
+            value = str(payload[key]).strip()
+            if "\x00" in value or len(value) > 4096:
+                raise ValueError(f"{key} 包含无效路径文本。")
+            result[key] = value
+        unparsed = sorted(required - set(result))
+        if unparsed:
+            raise ValueError(f"配置字段缺少类型定义：{unparsed}。")
+        return result
+
+    def publish_writer_prepare_result(self, *, error: str | None) -> None:
+        """Project retryable writer preparation without ending the GUI runtime."""
+
+        with self._lock:
+            self._state.writer_retry_pending = False
+            if error:
+                self._state.writer_blocked = True
+                self._state.writer_warning = str(error)
+                self._state.recording_ready = False
+                self._state.phase = "blocked"
+                self._state.title = "正式 Writer 已阻塞"
+                self._state.detail = str(error)
+            else:
+                self._state.writer_blocked = False
+                self._state.writer_warning = ""
+                if self._state.startup_blockers:
+                    self._set_readiness_blocked_locked()
+                elif self._state.phase == "blocked":
+                    self._state.phase = "armed"
+                    self._state.title = "正式 Writer 已就绪"
+                    self._state.detail = "正在进入采集倒计时；规则运动尚未开始。"
+            self._rebuild_controls()
+            self._touch()
+
+    def complete_device_retry(self, *, error: str | None) -> None:
+        """Complete the rule UI's bounded Hold-then-retry transaction."""
+
+        with self._lock:
+            if not self._state.device_retry_pending:
+                return
+            self._state.device_retry_pending = False
+            self._device_retry_waiting_for_hold = False
+            if error:
+                self._state.phase = "blocked"
+                self._state.title = "设备重连未执行"
+                self._state.detail = str(error)
+            elif self._state.startup_blockers:
+                self._set_readiness_blocked_locked()
+            else:
+                self._project_prestart_readiness_locked()
+            self._rebuild_controls()
+            self._touch()
+
+    def observe_rule_status(self, status: Mapping[str, object]) -> None:
+        with self._lock:
+            self._rule_status_seen = True
+            armed = bool(status.get("armed", False))
+            begun = bool(status.get("execution_begun", False))
+            completed = bool(status.get("completed", False))
+            aborted = bool(status.get("aborted", False))
+            held = bool(status.get("held", False))
+            waiting = str(status.get("waiting_reason", "") or "")
+            if "session_state" in status:
+                self._state.session_state = str(status.get("session_state") or "").upper()
+                if self._state.session_state in {"ARMED", "RUNNING"}:
+                    self._state.runtime_home_pending = False
+            if "readiness_reason" in status:
+                self._state.readiness_reason = str(
+                    status.get("readiness_reason") or ""
+                )
+            if "readiness_blockers" in status:
+                raw_blockers = status.get("readiness_blockers")
+                if isinstance(raw_blockers, Mapping):
+                    readiness_blockers = {
+                        str(key): str(value) for key, value in raw_blockers.items()
+                    }
+                    self._rule_readiness_blockers = readiness_blockers
+                    self._rebuild_startup_blockers_locked()
+            self._state.step_id = (
+                None if status.get("step_id") is None else str(status["step_id"])
+            )
+            self._state.directive_kind = (
+                None
+                if status.get("directive_kind") is None
+                else str(status["directive_kind"])
+            )
+            self._state.sequence_index = (
+                None
+                if status.get("sequence_index") is None
+                else int(status["sequence_index"])
+            )
+            self._state.stage_label = (
+                None if status.get("stage_label") is None else str(status["stage_label"])
+            )
+            self._state.stage_index = self._optional_int(status.get("stage_index"))
+            self._state.stage_frame_index = self._optional_int(
+                status.get("stage_frame_index")
+            )
+            self._state.stage_frame_total = self._optional_int(
+                status.get("stage_frame_total")
+            )
+            self._state.recorded_sample_count = max(
+                0, self._optional_int(status.get("recorded_sample_count")) or 0
+            )
+            self._state.planned_sample_count = max(
+                0, self._optional_int(status.get("planned_sample_count")) or 0
+            )
+            self._state.collection_position = (
+                None
+                if status.get("collection_position") is None
+                else str(status["collection_position"])
+            )
+            speed = status.get("initial_alignment_speed_scale")
+            try:
+                self._state.initial_alignment_speed_scale = (
+                    None if speed is None else float(speed)
+                )
+            except (TypeError, ValueError):
+                self._state.initial_alignment_speed_scale = None
+            raw_gripper_sides = status.get("gripper_sides") or ()
+            self._state.gripper_sides = [str(side) for side in raw_gripper_sides]
+            self._state.control_topology = str(
+                status.get("control_topology", "") or "双臂（无夹爪）"
+            )
+            self._state.gripper_control_available = bool(
+                status.get("gripper_control_available", False)
+            )
+            self._state.gripper_action_pending = bool(
+                status.get(
+                    "gripper_action_pending",
+                    self._state.gripper_action_pending,
+                )
+            )
+            self._state.rule_start_available = bool(
+                status.get("rule_start_available", False)
+            )
+            if "configuration_available" in status:
+                self._state.configuration_available = bool(
+                    status.get("configuration_available", False)
+                )
+            else:
+                # Compatibility for old/in-process status fixtures.  The
+                # production rule runtime always publishes the authoritative
+                # lifecycle value.
+                self._state.configuration_available = bool(
+                    self._state.rule_start_available
+                    and not completed
+                    and not aborted
+                )
+            self._state.gripper_action_status = str(
+                status.get("gripper_action_status", "") or ""
+            )
+            raw_configuration = status.get("rule_configuration")
+            if isinstance(raw_configuration, Mapping):
+                self._state.rule_configuration = dict(raw_configuration)
+            self._state.collection_mode = str(
+                status.get("collection_mode", self._state.collection_mode)
+                or "rule_based_writing"
+            )
+            raw_batch = status.get("rule_configuration_batch")
+            if isinstance(raw_batch, (list, tuple)):
+                self._state.rule_configuration_batch = [
+                    dict(item) for item in raw_batch if isinstance(item, Mapping)
+                ]
+            self._state.batch_index = max(
+                0, self._optional_int(status.get("batch_index")) or 0
+            )
+            self._state.batch_count = max(
+                1, self._optional_int(status.get("batch_count")) or 1
+            )
+            self._state.batch_completed_count = max(
+                0, self._optional_int(status.get("batch_completed_count")) or 0
+            )
+            self._state.batch_cycle_complete = bool(
+                status.get("batch_cycle_complete", False)
+            )
+            self._state.configuration_pending = bool(
+                status.get(
+                    "configuration_pending",
+                    self._state.configuration_pending,
+                )
+            )
+            self._state.configuration_error = str(
+                status.get(
+                    "configuration_error",
+                    self._state.configuration_error,
+                )
+                or ""
+            )
+            self._state.height_calibration_enabled = bool(
+                status.get("height_calibration_enabled", False)
+            )
+            self._state.height_calibrated_z_m = self._optional_float(
+                status.get("height_calibrated_z_m")
+            )
+            self._state.height_lower_tolerance_m = self._optional_float(
+                status.get("height_lower_tolerance_m")
+            ) or 0.001
+            self._state.height_upper_tolerance_m = self._optional_float(
+                status.get("height_upper_tolerance_m")
+            ) or 0.001
+            self._state.height_lower_bound_z_m = self._optional_float(
+                status.get("height_lower_bound_z_m")
+            )
+            self._state.height_upper_bound_z_m = self._optional_float(
+                status.get("height_upper_bound_z_m")
+            )
+            self._state.height_calibration_available = bool(
+                status.get("height_calibration_available", False)
+            )
+            self._state.height_calibration_clear_available = bool(
+                status.get("height_calibration_clear_available", False)
+            )
+            self._state.height_calibration_pending = bool(
+                status.get(
+                    "height_calibration_pending",
+                    self._state.height_calibration_pending,
+                )
+            )
+            self._state.height_calibration_error = str(
+                status.get(
+                    "height_calibration_error",
+                    self._state.height_calibration_error,
+                )
+                or ""
+            )
+            self._state.recording_ready = bool(status.get("recording_ready", False))
+            self._state.held = held
+            self._state.completed = completed
+            self._state.aborted = aborted
+            if self._state.device_retry_pending:
+                self._project_device_retry_transaction_locked()
+            elif self._state.configuration_pending:
+                self._state.phase = "configuring"
+                self._state.title = "正在更新规则组合"
+                self._state.detail = "正在后台读取并验证所选来源；完成前不会输出运动命令。"
+            elif self._state.runtime_home_pending:
+                self._set_runtime_home_pending_locked()
+            elif self._state.startup_blockers and not begun:
+                self._set_readiness_blocked_locked()
+            elif self._state.writer_blocked and not begun:
+                self._state.phase = "blocked"
+                self._state.title = "正式 Writer 已阻塞"
+                self._state.detail = self._state.writer_warning
+            elif aborted:
+                self._state.phase = "aborted"
+                self._state.title = "规则采集已停止"
+                self._state.detail = "机械臂已进入 Hold；当前规则任务不会继续执行。"
+            elif completed:
+                self._state.phase = "completed"
+                self._state.title = "规则采集已完成"
+                self._state.detail = "规则计划已完成，正在或已经提交 writer。"
+            elif held:
+                self._state.phase = "blocked"
+                self._state.title = "规则采集已暂停"
+                self._state.detail = (
+                    "本轮 Episode 已取消；确认机械臂安全后点击“重新安全初始化”，"
+                    "完成后可重新开始规则采集。"
+                )
+            elif begun:
+                self._state.phase = "running"
+                self._state.title = "规则采集运行中"
+                if waiting in {
+                    "formal_writer_paused",
+                    "initial_alignment_tracking_lag",
+                }:
+                    self._state.detail = self._waiting_detail(waiting)
+                else:
+                    step = self._state.step_id or "等待下一步"
+                    self._state.detail = f"当前规则步骤：{step}"
+            elif armed:
+                self._state.phase = "armed"
+                self._state.title = "规则采集启动中"
+                self._state.detail = self._waiting_detail(waiting)
+            elif self._rule_runtime_bound:
+                self._project_prestart_readiness_locked(
+                    status_started=bool(status.get("started", False))
+                )
+            if self._state.phase == "ready":
+                if self._state.configuration_error:
+                    self._state.detail = self._state.configuration_error
+                elif self._state.gripper_action_status:
+                    self._state.detail = self._state.gripper_action_status
+            self._rebuild_controls()
+            self._touch()
+
+    @staticmethod
+    def _waiting_detail(waiting: str) -> str:
+        if waiting in {
+            "formal_episode_not_active",
+            "formal_writer_not_recording",
+        }:
+            return "正在准备规则采集 writer；就绪前不会输出运动命令。"
+        if waiting.startswith("causal_arm_feedback"):
+            return "正在等待双臂因果反馈就绪；就绪前不会输出运动命令。"
+        if waiting == "initial_alignment_planning":
+            return "正在后台规划并验证双臂初始化路径；验证完成前不会输出运动命令。"
+        if waiting == "initial_alignment_tracking_lag":
+            return "双臂实测状态暂时落后于初始化控制流；保持当前认证目标，跟上后自动继续。"
+        if waiting == "startup_home_continuity_dwell":
+            return (
+                "首条初始化 qref 正在通过 runtime Home 连续性验证；"
+                "连续验证完成前不会下发运动或写入样本。"
+            )
+        if waiting == "initial_alignment_safety_rejected":
+            return "双臂初始化路径未通过安全验证，机械臂已进入 Hold。"
+        if waiting == "coupled_pose_safety_rejected":
+            return "规则动作未通过双臂耦合安全验证，机械臂已进入 Hold。"
+        if waiting == "runtime_home_required_after_hold":
+            return "本轮规则采集已取消；需要重新完成安全初始化后才能再次开始。"
+        if waiting == "formal_writer_paused":
+            return "采集模态暂时未就绪；保持最后一个安全目标，连续新鲜后自动恢复。"
+        if waiting == "session_readiness_failure":
+            return (
+                "机械臂尚未通过 Session arm admission；请检查硬件状态并重新完成 runtime Home。"
+            )
+        return "规则任务已确认，正在通过运行前门禁。"
+
+    def request_completion_stop(self) -> None:
+        """Ask the existing writer owner to finalize after the plan completes."""
+
+        with self._lock:
+            if self._completion_stop_queued:
+                return
+            self._completion_stop_queued = True
+            # Carry an explicit completion reason so the progress adapter can
+            # distinguish a successfully completed rule window from an
+            # operator-aborted/manual stop.
+            self._runtime_events.put("episode_stop:rule_based_complete")
+            self._touch()
+
+    def request_failure_stop(self) -> None:
+        """Ask the writer owner to discard/seal a failed rule Episode."""
+
+        with self._lock:
+            if self._completion_stop_queued:
+                return
+            self._completion_stop_queued = True
+            self._runtime_events.put("episode_stop:rule_based_abort")
+            self._touch()
+
+    def append_message(self, tag: str, message: str) -> None:
+        normalized_tag = str(tag)
+        if normalized_tag not in self._VISIBLE_MESSAGE_TAGS:
+            return
+        with self._lock:
+            self._state.messages.append(
+                {"tag": normalized_tag, "message": str(message)}
+            )
+            self._state.messages = self._state.messages[-32:]
+            self._touch()
+
+    def mark_shutdown(self, message: str) -> None:
+        with self._lock:
+            self._state.shutdown = True
+            self._state.phase = "shutdown"
+            self._state.title = "规则采集程序已退出"
+            self._state.detail = str(message)
+            self._rebuild_controls()
+            self._touch()
+
+    def _rebuild_controls(self) -> None:
+        terminal = self._state.completed or self._state.aborted or self._state.shutdown
+        self._state.can_configure = bool(
+            self._rule_runtime_bound
+            and self._state.configuration_available
+            and not self._state.shutdown
+            and not self._state.device_retry_pending
+            and not self._state.configuration_pending
+            and not self._state.writer_retry_pending
+            and not self._state.gripper_action_pending
+            and not self._state.height_calibration_pending
+        )
+        self._state.can_start = bool(
+            self._rule_runtime_bound
+            and (self._state.rule_start_available or self._state.writer_blocked)
+            and not terminal
+            and self._state.phase in {"ready", "blocked"}
+            and not self._state.configuration_pending
+            and not self._state.writer_retry_pending
+            and not self._state.gripper_action_pending
+            and not self._state.height_calibration_pending
+            and not self._state.startup_blockers
+        )
+        self._state.can_stop = bool(
+            not terminal
+            and (
+                self._state.phase in {"armed", "running"}
+                or (self._state.phase == "blocked" and self._state.writer_blocked)
+            )
+        )
+        self._state.can_retry_devices = bool(
+            self._rule_runtime_bound
+            and not terminal
+            and self._state.phase in {"ready", "blocked", "preparing"}
+            and self._has_retryable_device_blockers_locked()
+            and self._device_retry_request_available_locked()
+            and not self._state.device_retry_pending
+            and not self._state.configuration_pending
+            and not self._state.writer_retry_pending
+            and not self._state.gripper_action_pending
+            and not self._state.height_calibration_pending
+        )
+        self._state.can_runtime_home = bool(
+            self._rule_runtime_bound
+            and not terminal
+            and not self._state.runtime_home_pending
+            and self._state.phase in {"ready", "blocked"}
+            and not self._state.configuration_pending
+            and not self._state.writer_retry_pending
+            and not self._state.gripper_action_pending
+            and not self._has_retryable_device_blockers_locked()
+            and self._session_requires_runtime_home_locked()
+        )
+        grippers_ready = bool(
+            self._state.gripper_control_available
+            and self._state.gripper_sides
+            and not self._state.gripper_action_pending
+        )
+        self._state.can_release_grippers = bool(
+            grippers_ready and not terminal and self._state.phase == "ready"
+            and not self._state.height_calibration_pending
+        )
+        self._state.can_close_grippers = bool(
+            grippers_ready and not terminal and self._state.phase == "ready"
+            and not self._state.height_calibration_pending
+        )
+        self._state.can_toggle_debug = bool(
+            self._rule_runtime_bound
+            and not self._state.shutdown
+            and not self._state.debug_mode_pending
+        )
+        self._state.can_capture_height = bool(
+            self._state.collection_mode == "rule_based_writing"
+            and self._state.height_calibration_available
+            and not terminal
+            and self._state.phase == "ready"
+            and not self._state.height_calibration_pending
+            and not self._state.configuration_pending
+            and not self._state.gripper_action_pending
+        )
+        self._state.can_clear_height = bool(
+            self._state.collection_mode == "rule_based_writing"
+            and self._state.height_calibration_clear_available
+            and not terminal
+            and self._state.phase == "ready"
+            and not self._state.height_calibration_pending
+            and not self._state.configuration_pending
+            and not self._state.gripper_action_pending
+        )
+
+    def _set_ready_locked(self) -> None:
+        self._state.phase = "ready"
+        self._state.title = "规则采集已就绪"
+        self._state.detail = "确认工作区安全后，点击“开始规则采集”。"
+
+    def _project_prestart_readiness_locked(
+        self,
+        *,
+        status_started: bool | None = None,
+    ) -> None:
+        """Project only an explicit runtime readiness receipt to the UI.
+
+        ``bind_rule_runtime`` is deliberately earlier than Session arm
+        admission.  This helper centralizes the pre-start projection so every
+        update path (generic startup publication, rule status, and
+        configuration completion) follows the same fail-closed ordering.
+        ``status_started`` is supplied by the status callback when available;
+        the cached ``_rule_status_seen`` gate still prevents a bind-only ready
+        state.
+        """
+
+        if self._state.runtime_home_pending:
+            self._set_runtime_home_pending_locked()
+            return
+        if self._state.startup_blockers:
+            self._set_readiness_blocked_locked()
+            return
+        if self._session_requires_runtime_home_locked():
+            self._set_readiness_blocked_locked()
+            return
+        if status_started is None:
+            status_started = self._rule_status_seen
+        session_state = str(self._state.session_state or "").upper()
+        if bool(status_started) and session_state not in {"", "ARMED", "RUNNING"}:
+            self._set_readiness_blocked_locked()
+            return
+        if not self._rule_status_seen:
+            self._set_preparing_status_locked()
+            return
+        if self._state.rule_start_available or self._state.writer_blocked:
+            if self._state.writer_blocked:
+                self._state.phase = "blocked"
+                self._state.title = "正式 Writer 已阻塞"
+                self._state.detail = self._state.writer_warning
+            else:
+                self._set_ready_locked()
+            return
+        # A status was received, but it has not granted the rule start gate
+        # (for example while the runtime is still opening the formal writer or
+        # waiting for a safe Session state).  Keep the controls disabled and
+        # make the wait explicit instead of claiming readiness.
+        self._set_preparing_status_locked()
+
+    def _set_preparing_status_locked(self) -> None:
+        self._state.phase = "preparing"
+        self._state.title = "规则采集环境准备中"
+        self._state.detail = (
+            "正在等待规则运行时完成设备、安全门禁和正式 Writer readiness；"
+            "确认完成前不会输出规则运动命令。"
+        )
+
+    @staticmethod
+    def _is_runtime_home_requirement(key: str, detail: str) -> bool:
+        if str(key) != "rig.session":
+            return False
+        text = str(detail or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "runtime home",
+                "runtime_home",
+                "arm admission",
+                "session state=",
+            )
+        )
+
+    def _has_retryable_device_blockers_locked(self) -> bool:
+        return any(
+            not self._is_runtime_home_requirement(key, detail)
+            for key, detail in self._state.startup_blockers.items()
+        )
+
+    def _device_retry_directly_admitted_locked(self) -> bool:
+        if "device_retry" in self._runtime_controls:
+            return True
+        # Preserve startup recovery before the generic runtime has published
+        # its first control projection.  Once a projection exists, it is the
+        # authoritative lower admission receipt.
+        return bool(
+            not self._runtime_controls_seen
+            and str(self._state.session_state or "").upper()
+            not in {"ARMED", "RUNNING"}
+        )
+
+    def _device_retry_request_available_locked(self) -> bool:
+        return bool(
+            self._device_retry_directly_admitted_locked()
+            or "h" in self._runtime_controls
+        )
+
+    def _set_device_retry_running_locked(self) -> None:
+        self._state.title = "正在重连失败设备"
+        self._state.detail = (
+            "底层停机已确认，正在重新检查设备 readiness；"
+            "确认通过前规则采集保持禁用。"
+        )
+
+    def _project_device_retry_transaction_locked(self) -> None:
+        self._state.phase = "preparing"
+        if self._device_retry_waiting_for_hold:
+            self._state.title = "正在安全停臂后重连"
+            self._state.detail = (
+                "已停止接纳规则命令；正在等待底层 Hold 与位置命令流释放回执，"
+                "确认后将自动重连失败设备。"
+            )
+            return
+        self._set_device_retry_running_locked()
+
+    def _advance_device_retry_transaction_locked(self) -> None:
+        if not (
+            self._state.device_retry_pending
+            and self._device_retry_waiting_for_hold
+            and "device_retry" in self._runtime_controls
+        ):
+            return
+        self._device_retry_waiting_for_hold = False
+        self._runtime_events.put("device_retry")
+        self._set_device_retry_running_locked()
+
+    def _session_requires_runtime_home_locked(self) -> bool:
+        state = str(self._state.session_state or "").upper()
+        if state in {"", "ARMED", "RUNNING", "FAULT", "ESTOP", "INIT"}:
+            return any(
+                self._is_runtime_home_requirement(key, detail)
+                for key, detail in self._state.startup_blockers.items()
+            )
+        if state not in {"CALIBRATION", "DEBUG_ONLY", "FROZEN", "RECOVERING"}:
+            return False
+        if not self._state.startup_blockers:
+            return bool(self._state.readiness_reason) or state != ""
+        return all(
+            self._is_runtime_home_requirement(key, detail)
+            for key, detail in self._state.startup_blockers.items()
+        )
+
+    def _set_runtime_home_pending_locked(self) -> None:
+        self._state.phase = "preparing"
+        self._state.title = "正在重新确认安全初始化"
+        self._state.detail = (
+            "正在重新采集 runtime Home；完成前规则采集保持禁用，"
+            "不会输出规则运动命令。"
+        )
+
+    def _set_readiness_blocked_locked(self) -> None:
+        if self._state.runtime_home_pending:
+            self._set_runtime_home_pending_locked()
+            return
+        self._state.phase = "blocked"
+        self._state.title = "机械臂安全接入未完成"
+        details = self._state.startup_blockers
+        reason = self._state.readiness_reason
+        if details and self._has_retryable_device_blockers_locked():
+            detail_lines = "; ".join(
+                f"{key}: {value}" for key, value in sorted(details.items())
+            )
+            self._state.detail = (
+                "规则采集保持禁用；请检查故障设备后点击“重连失败设备”，"
+                "并重新完成 runtime Home。\n"
+                + detail_lines
+            )
+        elif details:
+            detail_lines = "; ".join(
+                f"{key}: {value}" for key, value in sorted(details.items())
+            )
+            self._state.detail = (
+                "设备已通过 readiness 检查，但仍需重新完成 runtime Home；"
+                "确认机械臂处于安全位置后点击“重新安全初始化”。\n"
+                + detail_lines
+            )
+        elif reason:
+            if self._session_requires_runtime_home_locked():
+                self._state.detail = (
+                    "规则采集保持禁用；请确认机械臂处于安全位置后点击"
+                    "“重新安全初始化”。\n"
+                    + reason
+                )
+            else:
+                self._state.detail = (
+                    "规则采集保持禁用；请先完成机械臂 runtime Home 和安全接入。\n"
+                    + reason
+                )
+        else:
+            self._state.detail = (
+                "规则采集保持禁用；机械臂尚未通过 Session arm admission。"
+            )
+
+    @staticmethod
+    def _optional_int(value: object) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _optional_float(value: object) -> float | None:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            return None
+        return normalized if math.isfinite(normalized) else None
+
+    def consume_runtime_events(self, *, max_events: int = 64) -> list[str]:
+        events: list[str] = []
+        for _ in range(max(1, int(max_events))):
+            try:
+                events.append(self._runtime_events.get_nowait())
+            except queue.Empty:
+                break
+        return events
+
+    def consume_rule_intents(self, *, max_events: int = 16) -> tuple[str, ...]:
+        intents: list[str] = []
+        for _ in range(max(1, int(max_events))):
+            try:
+                intents.append(self._rule_intents.get_nowait().value)
+            except queue.Empty:
+                break
+        return tuple(intents)
+
+    def consume_configuration_requests(
+        self,
+        *,
+        max_events: int = 4,
+    ) -> tuple[dict[str, object], ...]:
+        requests: list[dict[str, object]] = []
+        for _ in range(max(1, int(max_events))):
+            try:
+                requests.append(self._configuration_requests.get_nowait())
+            except queue.Empty:
+                break
+        return tuple(requests)
+
+    def consume_height_calibration_requests(
+        self,
+        *,
+        max_events: int = 4,
+    ) -> tuple[dict[str, object], ...]:
+        requests: list[dict[str, object]] = []
+        for _ in range(max(1, int(max_events))):
+            try:
+                requests.append(self._height_calibration_requests.get_nowait())
+            except queue.Empty:
+                break
+        return tuple(requests)
+
+    def configuration_options(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._configuration_options)
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return asdict(self._state)
+
+
+__all__ = [
+    "RuleBasedWritingApplication",
+    "RuleBasedWritingIntent",
+    "RuleBasedWritingUiState",
+]

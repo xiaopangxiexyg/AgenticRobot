@@ -22,6 +22,7 @@ from dataset_contracts.progress_profile import (
     ProgressProfileContractError,
     ProgressStepDefinitionV1,
     ProgressStepArmControlV1,
+    ProgressStepArmControlV2,
     TaskProgressProfileV1,
     validate_progress_episode_binding,
 )
@@ -105,6 +106,27 @@ def test_progress_step_arm_control_is_optional_and_hash_bound() -> None:
             right="teleop",
             fixed_scope="arm_only",
         )
+
+
+def test_progress_step_arm_control_v2_preserves_honest_arm_only_scope() -> None:
+    control = ProgressStepArmControlV2(
+        left="fixed_hold",
+        right="teleop",
+        fixed_scope="arm_only",
+    )
+
+    assert control.fixed_sides == ("left",)
+    assert control.teleop_sides == ("right",)
+    assert ProgressStepArmControlV2.from_payload(control.to_payload()) == control
+
+    profile = replace(
+        _linear_profile(),
+        steps=(
+            replace(_linear_profile().steps[0], arm_control=control),
+            _linear_profile().steps[1],
+        ),
+    )
+    assert TaskProgressProfileV1.from_payload(profile.to_payload()) == profile
 
 
 def test_repeated_semantic_type_has_distinct_progress_identity() -> None:

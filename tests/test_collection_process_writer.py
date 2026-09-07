@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import shutil
 import time
 from pathlib import Path
@@ -234,6 +235,11 @@ def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_pat
         assert accepted[0].episode_frame_index == 0
         assert accepted[0].sample_timestamp == snapshot.step_result.timestamp
         assert worker.drain_sample_acceptance_receipts() == ()
+        terminal = worker.drain_sample_terminal_events()
+        assert len(terminal) == 1
+        assert terminal[0].accepted is True
+        assert terminal[0].receipt == accepted[0]
+        assert worker.drain_sample_terminal_events() == ()
         # Pause/resume uses this ordered control message before accepting the
         # next continuity segment in the same episode.
         worker.reset_temporal_history()
@@ -251,6 +257,88 @@ def test_process_collection_worker_writes_and_finalizes_without_hardware(tmp_pat
         / "episode_000000"
         / "sensor_a.uint8.bin"
     ).is_file()
+
+
+def test_process_collection_worker_rejects_submission_outside_lifecycle(tmp_path) -> None:
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            nominal_fps=15.0,
+            task_id="process-lifecycle-admission-test",
+            write_parquet=False,
+            write_video=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(
+            active_sides=("left", "right"),
+            camera_buffers={},
+            require_camera_frames=False,
+        ),
+        config=ProcessCollectionConfig(
+            queue_size=1,
+            shared_slot_count=1,
+            shared_slot_bytes=4096,
+            worker_nice=0,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not started"):
+        worker.submit_snapshot(_snapshot())
+    worker.close(force=True)
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.submit_snapshot(_snapshot())
+
+
+def test_process_worker_keeps_fatal_terminal_event_without_receipt_opt_in(tmp_path) -> None:
+    """Fatal writer outcomes remain visible in headless/rule-based mode."""
+
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            nominal_fps=15.0,
+            task_id="process-terminal-only-test",
+            write_parquet=False,
+            write_video=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(
+            active_sides=("left", "right"),
+            camera_buffers={},
+            require_camera_frames=False,
+        ),
+        config=ProcessCollectionConfig(
+            queue_size=1,
+            shared_slot_count=1,
+            shared_slot_bytes=1024,
+            worker_nice=0,
+            sample_acceptance_receipt_capacity=0,
+        ),
+    )
+
+    class _OneMessageQueue:
+        def __init__(self, message: dict[str, object]) -> None:
+            self._message = message
+
+        def get_nowait(self) -> dict[str, object]:
+            if self._message is None:
+                raise queue.Empty
+            message = self._message
+            self._message = None
+            return message
+
+    worker._ack_queue = _OneMessageQueue(
+        {
+            "kind": "worker_error",
+            "error": "worker.handle.test: RuntimeError: disk failure",
+            "terminal_metadata": {"sample_id": "s-1"},
+        }
+    )
+    try:
+        assert worker._sample_acceptance_receipt_buffer.capacity == 0
+        assert worker._sample_terminal_event_buffer.capacity > 0
+        events = worker.drain_sample_terminal_events()
+        assert len(events) == 1
+        assert events[0].terminal_kind == "fatal"
+        assert events[0].metadata == {"sample_id": "s-1"}
+    finally:
+        worker.close(force=True)
 
 
 def test_process_collection_worker_writes_native_tactile_bundle(tmp_path) -> None:
@@ -360,6 +448,10 @@ def test_process_worker_rejects_stale_v22_sample_without_poisoning_worker(tmp_pa
         assert stale_stats.sample_rejections == 1
         assert stale_stats.completed_samples == 0
         assert worker.drain_sample_acceptance_receipts() == ()
+        stale_terminal = worker.drain_sample_terminal_events()
+        assert len(stale_terminal) == 1
+        assert stale_terminal[0].accepted is False
+        assert stale_terminal[0].terminal_kind == "rejected"
 
         assert worker.submit_snapshot(
             _strict_snapshot(timestamp=timestamp + 0.1, joint_timestamp=timestamp + 0.0)
@@ -972,5 +1064,46 @@ def test_process_collection_discard_clears_reused_episode_caches(tmp_path) -> No
         assert worker.start_episode({"attempt": 2}) == 0
         assert worker.tactile_frame_counts(0) == {}
         assert worker.discard_episode(0) is True
+    finally:
+        worker.close()
+
+
+def test_process_collection_rejects_duplicate_or_mismatched_legacy_lifecycle(
+    tmp_path,
+) -> None:
+    worker = ProcessCollectionWorker(
+        writer_config=LeRobotV21WriterConfig(
+            root_dir=tmp_path,
+            nominal_fps=15.0,
+            task_id="lifecycle-guard-test",
+            write_parquet=False,
+            write_video=False,
+        ),
+        sample_builder_config=CollectorSampleBuilderConfig(
+            active_sides=("left", "right"),
+            camera_buffers={},
+            require_camera_frames=False,
+        ),
+        config=ProcessCollectionConfig(
+            queue_size=2,
+            shared_slot_count=1,
+            shared_slot_bytes=4096,
+            worker_nice=0,
+        ),
+    )
+    try:
+        worker.start()
+        assert worker.start_episode({"attempt": 1}) == 0
+        with pytest.raises(RuntimeError, match="still active"):
+            worker.start_episode({"attempt": 2})
+        with pytest.raises(ValueError, match="does not match"):
+            worker.finalize_episode(99, summary={})
+        with pytest.raises(ValueError, match="does not match"):
+            worker.discard_episode(99)
+        assert worker.discard_episode(0) is True
+        assert worker.discard_episode(0) is False
+        with pytest.raises(RuntimeError, match="No legacy episode"):
+            worker.finalize_episode(0, summary={})
+        worker.reload_finalized_dataset_state()
     finally:
         worker.close()

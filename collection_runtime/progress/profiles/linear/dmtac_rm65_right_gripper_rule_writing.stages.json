@@ -1,0 +1,16 @@
+{
+  "schema": "dexteleop.task_stage_profile.v1",
+  "profile_id": "dmtac_rm65_right_gripper_rule_writing_stages",
+  "profile_version": "1",
+  "task_progress_profile_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "stages": [
+    {
+      "schema": "dexteleop.progress_stage_definition.v1",
+      "progress_step_id": "right_write",
+      "stage_id": "right_write.write",
+      "display_name": "右手规则书写",
+      "description": "右手完成落笔、规则书写与提笔的完整采集。",
+      "ordinal": 1
+    }
+  ]
+}

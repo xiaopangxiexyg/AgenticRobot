@@ -6,20 +6,28 @@ import pytest
 
 from dataset_contracts.progress_profile import (
     ProgressStepArmControlV1,
+    ProgressStepArmControlV2,
     ProgressStepDefinitionV1,
     TaskProgressProfileV1,
 )
 from teleop_runtime.diagnostics import TeleopRunState
 from teleop_runtime.real_teleop.progress_arm_control import (
+    PendingProgressArmTransition,
     build_progress_entry_arm_transition_plan,
     build_progress_arm_transition_plan,
     progress_step_arm_requirements_differ,
     strict_progress_arm_sample_rejection,
+    validate_progress_arm_plan_fixed_scopes,
+    validate_progress_profile_fixed_scopes,
 )
 from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
 from teleop_runtime.real_teleop.control_loop import (
+    _reconcile_active_progress_entry_arm_control,
+    _reconcile_active_progress_intent_arm_control,
     _reconcile_idle_progress_entry_arm_control,
+    _runtime_extension_defers_progress_entry_arm_plan,
 )
+from teleop_runtime.real_teleop.progress_contracts import ProgressMutationCommand
 from teleop_runtime.schemas import EffectorCommand, TeleopCommand
 from teleop_runtime.session import SessionStepResult
 
@@ -48,18 +56,22 @@ def _profile(*, declared: bool = True) -> TaskProgressProfileV1:
     )
 
 
-def _step(*, fixed_side: str | None) -> SessionStepResult:
+def _step(
+    *,
+    fixed_side: str | None,
+    fixed_scope: str = "arm_and_end_effector",
+) -> SessionStepResult:
     metadata = {}
     effector_metadata = {}
     if fixed_side is not None:
         metadata = {
             "fix_arm_active_side": fixed_side,
-            "fix_arm_scope": "arm_and_end_effector",
+            "fix_arm_scope": fixed_scope,
         }
         effector_metadata = {
             "fix_arm_active": True,
             "fix_arm_side": fixed_side,
-            "fix_arm_scope": "arm_and_end_effector",
+            "fix_arm_scope": fixed_scope,
         }
     command = TeleopCommand(timestamp=1.0, metadata=metadata)
     for side in ("left", "right"):
@@ -220,6 +232,189 @@ def test_pre_episode_fixed_side_waits_for_first_command_without_home() -> None:
     assert not ready
 
 
+def test_active_episode_additive_fix_wait_never_creates_empty_home_transition() -> None:
+    plan = build_progress_entry_arm_transition_plan(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=(),
+        enforcement_mode="profile",
+    )
+    assert plan is not None
+    assert not plan.requires_home
+
+    deferred_ready, deferred_pending = (
+        _reconcile_active_progress_entry_arm_control(
+            plan,
+            deferred=True,
+            apply_direct=lambda _plan: pytest.fail(
+                "a deferred entry Fix must not be applied by the progress owner"
+            ),
+        )
+    )
+    waiting_ready, waiting_pending = (
+        _reconcile_active_progress_entry_arm_control(
+            plan,
+            deferred=False,
+            apply_direct=lambda _plan: False,
+        )
+    )
+
+    assert not deferred_ready
+    assert deferred_pending is None
+    assert not waiting_ready
+    assert waiting_pending is None
+
+
+def test_active_episode_newly_live_arm_retains_nonempty_home_transition() -> None:
+    plan = build_progress_entry_arm_transition_plan(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=("right",),
+        enforcement_mode="profile",
+    )
+    assert plan is not None and plan.requires_home
+
+    ready, pending = _reconcile_active_progress_entry_arm_control(
+        plan,
+        deferred=False,
+        apply_direct=lambda _plan: False,
+    )
+
+    assert not ready
+    assert pending is not None
+    assert pending.capture_sides == ("right",)
+
+
+def test_progress_intent_additive_fix_wait_does_not_capture_unrelated_live_arm() -> None:
+    plan = build_progress_entry_arm_transition_plan(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=(),
+        enforcement_mode="profile",
+    )
+    assert plan is not None and not plan.requires_home
+    intent = ProgressMutationCommand("advance-add-fix", "ADVANCE_PROGRESS")
+
+    ready, pending = _reconcile_active_progress_intent_arm_control(
+        plan,
+        intent=intent,
+        force_home=True,
+        apply_direct=lambda _plan: pytest.fail(
+            "forced Home must not bypass additive-Fix semantics"
+        ),
+    )
+
+    assert not ready
+    assert pending is None
+
+
+def test_progress_intent_home_captures_exact_newly_live_sides() -> None:
+    plan = build_progress_entry_arm_transition_plan(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=("right",),
+        enforcement_mode="profile",
+    )
+    assert plan is not None and plan.requires_home
+    intent = ProgressMutationCommand("undo-release", "UNDO_LAST_ADVANCE")
+
+    ready, pending = _reconcile_active_progress_intent_arm_control(
+        plan,
+        intent=intent,
+        force_home=True,
+        apply_direct=lambda _plan: pytest.fail("forced Home must skip direct apply"),
+    )
+
+    assert not ready
+    assert pending is not None
+    assert pending.intent == intent
+    assert pending.capture_sides == ("right",)
+
+
+def test_pending_home_contract_rejects_unrelated_or_additive_capture_sides() -> None:
+    newly_live_plan = build_progress_entry_arm_transition_plan(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=("right",),
+        enforcement_mode="profile",
+    )
+    additive_plan = build_progress_entry_arm_transition_plan(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=(),
+        enforcement_mode="profile",
+    )
+    assert newly_live_plan is not None and newly_live_plan.requires_home
+    assert additive_plan is not None and not additive_plan.requires_home
+
+    with pytest.raises(ValueError, match="exactly its newly_teleop_sides"):
+        PendingProgressArmTransition(
+            intent=None,
+            plan=newly_live_plan,
+            capture_sides=("left",),
+        )
+    with pytest.raises(ValueError, match="exactly its newly_teleop_sides"):
+        PendingProgressArmTransition(
+            intent=None,
+            plan=additive_plan,
+            capture_sides=("right",),
+        )
+
+
+def test_runtime_extension_may_defer_only_validated_additive_entry_fix() -> None:
+    plan = build_progress_entry_arm_transition_plan(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=(),
+        enforcement_mode="profile",
+    )
+    assert plan is not None
+    calls = []
+
+    class _Extension:
+        @staticmethod
+        def defers_progress_entry_arm_control(**kwargs):
+            calls.append(dict(kwargs))
+            return True
+
+    controller = SimpleNamespace(scope_for_side=lambda _side: "arm_and_end_effector")
+
+    assert _runtime_extension_defers_progress_entry_arm_plan(
+        extension=_Extension(),
+        controller=controller,
+        plan=plan,
+    )
+    assert calls == [
+        {
+            "target_progress_step_id": "right_move",
+            "current_fixed_sides": (),
+            "target_fixed_sides": ("left",),
+            "fixed_scope": "arm_and_end_effector",
+        }
+    ]
+
+
+def test_runtime_extension_cannot_defer_a_fix_release_requiring_home() -> None:
+    plan = build_progress_entry_arm_transition_plan(
+        profile=_profile(),
+        selected_entry_step_id="right_move",
+        current_fixed_sides=("right",),
+        enforcement_mode="profile",
+    )
+    assert plan is not None and plan.requires_home
+    extension = SimpleNamespace(
+        defers_progress_entry_arm_control=lambda **_kwargs: True
+    )
+    controller = SimpleNamespace(scope_for_side=lambda _side: "arm_and_end_effector")
+
+    with pytest.raises(RuntimeError, match="only an additive"):
+        _runtime_extension_defers_progress_entry_arm_plan(
+            extension=extension,
+            controller=controller,
+            plan=plan,
+        )
+
+
 def test_undeclared_profile_is_compatible_except_in_strict_mode() -> None:
     assert build_progress_arm_transition_plan(
         profile=_profile(declared=False),
@@ -252,6 +447,107 @@ def test_strict_writer_gate_checks_step_id_mode_and_fixed_scope() -> None:
             active_sides=("left", "right"),
         )
     )
+
+
+def test_arm_only_profile_matches_only_arm_only_runtime_samples() -> None:
+    profile = TaskProgressProfileV1(
+        profile_id="right-gripper-rule",
+        profile_version="1",
+        task_id="rule-writing",
+        steps=(
+            ProgressStepDefinitionV1(
+                "right_write",
+                "WRITE_WITH_BRUSH",
+                "Right write",
+                1,
+                arm_control=ProgressStepArmControlV2(
+                    left="fixed_hold",
+                    right="teleop",
+                    fixed_scope="arm_only",
+                ),
+            ),
+        ),
+        initial_step_id="right_write",
+        terminal_step_ids=("right_write",),
+    )
+
+    plan = build_progress_entry_arm_transition_plan(
+        profile=profile,
+        selected_entry_step_id="right_write",
+        current_fixed_sides=(),
+        enforcement_mode="profile",
+    )
+    assert plan is not None
+    assert plan.requirement.fixed_scope == "arm_only"
+    validate_progress_arm_plan_fixed_scopes(
+        plan,
+        scope_for_side=lambda _side: "arm_only",
+    )
+    with pytest.raises(RuntimeError, match="expected='arm_only'.*side=left"):
+        validate_progress_arm_plan_fixed_scopes(
+            plan,
+            scope_for_side=lambda _side: "arm_and_end_effector",
+        )
+    assert strict_progress_arm_sample_rejection(
+        profile=profile,
+        progress_step_id="right_write",
+        step_result=_step(fixed_side="left", fixed_scope="arm_only"),
+        active_sides=("left", "right"),
+    ) is None
+    assert "expected=arm_only" in str(
+        strict_progress_arm_sample_rejection(
+            profile=profile,
+            progress_step_id="right_write",
+            step_result=_step(fixed_side="left"),
+            active_sides=("left", "right"),
+        )
+    )
+
+
+def test_complete_profile_scope_admission_reports_all_incompatible_steps() -> None:
+    profile = TaskProgressProfileV1(
+        profile_id="mixed-scope",
+        profile_version="1",
+        task_id="task",
+        steps=(
+            ProgressStepDefinitionV1(
+                "left_step",
+                "WRITE",
+                "Left",
+                1,
+                allowed_next_step_ids=("right_step",),
+                arm_control=ProgressStepArmControlV2(
+                    left="fixed_hold",
+                    right="teleop",
+                    fixed_scope="arm_only",
+                ),
+            ),
+            ProgressStepDefinitionV1(
+                "right_step",
+                "WRITE",
+                "Right",
+                2,
+                arm_control=ProgressStepArmControlV2(
+                    left="teleop",
+                    right="fixed_hold",
+                    fixed_scope="arm_only",
+                ),
+            ),
+        ),
+        initial_step_id="left_step",
+        terminal_step_ids=("right_step",),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        validate_progress_profile_fixed_scopes(
+            profile,
+            scope_for_side=lambda _side: "arm_and_end_effector",
+        )
+    message = str(exc_info.value)
+    assert "step=left_step:side=left" in message
+    assert "step=right_step:side=right" in message
+
+
 
 
 def test_async_strict_gate_uses_progress_step_captured_at_sample_cut() -> None:

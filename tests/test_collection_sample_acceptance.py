@@ -6,6 +6,8 @@ import pytest
 
 from collection_runtime.sample_acceptance import (
     AcceptedSampleReceipt,
+    SampleTerminalEvent,
+    SampleTerminalEventBuffer,
     SampleAcceptanceReceiptBuffer,
 )
 from teleop_runtime.real_teleop.dataset_recorder import RealTeleopDatasetRecorder
@@ -98,3 +100,49 @@ def test_disabled_thread_receipts_do_not_inspect_sample() -> None:
 
     recorder._record_thread_sample_acceptance(_MustNotBeRead())
     assert recorder.drain_accepted_sample_receipts() == ()
+
+
+def test_terminal_event_buffer_retains_rejections_and_fails_closed_on_overflow() -> None:
+    buffer = SampleTerminalEventBuffer(capacity=2)
+    buffer.append(
+        SampleTerminalEvent(
+            accepted=False,
+            reason="contract rejected",
+            terminal_kind="rejected",
+        )
+    )
+    buffer.append(
+        SampleTerminalEvent(
+            accepted=False,
+            reason="writer failed",
+            terminal_kind="fatal",
+        )
+    )
+    assert [event.terminal_kind for event in buffer.drain()] == [
+        "rejected",
+        "fatal",
+    ]
+
+    buffer.append(
+        SampleTerminalEvent(
+            accepted=False,
+            reason="first",
+            terminal_kind="rejected",
+        )
+    )
+    buffer.append(
+        SampleTerminalEvent(
+            accepted=False,
+            reason="second",
+            terminal_kind="rejected",
+        )
+    )
+    buffer.append(
+        SampleTerminalEvent(
+            accepted=False,
+            reason="third",
+            terminal_kind="rejected",
+        )
+    )
+    with pytest.raises(RuntimeError, match="terminal event buffer overflowed"):
+        buffer.drain()

@@ -90,6 +90,22 @@ pair after the coarse annotation set is sealed and publishes the fine labels
 as an additive detail overlay; it never rewrites the original Episode,
 Parquet, video, or coarse annotation set.
 
+`dmtac_rm65_right_gripper_rule_writing_progress` is the dedicated one-step
+profile for rule-based writing with both RM65 arms but only the right DMTAC
+gripper connected. Its nested v2 arm-control declaration records the actual
+topology: the left arm is `fixed_hold` with `arm_only` scope, while the right
+arm remains active with its configured gripper. The `_detailed` selection
+binds the exact three-stage `pen_down` replay, rule-based `write`, and relative
+`pen_up` replay timeline. This profile must not be substituted for the normal
+dual-gripper profile; the launcher selects the latter when
+`--with-left-gripper` is explicit.
+
+`dmtac_rm65_full_trajectory_replay_v1_progress` is the dedicated one-step,
+one-stage profile for recording a complete source Episode replay. Its only
+fine stage is `execute_task.full_replay`, so a normal new Episode starts at an
+initial stage and never misrepresents the run as a recovery entry into the
+generic bimanual profile's middle `manipulate` stage.
+
 The catalog also contains
 `test_dmtac_rm65_bimanual_position_v1_three_stage_progress`. It deliberately
 uses the formal DMTAC task ID so that it appears in the current RealTeleop

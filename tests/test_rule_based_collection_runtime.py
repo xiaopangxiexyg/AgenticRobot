@@ -130,3 +130,39 @@ def test_adapter_runtime_path_reuses_the_same_resolution_boundary() -> None:
         emission.command.commands["right_arm"].value,
         np.full(6, 2.0),
     )
+
+
+def test_optional_empty_runtime_segment_skips_without_emitting_and_resets_sources() -> None:
+    class OptionalSource:
+        def __init__(self) -> None:
+            self.reset_count = 0
+
+        def produce_action(self, _observation, *, context=None):
+            del context
+            return None
+
+        def reset(self) -> None:
+            self.reset_count += 1
+
+    optional = OptionalSource()
+    final = RobotAction.bimanual_qpos(right_arm=np.ones(6), source="after_empty")
+    plan = RuleBasedCollectionPlan(
+        steps=(
+            RuleBasedActionSegment(
+                step_id="optional",
+                action_source=optional,
+                stop_condition=RuleBasedSegmentStopCondition(max_steps=1),
+                allow_empty=True,
+                planned_steps_hint=0,
+            ),
+            RuleBasedCustomAction(step_id="final", action=final),
+        )
+    )
+    adapter = RuleBasedCollectionAdapter(RuleBasedCollectionCursor(plan, {}))
+
+    emission = adapter.next_runtime(None)
+    assert emission.directive.step_id == "final"
+    assert emission.directive.sequence_index == 0
+    adapter.reset()
+    assert optional.reset_count == 1
+    assert adapter.next_runtime(None).directive.step_id == "final"

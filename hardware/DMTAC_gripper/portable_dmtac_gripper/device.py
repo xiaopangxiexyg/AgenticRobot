@@ -226,6 +226,7 @@ class DMTacGripperDevice:
         connect_gripper: bool = True,
         connect_tactile: bool = True,
         apply_tactile_calibration_on_connect: bool = True,
+        allow_partial_connect: bool = False,
     ) -> None:
         self.gripper_config = gripper or GripperConfig()
         self.tactile_config = tactile or TactileConfig()
@@ -234,11 +235,21 @@ class DMTacGripperDevice:
         self.apply_tactile_calibration_on_connect = bool(
             apply_tactile_calibration_on_connect
         )
+        # A DMTAC stack contains two independent transports: the command
+        # gripper serial link and the tactile cameras.  Runtime teleop may
+        # safely keep command control when tactile discovery is temporarily
+        # unavailable; strict callers (assignment/calibration tools) retain
+        # the historical all-or-nothing behaviour by leaving this false.
+        self.allow_partial_connect = bool(allow_partial_connect)
         self.gripper: Optional[InspireGripper] = None
         self.tactile: Optional[DMTacMultiDevice] = None
+        self.tactile_connect_error: str | None = None
         self._distributed_force_denoiser = DistributedForceDenoiser(self.tactile_config.denoise_config)
 
     def connect(self) -> "DMTacGripperDevice":
+        # Establish the gripper first.  A tactile failure must never make a
+        # successfully opened command serial link look disconnected in the
+        # partial-connect mode used by the live backend.
         try:
             if self.connect_gripper and self.gripper is None:
                 cfg = self.gripper_config
@@ -255,30 +266,52 @@ class DMTacGripperDevice:
                     use_write_multiple_registers=cfg.use_write_multiple_registers,
                     debug=cfg.debug,
                 )
-
-            if self.connect_tactile and self.tactile is None:
-                dev_ids = list(self.tactile_config.dev_ids or discover_device_ids()[:2])
-                if not dev_ids:
-                    raise RuntimeError(
-                        "No DM-Tac tactile device was discovered. Check USB with `lsusb`, "
-                        "or pass explicit ids with TactileConfig(dev_ids=[...])."
-                    )
-                configs = [
-                    tactile_device_config(dev_id, self.tactile_config)
-                    for dev_id in dev_ids
-                ]
-                tactile = DMTacMultiDevice(configs)
-                self.tactile = tactile
-                tactile.connect()
-                if self.apply_tactile_calibration_on_connect:
-                    self.apply_fixed_tactile_calibration()
-                self.reset_tactile_filter()
         except BaseException:
             try:
                 self.close()
             except BaseException:
                 pass
             raise
+
+        if not self.connect_tactile or self.tactile is not None:
+            return self
+
+        tactile: DMTacMultiDevice | None = None
+        try:
+            dev_ids = list(self.tactile_config.dev_ids or discover_device_ids()[:2])
+            if not dev_ids:
+                raise RuntimeError(
+                    "No DM-Tac tactile device was discovered. Check USB with `lsusb`, "
+                    "or pass explicit ids with TactileConfig(dev_ids=[...])."
+                )
+            configs = [
+                tactile_device_config(dev_id, self.tactile_config)
+                for dev_id in dev_ids
+            ]
+            tactile = DMTacMultiDevice(configs)
+            self.tactile = tactile
+            tactile.connect()
+            if self.apply_tactile_calibration_on_connect:
+                self.apply_fixed_tactile_calibration()
+            self.reset_tactile_filter()
+            self.tactile_connect_error = None
+        except BaseException as exc:
+            # Close only the tactile candidate here.  ``close`` on the whole
+            # composite is intentionally reserved for strict rollback and
+            # would discard a usable gripper in capability mode.
+            if tactile is not None:
+                try:
+                    tactile.close()
+                except BaseException:
+                    pass
+            self.tactile = None
+            self.tactile_connect_error = f"{type(exc).__name__}: {exc}"
+            if not self.allow_partial_connect or self.gripper is None:
+                try:
+                    self.close()
+                except BaseException:
+                    pass
+                raise
 
         return self
 
@@ -332,6 +365,21 @@ class DMTacGripperDevice:
 
     def clear_fault(self) -> None:
         self.require_gripper().clear_fault()
+
+    def clear_fault_and_confirm(
+        self,
+        *,
+        timeout: float = 3.0,
+        poll_interval: float = 0.20,
+        ack_interval: float = 0.75,
+        required_consecutive_zero_reads: int = 3,
+    ) -> GripperState:
+        return self.require_gripper().clear_fault_and_confirm(
+            timeout=timeout,
+            poll_interval=poll_interval,
+            ack_interval=ack_interval,
+            required_consecutive_zero_reads=required_consecutive_zero_reads,
+        )
 
     def stop(self) -> None:
         self.require_gripper().estop()

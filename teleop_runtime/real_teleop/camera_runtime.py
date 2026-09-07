@@ -312,6 +312,36 @@ def apply_real_teleop_camera_startup_defaults(
             config.color_format = requested_color_format
 
 
+def apply_real_teleop_camera_history_defaults(
+    camera_configs: Mapping[str, RealSenseRGBCameraConfig],
+    *,
+    frame_max_age_sec: float,
+) -> None:
+    """Retain enough causal RGB history for the configured age contract.
+
+    A sample cut is taken before command/IK work.  Several camera frames may
+    arrive before the writer asks for the newest frame at or before that cut,
+    so the historical two-frame default is insufficient even when every
+    camera is healthy and sustaining its configured FPS.
+    """
+
+    max_age_sec = float(frame_max_age_sec)
+    if not math.isfinite(max_age_sec) or max_age_sec <= 0.0:
+        raise ValueError("camera frame max age must be finite and positive")
+    for config in camera_configs.values():
+        configured_keep_last = int(config.keep_last)
+        required_keep_last = int(math.ceil(max_age_sec * float(config.fps))) + 2
+        config.keep_last = max(configured_keep_last, required_keep_last)
+        config.metadata = dict(config.metadata)
+        config.metadata.setdefault("configured_keep_last", configured_keep_last)
+        config.metadata.update(
+            {
+                "real_teleop_causal_history_keep_last": int(config.keep_last),
+                "real_teleop_causal_history_max_age_sec": max_age_sec,
+            }
+        )
+
+
 def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSource]:
     if bool(getattr(args, "no_camera", False)):
         return {}
@@ -350,6 +380,16 @@ def _build_camera_sources(args: argparse.Namespace) -> dict[str, RealSenseRGBSou
                 REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME,
             )
             or REALSENSE_STARTUP_WARMUP_BOUNDED_FIRST_FRAME
+        ),
+    )
+    apply_real_teleop_camera_history_defaults(
+        camera_configs,
+        frame_max_age_sec=float(
+            getattr(
+                args,
+                "camera_frame_max_age_sec",
+                DEFAULT_CAMERA_FRAME_MAX_AGE_SEC,
+            )
         ),
     )
     wrist_depth_requested = bool(getattr(args, "wrist_depth_mask", False)) or bool(
@@ -931,6 +971,7 @@ __all__ = [
     "CAMERA_STARTUP_SELF_CHECK_INTERVAL_SEC",
     "CAMERA_START_STAGGER_SEC",
     "CameraStartupFreshnessGate",
+    "apply_real_teleop_camera_history_defaults",
     "_build_camera_sources",
     "_camera_startup_items",
     "_close_camera_sources",

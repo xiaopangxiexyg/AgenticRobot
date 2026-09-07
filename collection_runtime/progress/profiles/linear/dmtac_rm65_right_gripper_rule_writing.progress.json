@@ -1,0 +1,26 @@
+{
+  "schema": "dexteleop.task_progress_profile.v1",
+  "profile_id": "dmtac_rm65_right_gripper_rule_writing_progress",
+  "profile_version": "1",
+  "task_id": "dmtac_rm65_rule_based_writing_v1",
+  "steps": [
+    {
+      "schema": "dexteleop.progress_step_definition.v1",
+      "progress_step_id": "right_write",
+      "semantic_type": "WRITE_WITH_BRUSH",
+      "display_name": "右手规则书写",
+      "ordinal": 1,
+      "arm_control": {
+        "schema": "dexteleop.progress_step_arm_control.v2",
+        "left": "fixed_hold",
+        "right": "teleop",
+        "fixed_scope": "arm_only"
+      },
+      "allowed_next_step_ids": []
+    }
+  ],
+  "initial_step_id": "right_write",
+  "terminal_step_ids": ["right_write"],
+  "topology_kind": "LINEAR",
+  "allow_retry_after_failure": true
+}

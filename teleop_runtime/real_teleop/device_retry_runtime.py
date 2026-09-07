@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import time
 from typing import Any
+
+from robot_motion.runtime.readiness import (
+    format_readiness_report,
+    readiness_report_blockers,
+)
 
 from .foot_pad_controls import (
     apply_live_foot_pad_topology,
@@ -44,15 +50,240 @@ def build_device_retry_runtime(
     promote_angle_trigger_gripper_input_to_q6: Callable[..., tuple[bool, str]],
     log: Callable[..., None],
     publish_camera_status: Callable[[], None] | None = None,
+    refresh_application_status: Callable[[], None] | None = None,
 ) -> DeviceRetryRuntime:
     DMTacGripperBackend = dmtac_gripper_backend_type
     FootPadSpecialArmInput = foot_pad_input_type
-    SPECIAL_ARM_CONTROL_MODE_FOOT_PAD = foot_pad_control_mode
+    del foot_pad_control_mode
     _has_dmtac_gripper_backend = has_dmtac_gripper_backend
     _promote_angle_trigger_gripper_input_to_q6 = (
         promote_angle_trigger_gripper_input_to_q6
     )
     _log = log
+    dynamic_readiness_keys: set[str] = set()
+    # ``Rig.readiness_report()`` may ask a vendor backend for a bounded state
+    # snapshot.  It is an observational status path, not a control-loop
+    # operation; keep it out of repeated GUI/status projections while still
+    # refreshing promptly after an explicit reconnect/Home boundary.
+    readiness_cache_ttl_sec = 0.25
+    readiness_cache_report: Mapping[str, object] | None = None
+    readiness_cache_at = 0.0
+    readiness_cache_key: tuple[object, ...] | None = None
+    readiness_cache_error: str | None = None
+
+    def _readiness_context_key() -> tuple[object, ...]:
+        session = getattr(components, "session", None)
+        rig = getattr(session, "rig", None)
+        raw_state = getattr(getattr(session, "state_machine", None), "state", None)
+        state = str(getattr(raw_state, "value", raw_state) or "").upper()
+        backends = getattr(rig, "backends", None)
+        if isinstance(backends, Mapping):
+            backend_key = tuple(
+                sorted((str(name), id(backend)) for name, backend in backends.items())
+            )
+        else:
+            backend_key = ()
+        return (
+            id(session),
+            id(rig),
+            bool(getattr(session, "_started", False)),
+            state,
+            backend_key,
+        )
+
+    def _invalidate_readiness_cache() -> None:
+        nonlocal readiness_cache_report, readiness_cache_at
+        nonlocal readiness_cache_key, readiness_cache_error
+        readiness_cache_report = None
+        readiness_cache_at = 0.0
+        readiness_cache_key = None
+        readiness_cache_error = None
+
+    def _rig_readiness_report(*, force: bool = False) -> Mapping[str, object] | None:
+        nonlocal readiness_cache_report, readiness_cache_at
+        nonlocal readiness_cache_key, readiness_cache_error
+        context_key = _readiness_context_key()
+        now = time.monotonic()
+        if (
+            not force
+            and readiness_cache_key == context_key
+            and now - readiness_cache_at < readiness_cache_ttl_sec
+        ):
+            return readiness_cache_report
+        session = getattr(components, "session", None)
+        rig = getattr(session, "rig", None)
+        report_fn = getattr(rig, "readiness_report", None)
+        if not callable(report_fn):
+            _invalidate_readiness_cache()
+            return None
+        try:
+            report = report_fn()
+        except Exception as exc:  # noqa: BLE001 - status must remain available.
+            error = f"{type(exc).__name__}: {exc}"
+            # Cache an observational failure briefly as well.  A disconnected
+            # vendor handle must not turn every hardware-status item into a
+            # serial retry storm; explicit retry invalidates this latch.
+            readiness_cache_report = None
+            readiness_cache_at = now
+            readiness_cache_key = context_key
+            if readiness_cache_error != error:
+                _log(
+                    "Device",
+                    "Rig readiness report failed; preserving existing device status: "
+                    f"{error}",
+                )
+                readiness_cache_error = error
+            return None
+        if not isinstance(report, Mapping):
+            readiness_cache_report = None
+            readiness_cache_at = now
+            readiness_cache_key = context_key
+            readiness_cache_error = "readiness report returned a non-mapping value"
+            return None
+        readiness_cache_report = dict(report)
+        readiness_cache_at = now
+        readiness_cache_key = context_key
+        readiness_cache_error = None
+        return readiness_cache_report
+
+    def _readiness_key(effector: str) -> str:
+        if effector in {"left_arm", "right_arm"}:
+            return f"arm.{effector.split('_', 1)[0]}.qpos"
+        if effector in {"left_hand", "right_hand"}:
+            return f"hand.{effector.split('_', 1)[0]}"
+        return f"rig.{effector}"
+
+    def _missing_rig_hand_backends() -> dict[str, str]:
+        """Detect an unexpectedly omitted hand in the authoritative Rig.
+
+        The canonical capability startup path preserves every configured
+        hand binding while the backend is being repaired.  This independent
+        check remains for compatibility builders and older live sessions that
+        may still have omitted a failed hand; a plain ``ready=True`` report
+        would otherwise erase the hand's startup error and expose a command
+        path that fails with ``KeyError``.
+        """
+
+        session = getattr(components, "session", None)
+        rig = getattr(session, "rig", None)
+        rig_backends = getattr(rig, "backends", None)
+        blockers: dict[str, str] = {}
+        for side in ("left", "right"):
+            if not bool(
+                getattr(components, f"{side}_hand_control_via_rig", False)
+            ):
+                continue
+            backend = getattr(components, f"{side}_hand_backend", None)
+            if backend is None:
+                continue
+            effector = f"{side}_hand"
+            if not isinstance(rig_backends, Mapping) or effector not in rig_backends:
+                blockers[effector] = "backend missing from Session Rig"
+        return blockers
+
+    def _sync_dynamic_rig_readiness(*, force: bool = False) -> dict[str, str]:
+        """Mirror current backend readiness into the shared status map."""
+
+        report = _rig_readiness_report(force=force)
+        if report is None:
+            return {}
+        blockers = readiness_report_blockers(report or {})
+        # A removed hand is not present in ``report['backends']``.  Merge this
+        # independent binding check before projecting readiness so the UI and
+        # collection admission remain fail-closed until retry restores it.
+        missing_hand_backends = _missing_rig_hand_backends()
+        blockers.update(missing_hand_backends)
+        current_dynamic_keys: set[str] = set()
+        for effector, reason in blockers.items():
+            key = _readiness_key(str(effector))
+            startup_device_errors[key] = f"{effector}: {reason}"
+            current_dynamic_keys.add(key)
+        report_ready = bool(report.get("ready", False))
+        if blockers or not report_ready:
+            detail_parts: list[str] = []
+            if not report_ready or readiness_report_blockers(report or {}):
+                detail_parts.append(format_readiness_report(report or {}))
+            detail_parts.extend(
+                f"{effector} {reason}"
+                for effector, reason in missing_hand_backends.items()
+            )
+            detail = "; ".join(part for part in detail_parts if part)
+            if not detail:
+                detail = "rig is not ready"
+            startup_device_errors["rig.session"] = f"Rig is not ready: {detail}"
+            current_dynamic_keys.add("rig.session")
+        else:
+            # A successful backend reconnect does not re-arm an already
+            # started Session.  Keep an explicit, non-device blocker until
+            # the operator performs a fresh runtime Home; otherwise the
+            # generic hardware projection can briefly claim that collection
+            # is ready while Session remains DEBUG_ONLY.
+            session = getattr(components, "session", None)
+            state_machine = getattr(session, "state_machine", None)
+            raw_state = getattr(state_machine, "state", None)
+            state = str(getattr(raw_state, "value", raw_state) or "").upper()
+            if bool(getattr(session, "_started", False)) and state not in {
+                "",
+                "ARMED",
+                "RUNNING",
+            }:
+                startup_device_errors["rig.session"] = (
+                    f"Session state={state}; runtime Home and hardware arm admission "
+                    "are required before rule collection."
+                )
+                current_dynamic_keys.add("rig.session")
+        # Remove only errors that this projection owns.  This matters when one
+        # backend recovers while another remains faulted: the old effector
+        # blocker must disappear without erasing the remaining one.
+        for key in tuple(dynamic_readiness_keys - current_dynamic_keys):
+            startup_device_errors.pop(key, None)
+        dynamic_readiness_keys.clear()
+        dynamic_readiness_keys.update(current_dynamic_keys)
+        return blockers
+
+    def _restore_rig_hand_binding(side: str, backend: object) -> None:
+        """Restore a hand omitted by a legacy/compatibility startup path.
+
+        A retry must restore the exact same backend object before clearing its
+        startup error; otherwise the UI can report a healthy serial device
+        while the authoritative Rig still raises ``missing effector`` on the
+        first command.  Inspire hand retargeters are similarly restored when
+        an older startup path removed them from the Session list.  DMTAC
+        scalar retargeters intentionally remain out-of-session and are
+        therefore not appended.
+        """
+
+        if not bool(
+            getattr(components, f"{str(side)}_hand_control_via_rig", False)
+        ):
+            return
+        session = getattr(components, "session", None)
+        rig = getattr(session, "rig", None)
+        rig_backends = getattr(rig, "backends", None)
+        if not isinstance(rig_backends, dict):
+            raise RuntimeError("Rig hand recovery requires a mutable backend map")
+        effector_name = f"{str(side)}_hand"
+        existing = rig_backends.get(effector_name)
+        if existing is not None and existing is not backend:
+            raise RuntimeError(
+                f"Rig already owns a different backend for {effector_name}"
+            )
+        rig_backends[effector_name] = backend
+
+        retargeter = getattr(components, f"{str(side)}_hand_retargeter", None)
+        session_retargeters = getattr(session, "retargeters", None)
+        if retargeter is not None and isinstance(session_retargeters, list):
+            if all(existing_retargeter is not retargeter for existing_retargeter in session_retargeters):
+                session_retargeters.append(retargeter)
+
+    def q6_required_for_collection() -> bool:
+        """Whether the current effective input still requires live Q6."""
+
+        return bool(getattr(args, "q6_config_required", False)) and str(
+            getattr(components, "gripper_input_source", "") or ""
+        ) != "angle_trigger"
+
+
     def hardware_requirement(key: str) -> str:
         if key.startswith("arm."):
             return "motion_safety"
@@ -63,16 +294,24 @@ def build_device_retry_runtime(
             return "required_for_collection"
         if key.startswith("dataset."):
             return "required_for_collection"
+        if key == "angle_trigger":
+            return (
+                "required_for_collection"
+                if str(getattr(components, "gripper_input_source", "") or "")
+                == "angle_trigger"
+                else "optional_input"
+            )
         if key == "gripper.input":
             return (
                 "required_for_collection"
-                if bool(getattr(args, "q6_config_required", False))
+                if q6_required_for_collection()
                 else "optional_input"
             )
         return "feature_dependent"
 
 
     def hardware_status_item(key: str) -> dict[str, object]:
+        _sync_dynamic_rig_readiness()
         detail = str(startup_device_errors.get(key, "") or "")
         if not detail:
             if key == "dataset.writer":
@@ -116,26 +355,48 @@ def build_device_retry_runtime(
                 "requirement": "optional_input",
                 "error": detail,
             }
-        if key == "gripper.input" and not bool(
-            getattr(args, "q6_config_required", False)
-        ):
+        if key == "gripper.input" and not q6_required_for_collection():
             return {
                 "online": False,
                 "health": "waiting",
                 "status_level": "warn",
-                "status_label": "Q6 未就绪（可选回退）",
+                "status_label": "Q6 未就绪（angle trigger 回退中）",
                 "requirement": "optional_input",
                 "error": detail,
             }
-        if key == "dataset.writer":
+        if key == "rig.session" and "runtime home" in detail.lower():
             return {
                 "online": False,
-                "health": "error",
-                "status_level": "error",
-                "status_label": "writer 准备失败",
+                "health": "waiting",
+                "status_level": "warn",
+                "status_label": "等待 runtime Home",
+                "requirement": hardware_requirement(key),
+                "error": detail,
+            }
+        if key == "dataset.writer":
+            storage_blocked = any(
+                marker in detail.lower()
+                for marker in (
+                    "insufficient free space",
+                    "insufficient_free_space",
+                    "free space",
+                )
+            )
+            return {
+                "online": False,
+                "health": "waiting" if storage_blocked else "error",
+                "status_level": "warn" if storage_blocked else "error",
+                "status_label": (
+                    "存储空间不足（采集阻塞）"
+                    if storage_blocked
+                    else "writer 准备失败"
+                ),
                 "requirement": hardware_requirement(key),
                 "error": (
-                    f"{detail}；再次开始数采会在后台创建全新 writer 并重试。"
+                    f"{detail}；释放/更换存储空间后，再次开始数采会在后台"
+                    "创建全新 writer 并重试。"
+                    if storage_blocked
+                    else f"{detail}；再次开始数采会在后台创建全新 writer 并重试。"
                 ),
             }
         return {
@@ -149,15 +410,20 @@ def build_device_retry_runtime(
 
 
     def collection_startup_blockers() -> dict[str, str]:
+        _sync_dynamic_rig_readiness()
         ignored_cameras = set(getattr(args, "ignore_camera", ()) or ())
         blockers: dict[str, str] = {}
         for key, detail in startup_device_errors.items():
             # Foot-pad is an operator convenience and never a data modality.
             if key == "foot_pad":
                 continue
-            if key == "gripper.input" and not bool(
-                getattr(args, "q6_config_required", False)
-            ):
+            # ``--q6-config-required`` describes the requested Q6 path, but
+            # capability admission may have selected a working angle-trigger
+            # source instead.  Keep the Q6 fault visible/reconnectable without
+            # making that superseded source block formal collection.  The
+            # angle-trigger startup error and per-episode freshness checks
+            # remain authoritative for the effective input.
+            if key == "gripper.input" and not q6_required_for_collection():
                 continue
             # The writer is rebuilt/revalidated on episode start.  Its
             # current startup error must not prevent that recovery attempt.
@@ -172,9 +438,11 @@ def build_device_retry_runtime(
     def publish_runtime_hardware_status() -> None:
         if control_ui is None:
             return
+        _sync_dynamic_rig_readiness()
         status_keys = {
             "arm.left.qpos",
             "arm.right.qpos",
+            "rig.session",
             *(f"camera.{key}" for key in camera_sources),
             *startup_device_errors,
         }
@@ -205,9 +473,30 @@ def build_device_retry_runtime(
                 key: hardware_status_item(key)
                 for key in sorted(status_keys)
             },
+            startup_blockers=collection_startup_blockers(),
             active_controls=clutch_input._current_active_controls(),
             **foot_pad_ui_state,
         )
+
+    def _publish_retry_completion(*, error: str | None) -> None:
+        publish_result = getattr(control_ui, "publish_device_retry_result", None)
+        if callable(publish_result):
+            publish_result(error=error)
+
+    def _publish_retry_outcome(*, error: str | None = None) -> None:
+        """Refresh generic and application-specific readiness in causal order."""
+
+        publish_runtime_hardware_status()
+        if callable(refresh_application_status):
+            try:
+                refresh_application_status()
+            except Exception as exc:  # noqa: BLE001 - status is observational only.
+                _log(
+                    "Device",
+                    "post-retry application status refresh failed; preserving "
+                    f"fail-closed readiness: {type(exc).__name__}: {exc}",
+                )
+        _publish_retry_completion(error=error)
 
 
     def sync_foot_pad_runtime_status() -> None:
@@ -239,8 +528,71 @@ def build_device_retry_runtime(
         if changed:
             publish_runtime_hardware_status()
 
+    def _retry_unready_rig_backends(report: Mapping[str, object]) -> None:
+        """Retry explicitly unready command backends of a live Session Rig."""
+
+        session = getattr(components, "session", None)
+        rig = getattr(session, "rig", None)
+        rig_backends = getattr(rig, "backends", None)
+        rig_reports = report.get("backends")
+        if not isinstance(rig_backends, Mapping) or not isinstance(
+            rig_reports, Mapping
+        ):
+            return
+        for effector, raw_report in rig_reports.items():
+            if not isinstance(raw_report, Mapping):
+                continue
+            report_ready = bool(raw_report.get("ready", False))
+            if report_ready:
+                continue
+            backend = rig_backends.get(str(effector))
+            if backend is None:
+                continue
+            if str(effector) in {"left_hand", "right_hand"}:
+                # The dedicated ``hand.<side>`` branch below owns hand
+                # reconnect and binding restoration.  Avoid running it twice
+                # when the dynamic Rig projection also reports the same hand.
+                hand_key = f"hand.{str(effector).split('_', 1)[0]}"
+                if hand_key in startup_device_errors:
+                    continue
+            is_ready = getattr(backend, "is_ready", None)
+            if not callable(is_ready):
+                continue
+            try:
+                if bool(is_ready()):
+                    continue
+                if str(effector) in {"left_hand", "right_hand"} and isinstance(
+                    backend, DMTacGripperBackend
+                ):
+                    reconnect = getattr(backend, "force_reconnect_gripper", None)
+                    if callable(reconnect):
+                        if not bool(reconnect(reason="manual_device_retry")):
+                            raise RuntimeError(
+                                "DMTAC gripper force reconnect did not recover"
+                            )
+                    else:
+                        backend.start()
+                else:
+                    backend.start()
+                if not bool(is_ready()):
+                    refresh = getattr(backend, "refresh_state_from_hardware", None)
+                    if callable(refresh):
+                        refresh()
+                if not bool(is_ready()):
+                    raise RuntimeError(f"{effector} backend is still not ready")
+            except Exception as exc:  # noqa: BLE001 - preserve fail-closed status.
+                _log(
+                    "Device",
+                    f"{effector} retry during Rig recovery failed: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+
 
     def retry_failed_devices() -> None:
+        # A retry is the explicit freshness boundary for readiness; do not
+        # reuse a cached fault from the preceding status tick.
+        _invalidate_readiness_cache()
+        _sync_dynamic_rig_readiness(force=True)
         dataset_recorder = dataset_recorder_provider()
         foot_pad_input = foot_pad_input_provider()
         recorder_busy = bool(
@@ -262,6 +614,7 @@ def build_device_retry_runtime(
                     control_hint=rejection_message,
                 )
             publish_runtime_hardware_status()
+            _publish_retry_completion(error=rejection_message)
             return
         admitted, rejection_message = clutch_input.device_retry_admission()
         if not admitted:
@@ -273,6 +626,7 @@ def build_device_retry_runtime(
                     control_hint=rejection_message,
                 )
             publish_runtime_hardware_status()
+            _publish_retry_completion(error=rejection_message)
             return
         q6_retry_handled = False
         camera_retry_attempted = False
@@ -320,7 +674,7 @@ def build_device_retry_runtime(
         if not startup_device_errors:
             if control_ui is not None and not q6_retry_handled:
                 control_ui.append_message("Device", "当前没有启动失败的可重连设备。")
-            publish_runtime_hardware_status()
+            _publish_retry_outcome()
             return
         retry_backends = {
             "arm.left.qpos": components.left_state_backend,
@@ -331,13 +685,60 @@ def build_device_retry_runtime(
         for key in tuple(startup_device_errors):
             try:
                 if key in retry_backends and retry_backends[key] is not None:
-                    retry_backends[key].start()
-                    if (
-                        key.startswith("hand.")
-                        and isinstance(retry_backends[key], DMTacGripperBackend)
-                        and not retry_backends[key].is_ready()
-                    ):
-                        raise RuntimeError("DMTAC backend is still not ready")
+                    backend = retry_backends[key]
+                    side = key.split(".", 1)[1] if key.startswith("hand.") else ""
+                    if side:
+                        # Reinsert the existing backend before checking its
+                        # readiness so a failed reconnect remains visible in
+                        # the Rig report instead of looking like a healthy Rig
+                        # with an untracked hand.
+                        _restore_rig_hand_binding(side, backend)
+                    if key.startswith("hand."):
+                        if isinstance(backend, DMTacGripperBackend):
+                            # ``start()`` is idempotent for a live serial
+                            # session; it cannot clear a latched vendor fault
+                            # or rebuild a stale serial handle.  Manual retry
+                            # owns an explicit close/recreate/clear-fault
+                            # cycle, then reads one fresh state before
+                            # readiness is evaluated.
+                            force_reconnect = getattr(
+                                backend, "force_reconnect_gripper", None
+                            )
+                            if callable(force_reconnect):
+                                if not bool(
+                                    force_reconnect(reason="manual_device_retry")
+                                ):
+                                    raise RuntimeError(
+                                        "DMTAC gripper force reconnect did not recover"
+                                    )
+                            else:
+                                # Keep compatibility with a lightweight
+                                # backend fixture that predates the explicit
+                                # reconnect seam, while still requiring a
+                                # fresh read below.
+                                backend.start()
+                            read_now = getattr(backend, "read_gripper_state_now", None)
+                            if callable(read_now):
+                                read_now()
+                        else:
+                            # Non-DMTAC hand backends (for example Inspire)
+                            # expose the ordinary idempotent start/readiness
+                            # contract.  The old retry path accidentally
+                            # skipped this branch and cleared the error even
+                            # though the hand remained disconnected.
+                            backend.start()
+                        if not bool(backend.is_ready()):
+                            report_fn = getattr(backend, "readiness_report", None)
+                            report = report_fn() if callable(report_fn) else {
+                                "ready": False,
+                                "reason": "backend is not ready",
+                            }
+                            detail = format_readiness_report(
+                                {"backends": {f"{side}_hand": report}}
+                            )
+                            raise RuntimeError(
+                                f"hand backend is still not ready: {detail}"
+                            )
                     if key.startswith("arm."):
                         state = retry_backends[key].refresh_state_from_hardware()
                         if state.get("current_qpos") is None:
@@ -376,9 +777,36 @@ def build_device_retry_runtime(
                             "resources; reconstruct the complete component graph "
                             "instead of restarting the same Session"
                         )
+                    # A started Session's ``start()`` is intentionally a
+                    # no-op.  Recheck the live Rig first and repair any exact
+                    # command backend that failed during its partial start.
+                    report_before = _rig_readiness_report()
+                    if report_before is not None and not bool(
+                        report_before.get("ready", False)
+                    ):
+                        _retry_unready_rig_backends(report_before)
+                        report_before = _rig_readiness_report(force=True)
+                    if report_before is not None and not bool(
+                        report_before.get("ready", False)
+                    ):
+                        raise RuntimeError(
+                            "Rig is not ready: "
+                            f"{format_readiness_report(report_before)}"
+                        )
                     components.session.start()
-                    if components.human_shadow_frontend is not None:
-                        components.human_shadow_frontend.start()
+                    report_after = _rig_readiness_report()
+                    if report_after is not None and not bool(
+                        report_after.get("ready", False)
+                    ):
+                        raise RuntimeError(
+                            "Rig is not ready after retry: "
+                            f"{format_readiness_report(report_after)}"
+                        )
+                    human_shadow_frontend = getattr(
+                        components, "human_shadow_frontend", None
+                    )
+                    if human_shadow_frontend is not None:
+                        human_shadow_frontend.start()
                     if (
                         vive_source is not None
                         and vive_source.clock_sync_enabled
@@ -391,6 +819,15 @@ def build_device_retry_runtime(
                         raise RuntimeError(
                             "core rig reconnected but required VIVE clock sync is not ready"
                         )
+                elif key == "vive.clock_sync" and vive_source is None:
+                    # Rule-based runtimes intentionally have no VIVE source;
+                    # tolerate a stale compatibility diagnostic from an older
+                    # startup projection and remove it instead of exposing an
+                    # impossible retry action.
+                    _log(
+                        "ViveClockSync",
+                        "VIVE clock-sync diagnostic ignored because this runtime has no VIVE source",
+                    )
                 elif key == "vive.clock_sync" and vive_source is not None:
                     sync_ready = vive_source.wait_for_clock_sync(
                         float(args.vive_clock_sync_startup_timeout_sec),
@@ -517,10 +954,16 @@ def build_device_retry_runtime(
                     args.dataset_startup_error = detail
                 continue
             startup_device_errors.pop(key, None)
+            dynamic_readiness_keys.discard(key)
             if key == "dataset.writer":
                 args.dataset_startup_error = ""
             if control_ui is not None:
                 control_ui.append_message("Device", f"{key} 重连成功。")
+            # A successful backend/session operation can change the report
+            # immediately.  Invalidate before the final projection so a
+            # recovered hand is not hidden behind a 250 ms stale cache.
+            _invalidate_readiness_cache()
+            _sync_dynamic_rig_readiness(force=True)
         if camera_retry_attempted and publish_camera_status is not None:
             try:
                 # ``hardware_status`` and the left-column RealSense cards are
@@ -534,7 +977,8 @@ def build_device_retry_runtime(
                 _log("Camera", message)
                 if control_ui is not None:
                     control_ui.append_message("Camera", message)
-        publish_runtime_hardware_status()
+        _invalidate_readiness_cache()
+        _publish_retry_outcome()
 
     return DeviceRetryRuntime(
         hardware_requirement=hardware_requirement,

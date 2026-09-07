@@ -24,10 +24,19 @@ class BimanualRig(Rig):
         parallel_dispatch: bool = False,
         parallel_workers: int | None = None,
         fail_stop_on_dispatch_error: bool = False,
+        allow_partial_start: bool = False,
     ):
         self.backends = dict(backends)
         self._name = name
         self.fail_stop_on_dispatch_error = bool(fail_stop_on_dispatch_error)
+        # Capability-mode runtimes need to keep the complete command topology
+        # visible while an optional effector is temporarily unavailable.  In
+        # that mode ``start`` records an individual backend failure and starts
+        # the remaining backends; the Rig stays non-terminal and its normal
+        # ``is_ready`` predicate remains fail-closed.  The historical strict
+        # lifecycle is unchanged when this flag is false.
+        self.allow_partial_start = bool(allow_partial_start)
+        self._startup_failures: dict[str, str] = {}
         self._started = False
         self._terminal = False
         worker_count = len(self.backends) if parallel_workers is None else max(1, int(parallel_workers))
@@ -53,6 +62,63 @@ class BimanualRig(Rig):
                 "again; construct a fresh rig."
             )
         attempted: list[tuple[str, EffectorBackend]] = []
+        if self.allow_partial_start:
+            # Capability admission is deliberately per-effector.  A failed
+            # hand must not prevent the arm command backends from becoming
+            # available, and must not remove the hand binding from the
+            # authoritative Rig (which would turn a recoverable fault into a
+            # dispatch-time KeyError).
+            for effector_name, backend in self.backends.items():
+                attempted.append((effector_name, backend))
+                try:
+                    backend.start()
+                except BaseException as exc:  # noqa: BLE001 - retain diagnosis and continue.
+                    self._startup_failures[str(effector_name)] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    # Backends own their failed-start cleanup in capability
+                    # mode.  A best-effort close here covers lightweight
+                    # implementations that allocate before raising, while a
+                    # close failure remains part of the operator diagnosis.
+                    try:
+                        backend.close()
+                    except BaseException as close_exc:  # noqa: BLE001
+                        self._startup_failures[str(effector_name)] += (
+                            f"; cleanup failed: {type(close_exc).__name__}: {close_exc}"
+                        )
+                    continue
+
+                # Some vendor backends intentionally swallow their transport
+                # exception in ``start`` so the GUI can remain alive.  Check
+                # readiness here as well; otherwise Session.start would mark
+                # the Rig started even though a later Home/collection command
+                # could never be admitted.
+                try:
+                    ready = bool(backend.is_ready())
+                except BaseException as exc:  # noqa: BLE001 - fail closed per backend.
+                    ready = False
+                    self._startup_failures[str(effector_name)] = (
+                        f"readiness check failed: {type(exc).__name__}: {exc}"
+                    )
+                if not ready and str(effector_name) not in self._startup_failures:
+                    reason = "backend is not ready"
+                    report_fn = getattr(backend, "readiness_report", None)
+                    if callable(report_fn):
+                        try:
+                            report = report_fn()
+                        except BaseException as exc:  # noqa: BLE001
+                            reason = (
+                                f"readiness report failed: {type(exc).__name__}: {exc}"
+                            )
+                        else:
+                            if isinstance(report, Mapping):
+                                report_reason = str(report.get("reason") or "").strip()
+                                if report_reason:
+                                    reason = report_reason
+                    self._startup_failures[str(effector_name)] = reason
+            self._started = True
+            return
+
         try:
             for effector_name, backend in self.backends.items():
                 attempted.append((effector_name, backend))
@@ -76,6 +142,82 @@ class BimanualRig(Rig):
 
     def is_ready(self) -> bool:
         return all(backend.is_ready() for backend in self.backends.values())
+
+    def readiness_report(self) -> dict[str, object]:
+        """Describe every backend that participates in Rig admission.
+
+        The report is intentionally read-only and bounded.  It is used for
+        startup/retry/UI diagnostics; command dispatch continues to use the
+        existing ``is_ready`` predicate and therefore keeps the fail-closed
+        safety contract.
+        """
+
+        backend_reports: dict[str, Mapping[str, object]] = {}
+        not_ready: list[str] = []
+        for effector_name, backend in self.backends.items():
+            report_fn = getattr(backend, "readiness_report", None)
+            try:
+                report = report_fn() if callable(report_fn) else None
+            except Exception as exc:  # noqa: BLE001 - expose, do not mask diagnosis.
+                report = {
+                    "ready": False,
+                    "backend": type(backend).__name__,
+                    "backend_type": type(backend).__name__,
+                    "reason": f"readiness report failed: {type(exc).__name__}: {exc}",
+                    "details": {
+                        "readiness_report_error": f"{type(exc).__name__}: {exc}"
+                    },
+                }
+            if not isinstance(report, Mapping):
+                try:
+                    ready = bool(backend.is_ready())
+                    reason = "" if ready else "backend is not ready"
+                except Exception as exc:  # noqa: BLE001 - expose, do not mask diagnosis.
+                    ready = False
+                    reason = f"readiness check failed: {type(exc).__name__}: {exc}"
+                report = {
+                    "ready": ready,
+                    "backend": type(backend).__name__,
+                    "backend_type": type(backend).__name__,
+                    "reason": reason,
+                    "details": {},
+                }
+            normalized = dict(report)
+            normalized.setdefault("backend", type(backend).__name__)
+            normalized.setdefault("backend_type", type(backend).__name__)
+            normalized["ready"] = bool(normalized.get("ready", False))
+            normalized.setdefault("reason", "")
+            details = normalized.get("details")
+            normalized["details"] = dict(details) if isinstance(details, Mapping) else {}
+            # ``backend.start`` failures are retained only while the backend
+            # remains unready.  This lets an explicit reconnect clear the old
+            # startup error without requiring a second Rig construction.
+            startup_failure = self._startup_failures.get(str(effector_name))
+            if normalized["ready"]:
+                self._startup_failures.pop(str(effector_name), None)
+            elif startup_failure:
+                normalized["details"].setdefault("startup_error", startup_failure)
+                if not str(normalized.get("reason") or "").strip():
+                    normalized["reason"] = startup_failure
+            backend_reports[str(effector_name)] = normalized
+            if not normalized["ready"]:
+                not_ready.append(str(effector_name))
+
+        ready = not not_ready
+        reason = "" if ready else "unready backends: " + ", ".join(not_ready)
+        return {
+            "ready": ready,
+            "rig": self.name,
+            "rig_type": type(self).__name__,
+            "started": bool(self._started),
+            "terminal": bool(self._terminal),
+            "reason": reason,
+            "backends": backend_reports,
+            # ``effectors`` is an intentionally redundant compatibility alias
+            # for consumers that describe command targets rather than devices.
+            "effectors": backend_reports,
+            "not_ready_effectors": tuple(not_ready),
+        }
 
     def send_commands(
         self,

@@ -529,11 +529,17 @@ class DevicePreflightTests(unittest.TestCase):
 
         self.assertEqual(scan_mock.call_args_list[0].kwargs["probe_all_serial"], False)
         self.assertEqual(scan_mock.call_args_list[1].kwargs["probe_all_serial"], True)
+        self.assertEqual(scan_mock.call_args_list[0].kwargs["max_reachable_grippers"], 2)
+        self.assertEqual(scan_mock.call_args_list[1].kwargs["max_reachable_grippers"], 2)
+        self.assertEqual(scan_mock.call_args_list[0].kwargs["preferred_gripper_ports"], ())
+        self.assertEqual(scan_mock.call_args_list[1].kwargs["preferred_gripper_ports"], ())
+        self.assertFalse(scan_mock.call_args_list[0].kwargs["scan_gripper_ids"])
+        self.assertTrue(scan_mock.call_args_list[1].kwargs["scan_gripper_ids"])
         self.assertEqual(
             result.dmtac_assignment["assignments"]["left"]["gripper"]["port"],
             "/dev/serial/by-id/left-gripper",
         )
-        self.assertTrue(any("retrying with all serial ports" in message for message in result.messages))
+        self.assertTrue(any("full-ID recovery scan" in message for message in result.messages))
 
     def test_dmtac_force_reconfigure_skips_valid_latest_and_saves(self) -> None:
         usb_assignment, *_ = device_preflight._load_dmtac_modules()
@@ -597,6 +603,51 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertTrue(any("startup probe failed" in message for message in result.messages))
         self.assertFalse(any("[DMTAC CONFIG ERROR]" in message for message in result.messages))
 
+    def test_dmtac_preflight_reports_reachable_faulted_gripper_as_unhealthy(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        scan = _dmtac_scan()
+        assignment = usb_assignment.build_assignment_from_tokens(
+            scan,
+            right_gripper="1",
+        )
+        scan["grippers"][1]["probe"].update(
+            {
+                "healthy": False,
+                "faulted": True,
+                "error_code": 16,
+                "error_description": "0x0010(internal_communication_fault)",
+                "state": {
+                    "error_code": 16,
+                    "status_code": 2,
+                    "current": 4,
+                    "temperature_c": 30,
+                },
+            }
+        )
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("right",),
+            require_dmtac_tactile=False,
+            auto_configure=True,
+        )
+
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", return_value=scan),
+            patch.object(usb_assignment, "load_assignment", return_value=assignment),
+        ):
+            device_preflight.prepare_dmtac(options, result)
+
+        warning = next(
+            message
+            for message in result.messages
+            if "reachable but not healthy" in message
+        )
+        self.assertIn("internal_communication_fault", warning)
+        self.assertIn("status_code=2", warning)
+        self.assertIn("current=4", warning)
+        self.assertIn("temperature_c=30", warning)
+        self.assertIsNotNone(result.dmtac_assignment)
+
     def test_dmtac_preflight_ignores_missing_inactive_gripper_without_reconfiguration(self) -> None:
         usb_assignment, *_ = device_preflight._load_dmtac_modules()
         full_scan = _dmtac_scan()
@@ -615,7 +666,11 @@ class DevicePreflightTests(unittest.TestCase):
             auto_configure=True,
         )
         with (
-            patch.object(usb_assignment, "scan_usb_devices", return_value=right_only_scan),
+            patch.object(
+                usb_assignment,
+                "scan_usb_devices",
+                return_value=right_only_scan,
+            ) as scan_mock,
             patch.object(usb_assignment, "load_assignment", return_value=assignment),
             patch.object(usb_assignment, "save_assignment") as save_mock,
         ):
@@ -626,8 +681,106 @@ class DevicePreflightTests(unittest.TestCase):
             result.dmtac_assignment["assignments"]["right"]["gripper"]["port"],
             "/dev/serial/by-id/right-gripper",
         )
+        self.assertEqual(scan_mock.call_args.kwargs["max_reachable_grippers"], 1)
+        self.assertEqual(
+            scan_mock.call_args.kwargs["preferred_gripper_ports"],
+            ("/dev/serial/by-id/right-gripper",),
+        )
+        self.assertFalse(scan_mock.call_args.kwargs["scan_gripper_ids"])
+        self.assertEqual(
+            scan_mock.call_args.kwargs["preferred_gripper_settings"][0]["gripper_id"],
+            1,
+        )
         self.assertEqual(save_mock.call_count, 0)
         self.assertFalse(any("entering reassignment" in message for message in result.messages))
+
+    def test_dmtac_preflight_rejects_tty_override_bound_to_opposite_identity(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        original_scan = _dmtac_scan()
+        assignment = usb_assignment.build_assignment_from_tokens(
+            original_scan,
+            left_gripper="0",
+            right_gripper="1",
+        )
+        current_scan = _dmtac_scan()
+        current_scan["grippers"][0].update(
+            {
+                "port": "/dev/ttyUSB1",
+                "device": "/dev/ttyUSB1",
+                "preferred_port": "/dev/ttyUSB1",
+                "port_aliases": ["/dev/ttyUSB1"],
+            }
+        )
+        current_scan["grippers"][1].update(
+            {
+                "port": "/dev/ttyUSB3",
+                "device": "/dev/ttyUSB3",
+                "preferred_port": "/dev/ttyUSB3",
+                "port_aliases": ["/dev/ttyUSB3"],
+                # Early-stop leaves the actual right endpoint unprobed after
+                # the stale ttyUSB1 override answers as the left device.
+                "probe": None,
+            }
+        )
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("right",),
+            require_dmtac_tactile=False,
+            dmtac_gripper_overrides={
+                "right": {
+                    "port": "/dev/ttyUSB1",
+                    "gripper_id": 1,
+                    "baudrate": 115200,
+                }
+            },
+        )
+
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", return_value=current_scan),
+            patch.object(usb_assignment, "load_assignment", return_value=assignment),
+            patch.object(usb_assignment, "save_assignment") as save_mock,
+        ):
+            with self.assertRaisesRegex(
+                device_preflight.DevicePreflightError,
+                "matches configured physical role 'left'.*expected current endpoint '/dev/ttyUSB3'",
+            ):
+                device_preflight.prepare_dmtac(options, result)
+
+        self.assertEqual(save_mock.call_count, 0)
+
+    def test_dmtac_preflight_accepts_override_matching_requested_identity(self) -> None:
+        usb_assignment, *_ = device_preflight._load_dmtac_modules()
+        scan = _dmtac_scan()
+        assignment = usb_assignment.build_assignment_from_tokens(
+            scan,
+            left_gripper="0",
+            right_gripper="1",
+        )
+        result = device_preflight.DevicePreflightResult(ok=True)
+        options = device_preflight.DevicePreflightOptions(
+            active_sides=("right",),
+            require_dmtac_tactile=False,
+            dmtac_gripper_overrides={
+                "right": {
+                    "port": "/dev/serial/by-id/right-gripper",
+                    "gripper_id": 1,
+                    "baudrate": 115200,
+                }
+            },
+        )
+
+        with (
+            patch.object(usb_assignment, "scan_usb_devices", return_value=scan),
+            patch.object(usb_assignment, "load_assignment", return_value=assignment),
+            patch.object(usb_assignment, "save_assignment") as save_mock,
+        ):
+            device_preflight.prepare_dmtac(options, result)
+
+        self.assertEqual(
+            result.dmtac_assignment["assignments"]["right"]["gripper"]["port"],
+            "/dev/serial/by-id/right-gripper",
+        )
+        self.assertEqual(save_mock.call_count, 0)
 
     def test_dmtac_preflight_still_fails_without_config_when_no_gripper_reachable(self) -> None:
         usb_assignment, *_ = device_preflight._load_dmtac_modules()
@@ -863,6 +1016,12 @@ class DevicePreflightTests(unittest.TestCase):
             "--device-preflight-yes",
             "--device-preflight-probe-all-serial",
             "--device-preflight-force-reconfigure",
+            "--right-gripper-port",
+            "/dev/ttyUSB1",
+            "--right-gripper-id",
+            "7",
+            "--right-gripper-baudrate",
+            "57600",
         ]
         with patch.object(sys, "argv", argv), patch.object(
             cli_runtime_config,
@@ -881,6 +1040,16 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertFalse(seen_options[0].require_dmtac_tactile)
         self.assertTrue(seen_options[0].probe_all_serial)
         self.assertTrue(seen_options[0].force_reconfigure)
+        self.assertEqual(
+            seen_options[0].dmtac_gripper_overrides,
+            {
+                "right": {
+                    "port": "/dev/ttyUSB1",
+                    "gripper_id": 7,
+                    "baudrate": 57600,
+                }
+            },
+        )
         self.assertEqual(
             args._dmtac_preflight_assignment["assignments"]["left"]["gripper"]["port"],
             "/dev/gripper-left",
@@ -956,7 +1125,8 @@ class DevicePreflightTests(unittest.TestCase):
             "dmtac-gripper",
             "--left-hand-backend",
             "none",
-            "--gripper-angle-trigger",
+            "--gripper-input-source",
+            "none",
             "--no-camera",
         ]
         with patch.object(sys, "argv", argv), patch.object(
@@ -970,6 +1140,8 @@ class DevicePreflightTests(unittest.TestCase):
         self.assertEqual(len(seen_options), 1)
         self.assertEqual(seen_options[0].active_sides, ("right",))
         self.assertTrue(seen_options[0].require_dmtac_gripper)
+        self.assertFalse(seen_options[0].require_q6)
+        self.assertEqual(args.gripper_input_source, "none")
 
     def test_real_teleop_missing_arm_ip_fails_before_device_preflight(self) -> None:
         argv = [
@@ -981,6 +1153,37 @@ class DevicePreflightTests(unittest.TestCase):
             "--hand-backend",
             "dmtac-gripper",
             "--gripper-angle-trigger",
+            "--no-camera",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(
+                cli_runtime_config,
+                "prepare_devices_for_teleop",
+            ) as mocked_prepare,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            real_teleop.parse_args()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(mocked_prepare.call_count, 0)
+
+    def test_real_teleop_duplicate_active_arm_ip_fails_before_device_preflight(self) -> None:
+        argv = [
+            "prog",
+            "--gui",
+            "--active-sides",
+            "both",
+            "--left-arm-ip",
+            "192.168.1.20",
+            "--right-arm-ip",
+            "192.168.1.20",
+            "--no-arm-ip-default-config",
+            "--no-arm-ip-save-latest",
+            "--hand-backend",
+            "none",
+            "--gripper-input-source",
+            "none",
             "--no-camera",
         ]
         with (

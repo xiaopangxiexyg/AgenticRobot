@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .progress_contracts import (
     PROGRESS_ARM_CONTROL_MODE_IGNORE,
-    PROGRESS_ARM_CONTROL_MODE_PROFILE,
     PROGRESS_ARM_CONTROL_MODE_STRICT,
     ProgressMutationCommand,
     normalize_progress_arm_control_mode,
 )
 from dataset_contracts.progress_profile import (
-    ProgressStepArmControlV1,
+    ProgressStepArmControl,
     TaskProgressProfileV1,
 )
 
@@ -26,7 +25,7 @@ class ProgressArmTransitionPlan:
     """One profile transition computed from canonical and actual arm state."""
 
     target_progress_step_id: str
-    requirement: ProgressStepArmControlV1
+    requirement: ProgressStepArmControl
     current_fixed_sides: tuple[str, ...]
     target_fixed_sides: tuple[str, ...]
     newly_teleop_sides: tuple[str, ...]
@@ -54,17 +53,90 @@ class PendingProgressArmTransition:
             "UNDO_LAST_ADVANCE",
         }:
             raise ValueError("Only Advance/Undo may wait on a profile arm transition.")
-        invalid = set(self.capture_sides) - {"left", "right"}
-        if invalid or not self.capture_sides:
+        capture_sides = tuple(self.capture_sides)
+        invalid = set(capture_sides) - {"left", "right"}
+        if invalid or not capture_sides:
             raise ValueError(
                 "A pending profile arm transition requires non-empty capture_sides."
             )
+        expected_sides = tuple(self.plan.newly_teleop_sides)
+        if not self.plan.requires_home or capture_sides != expected_sides:
+            raise ValueError(
+                "A pending profile arm transition must capture exactly its "
+                "newly_teleop_sides: "
+                f"expected={expected_sides!r} actual={capture_sides!r}."
+            )
+        object.__setattr__(self, "capture_sides", capture_sides)
+
+
+def validate_progress_arm_plan_fixed_scopes(
+    plan: ProgressArmTransitionPlan,
+    *,
+    scope_for_side: Callable[[str], str],
+) -> None:
+    """Require the runtime FixArm topology to match the profile exactly."""
+
+    for side in plan.target_fixed_sides:
+        actual_scope = str(scope_for_side(side))
+        if actual_scope != plan.requirement.fixed_scope:
+            raise RuntimeError(
+                "Profile fixed_hold scope does not match runtime FixArm: "
+                f"expected={plan.requirement.fixed_scope!r} "
+                f"actual={actual_scope!r} side={side}."
+            )
+
+
+def validate_progress_profile_fixed_scopes(
+    profile: TaskProgressProfileV1,
+    *,
+    scope_for_side: Callable[[str], str],
+) -> None:
+    """Admit a complete profile against the live FixArm topology once.
+
+    A transition-level check is still required at the final command boundary,
+    but checking only the currently selected step made an incompatible profile
+    fail repeatedly from the realtime loop as soon as the operator changed
+    progress entry.  Validate every declared fixed side up front and report
+    all mismatches together so the application can latch one actionable UI
+    blocker.  Profiles with no ``arm_control`` declaration remain compatible
+    in the default (non-strict) mode; strict-mode declaration validation is
+    owned by :func:`build_progress_arm_transition_plan`.
+    """
+
+    if not isinstance(profile, TaskProgressProfileV1):
+        raise TypeError("profile must be TaskProgressProfileV1.")
+    if not callable(scope_for_side):
+        raise TypeError("scope_for_side must be callable.")
+    mismatches: list[str] = []
+    for step in profile.steps:
+        requirement = step.arm_control
+        if requirement is None:
+            continue
+        for side in requirement.fixed_sides:
+            try:
+                actual_scope = str(scope_for_side(side))
+            except Exception as exc:  # noqa: BLE001 - admission remains fail-closed.
+                mismatches.append(
+                    f"step={step.progress_step_id}:side={side}:"
+                    f"scope lookup failed ({type(exc).__name__}: {exc})"
+                )
+                continue
+            if actual_scope != requirement.fixed_scope:
+                mismatches.append(
+                    f"step={step.progress_step_id}:side={side}:"
+                    f"expected={requirement.fixed_scope}:actual={actual_scope or 'missing'}"
+                )
+    if mismatches:
+        raise RuntimeError(
+            "Progress profile fixed_hold scope is incompatible with the live "
+            "FixArm topology: " + "; ".join(mismatches)
+        )
 
 
 def progress_step_arm_requirement(
     profile: TaskProgressProfileV1,
     progress_step_id: str,
-) -> ProgressStepArmControlV1 | None:
+) -> ProgressStepArmControl | None:
     step = profile.step_by_id.get(str(progress_step_id))
     if step is None:
         raise ValueError(f"Unknown progress step {progress_step_id!r}.")
@@ -203,4 +275,6 @@ __all__ = [
     "progress_step_arm_requirement",
     "progress_step_arm_requirements_differ",
     "strict_progress_arm_sample_rejection",
+    "validate_progress_arm_plan_fixed_scopes",
+    "validate_progress_profile_fixed_scopes",
 ]

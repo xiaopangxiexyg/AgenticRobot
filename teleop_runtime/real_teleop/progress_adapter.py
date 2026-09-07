@@ -65,6 +65,12 @@ REAL_TELEOP_PROGRESS_REFERENCE_SCHEMA_V1 = (
 )
 
 _NORMAL_COMPLETION_REASONS = frozenset({"manual_key_stop"})
+_RULE_BASED_COMPLETION_REASON = "rule_based_complete"
+_RULE_BASED_DETAIL_STAGE_IDS = (
+    "right_write.pen_down",
+    "right_write.write",
+    "right_write.pen_up",
+)
 _SAFETY_STOP_REASONS = frozenset(
     {
         "force_collision",
@@ -983,15 +989,30 @@ class RealTeleopProgressEpisode:
             effective_at=effective_at,
             origin="episode_owner_stop",
         )
+        rule_based_window_completion = bool(
+            normalized == _RULE_BASED_COMPLETION_REASON
+            and self.binding.recording_scope == "EVENT_WINDOW"
+            and self.state.phase == "ACTIVE_ATTEMPT"
+            and self.binding.entry_step_id == "right_write"
+            and self.stage_profile is not None
+            and self.stage_entry_binding is not None
+            and tuple(
+                stage.stage_id
+                for stage in self.stage_profile.stages_for_step("right_write")
+            )
+            == _RULE_BASED_DETAIL_STAGE_IDS
+        )
         normal_completion = bool(
             normalized in _NORMAL_COMPLETION_REASONS
             and self.state.phase == "ACTIVE_ATTEMPT"
             and self.state.current_progress_step_id
             in self.profile.terminal_step_ids
         )
-        if normal_completion:
+        if normal_completion or rule_based_window_completion:
             self.controller.complete(
-                CompleteEpisodeProgressRequest(),
+                CompleteEpisodeProgressRequest(
+                    completed_progress_step=rule_based_window_completion,
+                ),
                 context=context,
             )
         else:

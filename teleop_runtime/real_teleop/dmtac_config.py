@@ -46,6 +46,10 @@ def apply_gripper_policy_to_dmtac_config(
             DMTAC_GRIPPER_TELEMETRY_COMMAND_GRACE_S,
         )
     )
+    config.startup_recovery_mode = str(
+        getattr(args, "dmtac_startup_recovery_mode", "stabilized")
+        or "stabilized"
+    )
     tactile_timeout_ms = getattr(args, "dmtac_tactile_timeout_ms", None)
     if tactile_timeout_ms is not None:
         config.tactile_timeout_ms = int(tactile_timeout_ms)
