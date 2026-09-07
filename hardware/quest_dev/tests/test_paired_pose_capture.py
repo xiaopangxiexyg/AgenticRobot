@@ -885,8 +885,8 @@ def test_robot_global_cursor_gap_fails_closed() -> None:
         capture.ingest_robot_event(skipped)
 
 
-@pytest.mark.parametrize("failure", ["identity", "emulated", "invalidation"])
-def test_selected_quest_identity_emulation_and_invalidation_are_terminal(
+@pytest.mark.parametrize("failure", ["identity", "invalidation"])
+def test_selected_quest_identity_and_invalidation_are_terminal(
     failure: str,
 ) -> None:
     capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=_binding())
@@ -897,19 +897,118 @@ def test_selected_quest_identity_emulation_and_invalidation_are_terminal(
             received_monotonic_ns=1_100_000_000,
             client_instance_id="different-page",
         )
-    elif failure == "emulated":
-        event = _quest_event(
-            event_sequence=0,
-            sample_sequence=1,
-            received_monotonic_ns=1_100_000_000,
-            emulated_position=True,
-        )
     else:
         event = _quest_invalidation(event_sequence=0)
 
     with pytest.raises(CaptureTerminalError):
         capture.ingest_quest_event(event)
     assert capture.snapshot_status()["terminal_reason"] is not None
+
+
+def test_emulated_selected_quest_pose_is_ignored_not_used_for_calibration() -> None:
+    projection = _projection()
+    binding = _binding(projection=projection)
+    capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=binding)
+    _begin(capture)
+
+    robots = (
+        _robot_event(
+            event_sequence=1,
+            source_sequence=1,
+            received_monotonic_ns=1_100_000_000,
+            projection=projection,
+        ),
+        _robot_event(
+            event_sequence=2,
+            source_sequence=2,
+            received_monotonic_ns=1_300_000_000,
+            projection=projection,
+        ),
+    )
+    quests = (
+        _quest_event(
+            event_sequence=0,
+            sample_sequence=1,
+            received_monotonic_ns=1_105_000_000,
+        ),
+        _quest_event(
+            event_sequence=1,
+            sample_sequence=2,
+            received_monotonic_ns=1_200_000_000,
+            emulated_position=True,
+        ),
+        _quest_event(
+            event_sequence=2,
+            sample_sequence=3,
+            received_monotonic_ns=1_305_000_000,
+        ),
+    )
+    for event in robots:
+        capture.ingest_robot_event(event)
+    for event in quests:
+        capture.ingest_quest_event(event)
+
+    receipt = capture.complete_window(
+        end_received_monotonic_ns=1_500_000_000,
+        robot_end_next_event_sequence=3,
+        quest_end_next_event_sequence=3,
+    )
+
+    assert receipt is not None
+    assert receipt.metrics["quest_sample_count"] == 2
+    assert receipt.metrics["quest_source_span_ns"] == 200_000_000
+    assert len(receipt.quest_events) == 3
+    assert capture.snapshot_status()["terminal_reason"] is None
+
+
+def test_emulated_quest_samples_cannot_satisfy_the_window_minimum() -> None:
+    projection = _projection()
+    binding = _binding(projection=projection)
+    capture = ManualStaticPairedPoseCapture(profile=_profile(), binding=binding)
+    _begin(capture)
+
+    for event in (
+        _robot_event(
+            event_sequence=1,
+            source_sequence=1,
+            received_monotonic_ns=1_100_000_000,
+            projection=projection,
+        ),
+        _robot_event(
+            event_sequence=2,
+            source_sequence=2,
+            received_monotonic_ns=1_300_000_000,
+            projection=projection,
+        ),
+    ):
+        capture.ingest_robot_event(event)
+    for event in (
+        _quest_event(
+            event_sequence=0,
+            sample_sequence=1,
+            received_monotonic_ns=1_105_000_000,
+            emulated_position=True,
+        ),
+        _quest_event(
+            event_sequence=1,
+            sample_sequence=2,
+            received_monotonic_ns=1_305_000_000,
+            emulated_position=True,
+        ),
+    ):
+        capture.ingest_quest_event(event)
+
+    with pytest.raises(
+        StaticWindowRejectedError,
+        match="Quest sample count is outside profile",
+    ):
+        capture.complete_window(
+            end_received_monotonic_ns=1_500_000_000,
+            robot_end_next_event_sequence=3,
+            quest_end_next_event_sequence=2,
+        )
+    assert capture.snapshot_status()["terminal_reason"] is None
+    assert capture.snapshot_status()["active_window_id"] is None
 
 
 def test_selected_robot_invalidation_is_terminal() -> None:

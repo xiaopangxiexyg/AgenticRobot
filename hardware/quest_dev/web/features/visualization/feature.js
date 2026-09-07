@@ -215,7 +215,14 @@
         );
       }
       if (config.show_controller_axes !== false) {
-        for (const controller of context.controllerPoses) {
+        // The display list may contain a last tracked pose while WebXR is
+        // temporarily missing grip tracking.  It is deliberately separate
+        // from context.controllerPoses, which is the raw list sent to the
+        // passive capture feature and must never contain cached poses.
+        const controllerPoses = (
+          context.displayControllerPoses || context.controllerPoses || []
+        );
+        for (const controller of controllerPoses) {
           const mvp = global.QuestDevXRMath.mat4Multiply(
             context.viewProjection,
             controller.pose.transform.matrix,
