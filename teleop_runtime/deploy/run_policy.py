@@ -1929,7 +1929,11 @@ def _rtc_active_latency_gate_result(
     required_completions: int,
     maximum_latency_sec: float,
 ) -> tuple[bool, bool, float | None]:
-    """Return ``(complete, accepted, observed_max)`` for Active RTC warmup."""
+    """Return ``(complete, accepted, observed_max)`` for Active RTC warmup.
+
+    ``maximum_latency_sec`` is an exclusive upper bound: an observation equal
+    to the configured threshold is not below the latency gate.
+    """
 
     discard = int(discard_completions)
     required = int(required_completions)
@@ -1943,7 +1947,7 @@ def _rtc_active_latency_gate_result(
     if len(admitted) < required:
         return False, False, None
     observed_max = max(admitted)
-    return True, observed_max <= maximum, observed_max
+    return True, observed_max < maximum, observed_max
 
 
 def _bounded_policy_step_limit_reached(
@@ -5005,8 +5009,8 @@ def main(
                                     )
                                     raise RuntimeError(
                                         "RTC Active latency gate rejected dispatch: "
-                                        f"warm maximum {observed_max:.6f}s exceeds "
-                                        "the configured bound "
+                                        f"warm maximum {observed_max:.6f}s is not below "
+                                        "the exclusive configured bound "
                                         f"{float(args.rtc_active_max_inference_latency_sec):.6f}s."
                                     )
                                 rtc_active_latency_gate_passed = True

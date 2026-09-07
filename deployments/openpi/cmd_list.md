@@ -2027,7 +2027,7 @@ python -u -m deployments.openpi.client.real \
 硬件授权后，才可以在同一条命令末尾显式加入 `--send-actions`。本节不授权真实运动，也不
 允许用 `--no-init-qpos`、`--disable-camera-semantic-resolution` 或 raw mask 作为故障绕过。
 
-## 23. 当前 Stage1/Stage2 all-view h32 trained model-RTC 部署测试
+## 23. 当前 corrected Stage1 v2 / historical Stage2 v1 all-view h32 trained model-RTC 部署测试
 
 本节对应 `front + left_wrist + right_wrist`、h32、absolute 的两个独立 trained model-RTC。
 必须先完成真实 observation/transport 的 conditioned no-action shadow：它会连接三路
@@ -2035,10 +2035,11 @@ RealSense、双臂状态和 DMTAC 状态，也会请求 GPU server 推理，但�
 `--send-actions` 而不会派发 policy action。`--rtc-real-shadow` 本身只选择实时 RTC 路径；
 在完成全部安全门后显式加入 `--send-actions` 才进入 Active，且不会移除 qpos-init。
 
-2026-09-04 的远端只读复核结果是：Stage1 `100000` checkpoint 已完整提交；Stage2 正式
-`100000` 训练尚未完成。下面 Stage2 默认仍选择最终目标 `100000`，因此在该目录完整出现前会
-fail closed，不能自动回退到 smoke、信号 checkpoint 或较早 step。若只是研究中间 step，必须
-显式设置 `SERVER_CKPT_STEP` 和 `CLIENT_CKPT_STEP`，并在记录中标明它不是最终训练结果。
+2026-09-07 的固定盘点结果是：系统性修正后的 Stage1 v2 在用户要求的 25k 停止点保存了
+完整 `25000` checkpoint，并在信号收尾时又完整提交了最新 `25006`；下面 Stage1 默认选择
+`25006`。Stage2 `100000` 也已完整，但它是系统性修正前的 historical v1，只用于兼容性对照，
+不能声称为 corrected Stage2 重训结果。两者都不得自动回退到 smoke 或较早 step；若研究中间
+step，必须显式设置 `SERVER_CKPT_STEP` 和 `CLIENT_CKPT_STEP` 并记录实际身份。
 
 client 与 server 的 checkpoint 变量刻意分开。默认二者选择同一步以减少现场变量，但协议不
 强制 model id/checkpoint step 相同；可以把 client 保持在一个已验证 artifact 上，切换到另一个
@@ -2055,27 +2056,31 @@ capability。model/step 只记录在两端 provenance 中；不要以覆盖 hash
 ```bash
 set -euo pipefail
 
-export DEPLOY_ROOT=/home/user/zc/openpi_stage12_model_rtc_deploy/20260904/AgenticRobot
+: "${DEPLOY_ROOT:?set DEPLOY_ROOT to one immutable AgenticRobot deployment snapshot}"
+: "${EXPECTED_DEPLOY_COMMIT:?set EXPECTED_DEPLOY_COMMIT to its full commit SHA}"
 export OPENPI_PYTHON=/home/user/zc/openpi/.venv/bin/python
 export POLICY_SERVER_HOST=127.0.0.1
 export OPENPI_PORT=8078
 export STAGE="${STAGE:-1}"
+export RTC_RUNTIME_OPENPI_ROOT="$DEPLOY_ROOT/model/openpi"
 export QPOS_INIT_DATASET=/home/user/zc/DexTeleop/datasets/sorted_v22/bimanual-cube-new-success
 export LEFT_GRIPPER_PORT=/dev/ttyUSB1
 export RIGHT_GRIPPER_PORT=/dev/ttyUSB3
 
 case "$STAGE" in
   1)
-    export PREPARED_PROFILE=/home/user/zc/openpi_stage1_model_rtc_runs/20260903_snapshot_v1/recovery/resume-75000-e21cb961/writing_stage1_all_valid_all_view_h32_absolute_non_rtc_100k_v1.resume-e21cb961.json
-    export MODEL_RTC_PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/model_rtc/writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json"
-    export OPENPI_ROOT=/home/user/zc/openpi_stage1_model_rtc_runs/20260903_snapshot_v1/code/openpi-e21cb961
-    export CHECKPOINT_ROOT=/home/user/zc/checkpoints/openpi/writing-stage1-all-valid-all-view-h32-absolute-prepared-model-rtc-v1/writing-stage1-all-valid-all-view-h32-absolute-model-rtc-b1-nw4-development-rtc-b17fb6a9-20260903
-    export DEFAULT_CKPT_STEP=100000
+    export PREPARED_PROFILE=/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/profiles/writing_stage1_all_valid_all_view_h32_absolute_non_rtc_100k_systemic_v3.json
+    export MODEL_RTC_PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/model_rtc/writing_stage1_all_valid_all_view_h32_absolute_prepared_model_rtc_v2.json"
+    export OPENPI_ROOT=/home/user/zc/openpi_stage1_model_rtc_runs/20260906_systemic_v3/code/openpi
+    export TRAINING_OPENPI_COMMIT=359f1ced5c68faeba3167a859a42153d36ab1fd2
+    export CHECKPOINT_ROOT=/home/user/zc/checkpoints/openpi/writing-stage1-all-valid-all-view-h32-absolute-prepared-model-rtc-v2/writing-stage1-all-valid-all-view-h32-absolute-model-rtc-systemic-v3-359f1ced-r1-20260906
+    export DEFAULT_CKPT_STEP=25006
     ;;
   2)
     export PREPARED_PROFILE=/home/user/zc/openpi_stage2_model_rtc_runs/20260904_snapshot_v5/profiles/writing_stage2_all_valid_all_view_h32_absolute_non_rtc_100k_lowmem_semanticbounds_v5.json
     export MODEL_RTC_PROFILE="$DEPLOY_ROOT/deployments/openpi/configs/model_rtc/writing_stage2_all_valid_all_view_h32_absolute_prepared_model_rtc_v1.json"
     export OPENPI_ROOT=/home/user/zc/openpi_stage2_model_rtc_runs/20260904_snapshot_v1/code/openpi-e21cb961
+    export TRAINING_OPENPI_COMMIT=e21cb9612de936fcf13c7757b27df1c086c6c59e
     export CHECKPOINT_ROOT=/home/user/zc/checkpoints/openpi/writing-stage2-all-valid-all-view-h32-absolute-prepared-model-rtc-v1/writing-stage2-all-valid-all-view-h32-absolute-model-rtc-b1-nw0-lowmem-semanticbounds-v5-20260904
     export DEFAULT_CKPT_STEP=100000
     ;;
@@ -2101,8 +2106,11 @@ done
 test -f "$PREPARED_PROFILE"
 test -f "$MODEL_RTC_PROFILE"
 test -d "$OPENPI_ROOT/.git" -o -f "$OPENPI_ROOT/.git"
-test "$(git -C "$OPENPI_ROOT" rev-parse HEAD)" = e21cb9612de936fcf13c7757b27df1c086c6c59e
-test -f "$DEPLOY_ROOT/model/openpi/scripts/serve_dexteleop_policy.py"
+test "$(git -C "$DEPLOY_ROOT" rev-parse HEAD)" = "$EXPECTED_DEPLOY_COMMIT"
+test "$(git -C "$OPENPI_ROOT" rev-parse HEAD)" = "$TRAINING_OPENPI_COMMIT"
+test -f "$RTC_RUNTIME_OPENPI_ROOT/scripts/serve_dexteleop_policy.py"
+test "$(git -C "$DEPLOY_ROOT" rev-parse HEAD:model/openpi)" = \
+  "$(git -C "$RTC_RUNTIME_OPENPI_ROOT" rev-parse HEAD)"
 ```
 
 该门只检查必要文件与冻结 OpenPI source identity；随后仍必须执行两端各自的语义检查。
@@ -2131,7 +2139,7 @@ PYTHONDONTWRITEBYTECODE=1 "$OPENPI_PYTHON" -u -m deployments.openpi.server \
   --openpi-root "$OPENPI_ROOT" \
   --enable-rtc-continuation \
   --rtc-inference-steps 8 \
-  --rtc-runtime-openpi-root "$DEPLOY_ROOT/model/openpi" \
+  --rtc-runtime-openpi-root "$RTC_RUNTIME_OPENPI_ROOT" \
   --prepared-config-check-only
 ```
 
@@ -2153,7 +2161,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.70
   --openpi-root "$OPENPI_ROOT" \
   --enable-rtc-continuation \
   --rtc-inference-steps 8 \
-  --rtc-runtime-openpi-root "$DEPLOY_ROOT/model/openpi" \
+  --rtc-runtime-openpi-root "$RTC_RUNTIME_OPENPI_ROOT" \
   --host 0.0.0.0 \
   --port "$OPENPI_PORT"
 ```
@@ -2203,6 +2211,7 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage${STAGE}_shadow_$
   --left-gripper-port "$LEFT_GRIPPER_PORT" \
   --right-gripper-port "$RIGHT_GRIPPER_PORT" \
   --max-steps 100 \
+  --min-rtc-emissions-before-exit 1 \
   --debug \
   --rtc-debug-level summary \
   --debug-dir "$RTC_DEBUG_DIR"
@@ -2226,7 +2235,8 @@ Stage2。运行前必须重新确认：两臂和笔/夹爪当前状态允许移�
 下面命令会真实发动作。它显式保留 dataset-frame qpos-init 和碰撞检查，并把
 `--wait-for-ready-confirm` 放在 profile 参数之后，以覆盖 RTC real-shadow profile 的自动启动
 默认值；初始化轨迹完成并出现 ready 提示后，仍须由现场操作者人工按 `A` 放行 policy。首次只
-运行 10 个 control step，不得自动注入按键：
+运行 10 个 control step，并显式固定 1 次冷启动丢弃、3 次 warm completion 与严格
+`<0.4 s` 延迟门；不得自动注入按键：
 
 ```bash
 set -euo pipefail
@@ -2251,6 +2261,9 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage1_active_$(date +
   --rtc-profile model_rtc_flow_inpaint_shadow_15_30_60_120_v1 \
   --rtc-inference-steps 8 \
   --rtc-real-shadow \
+  --rtc-active-warmup-discard-completions 1 \
+  --rtc-active-warmup-completions 3 \
+  --rtc-active-max-inference-latency-sec 0.4 \
   --policy-action-pose-mode absolute \
   --policy-qpos-init-dataset "$QPOS_INIT_DATASET" \
   --policy-qpos-init-episode 0 \
@@ -2263,6 +2276,7 @@ export RTC_DEBUG_DIR="/home/user/zc/logs/openpi_model_rtc_stage1_active_$(date +
   --send-actions \
   --wait-for-ready-confirm \
   --max-steps 10 \
+  --min-rtc-emissions-before-exit 1 \
   --debug \
   --rtc-debug-level summary \
   --debug-dir "$RTC_DEBUG_DIR"

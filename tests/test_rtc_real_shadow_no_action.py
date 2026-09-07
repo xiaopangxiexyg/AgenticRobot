@@ -194,12 +194,20 @@ def test_active_rtc_latency_gate_discards_cold_sample_and_bounds_warm_max() -> N
     assert pending == (False, False, None)
 
     accepted = run_policy._rtc_active_latency_gate_result(
+        [8.0, 0.20, 0.30, 0.399999],
+        discard_completions=1,
+        required_completions=3,
+        maximum_latency_sec=0.4,
+    )
+    assert accepted == (True, True, 0.399999)
+
+    boundary_rejected = run_policy._rtc_active_latency_gate_result(
         [8.0, 0.20, 0.30, 0.40],
         discard_completions=1,
         required_completions=3,
         maximum_latency_sec=0.4,
     )
-    assert accepted == (True, True, 0.40)
+    assert boundary_rejected == (True, False, 0.40)
 
     rejected = run_policy._rtc_active_latency_gate_result(
         [8.0, 0.20, 0.41, 0.30],

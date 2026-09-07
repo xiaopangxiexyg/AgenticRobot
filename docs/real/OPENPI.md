@@ -135,7 +135,7 @@ gate 都通过后，才能在已经验证的同一条 client 命令末尾增加�
 --send-actions
 ```
 
-完整命令必须按 policy 类型从 `cmd_list.md` 第 8、9、10、19 或 20 节选择。
+完整命令必须按 policy 类型从 `cmd_list.md` 第 8、9、10、19、20 或 23 节选择。
 `rm65_bimanual_dmtac` profile 本身不会开启动作。
 
 Stage1 通常执行绑定的数据集 qpos-init；Stage2–4 只有在当前姿态就是已确认的连续衔接
@@ -144,18 +144,21 @@ ready、碰撞、力限或观测新鲜度门。不要加入 `--auto-start`、`--
 `--no-wait-for-ready-confirm` 来缩短正式流程。
 
 model-RTC Active 还会在 qpos-init 完成后保持测量 qpos，丢弃默认 1 次冷启动 completion，
-用随后 3 次 completion 做推理延迟门；默认最大值为 0.4 秒。在该门通过且操作者完成 ready
+用随后 3 次 completion 做推理延迟门；默认上界为 0.4 秒，且每次 warm completion 都必须
+严格小于该值。在该门通过且操作者完成 ready
 确认之前不会下发策略动作。计划 underrun、producer 不可用或延迟超限都会清空待执行计划并
 保持最新测量 qpos；无法建立该 Hold 时升级到更强 Hold 并报错退出。`--max-steps` 验收可配合
-`--min-rtc-emissions-before-exit`，避免“进程正常退出但零有效 emission”的假通过。
+`--min-rtc-emissions-before-exit`；第 23 节的有界 no-action 和 Active 验收都显式要求至少 1 个
+committed emission，避免“进程正常退出但零有效 emission”的假通过。
 
-trained model-RTC sampler 默认保持 10 step。若 10-step warm latency 无法通过 0.4 秒门，
+trained model-RTC sampler 默认保持 10 step。若 10-step warm latency 无法通过 `<0.4 s` 门，
 可在同一轮 server 与 client 命令中都显式加入 `--rtc-inference-steps 8`。这不是修改 checkpoint
 或训练 profile：client 会根据 loaded provider 的完整实现参数生成 deployment-only binding
 receipt，并要求把步数恢复为 10 后精确复现训练契约哈希；任何其它参数漂移或两端步数不一致
 都会在动作派发前失败。server 还必须用 `--rtc-runtime-openpi-root` 显式选择当前不可变部署
 快照中 gitlink 固定的 `model/openpi`，而 `--openpi-root` 仍指向 profile 固定的训练 checkout；
-两者不能靠修改旧训练 checkout 合并。不要通过放宽 `--rtc-active-max-inference-sec` 代替该绑定。
+两者不能靠修改旧训练 checkout 合并。不要通过放宽
+`--rtc-active-max-inference-latency-sec` 代替该绑定。
 
 ## 6. 更换 checkpoint 或 server 模型
 
@@ -166,7 +169,8 @@ receipt，并要求把步数恢复为 10 后精确复现训练契约哈希；任
 
 默认允许 server 与 client 使用不同 model/step，但二者仍必须通过实际协议、layout、相机、
 normalization、prompt 和 RTC capability 检查。不得通过手工覆盖 model id、layout hash、step、
-camera routing 或 action pose mode 来绕过 artifact/profile 错误。当前 Stage1/Stage2 all-view
-h32 model-RTC 的完整远端命令见 `cmd_list.md` 第 23 节；该路线只开放真实 observation 的
+camera routing 或 action pose mode 来绕过 artifact/profile 错误。当前 corrected Stage1 v2
+`25006` 与 historical Stage2 v1 `100000` 的完整远端命令见 `cmd_list.md` 第 23 节；
+该路线只开放真实 observation 的
 no-action shadow。真实动作还必须显式加入 `--send-actions`，完成 dataset-frame qpos-init、
 ready 确认和上述 Active latency gate；profile 本身不会授予动作权限。
