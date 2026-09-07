@@ -1978,6 +1978,19 @@ class ManualStaticPairedPoseCapture:
         )
         return parse_paired_pose_dataset(dataset.as_dict())
 
+    def candidate_dataset(self) -> PairedPoseDataset:
+        """Return an immutable fit candidate without pinning final source cuts."""
+
+        with self._lock:
+            self._assert_live()
+            if self._active is not None:
+                raise RuntimeError(
+                    "cannot build a candidate dataset while a window is active"
+                )
+            if not self._completed:
+                raise RuntimeError("at least one accepted static window is required")
+            return self._build_dataset(tuple(self._completed))
+
     def snapshot_status(self) -> dict[str, Any]:
         """Return bounded, pose-redacted status only."""
 

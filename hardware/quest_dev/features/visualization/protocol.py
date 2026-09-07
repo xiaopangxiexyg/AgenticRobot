@@ -80,6 +80,7 @@ def calibration_preview_message(
     matrix_quest_from_robot_base: Sequence[float],
     robot_frame: str,
     tcp_frame: str,
+    robot_coordinate_binding_hash: str,
     matrix_robot_from_tcp: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Publish a candidate-only Quest-space robot-frame preview.
@@ -121,6 +122,7 @@ def calibration_preview_message(
         "matrix_quest_from_robot_base": matrix,
         "robot_frame": str(robot_frame),
         "tcp_frame": str(tcp_frame),
+        "robot_coordinate_binding_hash": str(robot_coordinate_binding_hash),
     }
     if tcp_matrix is not None:
         payload["matrix_robot_from_tcp"] = tcp_matrix

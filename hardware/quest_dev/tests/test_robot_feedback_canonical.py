@@ -11,6 +11,7 @@ from hardware.quest_dev.features.visualization.frame_binding import (
 )
 from hardware.quest_dev.features.visualization.pose_projection import (
     project_pose_publication,
+    project_unaligned_pose_publication,
 )
 from robot_motion.action.execution_observation import (
     ExecutionFactReference,
@@ -23,7 +24,6 @@ from robot_motion.runtime.pose_observation import (
     PoseCoordinateBinding,
     PoseMeasurementPublication,
 )
-
 
 _CLOCK_ID = "host-boot-1.monotonic"
 _TOOL_HASH = "sha256:" + "1" * 64
@@ -173,6 +173,51 @@ def make_frame_binding(coordinate: PoseCoordinateBinding) -> AcceptedFrameBindin
 
 
 class CanonicalPoseProjectionTests(unittest.TestCase):
+    def test_passive_publication_projects_raw_tcp_without_claiming_alignment(
+        self,
+    ) -> None:
+        coordinate = make_coordinate()
+        record = project_unaligned_pose_publication(
+            make_publication(coordinate),
+            expected_robot="ar5_1",
+            key="journal:right",
+            expected_coordinate_binding=coordinate,
+            max_age_s=0.25,
+            now_monotonic_ns=1_100_000_000,
+        )
+        self.assertTrue(record["fresh"])
+        self.assertFalse(record["alignment_ready"])
+        self.assertFalse(record["control_ready"])
+        self.assertEqual(record["source"], "passive_pose_journal")
+        self.assertEqual(record["matrix_robot_from_tcp"][12:15], [0.2, 0.0, 0.0])
+        self.assertEqual(
+            record["pose_binding"]["coordinate_binding_hash"],
+            coordinate.semantic_content_hash,
+        )
+
+    def test_raw_tcp_projection_rejects_a_different_coordinate_binding(self) -> None:
+        coordinate = make_coordinate()
+        different = PoseCoordinateBinding(
+            **{
+                **{
+                    key: value
+                    for key, value in coordinate.as_dict().items()
+                    if key != "semantic_content_hash"
+                },
+                "source_epoch_id": "different-epoch",
+            }
+        )
+        record = project_unaligned_pose_publication(
+            make_publication(coordinate),
+            expected_robot="ar5_1",
+            key="journal:right",
+            expected_coordinate_binding=different,
+            max_age_s=0.25,
+            now_monotonic_ns=1_100_000_000,
+        )
+        self.assertFalse(record["fresh"])
+        self.assertEqual(record["error"], "coordinate_binding_mismatch")
+
     def test_passive_publication_projects_into_quest_space(self) -> None:
         coordinate = make_coordinate()
         record = project_pose_publication(

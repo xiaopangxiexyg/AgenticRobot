@@ -249,9 +249,7 @@ def _quest_event(
                     "source_session_id": controller_source_session_id,
                     "handedness": handedness,
                     "target_ray_mode": target_ray_mode,
-                    "profiles": (
-                        ["oculus-touch-v3"] if profiles is None else profiles
-                    ),
+                    "profiles": (["oculus-touch-v3"] if profiles is None else profiles),
                     "emulated_position": emulated_position,
                     "matrix_reference_from_grip": _controller_matrix(x_m=x_m),
                 }
@@ -568,6 +566,22 @@ def test_static_window_success_is_candidate_only_and_round_trips_r0_dataset() ->
     reparsed = parse_paired_pose_capture_evidence(payload)
     assert reparsed.semantic_content_hash == evidence.semantic_content_hash
     assert reparsed.dataset.semantic_sha256 == evidence.dataset.semantic_sha256
+
+
+def test_candidate_dataset_does_not_seal_or_pin_final_source_cuts() -> None:
+    capture, binding, robots, _, _ = _completed_capture()
+
+    candidate = capture.candidate_dataset()
+
+    status = capture.snapshot_status()
+    assert status["sealed"] is False
+    assert status["finalizing"] is False
+    evidence = capture.seal_capture(
+        robot_cut=_healthy_robot_cut(binding=binding, latest_event=robots[-1]),
+        quest_cut=_healthy_quest_cut(binding=binding),
+    )
+    assert evidence is not None
+    assert evidence.dataset.semantic_sha256 == candidate.semantic_sha256
 
 
 def test_complete_window_requires_both_exclusive_watermarks_to_drain() -> None:

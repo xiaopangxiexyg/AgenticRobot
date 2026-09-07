@@ -10,16 +10,19 @@
 `c` 解算得到的结果只发送到 Quest 做预览；不会把变换写入正式配置，也不会改变
 机械臂控制器状态。
 
-当前代码交付信息：
+当前接管信息（2026-09-08）：
 
 | 项目 | 当前值 |
 | --- | --- |
-| 开发分支 | `task/codex/quest-passive-left-b426-all-20260907` |
-| 当前提交 | `ff41f224b612ccf01bad25ea70ea3a2604f3b64f` |
-| 基线提交 | `b426d08c0ffaffb4878b376c672e362f85c0a278` |
+| Harness Task | `AR-20260908-quest-passive-single-reader-recoverable-fit-r0` |
+| 当前开发分支 | `task/AR-20260908-quest-passive-single-reader-recoverable-fit-r0` |
+| 当前任务基线 | `c0140d0fbf362bf9b3e94e840548a007b0a0039f`（`development`） |
+| 当前候选提交 | 以本 worktree 的 `git rev-parse HEAD` 为准；尚未推送或集成 |
+| 历史输入分支 | `task/codex/quest-passive-left-b426-all-20260907` |
+| 历史输入 tip | `58a67862507199be44d275e7cdced638e27474f8` |
 | 远端主机 | `user@192.168.70.116` |
 | 远端 worktree | `/home/user/zc/AgenticRobot-quest-passive-20260906` |
-| 远端状态 | `HEAD == origin/task/codex/quest-passive-left-b426-all-20260907`，工作区干净 |
+| 远端状态 | 下述远端信息来自历史交接快照，本次接管未重新同步或验证 |
 | Python | `/home/user/miniconda3/envs/dexteleop310/bin/python` |
 | 左臂 IP | `192.168.101.21` |
 | 右臂 IP | `192.168.1.20`，本任务不参与标定 |
@@ -27,7 +30,7 @@
 | Quest reference space | 默认 `local-floor` |
 | 配对码模式 | `--trusted-lan`，默认配对码 `111111` |
 
-已验证的软件证据：
+历史输入分支曾记录的软件证据（不能当作当前候选的验证结果）：
 
 - 远端 Python Quest/RM65 相关测试：`205 passed, 4 subtests passed`；
 - 本地浏览器 JS 契约测试：`5 passed`；
@@ -35,6 +38,9 @@
 - 最终 dry-run 已确认 `send_actions=false`、`cameras=false`、
   `end_effectors=false`；
 - 尚未把“真实 Quest + 真实左臂完成三组静止采样并得到合格拟合”的结果写成硬件验收证据。
+
+本次接管的当前候选已通过 `214 passed` 的相关 Python 离线回归、`19 passed` 的浏览器
+子测试以及相关 JS 语法检查；未执行远端同步、真实设备读取或硬件验收。
 
 ## 2. 原始任务要求
 
@@ -107,8 +113,10 @@ Quest WebXR frame
 RealMan RM65 observation-only path
   ├─ 既有 RM65 backend 读取当前硬件状态
   ├─ canonical FK -> T_robot_base_from_tcp
-  ├─ application-owned passive robot pose journal
-  └─ 与 Quest accepted events 在静止窗口内配对
+  └─ run_policy / ArmStateReader 唯一拥有 passive robot pose journal
+       ├─ 与 Quest accepted events 在静止窗口内配对
+       └─ latest canonical PoseMeasurementPublication
+            └─ raw robot_tcp diagnostic telemetry（不另建 RealMan reader）
 
 三个或更多静止窗口
   └─ AX=XB candidate fit
@@ -127,13 +135,16 @@ RealMan RM65 observation-only path
 | `hardware/quest_dev/web/features/controller_pose/feature.js` | 上传 raw pose 与每个 input source 的 tracking diagnostics | 不发送 action/target/control 字段 |
 | `hardware/quest_dev/features/controller_pose/protocol.py` | 校验矩阵、session、source、诊断与 pose 的一致性 | 不保存轨迹，不调用机械臂 |
 | `hardware/quest_dev/features/controller_pose/runtime.py` | 做认证、序号、频率、session/generation admission，只保留 latest | 不自己刷新 RealMan |
-| `teleop_runtime/deploy/quest_paired_pose_capture.py` | 选择候选、固定窗口、配对 Quest/机器人事件、封存候选证据 | 不接受正式标定，不安装 frame |
+| `teleop_runtime/deploy/quest_paired_pose_capture.py` | 选择候选、固定窗口、配对 Quest/机器人事件，并从同一被动 journal 发布 raw TCP | 不创建第二个 RealMan reader，不接受正式标定，不安装 frame |
 | `hardware/quest_dev/features/visualization/paired_pose_capture.py` | 被动静止窗口 reducer、站定性检查、R0 数据集投影 | 不拥有设备生命周期或后台设备线程 |
 | `hardware/quest_dev/web/features/visualization/feature.js` | 接收 preview/只读 robot feedback 并绘制 base/TCP | 不把 preview 变成 accepted binding |
 | `RealMan backend / ArmStateReader` | 读取并发布既有左臂状态和 FK 姿态 | 不由 Quest feature 发起第二套读取或控制 |
 
 一个 Quest host 只创建一个 controller-pose runtime；一个应用只借用这个已启动的
-runtime。禁止为了绕过候选或状态问题而创建第二个 host、第二个 controller runtime、
+runtime。标定 launcher 不再向 Quest host 传递 RealMan IP/URDF，历史的 Quest 直连
+RealMan reader 与探针已移除。若自定义 Quest 配置启用了
+`visualization.robot_feedback`，标定 launcher 和 lower runtime 都会在启动设备前拒绝该
+组合。禁止为了绕过候选或状态问题而创建第二个 host、第二个 controller runtime、
 第二个 RealMan reader 或全局隐式 registry。
 
 ## 4. 坐标系与解算含义
@@ -162,6 +173,7 @@ T_questReference_from_controllerGrip(i)
 - Quest session/reference-space epoch；
 - `matrix_quest_from_robot_base`；
 - 机器人 frame 和 TCP frame；
+- 与机器人被动 journal 完全一致的 `robot_coordinate_binding_hash`；
 - 最后一个静止样本中的 `matrix_robot_from_tcp`，以便在下一包实时反馈到达前也能显示 TCP；
 - preview/candidate/accepted 状态明确标记为“diagnostic preview”，不能冒充正式标定。
 
@@ -171,6 +183,10 @@ Quest 中默认绘制：
 - TCP RGB 坐标轴；
 - TCP 线框/末端 marker；
 - controller axes 和 reference marker（用于诊断）。
+
+浏览器只有在 live `robot_tcp.pose_binding.coordinate_binding_hash` 与 preview 的
+`robot_coordinate_binding_hash` 完全相等时，才会把实时 TCP 组合到候选 base 变换；
+不匹配时拒绝该 live TCP，并最多使用 preview 自带的最后一个已配对 TCP。
 
 reference space reset 会使旧 preview、旧 controller display cache 和旧 generation 数据
 失效。必须等待新 generation 的真实 pose 后重新采集，不能跨 generation 拼接。
@@ -274,7 +290,10 @@ host parser 会校验诊断和 pose 的一致性，例如 `untracked` 不能同�
 
 - 一个窗口自动完成并看到 `window completed` 后，再按 `r` 进入下一个窗口；
 - 至少完成 3 个被接受的静止窗口后，按 `c`；
-- `c` 会封存候选证据、运行诊断 AX=XB fit，并发布 Quest preview；
+- `c` 会先在未封存候选数据上运行诊断 AX=XB 预检；只有预检成功且数据哈希一致，
+  才会封存同一数据集、生成诊断 fit 并发布 Quest preview；
+- 若预检因旋转轴覆盖、平移秩或数值条件不足而失败，capture 保持打开，操作者可继续
+  按 `r` 增加点位后再次按 `c`，无需重启并丢弃已接受窗口；
 - `c` 不接受正式标定、不安装 frame、不发送机器人动作；
 - 如果窗口因 tracking loss、duration、sample count、stationarity 或 pair skew 被拒绝，
   保留已有证据状态，重新等手柄 tracking 稳定后再按 `r`；
@@ -400,6 +419,7 @@ curl -ksS \
 | `quest sample count` 不足 | 真实 pose 帧不足或 tracking 中断 | 重新采集，确保 tracking 持续且不遮挡控制器 |
 | `robot sample count` 不足 | RealMan 只读观测未达到窗口样本门槛 | 检查左臂 IP、SDK 观测链路和 arm state refresh |
 | `candidate selection ambiguous` | 存在多个符合条件的手柄候选 | 只保留左手柄/关闭其他 XR input source，保持 handedness=left |
+| `diagnostic fit preflight failed; capture remains open` | 当前点位的 AX=XB 可观测性不足 | 保留已有窗口，改变机械臂/手柄姿态后按 `r` 增加独立点位，再按 `c` |
 | `passive capture became terminal` | session/reference/source/reducer 事实不可再信任 | Ctrl+C 后重新启动 observation-only session |
 | `unrecognized arguments` | 实际运行的目录/分支不是同步后的版本 | 先检查 `pwd`、`git status`、`git rev-parse HEAD` |
 | `cd: no such file or directory` | 使用了旧项目目录名 | 使用 `/home/user/zc/AgenticRobot-quest-passive-20260906` |
@@ -463,9 +483,13 @@ identity 约束。不能拿下一窗口或历史缓存补齐当前窗口。
 - 同步前重新确认目标 branch 和输入 SHA；
 - 远端只允许 `fetch` 后 `merge --ff-only`；
 - fast-forward 失败时停止并报告，不能 reset、rebase、clean 或强推来制造同步；
-- 当前分支已标记 `ready-for-integration`，当前 tip 为 `ff41f224`。
+- 当前 Harness task 与历史输入分支是不同的代码身份；不得把历史远端状态或历史测试
+  结果写成当前候选已同步、已集成或已验收；
+- 本次接管只形成本地候选与 Harness 交接，不含 push、远端同步或 merge 授权。
 
-### 10.2 远端复核命令
+### 10.2 历史远端只读复核
+
+仅在另行安排现场接管时，先用只读命令确认历史远端实际状态：
 
 ```bash
 ssh user@192.168.70.116 \
@@ -475,72 +499,60 @@ ssh user@192.168.70.116 \
   'git -C /home/user/zc/AgenticRobot-quest-passive-20260906 rev-parse HEAD'
 ```
 
-预期 HEAD：
+历史交接记录的 HEAD 是：
 
 ```text
-ff41f224b612ccf01bad25ea70ea3a2604f3b64f
+58a67862507199be44d275e7cdced638e27474f8
 ```
 
-同步流程必须是：
-
-```bash
-git push origin task/codex/quest-passive-left-b426-all-20260907
-
-ssh user@192.168.70.116 \
-  'git -C /home/user/zc/AgenticRobot-quest-passive-20260906 fetch origin task/codex/quest-passive-left-b426-all-20260907'
-
-ssh user@192.168.70.116 \
-  'git -C /home/user/zc/AgenticRobot-quest-passive-20260906 merge --ff-only origin/task/codex/quest-passive-left-b426-all-20260907'
-```
-
-不要使用 `git reset --hard`、`git clean`、强制 push 或全目录复制。
+HEAD、分支或工作区若与记录不同，应停止并重新确认来源。任何 push、fetch 后更新远端
+worktree 或 merge 都需要单独授权和新的精确目标；不要使用 `git reset --hard`、
+`git clean`、强制 push 或全目录复制。
 
 ## 11. 测试与验证命令
 
-### 11.1 远端 Python 回归测试
+### 11.1 当前候选的本地 Python 回归测试
 
 ```bash
-ssh user@192.168.70.116 \
-  'cd /home/user/zc/AgenticRobot-quest-passive-20260906 && \
-  /home/user/miniconda3/envs/dexteleop310/bin/python -m pytest -q \
+PYTHONDONTWRITEBYTECODE=1 bash scripts/run_pytest.sh -p no:cacheprovider \
     hardware/quest_dev/tests/test_controller_pose.py \
     hardware/quest_dev/tests/test_paired_pose_capture.py \
-    hardware/quest_dev/tests/test_realman_feedback.py \
     hardware/quest_dev/tests/test_robot_feedback_canonical.py \
     hardware/quest_dev/tests/test_server.py \
     tests/test_control_station_quest_calibration_launch.py \
     tests/test_control_station_quest_calibration_web.py \
     tests/test_deploy_quest_paired_pose_capture.py \
     tests/test_quest_terminal_capture.py \
-    tests/test_rm65_pose_observation_binding.py'
+    tests/test_rm65_pose_observation_binding.py \
+    tests/test_docs_navigation.py \
+    tests/test_hardware_boundaries.py
 ```
 
-预期：`205 passed, 4 subtests passed`。
+本次当前候选结果：`214 passed`。后续变更仍必须以届时实际输出为准，不能沿用该数字。
 
 ### 11.2 浏览器脚本语法检查
 
-远端 Node 12 不支持 `node --test`，使用：
+当前本地环境使用每个脚本的直接执行结果作为子测试数量证据：
 
 ```bash
-ssh user@192.168.70.116 \
-  'cd /home/user/zc/AgenticRobot-quest-passive-20260906 && \
-  for f in hardware/quest_dev/web/*.js \
-           hardware/quest_dev/web/features/controller_pose/feature.js \
-           hardware/quest_dev/web/features/visualization/*.js; do \
-    node --check "$f" || exit 1; \
-  done'
+node hardware/quest_dev/tests/controller_pose_sampling.test.js
+node hardware/quest_dev/tests/controller_pose_display.test.js
+node hardware/quest_dev/tests/controller_pose_feature.test.js
+node hardware/quest_dev/tests/controller_source_identity.test.js
+node hardware/quest_dev/tests/visualization_feature.test.js
 ```
 
-本地若 Node 支持内建 test runner，可额外执行：
+浏览器脚本还应执行语法检查：
 
 ```bash
-node --test \
-  hardware/quest_dev/tests/controller_pose_sampling.test.js \
-  hardware/quest_dev/tests/controller_pose_display.test.js \
-  hardware/quest_dev/tests/controller_pose_feature.test.js \
-  hardware/quest_dev/tests/controller_source_identity.test.js \
-  hardware/quest_dev/tests/visualization_feature.test.js
+for f in hardware/quest_dev/web/*.js \
+         hardware/quest_dev/web/features/controller_pose/feature.js \
+         hardware/quest_dev/web/features/visualization/*.js; do
+  node --check "$f" || exit 1
+done
 ```
+
+本次当前候选的五个 Node 脚本合计结果：`19 passed`，相关脚本语法检查全部通过。
 
 ### 11.3 代码卫生
 
@@ -595,6 +607,9 @@ Python 代码变更执行对应环境的 `ruff check` 和 `py_compile`；浏览�
 - `eabf86c6`：选择候选前拒绝 stale controller candidate；
 - `ff41f224`：上报 `getPose()` 细分原因、限制 display cache 250 ms、增加 0.5 s
   latest freshness gate，并使一次 `r` 在 tracking 恢复后自动开始 3 秒窗口。
+- 当前 Harness 修复：取消 Quest host 的第二套 RealMan reader、CLI 覆盖与重复探针；实时
+  TCP 与静止窗口都读取 `ArmStateReader` 的同一 canonical passive journal；preview/live
+  TCP 绑定哈希必须一致；`c` 在封存前预检可观测性，失败后可继续采样。
 
 修复后的核心原则是：
 
@@ -603,6 +618,7 @@ VR 中可见 != 当前 raw grip pose 有效
 历史候选存在 != 当前可以选择
 diagnostic preview != 正式 calibration accepted
 read-only RealMan feedback != 机械臂已被控制
+fit preflight failed != capture 必须作废
 ```
 
 ## 14. 未完成事项与后续工作

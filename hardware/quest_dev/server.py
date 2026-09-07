@@ -552,76 +552,6 @@ def load_config(path: Path) -> dict[str, Any]:
     return config
 
 
-def apply_realman_observation_overrides(
-    config: dict[str, Any],
-    *,
-    left_ip: str | None = None,
-    left_urdf: Path | None = None,
-) -> dict[str, Any]:
-    """Apply an explicit left-arm, observation-only launch override.
-
-    The repository config intentionally keeps hardware feedback disabled.  A
-    host operator can opt in for one process by supplying both values on the
-    CLI; this function only changes feature configuration and never exposes a
-    control or command transport.
-    """
-
-    if left_ip is None and left_urdf is None:
-        return config
-    if left_ip is None or left_urdf is None:
-        raise ValueError(
-            "--realman-left-ip and --realman-left-urdf must be supplied together"
-        )
-    normalized_ip = str(left_ip).strip()
-    if not normalized_ip:
-        raise ValueError("--realman-left-ip must be non-empty")
-    normalized_urdf = Path(left_urdf).expanduser()
-    if not str(normalized_urdf).strip():
-        raise ValueError("--realman-left-urdf must be non-empty")
-
-    raw_features = config.setdefault("features", {})
-    if not isinstance(raw_features, dict):
-        raise TypeError("features config must be a mapping")
-    visualization = raw_features.setdefault("visualization", {})
-    if not isinstance(visualization, dict):
-        raise TypeError("features.visualization must be a mapping")
-    if visualization.get("enabled", True) is not True:
-        raise ValueError(
-            "left RealMan observation override requires visualization.enabled=true"
-        )
-    feedback = visualization.setdefault("robot_feedback", {})
-    if not isinstance(feedback, dict):
-        raise TypeError("features.visualization.robot_feedback must be a mapping")
-    realman = feedback.setdefault("realman", {})
-    if not isinstance(realman, dict):
-        raise TypeError(
-            "features.visualization.robot_feedback.realman must be a mapping"
-        )
-    raw_arms = realman.setdefault("arms", {})
-    if not isinstance(raw_arms, dict):
-        raise TypeError(
-            "features.visualization.robot_feedback.realman.arms must be a mapping"
-        )
-    left_arm = raw_arms.setdefault("rm65_left", {})
-    if not isinstance(left_arm, dict):
-        raise TypeError("realman.arms.rm65_left must be a mapping")
-    left_arm.update(
-        {
-            "enabled": True,
-            "side": "left",
-            "arm_ip": normalized_ip,
-            "arm_urdf_path": str(normalized_urdf),
-        }
-    )
-    feedback["enabled"] = True
-    realman["arms"] = raw_arms
-    feedback["realman"] = realman
-    visualization["robot_feedback"] = feedback
-    raw_features["visualization"] = visualization
-    config["features"] = raw_features
-    return config
-
-
 def resolve_module_path(value: str) -> Path:
     path = Path(value).expanduser()
     return path if path.is_absolute() else MODULE_ROOT / path
@@ -1065,8 +995,6 @@ def build_quest_dev_host(
     config_path: Path = MODULE_ROOT / "config.yaml",
     *,
     force_http: bool = False,
-    realman_left_ip: str | None = None,
-    realman_left_urdf: Path | None = None,
     monotonic_ns_clock: Callable[[], int] = time.monotonic_ns,
     runtime_loader: Callable[
         [str, QuestDevHTTPServer, dict[str, Any], threading.Event], Any
@@ -1080,11 +1008,6 @@ def build_quest_dev_host(
         raise TypeError("runtime_loader must be callable")
 
     config = load_config(Path(config_path).resolve())
-    apply_realman_observation_overrides(
-        config,
-        left_ip=realman_left_ip,
-        left_urdf=realman_left_urdf,
-    )
     server_cfg = config.get("server", {})
     if not isinstance(server_cfg, dict):
         raise TypeError("server config must be a mapping")
@@ -1152,34 +1075,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--http", action="store_true", help="disable HTTPS for local desktop tests"
     )
-    parser.add_argument(
-        "--realman-left-ip",
-        default=None,
-        help=(
-            "explicitly enable read-only RealMan RM65 left-arm feedback for this "
-            "host process"
-        ),
-    )
-    parser.add_argument(
-        "--realman-left-urdf",
-        type=Path,
-        default=None,
-        help=(
-            "six-axis arm-only URDF paired with --realman-left-ip; do not pass the "
-            "18-DoF RM65+Inspire hand URDF"
-        ),
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    host = build_quest_dev_host(
-        args.config,
-        force_http=args.http,
-        realman_left_ip=args.realman_left_ip,
-        realman_left_urdf=args.realman_left_urdf,
-    )
+    host = build_quest_dev_host(args.config, force_http=args.http)
     launch = host.launch_info
     print(f"[quest-dev] open on Quest: {launch.base_url}", flush=True)
     print(f"[quest-dev] 6-digit pairing code: {launch.pairing_code}", flush=True)

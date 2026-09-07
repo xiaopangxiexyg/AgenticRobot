@@ -167,6 +167,8 @@
           || message.accepted !== false
           || message.alignment_status !== 'diagnostic_preview'
           || !hasFiniteMatrix(message.matrix_quest_from_robot_base)
+          || typeof message.robot_coordinate_binding_hash !== 'string'
+          || message.robot_coordinate_binding_hash.length === 0
         ) {
           latestCalibrationPreview = null;
           setCaptureStatus('invalid calibration preview', false);
@@ -263,6 +265,9 @@
         if (
           previewRecord
           && previewRecord.fresh === true
+          && previewRecord.pose_binding
+          && previewRecord.pose_binding.coordinate_binding_hash
+            === preview.robot_coordinate_binding_hash
           && hasFiniteMatrix(previewRecord.matrix_robot_from_tcp)
         ) {
           robotTcpMatrix = new Float32Array(previewRecord.matrix_robot_from_tcp);

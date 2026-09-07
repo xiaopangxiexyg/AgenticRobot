@@ -63,13 +63,18 @@ def test_terminal_r_and_c_reuse_the_capture_application_without_owning_stdin() -
         state["capture"]["sealed"] = True
         state["state"] = "sealed"
         state["evidence_hash"] = "evidence-hash"
-        return object()
+        return SimpleNamespace(dataset=SimpleNamespace(semantic_sha256="dataset-hash"))
+
+    def candidate_dataset():
+        calls.append(("candidate_dataset", None))
+        return SimpleNamespace(semantic_sha256="dataset-hash")
 
     application.snapshot_status = snapshot_status  # type: ignore[method-assign]
     application.poll = lambda: snapshot_status()  # type: ignore[method-assign]
     application.select_unique_candidate = select_unique_candidate  # type: ignore[method-assign]
     application.begin_window = begin_window  # type: ignore[method-assign]
     application.complete_window = complete_window  # type: ignore[method-assign]
+    application.candidate_dataset = candidate_dataset  # type: ignore[method-assign]
     application.request_seal = request_seal  # type: ignore[method-assign]
     application.publish_capture_status = (  # type: ignore[method-assign]
         lambda *, terminal_message=None: status_messages.append(terminal_message)
@@ -92,6 +97,7 @@ def test_terminal_r_and_c_reuse_the_capture_application_without_owning_stdin() -
         preferred_handedness="left",
         monotonic_ns_clock=lambda: now_ns[0],
         emit=output.append,
+        preflight_fit_function=lambda _dataset: object(),
         fit_function=lambda _evidence: diagnostic_fit,
     )
 
@@ -122,10 +128,71 @@ def test_terminal_r_and_c_reuse_the_capture_application_without_owning_stdin() -
     # c completes/seals the already-recorded three-window set and publishes
     # only a diagnostic preview.  No stdin reader is created by the controller.
     assert controller.handle_key("c") is True
+    assert calls[-2:] == [("candidate_dataset", None), ("request_seal", None)]
     assert ("request_seal", None) in calls
     assert preview_calls == [diagnostic_fit]
     assert any("preview only" in line for line in output)
     assert status_messages
+
+
+def test_failed_fit_preflight_keeps_capture_open_for_more_windows() -> None:
+    application = object.__new__(QuestPairedPoseCaptureApplication)
+    state = {
+        "selected_candidate_hash": "candidate-hash",
+        "candidate_count": 1,
+        "state": "bound",
+        "capture": {
+            "active_window_id": None,
+            "completed_window_count": 3,
+            "draining": False,
+            "sealed": False,
+        },
+        "evidence_hash": None,
+        "terminal_reason": None,
+    }
+    sealed = [False]
+    started: list[str] = []
+    status_messages: list[str | None] = []
+
+    application.snapshot_status = lambda: {
+        **state,
+        "capture": dict(state["capture"]),
+    }  # type: ignore[method-assign]
+    application.candidate_dataset = lambda: object()  # type: ignore[method-assign]
+
+    def forbidden_seal():
+        sealed[0] = True
+        raise AssertionError("failed preflight must not seal capture")
+
+    application.request_seal = forbidden_seal  # type: ignore[method-assign]
+    application.begin_window = (  # type: ignore[method-assign]
+        lambda *, window_id: started.append(window_id)
+    )
+    application.publish_capture_status = (  # type: ignore[method-assign]
+        lambda *, terminal_message=None: status_messages.append(terminal_message)
+    )
+
+    output: list[str] = []
+    controller = QuestTerminalCaptureController(
+        application=application,
+        robot_side="left",
+        preferred_handedness="left",
+        monotonic_ns_clock=lambda: 0,
+        emit=output.append,
+        preflight_fit_function=lambda _dataset: (_ for _ in ()).throw(
+            ValueError("insufficient rotational diversity")
+        ),
+    )
+
+    assert controller.handle_key("c") is True
+    assert sealed == [False]
+    assert controller.terminal_error is None
+    assert state["capture"]["sealed"] is False
+    assert any("capture remains open" in line for line in output)
+    assert any("Press r" in str(message) for message in status_messages)
+
+    assert controller.handle_key("r") is True
+    assert started == ["static-window-001"]
 
 
 def test_retryable_selection_rejection_does_not_latch_terminal_capture() -> None:

@@ -193,6 +193,7 @@ test('visualization draws diagnostic robot base and raw-feedback TCP preview', (
       accepted: false,
       alignment_status: 'diagnostic_preview',
       robot: 'rm65_left',
+      robot_coordinate_binding_hash: 'binding-hash-left',
       robot_frame: 'left_arm_base',
       tcp_frame: 'tool_tcp',
       quest_session_id: 'xr-session-1',
@@ -213,6 +214,9 @@ test('visualization draws diagnostic robot base and raw-feedback TCP preview', (
           fresh: true,
           alignment_ready: false,
           matrix_robot_from_tcp: identityMatrix(),
+          pose_binding: {
+            coordinate_binding_hash: 'binding-hash-left',
+          },
         },
       },
     },
@@ -236,6 +240,7 @@ test('diagnostic preview draws the captured TCP before live feedback arrives', (
       accepted: false,
       alignment_status: 'diagnostic_preview',
       robot: 'rm65_left',
+      robot_coordinate_binding_hash: 'binding-hash-left',
       robot_frame: 'left_arm_base',
       tcp_frame: 'tool_tcp',
       quest_session_id: 'xr-session-1',
@@ -249,4 +254,50 @@ test('diagnostic preview draws the captured TCP before live feedback arrives', (
   implementation.renderView(matchingContext());
   assert.equal(draws.length, 3);
   assert.match(overlayStatus.textContent, /base axes \+ TCP marker/);
+});
+
+test('diagnostic preview rejects live TCP from another robot binding', () => {
+  const { implementation, draws } = loadFeature();
+  implementation.onXRReady({ gl: {} });
+  implementation.handleServerMessage({
+    message: {
+      type: 'calibration_preview',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      preview: true,
+      accepted: false,
+      alignment_status: 'diagnostic_preview',
+      robot: 'rm65_left',
+      robot_coordinate_binding_hash: 'capture-binding-hash',
+      robot_frame: 'left_arm_base',
+      tcp_frame: 'tool_tcp',
+      quest_session_id: 'xr-session-1',
+      reference_space_type: 'local-floor',
+      reference_space_generation: 0,
+      matrix_quest_from_robot_base: identityMatrix(),
+    },
+  });
+  implementation.handleServerMessage({
+    message: {
+      type: 'robot_tcp',
+      feature: 'visualization',
+      protocol_version: 2,
+      feature_protocol_version: 2,
+      robots: {
+        rm65_left: {
+          robot: 'rm65_left',
+          fresh: true,
+          alignment_ready: false,
+          matrix_robot_from_tcp: identityMatrix(),
+          pose_binding: {
+            coordinate_binding_hash: 'different-binding-hash',
+          },
+        },
+      },
+    },
+  });
+
+  implementation.renderView(matchingContext());
+  assert.equal(draws.length, 1);
 });

@@ -27,6 +27,9 @@ from hardware.quest_dev.features.controller_pose.runtime import (
     ControllerPoseSubscription,
     ControllerPoseTelemetryRuntime,
 )
+from hardware.quest_dev.features.visualization.paired_pose_calibration import (
+    PairedPoseDataset,
+)
 from hardware.quest_dev.features.visualization.paired_pose_capture import (
     CaptureTerminalError,
     ManualStaticPairedPoseCapture,
@@ -37,9 +40,14 @@ from hardware.quest_dev.features.visualization.paired_pose_capture import (
     StaticWindowReceipt,
     StaticWindowRejectedError,
 )
+from hardware.quest_dev.features.visualization.pose_projection import (
+    project_unaligned_pose_publication,
+)
 from hardware.quest_dev.features.visualization.protocol import (
     calibration_preview_message,
     capture_status_message,
+    feedback_error_message,
+    robot_tcp_message,
 )
 from hardware.quest_dev.features.visualization.transforms import matrix_to_column_major
 from hardware.quest_dev.server import (
@@ -55,6 +63,7 @@ from robot_motion.runtime.pose_observation import (
     PoseMeasurementInvalidationEvent,
     PoseMeasurementJournalCut,
     PoseMeasurementJournalEvent,
+    PoseMeasurementPublication,
 )
 
 from .arm_state_reader import ArmStateReader
@@ -67,6 +76,8 @@ QUEST_CONTROLLER_CANDIDATE_HASH_DOMAIN = (
 )
 DEFAULT_STATIC_WINDOW_DURATION_S = 3.0
 DEFAULT_CURRENT_TRACKING_MAX_AGE_S = 0.5
+DEFAULT_ROBOT_FEEDBACK_MAX_AGE_S = 0.25
+DEFAULT_ROBOT_FEEDBACK_PUBLISH_HZ = 30.0
 
 QuestPoseEvent = ControllerPoseAcceptedEvent | ControllerPoseInvalidationEvent
 
@@ -87,9 +98,7 @@ class QuestControllerSelectionUnavailableError(RuntimeError):
     """A retryable controller discovery/tracking condition blocks selection."""
 
 
-class QuestControllerTrackingUnavailableError(
-    QuestControllerSelectionUnavailableError
-):
+class QuestControllerTrackingUnavailableError(QuestControllerSelectionUnavailableError):
     """The discovered controller has no current real grip pose."""
 
 
@@ -129,6 +138,9 @@ class PassiveRobotPoseJournalSource:
     _events_after: Callable[[int], tuple[PoseMeasurementJournalEvent, ...]] = field(
         repr=False, compare=False
     )
+    _latest_pose_measurement: Callable[[str], PoseMeasurementPublication | None] = (
+        field(repr=False, compare=False)
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.receiver_clock, ClockDomainDescriptor):
@@ -137,8 +149,12 @@ class PassiveRobotPoseJournalSource:
             raise ValueError("receiver_clock.monotonic must be exactly True")
         if not callable(self.monotonic_ns_clock):
             raise TypeError("monotonic_ns_clock must be callable")
-        if not callable(self._atomic_cut) or not callable(self._events_after):
-            raise TypeError("pose journal cut/event readers must be callable")
+        if (
+            not callable(self._atomic_cut)
+            or not callable(self._events_after)
+            or not callable(self._latest_pose_measurement)
+        ):
+            raise TypeError("pose journal cut/event/latest readers must be callable")
         bindings = dict(self.coordinate_binding_by_side)
         if not bindings:
             raise ValueError("coordinate_binding_by_side must not be empty")
@@ -191,6 +207,29 @@ class PassiveRobotPoseJournalSource:
             raise TypeError("robot pose journal returned an untyped event")
         return events
 
+    def latest_pose_measurement(
+        self,
+        *,
+        side: str,
+    ) -> PoseMeasurementPublication | None:
+        """Read the latest canonical pose fact without advancing its journal."""
+
+        normalized_side = _required_text(side, name="side").lower()
+        try:
+            expected_binding = self.coordinate_binding_by_side[normalized_side]
+        except KeyError:
+            raise KeyError("requested robot side is not bound") from None
+        publication = self._latest_pose_measurement(normalized_side)
+        if publication is None:
+            return None
+        if not isinstance(publication, PoseMeasurementPublication):
+            raise TypeError("robot pose journal returned an invalid latest fact")
+        if publication.coordinate_binding != expected_binding:
+            raise RuntimeError("latest robot pose coordinate binding drifted")
+        if publication.receiver_clock != self.receiver_clock:
+            raise RuntimeError("latest robot pose receiver clock drifted")
+        return publication
+
 
 def bind_passive_robot_pose_journal_source(
     *,
@@ -226,6 +265,9 @@ def bind_passive_robot_pose_journal_source(
         coordinate_binding_by_side=expected,
         _atomic_cut=arm_reader.pose_measurement_journal_cut,
         _events_after=arm_reader.pose_measurement_events_after,
+        _latest_pose_measurement=lambda side: arm_reader.latest_pose_measurement(
+            side=side
+        ),
     )
 
 
@@ -438,8 +480,6 @@ class QuestPairedPoseCaptureLaunchConfig:
     startup_timeout_s: float
     callback_drain_timeout_s: float
     host_join_timeout_s: float
-    realman_left_ip: str | None = None
-    realman_left_urdf: Path | None = None
     controller_handedness: str | None = None
 
     def __post_init__(self) -> None:
@@ -453,19 +493,6 @@ class QuestPairedPoseCaptureLaunchConfig:
             "capture_id",
             _required_text(self.capture_id, name="capture_id"),
         )
-        left_ip = self.realman_left_ip
-        left_urdf = self.realman_left_urdf
-        if (left_ip is None) != (left_urdf is None):
-            raise ValueError(
-                "realman_left_ip and realman_left_urdf must be supplied together"
-            )
-        if left_ip is not None:
-            object.__setattr__(
-                self,
-                "realman_left_ip",
-                _required_text(left_ip, name="realman_left_ip"),
-            )
-            object.__setattr__(self, "realman_left_urdf", Path(left_urdf))
         handedness = self.controller_handedness
         if handedness in (None, "", "any"):
             handedness = None
@@ -508,6 +535,8 @@ class QuestPairedPoseCaptureApplicationPort(Protocol):
     ) -> Mapping[str, Any]: ...
 
     def publish_diagnostic_preview(self, diagnostic_fit: Any) -> Mapping[str, Any]: ...
+
+    def candidate_dataset(self) -> PairedPoseDataset: ...
 
     def close(self) -> None: ...
 
@@ -624,6 +653,7 @@ class QuestPairedPoseCaptureApplication:
         self._last_close_error: str | None = None
         self._host_cleanup_failure: str | None = None
         self._discard_callbacks = False
+        self._last_robot_feedback_publish_ns: int | None = None
 
         subscription: ControllerPoseSubscription | None = None
         try:
@@ -1030,8 +1060,7 @@ class QuestPairedPoseCaptureApplication:
             latest.client_instance_id != candidate.client_instance_id
             or latest.xr_session_id != candidate.xr_session_id
             or latest.reference_space_type != candidate.reference_space_type
-            or latest.reference_space_generation
-            != candidate.reference_space_generation
+            or latest.reference_space_generation != candidate.reference_space_generation
         ):
             return "XR session or reference-space generation changed"
         matches = tuple(
@@ -1057,8 +1086,7 @@ class QuestPairedPoseCaptureApplication:
         diagnostics = tuple(
             diagnostic
             for diagnostic in latest.controller_diagnostics
-            if diagnostic.source_session_id
-            == candidate.controller_source_session_id
+            if diagnostic.source_session_id == candidate.controller_source_session_id
         )
         if len(diagnostics) > 1:
             return "latest sample repeats the selected tracking diagnostic"
@@ -1069,9 +1097,7 @@ class QuestPairedPoseCaptureApplication:
                 "pose_unavailable": (
                     "WebXR getPose(gripSpace, referenceSpace) returned null"
                 ),
-                "pose_transform_unavailable": (
-                    "WebXR grip pose has no 4x4 transform"
-                ),
+                "pose_transform_unavailable": ("WebXR grip pose has no 4x4 transform"),
                 "pose_matrix_invalid": "WebXR grip pose matrix is not finite",
                 "pose_error": "WebXR getPose raised an exception",
             }.get(diagnostic.reason, "WebXR did not provide a real grip pose")
@@ -1085,9 +1111,8 @@ class QuestPairedPoseCaptureApplication:
             f"{item.source_session_id}:{item.handedness}:{item.reason}"
             for item in latest.controller_diagnostics
         )
-        return (
-            "selected source is absent from the latest XR input-source set"
-            + ("" if not active else f"; current sources={active}")
+        return "selected source is absent from the latest XR input-source set" + (
+            "" if not active else f"; current sources={active}"
         )
 
     def _validate_robot_selection_cut_locked(
@@ -1304,7 +1329,47 @@ class QuestPairedPoseCaptureApplication:
             status = self._snapshot_status_locked()
             if self._terminal_reason is not None and not self._closed:
                 raise QuestPairedPoseCaptureTerminalError(self._terminal_reason)
-            return status
+        self.publish_live_robot_feedback()
+        return status
+
+    def publish_live_robot_feedback(self) -> Mapping[str, Any] | None:
+        """Publish raw TCP telemetry from the already-owned policy journal."""
+
+        with self._condition:
+            side = self._selected_robot_side
+            if side is None or self._closed:
+                return None
+            now_ns = int(self.robot_pose_journal.monotonic_ns_clock())
+            minimum_period_ns = round(
+                1_000_000_000.0 / DEFAULT_ROBOT_FEEDBACK_PUBLISH_HZ
+            )
+            previous_ns = self._last_robot_feedback_publish_ns
+            if previous_ns is not None and now_ns - previous_ns < minimum_period_ns:
+                return None
+            self._last_robot_feedback_publish_ns = now_ns
+            coordinate_binding = self.robot_pose_journal.coordinate_binding_by_side[
+                side
+            ]
+        robot = f"rm65_{side}"
+        try:
+            publication = self.robot_pose_journal.latest_pose_measurement(side=side)
+            record = project_unaligned_pose_publication(
+                publication,
+                expected_robot=robot,
+                key=f"policy-pose-journal:{side}",
+                expected_coordinate_binding=coordinate_binding,
+                max_age_s=DEFAULT_ROBOT_FEEDBACK_MAX_AGE_S,
+                now_monotonic_ns=now_ns,
+            )
+            payload = robot_tcp_message({robot: record})
+        except Exception as exc:  # noqa: BLE001 - display cannot own capture health.
+            payload = feedback_error_message(
+                f"passive_pose_journal:{type(exc).__name__}:{exc}"
+            )
+        publisher = getattr(self.runtime.server, "publish_feature_message", None)
+        if callable(publisher):
+            publisher("visualization", payload)
+        return payload
 
     def publish_capture_status(
         self,
@@ -1357,12 +1422,22 @@ class QuestPairedPoseCaptureApplication:
             ),
             robot_frame=binding.robot.reference_frame_id,
             tcp_frame=binding.robot.moving_frame_id,
+            robot_coordinate_binding_hash=binding.robot.semantic_content_hash,
             matrix_robot_from_tcp=preview_tcp_matrix,
         )
         publisher = getattr(self.runtime.server, "publish_feature_message", None)
         if callable(publisher):
             publisher("visualization", payload)
         return payload
+
+    def candidate_dataset(self) -> PairedPoseDataset:
+        """Build a non-final candidate dataset from accepted windows only."""
+
+        self.poll()
+        with self._condition:
+            self._assert_operator_action_available_locked()
+            capture = self._require_capture_locked()
+            return capture.candidate_dataset()
 
     def _validate_quest_cut_locked(self, cut: ControllerPoseEventCut) -> None:
         subscription = self._require_subscription_locked()
@@ -1730,6 +1805,7 @@ class QuestTerminalCaptureController:
         window_duration_s: float = DEFAULT_STATIC_WINDOW_DURATION_S,
         monotonic_ns_clock: Callable[[], int] | None = None,
         emit: Callable[[str], None] = print,
+        preflight_fit_function: Callable[[Any], Any] | None = None,
         fit_function: Callable[[PairedPoseCaptureEvidence], Any] | None = None,
     ) -> None:
         if not isinstance(application, QuestPairedPoseCaptureApplication):
@@ -1746,11 +1822,11 @@ class QuestTerminalCaptureController:
             ).lower()
         )
         if handedness is not None and handedness not in {"left", "right"}:
-            raise ValueError(
-                "preferred_handedness must be left, right, any, or None"
-            )
+            raise ValueError("preferred_handedness must be left, right, any, or None")
         if not callable(emit):
             raise TypeError("emit must be callable")
+        if preflight_fit_function is not None and not callable(preflight_fit_function):
+            raise TypeError("preflight_fit_function must be callable or None")
         if fit_function is not None and not callable(fit_function):
             raise TypeError("fit_function must be callable or None")
         self.application = application
@@ -1770,6 +1846,7 @@ class QuestTerminalCaptureController:
         if not callable(clock):
             raise TypeError("monotonic_ns_clock must be callable")
         self.emit = emit
+        self.preflight_fit_function = preflight_fit_function
         self.fit_function = fit_function
         self.window_duration_s = duration_s
         self._window_duration_ns = round(duration_s * 1_000_000_000.0)
@@ -1851,9 +1928,7 @@ class QuestTerminalCaptureController:
     def _begin_next_window(self) -> None:
         window_id = self._next_window_id()
         self.application.begin_window(window_id=window_id)
-        self._window_deadline_ns = (
-            self._now_monotonic_ns() + self._window_duration_ns
-        )
+        self._window_deadline_ns = self._now_monotonic_ns() + self._window_duration_ns
         self.emit(
             "[Quest] window started: "
             f"{window_id}; hold the arm/controller still for "
@@ -1920,9 +1995,7 @@ class QuestTerminalCaptureController:
             return False
         if receipt is None:
             self._window_deadline_ns = None
-            self._pending_action = (
-                "seal_after_complete" if seal_after else "complete"
-            )
+            self._pending_action = "seal_after_complete" if seal_after else "complete"
             self.emit("[Quest] window end pinned; draining Quest/RealMan samples...")
             self._publish_status(force=True)
             return False
@@ -1953,7 +2026,40 @@ class QuestTerminalCaptureController:
             self._publish_status(force=True)
             return
         try:
+            dataset = self.application.candidate_dataset()
+            preflight_fit_function = self.preflight_fit_function
+            if preflight_fit_function is None:
+                from hardware.quest_dev.features.visualization.paired_pose_calibration import (
+                    fit_paired_pose_calibration,
+                )
+
+                preflight_fit_function = fit_paired_pose_calibration
+            preflight_fit = preflight_fit_function(dataset)
+            preflight_dataset_hash = getattr(preflight_fit, "dataset_sha256", None)
+            dataset_hash = getattr(dataset, "semantic_sha256", None)
+            if (
+                preflight_dataset_hash is not None
+                and dataset_hash is not None
+                and preflight_dataset_hash != dataset_hash
+            ):
+                raise ValueError(
+                    "diagnostic preflight fit changed the candidate dataset hash"
+                )
+        except Exception as error:  # noqa: BLE001 - keep sampling after bad geometry.
+            self._pending_action = None
+            message = (
+                "diagnostic fit preflight failed; capture remains open: "
+                f"{type(error).__name__}: {error}. Press r to collect another window."
+            )
+            self.emit(f"[Quest] {message}")
+            self._publish_status(terminal_message=message, force=True)
+            return
+        try:
             evidence = self.application.request_seal()
+            if evidence.dataset.semantic_sha256 != dataset.semantic_sha256:
+                raise RuntimeError(
+                    "sealed evidence dataset differs from the preflight candidate"
+                )
             fit_function = self.fit_function
             if fit_function is None:
                 from .quest_paired_pose_evidence_store import (
@@ -2384,13 +2490,6 @@ class QuestPairedPoseCaptureFactory:
             "monotonic_ns_clock": clock,
             "runtime_loader": runtime_loader,
         }
-        if self.config.realman_left_ip is not None:
-            host_kwargs.update(
-                {
-                    "realman_left_ip": self.config.realman_left_ip,
-                    "realman_left_urdf": self.config.realman_left_urdf,
-                }
-            )
         host = self.host_builder(self.config.config_path, **host_kwargs)
         with self._condition:
             self._owned_host = host

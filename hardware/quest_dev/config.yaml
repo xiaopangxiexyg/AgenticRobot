@@ -28,34 +28,6 @@ features:
       reference_marker_size_m: 0.10
       reference_marker_forward_m: 0.8
       reference_marker_down_from_viewer_m: 0.15
-    # 可选的 RealMan RM65 真机只读反馈。默认关闭；启用后直接调用
-    # RM65ArmBackend 的 observation_only 状态读取，不发送动作或控制指令。
-    robot_feedback:
-      enabled: false
-      rate_hz: 30
-      max_age_s: 0.25
-      realman:
-        # 可选：使用项目现有的 RM65 IP assignment；也可在每个 arm 下
-        # 写 arm_ip，或通过 QUEST_REALMAN_LEFT_IP/RIGHT_IP 注入。
-        ip_assignment: latest
-        control_domain_id: quest-dev:realman-rm65-observation
-        arms:
-          rm65_left:
-            enabled: false
-            side: left
-            arm_ip: ""
-          rm65_right:
-            enabled: false
-            side: right
-            arm_ip: ""
-      # Reviewed bindings are intentionally absent by default. Without one,
-      # live robot_tcp remains diagnostic-only; after terminal c, the
-      # candidate preview may still draw the captured TCP pose next to the
-      # diagnostic robot-base axes, without installing an accepted binding.
-      frame_bindings: {}
-      # Paths are resolved relative to hardware/quest_dev when not absolute.
-      # A loaded file must be the canonical accepted_frame_binding.v1 payload.
-      frame_binding_paths: {}
   controller_pose:
     enabled: true
     client:

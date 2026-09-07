@@ -242,6 +242,20 @@ def _capture_id(value: str | None) -> str:
 
 def _pairing_token_env(config_path: Path) -> str:
     config = load_config(config_path)
+    features = config.get("features", {})
+    if not isinstance(features, Mapping):
+        raise TypeError("Quest config features must be a mapping")
+    visualization = features.get("visualization", {})
+    if not isinstance(visualization, Mapping):
+        raise TypeError("Quest config visualization feature must be a mapping")
+    robot_feedback = visualization.get("robot_feedback", {})
+    if not isinstance(robot_feedback, Mapping):
+        raise TypeError("Quest config visualization.robot_feedback must be a mapping")
+    if bool(robot_feedback.get("enabled", False)):
+        raise ValueError(
+            "Quest calibration requires visualization.robot_feedback.enabled=false; "
+            "run_policy owns the only RealMan pose reader"
+        )
     server = config.get("server", {})
     if not isinstance(server, Mapping):
         raise TypeError("Quest config server must be a mapping")
@@ -482,16 +496,6 @@ def run(
                 startup_timeout_s=float(args.quest_startup_timeout_s),
                 callback_drain_timeout_s=float(args.callback_drain_timeout_s),
                 host_join_timeout_s=float(args.host_join_timeout_s),
-                realman_left_ip=(
-                    str(args.arm_ip)
-                    if str(args.side) == "left" and args.arm_urdf_path
-                    else None
-                ),
-                realman_left_urdf=(
-                    Path(args.arm_urdf_path)
-                    if str(args.side) == "left" and args.arm_urdf_path
-                    else None
-                ),
                 controller_handedness=(
                     None
                     if str(args.controller_handedness) == "any"

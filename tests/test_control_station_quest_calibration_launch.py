@@ -153,6 +153,27 @@ def test_dry_run_prints_resolved_contract_without_constructing_runtime() -> None
     }
 
 
+def test_calibration_rejects_a_configured_second_realman_reader(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "quest-direct-realman.yaml"
+    config_path.write_text(
+        """
+server:
+  pairing:
+    enabled: true
+features:
+  visualization:
+    robot_feedback:
+      enabled: true
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="only RealMan pose reader"):
+        run(_args("--quest-config", str(config_path), "--dry-run"))
+
+
 def test_run_composes_one_factory_and_restores_pairing_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -192,6 +213,8 @@ def test_run_composes_one_factory_and_restores_pairing_environment(
     assert factories[0].config.force_http is False
     assert factories[0].config.capture_id == "operator-test-capture"
     assert factories[0].config.profile.profile_id == OPERATOR_TRIAL_PROFILE_ID_V1
+    assert not hasattr(factories[0].config, "realman_left_ip")
+    assert not hasattr(factories[0].config, "realman_left_urdf")
     assert policy_calls == [(build_deploy_argv(_args("--trusted-lan")), factories[0])]
     assert coordinators[0].start_calls == 1
     assert coordinators[0].close_calls == 1

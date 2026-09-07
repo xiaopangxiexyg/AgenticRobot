@@ -2,6 +2,9 @@
 
 ## Goal
 
+当前 Quest/RM65 被动标定的现场操作、代码身份与安全交接见
+[Quest 被动标定与 RM65 可视化任务交接](quest_passive_calibration_handoff.zh-CN.md)。
+
 The final operator-facing behavior is a Quest WebXR view that overlays the
 robot's measured TCP and a policy's selected future trajectory in one reviewed
 coordinate frame.  The view is diagnostic and predictive only: it must not own

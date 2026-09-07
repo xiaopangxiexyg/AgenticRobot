@@ -13,9 +13,8 @@
 - 手柄坐标轴和最多 20 Hz 的 `gripSpace` 只读遥测；
 - host 侧按认证客户端保留 latest-only 样本，reset/end/disconnect 立即失效；
 - 固定在 TCP 上的 Quest 手柄与机器人 TCP 成对位姿离线拟合；
-- 可选 RealMan RM65 真机只读反馈；默认关闭。启用后直接通过已有 `RM65ArmBackend` 的
-  `observation_only` 路径读取关节状态并做 TCP 正向运动学。只有外部 reviewed binding、当前
-  Quest epoch 和当前 RM65 pose identity 全部匹配时才绘制 TCP axes。
+- application layer 可通过 versioned `robot_tcp` 消息发布只读机器人观测；Quest hardware
+  runtime 不创建机器人 backend，也不拥有状态刷新或设备生命周期。
 
 ## 目录结构
 
@@ -53,60 +52,10 @@ python -m pip install -r hardware/quest_dev/requirements.txt
 python -m hardware.quest_dev.server
 ```
 
-启用 RealMan RM65 直读时，应在项目支持的 `dexteleop310` 环境中运行；该路径还需要
-仓库已有的 `teleop_runtime`、Pinocchio、RM65 SDK 适配器和 RM65 URDF 资源，不能只用
-浏览器基座的最小依赖文件。
-
-默认配置仍关闭真机读取。现场只读联调可通过 CLI 为本次进程显式注入左臂地址和
-六轴 arm-only URDF，不需要改写默认配置：
-
-```bash
-python -m hardware.quest_dev.server \
-  --realman-left-ip 192.168.101.21 \
-  --realman-left-urdf /home/user/zc/HarnessInputs/contract-assets-v1/rm65_inspire_tac/rm65_arm.urdf
-```
-
-两个参数必须同时提供；该覆盖只启用 `RM65ArmBackend(observation_only=True)` 的状态
-读取，并不会启用动作、停止、复位或夹爪路径。`rm65_arm.urdf` 是 6 自由度 arm-only
-模型；`rm65_inspire_tac_left.urdf` 是包含 Inspire 手部的 18 自由度完整模型，不能直接
-作为当前六轴 TCP FK 输入。
-
-在启动 Quest host 前，可以先用一次性探针验证 RealMan 连接、状态读取和本地 FK。探针
-要求显式传入审核过的 RM65 IP 与 URDF；它只创建 `observation_only=True` backend，输出
-机械臂坐标系下的诊断 TCP 位姿，退出时关闭 SDK transport，不发送动作、停止、复位或
-夹爪命令：
-
-```bash
-python -m hardware.quest_dev.tools.read_realman_feedback \\
-  --side left \\
-  --robot-id rm65_left \\
-  --arm-ip 192.168.101.21 \\
-  --arm-urdf "$PWD/assets/rm65_inspire_tac/rm65_arm.urdf" \\
-  --samples 3
-```
-
-每行的 `fresh=true`、`observation_only=true`、`matrix_robot_from_tcp` 表明 RM65 状态
-读取和 FK 成功；这个探针不会验证 Quest 网络、WebXR 或 Quest-space 标定矩阵。
-
-配置示例（默认仍关闭硬件连接）：
-
-```yaml
-features:
-  visualization:
-    robot_feedback:
-      enabled: true
-      realman:
-        arms:
-          rm65_right:
-            enabled: true
-            side: right
-            arm_ip: "<reviewed-rm65-ip>"
-            arm_urdf_path: "<repo>/assets/rm65_inspire_tac/rm65_arm.urdf"
-      frame_binding_paths: {}
-```
-
-没有 reviewed `accepted_frame_binding.v1` 时，host 消息最多携带 RM65 机械臂坐标系下的
-诊断 TCP 位姿，浏览器不会绘制 Quest-space TCP；这是为了避免把未经验收的标定当成对齐结果。
+通用 `hardware.quest_dev.server` 只拥有 Quest HTTP/WSS 与 browser feature 生命周期。
+需要 RM65 状态时，应由 `control_station` / `teleop_runtime` 应用层拥有唯一 backend 和
+canonical pose journal，再向该 host 发布只读 `robot_tcp`。若 Quest 配置试图启用
+`visualization.robot_feedback`，lower runtime 会 fail closed，避免产生第二个设备 reader。
 
 默认监听 `8444`。首次 HTTPS 启动会生成本机开发用自签名证书；Quest 与主机需在
 同一受信局域网，且需在 Quest Browser 中手动接受证书风险。
@@ -253,8 +202,8 @@ node --test hardware/quest_dev/tests/*.test.js
 ## 来源与所有权
 
 - HTTPS/WSS 与 WebXR 基础来自既有 `quest_pose`，遥操作发布和状态写入已移除；
-- visualization 直接复用既有 RealMan RM65 只读 backend；不会初始化 Redis，也不会把旧的
-  外部缓存 pose 当作机械臂 canonical pose；
+- visualization 只消费 application layer 发布的 versioned telemetry；不会初始化 Redis、
+  RealMan backend，也不会把外部缓存 pose 当作机械臂 canonical pose；
 - reviewed binding 的 parser 只验证外部 acceptance receipt，不自动创建或接受标定；
 - `hardware/quest_dev` 只拥有 Quest 接入与 feature-local 诊断，不拥有控制 authority、
   canonical safety、轨迹生成、future selection 或执行生命周期；

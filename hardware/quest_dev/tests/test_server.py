@@ -75,7 +75,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIsInstance(config, dict)
         visualization = config["features"]["visualization"]
         self.assertTrue(visualization["enabled"])
-        self.assertFalse(visualization["robot_feedback"]["enabled"])
+        self.assertNotIn("robot_feedback", visualization)
         self.assertTrue(config["features"]["controller_pose"]["enabled"])
         self.assertTrue(config["server"]["pairing"]["enabled"])
 
@@ -100,34 +100,6 @@ class ConfigurationTests(unittest.TestCase):
     def test_relative_paths_are_module_relative(self) -> None:
         resolved = server.resolve_module_path("assets/certs/example.crt")
         self.assertEqual(resolved, MODULE_ROOT / "assets/certs/example.crt")
-
-    def test_realman_left_override_is_explicit_and_keeps_right_disabled(self) -> None:
-        config = server.load_config(MODULE_ROOT / "config.yaml")
-        server.apply_realman_observation_overrides(
-            config,
-            left_ip="192.168.101.21",
-            left_urdf=Path("/reviewed/rm65_arm.urdf"),
-        )
-        feedback = config["features"]["visualization"]["robot_feedback"]
-        self.assertTrue(feedback["enabled"])
-        self.assertEqual(
-            feedback["realman"]["arms"]["rm65_left"],
-            {
-                "enabled": True,
-                "side": "left",
-                "arm_ip": "192.168.101.21",
-                "arm_urdf_path": "/reviewed/rm65_arm.urdf",
-            },
-        )
-        self.assertFalse(feedback["realman"]["arms"]["rm65_right"]["enabled"])
-
-    def test_realman_left_override_requires_both_reviewed_inputs(self) -> None:
-        config = server.load_config(MODULE_ROOT / "config.yaml")
-        with self.assertRaisesRegex(ValueError, "supplied together"):
-            server.apply_realman_observation_overrides(
-                config,
-                left_ip="192.168.101.21",
-            )
 
     def test_plain_http_is_forced_to_loopback(self) -> None:
         self.assertEqual(
@@ -688,8 +660,6 @@ class QuestDevHostTests(unittest.TestCase):
                 return_value=mock.Mock(
                     config=config_path,
                     http=True,
-                    realman_left_ip=None,
-                    realman_left_urdf=None,
                 ),
             ),
             mock.patch.object(
@@ -705,8 +675,6 @@ class QuestDevHostTests(unittest.TestCase):
         build_host.assert_called_once_with(
             config_path,
             force_http=True,
-            realman_left_ip=None,
-            realman_left_urdf=None,
         )
         fake_host.serve_forever.assert_called_once_with()
         self.assertEqual(install_signal.call_count, 2)
@@ -886,41 +854,15 @@ class FeatureRuntimeTests(unittest.TestCase):
                 message["feature_protocol_version"], FEATURE_PROTOCOL_VERSION
             )
 
-    def test_loop_broadcasts_read_only_feedback(self) -> None:
-        stop_event = threading.Event()
+    def test_hardware_runtime_rejects_robot_feedback_ownership(self) -> None:
+        runtime = VisualizationRuntime(
+            object(),
+            {"robot_feedback": {"enabled": True}},
+            threading.Event(),
+        )
 
-        class Reader:
-            def poll(self) -> dict:
-                return robot_tcp_message(
-                    {
-                        "rm65_left": {
-                            "robot": "rm65_left",
-                            "source": "realman_rm65_direct",
-                            "fresh": True,
-                            "control_ready": False,
-                            "alignment_ready": False,
-                        }
-                    }
-                )
-
-        class BroadcastServer:
-            def __init__(self) -> None:
-                self.messages: list[dict] = []
-
-            def publish_feature_message(self, feature: str, payload: dict) -> int:
-                self.feature = feature
-                self.messages.append(payload)
-                stop_event.set()
-                return 1
-
-        host = BroadcastServer()
-        runtime = VisualizationRuntime(host, {}, stop_event)
-        runtime.reader = Reader()
-        runtime._run_feedback_loop(rate_hz=30)
-        self.assertEqual(host.feature, "visualization")
-        self.assertEqual(len(host.messages), 1)
-        self.assertTrue(host.messages[0]["robots"]["rm65_left"]["fresh"])
-        self.assertFalse(host.messages[0]["robots"]["rm65_left"]["control_ready"])
+        with self.assertRaisesRegex(ValueError, "application layer"):
+            runtime.start()
 
 
 if __name__ == "__main__":
