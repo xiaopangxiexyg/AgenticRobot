@@ -78,11 +78,11 @@ SocketCAN/MotorBridge 的接入边界和频率验收顺序，不替代急停、�
   MIT/POS_VEL 控制帧，也不改变运行前已经存在的电机状态；`CAPTURED` 只表示采样完成，
   不能解读为力控或硬件通过。该结果用于判断 `last-safe` 速度门是否被反馈量化噪声触发，
   不允许据此直接放宽保护阈值。
-- 反馈进入限位/速度/阻抗计算前，只有 joint2 与 joint3 的窄边界
-  `-5e-4 <= q < 0 rad` 会被表示为合法的 `0 rad`。这是对已标零后编码器量化负零的
-  反馈表示归一化，不修改 pinned URDF 的 `[0, 3.14]` 位置限位，也不改变出站参考、
-  torque/slew 包络或更负值的 fail-closed 行为；例如 `q < -5e-4 rad` 仍会被原有限位门
-  拒绝。JSON 样本同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
+- 反馈进入限位/速度/阻抗计算前，J2 的已标定边界
+  `-6e-3 <= q < 0 rad`、J3 的既有边界 `-5e-4 <= q < 0 rad` 会被表示为合法的
+  `0 rad`。这是反馈状态的有界投影，不修改 pinned URDF 的 `[0, 3.14]` 位置限位，
+  也不改变出站参考、torque/slew 包络或更负值的 fail-closed 行为；J1/J4/J5/J6
+  不执行该投影。JSON 样本同时保留 `raw_qpos_rad`、归一化后的 `qpos_rad` 和
   `boundary_normalized_joint_names`，便于复核实际读数。
 - active low-gain probe 用相邻 normalized q 与精确 host receive `dt` 计算 qvel，再用连续
   qvel 与 `dt` 计算 qacc。首个控制样本没有前一 qvel 时不伪造 qacc；`dt <= 0`、非有限值、
