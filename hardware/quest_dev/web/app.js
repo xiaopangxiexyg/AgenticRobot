@@ -23,8 +23,9 @@
   let xrSessionId = null;
   let referenceSpaceType = null;
   let referenceSpaceGeneration = 0;
-  let inputSourceIds = new WeakMap();
-  let nextInputSourceId = 1;
+  const controllerSourceIdentity = (
+    window.QuestDevControllerSourceIdentity.createTracker()
+  );
   let gl = null;
   let clientConfig = {
     protocol_version: 2,
@@ -256,23 +257,13 @@
     }
   }
 
-  function sourceSessionId(source) {
-    let value = inputSourceIds.get(source);
-    if (!value) {
-      value = `input-${nextInputSourceId}`;
-      nextInputSourceId += 1;
-      inputSourceIds.set(source, value);
-    }
-    return value;
-  }
-
-  function controllerSample(frame, referenceSpace, source) {
+  function controllerSample(frame, referenceSpace, source, sourceSessionId) {
     if (!source.gripSpace) return null;
     const pose = frame.getPose(source.gripSpace, referenceSpace);
     if (!pose) return null;
     return {
       pose,
-      sourceSessionId: sourceSessionId(source),
+      sourceSessionId,
       handedness: source.handedness || 'none',
       targetRayMode: source.targetRayMode || 'tracked-pointer',
       profiles: Array.from(source.profiles || []),
@@ -346,8 +337,7 @@
       xrSessionId = randomId('xr');
       referenceSpaceType = reference.type;
       referenceSpaceGeneration = 0;
-      inputSourceIds = new WeakMap();
-      nextInputSourceId = 1;
+      controllerSourceIdentity.reset();
 
       session.addEventListener('end', () => {
         if (xrSession !== session) return;
@@ -367,8 +357,7 @@
         xrSessionId = null;
         referenceSpaceType = null;
         referenceSpaceGeneration = 0;
-        inputSourceIds = new WeakMap();
-        nextInputSourceId = 1;
+        controllerSourceIdentity.reset();
         updateStartButton();
         setStatus(xrStatus, 'ended', false);
       }, { once: true });
@@ -423,8 +412,17 @@
         session.requestAnimationFrame(onFrame);
         const viewerPose = frame.getViewerPose(referenceSpace);
         const controllerPoses = [];
+        const sourceOccurrences = new Map();
         for (const source of session.inputSources) {
-          const sample = controllerSample(frame, referenceSpace, source);
+          const fingerprint = controllerSourceIdentity.fingerprint(source);
+          const occurrence = sourceOccurrences.get(fingerprint) || 0;
+          sourceOccurrences.set(fingerprint, occurrence + 1);
+          const sample = controllerSample(
+            frame,
+            referenceSpace,
+            source,
+            controllerSourceIdentity.idFor(source, occurrence),
+          );
           if (sample) controllerPoses.push(sample);
         }
         window.QuestDevFeatures.onXRFrame({
@@ -454,8 +452,7 @@
         xrSessionId = null;
         referenceSpaceType = null;
         referenceSpaceGeneration = 0;
-        inputSourceIds = new WeakMap();
-        nextInputSourceId = 1;
+        controllerSourceIdentity.reset();
       }
       throw error;
     } finally {
