@@ -1108,6 +1108,25 @@ def test_arming_settle_transition_accepts_stationary_feedback() -> None:
     assert qvel[2] == pytest.approx(0.002)
 
 
+def test_arming_settle_transition_accepts_bounded_enable_transient() -> None:
+    previous = (0.1, 0.7, 1.1, 0.0, -0.1, 0.2)
+    current = (0.1, 0.7032942, 1.1, 0.0, -0.1, 0.2)
+
+    accepted, qvel = probe._validate_arming_settle_transition(
+        current,
+        previous_qpos_rad=previous,
+        current_timestamp_sec=1.05,
+        previous_timestamp_sec=1.0,
+        position_limits_rad=_fault_hold_limits(),
+        # Startup uses the normal motion watchdog (the command under test uses
+        # 5 rad/s), not the 0.02 rad/s protective-hold admission gate.
+        max_velocity_rad_s=5.0,
+    )
+
+    assert accepted == current
+    assert qvel[1] == pytest.approx(0.065884)
+
+
 def test_arming_settle_transition_rejects_motion() -> None:
     with pytest.raises(probe.LowGainProbeError, match="moving"):
         probe._validate_arming_settle_transition(

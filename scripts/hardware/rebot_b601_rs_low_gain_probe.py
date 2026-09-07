@@ -723,21 +723,21 @@ def _validate_arming_settle_transition(
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
     """Validate one post-enable feedback transition before torque is allowed.
 
-    The transition uses consecutive host receive timestamps and the same
-    fresh/in-limit/near-zero-velocity validator as the protective hold.  This
+    The transition uses consecutive host receive timestamps and the normal
+    active-path velocity abort threshold.  It deliberately does not reuse the
+    stricter protective-hold stationary-admission gate: enabling the drives can
+    produce a short, bounded transient before the startup lock settles.  This
     helper only validates observations; it never sends a motor command.
     """
 
-    if current_qpos_rad is None:
-        raise LowGainProbeError(
-            "arming settle requires a complete feedback position snapshot"
-        )
-    current, _ = normalize_feedback_boundary_qpos(
+    current = _validate_in_limit_qpos(
         current_qpos_rad,
+        position_limits_rad=position_limits_rad,
         name="arming_settle_qpos_rad",
     )
-    previous, _ = normalize_feedback_boundary_qpos(
+    previous = _validate_in_limit_qpos(
         previous_qpos_rad,
+        position_limits_rad=position_limits_rad,
         name="arming_settle_previous_qpos_rad",
     )
     current_timestamp = _finite(
@@ -758,14 +758,19 @@ def _validate_arming_settle_transition(
         (current_value - previous_value) / dt
         for current_value, previous_value in zip(current, previous, strict=True)
     )
-    accepted = _validate_fault_hold_snapshot(
-        current,
-        qvel_rad_s=qvel,
-        observed_age_sec=0.0,
-        position_limits_rad=position_limits_rad,
-        max_velocity_rad_s=max_velocity_rad_s,
+    qvel = _six(qvel, name="arming_settle_qvel_rad_s")
+    velocity_limit = _positive(
+        max_velocity_rad_s,
+        name="arming_settle_velocity_limit_rad_s",
     )
-    return accepted, qvel
+    observed_max_velocity = max(abs(value) for value in qvel)
+    if observed_max_velocity > velocity_limit:
+        raise LowGainProbeError(
+            "arming settle feedback is moving: "
+            f"max_abs_velocity={observed_max_velocity:.6f} rad/s > "
+            f"{velocity_limit:.6f} rad/s"
+        )
+    return current, qvel
 
 
 def _validate_in_limit_qpos(
@@ -2945,7 +2950,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     arming_settle_samples = 0
     arming_settle_passed = False
     arming_settle_elapsed_sec: float | None = None
-    arming_settle_velocity_limit_rad_s = args.fault_hold_max_velocity_rad_s
+    # Startup settle admits the bounded enable transient under the normal
+    # active-path motion watchdog.  The stricter fault-hold value remains only
+    # the first-Ctrl-C/last-safe stationary admission gate.
+    arming_settle_velocity_limit_rad_s = args.velocity_abort_rad_s
     arming_settle_last_qvel: tuple[float, ...] | None = None
     connected = False
     enabled = False
@@ -3974,6 +3982,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
             "passed": arming_settle_passed,
             "elapsed_sec": arming_settle_elapsed_sec,
             "velocity_limit_rad_s": arming_settle_velocity_limit_rad_s,
+            "velocity_limit_source": "normal_motion_velocity_abort",
             "last_qvel_rad_s": arming_settle_last_qvel,
             "torque_commands_sent": arming_settle_torque_commands,
             "reference_qpos_rad": initial_q,

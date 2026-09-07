@@ -342,7 +342,9 @@ ENABLED_UNARMED → LOCKING → LOCKED → GRAVITY_RAMP (total-torque slew) → 
 slew，避免补偿空窗造成末端缓慢下坠。重力与临时关节锁保持连续后，再用同样的
 `--torque-rise-time-sec` 把临时关节锁平滑交给最终控制器，`pose-hold/cartesian-hold`
 的末端弹簧在 `HANDOFF` 中逐步成为位置恢复主体。启动阶段不依赖未受软件包络约束的
-vendor Kp；MIT 帧的 vendor Kp 保持为零。
+vendor Kp；MIT 帧的 vendor Kp 保持为零。`LOCKED` 的过渡检查使用本次运行的
+`--velocity-abort-rad-s`，以容纳使能瞬态中仍在正常运动包络内的反馈变化；它不复用
+仅用于首次 protective-hold admission 的严格 `--fault-hold-max-velocity-rad-s`。
 
 ### 异常时的 protective hold（全臂可拖动重力保持）
 
@@ -373,9 +375,10 @@ ACTIVE
    0.4.9 没有设备源时间戳，所以 JSON 仍明确标记 `freshness_verified=false`，不能宣传成
    vendor freshness；
 3. 首帧 admission 仍使用 `--fault-hold-max-velocity-rad-s` 的静止候选门，普通故障入口
-   则使用本次运行的 `--velocity-abort-rad-s`。这只决定是否能安全进入保持，不限制进入保持
-   后的正常人工拖动；保持阶段按 `--velocity-abort-rad-s` 和 `--acceleration-abort-rad-s2`
-   监视真正不可处理的运动；
+   则使用本次运行的 `--velocity-abort-rad-s`。启动 `LOCKED` settle 也使用后者，以区分
+   使能瞬态与首次 Ctrl-C 的静止快照要求。这些门只决定是否能安全进入保持，不限制进入
+   保持后的正常人工拖动；保持阶段按 `--velocity-abort-rad-s` 和
+   `--acceleration-abort-rad-s2` 监视真正不可处理的运动；
 4. 只有通过上述检查后才发送第一帧。发送集始终是完整 `joint1..joint6`，vendor `kp=0`。
    protective-hold profile 的软件 Kp=0；未选择非零 driver Kd 时，软件使用
    `--protective-hold-kd`（默认 `1.0 N·m·s/rad`）作为中等阻尼；显式选择 driver Kd 时，
