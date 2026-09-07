@@ -341,9 +341,23 @@ def _stopped_payload(
     control_fault = composition.application.control_fault
     lower_hold_proved = bool(hold is not None and hold.succeeded)
     passive_read_failures = []
+    gateway_session = composition.deployment.gateway_session
     for skill_id, executor in (
-        composition.deployment.gateway_session.executors_by_skill_id.items()
+        ("state.read_tcp_pose", gateway_session.state_executor),
+        ("perception.capture_rgb", gateway_session.rgb_executor),
+        ("perception.capture_depth", gateway_session.depth_executor),
+        ("perception.localize_objects", gateway_session.localization_executor),
+        (
+            "perception.plan_point_grasp",
+            gateway_session.station_point_grasp_executor,
+        ),
+        (
+            "perception.render_point_grasp_candidate",
+            gateway_session.station_point_grasp_render_executor,
+        ),
     ):
+        if executor is None:
+            continue
         diagnostics = getattr(executor, "failure_diagnostics", ())
         passive_read_failures.extend(
             {"skill_id": skill_id, **dict(diagnostic)}

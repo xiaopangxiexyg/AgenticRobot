@@ -461,10 +461,10 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     passive_executor = SimpleNamespace(
         failure_diagnostics=(
             {
-                "executor_id": "camera-reader:test",
-                "operation_id": "operation:rgb:test",
+                "executor_id": "point-grasp-planner:test",
+                "operation_id": "operation:point-grasp:test",
                 "exception_type": "RuntimeError",
-                "message": "rgb_capture_inter_camera_skew_exceeded",
+                "message": "point-grasp inference failed",
                 "failed_at": 10.25,
             },
         )
@@ -511,8 +511,14 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
             gateway_session=SimpleNamespace(
                 contract_bundle=SimpleNamespace(route_manifest=manifest),
                 executors_by_skill_id={
-                    "perception.capture_rgb": passive_executor,
+                    "motion.step_tcp_cardinal": SimpleNamespace(),
                 },
+                state_executor=SimpleNamespace(failure_diagnostics=()),
+                rgb_executor=None,
+                depth_executor=None,
+                localization_executor=None,
+                station_point_grasp_executor=passive_executor,
+                station_point_grasp_render_executor=None,
             ),
             control_runtime=runtime,
         ),
@@ -565,11 +571,11 @@ def test_cli_assembles_then_reports_ready_and_lower_hold(
     assert events[1]["control_cycle"]["cycle_count"] == 9
     assert events[1]["passive_read_failures"] == [
         {
-            "skill_id": "perception.capture_rgb",
-            "executor_id": "camera-reader:test",
-            "operation_id": "operation:rgb:test",
+            "skill_id": "perception.plan_point_grasp",
+            "executor_id": "point-grasp-planner:test",
+            "operation_id": "operation:point-grasp:test",
             "exception_type": "RuntimeError",
-            "message": "rgb_capture_inter_camera_skew_exceeded",
+            "message": "point-grasp inference failed",
             "failed_at": 10.25,
         }
     ]
