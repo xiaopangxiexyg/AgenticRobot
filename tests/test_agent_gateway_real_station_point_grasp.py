@@ -4,8 +4,9 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image
 
-from agent_gateway.profiles.real import realsense_perception
+from agent_gateway.profiles.real import point_grasp_render_gateway, realsense_perception
 from agent_gateway.profiles.real.perception_application import (
     assemble_camera_only_real_perception_composition,
 )
@@ -28,6 +29,7 @@ from agent_gateway.profiles.real.station_point_grasp_deployment import (
 )
 from agent_gateway.profiles.real.station_point_grasp_render_deployment import (
     REAL_STATION_POINT_GRASP_RENDER_OUTPUT_SLOT_ID_V1,
+    build_station_bound_point_grasp_render_registration,
 )
 from agent_gateway.protocol.contracts import AgentSkillRequest
 from agent_gateway.transport.client_bindings import (
@@ -327,6 +329,48 @@ def test_station_point_grasp_fails_if_revision_changes_during_inference() -> Non
 
     with pytest.raises(RuntimeError, match="during point-grasp model inference"):
         provider.plan_request(_request())
+
+
+def test_debug_target_coordinate_overlay_projects_depth_target_in_station_frame() -> (
+    None
+):
+    image = Image.new("RGB", (200, 160), (10, 10, 10))
+    rendered = point_grasp_render_gateway._render_target_coordinate_debug_overlay(
+        image,
+        target_point_reference_m=(0.0, 0.0, 1.0),
+        reference_from_camera=np.eye(4),
+        intrinsics={
+            "width": 200,
+            "height": 160,
+            "fx": 100.0,
+            "fy": 100.0,
+            "cx": 100.0,
+            "cy": 80.0,
+        },
+    )
+
+    assert rendered is not image
+    assert image.getpixel((100, 74)) == (10, 10, 10)
+    assert rendered.getpixel((100, 74)) == (0, 255, 255)
+    assert rendered.getpixel((103, 80)) == (255, 64, 64)
+    assert rendered.getpixel((100, 84)) == (64, 255, 64)
+
+
+def test_debug_target_coordinate_profile_is_default_off_and_hash_bound() -> None:
+    _source, _revision, _planner, point_grasp, _provider = _provider_stack()
+    default = build_station_bound_point_grasp_render_registration(
+        point_grasp_registration=point_grasp,
+    )
+    enabled = build_station_bound_point_grasp_render_registration(
+        point_grasp_registration=point_grasp,
+        debug_target_coordinate_overlay=True,
+    )
+
+    assert default.profile.debug_target_coordinate_overlay is False
+    assert enabled.profile.debug_target_coordinate_overlay is True
+    assert (
+        default.profile.semantic_content_hash != enabled.profile.semantic_content_hash
+    )
 
 
 def test_point_grasp_is_default_off_and_lifecycle_order_is_reversible(
