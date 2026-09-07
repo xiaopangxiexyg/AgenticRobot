@@ -122,17 +122,28 @@ def _fixed_transform_from_ancestor(
     return _pose(ancestor_from_current, field_name=f"{ancestor}_from_{descendant}")
 
 
-def _placement_matches_selected_urdf(value: object, *, urdf_path: Path) -> bool:
+def _placement_matches_selected_urdf(
+    value: object,
+    *,
+    urdf_path: Path,
+    asset_root: Path,
+) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
     declared = Path(value)
-    if declared.is_absolute():
-        try:
+    try:
+        if declared.is_absolute():
             return declared.resolve(strict=True) == urdf_path
-        except OSError:
+        if not declared.parts or declared.parts[0] != "assets":
             return False
-    parts = declared.parts
-    return bool(parts) and tuple(urdf_path.parts[-len(parts) :]) == parts
+        relative = Path(*declared.parts[1:])
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            return False
+        candidate = (asset_root / relative).resolve(strict=True)
+        candidate.relative_to(asset_root)
+        return candidate == urdf_path
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _require_registry_placement(
@@ -142,6 +153,7 @@ def _require_registry_placement(
     camera_frame: str,
     expected_parent: str,
     urdf_path: Path,
+    asset_root: Path,
 ) -> None:
     placements = frame_spec.get("placements")
     matches = tuple(
@@ -150,7 +162,11 @@ def _require_registry_placement(
         if isinstance(item, Mapping)
         and str(item.get("frame")) == camera_frame
         and str(item.get("parent_frame")) == expected_parent
-        and _placement_matches_selected_urdf(item.get("urdf"), urdf_path=urdf_path)
+        and _placement_matches_selected_urdf(
+            item.get("urdf"),
+            urdf_path=urdf_path,
+            asset_root=asset_root,
+        )
     )
     if len(matches) != 1:
         raise ValueError(
@@ -362,6 +378,7 @@ def build_rm65_rgb_camera_geometry(
     target_builder: object,
     camera_registry_path: str | Path,
     camera_mount_urdf_path: str | Path,
+    camera_asset_root: str | Path,
     scene_world_from_arm_base_by_side: Mapping[str, np.ndarray],
     scene_world_from_canonical_station: np.ndarray,
 ) -> RM65RgbCameraGeometry:
@@ -369,8 +386,16 @@ def build_rm65_rgb_camera_geometry(
 
     registry_path = Path(camera_registry_path).resolve(strict=True)
     urdf_path = Path(camera_mount_urdf_path).resolve(strict=True)
-    if not registry_path.is_file() or not urdf_path.is_file():
-        raise ValueError("camera registry and mount URDF must be regular files")
+    asset_root = Path(camera_asset_root).resolve(strict=True)
+    if (
+        not registry_path.is_file()
+        or not urdf_path.is_file()
+        or not asset_root.is_dir()
+    ):
+        raise ValueError(
+            "camera registry and mount URDF must be regular files and camera "
+            "asset root must be a directory"
+        )
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     cameras = registry.get("cameras")
     if not isinstance(cameras, Mapping):
@@ -428,6 +453,7 @@ def build_rm65_rgb_camera_geometry(
             camera_frame=camera_frame,
             expected_parent=expected_parent,
             urdf_path=urdf_path,
+            asset_root=asset_root,
         )
         parent_from_camera = _fixed_transform_from_ancestor(
             urdf_root=root,
@@ -479,6 +505,7 @@ def build_rm65_rgb_camera_geometry(
             camera_frame=camera_frame,
             expected_parent=expected_parent,
             urdf_path=urdf_path,
+            asset_root=asset_root,
         )
         parent_from_camera = _fixed_transform_from_ancestor(
             urdf_root=root,

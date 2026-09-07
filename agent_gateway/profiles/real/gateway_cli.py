@@ -50,8 +50,9 @@ from .session_authorization import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_CAMERA_ASSET_ROOT = _REPO_ROOT / "assets"
 DEFAULT_RM65_CAMERA_MOUNT_URDF = (
-    _REPO_ROOT / "assets/rm65_inspire_gripper_v4/"
+    _CAMERA_ASSET_ROOT / "rm65_inspire_gripper_v4/"
     "rm65_dual_arm_wrist_cameras_v4_head_camera_4b2_cad_with_legacy_housing.urdf"
 )
 DEFAULT_RM65_CAMERA_REGISTRY_V4 = (
@@ -594,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
         camera_registry_path=camera_registry,
         artifact_root=artifact_root,
         camera_mount_urdf_path=camera_mount_urdf,
+        camera_asset_root=_CAMERA_ASSET_ROOT if camera_mount_urdf is not None else None,
         object_localizer=object_localizer,
         point_grasp_planner=point_grasp_planner,
         debug_render_object_coordinates=args.debug_render_object_coordinates,

@@ -478,6 +478,27 @@ def test_composition_requires_complete_perception_attachment(
         )
 
 
+def test_composition_requires_camera_mount_and_asset_root_together(
+    monkeypatch,
+) -> None:
+    lower, _guard = _lower(monkeypatch)
+
+    with pytest.raises(ValueError, match="URDF and its asset root"):
+        assemble_exclusive_rm65_agent_primitive_composition(
+            lower=lower,
+            socket_path=REPO_ROOT / "temp/test-real-rm65-camera-root.sock",
+            authorized_side="right",
+            authorized_action="forward",
+            confirmation_token=REAL_AGENT_PRIMITIVE_CONFIRM_TOKEN,
+            client_id="rpent:test",
+            client_uid=1000,
+            runtime_session_id="real-rm65:camera-root-test",
+            control_domain_id="exclusive-real-skill:camera-root-test",
+            embodiment_instance_id="dual-rm65:camera-root-test",
+            camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        )
+
+
 def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
     monkeypatch,
     tmp_path,
@@ -503,6 +524,7 @@ def test_composition_opt_in_closes_v4_three_view_grasp_and_motion_routes(
         camera_registry_path=DEFAULT_RM65_CAMERA_REGISTRY_V4,
         artifact_root=tmp_path,
         camera_mount_urdf_path=DEFAULT_RM65_CAMERA_MOUNT_URDF,
+        camera_asset_root=REPO_ROOT / "assets",
         object_localizer=localizer,
         point_grasp_planner=planner,
         debug_render_object_coordinates=True,
