@@ -1,4 +1,4 @@
-# DexTeleop test suite
+# AgenticRobot test suite
 
 The current compatibility layout keeps general pytest modules at
 `tests/test_<owner-or-domain>_<feature>.py` and classifies execution semantics
@@ -10,8 +10,9 @@ refactors, marker changes, and file moves in separate reviewable batches.
 
 When production code or tests are being changed in parallel, use logical
 classification instead of physical migration.  Do not move or split a test
-module while it is modified, untracked, imported by another test, or named by
-an active plan or command.  Marker-only governance changes may proceed when
+module while another owner is editing it. Update current imports, scripts, and
+documented commands together when a move is justified; an old plan is not a
+permanent path freeze. Marker-only governance changes may proceed when
 they are isolated from the files under active ownership.
 
 Treat existing root-level test paths as compatibility interfaces during
@@ -30,11 +31,11 @@ into the migration diff.
 From the repository root:
 
 ```bash
-python -m pytest --collect-only -q
+bash scripts/run_pytest.sh --collect-only -q
 # Bounded edit feedback:
-python -m pytest -q -m "unit and not optional and not hardware and not slow_sim"
-python -m pytest -q -m "contract and not optional and not hardware and not slow_sim"
-python -m pytest -q -m "integration and not optional and not hardware and not slow_sim"
+bash scripts/run_pytest.sh -q -m "unit and not optional and not hardware and not slow_sim"
+bash scripts/run_pytest.sh -q -m "contract and not optional and not hardware and not slow_sim"
+bash scripts/run_pytest.sh -q -m "integration and not optional and not hardware and not slow_sim"
 # Parallel bounded edit feedback (unit + integration, isolated caches/reports):
 bash scripts/run_fast_feedback.sh
 # Complete compatibility and integration-commit acceptance:
@@ -48,6 +49,22 @@ audited. The sim-real suite now carries the same marker vocabulary and exposes
 its own fast/full commands in `sim/sim_real_tests/README.md`, but it is still
 selected only by an explicit path. Do not treat a successful default run as
 coverage of those suites.
+
+## Selecting evidence for a change
+
+| Change | Development feedback | Before integration |
+| --- | --- | --- |
+| Documentation or Skill wording | Links, examples, relevant contract checks | Review the diff; no new text-matching tests by default |
+| Behavior or bug fix | Focused owner tests, including the demonstrated failure | Affected consumers and failure/state transitions |
+| Public contract, dependency boundary, refactor | Contract and owner tests; compare collection if tests move | Relevant cross-package suites and full non-hardware acceptance on the combined commit |
+| Simulation/control dynamics | Deterministic replay or simulator cases with declared inputs | Relevant complete simulation acceptance; report hardware separately |
+
+Use coverage, when available in the test environment, to locate missed changed
+branches: invalid input, cancellation, timeout, stale state, persistence failure,
+and recovery. Do not prescribe an arbitrary repository percentage or create
+duplicate tests to raise it. A minimal environment's optional skips are useful
+feedback but do not satisfy acceptance for changed optional behavior. Record
+missing dependencies and known unrelated failures explicitly.
 
 ## Cost gates in parallel worktrees
 
@@ -156,7 +173,7 @@ imported, and are skipped unless the operator supplies `--run-hardware`.
 The explicit invocation shape is:
 
 ```bash
-python -m pytest -q -m hardware --run-hardware <exact-test-node>
+bash scripts/run_pytest.sh -q -m hardware --run-hardware <exact-test-node>
 ```
 
 That flag is permission, not a safety check.  Before running it, follow the

@@ -215,18 +215,27 @@ def test_prepared_server_adapter_advertises_decodes_and_restores_class() -> None
     )
     metadata = {"dataset_adapter": {"camera_slots": ["base_0_rgb"]}}
 
-    with install_openpi_image_wire_server_adapter(module, config):
+    request_key = "observation.images.front"
+    with install_openpi_image_wire_server_adapter(
+        module,
+        config,
+        image_keys=(request_key,),
+    ):
         server = module.WebsocketPolicyServer(metadata=metadata)
         capability = server._metadata[OPENPI_IMAGE_WIRE_CAPABILITY_KEY_V1]
+        assert capability["image_keys"] == [request_key]
         encoded, _ = encode_openpi_image_wire_request(
-            {"base_0_rgb": _image()},
-            _client(OPENPI_IMAGE_WIRE_JPEG_V1),
+            {request_key: _image()},
+            OpenPIImageWireClientConfig(
+                preferred_codec=OPENPI_IMAGE_WIRE_JPEG_V1,
+                image_keys=(request_key,),
+            ),
             {OPENPI_IMAGE_WIRE_CAPABILITY_KEY_V1: capability},
         )
         result = server._infer(encoded)
 
         assert result["actions"].shape == (1, 2)
-        assert server.received["base_0_rgb"].shape == (6, 6, 3)
+        assert server.received[request_key].shape == (6, 6, 3)
         assert server.last_image_wire_decode_receipt.image_count == 1
 
     assert module.WebsocketPolicyServer is FakeWebsocketPolicyServer
@@ -266,7 +275,7 @@ def test_transport_encodes_after_handshake_and_records_wire_sizes() -> None:
     assert receipt.response_bytes is not None
 
 
-def test_policy_binds_optimized_codec_to_artifact_camera_slots() -> None:
+def test_policy_binds_optimized_codec_to_actual_openpi_request_keys() -> None:
     try:
         from deployments.openpi.client.policy import OpenPIClientPolicyConfig
     except ModuleNotFoundError as exc:
@@ -275,15 +284,55 @@ def test_policy_binds_optimized_codec_to_artifact_camera_slots() -> None:
         raise
 
     config = OpenPIClientPolicyConfig(
-        required_camera_slots=("base_0_rgb",),
+        required_camera_slots=(
+            "base_0_rgb",
+            "left_wrist_0_rgb",
+            "right_wrist_0_rgb",
+        ),
+        required_image_keys=("front", "left_wrist", "right_wrist"),
+        image_key_map={
+            "front": "observation.images.front",
+            "left_wrist": "observation.images.left_wrist",
+            "right_wrist": "observation.images.right_wrist",
+        },
         image_wire_config={
             "preferred_codec": OPENPI_IMAGE_WIRE_JPEG_V1,
             "allow_legacy_fallback": True,
         },
     )
 
-    assert config.image_wire_config.image_keys == ("base_0_rgb",)
+    assert config.image_wire_config.image_keys == (
+        "observation.images.front",
+        "observation.images.left_wrist",
+        "observation.images.right_wrist",
+    )
     assert config.image_wire_config.preferred_codec == OPENPI_IMAGE_WIRE_JPEG_V1
+
+
+def test_prepared_runtime_maps_camera_slots_to_actual_request_keys() -> None:
+    from deployments.openpi.prepared_server_runtime import (
+        _prepared_request_image_keys,
+    )
+
+    camera_slots = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+    request_keys = (
+        "observation.images.front",
+        "observation.images.left_wrist",
+        "observation.images.right_wrist",
+    )
+    resolution = SimpleNamespace(
+        deployment_artifact=SimpleNamespace(
+            camera_input=SimpleNamespace(
+                server_camera_slots=camera_slots,
+                inputs=tuple(
+                    SimpleNamespace(model_input_key=key) for key in request_keys
+                ),
+            )
+        )
+    )
+    config = SimpleNamespace(model=SimpleNamespace(image_keys=camera_slots))
+
+    assert _prepared_request_image_keys(resolution, config) == request_keys
 
 
 def test_actual_openpi_server_class_can_be_wrapped_without_model_or_socket() -> None:

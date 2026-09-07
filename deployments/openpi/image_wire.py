@@ -834,6 +834,8 @@ def simulate_openpi_image_wire_roundtrip(
 def install_openpi_image_wire_server_adapter(
     websocket_policy_server_module: Any,
     config: OpenPIImageWireServerConfig,
+    *,
+    image_keys: Sequence[str] | None = None,
 ) -> Iterator[None]:
     """Temporarily wrap OpenPI's server class inside one prepared process."""
 
@@ -842,15 +844,32 @@ def install_openpi_image_wire_server_adapter(
     if not config.enabled:
         yield
         return
+    configured_image_keys = (
+        None
+        if image_keys is None
+        else tuple(str(value).strip() for value in image_keys)
+    )
+    if configured_image_keys is not None and (
+        not configured_image_keys
+        or any(not key for key in configured_image_keys)
+        or len(set(configured_image_keys)) != len(configured_image_keys)
+    ):
+        raise OpenPIImageWireError(
+            "Image-wire server request keys must be unique and non-empty."
+        )
     original = websocket_policy_server_module.WebsocketPolicyServer
 
     class ImageWireWebsocketPolicyServer(original):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            image_keys = _server_image_keys(self._metadata)
+            request_image_keys = (
+                _server_image_keys(self._metadata)
+                if configured_image_keys is None
+                else configured_image_keys
+            )
             capability = build_openpi_image_wire_capability(
                 config,
-                image_keys=image_keys,
+                image_keys=request_image_keys,
             )
             existing = self._metadata.get(OPENPI_IMAGE_WIRE_CAPABILITY_KEY_V1)
             if existing is not None and existing != capability:

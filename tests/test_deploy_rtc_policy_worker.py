@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import threading
 import time
 
@@ -12,6 +13,7 @@ from robot_motion.deploy import (
     POLICY_WORKER_SESSION_ACTIVE,
     POLICY_WORKER_SESSION_DRAINED,
     PolicyInferenceRequest,
+    RTC_FLOW_INPAINT_MODE_V1,
     admit_policy_chunk_result,
     admit_policy_inference_request,
     create_policy_async_producer,
@@ -23,6 +25,8 @@ from robot_motion.deploy.policy_worker import (
     POLICY_EXECUTOR_CANCEL_NOT_SUPPORTED,
     POLICY_EXECUTOR_CANCEL_PENDING,
     POLICY_EXECUTOR_CANCEL_REQUESTED,
+    POLICY_WORKER_FAULT_DETAIL_MAX_CHARS,
+    _fault_result,
 )
 from robot_motion.deploy.observation_view import PolicyObservationView
 from robot_motion.runtime.observation_cut import (
@@ -283,6 +287,48 @@ def test_worker_exception_becomes_typed_fault_completion() -> None:
         )
     finally:
         worker.stop(timeout_sec=1.0)
+
+
+def test_conditioned_worker_fault_preserves_binding_without_fake_receipts() -> None:
+    work_item, plan, _policy, _record, _left, _right = _virtual_work_item()
+    request = replace(
+        work_item.request,
+        rtc_mode=RTC_FLOW_INPAINT_MODE_V1,
+        conditioning_binding_hash="sha256:conditioned-worker-fault",
+    )
+    producer = create_policy_async_producer(
+        state_id="async-producer:conditioned-worker-fault",
+        plan=plan,
+        worker_session_id=work_item.worker_session_id,
+        created_at=10.0,
+    )
+    requested = admit_policy_inference_request(producer, request)
+    assert requested.receipt.accepted
+
+    result = _fault_result(
+        request,
+        inference_started_at=10.0,
+        inference_completed_at=10.0,
+        result_received_at=10.0,
+        error=RuntimeError("transport deadline\n" + "x" * 1000),
+    )
+
+    assert result.conditioning_binding_hash == request.conditioning_binding_hash
+    assert result.conditioning_encoding_receipt_hash is None
+    assert result.conditioning_consumption_receipt_hash is None
+    assert result.fault_code == "policy_worker_exception:RuntimeError"
+    assert result.fault_detail is not None
+    assert len(result.fault_detail) == POLICY_WORKER_FAULT_DETAIL_MAX_CHARS
+    assert "\n" not in result.fault_detail
+    admitted = admit_policy_chunk_result(
+        requested.state,
+        result,
+        worker_session_id=work_item.worker_session_id,
+        admitted_at=10.0,
+        actual_cursor_at=10.0,
+    )
+    assert not admitted.receipt.accepted
+    assert admitted.receipt.reasons == ("worker_result_fault",)
 
 
 def test_stop_requests_executor_cancel_and_only_thread_exit_proves_drain() -> None:

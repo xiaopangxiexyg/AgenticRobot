@@ -792,6 +792,16 @@
       "expected_rule": "!.agents/skills/remote-access/**"
     },
     {
+      "label": "versioned integrate-shared-worktrees Skill root",
+      "probe": ".agents/skills/integrate-shared-worktrees",
+      "expected_rule": "!.agents/skills/integrate-shared-worktrees/"
+    },
+    {
+      "label": "versioned integrate-shared-worktrees Skill content",
+      "probe": ".agents/skills/integrate-shared-worktrees/.dexteleop-local-resource-probe",
+      "expected_rule": "!.agents/skills/integrate-shared-worktrees/**"
+    },
+    {
       "label": "versioned data documentation",
       "probe": "docs/data/.dexteleop-local-resource-probe",
       "expected_rule": "!docs/data/**"

@@ -160,7 +160,10 @@ def _runtime_semantics_baseline() -> dict[str, Any]:
         ),
         "deploy_last_action_stage": (
             "accepted_canonical_safe_action"
-            if "last_action = canonical_action.action.vector.astype" in deploy_source
+            if (
+                "last_action = canonical_action.action.vector.astype" in deploy_source
+                or "last_action = _prepared_action_last_action(" in deploy_source
+            )
             and "if execution.accepted:" in deploy_source
             else "missing"
         ),

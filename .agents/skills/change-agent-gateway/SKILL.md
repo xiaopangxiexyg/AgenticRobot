@@ -1,6 +1,6 @@
 ---
 name: change-agent-gateway
-description: Change or review a proposed change to AgenticRobot agent_gateway-owned protocol, runtime, transport, semantic Skill, Route, Artifact I/O, compatibility, or concrete profile bindings. Use when a Gateway capability, schema, registration, executor binding, resource lifecycle, frame binding, admission, cancellation, HOLD, or public compatibility contract changes; do not use merely because a task runs remotely or debugs motion outside a Gateway boundary.
+description: Change or review AgenticRobot Gateway protocol, admission, transport, semantic Skills, Routes, Artifact I/O, compatibility, or concrete profile bindings. Use when a Gateway-owned contract changes, not for unrelated motion or remote execution.
 ---
 
 # Change Agent Gateway

@@ -1,0 +1,110 @@
+# 独立 Git 开发与交接
+
+这是 AgenticRobot 维护的通用轻量 Git 流程，RPent 等仓库可复用。默认开发入口
+仍为 HarnessCodingTool 定义的 Harness。选择独立 Git 时说明一次即可，不需要
+Harness 服务、Task、lease 或机器人资产。已受 Harness 管理的工作必须先完成
+明确交接才能切换；不能用本流程绕过其冲突、写入、证据或集成门禁。
+
+## 创建与所有权
+
+先确认目标仓库、开发线和已有工作：
+
+```bash
+git worktree list --porcelain
+git status --short --branch
+```
+
+本项目通常以 AgenticRobot `development`、RPent `correction` 为基线；其他开发线
+必须来自实际任务。复用清楚归属的现有任务，或为独立范围建立新工作区。短路径、
+不同基线和隔离集成是合理的新建原因。不要仅为命名统一重命名旧分支。
+
+从 AgenticRobot 运行认领工具；`--repo-root` 可指定另一个 Git 仓库：
+
+```bash
+python scripts/claim_worktree.py \
+  --repo-root /absolute/path/to/repository \
+  --branch codex/<task-name> \
+  --path /absolute/path/to/new-worktree \
+  --base <development-line-or-commit> --owner <actual-owner> \
+  --write-scope 'src/feature/**' --write-scope 'tests/test_feature.py' \
+  --semantic-scope '<changed behavior or public contract>' \
+  --validation '<planned focused checks>'
+```
+
+`task/` 旧命名仍可用。工具只负责创建和声明，不自动判断语义独立性，也不持有
+排他锁。写入前确认没有其他所有者修改相同文件或公共契约；如果同仓库存在
+Harness Task，检查其当前范围并与其协调者解决重叠。
+
+资产不是认领前提。已配置且完整的只读资产可以自动链接；缺失资产会明确报告，
+纯代码或文档任务仍可创建。`--asset-root` 或 `--require-assets` 表示本次要求完整
+资产，验证失败则不创建分支。后续资产任务参考 `docs/setup/LOCAL_RESOURCES.md`。
+
+## 一个分支描述，按需读取
+
+在 clone 的本地 Git config 中保存描述，不再创建平行的进度 JSON 或状态文档。
+`claim_worktree.py` 写入、`worktree_inventory.py` 读取同一格式：
+
+```text
+owner: actual-owner
+state: active
+base: <full-commit-sha>
+tip: pending
+write-scope: src/feature/**
+write-scope: tests/test_feature.py
+semantic-scope: public feature behavior
+excludes: none
+depends-on: none
+validation: <command and, when finished, result/environment>
+```
+
+列表字段可重复，路径使用仓库相对 POSIX 路径或 glob，不把自然语言当成文件路径。
+状态为 `active`、`ready-for-integration`、`integrating`、`validated-for-mainline`、
+`blocked` 或 `superseded`。当前源码是事实来源，状态只是所有者的声明。
+旧版分号 `owner=...; write_scope=...` 记录可读，缺失 tip 只解释为 pending；
+旧 `candidate` 作为 tip 的兼容字段读取。不要批量重写同伴记录。
+
+用 `git branch --edit-description <branch>` 更新完整记录。跨 clone 交接时携带该
+描述，因为 Git config 不随 fetch/push 传递。单人普通任务不需要额外角色分配表。
+
+```bash
+python scripts/worktree_inventory.py /absolute/path/to/repository \
+  --mainline development --branch codex/<task> --branch <relevant-peer>
+```
+
+省略 `--branch` 做完整只读盘点。输出明确标明选择范围；选错不存在的分支会失败。
+`--strict` 将发现的问题转成非零退出码，不能当作并行授权。只读盘点可在未解决
+冲突时运行。不要每条命令重扫历史 worktree；开始写入、交接、集成及相关状态
+变化时刷新需要的事实。未知所有者不能被推断为空闲。
+
+工具报告具体重复路径及相同的声明字符串。不同 glob、不同措辞仍可能指向同一
+公共契约，必须结合实际 API、schema、持久化、依赖方向、执行权限做语义判断。
+有序集成输入之间的预期重叠不等于允许其他任务同时修改它们。
+
+## 验证与交接
+
+开发时跑最小相关行为测试，提交前覆盖受影响契约和合理失败路径。选层级的依据
+见各仓库 `tests/README.md`。不要为文案编辑新建重复断言；不要用宽泛覆盖率数字
+代替边界、异常、状态转换和消费者兼容性测试。测试代码也应按实际复用抽象。
+
+交接前检查 diff、工作区状态和实际 HEAD。ready 必须绑定完整 tip SHA、固定 base、
+已通过的命令和环境以及已知 skips/未验证行为。新增提交或参与运行的未提交源码
+使旧 ready 失效，先回到 active。无关运行记录要解释并保留，不靠删除制造干净状态。
+
+## 有授权的集成
+
+为本次目标更新指定唯一集成者；角色或分支名称本身不赋予合并/推送权限。
+先准备可评审的候选，再取得具体操作所需的授权。
+
+1. 固定目标线和输入的完整 SHA；按已确认依赖顺序在独立集成工作区合并输入。
+2. 检查组合结果并提交，运行该仓库要求的集成验收；记录这一个已验证的 tip。
+3. 更新目标前重查每个输入、目标及工作区状态；如果目标或输入变动，重新评估
+   受影响的集成和验证，不直接套用旧的绿色结果。
+4. 目标只能前移到这个已验证的提交。远端无法确认时保留本地结果，不声称已同步。
+
+集成记录增加 `target-ref: <actual-line>`，并按顺序重复
+`input: <branch-or-ref> <full-commit-sha>`；base 是创建集成分支时目标的 SHA。
+兼容旧的以 main 为目标的记录，但新记录始终明确目标，不能把 development 或
+correction 的移动误报为 main 的变化。
+
+不能解决的语义冲突交由对应所有者或用户决定；清楚且在范围内的机械冲突可自行
+修复。禁止通过修改、reset、clean、stash、移动或删除同伴 worktree 解决协调问题。

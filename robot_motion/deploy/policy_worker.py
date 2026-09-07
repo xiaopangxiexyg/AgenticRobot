@@ -77,6 +77,8 @@ POLICY_EXECUTOR_CANCELLATION_STATUSES_V1 = (
     POLICY_EXECUTOR_CANCEL_DECLINED,
     POLICY_EXECUTOR_CANCEL_FAILED,
 )
+POLICY_WORKER_FAULT_CODE_MAX_CHARS = 128
+POLICY_WORKER_FAULT_DETAIL_MAX_CHARS = 512
 
 
 def _required(value: object, *, field_name: str) -> str:
@@ -537,6 +539,14 @@ def _fault_result(
     error: BaseException,
 ) -> PolicyChunkResult:
     error_type = type(error).__name__
+    fault_code = f"policy_worker_exception:{error_type}"
+    if len(fault_code) > POLICY_WORKER_FAULT_CODE_MAX_CHARS:
+        fault_code = fault_code[:POLICY_WORKER_FAULT_CODE_MAX_CHARS]
+    fault_detail = " ".join(str(error).split()) or error_type
+    if len(fault_detail) > POLICY_WORKER_FAULT_DETAIL_MAX_CHARS:
+        fault_detail = (
+            fault_detail[: POLICY_WORKER_FAULT_DETAIL_MAX_CHARS - 3] + "..."
+        )
     return PolicyChunkResult(
         request_id=request.request_id,
         request_hash=request.semantic_content_hash,
@@ -566,8 +576,9 @@ def _fault_result(
         decoded_absolute_actions=(),
         model_output_hash=None,
         protocol_version="bounded_policy_worker_v1",
-        fault_code=f"policy_worker_exception:{error_type}",
-        fault_detail=str(error),
+        fault_code=fault_code,
+        fault_detail=fault_detail,
+        conditioning_binding_hash=request.conditioning_binding_hash,
     )
 
 

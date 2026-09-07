@@ -3,10 +3,10 @@
 Use `$remote-access` when invoking, diagnosing, or changing this wrapper set.
 This scoped file governs changes to `codex_remote/` itself.
 
-- Modify wrappers, shared safety logic, or safety policy only when the user
-  explicitly requests that surface. Inspect the wrapper, shared helper, focused
-  tests, and relevant `codex_remote/README.md` section; state the effect and keep
-  the change narrowly scoped.
+- Wrapper maintenance necessary for an authorized task may proceed within its
+  declared scope. Changes to safety policy, allowed effects, or authorization
+  boundaries require an explicit decision covering that behavior. Inspect the
+  affected wrapper, helper, focused tests, and relevant README section.
 - Preserve explicit target selection, fail-closed control-risk classification,
   fresh safety-token validation, bounded timeouts, and wrapper-owned quoting.
   Do not add an ad hoc bypass for remote writes, process control, device state,

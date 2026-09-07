@@ -1,6 +1,6 @@
 ---
 name: debug-teleop-ik-motion
-description: Diagnose, review, or change AgenticRobot pose-to-command behavior, including teleoperation jitter, sticking, catch-up, wrong-range or continued motion, IK branch and singularity faults, joint limits, interpolation, stateful modifiers, Active-versus-shadow gaps, and replay/deployment Pose-to-QPOS differences. Use for motion-path logic and evidence, not primary camera or device discovery, GUI, dataset schemas, remote execution, or Gateway wire contracts.
+description: Diagnose or change AgenticRobot pose-to-command motion, IK, reference, interpolation, dispatch, or stateful modifiers; compare offline, shadow, and Active evidence. Use for motion-path faults, not camera discovery or Gateway wire contracts.
 ---
 
 # Debug Teleoperation IK Motion
@@ -23,8 +23,9 @@ or validating a candidate.
   boundary; do not edit.
 - **Review:** evaluate a proposal or diff for contract violations and missing
   cases; do not silently implement it.
-- **Implement:** make the smallest reversible, evidence-supported change and
-  preserve a selectable fallback.
+- **Implement:** make the smallest structurally complete, evidence-supported
+  change. Use a known Git revision or deployment rollback for recovery; add a
+  selectable runtime fallback only for an identified operational requirement.
 - **Validate:** compare a named baseline and candidate under equivalent inputs
   and declared acceptance criteria.
 
@@ -72,7 +73,7 @@ change.
    frame, update clock, reset/HOLD/stale behavior, and bound. Validate the final
    sum, not only individual components.
 7. **Change reversibly.** Keep candidate generation, selection, smoothing, and
-   admission separable. Preserve the stable path unless promotion is requested.
+   admission separable. Preserve the baseline revision and its evidence.
    Add bounded reason codes or debug fields instead of unbounded hot-path logs.
    Never weaken or incidentally change canonical collision, force-stop, or
    emergency-stop behavior to make a motion-path candidate pass.
@@ -96,5 +97,5 @@ change.
 
 State the selected mode, strongest confirmed boundary, decisive evidence,
 remaining alternatives, confidence, and next safe action. For implementation,
-also report the fallback and exact validation run. Distinguish offline, replay,
+also report the recovery path and exact validation run. Distinguish offline, replay,
 simulation, shadow, and real-hardware evidence.

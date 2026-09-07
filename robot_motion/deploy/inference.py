@@ -809,10 +809,24 @@ class PolicyChunkResult:
             self.conditioning_consumption_receipt_hash,
         )
         if any(value is not None for value in conditioning_hashes):
-            if not all(value is not None for value in conditioning_hashes):
+            if self.conditioning_binding_hash is None:
                 raise ValueError(
-                    "A conditioned result requires binding, encoding, and "
-                    "consumption receipt hashes together."
+                    "Conditioning receipts require their causal binding hash."
+                )
+            if (
+                self.conditioning_consumption_receipt_hash is not None
+                and self.conditioning_encoding_receipt_hash is None
+            ):
+                raise ValueError(
+                    "A conditioning consumption receipt requires its encoding "
+                    "receipt hash."
+                )
+            if status == "ready" and not all(
+                value is not None for value in conditioning_hashes
+            ):
+                raise ValueError(
+                    "A ready conditioned result requires binding, encoding, "
+                    "and consumption receipt hashes together."
                 )
             if self.rtc_mode != RTC_FLOW_INPAINT_MODE_V1:
                 raise ValueError(

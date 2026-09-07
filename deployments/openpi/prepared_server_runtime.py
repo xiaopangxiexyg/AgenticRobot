@@ -335,6 +335,34 @@ def build_prepared_openpi_config(
     return config
 
 
+def _prepared_request_image_keys(
+    resolution: PreparedDeploymentResolution,
+    config: Any,
+) -> tuple[str, ...]:
+    """Resolve the keys present in the actual OpenPI inference request."""
+
+    camera_input = resolution.deployment_artifact.camera_input
+    if camera_input is None:
+        raise ValueError(
+            "Prepared image-wire deployment requires a camera input contract."
+        )
+    expected_slots = tuple(str(value) for value in config.model.image_keys)
+    if camera_input.server_camera_slots != expected_slots:
+        raise ValueError(
+            "Prepared image-wire camera slots differ from the loaded model."
+        )
+    request_keys = tuple(item.model_input_key for item in camera_input.inputs)
+    if (
+        not request_keys
+        or any(not key for key in request_keys)
+        or len(set(request_keys)) != len(request_keys)
+    ):
+        raise ValueError(
+            "Prepared image-wire request keys must be unique and non-empty."
+        )
+    return request_keys
+
+
 def prepared_config_summary(
     resolution: PreparedDeploymentResolution,
     config: Any,
@@ -397,7 +425,7 @@ def prepared_config_summary(
     if image_wire_config is not None and image_wire_config.enabled:
         summary["image_wire_capability"] = build_openpi_image_wire_capability(
             image_wire_config,
-            image_keys=tuple(str(value) for value in config.model.image_keys),
+            image_keys=_prepared_request_image_keys(resolution, config),
         )
     return summary
 
@@ -504,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
         resolution.profile.get("openpi_observation_mode"),
         image_keys=tuple(str(value) for value in config.model.image_keys),
     )
+    request_image_keys: tuple[str, ...] | None = None
     if state_only_bridge is not None and image_wire_config.enabled:
         raise ValueError(
             "State-only prepared deployment cannot enable image-wire transport."
@@ -522,20 +551,21 @@ def main(argv: list[str] | None = None) -> int:
                 f"model resolution: {requested_resolution!r} != "
                 f"{model_resolution!r}."
             )
-        advertised_capability = build_openpi_image_wire_capability(
-            image_wire_config,
-            image_keys=tuple(str(value) for value in config.model.image_keys),
-        )
+        request_image_keys = _prepared_request_image_keys(resolution, config)
         training_alignment = resolution.checkpoint_payload.get(
             OPENPI_IMAGE_WIRE_TRAINING_METADATA_KEY_V1
         )
         if training_alignment is not None:
+            expected_training_capability = build_openpi_image_wire_capability(
+                image_wire_config,
+                image_keys=tuple(str(value) for value in config.model.image_keys),
+            )
             if not isinstance(training_alignment, Mapping) or (
                 training_alignment.get("server_capability")
-                != advertised_capability
+                != expected_training_capability
             ):
                 raise ValueError(
-                    "Prepared image-wire server capability differs from the "
+                    "Prepared image-wire training capability differs from the "
                     "checkpoint training alignment contract."
                 )
     registry = training_config._CONFIGS_DICT
@@ -577,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
         with install_openpi_image_wire_server_adapter(
             server_module.websocket_policy_server,
             image_wire_config,
+            image_keys=request_image_keys,
         ), install_openpi_state_only_server_adapter(
             server_module.websocket_policy_server,
             state_only_bridge,

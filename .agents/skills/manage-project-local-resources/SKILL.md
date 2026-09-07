@@ -1,6 +1,6 @@
 ---
 name: manage-project-local-resources
-description: Audit, add, link, copy, migrate, recreate, or rebind AgenticRobot resources intentionally kept outside Git, including datasets, records, assets, model or vendor bundles, machine-local configuration, development certificates, generated output, and runtime artifacts. Use when .gitignore, the local-resources manifest, asset-store links, physical storage, or cross-worktree resource placement changes; do not use for tracked source refactors, dataset semantics, or remote command execution itself.
+description: Manage AgenticRobot ignored resources, asset links, datasets, model/vendor bundles, machine configuration, or runtime output across worktrees. Use for placement, binding, migration, or ignore-policy changes; domain schemas and remote commands have separate owners.
 ---
 
 # Manage Project Local Resources

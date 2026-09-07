@@ -1,0 +1,4 @@
+interface:
+  display_name: "Standalone Git Worktrees"
+  short_description: "Coordinate isolated Git work and reviewed handoffs"
+  default_prompt: "Use $integrate-shared-worktrees to coordinate this standalone Git task and its validation; use the Task contract if Harness manages it."
