@@ -603,6 +603,7 @@ class ControllerPoseTelemetryRuntime:
 
     def snapshot_status(self) -> dict[str, Any]:
         with self.lock:
+            now_ns = int(self.monotonic_ns_clock())
             clients = {
                 str(client_id): {
                     "client_instance_id": state.client_instance_id,
@@ -613,6 +614,30 @@ class ControllerPoseTelemetryRuntime:
                     "controller_count": len(state.latest.controllers)
                     if state.latest is not None
                     else 0,
+                    "latest_age_s": (
+                        None
+                        if state.latest is None
+                        else max(
+                            0,
+                            now_ns - int(state.latest.received_monotonic_ns),
+                        )
+                        / 1_000_000_000.0
+                    ),
+                    "controller_tracking": (
+                        []
+                        if state.latest is None
+                        else [
+                            {
+                                "source_session_id": item.source_session_id,
+                                "handedness": item.handedness,
+                                "target_ray_mode": item.target_ray_mode,
+                                "tracking_state": item.tracking_state,
+                                "reason": item.reason,
+                                "error_name": item.error_name,
+                            }
+                            for item in state.latest.controller_diagnostics
+                        ]
+                    ),
                 }
                 for client_id, state in self.states.items()
             }

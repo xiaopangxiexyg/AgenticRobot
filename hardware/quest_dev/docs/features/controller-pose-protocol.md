@@ -41,6 +41,15 @@ latest pose，并拒绝旧 generation 的后续样本。session end 或 WSS disc
       "emulated_position": false,
       "matrix_reference_from_grip": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.1, 1.2, -0.5, 1]
     }
+  ],
+  "controller_diagnostics": [
+    {
+      "source_session_id": "input-1",
+      "handedness": "right",
+      "target_ray_mode": "tracked-pointer",
+      "tracking_state": "tracked",
+      "reason": "tracked"
+    }
   ]
 }
 ```
@@ -49,7 +58,11 @@ latest pose，并拒绝旧 generation 的后续样本。session end 或 WSS disc
 正交旋转和 determinant `+1`，限制 controller 数量、profiles 长度、序号及到达频率。
 runtime 只保留每个认证客户端的 latest sample；不写文件、不形成轨迹，也不调用任何
 机器人、外部缓存或控制接口。需要 pairing bearer 的 `/api/status` 只暴露
-session/generation/sequence/count 摘要，不暴露 pose matrix。
+session/generation/sequence/count、样本 age 和无位姿的 tracking reason 摘要，不暴露
+pose matrix。`controller_diagnostics` 对当前每个 `XRInputSource` 都存在，因此
+`controllers=[]` 时仍能区分 `missing_grip_space`、`pose_unavailable`（即
+`getPose()==null`）、`pose_error`、无效 transform 等原因。诊断和 pose 必须一致，
+不能用诊断字段把 emulated/untracked 样本伪装成真实位姿。
 
 `profiles` 是当前 `XRInputSource` 的能力诊断字段，不是稳定硬件身份。Quest Browser
 可能在 XR 启动或追踪建立后从通用 profile 更新为具体 profile；浏览器和 host 都使用

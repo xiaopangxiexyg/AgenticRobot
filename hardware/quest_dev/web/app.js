@@ -453,6 +453,7 @@
             sourceSessionId,
             sample,
             sampled.diagnostic,
+            time,
           );
           if (displayPose) displayControllerPoses.push(displayPose);
         }
