@@ -252,8 +252,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         type=_positive_float,
         default=0.4,
         help=(
-            "Maximum accepted warm inference latency for Active conditioned "
-            "RTC (default: 0.4 s, the 12-step bound at 30 Hz)."
+            "Exclusive upper bound for every admitted warm inference latency "
+            "in Active conditioned RTC (default: strictly below 0.4 s)."
         ),
     )
     parser.add_argument(
