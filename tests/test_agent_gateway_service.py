@@ -2065,6 +2065,15 @@ def test_required_output_passive_read_can_commit_failure_without_artifact(
         failed = service.operation_store.get(operation_id)
         assert failed is not None and failed.status == "failed"
         assert failed.reason_code == "passive_read_executor_exception:RuntimeError"
+        assert executor.failure_diagnostics == (
+            {
+                "executor_id": "passive-reader-executor:required-output-failure",
+                "operation_id": operation_id,
+                "exception_type": "RuntimeError",
+                "message": "fixture read failed before producing its Artifact",
+                "failed_at": 10.0,
+            },
+        )
         assert failed.output_artifact_bindings == ()
         assert domain_port.calls == []
     finally:
