@@ -9,9 +9,10 @@
 - 当前候选位于
   `/home/zc/HandMotion/Developing/HarnessLocal/agentic-robot/Worktrees/AR-20260906-b601-gravity-startup-handoff-r1/AgenticRobot`，分支为
   `task/AR-20260906-b601-gravity-startup-handoff-r1`。
-- 本文撰写时实际代码提交为 `7fb67ccb611dfd40a043e5a25123e0a2537639ae`，tree 为
-  `d809c202755a11cc52ba9fe201c89d9a22da901e`，工作树干净；新增本文后旧 tip 不再是
-  最终交接 tip，交接前必须重新执行本文第 12 节的 pin 检查。
+- 本文初稿曾以 `7fb67ccb611dfd40a043e5a25123e0a2537639ae`（tree
+  `d809c202755a11cc52ba9fe201c89d9a22da901e`）为基线；这两个值只用于历史 provenance，
+  不是当前候选的永久身份。任何文档、代码或合并提交都会使旧 pin 失效；交接、验收和
+  集成前必须按本文第 12 节重新读取候选的实际 `HEAD`、`HEAD^{tree}` 和 clean 状态。
 - 候选尚未合并到 `AgenticRobot-development-mainline`。当前 development checkout
   的现场 HEAD 为 `c0140d0fbf362bf9b3e94e840548a007b0a0039f`；使用
   `git merge-base --is-ancestor <candidate> <development>` 重新确认，不得凭分支名推断
