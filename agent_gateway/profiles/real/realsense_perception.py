@@ -1204,10 +1204,13 @@ class RealSenseAgentPerceptionProvider:
                 evidence_refs=("real-rgb-static-camera:" + geometry_cut_hash,),
             )
         else:
+            pose_observed_at = _finite_timestamp(
+                self._clock(), field_name="camera pose clock"
+            )
             geometry = self.rgb_camera_geometry.pose_cut(
                 source_id=source_id,
                 frame_acquired_at=source_at,
-                now=now,
+                now=pose_observed_at,
             )
         capture_hash = canonical_content_hash(
             {
