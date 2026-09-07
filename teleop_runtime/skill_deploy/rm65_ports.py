@@ -7,6 +7,7 @@ it does not construct RealTeleop, a Gateway, a device, or a control thread.
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -24,8 +25,8 @@ from teleop_runtime.deploy.arm_safety_runtime import (
 )
 from teleop_runtime.deploy.arm_state_reader import ArmStateReader
 from teleop_runtime.deploy.dispatch import (
-    POSITION_REFERENCE_DISPATCH_AUDIT_POST,
     POSITION_REFERENCE_DISPATCH_AUDIT_CHOICES,
+    POSITION_REFERENCE_DISPATCH_AUDIT_POST,
     dispatch_position_reference_command,
     require_arm_backends_ready_for_position_dispatch,
 )
@@ -371,6 +372,7 @@ class ExclusiveRM65SkillDeployPorts:
         states = self.arm_state_reader.snapshot(
             requested_at,
             cut_after_refresh=True,
+            concurrent_refresh_sides=("left", "right"),
         )
         available_at = max(requested_at, float(self.clock()))
         qpos_by_side: dict[str, np.ndarray] = {}
@@ -379,7 +381,10 @@ class ExclusiveRM65SkillDeployPorts:
         for side in ("left", "right"):
             state = states.get(side)
             if not isinstance(state, Mapping):
-                raise RuntimeError(f"{side} RM65 hardware state is missing.")
+                # This is a live observation fault, not caller type validation.
+                raise RuntimeError(  # noqa: TRY004
+                    f"{side} RM65 hardware state is missing."
+                )
             if state.get("causal_snapshot_missing") is True:
                 raise RuntimeError(
                     f"{side} RM65 hardware qpos cut is causally unavailable "
@@ -405,8 +410,49 @@ class ExclusiveRM65SkillDeployPorts:
                 )
             age_sec = max(0.0, available_at - measured_at)
             if age_sec > self.profile.max_measurement_age_sec:
+                timing_by_side = {}
+                age_by_side = {}
+                measured_by_side = {}
+                for diagnostic_side in ("left", "right"):
+                    diagnostic_state = states.get(diagnostic_side)
+                    if not isinstance(diagnostic_state, Mapping):
+                        continue
+                    try:
+                        diagnostic_measured_at = float(
+                            diagnostic_state.get("hardware_measurement_timestamp")
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    measured_by_side[diagnostic_side] = diagnostic_measured_at
+                    age_by_side[diagnostic_side] = max(
+                        0.0,
+                        available_at - diagnostic_measured_at,
+                    )
+                    raw_timing = diagnostic_state.get("hardware_read_phase_timing")
+                    if isinstance(raw_timing, Mapping):
+                        timing_by_side[diagnostic_side] = {
+                            str(key): float(value)
+                            for key, value in raw_timing.items()
+                            if isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value))
+                        }
+                diagnostic = {
+                    "available_at": available_at,
+                    "measurement_age_sec_by_side": age_by_side,
+                    "measurement_span_sec": (
+                        max(measured_by_side.values())
+                        - min(measured_by_side.values())
+                        if len(measured_by_side) == 2
+                        else None
+                    ),
+                    "concurrently_refreshed_sides": ["left", "right"],
+                    "hardware_read_phase_timing_by_side": timing_by_side,
+                }
                 raise RuntimeError(
-                    f"{side} RM65 hardware qpos cut is stale: {age_sec:.6f}s."
+                    f"{side} RM65 hardware qpos cut is stale: {age_sec:.6f}s; "
+                    "coherence_diagnostic="
+                    + json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
                 )
             qpos_by_side[side] = qpos.copy()
             measured_at_by_side[side] = measured_at
@@ -415,9 +461,14 @@ class ExclusiveRM65SkillDeployPorts:
                 "measurement_sequence": sequence,
                 "qpos": tuple(float(value) for value in qpos),
             }
+        measurement_span_sec = max(measured_at_by_side.values()) - min(
+            measured_at_by_side.values()
+        )
         evidence_hash = canonical_content_hash(
             {
                 "available_at": available_at,
+                "concurrently_refreshed_sides": ["left", "right"],
+                "measurement_span_sec": measurement_span_sec,
                 "sides": evidence_payload,
             },
             domain="dexteleop.real_skill.rm65_hardware_qpos_cut.v1",
@@ -428,6 +479,8 @@ class ExclusiveRM65SkillDeployPorts:
                 metadata={
                     "source": "exclusive_rm65_skill_deploy",
                     "hardware_qpos_cut_hash": evidence_hash,
+                    "concurrently_refreshed_sides": ("left", "right"),
+                    "hardware_measurement_span_sec": measurement_span_sec,
                 },
             ),
             qpos_by_side=qpos_by_side,

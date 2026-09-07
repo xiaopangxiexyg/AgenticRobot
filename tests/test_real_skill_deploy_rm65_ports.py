@@ -10,14 +10,14 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from agent_gateway.profiles.real.exclusive_factory import (
+    assemble_exclusive_rm65_agent_primitive_deployment,
+)
 from robot_motion.runtime import (
     CommandDispatchReceipt,
     EffectorCommand,
     TeleopCommand,
     TeleopObservation,
-)
-from agent_gateway.profiles.real.exclusive_factory import (
-    assemble_exclusive_rm65_agent_primitive_deployment,
 )
 from teleop_runtime.interfaces import EffectorBackend
 from teleop_runtime.skill_deploy import (
@@ -263,8 +263,79 @@ def test_rm65_ports_reject_stale_hardware_cut() -> None:
     ports, _, _ = _ports(age_sec=1.0)
     ports.start()
 
-    with pytest.raises(RuntimeError, match="hardware qpos cut is stale"):
+    with pytest.raises(RuntimeError, match="coherence_diagnostic") as captured:
         ports.observe()
+
+    assert '"concurrently_refreshed_sides":["left","right"]' in str(captured.value)
+
+
+def test_rm65_ports_request_one_concurrent_dual_arm_fresh_cut() -> None:
+    ports, _, _ = _ports()
+    ports.start()
+    ports.clock = lambda: 100.21
+
+    def state(side: str, measured_at: float) -> dict[str, object]:
+        return {
+            "hardware_qpos": np.full(6, 0.1 if side == "left" else 0.2),
+            "hardware_measurement_timestamp": measured_at,
+            "hardware_measurement_sequence": 4 if side == "left" else 5,
+            "hardware_measurement_valid": True,
+            "hardware_read_success": True,
+        }
+
+    class _CoherenceReader:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def snapshot(
+            self,
+            _now: float,
+            *,
+            cut_after_refresh: bool,
+            concurrent_refresh_sides: tuple[str, ...] = (),
+        ) -> dict[str, dict[str, object]]:
+            assert cut_after_refresh is True
+            self.calls.append(concurrent_refresh_sides)
+            assert concurrent_refresh_sides == ("left", "right")
+            return {
+                "left": state("left", 100.205),
+                "right": state("right", 100.20),
+            }
+
+    reader = _CoherenceReader()
+    ports.arm_state_reader = reader
+
+    cut = ports.observe()
+
+    assert reader.calls == [("left", "right")]
+    assert cut.observation.metadata["concurrently_refreshed_sides"] == (
+        "left",
+        "right",
+    )
+    assert cut.observation.metadata["hardware_measurement_span_sec"] == pytest.approx(
+        0.005
+    )
+    assert cut.measured_at == pytest.approx(100.20)
+
+
+def test_rm65_ports_avoid_serial_read_induced_staleness() -> None:
+    ports, backends, _ = _ports()
+    ports.start()
+    ports.clock = time.time
+    ports.arm_state_reader.clock = time.time
+
+    for backend in backends.values():
+        def delayed_refresh(*, selected_backend=backend):
+            time.sleep(0.21)
+            selected_backend.measured_at = time.time()
+            return selected_backend.get_state()
+
+        backend.refresh_state_from_hardware = delayed_refresh
+
+    cut = ports.observe()
+
+    assert cut.available_at - cut.measured_at < 0.05
+    assert cut.observation.metadata["hardware_measurement_span_sec"] < 0.05
 
 
 def test_rm65_ports_use_checked_dispatch_and_lower_hold() -> None:

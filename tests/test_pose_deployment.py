@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,10 @@ from dataset_contracts import (
 )
 from dataset_contracts.v22 import PolicyIOLayout
 from robot_motion.deploy.actions import NormalizedAction
-from robot_motion.deploy.observation import DeploymentObservation, build_deployment_observation
+from robot_motion.deploy.observation import (
+    DeploymentObservation,
+    build_deployment_observation,
+)
 from robot_motion.deploy.pose_adapter import (
     PoseDeploymentError,
     convert_last_action_to_policy_mode,
@@ -25,8 +29,12 @@ from robot_motion.deploy.pose_adapter import (
     convert_normalized_action_chunk_to_relative,
     prepare_observation_for_policy_pose_mode,
 )
-from robot_motion.deploy.schema import ACTION_ARM_POSE_SLICES, ACTION_DIM, OBSERVATION_STATE_DIM
-from robot_motion.deploy.schema import STATE_ARM_POSE_SLICES
+from robot_motion.deploy.schema import (
+    ACTION_ARM_POSE_SLICES,
+    ACTION_DIM,
+    OBSERVATION_STATE_DIM,
+    STATE_ARM_POSE_SLICES,
+)
 from robot_motion.deploy.session_contract import (
     POLICY_ABSOLUTE_FRAME_CANONICAL_DESK,
     resolve_deploy_session_contract,
@@ -655,3 +663,30 @@ def test_arm_state_reader_post_refresh_cut_is_live_only() -> None:
     assert live["causal_snapshot_missing"] is False
     assert live["causal_snapshot_cutoff_timestamp"] == pytest.approx(100.1)
     assert live["hardware_measurement_timestamp"] == pytest.approx(100.1)
+
+
+def test_arm_state_reader_refreshes_coherent_sides_concurrently() -> None:
+    backends = {
+        side: _MeasuredDeployArmBackend()
+        for side in ("left", "right")
+    }
+    barrier = threading.Barrier(2)
+    refreshes = {"left": 0, "right": 0}
+    for side, backend in backends.items():
+        original = backend.refresh_state_from_hardware
+
+        def refresh(*, selected_side=side, selected_original=original):
+            refreshes[selected_side] += 1
+            barrier.wait(timeout=1.0)
+            return selected_original()
+
+        backend.refresh_state_from_hardware = refresh
+    reader = ArmStateReader(backends, refresh_hz=30.0, clock=lambda: 100.0)
+
+    reader.snapshot(
+        100.0,
+        cut_after_refresh=True,
+        concurrent_refresh_sides=("left", "right"),
+    )
+
+    assert refreshes == {"left": 1, "right": 1}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -501,6 +502,7 @@ class ArmStateReader:
         now: float,
         *,
         cut_after_refresh: bool = False,
+        concurrent_refresh_sides: tuple[str, ...] = (),
     ) -> dict[str, dict[str, Any]]:
         """Refresh and select arm state at an explicit causal cut.
 
@@ -510,11 +512,82 @@ class ArmStateReader:
         observation (for example a startup Skill admission): it captures one
         shared cut after all requested refreshes and selects the newly
         published state without weakening historical queries.
+
+        ``concurrent_refresh_sides`` is for an application owner that needs a
+        coherent multi-arm live cut.  The named independent backends are
+        force-refreshed concurrently, then every side is selected at one shared
+        causal cutoff.  This avoids making the first serial hardware sample
+        stale while waiting for the second controller.
         """
 
         requested_at = float(now)
         if not math.isfinite(requested_at):
             raise ValueError("now must be finite")
+        concurrent_sides = frozenset(concurrent_refresh_sides)
+        unknown_concurrent_sides = concurrent_sides - set(self.backends)
+        if unknown_concurrent_sides:
+            raise ValueError(
+                "concurrent_refresh_sides contains unknown backends: "
+                f"{sorted(unknown_concurrent_sides)}"
+            )
+        concurrent_ready: dict[str, bool] = {}
+        concurrent_refresh_errors: dict[str, str] = {}
+        if concurrent_sides:
+            for side in concurrent_sides:
+                backend = self.backends[side]
+                projection = self.pose_projection_by_side.get(side)
+                try:
+                    concurrent_ready[side] = backend.is_ready() is True
+                    if not concurrent_ready[side] and projection is not None:
+                        self._invalidate_pose_projection(
+                            side=side,
+                            projection=projection,
+                            reason="backend_not_ready",
+                            error=RuntimeError("backend is not ready"),
+                        )
+                except Exception as exc:
+                    if projection is None:
+                        raise
+                    concurrent_ready[side] = False
+                    self._invalidate_pose_projection(
+                        side=side,
+                        projection=projection,
+                        reason="backend_readiness_unavailable",
+                        error=exc,
+                    )
+
+            def refresh_one(side: str) -> str | None:
+                try:
+                    refresh = getattr(
+                        self.backends[side],
+                        "refresh_state_from_hardware",
+                        None,
+                    )
+                    if callable(refresh):
+                        refresh()
+                except Exception as exc:  # noqa: BLE001
+                    return f"refresh_failed:{type(exc).__name__}:{exc}"
+                return None
+
+            ready_sides = tuple(
+                side
+                for side in self.backends
+                if side in concurrent_sides and concurrent_ready[side]
+            )
+            if ready_sides:
+                with ThreadPoolExecutor(
+                    max_workers=len(ready_sides),
+                    thread_name_prefix="arm-state-refresh",
+                ) as executor:
+                    futures = {
+                        side: executor.submit(refresh_one, side)
+                        for side in ready_sides
+                    }
+                    for side, future in futures.items():
+                        refresh_error = future.result()
+                        if refresh_error is not None:
+                            concurrent_refresh_errors[side] = refresh_error
+                        self._last_refresh_at[side] = now
         states: dict[str, dict[str, Any]] = {}
         refresh_period = 0.0 if self.refresh_hz <= 0.0 else 1.0 / self.refresh_hz
         for side, backend in self.backends.items():
@@ -522,32 +595,36 @@ class ArmStateReader:
             projection_source_ready = True
             projection_binding_ready = True
             if projection is not None:
-                try:
-                    projection_source_ready = backend.is_ready() is True
-                    if not projection_source_ready:
+                if side in concurrent_sides:
+                    projection_source_ready = concurrent_ready[side]
+                else:
+                    try:
+                        projection_source_ready = backend.is_ready() is True
+                        if not projection_source_ready:
+                            self._invalidate_pose_projection(
+                                side=side,
+                                projection=projection,
+                                reason="backend_not_ready",
+                                error=RuntimeError("backend is not ready"),
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        projection_source_ready = False
                         self._invalidate_pose_projection(
                             side=side,
                             projection=projection,
-                            reason="backend_not_ready",
-                            error=RuntimeError("backend is not ready"),
+                            reason="backend_readiness_unavailable",
+                            error=exc,
                         )
-                except Exception as exc:  # noqa: BLE001
-                    projection_source_ready = False
-                    self._invalidate_pose_projection(
-                        side=side,
-                        projection=projection,
-                        reason="backend_readiness_unavailable",
-                        error=exc,
-                    )
-            refresh_error: str | None = None
+            refresh_error = concurrent_refresh_errors.get(side)
             if (
-                refresh_period > 0.0
+                side not in concurrent_sides
+                and refresh_period > 0.0
+                and now - self._last_refresh_at.get(side, 0.0) >= refresh_period
                 and (
                     projection_source_ready
                     if projection is not None
                     else backend.is_ready()
                 )
-                and now - self._last_refresh_at.get(side, 0.0) >= refresh_period
             ):
                 try:
                     refresh = getattr(backend, "refresh_state_from_hardware", None)
@@ -563,6 +640,13 @@ class ArmStateReader:
                             error=RuntimeError(refresh_error),
                         )
                 self._last_refresh_at[side] = now
+            elif refresh_error is not None and projection is not None:
+                self._invalidate_pose_projection(
+                    side=side,
+                    projection=projection,
+                    reason="hardware_refresh_failed",
+                    error=RuntimeError(refresh_error),
+                )
             try:
                 pose_state_read = self.pose_state_read_by_side.get(side)
                 if pose_state_read is None:
