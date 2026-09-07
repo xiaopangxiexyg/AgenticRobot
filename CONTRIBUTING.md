@@ -15,6 +15,10 @@ writer lease 和验证流程。不要再为同一 Task 运行 claim_worktree 或
 
 ## 2. 环境与资源按需准备
 
+纯代码、测试和文档开发不要求机器人资产。只有本次任务需要仿真、模型或设备资产时，
+才配置共享 `assets/` 根目录。独立 Git 工作流的认领工具会在资产可用时建立被 Git
+忽略的兼容链接；缺少资产只产生警告，需要资产时使用 `--require-assets` 提前失败。
+
 Python、依赖和锁文件以 [README_ENV.md](README_ENV.md) 为准。完整开发环境：
 
 ```bash
