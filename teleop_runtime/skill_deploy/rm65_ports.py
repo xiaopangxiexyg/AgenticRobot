@@ -730,10 +730,28 @@ class ExclusiveRM65SkillDeployPorts:
                     for name, receipt in dict(batch.get("effectors") or {}).items()
                 },
             }
+            post_health = dict(batch.get("arm_backend_health") or {})
+            diagnostics = {
+                "position_dispatch_timing": dict(
+                    batch.get("position_dispatch_timing") or {}
+                ),
+                "backend_streaming_by_side": {
+                    side: dict(
+                        dict(post_health.get("sides") or {})
+                        .get(side, {})
+                        .get("background_streaming")
+                        or {}
+                    )
+                    for side in ("left", "right")
+                },
+            }
         except Exception as exc:  # noqa: BLE001 - convert to fail-closed receipt.
             succeeded = False
             summary = {
                 "accepted": False,
+                "error_type": type(exc).__name__,
+            }
+            diagnostics = {
                 "error_type": type(exc).__name__,
             }
         receipt_hash = canonical_content_hash(
@@ -743,6 +761,7 @@ class ExclusiveRM65SkillDeployPorts:
         return RealSkillMotionDispatchReceipt(
             succeeded=succeeded,
             evidence_refs=("rm65-skill-dispatch:" + receipt_hash,),
+            diagnostics=diagnostics,
         )
 
     def hold(self, reason: str) -> RealSkillMotionHoldReceipt:

@@ -125,6 +125,36 @@ revision/frame graph/calibration 应关闭失败。DMTAC TCP 到 solver endpoint
 这些说明和离线测试不构成真机运行授权；任何真实调用仍需下层 envelope、IK、碰撞/跳变/
 奇异性门禁、dispatch admission、收敛检查和终态 HOLD 证明。
 
+#### 真机 Skill 运动 trace
+
+需要定位抖动、超时或发送降频时，可在启动 `real-rm65` 时显式增加：
+
+```bash
+--motion-trace-root /absolute/private/motion_traces \
+--motion-trace-max-duration-sec 120
+```
+
+trace 不改变目标、IK、admission、freshness、碰撞、轨迹或 HOLD。启动前一次性为 60 Hz
+reference/IK 和左右各 120 Hz actuator command 分配固定内存；运行期间只复制固定字段，缓冲区
+满时累计 drop 而不等待，不执行 JSON、FK 或磁盘写入。下层停止并解除 trace callback 后才生成：
+
+- `motion_trace.npz`：30 Hz 实测 qpos/TCP、60 Hz 请求目标/原始 IK/最终 qref/分支/碰撞余量/
+  各阶段耗时，以及左右 120 Hz 的实际 SDK qcmd、发送时刻与结果；
+- `summary.json`：branch switch、reference/qcmd/measured 的 step/velocity/acceleration/jerk、
+  send gap、SDK latency、deadline、pose error 和 trace drop/error 汇总；
+- `manifest.json`：schema、dtype、时钟、容量、运行身份和完整性状态。
+
+进程退出后从 `gateway_stopped.motion_trace.output_dir` 取得实际目录，再检查：
+
+```bash
+python -m teleop_runtime.skill_deploy.motion_trace inspect \
+  /absolute/private/motion_traces/<session-directory>
+```
+
+`gateway_stopped.motion_trace.closed=true`、`manifest.json.result.closed=true` 且
+`summary.json` 存在，才表示 requested trace 已完整落盘；trace 成功不等价于运动成功，运动仍以
+operation outcome、实测收敛和 lower-confirmed HOLD 为准。
+
 ### 真机只读 perception profile（H1）
 
 ```bash
