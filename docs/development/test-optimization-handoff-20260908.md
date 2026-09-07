@@ -38,7 +38,8 @@ AgenticRobot 每次合并前的测试耗时过长，尤其是完整 acceptance �
 | 目标线 | development |
 | 目标线基准 | 4743d20a97fa07acc47d4217c39be4040c22b62e |
 | 候选分支 | task/root/full-acceptance-six-shard-optin-20260908 |
-| 候选提交（加入本文档前） | 04221f5e38f1ac1914085446b72e0b2088c3e424 |
+| 实现提交（本文档的父提交） | 04221f5e38f1ac1914085446b72e0b2088c3e424 |
+| 当前交接 tip（含本文档） | fcffb732afb74a63b1df69c179a56a96f341e53a |
 | 候选工作区 | /tmp/ar-full-acceptance-six-shard-optin-20260908 |
 | 候选所有者 | root |
 | 目标线状态 | development 未改变，未合并、未 push |
@@ -323,4 +324,4 @@ DEXTELEOP_FULL_ACCEPTANCE_SHARDS=6 \
 
 本批完成了低风险的 5/6 分片 opt-in 实现。聚焦验证稳定通过；六分片真实运行墙钟约 211 秒，显示资源充足主机上约 20% 的实际墙钟收益。由于完整运行仍有 gitlink 资源缺失和既有 MuJoCo 失败，且本机 swap 已满，默认值保持 4 是有意的安全决策。
 
-本文档加入候选后必须重新提交、更新 branch description 的 write scope/tip/validation，并重新交接。除非完成集成前检查并取得明确授权，不能合并到 development、推送远端或声称受保护 acceptance 已通过。
+当前交接 tip 为 fcffb732afb74a63b1df69c179a56a96f341e53a；后续任何代码、测试或文档改动都会使该 ready 记录失效，必须重新提交、更新 branch description 的 write scope/tip/validation，并重新交接。除非完成集成前检查并取得明确授权，不能合并到 development、推送远端或声称受保护 acceptance 已通过。
