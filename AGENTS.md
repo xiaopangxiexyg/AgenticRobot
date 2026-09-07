@@ -95,21 +95,17 @@ developer-local absolute path.
 
 ## Verification
 
-Before implementation, identify the changed behavior, invariants, actual
-consumers, and failure paths. Prefer one clear implementation owner; update
-in-scope callers and remove real duplication rather than adding speculative
-fallbacks or abstractions. Review the actual diff against the requested outcome.
-For high-impact contract, safety, persistence, concurrency, or instruction
-changes, arrange independent review. Resolve concrete findings in the owning
-worktree and recheck affected behavior on the new candidate; unresolved semantic
-choices go to their owner. Ordinary low-risk edits need no extra reviewer.
+Identify changed behavior, invariants, consumers, and failure paths; self-review
+correctness, responsibilities, and duplication. Independently review high-impact
+contract, safety, persistence, concurrency, or instruction changes; fix findings
+and recheck affected behavior. Undecided semantics go to their owner. Low-risk
+edits need no extra reviewer.
 
 Run repository tests through `bash scripts/run_pytest.sh ...`; the wrapper owns
 the supported environment and short AF_UNIX test paths. Use `tests/README.md`
 to select focused feedback, affected contracts, and integration acceptance.
 Cover changed failure modes and boundaries; avoid tests that merely restate
 implementation text or duplicate the same behavior. Run `git diff --check`.
-Handoff includes behavior delivered, affected consumers, important review
-findings and their resolution, and remaining gaps in the existing task record.
+Include behavior, consumers, review findings and resolution, and gaps in the handoff.
 Report offline, simulation, remote, and real-hardware evidence separately;
 none implies another.
