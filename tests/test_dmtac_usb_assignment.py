@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import io
 import tempfile
-import time
+import threading
 import unittest
 from pathlib import Path
 from contextlib import redirect_stdout
@@ -871,12 +871,30 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         self.assertEqual(grid.shape, (20, 30, 3))
 
     def test_dmtac_multi_device_parallel_read_overlaps_device_getters(self) -> None:
+        parallel_phase = False
+        sequential_entries: list[str] = []
+        parallel_entries: list[str] = []
+        parallel_threads: set[int] = set()
+        entry_lock = threading.Lock()
+        all_parallel_readers_entered = threading.Event()
+
         class FakeDevice:
             def __init__(self, dev_id: str) -> None:
                 self.dev_id = dev_id
 
             def read(self, **_kwargs):
-                time.sleep(0.05)
+                if not parallel_phase:
+                    sequential_entries.append(self.dev_id)
+                    return TacFrame(device_id=self.dev_id, timestamp_ns=0, status=0, fid=1)
+                with entry_lock:
+                    parallel_entries.append(self.dev_id)
+                    parallel_threads.add(threading.get_ident())
+                    if len(parallel_entries) == 3:
+                        all_parallel_readers_entered.set()
+                if not all_parallel_readers_entered.wait(timeout=5.0):
+                    raise AssertionError(
+                        "parallel readers did not overlap before one returned"
+                    )
                 return TacFrame(device_id=self.dev_id, timestamp_ns=0, status=0, fid=1)
 
             def close(self) -> None:
@@ -885,19 +903,17 @@ class DMTacUsbAssignmentTest(unittest.TestCase):
         multi = DMTacMultiDevice([DeviceConfig("a"), DeviceConfig("b"), DeviceConfig("c")])
         multi.devices = [FakeDevice("a"), FakeDevice("b"), FakeDevice("c")]
         try:
-            sequential_start = time.perf_counter()
             sequential = multi.read_all(parallel=False)
-            sequential_elapsed = time.perf_counter() - sequential_start
-
-            parallel_start = time.perf_counter()
+            parallel_phase = True
             parallel = multi.read_all(parallel=True)
-            parallel_elapsed = time.perf_counter() - parallel_start
         finally:
             multi.close()
 
+        self.assertEqual(sequential_entries, ["a", "b", "c"])
+        self.assertCountEqual(parallel_entries, ("a", "b", "c"))
+        self.assertEqual(len(parallel_threads), 3)
         self.assertEqual(tuple(sequential), ("a", "b", "c"))
         self.assertEqual(tuple(parallel), ("a", "b", "c"))
-        self.assertLess(parallel_elapsed, sequential_elapsed * 0.75)
 
     def test_dmtac_device_converts_distributed_force_to_float32_array(self) -> None:
         import numpy as np
